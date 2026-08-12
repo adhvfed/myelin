@@ -126,7 +126,9 @@ pub fn is_blocking_alter(ddl: &str) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MigrationError {
-    Destructive { id: &'static str },
+    Destructive {
+        id: &'static str,
+    },
     BlockingAlterOnHotTable {
         id: &'static str,
         table: &'static str,

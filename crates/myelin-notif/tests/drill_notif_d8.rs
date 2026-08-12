@@ -23,8 +23,7 @@ fn dnd_quiet() -> QuietHours {
 #[test]
 fn notif_d8_critical_escalation_pierces_dnd_watching_suppressed() {
     let quiet = dnd_quiet();
-    let recipient_in_quiet =
-        quiet.is_quiet_at( 600,  2);
+    let recipient_in_quiet = quiet.is_quiet_at(600, 2);
     assert!(
         recipient_in_quiet,
         "the recipient is in DND (the quiet window covers the instant)"
@@ -73,5 +72,4 @@ fn notif_d8_critical_escalation_pierces_dnd_watching_suppressed() {
         !delivered.contains(&Channel::Email),
         "the off-cell email push is suppressed (non-crit suppressed)"
     );
-
 }

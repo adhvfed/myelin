@@ -100,7 +100,7 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
         &bounded_stale(),
         None,
         &ts("2026-06-19T00:00:01Z"),
-         true,
+        true,
     );
     assert!(
         matches!(healthy.served, Served::Fresh),
@@ -121,7 +121,7 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
         &bounded_stale(),
         None,
         &ts("2026-06-19T00:00:02Z"),
-         false,
+        false,
     );
     assert!(
         matches!(survived.served, Served::Static),
@@ -141,7 +141,7 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
         &strong(),
         None,
         &ts("2026-06-19T00:00:03Z"),
-         false,
+        false,
     );
     assert!(
         matches!(strong_during_hiccup.served, Served::BypassClosed),
@@ -169,7 +169,7 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
             &bounded_stale(),
             None,
             &ts(&format!("2026-06-19T00:05:{i:02}Z")),
-             false,
+            false,
         );
         if d.is_allow() {
             successful_authz_after_cache_for_revoked += 1;

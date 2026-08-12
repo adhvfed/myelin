@@ -134,12 +134,18 @@ pub fn placement_durable_migrations() -> crate::migration::Migrations {
         Migration::plain("0030_cell", CELL_MIGRATION),
         Migration::plain("0031_tenant_placement", TENANT_PLACEMENT_MIGRATION),
         Migration::plain("0032_placement_invariant_fn", PLACEMENT_INVARIANT_FN),
-        Migration::plain("0033_placement_invariant_trigger", PLACEMENT_INVARIANT_TRIGGER),
+        Migration::plain(
+            "0033_placement_invariant_trigger",
+            PLACEMENT_INVARIANT_TRIGGER,
+        ),
         Migration::plain("0034_misroute_audit", MISROUTE_AUDIT_MIGRATION),
         Migration::plain("0035_repo_placement", REPO_PLACEMENT_MIGRATION),
         Migration::plain("0036_cell_provisioning", CELL_PROVISIONING_MIGRATION),
         Migration::plain("0037_local_tenant", LOCAL_TENANT_MIGRATION),
-        Migration::plain("0038_repo_placement_invariant_fn", REPO_PLACEMENT_INVARIANT_FN),
+        Migration::plain(
+            "0038_repo_placement_invariant_fn",
+            REPO_PLACEMENT_INVARIANT_FN,
+        ),
         Migration::plain(
             "0039_repo_placement_invariant_trigger",
             REPO_PLACEMENT_INVARIANT_TRIGGER,
@@ -217,7 +223,10 @@ impl core::fmt::Display for PlacementWriteError {
                  land): {why}"
             ),
             PlacementWriteError::Db(why) => {
-                write!(f, "placement write failed (DB error, the write did NOT land): {why}")
+                write!(
+                    f,
+                    "placement write failed (DB error, the write did NOT land): {why}"
+                )
             }
         }
     }
@@ -553,7 +562,10 @@ impl DurablePlacementBacking {
         Ok(row.map(|r| local_tenant_from_row(&r)))
     }
 
-    pub async fn local_tenants(&self, cell_id: &str) -> Result<Vec<DurableLocalTenantRow>, PgError> {
+    pub async fn local_tenants(
+        &self,
+        cell_id: &str,
+    ) -> Result<Vec<DurableLocalTenantRow>, PgError> {
         let rows = sqlx::query(
             "SELECT cell_id, tenant_id, isolation_tier, active \
              FROM local_tenant WHERE cell_id = $1 ORDER BY tenant_id",

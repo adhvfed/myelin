@@ -90,17 +90,9 @@ fn refuse(msg: impl Into<String>) -> AuthzError {
 
 #[derive(Clone, Debug)]
 pub enum JwkKey {
-    Rsa {
-        n: Vec<u8>,
-        e: Vec<u8>,
-    },
-    EcP256 {
-        x: Vec<u8>,
-        y: Vec<u8>,
-    },
-    Ed25519 {
-        x: Vec<u8>,
-    },
+    Rsa { n: Vec<u8>, e: Vec<u8> },
+    EcP256 { x: Vec<u8>, y: Vec<u8> },
+    Ed25519 { x: Vec<u8> },
 }
 
 impl JwkKey {

@@ -30,10 +30,7 @@ pub fn dpia_markers_of(fields: &[PersonalDataField]) -> BTreeSet<DpiaMarker> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DpiaVerdict {
-    Required {
-        marker: DpiaMarker,
-        reason: String,
-    },
+    Required { marker: DpiaMarker, reason: String },
 }
 
 impl DpiaVerdict {

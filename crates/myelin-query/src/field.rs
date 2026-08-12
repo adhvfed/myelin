@@ -185,11 +185,7 @@ fn midpoint(lo: &[u8], hi: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     for i in 0..MIDPOINT_DESCENT_CAP {
         let lo_d = if i < lo.len() { rank(lo[i]) } else { 0 };
-        let hi_d = if i < hi.len() {
-            rank(hi[i])
-        } else {
-            BASE
-        };
+        let hi_d = if i < hi.len() { rank(hi[i]) } else { BASE };
 
         if hi_d > lo_d + 1 {
             let mid = lo_d + (hi_d - lo_d) / 2;

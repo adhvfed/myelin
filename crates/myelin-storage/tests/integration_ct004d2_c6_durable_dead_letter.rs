@@ -24,7 +24,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}_{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 fn principal() -> Principal {
@@ -169,17 +173,13 @@ async fn h2_panic_path_persists_the_poison_durably_and_pii_free() {
         }
     }
 
-    let dedup =
-        DedupLedger::durable(
-            Arc::new(myelin_storage::events_durable::DurableDedupBacking::new(
-                pool.clone(),
-                rt.clone(),
-            )) as Arc<dyn DurableDedup>,
-        );
-    let sink = DeadLetterSink::durable(
-        Arc::new(DurableDeadLetterBacking::new(pool.clone(), rt.clone()))
-            as Arc<dyn DurableDeadLetter>,
-    );
+    let dedup = DedupLedger::durable(Arc::new(
+        myelin_storage::events_durable::DurableDedupBacking::new(pool.clone(), rt.clone()),
+    ) as Arc<dyn DurableDedup>);
+    let sink = DeadLetterSink::durable(Arc::new(DurableDeadLetterBacking::new(
+        pool.clone(),
+        rt.clone(),
+    )) as Arc<dyn DurableDeadLetter>);
     let consumer = Consumer::new(
         PanicHandler {
             ran: AtomicU32::new(0),
@@ -294,17 +294,13 @@ async fn db_unreachable_record_falls_back_never_silently_drops() {
         }
     }
 
-    let dedup =
-        DedupLedger::durable(
-            Arc::new(myelin_storage::events_durable::DurableDedupBacking::new(
-                pool.clone(),
-                rt.clone(),
-            )) as Arc<dyn DurableDedup>,
-        );
-    let sink = DeadLetterSink::durable(
-        Arc::new(DurableDeadLetterBacking::new(dead_pool, rt.clone()))
-            as Arc<dyn DurableDeadLetter>,
-    );
+    let dedup = DedupLedger::durable(Arc::new(
+        myelin_storage::events_durable::DurableDedupBacking::new(pool.clone(), rt.clone()),
+    ) as Arc<dyn DurableDedup>);
+    let sink = DeadLetterSink::durable(Arc::new(DurableDeadLetterBacking::new(
+        dead_pool,
+        rt.clone(),
+    )) as Arc<dyn DurableDeadLetter>);
     let consumer = Consumer::new(
         PanicHandler,
         Subscription::bind(

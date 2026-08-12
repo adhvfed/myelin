@@ -284,7 +284,9 @@ impl ReverseIndexConsumer {
                 .and_then(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    format!("identity.tuple.written delta {index} has no non-empty `{field}` string")
+                    format!(
+                        "identity.tuple.written delta {index} has no non-empty `{field}` string"
+                    )
                 })
         }
 
@@ -374,13 +376,11 @@ fn type_of_object_id(object_id: &str) -> String {
 }
 
 fn canonical_zookie(value: &str) -> bool {
-    value
-        .strip_prefix("zk-")
-        .is_some_and(|revision| {
-            revision.len() == 20
-                && revision.bytes().all(|byte| byte.is_ascii_digit())
-                && revision.parse::<u64>().is_ok()
-        })
+    value.strip_prefix("zk-").is_some_and(|revision| {
+        revision.len() == 20
+            && revision.bytes().all(|byte| byte.is_ascii_digit())
+            && revision.parse::<u64>().is_ok()
+    })
 }
 
 #[cfg(test)]

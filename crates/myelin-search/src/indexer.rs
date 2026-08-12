@@ -13,13 +13,7 @@ pub const INDEXER_CONSUMER: &str = "search-incremental-indexer";
 
 pub static INDEXER_SUBJECTS: &[SubjectPattern] = &[];
 
-pub const INDEXER_SUBJECT_PREFIXES: &[&str] = &[
-    "issue.",
-    "knowledge.",
-    "chat.",
-    "git.",
-    "authz.",
-];
+pub const INDEXER_SUBJECT_PREFIXES: &[&str] = &["issue.", "knowledge.", "chat.", "git.", "authz."];
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct IndexSpec {
@@ -741,7 +735,10 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "zk-7", "version": 3 }),
         );
-        assert_eq!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            ix.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
 
         assert_eq!(
             fetcher.call_count(r),
@@ -874,7 +871,10 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "z" }),
         );
-        assert_eq!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            ix.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
 
         let query = MockEmbeddingAdapter::new(8)
             .embed("distributed consensus and raft")
@@ -932,7 +932,10 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "zk-1" }),
         );
-        assert_eq!(ix.handle(&create, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            ix.handle(&create, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
             Some("zk-1")
@@ -945,7 +948,10 @@ mod tests {
             r,
             serde_json::json!({ "zookie": "zk-2", "refs": [r] }),
         );
-        assert_eq!(ix.handle(&perm, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            ix.handle(&perm, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
 
         assert_eq!(
             ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
@@ -991,7 +997,10 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(
-            matches!(ix.handle(&perm, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
+            matches!(
+                ix.handle(&perm, &mut myelin_events::HandlerTx::none()),
+                HandleOutcome::NonRetryable(_)
+            ),
             "missing zookie/refs → poison"
         );
     }
@@ -1001,12 +1010,10 @@ mod tests {
         let r = "myelin://acme/issue/issue/ENG-1";
         let fetcher = Arc::new(FakeFetcher::with(r, proj("body")));
         let ix = indexer_with(vec![issue_spec()], fetcher);
-        ix.handle(&event(
-            "01J-1",
-            "issue.issue.created",
-            r,
-            serde_json::json!({}),
-        ), &mut myelin_events::HandlerTx::none());
+        ix.handle(
+            &event("01J-1", "issue.issue.created", r, serde_json::json!({})),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
         let erased = event(
@@ -1015,7 +1022,10 @@ mod tests {
             r,
             serde_json::json!({ "ref": r }),
         );
-        assert_eq!(ix.handle(&erased, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            ix.handle(&erased, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             ix.live_count(&tenant(), &region()),
             0,
@@ -1028,22 +1038,18 @@ mod tests {
         let r = "myelin://acme/issue/issue/ENG-1";
         let fetcher = Arc::new(FakeFetcher::with(r, proj("body")));
         let ix = indexer_with(vec![issue_spec()], fetcher.clone());
-        ix.handle(&event(
-            "01J-1",
-            "issue.issue.created",
-            r,
-            serde_json::json!({}),
-        ), &mut myelin_events::HandlerTx::none());
+        ix.handle(
+            &event("01J-1", "issue.issue.created", r, serde_json::json!({})),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
         fetcher.projections.lock().unwrap().remove(r);
         assert_eq!(
-            ix.handle(&event(
-                "01J-2",
-                "issue.issue.updated",
-                r,
-                serde_json::json!({})
-            ), &mut myelin_events::HandlerTx::none()),
+            ix.handle(
+                &event("01J-2", "issue.issue.updated", r, serde_json::json!({})),
+                &mut myelin_events::HandlerTx::none()
+            ),
             HandleOutcome::Done
         );
         assert_eq!(
@@ -1065,7 +1071,10 @@ mod tests {
             sub_ref,
             serde_json::json!({}),
         );
-        assert_eq!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            ix.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
 
         let by_parent = ix
             .search_ft(&tenant(), &region(), &AclFilter::ids([parent]), "prose", 10)
@@ -1184,7 +1193,10 @@ mod tests {
         let ev = event("01J-1", "issue.issue.created", r, serde_json::json!({}));
 
         assert!(
-            matches!(ix.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Retry(_)),
+            matches!(
+                ix.handle(&ev, &mut myelin_events::HandlerTx::none()),
+                HandleOutcome::Retry(_)
+            ),
             "a transient hiccup retries"
         );
         assert_eq!(
@@ -1210,12 +1222,10 @@ mod tests {
         let fetcher = Arc::new(FakeFetcher::with(r, proj("body")));
         let ix = indexer_with(vec![issue_spec()], fetcher);
         assert_eq!(ix.index_lag(), 0, "a fresh indexer has no lag");
-        ix.handle(&event(
-            "01J-1",
-            "issue.issue.created",
-            r,
-            serde_json::json!({}),
-        ), &mut myelin_events::HandlerTx::none());
+        ix.handle(
+            &event("01J-1", "issue.issue.created", r, serde_json::json!({})),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(
             ix.index_lag(),
             0,

@@ -22,9 +22,7 @@ impl ReplicaCell {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplicaFreshness {
     Current,
-    Stale {
-        behind_by: u64,
-    },
+    Stale { behind_by: u64 },
 }
 
 impl ReplicaFreshness {

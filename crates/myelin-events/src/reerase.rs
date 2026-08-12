@@ -1,9 +1,9 @@
 use crate::holder::{BusEventLog, BusHolder, EraseReceipt, InlinePiiShredder, ShredError};
 use crate::outbox::{IdMinter, OutboxStore};
 use crate::{PiiKeyRef, Region, TenantId, Timestamp};
-use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
+use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 

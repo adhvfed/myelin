@@ -402,8 +402,7 @@ mod tests {
 
     #[test]
     fn masks_every_occurrence_of_each_needle() {
-        let plan =
-            RedactionPlan::for_needles([b"s3cr3t".to_vec(), b"hunter2".to_vec()]).unwrap();
+        let plan = RedactionPlan::for_needles([b"s3cr3t".to_vec(), b"hunter2".to_vec()]).unwrap();
         let got = plan.redact(b"token=s3cr3t and again s3cr3t; pw=hunter2");
         assert!(!contains_bytes(&got, b"s3cr3t"));
         assert!(!contains_bytes(&got, b"hunter2"));
@@ -471,12 +470,9 @@ mod tests {
     #[test]
     fn adjacent_markers_cannot_synthesize_another_secret() {
         let synthesized = b"######".to_vec();
-        let plan = RedactionPlan::for_needles([
-            b"left".to_vec(),
-            b"right".to_vec(),
-            synthesized.clone(),
-        ])
-        .unwrap();
+        let plan =
+            RedactionPlan::for_needles([b"left".to_vec(), b"right".to_vec(), synthesized.clone()])
+                .unwrap();
         let output = plan.redact(b"leftright");
         assert!(!contains_bytes(&output, &synthesized));
     }
@@ -484,12 +480,8 @@ mod tests {
     #[test]
     fn all_byte_alphabet_is_rejected_instead_of_using_an_empty_marker() {
         let all_bytes: Vec<u8> = (0u8..=u8::MAX).collect();
-        let error = RedactionPlan::for_needles([
-            all_bytes,
-            b"ab".to_vec(),
-            b"X".to_vec(),
-        ])
-        .expect_err("a marker-less plan must be refused fail-closed");
+        let error = RedactionPlan::for_needles([all_bytes, b"ab".to_vec(), b"X".to_vec()])
+            .expect_err("a marker-less plan must be refused fail-closed");
         assert_eq!(error, RedactionPlanError);
     }
 

@@ -42,12 +42,7 @@ fn ga_11_outbound_push_mirror_residency_gate_denies_extra_eu_admits_within_eu() 
     let mut feature = OutboundReplicationFeature::new();
 
     let extra_eu_mirror = OutboundConfig::push_mirror(Region::new("us-east"));
-    let d1 = feature.try_replicate(
-        &mut gate,
-        &policy,
-        &extra_eu_mirror,
-         true,
-    );
+    let d1 = feature.try_replicate(&mut gate, &policy, &extra_eu_mirror, true);
     assert!(
         matches!(
             d1,
@@ -59,12 +54,7 @@ fn ga_11_outbound_push_mirror_residency_gate_denies_extra_eu_admits_within_eu() 
     );
 
     let within_eu_clone = OutboundConfig::cdn_clone(Region::new("fr-par"));
-    let d2 = feature.try_replicate(
-        &mut gate,
-        &policy,
-        &within_eu_clone,
-         false,
-    );
+    let d2 = feature.try_replicate(&mut gate, &policy, &within_eu_clone, false);
     assert_eq!(
         d2,
         OutboundDecision::Allow {
@@ -74,7 +64,7 @@ fn ga_11_outbound_push_mirror_residency_gate_denies_extra_eu_admits_within_eu() 
     );
 
     let disguised = OutboundConfig::cdn_clone(Region::new("ap-tokyo"));
-    let d3 = feature.try_replicate(&mut gate, &policy, &disguised,  true);
+    let d3 = feature.try_replicate(&mut gate, &policy, &disguised, true);
     assert!(
         matches!(
             d3,
@@ -86,12 +76,7 @@ fn ga_11_outbound_push_mirror_residency_gate_denies_extra_eu_admits_within_eu() 
     );
 
     let within_eu_mirror = OutboundConfig::push_mirror(Region::new("nl-ams"));
-    let d4 = feature.try_replicate(
-        &mut gate,
-        &policy,
-        &within_eu_mirror,
-         false,
-    );
+    let d4 = feature.try_replicate(&mut gate, &policy, &within_eu_mirror, false);
     assert_eq!(
         d4,
         OutboundDecision::Allow {

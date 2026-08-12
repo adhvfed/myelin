@@ -285,9 +285,7 @@ pub fn gate_outcome(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GateOutcome {
     AllRequiredGreen,
-    Blocked {
-        unmet: Vec<CheckContext>,
-    },
+    Blocked { unmet: Vec<CheckContext> },
 }
 
 fn check_status_subjects() -> &'static [SubjectPattern] {

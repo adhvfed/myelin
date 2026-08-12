@@ -79,27 +79,48 @@ async fn a_boot_migration_executes_ddl_and_is_idempotent() {
         .await
         .expect("boot migration executes DDL against the live DB");
 
-    assert!(table_exists(provider.db_pool(), t1).await, "{t1} must exist after boot migrate");
-    assert!(table_exists(provider.db_pool(), t2).await, "{t2} must exist after boot migrate");
-    assert_eq!(PgMigrator::applied_count(provider.db_pool(), id1).await.unwrap(), 1);
-    assert_eq!(PgMigrator::applied_count(provider.db_pool(), id2).await.unwrap(), 1);
+    assert!(
+        table_exists(provider.db_pool(), t1).await,
+        "{t1} must exist after boot migrate"
+    );
+    assert!(
+        table_exists(provider.db_pool(), t2).await,
+        "{t2} must exist after boot migrate"
+    );
+    assert_eq!(
+        PgMigrator::applied_count(provider.db_pool(), id1)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        PgMigrator::applied_count(provider.db_pool(), id2)
+            .await
+            .unwrap(),
+        1
+    );
 
     provider
         .migrate(&migrations, &HotTables::none())
         .await
         .expect("re-running the same migrations is idempotent");
     assert_eq!(
-        PgMigrator::applied_count(provider.db_pool(), id1).await.unwrap(),
+        PgMigrator::applied_count(provider.db_pool(), id1)
+            .await
+            .unwrap(),
         1,
         "a second boot migrate must NOT duplicate-apply id1"
     );
-    assert_eq!(PgMigrator::applied_count(provider.db_pool(), id2).await.unwrap(), 1);
+    assert_eq!(
+        PgMigrator::applied_count(provider.db_pool(), id2)
+            .await
+            .unwrap(),
+        1
+    );
 
     let drop_id = leak(format!("mr022a_{suffix}_drop"));
-    let destructive = Migrations::of([Migration::plain(
-        drop_id,
-        leak(format!("DROP TABLE {t1};")),
-    )]);
+    let destructive =
+        Migrations::of([Migration::plain(drop_id, leak(format!("DROP TABLE {t1};")))]);
     let err = provider
         .migrate(&destructive, &HotTables::none())
         .await
@@ -111,8 +132,16 @@ async fn a_boot_migration_executes_ddl_and_is_idempotent() {
         ),
         other => panic!("expected a Pg(forward-only) rejection, got {other}"),
     }
-    assert_eq!(PgMigrator::applied_count(provider.db_pool(), drop_id).await.unwrap(), 0);
-    assert!(table_exists(provider.db_pool(), t1).await, "{t1} must survive the rejected DROP");
+    assert_eq!(
+        PgMigrator::applied_count(provider.db_pool(), drop_id)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        table_exists(provider.db_pool(), t1).await,
+        "{t1} must survive the rejected DROP"
+    );
 
     for t in [t1, t2] {
         let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {t}"))
@@ -146,7 +175,10 @@ async fn b_provider_builds_real_pool_from_env_and_migrates_foundation() {
         provider.database_is_ready().await,
         "readiness executes a real PostgreSQL round trip"
     );
-    assert!(!provider.config().region.is_empty(), "the provider carries the region pin");
+    assert!(
+        !provider.config().region.is_empty(),
+        "the provider carries the region pin"
+    );
 
     provider.db_pool().close().await;
     assert!(
@@ -161,16 +193,30 @@ async fn b_provider_builds_real_pool_from_env_and_migrates_foundation() {
         .migrate_foundation()
         .await
         .expect("the composition root runs the foundation migrations at startup");
-    assert!(table_exists(admin.db_pool(), "outbox").await, "the outbox table exists after boot");
+    assert!(
+        table_exists(admin.db_pool(), "outbox").await,
+        "the outbox table exists after boot"
+    );
     assert!(
         table_exists(admin.db_pool(), "consumer_dedup").await,
         "the consumer_dedup table exists after boot"
     );
-    assert!(PgMigrator::is_applied(admin.db_pool(), "0000_outbox").await.unwrap());
-    assert!(PgMigrator::is_applied(admin.db_pool(), "0001_consumer_dedup").await.unwrap());
-    admin.migrate_foundation().await.expect("foundation migrate is idempotent");
+    assert!(PgMigrator::is_applied(admin.db_pool(), "0000_outbox")
+        .await
+        .unwrap());
+    assert!(
+        PgMigrator::is_applied(admin.db_pool(), "0001_consumer_dedup")
+            .await
+            .unwrap()
+    );
+    admin
+        .migrate_foundation()
+        .await
+        .expect("foundation migrate is idempotent");
     assert_eq!(
-        PgMigrator::applied_count(admin.db_pool(), "0000_outbox").await.unwrap(),
+        PgMigrator::applied_count(admin.db_pool(), "0000_outbox")
+            .await
+            .unwrap(),
         1,
         "the outbox foundation migration is applied EXACTLY once across re-boots"
     );
@@ -189,7 +235,10 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
             return;
         }
     };
-    store.migrate().await.expect("rebac_tuple + RLS policy exist");
+    store
+        .migrate()
+        .await
+        .expect("rebac_tuple + RLS policy exist");
 
     let pool = connect_pool_with_reset(&cfg.database_url, &cfg.region, 4)
         .await
@@ -227,7 +276,11 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
     }
 
     let seen_by_a = read_objects(&pool, &tenant_a, &region).await;
-    assert_eq!(seen_by_a, vec![obj.clone()], "tenant A sees its own row under RLS");
+    assert_eq!(
+        seen_by_a,
+        vec![obj.clone()],
+        "tenant A sees its own row under RLS"
+    );
 
     let seen_by_b = read_objects(&pool, &tenant_b, &region).await;
     assert!(
@@ -239,9 +292,11 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
         .await
         .expect("single-connection app-role pool");
 
-    with_tenant_tx(&pool1, "ghost-tenant", &region, |_conn| Box::pin(async move { Ok(()) }))
-        .await
-        .expect("a tenant-scoped tx commits");
+    with_tenant_tx(&pool1, "ghost-tenant", &region, |_conn| {
+        Box::pin(async move { Ok(()) })
+    })
+    .await
+    .expect("a tenant-scoped tx commits");
     assert!(
         current_tenant_guc(&pool1).await.is_empty(),
         "no residual tenant GUC after a committed tenant-scoped transaction (SET LOCAL discarded)"
@@ -264,11 +319,16 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
         .connect(&cfg.database_url)
         .await
         .expect("bare single-connection pool (no reset-on-release)");
-    with_tenant_tx(&bare, "probe-tenant", &region, |_conn| Box::pin(async move { Ok(()) }))
-        .await
-        .expect("a tenant-scoped tx commits on the bare pool");
+    with_tenant_tx(&bare, "probe-tenant", &region, |_conn| {
+        Box::pin(async move { Ok(()) })
+    })
+    .await
+    .expect("a tenant-scoped tx commits on the bare pool");
     let residual_bare: Option<String> = {
-        let mut conn = bare.acquire().await.expect("reacquire the same bare connection");
+        let mut conn = bare
+            .acquire()
+            .await
+            .expect("reacquire the same bare connection");
         sqlx::query_scalar("SELECT current_setting('myelin.tenant_id', true)")
             .fetch_one(&mut *conn)
             .await
@@ -294,7 +354,9 @@ async fn c_tenant_tx_isolates_and_does_not_bleed() {
         }
     })
     .await;
-    println!("OK [C]: tenant-scoped-tx isolates across tenants (RLS in tx) + no GUC bleed on reuse.");
+    println!(
+        "OK [C]: tenant-scoped-tx isolates across tenants (RLS in tx) + no GUC bleed on reuse."
+    );
 }
 
 async fn read_objects(pool: &sqlx::PgPool, tenant: &str, region: &str) -> Vec<String> {
@@ -305,7 +367,10 @@ async fn read_objects(pool: &sqlx::PgPool, tenant: &str, region: &str) -> Vec<St
                 .fetch_all(&mut *conn)
                 .await
                 .map_err(|e| myelin_storage::pg::PgError::Query(e.to_string()))?;
-            Ok(rows.iter().map(|r| r.get::<String, _>("object_id")).collect::<Vec<_>>())
+            Ok(rows
+                .iter()
+                .map(|r| r.get::<String, _>("object_id"))
+                .collect::<Vec<_>>())
         })
     })
     .await

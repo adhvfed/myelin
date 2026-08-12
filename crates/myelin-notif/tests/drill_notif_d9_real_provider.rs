@@ -119,5 +119,4 @@ fn notif_d9_real_provider_offcell_payload_is_purgeable_via_the_erasure_hook() {
         transport.was_erased(&provider_ref),
         "the sub-processor was asked to purge the already-sent off-cell payload (NOTIF-P27 hook)"
     );
-
 }

@@ -119,7 +119,10 @@ fn producer_reflex_consumer_binds_a_star_free_foreign_whitelist() {
             s.0
         );
     }
-    let outcome = consumer.handle(&merge_event("p-1", "success"), &mut myelin_events::HandlerTx::none());
+    let outcome = consumer.handle(
+        &merge_event("p-1", "success"),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(outcome, HandleOutcome::Done);
 }
 

@@ -261,11 +261,7 @@ impl<K: Hash + Eq, T: Clone, C: Clock> FailStatic<K, T, C> {
         }
     }
 
-    fn serve_from_cache(
-        &self,
-        key: K,
-        refresh: &impl Fn() -> Result<T, ServeError>,
-    ) -> Answer<T> {
+    fn serve_from_cache(&self, key: K, refresh: &impl Fn() -> Result<T, ServeError>) -> Answer<T> {
         let now = self.clock.now_secs();
         let cache = self.cache.lock().expect("fail-static cache poisoned");
         let Some(entry) = cache.get(&key) else {
@@ -335,8 +331,8 @@ mod tests {
 
     #[test]
     fn constructor_rejects_static_max_over_revocation_sla() {
-        let err =
-            FailStatic::<&str, u32>::try_new(30, 301, drill_bound()).expect_err("must reject > SLA");
+        let err = FailStatic::<&str, u32>::try_new(30, 301, drill_bound())
+            .expect_err("must reject > SLA");
         assert_eq!(
             err,
             FailStaticError::ExceedsRevocationSla {
@@ -348,8 +344,8 @@ mod tests {
 
     #[test]
     fn constructor_rejects_static_max_under_agent_token_ttl() {
-        let err =
-            FailStatic::<&str, u32>::try_new(30, 59, drill_bound()).expect_err("must reject < token TTL");
+        let err = FailStatic::<&str, u32>::try_new(30, 59, drill_bound())
+            .expect_err("must reject < token TTL");
         assert_eq!(
             err,
             FailStaticError::BelowAgentTokenTtl {
@@ -375,8 +371,10 @@ mod tests {
     #[test]
     fn constructor_admits_at_the_exact_boundaries() {
         FailStatic::<&str, u32>::try_new(30, 300, drill_bound()).expect("== SLA is admitted (≤)");
-        FailStatic::<&str, u32>::try_new(30, 60, drill_bound()).expect("== token TTL is admitted (≥)");
-        FailStatic::<&str, u32>::try_new(120, 120, drill_bound()).expect("fresh==static is admitted");
+        FailStatic::<&str, u32>::try_new(30, 60, drill_bound())
+            .expect("== token TTL is admitted (≥)");
+        FailStatic::<&str, u32>::try_new(120, 120, drill_bound())
+            .expect("fresh==static is admitted");
     }
 
     #[test]
@@ -427,8 +425,8 @@ mod tests {
     #[test]
     fn stale_serves_the_last_known_good_never_escalates() {
         let clock = TestClock::at(0);
-        let fs =
-            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+        let fs = FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
+            .expect("valid");
         assert_eq!(fs.get("k", || Ok(42u32)), Answer::Fresh(42));
         fs_clock(&fs).advance(50);
         match fs.get("k", fail_once()) {
@@ -442,8 +440,8 @@ mod tests {
     #[test]
     fn stale_while_revalidate_refreshes_when_upstream_recovers() {
         let clock = TestClock::at(0);
-        let fs =
-            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+        let fs = FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
+            .expect("valid");
         assert_eq!(fs.get("k", || Ok(1u32)), Answer::Fresh(1));
         fs_clock(&fs).advance(50);
         assert_eq!(fs.get("k", || Ok(2u32)), Answer::Fresh(2));
@@ -457,8 +455,8 @@ mod tests {
     #[test]
     fn signals_count_fresh_stale_closed_and_staleness_age() {
         let clock = TestClock::at(0);
-        let fs =
-            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+        let fs = FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
+            .expect("valid");
         assert_eq!(fs.get("k", || Ok(5u32)), Answer::Fresh(5));
         fs_clock(&fs).advance(50);
         assert_eq!(fs.get("k", fail_once()), Answer::Static(5));
@@ -531,8 +529,8 @@ mod tests {
     #[test]
     fn background_refresh_restamps_the_cache_on_recovery() {
         let clock = TestClock::at(0);
-        let fs =
-            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+        let fs = FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
+            .expect("valid");
         assert_eq!(fs.get("k", || Ok(1u32)), Answer::Fresh(1));
         fs_clock(&fs).advance(50);
 
@@ -644,8 +642,8 @@ mod tests {
     #[test]
     fn debug_shows_bounds_and_counters_not_cached_values() {
         let clock = TestClock::at(0);
-        let fs =
-            FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock).expect("valid");
+        let fs = FailStatic::<&str, u32, _>::try_new_with_clock(10, 100, drill_bound(), clock)
+            .expect("valid");
         assert_eq!(fs.get("k", || Ok(57005_u32)), Answer::Fresh(57005));
         let dbg = format!("{fs:?}");
         assert!(

@@ -267,9 +267,7 @@ impl HyokCrossStoreInputs<'_> {
                 )
                 .map(|hits| hits.iter().any(|h| h.doc_id == self.platform_doc_id))
                 .unwrap_or(false),
-            DerivedStore::Vectors => {
-                self.indexer.live_vector_count(&self.tenant, &self.region) > 0
-            }
+            DerivedStore::Vectors => self.indexer.live_vector_count(&self.tenant, &self.region) > 0,
             DerivedStore::Caches => self.platform_cache_present,
             DerivedStore::Backups => self.platform_backup_present,
         }

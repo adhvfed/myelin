@@ -66,7 +66,9 @@ impl ErasureLedger {
         }
     }
 
-    pub fn with_pg(backing: crate::restore_verify_durable::DurableRestoreErasureLedger) -> ErasureLedger {
+    pub fn with_pg(
+        backing: crate::restore_verify_durable::DurableRestoreErasureLedger,
+    ) -> ErasureLedger {
         ErasureLedger {
             backend: ErasureLedgerBackend::Pg(Box::new(backing)),
         }
@@ -85,7 +87,9 @@ impl ErasureLedger {
                     .expect("erasure ledger poisoned")
                     .insert(tenant, completed_at_offset);
             }
-            ErasureLedgerBackend::Pg(backing) => backing.record_erased_at(&tenant, completed_at_offset),
+            ErasureLedgerBackend::Pg(backing) => {
+                backing.record_erased_at(&tenant, completed_at_offset)
+            }
         }
         self
     }
@@ -356,7 +360,8 @@ impl RestoreVerifyGate {
             .map(|r| r.tenant)
             .collect();
         for (tenant, completed_at_offset) in inputs.erasure_ledger.records() {
-            if completed_at_offset > report.restored_to_offset && !post_pit_tenants.contains(&tenant)
+            if completed_at_offset > report.restored_to_offset
+                && !post_pit_tenants.contains(&tenant)
             {
                 return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
             }

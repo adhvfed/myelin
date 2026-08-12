@@ -23,14 +23,8 @@ impl Default for DrillContext {
 
 #[derive(Clone, Debug)]
 pub enum DrillResult {
-    Pass {
-        name: String,
-        verdict: Assertion,
-    },
-    Fail {
-        name: String,
-        verdict: Assertion,
-    },
+    Pass { name: String, verdict: Assertion },
+    Fail { name: String, verdict: Assertion },
 }
 
 impl DrillResult {

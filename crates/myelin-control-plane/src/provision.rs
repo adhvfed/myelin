@@ -45,15 +45,9 @@ impl ProvisionVerdict {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProvisionFailure {
-    RestoreVerifyFailed {
-        detail: String,
-    },
-    NotReady {
-        down_dependencies: Vec<String>,
-    },
-    UnknownCell {
-        cell: CellId,
-    },
+    RestoreVerifyFailed { detail: String },
+    NotReady { down_dependencies: Vec<String> },
+    UnknownCell { cell: CellId },
 }
 
 impl std::fmt::Display for ProvisionFailure {

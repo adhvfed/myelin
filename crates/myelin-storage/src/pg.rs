@@ -54,8 +54,8 @@ impl PgStore {
                     .to_string(),
             ));
         }
-        let pool =
-            crate::tenant_tx::connect_pool_with_reset(database_url, region, max_connections).await?;
+        let pool = crate::tenant_tx::connect_pool_with_reset(database_url, region, max_connections)
+            .await?;
         Ok(PgStore {
             pool,
             region: region.to_string(),
@@ -186,8 +186,11 @@ impl PgStore {
         self.ensure_region()?;
         self.authz_queries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (tenant_owned, subject, relation) =
-            (tenant.to_string(), subject.to_string(), relation.to_string());
+        let (tenant_owned, subject, relation) = (
+            tenant.to_string(),
+            subject.to_string(),
+            relation.to_string(),
+        );
         crate::tenant_tx::with_tenant_tx(&self.pool, tenant, &self.region, move |conn| {
             Box::pin(async move {
                 let rows = sqlx::query(
@@ -257,7 +260,8 @@ impl PgStore {
         &self,
         acting_tenant: &str,
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, PgError> {
-        self.scoped_conn_in_region(acting_tenant, &self.region).await
+        self.scoped_conn_in_region(acting_tenant, &self.region)
+            .await
     }
 
     pub async fn scoped_conn_in_region(
@@ -304,8 +308,11 @@ impl PgStore {
         }
         self.authz_queries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (tenant_owned, subject, relation) =
-            (tenant.to_string(), subject.to_string(), relation.to_string());
+        let (tenant_owned, subject, relation) = (
+            tenant.to_string(),
+            subject.to_string(),
+            relation.to_string(),
+        );
         crate::tenant_tx::with_tenant_tx(&self.pool, tenant, region, move |conn| {
             Box::pin(async move {
                 let rows = sqlx::query(

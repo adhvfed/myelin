@@ -103,7 +103,7 @@ fn hardened_boot_selftest_boots_a_real_microvm_and_asserts_the_profile() {
         "fully default-deny ⇒ NO NIC attached"
     );
 
-    let cfg = FcMachineConfig::from_spec(&spec, &profile,  true);
+    let cfg = FcMachineConfig::from_spec(&spec, &profile, true);
     assert!(
         cfg.root_is_read_only(),
         "the boot config's root drive MUST be read-only"

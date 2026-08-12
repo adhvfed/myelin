@@ -35,9 +35,7 @@ pub struct TransportReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderErasureOutcome {
-    Requested {
-        provider_ref: String,
-    },
+    Requested { provider_ref: String },
     NothingToErase,
 }
 

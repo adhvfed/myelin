@@ -48,7 +48,7 @@ fn open_review_resolve_merge_chains_end_to_end() {
         PrState::Open
     );
 
-    let mut review = Review::request(owners[0].clone(),  false);
+    let mut review = Review::request(owners[0].clone(), false);
     assert_eq!(review.state, ReviewState::Requested);
     review.submit(ReviewVerdict::Approve).unwrap();
     assert!(review.is_current_approval());

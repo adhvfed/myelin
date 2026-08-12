@@ -23,7 +23,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}_{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 fn principal() -> Principal {
@@ -109,12 +113,13 @@ async fn setup(pool: &sqlx::PgPool, effect_table: &str) {
 }
 
 async fn effect_present(pool: &sqlx::PgPool, table: &str, id: &str) -> bool {
-    let exists: bool =
-        sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE event_id = $1)"))
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .expect("effect read");
+    let exists: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM {table} WHERE event_id = $1)"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("effect read");
     exists
 }
 
@@ -148,7 +153,8 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     let region = Region(cfg.region.clone());
 
     tokio::task::block_in_place(|| {
-        let (mut cotx, fresh) = ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
+        let (mut cotx, fresh) =
+            ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
         assert!(fresh, "first delivery marks the dedup row FRESH");
         let conn = cotx
             .connection()
@@ -175,8 +181,12 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     );
 
     tokio::task::block_in_place(|| {
-        let (mut cotx, fresh) = ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
-        assert!(fresh, "after the rollback the redelivery is STILL FRESH (0 lost)");
+        let (mut cotx, fresh) =
+            ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
+        assert!(
+            fresh,
+            "after the rollback the redelivery is STILL FRESH (0 lost)"
+        );
         let conn = cotx
             .connection()
             .unwrap()
@@ -202,17 +212,25 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     );
 
     tokio::task::block_in_place(|| {
-        let (cotx, fresh) = ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
-        assert!(!fresh, "the committed mark makes a redelivery a DUPLICATE (deduped)");
+        let (cotx, fresh) =
+            ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
+        assert!(
+            !fresh,
+            "the committed mark makes a redelivery a DUPLICATE (deduped)"
+        );
         cotx.rollback();
     });
-    let effect_count: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {effect} WHERE event_id = $1"))
-            .bind(&id)
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-    assert_eq!(effect_count, 1, "exactly ONE effect row - no duplicate on redelivery");
+    let effect_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {effect} WHERE event_id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        effect_count, 1,
+        "exactly ONE effect row - no duplicate on redelivery"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -257,7 +275,11 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
     );
     let out = tokio::task::block_in_place(|| retry_consumer.deliver(&msg));
     assert_eq!(out, Delivered::Retried(1), "a Retry is not acked");
-    assert_eq!(retry_consumer.handler().ran.load(Ordering::SeqCst), 1, "the handler ran");
+    assert_eq!(
+        retry_consumer.handler().ran.load(Ordering::SeqCst),
+        1,
+        "the handler ran"
+    );
     assert!(
         !dedup_present(&pool, &cname, &id).await,
         "Retry rolled back the co-commit tx → the dedup mark is GONE"
@@ -289,17 +311,22 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
     );
 
     let out = tokio::task::block_in_place(|| done_consumer.deliver(&msg));
-    assert_eq!(out, Delivered::Deduplicated, "the committed mark dedups the redelivery");
+    assert_eq!(
+        out,
+        Delivered::Deduplicated,
+        "the committed mark dedups the redelivery"
+    );
     assert_eq!(
         done_consumer.handler().ran.load(Ordering::SeqCst),
         1,
         "the Done handler ran exactly once across the redelivery (dedup-skip)"
     );
-    let effect_count: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {effect} WHERE event_id = $1"))
-            .bind(&id)
-            .fetch_one(&pool)
-            .await
-            .expect("count");
+    let effect_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {effect} WHERE event_id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
     assert_eq!(effect_count, 1, "exactly ONE effect row - no duplicate");
 }

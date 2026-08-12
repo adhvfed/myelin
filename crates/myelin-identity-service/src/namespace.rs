@@ -66,8 +66,13 @@ impl FragmentDef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdmitReject {
     EmptyObjectType,
-    DuplicateObjectType { object_type: String },
-    NameMintsObjectId { name: String, kind: &'static str },
+    DuplicateObjectType {
+        object_type: String,
+    },
+    NameMintsObjectId {
+        name: String,
+        kind: &'static str,
+    },
     UndeclaredRelation {
         permission: String,
         relation: String,
@@ -76,9 +81,15 @@ pub enum AdmitReject {
         permission: String,
         tupleset: String,
     },
-    PermissionCycle { permission: String },
-    RuleTooDeep { permission: String },
-    DuplicatePermission { permission: String },
+    PermissionCycle {
+        permission: String,
+    },
+    RuleTooDeep {
+        permission: String,
+    },
+    DuplicatePermission {
+        permission: String,
+    },
 }
 
 impl core::fmt::Display for AdmitReject {
@@ -172,9 +183,7 @@ impl NamespaceEngine {
             Ok(compiled) => {
                 let ot = frag.object_type.0.clone();
                 self.schema.insert(ot.clone(), compiled);
-                FragmentAdmit::Admitted {
-                    fragment_id: ot,
-                }
+                FragmentAdmit::Admitted { fragment_id: ot }
             }
         }
     }

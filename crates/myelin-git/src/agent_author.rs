@@ -45,9 +45,7 @@ impl AgentAuthorship {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Authorship {
-    Human {
-        author_pseudonym: String,
-    },
+    Human { author_pseudonym: String },
     Agent(AgentAuthorship),
 }
 

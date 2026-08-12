@@ -1063,7 +1063,7 @@ mod tests {
             "a wheel draining within budget is not owed a dedicated tier (rate alone never promotes)"
         );
         assert!(
-            gate.promotion_owed_for( 250_000,  5_000),
+            gate.promotion_owed_for(250_000, 5_000),
             "a wheel over rate AND falling behind is owed a dedicated scheduling tier"
         );
         assert!(

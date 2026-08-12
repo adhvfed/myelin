@@ -10,8 +10,8 @@ use myelin_storage::tenant_tx::connect_pool_with_reset;
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, ArtifactRef, BusErasureLedger, BusEventLog, BusHolder,
     CausedBy, DataRole, DurableBusErasure, EmitContext, EraseReceipt, EventDraft, EventEnvelope,
-    EventId, EventType, IdMinter, InMemoryShredder, InlinePiiShredder, MonotonicMinter, OutboxStore,
-    PiiKeyRef, Region, TenantId, Timestamp, Visibility,
+    EventId, EventType, IdMinter, InMemoryShredder, InlinePiiShredder, MonotonicMinter,
+    OutboxStore, PiiKeyRef, Region, TenantId, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -22,7 +22,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 fn region() -> Region {
@@ -41,7 +45,9 @@ fn keyref(subject: &str) -> PiiKeyRef {
 
 async fn ensure_table(pool: &sqlx::PgPool) {
     for _ in 0..8 {
-        let _ = sqlx::raw_sql(BUS_ERASURE_LEDGER_MIGRATION).execute(pool).await;
+        let _ = sqlx::raw_sql(BUS_ERASURE_LEDGER_MIGRATION)
+            .execute(pool)
+            .await;
         let exists: bool =
             sqlx::query_scalar("SELECT to_regclass('public.bus_erasure_ledger') IS NOT NULL")
                 .fetch_one(pool)
@@ -62,11 +68,16 @@ async fn cleanup(pool: &sqlx::PgPool, tenant: &str) {
         .ok();
 }
 
-fn durable_ledger(tenant: &str, pool: &sqlx::PgPool, rt: &tokio::runtime::Handle) -> BusErasureLedger {
+fn durable_ledger(
+    tenant: &str,
+    pool: &sqlx::PgPool,
+    rt: &tokio::runtime::Handle,
+) -> BusErasureLedger {
     BusErasureLedger::durable(
         TenantId(tenant.into()),
         region(),
-        Arc::new(DurableBusErasureBacking::new(pool.clone(), rt.clone())) as Arc<dyn DurableBusErasure>,
+        Arc::new(DurableBusErasureBacking::new(pool.clone(), rt.clone()))
+            as Arc<dyn DurableBusErasure>,
     )
 }
 
@@ -159,7 +170,11 @@ async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
         "the shredded key refs survived NORMALIZED (unsorted+duplicated input came back sorted, \
          deduped - first-insert-path parity with the memory arm, the W6c verifier finding)"
     );
-    assert_eq!(entries[0].erased_at.0, now().0, "the erased_at timestamp survived");
+    assert_eq!(
+        entries[0].erased_at.0,
+        now().0,
+        "the erased_at timestamp survived"
+    );
 
     println!(
         "[MR-009b/W6c-events] PASS  test=RECORDS-SURVIVE-FRESH-POOL  tenant={tenant} \
@@ -189,7 +204,11 @@ async fn w6c_idempotent_key_refs_merge_dedups_and_keeps_first_erased_at() {
     ledger.record(&subject, &[keyref("b"), keyref("c")], later());
 
     let entries = ledger.entries();
-    assert_eq!(entries.len(), 1, "idempotent: still ONE row for the subject");
+    assert_eq!(
+        entries.len(),
+        1,
+        "idempotent: still ONE row for the subject"
+    );
     let e = &entries[0];
     assert_eq!(
         e.key_refs,
@@ -231,12 +250,19 @@ async fn w6c_partition_isolation_tenant_a_invisible_to_tenant_b() {
 
     ledger_a.record(&subject, &[keyref("a")], now());
 
-    assert!(ledger_a.is_erased(&subject), "tenant A sees its own erasure");
+    assert!(
+        ledger_a.is_erased(&subject),
+        "tenant A sees its own erasure"
+    );
     assert!(
         !ledger_b.is_erased(&subject),
         "tenant B's scope does NOT see tenant A's erasure (partition isolation)"
     );
-    assert_eq!(ledger_a.entries().len(), 1, "A's replay set has the subject");
+    assert_eq!(
+        ledger_a.entries().len(),
+        1,
+        "A's replay set has the subject"
+    );
     assert!(
         ledger_b.entries().is_empty(),
         "B's replay set is EMPTY (the explicit (tenant, region) predicate isolates it)"
@@ -271,7 +297,14 @@ async fn w6c_re_erase_after_restore_drives_off_the_durable_ledger() {
     let write_ledger = durable_ledger(&tenant, &pool, &rt);
     let mut outbox = OutboxStore::new();
     let _receipt: EraseReceipt = holder
-        .erase_and_record(subject, &mut live_log, &mut outbox, minter(), &write_ledger, now())
+        .erase_and_record(
+            subject,
+            &mut live_log,
+            &mut outbox,
+            minter(),
+            &write_ledger,
+            now(),
+        )
         .expect("erase+record");
     let key = keyref(subject);
     assert!(!shredder.is_live(&key), "key dead in the live cell");
@@ -291,20 +324,35 @@ async fn w6c_re_erase_after_restore_drives_off_the_durable_ledger() {
 
     let mut reerase_outbox = OutboxStore::new();
     let receipt = holder
-        .re_erase_after_restore(&restart_ledger, &mut restored_log, &mut reerase_outbox, minter(), now())
+        .re_erase_after_restore(
+            &restart_ledger,
+            &mut restored_log,
+            &mut reerase_outbox,
+            minter(),
+            now(),
+        )
         .expect("re-erase after restore");
 
     assert!(
         !shredder.is_live(&key),
         "the key stays destroyed across the restore (re-erasure re-shredded it)"
     );
-    assert_eq!(receipt.re_erased_subjects, 1, "one ledger subject replayed (from PG)");
+    assert_eq!(
+        receipt.re_erased_subjects, 1,
+        "one ledger subject replayed (from PG)"
+    );
     assert_eq!(
         receipt.keys_resurrected_by_restore, 1,
         "the restore brought the key back (the honest signal)"
     );
-    assert_eq!(receipt.resurrected, 0, "THE GATE: 0 resurrected keys post-restore");
-    assert!(receipt.is_green(), "the Bus's BUS-D8 restore-verify leg is GREEN off the durable ledger");
+    assert_eq!(
+        receipt.resurrected, 0,
+        "THE GATE: 0 resurrected keys post-restore"
+    );
+    assert!(
+        receipt.is_green(),
+        "the Bus's BUS-D8 restore-verify leg is GREEN off the durable ledger"
+    );
 
     println!(
         "[MR-009b/W6c-events] PASS  test=RE-ERASE-AFTER-RESTORE-OFF-DURABLE-LEDGER  tenant={tenant} \

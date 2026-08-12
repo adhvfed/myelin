@@ -13,41 +13,80 @@ const BTRFS_NAME_MAX: usize = 255;
 
 #[derive(Debug)]
 pub enum WorkspaceStorageError {
-    NotBtrfs { base_dir: PathBuf },
-    QuotaNotEnforcing { base_dir: PathBuf, status: String },
-    InvalidJobId { job_id: String },
+    NotBtrfs {
+        base_dir: PathBuf,
+    },
+    QuotaNotEnforcing {
+        base_dir: PathBuf,
+        status: String,
+    },
+    InvalidJobId {
+        job_id: String,
+    },
     ZeroQuota,
-    SubvolumeCreateFailed { path: PathBuf, stderr: String },
-    IdentityReadFailed { path: PathBuf, reason: String },
-    QuotaLimitFailed { path: PathBuf, stderr: String },
+    SubvolumeCreateFailed {
+        path: PathBuf,
+        stderr: String,
+    },
+    IdentityReadFailed {
+        path: PathBuf,
+        reason: String,
+    },
+    QuotaLimitFailed {
+        path: PathBuf,
+        stderr: String,
+    },
     QuotaNotAsserted {
         path: PathBuf,
         requested: u64,
         observed: Option<u64>,
     },
-    OwnershipFailed { path: PathBuf, reason: String },
+    OwnershipFailed {
+        path: PathBuf,
+        reason: String,
+    },
     UnrecoverableLeak {
         path: PathBuf,
         subvol_id: Option<u64>,
         provisioning_error: String,
         cleanup_error: String,
     },
-    DeleteFailed { subvol_id: u64, stderr: String },
-    SyncPending { subvol_id: u64, reason: String },
+    DeleteFailed {
+        subvol_id: u64,
+        stderr: String,
+    },
+    SyncPending {
+        subvol_id: u64,
+        reason: String,
+    },
     WrongStorage {
         expected_base: PathBuf,
         actual_base: PathBuf,
     },
-    BackendMismatch { detail: String },
-    DirectoryAbsenceUnproven { path: PathBuf, reason: String },
+    BackendMismatch {
+        detail: String,
+    },
+    DirectoryAbsenceUnproven {
+        path: PathBuf,
+        reason: String,
+    },
     DirectoryQuotaExceeded {
         path: PathBuf,
         quota_bytes: u64,
         would_be_bytes: u64,
     },
-    ListFailed { base_dir: PathBuf, reason: String },
-    UnexpectedEntry { path: PathBuf, reason: String },
-    Io { path: PathBuf, reason: String },
+    ListFailed {
+        base_dir: PathBuf,
+        reason: String,
+    },
+    UnexpectedEntry {
+        path: PathBuf,
+        reason: String,
+    },
+    Io {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl fmt::Display for WorkspaceStorageError {
@@ -143,7 +182,9 @@ impl std::error::Error for WorkspaceStorageError {}
 
 #[derive(Debug)]
 enum WorkspaceIdentity {
-    Btrfs { subvol_id: u64 },
+    Btrfs {
+        subvol_id: u64,
+    },
     #[cfg(any(test, feature = "test-support"))]
     Directory {
         device: u64,
@@ -848,21 +889,21 @@ fn scan_regular_file_bytes(dir: &Path) -> Result<u64, WorkspaceStorageError> {
                 reason: format!("scan read_dir entry: {e}"),
             })?;
             let path = entry.path();
-            let meta =
-                std::fs::symlink_metadata(&path).map_err(|e| WorkspaceStorageError::Io {
-                    path: path.clone(),
-                    reason: format!("scan stat: {e}"),
-                })?;
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| WorkspaceStorageError::Io {
+                path: path.clone(),
+                reason: format!("scan stat: {e}"),
+            })?;
             let ft = meta.file_type();
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
-                total = total.checked_add(meta.size()).ok_or_else(|| {
-                    WorkspaceStorageError::Io {
-                        path: path.clone(),
-                        reason: "byte-accounting overflow while scanning workspace".to_string(),
-                    }
-                })?;
+                total =
+                    total
+                        .checked_add(meta.size())
+                        .ok_or_else(|| WorkspaceStorageError::Io {
+                            path: path.clone(),
+                            reason: "byte-accounting overflow while scanning workspace".to_string(),
+                        })?;
             }
         }
     }
@@ -919,8 +960,8 @@ impl DirectoryWorkspaceStorage {
                 return Err(WorkspaceStorageError::UnrecoverableLeak {
                     path,
                     subvol_id: None,
-                    provisioning_error: "an untracked workspace leaf already exists at this job key"
-                        .to_string(),
+                    provisioning_error:
+                        "an untracked workspace leaf already exists at this job key".to_string(),
                     cleanup_error: "left in place - a pre-existing residual is not this call's to \
                                     remove; a human must reconcile"
                         .to_string(),
@@ -932,7 +973,9 @@ impl DirectoryWorkspaceStorage {
             });
         }
         if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)) {
-            return Err(self.rollback_fresh_leaf(&path, format!("chmod 0755 on the fresh leaf: {e}")));
+            return Err(
+                self.rollback_fresh_leaf(&path, format!("chmod 0755 on the fresh leaf: {e}"))
+            );
         }
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(meta) => meta,
@@ -954,7 +997,11 @@ impl DirectoryWorkspaceStorage {
         })
     }
 
-    fn rollback_fresh_leaf(&self, path: &Path, provisioning_error: String) -> WorkspaceStorageError {
+    fn rollback_fresh_leaf(
+        &self,
+        path: &Path,
+        provisioning_error: String,
+    ) -> WorkspaceStorageError {
         let leak = |cleanup_error: String| WorkspaceStorageError::UnrecoverableLeak {
             path: path.to_path_buf(),
             subvol_id: None,
@@ -965,7 +1012,9 @@ impl DirectoryWorkspaceStorage {
             return leak(format!("remove_dir of the fresh leaf failed: {e}"));
         }
         if let Err(e) = fsync_dir(&self.canonical_base) {
-            return leak(format!("fsync of the parent base after rollback failed: {e}"));
+            return leak(format!(
+                "fsync of the parent base after rollback failed: {e}"
+            ));
         }
         match exists_or_error(path) {
             Ok(false) => WorkspaceStorageError::Io {
@@ -1013,15 +1062,21 @@ impl DirectoryWorkspaceStorage {
             )));
         }
         let Some(name) = leaf.file_name().and_then(|n| n.to_str()) else {
-            return Err(unproven("leaf name is not a valid single component".to_string()));
+            return Err(unproven(
+                "leaf name is not a valid single component".to_string(),
+            ));
         };
         if validate_job_id(name).is_err() {
-            return Err(unproven(format!("leaf name {name:?} is not a safe component")));
+            return Err(unproven(format!(
+                "leaf name {name:?} is not a safe component"
+            )));
         }
         let meta = std::fs::symlink_metadata(leaf)
             .map_err(|e| unproven(format!("stat before delete: {e}")))?;
         if meta.file_type().is_symlink() {
-            return Err(unproven("leaf is a symlink - refusing to delete".to_string()));
+            return Err(unproven(
+                "leaf is a symlink - refusing to delete".to_string(),
+            ));
         }
         if !meta.is_dir() {
             return Err(unproven("leaf is not a directory".to_string()));
@@ -1045,7 +1100,9 @@ impl DirectoryWorkspaceStorage {
             Ok(true) => Err(unproven(
                 "the leaf is STILL present after remove_dir_all + fsync".to_string(),
             )),
-            Err(e) => Err(unproven(format!("post-delete absence re-check failed: {e}"))),
+            Err(e) => Err(unproven(format!(
+                "post-delete absence re-check failed: {e}"
+            ))),
         }
     }
 
@@ -1146,7 +1203,9 @@ impl PreparedWorkspace {
         if !safe_name {
             return Err(WorkspaceStorageError::Io {
                 path: self.host_path.join(file_name),
-                reason: format!("checked write name {file_name:?} is not a safe filename component"),
+                reason: format!(
+                    "checked write name {file_name:?} is not a safe filename component"
+                ),
             });
         }
         let target = self.host_path.join(file_name);
@@ -1248,7 +1307,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn full_privileged_lifecycle_create_quota_verify_exceed_delete_sync() {
         let Some(mut storage) = open_or_skip_privileged("lifecycle") else {
             return;
@@ -1305,7 +1367,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn zero_quota_is_rejected() {
         let Some(mut storage) = open_or_skip_env("zero-quota") else {
             return;
@@ -1320,7 +1385,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn orphan_listing_verifies_before_filtering_and_finds_the_real_orphan() {
         let Some(mut storage) = open_or_skip_privileged("orphan-listing") else {
             return;
@@ -1357,7 +1425,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn a_capability_from_one_storage_is_refused_by_another() {
         let Some(mut storage_a) = open_or_skip_privileged("cross-storage-a") else {
             return;
@@ -1405,7 +1476,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn orphan_listing_reports_a_non_subvolume_entry_loudly_even_if_its_name_is_active() {
         let Some(mut storage) = open_or_skip_env("stray-entry") else {
             return;

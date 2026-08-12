@@ -22,10 +22,7 @@ pub struct InboxFrame {
 #[derive(Debug)]
 pub enum WatchOutcome {
     Live(InboxWatch),
-    ResyncRequired {
-        last_seq: u64,
-        window_floor: u64,
-    },
+    ResyncRequired { last_seq: u64, window_floor: u64 },
 }
 
 impl WatchOutcome {

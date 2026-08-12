@@ -24,7 +24,9 @@ pub struct ConformanceStep {
 
 #[derive(Clone, Copy, Debug)]
 pub enum RankOp {
-    First { jitter: (usize, usize) },
+    First {
+        jitter: (usize, usize),
+    },
     Last {
         after: Option<&'static str>,
         jitter: (usize, usize),

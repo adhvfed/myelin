@@ -580,22 +580,41 @@ mod tests {
     fn cp_d8_zero_holds_on_the_projected_production_arm() {
         let mut b = HomeCellResolver::new();
         b.permit("myelin://01J0BETA/issues/issue/7", "viewer-1");
-        b.render("myelin://01J0BETA/issues/issue/7", "Ship M5", "open", "issue");
+        b.render(
+            "myelin://01J0BETA/issues/issue/7",
+            "Ship M5",
+            "open",
+            "issue",
+        );
 
         let mut resolvers: HashMap<CellId, Arc<dyn CellLocalResolver>> = HashMap::new();
         resolvers.insert(CellId::from_token("cell-b"), Arc::new(b));
         let reg = CellResolverRegistry::projected(Arc::new(ProjectedFromCells { resolvers }));
         let bridge = CrossCellBridge::new(CellId::from_token("cell-a"), reg);
 
-        let p = pointer("myelin://01J0BETA/issues/issue/7", ArtifactType::Issue, "cell-b");
+        let p = pointer(
+            "myelin://01J0BETA/issues/issue/7",
+            ArtifactType::Issue,
+            "cell-b",
+        );
         let ok = bridge.resolve(&p, &ViewerId::from_token("viewer-1"), BridgeMode::Live);
-        assert!(ok.is_projection(), "authorised viewer gets the projection on the projected arm");
+        assert!(
+            ok.is_projection(),
+            "authorised viewer gets the projection on the projected arm"
+        );
         assert_eq!(bridge.cross_cell_raw_rows(), 0);
 
         let denied = bridge.resolve(&p, &ViewerId::from_token("viewer-2"), BridgeMode::Live);
-        assert_eq!(denied.tombstone_reason(), Some(BridgeTombstoneReason::Denied));
+        assert_eq!(
+            denied.tombstone_reason(),
+            Some(BridgeTombstoneReason::Denied)
+        );
 
-        let ghost = pointer("myelin://01J0GHOST/issues/issue/1", ArtifactType::Issue, "cell-unknown");
+        let ghost = pointer(
+            "myelin://01J0GHOST/issues/issue/1",
+            ArtifactType::Issue,
+            "cell-unknown",
+        );
         let gone = bridge.resolve(&ghost, &ViewerId::from_token("viewer-1"), BridgeMode::Live);
         assert_eq!(gone.tombstone_reason(), Some(BridgeTombstoneReason::Gone));
         assert_eq!(bridge.cross_cell_raw_rows(), 0);

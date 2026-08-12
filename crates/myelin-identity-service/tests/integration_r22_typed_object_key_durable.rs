@@ -41,7 +41,10 @@ struct UniqueMinter {
 
 impl UniqueMinter {
     fn new(base: impl Into<String>) -> Self {
-        UniqueMinter { base: base.into(), n: std::sync::atomic::AtomicU64::new(0) }
+        UniqueMinter {
+            base: base.into(),
+            n: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 }
 
@@ -62,7 +65,10 @@ fn tuple(object: &str, relation: &str, subject: &str) -> RelationTuple {
 }
 
 fn latest() -> Consistency {
-    Consistency { at_least: Zookie(String::new()), mode: ConsistencyMode::Strong }
+    Consistency {
+        at_least: Zookie(String::new()),
+        mode: ConsistencyMode::Strong,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -128,18 +134,32 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
     let reader = Permission("reader".into());
     let d = |object: &str| {
         check
-            .check(&alice, &reader, &ArtifactRef(object.into()), &latest(), None)
+            .check(
+                &alice,
+                &reader,
+                &ArtifactRef(object.into()),
+                &latest(),
+                None,
+            )
             .expect("check evaluates")
     };
 
-    assert_eq!(d("issue:X-1"), Decision::Allow, "bare spelling matches the durable grant");
+    assert_eq!(
+        d("issue:X-1"),
+        Decision::Allow,
+        "bare spelling matches the durable grant"
+    );
     assert_eq!(
         d(&format!("myelin://{tenant}/issues/issue/X-1")),
         Decision::Allow,
         "URN spelling matches the SAME durable grant (one canonical key)"
     );
 
-    assert_eq!(d("repo:X-1"), Decision::Deny, "durable issue:X grant must not authorize repo:X");
+    assert_eq!(
+        d("repo:X-1"),
+        Decision::Deny,
+        "durable issue:X grant must not authorize repo:X"
+    );
     assert_eq!(
         d(&format!("myelin://{tenant}/git/repo/X-1")),
         Decision::Deny,
@@ -151,5 +171,9 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
         Decision::Allow,
         "the durable namespaced-slug grant matches its own check"
     );
-    assert_eq!(d("repo:app"), Decision::Deny, "no aliasing onto the collapsed slug");
+    assert_eq!(
+        d("repo:app"),
+        Decision::Deny,
+        "no aliasing onto the collapsed slug"
+    );
 }

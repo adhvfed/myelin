@@ -521,25 +521,23 @@ fn revalidate_stale_candidates<B: IndexBackend>(
         let indexed = backend.indexed_zookie_of(&hit.doc_id);
         match crate::consistency::disposition(indexed.as_deref(), zookie) {
             crate::consistency::CandidateDisposition::Fresh => out.push(hit),
-            crate::consistency::CandidateDisposition::StaleNeedsRevalidation => {
-                match check {
-                    Some(port) => {
-                        cstats.record_revalidation();
-                        let object = ObjectId(hit.doc_id.clone());
-                        let still_allowed = port
-                            .check(subject, permission, &object, at)
-                            .map_err(QueryError::Authz)?;
-                        if still_allowed {
-                            out.push(hit);
-                        } else {
-                            cstats.record_excluded_stale();
-                        }
-                    }
-                    None => {
+            crate::consistency::CandidateDisposition::StaleNeedsRevalidation => match check {
+                Some(port) => {
+                    cstats.record_revalidation();
+                    let object = ObjectId(hit.doc_id.clone());
+                    let still_allowed = port
+                        .check(subject, permission, &object, at)
+                        .map_err(QueryError::Authz)?;
+                    if still_allowed {
+                        out.push(hit);
+                    } else {
                         cstats.record_excluded_stale();
                     }
                 }
-            }
+                None => {
+                    cstats.record_excluded_stale();
+                }
+            },
         }
     }
     Ok(out)

@@ -106,7 +106,9 @@ fn overlay_prod_path_pristine_base_and_zero_escapes_on_real_kernel_overlayfs() {
             "[overlay drill] MYELIN_REQUIRE_OVERLAY=1 but {msg}: the drill cannot prove the CoW \
              overlay on the real path - a DATED NO-GO, never a vacuous green."
         );
-        eprintln!("[overlay drill] SKIPPED: {msg}. (Stage runsc + a busybox-class rootfs to run it.)");
+        eprintln!(
+            "[overlay drill] SKIPPED: {msg}. (Stage runsc + a busybox-class rootfs to run it.)"
+        );
         return;
     }
 
@@ -174,16 +176,15 @@ fn overlay_prod_path_pristine_base_and_zero_escapes_on_real_kernel_overlayfs() {
         let probe_dir = merged.join("myelin-overlay-drill-probe.d");
         let probe_file = merged.join("myelin-overlay-drill-probe.txt");
         std::fs::create_dir(&probe_dir).expect("create a probe dir in the merged view");
-        std::fs::write(&probe_file, b"overlay-drill-upper").expect("write a probe file in the merged view");
+        std::fs::write(&probe_file, b"overlay-drill-upper")
+            .expect("write a probe file in the merged view");
 
         let base_victim: Option<PathBuf> = std::fs::read_dir(&merged)
             .expect("enumerate the merged view")
             .flatten()
             .find(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
             .map(|e| e.file_name().into())
-            .filter(|name: &PathBuf| {
-                name != Path::new("myelin-overlay-drill-probe.txt")
-            });
+            .filter(|name: &PathBuf| name != Path::new("myelin-overlay-drill-probe.txt"));
         if let Some(ref victim) = base_victim {
             std::fs::remove_file(merged.join(victim))
                 .expect("delete a base file THROUGH the merged view (a whiteout in the upper)");
@@ -241,7 +242,8 @@ fn overlay_prod_path_pristine_base_and_zero_escapes_on_real_kernel_overlayfs() {
         build_gvisor_corpus_script(PIDS_MAX),
     ]);
 
-    let base_digest_before = canonical_tree_sha256_hex(&base).expect("digest base before the launch");
+    let base_digest_before =
+        canonical_tree_sha256_hex(&base).expect("digest base before the launch");
 
     let launch = backend
         .launch(&spec, &ok_hooks())

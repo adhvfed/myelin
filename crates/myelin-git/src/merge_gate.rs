@@ -59,9 +59,7 @@ pub fn parse_required_context(s: &str) -> Result<CheckContext, RequiredContextPa
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequiredContextParseError {
     Empty,
-    EmptyName {
-        raw: String,
-    },
+    EmptyName { raw: String },
 }
 
 impl std::fmt::Display for RequiredContextParseError {
@@ -85,9 +83,7 @@ impl std::error::Error for RequiredContextParseError {}
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MergeGateOutcome {
     Admitted,
-    Blocked {
-        unmet: Vec<UnmetContext>,
-    },
+    Blocked { unmet: Vec<UnmetContext> },
 }
 
 impl MergeGateOutcome {
@@ -105,9 +101,7 @@ pub struct UnmetContext {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnmetReason {
     Missing,
-    NotGreen {
-        state: CheckState,
-    },
+    NotGreen { state: CheckState },
     CostUnsettled,
     UntrustedForkNeutral,
 }

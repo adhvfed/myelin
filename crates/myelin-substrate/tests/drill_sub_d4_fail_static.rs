@@ -101,7 +101,7 @@ fn run_sub_d4_sequence() -> (SignalSource, FailStaticAuthz<TestClock>, i64) {
         if i == 4 {
             fs.clock().advance(fs.static_max() + 1);
         }
-        let d = fs.serve(key, &bounded_stale(),  true, &src);
+        let d = fs.serve(key, &bounded_stale(), true, &src);
         if d.is_allow() {
             allowed_after_revoke += 1;
         } else {

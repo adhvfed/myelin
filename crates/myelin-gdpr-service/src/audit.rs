@@ -465,7 +465,10 @@ mod tests {
             "01J-root",
             None,
         );
-        assert_eq!(c.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            c.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
 
         let tenant = TenantId("acme".into());
         let entries = c.log().entries_for(&tenant);
@@ -529,7 +532,10 @@ mod tests {
             !serialized.contains("alice@example.test"),
             "no email reaches the audit entry"
         );
-        assert_eq!(e.subject, ArtifactRef("myelin://acme/identity/tuple/t1".into()));
+        assert_eq!(
+            e.subject,
+            ArtifactRef("myelin://acme/identity/tuple/t1".into())
+        );
     }
 
     #[test]
@@ -605,30 +611,39 @@ mod tests {
     #[test]
     fn the_hash_chain_is_per_tenant() {
         let c = AuditConsumer::new();
-        c.handle(&action_event(
-            "01J-a1",
-            human("u", "acme"),
-            "identity.tuple.written",
-            "myelin://acme/x",
-            "r1",
-            None,
-        ), &mut myelin_events::HandlerTx::none());
-        c.handle(&action_event(
-            "01J-b1",
-            human("u", "globex"),
-            "identity.tuple.written",
-            "myelin://globex/x",
-            "r2",
-            None,
-        ), &mut myelin_events::HandlerTx::none());
-        c.handle(&action_event(
-            "01J-a2",
-            human("u", "acme"),
-            "identity.tuple.written",
-            "myelin://acme/y",
-            "r3",
-            None,
-        ), &mut myelin_events::HandlerTx::none());
+        c.handle(
+            &action_event(
+                "01J-a1",
+                human("u", "acme"),
+                "identity.tuple.written",
+                "myelin://acme/x",
+                "r1",
+                None,
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
+        c.handle(
+            &action_event(
+                "01J-b1",
+                human("u", "globex"),
+                "identity.tuple.written",
+                "myelin://globex/x",
+                "r2",
+                None,
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
+        c.handle(
+            &action_event(
+                "01J-a2",
+                human("u", "acme"),
+                "identity.tuple.written",
+                "myelin://acme/y",
+                "r3",
+                None,
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
 
         let acme = c.log().entries_for(&TenantId("acme".into()));
         let globex = c.log().entries_for(&TenantId("globex".into()));
@@ -643,14 +658,17 @@ mod tests {
     fn a_retroactive_edit_breaks_the_chain() {
         let c = AuditConsumer::new();
         for i in 0..5 {
-            c.handle(&action_event(
-                &format!("01J-{i}"),
-                human("u", "acme"),
-                "identity.tuple.written",
-                &format!("myelin://acme/x/{i}"),
-                "r",
-                None,
-            ), &mut myelin_events::HandlerTx::none());
+            c.handle(
+                &action_event(
+                    &format!("01J-{i}"),
+                    human("u", "acme"),
+                    "identity.tuple.written",
+                    &format!("myelin://acme/x/{i}"),
+                    "r",
+                    None,
+                ),
+                &mut myelin_events::HandlerTx::none(),
+            );
         }
         let tenant = TenantId("acme".into());
         let entries = c.log().entries_for(&tenant);
@@ -718,22 +736,28 @@ mod tests {
     fn merkle_root_is_deterministic_and_changes_on_append() {
         let mk = || {
             let c = AuditConsumer::new();
-            c.handle(&action_event(
-                "01J-1",
-                human("u", "acme"),
-                "identity.tuple.written",
-                "myelin://acme/x",
-                "r",
-                None,
-            ), &mut myelin_events::HandlerTx::none());
-            c.handle(&action_event(
-                "01J-2",
-                human("u", "acme"),
-                "identity.tuple.written",
-                "myelin://acme/y",
-                "r",
-                None,
-            ), &mut myelin_events::HandlerTx::none());
+            c.handle(
+                &action_event(
+                    "01J-1",
+                    human("u", "acme"),
+                    "identity.tuple.written",
+                    "myelin://acme/x",
+                    "r",
+                    None,
+                ),
+                &mut myelin_events::HandlerTx::none(),
+            );
+            c.handle(
+                &action_event(
+                    "01J-2",
+                    human("u", "acme"),
+                    "identity.tuple.written",
+                    "myelin://acme/y",
+                    "r",
+                    None,
+                ),
+                &mut myelin_events::HandlerTx::none(),
+            );
             c
         };
         let tenant = TenantId("acme".into());
@@ -746,14 +770,17 @@ mod tests {
 
         let c = mk();
         let before = c.log().root(&tenant);
-        c.handle(&action_event(
-            "01J-3",
-            human("u", "acme"),
-            "identity.tuple.written",
-            "myelin://acme/z",
-            "r",
-            None,
-        ), &mut myelin_events::HandlerTx::none());
+        c.handle(
+            &action_event(
+                "01J-3",
+                human("u", "acme"),
+                "identity.tuple.written",
+                "myelin://acme/z",
+                "r",
+                None,
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
         let after = c.log().root(&tenant);
         assert_ne!(
             before, after,
@@ -769,14 +796,17 @@ mod tests {
         );
         assert_eq!(AUDIT_APPEND_LAG.1, "events", "the SLO unit is pinned");
         let c = AuditConsumer::new();
-        c.handle(&action_event(
-            "01J-1",
-            human("u", "acme"),
-            "identity.tuple.written",
-            "myelin://acme/x",
-            "r",
-            None,
-        ), &mut myelin_events::HandlerTx::none());
+        c.handle(
+            &action_event(
+                "01J-1",
+                human("u", "acme"),
+                "identity.tuple.written",
+                "myelin://acme/x",
+                "r",
+                None,
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(
             c.append_lag(),
             0,

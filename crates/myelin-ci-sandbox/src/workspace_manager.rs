@@ -1,9 +1,9 @@
 use crate::dirlock::{fd_identity, path_identity};
+#[cfg(any(test, feature = "test-support"))]
+use crate::workspace_storage::DirectoryWorkspaceStorage;
 use crate::workspace_storage::{
     PreparedWorkspace, WorkspaceStorage, WorkspaceStorageBackend, WorkspaceStorageError,
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::workspace_storage::DirectoryWorkspaceStorage;
 use std::collections::BTreeSet;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -117,14 +117,22 @@ impl std::fmt::Display for CapacityRefusal {
 
 #[derive(Debug)]
 pub enum WorkspaceRequestRefusal {
-    Disabled { capacity: CapacityLease },
-    Reconciling { capacity: CapacityLease },
-    Poisoned { capacity: CapacityLease },
+    Disabled {
+        capacity: CapacityLease,
+    },
+    Reconciling {
+        capacity: CapacityLease,
+    },
+    Poisoned {
+        capacity: CapacityLease,
+    },
     JobAlreadyActive {
         job_key: String,
         capacity: CapacityLease,
     },
-    WrongManager { capacity: CapacityLease },
+    WrongManager {
+        capacity: CapacityLease,
+    },
     CapacityMismatch {
         requested: u64,
         leased: u64,
@@ -455,10 +463,11 @@ impl WorkspaceManager {
             } => (base_dir.clone(), *host_capacity_bytes),
         };
         let lock = acquire_directory_lock(&base_dir)?;
-        let locked_identity = fd_identity(&lock).map_err(|e| WorkspaceManagerError::LockFailed {
-            base_dir: base_dir.clone(),
-            reason: format!("fstat locked directory: {e}"),
-        })?;
+        let locked_identity =
+            fd_identity(&lock).map_err(|e| WorkspaceManagerError::LockFailed {
+                base_dir: base_dir.clone(),
+                reason: format!("fstat locked directory: {e}"),
+            })?;
         let shared = Arc::new(SharedState {
             _lock: Some(lock),
             state: Mutex::new(ManagerState {
@@ -869,7 +878,8 @@ fn open_enabled_backend(
         #[cfg(any(test, feature = "test-support"))]
         WorkspaceStorageMode::DeterministicDirectoryForTests { .. } => {
             Ok(WorkspaceStorageBackend::DeterministicDirectoryForTests(
-                DirectoryWorkspaceStorage::open(base_dir).map_err(WorkspaceManagerError::Storage)?,
+                DirectoryWorkspaceStorage::open(base_dir)
+                    .map_err(WorkspaceManagerError::Storage)?,
             ))
         }
         WorkspaceStorageMode::Disabled => unreachable!(
@@ -1595,7 +1605,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn boot_reconciliation_deletes_a_preexisting_orphan_before_reporting_healthy() {
         let base = btrfs_test_base("boot-reconcile");
         if !ephemeral_disk_available(&base) {
@@ -1632,7 +1645,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn check_health_succeeds_against_a_real_still_healthy_backend() {
         let base = btrfs_test_base("health-check-real-happy-path");
         if !ephemeral_disk_available(&base) {
@@ -1653,7 +1669,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn create_workspace_then_delete_workspace_releases_capacity_and_clears_active_job_id() {
         let base = btrfs_test_base("create-then-delete");
         if !ephemeral_disk_available(&base) {
@@ -1697,7 +1716,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn dropping_a_managed_workspace_without_deleting_poisons_the_manager_with_one_incident() {
         let base = btrfs_test_base("drop-without-delete");
         if !ephemeral_disk_available(&base) {

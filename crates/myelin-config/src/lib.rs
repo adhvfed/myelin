@@ -7,10 +7,7 @@ pub const OIDC_JWKS_MAX_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     Missing(&'static str),
-    Invalid {
-        var: &'static str,
-        reason: String,
-    },
+    Invalid { var: &'static str, reason: String },
 }
 
 impl core::fmt::Display for ConfigError {

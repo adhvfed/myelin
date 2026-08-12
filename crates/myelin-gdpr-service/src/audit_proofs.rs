@@ -463,11 +463,14 @@ mod tests {
 
     fn append_n(auth: &AuditAuthority<CellSigningKey>, tenant: &str, n: usize) {
         for i in 0..n {
-            auth.consumer().handle(&action_event(
-                &format!("01J-{tenant}-{i}"),
-                tenant,
-                &format!("myelin://{tenant}/x/{i}"),
-            ), &mut myelin_events::HandlerTx::none());
+            auth.consumer().handle(
+                &action_event(
+                    &format!("01J-{tenant}-{i}"),
+                    tenant,
+                    &format!("myelin://{tenant}/x/{i}"),
+                ),
+                &mut myelin_events::HandlerTx::none(),
+            );
         }
     }
 
@@ -702,11 +705,10 @@ mod tests {
     fn the_witness_sees_only_an_opaque_root_no_pii() {
         let auth = authority();
         let tenant = TenantId("acme".into());
-        auth.consumer().handle(&action_event(
-            "01J-1",
-            "acme",
-            "myelin://acme/SENSITIVE-SUBJECT",
-        ), &mut myelin_events::HandlerTx::none());
+        auth.consumer().handle(
+            &action_event("01J-1", "acme", "myelin://acme/SENSITIVE-SUBJECT"),
+            &mut myelin_events::HandlerTx::none(),
+        );
         let sth = auth.signed_tree_head(&tenant, "t1").unwrap();
         let witness = NotaryWitness::new(CellSigningKey::from_seed("notary"));
         let attestation = auth.anchor_to_witness(&sth, &witness);

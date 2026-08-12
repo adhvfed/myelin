@@ -530,9 +530,18 @@ fn commit_row_and_diff_json_carry_the_browse_contract() {
             old_path: None,
             status: 'M',
             lines: vec![
-                DiffLineView { origin: ' ', content: "context".into() },
-                DiffLineView { origin: '+', content: "added".into() },
-                DiffLineView { origin: '-', content: "removed".into() },
+                DiffLineView {
+                    origin: ' ',
+                    content: "context".into(),
+                },
+                DiffLineView {
+                    origin: '+',
+                    content: "added".into(),
+                },
+                DiffLineView {
+                    origin: '-',
+                    content: "removed".into(),
+                },
             ],
         }],
     };

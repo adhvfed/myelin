@@ -143,16 +143,28 @@ impl PartitionKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubjectError {
-    TypeTooShort { type_: String },
-    MalformedAggregate { aggregate: String },
-    BadSubjectToken { field: &'static str, token: String },
+    TypeTooShort {
+        type_: String,
+    },
+    MalformedAggregate {
+        aggregate: String,
+    },
+    BadSubjectToken {
+        field: &'static str,
+        token: String,
+    },
     SubjectTooLong {
         field: &'static str,
         bytes: usize,
         max_bytes: usize,
     },
-    NotAnEventSubject { subject: String },
-    WrongTokenCount { subject: String, tokens: usize },
+    NotAnEventSubject {
+        subject: String,
+    },
+    WrongTokenCount {
+        subject: String,
+        tokens: usize,
+    },
 }
 
 impl std::fmt::Display for SubjectError {

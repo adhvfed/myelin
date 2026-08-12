@@ -155,5 +155,4 @@ fn iss_d6_sla_breach_starts_real_chain_walks_exactly_once_then_ack_halts() {
         1,
         "exactly one notif.escalation.acked event committed via the outbox (the ONLY emit path)"
     );
-
 }

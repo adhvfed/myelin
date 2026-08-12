@@ -10,10 +10,7 @@ use crate::orchestration::{EraseChecklist, HolderReceipt, UpstreamHolderOrchestr
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HoldScope {
     Tenant(String),
-    Subject {
-        tenant: String,
-        subject: String,
-    },
+    Subject { tenant: String, subject: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

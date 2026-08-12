@@ -33,7 +33,10 @@ fn idor_drill_zero_path_derived_tenants() {
         }
         let q = TenantQuery::for_table(scope.clone(), TenantTable::new("issue"));
         assert!(q.predicate_sql().contains("tenant = $1 AND region = $2"));
-        assert_eq!(q.predicate_binds().first().map(String::as_str), Some("acme"));
+        assert_eq!(
+            q.predicate_binds().first().map(String::as_str),
+            Some("acme")
+        );
     }
 
     signals.set_scalar(SignalName::CrossTenantCount, cross_tenant_reads);

@@ -192,7 +192,7 @@ fn cdc_5_9_check_status_decodes_into_the_issues_consumer_posture() {
         "the consumer reads the 5.9 untrusted_fork token verbatim (never recomputed)"
     );
 
-    let check = LinkedPrCheck::untrusted_fork(state,  false);
+    let check = LinkedPrCheck::untrusted_fork(state, false);
     assert!(
         !check.is_acceptable(),
         "Issues consumes the SAME trust posture as Git's merge gate (un-endorsed fork ⇒ neutral)"

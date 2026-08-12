@@ -60,11 +60,7 @@ impl WorkloadRotatedSpec {
         Ok((permit, prep))
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        private_interfaces,
-        private_bounds
-    )]
+    #[allow(clippy::too_many_arguments, private_interfaces, private_bounds)]
     pub(super) fn acquire_permit_and_run(
         &self,
         hooks: &RunnerHooks,
@@ -105,11 +101,7 @@ impl WorkloadRotatedSpec {
     }
 
     #[cfg(all(test, feature = "test-support"))]
-    #[allow(
-        clippy::too_many_arguments,
-        private_interfaces,
-        private_bounds
-    )]
+    #[allow(clippy::too_many_arguments, private_interfaces, private_bounds)]
     pub(super) fn acquire_permit_and_run_given<F>(
         &self,
         hooks: &RunnerHooks,

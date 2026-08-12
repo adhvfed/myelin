@@ -65,14 +65,8 @@ impl Tree {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobChange {
-    Upserted {
-        path: String,
-        blob: Blob,
-    },
-    Deleted {
-        path: String,
-        oid: BlobOid,
-    },
+    Upserted { path: String, blob: Blob },
+    Deleted { path: String, oid: BlobOid },
 }
 
 impl BlobChange {
@@ -198,8 +192,7 @@ fn split_camel(token: &str) -> Vec<String> {
     for i in 1..chars.len() {
         let prev = chars[i - 1];
         let cur = chars[i];
-        let boundary =
-            (!prev.is_uppercase() && cur.is_uppercase())
+        let boundary = (!prev.is_uppercase() && cur.is_uppercase())
             || (prev.is_uppercase()
                 && cur.is_uppercase()
                 && chars.get(i + 1).is_some_and(|n| n.is_lowercase()))

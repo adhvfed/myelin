@@ -370,10 +370,7 @@ pub struct RewriteWiring<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RewriteDenied {
-    RateLimited {
-        tenant: TenantId,
-        budget: u32,
-    },
+    RateLimited { tenant: TenantId, budget: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]

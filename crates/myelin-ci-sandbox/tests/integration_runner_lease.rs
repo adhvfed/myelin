@@ -27,8 +27,9 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
-        {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.as_mut().poll(cx)
+        })) {
             Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Err(payload) => std::task::Poll::Ready(Err(payload)),

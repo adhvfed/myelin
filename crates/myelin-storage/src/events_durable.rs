@@ -87,8 +87,8 @@ impl DurableDedup for DurableDedupBacking {
         tenant: &TenantId,
         region: &Region,
     ) -> (Box<dyn CoCommitTx>, bool) {
-        let acquired: Result<(sqlx::Transaction<'static, sqlx::Postgres>, bool), sqlx::Error> = self
-            .block(async {
+        let acquired: Result<(sqlx::Transaction<'static, sqlx::Postgres>, bool), sqlx::Error> =
+            self.block(async {
                 let mut tx = self.pool.begin().await?;
                 sqlx::query(
                     "SELECT set_config('myelin.tenant_id', $1, true), \
@@ -278,7 +278,11 @@ impl DurableDeliveryQuarantine for DurableDeliveryQuarantineBacking {
             .map_err(|_| "stream sequence exceeds durable range".to_string())?;
         let delivery_attempt = i64::try_from(delivery_attempt)
             .map_err(|_| "delivery attempt exceeds durable range".to_string())?;
-        if consumer.is_empty() || broker_ref.stream.is_empty() || stream_sequence <= 0 || delivery_attempt <= 0 {
+        if consumer.is_empty()
+            || broker_ref.stream.is_empty()
+            || stream_sequence <= 0
+            || delivery_attempt <= 0
+        {
             return Err("invalid delivery quarantine reference".into());
         }
         self.block(async {

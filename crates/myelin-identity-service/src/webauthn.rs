@@ -24,17 +24,9 @@ const FLAG_ED: u8 = 0x80;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoseKey {
-    Es256 {
-        x: Vec<u8>,
-        y: Vec<u8>,
-    },
-    Rs256 {
-        n: Vec<u8>,
-        e: Vec<u8>,
-    },
-    Ed25519 {
-        x: Vec<u8>,
-    },
+    Es256 { x: Vec<u8>, y: Vec<u8> },
+    Rs256 { n: Vec<u8>, e: Vec<u8> },
+    Ed25519 { x: Vec<u8> },
 }
 
 impl CoseKey {

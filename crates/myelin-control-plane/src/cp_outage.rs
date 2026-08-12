@@ -101,9 +101,7 @@ pub struct Served {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServeFailure {
     Gateway(GatewayReject),
-    NoRoute {
-        tenant_id: TenantId,
-    },
+    NoRoute { tenant_id: TenantId },
 }
 
 impl core::fmt::Display for ServeFailure {

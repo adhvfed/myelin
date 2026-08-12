@@ -33,9 +33,7 @@ impl CdnEdgeSet {
     ) -> Vec<&'a CdnEdgePop> {
         candidates
             .iter()
-            .filter(|pop| {
-                !tenant_is_eu || pop.within_eu
-            })
+            .filter(|pop| !tenant_is_eu || pop.within_eu)
             .collect()
     }
 
@@ -97,8 +95,7 @@ impl<'a> CdnCloneClass<'a> {
         hash: &ContentHash,
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, crate::blob::BlobError> {
-        self.base
-            .get_bounded(&self.tenant, hash, maximum_bytes)
+        self.base.get_bounded(&self.tenant, hash, maximum_bytes)
     }
 
     pub fn eligible_edges<'p>(&self, candidates: &'p [CdnEdgePop]) -> Vec<&'p CdnEdgePop> {

@@ -543,10 +543,7 @@ pub struct SamlRequestBinding {
 }
 
 impl SamlRequestBinding {
-    pub fn new(
-        acs_url: impl Into<String>,
-        request_id: impl Into<String>,
-    ) -> SamlRequestBinding {
+    pub fn new(acs_url: impl Into<String>, request_id: impl Into<String>) -> SamlRequestBinding {
         SamlRequestBinding {
             acs_url: acs_url.into(),
             request_id: request_id.into(),
@@ -665,7 +662,8 @@ impl CredentialVerifier for SamlVerifier {
                  and AuthnRequest ID",
             )
         })?;
-        if request_binding.acs_url.trim().is_empty() || request_binding.request_id.trim().is_empty() {
+        if request_binding.acs_url.trim().is_empty() || request_binding.request_id.trim().is_empty()
+        {
             return Err(refuse(
                 "SAML request binding has an empty ACS URL or AuthnRequest ID",
             ));
@@ -754,10 +752,12 @@ impl CredentialVerifier for SamlVerifier {
         let method = match sig_alg {
             RSA_SHA256 => SigMethod::RsaSha256,
             ECDSA_SHA256 => SigMethod::EcdsaSha256,
-            other => return Err(refuse(format!(
+            other => {
+                return Err(refuse(format!(
                 "unsupported/weak SignatureMethod `{other}` (only rsa-sha256 / ecdsa-sha256 are \
                      accepted - SHA-1 is rejected)"
-            ))),
+            )))
+            }
         };
 
         let references = children_named(signed_info, &signed_info_scope, DS_NS, "Reference");
@@ -1070,7 +1070,9 @@ impl CredentialVerifier for SamlVerifier {
             SAML_NS,
             "SubjectConfirmationData",
         )
-        .ok_or_else(|| refuse("signed bearer SubjectConfirmation has no SubjectConfirmationData"))?;
+        .ok_or_else(|| {
+            refuse("signed bearer SubjectConfirmation has no SubjectConfirmationData")
+        })?;
         let confirmation_attr = |name: &str| {
             confirmation_data
                 .attrs
@@ -1464,8 +1466,8 @@ mod tests {
             config(vec![signer.jwk()]).with_region_default("ap-south"),
             ReplayGuard::new(),
         )
-            .with_request_binding(SamlRequestBinding::new(ACS, REQUEST_ID))
-            .with_clock(|| NOW);
+        .with_request_binding(SamlRequestBinding::new(ACS, REQUEST_ID))
+        .with_clock(|| NOW);
         let raw = format!(
             "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" ID=\"_resp2\" \
              Version=\"2.0\" IssueInstant=\"{NB}\" Destination=\"{ACS}\" \
@@ -1509,8 +1511,8 @@ mod tests {
     #[test]
     fn verifier_without_server_request_binding_fails_closed() {
         let signer = RsaSigner::generate();
-        let verifier = SamlVerifier::new(config(vec![signer.jwk()]), ReplayGuard::new())
-            .with_clock(|| NOW);
+        let verifier =
+            SamlVerifier::new(config(vec![signer.jwk()]), ReplayGuard::new()).with_clock(|| NOW);
         let doc = build_doc(
             "_missing_binding",
             ISSUER,

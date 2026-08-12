@@ -242,10 +242,7 @@ fn resync_required_falls_back_to_a_full_cold_rebuild_zero_lost() {
     for id in ["itm-a", "itm-b", "itm-c"] {
         publish_inbox_frame(&mut fh, &me, id).unwrap();
     }
-    let out = watch_resume(
-        &mut fh, &me, 0,
-    )
-    .unwrap();
+    let out = watch_resume(&mut fh, &me, 0).unwrap();
     assert!(
         out.is_resync_required(),
         "an evicted-head fresh cursor resyncs"

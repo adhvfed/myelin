@@ -70,12 +70,15 @@ fn consumer_issue_feed_drives_the_shared_frame() {
     assert!(subjects.contains(&events::ISSUE_TRANSITIONED.to_string()));
     assert!(subjects.contains(&events::CYCLE_COMPLETED.to_string()));
     assert!(subjects.iter().all(|s| s != "*"), "never `*` (BUS-3)");
-    c.handle(&ev(
-        "01J-1",
-        events::SLA_MET,
-        "myelin://acme/issue/issue/ENG-1",
-        "issue:ENG-1",
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "01J-1",
+            events::SLA_MET,
+            "myelin://acme/issue/issue/ENG-1",
+            "issue:ENG-1",
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(
         c.doc_count(),
         1,
@@ -88,8 +91,14 @@ fn consumer_issue_feed_drives_the_shared_frame() {
 fn consumer_honours_the_restriction_flag() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
-    c.handle(&ev("a1", events::SLA_MET, "psn:alice", "issue:A"), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev("b1", events::SLA_MET, "psn:bob", "issue:B"), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev("a1", events::SLA_MET, "psn:alice", "issue:A"),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev("b1", events::SLA_MET, "psn:bob", "issue:B"),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| assert_eq!(a.velocity(), 2, "both contribute unrestricted"));
     flag.set("psn:alice", true);
     c.analytics(|a| {
@@ -105,8 +114,14 @@ fn consumer_honours_the_restriction_flag() {
 #[test]
 fn consumer_and_provider_project_the_same_read_model() {
     let c = IssueOlapConsumer::new(region(), RestrictionFlag::new());
-    c.handle(&ev("e1", events::SLA_MET, "psn:a", "issue:1"), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev("e2", events::ISSUE_TRANSITIONED, "psn:b", "issue:2"), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev("e1", events::SLA_MET, "psn:a", "issue:1"),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev("e2", events::ISSUE_TRANSITIONED, "psn:b", "issue:2"),
+        &mut myelin_events::HandlerTx::none(),
+    );
 
     let mut raw = OlapReadStore::pinned_to(region());
     raw.apply(&OlapEvent::from_envelope(&ev(

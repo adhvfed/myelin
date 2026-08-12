@@ -196,7 +196,6 @@ pub struct OutboxStore {
     backend: OutboxBackend,
 }
 
-
 pub trait DurableOutboxBacking: Send + Sync {
     fn commit_staged(&self, rows: Vec<OutboxRow>) -> Result<()>;
 

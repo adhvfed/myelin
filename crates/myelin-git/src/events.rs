@@ -1,6 +1,4 @@
-use myelin_events::{
-    validate_event_type, RegisteredToken, SubsystemTokenList,
-};
+use myelin_events::{validate_event_type, RegisteredToken, SubsystemTokenList};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 
 pub fn event_actor_pseudonym(tenant: &str, subject: &str) -> String {
@@ -8,18 +6,14 @@ pub fn event_actor_pseudonym(tenant: &str, subject: &str) -> String {
 }
 
 fn event_actor_field_pseudonym(field: &str, tenant: &str, subject: &str) -> String {
-    let digest = blake3::hash(
-        format!("myelin.git.event-actor.v1\0{field}\0{tenant}\0{subject}").as_bytes(),
-    );
+    let digest =
+        blake3::hash(format!("myelin.git.event-actor.v1\0{field}\0{tenant}\0{subject}").as_bytes());
     format!("git-event:{}", &digest.to_hex()[..32])
 }
 
 pub fn pseudonymized_event_principal(tenant: &str, principal: &Principal) -> Principal {
     let mut projected = principal.clone();
-    projected.principal_id = PrincipalId(event_actor_pseudonym(
-        tenant,
-        &principal.principal_id.0,
-    ));
+    projected.principal_id = PrincipalId(event_actor_pseudonym(tenant, &principal.principal_id.0));
     if let PrincipalKind::Agent {
         runtime_ref,
         on_behalf_of,
@@ -268,7 +262,10 @@ mod tests {
             "runtime://raw-host/session",
             "human:raw-delegator",
         ] {
-            assert!(!serialized.contains(raw), "raw nested identifier leaked: {raw}");
+            assert!(
+                !serialized.contains(raw),
+                "raw nested identifier leaked: {raw}"
+            );
         }
         let PrincipalKind::Agent {
             runtime_ref,
@@ -280,7 +277,10 @@ mod tests {
         let delegator = on_behalf_of.expect("delegator projection");
         assert_ne!(projected.principal_id.0, runtime_ref.0);
         assert_ne!(projected.principal_id.0, delegator.0);
-        assert_ne!(runtime_ref.0, delegator.0, "field domains must not correlate");
+        assert_ne!(
+            runtime_ref.0, delegator.0,
+            "field domains must not correlate"
+        );
     }
 
     #[test]

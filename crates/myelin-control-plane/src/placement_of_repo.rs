@@ -35,13 +35,8 @@ pub(crate) struct RepoPlacementRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepoPlacementError {
-    NotARepoRef {
-        repo: ArtifactRef,
-    },
-    TenantNotPlaced {
-        repo: ArtifactRef,
-        tenant: TenantId,
-    },
+    NotARepoRef { repo: ArtifactRef },
+    TenantNotPlaced { repo: ArtifactRef, tenant: TenantId },
     Invariant(PlacementError),
 }
 

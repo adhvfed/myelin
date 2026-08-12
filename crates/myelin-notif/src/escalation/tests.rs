@@ -182,12 +182,7 @@ fn notify_for_critical_pierces_even_if_pierce_classes_omits_critical() {
         windows: vec![],
         pierce_classes: vec![],
     };
-    let out = notify_for(
-        &chans,
-        Class::Critical,
-        &no_pierce,
-         true,
-    );
+    let out = notify_for(&chans, Class::Critical, &no_pierce, true);
     assert_eq!(
         out, chans,
         "critical pages all channels regardless of pierce_classes config"

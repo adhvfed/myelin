@@ -347,7 +347,7 @@ fn run_production_guest_streaming(
     let script = build_command_runner_script(spec, &nonce);
     let script_drive = stage_padded_script(&script)?;
 
-    let cfg = FcMachineConfig::from_spec(spec, profile,  false);
+    let cfg = FcMachineConfig::from_spec(spec, profile, false);
     let cfg_json = cfg.command_runner_json(&script_drive);
     let cfg_path = match write_config_json(&cfg_json) {
         Ok(p) => p,
@@ -1067,9 +1067,9 @@ pub fn drill_config_json(script_drive_path: &std::path::Path, vcpu: u32, mem_mib
         &default_kernel(),
         &boot_args,
         &default_rootfs(),
-         true,
+        true,
         script_drive_path,
-         false,
+        false,
         vcpu,
         mem_mib,
     )
@@ -1811,13 +1811,7 @@ mod tests {
         let console = framed_console("n", &bytes, b"", 0);
         let plan = crate::redaction::RedactionPlan::for_needles([secret.to_vec()]).unwrap();
 
-        let out = capture_stream_redacted(
-            &console,
-            MARK_STDOUT_BEGIN,
-            MARK_STDOUT_END,
-            "n",
-            &plan,
-        );
+        let out = capture_stream_redacted(&console, MARK_STDOUT_BEGIN, MARK_STDOUT_END, "n", &plan);
         assert!(!out.windows(secret.len()).any(|window| window == secret));
         assert!(
             !out.windows(4).any(|window| window == &secret[..4]),

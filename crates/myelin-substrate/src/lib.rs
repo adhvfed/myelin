@@ -27,7 +27,8 @@ pub use fail_static::{
     TestClock,
 };
 pub use fail_static_authz::{
-    encode_authz_key, AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz, AUTHZ_FRESH_TTL_SECS,
+    encode_authz_key, AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz,
+    AUTHZ_FRESH_TTL_SECS,
 };
 pub use firehose::{
     FirehoseScope, FirehoseSignals, Frame, FrameBuffer, FrameClass, FrameLagSample, PushOutcome,

@@ -304,11 +304,9 @@ fn dispose_git_wire_run_failure(
             }
             WireError::Runtime(message)
         }
-        RunFailure::CommitOutcomeUnknown { .. } => {
-            WireError::Runtime(format!(
-                "durable launch commit outcome unknown, needs reconciliation: {message}"
-            ))
-        }
+        RunFailure::CommitOutcomeUnknown { .. } => WireError::Runtime(format!(
+            "durable launch commit outcome unknown, needs reconciliation: {message}"
+        )),
         RunFailure::CommittedButNotExecuted { .. } => {
             let zero = ResourceUsage {
                 cpu_seconds: 0,

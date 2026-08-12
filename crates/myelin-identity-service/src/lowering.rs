@@ -167,10 +167,7 @@ pub fn watermark_verdict(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatermarkVerdict {
     JoinServes,
-    FallBackToCheck {
-        required: Zookie,
-        watermark: Zookie,
-    },
+    FallBackToCheck { required: Zookie, watermark: Zookie },
 }
 
 #[allow(clippy::too_many_arguments)]

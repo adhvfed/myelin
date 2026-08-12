@@ -135,8 +135,7 @@ impl GvisorBackend {
         ) -> RetainedWorkloadOutcome,
     {
         use crate::checkout_orchestration::{
-            route_after_disposal, CheckoutContinuationOutcome,
-            CheckoutOrchestrationError,
+            route_after_disposal, CheckoutContinuationOutcome, CheckoutOrchestrationError,
         };
         use crate::CheckoutPhase;
 

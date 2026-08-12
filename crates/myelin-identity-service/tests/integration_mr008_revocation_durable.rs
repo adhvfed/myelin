@@ -88,20 +88,28 @@ async fn cleanup(admin: &SubstrateProvider, tenants: &[&str]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revocation_is_durable_and_idempotent_across_a_fresh_store_instance() {
     let Some(admin) = migrate().await else { return };
-    let Some(app) = app_provider().await else { return };
+    let Some(app) = app_provider().await else {
+        return;
+    };
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
     let tenant = format!("mr008-rev-{suffix}");
     let s = scope(&tenant, &region);
 
-    let store1 = RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
+    let store1 =
+        RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     let jti = RevokeTarget::Jti("jti-1".into());
     store1.revoke(&s, &jti, ts("2026-06-26T00:00:00Z"));
-    store1.disable_principal(&s, &PrincipalId("p:alice".into()), ts("2026-06-26T00:00:00Z"));
+    store1.disable_principal(
+        &s,
+        &PrincipalId("p:alice".into()),
+        ts("2026-06-26T00:00:00Z"),
+    );
     store1.revoke(&s, &jti, ts("2026-06-26T09:00:00Z"));
 
-    let store2 = RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
+    let store2 =
+        RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     assert!(
         store2.is_revoked(&s, &jti, &ts("2026-06-26T00:00:01Z")),
         "a revoked jti reads back as revoked from a fresh store instance (durable)"
@@ -123,20 +131,25 @@ async fn revocation_is_durable_and_idempotent_across_a_fresh_store_instance() {
     assert!(store2.is_revoked(&s, &jti, &ts("2026-06-26T00:00:01Z")));
 
     cleanup(&admin, &[&tenant]).await;
-    println!("OK [a]: revocation durable + idempotent across a fresh store instance over the same pool.");
+    println!(
+        "OK [a]: revocation durable + idempotent across a fresh store instance over the same pool."
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
     let Some(admin) = migrate().await else { return };
-    let Some(app) = app_provider().await else { return };
+    let Some(app) = app_provider().await else {
+        return;
+    };
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
     let tenant = format!("mr008-ttl-{suffix}");
     let s = scope(&tenant, &region);
 
-    let store1 = RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
+    let store1 =
+        RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     store1.register_run_token_ttl(
         &s,
         "run-jti",
@@ -151,7 +164,8 @@ async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
     );
     store1.tear_down_run_token(&s, "torn-jti", ts("2026-06-26T00:01:00Z"));
 
-    let store2 = RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
+    let store2 =
+        RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     let run = RevokeTarget::Jti("run-jti".into());
 
     assert!(
@@ -183,7 +197,11 @@ async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
         "an explicit teardown is durable: reads TornDown across a fresh instance"
     );
     assert_eq!(
-        store2.run_token_state(&s, &RevokeTarget::Jti("never".into()), &ts("2026-06-26T00:02:00Z")),
+        store2.run_token_state(
+            &s,
+            &RevokeTarget::Jti("never".into()),
+            &ts("2026-06-26T00:02:00Z")
+        ),
         RunTokenState::Unknown,
         "an unminted jti fails closed (Unknown), never Live"
     );
@@ -212,7 +230,9 @@ async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tenant_a_revocations_invisible_to_b_and_no_guc_bleeds() {
     let Some(admin) = migrate().await else { return };
-    let Some(app) = app_provider().await else { return };
+    let Some(app) = app_provider().await else {
+        return;
+    };
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
@@ -224,9 +244,16 @@ async fn tenant_a_revocations_invisible_to_b_and_no_guc_bleeds() {
     let store = RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle);
     let jti = RevokeTarget::Jti("jti-secret".into());
     store.revoke(&sa, &jti, ts("2026-06-26T00:00:00Z"));
-    store.disable_principal(&sa, &PrincipalId("p:alice".into()), ts("2026-06-26T00:00:00Z"));
+    store.disable_principal(
+        &sa,
+        &PrincipalId("p:alice".into()),
+        ts("2026-06-26T00:00:00Z"),
+    );
 
-    assert!(store.is_revoked(&sa, &jti, &ts("2026-06-26T00:00:01Z")), "tenant A sees its revocation");
+    assert!(
+        store.is_revoked(&sa, &jti, &ts("2026-06-26T00:00:01Z")),
+        "tenant A sees its revocation"
+    );
     assert_eq!(store.revocation_count(&sa), 2);
 
     assert!(
@@ -241,7 +268,11 @@ async fn tenant_a_revocations_invisible_to_b_and_no_guc_bleeds() {
         ),
         "tenant B cannot see tenant A's disabled principal"
     );
-    assert_eq!(store.revocation_count(&sb), 0, "tenant B's revocation partition is empty");
+    assert_eq!(
+        store.revocation_count(&sb),
+        0,
+        "tenant B's revocation partition is empty"
+    );
 
     assert!(
         residual_guc(app.db_pool()).await.is_empty(),

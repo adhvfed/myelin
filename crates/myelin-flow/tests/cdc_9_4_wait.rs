@@ -58,9 +58,7 @@ fn waiting_body() -> Box<WorkflowBody> {
         {
             WaitOutcome::Signalled {
                 payload_key_ref, ..
-            } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => {
-                Ok(vec![])
-            }
+            } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => Ok(vec![]),
             WaitOutcome::Signalled { .. } => ctx
                 .activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
                     Ok(vec![ArtifactRef("myelin://acme/agent/effect/done".into())])

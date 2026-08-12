@@ -200,7 +200,10 @@ impl CiLogIndex {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiLogError {
-    UnknownStep { job_id: String, step_no: u32 },
+    UnknownStep {
+        job_id: String,
+        step_no: u32,
+    },
     MalformedAnchor(String),
     Archive(ArchiveError),
     SpanOutOfBounds {
@@ -593,15 +596,9 @@ mod tests {
                 .expect("exact limits accepted"),
             10
         );
-        assert!(frame
-            .encoded_payload_len_with_limits(2, 2, 10)
-            .is_err());
-        assert!(frame
-            .encoded_payload_len_with_limits(3, 1, 10)
-            .is_err());
-        assert!(frame
-            .encoded_payload_len_with_limits(3, 2, 9)
-            .is_err());
+        assert!(frame.encoded_payload_len_with_limits(2, 2, 10).is_err());
+        assert!(frame.encoded_payload_len_with_limits(3, 1, 10).is_err());
+        assert!(frame.encoded_payload_len_with_limits(3, 2, 9).is_err());
     }
 
     #[test]

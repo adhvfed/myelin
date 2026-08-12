@@ -199,7 +199,10 @@ fn transient_owner_unavailable_retries_never_fabricates() {
     let ev = event("01J-9", "issue.issue.created", r);
 
     assert!(
-        matches!(indexer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Retry(_)),
+        matches!(
+            indexer.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Retry(_)
+        ),
         "a transient hiccup retries"
     );
     assert_eq!(

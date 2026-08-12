@@ -327,7 +327,7 @@ impl FirehoseArchiver {
             FIREHOSE_MAX_SEGMENT_BYTES,
             FIREHOSE_MAX_SEGMENT_FRAMES,
         )
-            .ok_or_else(|| ArchiveError::CorruptSegment(content_hash.clone()))
+        .ok_or_else(|| ArchiveError::CorruptSegment(content_hash.clone()))
     }
 
     pub fn segment_covering(&self, seq: u64) -> Option<SealedSegment> {

@@ -9,9 +9,8 @@ use myelin_events::{
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::{DurableGitRepo, DurableGitStore};
 use myelin_git::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, Pusher, PushOutcome, PushSession, RefName,
-    RefStore,
-    RejectReason,
+    CrashPoint, InMemoryObjectDb, Oid, ProposedRefUpdate, PushOutcome, PushSession, Pusher,
+    RefName, RefStore, RejectReason,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -87,7 +86,11 @@ fn ref_written_through_refstore_survives_a_fresh_refstore_over_the_same_root() {
         );
         let db = InMemoryObjectDb::new();
         let outcome = refstore
-            .receive(&push_create("refs/heads/main", &commit, "acme"), &db, CrashPoint::None)
+            .receive(
+                &push_create("refs/heads/main", &commit, "acme"),
+                &db,
+                CrashPoint::None,
+            )
             .expect("receive");
         assert!(
             matches!(outcome, PushOutcome::Accepted { .. }),
@@ -143,7 +146,11 @@ fn created_bare_repo_is_git_fsck_clean_external_oracle() {
         Arc::new(MonotonicMinter::new()),
     );
     refstore
-        .receive(&push_create("refs/heads/main", &commit, "acme"), &InMemoryObjectDb::new(), CrashPoint::None)
+        .receive(
+            &push_create("refs/heads/main", &commit, "acme"),
+            &InMemoryObjectDb::new(),
+            CrashPoint::None,
+        )
         .expect("receive");
 
     repo.fsck().expect("in-process fsck clean");
@@ -191,16 +198,27 @@ fn durable_refstore_rejects_stale_cas_and_ref_does_not_move() {
 
     assert!(matches!(
         refstore
-            .receive(&push_create("refs/heads/feature", &c1, "acme"), &db, CrashPoint::None)
+            .receive(
+                &push_create("refs/heads/feature", &c1, "acme"),
+                &db,
+                CrashPoint::None
+            )
             .unwrap(),
         PushOutcome::Accepted { .. }
     ));
 
     let stale = refstore
-        .receive(&push_create("refs/heads/feature", &c2, "acme"), &db, CrashPoint::None)
+        .receive(
+            &push_create("refs/heads/feature", &c2, "acme"),
+            &db,
+            CrashPoint::None,
+        )
         .unwrap();
     assert!(
-        matches!(stale, PushOutcome::Rejected(RejectReason::NonFastForward { .. })),
+        matches!(
+            stale,
+            PushOutcome::Rejected(RejectReason::NonFastForward { .. })
+        ),
         "a stale CAS is rejected, got {stale:?}"
     );
     assert_eq!(
@@ -233,12 +251,19 @@ fn tenant_isolation_through_the_durable_store() {
         Arc::new(MonotonicMinter::new()),
     );
     refstore_a
-        .receive(&push_create("refs/heads/main", &commit, "tenant-a"), &InMemoryObjectDb::new(), CrashPoint::None)
+        .receive(
+            &push_create("refs/heads/main", &commit, "tenant-a"),
+            &InMemoryObjectDb::new(),
+            CrashPoint::None,
+        )
         .expect("receive a");
 
     assert_ne!(store.repo_path(&a).unwrap(), store.repo_path(&b).unwrap());
     assert!(store.repo_exists(&a));
-    assert!(!store.repo_exists(&b), "tenant B cannot reach A's repo by path");
+    assert!(
+        !store.repo_exists(&b),
+        "tenant B cannot reach A's repo by path"
+    );
 
     let repo_b = Arc::new(store.create_repo(&b).expect("create b"));
     let refstore_b = RefStore::open_durable(
@@ -280,7 +305,11 @@ fn path_traversal_cross_tenant_breakout_is_rejected_on_read_and_write() {
         Arc::new(MonotonicMinter::new()),
     );
     refstore_a
-        .receive(&push_create("refs/heads/main", &secret, "tenant-a"), &InMemoryObjectDb::new(), CrashPoint::None)
+        .receive(
+            &push_create("refs/heads/main", &secret, "tenant-a"),
+            &InMemoryObjectDb::new(),
+            CrashPoint::None,
+        )
         .expect("receive a");
 
     let b_legit = RepoLoc::new("tenant-b", "fr-par", "mine");
@@ -292,7 +321,10 @@ fn path_traversal_cross_tenant_breakout_is_rejected_on_read_and_write() {
         store.create_repo(&attack).is_err(),
         "create_repo must REFUSE a traversing slug (no cross-tenant write)"
     );
-    assert!(store.open_repo(&attack).is_err(), "open_repo must REFUSE a traversing slug");
+    assert!(
+        store.open_repo(&attack).is_err(),
+        "open_repo must REFUSE a traversing slug"
+    );
     assert!(
         !store.repo_exists(&attack),
         "repo_exists must be false (fail-closed) for a traversing slug"
@@ -309,8 +341,7 @@ fn path_traversal_cross_tenant_breakout_is_rejected_on_read_and_write() {
     );
 
     let reader = GixCore::new(RootedResolver::new(&root));
-    let read_attempt =
-        reader.read_blob_bounded(&attack, &CoreOid::new(secret.0.clone()), 1024);
+    let read_attempt = reader.read_blob_bounded(&attack, &CoreOid::new(secret.0.clone()), 1024);
     assert!(
         read_attempt.is_err(),
         "GixCore read through a traversing slug must be refused (read path closed), got {read_attempt:?}"
@@ -323,7 +354,11 @@ fn path_traversal_cross_tenant_breakout_is_rejected_on_read_and_write() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
-    assert_eq!(entries, vec!["mine.git".to_string()], "no smuggled dir under tenant-b");
+    assert_eq!(
+        entries,
+        vec!["mine.git".to_string()],
+        "no smuggled dir under tenant-b"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -333,8 +368,14 @@ fn absolute_component_locator_is_rejected_on_write() {
     let root = temp_root("abs");
     let store = DurableGitStore::rooted(&root);
     let attack = RepoLoc::new("/tmp/evil-myelin-escape", "fr-par", "core");
-    assert!(store.create_repo(&attack).is_err(), "absolute tenant refused");
-    assert!(store.repo_path(&attack).is_err(), "absolute tenant not resolved");
+    assert!(
+        store.create_repo(&attack).is_err(),
+        "absolute tenant refused"
+    );
+    assert!(
+        store.repo_path(&attack).is_err(),
+        "absolute tenant not resolved"
+    );
     assert!(
         !std::path::Path::new("/tmp/evil-myelin-escape").exists(),
         "nothing was created outside the store root"

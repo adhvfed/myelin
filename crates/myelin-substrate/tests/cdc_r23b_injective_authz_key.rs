@@ -1,5 +1,7 @@
 use myelin_identity::{Consistency, ConsistencyMode, Decision, Zookie};
-use myelin_substrate::{encode_authz_key, FailStaticAuthz, FailStaticThreshold, ServeError, TestClock};
+use myelin_substrate::{
+    encode_authz_key, FailStaticAuthz, FailStaticThreshold, ServeError, TestClock,
+};
 
 fn threshold() -> FailStaticThreshold {
     FailStaticThreshold {
@@ -81,7 +83,10 @@ fn git_shaped_adversarial_pair_is_injective_and_does_not_alias() {
 
     let key_a = encode_authz_key(&a);
     let key_b = encode_authz_key(&b);
-    assert_ne!(key_a, key_b, "injective encoding separates the git-shaped pair");
+    assert_ne!(
+        key_a, key_b,
+        "injective encoding separates the git-shaped pair"
+    );
 
     let fs = authz_at(1_000);
     assert!(fs.serve(key_a, &bounded_stale(), false, allow).is_allow());
@@ -101,7 +106,9 @@ fn colliding_pair_does_not_alias_through_the_static_background_refresh_path() {
 
     let fs = authz_at(1_000);
 
-    assert!(fs.serve(key_a.clone(), &bounded_stale(), false, allow).is_allow());
+    assert!(fs
+        .serve(key_a.clone(), &bounded_stale(), false, allow)
+        .is_allow());
     fs.clock().advance(31);
 
     let a_calls = std::cell::Cell::new(0u32);
@@ -132,7 +139,10 @@ fn colliding_pair_does_not_alias_through_the_static_background_refresh_path() {
         "A's own key was re-stamped by the background refresh (fresh again): {a_after:?}"
     );
     let b_after = fs.serve(key_b, &bounded_stale(), false, hiccup);
-    assert!(b_after.is_deny(), "B still has no entry of its own: {b_after:?}");
+    assert!(
+        b_after.is_deny(),
+        "B still has no entry of its own: {b_after:?}"
+    );
 }
 
 #[test]

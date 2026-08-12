@@ -1,7 +1,5 @@
 use myelin_issues::{spend_bearing_run, IssueRunKind, IssueSpendGate, SpendError};
-use myelin_storage::reserve_settle::{
-    CostLedger, MeteredUnit, MicroUsd, ReservationState, RunId,
-};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, ReservationState, RunId};
 use myelin_tenancy::TenantId;
 
 fn tenant() -> TenantId {

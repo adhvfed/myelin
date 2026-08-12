@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
-use crate::blob::{BlobDependencyError, BlobError, BlobMeta, BlobStore, ContentHash, HashAlgo, Result};
+use crate::blob::{
+    BlobDependencyError, BlobError, BlobMeta, BlobStore, ContentHash, HashAlgo, Result,
+};
 
 #[derive(Clone)]
 pub struct S3BlobStore {
@@ -90,16 +92,21 @@ impl S3BlobStore {
             &ContentHash::blake3(READINESS_MARKER_BYTES),
         );
         let result = self.block(async {
-            self.client.put_object()
+            self.client
+                .put_object()
                 .bucket(&self.bucket)
                 .key(&marker_key)
                 .body(ByteStream::from_static(READINESS_MARKER_BYTES))
-                .send().await
+                .send()
+                .await
                 .map_err(|error| classify_sdk_error(&error, PreflightOperation::Put))?;
-            let output = self.client.get_object()
+            let output = self
+                .client
+                .get_object()
                 .bucket(&self.bucket)
                 .key(&marker_key)
-                .send().await
+                .send()
+                .await
                 .map_err(|error| classify_sdk_error(&error, PreflightOperation::Get))?;
             let content_length = output.content_length();
             verify_readiness_marker(output.body, content_length).await
@@ -109,9 +116,17 @@ impl S3BlobStore {
     }
 
     pub fn readiness(&self) -> std::result::Result<(), S3ReadinessError> {
-        let state = *self.readiness.lock().unwrap_or_else(|error| error.into_inner());
-        if matches!(state.last_error, Some(S3ReadinessError::PermanentConfig | S3ReadinessError::PermanentAuth)) {
-            return Err(state.last_error.expect("matched a permanent readiness error"));
+        let state = *self
+            .readiness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if matches!(
+            state.last_error,
+            Some(S3ReadinessError::PermanentConfig | S3ReadinessError::PermanentAuth)
+        ) {
+            return Err(state
+                .last_error
+                .expect("matched a permanent readiness error"));
         }
         if Instant::now() < state.next_probe {
             return state.last_error.map_or(Ok(()), Err);
@@ -120,17 +135,24 @@ impl S3BlobStore {
     }
 
     fn record_preflight(&self, result: std::result::Result<(), S3ReadinessError>) {
-        let mut state = self.readiness.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .readiness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.last_error = result.err();
-        state.next_probe = Instant::now() + if state.last_error.is_none() {
-            HEALTHY_PROBE_INTERVAL
-        } else {
-            UNHEALTHY_PROBE_INTERVAL
-        };
+        state.next_probe = Instant::now()
+            + if state.last_error.is_none() {
+                HEALTHY_PROBE_INTERVAL
+            } else {
+                UNHEALTHY_PROBE_INTERVAL
+            };
     }
 
     fn mark_runtime_failure(&self, kind: S3ReadinessError) {
-        let mut state = self.readiness.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self
+            .readiness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         state.last_error = Some(kind);
         state.next_probe = Instant::now();
     }
@@ -268,7 +290,8 @@ fn stored_len_from_content_length(content_length: Option<i64>) -> Option<usize> 
 
 fn s3_config_is_valid(cfg: &S3Config) -> bool {
     let endpoint = cfg.endpoint.trim();
-    let authority = endpoint.strip_prefix("http://")
+    let authority = endpoint
+        .strip_prefix("http://")
         .or_else(|| endpoint.strip_prefix("https://"))
         .and_then(|rest| rest.split('/').next())
         .unwrap_or_default();
@@ -276,23 +299,35 @@ fn s3_config_is_valid(cfg: &S3Config) -> bool {
     !authority.is_empty()
         && !authority.contains([' ', '@', '#', '?'])
         && !cfg.region.is_empty()
-        && cfg.region.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && cfg
+            .region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         && !cfg.access_key.trim().is_empty()
         && !cfg.secret_key.trim().is_empty()
         && (3..=63).contains(&bucket.len())
         && bucket.first().is_some_and(u8::is_ascii_alphanumeric)
         && bucket.last().is_some_and(u8::is_ascii_alphanumeric)
-        && bucket.iter().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.'))
+        && bucket.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        })
         && !cfg.bucket.contains("..")
         && !cfg.bucket.contains(".-")
         && !cfg.bucket.contains("-.")
 }
 
 #[derive(Clone, Copy)]
-enum PreflightOperation { Put, Get }
+enum PreflightOperation {
+    Put,
+    Get,
+}
 
 #[derive(Clone, Copy)]
-enum PreflightFailure { Construction, Service(u16), Other }
+enum PreflightFailure {
+    Construction,
+    Service(u16),
+    Other,
+}
 
 fn classify_sdk_error<E>(
     error: &aws_sdk_s3::error::SdkError<E>,
@@ -359,10 +394,13 @@ mod tests {
             &ContentHash::blake3(READINESS_MARKER_BYTES),
         );
         assert!(key.starts_with(".myelin-readiness/blake3/"));
-        assert_eq!(key, S3BlobStore::key_path(
-            &TenantId(READINESS_TENANT.into()),
-            &ContentHash::blake3(READINESS_MARKER_BYTES),
-        ));
+        assert_eq!(
+            key,
+            S3BlobStore::key_path(
+                &TenantId(READINESS_TENANT.into()),
+                &ContentHash::blake3(READINESS_MARKER_BYTES),
+            )
+        );
     }
 
     #[tokio::test]
@@ -406,10 +444,22 @@ mod tests {
     fn malformed_authority_configuration_is_rejected() {
         assert!(s3_config_is_valid(&config()));
         for invalid in [
-            S3Config { endpoint: "not-a-url".into(), ..config() },
-            S3Config { bucket: "UPPERCASE".into(), ..config() },
-            S3Config { region: "bad region".into(), ..config() },
-            S3Config { secret_key: String::new(), ..config() },
+            S3Config {
+                endpoint: "not-a-url".into(),
+                ..config()
+            },
+            S3Config {
+                bucket: "UPPERCASE".into(),
+                ..config()
+            },
+            S3Config {
+                region: "bad region".into(),
+                ..config()
+            },
+            S3Config {
+                secret_key: String::new(),
+                ..config()
+            },
         ] {
             assert!(!s3_config_is_valid(&invalid));
         }
@@ -425,9 +475,20 @@ mod tests {
 
     #[test]
     fn dependency_error_rendering_contains_no_authority_detail() {
-        let rendered = [S3ReadinessError::PermanentConfig, S3ReadinessError::PermanentAuth, S3ReadinessError::Transient]
-            .map(|error| error.to_string()).join(" ");
-        for forbidden in ["ACCESS_SENTINEL", "SECRET_SENTINEL", "object.example.invalid", "myelin-prod", READINESS_TENANT] {
+        let rendered = [
+            S3ReadinessError::PermanentConfig,
+            S3ReadinessError::PermanentAuth,
+            S3ReadinessError::Transient,
+        ]
+        .map(|error| error.to_string())
+        .join(" ");
+        for forbidden in [
+            "ACCESS_SENTINEL",
+            "SECRET_SENTINEL",
+            "object.example.invalid",
+            "myelin-prod",
+            READINESS_TENANT,
+        ] {
             assert!(!rendered.contains(forbidden));
         }
     }
@@ -436,15 +497,51 @@ mod tests {
     fn readiness_classifier_is_operation_aware_and_fail_closed() {
         use PreflightOperation::{Get, Put};
         let cases = [
-            (PreflightFailure::Construction, Put, S3ReadinessError::PermanentConfig),
-            (PreflightFailure::Service(401), Put, S3ReadinessError::PermanentAuth),
-            (PreflightFailure::Service(403), Get, S3ReadinessError::PermanentAuth),
-            (PreflightFailure::Service(404), Put, S3ReadinessError::PermanentConfig),
-            (PreflightFailure::Service(404), Get, S3ReadinessError::Transient),
-            (PreflightFailure::Service(408), Put, S3ReadinessError::Transient),
-            (PreflightFailure::Service(429), Get, S3ReadinessError::Transient),
-            (PreflightFailure::Service(503), Put, S3ReadinessError::Transient),
-            (PreflightFailure::Service(422), Get, S3ReadinessError::PermanentConfig),
+            (
+                PreflightFailure::Construction,
+                Put,
+                S3ReadinessError::PermanentConfig,
+            ),
+            (
+                PreflightFailure::Service(401),
+                Put,
+                S3ReadinessError::PermanentAuth,
+            ),
+            (
+                PreflightFailure::Service(403),
+                Get,
+                S3ReadinessError::PermanentAuth,
+            ),
+            (
+                PreflightFailure::Service(404),
+                Put,
+                S3ReadinessError::PermanentConfig,
+            ),
+            (
+                PreflightFailure::Service(404),
+                Get,
+                S3ReadinessError::Transient,
+            ),
+            (
+                PreflightFailure::Service(408),
+                Put,
+                S3ReadinessError::Transient,
+            ),
+            (
+                PreflightFailure::Service(429),
+                Get,
+                S3ReadinessError::Transient,
+            ),
+            (
+                PreflightFailure::Service(503),
+                Put,
+                S3ReadinessError::Transient,
+            ),
+            (
+                PreflightFailure::Service(422),
+                Get,
+                S3ReadinessError::PermanentConfig,
+            ),
             (PreflightFailure::Other, Get, S3ReadinessError::Transient),
         ];
         for (failure, operation, expected) in cases {

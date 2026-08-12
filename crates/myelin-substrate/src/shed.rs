@@ -44,9 +44,7 @@ impl RunClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShedDecision {
     Admit,
-    Shed {
-        retry_after_secs: u64,
-    },
+    Shed { retry_after_secs: u64 },
 }
 
 impl ShedDecision {

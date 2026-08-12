@@ -166,7 +166,7 @@ fn ci_d10_self_hosted_mint_cannot_mint_cross_tenant() {
             &Timestamp("2026-06-22T00:00:00Z".into()),
         );
         match r {
-            Err(MintError::SelfHostedScopeViolation(_)) => {  }
+            Err(MintError::SelfHostedScopeViolation(_)) => {}
             Ok(_) => cross_tenant_tokens_minted += 1,
             Err(other) => panic!(
                 "a cross-tenant self-hosted mint must fail with SelfHostedScopeViolation, got \

@@ -18,9 +18,7 @@ pub const S2_HOLDER: &str = "identity_pseudonym";
 pub enum PseudonymError {
     Kms(String),
     CorruptMapping,
-    GrammarMismatch {
-        handle: String,
-    },
+    GrammarMismatch { handle: String },
     Storage(String),
 }
 
@@ -376,23 +374,23 @@ impl PseudonymStore {
                 let Some(row) = inner
                     .by_subject
                     .get(&part_key)
-                    .and_then(|p| p.get(&subject.0)) else {
-                        return Ok(None);
-                    };
-                let Some(sealed) = inner
-                    .sealed
-                    .get(&part_key)
-                    .and_then(|p| p.get(&subject.0)) else {
-                        return Err(PseudonymError::CorruptMapping);
-                    };
+                    .and_then(|p| p.get(&subject.0))
+                else {
+                    return Ok(None);
+                };
+                let Some(sealed) = inner.sealed.get(&part_key).and_then(|p| p.get(&subject.0))
+                else {
+                    return Err(PseudonymError::CorruptMapping);
+                };
                 (row.real_id_key_ref.clone(), sealed.clone())
             }
             PseudonymBackend::Pg(pg) => {
                 let Some(drow) = pg
                     .block(pg.backing.get_by_principal(&scope.tenant().0, &subject.0))
-                    .map_err(|e| PseudonymError::Storage(e.to_string()))? else {
-                        return Ok(None);
-                    };
+                    .map_err(|e| PseudonymError::Storage(e.to_string()))?
+                else {
+                    return Ok(None);
+                };
                 let row = Self::durable_to_row(scope, &drow)?;
                 let sealed = Self::durable_to_sealed(&drow)?;
                 (row.real_id_key_ref, sealed)
@@ -443,13 +441,11 @@ impl PseudonymStore {
                 }
                 removed
             }
-            PseudonymBackend::Pg(pg) => {
-                Self::require_durable_shred(
-                    pg.block(pg.backing.shred(&scope.tenant().0, &subject.0)),
-                    scope,
-                    subject,
-                )
-            }
+            PseudonymBackend::Pg(pg) => Self::require_durable_shred(
+                pg.block(pg.backing.shred(&scope.tenant().0, &subject.0)),
+                scope,
+                subject,
+            ),
         }
     }
 
@@ -619,7 +615,10 @@ mod tests {
         let panic = std::panic::catch_unwind(|| {
             PseudonymStore::require_durable_shred(Err("database unavailable"), &s, &subject)
         });
-        assert!(panic.is_err(), "a storage fault must refuse the erase receipt");
+        assert!(
+            panic.is_err(),
+            "a storage fault must refuse the erase receipt"
+        );
     }
 
     #[test]

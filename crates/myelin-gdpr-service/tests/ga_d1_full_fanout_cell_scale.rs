@@ -92,7 +92,6 @@ fn ga_d1_full_h1_h18_fan_out_reaches_every_holder_0_missed() {
         cert.content_hash.starts_with("blake3:"),
         "Merkle-provable leaf (the inclusion rides P-GA-20)"
     );
-
 }
 
 #[test]

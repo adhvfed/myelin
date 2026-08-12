@@ -159,5 +159,4 @@ fn notif_d9_in_app_stays_in_cell_and_offcell_redacted_across_recovery() {
         offcell_fullbody, 0,
         "0 off-cell full-body (every off-cell payload is redacted)"
     );
-
 }

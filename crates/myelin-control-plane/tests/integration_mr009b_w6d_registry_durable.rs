@@ -6,8 +6,8 @@ use myelin_config::MyelinConfig;
 use myelin_control_plane::place::{CounterMinter, PlacementService};
 use myelin_control_plane::{
     Capacity, Cell, CellGateway, CellProvisioning, CellStatus, DegenerateControlPlane,
-    GatewayReject, IsolationKind, LocalTenant, MisrouteAudit, PlacementStatus,
-    ProvisioningOutcome, Registry, RepoPlacementError, StorageGroup, TenantPlacement,
+    GatewayReject, IsolationKind, LocalTenant, MisrouteAudit, PlacementStatus, ProvisioningOutcome,
+    Registry, RepoPlacementError, StorageGroup, TenantPlacement,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::placement_durable::{
@@ -119,9 +119,17 @@ async fn all_five_registry_surfaces_survive_a_fresh_pool() {
                     DurablePlacementBacking::new(provider.db_pool().clone()),
                     tokio::runtime::Handle::current(),
                 );
-                assert!(reg.insert_cell(cell(&west, "eu-west")).is_none(), "fresh cell");
-                reg.place_tenant(placement(&tenant, "eu-west", &west, &format!("acme-{suffix}")))
-                    .expect("a single-region placement is admitted");
+                assert!(
+                    reg.insert_cell(cell(&west, "eu-west")).is_none(),
+                    "fresh cell"
+                );
+                reg.place_tenant(placement(
+                    &tenant,
+                    "eu-west",
+                    &west,
+                    &format!("acme-{suffix}"),
+                ))
+                .expect("a single-region placement is admitted");
                 reg.register_repo(&repo, StorageGroup::from_token("pack-0"))
                     .expect("a repo on its tenant's home cell is registered");
                 reg.log_provisioning(CellProvisioning {
@@ -160,7 +168,11 @@ async fn all_five_registry_surfaces_survive_a_fresh_pool() {
                 .expect("the repo placement SURVIVED (the NOT-rebuildable stored fact)");
             assert_eq!(rp.cell_id.as_str(), west);
             assert_eq!(rp.group.as_str(), "pack-0");
-            assert_eq!(rp.region.as_str(), "eu-west", "region derived from the tenant placement");
+            assert_eq!(
+                rp.region.as_str(),
+                "eu-west",
+                "region derived from the tenant placement"
+            );
             let log: Vec<_> = reg2
                 .provisioning_log()
                 .into_iter()
@@ -202,8 +214,13 @@ async fn repo_placement_region_derivation_cannot_drift() {
             );
             reg.insert_cell(cell(&west, "eu-west"));
             reg.insert_cell(cell(&north, "eu-north"));
-            reg.place_tenant(placement(&tenant, "eu-west", &west, &format!("pin-{suffix}")))
-                .expect("placed in eu-west");
+            reg.place_tenant(placement(
+                &tenant,
+                "eu-west",
+                &west,
+                &format!("pin-{suffix}"),
+            ))
+            .expect("placed in eu-west");
             reg.register_repo(&repo, StorageGroup::from_token("pack-0"))
                 .expect("registered on the home cell");
 
@@ -217,11 +234,18 @@ async fn repo_placement_region_derivation_cannot_drift() {
             .bind(&north)
             .execute(pool)
             .await;
-            let err = direct.expect_err("the DB TRIGGER must reject a cross-region repo home on a DIRECT insert");
+            let err = direct.expect_err(
+                "the DB TRIGGER must reject a cross-region repo home on a DIRECT insert",
+            );
             let dberr = err.as_database_error().expect("a database error");
-            assert_eq!(dberr.code().as_deref(), Some("23514"), "SQLSTATE check_violation");
+            assert_eq!(
+                dberr.code().as_deref(),
+                Some("23514"),
+                "SQLSTATE check_violation"
+            );
             assert!(
-                err.to_string().contains("residency pin holds at repo grain"),
+                err.to_string()
+                    .contains("residency pin holds at repo grain"),
                 "the trigger's rejection is loud + named: {err}"
             );
 
@@ -230,7 +254,8 @@ async fn repo_placement_region_derivation_cannot_drift() {
                 .bind(&north)
                 .execute(pool)
                 .await;
-            let uerr = update.expect_err("the trigger must reject a cross-region UPDATE of the stored fact");
+            let uerr = update
+                .expect_err("the trigger must reject a cross-region UPDATE of the stored fact");
             assert_eq!(
                 uerr.as_database_error().and_then(|d| d.code()).as_deref(),
                 Some("23514")
@@ -245,24 +270,41 @@ async fn repo_placement_region_derivation_cannot_drift() {
             .bind(&west)
             .execute(pool)
             .await;
-            let gerr = ghost.expect_err("an unplaced tenant's repo is refused fail-closed at the DB");
+            let gerr =
+                ghost.expect_err("an unplaced tenant's repo is refused fail-closed at the DB");
             assert!(gerr.to_string().contains("fail-closed"), "loud: {gerr}");
 
             let e = reg
-                .relocate_repo(&repo, CellId::from_token(&north), StorageGroup::from_token("g"))
+                .relocate_repo(
+                    &repo,
+                    CellId::from_token(&north),
+                    StorageGroup::from_token("g"),
+                )
                 .expect_err("a cross-region relocation target is rejected (the residency pin)");
             assert!(matches!(e, RepoPlacementError::Invariant(_)), "{e}");
             let still = reg.placement_of_repo(&repo).expect("still placed");
-            assert_eq!(still.cell_id.as_str(), west, "the rejected relocation did not move the repo");
+            assert_eq!(
+                still.cell_id.as_str(),
+                west,
+                "the rejected relocation did not move the repo"
+            );
             assert_eq!(still.region.as_str(), "eu-west");
 
             let west2 = format!("cellw2{suffix}");
             reg.insert_cell(cell(&west2, "eu-west"));
-            reg.relocate_repo(&repo, CellId::from_token(&west2), StorageGroup::from_token("pack-7"))
-                .expect("a same-region relocation is admitted");
+            reg.relocate_repo(
+                &repo,
+                CellId::from_token(&west2),
+                StorageGroup::from_token("pack-7"),
+            )
+            .expect("a same-region relocation is admitted");
             let moved = reg.placement_of_repo(&repo).expect("placed");
             assert_eq!(moved.cell_id.as_str(), west2);
-            assert_eq!(moved.region.as_str(), "eu-west", "region unchanged - derived, not stored");
+            assert_eq!(
+                moved.region.as_str(),
+                "eu-west",
+                "region unchanged - derived, not stored"
+            );
         },
         || async {
             cleanup(pool, &suffix).await;
@@ -345,8 +387,13 @@ async fn a_gateway_misroute_lands_in_the_durable_audit_sink() {
             );
             reg.insert_cell(cell(&home, "eu-west"));
             reg.insert_cell(cell(&wrong, "eu-west"));
-            reg.place_tenant(placement(&tenant, "eu-west", &home, &format!("mis-{suffix}")))
-                .expect("placed on the home cell");
+            reg.place_tenant(placement(
+                &tenant,
+                "eu-west",
+                &home,
+                &format!("mis-{suffix}"),
+            ))
+            .expect("placed on the home cell");
 
             let gw = CellGateway::with_audit(
                 CellId::from_token(&wrong),
@@ -364,7 +411,11 @@ async fn a_gateway_misroute_lands_in_the_durable_audit_sink() {
                 .expect_err("an unknown tenant is rejected");
             assert!(matches!(no_route, GatewayReject::NoSuchTenant { .. }));
             assert_eq!(gw.misroute_count(), 2);
-            assert_eq!(gw.cross_tenant_reads(), 0, "the CP-D2 zero holds on the durable-audit path");
+            assert_eq!(
+                gw.cross_tenant_reads(),
+                0,
+                "the CP-D2 zero holds on the durable-audit path"
+            );
 
             let audit2 = DurableMisrouteAuditBacking::new(fresh_pool().await);
             let recs: Vec<_> = audit2
@@ -374,12 +425,23 @@ async fn a_gateway_misroute_lands_in_the_durable_audit_sink() {
                 .into_iter()
                 .filter(|r| r.tenant_id == tenant || r.tenant_id == ghost)
                 .collect();
-            assert_eq!(recs.len(), 2, "both rejections landed in the durable sink via the gateway");
+            assert_eq!(
+                recs.len(),
+                2,
+                "both rejections landed in the durable sink via the gateway"
+            );
             assert_eq!(recs[0].tenant_id, tenant);
             assert_eq!(recs[0].received_by_cell, wrong);
-            assert_eq!(recs[0].home_cell.as_deref(), Some(home.as_str()), "the redirect target survived");
+            assert_eq!(
+                recs[0].home_cell.as_deref(),
+                Some(home.as_str()),
+                "the redirect target survived"
+            );
             assert_eq!(recs[1].tenant_id, ghost);
-            assert_eq!(recs[1].home_cell, None, "no redirect target for an unknown tenant");
+            assert_eq!(
+                recs[1].home_cell, None,
+                "no redirect target for an unknown tenant"
+            );
         },
         || async {
             cleanup(pool, &suffix).await;
@@ -410,7 +472,11 @@ async fn self_host_boots_on_pg_and_routing_survives_restart() {
                     DurableMisrouteAuditBacking::new(pool.clone()),
                     tokio::runtime::Handle::current(),
                 );
-                assert_eq!(sh.cell().cell_id.as_str(), cell_id, "the one cell row is durable");
+                assert_eq!(
+                    sh.cell().cell_id.as_str(),
+                    cell_id,
+                    "the one cell row is durable"
+                );
                 let service = PlacementService::new(CounterMinter::new());
                 let answer = sh
                     .place(&service, IsolationKind::Pool, &format!("team-{suffix}"))
@@ -431,7 +497,11 @@ async fn self_host_boots_on_pg_and_routing_survives_restart() {
             let discovered = sh2
                 .discover_cell(&tenant)
                 .expect("the placed tenant STILL discovers after the restart");
-            assert_eq!(discovered.as_str(), cell_id, "discover returns 'this cell' after restart");
+            assert_eq!(
+                discovered.as_str(),
+                cell_id,
+                "discover returns 'this cell' after restart"
+            );
             let p = sh2
                 .placement_of(&tenant)
                 .expect("the placement survived the restart");

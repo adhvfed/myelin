@@ -164,16 +164,10 @@ mod tests {
         ));
 
         let merges = Cell::new(0u32);
-        let perf = GitMergePerformer::new(
-            &proj,
-            GitOid(HEAD.into()),
-            policy(),
-            vec![],
-            |_r| {
-                merges.set(merges.get() + 1);
-                Ok("should-not-run".into())
-            },
-        );
+        let perf = GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), vec![], |_r| {
+            merges.set(merges.get() + 1);
+            Ok("should-not-run".into())
+        });
         assert!(matches!(
             perf.gate_outcome(),
             MergeGateOutcome::Blocked { .. }

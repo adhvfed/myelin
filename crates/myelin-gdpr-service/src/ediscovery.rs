@@ -247,16 +247,26 @@ mod tests {
     }
 
     fn seed(auth: &AuditAuthority<CellSigningKey>) {
-        auth.consumer()
-            .handle(&action_event("1", "acme", "myelin://acme/subj/A", "r-1"), &mut myelin_events::HandlerTx::none());
-        auth.consumer()
-            .handle(&action_event("2", "acme", "myelin://acme/subj/B", "r-2"), &mut myelin_events::HandlerTx::none());
-        auth.consumer()
-            .handle(&action_event("3", "acme", "myelin://acme/subj/A", "r-3"), &mut myelin_events::HandlerTx::none());
-        auth.consumer()
-            .handle(&action_event("4", "acme", "myelin://acme/subj/A", "m-7"), &mut myelin_events::HandlerTx::none());
-        auth.consumer()
-            .handle(&action_event("5", "acme", "myelin://acme/subj/B", "m-7"), &mut myelin_events::HandlerTx::none());
+        auth.consumer().handle(
+            &action_event("1", "acme", "myelin://acme/subj/A", "r-1"),
+            &mut myelin_events::HandlerTx::none(),
+        );
+        auth.consumer().handle(
+            &action_event("2", "acme", "myelin://acme/subj/B", "r-2"),
+            &mut myelin_events::HandlerTx::none(),
+        );
+        auth.consumer().handle(
+            &action_event("3", "acme", "myelin://acme/subj/A", "r-3"),
+            &mut myelin_events::HandlerTx::none(),
+        );
+        auth.consumer().handle(
+            &action_event("4", "acme", "myelin://acme/subj/A", "m-7"),
+            &mut myelin_events::HandlerTx::none(),
+        );
+        auth.consumer().handle(
+            &action_event("5", "acme", "myelin://acme/subj/B", "m-7"),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
 
     #[test]

@@ -23,7 +23,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}_{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 fn principal() -> Principal {

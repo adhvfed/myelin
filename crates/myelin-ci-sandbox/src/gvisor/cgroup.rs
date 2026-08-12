@@ -397,7 +397,6 @@ mod tests {
             ],
             "2000 millicpu must become a two-core cpu.max quota in the same job cgroup"
         );
-
     }
 
     #[test]

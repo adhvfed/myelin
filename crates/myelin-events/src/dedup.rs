@@ -88,7 +88,6 @@ pub struct DedupLedger {
     backend: DedupBackend,
 }
 
-
 impl DedupLedger {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new() -> Self {

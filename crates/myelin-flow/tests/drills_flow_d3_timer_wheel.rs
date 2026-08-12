@@ -84,7 +84,7 @@ fn drill_flow_d3_timer_wheel_100k_floor_within_budget_zero_lost_zero_dup() {
         runs.clone(),
         tele.clone(),
         0,
-         4_096,
+        4_096,
     );
     assert_eq!(
         timers.wheel_lag(0, 30),

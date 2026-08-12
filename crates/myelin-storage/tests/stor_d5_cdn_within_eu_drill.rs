@@ -9,12 +9,7 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
     let tenant = TenantId::from_token("tenant-d5-cdn");
     let region = Region::new("fr-par");
     let store = FsBlobStore::new();
-    let cdn = CdnCloneClass::over(
-        tenant.clone(),
-        region.clone(),
-         true,
-        &store,
-    );
+    let cdn = CdnCloneClass::over(tenant.clone(), region.clone(), true, &store);
 
     let bundle = b"PACK\0clone-bundle\0hot-repo-objects";
     let address = cdn.publish_bundle(bundle).expect("publish a clone bundle");

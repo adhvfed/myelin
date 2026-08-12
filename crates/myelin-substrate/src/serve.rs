@@ -4,12 +4,12 @@ use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurf
 use crate::migrations::{HotTables, Migration, MigrationRunner, Migrations};
 use crate::topology::PublicSurface;
 use crate::{Config, ServeError};
-use myelin_events::relay::{BusTransport, EventConsumer};
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::relay::InProcessBus;
+use myelin_events::relay::{BusTransport, EventConsumer};
 use myelin_events::{
-    BrokerDeliveryBody, Consumer, ConsumerName, Delivered, DeliveryQuarantineReason,
-    DeliveryToken, DurableDeliveryQuarantine, EventHandler, Message, OutboxStore, Relay, Timestamp,
+    BrokerDeliveryBody, Consumer, ConsumerName, Delivered, DeliveryQuarantineReason, DeliveryToken,
+    DurableDeliveryQuarantine, EventHandler, Message, OutboxStore, Relay, Timestamp,
 };
 use myelin_storage::{OltpConfig, OltpPool, OltpStoreHolder};
 use std::collections::BTreeMap;
@@ -356,7 +356,9 @@ impl ServeHandle {
         delivery_attempt: u64,
         reason: DeliveryQuarantineReason,
     ) {
-        let Some(transport) = &self.consumer_transport else { return };
+        let Some(transport) = &self.consumer_transport else {
+            return;
+        };
         let Some(quarantine) = &self.delivery_quarantine else {
             self.health_probe().mark_down("oltp");
             self.settle_retry(token, 1);
@@ -560,10 +562,11 @@ impl ServeHandle {
                                 Delivered::DeadLettered(_) => exhausted = true,
                                 Delivered::Retried(dlq_retry_secs) => {
                                     terminal = false;
-                                    retry_after_secs = Some(retry_after_secs.map_or(
-                                        dlq_retry_secs,
-                                        |current: u64| current.max(dlq_retry_secs),
-                                    ));
+                                    retry_after_secs = Some(
+                                        retry_after_secs.map_or(dlq_retry_secs, |current: u64| {
+                                            current.max(dlq_retry_secs)
+                                        }),
+                                    );
                                 }
                                 _ => unreachable!("retry exhaustion returns DLQ or Retry"),
                             }
@@ -579,7 +582,8 @@ impl ServeHandle {
                         self.health_probe().mark_down(dependency.name());
                         terminal = false;
                         retry_after_secs = Some(
-                            retry_after_secs.map_or(delay_secs, |current: u64| current.max(delay_secs)),
+                            retry_after_secs
+                                .map_or(delay_secs, |current: u64| current.max(delay_secs)),
                         );
                     }
                     Delivered::Throttled(_) => {
@@ -611,8 +615,7 @@ impl ServeHandle {
             } else if let (Some(transport), Some(delay_secs)) =
                 (&self.consumer_transport, retry_after_secs)
             {
-                if let Err(error) = transport.retry(token, delay_secs.min(300))
-                {
+                if let Err(error) = transport.retry(token, delay_secs.min(300)) {
                     eprintln!(
                         "[{}] broker retry NAK failed for event {}: {}",
                         self.name, env.event_id.0, error.0
@@ -952,14 +955,14 @@ mod tests {
                                 .map(|envelope| {
                                     next_token += 1;
                                     myelin_events::BrokerDelivery {
-                                    token: token(next_token),
-                                    broker_ref: Some(myelin_events::BrokerDeliveryRef {
-                                        stream: "TEST".into(),
-                                        stream_sequence: next_token,
-                                    }),
-                                    body: BrokerDeliveryBody::Event(Box::new(envelope)),
-                                    delivery_attempt: Some(1),
-                                }
+                                        token: token(next_token),
+                                        broker_ref: Some(myelin_events::BrokerDeliveryRef {
+                                            stream: "TEST".into(),
+                                            stream_sequence: next_token,
+                                        }),
+                                        body: BrokerDeliveryBody::Event(Box::new(envelope)),
+                                        delivery_attempt: Some(1),
+                                    }
                                 })
                                 .collect()
                         })
@@ -1019,10 +1022,7 @@ mod tests {
             }
         }
 
-        fn ack(
-            &self,
-            token: DeliveryToken,
-        ) -> Result<(), myelin_events::TransportError> {
+        fn ack(&self, token: DeliveryToken) -> Result<(), myelin_events::TransportError> {
             let mut state = self.state();
             if state.fail_ack {
                 return Err(myelin_events::TransportError("ack unavailable".into()));
@@ -1040,10 +1040,7 @@ mod tests {
             Ok(())
         }
 
-        fn terminate(
-            &self,
-            token: DeliveryToken,
-        ) -> Result<(), myelin_events::TransportError> {
+        fn terminate(&self, token: DeliveryToken) -> Result<(), myelin_events::TransportError> {
             self.state().terms.push(token);
             Ok(())
         }
@@ -1122,7 +1119,11 @@ mod tests {
             if self
                 .fail_next
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    if left > 0 { Some(left - 1) } else { None }
+                    if left > 0 {
+                        Some(left - 1)
+                    } else {
+                        None
+                    }
                 })
                 .is_ok()
             {
@@ -1150,10 +1151,7 @@ mod tests {
         }
     }
 
-    fn always_retry_consumer(
-        dedup: DedupLedger,
-        dlq: DlqProbe,
-    ) -> (ConsumerReg, Arc<AtomicU32>) {
+    fn always_retry_consumer(dedup: DedupLedger, dlq: DlqProbe) -> (ConsumerReg, Arc<AtomicU32>) {
         struct H(Arc<AtomicU32>);
         impl EventHandler for H {
             fn subjects(&self) -> &'static [SubjectPattern] {
@@ -1188,7 +1186,9 @@ mod tests {
     fn dependency_unavailable_consumer(dedup: DedupLedger, dlq: DlqProbe) -> ConsumerReg {
         struct H;
         impl EventHandler for H {
-            fn subjects(&self) -> &'static [SubjectPattern] { SUBJECTS }
+            fn subjects(&self) -> &'static [SubjectPattern] {
+                SUBJECTS
+            }
             fn handle(
                 &self,
                 _event: &EventEnvelope,
@@ -1207,14 +1207,20 @@ mod tests {
                     ConsumerName("blob-dependent".into()),
                     &["myelin://acme/issues/"],
                     PrefetchBound::DEFAULT,
-                ).unwrap(),
+                )
+                .unwrap(),
                 dedup,
-            ).with_dead_letter_sink(myelin_events::DeadLetterSink::durable(Arc::new(dlq))),
+            )
+            .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(Arc::new(dlq))),
         )
     }
 
     fn external_consumer_spec(probe: PullProbe, consumers: Vec<ConsumerReg>) -> AppSpec {
-        external_consumer_spec_with_quarantine(probe, consumers, Arc::new(QuarantineProbe::default()))
+        external_consumer_spec_with_quarantine(
+            probe,
+            consumers,
+            Arc::new(QuarantineProbe::default()),
+        )
     }
 
     fn external_consumer_spec_with_quarantine(
@@ -1226,7 +1232,9 @@ mod tests {
             "external-consumer",
             Config::default(),
             OutboxSpec::external_relay_with_consumer(
-                OutboxStore::new(), Box::new(probe), quarantine,
+                OutboxStore::new(),
+                Box::new(probe),
+                quarantine,
             ),
         );
         spec.consumers = consumers;
@@ -1260,13 +1268,13 @@ mod tests {
             .await
             .expect_err("unresolved settlement makes the drain unclean");
 
-        assert_eq!(
-            error.0,
-            "graceful drain has unresolved broker settlements"
-        );
+        assert_eq!(error.0, "graceful drain has unresolved broker settlements");
         let state = observed.state();
         assert_eq!(state.pulls, 0, "shutdown settlement flush never pulls work");
-        assert_eq!(state.flushes, 1, "shutdown attempts the retained intents once");
+        assert_eq!(
+            state.flushes, 1,
+            "shutdown attempts the retained intents once"
+        );
     }
 
     #[tokio::test]
@@ -1456,7 +1464,8 @@ mod tests {
             myelin_events::BrokerDelivery {
                 token: token(1),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
-                    stream: "TEST".into(), stream_sequence: 1,
+                    stream: "TEST".into(),
+                    stream_sequence: 1,
                 }),
                 body: BrokerDeliveryBody::Poison(
                     myelin_events::DeliveryPoisonKind::MalformedEnvelope,
@@ -1466,7 +1475,8 @@ mod tests {
             myelin_events::BrokerDelivery {
                 token: token(2),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
-                    stream: "TEST".into(), stream_sequence: 2,
+                    stream: "TEST".into(),
+                    stream_sequence: 2,
                 }),
                 body: BrokerDeliveryBody::Event(Box::new(event)),
                 delivery_attempt: Some(1),
@@ -1475,8 +1485,11 @@ mod tests {
         let quarantine = Arc::new(QuarantineProbe::default());
         let (consumer, runs) = hello_consumer(DedupLedger::new());
         let handle = boot(external_consumer_spec_with_quarantine(
-            probe.clone(), vec![consumer], quarantine.clone(),
-        )).unwrap();
+            probe.clone(),
+            vec![consumer],
+            quarantine.clone(),
+        ))
+        .unwrap();
 
         handle.tick();
 
@@ -1494,7 +1507,8 @@ mod tests {
             myelin_events::BrokerDelivery {
                 token: token(1),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
-                    stream: "TEST".into(), stream_sequence: 1,
+                    stream: "TEST".into(),
+                    stream_sequence: 1,
                 }),
                 body: BrokerDeliveryBody::Poison(
                     myelin_events::DeliveryPoisonKind::SubjectMismatch,
@@ -1504,7 +1518,8 @@ mod tests {
             myelin_events::BrokerDelivery {
                 token: token(2),
                 broker_ref: Some(myelin_events::BrokerDeliveryRef {
-                    stream: "TEST".into(), stream_sequence: 2,
+                    stream: "TEST".into(),
+                    stream_sequence: 2,
                 }),
                 body: BrokerDeliveryBody::Event(Box::new(event)),
                 delivery_attempt: Some(1),
@@ -1514,8 +1529,11 @@ mod tests {
         quarantine.fail_next.store(true, Ordering::SeqCst);
         let (consumer, runs) = hello_consumer(DedupLedger::new());
         let handle = boot(external_consumer_spec_with_quarantine(
-            probe.clone(), vec![consumer], quarantine,
-        )).unwrap();
+            probe.clone(),
+            vec![consumer],
+            quarantine,
+        ))
+        .unwrap();
 
         handle.tick();
 
@@ -1523,22 +1541,31 @@ mod tests {
         assert_eq!(probe.state().retries, vec![token(1)]);
         assert_eq!(probe.state().acks, vec![token(2)]);
         assert!(probe.state().terms.is_empty());
-        assert!(!handle.metrics_health().readiness().is_ready(), "OLTP failure is unhealthy");
+        assert!(
+            !handle.metrics_health().readiness().is_ready(),
+            "OLTP failure is unhealthy"
+        );
     }
 
     #[test]
     fn transient_metadata_fault_is_nak_only_and_never_quarantined() {
         let probe = PullProbe::default();
-        probe.state().batches.push_back(vec![myelin_events::BrokerDelivery {
-            token: token(9),
-            broker_ref: None,
-            body: BrokerDeliveryBody::TransientMetadataFault,
-            delivery_attempt: None,
-        }]);
+        probe
+            .state()
+            .batches
+            .push_back(vec![myelin_events::BrokerDelivery {
+                token: token(9),
+                broker_ref: None,
+                body: BrokerDeliveryBody::TransientMetadataFault,
+                delivery_attempt: None,
+            }]);
         let quarantine = Arc::new(QuarantineProbe::default());
         let handle = boot(external_consumer_spec_with_quarantine(
-            probe.clone(), Vec::new(), quarantine.clone(),
-        )).unwrap();
+            probe.clone(),
+            Vec::new(),
+            quarantine.clone(),
+        ))
+        .unwrap();
 
         handle.tick();
 
@@ -1594,11 +1621,7 @@ mod tests {
         let dlq = DlqProbe::default();
         let dedup = DedupLedger::new();
         let (consumer, calls) = always_retry_consumer(dedup.clone(), dlq.clone());
-        let handle = boot(external_consumer_spec(
-            probe.clone(),
-            vec![consumer],
-        ))
-        .unwrap();
+        let handle = boot(external_consumer_spec(probe.clone(), vec![consumer])).unwrap();
 
         handle.tick();
 
@@ -1661,8 +1684,15 @@ mod tests {
         assert_eq!(probe.state().retries, vec![token(1)]);
         assert!(probe.state().terms.is_empty());
         assert!(probe.state().acks.is_empty());
-        assert!(dlq.records.lock().unwrap_or_else(|error| error.into_inner()).is_empty());
-        assert!(dedup.is_empty(), "dependency failure commits no dedup effect");
+        assert!(dlq
+            .records
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
+        assert!(
+            dedup.is_empty(),
+            "dependency failure commits no dedup effect"
+        );
     }
 
     #[test]
@@ -1684,11 +1714,7 @@ mod tests {
         let dlq = DlqProbe::default();
         dlq.fail_next.store(1, Ordering::SeqCst);
         let (consumer, calls) = always_retry_consumer(DedupLedger::new(), dlq);
-        let handle = boot(external_consumer_spec(
-            probe.clone(),
-            vec![consumer],
-        ))
-        .unwrap();
+        let handle = boot(external_consumer_spec(probe.clone(), vec![consumer])).unwrap();
 
         handle.tick();
 

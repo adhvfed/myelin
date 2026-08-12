@@ -202,7 +202,11 @@ fn drill_sub_d2_slow_subject_does_not_block_fast_subject() {
         fn subjects(&self) -> &'static [SubjectPattern] {
             SUBJECTS
         }
-        fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
+        fn handle(
+            &self,
+            ev: &EventEnvelope,
+            _tx: &mut myelin_events::HandlerTx<'_>,
+        ) -> HandleOutcome {
             if ev.subject.0.contains("/slow/") {
                 HandleOutcome::Retry(myelin_events::Backoff { seconds: 30 })
             } else {

@@ -78,21 +78,28 @@ fn e2e_3_audit_tamper_on_the_lineage_anchor_is_detected() {
     );
 
     for i in 0..4 {
-        let outcome = auth.consumer().handle(&deploy_audit_action(
-            &format!("01J-pre-{i}"),
-            &ArtifactRef(format!("myelin://acme/x/{i}")),
-        ), &mut myelin_events::HandlerTx::none());
+        let outcome = auth.consumer().handle(
+            &deploy_audit_action(
+                &format!("01J-pre-{i}"),
+                &ArtifactRef(format!("myelin://acme/x/{i}")),
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(outcome, HandleOutcome::Done);
     }
     let lineage_entry_seq = auth.consumer().log().len_for(&tenant);
-    let outcome = auth
-        .consumer()
-        .handle(&deploy_audit_action("01J-deploy-lineage", &anchor), &mut myelin_events::HandlerTx::none());
+    let outcome = auth.consumer().handle(
+        &deploy_audit_action("01J-deploy-lineage", &anchor),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(outcome, HandleOutcome::Done);
-    let outcome = auth.consumer().handle(&deploy_audit_action(
-        "01J-chat-gonogo",
-        &ArtifactRef("myelin://acme/chat/thread/go-no-go".into()),
-    ), &mut myelin_events::HandlerTx::none());
+    let outcome = auth.consumer().handle(
+        &deploy_audit_action(
+            "01J-chat-gonogo",
+            &ArtifactRef("myelin://acme/chat/thread/go-no-go".into()),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(outcome, HandleOutcome::Done);
 
     assert!(

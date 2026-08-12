@@ -72,9 +72,7 @@ impl CheckSeamOrder {
             });
         }
         match self.by_seq.entry(seq) {
-            std::collections::btree_map::Entry::Occupied(_) => {
-                Ok(false)
-            }
+            std::collections::btree_map::Entry::Occupied(_) => Ok(false),
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(OrderedCheck {
                     seq,

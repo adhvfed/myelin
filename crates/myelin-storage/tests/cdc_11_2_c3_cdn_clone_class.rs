@@ -14,7 +14,7 @@ impl<'a> CloneStormAccelerator<'a> {
             cdn: CdnCloneClass::over(
                 TenantId::from_token(tenant),
                 Region::new(region),
-                 true,
+                true,
                 store,
             ),
         }

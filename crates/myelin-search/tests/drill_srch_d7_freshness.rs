@@ -106,7 +106,10 @@ fn srch_d7_synthetic_event_is_searchable_within_the_freshness_budget() {
     );
 
     let t0 = Instant::now();
-    assert_eq!(indexer.handle(&event("01J-1", r), &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(
+        indexer.handle(&event("01J-1", r), &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
     let hits = indexer
         .search_ft(&tenant(), &region(), &AclFilter::ids([r]), "raft", 10)
         .expect("search");

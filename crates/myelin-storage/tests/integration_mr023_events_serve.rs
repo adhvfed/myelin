@@ -11,9 +11,9 @@ use myelin_storage::tenant_tx::connect_pool_with_reset;
 use myelin_events::consumer::{ConsumerSpec, Delivered, Message};
 use myelin_events::relay::BusTransport;
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CausedBy, ConsumerName, CorrelationId, DataRole,
-    DedupLedger, EventEnvelope, EventHandler, EventId, EventType, HandleOutcome, SubjectPattern,
-    Timestamp, Visibility, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
+    Actor, AggregateKey, ArtifactRef, CausedBy, ConsumerName, CorrelationId, DataRole, DedupLedger,
+    EventEnvelope, EventHandler, EventId, EventType, HandleOutcome, SubjectPattern, Timestamp,
+    Visibility, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::events_durable::DurableDedupBacking;
@@ -26,7 +26,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 fn principal() -> Principal {
@@ -192,7 +196,10 @@ async fn mr023_serve_zero_lost_zero_ghost_under_crash() {
     );
 
     let published = runtime.drain_relay_to_empty().await.expect("restart drain");
-    assert_eq!(published, N, "the restarted relay re-claims all N unsent rows");
+    assert_eq!(
+        published, N,
+        "the restarted relay re-claims all N unsent rows"
+    );
     assert_eq!(
         runtime.outbox_depth().await.expect("final depth"),
         0,
@@ -402,12 +409,13 @@ async fn mr023_co_commit_is_emit_iff_committed_atomic() {
         .await;
     assert!(res.is_err(), "the aborting tx returns Err");
 
-    let state_rows: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {state_table} WHERE event_id = $1"))
-            .bind(&abort_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count abort state");
+    let state_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {state_table} WHERE event_id = $1"
+    ))
+    .bind(&abort_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count abort state");
     let outbox_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE event_id = $1")
         .bind(&abort_id)
         .fetch_one(&pool)
@@ -439,12 +447,13 @@ async fn mr023_co_commit_is_emit_iff_committed_atomic() {
         .await
         .expect("co-commit commits");
 
-    let ok_state: i64 =
-        sqlx::query_scalar(&format!("SELECT count(*) FROM {state_table} WHERE event_id = $1"))
-            .bind(&ok_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count ok state");
+    let ok_state: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {state_table} WHERE event_id = $1"
+    ))
+    .bind(&ok_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count ok state");
     let ok_outbox: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM outbox WHERE event_id = $1 AND published_at IS NULL",
     )

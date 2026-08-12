@@ -38,21 +38,13 @@ pub enum TriggerKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disposition {
-    Delivered {
-        action: Box<EventEnvelope>,
-    },
+    Delivered { action: Box<EventEnvelope> },
     NotifiedOnly,
     SelfGuardDropped,
     ReferenceGateDropped,
-    DepthCeilingParked {
-        depth: u32,
-    },
-    BreakerShed {
-        shed: ShedSignal,
-    },
-    OverCapShed {
-        shed: ShedSignal,
-    },
+    DepthCeilingParked { depth: u32 },
+    BreakerShed { shed: ShedSignal },
+    OverCapShed { shed: ShedSignal },
     NoBalanceRefused,
 }
 

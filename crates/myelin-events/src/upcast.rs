@@ -11,7 +11,10 @@ pub enum RegisterError {
         from: u32,
         to: u32,
     },
-    DuplicateHop { type_: EventType, from: u32 },
+    DuplicateHop {
+        type_: EventType,
+        from: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -208,9 +208,8 @@ impl<S: InlinePiiShredder> BusHolder<S> {
         for ev in &report.inline_pii_events {
             log.mark_tombstoned(&ev.event_id);
             let draft = self.erased_tombstone_draft(subject, &ev.event_id);
-            otx.emit(draft, None).map_err(|_| {
-                ShredError::KmsUnavailable(ev.pii_key_ref.clone())
-            })?;
+            otx.emit(draft, None)
+                .map_err(|_| ShredError::KmsUnavailable(ev.pii_key_ref.clone()))?;
             tombstones_emitted += 1;
         }
         otx.stage_state_change(format!(

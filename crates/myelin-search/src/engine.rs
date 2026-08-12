@@ -643,11 +643,9 @@ impl IndexBackend for TantivyBackend {
         let hits = match acl_filter {
             AclFilter::None => Vec::new(),
             AclFilter::All => self.vectors.knn(query, k),
-            _ => self
-                .vectors
-                .knn_filtered(query, k, |doc_id, acl_object| {
-                    acl_filter.admits(doc_id, acl_object)
-                }),
+            _ => self.vectors.knn_filtered(query, k, |doc_id, acl_object| {
+                acl_filter.admits(doc_id, acl_object)
+            }),
         };
         Ok(hits)
     }

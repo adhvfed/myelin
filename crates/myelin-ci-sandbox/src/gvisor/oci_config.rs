@@ -227,7 +227,9 @@ pub(super) enum OciExecutionLayout {
         absolute_rootfs: AbsoluteRootfs,
         mounts: GitWireMounts,
     },
-    ExplicitUserNamespace { config: UserNamespaceConfig },
+    ExplicitUserNamespace {
+        config: UserNamespaceConfig,
+    },
     ExplicitUserNamespaceWithWorkspace {
         config: UserNamespaceConfig,
         workspace: OciWorkspaceMount,

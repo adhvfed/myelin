@@ -67,8 +67,11 @@ fn matches_real_tar_recipe_over_a_synthetic_tree() {
         b"pointed-to by a long-target symlink",
     )
     .unwrap();
-    std::os::unix::fs::symlink(&long_target, dir.join("longlink-target-dir/link-with-long-target"))
-        .unwrap();
+    std::os::unix::fs::symlink(
+        &long_target,
+        dir.join("longlink-target-dir/link-with-long-target"),
+    )
+    .unwrap();
     fs::create_dir_all(dir.join("etc").join("ca-certificates")).unwrap();
     fs::write(
         dir.join("etc").join("ca-certificates").join("cert.pem"),

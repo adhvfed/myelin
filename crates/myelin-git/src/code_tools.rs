@@ -123,13 +123,9 @@ impl HistoryRewritePlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryRewriteError {
     EmptyPlan,
-    RateLimited {
-        tenant: String,
-    },
+    RateLimited { tenant: String },
     SandboxFailed(GitCoreError),
-    IncompleteFanOut {
-        missing: Vec<CacheNamespace>,
-    },
+    IncompleteFanOut { missing: Vec<CacheNamespace> },
 }
 
 impl std::fmt::Display for HistoryRewriteError {

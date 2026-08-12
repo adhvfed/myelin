@@ -84,7 +84,9 @@ async fn load_or_generate_roundtrips_the_same_root_across_a_fresh_backing() {
     );
 
     cleanup(provider.db_pool(), &cell).await;
-    println!("OK [1]: load_or_generate roundtrips the SAME cell-authority root across a fresh backing.");
+    println!(
+        "OK [1]: load_or_generate roundtrips the SAME cell-authority root across a fresh backing."
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -120,7 +122,10 @@ async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
             .fetch_one(provider.db_pool())
             .await
             .expect("count roots");
-    assert_eq!(root_rows, 1, "the wrong-key boot did NOT mint a second root");
+    assert_eq!(
+        root_rows, 1,
+        "the wrong-key boot did NOT mint a second root"
+    );
 
     let recovered = DurableCellRootBacking::new(fresh_pool().await, &cell)
         .load_or_generate(&seal)
@@ -166,7 +171,10 @@ async fn concurrent_first_boot_produces_a_single_root() {
             m.ed25519_seed, first.ed25519_seed,
             "concurrent boot #{i} adopted a DIFFERENT root seed (two roots - the race was not resolved)"
         );
-        assert_eq!(m.mac_key, first.mac_key, "concurrent boot #{i} adopted a different MAC key");
+        assert_eq!(
+            m.mac_key, first.mac_key,
+            "concurrent boot #{i} adopted a different MAC key"
+        );
     }
 
     let root_rows: i64 =
@@ -175,10 +183,15 @@ async fn concurrent_first_boot_produces_a_single_root() {
             .fetch_one(provider.db_pool())
             .await
             .expect("count roots");
-    assert_eq!(root_rows, 1, "a concurrent first boot produced EXACTLY one root row");
+    assert_eq!(
+        root_rows, 1,
+        "a concurrent first boot produced EXACTLY one root row"
+    );
 
     cleanup(provider.db_pool(), &cell).await;
-    println!("OK [3]: a concurrent first boot converges on a single cell-authority root (never two).");
+    println!(
+        "OK [3]: a concurrent first boot converges on a single cell-authority root (never two)."
+    );
 }
 
 async fn cleanup(pool: &sqlx::postgres::PgPool, cell: &str) {

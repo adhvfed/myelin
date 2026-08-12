@@ -118,7 +118,10 @@ pub(crate) fn verify_ancestors_not_writable_by_us(dir: &Path) -> Result<(), Stri
     Ok(())
 }
 
-pub(crate) fn check_ancestor_not_owned_or_writable(fd: &OwnedFd, label: &Path) -> Result<(), String> {
+pub(crate) fn check_ancestor_not_owned_or_writable(
+    fd: &OwnedFd,
+    label: &Path,
+) -> Result<(), String> {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
         return Err(format!(

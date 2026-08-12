@@ -123,7 +123,7 @@ fn cdc_4_11_consumer_wraps_check_in_resilient_client_and_survives_a_hiccup() {
         &obj,
         &bounded_stale(),
         &ts("2026-06-19T00:00:01Z"),
-         true,
+        true,
     );
     assert!(
         matches!(phase1.served, Served::Fresh),
@@ -146,7 +146,7 @@ fn cdc_4_11_consumer_wraps_check_in_resilient_client_and_survives_a_hiccup() {
         &obj,
         &bounded_stale(),
         &ts("2026-06-19T00:00:02Z"),
-         false,
+        false,
     );
     assert!(
         matches!(phase2.served, Served::Static),

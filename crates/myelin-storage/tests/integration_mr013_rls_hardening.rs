@@ -13,7 +13,11 @@ fn admin_url(cfg: &MyelinConfig) -> String {
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 async fn bare_single_conn(database_url: &str) -> sqlx::PgPool {
@@ -43,7 +47,10 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
             return;
         }
     };
-    admin.migrate().await.expect("migrate (rebac_tuple + RLS policy)");
+    admin
+        .migrate()
+        .await
+        .expect("migrate (rebac_tuple + RLS policy)");
 
     let tag = uniq();
     let tenant_a = format!("mr013-A-{tag}");

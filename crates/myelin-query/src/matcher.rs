@@ -84,7 +84,10 @@ pub enum RelMembership {
         relation: String,
         object_id: ObjectId,
     },
-    InTupleSet { index: String, object_id: ObjectId },
+    InTupleSet {
+        index: String,
+        object_id: ObjectId,
+    },
 }
 
 fn setexpr_contains(

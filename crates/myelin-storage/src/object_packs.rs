@@ -28,12 +28,7 @@ pub fn cdn_over_object_backing<'a, B: BlobStore>(
     region: Region,
     tenant_is_eu: bool,
 ) -> CdnCloneClass<'a> {
-    CdnCloneClass::over(
-        tier.tenant().clone(),
-        region,
-        tenant_is_eu,
-        tier.blobs(),
-    )
+    CdnCloneClass::over(tier.tenant().clone(), region, tenant_is_eu, tier.blobs())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -42,15 +42,9 @@ impl CiPipelineSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PipelineOutcome {
-    Succeeded {
-        stages_completed: usize,
-    },
-    Failed {
-        stage: String,
-    },
-    TimedOut {
-        stage: String,
-    },
+    Succeeded { stages_completed: usize },
+    Failed { stage: String },
+    TimedOut { stage: String },
     Parked,
 }
 

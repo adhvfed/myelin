@@ -11,8 +11,8 @@ pub mod loopsafety;
 pub mod maintenance;
 pub mod merge_queue;
 pub mod migrations;
-pub mod pg_drive_store;
 pub mod pg_dispatcher;
+pub mod pg_drive_store;
 pub mod pg_executor;
 pub mod remint;
 #[cfg(any(test, feature = "test-support"))]
@@ -73,16 +73,16 @@ pub use merge_queue::{
     CI_RESULT_SIGNAL, GIT_PR_MERGED_EVENT,
 };
 pub use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd};
-pub use pg_drive_store::{
-    ActivityAttemptWrite, CommitOutcome as PgDriveCommitOutcome, DriveCommit, DriveLease,
-    DriveSnapshot, DriveStoreError, FiredTimer, HistoryWrite, LoadedHistory, PendingSignal,
-    PgFlowDriveStore, SignalKey, TimerArm,
-};
 pub use pg_dispatcher::{
     configured_production_definitions, PgClaimedDriveInput, PgDriveBatch, PgFlowWorker,
     PgInputResolveError, PgResolvedDriveInput, PgResolvedWorkflowBody, PgRunOnceOutcome,
     PgWorkerError, PgWorkerScope, PgWorkflowBody, PgWorkflowInputResolver,
     MAX_PG_RESOLVED_INPUT_BYTES, OPERATIONAL_PROBE_WF_TYPE,
+};
+pub use pg_drive_store::{
+    ActivityAttemptWrite, CommitOutcome as PgDriveCommitOutcome, DriveCommit, DriveLease,
+    DriveSnapshot, DriveStoreError, FiredTimer, HistoryWrite, LoadedHistory, PendingSignal,
+    PgFlowDriveStore, SignalKey, TimerArm,
 };
 pub use pg_executor::{CancelOnConnOutcome, PgFlowExecutor};
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};

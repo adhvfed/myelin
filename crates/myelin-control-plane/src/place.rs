@@ -382,15 +382,13 @@ mod tests {
 
     #[test]
     fn place_refuses_rather_than_cross_region() {
-        let mut reg = registry_with([
-            cell(
-                "cell-n-1",
-                "eu-north",
-                IsolationKind::Pool,
-                1,
-                CellStatus::Active,
-            ),
-        ]);
+        let mut reg = registry_with([cell(
+            "cell-n-1",
+            "eu-north",
+            IsolationKind::Pool,
+            1,
+            CellStatus::Active,
+        )]);
         let svc = PlacementService::new(CounterMinter::new());
         let err = svc
             .place(

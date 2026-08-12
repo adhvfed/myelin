@@ -115,7 +115,7 @@ fn ag_d4_ci_t1_reconfirmed_zero_escapes_on_the_production_runner_image() {
     let script = build_corpus_script(DRILL_PIDS_MAX);
     let corpus_drive = stage_padded_corpus(&script);
 
-    let cfg_json = drill_config_json(&corpus_drive,  1,  256);
+    let cfg_json = drill_config_json(&corpus_drive, 1, 256);
     let cfg_path = std::env::temp_dir().join(format!(
         "myelin-agd4-prodimg-cfg-{}.json",
         std::process::id()

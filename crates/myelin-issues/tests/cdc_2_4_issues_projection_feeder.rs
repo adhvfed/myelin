@@ -51,7 +51,10 @@ fn producer_issues_authors_a_star_free_issue_updated_handler() {
         subjects.iter().all(|s| s.0 != "*" && s.0 != ">"),
         "the feeder NEVER binds a wildcard subscription (BUS-3)"
     );
-    let outcome = feeder.handle(&updated_event("p-1", "bug", &["severity"]), &mut myelin_events::HandlerTx::none());
+    let outcome = feeder.handle(
+        &updated_event("p-1", "bug", &["severity"]),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(outcome, HandleOutcome::Done);
 }
 

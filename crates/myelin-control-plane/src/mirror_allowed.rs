@@ -19,12 +19,8 @@ impl MirrorTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MirrorDecision {
-    Allow {
-        reason: MirrorAllowReason,
-    },
-    Deny {
-        reason: MirrorDenyReason,
-    },
+    Allow { reason: MirrorAllowReason },
+    Deny { reason: MirrorDenyReason },
 }
 
 impl MirrorDecision {

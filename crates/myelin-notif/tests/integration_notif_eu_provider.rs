@@ -136,5 +136,4 @@ async fn real_eu_provider_idem_key_collapse_holds_against_the_live_unique_constr
         .execute(&admin)
         .await
         .unwrap();
-
 }

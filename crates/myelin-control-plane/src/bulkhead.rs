@@ -8,9 +8,7 @@ pub const SURGE_MULTIPLIER: u32 = 30;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellAdmission {
     Admitted,
-    Shed {
-        retry_after_secs: u64,
-    },
+    Shed { retry_after_secs: u64 },
     Faulted,
 }
 

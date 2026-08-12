@@ -903,8 +903,7 @@ impl PgRelay {
                         .fetch_one(&mut *tx)
                         .await;
                 match existing {
-                    Ok(stored) if stored == payload => {
-                    }
+                    Ok(stored) if stored == payload => {}
                     Ok(_) => return CommitAttempt::DuplicateEventId(row.event_id.0.clone()),
                     Err(e) => return CommitAttempt::Db(PgError::Query(e.to_string())),
                 }

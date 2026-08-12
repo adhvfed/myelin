@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use myelin_config::MyelinConfig;
 use myelin_control_plane::cross_cell_bridge::{
-    BridgeMode, BridgeProjection, BridgeResolution, BridgeTombstoneReason, CellLocalResolver, ViewerId,
+    BridgeMode, BridgeProjection, BridgeResolution, BridgeTombstoneReason, CellLocalResolver,
+    ViewerId,
 };
 use myelin_control_plane::{CellResolverRegistry, CrossCellBridge, ProjectionError};
 use myelin_storage::migration::HotTables;
@@ -163,10 +164,19 @@ async fn resolver_registry_projects_from_the_durable_cell_table() {
                 BridgeMode::Live,
             );
             let BridgeResolution::Projection(proj) = res else {
-                panic!("an authorised viewer resolves to a projection through the projected registry");
+                panic!(
+                    "an authorised viewer resolves to a projection through the projected registry"
+                );
             };
-            assert_eq!(proj.title, ep_b, "resolved through cell-b's projected handle");
-            assert_eq!(bridge.cross_cell_raw_rows(), 0, "CP-D8 zero holds on the projected arm");
+            assert_eq!(
+                proj.title, ep_b,
+                "resolved through cell-b's projected handle"
+            );
+            assert_eq!(
+                bridge.cross_cell_raw_rows(),
+                0,
+                "CP-D8 zero holds on the projected arm"
+            );
 
             let ghost = bridge.resolve(
                 &pointer("myelin://01J0GHOST/issues/issue/1", "cell-unknown"),
@@ -190,7 +200,10 @@ async fn resolver_registry_projects_from_the_durable_cell_table() {
             ) else {
                 panic!("the fresh-pool projection resolves cell-c");
             };
-            assert_eq!(proj2.title, ep_c, "the fresh-pool projection is authoritative from the durable rows");
+            assert_eq!(
+                proj2.title, ep_c,
+                "the fresh-pool projection is authoritative from the durable rows"
+            );
 
             backing
                 .insert_cell(&cell_row(&bad_ep, "eu-west", ""))
@@ -221,7 +234,12 @@ async fn resolver_registry_projects_from_the_durable_cell_table() {
         || async {
             cleanup(
                 &pool,
-                &[cell_b.clone(), cell_c.clone(), bad_ep.clone(), unres.clone()],
+                &[
+                    cell_b.clone(),
+                    cell_c.clone(),
+                    bad_ep.clone(),
+                    unres.clone(),
+                ],
             )
             .await;
         },

@@ -38,9 +38,7 @@ impl core::fmt::Debug for CellRootMaterial {
 
 #[derive(Debug)]
 pub enum CellRootError {
-    WrongSealKey {
-        cell_id: String,
-    },
+    WrongSealKey { cell_id: String },
     Db(PgError),
 }
 
@@ -101,7 +99,8 @@ impl DurableCellRootBacking {
         plain[..KEY_LEN].copy_from_slice(random_key().as_slice());
         plain[KEY_LEN..].copy_from_slice(random_key().as_slice());
         let (nonce, ciphertext) = seal_key.seal_bytes(&plain);
-        self.insert_sealed_root_if_absent(&nonce, &ciphertext).await?;
+        self.insert_sealed_root_if_absent(&nonce, &ciphertext)
+            .await?;
         let (nonce, ciphertext) = self.read_sealed_root().await?.ok_or_else(|| {
             CellRootError::Db(PgError::Query(
                 "sealed cell-authority root vanished immediately after insert".into(),

@@ -397,16 +397,7 @@ impl DurableGitRepo {
         if direct_ref_has_target(&repo, "refs/heads/main")? {
             return Ok("refs/heads/main".to_string());
         }
-        let summary = scan_refs(
-            &repo,
-            head_target,
-            None,
-            None,
-            None,
-            0,
-            WIRE_SCAN_LIMITS,
-        )?
-        .summary;
+        let summary = scan_refs(&repo, head_target, None, None, None, 0, WIRE_SCAN_LIMITS)?.summary;
         Ok(format!("refs/heads/{}", summary.default_branch))
     }
 

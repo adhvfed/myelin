@@ -306,7 +306,7 @@ mod tests {
             "the stale allow is live before revoke"
         );
 
-        let after = fs.serve("k", &bounded_stale(),  true, hiccup);
+        let after = fs.serve("k", &bounded_stale(), true, hiccup);
         assert_eq!(
             after.served,
             AuthzServed::Revoked,

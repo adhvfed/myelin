@@ -14,12 +14,8 @@ pub struct ArmingId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnResolve {
     Notify,
-    Workflow {
-        workflow_ref: WorkflowRef,
-    },
-    Emit {
-        emit_type: String,
-    },
+    Workflow { workflow_ref: WorkflowRef },
+    Emit { emit_type: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

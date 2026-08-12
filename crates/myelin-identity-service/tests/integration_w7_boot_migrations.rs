@@ -6,7 +6,9 @@ use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::principal_store::{PrincipalProfile, PrincipalStore};
 use myelin_storage::migration::HotTables;
-use myelin_storage::{all_durable_migrations, DurablePrincipalBacking, KmsEngine, SubstrateProvider};
+use myelin_storage::{
+    all_durable_migrations, DurablePrincipalBacking, KmsEngine, SubstrateProvider,
+};
 use myelin_tenancy::{Region, TenantId};
 
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
@@ -83,8 +85,13 @@ async fn principal_store_with_pg_write_succeeds_after_the_aggregate_boot() {
                 display_name: "Alice".into(),
             }),
         )
-        .expect("PrincipalStore::with_pg write COMMITS after the boot-migrations fix (was the defect)");
-    assert!(written.profile_ref.is_some(), "a profiled principal has a profile_ref");
+        .expect(
+            "PrincipalStore::with_pg write COMMITS after the boot-migrations fix (was the defect)",
+        );
+    assert!(
+        written.profile_ref.is_some(),
+        "a profiled principal has a profile_ref"
+    );
 
     let read = PrincipalStore::with_pg(kms, DurablePrincipalBacking::new(app.clone()), handle)
         .get_principal(&s, &alice)
@@ -96,7 +103,10 @@ async fn principal_store_with_pg_write_succeeds_after_the_aggregate_boot() {
         "DELETE FROM principal WHERE tenant_id = $1",
         "DELETE FROM credential_link WHERE tenant_id = $1",
     ] {
-        let _ = sqlx::query(sql).bind(&tenant).execute(admin.db_pool()).await;
+        let _ = sqlx::query(sql)
+            .bind(&tenant)
+            .execute(admin.db_pool())
+            .await;
     }
     println!(
         "OK: after migrate_foundation + all_durable_migrations, the first PrincipalStore::with_pg \

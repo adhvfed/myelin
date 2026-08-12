@@ -5,13 +5,7 @@ pub const CLOUD_METADATA_IP: &str = "169.254.169.254";
 
 pub const LINK_LOCAL_PREFIX: &str = "169.254.";
 
-pub const ALWAYS_BLOCKED_PRIVATE_PREFIXES: &[&str] = &[
-    "10.",
-    "192.168.",
-    "127.",
-    "169.254.",
-    "0.",
-];
+pub const ALWAYS_BLOCKED_PRIVATE_PREFIXES: &[&str] = &["10.", "192.168.", "127.", "169.254.", "0."];
 
 pub const EGRESS_TAP_DEVICE: &str = "tap-myelin";
 

@@ -111,9 +111,7 @@ impl<'g, I: IdentityService, C: Clock> EndorsementResolver<'g, I, C> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TrustScope {
     Trusted,
-    Fork {
-        pr_id: String,
-    },
+    Fork { pr_id: String },
 }
 
 impl TrustScope {

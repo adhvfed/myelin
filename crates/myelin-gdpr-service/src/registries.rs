@@ -13,8 +13,7 @@ pub const SUBPROCESSOR_OBJECTIONS: (&str, &str) = ("gdpr.subprocessor_objections
 
 const EEA_AREAS: &[&str] = &[
     "at", "be", "bg", "hr", "cy", "cz", "dk", "ee", "fi", "fr", "de", "gr", "hu", "ie", "it", "lv",
-    "lt", "lu", "mt", "nl", "pl", "pt", "ro", "sk", "si", "es", "se",
-    "is", "li", "no",
+    "lt", "lu", "mt", "nl", "pl", "pt", "ro", "sk", "si", "es", "se", "is", "li", "no",
 ];
 
 pub fn is_eea_region(region: &Region) -> bool {

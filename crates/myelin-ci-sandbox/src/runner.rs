@@ -555,8 +555,14 @@ pub enum RunnerError {
         hooks: CompletionSettlementOwner,
         reporter: CompletionSettlementOwner,
     },
-    PreparationRoutingFailed { job_id: String, message: String },
-    ReconciliationRequired { job_id: String, message: String },
+    PreparationRoutingFailed {
+        job_id: String,
+        message: String,
+    },
+    ReconciliationRequired {
+        job_id: String,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for RunnerError {
@@ -664,9 +670,7 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 )?,
             )),
             SandboxCycleOutcome::PreparationRetryable { claim, .. } => Ok(
-                PreparationOutcomeDispatch::Retried(
-                    self.reporter.report_preparation_retry(claim)?,
-                ),
+                PreparationOutcomeDispatch::Retried(self.reporter.report_preparation_retry(claim)?),
             ),
             SandboxCycleOutcome::WorkloadLaunched(_)
             | SandboxCycleOutcome::WorkloadRetryable { .. }
@@ -744,8 +748,8 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             let backend = self.backend;
             let hooks = &self.hooks;
             let spec = &job.spec;
-            let launch_thread = scope
-                .spawn(move || backend.run_cycle(spec, hooks, output, backend_cancellation));
+            let launch_thread =
+                scope.spawn(move || backend.run_cycle(spec, hooks, output, backend_cancellation));
             let consumed = (|| -> Result<(), String> {
                 while let Ok(frame) = rx.recv() {
                     self.firehose.ship_frame(
@@ -808,10 +812,7 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 message,
             } => {
                 self.reporter
-                    .report_retryable_attempt(
-                        &claim,
-                        &RetryableAttemptFailure { cause, usage },
-                    )
+                    .report_retryable_attempt(&claim, &RetryableAttemptFailure { cause, usage })
                     .map_err(RunnerError::ReportFailed)?;
                 return Err(RunnerError::RetryableAttemptRecorded {
                     job_id: job.job_id,
@@ -959,12 +960,10 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             _ => unreachable!("only a preparation terminal can fail its terminal log flush"),
         };
         match self.reporter.report_preparation_retry(claim) {
-            Ok(PreparationRetryReport::Requeued) => {
-                Ok(RunnerCycleOutcome::PreparationRetryable {
-                    job_id: job.job_id.clone(),
-                    report: PreparationRetryReport::Requeued,
-                })
-            }
+            Ok(PreparationRetryReport::Requeued) => Ok(RunnerCycleOutcome::PreparationRetryable {
+                job_id: job.job_id.clone(),
+                report: PreparationRetryReport::Requeued,
+            }),
             Ok(PreparationRetryReport::NoOp) => Err(RunnerError::PreparationRoutingFailed {
                 job_id: job.job_id.clone(),
                 message: format!(
@@ -972,8 +971,8 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 ),
             }),
             Err(error) => Err(RunnerError::PreparationRoutingFailed {
-                    job_id: job.job_id.clone(),
-                    message: format!("{message}; retry report failed: {error}"),
+                job_id: job.job_id.clone(),
+                message: format!("{message}; retry report failed: {error}"),
             }),
         }
     }
@@ -996,8 +995,9 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             PreparationOutcomeDispatch::Retried(PreparationRetryReport::NoOp) => {
                 Err(RunnerError::PreparationRoutingFailed {
                     job_id: job.job_id.clone(),
-                    message: "preparation retry CAS returned no-op; claim state requires reconciliation"
-                        .into(),
+                    message:
+                        "preparation retry CAS returned no-op; claim state requires reconciliation"
+                            .into(),
                 })
             }
             _ => unreachable!("a preparation-retry outcome has one reporter route"),
@@ -1202,25 +1202,25 @@ mod tests {
         ) -> Result<crate::SandboxCycleOutcome, SandboxLaunchError<Self::Error>> {
             self.cycle_calls.fetch_add(1, Ordering::SeqCst);
             Ok(match self.mode {
-                CycleMode::Workload => crate::SandboxCycleOutcome::WorkloadLaunched(SandboxLaunch {
-                    handle: SandboxHandle {
-                        guest_id: format!("cycle-{}", spec.idem_token.0),
-                    },
-                    result: SandboxResult::stub_ok(ResourceUsage {
-                        cpu_seconds: 2,
-                        mem_byte_seconds: 3,
-                    }),
-                    output_complete: true,
-                }),
-                CycleMode::PreparationTerminal => {
-                    crate::SandboxCycleOutcome::PreparationTerminal {
-                        claim: prep_report_claim(),
-                        disposition: PreparationTerminalDisposition::Failed {
-                            phase: PreparationPhase::CheckoutMaterialization,
+                CycleMode::Workload => {
+                    crate::SandboxCycleOutcome::WorkloadLaunched(SandboxLaunch {
+                        handle: SandboxHandle {
+                            guest_id: format!("cycle-{}", spec.idem_token.0),
                         },
-                        diagnostic: Some("injected materialization diagnostic".into()),
-                    }
+                        result: SandboxResult::stub_ok(ResourceUsage {
+                            cpu_seconds: 2,
+                            mem_byte_seconds: 3,
+                        }),
+                        output_complete: true,
+                    })
                 }
+                CycleMode::PreparationTerminal => crate::SandboxCycleOutcome::PreparationTerminal {
+                    claim: prep_report_claim(),
+                    disposition: PreparationTerminalDisposition::Failed {
+                        phase: PreparationPhase::CheckoutMaterialization,
+                    },
+                    diagnostic: Some("injected materialization diagnostic".into()),
+                },
                 CycleMode::PreparationRetryable => {
                     crate::SandboxCycleOutcome::PreparationRetryable {
                         claim: prep_report_claim(),
@@ -1315,10 +1315,11 @@ mod tests {
                     "injected preparation-terminal transaction rollback".into(),
                 ));
             }
-            self.prep_terminals
-                .lock()
-                .unwrap()
-                .push((claim.clone(), disposition, diagnostic.map(str::to_owned)));
+            self.prep_terminals.lock().unwrap().push((
+                claim.clone(),
+                disposition,
+                diagnostic.map(str::to_owned),
+            ));
             Ok(SignalOutcome::Buffered)
         }
 
@@ -1609,7 +1610,10 @@ mod tests {
             backend,
             firehose,
             reporter,
-            hooks_with_owner(CompletionSettlementOwner::TerminalReporter, Arc::new(Mutex::new(Vec::new()))),
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                Arc::new(Mutex::new(Vec::new())),
+            ),
         )
     }
 
@@ -1626,18 +1630,21 @@ mod tests {
         ));
         let backend = CycleOnlyBackend::new(CycleMode::Workload);
         let firehose = CountingFirehose::new();
-        let reporter = RecordingTerminalReporter::reporter_owned(
-            Arc::new(Mutex::new(Vec::new())),
-            false,
-        );
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(Arc::new(Mutex::new(Vec::new())), false);
         let agent = cycle_agent(leases.clone(), &backend, &firehose, &reporter);
 
-        let outcome = agent.run_one_cycle(1_000).expect("typed workload cycle succeeds");
+        let outcome = agent
+            .run_one_cycle(1_000)
+            .expect("typed workload cycle succeeds");
         assert!(matches!(outcome, RunnerCycleOutcome::Workload(_)));
         assert_eq!(backend.cycle_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.kills.load(Ordering::SeqCst), 1);
         assert_eq!(reporter.reports.load(Ordering::SeqCst), 1);
-        assert!(leases.get(&tenant(), "job-1").is_none(), "workload completion settles the lease");
+        assert!(
+            leases.get(&tenant(), "job-1").is_none(),
+            "workload completion settles the lease"
+        );
     }
 
     #[test]
@@ -1657,27 +1664,48 @@ mod tests {
             ));
             let backend = CycleOnlyBackend::new(mode);
             let firehose = CountingFirehose::new();
-            let reporter = RecordingTerminalReporter::reporter_owned(
-                Arc::new(Mutex::new(Vec::new())),
-                false,
-            );
+            let reporter =
+                RecordingTerminalReporter::reporter_owned(Arc::new(Mutex::new(Vec::new())), false);
             let agent = cycle_agent(leases.clone(), &backend, &firehose, &reporter);
 
-            let outcome = agent.run_one_cycle(1_000).expect("preparation route succeeds");
+            let outcome = agent
+                .run_one_cycle(1_000)
+                .expect("preparation route succeeds");
             if terminal {
-                assert!(matches!(outcome, RunnerCycleOutcome::PreparationTerminal { .. }));
+                assert!(matches!(
+                    outcome,
+                    RunnerCycleOutcome::PreparationTerminal { .. }
+                ));
                 assert_eq!(reporter.prep_terminals.lock().unwrap().len(), 1);
                 assert_eq!(reporter.prep_retries.lock().unwrap().len(), 0);
             } else {
-                assert!(matches!(outcome, RunnerCycleOutcome::PreparationRetryable { .. }));
+                assert!(matches!(
+                    outcome,
+                    RunnerCycleOutcome::PreparationRetryable { .. }
+                ));
                 assert_eq!(reporter.prep_terminals.lock().unwrap().len(), 0);
                 assert_eq!(reporter.prep_retries.lock().unwrap().len(), 1);
             }
             assert_eq!(backend.cycle_calls.load(Ordering::SeqCst), 1);
-            assert_eq!(backend.kills.load(Ordering::SeqCst), 0, "no workload handle existed");
-            assert_eq!(reporter.reports.load(Ordering::SeqCst), 0, "no job.done workload report");
-            assert_eq!(reporter.retry_reports.load(Ordering::SeqCst), 0, "no workload retry report");
-            assert!(leases.get(&tenant(), "job-1").is_some(), "preparation reporter owns queue settlement/requeue");
+            assert_eq!(
+                backend.kills.load(Ordering::SeqCst),
+                0,
+                "no workload handle existed"
+            );
+            assert_eq!(
+                reporter.reports.load(Ordering::SeqCst),
+                0,
+                "no job.done workload report"
+            );
+            assert_eq!(
+                reporter.retry_reports.load(Ordering::SeqCst),
+                0,
+                "no workload retry report"
+            );
+            assert!(
+                leases.get(&tenant(), "job-1").is_some(),
+                "preparation reporter owns queue settlement/requeue"
+            );
         }
     }
 
@@ -1720,7 +1748,10 @@ mod tests {
         {
             let recorded = reporter.prep_terminals.lock().unwrap();
             assert_eq!(recorded.len(), 1);
-            assert_eq!(recorded[0].0, claim, "the reporter got the outcome's exact claim");
+            assert_eq!(
+                recorded[0].0, claim,
+                "the reporter got the outcome's exact claim"
+            );
             assert_eq!(recorded[0].1, disposition);
             assert_eq!(recorded[0].2.as_deref(), Some(diagnostic));
         }
@@ -1747,7 +1778,10 @@ mod tests {
                 message: "post-settle failure".into(),
             })
             .expect("classifies the non-preparation outcome");
-        assert_eq!(dispatched, PreparationOutcomeDispatch::NotAPreparationReport);
+        assert_eq!(
+            dispatched,
+            PreparationOutcomeDispatch::NotAPreparationReport
+        );
         assert_eq!(reporter.prep_terminals.lock().unwrap().len(), 1);
         assert_eq!(reporter.prep_retries.lock().unwrap().len(), 1);
     }

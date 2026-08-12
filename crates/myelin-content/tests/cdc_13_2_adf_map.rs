@@ -10,7 +10,7 @@ fn issues_import_consumes_map(nodes: &[AdfNode], resolves_in_tenant: bool) -> Im
     for &node in nodes {
         let m = mapping_for(node);
         match &m.loss {
-            Loss::None => {  }
+            Loss::None => {}
             Loss::Lossy { what } => {
                 report.record(node, m.target, what.to_string());
             }
@@ -50,7 +50,7 @@ fn cdc_13_2_provider_freezes_map_consumer_records_losses() {
         AdfNode::Extension,
         AdfNode::Paragraph,
     ];
-    let report = issues_import_consumes_map(&lossy_doc,  false);
+    let report = issues_import_consumes_map(&lossy_doc, false);
     assert_eq!(
         report.loss_count(),
         3,
@@ -61,7 +61,7 @@ fn cdc_13_2_provider_freezes_map_consumer_records_losses() {
     assert_eq!(report.conversions[1].node, AdfNode::Status);
     assert_eq!(report.conversions[2].node, AdfNode::Extension);
 
-    let resolved = issues_import_consumes_map(&[AdfNode::Mention],  true);
+    let resolved = issues_import_consumes_map(&[AdfNode::Mention], true);
     assert!(
         resolved.is_lossless(),
         "an in-tenant mention survives as a structured node"

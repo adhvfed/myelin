@@ -6,13 +6,30 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
-    Paragraph { inline: Inline },
-    Heading { level: HeadingLevel, inline: Inline },
-    BulletList { items: Vec<ListItem> },
-    OrderedList { items: Vec<ListItem>, start: u32 },
-    TaskList { items: Vec<TaskItem> },
-    Blockquote { blocks: Vec<Block> },
-    CodeBlock { lang: Option<String>, text: String },
+    Paragraph {
+        inline: Inline,
+    },
+    Heading {
+        level: HeadingLevel,
+        inline: Inline,
+    },
+    BulletList {
+        items: Vec<ListItem>,
+    },
+    OrderedList {
+        items: Vec<ListItem>,
+        start: u32,
+    },
+    TaskList {
+        items: Vec<TaskItem>,
+    },
+    Blockquote {
+        blocks: Vec<Block>,
+    },
+    CodeBlock {
+        lang: Option<String>,
+        text: String,
+    },
     Callout {
         tone: CalloutTone,
         blocks: Vec<Block>,
@@ -32,9 +49,17 @@ pub enum Block {
         reference: ArtifactRef,
         display: EmbedDisplay,
     },
-    DbView { db: ArtifactRef, view: ViewSpec },
-    Toggle { summary: Inline, blocks: Vec<Block> },
-    SyncBlock { source: ArtifactRef },
+    DbView {
+        db: ArtifactRef,
+        view: ViewSpec,
+    },
+    Toggle {
+        summary: Inline,
+        blocks: Vec<Block>,
+    },
+    SyncBlock {
+        source: ArtifactRef,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -131,18 +131,10 @@ impl FrameDraft {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FirehoseError {
-    OverBroadScope {
-        scope: String,
-        why: &'static str,
-    },
-    ResyncRequired {
-        last_seq: u64,
-        window_floor: u64,
-    },
+    OverBroadScope { scope: String, why: &'static str },
+    ResyncRequired { last_seq: u64, window_floor: u64 },
     TailLimitExceeded,
-    ScopeLimitExceeded {
-        maximum: usize,
-    },
+    ScopeLimitExceeded { maximum: usize },
 }
 
 impl FirehoseError {

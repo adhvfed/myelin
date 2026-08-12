@@ -44,11 +44,10 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
     let provider = AuditAuthority::new(CellSigningKey::from_seed("cell:fr-par:audit"));
     let tenant = TenantId("acme".into());
     for i in 0..6 {
-        provider.consumer().handle(&action(
-            &format!("01J-{i}"),
-            "acme",
-            &format!("myelin://acme/x/{i}"),
-        ), &mut myelin_events::HandlerTx::none());
+        provider.consumer().handle(
+            &action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
 
     let sth_v1: SignedTreeHead = provider
@@ -60,11 +59,10 @@ fn cdc_10_6_provider_serves_proofs_consumer_auditor_verifies() {
     let attestation: WitnessAttestation = provider.anchor_to_witness(&sth_v1, &witness);
 
     for i in 6..10 {
-        provider.consumer().handle(&action(
-            &format!("01J-{i}"),
-            "acme",
-            &format!("myelin://acme/x/{i}"),
-        ), &mut myelin_events::HandlerTx::none());
+        provider.consumer().handle(
+            &action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     let sth_v2 = provider
         .signed_tree_head(&tenant, "2026-06-20T01:00:00Z")

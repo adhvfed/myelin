@@ -165,7 +165,11 @@ pub(crate) fn placement_to_durable(p: &TenantPlacement) -> DurablePlacementRow {
         isolation_tier: isolation_text(p.isolation_tier).to_string(),
         slug: p.slug.clone(),
         status: placement_status_text(p.status).to_string(),
-        member_cells: p.member_cells.iter().map(|c| c.as_str().to_string()).collect(),
+        member_cells: p
+            .member_cells
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect(),
     }
 }
 
@@ -288,7 +292,9 @@ impl Registry {
             RegistryBackend::Pg(pg) => pg
                 .block(pg.backing.get_cell(cell_id.as_str()))
                 .unwrap_or_else(|e| placement_db_panic("cell read", &e))
-                .map(|r| durable_to_cell(&r).unwrap_or_else(|| corrupt_row_panic("cell", &r.cell_id))),
+                .map(|r| {
+                    durable_to_cell(&r).unwrap_or_else(|| corrupt_row_panic("cell", &r.cell_id))
+                }),
         }
     }
 

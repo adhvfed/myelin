@@ -73,15 +73,10 @@ impl RepoId {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitPackError {
-    RepoNotPlaced {
-        repo: RepoId,
-    },
+    RepoNotPlaced { repo: RepoId },
     Blob(BlobError),
     Placement(PlacementError),
-    ReadLimitExceeded {
-        actual: usize,
-        maximum: usize,
-    },
+    ReadLimitExceeded { actual: usize, maximum: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,10 +99,7 @@ impl std::fmt::Display for GitPackError {
             ),
             GitPackError::Blob(e) => write!(f, "git pack tier blob error: {e}"),
             GitPackError::Placement(e) => write!(f, "git pack placement rejected: {e}"),
-            GitPackError::ReadLimitExceeded {
-                actual,
-                maximum,
-            } => write!(
+            GitPackError::ReadLimitExceeded { actual, maximum } => write!(
                 f,
                 "git pack tier read refused: observed {actual}, exceeding the limit of {maximum}"
             ),

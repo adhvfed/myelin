@@ -96,13 +96,10 @@ impl CheckEngine {
             let stored_key = myelin_refs::object_key(&ArtifactRef(st.tuple.object.0.clone()))
                 .map(|k| k.tuple_key())
                 .unwrap_or_else(|| st.tuple.object.0.clone());
-            by_object
-                .entry(stored_key)
-                .or_default()
-                .push(SnapTuple {
-                    relation: st.tuple.relation.0.clone(),
-                    subject: st.tuple.subject.0.clone(),
-                });
+            by_object.entry(stored_key).or_default().push(SnapTuple {
+                relation: st.tuple.relation.0.clone(),
+                subject: st.tuple.subject.0.clone(),
+            });
         }
         SnapshotView { by_object }
     }
@@ -901,10 +898,7 @@ mod tests {
             Decision::Allow,
             "a bare-spelled grant matches a URN-spelled check of the SAME object"
         );
-        let eng2 = engine_with(
-            &s,
-            &[add("myelin://acme/git/repo/core", "reader", "p:bob")],
-        );
+        let eng2 = engine_with(&s, &[add("myelin://acme/git/repo/core", "reader", "p:bob")]);
         assert_eq!(
             eng2.check(
                 &s,

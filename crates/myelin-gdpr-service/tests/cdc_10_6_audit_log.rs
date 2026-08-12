@@ -88,7 +88,10 @@ fn cdc_10_6_provider_emits_via_outbox_consumer_appends_minimised_hash_chained_en
     );
     assert_eq!(e.actor.actor_kind, "human");
     assert_eq!(e.action, IDENTITY_TUPLE_WRITTEN);
-    assert_eq!(e.subject, ArtifactRef("myelin://acme/identity/tuple/t1".into()));
+    assert_eq!(
+        e.subject,
+        ArtifactRef("myelin://acme/identity/tuple/t1".into())
+    );
     assert!(
         e.prev_hash.starts_with("blake3:"),
         "hash-chain link present"

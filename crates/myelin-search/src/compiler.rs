@@ -120,15 +120,22 @@ pub struct ConjoinedPlan<A> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompileError {
     CostBound(PredicateError),
-    UndeclaredField { field: String },
+    UndeclaredField {
+        field: String,
+    },
     TypeMismatch {
         field: String,
         declared: FieldType,
         got: &'static str,
     },
-    NotOrderable { field: String, ty: FieldType },
+    NotOrderable {
+        field: String,
+        ty: FieldType,
+    },
     NotCompiled,
-    UnsupportedShape { reason: &'static str },
+    UnsupportedShape {
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for CompileError {

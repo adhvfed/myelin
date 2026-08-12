@@ -543,13 +543,7 @@ mod tests {
 
         g.id_ref().set_hiccup(true);
         g.clock().advance(31);
-        let d = g.front_door_check(
-            &alice,
-            &pull,
-            &repo,
-            Zookie(String::new()),
-             true,
-        );
+        let d = g.front_door_check(&alice, &pull, &repo, Zookie(String::new()), true);
         assert_eq!(
             d.served,
             AuthzServed::Revoked,

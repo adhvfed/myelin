@@ -62,14 +62,10 @@ struct EncryptedProfile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrincipalError {
     InvalidProvisioning,
-    CrossTenant {
-        detail: String,
-    },
+    CrossTenant { detail: String },
     Kms(String),
     CorruptProfile,
-    UnknownPrincipal {
-        principal_id: String,
-    },
+    UnknownPrincipal { principal_id: String },
     Storage(String),
 }
 
@@ -790,7 +786,9 @@ mod tests {
         assert_eq!(read.kind, PrincipalKind::Human);
         assert_eq!(read.status, PrincipalStatus::Active);
         assert_eq!(
-            store.try_principals_in(&s).expect("directory scan succeeds"),
+            store
+                .try_principals_in(&s)
+                .expect("directory scan succeeds"),
             vec![written.clone()]
         );
         assert_eq!(

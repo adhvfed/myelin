@@ -46,9 +46,18 @@ fn action(id: &str, tenant: &str, subject: &str) -> EventEnvelope {
 fn gate_ediscovery_export_is_inclusion_proof_bearing_and_legal_hold_frozen() {
     let authority = AuditAuthority::new(CellSigningKey::from_seed("cell:fr-par:audit-key"));
     let holds = LegalHoldRegistry::new();
-    authority.consumer().handle(&action("1", "acme", "u-A"), &mut myelin_events::HandlerTx::none());
-    authority.consumer().handle(&action("2", "acme", "u-B"), &mut myelin_events::HandlerTx::none());
-    authority.consumer().handle(&action("3", "acme", "u-A"), &mut myelin_events::HandlerTx::none());
+    authority.consumer().handle(
+        &action("1", "acme", "u-A"),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    authority.consumer().handle(
+        &action("2", "acme", "u-B"),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    authority.consumer().handle(
+        &action("3", "acme", "u-A"),
+        &mut myelin_events::HandlerTx::none(),
+    );
 
     let exporter = EDiscoveryExporter::new(&authority, &holds);
     let scope = EDiscoveryScope::Subject {

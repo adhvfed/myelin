@@ -113,8 +113,8 @@ fn iss_d11_erase_fans_to_issues_plus_cascade_zero_recoverable_post_restore_reera
             holder_id: ISSUES_DB.into(),
             key_epoch_destroyed: destroyed_epoch,
         }],
-         1_000,
-         42,
+        1_000,
+        42,
     );
     let to_reerase = ledger.post_pit_records_after(500);
     assert!(

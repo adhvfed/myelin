@@ -159,7 +159,10 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
             Some(&profile("alice@acme.test", "Alice")),
         )
         .expect("durable principal write");
-    assert!(written.profile_ref.is_some(), "a profiled principal has a profile_ref");
+    assert!(
+        written.profile_ref.is_some(),
+        "a profiled principal has a profile_ref"
+    );
     pstore1
         .put_principal(
             &s,
@@ -199,7 +202,10 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
     assert_eq!(read.kind, PrincipalKind::Human);
     assert_eq!(read.data_role, DataRole::Processor);
     assert_eq!(read.status, PrincipalStatus::Active);
-    assert!(read.profile_ref.is_some(), "the erasable profile_ref persists (ciphertext durable)");
+    assert!(
+        read.profile_ref.is_some(),
+        "the erasable profile_ref persists (ciphertext durable)"
+    );
     assert_eq!(
         pstore2.principals_in(&s).len(),
         2,
@@ -209,7 +215,11 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         .get_profile(&s, &alice)
         .expect("profile read succeeds")
         .expect("the profile ciphertext is durable + decrypts under the shared KMS");
-    assert_eq!(prof, profile("alice@acme.test", "Alice"), "the profile round-trips");
+    assert_eq!(
+        prof,
+        profile("alice@acme.test", "Alice"),
+        "the profile round-trips"
+    );
 
     let mut edges: Vec<(String, String, String)> = tstore2
         .tuples_in(&s)
@@ -232,13 +242,18 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         "DELETE FROM principal WHERE tenant_id = $1",
         "DELETE FROM credential_link WHERE tenant_id = $1",
     ] {
-        let _ = sqlx::query(sql).bind(&tenant).execute(admin.db_pool()).await;
+        let _ = sqlx::query(sql)
+            .bind(&tenant)
+            .execute(admin.db_pool())
+            .await;
     }
     let _ = sqlx::query("DELETE FROM outbox WHERE aggregate LIKE $1")
         .bind(format!("identity:tuple:{tenant}:%"))
         .execute(admin.db_pool())
         .await;
-    println!("OK [1]: principal row + profile ciphertext + tuple edges durable across a fresh instance.");
+    println!(
+        "OK [1]: principal row + profile ciphertext + tuple edges durable across a fresh instance."
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -267,8 +282,11 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
     let sa = scope(&tenant_a, &region);
     let sb = scope(&tenant_b, &region);
 
-    let pstore =
-        PrincipalStore::with_pg(kms.clone(), DurablePrincipalBacking::new(app.clone()), handle.clone());
+    let pstore = PrincipalStore::with_pg(
+        kms.clone(),
+        DurablePrincipalBacking::new(app.clone()),
+        handle.clone(),
+    );
     let tstore = TupleStore::with_pg_minter(
         Arc::new(UniqueMinter::new(format!("{suffix}w2"))),
         DurableTupleBacking::new(app.clone()),
@@ -297,22 +315,33 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         )
         .expect("tenant A tuple write");
 
-    assert_eq!(pstore.principals_in(&sa).len(), 1, "tenant A sees its principal");
+    assert_eq!(
+        pstore.principals_in(&sa).len(),
+        1,
+        "tenant A sees its principal"
+    );
     assert_eq!(tstore.tuples_in(&sa).len(), 1, "tenant A sees its tuple");
 
     assert!(
         pstore.get_principal(&sb, &alice).is_none(),
         "tenant B cannot see tenant A's principal (RLS via with_tenant_tx)"
     );
-    assert!(pstore.principals_in(&sb).is_empty(), "tenant B's principal partition is empty");
-    assert!(tstore.tuples_in(&sb).is_empty(), "tenant B cannot see tenant A's tuple (RLS)");
+    assert!(
+        pstore.principals_in(&sb).is_empty(),
+        "tenant B's principal partition is empty"
+    );
+    assert!(
+        tstore.tuples_in(&sb).is_empty(),
+        "tenant B cannot see tenant A's tuple (RLS)"
+    );
 
     assert!(
         residual_guc(app.db_pool()).await.is_empty(),
         "no residual myelin.tenant_id GUC after the tenant-scoped ops (no bleed)"
     );
 
-    let unknown = pstore.link_credential(&sa, "oidc", "sub-unknown", &PrincipalId("p:ghost".into()));
+    let unknown =
+        pstore.link_credential(&sa, "oidc", "sub-unknown", &PrincipalId("p:ghost".into()));
     assert!(
         matches!(
             unknown,
@@ -328,7 +357,9 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         .expect("the credential resolves to its principal");
     assert_eq!(resolved.principal_id, alice);
     assert!(
-        pstore.resolve_credential(&sb, "oidc", "sub-alice").is_none(),
+        pstore
+            .resolve_credential(&sb, "oidc", "sub-alice")
+            .is_none(),
         "a credential verified for tenant A never resolves into tenant B's directory"
     );
 
@@ -424,9 +455,19 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
             .expect("read the co-committed outbox envelope");
     let env: EventEnvelope =
         serde_json::from_value(env_json).expect("the outbox row is a canonical EventEnvelope");
-    assert_eq!(env.type_.0, IDENTITY_TUPLE_WRITTEN, "the co-committed event is identity.tuple.written");
-    assert_eq!(env.payload["zookie"], serde_json::json!(z.0), "it carries the write's zookie");
-    assert!(!env.contains_personal_data, "the identity.* event carries no inline PII");
+    assert_eq!(
+        env.type_.0, IDENTITY_TUPLE_WRITTEN,
+        "the co-committed event is identity.tuple.written"
+    );
+    assert_eq!(
+        env.payload["zookie"],
+        serde_json::json!(z.0),
+        "it carries the write's zookie"
+    );
+    assert!(
+        !env.contains_personal_data,
+        "the identity.* event carries no inline PII"
+    );
     assert_eq!(
         env.actor.0.principal_id.0, "p:writer",
         "attribution by opaque principal_id only"
@@ -446,7 +487,10 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         )
         .expect_err("a stale precondition aborts the write");
     assert!(
-        matches!(err, myelin_identity_service::tuple_store::WriteError::PreconditionFailed { .. }),
+        matches!(
+            err,
+            myelin_identity_service::tuple_store::WriteError::PreconditionFailed { .. }
+        ),
         "the aborted write is a precondition failure"
     );
     assert_eq!(
@@ -459,7 +503,11 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
         "DELETE FROM outbox WHERE aggregate = $1",
     ] {
-        let bind = if sql.contains("outbox") { &aggregate } else { &tenant };
+        let bind = if sql.contains("outbox") {
+            &aggregate
+        } else {
+            &tenant
+        };
         let _ = sqlx::query(sql).bind(bind).execute(admin.db_pool()).await;
     }
     println!(

@@ -43,12 +43,8 @@ impl OutboundConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutboundDecision {
-    Allow {
-        reason: OutboundAllowReason,
-    },
-    Deny {
-        reason: OutboundDenyReason,
-    },
+    Allow { reason: OutboundAllowReason },
+    Deny { reason: OutboundDenyReason },
 }
 
 impl OutboundDecision {
@@ -67,12 +63,8 @@ pub enum OutboundAllowReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutboundDenyReason {
-    ExtraEuReplicationDeniedByDefault {
-        target_region: Region,
-    },
-    ExtraEuCdnEdgeDenied {
-        target_region: Region,
-    },
+    ExtraEuReplicationDeniedByDefault { target_region: Region },
+    ExtraEuCdnEdgeDenied { target_region: Region },
 }
 
 #[derive(Default)]

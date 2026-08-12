@@ -92,7 +92,7 @@ fn ag_d4_ci_t1_hard_escape_gate_zero_escapes_on_a_real_kernel() {
     let script = build_corpus_script(DRILL_PIDS_MAX);
     let corpus_drive = stage_padded_corpus(&script);
 
-    let cfg_json = drill_config_json(&corpus_drive,  1,  256);
+    let cfg_json = drill_config_json(&corpus_drive, 1, 256);
     let cfg_path =
         std::env::temp_dir().join(format!("myelin-agd4-cfg-{}.json", std::process::id()));
     std::fs::write(&cfg_path, &cfg_json).expect("write drill machine config");

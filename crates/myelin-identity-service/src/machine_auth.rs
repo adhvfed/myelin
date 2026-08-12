@@ -54,9 +54,13 @@ pub enum CredentialPurpose {
         delegation_snapshot: Option<i64>,
     },
     Pat,
-    CiJob { run_id: String },
+    CiJob {
+        run_id: String,
+    },
     DeployKey,
-    PerJob { run_id: String },
+    PerJob {
+        run_id: String,
+    },
 }
 
 impl CredentialPurpose {
@@ -76,9 +80,7 @@ impl CredentialPurpose {
         match self {
             CredentialPurpose::HumanSession
             | CredentialPurpose::OperatorBootstrap
-            | CredentialPurpose::AgentRun { .. } => {
-                MachineKind::Agent
-            }
+            | CredentialPurpose::AgentRun { .. } => MachineKind::Agent,
             CredentialPurpose::Pat => MachineKind::Pat,
             CredentialPurpose::CiJob { .. } => MachineKind::Ci,
             CredentialPurpose::DeployKey => MachineKind::DeployKey,
@@ -568,19 +570,19 @@ impl CapabilityAuthenticator {
                 &token.subject_key,
             ),
         }
-            .map_err(|e| {
-                AuthzError::FailClosed(format!(
-                    "identity directory lookup failed for verified `{}` token - fail-closed: {e}",
-                    credential.scheme
-                ))
-            })?
-            .ok_or_else(|| {
-                AuthzError::FailClosed(format!(
-                    "no `{}` token record for the verified subject in tenant `{}` (unknown token - \
+        .map_err(|e| {
+            AuthzError::FailClosed(format!(
+                "identity directory lookup failed for verified `{}` token - fail-closed: {e}",
+                credential.scheme
+            ))
+        })?
+        .ok_or_else(|| {
+            AuthzError::FailClosed(format!(
+                "no `{}` token record for the verified subject in tenant `{}` (unknown token - \
                      fail-closed, never a fabricated session)",
-                    credential.scheme, token.tenant.0
-                ))
-            })?;
+                credential.scheme, token.tenant.0
+            ))
+        })?;
 
         match row.status {
             PrincipalStatus::Active => {}

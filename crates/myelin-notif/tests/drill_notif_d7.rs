@@ -135,5 +135,4 @@ fn notif_d7_kill_mid_ack_window_pages_next_step_exactly_once_then_ack_halts() {
         1,
         "exactly one notif.escalation.acked event committed via the outbox (the ONLY emit path)"
     );
-
 }

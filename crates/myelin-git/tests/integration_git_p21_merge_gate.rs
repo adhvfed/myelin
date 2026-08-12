@@ -146,8 +146,8 @@ async fn fork_gate_neutral_until_endorsed_over_postgres() {
             &policy,
             &[CheckContext::ci("build")],
         )
-            .await
-            .unwrap(),
+        .await
+        .unwrap(),
         MergeGateOutcome::Admitted,
         "a maintainer-endorsed fork success admits over Postgres"
     );

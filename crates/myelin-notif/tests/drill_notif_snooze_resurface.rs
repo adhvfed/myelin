@@ -91,7 +91,6 @@ fn snooze_resurface_durability_kill_before_until_resurfaces_exactly_once() {
         "unread",
         "still exactly one re-surface"
     );
-
 }
 
 #[test]
@@ -154,5 +153,4 @@ fn snooze_and_escalation_share_one_durable_wheel_no_second_mechanism() {
         wheel.has_timer(&run_id),
         "the escalation timer is untouched by the snooze fire"
     );
-
 }

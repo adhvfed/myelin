@@ -1,4 +1,7 @@
-#![cfg_attr(not(any(test, feature = "test-support")), allow(unused_imports, dead_code))]
+#![cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(unused_imports, dead_code)
+)]
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};

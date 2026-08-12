@@ -81,9 +81,7 @@ pub fn secret_fragment() -> FragmentDef {
     frag(
         object_types::SECRET,
         &["parent_ci_project", SECRET_DIRECT_READER],
-        vec![
-            perm(READ, rel(SECRET_DIRECT_READER)),
-        ],
+        vec![perm(READ, rel(SECRET_DIRECT_READER))],
     )
 }
 

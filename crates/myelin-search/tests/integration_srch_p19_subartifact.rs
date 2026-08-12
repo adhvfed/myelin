@@ -576,7 +576,9 @@ fn e2e1_confidential_sub_doc_semantic_path_admits_via_parent_acl_object() {
     ix.index(&created_event("knowledge.page.updated", block_ref))
         .expect("index secret block (embedded)");
 
-    let query = MockEmbeddingAdapter::new(8).embed(text).expect("embed query");
+    let query = MockEmbeddingAdapter::new(8)
+        .embed(text)
+        .expect("embed query");
 
     let denied = ix
         .search_semantic(&tenant(), &region(), &AclFilter::None, &query, 10)
@@ -614,14 +616,19 @@ fn e2e1_confidential_sub_doc_semantic_deny_set_both_directions() {
     ix.index(&created_event("knowledge.page.updated", block_ref))
         .expect("index secret block (embedded)");
 
-    let query = MockEmbeddingAdapter::new(8).embed(text).expect("embed query");
+    let query = MockEmbeddingAdapter::new(8)
+        .embed(text)
+        .expect("embed query");
 
     let unrelated_deny = AclFilter::not_ids(["myelin://acme/knowledge/page/other"]);
     let admitted = ix
         .search_semantic(&tenant(), &region(), &unrelated_deny, &query, 10)
         .expect("semantic unrelated deny");
     assert_eq!(
-        admitted.iter().map(|h| h.doc_id.as_str()).collect::<Vec<_>>(),
+        admitted
+            .iter()
+            .map(|h| h.doc_id.as_str())
+            .collect::<Vec<_>>(),
         vec![block_ref],
         "a deny naming neither identifier admits the sub-doc (control)"
     );

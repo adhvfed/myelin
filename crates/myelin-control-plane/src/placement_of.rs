@@ -57,9 +57,7 @@ impl std::error::Error for Misroute {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GatewayReject {
     Misroute(Misroute),
-    NoSuchTenant {
-        tenant_id: TenantId,
-    },
+    NoSuchTenant { tenant_id: TenantId },
 }
 
 impl core::fmt::Display for GatewayReject {
@@ -117,7 +115,9 @@ impl core::fmt::Debug for MisrouteAudit {
             MisrouteAuditBackend::Memory(_) => "Memory(test-double)",
             MisrouteAuditBackend::Pg(_) => "Pg(durable)",
         };
-        f.debug_struct("MisrouteAudit").field("backend", &arm).finish()
+        f.debug_struct("MisrouteAudit")
+            .field("backend", &arm)
+            .finish()
     }
 }
 
@@ -136,7 +136,10 @@ impl MisrouteAudit {
         }
     }
 
-    pub fn with_pg(backing: DurableMisrouteAuditBacking, rt: tokio::runtime::Handle) -> MisrouteAudit {
+    pub fn with_pg(
+        backing: DurableMisrouteAuditBacking,
+        rt: tokio::runtime::Handle,
+    ) -> MisrouteAudit {
         MisrouteAudit {
             backend: MisrouteAuditBackend::Pg(PgMisrouteAudit { backing, rt }),
         }
@@ -194,11 +197,9 @@ impl MisrouteAudit {
             MisrouteAuditBackend::Memory(records) => {
                 records.lock().unwrap_or_else(|e| e.into_inner()).len()
             }
-            MisrouteAuditBackend::Pg(pg) => pg
-                .block(pg.backing.count())
-                .unwrap_or_else(|e| {
-                    panic!("misroute audit: durable count FAILED (fail-static loud): {e}")
-                }) as usize,
+            MisrouteAuditBackend::Pg(pg) => pg.block(pg.backing.count()).unwrap_or_else(|e| {
+                panic!("misroute audit: durable count FAILED (fail-static loud): {e}")
+            }) as usize,
         }
     }
 }

@@ -22,10 +22,7 @@ pub enum SubGrain {
     Heading(String),
     Row(String),
     Field(String),
-    LineRange {
-        minted_start: u64,
-        minted_end: u64,
-    },
+    LineRange { minted_start: u64, minted_end: u64 },
     M4Producer(SubKind),
 }
 

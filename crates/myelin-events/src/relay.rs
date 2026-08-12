@@ -1,6 +1,6 @@
-use crate::outbox::OutboxStore;
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbox::OutboxRow;
+use crate::outbox::OutboxStore;
 use crate::{ArtifactRef, EventEnvelope, EventId, TenantId, Timestamp};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

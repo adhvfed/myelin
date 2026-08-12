@@ -18,12 +18,8 @@ pub enum TrustTier {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CacheScope {
     Trusted,
-    Fork {
-        pr_id: String,
-    },
-    Branch {
-        name: String,
-    },
+    Fork { pr_id: String },
+    Branch { name: String },
 }
 
 impl CacheScope {
@@ -202,9 +198,7 @@ impl<'b> CiCacheNamespace<'b> {
             index.get(&key).cloned()
         };
         match hash {
-            Some(h) => Ok(self
-                .base
-                .get_bounded(&self.tenant, &h, maximum_bytes)?),
+            Some(h) => Ok(self.base.get_bounded(&self.tenant, &h, maximum_bytes)?),
             None => Err(CacheScopeError::Miss {
                 scope: scope.segment(),
                 name: name.to_string(),

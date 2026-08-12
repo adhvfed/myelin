@@ -324,7 +324,9 @@ async fn immutable_input_resolution_retries_without_commit_and_permanent_refusal
                 assert_eq!(input.region, Region("no-osl".into()));
                 assert_eq!(input.run_id, "R-resolved");
                 if resolver_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err(PgInputResolveError::Retry("manifest store unavailable".into()))
+                    Err(PgInputResolveError::Retry(
+                        "manifest store unavailable".into(),
+                    ))
                 } else {
                     Ok(b"pinned-manifest".to_vec())
                 }
@@ -356,16 +358,7 @@ async fn immutable_input_resolution_retries_without_commit_and_permanent_refusal
     )
     .unwrap();
 
-    seed_run(
-        &pool,
-        "acme",
-        "no-osl",
-        "R-resolved",
-        "wf.resolved",
-        0,
-        5,
-    )
-    .await;
+    seed_run(&pool, "acme", "no-osl", "R-resolved", "wf.resolved", 0, 5).await;
     assert!(matches!(
         flow.run_once(1_752_796_800, "2026-07-18T00:00:00Z")
             .await,
@@ -403,16 +396,7 @@ async fn immutable_input_resolution_retries_without_commit_and_permanent_refusal
     assert_eq!(completed, ("completed".into(), 1, 1));
     assert_eq!(body_calls.load(Ordering::SeqCst), 1);
 
-    seed_run(
-        &pool,
-        "acme",
-        "no-osl",
-        "R-refused",
-        "wf.refused",
-        0,
-        5,
-    )
-    .await;
+    seed_run(&pool, "acme", "no-osl", "R-refused", "wf.refused", 0, 5).await;
     assert!(matches!(
         flow.run_once(1_752_796_802, "2026-07-18T00:00:02Z")
             .await
@@ -429,7 +413,11 @@ async fn immutable_input_resolution_retries_without_commit_and_permanent_refusal
     .await
     .unwrap();
     assert_eq!(refused, ("nondeterministic".into(), 0, None, 0));
-    assert_eq!(body_calls.load(Ordering::SeqCst), 1, "refused body never ran");
+    assert_eq!(
+        body_calls.load(Ordering::SeqCst),
+        1,
+        "refused body never ran"
+    );
 
     cleanup(bare, pool, schema).await;
 }

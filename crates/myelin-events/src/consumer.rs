@@ -385,19 +385,17 @@ impl<H: EventHandler> Consumer<H> {
             }
         };
         match outcome {
-            HandleOutcome::Done => {
-                match cotx.commit() {
-                    Ok(()) => {
-                        self.clear_pending(&msg.subject, &event_id);
-                        self.clear_tenant_inflight(&tenant, &event_id);
-                        Delivered::Acked
-                    }
-                    Err(_e) => {
-                        self.bump_pending(&msg.subject, &event_id);
-                        Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
-                    }
+            HandleOutcome::Done => match cotx.commit() {
+                Ok(()) => {
+                    self.clear_pending(&msg.subject, &event_id);
+                    self.clear_tenant_inflight(&tenant, &event_id);
+                    Delivered::Acked
                 }
-            }
+                Err(_e) => {
+                    self.bump_pending(&msg.subject, &event_id);
+                    Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+                }
+            },
             HandleOutcome::NonRetryable(reason) => {
                 cotx.rollback();
                 match self.push_dead_letter(envelope, reason.clone()) {

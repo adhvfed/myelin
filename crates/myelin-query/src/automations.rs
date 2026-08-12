@@ -175,10 +175,18 @@ impl DurableExecutor for InMemoryExecutor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    NoMatch { rule_id: AutomationId },
-    GateFailed { rule_id: AutomationId },
-    BudgetShed { rule_id: AutomationId },
-    AwaitingApproval { rule_id: AutomationId },
+    NoMatch {
+        rule_id: AutomationId,
+    },
+    GateFailed {
+        rule_id: AutomationId,
+    },
+    BudgetShed {
+        rule_id: AutomationId,
+    },
+    AwaitingApproval {
+        rule_id: AutomationId,
+    },
     Emitted {
         rule_id: AutomationId,
         draft: PublishDraft,
@@ -191,7 +199,9 @@ pub enum Outcome {
         rule_id: AutomationId,
         error: ExecutorError,
     },
-    AlreadyFired { rule_id: AutomationId },
+    AlreadyFired {
+        rule_id: AutomationId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

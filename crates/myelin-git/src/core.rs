@@ -621,19 +621,11 @@ mod tests {
             b"ok"
         );
         assert_eq!(
-            core.read_blob_bounded(&repo, &Oid::new("abc"), 16)
-                .unwrap(),
+            core.read_blob_bounded(&repo, &Oid::new("abc"), 16).unwrap(),
             b"blob"
         );
         assert_eq!(
-            core.diff_blobs_bounded(
-                &repo,
-                &Oid::new("a"),
-                &Oid::new("b"),
-                1024,
-                100,
-                8192,
-            )
+            core.diff_blobs_bounded(&repo, &Oid::new("a"), &Oid::new("b"), 1024, 100, 8192,)
                 .unwrap()
                 .len(),
             1

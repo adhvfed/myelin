@@ -1,9 +1,9 @@
+#[cfg(any(test, feature = "test-support"))]
+use myelin_events::MonotonicMinter;
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, ArtifactRef as EvArtifactRef, DataRole as EvDataRole,
     EmitContext, EventDraft, EventEnvelope, EventId, EventType, IdMinter, Timestamp, Visibility,
 };
-#[cfg(any(test, feature = "test-support"))]
-use myelin_events::MonotonicMinter;
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::{EmitContextBase, OutboxStore, OutboxTransaction, OutboxTx};
 use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
@@ -20,13 +20,8 @@ pub const S3_HOLDER: &str = "identity_rebac_tuples";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteError {
-    PreconditionFailed {
-        expected: Zookie,
-        actual: Zookie,
-    },
-    CrossTenant {
-        detail: String,
-    },
+    PreconditionFailed { expected: Zookie, actual: Zookie },
+    CrossTenant { detail: String },
     CommitFailed(String),
 }
 

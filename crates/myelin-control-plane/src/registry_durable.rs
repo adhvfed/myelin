@@ -2,12 +2,12 @@ use myelin_storage::{DurableMisrouteAuditBacking, DurablePlacementBacking, Place
 use myelin_tenancy::{CellId, TenantId};
 
 use crate::placement_of::{MisrouteAuditRecord, PlacementOf};
+#[cfg(any(test, feature = "test-support"))]
+use crate::registry::Registry;
 use crate::registry::{
     cell_to_durable, corrupt_row_panic, durable_to_cell, durable_to_placement, placement_db_panic,
     placement_to_durable,
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::registry::Registry;
 use crate::schema::{Cell, TenantPlacement};
 
 #[derive(Clone)]
@@ -90,10 +90,7 @@ impl DurablePlacementRegistry {
         }
     }
 
-    pub fn place_tenant(
-        &mut self,
-        placement: TenantPlacement,
-    ) -> Result<(), PlacementWriteError> {
+    pub fn place_tenant(&mut self, placement: TenantPlacement) -> Result<(), PlacementWriteError> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(reg) => match reg.place_tenant(placement) {
@@ -197,7 +194,8 @@ mod tests {
     #[test]
     fn memory_arm_round_trips_and_enforces_the_invariant() {
         let mut reg = DurablePlacementRegistry::in_memory();
-        reg.insert_cell(cell("cell-w-1", "eu-west")).expect("insert cell");
+        reg.insert_cell(cell("cell-w-1", "eu-west"))
+            .expect("insert cell");
         reg.place_tenant(placement("01J0ACME", "eu-west", "cell-w-1", &["cell-w-1"]))
             .expect("a single-region placement is admitted");
         let answer = reg
@@ -206,11 +204,20 @@ mod tests {
         assert_eq!(answer.home_cell.as_str(), "cell-w-1");
         assert_eq!(answer.region.as_str(), "eu-west");
 
-        reg.insert_cell(cell("cell-n-1", "eu-north")).expect("insert north cell");
+        reg.insert_cell(cell("cell-n-1", "eu-north"))
+            .expect("insert north cell");
         let e = reg
-            .place_tenant(placement("01J0BETA", "eu-west", "cell-w-1", &["cell-w-1", "cell-n-1"]))
+            .place_tenant(placement(
+                "01J0BETA",
+                "eu-west",
+                "cell-w-1",
+                &["cell-w-1", "cell-n-1"],
+            ))
             .expect_err("a cross-region member cell is rejected");
-        assert!(matches!(e, PlacementWriteError::InvariantRejected(_)), "got {e}");
+        assert!(
+            matches!(e, PlacementWriteError::InvariantRejected(_)),
+            "got {e}"
+        );
     }
 
     #[test]

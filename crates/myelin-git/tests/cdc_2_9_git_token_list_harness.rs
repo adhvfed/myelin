@@ -1,6 +1,4 @@
-use myelin_events::{
-    HarnessError, RegisteredToken, TaxonomyError, TokenListHarness,
-};
+use myelin_events::{HarnessError, RegisteredToken, TaxonomyError, TokenListHarness};
 use myelin_git::events::{
     git_event_token_list, GIT_EVENT_TOKENS, GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_OPENED,
     GIT_PR_SYNCHRONIZED,
@@ -33,9 +31,7 @@ fn git_complete_list_is_admitted_by_the_bus_harness_in_full() {
 #[test]
 fn the_harness_rejects_a_malformed_addition_to_gits_list() {
     let mut harness = TokenListHarness::new();
-    harness
-        .register(&git_event_token_list())
-        .unwrap();
+    harness.register(&git_event_token_list()).unwrap();
 
     assert!(matches!(
         harness.add("git", RegisteredToken::references_only("git.pr.open")),

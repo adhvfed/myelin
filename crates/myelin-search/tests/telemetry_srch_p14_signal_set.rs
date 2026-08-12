@@ -191,7 +191,7 @@ fn full_snapshot() -> SearchTelemetry {
 
     let cache = CacheStats::new();
 
-    let mut t = SearchTelemetry::from_stats( 0, &qstats, &cstats, &cache);
+    let mut t = SearchTelemetry::from_stats(0, &qstats, &cstats, &cache);
 
     t.record_red(
         myelin_search::RedLabels {

@@ -165,7 +165,10 @@ impl EventsRuntime {
     pub async fn drain_relay_to_empty(&self) -> Result<usize, PgError> {
         let mut total = 0usize;
         loop {
-            let n = self.relay.relay_once(&self.bus, DEFAULT_DRAIN_BATCH).await?;
+            let n = self
+                .relay
+                .relay_once(&self.bus, DEFAULT_DRAIN_BATCH)
+                .await?;
             total += n;
             if n == 0 {
                 break;
@@ -196,12 +199,18 @@ impl EventsRuntime {
                     envelope,
                 };
                 let delivered_outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| consumer.deliver(&msg)));
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        consumer.deliver(&msg)
+                    }));
                 match delivered_outcome {
                     Ok(Delivered::Acked | Delivered::Deduplicated | Delivered::DeadLettered(_)) => {
                         self.bus.ack(&self.consumer_name, &event_id);
                     }
-                    Ok(Delivered::Retried(_) | Delivered::DependencyUnavailable(_, _) | Delivered::Throttled(_)) => {}
+                    Ok(
+                        Delivered::Retried(_)
+                        | Delivered::DependencyUnavailable(_, _)
+                        | Delivered::Throttled(_),
+                    ) => {}
                     Err(_panic) => {
                         eprintln!(
                             "[events-pump] LOUD: delivery machinery PANICKED for event_id={} \

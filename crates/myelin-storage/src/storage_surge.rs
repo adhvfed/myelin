@@ -26,9 +26,7 @@ impl StorageLaneClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageAdmission {
     Admit,
-    Shed {
-        retry_after_secs: u64,
-    },
+    Shed { retry_after_secs: u64 },
 }
 
 impl StorageAdmission {

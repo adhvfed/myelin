@@ -21,13 +21,8 @@ impl ResolverProjection for ProjectedResolverSet {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectionError {
-    MissingEndpoint {
-        cell_id: String,
-    },
-    Unresolvable {
-        cell_id: String,
-        why: String,
-    },
+    MissingEndpoint { cell_id: String },
+    Unresolvable { cell_id: String, why: String },
     Db(String),
 }
 
@@ -74,14 +69,15 @@ impl CellResolverRegistry {
                 });
             }
             let cell = CellId::from_token(&row.cell_id);
-            let handle = factory(&cell, &row.endpoint).map_err(|why| ProjectionError::Unresolvable {
-                cell_id: row.cell_id.clone(),
-                why,
-            })?;
+            let handle =
+                factory(&cell, &row.endpoint).map_err(|why| ProjectionError::Unresolvable {
+                    cell_id: row.cell_id.clone(),
+                    why,
+                })?;
             resolvers.insert(cell, handle);
         }
-        Ok(CellResolverRegistry::projected(Arc::new(ProjectedResolverSet {
-            resolvers,
-        })))
+        Ok(CellResolverRegistry::projected(Arc::new(
+            ProjectedResolverSet { resolvers },
+        )))
     }
 }

@@ -53,34 +53,46 @@ fn iss_d8b_olap_feed_drill_is_green() {
     let flag = RestrictionFlag::new();
     let live = IssueOlapConsumer::new(region(), flag.clone());
 
-    live.handle(&ev(
-        "a-sla",
-        events::SLA_MET,
-        "psn:alice",
-        "issue:A",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    live.handle(&ev(
-        "a-tr",
-        events::ISSUE_TRANSITIONED,
-        "psn:alice",
-        "issue:A2",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
-    live.handle(&ev(
-        "b-sla",
-        events::SLA_BREACHED,
-        "psn:bob",
-        "issue:B",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    live.handle(&ev(
-        "b-tr",
-        events::ISSUE_TRANSITIONED,
-        "psn:bob",
-        "issue:B2",
-        serde_json::json!({ "category": "started" }),
-    ), &mut myelin_events::HandlerTx::none());
+    live.handle(
+        &ev(
+            "a-sla",
+            events::SLA_MET,
+            "psn:alice",
+            "issue:A",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live.handle(
+        &ev(
+            "a-tr",
+            events::ISSUE_TRANSITIONED,
+            "psn:alice",
+            "issue:A2",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live.handle(
+        &ev(
+            "b-sla",
+            events::SLA_BREACHED,
+            "psn:bob",
+            "issue:B",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live.handle(
+        &ev(
+            "b-tr",
+            events::ISSUE_TRANSITIONED,
+            "psn:bob",
+            "issue:B2",
+            serde_json::json!({ "category": "started" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
 
     flag.set("psn:alice", true);
     let leak = live.analytics(|a| {
@@ -151,13 +163,16 @@ fn iss_d8b_olap_feed_drill_is_green() {
 #[test]
 fn iss_d8b_drill_is_non_vacuous() {
     let live = IssueOlapConsumer::new(region(), RestrictionFlag::new());
-    live.handle(&ev(
-        "a1",
-        events::SLA_MET,
-        "psn:alice",
-        "issue:A",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    live.handle(
+        &ev(
+            "a1",
+            events::SLA_MET,
+            "psn:alice",
+            "issue:A",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     let signal = IssueOlapFeedSignal {
         store: ISSUE_ANALYTICS_OLAP,
         oltp_read_count: live.oltp_read_count(),

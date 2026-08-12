@@ -58,10 +58,7 @@ fn id_d5_adversarial_delegation_zero_escapes_with_intersection_proof() {
                 tenant_policy: auth(&["repo:acme/web#read"]),
                 trigger_actor_held: auth(&["repo:acme/web#read"]),
             },
-            effects: vec![
-                ("repo:acme/web#read", true),
-                ("repo:acme/web#admin", false),
-            ],
+            effects: vec![("repo:acme/web#read", true), ("repo:acme/web#admin", false)],
         },
         AdversarialCase {
             name: "tenant-guardrail-forbids",
@@ -71,10 +68,7 @@ fn id_d5_adversarial_delegation_zero_escapes_with_intersection_proof() {
                 tenant_policy: auth(&["repo:acme/web#read"]),
                 trigger_actor_held: auth(&["repo:acme/web#read", "repo:acme/web#write"]),
             },
-            effects: vec![
-                ("repo:acme/web#read", true),
-                ("repo:acme/web#write", false),
-            ],
+            effects: vec![("repo:acme/web#read", true), ("repo:acme/web#write", false)],
         },
         AdversarialCase {
             name: "delegator-lost-the-right",
@@ -84,10 +78,7 @@ fn id_d5_adversarial_delegation_zero_escapes_with_intersection_proof() {
                 tenant_policy: auth(&["repo:acme/web#read", "repo:acme/web#write"]),
                 trigger_actor_held: auth(&["repo:acme/web#read"]),
             },
-            effects: vec![
-                ("repo:acme/web#read", true),
-                ("repo:acme/web#write", false),
-            ],
+            effects: vec![("repo:acme/web#read", true), ("repo:acme/web#write", false)],
         },
         AdversarialCase {
             name: "delegate-a-grant-never-held",

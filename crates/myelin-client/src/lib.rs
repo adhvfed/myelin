@@ -290,8 +290,7 @@ impl Breaker {
                     }
                 }
             }
-            BreakerState::Open => {
-            }
+            BreakerState::Open => {}
         }
     }
 }

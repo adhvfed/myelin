@@ -401,11 +401,7 @@ mod tests {
     #[test]
     fn entirely_gone_content_is_a_pr_rooted_tombstone() {
         let (_, anchor) = fixture();
-        let new = blob(&[
-            "use crate::ledger;",
-            "",
-            "fn refund() {}",
-        ]);
+        let new = blob(&["use crate::ledger;", "", "fn refund() {}"]);
         let r = resolve(&anchor, &new, &oid("new-blob"), &pr());
         assert_eq!(r.state, AnchorState::Gone);
         assert_eq!(r.resolved_range, None);

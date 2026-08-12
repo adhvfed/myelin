@@ -162,12 +162,10 @@ pub(super) fn run_production_container_streaming(
                 Err(cleanup) => Err(RunFailure::executed(cleanup, result.usage)),
             }
         }
-        Err(e) => {
-            Err(match bundle.cleanup() {
-                Ok(()) => e,
-                Err(cleanup) => augment_run_failure_message(e, cleanup),
-            })
-        }
+        Err(e) => Err(match bundle.cleanup() {
+            Ok(()) => e,
+            Err(cleanup) => augment_run_failure_message(e, cleanup),
+        }),
     };
     Ok(finalize_and_merge(
         primary,
@@ -215,9 +213,8 @@ impl BundleCleanupGuard {
 impl Drop for BundleCleanupGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.cleanup().unwrap_or_else(|error| {
-                panic!("fail-closed secret bundle cleanup: {error}")
-            });
+            self.cleanup()
+                .unwrap_or_else(|error| panic!("fail-closed secret bundle cleanup: {error}"));
         }
     }
 }

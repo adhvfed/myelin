@@ -97,9 +97,7 @@ pub fn mark_all_read(
     inbox.mutate_matching(
         &principal.tenant,
         recipient,
-        |row: &RoutedInboxItem| {
-            filter.matches(row) && row_is_active(row)
-        },
+        |row: &RoutedInboxItem| filter.matches(row) && row_is_active(row),
         |row| {
             row.state = ReadState::Read.token().to_string();
             row.snooze_until = None;

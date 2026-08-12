@@ -107,7 +107,12 @@ fn worker(pool: &PgPool, tenant: &str, region: &str, partition: i16, name: &str)
     )
     .expect("valid worker scope");
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    PgFlowWorker::new(pool.clone(), tokio::runtime::Handle::current(), minter, scope)
+    PgFlowWorker::new(
+        pool.clone(),
+        tokio::runtime::Handle::current(),
+        minter,
+        scope,
+    )
 }
 
 fn register_cijob(flow: &mut PgFlowWorker, runner: Arc<RecordingJobRunner>) {
@@ -177,7 +182,11 @@ async fn typed_ci_job_done_wakes_parked_run_and_stores_the_legacy_string_array()
 
     seed_run(&pool, "acme", "no-osl", "R-typed", 5).await;
     flow.run_once(1000, "2026-07-20T00:00:00Z").await.unwrap();
-    assert_eq!(run_state(&pool, "R-typed").await, "waiting", "parked on job.done");
+    assert_eq!(
+        run_state(&pool, "R-typed").await,
+        "waiting",
+        "parked on job.done"
+    );
 
     let token = job_idem_token("R-typed", "wf.cijob:0");
     let outcome = tokio::task::block_in_place(|| {
@@ -194,7 +203,11 @@ async fn typed_ci_job_done_wakes_parked_run_and_stores_the_legacy_string_array()
         })
     })
     .expect("typed CiJobDone accepted");
-    assert_eq!(outcome, SignalOutcome::Buffered, "the first typed delivery buffered");
+    assert_eq!(
+        outcome,
+        SignalOutcome::Buffered,
+        "the first typed delivery buffered"
+    );
     assert_eq!(
         run_state(&pool, "R-typed").await,
         "running",
@@ -219,7 +232,11 @@ async fn typed_ci_job_done_wakes_parked_run_and_stores_the_legacy_string_array()
 
     let driven = flow.run_once(1001, "2026-07-20T00:00:01Z").await.unwrap();
     assert!(matches!(driven, PgRunOnceOutcome::Driven { .. }));
-    assert_eq!(run_state(&pool, "R-typed").await, "completed", "the run ran to completion");
+    assert_eq!(
+        run_state(&pool, "R-typed").await,
+        "completed",
+        "the run ran to completion"
+    );
     let received: serde_json::Value = sqlx::query_scalar(
         "SELECT result FROM wf_history WHERE run_id='R-typed' AND kind='signal_received'",
     )
@@ -231,7 +248,11 @@ async fn typed_ci_job_done_wakes_parked_run_and_stores_the_legacy_string_array()
         received.contains("ci.stage.verdict:pass:build"),
         "the journaled signal_received carries the typed verdict marker, replay-stable"
     );
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "exactly one dispatch");
+    assert_eq!(
+        runner.calls.load(Ordering::SeqCst),
+        1,
+        "exactly one dispatch"
+    );
     cleanup(bare, pool, schema).await;
 }
 
@@ -298,7 +319,11 @@ async fn typed_ci_job_done_rejects_bad_grammar_wrong_name_and_unvalidated_ref() 
         .await
         .unwrap();
     assert_eq!(signals, 0, "no rejected delivery buffered a row");
-    assert_eq!(run_state(&pool, "R-reject").await, "waiting", "the run is still parked");
+    assert_eq!(
+        run_state(&pool, "R-reject").await,
+        "waiting",
+        "the run is still parked"
+    );
     cleanup(bare, pool, schema).await;
 }
 
@@ -306,7 +331,11 @@ async fn typed_ci_job_done_rejects_bad_grammar_wrong_name_and_unvalidated_ref() 
 async fn commit_settles_runnable_iff_a_matching_signal_is_pending() {
     let _test_guard = TEST_LOCK.lock().await;
     let (bare, pool, schema) = setup("race").await;
-    let store = PgFlowDriveStore::new(pool.clone(), TenantId("acme".into()), Region("no-osl".into()));
+    let store = PgFlowDriveStore::new(
+        pool.clone(),
+        TenantId("acme".into()),
+        Region("no-osl".into()),
+    );
 
     async fn park_with_pending(
         pool: &PgPool,
@@ -372,7 +401,10 @@ async fn commit_settles_runnable_iff_a_matching_signal_is_pending() {
         },
     )
     .await;
-    assert_eq!(matched, "running", "a matching mid-drive signal settles the run runnable");
+    assert_eq!(
+        matched, "running",
+        "a matching mid-drive signal settles the run runnable"
+    );
 
     let wrong_idem = park_with_pending(
         &pool,
@@ -387,7 +419,10 @@ async fn commit_settles_runnable_iff_a_matching_signal_is_pending() {
         },
     )
     .await;
-    assert_eq!(wrong_idem, "waiting", "a non-matching idem_key does not re-arm the run");
+    assert_eq!(
+        wrong_idem, "waiting",
+        "a non-matching idem_key does not re-arm the run"
+    );
 
     let unrelated = park_with_pending(
         &pool,
@@ -431,11 +466,22 @@ async fn claim_repairs_a_stranded_waiting_run_with_a_matching_pending_signal() {
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(run_state(&pool, "R-strand").await, "waiting", "stranded: waiting with a pending match");
+    assert_eq!(
+        run_state(&pool, "R-strand").await,
+        "waiting",
+        "stranded: waiting with a pending match"
+    );
 
     let driven = flow.run_once(1001, "2026-07-20T00:00:01Z").await.unwrap();
-    assert!(matches!(driven, PgRunOnceOutcome::Driven { .. }), "the repair claim drove the run");
-    assert_eq!(run_state(&pool, "R-strand").await, "completed", "the stranded run recovered + completed");
+    assert!(
+        matches!(driven, PgRunOnceOutcome::Driven { .. }),
+        "the repair claim drove the run"
+    );
+    assert_eq!(
+        run_state(&pool, "R-strand").await,
+        "completed",
+        "the stranded run recovered + completed"
+    );
     let consumed: Option<i64> = sqlx::query_scalar(
         "SELECT consumed_seq FROM wf_signal WHERE run_id='R-strand' AND idem_key=$1",
     )
@@ -443,7 +489,10 @@ async fn claim_repairs_a_stranded_waiting_run_with_a_matching_pending_signal() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(consumed.is_some(), "the repaired drive consumed the previously-stranded signal");
+    assert!(
+        consumed.is_some(),
+        "the repaired drive consumed the previously-stranded signal"
+    );
     cleanup(bare, pool, schema).await;
 }
 
@@ -495,7 +544,10 @@ async fn late_job_done_to_a_terminal_run_is_an_acknowledged_no_op() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(history_after, history_before, "terminal history is unchanged");
+    assert_eq!(
+        history_after, history_before,
+        "terminal history is unchanged"
+    );
 
     sqlx::query(
         "INSERT INTO wf_signal (tenant_id,region,run_id,signal_name,idem_key,payload,received_at) \
@@ -543,13 +595,15 @@ async fn late_job_done_to_a_terminal_run_is_an_acknowledged_no_op() {
         .unwrap(),
     );
     let err = tokio::task::block_in_place(|| {
-        wrong_tenant_exec.executor().signal(myelin_flow::SignalSpec {
-            run: RunId("R-term".into()),
-            signal_name: "job.done".into(),
-            idem_key: "x".into(),
-            payload: vec![],
-            payload_key_ref: None,
-        })
+        wrong_tenant_exec
+            .executor()
+            .signal(myelin_flow::SignalSpec {
+                run: RunId("R-term".into()),
+                signal_name: "job.done".into(),
+                idem_key: "x".into(),
+                payload: vec![],
+                payload_key_ref: None,
+            })
     })
     .expect_err("a cross-tenant delivery is surfaced, never a no-op");
     assert!(matches!(err, ExecutorError::UnknownRun(_)));
@@ -591,7 +645,11 @@ async fn passed_false_ci_job_done_decodes_through_read_stage_verdict_to_completi
 
     seed_run_typed(&pool, "acme", "no-osl", "R-fail", "wf.cijobv", 11).await;
     flow.run_once(1000, "2026-07-20T00:00:00Z").await.unwrap();
-    assert_eq!(run_state(&pool, "R-fail").await, "waiting", "parked on job.done");
+    assert_eq!(
+        run_state(&pool, "R-fail").await,
+        "waiting",
+        "parked on job.done"
+    );
 
     let token = job_idem_token("R-fail", "wf.cijobv:0");
     tokio::task::block_in_place(|| {
@@ -610,7 +668,11 @@ async fn passed_false_ci_job_done_decodes_through_read_stage_verdict_to_completi
     .expect("typed failing verdict accepted");
 
     let driven = flow.run_once(1001, "2026-07-20T00:00:01Z").await.unwrap();
-    assert_eq!(run_state(&pool, "R-fail").await, "completed", "the run completed");
+    assert_eq!(
+        run_state(&pool, "R-fail").await,
+        "completed",
+        "the run completed"
+    );
     match driven {
         PgRunOnceOutcome::Driven {
             outcome: DriveOutcome::Completed(result),
@@ -643,8 +705,11 @@ async fn race_settled_running_row_is_claimed_and_driven_to_completion() {
     })
     .expect("register wf.wait body");
 
-    let store =
-        PgFlowDriveStore::new(pool.clone(), TenantId("acme".into()), Region("no-osl".into()));
+    let store = PgFlowDriveStore::new(
+        pool.clone(),
+        TenantId("acme".into()),
+        Region("no-osl".into()),
+    );
     seed_run_typed(&pool, "acme", "no-osl", "R-drive", "wf.wait", 12).await;
     let lease = store
         .claim_runnable(12, "worker-race-drive", 60)
@@ -706,7 +771,10 @@ async fn race_settled_running_row_is_claimed_and_driven_to_completion() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(consumed.is_some(), "the driven run consumed the raced signal");
+    assert!(
+        consumed.is_some(),
+        "the driven run consumed the raced signal"
+    );
     cleanup(bare, pool, schema).await;
 }
 
@@ -714,8 +782,11 @@ async fn race_settled_running_row_is_claimed_and_driven_to_completion() {
 async fn same_drive_id_with_a_different_park_descriptor_fails_closed() {
     let _test_guard = TEST_LOCK.lock().await;
     let (bare, pool, schema) = setup("fingerprint").await;
-    let store =
-        PgFlowDriveStore::new(pool.clone(), TenantId("acme".into()), Region("no-osl".into()));
+    let store = PgFlowDriveStore::new(
+        pool.clone(),
+        TenantId("acme".into()),
+        Region("no-osl".into()),
+    );
     seed_run_typed(&pool, "acme", "no-osl", "R-fp", "wf.wait", 13).await;
     let lease = store
         .claim_runnable(13, "worker-fp", 60)
@@ -813,7 +884,9 @@ async fn forced_repair_cadence_recovers_a_stranded_run_despite_a_continuous_back
     .unwrap();
 
     for i in 0..70 {
-        flow.run_once(1001 + i, "2026-07-20T00:01:00Z").await.unwrap();
+        flow.run_once(1001 + i, "2026-07-20T00:01:00Z")
+            .await
+            .unwrap();
     }
     assert_eq!(
         run_state(&pool, "R-strand").await,

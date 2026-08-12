@@ -59,13 +59,8 @@ impl CellPartition {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CrossCellResolution {
-    Projection {
-        home_cell: CellId,
-        zookie: Zookie,
-    },
-    Tombstone {
-        home_cell: CellId,
-    },
+    Projection { home_cell: CellId, zookie: Zookie },
+    Tombstone { home_cell: CellId },
 }
 
 impl CrossCellResolution {

@@ -13,15 +13,9 @@ pub const ERASURE_LEDGER: &str = "identity_pseudonym_erasure_ledger";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PseudonymEraseError {
-    Erased {
-        subject: String,
-    },
-    NoMapping {
-        subject: String,
-    },
-    Infrastructure {
-        detail: String,
-    },
+    Erased { subject: String },
+    NoMapping { subject: String },
+    Infrastructure { detail: String },
 }
 
 impl core::fmt::Display for PseudonymEraseError {

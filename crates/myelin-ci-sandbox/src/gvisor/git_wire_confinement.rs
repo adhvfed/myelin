@@ -4,13 +4,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub enum WireError {
     Path(String),
-    StdinTooLarge {
-        len: usize,
-        cap: usize,
-    },
-    OutputTooLarge {
-        cap: usize,
-    },
+    StdinTooLarge { len: usize, cap: usize },
+    OutputTooLarge { cap: usize },
     Hardening(String),
     Hook(HookError),
     Runtime(String),

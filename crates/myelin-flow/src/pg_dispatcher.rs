@@ -94,11 +94,10 @@ pub type PgWorkflowBody = dyn Fn(&PgClaimedDriveInput, &mut WfCtx) -> Result<Vec
     + Sync
     + 'static;
 
-pub type PgResolvedWorkflowBody =
-    dyn Fn(&PgResolvedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
-        + Send
-        + Sync
-        + 'static;
+pub type PgResolvedWorkflowBody = dyn Fn(&PgResolvedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
+    + Send
+    + Sync
+    + 'static;
 
 #[derive(Clone)]
 struct RegisteredBody {
@@ -363,9 +362,8 @@ impl PgFlowWorker {
             + Sync
             + 'static,
     {
-        let body = move |input: &PgResolvedDriveInput, ctx: &mut WfCtx| {
-            legacy_body(&input.claimed, ctx)
-        };
+        let body =
+            move |input: &PgResolvedDriveInput, ctx: &mut WfCtx| legacy_body(&input.claimed, ctx);
         self.register_body(wf_type, version, code_hash, None, body)
     }
 
@@ -384,13 +382,7 @@ impl PgFlowWorker {
             + Sync
             + 'static,
     {
-        self.register_body(
-            wf_type,
-            version,
-            code_hash,
-            Some(Arc::new(resolver)),
-            body,
-        )
+        self.register_body(wf_type, version, code_hash, Some(Arc::new(resolver)), body)
     }
 
     fn register_body<F>(
@@ -407,7 +399,8 @@ impl PgFlowWorker {
             + Sync
             + 'static,
     {
-        self.executor.register_definition(wf_type, version, code_hash)?;
+        self.executor
+            .register_definition(wf_type, version, code_hash)?;
         let key = (wf_type.to_owned(), version);
         if self.bodies.contains_key(&key) {
             return Err(PgWorkerError::InvalidConfig(format!(
@@ -597,8 +590,7 @@ impl PgFlowWorker {
         }
         let resolved_input = PgResolvedDriveInput {
             claimed: drive_input,
-            material: resolved_material
-                .expect("permanent resolution failure returned above"),
+            material: resolved_material.expect("permanent resolution failure returned above"),
         };
         let mut ctx = WfCtx::resume_staged_versioned(
             Arc::new(DriveIdMinter::new(&lease.run_id)),
@@ -723,13 +715,8 @@ impl PgFlowWorker {
         now_rfc3339: &str,
         shutdown: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<PgDriveBatch, PgWorkerError> {
-        self.run_until_idle_inner(
-            max_runs,
-            now_unix_secs,
-            now_rfc3339,
-            Some(shutdown),
-        )
-        .await
+        self.run_until_idle_inner(max_runs, now_unix_secs, now_rfc3339, Some(shutdown))
+            .await
     }
 
     async fn run_until_idle_inner(

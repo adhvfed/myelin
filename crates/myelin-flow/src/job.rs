@@ -229,9 +229,9 @@ impl WfCtx {
 
     pub fn join_dispatched_job(&mut self, job: &DispatchedJob) -> WfResult<JobOutcome> {
         let Some(expected) = self.job_dispatches.get(&job.idem_token) else {
-            return Err(self.diverge(
-                "job join refused an unregistered/foreign dispatch handle".into(),
-            ));
+            return Err(
+                self.diverge("job join refused an unregistered/foreign dispatch handle".into())
+            );
         };
         let identity_matches = expected
             == &(
@@ -316,8 +316,7 @@ impl WfCtx {
             return self.schedule_and_run_job(spec, runner, timeout_secs);
         };
 
-        let admit =
-            self.reserve_and_begin(&gate, cost, crate::budget::DispatchNoun::LONG_PARK)?;
+        let admit = self.reserve_and_begin(&gate, cost, crate::budget::DispatchNoun::LONG_PARK)?;
 
         let outcome = self.schedule_and_run_job(spec, runner, timeout_secs)?;
 

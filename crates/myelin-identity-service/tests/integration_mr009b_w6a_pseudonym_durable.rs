@@ -264,13 +264,22 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
     let receipt = engine2
         .re_erase_after_restore(&s, at("2026-06-19T11:00:00Z"))
         .expect("re-erasure verification");
-    assert_eq!(receipt.re_erased, 2, "the ledger drove re-erasure of BOTH subjects");
+    assert_eq!(
+        receipt.re_erased, 2,
+        "the ledger drove re-erasure of BOTH subjects"
+    );
     assert_eq!(
         receipt.pre_pass_resurrected, 2,
         "the restore resurrected both (the honest signal)"
     );
-    assert_eq!(receipt.resurrected, 0, "0 resurrected AFTER the pass - the ID-D8 threshold");
-    assert!(receipt.is_green(), "the ID-D8 re-erasure drill is GREEN across a live-PG restart");
+    assert_eq!(
+        receipt.resurrected, 0,
+        "0 resurrected AFTER the pass - the ID-D8 threshold"
+    );
+    assert!(
+        receipt.is_green(),
+        "the ID-D8 re-erasure drill is GREEN across a live-PG restart"
+    );
     assert!(
         engine2.pseudonyms().resolve_subject(&s, &alice).is_none(),
         "alice re-erased (0 recoverable real identity)"
@@ -314,15 +323,24 @@ async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
         "no cross-tenant map read: B cannot see A's mapping"
     );
     assert!(
-        store.resolve(&sb, &handle("anon-a", &tenant_a)).expect("resolve") .is_none(),
+        store
+            .resolve(&sb, &handle("anon-a", &tenant_a))
+            .expect("resolve")
+            .is_none(),
         "no cross-tenant resolve"
     );
-    assert!(store.mappings_in(&sb).is_empty(), "B's map partition is empty");
+    assert!(
+        store.mappings_in(&sb).is_empty(),
+        "B's map partition is empty"
+    );
     assert!(
         !ledger.is_erased(&sb, &alice),
         "no cross-tenant erasure-ledger read"
     );
-    assert!(ledger.entries_in(&sb).is_empty(), "B's ledger partition is empty");
+    assert!(
+        ledger.entries_in(&sb).is_empty(),
+        "B's ledger partition is empty"
+    );
     assert!(store.mapping_of(&sa, &alice).is_some());
     assert!(ledger.is_erased(&sa, &alice));
 
@@ -337,7 +355,11 @@ async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
     };
     let ledger2 = erasure_ledger(&app2);
     let entries = ledger2.entries_in(&sa);
-    assert_eq!(entries.len(), 1, "a re-record does not duplicate (idempotent upsert)");
+    assert_eq!(
+        entries.len(),
+        1,
+        "a re-record does not duplicate (idempotent upsert)"
+    );
     assert_eq!(
         entries[0].erased_at,
         at("2026-06-19T12:00:00Z"),

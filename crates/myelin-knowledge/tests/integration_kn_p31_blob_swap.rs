@@ -121,8 +121,7 @@ async fn kn_p31_repointed_knowledge_store_blob_path_is_durable_across_reconstruc
 
     let _ = tokio::task::spawn_blocking(move || {
         let object = S3BlobStore::connect(&cfg.s3, handle);
-        let store =
-            KnowledgeStore::open(oltp(), Arc::new(object)).expect("cleanup store opens");
+        let store = KnowledgeStore::open(oltp(), Arc::new(object)).expect("cleanup store opens");
         let _ = store.blobs().delete(&tenant, &hash);
     })
     .await;

@@ -154,10 +154,9 @@ async fn durable_principal_write_succeeds_after_the_boot_sequence() {
         status: "\"Active\"".into(),
         profile: None,
     };
-    backing
-        .put_principal(&tenant, row.clone())
-        .await
-        .expect("the durable principal write COMMITS after the boot-migrations fix (was the defect)");
+    backing.put_principal(&tenant, row.clone()).await.expect(
+        "the durable principal write COMMITS after the boot-migrations fix (was the defect)",
+    );
 
     let read = DurablePrincipalBacking::new(app.clone())
         .get_principal(&tenant, "p:alice")

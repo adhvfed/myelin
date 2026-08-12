@@ -45,11 +45,10 @@ fn ga_d3_a_retroactive_edit_is_detected_three_independent_ways() {
 
     const N: usize = 12;
     for i in 0..N {
-        let outcome = auth.consumer().handle(&audit_action(
-            &format!("01J-{i}"),
-            "acme",
-            &format!("myelin://acme/x/{i}"),
-        ), &mut myelin_events::HandlerTx::none());
+        let outcome = auth.consumer().handle(
+            &audit_action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(outcome, myelin_events::HandleOutcome::Done);
     }
 
@@ -114,7 +113,6 @@ fn ga_d3_a_retroactive_edit_is_detected_three_independent_ways() {
         !attestation.matches(&tampered_root),
         "GA-D3 detection 3/3: the independent witness mismatches the tampered tree"
     );
-
 }
 
 #[test]
@@ -122,11 +120,10 @@ fn ga_d3_a_deleted_entry_is_detected() {
     let auth = AuditAuthority::new(CellSigningKey::from_seed("cell:fr-par:audit"));
     let tenant = TenantId("acme".into());
     for i in 0..8 {
-        auth.consumer().handle(&audit_action(
-            &format!("01J-{i}"),
-            "acme",
-            &format!("myelin://acme/x/{i}"),
-        ), &mut myelin_events::HandlerTx::none());
+        auth.consumer().handle(
+            &audit_action(&format!("01J-{i}"), "acme", &format!("myelin://acme/x/{i}")),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     let published = auth.signed_tree_head(&tenant, "t").unwrap();
 

@@ -335,13 +335,7 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
         "staleness age ≤ static_max ≤ revocation SLA (a degrade never outlives the bound)"
     );
 
-    let d = gate.front_door_check(
-        &alice,
-        &pull,
-        &repo,
-        Zookie(String::new()),
-         true,
-    );
+    let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), true);
     assert_eq!(
         d.served,
         AuthzServed::Revoked,

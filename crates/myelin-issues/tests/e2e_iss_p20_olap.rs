@@ -51,34 +51,46 @@ fn restrict_drops_from_analytics_then_replay_is_drift_free() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
 
-    c.handle(&ev(
-        "a-sla",
-        events::SLA_MET,
-        "psn:alice",
-        "issue:A",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev(
-        "a-tr",
-        events::ISSUE_TRANSITIONED,
-        "psn:alice",
-        "issue:A2",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev(
-        "b-sla",
-        events::SLA_MET,
-        "psn:bob",
-        "issue:B",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev(
-        "b-tr",
-        events::ISSUE_TRANSITIONED,
-        "psn:bob",
-        "issue:B2",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "a-sla",
+            events::SLA_MET,
+            "psn:alice",
+            "issue:A",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev(
+            "a-tr",
+            events::ISSUE_TRANSITIONED,
+            "psn:alice",
+            "issue:A2",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev(
+            "b-sla",
+            events::SLA_MET,
+            "psn:bob",
+            "issue:B",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev(
+            "b-tr",
+            events::ISSUE_TRANSITIONED,
+            "psn:bob",
+            "issue:B2",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
 
     assert_eq!(
         c.oltp_read_count(),
@@ -189,13 +201,16 @@ fn the_feed_addresses_the_one_shared_olap_warehouse() {
 #[test]
 fn a_non_analytics_token_is_dropped_end_to_end() {
     let c = IssueOlapConsumer::new(region(), RestrictionFlag::new());
-    let outcome = c.handle(&ev(
-        "c1",
-        events::ISSUE_CREATED,
-        "psn:alice",
-        "issue:A",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    let outcome = c.handle(
+        &ev(
+            "c1",
+            events::ISSUE_CREATED,
+            "psn:alice",
+            "issue:A",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(outcome, HandleOutcome::Done);
     assert_eq!(c.doc_count(), 0, "a non-analytics token projects nothing");
 }
