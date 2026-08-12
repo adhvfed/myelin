@@ -15,8 +15,18 @@ use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
 use std::time::Duration;
 
-fn admin_config() -> MyelinConfig {
+fn app_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
+fn admin_config() -> MyelinConfig {
+    let mut config = app_config();
     config.database_url = config
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
@@ -208,13 +218,9 @@ fn red_mainline_binding(agent_id: Uuid) -> NewAgentTriggerBinding {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_automation_roster_starts_with_recent_work_and_pages_from_there() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate_foundation()
         .await
@@ -224,7 +230,7 @@ async fn an_automation_roster_starts_with_recent_work_and_pages_from_there() {
         .await
         .expect("the governed trigger schema migrates with the durable platform");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+    let app = SubstrateProvider::connect(app_config(), 8)
         .await
         .expect("open the constrained app provider");
     let tenant = unique_tenant();
@@ -281,13 +287,9 @@ async fn an_automation_roster_starts_with_recent_work_and_pages_from_there() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate_foundation()
         .await
@@ -297,7 +299,7 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         .await
         .expect("the governed trigger schema migrates with the durable platform");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+    let app = SubstrateProvider::connect(app_config(), 8)
         .await
         .expect("open the constrained app provider");
     let tenant = unique_tenant();
@@ -885,13 +887,9 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn active_automation_capacity_is_fair_retry_safe_and_concurrency_fenced() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate_foundation()
         .await
@@ -901,7 +899,7 @@ async fn active_automation_capacity_is_fair_retry_safe_and_concurrency_fenced() 
         .await
         .expect("the governed trigger schema migrates with the durable platform");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+    let app = SubstrateProvider::connect(app_config(), 8)
         .await
         .expect("open the constrained app provider");
     let tenant = unique_tenant();
@@ -1079,13 +1077,9 @@ async fn active_automation_capacity_is_fair_retry_safe_and_concurrency_fenced() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_poison_firing_becomes_explainable_history_without_harming_the_queue() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate_foundation()
         .await
@@ -1095,7 +1089,7 @@ async fn one_poison_firing_becomes_explainable_history_without_harming_the_queue
         .await
         .expect("the terminal-reason migration is part of the durable platform");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+    let app = SubstrateProvider::connect(app_config(), 8)
         .await
         .expect("open the constrained app provider");
     let tenant = unique_tenant();
@@ -1187,7 +1181,7 @@ async fn an_automation_owner_sees_the_newest_rule_evaluation_error() {
         .await
         .expect("the automation diagnostic is part of the durable platform");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+    let app = SubstrateProvider::connect(app_config(), 8)
         .await
         .expect("open the constrained app provider");
     let tenant = unique_tenant();
