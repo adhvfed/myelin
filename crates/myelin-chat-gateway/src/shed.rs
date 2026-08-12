@@ -44,9 +44,7 @@ impl LiveSurface {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShedVerdict {
     Deliver,
-    Shed {
-        retry_after_secs: u64,
-    },
+    Shed { retry_after_secs: u64 },
 }
 
 impl ShedVerdict {

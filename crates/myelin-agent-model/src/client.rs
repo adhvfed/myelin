@@ -23,7 +23,9 @@ pub struct ToolCallResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelTurn {
-    User { content: String },
+    User {
+        content: String,
+    },
     Assistant {
         content: Option<String>,
         tool_calls: Vec<ToolCallRequest>,

@@ -34,10 +34,7 @@ pub enum GatewayError {
     Unauthenticated(String),
     NotAMember(String),
     OverBroadScope(FirehoseError),
-    ResyncRequired {
-        last_seq: u64,
-        window_floor: u64,
-    },
+    ResyncRequired { last_seq: u64, window_floor: u64 },
     SnapshotFailed(String),
 }
 

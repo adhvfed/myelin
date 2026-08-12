@@ -174,9 +174,7 @@ impl LunaClient {
                             .header("content-type", "application/json")
                             .header("authorization", format!("Bearer {api_key}"))
                             .body(Full::new(body))
-                            .map_err(|e| {
-                                ModelError::Transport(format!("build request: {e}"))
-                            })?;
+                            .map_err(|e| ModelError::Transport(format!("build request: {e}")))?;
 
                         tokio::time::timeout(timeout, async {
                             let response = client.request(request).await.map_err(|e| {
@@ -378,7 +376,10 @@ mod tests {
             max_output_tokens: Some(16),
         };
         let body = client.body_for(&request);
-        assert!(body.get("tool_choice").is_none(), "no tool_choice without tools");
+        assert!(
+            body.get("tool_choice").is_none(),
+            "no tool_choice without tools"
+        );
         assert!(body.get("tools").is_none(), "no tools key without tools");
         assert_eq!(body["reasoning_effort"], "none");
     }
@@ -404,13 +405,21 @@ mod tests {
             max_output_tokens: Some(64),
         };
         let body = client.body_for(&request);
-        assert_eq!(body["tools"][0]["function"]["name"], "git-read_check_status");
+        assert_eq!(
+            body["tools"][0]["function"]["name"],
+            "git-read_check_status"
+        );
         assert_eq!(
             body["messages"][1]["tool_calls"][0]["function"]["name"],
             "git-read_check_status"
         );
-        let openai_pattern = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        assert!(openai_pattern(body["tools"][0]["function"]["name"].as_str().unwrap()));
+        let openai_pattern = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        };
+        assert!(openai_pattern(
+            body["tools"][0]["function"]["name"].as_str().unwrap()
+        ));
 
         let value = serde_json::json!({
             "choices": [{"message": {"content": null, "tool_calls": [{
