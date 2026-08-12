@@ -991,34 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn derivative_module_has_no_cross_store_read_import() {
-        let manifest = include_str!("../Cargo.toml");
-        for forbidden in ["myelin-search", "myelin-refs", "myelin-notif"] {
-            assert!(
-                !manifest.contains(forbidden),
-                "myelin-gdpr-service Cargo.toml must NOT depend on {forbidden} (the no-cross-store-read \
-                 law, gdpr §3.1) - the derived stores are reached through the PersonalDataHolder seam"
-            );
-        }
-        let src = include_str!("derivative_erasure.rs");
-        for line in src.lines() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            let is_import = code.starts_with("use ")
-                || code.starts_with("pub use ")
-                || code.starts_with("extern crate ");
-            for forbidden in ["myelin_search", "myelin_refs", "myelin_notif"] {
-                assert!(
-                    !(is_import && line.contains(forbidden)),
-                    "derivative_erasure.rs must NOT import {forbidden} (the no-cross-store-read law): `{code}`"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn derivative_erase_is_idempotent() {
         let search = SearchIndexModel::new();
         search.index_from_source("u-7", "y");

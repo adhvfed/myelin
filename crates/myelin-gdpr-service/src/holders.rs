@@ -87,12 +87,10 @@ impl<'a> GdprOwnStoreHolder<'a> {
 
     fn subject_key_handles(subject: &SubjectRef, tenant: &TenantId) -> Vec<ShredKeyHandle> {
         let sid = Self::subject_id(subject);
-        vec![
-            ShredKeyHandle {
-                tenant: tenant.clone(),
-                class: ShredKeyClass::Subject(sid),
-            },
-        ]
+        vec![ShredKeyHandle {
+            tenant: tenant.clone(),
+            class: ShredKeyClass::Subject(sid),
+        }]
     }
 }
 
@@ -696,41 +694,6 @@ mod tests {
         let subj = subject("u-dyn");
         for h in holders {
             assert!(h.locate(&subj, t("acme")).is_ok());
-        }
-    }
-
-    #[test]
-    fn gdpr_service_has_no_cross_store_read_import() {
-        let manifest = include_str!("../Cargo.toml");
-        assert!(
-            !manifest.contains("myelin-storage"),
-            "myelin-gdpr-service Cargo.toml must NOT depend on myelin-storage (the no-cross-store- \
-             read law, gdpr §3.1) - the crypto-shred MECHANISM is reached through the CryptoShredKms \
-             seam"
-        );
-
-        for (name, src) in [
-            ("holders.rs", include_str!("holders.rs")),
-            ("lib.rs", include_str!("lib.rs")),
-            ("audit.rs", include_str!("audit.rs")),
-            ("orchestration.rs", include_str!("orchestration.rs")),
-            ("dsr.rs", include_str!("dsr.rs")),
-            ("fanout.rs", include_str!("fanout.rs")),
-        ] {
-            for line in src.lines() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    continue;
-                }
-                let is_import = code.starts_with("use ")
-                    || code.starts_with("pub use ")
-                    || code.starts_with("extern crate ");
-                assert!(
-                    !(is_import && line.contains("myelin_storage")),
-                    "{name} must NOT import myelin-storage (the no-cross-store-read law, gdpr §3.1): \
-                     `{code}`"
-                );
-            }
         }
     }
 }

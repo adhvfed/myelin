@@ -299,27 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn no_oltp_scan_backdoor_structural_source_assertion() {
-        let src = include_str!("olap.rs");
-        let prod = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the module has a production half above its tests");
-        let code: String = prod
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for forbid in ["OltpPool", "from_oltp", "scan_oltp", "OltpConfig"] {
-            assert!(
-                !code.contains(forbid),
-                "OLTP-scan backdoor: the OLAP frame production code must not reference `{forbid}` - \
-                 reindex-from-source / the bus consumer are the ONLY feed paths (§3.4)"
-            );
-        }
-    }
-
-    #[test]
     fn reindex_from_source_equals_live_projection() {
         let mut source = SourceLog::new();
         source

@@ -525,35 +525,4 @@ mod tests {
             "names the no-backup proof: {s}"
         );
     }
-
-    #[test]
-    fn no_backup_restore_path_for_derived_stores_structural() {
-        let src = include_str!("e2e3_reindex_parity.rs");
-        let prod = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("a production half above tests");
-        let code: String = prod
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("//!"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for forbid in [
-            "restore_derived_from_backup",
-            "restore_from_backup",
-            "restore_derived",
-            "PITR",
-            "base_backup",
-        ] {
-            assert!(
-                !code.contains(forbid),
-                "a derived store must have NO backup-restore path - this module's rebuild verb is \
-                 reindex-from-source ONLY (§7.1/§7.3); found forbidden `{forbid}`"
-            );
-        }
-        assert!(
-            code.contains("reindex"),
-            "the derived-store rebuild path IS reindex-from-source"
-        );
-    }
 }

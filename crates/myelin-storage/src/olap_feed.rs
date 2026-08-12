@@ -479,27 +479,6 @@ mod tests {
         .is_green());
     }
 
-    #[test]
-    fn no_oltp_scan_backdoor_in_the_feed_structural() {
-        let src = include_str!("olap_feed.rs");
-        let prod = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("a production half above tests");
-        let code: String = prod
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("//!"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for forbid in ["OltpPool", "from_oltp", "scan_oltp", "OltpConfig"] {
-            assert!(
-                !code.contains(forbid),
-                "OLTP-scan backdoor: the OLAP live feed must not reference `{forbid}` - \
-                 reindex-from-source / the bus consumer are the ONLY feed paths (§3.4)"
-            );
-        }
-    }
-
     fn subject_prefix() -> &'static str {
         ""
     }

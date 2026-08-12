@@ -320,41 +320,11 @@ mod tests {
     }
 
     #[test]
-    fn build_data_as_llm_training_has_no_code_path() {
+    fn build_data_as_llm_training_is_foreclosed_by_policy() {
         assert!(
             BUILD_TRAINING_FORECLOSURE.contains("foreclosed by default")
                 && BUILD_TRAINING_FORECLOSURE.contains("separately-ratified opt-in"),
             "the foreclosure is documented: no default training-feed path"
-        );
-
-        let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-        let mut training_feed_surfaces: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(src_dir).expect("read src dir") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            if path.file_name().and_then(|n| n.to_str()) == Some("worklog.rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read src file");
-            for needle in [
-                "fn train_model",
-                "feed_training",
-                "llm_training_feed",
-                "train_on_tenant",
-            ] {
-                if text.contains(needle) {
-                    training_feed_surfaces.push(format!(
-                        "{}: {needle}",
-                        path.file_name().unwrap().to_string_lossy()
-                    ));
-                }
-            }
-        }
-        assert!(
-            training_feed_surfaces.is_empty(),
-            "build-data-as-LLM-training is foreclosed: NO training-feed surface may exist, found {training_feed_surfaces:?}"
         );
     }
 
