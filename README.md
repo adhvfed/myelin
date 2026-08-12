@@ -157,6 +157,8 @@ myelin chat create engineering --topic "Release coordination" --idempotency-key 
 myelin chat send 01J... "Ready for review." --idempotency-key release-message
 myelin chat ref 01J... myelin://acme/issue/issue/ENG-41 --idempotency-key release-issue
 myelin chat history 01J...
+myelin ref links myelin://acme/chat/message/01J...
+myelin ref backlinks myelin://acme/issue/issue/ENG-41
 
 myelin doc page list
 myelin doc page create --title "Deployment runbook" --template runbook \

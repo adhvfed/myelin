@@ -9,9 +9,22 @@ use super::terminal_safe_single_line;
 pub fn render_response(value: &Value, call: Option<&EdgeCall>) -> Option<String> {
     let root = value.get("root_ref")?.as_str()?;
     let items = value.get("items")?.as_array()?;
-    let mut output = format!("Backlinks to {}\n", terminal_safe_single_line(root));
+    let outgoing = call.is_some_and(|call| call.path == "/v1/refs/links");
+    let mut output = format!(
+        "{} {}\n",
+        if outgoing {
+            "Links from"
+        } else {
+            "Backlinks to"
+        },
+        terminal_safe_single_line(root)
+    );
     if items.is_empty() {
-        output.push_str("(no visible backlinks)\n");
+        output.push_str(if outgoing {
+            "(no visible links)\n"
+        } else {
+            "(no visible backlinks)\n"
+        });
     }
     for item in items {
         let relation = terminal_safe_single_line(item.get("relation")?.as_str()?);
@@ -34,7 +47,8 @@ pub fn render_response(value: &Value, call: Option<&EdgeCall>) -> Option<String>
             .ok()?;
         let _ = writeln!(
             output,
-            "… (more - run: myelin ref backlinks {} --cursor {})",
+            "… (more - run: myelin ref {} {} --cursor {})",
+            if outgoing { "links" } else { "backlinks" },
             terminal_safe_single_line(&decoded),
             terminal_safe_single_line(cursor)
         );
@@ -64,6 +78,32 @@ mod tests {
         assert_eq!(
             rendered,
             "Backlinks to myelin://acme/issue/issue/ENG-41\nlinks      myelin://acme/chat/message/M1#message-M1  by agent:release-helper\n"
+        );
+    }
+
+    #[test]
+    fn outgoing_context_reads_in_the_direction_the_user_asked_for() {
+        let call = crate::dispatch::refs_dispatch(&[
+            "links",
+            "myelin://acme/knowledge/page/01J00000000000000000000000",
+        ])
+        .unwrap();
+        let rendered = render_response(
+            &serde_json::json!({
+                "root_ref": "myelin://acme/knowledge/page/01J00000000000000000000000",
+                "items": [{
+                    "ref": "myelin://acme/issue/issue/ENG-41",
+                    "relation": "links",
+                    "origin_actor": "human:founder"
+                }],
+                "page": { "next_cursor": null, "limit": 50 }
+            }),
+            Some(&call),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "Links from myelin://acme/knowledge/page/01J00000000000000000000000\nlinks      myelin://acme/issue/issue/ENG-41  by human:founder\n"
         );
     }
 }

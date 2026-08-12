@@ -216,6 +216,32 @@ async function runCli(configDirectory: string, ...args: string[]) {
   return runCliWith(configDirectory, {}, args);
 }
 
+async function findThroughEveryCliPage(
+  configDirectory: string,
+  resource: "agent" | "automation",
+  id: string,
+): Promise<JsonRecord> {
+  let cursor: string | undefined;
+  const visited = new Set<string>();
+  for (;;) {
+    const args = ["--json", resource, "list", "--limit", "100"];
+    if (cursor) args.push("--cursor", cursor);
+    const listed = await runCli(configDirectory, ...args);
+    expect(listed.exitCode, listed.stderr).toBe(0);
+    const envelope = record(JSON.parse(listed.stdout), `${resource} roster page`);
+    const item = array(envelope.items, `${resource} roster items`)
+      .map((value, index) => record(value, `${resource} roster item ${index}`))
+      .find((value) => value.id === id);
+    if (item) return item;
+
+    const next = record(envelope.page, `${resource} roster paging`).next_cursor;
+    if (next === null) throw new Error(`${resource} ${id} was absent after walking every roster page`);
+    cursor = string(next, `${resource} roster cursor`);
+    if (visited.has(cursor)) throw new Error(`${resource} roster repeated cursor ${cursor}`);
+    visited.add(cursor);
+  }
+}
+
 async function runCliWith(
   configDirectory: string,
   options: { environment?: NodeJS.ProcessEnv; input?: string },
@@ -653,25 +679,12 @@ describe("the CLI authentication journey", () => {
         agent: { id: activated.agent.id, ref: activated.agent.ref },
       });
 
-      const agentRoster = await runCli(
-        configDirectory,
-        "--json",
-        "agent",
-        "list",
-        "--limit",
-        "100",
-      );
-      expect(agentRoster.exitCode, agentRoster.stderr).toBe(0);
-      const roster = JSON.parse(agentRoster.stdout) as {
-        items: Array<{ id: string; ref: string; name: string }>;
-      };
-      expect(roster.items).toContainEqual(
-        expect.objectContaining({
+      expect(await findThroughEveryCliPage(configDirectory, "agent", activated.agent.id))
+        .toMatchObject({
           id: activated.agent.id,
           ref: activated.agent.ref,
           name: agentName,
-        }),
-      );
+        });
 
       const showAgent = await runCli(configDirectory, "agent", "show", activated.agent.id);
       expect(showAgent.exitCode, showAgent.stderr).toBe(0);
@@ -791,18 +804,8 @@ describe("the CLI authentication journey", () => {
         trigger: { id: automationId, run_as_agent_id: hostedAgentId },
       });
 
-      const automationRoster = await runCli(
-        configDirectory,
-        "--json",
-        "automation",
-        "list",
-        "--limit",
-        "100",
-      );
-      expect(automationRoster.exitCode, automationRoster.stderr).toBe(0);
-      expect(
-        array(record(JSON.parse(automationRoster.stdout), "automation roster").items, "automations"),
-      ).toEqual(expect.arrayContaining([expect.objectContaining({ id: automationId })]));
+      expect(await findThroughEveryCliPage(configDirectory, "automation", automationId))
+        .toMatchObject({ id: automationId });
 
       const showAutomation = await runCli(
         configDirectory,
@@ -1953,6 +1956,31 @@ describe("the CLI authentication journey", () => {
           relation_class: "reference",
         });
       }
+
+      const outgoingContext = await eventually<JsonRecord>(
+        async () => {
+          const listed = await runCli(
+            configDirectory,
+            "--json",
+            "ref",
+            "links",
+            string(postedByAgent.ref, "agent-authored context reference"),
+          );
+          expect(listed.exitCode, listed.stderr).toBe(0);
+          const response = record(JSON.parse(listed.stdout), "permission-filtered outgoing links");
+          const targets = array(response.items, "visible outgoing link items")
+            .map((item, index) => record(item, `visible outgoing link ${index}`))
+            .filter((item) => item.source_root_ref === postedByAgent.ref);
+          return targets.length === 2 ? response : undefined;
+        },
+        { description: "the agent's context message to lead to both pieces of delivery work" },
+      );
+      expect(array(outgoingContext.items, "outgoing context targets")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ target_root_ref: agentIssueRef, relation: "links" }),
+          expect.objectContaining({ target_root_ref: agentPullRequestRef, relation: "links" }),
+        ]),
+      );
 
       // The target is gated too. Knowing (or guessing) a private canonical ref cannot turn the
       // graph into an existence oracle for another developer.
