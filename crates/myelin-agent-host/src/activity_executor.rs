@@ -17,7 +17,9 @@ use myelin_mcp::{
 };
 use myelin_notif::agent_effect_approval_targets;
 use myelin_notif::pg_inbox::PgInboxStore;
-use myelin_storage::hitl_gate_durable::{DurableHitlGateBacking, GateState};
+use myelin_storage::hitl_gate_durable::{
+    DurableHitlGateBacking, GateDecideError, GateRecord, GateState,
+};
 use myelin_storage::reserve_settle::{CostLedger, ReservationState, RunId as CostRunId};
 use myelin_storage::{PgOutboxBacking, SubstrateProvider, TenantScope};
 use myelin_tenancy::ArtifactRef;
@@ -196,64 +198,154 @@ impl AgentHostActivityExecutor {
         ))
     }
 
-    fn expire_gate(
+    fn ensure_gate_belongs_to_run(
+        input: &HostedAgentWorkflowInput,
+        gate: &GateRecord,
+    ) -> Result<(), String> {
+        if gate.run_id != input.run_id || gate.requested_by != input.agent.principal_id.0 {
+            return Err("hosted approval gate is not bound to this run".into());
+        }
+        Ok(())
+    }
+
+    fn load_gate(&self, scope: &TenantScope, gate_id: &str) -> Result<GateRecord, String> {
+        self.drive(self.gates.fetch(scope, gate_id))
+            .map_err(|error| format!("load hosted approval gate: {error}"))?
+            .ok_or_else(|| "hosted approval gate disappeared".to_string())
+    }
+
+    fn audit_terminal_gate(
         &self,
         input: &HostedAgentWorkflowInput,
-        gate_id: &str,
-        now_secs: i64,
+        scope: &TenantScope,
+        gate: &GateRecord,
+        reason: HostedAgentStopReason,
     ) -> Result<(), String> {
-        let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
-        let outcome = self
-            .drive(self.gates.expire_if_due(&scope, gate_id, now_secs))
-            .map_err(|error| format!("expire hosted approval gate: {error}"))?
-            .map_err(|error| format!("expire hosted approval gate: {error}"))?;
-        let gate = outcome.record;
-        if gate.run_id != input.run_id || gate.requested_by != input.agent.principal_id.0 {
-            return Err("expired approval gate is not bound to this hosted run".into());
-        }
         let contract = approval_contract_from_effect_key(&gate.effect_id).ok_or_else(|| {
-            "expired approval gate has no registered approval contract".to_string()
+            "terminal approval gate has no registered approval contract".to_string()
         })?;
         let audited_at_unix = gate.decided_at_unix.unwrap_or(gate.expires_at_unix);
         let audited_at = chrono::DateTime::from_timestamp(audited_at_unix, 0)
-            .ok_or_else(|| "hosted approval expiry timestamp is invalid".to_string())?
+            .ok_or_else(|| "hosted approval decision timestamp is invalid".to_string())?
             .to_rfc3339();
-        let actor = Principal::new(
-            input.tenant.clone(),
-            input.region.clone(),
-            PrincipalId("service:mcp-hitl-expiry".into()),
-            PrincipalKind::Service,
-            DataRole::Controller,
-            PrincipalStatus::Active,
-        );
+        let (phase, actor, jti) = match reason {
+            HostedAgentStopReason::Rejected => {
+                let decided_by = gate
+                    .decided_by
+                    .clone()
+                    .ok_or_else(|| "rejected hosted approval has no deciding human".to_string())?;
+                let actor = if input.trigger_actor.principal_id.0 == decided_by
+                    && input.trigger_actor.kind == PrincipalKind::Human
+                {
+                    input.trigger_actor.clone()
+                } else {
+                    Principal::new(
+                        input.tenant.clone(),
+                        input.region.clone(),
+                        PrincipalId(decided_by),
+                        PrincipalKind::Human,
+                        DataRole::Controller,
+                        PrincipalStatus::Active,
+                    )
+                };
+                (
+                    AuditPhase::Rejected,
+                    actor,
+                    format!("human-decision:{}", gate.gate_id),
+                )
+            }
+            HostedAgentStopReason::Expired => (
+                AuditPhase::Expired,
+                Principal::new(
+                    input.tenant.clone(),
+                    input.region.clone(),
+                    PrincipalId("service:mcp-hitl-expiry".into()),
+                    PrincipalKind::Service,
+                    DataRole::Controller,
+                    PrincipalStatus::Active,
+                ),
+                "system:hitl-expiry".into(),
+            ),
+        };
         OutboxGovernanceAudit::new(
             self.outbox.clone(),
             Arc::new(GateAuditMinter::new(
                 input.tenant.as_str(),
                 &gate.gate_id,
-                AuditPhase::Expired,
+                phase,
             )),
         )
         .record(GovernanceAuditRecord {
-            scope: &scope,
+            scope,
             actor: &actor,
             run_id: &RunId(gate.run_id.clone()),
             target: GovernanceAuditTarget::Gate(&gate.gate_id),
             tool: contract.tool(),
-            jti: "system:hitl-expiry",
-            phase: AuditPhase::Expired,
+            jti: &jti,
+            phase,
             outcome: None,
             now: &Timestamp(audited_at),
         })
-        .map_err(|error| format!("audit hosted approval expiry: {error}"))?;
+        .map_err(|error| format!("audit terminal hosted approval: {error}"))
+    }
+
+    fn complete_gate_notifications(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        gate: &GateRecord,
+    ) -> Result<(), String> {
         for target in agent_effect_approval_targets(&input.tenant, &input.region, &gate) {
             self.drive(
                 self.inbox
                     .complete_if_present(&target.scope, &target.item_id),
             )
-            .map_err(|error| format!("complete expired approval inbox item: {error:?}"))?;
+            .map_err(|error| format!("complete terminal approval inbox item: {error:?}"))?;
         }
         Ok(())
+    }
+
+    fn reconcile_stopped_gate(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        gate_id: &str,
+        requested_reason: HostedAgentStopReason,
+    ) -> Result<HostedAgentStopReason, String> {
+        let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
+        let (gate, reason) = match requested_reason {
+            HostedAgentStopReason::Rejected => (
+                self.load_gate(&scope, gate_id)?,
+                HostedAgentStopReason::Rejected,
+            ),
+            HostedAgentStopReason::Expired => {
+                let now_secs = self.deadline_clock.now_unix_secs()?;
+                match self
+                    .drive(self.gates.expire_if_due(&scope, gate_id, now_secs))
+                    .map_err(|error| format!("expire hosted approval gate: {error}"))?
+                {
+                    Ok(outcome) => (outcome.record, HostedAgentStopReason::Expired),
+                    Err(GateDecideError::AlreadyDecided(GateState::Rejected)) => (
+                        self.load_gate(&scope, gate_id)?,
+                        HostedAgentStopReason::Rejected,
+                    ),
+                    Err(error) => return Err(format!("expire hosted approval gate: {error}")),
+                }
+            }
+        };
+        Self::ensure_gate_belongs_to_run(input, &gate)?;
+        let expected_state = match reason {
+            HostedAgentStopReason::Rejected => GateState::Rejected,
+            HostedAgentStopReason::Expired => GateState::Expired,
+        };
+        if gate.state != expected_state {
+            return Err(format!(
+                "hosted approval is {} but its stop reason is {}",
+                gate.state.as_str(),
+                reason.as_str(),
+            ));
+        }
+        self.audit_terminal_gate(input, &scope, &gate, reason)?;
+        self.complete_gate_notifications(input, &gate)?;
+        Ok(reason)
     }
 }
 
@@ -309,14 +401,9 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
             Ok(_) => Ok(HostedAgentActivityOutcome::Completed(Self::run_ref(input))),
             Err(AgentHostError::Run(SkeletonError::ApprovalRequired { gate_id })) => {
                 let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
-                let gate = self
-                    .drive(self.gates.fetch(&scope, &gate_id))
-                    .map_err(|error| format!("load hosted approval gate: {error}"))?
-                    .ok_or_else(|| "hosted approval gate disappeared".to_string())?;
-                if gate.run_id != input.run_id
-                    || gate.requested_by != input.agent.principal_id.0
-                    || gate.state != GateState::Waiting
-                {
+                let gate = self.load_gate(&scope, &gate_id)?;
+                Self::ensure_gate_belongs_to_run(input, &gate)?;
+                if gate.state != GateState::Waiting {
                     return Err("hosted approval gate is not bound to this waiting run".into());
                 }
                 Ok(HostedAgentActivityOutcome::ApprovalRequired {
@@ -339,9 +426,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         if !activity_key.starts_with(&format!("{}/", input.run_id)) {
             return Err("hosted stop activity key belongs to a different run".into());
         }
-        if reason == HostedAgentStopReason::Expired {
-            self.expire_gate(input, gate_id, self.deadline_clock.now_unix_secs()?)?;
-        }
+        let reason = self.reconcile_stopped_gate(input, gate_id, reason)?;
         let mut ledger = CostLedger::with_pg(self.provider.clone());
         ledger
             .settle(&input.tenant, &CostRunId::new(input.run_id.clone()), &[])

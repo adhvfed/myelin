@@ -17,7 +17,9 @@ use myelin_identity::{
 use myelin_identity_service::{NewAgent, PgAgentRegistry, HOSTED_LUNA_RUNTIME};
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_notif::{agent_effect_approval_targets, pending_agent_effect_approval};
-use myelin_storage::hitl_gate_durable::{opaque_gate_id, GateRecord, GateState, HitlVerdictStore};
+use myelin_storage::hitl_gate_durable::{
+    opaque_gate_id, DurableHitlGateBacking, GateRecord, GateState, HitlVerdictStore,
+};
 use myelin_storage::migration::{HotTables, Migrations};
 use myelin_storage::reserve_settle::{CostLedger, ReservationState, RunId};
 use myelin_storage::{
@@ -199,6 +201,179 @@ fn governed_input(tenant: &TenantId, region: &Region, run_id: &str) -> HostedAge
             payload: serde_json::json!({}),
         },
     }
+}
+
+struct WaitingApprovalStory {
+    input: HostedAgentWorkflowInput,
+    cost_run: RunId,
+    gate_id: String,
+    scope: TenantScope,
+    gate: GateRecord,
+    inbox: PgInboxStore,
+}
+
+async fn stage_waiting_merge_approval(
+    app: &SubstrateProvider,
+    tenant: &TenantId,
+    region: &Region,
+    run_label: &str,
+    pull_request_number: u64,
+) -> WaitingApprovalStory {
+    let run_id = unique(run_label);
+    let input = governed_input(tenant, region, &run_id);
+    let cost_run = RunId::new(run_id.clone());
+    let mut ledger = CostLedger::with_pg(app.clone());
+    ledger
+        .reserve(
+            tenant.clone(),
+            cost_run.clone(),
+            MicroUsd(input.budget_minor_units),
+            MicroUsd(input.budget_minor_units),
+        )
+        .expect("the waiting run has a governed reservation");
+    ledger
+        .begin(tenant, &cost_run)
+        .expect("the waiting run started before asking a human");
+
+    let gate_id = opaque_gate_id();
+    let scope = TenantScope::from_verified_token(&input.agent, region.clone());
+    let gate = GateRecord {
+        gate_id: gate_id.clone(),
+        run_id,
+        effect_id: myelin_mcp::governance::mcp_effect_key(
+            "git.merge",
+            &serde_json::json!({"repo": "platform", "number": pull_request_number}),
+        ),
+        risk_summary: format!("Merge pull request platform#{pull_request_number}").into_bytes(),
+        cost_estimate: 0,
+        approver_filter: vec!["founder".into(), "maintainer".into()],
+        state: GateState::Waiting,
+        card_ref: Some(format!(
+            "myelin://{}/git/pr/platform:{pull_request_number}",
+            tenant.0
+        )),
+        requested_by: input.agent.principal_id.0.clone(),
+        decided_by: None,
+        opened_at_unix: 90,
+        decided_at_unix: None,
+        expires_at_unix: 100,
+        approval_consumed_at_unix: None,
+    };
+    HitlVerdictStore::with_pg(app.clone())
+        .open(&scope, gate.clone())
+        .expect("the exact effect waits durably");
+    let inbox = PgInboxStore::new(app.db_pool().clone());
+    for recipient in &gate.approver_filter {
+        inbox
+            .ensure(&pending_agent_effect_approval(
+                tenant, region, recipient, &gate,
+            ))
+            .await
+            .expect("each eligible human sees the same exact decision");
+    }
+    WaitingApprovalStory {
+        input,
+        cost_run,
+        gate_id,
+        scope,
+        gate,
+        inbox,
+    }
+}
+
+async fn terminal_approval_executor(
+    app: &SubstrateProvider,
+    cell_label: &str,
+) -> AgentHostActivityExecutor {
+    let seal_key = SealKey::from_encoded(&"66".repeat(32)).expect("a 32-byte test seal key");
+    let host = Arc::new(
+        AgentHost::new(
+            app.clone(),
+            unique(cell_label),
+            &seal_key,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("the production host starts"),
+    );
+    AgentHostActivityExecutor::new(
+        host,
+        app.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(RefusingModelFactory {
+            calls: AtomicUsize::new(0),
+        }),
+    )
+    .with_deadline_clock(Arc::new(FixedDeadlineClock(101)))
+}
+
+async fn assert_approval_cards_are_done(story: &WaitingApprovalStory, message: &str) {
+    for target in
+        agent_effect_approval_targets(&story.input.tenant, &story.input.region, &story.gate)
+    {
+        assert_eq!(
+            story
+                .inbox
+                .get(&target.scope, &target.item_id)
+                .await
+                .expect("the terminal approval remains in history")
+                .item
+                .state,
+            "done",
+            "{message}",
+        );
+    }
+}
+
+async fn approval_audit_count(
+    app: &SubstrateProvider,
+    tenant: &TenantId,
+    run_id: &str,
+    event_type: &str,
+) -> i64 {
+    let aggregate = format!("mcp-run:{run_id}");
+    let event_type = event_type.to_string();
+    app.with_tenant_tx(&tenant.0, move |conn| {
+        Box::pin(async move {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM outbox \
+                 WHERE aggregate = $1 AND envelope->>'type_' = $2",
+            )
+            .bind(&aggregate)
+            .bind(&event_type)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+        })
+    })
+    .await
+    .expect("read the terminal approval audit")
+}
+
+async fn clean_terminal_approval_story(app: &SubstrateProvider, tenant: &TenantId) {
+    let cleanup_tenant = tenant.0.clone();
+    app.with_tenant_tx(&tenant.0, move |conn| {
+        Box::pin(async move {
+            for statement in [
+                "DELETE FROM outbox_quarantine WHERE event_id IN \
+                 (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",
+                "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
+                "DELETE FROM notif_inbox_item WHERE tenant_id = $1",
+                "DELETE FROM agent_hitl_gate WHERE tenant_id = $1",
+                "DELETE FROM cost_event WHERE tenant_id = $1",
+                "DELETE FROM cost_reservation WHERE tenant_id = $1",
+            ] {
+                sqlx::query(statement)
+                    .bind(&cleanup_tenant)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .expect("clean the isolated approval story");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -525,95 +700,27 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_expired_hosted_approval_settles_once_and_leaves_no_actionable_card() {
+async fn terminal_hosted_approvals_settle_once_even_when_their_wake_signal_is_lost() {
     let Some(app) = test_provider().await else {
         return;
     };
     let tenant = TenantId(unique("hosted-expiry"));
     let region = Region(app.config().region.clone());
-    let run_id = unique("expired-run");
-    let input = governed_input(&tenant, &region, &run_id);
-    let cost_run = RunId::new(run_id.clone());
-    let mut ledger = CostLedger::with_pg(app.clone());
-    ledger
-        .reserve(
-            tenant.clone(),
-            cost_run.clone(),
-            MicroUsd(input.budget_minor_units),
-            MicroUsd(input.budget_minor_units),
-        )
-        .expect("the waiting run has a governed reservation");
-    ledger
-        .begin(&tenant, &cost_run)
-        .expect("the waiting run started before asking a human");
-
-    let gate_id = opaque_gate_id();
-    let scope = TenantScope::from_verified_token(&input.agent, region.clone());
-    let gate = GateRecord {
-        gate_id: gate_id.clone(),
-        run_id: run_id.clone(),
-        effect_id: myelin_mcp::governance::mcp_effect_key(
-            "git.merge",
-            &serde_json::json!({"repo": "platform", "number": 7}),
-        ),
-        risk_summary: b"Merge pull request platform#7".to_vec(),
-        cost_estimate: 0,
-        approver_filter: vec!["founder".into(), "maintainer".into()],
-        state: GateState::Waiting,
-        card_ref: Some(format!("myelin://{}/git/pr/platform:7", tenant.0)),
-        requested_by: input.agent.principal_id.0.clone(),
-        decided_by: None,
-        opened_at_unix: 90,
-        decided_at_unix: None,
-        expires_at_unix: 100,
-        approval_consumed_at_unix: None,
-    };
-    HitlVerdictStore::with_pg(app.clone())
-        .open(&scope, gate.clone())
-        .expect("the exact effect waits durably");
-    let inbox = PgInboxStore::new(app.db_pool().clone());
-    for recipient in &gate.approver_filter {
-        inbox
-            .ensure(&pending_agent_effect_approval(
-                &tenant, &region, recipient, &gate,
-            ))
-            .await
-            .expect("each eligible human sees the same exact decision");
-    }
-
-    let seal_key = SealKey::from_encoded(&"66".repeat(32)).expect("a 32-byte test seal key");
-    let host = Arc::new(
-        AgentHost::new(
-            app.clone(),
-            unique("hosted-expiry-cell"),
-            &seal_key,
-            tokio::runtime::Handle::current(),
-        )
-        .await
-        .expect("the production host starts"),
-    );
-    let executor = AgentHostActivityExecutor::new(
-        host,
-        app.clone(),
-        tokio::runtime::Handle::current(),
-        Arc::new(RefusingModelFactory {
-            calls: AtomicUsize::new(0),
-        }),
-    )
-    .with_deadline_clock(Arc::new(FixedDeadlineClock(101)));
-    let stop_key = format!("{run_id}/agent.run:2/expire");
+    let expired = stage_waiting_merge_approval(&app, &tenant, &region, "expired-run", 7).await;
+    let executor = terminal_approval_executor(&app, "hosted-expiry-cell").await;
+    let stop_key = format!("{}/agent.run:2/expire", expired.input.run_id);
 
     let first = executor
         .stop(
-            &input,
+            &expired.input,
             &stop_key,
             90,
-            &gate_id,
+            &expired.gate_id,
             HostedAgentStopReason::Expired,
         )
         .expect("recovery closes every durable surface against live time");
     let expired_gate = HitlVerdictStore::with_pg(app.clone())
-        .fetch(&scope, &gate_id)
+        .fetch(&expired.scope, &expired.gate_id)
         .expect("the gate remains queryable");
     assert_eq!(expired_gate.state, GateState::Expired);
     assert_eq!(
@@ -622,73 +729,94 @@ async fn an_expired_hosted_approval_settles_once_and_leaves_no_actionable_card()
         "journaled workflow time cannot freeze an approval deadline",
     );
     assert_eq!(
-        CostLedger::with_pg(app.clone()).state_of(&tenant, &cost_run),
+        CostLedger::with_pg(app.clone()).state_of(&tenant, &expired.cost_run),
         Ok(Some(ReservationState::Settled)),
     );
-    for target in agent_effect_approval_targets(&tenant, &region, &gate) {
-        assert_eq!(
-            inbox
-                .get(&target.scope, &target.item_id)
-                .await
-                .expect("the projected approval remains in history")
-                .item
-                .state,
-            "done",
-            "expiry never leaves another eligible human with a stale action",
-        );
-    }
+    assert_approval_cards_are_done(
+        &expired,
+        "expiry never leaves another eligible human with a stale action",
+    )
+    .await;
 
     assert_eq!(
         executor
             .stop(
-                &input,
+                &expired.input,
                 &stop_key,
                 101,
-                &gate_id,
+                &expired.gate_id,
                 HostedAgentStopReason::Expired,
             )
             .expect("timer replay is idempotent"),
         first,
     );
-    let aggregate = format!("mcp-run:{run_id}");
-    let expiry_audits: i64 = app
-        .with_tenant_tx(&tenant.0, move |conn| {
-            Box::pin(async move {
-                sqlx::query_scalar(
-                    "SELECT count(*) FROM outbox \
-                     WHERE aggregate = $1 AND envelope->>'type_' = 'git.merge.expired'",
-                )
-                .bind(&aggregate)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
-            })
-        })
-        .await
-        .expect("read the expiry audit");
+    let expiry_audits =
+        approval_audit_count(&app, &tenant, &expired.input.run_id, "git.merge.expired").await;
     assert_eq!(expiry_audits, 1, "timer replay emits one governance fact");
 
-    let cleanup_tenant = tenant.0.clone();
-    app.with_tenant_tx(&tenant.0, move |conn| {
-        Box::pin(async move {
-            for statement in [
-                "DELETE FROM outbox_quarantine WHERE event_id IN \
-                 (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",
-                "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
-                "DELETE FROM notif_inbox_item WHERE tenant_id = $1",
-                "DELETE FROM agent_hitl_gate WHERE tenant_id = $1",
-                "DELETE FROM cost_event WHERE tenant_id = $1",
-                "DELETE FROM cost_reservation WHERE tenant_id = $1",
-            ] {
-                sqlx::query(statement)
-                    .bind(&cleanup_tenant)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
-            }
-            Ok(())
-        })
-    })
-    .await
-    .expect("clean the isolated expiry story");
+    let rejected = stage_waiting_merge_approval(&app, &tenant, &region, "rejected-run", 8).await;
+    let decision = DurableHitlGateBacking::new(app.clone())
+        .decide(
+            &rejected.scope,
+            &rejected.gate_id,
+            GateState::Rejected,
+            "founder",
+            PrincipalKind::Human,
+            95,
+        )
+        .await
+        .expect("the rejection commits even when its later wake signal is lost")
+        .expect("the founder may reject the exact effect");
+    assert!(decision.changed);
+
+    let rejected_stop_key = format!("{}/agent.run:2/expire", rejected.input.run_id);
+    let rejected_stop = executor
+        .stop(
+            &rejected.input,
+            &rejected_stop_key,
+            90,
+            &rejected.gate_id,
+            HostedAgentStopReason::Expired,
+        )
+        .expect("the timer discovers and preserves the durable rejection");
+    assert!(
+        rejected_stop.0.contains(":stopped:rejected:gate:"),
+        "a missed wake cannot relabel a human rejection as expiry",
+    );
+    let durable_rejection = HitlVerdictStore::with_pg(app.clone())
+        .fetch(&rejected.scope, &rejected.gate_id)
+        .expect("the rejected gate remains queryable");
+    assert_eq!(durable_rejection.state, GateState::Rejected);
+    assert_eq!(durable_rejection.decided_at_unix, Some(95));
+    assert_eq!(
+        CostLedger::with_pg(app.clone()).state_of(&tenant, &rejected.cost_run),
+        Ok(Some(ReservationState::Settled)),
+    );
+    assert_approval_cards_are_done(
+        &rejected,
+        "a missed wake cannot leave another human with a stale rejection card",
+    )
+    .await;
+    assert_eq!(
+        executor
+            .stop(
+                &rejected.input,
+                &rejected_stop_key,
+                101,
+                &rejected.gate_id,
+                HostedAgentStopReason::Expired,
+            )
+            .expect("missed-wake recovery is replay-idempotent"),
+        rejected_stop,
+    );
+    let rejected_audits =
+        approval_audit_count(&app, &tenant, &rejected.input.run_id, "git.merge.rejected").await;
+    let false_expiry_audits =
+        approval_audit_count(&app, &tenant, &rejected.input.run_id, "git.merge.expired").await;
+    assert_eq!(
+        (rejected_audits, false_expiry_audits),
+        (1, 0),
+        "recovery records the rejection once and never invents an expiry",
+    );
+    clean_terminal_approval_story(&app, &tenant).await;
 }
