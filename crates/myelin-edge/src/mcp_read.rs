@@ -1,5 +1,6 @@
 use crate::{
-    DurableChatReadApi, DurableCiReadApi, DurableIssueReadApi, DurableKnowledgeReadApi, EdgeError,
+    DurableChatReadApi, DurableCiReadApi, DurableIssueReadApi, DurableKnowledgeReadApi,
+    DurableProjectReadApi, EdgeError,
 };
 use myelin_ci_controlplane::surfacing_store::CI_LOG_RANGE_DEFAULT;
 use myelin_identity::Principal;
@@ -23,6 +24,7 @@ pub struct McpReadExecutor {
     knowledge: Option<DurableKnowledgeReadApi>,
     chat: Option<DurableChatReadApi>,
     git: Option<Arc<DurableGitBackend>>,
+    projects: Option<DurableProjectReadApi>,
     authority: Arc<RunTokenAuthorizer>,
     access_subject: Principal,
 }
@@ -39,6 +41,7 @@ impl McpReadExecutor {
             knowledge: None,
             chat: None,
             git: None,
+            projects: None,
             authority,
             access_subject,
         }
@@ -61,6 +64,11 @@ impl McpReadExecutor {
 
     pub fn with_git(mut self, git: Arc<DurableGitBackend>) -> Self {
         self.git = Some(git);
+        self
+    }
+
+    pub fn with_projects(mut self, projects: DurableProjectReadApi) -> Self {
+        self.projects = Some(projects);
         self
     }
 }
@@ -218,6 +226,16 @@ impl DirectReadExecutor for McpReadExecutor {
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
                     .read_file(access_subject, repo, gitref, path)
+                    .map_err(map_edge_error)
+            }
+            "projects.list" => {
+                exact_fields(arguments, &[], &["limit", "cursor"])?;
+                let limit = optional_u32(arguments, "limit")?.unwrap_or(50);
+                let cursor = optional_string(arguments, "cursor")?.map(str::to_string);
+                self.projects
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .list(access_subject, limit, cursor)
                     .map_err(map_edge_error)
             }
             _ => Err(DirectReadError::Unavailable),

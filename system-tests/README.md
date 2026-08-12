@@ -51,7 +51,8 @@ The suite is intentionally organized around externally visible contracts:
   once without copying the browser credential.
 - `cli-authentication` approves two browser identities into named local contexts, switches between
   them without exposing either secret, configures and operates external and hosted agents plus
-  event-driven automations without integration keys, binds native Git to exactly one profile,
+  event-driven automations without integration keys, lets an agent discover visible projects,
+  binds native Git to exactly one profile,
   carries an agent issue closure through a canonical human approval card and an exact lost-response
   retry, refuses an expired session before transport, and removes both OS-backed credentials on
   logout.

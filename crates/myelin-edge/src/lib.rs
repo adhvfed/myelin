@@ -106,7 +106,7 @@ pub use knowledge_http::{
 pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
 pub use privacy_http::register_privacy;
-pub use project_http::register_projects;
+pub use project_http::{register_projects, DurableProjectReadApi};
 pub use refs_http::{register_refs, DurableRefsReadApi};
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
 pub use repo_authz_live::{

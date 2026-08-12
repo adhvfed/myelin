@@ -514,6 +514,7 @@ pub const GOVERNED_DIRECT_READ_TOOLS: &[&str] = &[
     "issues.view",
     "knowledge.list_pages",
     "knowledge.read_page",
+    "projects.list",
 ];
 
 fn read_resource_ref(

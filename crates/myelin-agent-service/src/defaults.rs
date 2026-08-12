@@ -63,6 +63,8 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("chat", "invite") => true,
         ("chat", "archive_channel") => true,
 
+        ("projects", "list") => false,
+
         _ => true,
     }
 }

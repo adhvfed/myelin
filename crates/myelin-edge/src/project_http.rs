@@ -20,8 +20,51 @@ const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
 
 #[derive(Clone)]
+pub struct DurableProjectReadApi {
+    store: PgProjectStore,
+    runtime: Handle,
+}
+
+impl DurableProjectReadApi {
+    pub fn new(store: PgProjectStore, runtime: Handle) -> Self {
+        Self { store, runtime }
+    }
+
+    pub fn list(
+        &self,
+        principal: &myelin_identity::Principal,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Value, EdgeError> {
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            return Err(EdgeError::BadRequest(
+                "project limit must be an integer between 1 and 100".into(),
+            ));
+        }
+        let mut visible = drive_result_on_runtime(
+            &self.runtime,
+            self.store
+                .list_visible(principal, cursor.as_deref(), limit + 1),
+            ProjectError::Storage("project read requires the Edge multi-thread runtime".into()),
+        )
+        .map_err(map_project_error)?;
+        let has_more = visible.len() > limit as usize;
+        visible.truncate(limit as usize);
+        let next_cursor = has_more
+            .then(|| visible.last().map(|project| project.id.clone()))
+            .flatten();
+        let items = visible
+            .iter()
+            .map(|project| project_json(&principal.tenant.0, project))
+            .collect::<Vec<_>>();
+        Ok(page_envelope(json!(items), next_cursor, limit as usize))
+    }
+}
+
+#[derive(Clone)]
 struct ProjectHttpApi {
     store: PgProjectStore,
+    reads: DurableProjectReadApi,
     authz: StoreBackedCheck,
     runtime: Handle,
 }
@@ -127,26 +170,9 @@ impl Handler for ProjectListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_body(ctx, "project list")?;
         let (limit, cursor) = parse_page_query(&ctx.request.query)?;
-        let mut visible = self
-            .api
-            .drive(
-                self.api
-                    .store
-                    .list_visible(ctx.principal, cursor.as_deref(), limit + 1),
-            )
-            .map_err(map_project_error)?;
-        let has_more = visible.len() > limit as usize;
-        visible.truncate(limit as usize);
-        let next_cursor = has_more
-            .then(|| visible.last().map(|project| project.id.clone()))
-            .flatten();
-        let items = visible
-            .iter()
-            .map(|project| project_json(&ctx.principal.tenant.0, project))
-            .collect::<Vec<_>>();
         Ok(no_store(EdgeResponse::json(
             200,
-            &page_envelope(json!(items), next_cursor, limit as usize),
+            &self.api.reads.list(ctx.principal, limit, cursor)?,
         )))
     }
 }
@@ -157,8 +183,10 @@ pub fn register_projects(
     authz: StoreBackedCheck,
     runtime: Handle,
 ) -> GatewayBuilder {
+    let reads = DurableProjectReadApi::new(store.clone(), runtime.clone());
     let api = ProjectHttpApi {
         store,
+        reads,
         authz,
         runtime,
     };

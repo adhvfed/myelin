@@ -30,6 +30,7 @@ pub mod loop_guards;
 pub mod metering;
 pub mod migrations;
 pub mod mock;
+pub mod project_read_tools;
 pub mod schema;
 pub mod skeleton;
 pub mod tool_exec;
@@ -126,6 +127,10 @@ pub use issues_read_tools::{issues_read_tool_defs, LIST_ISSUES_TOOL, VIEW_ISSUE_
 
 pub use knowledge_mcp_tools::{
     knowledge_mcp_tool_defs, link_work_tool_def, LINK_WORK_TOOL, LIST_PAGES_TOOL, READ_PAGE_TOOL,
+};
+
+pub use project_read_tools::{
+    project_read_tool_defs, LIST_PROJECTS_TOOL, PROJECTS_SUBSYSTEM, PROJECTS_TOOL_VERSION,
 };
 
 pub use chat_read_tools::{chat_read_tool_defs, LIST_CONVERSATIONS_TOOL, READ_MESSAGES_TOOL};

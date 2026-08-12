@@ -533,6 +533,7 @@ describe("the CLI authentication journey", () => {
           "knowledge.link_work",
           "knowledge.list_pages",
           "knowledge.read_page",
+          "projects.list",
           "chat.list_conversations",
           "chat.post",
           "chat.read_messages",
@@ -579,6 +580,8 @@ describe("the CLI authentication journey", () => {
         "knowledge.list_pages",
         "--tool",
         "knowledge.read_page",
+        "--tool",
+        "projects.list",
         "--tool",
         "chat.list_conversations",
         "--tool",
@@ -628,6 +631,7 @@ describe("the CLI authentication journey", () => {
             { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 1 },
+            { name: "projects.list", version: 1 },
           ],
           grants: expect.arrayContaining([
             "agent.tools.read",
@@ -639,6 +643,7 @@ describe("the CLI authentication journey", () => {
             "issue.view",
             "knowledge.edit",
             "knowledge.read",
+            "project.view",
             "repo.pull",
             "repo.push",
             "run.view",
@@ -668,6 +673,7 @@ describe("the CLI authentication journey", () => {
           "knowledge.link_work",
           "knowledge.list_pages",
           "knowledge.read_page",
+          "projects.list",
           "chat.list_conversations",
           "chat.post",
           "chat.read_messages",
@@ -715,6 +721,8 @@ describe("the CLI authentication journey", () => {
         "knowledge.list_pages",
         "--tool",
         "knowledge.read_page",
+        "--tool",
+        "projects.list",
         "--tool",
         "chat.list_conversations",
         "--tool",
@@ -969,6 +977,7 @@ describe("the CLI authentication journey", () => {
             { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 1 },
+            { name: "projects.list", version: 1 },
           ],
           effective_grants: activated.agent.grants,
           state: "ready",
@@ -1061,6 +1070,7 @@ describe("the CLI authentication journey", () => {
         "knowledge.link_work",
         "knowledge.list_pages",
         "knowledge.read_page",
+        "projects.list",
       ]);
       const toolsByName = new Map(
         discoveredTools.map((tool) => [string(tool.name, "MCP tool name"), tool]),
@@ -1141,6 +1151,10 @@ describe("the CLI authentication journey", () => {
       expect(schemaFor("knowledge.read_page")).toMatchObject({
         type: "object",
         required: ["page_id"],
+        additionalProperties: false,
+      });
+      expect(schemaFor("projects.list")).toMatchObject({
+        type: "object",
         additionalProperties: false,
       });
 
@@ -1234,6 +1248,7 @@ describe("the CLI authentication journey", () => {
         "knowledge.link_work",
         "knowledge.list_pages",
         "knowledge.read_page",
+        "projects.list",
       ]);
 
       // Pausing a collaborator is one durable human action: new work stops and in-flight bearer
@@ -1958,14 +1973,28 @@ describe("the CLI authentication journey", () => {
       });
       expect(humanVisibleAgentPullRequest.number).toBe(agentPullRequestNumber);
 
-      // The collaborator can now turn what it learned into durable team work. Project metadata
-      // supplies the issue type and prefix, the human's live project access bounds the write, and
-      // a lost MCP response can be retried without creating a second ticket.
+      // The collaborator can discover the founder's projects through the same permission boundary
+      // instead of depending on an operator to hide a UUID in its prompt. That visible project
+      // metadata supplies the issue type and prefix for durable team work.
+      const projectPage = await askAgent(resumedRun, 18, "projects.list", { limit: 100 });
+      const agentVisibleProject = array(projectPage.items, "agent-visible projects")
+        .map((project, index) => record(project, `agent-visible project ${index}`))
+        .find((project) => project.name === cliProjectName);
+      expect(agentVisibleProject).toMatchObject({
+        id: createdProject.project.id,
+        ref: createdProject.project.ref,
+        name: cliProjectName,
+        issue_prefix: createdProject.project.issue_prefix,
+        default_issue_type_id: createdProject.project.default_issue_type_id,
+      });
+
+      // The human's live project access bounds the write, and a lost MCP response can be retried
+      // without creating a second ticket.
       const agentIssueTitle = uniqueName("Investigate the credentialless release failure");
       const agentIssueKey = `agent-issue-${randomUUID()}`;
       const createdByAgent = await askAgentToAct(
         resumedRun,
-        18,
+        19,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -1975,7 +2004,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentIssue = await askAgentToAct(
         resumedRun,
-        19,
+        20,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -2166,7 +2195,7 @@ describe("the CLI authentication journey", () => {
       const agentKnowledgeLinkKey = `agent-knowledge-link-${randomUUID()}`;
       const linkedByAgent = await askAgentToAct(
         resumedRun,
-        20,
+        21,
         "knowledge.link_work",
         {
           page_id: knowledgePageId,
@@ -2177,7 +2206,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentKnowledgeLink = await askAgentToAct(
         resumedRun,
-        21,
+        22,
         "knowledge.link_work",
         {
           page_id: knowledgePageId,
@@ -2273,7 +2302,7 @@ describe("the CLI authentication journey", () => {
       const agentPostKey = `agent-chat-${randomUUID()}`;
       const postedByAgent = await askAgentToAct(
         resumedRun,
-        18,
+        23,
         "chat.post",
         {
           conversation_id: conversationId,
@@ -2284,7 +2313,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentPost = await askAgentToAct(
         resumedRun,
-        19,
+        24,
         "chat.post",
         {
           conversation_id: conversationId,

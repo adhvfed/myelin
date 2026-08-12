@@ -1165,20 +1165,16 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     if git_wire.is_some() {
         builder = register_git_wire(builder, git_backend.clone());
     }
+    let projects = myelin_identity_service::PgProjectStore::new(provider.clone());
     let issue_mutations = myelin_edge::DurableIssueMutationApi::new(
         issue_store.clone(),
-        myelin_identity_service::PgProjectStore::new(provider.clone()),
+        projects.clone(),
         issue_authorizer.clone(),
         issue_reconciler.wakeup(),
         handle.clone(),
     );
     builder = register_issues(builder, issue_mutations.clone());
-    builder = register_projects(
-        builder,
-        myelin_identity_service::PgProjectStore::new(provider.clone()),
-        check.clone(),
-        handle.clone(),
-    );
+    builder = register_projects(builder, projects.clone(), check.clone(), handle.clone());
     builder = register_refs(
         builder,
         DurableRefsReadApi::new(provider.db_pool().clone(), repo_authz, handle.clone()),
@@ -1244,6 +1240,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 ),
                 mcp_chat.clone(),
                 DurableChatMutationApi::new(mcp_chat),
+                myelin_edge::DurableProjectReadApi::new(projects, handle.clone()),
             ),
             handle.clone(),
         ),

@@ -36,8 +36,9 @@ use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
 use crate::{
     ChatEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
-    DurableIssueMutationApi, DurableKnowledgeMutationApi, DurableKnowledgeReadApi, GitEffectApi,
-    IssueEffectApi, KnowledgeEffectApi, McpReadExecutor, RoutedEffectApi,
+    DurableIssueMutationApi, DurableKnowledgeMutationApi, DurableKnowledgeReadApi,
+    DurableProjectReadApi, GitEffectApi, IssueEffectApi, KnowledgeEffectApi, McpReadExecutor,
+    RoutedEffectApi,
 };
 
 #[derive(Clone)]
@@ -79,6 +80,7 @@ pub struct AgentMcpResources {
     knowledge_mutations: DurableKnowledgeMutationApi,
     chat: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
+    projects: DurableProjectReadApi,
 }
 
 impl AgentMcpResources {
@@ -89,6 +91,7 @@ impl AgentMcpResources {
         knowledge: DurableKnowledgeMutationApi,
         chat: DurableChatReadApi,
         chat_mutations: DurableChatMutationApi,
+        projects: DurableProjectReadApi,
     ) -> Self {
         Self {
             git,
@@ -98,6 +101,7 @@ impl AgentMcpResources {
             knowledge_mutations: knowledge,
             chat,
             chat_mutations,
+            projects,
         }
     }
 }
@@ -493,7 +497,8 @@ impl Handler for AgentMcpHandler {
             .with_issues(self.services.resources.issues.reads())
             .with_knowledge(self.services.resources.knowledge.clone())
             .with_chat(self.services.resources.chat.clone())
-            .with_git(self.services.resources.git.clone()),
+            .with_git(self.services.resources.git.clone())
+            .with_projects(self.services.resources.projects.clone()),
         );
         let server = McpServer::with_router_and_reads(registry, router, reads);
         let frame = std::str::from_utf8(&ctx.request.body)

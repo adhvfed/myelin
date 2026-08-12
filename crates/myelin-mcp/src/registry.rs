@@ -219,6 +219,7 @@ mod tests {
                 "knowledge.link_work",
                 "knowledge.list_pages",
                 "knowledge.read_page",
+                "projects.list",
             ]
         );
         assert!(registry.resolve("git.merge").unwrap().requires_approval());
