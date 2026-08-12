@@ -69,21 +69,64 @@ async fn migrated_admin_pool() -> PgPool {
     admin
 }
 
-#[allow(clippy::too_many_arguments)]
-fn edge_event(
-    tenant: &TenantId,
-    region: &Region,
-    event_id: &str,
-    event_type: &str,
-    recorded_at: &str,
-    source: &ArtifactRef,
-    target: &ArtifactRef,
-    rel: &str,
-    rel_class: &str,
-) -> EventEnvelope {
+struct EdgeFact<'a> {
+    event_id: String,
+    event_type: &'static str,
+    recorded_at: String,
+    source: &'a ArtifactRef,
+    target: &'a ArtifactRef,
+    relation: &'a str,
+    class: &'a str,
+}
+
+impl<'a> EdgeFact<'a> {
+    fn created(
+        event_id: impl Into<String>,
+        recorded_at: impl Into<String>,
+        source: &'a ArtifactRef,
+        target: &'a ArtifactRef,
+    ) -> Self {
+        Self::new("refs.edge.created", event_id, recorded_at, source, target)
+    }
+
+    fn removed(
+        event_id: impl Into<String>,
+        recorded_at: impl Into<String>,
+        source: &'a ArtifactRef,
+        target: &'a ArtifactRef,
+    ) -> Self {
+        Self::new("refs.edge.removed", event_id, recorded_at, source, target)
+    }
+
+    fn new(
+        event_type: &'static str,
+        event_id: impl Into<String>,
+        recorded_at: impl Into<String>,
+        source: &'a ArtifactRef,
+        target: &'a ArtifactRef,
+    ) -> Self {
+        Self {
+            event_id: event_id.into(),
+            event_type,
+            recorded_at: recorded_at.into(),
+            source,
+            target,
+            relation: "links",
+            class: "reference",
+        }
+    }
+
+    fn classified_as(mut self, relation: &'a str, class: &'a str) -> Self {
+        self.relation = relation;
+        self.class = class;
+        self
+    }
+}
+
+fn edge_event(tenant: &TenantId, region: &Region, fact: EdgeFact<'_>) -> EventEnvelope {
     EventEnvelope {
-        event_id: EventId(event_id.into()),
-        type_: EventType(event_type.into()),
+        event_id: EventId(fact.event_id.clone()),
+        type_: EventType(fact.event_type.into()),
         schema_ver: 1,
         tenant: tenant.clone(),
         region: region.clone(),
@@ -95,23 +138,23 @@ fn edge_event(
             },
             tenant.clone(),
         )),
-        subject: source.clone(),
-        aggregate: AggregateKey(format!("refs-edge:{}:{}", source.0, target.0)),
+        subject: fact.source.clone(),
+        aggregate: AggregateKey(format!("refs-edge:{}:{}", fact.source.0, fact.target.0)),
         causation_id: None,
-        correlation_id: CorrelationId(format!("story:{event_id}")),
+        correlation_id: CorrelationId(format!("story:{}", fact.event_id)),
         caused_by: None,
         depth: 1,
         contains_personal_data: false,
         data_role: DataRole::Controller,
         visibility: Visibility::Internal,
         pii_key_ref: None,
-        occurred_at: Timestamp(recorded_at.into()),
-        recorded_at: Timestamp(recorded_at.into()),
+        occurred_at: Timestamp(fact.recorded_at.clone()),
+        recorded_at: Timestamp(fact.recorded_at),
         payload: serde_json::json!({
-            "source": source.0,
-            "target": target.0,
-            "rel": rel,
-            "rel_class": rel_class,
+            "source": fact.source.0,
+            "target": fact.target.0,
+            "rel": fact.relation,
+            "rel_class": fact.class,
         }),
     }
 }
@@ -164,27 +207,8 @@ impl ProjectorHarness {
         ArtifactRef(format!("myelin://{}/issue/issue/{key}", self.tenant.0))
     }
 
-    fn event(
-        &self,
-        event_id: &str,
-        event_type: &str,
-        recorded_at: &str,
-        source: &ArtifactRef,
-        target: &ArtifactRef,
-        rel: &str,
-        rel_class: &str,
-    ) -> EventEnvelope {
-        edge_event(
-            &self.tenant,
-            &self.region,
-            event_id,
-            event_type,
-            recorded_at,
-            source,
-            target,
-            rel,
-            rel_class,
-        )
+    fn event(&self, fact: EdgeFact<'_>) -> EventEnvelope {
+        edge_event(&self.tenant, &self.region, fact)
     }
 
     fn deliver(&self, event: &EventEnvelope) -> Delivered {
@@ -249,15 +273,12 @@ async fn a_delivered_reference_edge_and_its_dedup_record_commit_together() {
     let story = ProjectorHarness::start("reference").await;
     let source = ArtifactRef(format!("myelin://{}/chat/message/M1", story.tenant.0));
     let target = story.issue("ENG-41");
-    let event = story.event(
-        &format!("refs-reference-create-{}", std::process::id()),
-        "refs.edge.created",
+    let event = story.event(EdgeFact::created(
+        format!("refs-reference-create-{}", std::process::id()),
         "2026-08-10T00:00:01Z",
         &source,
         &target,
-        "links",
-        "reference",
-    );
+    ));
 
     assert_eq!(story.deliver(&event), Delivered::Acked);
     assert_eq!(
@@ -283,15 +304,12 @@ async fn an_existing_reference_keeps_its_legacy_handle_as_new_events_converge() 
     let story = ProjectorHarness::start("legacy-identity").await;
     let source = ArtifactRef(format!("myelin://{}/chat/message/M1", story.tenant.0));
     let target = story.issue("ENG-41");
-    let created = story.event(
-        &format!("refs-legacy-create-{}", std::process::id()),
-        "refs.edge.created",
+    let created = story.event(EdgeFact::created(
+        format!("refs-legacy-create-{}", std::process::id()),
         "2026-08-11T00:00:01Z",
         &source,
         &target,
-        "links",
-        "reference",
-    );
+    ));
     assert_eq!(story.deliver(&created), Delivered::Acked);
 
     let strong_id = edge_id(&story.tenant, &source.0, &target.0, "links");
@@ -310,15 +328,12 @@ async fn an_existing_reference_keeps_its_legacy_handle_as_new_events_converge() 
     .await
     .expect("stand in for a reference persisted by the previous identity scheme");
 
-    let refreshed = story.event(
-        &format!("refs-legacy-refresh-{}", std::process::id()),
-        "refs.edge.created",
+    let refreshed = story.event(EdgeFact::created(
+        format!("refs-legacy-refresh-{}", std::process::id()),
         "2026-08-11T00:00:02Z",
         &source,
         &target,
-        "links",
-        "reference",
-    );
+    ));
     assert_eq!(story.deliver(&refreshed), Delivered::Acked);
     let graph = PgEdgeStore::new(story.app.clone());
     let backlinks = graph
@@ -331,15 +346,12 @@ async fn an_existing_reference_keeps_its_legacy_handle_as_new_events_converge() 
         "opaque handles already handed to clients remain stable"
     );
 
-    let mut removed = story.event(
-        &format!("refs-legacy-remove-{}", std::process::id()),
-        "refs.edge.removed",
+    let mut removed = story.event(EdgeFact::removed(
+        format!("refs-legacy-remove-{}", std::process::id()),
         "2026-08-11T00:00:03Z",
         &source,
         &target,
-        "links",
-        "reference",
-    );
+    ));
     removed.payload = serde_json::json!({ "edge_id": legacy_id });
     assert_eq!(story.deliver(&removed), Delivered::Acked);
     assert!(graph
@@ -359,15 +371,12 @@ async fn an_identity_collision_is_parked_without_overwriting_either_reference() 
         story.tenant.0
     ));
     let protected_target = story.issue("SAFE-1");
-    let protected = story.event(
-        &format!("refs-collision-protected-{}", std::process::id()),
-        "refs.edge.created",
+    let protected = story.event(EdgeFact::created(
+        format!("refs-collision-protected-{}", std::process::id()),
         "2026-08-11T00:00:01Z",
         &protected_source,
         &protected_target,
-        "links",
-        "reference",
-    );
+    ));
     assert_eq!(story.deliver(&protected), Delivered::Acked);
 
     let incoming_source = ArtifactRef(format!("myelin://{}/chat/message/incoming", story.tenant.0));
@@ -390,15 +399,12 @@ async fn an_identity_collision_is_parked_without_overwriting_either_reference() 
     .await
     .expect("simulate a digest collision without needing to break BLAKE3");
 
-    let incoming = story.event(
-        &format!("refs-collision-incoming-{}", std::process::id()),
-        "refs.edge.created",
+    let incoming = story.event(EdgeFact::created(
+        format!("refs-collision-incoming-{}", std::process::id()),
         "2026-08-11T00:00:02Z",
         &incoming_source,
         &incoming_target,
-        "links",
-        "reference",
-    );
+    ));
     match story.deliver(&incoming) {
         Delivered::DeadLettered(Reason(reason)) => assert!(
             reason.contains("identity collision"),
@@ -429,22 +435,22 @@ async fn a_removed_issue_dependency_stays_gone_when_its_creation_arrives_late() 
     let planning = story.issue("PLAN-1");
     let delivery = story.issue("SHIP-1");
     let created = story.event(
-        &format!("refs-lifecycle-create-{}", std::process::id()),
-        "refs.edge.created",
-        "2026-08-10T00:00:01Z",
-        &planning,
-        &delivery,
-        "blocks",
-        "lifecycle",
+        EdgeFact::created(
+            format!("refs-lifecycle-create-{}", std::process::id()),
+            "2026-08-10T00:00:01Z",
+            &planning,
+            &delivery,
+        )
+        .classified_as("blocks", "lifecycle"),
     );
     let removed = story.event(
-        &format!("refs-lifecycle-remove-{}", std::process::id()),
-        "refs.edge.removed",
-        "2026-08-10T00:00:02Z",
-        &planning,
-        &delivery,
-        "blocks",
-        "lifecycle",
+        EdgeFact::removed(
+            format!("refs-lifecycle-remove-{}", std::process::id()),
+            "2026-08-10T00:00:02Z",
+            &planning,
+            &delivery,
+        )
+        .classified_as("blocks", "lifecycle"),
     );
 
     assert_eq!(story.deliver(&removed), Delivered::Acked);
@@ -484,15 +490,12 @@ async fn a_hot_reference_can_be_read_forward_without_rescanning_or_duplicates() 
             "myelin://{}/chat/message/M{sequence}",
             story.tenant.0
         ));
-        let event = story.event(
-            &format!("refs-keyset-{sequence}-{}", std::process::id()),
-            "refs.edge.created",
-            &format!("2026-08-10T00:00:0{sequence}Z"),
+        let event = story.event(EdgeFact::created(
+            format!("refs-keyset-{sequence}-{}", std::process::id()),
+            format!("2026-08-10T00:00:0{sequence}Z"),
             &source,
             &target,
-            "links",
-            "reference",
-        );
+        ));
         assert_eq!(story.deliver(&event), Delivered::Acked);
     }
 
@@ -527,13 +530,13 @@ async fn an_artifact_can_page_the_links_it_makes_without_rescanning() {
     for sequence in 1..=3 {
         let target = story.issue(&format!("ENG-{sequence}"));
         let event = story.event(
-            &format!("refs-outbound-{sequence}-{}", std::process::id()),
-            "refs.edge.created",
-            &format!("2026-08-10T00:00:0{sequence}Z"),
-            &source,
-            &target,
-            "closes",
-            "lifecycle",
+            EdgeFact::created(
+                format!("refs-outbound-{sequence}-{}", std::process::id()),
+                format!("2026-08-10T00:00:0{sequence}Z"),
+                &source,
+                &target,
+            )
+            .classified_as("closes", "lifecycle"),
         );
         assert_eq!(story.deliver(&event), Delivered::Acked);
     }
@@ -569,25 +572,21 @@ async fn the_same_link_can_live_in_two_regions_and_disappear_from_only_one() {
     let second_consumer = story.consumer_for(&second_region);
     let source = ArtifactRef(format!("myelin://{}/chat/message/M1", story.tenant.0));
     let target = story.issue("ENG-41");
-    let first_created = story.event(
-        &format!("refs-region-first-create-{}", std::process::id()),
-        "refs.edge.created",
+    let first_created = story.event(EdgeFact::created(
+        format!("refs-region-first-create-{}", std::process::id()),
         "2026-08-11T00:00:01Z",
         &source,
         &target,
-        "links",
-        "reference",
-    );
+    ));
     let second_created = edge_event(
         &story.tenant,
         &second_region,
-        &format!("refs-region-second-create-{}", std::process::id()),
-        "refs.edge.created",
-        "2026-08-11T00:00:02Z",
-        &source,
-        &target,
-        "links",
-        "reference",
+        EdgeFact::created(
+            format!("refs-region-second-create-{}", std::process::id()),
+            "2026-08-11T00:00:02Z",
+            &source,
+            &target,
+        ),
     );
 
     assert_eq!(story.deliver(&first_created), Delivered::Acked);
@@ -618,15 +617,12 @@ async fn the_same_link_can_live_in_two_regions_and_disappear_from_only_one() {
         1
     );
 
-    let first_removed = story.event(
-        &format!("refs-region-first-remove-{}", std::process::id()),
-        "refs.edge.removed",
+    let first_removed = story.event(EdgeFact::removed(
+        format!("refs-region-first-remove-{}", std::process::id()),
         "2026-08-11T00:00:03Z",
         &source,
         &target,
-        "links",
-        "reference",
-    );
+    ));
     assert_eq!(story.deliver(&first_removed), Delivered::Acked);
     assert!(graph
         .inbound_live(&story.tenant, &story.region, &target, 10)
@@ -683,13 +679,12 @@ async fn a_new_tenant_can_start_linking_work_without_restarting_refs() {
     let event = edge_event(
         &tenant,
         &region,
-        &format!("refs-live-tenant-{suffix}"),
-        "refs.edge.created",
-        "2026-08-11T00:00:01Z",
-        &source,
-        &target,
-        "links",
-        "reference",
+        EdgeFact::created(
+            format!("refs-live-tenant-{suffix}"),
+            "2026-08-11T00:00:01Z",
+            &source,
+            &target,
+        ),
     );
     let message = Message {
         subject: source.0.clone(),
