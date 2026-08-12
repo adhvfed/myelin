@@ -627,7 +627,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.close", version: 1 },
             { name: "issues.create", version: 2 },
             { name: "issues.list", version: 1 },
-            { name: "issues.view", version: 1 },
+            { name: "issues.view", version: 2 },
             { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 1 },
@@ -973,7 +973,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.close", version: 1 },
             { name: "issues.create", version: 2 },
             { name: "issues.list", version: 1 },
-            { name: "issues.view", version: 1 },
+            { name: "issues.view", version: 2 },
             { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 1 },
@@ -1136,7 +1136,7 @@ describe("the CLI authentication journey", () => {
       });
       expect(schemaFor("issues.view")).toMatchObject({
         type: "object",
-        required: ["issue_id"],
+        required: ["issue_ref"],
         additionalProperties: false,
       });
       expect(schemaFor("knowledge.link_work")).toMatchObject({
@@ -1696,19 +1696,21 @@ describe("the CLI authentication journey", () => {
         key: createdProject.project.issue_prefix,
         limit: 10,
       });
-      expect(array(issuePage.items, "agent-visible issues")).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            id: issueId,
-            key: issueKey,
-            title: contextualIssueTitle,
-            ref: `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
-          }),
-        ]),
-      );
+      const agentVisibleIssue = array(issuePage.items, "agent-visible issues")
+        .map((issue, index) => record(issue, `agent-visible issue ${index}`))
+        .find((issue) => issue.key === issueKey);
+      expect(agentVisibleIssue).toMatchObject({
+        id: issueId,
+        key: issueKey,
+        title: contextualIssueTitle,
+        ref: contextualIssueRef,
+      });
       expect(issuePage.page).toMatchObject({ limit: 10 });
 
-      const viewedIssue = await askAgent(resumedRun, 4, "issues.view", { issue_id: issueId });
+      const agentVisibleIssueRef = string(agentVisibleIssue?.ref, "agent-visible issue ref");
+      const viewedIssue = await askAgent(resumedRun, 4, "issues.view", {
+        issue_ref: agentVisibleIssueRef,
+      });
       expect(viewedIssue).toMatchObject({
         id: issueId,
         key: issueKey,

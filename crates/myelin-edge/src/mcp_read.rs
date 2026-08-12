@@ -127,16 +127,20 @@ impl DirectReadExecutor for McpReadExecutor {
                 .list(access_subject, issue_page(arguments)?)
                 .map_err(map_edge_error),
             "issues.view" => {
-                exact_fields(arguments, &["issue_id"], &["issue_id"])?;
-                let issue_id = required_string(arguments, "issue_id")?;
-                if !is_canonical_uuid(issue_id) {
-                    return Err(invalid("`issue_id` must be a canonical lowercase UUID"));
+                let issues = self.issues.as_ref().ok_or(DirectReadError::Unavailable)?;
+                match issue_view_target(arguments)? {
+                    IssueViewTarget::Reference(issue_ref) => issues
+                        .view_ref(access_subject, issue_ref)
+                        .map_err(map_edge_error),
+                    IssueViewTarget::LegacyId(issue_id) => {
+                        if !is_canonical_uuid(issue_id) {
+                            return Err(invalid("`issue_id` must be a canonical lowercase UUID"));
+                        }
+                        issues
+                            .view(access_subject, issue_id)
+                            .map_err(map_edge_error)
+                    }
                 }
-                self.issues
-                    .as_ref()
-                    .ok_or(DirectReadError::Unavailable)?
-                    .view(access_subject, issue_id)
-                    .map_err(map_edge_error)
             }
             "knowledge.list_pages" => {
                 exact_fields(arguments, &[], &["limit", "cursor"])?;
@@ -257,6 +261,20 @@ fn issue_page(arguments: &Value) -> Result<IssuePageRequest, DirectReadError> {
     let cursor = optional_string(arguments, "cursor")?.map(str::to_string);
     IssuePageRequest::filtered(state, key, limit, cursor)
         .map_err(|error| invalid(error.to_string()))
+}
+
+enum IssueViewTarget<'a> {
+    Reference(&'a str),
+    LegacyId(&'a str),
+}
+
+fn issue_view_target(arguments: &Value) -> Result<IssueViewTarget<'_>, DirectReadError> {
+    if arguments.get("issue_ref").is_some() {
+        exact_fields(arguments, &["issue_ref"], &["issue_ref"])?;
+        return required_string(arguments, "issue_ref").map(IssueViewTarget::Reference);
+    }
+    exact_fields(arguments, &["issue_id"], &["issue_id"])?;
+    required_string(arguments, "issue_id").map(IssueViewTarget::LegacyId)
 }
 
 fn exact_fields(
@@ -394,6 +412,32 @@ mod tests {
             json!({"tenant":"other"}),
         ] {
             assert!(issue_page(&arguments).is_err(), "accepted {arguments}");
+        }
+    }
+
+    #[test]
+    fn issue_view_accepts_one_versioned_identity_without_aliasing() {
+        assert!(matches!(
+            issue_view_target(&json!({"issue_ref":"myelin://acme/issue/issue/ENG-41"})),
+            Ok(IssueViewTarget::Reference(
+                "myelin://acme/issue/issue/ENG-41"
+            ))
+        ));
+        assert!(matches!(
+            issue_view_target(&json!({"issue_id":"11111111-1111-1111-1111-111111111111"})),
+            Ok(IssueViewTarget::LegacyId(
+                "11111111-1111-1111-1111-111111111111"
+            ))
+        ));
+        for arguments in [
+            json!({}),
+            json!({"issue_ref":"myelin://acme/issue/issue/ENG-41","issue_id":"11111111-1111-1111-1111-111111111111"}),
+            json!({"issue_ref":"myelin://acme/issue/issue/ENG-41","tenant":"other"}),
+        ] {
+            assert!(
+                issue_view_target(&arguments).is_err(),
+                "accepted {arguments}"
+            );
         }
     }
 }

@@ -256,9 +256,12 @@ mod tests {
     }
 
     #[test]
-    fn an_old_agent_keeps_create_v1_while_a_new_selection_receives_v2() {
-        let old = ToolRegistry::for_cursors(&["issues.create.v1".into()]).unwrap();
-        let current = ToolRegistry::for_cursors(&["issues.create.v2".into()]).unwrap();
+    fn old_agents_keep_uuid_contracts_while_new_selections_receive_reference_contracts() {
+        let old = ToolRegistry::for_cursors(&["issues.create.v1".into(), "issues.view.v1".into()])
+            .unwrap();
+        let current =
+            ToolRegistry::for_cursors(&["issues.create.v2".into(), "issues.view.v2".into()])
+                .unwrap();
 
         let old_create = old.resolve("issues.create").unwrap();
         let current_create = current.resolve("issues.create").unwrap();
@@ -269,6 +272,12 @@ mod tests {
             .definition()
             .input_schema
             .contains("project_ref"));
+        let old_view = old.resolve("issues.view").unwrap();
+        let current_view = current.resolve("issues.view").unwrap();
+        assert_eq!(old_view.cursor(), "issues.view.v1");
+        assert_eq!(current_view.cursor(), "issues.view.v2");
+        assert!(old_view.definition().input_schema.contains("issue_id"));
+        assert!(current_view.definition().input_schema.contains("issue_ref"));
     }
 
     #[test]

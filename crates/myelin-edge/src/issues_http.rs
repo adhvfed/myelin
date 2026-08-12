@@ -79,6 +79,18 @@ impl DurableIssueReadApi {
         Ok(issue_json(&principal.tenant.0, &issue))
     }
 
+    pub fn view_ref(
+        &self,
+        principal: &myelin_identity::Principal,
+        issue_ref: &str,
+    ) -> Result<Value, EdgeError> {
+        let key = issue_key_from_ref(principal, issue_ref)?;
+        let issue_id = self
+            .drive(self.store.resolve_id_by_key(principal, &key))
+            .map_err(map_store_error)?;
+        self.view(principal, &issue_id)
+    }
+
     pub fn list_relations(
         &self,
         principal: &myelin_identity::Principal,
