@@ -1,14 +1,6 @@
-// THE DEV-SEAM CONTRACT (shared by the dev edge + the dev-login seam) — clearly marked, NOT production.
-//
-// Why this exists: the real `myelin-edge` binary authenticates with signed capabilities and a seeded
-// S1 principal directory, while hermetic UI tests intentionally run without an external IdP. The dev
-// edge therefore accepts ONE well-known dev token and the explicitly guarded dev-login seam mints a
-// session carrying it. The gateway client + session machinery remain contract-faithful; only this
-// local authentication fixture is a stand-in. NEVER ship it.
-//
-// The data the dev edge serves mirrors both REAL Git contracts: summary-only catalogue rows and the
-// enriched object-addressed RepoHome. Keeping those fixtures distinct prevents either shape from
-// accidentally satisfying the other's decoder.
+// Shared fixtures for the local edge and development login. Browser tests use fixed credentials
+// because they run without an external identity provider. Repository list and home fixtures remain
+// separate so their decoders cannot accept the wrong response shape.
 
 import { createHash } from "node:crypto";
 
@@ -188,12 +180,7 @@ function bareName(slug) {
   return parts.length > 1 ? parts.slice(1).join("/") : slug;
 }
 
-// ── GT-004 browse surface: the single repo home, blob, commit log + diff, PR overview ──
-//
-// These mirror the REAL durable-edge JSON shapes exactly (crates/myelin-git/src/web.rs `to_json` +
-// crates/myelin-edge/src/git_durable.rs) so the Solid screens render the genuine contract. The data is
-// the SAME seed the repos list serves (acme/myelin populated, acme/sandbox empty), extended with a
-// real commit pair, a file, and two PRs (one blocked-with-a-fork-trust-badge, one ready).
+// Repository browse fixtures follow the durable edge JSON shapes and extend the repository-list seed.
 
 /** GET /v1/git/repos/{repo} → the RepoHome ViewModel (null = 404). */
 export function repoHomeJson(repo) {
@@ -537,8 +524,7 @@ const SEED_COMMITS = {
   ],
 };
 
-/** GET /v1/git/repos/{repo}/commits/{ref} → the `{items,page}` commit-log envelope (null = 404). R3.4:
- *  bidirectional cursor + honest range/page position (no fabricated total). */
+/** GET /v1/git/repos/{repo}/commits/{ref} with bidirectional cursors and no synthetic total. */
 export function commitsEnvelope(repo, limit = 50, cursor) {
   const all = SEED_COMMITS[repo];
   if (!all) return null;
@@ -917,8 +903,7 @@ function pagedDiff(cursor) {
   };
 }
 
-// ── R3.3 — a per-process mutable thread/review store (the dev-edge stateful surface the e2e drives).
-//    Keyed by `${repo}:${n}`; a fresh process starts empty (an honest "No discussion yet"). ──
+// Per-process thread/review store, keyed by `${repo}:${n}`.
 const THREADS = new Map();
 let threadSeq = 0;
 /** Reset only the mutable PR discussion/review fixtures. The dev edge exposes this through its

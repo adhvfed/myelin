@@ -38,7 +38,7 @@ describe("runTokenLogin", () => {
       scheme: DEFAULT_TOKEN_SCHEME,
       credentialExpiresAtMs: 4_102_444_800_000,
       principalId: "u_operator",
-      // No human name in whoami → the PII-free principal id IS the honest display label.
+      // Capability-token identities use the principal ID as the display label.
       displayName: "u_operator",
       region: "eu-west",
       tenant: "acme",

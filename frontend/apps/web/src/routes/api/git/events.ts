@@ -1,12 +1,5 @@
-// The FIREHOSE BROWSER PROXY (R3.5, OQ-4) — a same-origin SSE route the browser's `EventSource` hits
-// for live tenant events. It runs server-side, reads the httpOnly session token, and pipes the edge's
-// UNIFIED firehose (`GET /v1/t/{tenant}/events`) back to the browser as `text/event-stream`. The
-// tenant is ALWAYS the SESSION's (never a client selector) — the same IDOR floor the edge enforces.
-// This is the single channel the first-run repos screen listens on for the typed
-// `repo.created`/`repo.pushed` frames; it is NOT a second channel and it never mints inbox items.
-//
-// FLOOR: the dev-edge holds this stream open but emits no frames, so against the harness the live
-// flip is inert (the manual Refresh is the fallback); against the real edge the typed frames arrive.
+// Same-origin SSE proxy for tenant events. The tenant and credentials come from the server-side
+// session rather than request parameters. The local edge keeps this stream open without emitting.
 import { getSessionRecord } from "~/server/session";
 import { edgeOrigin } from "~/server/edge-origin";
 

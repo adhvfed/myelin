@@ -1,4 +1,4 @@
-/** Dignified repository-route states. Capacity is distinct from a transient failure: retrying an
+/** Repository-route states. Capacity is distinct from a transient failure: retrying an
  * intentionally bounded interactive diff cannot make it smaller. */
 export type RepoErrorKind =
   | "no-access"

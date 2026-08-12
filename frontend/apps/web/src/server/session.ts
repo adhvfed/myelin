@@ -1,11 +1,6 @@
-// The server-side httpOnly-cookie SESSION machinery (doc 10 §5 / mirrors crates/myelin-edge/src/
-// session.rs). This is REAL: the cookie carries ONLY an opaque session id; the Bearer token + the
-// principal facts live in a SERVER-SIDE store keyed by that id. So **tokens never reach client JS** —
-// `document.cookie` holds only the opaque, httpOnly id, and the token is never serialised to the page.
-//
-// Production records live in region-local Valkey so every web replica sees the same revocation and
-// rotation state. The in-memory implementation is retained only for hermetic local development.
-// The dev session is MINTED by the explicitly gated dev-login seam; it is NOT production auth.
+// Server-side session storage. The HTTP-only cookie contains an opaque ID; credentials and identity
+// fields remain in the server-side store. Deployed instances use Valkey, while local development can
+// use the in-memory backend.
 
 import { getCookie, setCookie, deleteCookie } from "vinxi/http";
 import { randomBytes } from "node:crypto";
@@ -21,11 +16,7 @@ export type { SessionRecord } from "./session-store";
 const cookie = sessionCookieSettings(import.meta.env.PROD);
 export const SESSION_COOKIE = cookie.name;
 
-/** Backed on `globalThis` so the SSR bundle and the server-functions bundle — which vinxi/Nitro loads
- * as SEPARATE module graphs in the SAME process — share ONE store. Without this, a session written by a
- * server action (server-fns bundle) is invisible to the app layout's SSR viewer verification on a
- * full-reload/deep-link navigation. In production that process-local reference points to the shared
- * Valkey transport. */
+/** Keep one store reference across Vinxi's separate SSR and server-function module graphs. */
 const globalStore = globalThis as unknown as {
   __myelinSessionStore?: SessionStore;
 };
@@ -70,10 +61,7 @@ export async function issueSession(rec: SessionRecord): Promise<string> {
   else await store.issue(id, rec);
   setCookie(SESSION_COOKIE, id, {
     httpOnly: true,
-    // `lax` (not `strict`): the session cookie MUST ride a top-level deep-link/full-reload navigation
-    // (e.g. opening `/git/repos/{repo}/prs/{n}` directly), which `strict` suppresses — while `lax`
-    // still withholds it from cross-site sub-requests, so the CSRF posture holds. (httpOnly keeps the
-    // opaque id out of client JS regardless.)
+    // `lax` permits top-level deep links while withholding the cookie from cross-site subrequests.
     sameSite: "lax",
     path: "/",
     // Secure in production; relaxed for the http dev/test harness so the cookie is actually set.

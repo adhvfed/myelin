@@ -1,8 +1,5 @@
-// The gateway-client CORE — pure, dependency-injected, unit-testable in node (no vinxi/fetch import).
-// It encodes the doc 10 §5 contract EXACTLY: read the session token, call the edge, and on a 401 do a
-// SINGLE refresh round-trip + ONE retry, else throw `Unauthorized` (the loader turns that into a
-// /login redirect). Typed errors extract the edge's `{error:{message,code}}` envelope. This file is
-// the security-load-bearing logic; `gateway.ts` wires the real cookie/fetch deps onto it.
+// Dependency-injected gateway flow used by the server adapter and Node tests. A 401 permits one
+// refresh and one retry before `Unauthorized` is returned.
 
 /** The edge's `{error:{message, code?}}` envelope (crates/myelin-edge/src/error.rs). */
 export interface EdgeErrorBody {
@@ -65,10 +62,10 @@ export interface GatewayDeps {
 /**
  * Run the edge call through the auth lifecycle.
  *
- * 1. No token → `Unauthorized` (the request was never authenticated).
- * 2. 401 → ONE refresh; if it yields a token, retry ONCE; a second 401 → clear + `Unauthorized`.
- * 3. A non-2xx (other than the handled 401) → `GatewayError` carrying the envelope message/code.
- * 4. 2xx → the parsed JSON body.
+ * 1. Missing token: `Unauthorized`.
+ * 2. First 401: refresh and retry; second 401: clear the session and return `Unauthorized`.
+ * 3. Other non-2xx response: `GatewayError`.
+ * 4. Success: parsed JSON.
  */
 export async function runGateway<T = unknown>(deps: GatewayDeps): Promise<T> {
   const token = await deps.getToken();

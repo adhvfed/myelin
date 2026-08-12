@@ -1,13 +1,6 @@
-// The REAL server-side cookie-auth gateway client (doc 10 §5). Runs ONLY server-side (it imports
-// vinxi/http + node fetch). It wires the real cookie-session + edge-fetch deps onto the pure
-// `runGateway` core: reads the session token from the httpOnly-cookie store, adds the Bearer token to
-// the edge call, and on 401 does the single refresh + one retry. **Tokens never reach client JS** —
-// this module is never bundled to the client (it is reachable only through `"use server"` functions).
-//
-// The edge it calls is the MR-014/015 contract (`/v1/...`, Bearer/cookie auth, `{error:{message}}`,
-// pagination). `MYELIN_EDGE_URL` points at it: in the harness that is the clearly-marked DEV EDGE
-// (`dev-edge/server.mjs`, which serves the real contract over the real Git ViewModel JSON). Pointing
-// this at the real `edge` binary is an environment change, not a second data path.
+// Server-only gateway client. It reads credentials from the HTTP-only session store, retries once
+// after a successful refresh, and never exposes bearer tokens to client code. `MYELIN_EDGE_URL` can
+// target either the local test double or a deployed edge.
 
 import { runGateway, GatewayError, Unauthorized } from "./gateway-core";
 import {
@@ -69,13 +62,7 @@ export async function edgePut<T = unknown>(
   return edgeRequest<T>("PUT", path, body, options);
 }
 
-/**
- * GET an UNAUTHENTICATED edge endpoint (no Bearer, no session) — for the logged-out `GET
- * /v1/auth/config` the login page reads before any session exists (R3.5). No auth lifecycle: a
- * non-2xx is a `GatewayError` the caller may floor-tolerate (the login page falls back to the
- * fail-closed "SSO unavailable" render if the edge is unreachable). Still server-only — the URL/env
- * never reach client JS.
- */
+/** GET a public edge endpoint without the session or refresh lifecycle. */
 export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
   const res = await fetch(`${edgeOrigin()}${path}`, {
     method: "GET",
@@ -265,13 +252,8 @@ export async function edgeLoginWithOidc(
   };
 }
 
-/**
- * VERIFY a CALLER-SUPPLIED capability token (R4.0 operator-token login). Calls the edge's
- * authenticated `GET /v1/whoami` with the PASTED token (NOT the session's) + the token scheme header,
- * and returns the viewer facts on a 200. This is how the frontend proves a bootstrap token actually
- * authenticates before minting a session. Server-only — the token never reaches client JS, and a
- * non-200 throws a token-FREE `Unauthorized` (the raw edge body is NEVER attached, so it can't leak).
- */
+/** Verify a caller-supplied capability token before creating a session. Error bodies are discarded
+ * because they may contain token or internal details. */
 export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Promise<EdgeWhoami> {
   const res = await fetch(`${edgeOrigin()}/v1/whoami`, {
     method: "GET",
@@ -284,7 +266,7 @@ export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Prom
     signal: gatewayRequestSignal(),
   });
   if (res.status !== 200) {
-    // Do NOT attach the response body — it could echo the token or an internal error. Honest, opaque.
+    // The response body could echo the token or internal details.
     throw new Unauthorized(`token verification failed (HTTP ${res.status})`);
   }
   const who = parseJson(await readLimitedText(res, 64 * 1024));
@@ -349,10 +331,8 @@ async function edgeRequest<T>(
   });
 }
 
-/** The RAW byte-fetch (R3.4 raw/download proxy). Streams an edge blob through the SAME server-side
- *  auth (Bearer from the session cookie; never a public signed URL — the sovereignty rail), with ONE
- *  refresh retry on 401. Returns the status, the edge's content-type, and a bounded stream. The browser
- *  proxy owns a safe Content-Disposition rather than trusting blob metadata. Binary-safe. */
+/** Stream a bounded edge blob through the session lifecycle. The browser proxy supplies its own
+ * Content-Disposition instead of trusting blob metadata. */
 export interface RawEdgeResponse {
   status: number;
   contentType: string;
@@ -467,7 +447,7 @@ export async function edgeGetRaw(
   if (!token) throw new Unauthorized("no session token (not authenticated)");
   let res = await doFetch(token);
   if (res.status === 401) {
-    // ONE refresh round-trip + retry (mirrors runGateway), then give up.
+    // Retry once after refreshing the session.
     await res.body?.cancel().catch(() => undefined);
     const rec = await getSessionRecord();
     let fresh: string | null = null;

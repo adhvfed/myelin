@@ -37,15 +37,8 @@ function originOf(url: string): string | null {
 }
 
 /**
- * The CSRF origin decision for a state-changing (session-minting) POST.
- *
- * - No canonical origin → we cannot compare → **reject**.
- * - `Origin` present → its full origin MUST match, else **reject** (the primary check; browsers always
- *   send `Origin` on a cross-site form POST, so a mismatch is a forgery).
- * - `Origin` absent, `Referer` present → the `Referer` origin MUST match, else **reject** (some
- *   clients omit `Origin`; `Referer` is the fallback same-site witness).
- * - Both absent → **reject** (a browser form POST sends at least one; absence is suspicious — a
- *   non-browser/forged request. Fail-closed: a legitimate login is always browser-initiated).
+ * Verify a state-changing request against the configured origin. Prefer `Origin`, fall back to
+ * `Referer`, and reject when the expected origin or both request headers are absent.
  */
 export function sameOriginVerdict(sig: OriginSignals): OriginVerdict {
   const expectedOrigin = sig.expectedOrigin ? originOf(sig.expectedOrigin) : null;
