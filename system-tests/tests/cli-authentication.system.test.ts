@@ -625,7 +625,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.search_code", version: 1 },
             { name: "git.write_file", version: 1 },
             { name: "issues.close", version: 1 },
-            { name: "issues.create", version: 1 },
+            { name: "issues.create", version: 2 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
             { name: "knowledge.link_work", version: 1 },
@@ -971,7 +971,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.search_code", version: 1 },
             { name: "git.write_file", version: 1 },
             { name: "issues.close", version: 1 },
-            { name: "issues.create", version: 1 },
+            { name: "issues.create", version: 2 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
             { name: "knowledge.link_work", version: 1 },
@@ -1127,7 +1127,7 @@ describe("the CLI authentication journey", () => {
       });
       expect(schemaFor("issues.create")).toMatchObject({
         type: "object",
-        required: ["project_id", "title"],
+        required: ["project_ref", "title"],
         additionalProperties: false,
       });
       expect(schemaFor("issues.list")).toMatchObject({
@@ -1987,6 +1987,10 @@ describe("the CLI authentication journey", () => {
         issue_prefix: createdProject.project.issue_prefix,
         default_issue_type_id: createdProject.project.default_issue_type_id,
       });
+      const agentVisibleProjectRef = string(
+        agentVisibleProject?.ref,
+        "agent-visible project ref",
+      );
 
       // The human's live project access bounds the write, and a lost MCP response can be retried
       // without creating a second ticket.
@@ -1997,7 +2001,7 @@ describe("the CLI authentication journey", () => {
         19,
         "issues.create",
         {
-          project_id: createdProject.project.id,
+          project_ref: agentVisibleProjectRef,
           title: agentIssueTitle,
         },
         agentIssueKey,
@@ -2007,7 +2011,7 @@ describe("the CLI authentication journey", () => {
         20,
         "issues.create",
         {
-          project_id: createdProject.project.id,
+          project_ref: agentVisibleProjectRef,
           title: agentIssueTitle,
         },
         agentIssueKey,

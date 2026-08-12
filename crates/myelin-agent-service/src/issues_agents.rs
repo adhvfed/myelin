@@ -18,6 +18,7 @@ pub const ESTIMATE_TOOL: &str = "estimate";
 pub const REORDER_TOOL: &str = "reorder";
 pub const ASSIGN_TOOL: &str = "assign";
 pub const CLOSE_TOOL: &str = "close";
+pub const CREATE_TOOL_VERSION: u32 = 2;
 
 pub fn create_required_caps() -> Vec<String> {
     cap(issue_objects::ISSUE, "create")
@@ -45,11 +46,23 @@ fn crud_tool_def(name: &str, caps: Vec<String>, input_schema: &str) -> ToolDef {
     )
 }
 
-pub fn create_tool_def() -> ToolDef {
+fn create_tool_def_v1() -> ToolDef {
     let mut definition = crud_tool_def(
         CREATE_TOOL,
         create_required_caps(),
         r#"{"type":"object","required":["project_id","title"],"properties":{"project_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"type_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"prefix":{"type":"string","pattern":"^[A-Z][A-Z0-9]{1,9}$"},"title":{"type":"string","minLength":1,"maxLength":512}},"additionalProperties":false}"#,
+    );
+    definition.exposed_over_mcp = true;
+    definition
+}
+
+pub fn create_tool_def() -> ToolDef {
+    let mut definition = mutate_tool_def(
+        ISSUES_SUBSYSTEM,
+        CREATE_TOOL,
+        CREATE_TOOL_VERSION,
+        r#"{"type":"object","required":["project_ref","title"],"properties":{"project_ref":{"type":"string","pattern":"^myelin://[^/]+/identity/project/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"title":{"type":"string","minLength":1,"maxLength":512}},"additionalProperties":false}"#,
+        create_required_caps(),
     );
     definition.exposed_over_mcp = true;
     definition
@@ -115,6 +128,7 @@ pub fn close_tool_def() -> ToolDef {
 
 pub fn full_issues_tool_defs() -> Vec<ToolDef> {
     let mut defs = vec![
+        create_tool_def_v1(),
         create_tool_def(),
         update_tool_def(),
         comment_tool_def(),
@@ -264,32 +278,36 @@ mod tests {
     }
 
     #[test]
-    fn full_catalogue_registers_all_twelve_arch_8_tools() {
+    fn full_catalogue_keeps_old_contracts_beside_the_twelve_arch_8_tools() {
         let defs = full_issues_tool_defs();
-        let names: Vec<&str> = defs.iter().map(|d| d.name.0.as_str()).collect();
+        let cursors = defs
+            .iter()
+            .map(|definition| format!("{}.v{}", definition.canonical_name(), definition.version))
+            .collect::<Vec<_>>();
         assert_eq!(
-            names,
+            cursors,
             vec![
-                "create",
-                "update",
-                "comment",
-                "link",
-                "estimate",
-                "reorder",
-                "assign",
-                "close",
-                "forecast",
-                "triage",
-                "sla_draft",
-                "transition",
+                "issues.create.v1",
+                "issues.create.v2",
+                "issues.update.v1",
+                "issues.comment.v1",
+                "issues.link.v1",
+                "issues.estimate.v1",
+                "issues.reorder.v1",
+                "issues.assign.v1",
+                "issues.close.v1",
+                "issues.forecast.v1",
+                "issues.triage.v1",
+                "issues.sla_draft.v1",
+                "issues.transition.v1",
             ],
-            "the FULL arch-§8 Issues catalogue, in order (8 CRUD + 4 agent)"
+            "the full arch-§8 Issues catalogue, plus the durable create v1 contract"
         );
 
         let mut cat = Catalogue { defs: vec![] };
         let registered = register_full_issues_tools(&mut cat).expect("seeded defs admit");
-        assert_eq!(registered.len(), 12);
-        for name in &names {
+        assert_eq!(registered.len(), 13);
+        for name in cursors.iter().filter_map(|cursor| cursor.split('.').nth(1)) {
             assert!(
                 cat.resolve(&ToolName(name.to_string())).is_some(),
                 "{name} registered into the ONE surface"
@@ -321,7 +339,11 @@ mod tests {
             );
             assert_eq!(d.effect_kind, EffectKind::Mutate);
             assert!(d.side_effecting);
-            assert_eq!(d.version, ISSUES_TOOL_VERSION);
+            if d.canonical_name() == "issues.create" {
+                assert!([ISSUES_TOOL_VERSION, CREATE_TOOL_VERSION].contains(&d.version));
+            } else {
+                assert_eq!(d.version, ISSUES_TOOL_VERSION);
+            }
             assert_eq!(
                 d.exposed_over_mcp,
                 matches!(
@@ -334,19 +356,35 @@ mod tests {
     }
 
     #[test]
-    fn create_is_the_strict_project_native_mcp_contract() {
+    fn create_uses_a_canonical_project_reference_without_hidden_ids() {
         let definition = create_tool_def();
         let schema: serde_json::Value = serde_json::from_str(&definition.input_schema).unwrap();
         assert_eq!(definition.canonical_name(), "issues.create");
+        assert_eq!(definition.version, CREATE_TOOL_VERSION);
+        assert!(definition.exposed_over_mcp);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["project_ref", "title"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["title"]["maxLength"], 512);
+        assert!(schema["properties"].get("project_id").is_none());
+        assert!(schema["properties"].get("type_id").is_none());
+        assert!(schema["properties"].get("prefix").is_none());
+    }
+
+    #[test]
+    fn create_v1_remains_available_for_already_activated_agents() {
+        let definition = create_tool_def_v1();
+        let schema: serde_json::Value = serde_json::from_str(&definition.input_schema).unwrap();
+        assert_eq!(definition.canonical_name(), "issues.create");
+        assert_eq!(definition.version, ISSUES_TOOL_VERSION);
         assert!(definition.exposed_over_mcp);
         assert_eq!(
             schema["required"],
             serde_json::json!(["project_id", "title"])
         );
-        assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["title"]["maxLength"], 512);
-        assert!(schema["properties"].get("project").is_none());
-        assert!(schema["properties"].get("type").is_none());
+        assert!(schema["properties"].get("project_ref").is_none());
     }
 
     #[test]

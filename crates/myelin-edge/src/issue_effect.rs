@@ -5,7 +5,9 @@ use myelin_agent::{
 };
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
+use myelin_issues::api::is_canonical_uuid;
 use myelin_storage::TenantScope;
+use myelin_tenancy::TenantId;
 use serde::Deserialize;
 
 use crate::agent_delegation::is_active_delegation;
@@ -23,6 +25,50 @@ pub struct IssueEffectApi {
 #[serde(deny_unknown_fields)]
 struct IssueCloseRequest {
     issue_ref: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalIssueCreateRequest {
+    project_ref: String,
+    title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AgentIssueCreateRequest {
+    Canonical(CanonicalIssueCreateRequest),
+    Legacy(IssueCreateRequest),
+}
+
+impl AgentIssueCreateRequest {
+    fn into_issue_request(self, tenant: &TenantId) -> Result<IssueCreateRequest, String> {
+        match self {
+            Self::Canonical(request) => Ok(IssueCreateRequest {
+                project_id: project_id_from_ref(tenant, &request.project_ref)?,
+                type_id: None,
+                prefix: None,
+                title: request.title,
+            }),
+            Self::Legacy(request) => Ok(request),
+        }
+    }
+}
+
+fn project_id_from_ref(tenant: &TenantId, project_ref: &str) -> Result<String, String> {
+    let parsed = myelin_refs::parse_scoped(project_ref)
+        .map_err(|error| format!("invalid project_ref: {error}"))?;
+    if parsed.tenant != *tenant
+        || parsed.subsystem != "identity"
+        || parsed.type_ != "project"
+        || parsed.sub.is_some()
+    {
+        return Err("project_ref must name a project root in the current tenant".into());
+    }
+    if !is_canonical_uuid(&parsed.id) {
+        return Err("project_ref must contain a canonical project UUID".into());
+    }
+    Ok(parsed.id)
 }
 
 impl IssueEffectApi {
@@ -84,13 +130,17 @@ impl IssueEffectApi {
     ) -> EffectResult {
         match tool {
             "issues.create" => {
-                let request: IssueCreateRequest = match serde_json::from_value(arguments) {
+                let request: AgentIssueCreateRequest = match serde_json::from_value(arguments) {
                     Ok(request) => request,
                     Err(error) => {
                         return EffectResult::Denied(format!(
                             "invalid issues.create arguments: {error}"
                         ))
                     }
+                };
+                let request = match request.into_issue_request(&self.principal.tenant) {
+                    Ok(request) => request,
+                    Err(error) => return EffectResult::Denied(error),
                 };
                 match self.issues.create_issue(
                     &self.principal,
@@ -184,23 +234,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proposed_issue_effects_are_strict_project_native_json_carriers() {
+    fn proposed_issue_effects_accept_each_versioned_create_contract_without_ambiguity() {
         let (tool, arguments) = parse_proposed(
-            r#"tool:issues.create|args:{"project_id":"11111111-1111-1111-1111-111111111111","title":"CI is red"}"#,
+            r#"tool:issues.create|args:{"project_ref":"myelin://acme/identity/project/11111111-1111-1111-1111-111111111111","title":"CI is red"}"#,
         )
         .unwrap();
         assert_eq!(tool, "issues.create");
-        let request: IssueCreateRequest = serde_json::from_value(arguments).unwrap();
+        let request: AgentIssueCreateRequest = serde_json::from_value(arguments).unwrap();
+        let request = request
+            .into_issue_request(&TenantId("acme".into()))
+            .unwrap();
+        assert_eq!(request.project_id, "11111111-1111-1111-1111-111111111111");
         assert_eq!(request.title, "CI is red");
         assert!(request.type_id.is_none());
         assert!(parse_proposed("garbage").is_none());
         assert!(parse_proposed("tool:issues.create|args:not-json").is_none());
 
         let (_, arguments) = parse_proposed(
-            r#"tool:issues.create|args:{"project_id":"11111111-1111-1111-1111-111111111111","title":"CI is red","tenant":"other"}"#,
+            r#"tool:issues.create|args:{"project_id":"11111111-1111-1111-1111-111111111111","title":"CI is red"}"#,
         )
         .unwrap();
-        assert!(serde_json::from_value::<IssueCreateRequest>(arguments).is_err());
+        let legacy: AgentIssueCreateRequest = serde_json::from_value(arguments).unwrap();
+        assert_eq!(
+            legacy
+                .into_issue_request(&TenantId("acme".into()))
+                .unwrap()
+                .project_id,
+            "11111111-1111-1111-1111-111111111111"
+        );
+
+        let (_, ambiguous) = parse_proposed(
+            r#"tool:issues.create|args:{"project_ref":"myelin://acme/identity/project/11111111-1111-1111-1111-111111111111","project_id":"11111111-1111-1111-1111-111111111111","title":"CI is red"}"#,
+        )
+        .unwrap();
+        assert!(serde_json::from_value::<AgentIssueCreateRequest>(ambiguous).is_err());
 
         let (_, close_arguments) = parse_proposed(
             r#"tool:issues.close|args:{"issue_ref":"myelin://acme/issue/issue/ENG-41"}"#,
@@ -213,5 +280,30 @@ mod tests {
         )
         .unwrap();
         assert!(serde_json::from_value::<IssueCloseRequest>(ambiguous_close).is_err());
+    }
+
+    #[test]
+    fn canonical_project_references_are_tenant_bound_project_roots() {
+        let tenant = TenantId("acme".into());
+        assert!(project_id_from_ref(
+            &tenant,
+            "myelin://other/identity/project/11111111-1111-1111-1111-111111111111"
+        )
+        .is_err());
+        assert!(project_id_from_ref(
+            &tenant,
+            "myelin://acme/issue/issue/11111111-1111-1111-1111-111111111111"
+        )
+        .is_err());
+        assert!(project_id_from_ref(
+            &tenant,
+            "myelin://acme/identity/project/11111111-1111-1111-1111-111111111111#field-name"
+        )
+        .is_err());
+        assert!(project_id_from_ref(
+            &tenant,
+            "myelin://acme/identity/project/11111111-1111-1111-1111-11111111111A"
+        )
+        .is_err());
     }
 }

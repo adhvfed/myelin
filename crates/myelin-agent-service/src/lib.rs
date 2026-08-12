@@ -120,7 +120,7 @@ pub use issues_agents::{
     mock_triage_agent, register_full_issues_tools, reorder_tool_def, replay_forecast_agent,
     triage_effect_for, triage_suggestion_strip, update_required_caps, update_tool_def,
     ForecastInput, ForecastOutput, LinearForecast, ASSIGN_TOOL, CLOSE_TOOL, CREATE_TOOL,
-    ESTIMATE_TOOL, LINK_TOOL, REORDER_TOOL, UPDATE_TOOL,
+    CREATE_TOOL_VERSION, ESTIMATE_TOOL, LINK_TOOL, REORDER_TOOL, UPDATE_TOOL,
 };
 
 pub use issues_read_tools::{issues_read_tool_defs, LIST_ISSUES_TOOL, VIEW_ISSUE_TOOL};

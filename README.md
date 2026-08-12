@@ -189,8 +189,9 @@ terminates every unfinished run atomically; resuming permits fresh work but neve
 run. No provider API key or long-lived agent credential is created or copied through this flow.
 Selected read tools resolve projects, CI runs, issues, and Knowledge pages through the human
 delegator's live Myelin permissions. An agent can discover a project's canonical reference,
-issue prefix, and default type without an operator putting opaque identifiers in its prompt. A
-selected `knowledge.link_work` tool can add one attributed,
+issue prefix, and default type without an operator putting opaque identifiers in its prompt, then
+create an issue from that reference while Myelin applies the project's owned defaults. A selected
+`knowledge.link_work` tool can add one attributed,
 retry-safe delivery link to a page the delegator owns. Both paths use canonical references without
 GitHub, Linear, or Notion keys.
 

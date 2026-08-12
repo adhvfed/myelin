@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn the_platform_catalogue_is_one_sorted_validated_cross_subsystem_surface() {
         let catalogue = PlatformToolCatalogue::platform().unwrap();
-        assert_eq!(catalogue.definitions().len(), 56);
+        assert_eq!(catalogue.definitions().len(), 57);
         let keys = catalogue
             .definitions()
             .iter()
@@ -218,6 +218,7 @@ mod tests {
             "ci.read_run",
             "ci.read_log",
             "issues.close",
+            "issues.create",
             "issues.list",
             "issues.view",
             "knowledge.list_pages",
@@ -227,6 +228,9 @@ mod tests {
         ] {
             assert!(names.contains(expected), "manifest omitted {expected}");
         }
+        let create = catalogue.resolve("issues.create").unwrap();
+        assert_eq!(create.version, crate::CREATE_TOOL_VERSION);
+        assert!(create.input_schema.contains("project_ref"));
         assert!(!names.contains("knowledge.publish"));
     }
 

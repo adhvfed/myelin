@@ -256,6 +256,22 @@ mod tests {
     }
 
     #[test]
+    fn an_old_agent_keeps_create_v1_while_a_new_selection_receives_v2() {
+        let old = ToolRegistry::for_cursors(&["issues.create.v1".into()]).unwrap();
+        let current = ToolRegistry::for_cursors(&["issues.create.v2".into()]).unwrap();
+
+        let old_create = old.resolve("issues.create").unwrap();
+        let current_create = current.resolve("issues.create").unwrap();
+        assert_eq!(old_create.cursor(), "issues.create.v1");
+        assert_eq!(current_create.cursor(), "issues.create.v2");
+        assert!(old_create.definition().input_schema.contains("project_id"));
+        assert!(current_create
+            .definition()
+            .input_schema
+            .contains("project_ref"));
+    }
+
+    #[test]
     fn git_and_ci_contracts_preserve_the_provider_schemas_exactly() {
         let registry = ToolRegistry::with_git_and_ci_reads().unwrap();
         let catalogue = PlatformToolCatalogue::platform().unwrap();
