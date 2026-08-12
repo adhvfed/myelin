@@ -694,6 +694,23 @@ struct PrCommandIdentity<'a> {
     expected_number: Option<i64>,
 }
 
+impl<'a> PrCommandIdentity<'a> {
+    fn merge(
+        operation_id: &'a PrOperationId,
+        actor_subject_id: &'a str,
+        payload_hash: &'a str,
+        number: i64,
+    ) -> Self {
+        Self {
+            operation_id,
+            actor_subject_id,
+            command_kind: "merge",
+            payload_hash,
+            expected_number: Some(number),
+        }
+    }
+}
+
 struct SealedPrRecord {
     record: serde_json::Value,
     title: EncryptedColumn,
@@ -1470,10 +1487,12 @@ impl PgPrStore {
                         merge_ledger_state(
                             conn,
                             &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            &command_hash,
-                            number_db,
+                            &PrCommandIdentity::merge(
+                                &operation_id,
+                                &actor_subject_id,
+                                &command_hash,
+                                number_db,
+                            ),
                         )
                         .await
                     })
@@ -1509,10 +1528,12 @@ impl PgPrStore {
                         match merge_ledger_state(
                             conn,
                             &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            &command_hash,
-                            number_db,
+                            &PrCommandIdentity::merge(
+                                &operation_id,
+                                &actor_subject_id,
+                                &command_hash,
+                                number_db,
+                            ),
                         )
                         .await?
                         {
@@ -1524,10 +1545,12 @@ impl PgPrStore {
                                 insert_merge_command(
                                     conn,
                                     &loc,
-                                    &operation_id,
-                                    &actor_subject_id,
-                                    &command_hash,
-                                    number_db,
+                                    &PrCommandIdentity::merge(
+                                        &operation_id,
+                                        &actor_subject_id,
+                                        &command_hash,
+                                        number_db,
+                                    ),
                                     status,
                                     Some(&result),
                                 )
@@ -2055,10 +2078,12 @@ impl PgPrStore {
                         match merge_ledger_state(
                             conn,
                             &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            &command_hash,
-                            number_db,
+                            &PrCommandIdentity::merge(
+                                &operation_id,
+                                &actor_subject_id,
+                                &command_hash,
+                                number_db,
+                            ),
                         )
                         .await?
                         {
@@ -2201,10 +2226,12 @@ impl PgPrStore {
                         match merge_ledger_state(
                             conn,
                             &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            &command_hash,
-                            number_db,
+                            &PrCommandIdentity::merge(
+                                &operation_id,
+                                &actor_subject_id,
+                                &command_hash,
+                                number_db,
+                            ),
                         )
                         .await?
                         {
@@ -2262,10 +2289,12 @@ impl PgPrStore {
                             insert_merge_command(
                                 conn,
                                 &loc,
-                                &operation_id,
-                                &actor_subject_id,
-                                &command_hash,
-                                number_db,
+                                &PrCommandIdentity::merge(
+                                    &operation_id,
+                                    &actor_subject_id,
+                                    &command_hash,
+                                    number_db,
+                                ),
                                 "completed",
                                 Some(&result),
                             )
@@ -2275,10 +2304,12 @@ impl PgPrStore {
                         insert_merge_command(
                             conn,
                             &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            &command_hash,
-                            number_db,
+                            &PrCommandIdentity::merge(
+                                &operation_id,
+                                &actor_subject_id,
+                                &command_hash,
+                                number_db,
+                            ),
                             "pending",
                             None,
                         )
@@ -2343,7 +2374,16 @@ impl PgPrStore {
                     .bind(&loc.tenant).bind(&loc.region).bind(&loc.repo).bind(number_db)
                     .fetch_optional(&mut *conn).await.map_err(|_| pg_query("lock merge PR"))?
                     .ok_or_else(|| myelin_storage::PgError::Query(format!("PR #{number} not found")))?;
-                match merge_ledger_state(conn, &loc, &operation_id, &actor_subject_id, &command_hash, number_db).await? {
+                match merge_ledger_state(
+                    conn,
+                    &loc,
+                    &PrCommandIdentity::merge(
+                        &operation_id,
+                        &actor_subject_id,
+                        &command_hash,
+                        number_db,
+                    ),
+                ).await? {
                     MergeLedgerState::Terminal(attempt) => return Ok(attempt),
                     MergeLedgerState::Absent => return Err(pg_query("merge command reservation missing")),
                     MergeLedgerState::Pending => {}
@@ -2564,10 +2604,7 @@ async fn record_command(
 async fn merge_ledger_state(
     conn: &mut sqlx::PgConnection,
     loc: &RepoLoc,
-    operation_id: &PrOperationId,
-    actor_subject_id: &str,
-    expected_hash: &str,
-    expected_number: i64,
+    command: &PrCommandIdentity<'_>,
 ) -> Result<MergeLedgerState, myelin_storage::PgError> {
     let row = sqlx::query(
         "SELECT repo_slug,actor_subject_id,command_kind,payload_hash,pr_number,status,result
@@ -2576,7 +2613,7 @@ async fn merge_ledger_state(
     )
     .bind(&loc.tenant)
     .bind(&loc.region)
-    .bind(operation_id.as_str())
+    .bind(command.operation_id.as_str())
     .fetch_optional(&mut *conn)
     .await
     .map_err(|_| pg_query("merge command lookup"))?;
@@ -2603,10 +2640,10 @@ async fn merge_ledger_state(
     let stored_number: i64 = row
         .try_get("pr_number")
         .map_err(|_| pg_query("decode merge command"))?;
-    if stored_actor != actor_subject_id
-        || stored_kind != "merge"
-        || stored_hash != expected_hash
-        || stored_number != expected_number
+    if stored_actor != command.actor_subject_id
+        || stored_kind != command.command_kind
+        || stored_hash != command.payload_hash
+        || command.expected_number != Some(stored_number)
     {
         return Err(myelin_storage::PgError::Query(
             "PR operation id was reused for a different command or target".into(),
@@ -2634,17 +2671,19 @@ async fn merge_ledger_state(
     Ok(MergeLedgerState::Terminal(result.into_attempt()))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn insert_merge_command(
     conn: &mut sqlx::PgConnection,
     loc: &RepoLoc,
-    operation_id: &PrOperationId,
-    actor_subject_id: &str,
-    payload_hash: &str,
-    pr_number: i64,
+    command: &PrCommandIdentity<'_>,
     status: &str,
     result: Option<&MergeCommandResult>,
 ) -> Result<(), myelin_storage::PgError> {
+    if command.command_kind != "merge" {
+        return Err(pg_query("persist non-merge command through merge ledger"));
+    }
+    let pr_number = command
+        .expected_number
+        .ok_or_else(|| pg_query("persist merge command without a PR target"))?;
     let result = result
         .map(serde_json::to_value)
         .transpose()
@@ -2657,9 +2696,9 @@ async fn insert_merge_command(
     .bind(&loc.tenant)
     .bind(&loc.region)
     .bind(&loc.repo)
-    .bind(operation_id.as_str())
-    .bind(actor_subject_id)
-    .bind(payload_hash)
+    .bind(command.operation_id.as_str())
+    .bind(command.actor_subject_id)
+    .bind(command.payload_hash)
     .bind(pr_number)
     .bind(status)
     .bind(result)
