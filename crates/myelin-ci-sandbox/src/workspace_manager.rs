@@ -546,9 +546,14 @@ impl WorkspaceManager {
             return Ok(());
         };
         let state = self.shared.lock_state();
-        let locked_identity = state
-            .locked_identity
-            .expect("an EphemeralDisk manager always records a locked identity at construction");
+        let Some(locked_identity) = state.locked_identity else {
+            let error = WorkspaceManagerError::LockFailed {
+                base_dir: base_dir.to_path_buf(),
+                reason: "enabled workspace manager has no recorded locked-directory identity"
+                    .to_string(),
+            };
+            return self.poison_and_report(state, error);
+        };
 
         if let Err(error) = check_path_matches_locked_identity(locked_identity, base_dir) {
             return self.poison_and_report(state, error);
@@ -570,11 +575,15 @@ impl WorkspaceManager {
             return self.poison_and_report(state, error);
         }
 
-        let health_result = state
-            .storage
-            .as_ref()
-            .expect("checked Some above")
-            .check_health();
+        let health_result = state.storage.as_ref().map_or_else(
+            || {
+                Err(WorkspaceStorageError::Io {
+                    path: base_dir.to_path_buf(),
+                    reason: "workspace storage disappeared during a locked health check".into(),
+                })
+            },
+            WorkspaceStorageBackend::check_health,
+        );
         match health_result {
             Ok(()) => {
                 if let Err(error) = check_path_matches_locked_identity(locked_identity, base_dir) {
@@ -700,10 +709,15 @@ impl WorkspaceManager {
                 },
             ));
         }
-        let storage = state
-            .storage
-            .as_mut()
-            .expect("Healthy admission implies storage is Some for an EphemeralDisk manager");
+        let Some(storage) = state.storage.as_mut() else {
+            drop(state);
+            self.shared.poison(
+                "healthy enabled workspace manager has no storage backend; refusing provisioning",
+            );
+            return Err(WorkspaceProvisionError::Refused(
+                WorkspaceRequestRefusal::Poisoned { capacity },
+            ));
+        };
         let result = storage.create_workspace(job_key, quota_bytes, owner_uid, owner_gid);
         self.apply_create_result(state, job_key, capacity, result)
     }
@@ -766,21 +780,36 @@ impl WorkspaceManager {
         }
         let mut workspace = workspace;
         let job_key = workspace.job_key.clone();
-        let prepared = workspace
-            .prepared
-            .take()
-            .expect("not yet consumed by a prior delete_workspace call");
-        let capacity = workspace
-            .capacity
-            .take()
-            .expect("not yet consumed by a prior delete_workspace call");
+        let (prepared, capacity) = match (workspace.prepared.take(), workspace.capacity.take()) {
+            (Some(prepared), Some(capacity)) => (prepared, capacity),
+            (prepared, capacity) => {
+                workspace.released = true;
+                let reason = format!(
+                    "managed workspace for job {job_key:?} lost its prepared storage or capacity capability before deletion"
+                );
+                drop(prepared);
+                if let Some(capacity) = capacity {
+                    capacity.abandon_with_reason(reason.clone());
+                } else {
+                    self.shared.poison(reason.clone());
+                }
+                return Err(DeleteWorkspaceError::InternalInvariantViolated { reason });
+            }
+        };
         workspace.released = true;
 
         let mut state = self.shared.lock_state();
-        let storage = state
-            .storage
-            .as_mut()
-            .expect("a ManagedWorkspace can only exist for an EphemeralDisk manager with storage");
+        let Some(storage) = state.storage.as_mut() else {
+            drop(state);
+            capacity.abandon_with_reason(format!(
+                "workspace storage backend disappeared before deleting job {job_key:?}; capacity retained pending reconciliation"
+            ));
+            return Err(DeleteWorkspaceError::InternalInvariantViolated {
+                reason: format!(
+                    "workspace storage backend disappeared before deleting job {job_key:?}"
+                ),
+            });
+        };
         let result = storage.delete_workspace(prepared);
         self.apply_delete_result(state, &job_key, capacity, result)
     }

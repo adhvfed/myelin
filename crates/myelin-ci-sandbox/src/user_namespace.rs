@@ -2081,11 +2081,14 @@ impl UserNamespaceAllocator {
     }
 
     pub fn check_identity(&self) -> Result<(), UserNamespaceRefusal> {
-        let locked_identity = self
-            .shared
-            .lock_state()
-            .locked_identity
-            .expect("a try_new-constructed allocator always records a locked identity");
+        let state = self.shared.lock_state();
+        let Some(locked_identity) = state.locked_identity else {
+            drop(state);
+            let reason = "userns allocator has no recorded locked-directory identity".to_string();
+            self.shared.poison(reason.clone());
+            return Err(UserNamespaceRefusal::Poisoned { reason });
+        };
+        drop(state);
         match crate::dirlock::path_identity(&self.leases_dir) {
             Ok(current) if current == locked_identity => Ok(()),
             Ok(_) => {
