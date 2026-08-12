@@ -222,11 +222,11 @@ describe.sequential("notification delivery lifecycle", () => {
     const subjects = ["first", "second"].map(
       (suffix) => `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${uniqueName(suffix)}`,
     );
-    for (const subject of subjects) {
+    for (const [index, subject] of subjects.entries()) {
       await bus.publish(signalEnvelope({
         actor: systemTestConfig.reviewerPrincipal,
         recipient: systemTestConfig.principal,
-        dedupKey: uniqueName("page"),
+        dedupKey: uniqueName(`page-${index + 1}`),
         subject,
       }));
     }
