@@ -84,20 +84,10 @@ async fn spawn(gateway: Arc<Gateway>) -> SocketAddr {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
-    let Ok(_) = std::env::var("DATABASE_URL") else {
-        eprintln!(
-            "SKIP bootstrap_token_authenticates_and_drives_the_product_surface: DATABASE_URL unset"
-        );
-        return;
-    };
     let config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
-    let bootstrap = match PgBootstrap::connect(config, 8).await {
-        Ok(bootstrap) => bootstrap,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let bootstrap = PgBootstrap::connect(config, 8)
+        .await
+        .expect("connect to the Postgres required by the bootstrap product-surface story");
     let handle = tokio::runtime::Handle::current();
     bootstrap
         .migrate_foundation()
