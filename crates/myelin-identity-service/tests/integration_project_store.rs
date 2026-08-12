@@ -13,6 +13,16 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 use std::sync::Arc;
 
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(config: &MyelinConfig) -> MyelinConfig {
     let mut admin = config.clone();
     admin.database_url = admin
@@ -70,14 +80,10 @@ impl IdMinter for FixedMinter {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
-    let config = MyelinConfig::dev();
-    let admin = match SubstrateProvider::connect(admin_config(&config), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let config = test_config();
+    let admin = SubstrateProvider::connect(admin_config(&config), 4)
+        .await
+        .expect("connect to the Postgres required by the project onboarding story");
     admin.migrate_foundation().await.unwrap();
     admin
         .migrate(&all_durable_migrations(), &HotTables::none())
