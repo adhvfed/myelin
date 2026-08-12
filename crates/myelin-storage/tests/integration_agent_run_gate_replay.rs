@@ -8,6 +8,16 @@ use myelin_storage::reserve_settle_durable::reserve_settle_durable_migrations;
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::TenantId;
 
+fn app_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(config: &MyelinConfig) -> MyelinConfig {
     let mut admin = config.clone();
     admin.database_url = admin
@@ -25,14 +35,10 @@ fn unique_suffix() -> u128 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_workflow_resumes_its_exact_cost_reservation() {
-    let config = MyelinConfig::dev();
-    let admin = match SubstrateProvider::connect(admin_config(&config), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let config = app_config();
+    let admin = SubstrateProvider::connect(admin_config(&config), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate(&reserve_settle_durable_migrations(), &HotTables::none())
         .await

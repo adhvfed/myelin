@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 use myelin_config::MyelinConfig;
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -39,31 +41,23 @@ fn unique(label: &str) -> String {
     )
 }
 
-async fn test_provider() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(), 2).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn test_provider() -> SubstrateProvider {
+    let admin = SubstrateProvider::connect(admin_config(), 2)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin.migrate_foundation().await.unwrap();
     admin
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
         .unwrap();
-    Some(
-        SubstrateProvider::connect(app_config(), 1)
-            .await
-            .expect("open the deliberately single-connection app provider"),
-    )
+    SubstrateProvider::connect(app_config(), 1)
+        .await
+        .expect("open the deliberately single-connection app provider")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_database_has_no_plaintext_door_for_an_agent_answer() {
-    let Some(provider) = test_provider().await else {
-        return;
-    };
+    let provider = test_provider().await;
     let tenant = unique("trace-plaintext-refused");
     let region = provider.config().region.clone();
     let transaction_tenant = tenant.clone();
@@ -132,9 +126,7 @@ fn legacy_subject_token(tenant: &str, region: &str, requested_by: &str) -> Strin
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subject_markers_are_blinded_without_reopening_legacy_privacy_choices() {
-    let Some(provider) = test_provider().await else {
-        return;
-    };
+    let provider = test_provider().await;
     let tenant = TenantId(unique("trace-blind-subject"));
     let region = provider.config().region.clone();
     let seal_key = SealKey::from_encoded(&"99".repeat(32)).expect("a 32-byte test seal key");
@@ -242,9 +234,7 @@ async fn subject_markers_are_blinded_without_reopening_legacy_privacy_choices() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_erasure_marker_refuses_to_resurrect_a_trace_on_worker_retry() {
-    let Some(provider) = test_provider().await else {
-        return;
-    };
+    let provider = test_provider().await;
     let tenant = TenantId(unique("trace-erasure"));
     let run_id = "33333333-3333-4333-8333-333333333333";
     let erased_trace = trace(run_id);
@@ -306,9 +296,7 @@ async fn an_erasure_marker_refuses_to_resurrect_a_trace_on_worker_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupted_subject_erasure_stays_blocked_and_finishes_on_retry() {
-    let Some(provider) = test_provider().await else {
-        return;
-    };
+    let provider = test_provider().await;
     let tenant = TenantId(unique("trace-erasure-resume"));
     let seal_key = SealKey::from_encoded(&"88".repeat(32)).expect("a 32-byte test seal key");
     let kms = Arc::new(
@@ -418,9 +406,7 @@ async fn an_interrupted_subject_erasure_stays_blocked_and_finishes_on_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_ones() {
-    let Some(provider) = test_provider().await else {
-        return;
-    };
+    let provider = test_provider().await;
     let tenant = TenantId(unique("trace-subject-erasure"));
     let seal_key = SealKey::from_encoded(&"77".repeat(32)).expect("a 32-byte test seal key");
     let kms = Arc::new(

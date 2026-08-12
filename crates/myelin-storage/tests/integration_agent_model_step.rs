@@ -37,13 +37,9 @@ fn unique_suffix() -> u128 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
     let config = app_config();
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
