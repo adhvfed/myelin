@@ -212,7 +212,7 @@ pub fn run_e2e1_pr_context_pane() -> E2eArtifact {
     let collaborator = e2e_viewer("collaborator");
     let denied = e2e_viewer("denied-teammate");
     let tenant = e2e_tenant();
-    let run_ref = ci_run_ref(&tenant.0, E2E1_RUN_ID);
+    let run_ref = ci_run_ref(&tenant.0, E2E1_RUN_ID).unwrap();
 
     let emit_ctx = CheckEmitContext {
         tenant: tenant.0.clone(),
@@ -367,7 +367,7 @@ const E2E3_DEPLOY_CARD: &str = "deploy-prod-payments-v2";
 
 fn e2e3_ci_source() -> CiReindexSource {
     let mut src = CiReindexSource::new();
-    let run_ref = ci_run_ref("acme", E2E3_RUN_ID);
+    let run_ref = ci_run_ref("acme", E2E3_RUN_ID).unwrap();
     src.upsert(
         CiReplayKind::Run,
         &run_ref.0,
@@ -456,7 +456,7 @@ fn e2e3_lineage_hops() -> Vec<(String, String, String)> {
     let spec = e2e3_spec_ref();
     let issue = e2e3_issue_ref();
     let pr = e2e3_pr_ref();
-    let run = ci_run_ref("acme", E2E3_RUN_ID).0;
+    let run = ci_run_ref("acme", E2E3_RUN_ID).unwrap().0;
     let deploy = format!("myelin://acme/ci/deployment/{E2E3_DEPLOY_CARD}");
     vec![
         (spec, issue.clone(), "decomposes".to_string()),
@@ -481,7 +481,7 @@ pub fn run_e2e3_spec_to_ship_lineage() -> E2eArtifact {
             }
         }
     }
-    let run_ref = ci_run_ref("acme", E2E3_RUN_ID).0;
+    let run_ref = ci_run_ref("acme", E2E3_RUN_ID).unwrap().0;
     let lineage_traceable = reached.contains(&e2e3_issue_ref())
         && reached.contains(&e2e3_pr_ref())
         && reached.contains(&run_ref)
@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn e2e1_unauthorized_projection_carries_no_run_fragment() {
         let denied = e2e_viewer("nobody");
-        let run_ref = ci_run_ref("acme", E2E1_RUN_ID);
+        let run_ref = ci_run_ref("acme", E2E1_RUN_ID).unwrap();
         let embed = ArtifactRef(format!("{}#step-{E2E1_FAIL_STEP}", run_ref.0));
         let mut store = ArtifactStore::new();
         store.put_run(

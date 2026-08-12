@@ -306,8 +306,10 @@ pub fn decode_ci_claimed_input(
     let canonical_manifest = ci_artifact_ref(
         &expected_tenant.0,
         &format!("drive-manifest-{manifest_digest}"),
-    );
-    let canonical_run = ci_run_ref(&expected_tenant.0, &ci_run_id);
+    )
+    .map_err(|error| ClaimedCiInputError(error.to_string()))?;
+    let canonical_run = ci_run_ref(&expected_tenant.0, &ci_run_id)
+        .map_err(|error| ClaimedCiInputError(error.to_string()))?;
     if input[0] != canonical_manifest || input[1] != canonical_run {
         return Err(ClaimedCiInputError(
             "claimed references are parseable but not byte-canonical".into(),
@@ -1187,8 +1189,9 @@ fn workflow_input(
         ci_artifact_ref(
             &record.tenant_id,
             &format!("drive-manifest-{manifest_digest}"),
-        ),
-        ci_run_ref(&record.tenant_id, &record.run_id),
+        )
+        .map_err(corrupt_ci_ref)?,
+        ci_run_ref(&record.tenant_id, &record.run_id).map_err(corrupt_ci_ref)?,
     ];
     let decoded = decode_ci_claimed_input(&TenantId(record.tenant_id.clone()), &input)
         .map_err(|error| PgCiStarterError::CorruptRun(error.to_string()))?;
@@ -1327,7 +1330,11 @@ fn validate_replay_manifest(
         &record.tenant_id,
         &format!("snapshot-{}", content_hash.to_multihash_string()),
     )
+    .map_err(corrupt_ci_ref)?
     .0;
+    let expected_run = ci_run_ref(&record.tenant_id, &record.run_id)
+        .map_err(corrupt_ci_ref)?
+        .0;
     if manifest.tenant_id != record.tenant_id
         || manifest.region != record.region
         || manifest.wf_run_id != record.wf_run_id
@@ -1335,7 +1342,7 @@ fn validate_replay_manifest(
         || manifest.source_snapshot_ref != expected_source
         || manifest.repo_ref != record.repo_ref.as_deref().unwrap_or_default()
         || manifest.commit_oid != record.commit_oid.as_deref().unwrap_or_default()
-        || manifest.run_ref != ci_run_ref(&record.tenant_id, &record.run_id).0
+        || manifest.run_ref != expected_run
         || manifest.started_at != started_at
         || manifest.trust_tier != trust_tier
     {
@@ -1587,6 +1594,7 @@ fn build_drive_manifest_v1(
             &record.tenant_id,
             &format!("snapshot-{}", prepared.content_hash().to_multihash_string()),
         )
+        .map_err(corrupt_ci_ref)?
         .0,
         source_plan_schema_version: RUN_PLAN_SCHEMA_V2,
         launch_request_digest: prepared
@@ -1600,7 +1608,9 @@ fn build_drive_manifest_v1(
         repo_ref,
         source_ref: record.source_ref.clone(),
         commit_oid,
-        run_ref: ci_run_ref(&record.tenant_id, &record.run_id).0,
+        run_ref: ci_run_ref(&record.tenant_id, &record.run_id)
+            .map_err(corrupt_ci_ref)?
+            .0,
         started_at: started_at.into(),
         trust_tier,
         check_attempts,
@@ -1609,6 +1619,10 @@ fn build_drive_manifest_v1(
     };
     manifest.validate().map_err(PgCiStarterError::Manifest)?;
     Ok(manifest)
+}
+
+fn corrupt_ci_ref(error: crate::CiRefError) -> PgCiStarterError {
+    PgCiStarterError::CorruptRun(error.to_string())
 }
 
 const SELECT_RESERVED_CHECK_ATTEMPTS_QUERY: &str = "\
@@ -2059,8 +2073,8 @@ mod tests {
 
     fn canonical_input() -> Vec<ArtifactRef> {
         vec![
-            ci_artifact_ref("acme", &format!("drive-manifest-blake3:{}", "a".repeat(64))),
-            ci_run_ref("acme", "10000000-0000-0000-0000-000000000001"),
+            ci_artifact_ref("acme", &format!("drive-manifest-blake3:{}", "a".repeat(64))).unwrap(),
+            ci_run_ref("acme", "10000000-0000-0000-0000-000000000001").unwrap(),
         ]
     }
 
@@ -2240,8 +2254,9 @@ mod tests {
                 ci_artifact_ref(
                     "acme",
                     &format!("drive-manifest-{}", decoded.manifest_digest())
-                ),
-                ci_run_ref("acme", decoded.ci_run_id())
+                )
+                .unwrap(),
+                ci_run_ref("acme", decoded.ci_run_id()).unwrap()
             ]
         );
     }
@@ -2253,14 +2268,16 @@ mod tests {
             vec![base[0].clone()],
             vec![base[1].clone(), base[0].clone()],
             vec![
-                ci_artifact_ref("acme", &format!("drive-manifest-sha256:{}", "a".repeat(64))),
+                ci_artifact_ref("acme", &format!("drive-manifest-sha256:{}", "a".repeat(64)))
+                    .unwrap(),
                 base[1].clone(),
             ],
             vec![
                 ci_artifact_ref(
                     "other",
                     &format!("drive-manifest-blake3:{}", "a".repeat(64)),
-                ),
+                )
+                .unwrap(),
                 base[1].clone(),
             ],
             vec![
@@ -2271,7 +2288,7 @@ mod tests {
             ],
             vec![
                 base[0].clone(),
-                ci_run_ref("acme", "10000000-0000-0000-0000-00000000000A"),
+                ci_run_ref("acme", "10000000-0000-0000-0000-00000000000A").unwrap(),
             ],
         ];
         for input in cases {

@@ -432,29 +432,29 @@ mod tests {
             .with_row(CiSealedRow::with_identity_edge(
                 CiStoreClass::RunState,
                 s.clone(),
-                ci_run_ref("acme", "run-7"),
+                ci_run_ref("acme", "run-7").unwrap(),
                 subject,
             ))
             .with_row(CiSealedRow::with_identity_edge(
                 CiStoreClass::Deployments,
                 s.clone(),
-                ci_deployment_ref("acme", "dep-3"),
+                ci_deployment_ref("acme", "dep-3").unwrap(),
                 subject,
             ))
             .with_row(CiSealedRow::sealed(
                 CiStoreClass::Logs,
                 s.clone(),
-                ci_run_ref("acme", "run-7"),
+                ci_run_ref("acme", "run-7").unwrap(),
             ))
             .with_row(CiSealedRow::sealed(
                 CiStoreClass::Artifacts,
                 s,
-                ci_run_ref("acme", "run-7"),
+                ci_run_ref("acme", "run-7").unwrap(),
             ))
             .with_row(CiSealedRow::sealed(
                 CiStoreClass::Caches,
                 t,
-                ci_run_ref("acme", "run-7"),
+                ci_run_ref("acme", "run-7").unwrap(),
             ))
     }
 
@@ -510,7 +510,7 @@ mod tests {
         let kms = seeded_kms(&footprint);
         let fanout = CiEraseFanOut::new(&kms, region());
         let mut store = ArtifactStore::new();
-        let run_ref = ci_run_ref("acme", "run-7");
+        let run_ref = ci_run_ref("acme", "run-7").unwrap();
         assert!(!store.is_erased(&run_ref));
         fanout
             .erase_subject("psn:ci-9", &tenant(), &footprint, &mut store)
@@ -570,7 +570,7 @@ mod tests {
         let footprint = CiSubjectFootprint::new().with_row(CiSealedRow::sealed(
             CiStoreClass::Caches,
             t,
-            ci_run_ref("acme", "run-7"),
+            ci_run_ref("acme", "run-7").unwrap(),
         ));
         let kms = seeded_kms(&footprint);
         let fanout = CiEraseFanOut::new(&kms, region());
@@ -668,7 +668,7 @@ mod tests {
         let live_footprint = CiSubjectFootprint::new().with_row(CiSealedRow::sealed(
             CiStoreClass::Logs,
             subject_dek_ref(&tenant(), 0, "psn:still-here"),
-            ci_run_ref("acme", "run-9"),
+            ci_run_ref("acme", "run-9").unwrap(),
         ));
         let kms2 = seeded_kms(&live_footprint);
         let fanout = CiEraseFanOut::new(&kms2, region());

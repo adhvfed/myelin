@@ -119,13 +119,13 @@ async fn ci_d3_erase_crypto_shreds_live_pii_and_pseudonymises_structure_survives
         .with_row(CiSealedRow::with_identity_edge(
             CiStoreClass::RunState,
             subj_key.clone(),
-            ci_run_ref(tenant.as_str(), run_id),
+            ci_run_ref(tenant.as_str(), run_id).unwrap(),
             subject,
         ))
         .with_row(CiSealedRow::sealed(
             CiStoreClass::Logs,
             subj_key.clone(),
-            ci_run_ref(tenant.as_str(), run_id),
+            ci_run_ref(tenant.as_str(), run_id).unwrap(),
         ));
     let mut store = ArtifactStore::new();
     let report = drive_ci_d3_erasure_reaches_every_holder(

@@ -245,10 +245,10 @@ pub use surfacing::{
     ci_artifact_ref, ci_deployment_ref, ci_pipeline_ref, ci_run_id_colref, ci_run_ref,
     ci_runner_ref, commit_check_ref, compose_run_list_query, lower_over_run_id,
     run_search_pre_filter, run_step_line_ref, run_step_ref, ArtifactStore, AuthzJoin,
-    AuthzVisibleIndex, BoundParam, CiArtifactType, CiSearchPreFilter, ComposedRunListQuery,
-    DeploymentMeta, LoweredFilter, PipelineMeta, ProjectError, Projected, Projection, Projector,
-    RenderHint, RunMeta, SubAnchor, Tombstone, TombstoneReason, AUTHZ_VISIBLE_TABLE, CI_SUBSYSTEM,
-    RUN_LIST_PERMISSION, VIEW,
+    AuthzVisibleIndex, BoundParam, CiArtifactType, CiRefError, CiSearchPreFilter,
+    ComposedRunListQuery, DeploymentMeta, LoweredFilter, PipelineMeta, ProjectError, Projected,
+    Projection, Projector, RenderHint, RunMeta, SubAnchor, Tombstone, TombstoneReason,
+    AUTHZ_VISIBLE_TABLE, CI_SUBSYSTEM, RUN_LIST_PERMISSION, VIEW,
 };
 
 #[cfg(any(test, feature = "test-support"))]

@@ -798,7 +798,7 @@ async fn initial_check_envelopes(
          ORDER BY envelope->'payload'->'context'->>'name'",
     )
     .bind(tenant)
-    .bind(ci_run_ref(tenant, run_id).0)
+    .bind(ci_run_ref(tenant, run_id).unwrap().0)
     .fetch_all(admin)
     .await
     .expect("read initial check outbox facts")
@@ -815,7 +815,7 @@ async fn assert_initial_checks(admin: &PgPool, tenant: &str, run_id: &str, attem
     .fetch_one(admin)
     .await
     .expect("read immutable CI start timestamp");
-    let run_ref = ci_run_ref(tenant, run_id).0;
+    let run_ref = ci_run_ref(tenant, run_id).unwrap().0;
     let rows = initial_check_envelopes(admin, tenant, run_id).await;
     assert_eq!(rows.len(), 3, "one initial fact per authored context");
     let expected_contexts = ["build", "package", "test"];
@@ -869,7 +869,7 @@ async fn cancelled_check_envelopes(
     tenant: &str,
     run_id: &str,
 ) -> Vec<serde_json::Value> {
-    let run_ref = ci_run_ref(tenant, run_id).0;
+    let run_ref = ci_run_ref(tenant, run_id).unwrap().0;
     sqlx::query_scalar(
         "SELECT envelope FROM outbox \
          WHERE envelope->>'type_' = 'ci.check.updated' \
@@ -892,7 +892,7 @@ async fn assert_cancelled_facts(
     run_id: &str,
     expected_cost_postures: &[bool],
 ) {
-    let run_ref = ci_run_ref(tenant, run_id).0;
+    let run_ref = ci_run_ref(tenant, run_id).unwrap().0;
     let terminal: Vec<serde_json::Value> = sqlx::query_scalar(
         "SELECT envelope FROM outbox \
          WHERE envelope->>'type_' = 'ci.run.cancelled' \
@@ -1020,7 +1020,9 @@ async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
         assert_eq!(row.4, expected_matrix);
         assert_eq!(
             row.5,
-            ci_artifact_ref(tenant, &format!("drive-manifest-{manifest_digest}")).0,
+            ci_artifact_ref(tenant, &format!("drive-manifest-{manifest_digest}"))
+                .unwrap()
+                .0,
             "spec_ref binds the immutable drive manifest, not customer plan input"
         );
         assert_eq!(row.6, "queued");
@@ -1098,8 +1100,8 @@ async fn expected_input(admin: &PgPool, tenant: &str, run_id: &str) -> Vec<Artif
     .await
     .unwrap();
     vec![
-        ci_artifact_ref(tenant, &format!("drive-manifest-{digest}")),
-        ci_run_ref(tenant, run_id),
+        ci_artifact_ref(tenant, &format!("drive-manifest-{digest}")).unwrap(),
+        ci_run_ref(tenant, run_id).unwrap(),
     ]
 }
 

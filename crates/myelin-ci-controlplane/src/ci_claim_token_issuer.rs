@@ -549,6 +549,7 @@ mod tests {
                 &run.tenant_id,
                 &format!("snapshot-{snapshot_digest}"),
             )
+            .unwrap()
             .0,
             source_plan_schema_version: RUN_PLAN_SCHEMA_V2,
             launch_request_digest: format!("blake3:{}", "b".repeat(64)),
@@ -559,7 +560,7 @@ mod tests {
             repo_ref: run.repo_ref.clone().unwrap(),
             source_ref: run.source_ref.clone(),
             commit_oid: run.commit_oid.clone().unwrap(),
-            run_ref: ci_run_ref(&run.tenant_id, &run.run_id).0,
+            run_ref: ci_run_ref(&run.tenant_id, &run.run_id).unwrap().0,
             started_at: "2026-07-22T12:00:00.000000Z".into(),
             trust_tier: CiManifestTrustTierV1::Trusted,
             check_attempts: BTreeMap::from([("test".into(), 1)]),

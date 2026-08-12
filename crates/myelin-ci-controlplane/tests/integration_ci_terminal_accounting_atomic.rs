@@ -773,8 +773,9 @@ async fn run_reporter_scenario(
                                 ci_artifact_ref(
                                     &tenant.0,
                                     &format!("drive-manifest-{manifest_digest}"),
-                                ),
-                        ci_run_ref(&tenant.0, ci_run),
+                                )
+                                .unwrap(),
+                        ci_run_ref(&tenant.0, ci_run).unwrap(),
                     ],
                     budget: None,
                     idem_key: "accounting-live".into(),

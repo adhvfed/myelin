@@ -112,7 +112,7 @@ fn a_run() -> RunMeta {
 
 #[test]
 fn provider_mints_grammatical_refs_the_consumer_refs_codec_round_trips() {
-    let run = ci_run_ref("acme", "01J7RUN");
+    let run = ci_run_ref("acme", "01J7RUN").unwrap();
     assert_eq!(myelin_refs::format(&run), "myelin://acme/ci/run/01J7RUN");
     assert_eq!(myelin_refs::parse(&myelin_refs::format(&run)).unwrap(), run);
 
@@ -126,7 +126,7 @@ fn provider_mints_grammatical_refs_the_consumer_refs_codec_round_trips() {
 
 #[test]
 fn provider_project_builds_the_projection_the_consumer_renders() {
-    let run = ci_run_ref("acme", "01J7RUN");
+    let run = ci_run_ref("acme", "01J7RUN").unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run, a_run());
     let projector = Projector::new(AllowList::allowing(&[&run]), store);
@@ -148,7 +148,7 @@ fn provider_project_builds_the_projection_the_consumer_renders() {
 
 #[test]
 fn provider_tombstones_on_deny_the_consumer_never_sees_the_title() {
-    let run = ci_run_ref("acme", "01J7RUN");
+    let run = ci_run_ref("acme", "01J7RUN").unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run, a_run());
     let projector = Projector::new(AllowList::allowing(&[]), store);

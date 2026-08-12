@@ -142,31 +142,51 @@ fn a_run() -> RunMeta {
 
 #[test]
 fn ci_artifact_refs_round_trip_canonical_keys() {
-    let run = ci_run_ref("acme", "01J7RUN");
+    let run = ci_run_ref("acme", "01J7RUN").unwrap();
     assert_eq!(myelin_refs::format(&run), "myelin://acme/ci/run/01J7RUN");
     assert_eq!(myelin_refs::parse(&myelin_refs::format(&run)).unwrap(), run);
 
     assert_eq!(
-        myelin_refs::format(&ci_deployment_ref("acme", "dep9")),
+        myelin_refs::format(&ci_deployment_ref("acme", "dep9").unwrap()),
         "myelin://acme/ci/deployment/dep9"
     );
     assert_eq!(
-        myelin_refs::format(&ci_pipeline_ref("acme", "pl3")),
+        myelin_refs::format(&ci_pipeline_ref("acme", "pl3").unwrap()),
         "myelin://acme/ci/pipeline/pl3"
     );
     assert_eq!(
-        myelin_refs::format(&ci_runner_ref("acme", "rn1")),
+        myelin_refs::format(&ci_runner_ref("acme", "rn1").unwrap()),
         "myelin://acme/ci/runner/rn1"
     );
     assert_eq!(
-        myelin_refs::format(&ci_artifact_ref("acme", "art2")),
+        myelin_refs::format(&ci_artifact_ref("acme", "art2").unwrap()),
         "myelin://acme/ci/artifact/art2"
     );
 }
 
 #[test]
+fn ci_artifact_refs_reject_ambiguous_root_components() {
+    assert_eq!(
+        ci_run_ref("", "run-1"),
+        Err(CiRefError::InvalidComponent {
+            component: "tenant"
+        })
+    );
+    assert_eq!(
+        ci_run_ref("acme/eu", "run-1"),
+        Err(CiRefError::InvalidComponent {
+            component: "tenant"
+        })
+    );
+    assert_eq!(
+        ci_artifact_ref("acme", "manifest#latest"),
+        Err(CiRefError::InvalidComponent { component: "id" })
+    );
+}
+
+#[test]
 fn step_mint_is_stable_across_retries_and_byte_identical_to_details_ref() {
-    let run = ci_run_ref("acme", "01J7RUN");
+    let run = ci_run_ref("acme", "01J7RUN").unwrap();
     let s1 = run_step_ref(&run, 3).unwrap();
     let s2 = run_step_ref(&run, 3).unwrap();
     assert_eq!(s1, s2, "the step mint is stable for a given (run, step)");
@@ -185,7 +205,7 @@ fn step_mint_is_stable_across_retries_and_byte_identical_to_details_ref() {
 
 #[test]
 fn line_range_and_check_mints_go_through_the_one_codec() {
-    let run = ci_run_ref("acme", "01J7RUN");
+    let run = ci_run_ref("acme", "01J7RUN").unwrap();
     let lr = run_step_line_ref(&run, 42, 88).unwrap();
     assert_eq!(
         myelin_refs::format(&lr),
@@ -363,7 +383,7 @@ fn difference_lowers_to_and_not_for_the_fork_exclusion() {
 
 #[test]
 fn authorized_viewer_gets_the_run_projection() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
     let p = Projector::new(StubId::new().allow_view(&run_ref), store);
@@ -391,7 +411,7 @@ fn authorized_viewer_gets_the_run_projection() {
 
 #[test]
 fn unauthorized_viewer_gets_a_tombstone_never_the_title() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
     let p = Projector::new(StubId::new(), store);
@@ -414,7 +434,7 @@ fn unauthorized_viewer_gets_a_tombstone_never_the_title() {
 
 #[test]
 fn an_id_hiccup_fails_closed_to_a_tombstone() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
     let p = Projector::new(StubId::new().allow_view(&run_ref).with_hiccup(), store);
@@ -429,7 +449,7 @@ fn an_id_hiccup_fails_closed_to_a_tombstone() {
 
 #[test]
 fn an_erased_run_projects_to_a_tombstone() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
     store.mark_erased(&run_ref);
@@ -449,7 +469,7 @@ fn an_erased_run_projects_to_a_tombstone() {
 
 #[test]
 fn a_restricted_subject_projects_to_a_tombstone() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
     store.mark_restricted(&run_ref);
@@ -463,7 +483,7 @@ fn a_restricted_subject_projects_to_a_tombstone() {
 
 #[test]
 fn a_step_sub_anchor_projects_and_inherits_the_parent_run_permission() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
@@ -480,7 +500,7 @@ fn a_step_sub_anchor_projects_and_inherits_the_parent_run_permission() {
 
 #[test]
 fn a_step_sub_is_tombstoned_when_the_parent_run_is_denied() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
@@ -492,8 +512,8 @@ fn a_step_sub_is_tombstoned_when_the_parent_run_is_denied() {
 
 #[test]
 fn project_deployment_and_pipeline_for_authorized_viewer() {
-    let dep_ref = ci_deployment_ref("acme", "dep9");
-    let pl_ref = ci_pipeline_ref("acme", "pl3");
+    let dep_ref = ci_deployment_ref("acme", "dep9").unwrap();
+    let pl_ref = ci_pipeline_ref("acme", "pl3").unwrap();
     let mut store = ArtifactStore::new();
     store.put_deployment(
         &dep_ref,
@@ -542,7 +562,7 @@ fn project_deployment_and_pipeline_for_authorized_viewer() {
 
 #[test]
 fn a_dangling_ref_is_not_found_not_a_tombstone() {
-    let run_ref = ci_run_ref("acme", "missing");
+    let run_ref = ci_run_ref("acme", "missing").unwrap();
     let p = Projector::new(StubId::new().allow_view(&run_ref), ArtifactStore::new());
     assert!(matches!(
         p.project(&run_ref, &viewer("alice"), z()),
@@ -562,7 +582,7 @@ fn a_non_ci_ref_is_a_loud_error_not_a_tombstone() {
 
 #[test]
 fn an_erased_step_subref_tombstones_even_when_the_root_is_not_erased() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
@@ -579,7 +599,7 @@ fn an_erased_step_subref_tombstones_even_when_the_root_is_not_erased() {
 
 #[test]
 fn a_restricted_step_subref_tombstones_even_when_the_root_is_not_restricted() {
-    let run_ref = ci_run_ref("acme", "01J7RUN");
+    let run_ref = ci_run_ref("acme", "01J7RUN").unwrap();
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
@@ -595,8 +615,8 @@ fn a_restricted_step_subref_tombstones_even_when_the_root_is_not_restricted() {
 
 #[test]
 fn runner_and_artifact_project_to_a_minimal_id_based_projection() {
-    let runner_ref = ci_runner_ref("acme", "rn1");
-    let art_ref = ci_artifact_ref("acme", "art2");
+    let runner_ref = ci_runner_ref("acme", "rn1").unwrap();
+    let art_ref = ci_artifact_ref("acme", "art2").unwrap();
     let p = Projector::new(
         StubId::new().allow_view(&runner_ref).allow_view(&art_ref),
         ArtifactStore::new(),
