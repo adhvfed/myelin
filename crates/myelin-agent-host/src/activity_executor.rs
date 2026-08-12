@@ -333,7 +333,7 @@ impl AgentHostActivityExecutor {
         input: &HostedAgentWorkflowInput,
         gate: &GateRecord,
     ) -> Result<(), String> {
-        for target in agent_effect_approval_targets(&input.tenant, &input.region, &gate) {
+        for target in agent_effect_approval_targets(&input.tenant, &input.region, gate) {
             self.drive(
                 self.inbox
                     .complete_if_present(&target.scope, &target.item_id),
