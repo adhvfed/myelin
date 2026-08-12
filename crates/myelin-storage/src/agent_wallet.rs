@@ -56,7 +56,10 @@ BEFORE UPDATE OR DELETE ON agent_wallet_ledger
 FOR EACH ROW EXECUTE FUNCTION myelin_reject_agent_wallet_ledger_mutation();";
 
 pub fn agent_wallet_migrations() -> Migrations {
-    Migrations::of([Migration::plain("0080_agent_wallet", AGENT_WALLET_MIGRATION)])
+    Migrations::of([Migration::plain(
+        "0080_agent_wallet",
+        AGENT_WALLET_MIGRATION,
+    )])
 }
 
 pub const AGENT_WALLET_CHARGE_KEY_MIGRATION: &str = "\
@@ -259,7 +262,7 @@ async fn read_balance(
     .fetch_optional(&mut *conn)
     .await
     .map_err(|e| PgError::Query(e.to_string()))?;
-    Ok(bal.map(MicroUsd::from_bigint))
+    bal.map(decode_balance).transpose()
 }
 
 async fn credit_on_conn(
@@ -284,7 +287,9 @@ async fn credit_on_conn(
         Some(v) => v,
         None => return Ok(Err(WalletError::BalanceOverflow)),
     };
-    let amount_bigint = amount.to_bigint().expect("amount fits bigint (checked above)");
+    let amount_bigint = amount
+        .to_bigint()
+        .expect("amount fits bigint (checked above)");
 
     sqlx::query(
         "INSERT INTO agent_wallet_ledger (tenant_id, region, kind, amount_micro, run_id) \
@@ -419,10 +424,18 @@ async fn lock_balance_optional(
             let bal: i64 = row
                 .try_get("balance_micro")
                 .map_err(|e| PgError::Query(format!("agent_wallet balance decode failed: {e}")))?;
-            Ok(Some(MicroUsd::from_bigint(bal)))
+            decode_balance(bal).map(Some)
         }
         None => Ok(None),
     }
+}
+
+fn decode_balance(balance: i64) -> Result<MicroUsd, PgError> {
+    MicroUsd::from_bigint(balance).ok_or_else(|| {
+        PgError::Query(
+            "agent_wallet balance is negative despite its non-negative storage constraint".into(),
+        )
+    })
 }
 
 async fn write_balance(
@@ -447,6 +460,12 @@ async fn write_balance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_balances_never_turn_negative_bigints_into_credit() {
+        assert_eq!(decode_balance(0).unwrap(), MicroUsd::ZERO);
+        assert!(decode_balance(-1).is_err());
+    }
 
     #[test]
     fn credit_kinds_map_to_ledger_tokens() {
@@ -480,7 +499,9 @@ mod tests {
         let ddl = AGENT_WALLET_MIGRATION;
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS agent_wallet ("));
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS agent_wallet_ledger ("));
-        assert!(ddl.contains("balance_micro bigint      NOT NULL DEFAULT 0 CHECK (balance_micro >= 0)"));
+        assert!(
+            ddl.contains("balance_micro bigint      NOT NULL DEFAULT 0 CHECK (balance_micro >= 0)")
+        );
         assert!(ddl.contains("PRIMARY KEY (tenant_id, region)"));
         assert!(ddl.contains("PRIMARY KEY (tenant_id, entry_id)"));
         assert!(ddl.contains("entry_id     uuid        NOT NULL DEFAULT gen_random_uuid()"));
@@ -492,7 +513,8 @@ mod tests {
             "both tables FORCE RLS"
         );
         assert_eq!(
-            ddl.matches("current_setting('myelin.tenant_id', true)").count(),
+            ddl.matches("current_setting('myelin.tenant_id', true)")
+                .count(),
             4,
             "the (tenant, region) policy is installed on both tables (USING + WITH CHECK each)"
         );

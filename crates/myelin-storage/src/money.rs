@@ -24,8 +24,8 @@ impl MicroUsd {
         }
     }
 
-    pub(crate) fn from_bigint(v: i64) -> MicroUsd {
-        MicroUsd(v as u64)
+    pub(crate) fn from_bigint(value: i64) -> Option<MicroUsd> {
+        u64::try_from(value).ok().map(MicroUsd)
     }
 }
 
@@ -59,7 +59,15 @@ mod tests {
         assert!(!over.fits_bigint(), "i64::MAX + 1 does NOT fit bigint");
         assert_eq!(over.to_bigint(), None);
 
-        assert_eq!(MicroUsd::from_bigint(i64::MAX), MicroUsd(i64::MAX as u64));
-        assert_eq!(MicroUsd::from_bigint(0), MicroUsd::ZERO);
+        assert_eq!(
+            MicroUsd::from_bigint(i64::MAX),
+            Some(MicroUsd(i64::MAX as u64))
+        );
+        assert_eq!(MicroUsd::from_bigint(0), Some(MicroUsd::ZERO));
+        assert_eq!(
+            MicroUsd::from_bigint(-1),
+            None,
+            "a corrupt negative bigint is never reinterpreted as spendable money"
+        );
     }
 }
