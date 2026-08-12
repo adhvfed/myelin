@@ -6,7 +6,7 @@ fn every_write_endpoint_is_id_checked_bus2() {
     for ep in http_catalogue() {
         if ep.method.is_write() {
             assert!(
-                ep.id_checked,
+                ep.is_id_checked(),
                 "write endpoint {} is not Id.check-gated (BUS-2 violation)",
                 ep.path
             );

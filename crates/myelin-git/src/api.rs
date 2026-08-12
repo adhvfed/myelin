@@ -28,10 +28,19 @@ pub struct Endpoint {
     pub method: Method,
     pub path: &'static str,
     pub handler: Handler,
-    pub id_checked: bool,
+    id_checked: bool,
 }
 
 impl Endpoint {
+    pub const fn checked(method: Method, path: &'static str, handler: Handler) -> Endpoint {
+        Endpoint {
+            method,
+            path,
+            handler,
+            id_checked: true,
+        }
+    }
+
     pub fn new(
         method: Method,
         path: &'static str,
@@ -48,96 +57,72 @@ impl Endpoint {
             id_checked,
         })
     }
+
+    pub const fn is_id_checked(&self) -> bool {
+        self.id_checked
+    }
 }
 
 pub fn http_catalogue() -> Vec<Endpoint> {
     vec![
-        Endpoint::new(Method::Get, "/api/git/repos", Handler::ListFilter, true).unwrap(),
-        Endpoint::new(Method::Post, "/api/git/repos", Handler::Lifecycle, true).unwrap(),
-        Endpoint::new(
+        Endpoint::checked(Method::Get, "/api/git/repos", Handler::ListFilter),
+        Endpoint::checked(Method::Post, "/api/git/repos", Handler::Lifecycle),
+        Endpoint::checked(
             Method::Get,
             "/api/git/repos/{repo}/prs/{n}",
             Handler::Project,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Get,
             "/api/git/repos/{repo}/prs/{n}/checks",
             Handler::CheckStatus,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Post,
             "/api/git/repos/{repo}/prs",
             Handler::Lifecycle,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Post,
             "/api/git/repos/{repo}/prs/{n}/reviews",
             Handler::Lifecycle,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Post,
             "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci",
             Handler::ForkEndorse,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Post,
             "/api/git/repos/{repo}/prs/{n}/merge",
             Handler::MergeGate,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Post,
             "/api/git/repos/{repo}/branch-protection",
             Handler::Settings,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Post,
             "/api/git/repos/{repo}/prs/{n}/checks",
             Handler::CheckStatus,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Get,
             "/api/git/repos/{repo}/blob/{ref}/{path}",
             Handler::Project,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Get,
             "/api/git/repos/{repo}/blame/{ref}/{path}",
             Handler::Project,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
+        ),
+        Endpoint::checked(
             Method::Post,
             "/api/git/repos/{repo}/blob/{ref}/{path}",
             Handler::ReceivePack,
-            true,
-        )
-        .unwrap(),
-        Endpoint::new(
-            Method::Get,
-            "/api/git/search/code",
-            Handler::CodeSearch,
-            true,
-        )
-        .unwrap(),
+        ),
+        Endpoint::checked(Method::Get, "/api/git/search/code", Handler::CodeSearch),
     ]
 }
 
