@@ -10,11 +10,7 @@
 #   workspace — this repo's FULL workspace, keyed to the root Cargo.lock (registry row
 #               `cargo-vendor-workspace-v1`, env override MYELIN_GVISOR_CARGO_VENDOR_WORKSPACE).
 #
-# Both variants share ONE staging recipe — the atomic build-then-promote, the world-readable
-# `chmod -R a+rX` guarantee, the committed-digest guard, and the content-addressed .versions layout
-# are identical byte-for-byte; only the source manifest/lockfile, the staged path + its env override,
-# and the manifest row id the committed digest is read from differ. The default (`smoke`, no args)
-# is behaviorally unchanged from the single-asset version this generalizes.
+# Both variants use the same atomic promotion, permissions, digest check, and versioned layout.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -105,12 +101,8 @@ printf '%s\n' \
   '[net]' \
   'offline = true' >"${TMP}/.cargo/config.toml"
 
-# The vendor tree is bind-mounted READ-ONLY into the sandbox and read there by a non-owner mapped
-# subuid — every entry MUST be world-readable (dirs world-traversable) or the offline build fails
-# with a bare EACCES on a vendored source file (some crates ship 0640 files). Guarantee it here so
-# the pinned tree is readable by construction; the registry ALSO enforces this fail-closed at verify
-# (GvisorAssetRegistry::verify_cargo_vendor_world_readable). `a+rX` only adds x to dirs/already-x
-# files, so it is a no-op on an already-world-readable tree (the committed smoke pin is unchanged).
+# The sandbox reads this bind mount as a mapped non-owner UID, so files must be world-readable and
+# directories world-traversable. Registry verification checks the same property.
 chmod -R a+rX "${TMP}"
 
 DIGEST="$(canonical_tree_sha256 "${TMP}")"

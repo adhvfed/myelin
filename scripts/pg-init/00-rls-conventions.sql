@@ -1,25 +1,10 @@
--- Myelin dev Postgres init (runs once on first cluster init, in /docker-entrypoint-initdb.d).
---
--- Establishes the (tenant, region) RLS-ready conventions the architecture pins
--- (multi-tenant isolation by Row-Level Security; the no-cross-tenant-read invariant
--- is enforced in Postgres, not just in app code). This script does NOT create the
--- domain tables — each service owns its own schema/migrations (the no-cross-db rule).
--- It creates:
---   1. non-superuser runtime roles that do NOT bypass RLS: the tenant application role and a
---      dedicated region-scheduler capability + constrained dev login;
---   2. a session GUC convention (myelin.tenant_id / myelin.region) the app sets per
---      transaction so RLS policies can reference current_setting(...);
---   3. a helper that every tenant-scoped migration calls to make a table RLS-ready
---      (ENABLE + FORCE row level security + the standard tenant/region policy).
---
--- POSTGRES_USER (myelin_admin) is the migration/owner role; the app connects as
--- myelin_app at runtime so RLS is actually enforced (the owner would otherwise be
--- exempt unless FORCE is set — we FORCE, and additionally use a non-owner app role).
+-- Development PostgreSQL initialization. It creates non-superuser runtime roles, tenant/region
+-- session settings, and the helper used by migrations to enable and force RLS. Domain tables remain
+-- owned by service migrations. myelin_admin owns migrations; myelin_app handles runtime queries.
 
 \set ON_ERROR_STOP on
 
--- 1. The runtime application role. NOSUPERUSER + NOBYPASSRLS is the load-bearing part:
---    a superuser (or a BYPASSRLS role) silently ignores every policy. The app MUST NOT.
+-- Runtime queries use a non-superuser role without BYPASSRLS.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'myelin_app') THEN

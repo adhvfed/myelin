@@ -1,27 +1,7 @@
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════════════════════════════════════
-# THE FRESH-VOLUME DEFINITION-FENCE DRILL (CT-007 lease/topology reconciliation)
-# ═══════════════════════════════════════════════════════════════════════════════════════════════
-#
-# WHY THIS EXISTS, AND WHY THE PERSISTENT DEV STACK CANNOT REPLACE IT
-#
-# Every other gate runs against the long-lived dev stack, where `pg-init` ran once long ago and the
-# migration role is a SUPERUSER. Two failure classes are therefore structurally invisible there:
-#
-#   1. INIT ORDERING — whether `scripts/pg-init/01-ci-definition-fence.sql` actually completes on a
-#      brand-new volume before any application table exists, so that `ci_0020h` finds its
-#      provisioning already in place. On the dev stack the provisioning simply pre-exists.
-#   2. THE NON-SUPERUSER MIGRATION POSTURE — whether a `NOSUPERUSER NOBYPASSRLS NOCREATEROLE`
-#      migration role can adopt the fence role through its explicit `SET TRUE` membership and create
-#      the probe as its final owner. A superuser succeeds even if that membership is missing
-#      entirely, so the dev stack cannot make that assertion honestly.
-#
-# This script builds a disposable `postgres:16`, lets Docker run the real `pg-init` scripts on a
-# fresh volume, creates a genuinely constrained migration role, and runs the ignored integration
-# target `integration_ci_definition_fence_fresh` through it.
-#
-# Usage:  scripts/drill-ci-definition-fence-fresh-postgres.sh
-# Exit:   0 only if every assertion in that target passed. LOUD on failure (prints container logs).
+# Exercise definition-fence provisioning on a new PostgreSQL 16 volume. This covers init ordering
+# and a non-superuser migration role, neither of which the long-lived development database can test.
+# The script runs `integration_ci_definition_fence_fresh` and prints container logs on failure.
 
 set -Eeuo pipefail
 
@@ -41,8 +21,7 @@ cleanup() {
     log "FAILED (exit $status) — PostgreSQL container logs follow:"
     docker logs "$CONTAINER" 2>&1 | tail -80 || true
   fi
-  # Always remove the container AND its anonymous volume; a leaked volume would make the next run
-  # non-fresh, which is precisely the property this drill depends on.
+  # Remove the anonymous volume so the next run starts fresh.
   docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
   exit "$status"
 }
@@ -63,25 +42,20 @@ docker run -d --name "$CONTAINER" \
   postgres:16 >/dev/null
 
 ADMIN_URL="postgres://myelin_admin:$SUPER_PW@127.0.0.1:$PORT/myelin"
-# Everything below talks to the PUBLISHED PORT from the host, never `docker exec`. That is
-# load-bearing: the entrypoint runs the init scripts against a temporary server on the container's
-# UNIX socket and only starts listening externally once they finish, so host connectivity is what
-# actually proves init completed. A `docker exec` readiness probe succeeds mid-init and would let
-# the assertions below run before `01-ci-definition-fence.sql` had executed at all.
+# Use the published port because it opens only after the init scripts finish; `docker exec` can
+# connect to the temporary server while initialization is still running.
 psql_admin() { PGPASSWORD="$SUPER_PW" psql -v ON_ERROR_STOP=1 -qtA \
   -h 127.0.0.1 -p "$PORT" -U myelin_admin -d myelin "$@" </dev/null; }
 psql_admin_stdin() { PGPASSWORD="$SUPER_PW" psql -v ON_ERROR_STOP=1 -qtA \
   -h 127.0.0.1 -p "$PORT" -U myelin_admin -d myelin; }
 
-# `docker logs | grep -q` is deliberately avoided: under `set -o pipefail`, `grep -q` exits on the
-# first match, `docker logs` dies of SIGPIPE, and the pipeline reports failure even though the
-# pattern WAS found. Capture once into a variable and match that instead.
+# Avoid `docker logs | grep -q` under pipefail because the early grep exit causes SIGPIPE.
 container_logs() { docker logs "$CONTAINER" 2>&1; }
 
 log "waiting for the fresh volume's init scripts to complete"
 ready=0
 for _ in $(seq 1 120); do
-  # Both conditions: the entrypoint announced init completion AND the published port answers.
+  # Require both the completion message and a responsive published port.
   logs="$(container_logs)"
   case "$logs" in
     *"PostgreSQL init process complete"*)
@@ -110,22 +84,20 @@ case "$first_init" in
   *) echo "the init scripts did not run in filename order"; exit 1 ;;
 esac
 
-# ── ASSERTION: the init scripts ran, and they ran BEFORE any application table exists ────────────
+# Check that initialization completed before application migrations.
 log "proving the init scripts completed on a fresh volume with no application schema"
 FENCE_ROLE="$(psql_admin -c "SELECT count(*) FROM pg_roles WHERE rolname='myelin_ci_definition_fence'")"
 [ "$FENCE_ROLE" = "1" ] || { echo "pg-init did not create the fence role"; exit 1; }
 SECURITY_SCHEMA="$(psql_admin -c "SELECT count(*) FROM pg_namespace WHERE nspname='myelin_ci_security'")"
 [ "$SECURITY_SCHEMA" = "1" ] || { echo "pg-init did not create myelin_ci_security"; exit 1; }
-# "No application table" means no MIGRATION has run: the ledger itself, and the two tables the
-# fence interacts with, must all be absent. `myelin_ci_scheduler_region_map` is deliberately NOT
-# counted — it is part of provisioning (00-rls-conventions.sql), not the application schema.
+# `myelin_ci_scheduler_region_map` is provisioning state, so it is not counted as an application table.
 MIGRATED="$(psql_admin -c "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relname IN ('myelin_applied_migration','workflow_run','wf_definition','job_queue')")"
 [ "$MIGRATED" = "0" ] || { echo "expected NO migrated tables before migrations, found $MIGRATED"; exit 1; }
 PROBE_ABSENT="$(psql_admin -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='myelin_ci_security'")"
 [ "$PROBE_ABSENT" = "0" ] || { echo "the probe must not exist before ci_0020h runs, found $PROBE_ABSENT"; exit 1; }
 log "  fence role + empty security schema present; 0 migrated tables — init ordering proven"
 
-# ── A genuinely constrained migration role, and the runtime role ─────────────────────────────────
+# Create a constrained migration role and the runtime grants.
 log "creating the NON-SUPERUSER migration role myelin_fresh_migrator"
 psql_admin_stdin <<SQL
 CREATE ROLE myelin_fresh_migrator LOGIN PASSWORD '$MIGRATOR_PW'
@@ -142,7 +114,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE myelin_fresh_migrator IN SCHEMA public
   GRANT USAGE, SELECT ON SEQUENCES TO myelin_app;
 SQL
 
-# ── Re-run the provisioning for THIS migration role (the documented operator step) ───────────────
+# Provision the fence membership for the constrained role.
 log "re-running 01-ci-definition-fence.sql with migration_role=myelin_fresh_migrator"
 PGPASSWORD="$SUPER_PW" psql -v ON_ERROR_STOP=1 -v migration_role=myelin_fresh_migrator \
   -h 127.0.0.1 -p "$PORT" -U myelin_admin -d myelin \

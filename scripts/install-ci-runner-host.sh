@@ -1,18 +1,7 @@
 #!/usr/bin/env bash
-# Provision a physical/VM host to run the CI control-plane's gVisor runner in its FULL hardened
-# configuration (rootless base + explicit-userns + Btrfs `EphemeralDisk` workspaces) — CT-007 slice 4
-# (production activation). This script is IDEMPOTENT (safe to re-run) and does ONLY host-level
-# provisioning: creating the dedicated service account, directories, and installing the pinned `runsc`
-# binary with the exact ownership/mode `myelin-ci-sandbox`'s own preflight checks require. It does NOT
-# start any service and does NOT grant `CAP_SYS_ADMIN` system-wide — see
-# `deploy/systemd/myelin-ci-controlplane.service`, which grants that capability ONLY to the runner
-# service itself via `AmbientCapabilities=`, never to the shared system `btrfs` binary.
-#
-# Every path/ownership/mode requirement enforced here is independently re-verified at process startup
-# by `crates/myelin-ci-sandbox/src/gvisor.rs` (`harden_explicit_userns_runsc_binary`,
-# `harden_explicit_userns_runsc_root`, `preflight_explicit_userns_helpers`) and
-# `crates/myelin-ci-sandbox/src/user_namespace.rs` (`harden_and_verify_leases_dir`, strict mode) — this
-# script does not need to be trusted on its own; a misconfigured host still fails closed at boot.
+# Provision the service account, directories, and pinned `runsc` binary for a gVisor CI runner.
+# This script is idempotent and does not start services or grant system-wide capabilities. Runner
+# startup rechecks paths, ownership, modes, and user-namespace configuration.
 #
 # Usage:
 #   sudo ./scripts/install-ci-runner-host.sh /path/to/pinned/runsc
@@ -77,20 +66,15 @@ fi
 
 echo "install-ci-runner-host: persistent state under ${VAR_ROOT}" >&2
 install -d -m 0755 -o root -g root "${VAR_ROOT}"
-# `UserNamespaceAllocator::try_new` (strict mode) requires the SAME leaf shape as runsc-root above:
-# service-account-owned, mode 0700, durable across restarts (it holds the crash-recovery lease
-# markers `UserNamespaceLease`'s whole design depends on — see user_namespace.rs's module doc).
+# User-namespace lease state is service-owned, mode 0700, and durable across restarts.
 if [[ ! -d "${USERNS_LEASES_DIR}" ]]; then
   install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${USERNS_LEASES_DIR}"
 else
   chown "${SERVICE_USER}:${SERVICE_GROUP}" "${USERNS_LEASES_DIR}"
   chmod 0700 "${USERNS_LEASES_DIR}"
 fi
-# The `WorkspaceManager` `EphemeralDisk` base_dir — a REAL Btrfs mount with quota support is a
-# separate, harder host requirement this script does NOT provision (creating/mounting a Btrfs
-# filesystem is a storage-layout decision for whoever runs this installer, not something to automate
-# blindly) — it only ensures the directory itself exists with the right ownership. Verify manually
-# that this path lands on a Btrfs filesystem (`stat -f -c %T`) before enabling `EphemeralDisk`.
+# This creates the workspace directory but not its Btrfs filesystem. Verify the filesystem and quota
+# support before enabling `EphemeralDisk`.
 if [[ ! -d "${CI_WORKSPACES_DIR}" ]]; then
   install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${CI_WORKSPACES_DIR}"
 else

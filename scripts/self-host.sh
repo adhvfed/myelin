@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
-# Myelin FOUNDER-SELF_HOST helper (R4.0) — bring the real `edge` binary up, mint an operator token,
-# point a git remote / the web app at it. The companion runbook is docs/self-host.md.
+# Self-host helper for the edge, CI services, operator bootstrap, Git, and the web app.
+# See docs/self-host.md.
 #
 #   ./scripts/self-host.sh env               print the full self-host env contract (eval-able), incl. the
 #                                          seal-key handling (generates the key once, reuses it)
 #   ./scripts/self-host.sh edge              build + run the edge over the self-host env (serves :8080)
 #   ./scripts/self-host.sh ci                build + run the opt-in CI control plane/runner in the
 #                                          foreground over the same self-host cell
-#   ./scripts/self-host.sh verify-ci-rootfs  prove the staged runner rootfs matches the digest pinned
-#                                          by the checked-in founder pipeline
+#   ./scripts/self-host.sh verify-ci-rootfs  verify the staged runner rootfs against its pinned digest
 #   ./scripts/self-host.sh publisher         provision the bounded shared JetStream stream, then run
 #                                          the elected least-privilege outbox publisher
 #   ./scripts/self-host.sh dispatch          build + run the Git-event→CI-run dispatch consumer
 #   ./scripts/self-host.sh git-checks        build + run Git's CI-check projection consumer
 #   ./scripts/self-host.sh verify-check <repo> <pr> <head-oid> [context]
-#                                          read-only proof that an exact PR head surfaced a required
-#                                          settled green context through the production edge
+#                                          verify a required settled context for a PR head
 #   ./scripts/self-host.sh verify-ci <run> <job> <marker> [evidence-dir]
-#                                          read-only proof that the exact successful/settled run has
-#                                          one byte-exact archived marker matching its live capture
+#                                          compare an archived marker with its live capture
 #   ./scripts/self-host.sh bootstrap -- <flags>
 #                                          run `edge bootstrap <flags>` over the self-host env, e.g.
 #                                            ./scripts/self-host.sh bootstrap -- --tenant acme --principal founder \
@@ -30,12 +27,10 @@
 #   ./scripts/self-host.sh web               print (or, with EXEC=1, run) the frontend start wired to
 #                                          MYELIN_EDGE_URL=http://127.0.0.1:8080
 #
-# The Fed stack must be up first (`fed start`). This script
-# reuses that stack's env contract and ADDS the edge-only env (seal key, git root, region, addr).
+# The Fed stack must be running first. This script extends its environment with edge settings.
 #
-# THE SEAL KEY IS THE ROOT OF TRUST. It unseals BOTH the KMS root AND the capability-token cell root.
-# It is generated ONCE into a 0600 file and reused; LOSE IT AND YOU LOSE EVERYTHING (all encrypted
-# columns + every minted token stops verifying). Back it up (see docs/self-host.md).
+# The seal key unlocks the KMS and capability-token roots. It is generated once with mode 0600 and
+# must be backed up; losing it makes encrypted data and existing tokens unusable.
 set -euo pipefail
 # Never inherit caller xtrace into a script that handles the seal key or an operator credential.
 set +x
@@ -59,8 +54,7 @@ SELF_HOST_ISSUES_PROJECT="20aee030-c7fa-4757-8243-700faf528690"
 SELF_HOST_ISSUES_TYPE="7d457754-f6a1-4cd8-8738-21751570b627"
 SELF_HOST_ISSUES_PREFIX="MYL"
 
-# Generate the seal key ONCE (0600), reuse thereafter. openssl if present, else /dev/urandom. NEVER
-# regenerated over an existing key (that would orphan the KMS root + every minted token, fail-closed).
+# Generate the seal key once, using openssl or /dev/urandom, without replacing an existing key.
 ensure_seal_key() {
   if [[ -s "${SEAL_KEY_FILE}" ]]; then
     return

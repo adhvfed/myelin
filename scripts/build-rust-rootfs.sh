@@ -1,101 +1,27 @@
 #!/usr/bin/env bash
-# Stage a Rust-capable gVisor rootfs — a Rust TOOLCHAIN SMOKE asset toward the CT-007 gate-2
-# (planning/system-reviews/2026-06-26/12-ci-track-ledger.md, "Pre-registered CT-007 cutover floor",
-# item 2/4) `build-test-clippy` job. It proves the Rust toolchain executes under the hardened
-# sandbox on the exact production hardening path — it is NOT yet proof of that job's full
-# capability (no checkout mount, no vendored/locked deps, no env propagation, no resource sizing
-# proven against a real build — see ci-workload-inventory.toml's `migration_state =
-# "capability-smoke"` on that row, and the ledger's 2026-07-25 correction entry). Node/browser/
-# Docker-in-Docker/advisory-DB-egress capabilities are OUT OF SCOPE here — separate runner assets,
-# separate scripts, later slices of the same gate.
+# Build the `linux-rust-v1` gVisor rootfs used by the Rust toolchain capability smoke test. This
+# asset does not replace `linux-small-v1` and does not cover checkout mounts, dependency vendoring,
+# environment propagation, resource sizing, Node/browser jobs, Docker-in-Docker, or database egress.
 #
-# THIS IS NOT THE PRODUCTION `linux-small-v1` profile (`.myelin/ci.toml`'s pinned
-# `myelin.local/linux-small-v1-rootfs`) and does not touch it, its base busybox rootfs
-# (~/.local/share/gvisor-assets/rootfs), or the git-capable rootfs
-# (~/.local/share/gvisor-assets/git-rootfs) staged by scripts/stage-git-rootfs.sh. It stages a
-# SEPARATE, independent asset used only to prove the Rust capability runs under the SAME
-# GvisorBackend::launch/launch_streaming hardened path (see
-# crates/myelin-ci-sandbox/tests/rust_capable_rootfs_prod_exec_test.rs).
+# The script pulls a versioned Debian Rust image and exports its filesystem. Docker is used only for
+# image retrieval and export; jobs run the resulting tree with `runsc`.
 #
-# UNLIKE stage-git-rootfs.sh (which hand-copies a single host binary + its 2 shared libs onto the
-# base busybox rootfs), the host's system `cargo`/`rustc` pull in DOZENS of transitive shared libs
-# (libgit2, libssl, libcurl, icu, ...) — hand-staging all of those would be fragile AND not a real
-# "digest-pinned reproducible artifact" (it would just be whatever pacman happens to have installed
-# today). Instead this script pulls an OFFICIAL, versioned `rust:<version>-slim-bookworm` Debian
-# image, pins the exact digest it resolves, and exports its REAL filesystem tree with `docker
-# export` — a full, coherent Debian userland + toolchain, not a hand-chased lib list.
-#
-#   ./scripts/build-rust-rootfs.sh          stage into ~/.local/share/gvisor-assets/rust-rootfs
-#                                           (idempotent — a no-op if the CURRENT tree's own
-#                                           canonical-tree digest still matches the committed pin in
-#                                           runner-assets.toml; a mismatch triggers a rebuild even
-#                                           without FORCE=1. If no committed pin exists yet at all —
-#                                           only possible before this asset's first-ever manifest
-#                                           row is written — the existing tree is left exactly as-is
-#                                           with no rebuild, since there is nothing to compare it
-#                                           against; FORCE=1 to rebuild regardless)
-#   FORCE=1 ./scripts/build-rust-rootfs.sh  re-stage unconditionally (re-pulls the image, re-exports)
+# Usage:
+#   ./scripts/build-rust-rootfs.sh
+#   FORCE=1 ./scripts/build-rust-rootfs.sh
 #   RUST_IMAGE_TAG=rust:1.83-slim-bookworm ./scripts/build-rust-rootfs.sh
-#                                           override the source image tag (must resolve to a REAL
-#                                           existing tag — this script does not invent one)
-#   ALLOW_DIGEST_CHANGE=1                  required if the freshly built tree's digest does NOT
-#                                           match the committed pin — see "DIGEST-CHANGE SAFETY" below
-#   MYELIN_ALLOW_REPLACE_UNMANAGED=1       required if MYELIN_GVISOR_RUST_ROOTFS names an existing
-#                                           real directory this script did not create — see
-#                                           "OVERRIDE-TARGET SAFETY" below
+#   ALLOW_DIGEST_CHANGE=1 ./scripts/build-rust-rootfs.sh
+#   MYELIN_ALLOW_REPLACE_UNMANAGED=1 ./scripts/build-rust-rootfs.sh
 #
-# Prereqs: `docker` on PATH (used ONLY to pull + export a filesystem; the sandbox that later RUNS
-# this rootfs is `runsc`, never docker — docker here is strictly an image-fetch/export tool, exactly
-# as it is already used for the `web-container` CI job's Dockerfile builds elsewhere in this repo).
+# `docker export` omits image environment metadata. The script therefore links `rustc` and `cargo`
+# directly from the installed toolchain into `/usr/local/bin` instead of relying on rustup proxies.
 #
-# PATH GOTCHA (real, not hypothetical): `docker export` exports ONLY the filesystem, not the image's
-# `ENV`/`CMD` metadata, so the official image's `PATH=/usr/local/cargo/bin:...` is LOST on export.
-# This repo's gVisor guest PATH is hardcoded to
-# `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
-# (crates/myelin-ci-sandbox/src/gvisor.rs, OciConfig::to_json) and does NOT read the source image's
-# env — so `rustc`/`cargo` must be made reachable on THAT path by pure filesystem content, not by
-# touching the hardening/OCI-config code. Symlinking `/usr/local/bin/{rustc,cargo}` is deliberately
-# NOT a symlink to the `/usr/local/cargo/bin/*` rustup PROXY binaries (those dispatch via
-# rustup's own $CARGO_HOME/$RUSTUP_HOME resolution, which depends on env/HOME state this sandbox
-# does not set up) but directly to the REAL toolchain binaries under
-# `/usr/local/rustup/toolchains/<host-triple>/bin/{rustc,cargo}` — confirmed by hand to run cleanly
-# under `env -i` (no ambient env) via their own relative-to-binary ($ORIGIN) rpath, so they work
-# regardless of what env vars the sandbox sets.
-#
-# STAGING SAFETY (2026-07-25, three findings from adversarial review by gpt-5.6-sol, fixed here):
-#
-# 1. ATOMIC VERSIONED PROMOTION. Content is staged into an immutable, digest-named directory under
-#    `<STAGED>.versions/sha256-<digest>/`, never in place. `<STAGED>` itself is a SYMLINK this script
-#    manages, atomically repointed (`mv -T` a freshly created symlink onto the old one — a rename,
-#    not a delete-then-create) to the new version directory only after that directory is fully built
-#    and verified. A failure at ANY point before the final `mv -T` leaves the previous live symlink
-#    (and everything it points to) completely untouched — there is no window where `<STAGED>` is
-#    absent, and no in-place deletion of the tree currently in use.
-# 2. DIGEST-CHANGE SAFETY. Before promotion, if `runner-assets.toml` already carries a committed pin
-#    for this asset, the freshly built tree's digest MUST match it, or the script refuses to promote
-#    (fails closed) — a mutable source-image tag drift, an export anomaly, or a regression in this
-#    script's own fixup logic must never silently replace a known-good asset with a DIFFERENT one.
-#    `ALLOW_DIGEST_CHANGE=1` is the explicit, conscious override for a genuinely intentional change
-#    (e.g. a new `RUST_IMAGE_TAG`) — the operator must then update the committed pin themselves.
-# 3. OVERRIDE-TARGET SAFETY. `MYELIN_GVISOR_RUST_ROOTFS` can point anywhere, so this script never
-#    deletes or renames an EXISTING REAL (non-symlink) directory at that path unless a sidecar marker
-#    file (`<STAGED>.myelin-managed`, sitting NEXT TO the directory, never inside the hashed tree
-#    content) proves this script created it. Without that marker, it refuses outright unless
-#    `MYELIN_ALLOW_REPLACE_UNMANAGED=1` is set, and even then only renames the unrecognized directory
-#    aside (to `<STAGED>.unmanaged.<timestamp>`) — never deletes it.
-#
-# INTEGRITY-CHECKED REUSE (2026-07-25, a reproduced bug from a second adversarial round by
-# gpt-5.6-sol, fixed here). Both the legacy-migration path and the versioned-promotion path can
-# encounter an ALREADY-EXISTING directory named after the digest they're about to place there
-# (`sha256-<digest>/`). The original code trusted the directory's NAME alone and discarded the
-# freshly-built (and already digest-verified) replacement — so if that existing directory had ever
-# drifted from its own name (e.g. something wrote an extra file into it after the fact), this script
-# would silently keep serving the CORRUPTED tree under a digest that no longer describes it, having
-# just deleted the correct one. `verify_version_dir_or_die` closes this: before ANY code path treats
-# an existing `sha256-<digest>/` directory as reusable, it recomputes that directory's OWN canonical
-# digest and requires it to still equal its name. A mismatch refuses loudly, preserves BOTH the
-# corrupt existing directory and the freshly-built correct candidate (for operator comparison/
-# quarantine), and never touches the live symlink — reuse must never mean "trust the pathname."
+# Promotion rules:
+#   1. Build into `<STAGED>.versions/sha256-<digest>`, then atomically repoint `<STAGED>`.
+#   2. Refuse a digest that differs from `runner-assets.toml` unless `ALLOW_DIGEST_CHANGE=1`.
+#   3. Refuse an unmanaged target directory unless `MYELIN_ALLOW_REPLACE_UNMANAGED=1`; with the
+#      override, rename it aside rather than deleting it.
+#   4. Recompute the digest of an existing version directory before reusing it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -111,10 +37,7 @@ die() { echo "build-rust-rootfs: $*" >&2; exit 1; }
 
 command -v docker >/dev/null 2>&1 || die "\`docker\` is required on PATH to pull/export the Rust image"
 
-# The exact recipe scripts/self-host.sh's verify_ci_rootfs() uses, reused for content pins here too.
-# NOTE: this hashes file MODE bits too (via the tar header), not just content — a directory promoted
-# with the wrong permissions (e.g. mktemp -d's default 0700) produces a DIFFERENT digest, which is
-# exactly how a real permission regression was caught here on 2026-07-25 (see runner-assets.toml).
+# This is the same recipe used by `self-host.sh verify_ci_rootfs`. Tar headers include file modes.
 canonical_tree_sha256() {
   tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu \
     -C "$1" -cf - . |
@@ -122,12 +45,7 @@ canonical_tree_sha256() {
     awk '{print $1}'
 }
 
-# Require an existing `${VERSIONS_DIR}/sha256-<digest>` directory to actually BE what its name
-# claims before any caller treats it as reusable — see "INTEGRITY-CHECKED REUSE" above. Takes the
-# version dir path, the digest its name claims, and a human label for the "what were we about to do"
-# error message. Dies loudly (preserving the version dir AND, per the caller's own trap state, the
-# freshly-built candidate) on a symlinked version dir or a content/name mismatch; otherwise returns
-# silently (0) meaning "safe to reuse, discard the redundant freshly-built candidate instead."
+# Verify an existing digest-named version directory before reusing it.
 verify_version_dir_or_die() {
   local version_dir="$1" expected_digest="$2" context="$3"
   if [[ -L "${version_dir}" ]]; then
@@ -159,7 +77,7 @@ committed_digest() {
   ' "${MANIFEST}"
 }
 
-# --- override-target safety: never delete/rename an existing real directory we didn't create ------
+# Handle a pre-existing target directory.
 if [[ -e "${STAGED}" && ! -L "${STAGED}" ]]; then
   if [[ -f "${MANAGED_MARKER}" ]]; then
     echo "build-rust-rootfs: ${STAGED} is a legacy (pre-versioning) tree this script previously built directly — migrating it under ${VERSIONS_DIR}" >&2
@@ -182,7 +100,7 @@ if [[ -e "${STAGED}" && ! -L "${STAGED}" ]]; then
   fi
 fi
 
-# --- idempotent no-op check: compare the CURRENT tree's OWN digest against the committed pin -------
+# Reuse a staged tree only when its digest matches the committed pin.
 if [[ "${FORCE:-0}" != "1" && -x "${STAGED}/usr/local/bin/rustc" && -x "${STAGED}/usr/local/bin/cargo" ]]; then
   PIN="$(committed_digest)"
   if [[ -z "${PIN}" ]]; then

@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
-# Myelin BACKUP/RESTORE DRILL (R4.3) — capture the LIVE self-host data (Postgres OLTP + the on-disk git
-# object tier), RESTORE it into a CLEAN target, and VERIFY the restore reads back byte-identical.
-#
-# This is the master-plan Tier-0 promise made a REPEATABLE DRILL, not a one-off: run it on a schedule
-# (cron / systemd timer — see the tail of this file) so "our backups actually restore" is proven
-# continuously against real data, never assumed.
+# Capture self-hosted PostgreSQL and Git data, restore it into clean targets, and compare the result.
+# Run this periodically through cron or a systemd timer.
 #
 #   ./scripts/backup-drill.sh run          capture → restore-to-clean → verify → report PASS/FAIL, cleanup
 #   KEEP=1 ./scripts/backup-drill.sh run   keep the capture artifacts + the restored DB for inspection
 #
-# What it proves:
-#   • Postgres: a `pg_dump` of the live `myelin` DB restores into a FRESH database with identical row
+# Checks:
+#   • PostgreSQL: a `pg_dump` restores into a fresh database with identical row
 #     counts for every self-host-bearing table (principals, ReBAC tuples, the cell token root, outbox, …).
-#   • Git object tier: every on-disk bare repo under MYELIN_GIT_ROOT, archived and extracted into a
-#     CLEAN root, `git fsck`es clean and advertises byte-identical ref→oid sets (destructive-restore
-#     parity — the same property `myelin_git::backup::destructive_restore…reads_back_identical` asserts).
+#   • Git: every bare repository passes `git fsck` and has the same ref-to-OID mapping after restore.
 #
 # Scope note: the git self-host repos are on-disk bare repos (GT-001), so the essential git state is
 # PG (refs/PR/authz rows) + the on-disk object tier captured here. The S3/RustFS blob tier holds large
 # LFS-class objects; a full DR runbook also snapshots the bucket (documented at the tail) — this drill
-# proves the two tiers the self-host cutover actually populated.
+# covers the two tiers populated by the current self-host setup.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,7 +32,7 @@ log()  { echo "backup-drill: $*" >&2; }
 fail() { echo "backup-drill: FAIL — $*" >&2; exit 1; }
 psql_admin() { docker exec -e PGPASSWORD="${MYELIN_PG_ADMIN_PW:-myelin_dev_pw}" "${PG_CONTAINER}" psql -U "${PG_USER}" "$@"; }
 
-# The self-host-bearing tables whose row counts must survive the round trip (loud if a table is missing).
+# Tables whose row counts must survive the round trip.
 VERIFY_TABLES=(principal rebac_tuple cell_token_root outbox kms_sealed_root revocation check_status)
 
 run_drill() {
@@ -112,7 +106,7 @@ run_drill() {
 
 # ── verification helpers ──────────────────────────────────────────────────────────────────────
 
-# The source PG row counts for every verify table (loud 'MISSING' if a table is absent).
+# Source row counts for each verified table.
 source_table_counts()  { _table_counts "${PG_DB}"; }
 restored_table_counts() { _table_counts "$1"; }
 _table_counts() {
@@ -132,7 +126,7 @@ _git_fingerprint() {
   local root="$1" repo rel
   while IFS= read -r repo; do
     rel="${repo#"${root}"/}"
-    # fsck must be clean; a corrupt restore fails the drill loudly.
+    # A corrupt repository fails verification.
     git --git-dir="${repo}" fsck --full --strict >/dev/null 2>&1 || { echo "${rel}.git FSCK-FAILED"; continue; }
     # Every ref → oid (sorted), plus the symbolic HEAD target (F9: HEAD must survive).
     git --git-dir="${repo}" for-each-ref --format='%(objectname) %(refname)' 2>/dev/null \
@@ -156,4 +150,4 @@ esac
 #
 # Full-DR extension (beyond this self-host drill): also `aws s3 sync s3://<bucket> <target>` (RustFS/
 # Scaleway Object Storage) for the T2 blob tier, and ship pg.dump + git-data.tgz off-host (the 3-2-1
-# rule). This drill proves the RESTORE PATH works; off-siting is an ops-runbook concern (R5.3).
+# rule). This drill covers restoration; off-site storage belongs in the operations runbook.

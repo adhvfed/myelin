@@ -1,69 +1,25 @@
--- ═══════════════════════════════════════════════════════════════════════════════════════════════
--- CI DEFINITION-FENCE PROVISIONING (CT-007 lease/topology reconciliation)
--- ═══════════════════════════════════════════════════════════════════════════════════════════════
+-- Provision the CI definition-fence role and schema. Definition cutover needs a database-wide check
+-- for non-terminal runs, but workflow_run uses forced RLS and boot has no tenant scope. The fence
+-- role therefore carries BYPASSRLS with narrowly granted columns.
 --
--- WHAT THIS PROVISIONS, AND WHY IT IS NOT A MIGRATION
---
--- The `ci.pipeline` definition cutover must answer one DATABASE-WIDE question while holding the
--- `wf_definition` row lock: "is any non-terminal run still pinned to the superseded version?".
--- `workflow_run` is FORCE ROW LEVEL SECURITY, and at boot there is no tenant/region scope, so the
--- answer can only be obtained by a role that can see past RLS. If that authority were missing the
--- probe would return FALSE rather than raising — a fail-OPEN cutover that drains the old version
--- while live runs still depend on it.
---
--- `BYPASSRLS` is cluster authority. Granting it is an operator action, deliberately NOT something an
--- application migration performs opportunistically when it happens to be running as a role with
--- CREATEROLE: migration behaviour must not vary with accidental excess privilege, and an
--- existing-volume rollout must be explicit and auditable. So this file provisions, and the
--- `ci_0020h` migration only VERIFIES and names this script in its refusal.
---
--- HOW TO RUN
+-- This is an operator provisioning step rather than a migration because granting BYPASSRLS requires
+-- cluster authority and must not depend on incidental migration-role privileges. ci_0020h verifies
+-- the result.
 --
 --   psql "$DATABASE_PROVISIONING_URL" \
 --     --set=ON_ERROR_STOP=1 \
 --     --set=migration_role=myelin_admin \
 --     --file scripts/pg-init/01-ci-definition-fence.sql
 --
--- `migration_role` MUST be the role behind `DATABASE_MIGRATION_URL` — the role that will run the
--- migrations. It defaults to `myelin_admin` so Docker's `/docker-entrypoint-initdb.d` ordering
--- (00- then 01-) provisions a fresh self-host volume with no operator action.
+-- migration_role must match DATABASE_MIGRATION_URL and defaults to myelin_admin. Run this with a
+-- cluster-admin connection.
 --
--- Requires a cluster-admin/superuser connection: it creates a role carrying BYPASSRLS.
+-- psql sends statements separately, so this script uses an explicit transaction to prevent partial
+-- provisioning. ci_0020h is already one Simple Query transaction and must not add another BEGIN.
+-- Validation precedes mutation so collision checks do not destroy evidence.
 --
--- ── WHY THIS SCRIPT USES AN EXPLICIT TRANSACTION AND `ci_0020h` DELIBERATELY DOES NOT ────────────
---
--- These two look like the same problem and are not.
---
--- `ci_0020h` is handed to PostgreSQL by `PgMigrator` as ONE Simple Query message, so every statement
--- in it already runs inside a single implicit transaction: a `RAISE` rolls back the whole prefix and
--- ENDS that transaction. Adding an explicit `BEGIN` there would instead leave the pooled migrator
--- connection sitting in an aborted transaction block, so the next user of that connection —
--- including the migrator's own `pg_advisory_unlock` — would fail with `25P02`.
---
--- `psql` is the opposite: it sends each statement as its own message, so each one COMMITS on
--- success. Without an explicit transaction, a refusal partway through this script would leave
--- everything before it permanently applied — e.g. a colliding role already normalized to
--- `BYPASSRLS` before the ownership refusal fires. An aborted `psql` session simply exits and the
--- transaction rolls back, so the explicit `BEGIN`/`COMMIT` below is exactly right HERE and exactly
--- wrong THERE.
---
--- ── ORDERING: VALIDATE EVERYTHING, THEN MUTATE ───────────────────────────────────────────────────
---
--- Every collision refusal runs BEFORE any normalization. An earlier version revoked "known excess"
--- first and then scanned for unexpected grants — which destroyed the very evidence the scan needed,
--- so a colliding role's privileges were silently laundered instead of refused. Validation is
--- therefore a strict phase: it reads, it raises with object identities, and it changes nothing.
---
--- SCOPE OF THE AUTHORITY THIS CREATES
---
--- The fence role is NOLOGIN (never connectable), NOINHERIT, owns exactly one schema
--- (`myelin_ci_security`) and — after `ci_0020h`/`ci_0022c` — exactly two aggregate/boolean-returning
--- functions (the superseded-run backlog probe and the CT-007 5b.3-6e.1 activation-readiness probe). It
--- is deliberately given NO privilege on `public` and NO table grants here: `ci_0020h` grants it SELECT
--- on exactly three non-payload columns of `workflow_run`, and `ci_0022c` on exactly four non-payload
--- columns of `job_queue`, once those tables exist. `BYPASSRLS` does not itself grant access to any
--- table, so the role's reach is the intersection of "can see past RLS" and "has SELECT on those
--- columns" — which is exactly the two questions it must answer.
+-- The NOLOGIN, NOINHERIT fence role owns myelin_ci_security. Later migrations grant only the
+-- non-payload columns needed by its two boolean probes; BYPASSRLS alone grants no table access.
 
 \set ON_ERROR_STOP on
 

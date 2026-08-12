@@ -1,16 +1,7 @@
 #!/usr/bin/env bash
-# Stage a git-bearing gVisor rootfs for the Myelin git WIRE (R4.1 / CT-006d).
-#
-# The receive-pack (push) and upload-pack (clone/fetch) paths ingest/serve the UNTRUSTED pack inside a
-# gVisor (`runsc`) sandbox that runs a REAL `git` in the guest (`git index-pack`, `git <svc>
-# --advertise-refs`/`--stateless-rpc`). That guest needs a rootfs containing `git` + its shared libs +
-# the git-core helpers. This script bakes one from the base busybox rootfs + the host's own `git`,
-# exactly as the CT-006 prod-exec tests stage it
-# (crates/myelin-ci-sandbox/tests/git_wire_prod_exec_test.rs::stage_git_rootfs) — so `self-host.sh` can
-# provision it once and point MYELIN_GVISOR_GIT_ROOTFS at it.
-#
-# PRODUCTION staging would bake an immutable, digest-pinned OCI git image; this host-git copy is the
-# single-founder self-host floor (the guest still runs NON-ROOT as uid 65534 — the CT-002 security lesson).
+# Stage a Git-capable gVisor rootfs for clone, fetch, and push. It layers the host Git binary, shared
+# libraries, and helpers onto the base BusyBox rootfs. The guest runs as uid 65534. Deployed assets
+# should instead come from an immutable, digest-pinned image.
 #
 #   ./scripts/stage-git-rootfs.sh          stage into ~/.local/share/gvisor-assets/git-rootfs (idempotent)
 #   FORCE=1 ./scripts/stage-git-rootfs.sh  re-stage from scratch (removes the existing staged tree)
@@ -41,7 +32,7 @@ for mountpoint in "${REQUIRED_MOUNTPOINTS[@]}"; do
   fi
 done
 
-# Idempotent only when the executable AND the complete fixed OCI mountpoint set are already staged.
+# Reuse the tree only when Git and every required mountpoint are present.
 if [[ "${FORCE:-0}" != "1" && -x "${STAGED}/usr/bin/git" && "${mountpoints_ready}" == "1" ]]; then
   echo "stage-git-rootfs: already staged at ${STAGED} (FORCE=1 to re-stage)" >&2
   echo "${STAGED}"
@@ -57,8 +48,7 @@ cp -a "${BASE_ROOTFS}/." "${STAGED}/"
 # The host `git` (a single multi-call binary; upload-pack/receive-pack dispatch off argv[0]).
 install -Dm755 "${HOST_GIT}" "${STAGED}/usr/bin/git"
 
-# Copy a host lib (resolving symlinks) into BOTH /usr/lib and /lib, recreating the soname symlink so
-# the in-guest dynamic linker finds it. Mirrors the test's stage_lib.
+# Copy each host library into /usr/lib and /lib with its soname symlink.
 stage_lib() {
   local soname="$1" host_path="$2" real real_name libdir dst link
   [[ -e "${host_path}" ]] || die "expected host lib ${host_path} (git's dependency) is absent"
@@ -84,8 +74,7 @@ for helper in git-upload-pack git-receive-pack; do
   ln -sf "../../bin/git" "${STAGED}/usr/lib/git-core/${helper}"
 done
 
-# The complete fixed OCI mount destination set must PRE-EXIST in the read-only, digest-pinned root.
-# runsc must never create any of these paths in the shared tree.
+# Mount destinations must exist before the rootfs becomes read-only.
 mkdir -p \
   "${STAGED}/tmp" \
   "${STAGED}/workspace" \
