@@ -12,7 +12,7 @@ use myelin_events::{OutboxStore, Timestamp, UlidMinter};
 use myelin_flow::WfJournal;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId};
 use myelin_mcp::{
-    git_merge_repo_from_effect_key, AuditPhase, GateAuditMinter, GovernanceAudit,
+    approval_contract_from_effect_key, AuditPhase, GateAuditMinter, GovernanceAudit,
     GovernanceAuditRecord, GovernanceAuditTarget, OutboxGovernanceAudit,
 };
 use myelin_notif::agent_effect_approval_targets;
@@ -211,11 +211,9 @@ impl AgentHostActivityExecutor {
         if gate.run_id != input.run_id || gate.requested_by != input.agent.principal_id.0 {
             return Err("expired approval gate is not bound to this hosted run".into());
         }
-        let tool = if git_merge_repo_from_effect_key(&gate.effect_id).is_some() {
-            "git.merge"
-        } else {
-            return Err("expired approval gate has no governance audit taxonomy".into());
-        };
+        let contract = approval_contract_from_effect_key(&gate.effect_id).ok_or_else(|| {
+            "expired approval gate has no registered approval contract".to_string()
+        })?;
         let audited_at_unix = gate.decided_at_unix.unwrap_or(gate.expires_at_unix);
         let audited_at = chrono::DateTime::from_timestamp(audited_at_unix, 0)
             .ok_or_else(|| "hosted approval expiry timestamp is invalid".to_string())?
@@ -241,7 +239,7 @@ impl AgentHostActivityExecutor {
             actor: &actor,
             run_id: &RunId(gate.run_id.clone()),
             target: GovernanceAuditTarget::Gate(&gate.gate_id),
-            tool,
+            tool: contract.tool(),
             jti: "system:hitl-expiry",
             phase: AuditPhase::Expired,
             outcome: None,

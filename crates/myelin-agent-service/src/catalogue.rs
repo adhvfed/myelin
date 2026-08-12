@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
-use myelin_agent::{ToolDef, ToolDefValidationError};
+use myelin_agent::{McpApprovalContract, ToolDef, ToolDefValidationError};
 use myelin_tenancy::{ArtifactRef, TenantId};
 use serde_json::{json, Value};
 
@@ -12,6 +12,7 @@ pub enum ToolCatalogueError {
     InvalidDefinition(ToolDefValidationError),
     UnsafeDefault(LooseningViolation),
     DuplicateVersion { name: String, version: u32 },
+    IncompleteApprovalContract { name: String },
 }
 
 impl core::fmt::Display for ToolCatalogueError {
@@ -22,6 +23,10 @@ impl core::fmt::Display for ToolCatalogueError {
             Self::DuplicateVersion { name, version } => {
                 write!(f, "duplicate tool definition `{name}` version {version}")
             }
+            Self::IncompleteApprovalContract { name } => write!(
+                f,
+                "MCP tool `{name}` requires approval but has no complete human decision contract"
+            ),
         }
     }
 }
@@ -74,6 +79,12 @@ impl PlatformToolCatalogue {
             assert_no_silent_loosening(&definition, &[])
                 .map_err(ToolCatalogueError::UnsafeDefault)?;
             let name = definition.canonical_name();
+            if definition.exposed_over_mcp
+                && definition.requires_approval
+                && McpApprovalContract::for_tool(&name).is_none()
+            {
+                return Err(ToolCatalogueError::IncompleteApprovalContract { name });
+            }
             let version = definition.version;
             let key = (name.clone(), version);
             if by_version.insert(key, definition).is_some() {
@@ -177,6 +188,10 @@ mod tests {
         let merge = catalogue.resolve("git.merge").unwrap();
         assert!(merge.exposed_over_mcp);
         assert!(merge.requires_approval);
+        assert_eq!(
+            McpApprovalContract::for_tool(&merge.canonical_name()),
+            Some(McpApprovalContract::GitMerge)
+        );
         let chat_archive = catalogue.resolve("chat.archive_channel").unwrap();
         assert!(chat_archive.requires_approval);
         let ci_read = catalogue.resolve("ci.read_run").unwrap();
@@ -263,6 +278,21 @@ mod tests {
         assert!(matches!(
             PlatformToolCatalogue::try_from_definitions([loosened]),
             Err(ToolCatalogueError::UnsafeDefault(_))
+        ));
+    }
+
+    #[test]
+    fn an_exposed_gated_tool_needs_the_whole_human_decision_path() {
+        let mut incomplete = myelin_git::api::agent_tool_defs()
+            .into_iter()
+            .find(|definition| definition.canonical_name() == "git.merge")
+            .unwrap();
+        incomplete.name = myelin_agent::ToolName("history_rewrite".into());
+
+        assert!(matches!(
+            PlatformToolCatalogue::try_from_definitions([incomplete]),
+            Err(ToolCatalogueError::IncompleteApprovalContract { name })
+                if name == "git.history_rewrite"
         ));
     }
 

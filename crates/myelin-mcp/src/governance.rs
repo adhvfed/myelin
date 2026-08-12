@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use myelin_agent::{
-    EffectApi, EffectApproval, EffectAuthority, EffectKind, EffectResult, ProposedEffect, RunCtx,
+    EffectApi, EffectApproval, EffectAuthority, EffectKind, EffectResult, McpApprovalContract,
+    ProposedEffect, RunCtx,
 };
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EventDraft, EventType, IdMinter,
@@ -389,6 +390,18 @@ fn audit_event_type(
             _ => Err("invalid governed read audit phase/outcome pairing".into()),
         };
     }
+    if matches!(
+        phase,
+        AuditPhase::Approved | AuditPhase::Rejected | AuditPhase::Expired
+    ) {
+        if outcome.is_some() {
+            return Err("invalid governance audit phase/outcome pairing".into());
+        }
+        let contract = McpApprovalContract::for_tool(tool).ok_or_else(|| {
+            "governance audit refused an unregistered approval contract".to_string()
+        })?;
+        return approval_audit_event_type(contract, phase);
+    }
     let suffix = match (phase, outcome) {
         (AuditPhase::Attempt, None) => "attempted",
         (
@@ -405,9 +418,6 @@ fn audit_event_type(
             AuditPhase::Outcome,
             Some(GovernanceAuditOutcome::Effect(CallOutcome::Indeterminate { .. })),
         ) => "indeterminate",
-        (AuditPhase::Approved, None) => "approved",
-        (AuditPhase::Rejected, None) => "rejected",
-        (AuditPhase::Expired, None) => "expired",
         _ => return Err("invalid governance audit phase/outcome pairing".into()),
     };
     match (tool, suffix) {
@@ -416,9 +426,6 @@ fn audit_event_type(
         ("git.merge", "gated") => Ok(myelin_git::events::GIT_MERGE_GATED),
         ("git.merge", "denied") => Ok(myelin_git::events::GIT_MERGE_DENIED),
         ("git.merge", "indeterminate") => Ok(myelin_git::events::GIT_MERGE_INDETERMINATE),
-        ("git.merge", "approved") => Ok(myelin_git::events::GIT_MERGE_APPROVED),
-        ("git.merge", "rejected") => Ok(myelin_git::events::GIT_MERGE_REJECTED),
-        ("git.merge", "expired") => Ok(myelin_git::events::GIT_MERGE_EXPIRED),
         ("git.open_pr", "attempted") => Ok(myelin_git::events::GIT_OPEN_PR_ATTEMPTED),
         ("git.open_pr", "applied") => Ok(myelin_git::events::GIT_OPEN_PR_APPLIED),
         ("git.open_pr", "gated") => Ok(myelin_git::events::GIT_OPEN_PR_GATED),
@@ -456,6 +463,20 @@ fn audit_event_type(
         ("issues.create", "denied") => Ok(myelin_issues::events::ISSUE_CREATE_DENIED),
         ("issues.create", "indeterminate") => Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE),
         _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
+    }
+}
+
+fn approval_audit_event_type(
+    contract: McpApprovalContract,
+    phase: AuditPhase,
+) -> Result<&'static str, String> {
+    match contract {
+        McpApprovalContract::GitMerge => match phase {
+            AuditPhase::Approved => Ok(myelin_git::events::GIT_MERGE_APPROVED),
+            AuditPhase::Rejected => Ok(myelin_git::events::GIT_MERGE_REJECTED),
+            AuditPhase::Expired => Ok(myelin_git::events::GIT_MERGE_EXPIRED),
+            _ => Err("invalid approval audit phase".into()),
+        },
     }
 }
 
@@ -1218,18 +1239,15 @@ impl GovernedRouter {
             myelin_identity::PrincipalStatus::Active,
         );
         for gate in expired {
-            let tool = if git_merge_repo_from_effect_key(&gate.effect_id).is_some() {
-                "git.merge"
-            } else {
-                return Err("expired gate has no registered governance audit taxonomy".into());
-            };
+            let contract = approval_contract_from_effect_key(&gate.effect_id)
+                .ok_or_else(|| "expired gate has no registered approval contract".to_string())?;
             let run_id = RunId(gate.run_id.clone());
             self.audit_sink.record(GovernanceAuditRecord {
                 scope: &self.principal.scope,
                 actor: &actor,
                 run_id: &run_id,
                 target: GovernanceAuditTarget::Gate(&gate.gate_id),
-                tool,
+                tool: contract.tool(),
                 jti: "system:hitl-expiry",
                 phase: AuditPhase::Expired,
                 outcome: None,
@@ -1332,20 +1350,22 @@ impl GovernedRouter {
 }
 
 fn approval_card_ref(scope: &TenantScope, tool: &str, args: &serde_json::Value) -> Option<String> {
-    match tool {
-        "git.merge" => Some(format!(
+    match McpApprovalContract::for_tool(tool)? {
+        McpApprovalContract::GitMerge => Some(format!(
             "myelin://{}/git/pr/{}:{}",
             scope.tenant().0,
             args.get("repo")?.as_str()?,
             args.get("number")?.as_u64()?,
         )),
-        _ => None,
     }
 }
 
 fn approval_risk_summary(tool: &str, args: &serde_json::Value) -> Vec<u8> {
-    match tool {
-        "git.merge" => match (
+    let Some(contract) = McpApprovalContract::for_tool(tool) else {
+        return format!("Apply governed tool {tool}").into_bytes();
+    };
+    match contract {
+        McpApprovalContract::GitMerge => match (
             args.get("repo").and_then(serde_json::Value::as_str),
             args.get("number").and_then(serde_json::Value::as_u64),
         ) {
@@ -1354,7 +1374,6 @@ fn approval_risk_summary(tool: &str, args: &serde_json::Value) -> Vec<u8> {
             }
             _ => b"Merge a pull request".to_vec(),
         },
-        _ => format!("Apply governed tool {tool}").into_bytes(),
     }
 }
 
@@ -1399,6 +1418,16 @@ pub fn git_merge_repo_from_effect_key(effect_key: &str) -> Option<String> {
     let repo = String::from_utf8(bytes).ok()?;
     myelin_git::gix_backend::validate_repo_slug(&repo).ok()?;
     Some(repo)
+}
+
+pub fn approval_contract_from_effect_key(effect_key: &str) -> Option<McpApprovalContract> {
+    let tool = effect_key.strip_prefix("mcp:v1:")?.split_once(':')?.0;
+    let contract = McpApprovalContract::for_tool(tool)?;
+    match contract {
+        McpApprovalContract::GitMerge => {
+            git_merge_repo_from_effect_key(effect_key).map(|_| contract)
+        }
+    }
 }
 
 fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
@@ -1491,7 +1520,11 @@ impl EffectApi for SkeletonEffectApi {
 mod security_tests {
     use myelin_events::IdMinter;
 
-    use super::{git_merge_repo_from_effect_key, mcp_effect_key, AuditPhase, GateAuditMinter};
+    use super::{
+        approval_contract_from_effect_key, git_merge_repo_from_effect_key, mcp_effect_key,
+        AuditPhase, GateAuditMinter,
+    };
+    use myelin_agent::McpApprovalContract;
 
     #[test]
     fn gate_lifecycle_audits_have_retry_stable_but_exact_event_identities() {
@@ -1529,6 +1562,10 @@ mod security_tests {
             git_merge_repo_from_effect_key(&first).as_deref(),
             Some("team/alpha")
         );
+        assert_eq!(
+            approval_contract_from_effect_key(&first),
+            Some(McpApprovalContract::GitMerge)
+        );
 
         let huge = mcp_effect_key(
             "git.open_pr",
@@ -1550,6 +1587,12 @@ mod security_tests {
         assert!(git_merge_repo_from_effect_key(
             "mcp:v1:git.merge:repohex:zz:blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         )
+        .is_none());
+        assert!(approval_contract_from_effect_key(&traversal).is_none());
+        assert!(approval_contract_from_effect_key(&mcp_effect_key(
+            "knowledge.publish",
+            &serde_json::json!({"page":"roadmap"}),
+        ))
         .is_none());
     }
 }

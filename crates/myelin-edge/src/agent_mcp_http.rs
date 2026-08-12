@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use myelin_agent::McpApprovalContract;
 use myelin_agent_service::hosted_run_contract::{
     hosted_agent_decision_ref, HostedAgentDecision, HOSTED_AGENT_APPROVAL_SIGNAL,
 };
@@ -14,7 +15,7 @@ use myelin_identity_service::{
     PrincipalStore, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
 };
 use myelin_mcp::{
-    git_merge_repo_from_effect_key, AuditPhase, GateApproverPolicy, GateAuditMinter,
+    approval_contract_from_effect_key, AuditPhase, GateApproverPolicy, GateAuditMinter,
     GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter, GovernedRun,
     McpServer, OutboxGovernanceAudit, ToolRegistry, MAX_FRAME_BYTES,
 };
@@ -221,13 +222,9 @@ impl AgentMcpServices {
         gate: &myelin_storage::hitl_gate_durable::GateRecord,
         decision: HostedAgentDecision,
     ) -> Result<(), EdgeError> {
-        let tool = if git_merge_repo_from_effect_key(&gate.effect_id).is_some() {
-            "git.merge"
-        } else {
-            return Err(EdgeError::Conflict(
-                "agent approval has no registered governance audit taxonomy".into(),
-            ));
-        };
+        let contract = approval_contract_from_effect_key(&gate.effect_id).ok_or_else(|| {
+            EdgeError::Conflict("agent approval has no registered approval contract".into())
+        })?;
         let phase = match decision {
             HostedAgentDecision::Approved => AuditPhase::Approved,
             HostedAgentDecision::Rejected => AuditPhase::Rejected,
@@ -253,7 +250,7 @@ impl AgentMcpServices {
                 actor: ctx.principal,
                 run_id: &RunId(gate.run_id.clone()),
                 target: GovernanceAuditTarget::Gate(&gate.gate_id),
-                tool,
+                tool: contract.tool(),
                 jti: &format!("human-decision:{}", gate.gate_id),
                 phase,
                 outcome: None,
@@ -675,16 +672,15 @@ impl GateApproverPolicy for CreatorApproverPolicy {
         tool: &str,
         args: &serde_json::Value,
     ) -> Result<Vec<PrincipalId>, String> {
-        if tool != "git.merge" {
-            return Err(format!(
-                "tool `{tool}` has no registered Edge approval policy"
-            ));
-        }
-        let repo = args
-            .get("repo")
-            .and_then(serde_json::Value::as_str)
-            .filter(|repo| !repo.is_empty() && repo.len() <= 255)
-            .ok_or_else(|| "merge approval requires a bounded repository slug".to_string())?;
+        let contract = McpApprovalContract::for_tool(tool)
+            .ok_or_else(|| format!("tool `{tool}` has no registered Edge approval policy"))?;
+        let repo = match contract {
+            McpApprovalContract::GitMerge => args
+                .get("repo")
+                .and_then(serde_json::Value::as_str)
+                .filter(|repo| !repo.is_empty() && repo.len() <= 255)
+                .ok_or_else(|| "merge approval requires a bounded repository slug".to_string())?,
+        };
         let row = self
             .principals
             .try_get_principal(&self.scope, &self.creator_id)

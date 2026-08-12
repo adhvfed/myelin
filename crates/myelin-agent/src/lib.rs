@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub mod approval;
 pub mod events;
+
+pub use approval::McpApprovalContract;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Conversation {
