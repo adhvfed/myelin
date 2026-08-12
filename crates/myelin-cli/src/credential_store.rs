@@ -227,3 +227,177 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), C
         ))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn create(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "myelin-cli-{label}-{}-{}",
+                std::process::id(),
+                new_reference()
+            ));
+            std::fs::create_dir_all(&path).expect("the test directory should be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let values: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key| values.get(key).cloned()
+    }
+
+    #[test]
+    fn references_are_opaque_canonical_and_fresh() {
+        let first = new_reference();
+        let second = new_reference();
+
+        validate_reference(&first).unwrap();
+        validate_reference(&second).unwrap();
+        assert_eq!(first.len(), REFERENCE_LENGTH);
+        assert_ne!(first, second);
+        assert!(!first.contains('='), "references use unpadded base64url");
+    }
+
+    #[test]
+    fn malformed_references_never_reach_a_secret_backend() {
+        for malformed in [
+            "",
+            "too-short",
+            "abcdefghijklmnopqrstu/",
+            "abcdefghijklmnopqrstu=",
+            "abcdefghijklmnopqrstuvv",
+        ] {
+            let error = validate_reference(malformed).unwrap_err();
+            assert!(error.to_string().contains("malformed"));
+        }
+    }
+
+    #[test]
+    fn the_os_keyring_is_the_only_default_secret_store() {
+        assert!(matches!(
+            CredentialSecretStore::selected(Path::new("/unused"), &env_from(&[])).unwrap(),
+            CredentialSecretStore::Keyring
+        ));
+        assert!(matches!(
+            CredentialSecretStore::selected(
+                Path::new("/unused"),
+                &env_from(&[(TEST_STORE_ENV, "")])
+            )
+            .unwrap(),
+            CredentialSecretStore::Keyring
+        ));
+
+        let error = CredentialSecretStore::selected(
+            Path::new("/unused"),
+            &env_from(&[(TEST_STORE_ENV, "anything-else")]),
+        )
+        .err()
+        .expect("unknown test stores must be rejected");
+        assert!(error.to_string().contains("debug-only test seam"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_test_store_exercises_the_secret_lifecycle_without_a_real_keyring() {
+        let directory = TestDirectory::create("credential-lifecycle");
+        let config_directory = directory.path().join("config");
+        let store = CredentialSecretStore::selected(
+            &config_directory,
+            &env_from(&[(TEST_STORE_ENV, TEST_STORE_VALUE)]),
+        )
+        .unwrap();
+        let reference = new_reference();
+
+        let missing = store.get(&reference).unwrap_err();
+        assert!(matches!(missing, CliError::NotAuthenticated(_)));
+
+        store.put(&reference, "first secret").unwrap();
+        assert_eq!(store.get(&reference).unwrap(), "first secret");
+        store.put(&reference, "replacement secret").unwrap();
+        assert_eq!(store.get(&reference).unwrap(), "replacement secret");
+
+        let path = store.test_secret_path(&reference).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        assert!(store.delete(&reference).unwrap());
+        assert!(!store.delete(&reference).unwrap());
+        assert!(matches!(
+            store.get(&reference).unwrap_err(),
+            CliError::NotAuthenticated(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_writes_replace_atomically_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::create("protected-write");
+        let path = directory.path().join("credential");
+        write_owner_only_atomic(&path, b"first").unwrap();
+        write_owner_only_atomic(&path, b"second").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            1,
+            "successful writes leave no temporary files behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_writes_fail_closed_when_every_temporary_name_is_taken() {
+        let directory = TestDirectory::create("protected-write-exhausted");
+        for attempt in 0..100 {
+            std::fs::write(
+                directory.path().join(format!(
+                    ".myelin-credential.tmp-{}-{attempt}",
+                    std::process::id()
+                )),
+                b"occupied",
+            )
+            .unwrap();
+        }
+        let destination = directory.path().join("credential");
+
+        let error = write_owner_only_atomic(&destination, b"must not be written").unwrap_err();
+
+        assert!(error.to_string().contains("cannot allocate"));
+        assert!(!destination.exists());
+    }
+}
