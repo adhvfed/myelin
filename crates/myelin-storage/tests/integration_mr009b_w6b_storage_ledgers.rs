@@ -22,6 +22,16 @@ use myelin_storage::{
 };
 use myelin_tenancy::TenantId;
 
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut c = cfg.clone();
     c.database_url = c
@@ -41,14 +51,10 @@ fn uniq() -> String {
     )
 }
 
-async fn migrate_admin() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn migrate_admin() -> SubstrateProvider {
+    let admin = SubstrateProvider::connect(admin_config(&test_config()), 4)
+        .await
+        .expect("connect to the Postgres required by the durable ledger integration stories");
     admin
         .migrate(&reserve_settle_durable_migrations(), &HotTables::none())
         .await
@@ -61,13 +67,13 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         .migrate(&post_pit_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the post-pit-erasure-ledger migration (0052)");
-    Some(admin)
+    admin
 }
 
 async fn app_provider() -> SubstrateProvider {
-    SubstrateProvider::connect(MyelinConfig::dev(), 6)
+    SubstrateProvider::connect(test_config(), 6)
         .await
-        .expect("connect app role")
+        .expect("connect to the app-role Postgres required by the durable ledger stories")
 }
 
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
@@ -88,9 +94,7 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mr009b_w6b_storage_ledgers_durable() {
-    let Some(admin) = migrate_admin().await else {
-        return;
-    };
+    let admin = migrate_admin().await;
     let app = app_provider().await;
     let region = app.config().region.clone();
     let suffix = uniq();
@@ -472,9 +476,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unavailable_cost_ledger_refuses_work_without_crashing_the_worker() {
-    let Some(admin) = migrate_admin().await else {
-        return;
-    };
+    let admin = migrate_admin().await;
     let app = app_provider().await;
     let region = app.config().region.clone();
     let tenant = TenantId(format!("01J0OUTAGE{}", uniq()));
