@@ -209,14 +209,22 @@ fn production_runtime_identity_and_git_storage_are_explicit_before_database_boot
         .find("runtime_config_or_exit(true)")
         .expect("serving must validate runtime identity and storage");
     let durable_core = serving
-        .find("compose_core(runtime.cell_id).await")
+        .find("compose_core(runtime.cell_id.clone()).await")
         .expect("validated cell identity must feed durable composition");
-    let git_root = serving
-        .find("runtime.git_root")
-        .expect("validated Git storage must feed serving");
+    let serve_call = serving
+        .find("serve(core, runtime).await")
+        .expect("validated runtime storage must feed serving");
+    let serve = source
+        .split_once("async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig)")
+        .expect("serving must consume the validated runtime config")
+        .1;
 
     assert!(runtime_config < durable_core);
-    assert!(runtime_config < git_root);
+    assert!(durable_core < serve_call);
+    assert!(serve.contains("let EdgeRuntimeConfig {"));
+    assert!(
+        serve.contains("let git_root = git_root.expect(\"serving config carries a Git root\")")
+    );
     assert!(source.contains("PgBootstrap::from_env(Mode::RequireEnv)"));
     assert!(!source.contains("\"cell-dev\".to_string()"));
     assert!(!source.contains(".join(\"myelin-git-data\")"));

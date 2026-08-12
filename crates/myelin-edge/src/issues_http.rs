@@ -5,7 +5,7 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_result_on_runtime;
-use crate::{Method, StoreBackedIssueAuthorizer};
+use crate::{IssueReconciliationWakeup, Method, StoreBackedIssueAuthorizer};
 use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
     api::IssueListState, is_canonical_request_event_id, public_issue_actor, CreateIssue,
@@ -103,6 +103,7 @@ pub struct DurableIssueMutationApi {
     store: Arc<ProductionIssueStore>,
     projects: PgProjectStore,
     authorizer: StoreBackedIssueAuthorizer,
+    reconciliation: IssueReconciliationWakeup,
     runtime: Handle,
 }
 
@@ -111,12 +112,14 @@ impl DurableIssueMutationApi {
         store: Arc<ProductionIssueStore>,
         projects: PgProjectStore,
         authorizer: StoreBackedIssueAuthorizer,
+        reconciliation: IssueReconciliationWakeup,
         runtime: Handle,
     ) -> Self {
         Self {
             store,
             projects,
             authorizer,
+            reconciliation,
             runtime,
         }
     }
@@ -139,14 +142,21 @@ impl DurableIssueMutationApi {
             title: request.title.clone(),
         };
         let proposal = resolve_create(self, authorized_viewer, request)?;
-        self.drive(self.store.create_idempotent_from_intent(
-            actor,
-            authorized_viewer,
-            proposal,
-            intent,
-            caller_key,
-        ))
-        .map_err(map_store_error)
+        let outcome = self
+            .drive(self.store.create_idempotent_from_intent(
+                actor,
+                authorized_viewer,
+                proposal,
+                intent,
+                caller_key,
+            ))
+            .map_err(map_store_error)?;
+        self.reconciliation.request_sweep();
+        Ok(outcome)
+    }
+
+    pub(crate) fn request_reconciliation(&self) {
+        self.reconciliation.request_sweep();
     }
 
     pub fn create_relation(

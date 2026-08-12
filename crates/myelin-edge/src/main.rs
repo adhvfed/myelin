@@ -1044,6 +1044,11 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 eprintln!("edge: Issues authorization reconciler refused to start: {error}");
                 std::process::exit(1);
             });
+    let issue_reconciler = spawn_issue_authorization_reconciler(
+        issue_store.clone(),
+        check.clone(),
+        issue_reconciliation_config,
+    );
     let thresholds = match myelin_substrate::Thresholds::load_canonical() {
         Ok(t) => t,
         Err(e) => {
@@ -1164,6 +1169,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         issue_store.clone(),
         myelin_identity_service::PgProjectStore::new(provider.clone()),
         issue_authorizer.clone(),
+        issue_reconciler.wakeup(),
         handle.clone(),
     );
     builder = register_issues(builder, issue_mutations.clone());
@@ -1272,8 +1278,6 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             std::process::exit(1);
         }
     };
-    let issue_reconciler =
-        spawn_issue_authorization_reconciler(issue_store, check, issue_reconciliation_config);
     eprintln!("edge: listening on {listen_addr}");
     let git_shutdown_for_signal = git_shutdown.clone();
     let server_result = serve_edge_until_shutdown_with_probe(

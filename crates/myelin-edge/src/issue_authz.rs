@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 
 pub const ISSUE_RECONCILE_TENANTS_ENV: &str = "MYELIN_ISSUES_RECONCILE_TENANTS";
@@ -346,11 +346,16 @@ pub struct IssueReconciliationHandle {
     shutdown: watch::Sender<bool>,
     join: JoinHandle<()>,
     metrics: Arc<IssueReconciliationMetrics>,
+    wakeup: IssueReconciliationWakeup,
 }
 
 impl IssueReconciliationHandle {
     pub fn metrics(&self) -> &Arc<IssueReconciliationMetrics> {
         &self.metrics
+    }
+
+    pub fn wakeup(&self) -> IssueReconciliationWakeup {
+        self.wakeup.clone()
     }
 
     pub async fn shutdown(self) -> Result<(), String> {
@@ -360,6 +365,17 @@ impl IssueReconciliationHandle {
             Ok(Err(_)) => Err("Issues reconciliation task join failed".into()),
             Err(_) => Err("Issues reconciliation task did not stop within 10 seconds".into()),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct IssueReconciliationWakeup {
+    notify: Arc<Notify>,
+}
+
+impl IssueReconciliationWakeup {
+    pub fn request_sweep(&self) {
+        self.notify.notify_one();
     }
 }
 
@@ -399,16 +415,19 @@ fn spawn_reconciliation_loop(
     let (shutdown, receiver) = watch::channel(false);
     let metrics = Arc::new(IssueReconciliationMetrics::default());
     let metrics_for_task = metrics.clone();
+    let wakeup = IssueReconciliationWakeup::default();
     let join = tokio::spawn(run_reconciliation_loop(
         sweeper,
         config,
         receiver,
         metrics_for_task,
+        wakeup.clone(),
     ));
     IssueReconciliationHandle {
         shutdown,
         join,
         metrics,
+        wakeup,
     }
 }
 
@@ -417,6 +436,7 @@ async fn run_reconciliation_loop(
     config: IssueReconciliationConfig,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<IssueReconciliationMetrics>,
+    wakeup: IssueReconciliationWakeup,
 ) {
     let mut delay = config.interval;
     loop {
@@ -445,11 +465,23 @@ async fn run_reconciliation_loop(
             report.failures > 0,
         );
 
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+        if report.failures > 0 {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = wakeup.notify.notified() => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
                 }
             }
         }
@@ -701,6 +733,26 @@ mod tests {
         assert_eq!(handle.metrics().snapshot().pending_seen, 2);
         handle.shutdown().await.expect("graceful worker shutdown");
         assert_eq!(sweeper.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn newly_staged_work_wakes_the_idle_worker() {
+        let sweeper = Arc::new(FakeSweeper::new([
+            IssueReconciliationReport::default(),
+            IssueReconciliationReport {
+                pending_seen: 1,
+                newly_activated: 1,
+                ..IssueReconciliationReport::default()
+            },
+        ]));
+        let handle = spawn_reconciliation_loop(sweeper, test_config());
+        wait_for_sweeps(handle.metrics(), 1).await;
+
+        handle.wakeup().request_sweep();
+        wait_for_sweeps(handle.metrics(), 2).await;
+
+        assert_eq!(handle.metrics().snapshot().newly_activated, 1);
+        handle.shutdown().await.expect("woken worker drains");
     }
 
     #[tokio::test]

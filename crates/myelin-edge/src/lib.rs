@@ -89,7 +89,8 @@ pub use git_wire_http::register_git_wire;
 pub use issue_authz::{
     spawn_issue_authorization_reconciler, IdentityIssueTupleWriter, IssueReconciliationConfig,
     IssueReconciliationHandle, IssueReconciliationMetrics, IssueReconciliationMetricsSnapshot,
-    IssueReconciliationReport, StoreBackedIssueAuthorizer, ISSUE_RECONCILE_TENANTS_ENV,
+    IssueReconciliationReport, IssueReconciliationWakeup, StoreBackedIssueAuthorizer,
+    ISSUE_RECONCILE_TENANTS_ENV,
 };
 pub use issue_effect::IssueEffectApi;
 pub use issues_http::{

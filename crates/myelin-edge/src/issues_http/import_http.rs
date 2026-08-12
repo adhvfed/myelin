@@ -171,6 +171,7 @@ impl Handler for IssueImportRunHandler {
             .iter()
             .filter(|(_, receipt)| receipt.created)
             .count();
+        self.api.request_reconciliation();
         let issues = outcomes
             .into_iter()
             .map(|(source_id, receipt)| {

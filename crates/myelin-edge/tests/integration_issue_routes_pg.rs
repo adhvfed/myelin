@@ -22,8 +22,9 @@ use myelin_identity_service::{
 };
 use myelin_issues::events::ISSUE_CLOSED;
 use myelin_issues::{
-    issues_hot_tables, issues_migrations, IssueAuthorizationBinding, IssueAuthorizationStatus,
-    IssueTupleWriter, PgIssueStore, ISSUE_KEY_PREFIX_LIST_INDEX, ISSUE_RECENT_LIST_INDEX,
+    is_resolvable_pseudonym, issues_hot_tables, issues_migrations, IssueAuthorizationBinding,
+    IssueAuthorizationStatus, IssueTupleWriter, PgIssueStore, ISSUE_KEY_PREFIX_LIST_INDEX,
+    ISSUE_RECENT_LIST_INDEX,
 };
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
@@ -349,6 +350,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         issue_store.clone(),
         PgProjectStore::new(provider.clone()),
         issue_authorizer,
+        myelin_edge::IssueReconciliationWakeup::default(),
         tokio::runtime::Handle::current(),
     );
     let builder = register_issues(
@@ -697,7 +699,9 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(issue["title"], title);
-    assert_eq!(issue["created_by"], creator.principal_id.0);
+    let public_author = issue["created_by"].as_str().expect("public issue author");
+    assert_ne!(public_author, creator.principal_id.0);
+    assert!(is_resolvable_pseudonym(public_author));
     assert_eq!(issue["creator_kind"], "human");
     let (status, page) = http(
         address,

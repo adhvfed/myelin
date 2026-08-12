@@ -37,7 +37,10 @@ async function awaitActiveIssue(title: string): Promise<JsonRecord> {
       );
       return response.status === 200 ? record(response.body.issue, "active issue") : undefined;
     },
-    { description: `issue authorization ${requestEventId}` },
+    {
+      description: `issue authorization ${requestEventId}`,
+      timeoutMs: 4_000,
+    },
   );
 }
 
