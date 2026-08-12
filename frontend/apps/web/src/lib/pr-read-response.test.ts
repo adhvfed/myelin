@@ -43,6 +43,7 @@ describe("PR read response projection", () => {
   it("projects the durable PR record", () => {
     expect(parsePr({
       number: 42,
+      ref: "myelin://acme/git/pr/core:42",
       pr_state: "open",
       title: "Bound the PR read path",
       body_md: "No unchecked JSON.",
@@ -60,6 +61,7 @@ describe("PR read response projection", () => {
       storage_key: "drop",
     })).toEqual({
       number: 42,
+      ref: "myelin://acme/git/pr/core:42",
       pr_state: "open",
       title: "Bound the PR read path",
       body_md: "No unchecked JSON.",
@@ -131,7 +133,7 @@ describe("PR read response projection", () => {
     () => parsePrListPage({ items: [{ ...row, checks_summary: { verdict: "pass", passing: 2, failing: 1, total: 2 } }], page: { next_cursor: null, prev_cursor: null, limit: 50 }, counts: { bucket: 1 } }, "cross"),
     () => parsePr({ number: 1, durable: false }),
     () => parsePr({
-      number: 1, pr_state: "open", title: "x", body_md: null, base_ref: "main",
+      number: 1, ref: "myelin://acme/git/pr/core:1", pr_state: "open", title: "x", body_md: null, base_ref: "main",
       head_ref: "refs/heads/x", head_oid: HEAD, author: "u", reviews: 0, created_at: null, durable: true,
     }),
     () => parsePrDiff({

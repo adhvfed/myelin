@@ -3,6 +3,8 @@ import { A, useAction } from "@solidjs/router";
 import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
 import { knowledgeMutate, type KnowledgeErrorKind, type KnowledgePage, type KnowledgeVisibility } from "~/lib/knowledge-api";
 
+type KnowledgeEditorBlock = EditorBlock & { references?: string[] };
+
 export interface KnowledgeWorkspaceProps {
   page: KnowledgePage;
   onSaved: (page: KnowledgePage) => Promise<void> | void;
@@ -22,7 +24,7 @@ export function KnowledgeWorkspace(props: KnowledgeWorkspaceProps) {
   const [pageId, setPageId] = createSignal("");
   const [title, setTitle] = createSignal("");
   const [visibility, setVisibility] = createSignal<KnowledgeVisibility>("private");
-  const [blocks, setBlocks] = createSignal<EditorBlock[]>([]);
+  const [blocks, setBlocks] = createSignal<KnowledgeEditorBlock[]>([]);
   const [version, setVersion] = createSignal(1);
   const [dirty, setDirty] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
@@ -34,7 +36,7 @@ export function KnowledgeWorkspace(props: KnowledgeWorkspaceProps) {
     const incoming = props.page;
     if (incoming.id !== pageId() || (!dirty() && incoming.version >= version())) {
       setPageId(incoming.id); setTitle(incoming.title); setVisibility(incoming.visibility);
-      setBlocks(incoming.blocks.map(({ id, type, markdown, state }) => ({ id, type, markdown, state })));
+      setBlocks(incoming.blocks.map(({ id, type, markdown, references, state }) => ({ id, type, markdown, references, state })));
       setVersion(incoming.version); setDirty(false); setError(null);
     }
   });
@@ -69,7 +71,7 @@ export function KnowledgeWorkspace(props: KnowledgeWorkspaceProps) {
     const latest = await props.onReload();
     if (!latest) return;
     setPageId(latest.id); setTitle(latest.title); setVisibility(latest.visibility);
-    setBlocks(latest.blocks.map(({ id, type, markdown, state }) => ({ id, type, markdown, state })));
+    setBlocks(latest.blocks.map(({ id, type, markdown, references, state }) => ({ id, type, markdown, references, state })));
     setVersion(latest.version); setDirty(false); setError(null);
   };
   const keepMine = async () => {

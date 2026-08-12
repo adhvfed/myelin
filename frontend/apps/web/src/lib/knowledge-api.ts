@@ -87,7 +87,13 @@ export const knowledgeMutate = action(async (mutation: KnowledgeMutation) => {
           expected_version: draft.expectedVersion,
           title: draft.title,
           visibility: draft.visibility,
-          blocks: draft.blocks.map((block) => ({ id: block.id, type: block.type, markdown: block.markdown, state: block.state ?? "active" })),
+          blocks: draft.blocks.map((block) => ({
+            id: block.id,
+            type: block.type,
+            markdown: block.markdown,
+            references: block.references ?? [],
+            state: block.state ?? "active",
+          })),
         }));
         if (!parsed) throw new KnowledgeRouteError("error");
         return parsed;

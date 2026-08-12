@@ -66,6 +66,11 @@ function repo(value: unknown): value is string {
   );
 }
 
+function prRef(value: unknown, number: number): value is string {
+  return bounded(value, 4 * 1024) &&
+    new RegExp(`^myelin://[^/]+/git/pr/[^/#]+:${number}$`).test(value);
+}
+
 function checksSummary(value: unknown): ChecksSummaryVM | null {
   const input = record(value);
   if (!input || !["pass", "fail", "running", "none", "unavailable"].includes(input.verdict as string) ||
@@ -142,7 +147,7 @@ export function parsePrListPage(value: unknown, scope: "repo" | "cross"): PrList
 
 export function parsePr(value: unknown): PrVM | null {
   const input = record(value);
-  if (!input || !positive(input.number) ||
+  if (!input || !positive(input.number) || !prRef(input.ref, input.number) ||
       !["draft", "open", "merged", "closed"].includes(input.pr_state as string) ||
       !(input.title === null || bounded(input.title, 512)) ||
       !(input.body_md === null || bounded(input.body_md, 64 * 1024, true)) ||
@@ -156,6 +161,7 @@ export function parsePr(value: unknown): PrVM | null {
       input.durable !== true) return null;
   return {
     number: input.number,
+    ref: input.ref,
     pr_state: input.pr_state as PrVM["pr_state"],
     title: input.title,
     body_md: input.body_md,

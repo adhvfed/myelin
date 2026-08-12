@@ -328,6 +328,7 @@ export interface CommitDiffVM {
 /** Durable PR record returned by `DurableGitBackend::pr_json`. */
 export interface PrVM {
   number: number;
+  ref: string;
   pr_state: "draft" | "open" | "merged" | "closed";
   title: string | null;
   body_md: string | null;

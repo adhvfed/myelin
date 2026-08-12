@@ -1172,7 +1172,9 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
 
 /** GET /v1/git/repos/{repo}/prs/{n} → the durable PR record (null = 404). */
 export function prJson(repo, n) {
-  return repo === "myelin" && SEED_PRS[n] ? SEED_PRS[n].pr : null;
+  return repo === "myelin" && SEED_PRS[n]
+    ? { ...SEED_PRS[n].pr, ref: `myelin://acme/git/pr/${repo}:${n}` }
+    : null;
 }
 
 /** GET /v1/git/repos/{repo}/prs/{n}/checks → the checks + merge-gate projection (null = 404). PR #3

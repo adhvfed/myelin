@@ -3295,9 +3295,10 @@ impl DurableGitBackend {
         }
     }
 
-    fn pr_json(rec: &PrRecord) -> Value {
+    fn pr_json(tenant: &str, repo: &str, rec: &PrRecord) -> Value {
         json!({
             "number": rec.number,
+            "ref": format!("myelin://{tenant}/git/pr/{repo}:{}", rec.number),
             "title": if rec.title.is_empty() { Value::Null } else { json!(rec.title) },
             "body_md": rec.body_md,
             "pr_state": Self::pr_state_token(rec.state),

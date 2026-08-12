@@ -8,6 +8,7 @@ export type KnowledgeTextState = "active" | "tombstoned";
 
 export interface KnowledgePageSummary {
   id: string;
+  ref: string;
   space: string;
   parent_page_id: string | null;
   title: string;
@@ -21,6 +22,7 @@ export interface KnowledgePageSummary {
 
 export interface KnowledgeBlock extends EditorBlock {
   id: string;
+  references: string[];
   state: KnowledgeTextState;
   is_you: boolean;
 }
@@ -49,7 +51,7 @@ export interface KnowledgeSaveDraft {
   expectedVersion: number;
   title: string;
   visibility: KnowledgeVisibility;
-  blocks: EditorBlock[];
+  blocks: Array<EditorBlock & { references?: string[] }>;
 }
 
 function record(value: unknown): WireRecord | null {
@@ -70,10 +72,23 @@ function cleanText(value: unknown, maximum: number, empty = false): value is str
     ![...value].some((character) => character === "\0");
 }
 
+function artifactRef(value: unknown): value is string {
+  return cleanText(value, 4 * 1024) && /^myelin:\/\/[^/]+\/[^/]+\/[^/]+\/[^#]+(?:#.+)?$/.test(value);
+}
+
+function pageRef(value: unknown, id: string): value is string {
+  return artifactRef(value) && new RegExp(`^myelin://[^/]+/knowledge/page/${id}$`).test(value);
+}
+
+function references(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > 32 || !value.every(artifactRef)) return null;
+  return value as string[];
+}
+
 function summary(value: unknown): KnowledgePageSummary | null {
   const row = record(value);
-  const keys = ["id", "space", "parent_page_id", "title", "title_state", "visibility", "version", "can_edit", "created_at", "updated_at"];
-  if (!row || !exact(row, keys) || !isKnowledgeUlid(row.id) || !cleanText(row.space, 64) ||
+  const keys = ["id", "ref", "space", "parent_page_id", "title", "title_state", "visibility", "version", "can_edit", "created_at", "updated_at"];
+  if (!row || !exact(row, keys) || !isKnowledgeUlid(row.id) || !pageRef(row.ref, row.id) || !cleanText(row.space, 64) ||
       (row.parent_page_id !== null && !isKnowledgeUlid(row.parent_page_id)) || !cleanText(row.title, 512) ||
       !["active", "tombstoned"].includes(row.title_state as string) ||
       !["private", "team"].includes(row.visibility as string) || !Number.isSafeInteger(row.version) ||
@@ -84,10 +99,12 @@ function summary(value: unknown): KnowledgePageSummary | null {
 
 function block(value: unknown): KnowledgeBlock | null {
   const row = record(value);
-  if (!row || !exact(row, ["id", "type", "markdown", "state", "is_you"]) || !isKnowledgeUlid(row.id) ||
+  const refs = references(row?.references);
+  if (!row || !exact(row, ["id", "type", "markdown", "references", "state", "is_you"]) || !refs || !isKnowledgeUlid(row.id) ||
       !BLOCK_TYPES.includes(row.type as BlockType) || !cleanText(row.markdown, 64 * 1024, true) ||
       !["active", "tombstoned"].includes(row.state as string) || typeof row.is_you !== "boolean" ||
-      (row.state === "tombstoned" && row.markdown !== "")) return null;
+      (row.state === "tombstoned" && row.markdown !== "") ||
+      [...(row.markdown as string)].filter((character) => character === "\uFFFC").length !== refs.length) return null;
   return row as unknown as KnowledgeBlock;
 }
 
@@ -157,17 +174,22 @@ export function parseKnowledgeSaveDraft(value: unknown): KnowledgeSaveDraft | nu
       !["private", "team"].includes(row.visibility as string) || !Array.isArray(row.blocks) ||
       row.blocks.length < 1 || row.blocks.length > 500) return null;
   let total = 0;
+  let totalReferences = 0;
   const blocks = row.blocks.map((value) => {
     const item = record(value);
-    if (!item || Object.keys(item).some((key) => !["id", "type", "markdown", "state"].includes(key)) ||
+    const refs = item?.references === undefined ? [] : references(item.references);
+    if (!item || !refs || Object.keys(item).some((key) => !["id", "type", "markdown", "references", "state"].includes(key)) ||
         (item.id !== undefined && !isKnowledgeUlid(item.id)) || !BLOCK_TYPES.includes(item.type as BlockType) ||
         !cleanText(item.markdown, 64 * 1024, true) ||
         (item.state !== undefined && !["active", "tombstoned"].includes(item.state as string)) ||
-        (item.state === "tombstoned" && (item.id === undefined || item.markdown !== ""))) return null;
+        (item.state === "tombstoned" && (item.id === undefined || item.markdown !== "")) ||
+        [...(item.markdown as string)].filter((character) => character === "\uFFFC").length !== refs.length) return null;
     total += utf8.encode(item.markdown as string).byteLength;
-    return item as unknown as EditorBlock;
+    totalReferences += refs.length;
+    return { ...item, ...(item.references === undefined ? {} : { references: refs }) } as unknown as EditorBlock & { references?: string[] };
   });
-  return blocks.every((item): item is EditorBlock => item !== null) && total <= 256 * 1024
+  return blocks.every((item): item is EditorBlock & { references?: string[] } => item !== null) &&
+      total <= 256 * 1024 && totalReferences <= 100
     ? { pageId: row.pageId, expectedVersion: row.expectedVersion as number, title: row.title, visibility: row.visibility, blocks } as KnowledgeSaveDraft
     : null;
 }

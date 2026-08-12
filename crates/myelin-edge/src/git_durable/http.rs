@@ -1312,7 +1312,7 @@ impl Handler for DOpenPr {
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
             201,
-            &json!({ "applied": { "action": "git.pr.open", "pr": DurableGitBackend::pr_json(&rec) }, "durable": true }),
+            &json!({ "applied": { "action": "git.pr.open", "pr": DurableGitBackend::pr_json(tenant_of(ctx), param(ctx, "repo")?, &rec) }, "durable": true }),
         ))
     }
 }
@@ -1328,7 +1328,7 @@ impl Handler for DPrOverview {
             .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
-        let mut vm = DurableGitBackend::pr_json(&rec);
+        let mut vm = DurableGitBackend::pr_json(tenant_of(ctx), param(ctx, "repo")?, &rec);
         if let Some(obj) = vm.as_object_mut() {
             match self.be.commits_in_pr_count(&loc, &rec) {
                 Some((count, has_more)) => {

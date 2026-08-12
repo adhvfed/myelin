@@ -14,8 +14,8 @@ function blocksFor(template) {
   return null;
 }
 
-function summary(row) { return { id: row.id, space: "engineering", parent_page_id: null, title: row.title, title_state: "active", visibility: row.visibility, version: row.version, can_edit: true, created_at: row.created_at, updated_at: row.updated_at }; }
-function document(row) { return { ...summary(row), blocks: row.blocks.map((block) => ({ ...block, state: "active", is_you: true })) }; }
+function summary(row) { return { id: row.id, ref: `myelin://acme/knowledge/page/${row.id}`, space: "engineering", parent_page_id: null, title: row.title, title_state: "active", visibility: row.visibility, version: row.version, can_edit: true, created_at: row.created_at, updated_at: row.updated_at }; }
+function document(row) { return { ...summary(row), blocks: row.blocks.map((block) => ({ ...block, references: block.references ?? [], state: "active", is_you: true })) }; }
 
 export function parseKnowledgeQuery(raw) {
   const values = new URLSearchParams(raw);
@@ -54,11 +54,15 @@ export class KnowledgeFixtures {
     if (body.expected_version !== row.version) return { status: 409 };
     const next = body.blocks.map((block) => {
       if (!block || typeof block !== "object" || Array.isArray(block) ||
-          Object.keys(block).some((key) => !["id", "type", "markdown", "state"].includes(key)) ||
+          Object.keys(block).some((key) => !["id", "type", "markdown", "references", "state"].includes(key)) ||
           !["type", "markdown", "state"].every((key) => Object.hasOwn(block, key)) ||
           (block.id !== undefined && !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(block.id)) ||
-          !TYPES.includes(block.type) || !clean(block.markdown, 64 * 1024, true) || block.state !== "active") return null;
-      return { id: block.id ?? ulid(++this.sequence), type: block.type, markdown: block.markdown };
+          !TYPES.includes(block.type) || !clean(block.markdown, 64 * 1024, true) ||
+          !Array.isArray(block.references) || block.references.length > 32 ||
+          block.references.some((reference) => typeof reference !== "string" || !reference.startsWith("myelin://")) ||
+          [...block.markdown].filter((character) => character === "\uFFFC").length !== block.references.length ||
+          block.state !== "active") return null;
+      return { id: block.id ?? ulid(++this.sequence), type: block.type, markdown: block.markdown, references: block.references };
     });
     if (next.some((block) => block === null)) return { status: 400 };
     row.title = body.title; row.visibility = body.visibility; row.blocks = next; row.version += 1; row.updated_at += 1;
