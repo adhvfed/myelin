@@ -278,6 +278,12 @@ pub struct AuthzVisibleIndex {
 type WatermarkMap = HashMap<(String, String), String>;
 type VisibleMap = HashMap<(String, String, String, String), Vec<String>>;
 
+fn lock_index<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl AuthzVisibleIndex {
     pub fn new() -> AuthzVisibleIndex {
         AuthzVisibleIndex::default()
@@ -298,7 +304,7 @@ impl AuthzVisibleIndex {
             subject.into(),
             relation.into(),
         );
-        let mut v = self.visible.lock().unwrap();
+        let mut v = lock_index(&self.visible);
         let set = v.entry(key).or_default();
         if !set.iter().any(|o| o == object_id) {
             set.push(object_id.into());
@@ -322,7 +328,7 @@ impl AuthzVisibleIndex {
             subject.into(),
             relation.into(),
         );
-        if let Some(set) = self.visible.lock().unwrap().get_mut(&key) {
+        if let Some(set) = lock_index(&self.visible).get_mut(&key) {
             set.retain(|o| o != object_id);
         }
         self.advance_watermark(tenant, region, at_revision);
@@ -330,7 +336,7 @@ impl AuthzVisibleIndex {
 
     pub fn advance_watermark(&self, tenant: &TenantId, region: &Region, revision: &str) {
         let key = (tenant.0.clone(), region.0.clone());
-        let mut w = self.watermark.lock().unwrap();
+        let mut w = lock_index(&self.watermark);
         let cur = w.entry(key).or_default();
         if revision > cur.as_str() {
             *cur = revision.into();
@@ -340,9 +346,7 @@ impl AuthzVisibleIndex {
     pub fn watermark(&self, tenant: &TenantId, region: &Region) -> Zookie {
         let key = (tenant.0.clone(), region.0.clone());
         Zookie(
-            self.watermark
-                .lock()
-                .unwrap()
+            lock_index(&self.watermark)
                 .get(&key)
                 .cloned()
                 .unwrap_or_default(),
@@ -413,10 +417,7 @@ impl AuthzVisibleIndex {
                 viewer.principal_id.0.clone(),
                 relation.to_string(),
             );
-            return self
-                .visible
-                .lock()
-                .unwrap()
+            return lock_index(&self.visible)
                 .get(&key)
                 .map(|set| set.iter().any(|o| o == candidate))
                 .unwrap_or(false);
