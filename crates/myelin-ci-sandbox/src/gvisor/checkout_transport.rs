@@ -4,7 +4,7 @@ use crate::runner::{
 };
 use crate::{
     HookError, IdemToken, JobSpec, LaunchPermit, MeterTarget, PhaseAuthorization, ResourceLimits,
-    ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxResult,
+    ResourceUsage, RunTokenCredential, SandboxResult,
 };
 use std::io;
 use std::io::{Seek, Write};
@@ -18,14 +18,12 @@ use git_wire_codec::{
 };
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct PrefetchedCheckoutPack {
     pub(super) file: std::fs::File,
     pub(super) shallow: bool,
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
+#[cfg(all(test, feature = "test-support"))]
 impl PrefetchedCheckoutPack {
     pub(crate) fn for_tests() -> Self {
         let path = std::env::temp_dir().join(format!(
@@ -42,189 +40,19 @@ impl PrefetchedCheckoutPack {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn fetch_checkout_pack(
-    backend: &GvisorBackend,
-    hooks: &RunnerHooks,
-    root: &Path,
-    tenant: &str,
-    region: &str,
-    repo: &str,
-    expected: &ExpectedGitCommitId,
-    limits: ResourceLimits,
-    run_token: RunTokenCredential,
-    meter_to: MeterTarget,
-    idem_token: IdemToken,
-) -> Result<PrefetchedCheckoutPack, CheckoutPreparationError> {
-    let allow_reachable = vec![
-        "-c".to_string(),
-        "uploadpack.allowReachableSHA1InWant=true".to_string(),
-    ];
-
-    let mut advertise_argv = allow_reachable.clone();
-    advertise_argv.extend([
-        "upload-pack".to_string(),
-        "--stateless-rpc".to_string(),
-        "--advertise-refs".to_string(),
-    ]);
-    let advertise_spec = GitWireSpec::for_repo(
-        root,
-        tenant,
-        region,
-        repo,
-        advertise_argv,
-        Vec::new(),
-        Vec::new(),
-        None,
-        limits,
-        run_token.clone(),
-        meter_to.clone(),
-        IdemToken(format!("{}:checkout-advertise", idem_token.0)),
-    )
-    .map_err(|e| CheckoutPreparationError::Refused(format!("build advertise-refs spec: {e}")))?;
-    let advertisement = backend
-        .launch_git_wire(&advertise_spec, hooks)
-        .map_err(|e| CheckoutPreparationError::Refused(format!("advertise-refs: {e}")))?;
-    let advertise_parse_result = (|| {
-        if !advertisement.result.passed() {
-            return Err(format!(
-                "advertise-refs did not pass (exit={:?} timed_out={}, stderr: {})",
-                advertisement.result.exit_code,
-                advertisement.result.timed_out,
-                String::from_utf8_lossy(&advertisement.result.stderr)
-            ));
-        }
-        parse_upload_pack_advertisement(&advertisement.result.stdout, expected)
-    })();
-    let kill_result = backend.kill(&advertisement.handle);
-    let parsed = match (advertise_parse_result, kill_result) {
-        (Ok(parsed), Ok(())) => parsed,
-        (Ok(parsed), Err(kill_error)) => {
-            return Err(CheckoutPreparationError::Refused(format!(
-                "advertise-refs parsed successfully ({parsed:?}) but retiring its sandbox handle \
-                 failed ({kill_error}) -- a live runsc container/bundle may have leaked"
-            )));
-        }
-        (Err(parse_error), Ok(())) => {
-            return Err(CheckoutPreparationError::Refused(format!(
-                "parse advertisement: {parse_error}"
-            )));
-        }
-        (Err(parse_error), Err(kill_error)) => {
-            return Err(CheckoutPreparationError::Refused(format!(
-                "parse advertisement failed ({parse_error}) AND retiring its sandbox handle also \
-                 failed ({kill_error}) -- a live runsc container/bundle may have leaked"
-            )));
-        }
-    };
-    if !parsed.directly_advertised && !parsed.allows_reachable_want {
-        return Err(CheckoutPreparationError::Refused(
-            "expected commit is not an advertised ref tip AND the server did not offer \
-             allow-reachable-sha1-in-want -- refusing rather than sending an unreachable want"
-                .to_string(),
-        ));
-    }
-
-    let mut capabilities = "no-progress ofs-delta".to_string();
-    if let Some(token) = expected.format().capability_token() {
-        capabilities.push(' ');
-        capabilities.push_str(token);
-    }
-    let mut request = pkt_line_encode(&format!("want {} {capabilities}\n", expected.as_str()));
-    request.extend_from_slice(&pkt_line_encode("deepen 1\n"));
-    request.extend_from_slice(b"0000");
-    request.extend_from_slice(&pkt_line_encode("done\n"));
-
-    let mut fetch_argv = allow_reachable;
-    fetch_argv.extend(["upload-pack".to_string(), "--stateless-rpc".to_string()]);
-    let fetch_spec = GitWireSpec::for_repo(
-        root,
-        tenant,
-        region,
-        repo,
-        fetch_argv,
-        request,
-        Vec::new(),
-        None,
-        limits,
-        run_token,
-        meter_to,
-        IdemToken(format!("{}:checkout-fetch", idem_token.0)),
-    )
-    .map_err(|e| CheckoutPreparationError::Refused(format!("build fetch spec: {e}")))?;
-    let mut pack_file = tempfile_for_checkout_pack()
-        .map_err(|e| CheckoutPreparationError::Refused(format!("stage pack artifact: {e}")))?;
-    let fetched = backend
-        .launch_git_wire(&fetch_spec, hooks)
-        .map_err(|e| CheckoutPreparationError::Refused(format!("fetch: {e}")))?;
-    let fetch_parse_result = if !fetched.result.passed() {
-        Err(format!(
-            "fetch did not pass (exit={:?} timed_out={}, stderr: {})",
-            fetched.result.exit_code,
-            fetched.result.timed_out,
-            String::from_utf8_lossy(&fetched.result.stderr)
-        ))
-    } else {
-        parse_checkout_fetch_response(
-            &fetched.result.stdout,
-            expected,
-            &mut pack_file,
-            limits.disk_bytes,
-        )
-    };
-    let kill_result = backend.kill(&fetched.handle);
-    let parsed_fetch = match (fetch_parse_result, kill_result) {
-        (Ok(parsed), Ok(())) => parsed,
-        (Ok(parsed), Err(kill_error)) => {
-            return Err(CheckoutPreparationError::Refused(format!(
-                "fetch parsed successfully ({parsed:?}) but retiring its sandbox handle failed \
-                 ({kill_error}) -- a live runsc container/bundle may have leaked"
-            )));
-        }
-        (Err(parse_error), Ok(())) => {
-            return Err(CheckoutPreparationError::Refused(format!(
-                "parse fetch response: {parse_error}"
-            )));
-        }
-        (Err(parse_error), Err(kill_error)) => {
-            return Err(CheckoutPreparationError::Refused(format!(
-                "parse fetch response failed ({parse_error}) AND retiring its sandbox handle also \
-                 failed ({kill_error}) -- a live runsc container/bundle may have leaked"
-            )));
-        }
-    };
-    pack_file
-        .flush()
-        .map_err(|e| CheckoutPreparationError::Refused(format!("flush pack artifact: {e}")))?;
-    let mut pack_file = pack_file
-        .into_inner()
-        .map_err(|e| CheckoutPreparationError::Refused(format!("finish pack artifact: {e}")))?;
-    pack_file
-        .seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| CheckoutPreparationError::Refused(format!("rewind pack artifact: {e}")))?;
-    Ok(PrefetchedCheckoutPack {
-        file: pack_file,
-        shallow: parsed_fetch.shallow,
-    })
-}
-
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct ParentAttemptCheckoutTransportOutcome {
     pack: PrefetchedCheckoutPack,
     pub(super) usage: ResourceUsage,
 }
 
 impl ParentAttemptCheckoutTransportOutcome {
-    #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> (PrefetchedCheckoutPack, ResourceUsage) {
         (self.pack, self.usage)
     }
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum CheckoutTransportError {
     Refused {
         message: String,
@@ -246,7 +74,6 @@ pub(crate) enum CheckoutTransportError {
 }
 
 impl CheckoutTransportError {
-    #[allow(dead_code)]
     pub(crate) fn attempt_disposition(&self) -> PreparationAttemptDisposition {
         match self {
             Self::Refused { .. } => PreparationAttemptDisposition::RefusedBeforeExecution {
@@ -929,7 +756,6 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
     })
 }
 
-#[allow(dead_code)]
 pub(super) fn tempfile_for_checkout_pack() -> io::Result<std::io::BufWriter<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = std::env::temp_dir().join(format!(
