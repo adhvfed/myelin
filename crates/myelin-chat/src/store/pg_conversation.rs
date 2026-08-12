@@ -17,6 +17,34 @@ pub const CONVERSATION_CLIENT_NONCE_INDEX: &str = "chat_conversation_client_nonc
 pub const CONVERSATION_PROJECT_RECENT_INDEX: &str = "chat_conversation_project_recent";
 pub const CONVERSATION_PROJECT_TOPIC_INDEX: &str = "chat_conversation_project_topic_unique";
 
+pub fn visible_public_conversations_cte() -> String {
+    format!(
+        "{},
+         visible_conversation(conversation_id) AS (
+           SELECT conversation.conversation_id
+             FROM chat_conversation conversation
+             JOIN visible_project project
+               ON project.object_id = 'project:' || conversation.parent_project
+             JOIN rebac_tuple parent_acl
+               ON parent_acl.tenant_id = conversation.tenant_id
+              AND parent_acl.region = conversation.region
+              AND parent_acl.object_id = 'channel:' || conversation.conversation_id
+              AND parent_acl.relation = 'parent_project'
+              AND parent_acl.subject = project.object_id || '#view'
+             JOIN rebac_tuple member_acl
+               ON member_acl.tenant_id = conversation.tenant_id
+              AND member_acl.region = conversation.region
+              AND member_acl.object_id = 'channel:' || conversation.conversation_id
+              AND member_acl.relation = 'member'
+              AND member_acl.subject = project.object_id || '#view'
+            WHERE conversation.tenant_id = $1 AND conversation.region = $2
+              AND conversation.kind = 'channel_public' AND NOT conversation.archived
+              AND conversation.acl_zookie IS NOT NULL
+         )",
+        myelin_identity_service::VISIBLE_PROJECTS_CTE,
+    )
+}
+
 pub const CONVERSATION_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS chat_conversation (
     tenant_id       text        NOT NULL,
@@ -298,31 +326,8 @@ impl PgConversationStore {
             .await
             .map_err(storage("acquire conversation connection"))?;
         self.set_session_scope(&mut conn, tenant, region).await?;
-        // This is the SQL lowering of the core hierarchy's `project#view` rewrite. Keep it
-        // synchronized with that namespace so authorization remains one bounded query.
-        let rows = sqlx::query(
-            "WITH RECURSIVE visible_project(object_id) AS (
-               SELECT object_id FROM rebac_tuple
-                WHERE tenant_id = $1 AND region = $2 AND subject = $3
-                  AND ((split_part(object_id, ':', 1) = 'org'
-                          AND relation IN ('member', 'admin'))
-                    OR (split_part(object_id, ':', 1) = 'team'
-                          AND relation = 'member')
-                    OR (split_part(object_id, ':', 1) = 'project'
-                          AND relation IN ('reader', 'writer')))
-               UNION
-               SELECT edge.object_id
-                 FROM rebac_tuple edge
-                 JOIN visible_project parent
-                   ON edge.subject = parent.object_id || '#view'
-                WHERE edge.tenant_id = $1 AND edge.region = $2
-                  AND ((split_part(edge.object_id, ':', 1) = 'team'
-                          AND edge.relation = 'parent_org'
-                          AND split_part(parent.object_id, ':', 1) = 'org')
-                    OR (split_part(edge.object_id, ':', 1) = 'project'
-                          AND edge.relation = 'parent_team'
-                          AND split_part(parent.object_id, ':', 1) = 'team'))
-             )
+        let query = format!(
+            "{}
              SELECT conversation.tenant_id, conversation.region,
                     conversation.conversation_id, conversation.kind,
                     conversation.home_cell, conversation.parent_project, conversation.name,
@@ -349,15 +354,17 @@ impl PgConversationStore {
                 AND conversation.acl_zookie IS NOT NULL
                 AND ($4::text IS NULL OR conversation.conversation_id < $4)
               ORDER BY conversation.conversation_id DESC LIMIT $5",
-        )
-        .bind(tenant)
-        .bind(region)
-        .bind(subject)
-        .bind(before)
-        .bind(i64::from(limit))
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(storage("list conversations"))?;
+            visible_public_conversations_cte(),
+        );
+        let rows = sqlx::query(&query)
+            .bind(tenant)
+            .bind(region)
+            .bind(subject)
+            .bind(before)
+            .bind(i64::from(limit))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(storage("list conversations"))?;
         rows.iter().map(row_to_conversation).collect()
     }
 }

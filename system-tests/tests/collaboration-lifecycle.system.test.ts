@@ -1126,7 +1126,7 @@ command = ["true"]
     );
   });
 
-  test("lets project collaborators talk while private project rooms stay absent", async () => {
+  test("lets project collaborators talk while private project rooms stay private", async () => {
     const channel = uniqueName("system-chat");
     const topic = "Coordinate the externally tested release";
     const projectId = systemTestConfig.issues.projectId;
@@ -1224,6 +1224,35 @@ command = ["true"]
       },
     );
     expect(absentPrivatePost.body).toMatchObject({ error: { code: "not_found" } });
+
+    const sharedWork = await awaitActiveIssue(uniqueName("Shared work with private context"));
+    const sharedWorkRef = string(sharedWork.ref, "shared work reference");
+    const privateContext = await systemClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(privateRoomId)}/messages`,
+      {
+        method: "POST",
+        body: {
+          content: "The private room may discuss shared work without revealing itself: ￼",
+          references: [sharedWorkRef],
+        },
+        idempotencyKey: `private-chat-context-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const privateMessageRef = `myelin://${systemTestConfig.tenant}/chat/message/${string(
+      privateContext.body.message_id,
+      "private context message id",
+    )}`;
+    await awaitBacklink(sharedWorkRef, privateMessageRef, "links");
+
+    const peerBacklinks = await reviewerClient.json(
+      `/v1/refs/backlinks?ref=${encodeURIComponent(sharedWorkRef)}`,
+    );
+    expect(
+      array(peerBacklinks.body.items, "peer-visible backlinks")
+        .map((item) => record(item, "peer-visible backlink"))
+        .some((item) => item.root_ref === privateMessageRef),
+    ).toBe(false);
 
     const firstRetryKey = `author-${randomUUID()}`;
     const first = await systemClient.json(

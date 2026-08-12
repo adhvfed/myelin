@@ -39,10 +39,11 @@ The suite is intentionally organized around externally visible contracts:
 - `realtime-lifecycle` subscribes as an external tenant client and verifies authenticated repository
   creation and push events over the server-sent event stream.
 - `collaboration-lifecycle` creates and safely retries a public Chat conversation, sends and pages
-  messages through one public retry identity, creates and edits a Knowledge page with the same
-  retry convention, exercises the asynchronous Issues authorization reconciler and optimistic
-  conflicts, starts a project and its first issue without operator-provided scope IDs, and follows
-  red mainline CI through a durable, retry-safe human approval into one
+  messages through one public retry identity, and proves private project conversations cannot leak
+  through backlinks on shared work. It creates and edits a Knowledge page with the same retry
+  convention, exercises the asynchronous Issues authorization reconciler and optimistic conflicts,
+  starts a project and its first issue without operator-provided scope IDs, and follows red mainline
+  CI through a durable, retry-safe human approval into one
   governed hosted-agent run and one attributed issue. It also proves a visible Issues event uses
   the Issues permission boundary—not a hidden CI-only matcher assumption—before reaching its gate.
 - `authentication-lifecycle` starts logged out, lets an authenticated browser identity approve one

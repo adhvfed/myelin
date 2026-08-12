@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 myelin-events = { path = "../myelin-events" }
 myelin-identity = { path = "../myelin-identity" }
+myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-agent = { path = "../myelin-agent" }
 myelin-refs = { path = "../myelin-refs" }
 myelin-content = { path = "../myelin-content" }

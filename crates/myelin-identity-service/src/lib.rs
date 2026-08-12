@@ -119,6 +119,7 @@ pub use principal_store::{
 pub use project_store::{
     project_ref, validate_new_project, NewProject, PgProjectStore, Project, ProjectCreation,
     ProjectError, MAX_PROJECT_NAME_BYTES, MAX_PROJECT_PREFIX_BYTES, PROJECT_WRITER_RELATION,
+    VISIBLE_PROJECTS_CTE,
 };
 pub use pseudonym_erase::{
     ErasureLedgerEntry, ErasureReceipt, PseudonymEraseError, PseudonymErasureLedger,

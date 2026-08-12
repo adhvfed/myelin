@@ -172,10 +172,10 @@ active profile; `--project`, `MYELIN_PROJECT`, and that saved value override one
 order. Creating a project with a saved profile makes it active for that profile; its owned issue
 prefix and default issue type then keep ordinary issue and conversation creation free of UUID and
 prefix ceremony. Chat rooms follow that project's live collaborators, so private project rooms do
-not appear to the rest of the tenant. The web Issues and Chat workspaces discover the same
-authorized project catalogue. A new organization can create its first project inside the New issue
-flow; established organizations choose a project by name and key. The browser never needs
-deployment-provided project, type, or prefix identifiers.
+not appear to the rest of the tenant or surface through backlinks on shared work. The web Issues
+and Chat workspaces discover the same authorized project catalogue. A new organization can create
+its first project inside the New issue flow; established organizations choose a project by name
+and key. The browser never needs deployment-provided project, type, or prefix identifiers.
 Git helpers are scoped to an exact Edge and profile.
 
 External MCP clients can use `myelin mcp serve --as <agent-id>` as their server command. The CLI

@@ -13,6 +13,30 @@ use uuid::Uuid;
 pub const PROJECT_WRITER_RELATION: &str = "writer";
 pub const MAX_PROJECT_NAME_BYTES: usize = 100;
 pub const MAX_PROJECT_PREFIX_BYTES: usize = 10;
+pub const VISIBLE_PROJECTS_CTE: &str = r#"
+WITH RECURSIVE visible_project(object_id) AS (
+  SELECT object_id FROM rebac_tuple
+   WHERE tenant_id = $1 AND region = $2 AND subject = $3
+     AND ((split_part(object_id, ':', 1) = 'org'
+             AND relation IN ('member', 'admin'))
+       OR (split_part(object_id, ':', 1) = 'team'
+             AND relation = 'member')
+       OR (split_part(object_id, ':', 1) = 'project'
+             AND relation IN ('reader', 'writer')))
+  UNION
+  SELECT edge.object_id
+    FROM rebac_tuple edge
+    JOIN visible_project parent
+      ON edge.subject = parent.object_id || '#view'
+   WHERE edge.tenant_id = $1 AND edge.region = $2
+     AND ((split_part(edge.object_id, ':', 1) = 'team'
+             AND edge.relation = 'parent_org'
+             AND split_part(parent.object_id, ':', 1) = 'org')
+       OR (split_part(edge.object_id, ':', 1) = 'project'
+             AND edge.relation = 'parent_team'
+             AND split_part(parent.object_id, ':', 1) = 'team'))
+)
+"#;
 const MAX_PROJECT_LIST_ROWS: u32 = 101;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,49 +264,27 @@ impl PgProjectStore {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    // This query is the SQL lowering of `namespace::core_hierarchy` for
-                    // `project#view`. Keep it synchronized with those rewrites so listing
-                    // remains both authorization-correct and a single database round trip.
-                    let rows = sqlx::query(
-                        "WITH RECURSIVE visible(object_id) AS (\
-                           SELECT object_id FROM rebac_tuple \
-                            WHERE tenant_id = $1 AND region = $2 AND subject = $3 \
-                              AND ((split_part(object_id, ':', 1) = 'org' \
-                                      AND relation IN ('member', 'admin')) \
-                                OR (split_part(object_id, ':', 1) = 'team' \
-                                      AND relation = 'member') \
-                                OR (split_part(object_id, ':', 1) = 'project' \
-                                      AND relation IN ('reader', 'writer'))) \
-                           UNION \
-                           SELECT edge.object_id \
-                             FROM rebac_tuple edge \
-                             JOIN visible parent \
-                               ON edge.subject = parent.object_id || '#view' \
-                            WHERE edge.tenant_id = $1 AND edge.region = $2 \
-                              AND ((split_part(edge.object_id, ':', 1) = 'team' \
-                                      AND edge.relation = 'parent_org' \
-                                      AND split_part(parent.object_id, ':', 1) = 'org') \
-                                OR (split_part(edge.object_id, ':', 1) = 'project' \
-                                      AND edge.relation = 'parent_team' \
-                                      AND split_part(parent.object_id, ':', 1) = 'team'))\
-                         ) \
+                    let query = format!(
+                        "{VISIBLE_PROJECTS_CTE} \
                          SELECT project.project_id, project.name, project.issue_prefix, \
                                 project.default_issue_type_id, project.created_by, \
                                 project.created_at \
                            FROM identity_project project \
-                           JOIN visible ON visible.object_id = 'project:' || project.project_id::text \
+                           JOIN visible_project visible \
+                             ON visible.object_id = 'project:' || project.project_id::text \
                           WHERE project.tenant_id = $1 AND project.region = $2 \
                             AND ($4::uuid IS NULL OR project.project_id < $4) \
-                          ORDER BY project.project_id DESC LIMIT $5",
-                    )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(&subject)
-                    .bind(cursor)
-                    .bind(i64::from(limit))
-                    .fetch_all(&mut *conn)
-                    .await
-                    .map_err(query_error("list visible identity projects"))?;
+                          ORDER BY project.project_id DESC LIMIT $5"
+                    );
+                    let rows = sqlx::query(&query)
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&subject)
+                        .bind(cursor)
+                        .bind(i64::from(limit))
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(query_error("list visible identity projects"))?;
                     rows.iter().map(project_from_row).collect()
                 })
             })

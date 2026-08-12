@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use myelin_chat::store::pg_conversation::visible_public_conversations_cte;
 use myelin_identity::Principal;
 use myelin_refs::{parse_scoped, strip_sub, ArtifactRef, ParsedArtifactRef};
 use myelin_refs_service::{PgEdgeStore, StoredBacklink};
@@ -308,44 +309,16 @@ async fn read_database_visibility(
             .map(|id| canonical_root(&tenant, "issue", "issue", &id)),
     );
 
-    let visible_messages = sqlx::query_scalar::<_, String>(
-        "SELECT message.message_id
-           FROM chat_message message
-           JOIN chat_conversation conversation
-             ON conversation.tenant_id = message.tenant_id
-            AND conversation.region = message.region
-            AND conversation.conversation_id = message.conversation_id
-          WHERE message.tenant_id = $1 AND message.region = $2
-            AND message.message_id = ANY($3)
-            AND conversation.kind = 'channel_public' AND NOT conversation.archived",
-    )
-    .bind(&tenant)
-    .bind(&region)
-    .bind(&message_ids)
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(database_error("authorize referenced chat messages"))?;
     result.roots.extend(
-        visible_messages
-            .into_iter()
-            .map(|id| canonical_root(&tenant, "chat", "message", &id)),
-    );
-
-    let visible_channels = sqlx::query_scalar::<_, String>(
-        "SELECT conversation_id FROM chat_conversation
-          WHERE tenant_id = $1 AND region = $2 AND conversation_id = ANY($3)
-            AND kind = 'channel_public' AND NOT archived",
-    )
-    .bind(&tenant)
-    .bind(&region)
-    .bind(&channel_ids)
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(database_error("authorize referenced chat channels"))?;
-    result.roots.extend(
-        visible_channels
-            .into_iter()
-            .map(|id| canonical_root(&tenant, "chat", "channel", &id)),
+        read_visible_chat_roots(
+            connection,
+            &tenant,
+            &region,
+            &subject,
+            &message_ids,
+            &channel_ids,
+        )
+        .await?,
     );
 
     let visible_pages = sqlx::query_scalar::<_, String>(
@@ -385,6 +358,45 @@ async fn read_database_visibility(
                 .then(|| (canonical_root(&tenant, "ci", "run", &run_id), repo.id))
         }));
     Ok(result)
+}
+
+async fn read_visible_chat_roots(
+    connection: &mut PgConnection,
+    tenant: &str,
+    region: &str,
+    subject: &str,
+    message_ids: &[String],
+    channel_ids: &[String],
+) -> Result<Vec<String>, myelin_storage::PgError> {
+    let query = format!(
+        "{}
+         SELECT 'message' AS artifact_type, message.message_id AS artifact_id
+           FROM chat_message message
+           JOIN visible_conversation conversation
+             ON conversation.conversation_id = message.conversation_id
+          WHERE message.tenant_id = $1 AND message.region = $2
+            AND message.message_id = ANY($4)
+         UNION ALL
+         SELECT 'channel' AS artifact_type, conversation_id AS artifact_id
+           FROM visible_conversation
+          WHERE conversation_id = ANY($5)",
+        visible_public_conversations_cte(),
+    );
+    let rows = sqlx::query_as::<_, (String, String)>(&query)
+        .bind(tenant)
+        .bind(region)
+        .bind(subject)
+        .bind(message_ids)
+        .bind(channel_ids)
+        .fetch_all(connection)
+        .await
+        .map_err(database_error("authorize referenced Chat artifacts"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(artifact_type, artifact_id)| {
+            canonical_root(tenant, "chat", &artifact_type, &artifact_id)
+        })
+        .collect())
 }
 
 fn database_error(context: &'static str) -> impl FnOnce(sqlx::Error) -> myelin_storage::PgError {
