@@ -7,7 +7,7 @@ use myelin_flow::{
 };
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{mpsc::SyncSender, Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -50,7 +50,7 @@ impl QueuedJob {
 
 #[derive(Clone, Default)]
 pub struct JobLeaseStore {
-    inner: Arc<Mutex<HashMap<(String, String), QueuedJob>>>,
+    inner: Arc<Mutex<BTreeMap<(String, String), QueuedJob>>>,
 }
 
 impl JobLeaseStore {
@@ -58,7 +58,7 @@ impl JobLeaseStore {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), QueuedJob>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(String, String), QueuedJob>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -86,10 +86,7 @@ impl JobLeaseStore {
         lease_ttl_secs: i64,
     ) -> Option<QueuedJob> {
         let mut q = self.lock();
-        let mut keys: Vec<_> = q.keys().cloned().collect();
-        keys.sort();
-        for k in keys {
-            let job = q.get_mut(&k).expect("key from the same map");
+        for job in q.values_mut() {
             if &job.region != region {
                 continue;
             }
@@ -893,7 +890,6 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 output_failure = Some(format!("durable log finish failed: {error}"));
             }
         }
-        let output_complete = output_failure.is_none();
         self.leases.heartbeat(
             &self.worker_id,
             &job.tenant,
@@ -906,10 +902,7 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             .kill(&handle)
             .map_err(|e| RunnerError::LaunchFailed(e.to_string()))?;
 
-        if !output_complete {
-            let message = output_failure
-                .clone()
-                .expect("output_failure is Some whenever !output_complete");
+        if let Some(message) = output_failure {
             self.reporter
                 .report_retryable_attempt(
                     &claim,

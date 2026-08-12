@@ -418,13 +418,19 @@ pub(super) fn settle_enabled_finalization(
     workspace_manager: Option<&WorkspaceManager>,
 ) -> Result<ContainerRun, RunFailure> {
     let enabled_cleanup_failure = match (enabled_context, &finalization) {
-        (Some(context), RuntimeFinalization::Finalized(finalized)) => {
-            let workspace_manager = workspace_manager.expect(
-                "an enabled context is only ever present alongside its workspace manager (Enabled)",
-            );
-            settle_enabled_workspace_and_lease(context, workspace_manager, &finalized.evidence)
-                .err()
-        }
+        (Some(context), RuntimeFinalization::Finalized(finalized)) => match workspace_manager {
+            Some(workspace_manager) => {
+                settle_enabled_workspace_and_lease(context, workspace_manager, &finalized.evidence)
+                    .err()
+            }
+            None => {
+                drop(context);
+                Some(
+                        "an enabled runtime finalized without its workspace manager; the workspace and userns lease were quarantined"
+                            .to_string(),
+                    )
+            }
+        },
         (Some(context), RuntimeFinalization::Failed { .. }) => {
             drop(context);
             None

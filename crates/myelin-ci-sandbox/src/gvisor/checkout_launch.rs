@@ -26,10 +26,10 @@ impl<'a> NotStartedCapsuleGuard<'a> {
         }
     }
 
-    fn disarm(mut self) -> checkout_runtime::AcquiredCheckoutRuntime {
-        self.capsule
-            .take()
-            .expect("the guard still holds the capsule")
+    fn disarm(mut self) -> Result<checkout_runtime::AcquiredCheckoutRuntime, HookError> {
+        self.capsule.take().ok_or_else(|| {
+            HookError("checkout capsule guard was already disarmed; resources quarantined".into())
+        })
     }
 }
 
@@ -164,7 +164,7 @@ impl GvisorBackend {
                 return Ok(resolve_post_acquisition_authority_failure(
                     authority,
                     report_claim,
-                    capsule_guard.disarm(),
+                    capsule_guard.disarm()?,
                     workspace_manager,
                     phase_was_begun,
                 ));
@@ -172,7 +172,7 @@ impl GvisorBackend {
         };
 
         let prepared = match hop_b(
-            capsule_guard.disarm(),
+            capsule_guard.disarm()?,
             preparation_spec,
             run_token,
             authorization,
@@ -1004,7 +1004,9 @@ mod tests {
         else {
             return;
         };
-        let runtime = NotStartedCapsuleGuard::new(runtime, &workspace_manager).disarm();
+        let runtime = NotStartedCapsuleGuard::new(runtime, &workspace_manager)
+            .disarm()
+            .unwrap();
         let diagnostics = runtime.dispose_checkout_runtime(&workspace_manager);
         assert!(
             diagnostics.is_empty(),
