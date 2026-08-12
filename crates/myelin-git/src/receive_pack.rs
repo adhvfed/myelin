@@ -822,19 +822,6 @@ impl RefStore {
         }
     }
 
-    fn aggregate_for(&self, ref_name: &RefName) -> AggregateKey {
-        GitRefEventKey::new(&self.repo, ref_name)
-            .expect("receive validates canonical Git ref event keys")
-            .aggregate()
-    }
-
-    fn subject_for(&self, ref_name: &RefName) -> ArtifactRef {
-        GitRefEventKey::new(&self.repo, ref_name)
-            .expect("receive validates canonical Git ref event keys")
-            .subject(&self.ctx_base.tenant.0)
-            .expect("validated Git ref key forms a canonical ArtifactRef")
-    }
-
     pub fn receive<M: QuarantineMigration>(
         &self,
         push: &PushSession,
@@ -842,15 +829,23 @@ impl RefStore {
         crash: CrashPoint,
     ) -> Result<PushOutcome, OutboxError> {
         let mut unique_refs = std::collections::BTreeSet::new();
+        let mut event_identities = Vec::with_capacity(push.updates.len());
         for update in &push.updates {
-            if GitRefEventKey::new(&self.repo, &update.ref_name).is_err() {
-                return Ok(PushOutcome::Rejected(RejectReason::InvalidRefName));
-            }
+            let event_key = match GitRefEventKey::new(&self.repo, &update.ref_name) {
+                Ok(event_key) => event_key,
+                Err(_) => return Ok(PushOutcome::Rejected(RejectReason::InvalidRefName)),
+            };
+            let subject = event_key
+                .subject(&self.ctx_base.tenant.0)
+                .map_err(|error| {
+                    OutboxError(format!("form canonical Git ref event subject: {error}"))
+                })?;
             if !unique_refs.insert(update.ref_name.clone()) {
                 return Ok(PushOutcome::Rejected(RejectReason::DuplicateRefUpdate {
                     ref_name: update.ref_name.clone(),
                 }));
             }
+            event_identities.push((event_key, subject));
         }
 
         let default_ref = match &self.backing {
@@ -927,7 +922,7 @@ impl RefStore {
             .begin(Arc::clone(&self.minter), self.ctx_base.clone());
 
         let mut planned: Vec<(RefName, Oid, u64, Option<Oid>, myelin_events::EventId)> = Vec::new();
-        for u in &push.updates {
+        for (u, (event_key, subject)) in push.updates.iter().zip(&event_identities) {
             let old = self.tip_of(&u.ref_name).map_err(|e| {
                 OutboxError(format!("read durable ref tip for {}: {e}", u.ref_name.0))
             })?;
@@ -946,8 +941,8 @@ impl RefStore {
 
             let draft = EventDraft {
                 type_: EventType(GIT_REF_UPDATED.into()),
-                subject: self.subject_for(&u.ref_name),
-                aggregate: self.aggregate_for(&u.ref_name),
+                subject: subject.clone(),
+                aggregate: event_key.aggregate(),
                 payload: serde_json::json!({
                     "repo": self.repo,
                     "ref": u.ref_name.0,
@@ -1064,8 +1059,8 @@ mod tests {
             assert_eq!(
                 evaluate_protected_ref_push(
                     &RefName::new("refs/heads/main"),
-                     true,
-                     false,
+                    true,
+                    false,
                     bypass,
                     &rs,
                     &head,
@@ -1088,7 +1083,7 @@ mod tests {
                 evaluate_protected_ref_push(
                     &RefName::new("refs/heads/main"),
                     false,
-                     true,
+                    true,
                     bypass,
                     &protected_ruleset(&[], false),
                     &head,
@@ -1107,7 +1102,7 @@ mod tests {
                 false,
                 true,
                 WRITER,
-                &protected_ruleset(&[],  true),
+                &protected_ruleset(&[], true),
                 &head,
                 &[],
                 &[],
@@ -1123,8 +1118,8 @@ mod tests {
         let rs = protected_ruleset(&["ci/build", "ci/test"], false);
         match evaluate_protected_ref_push(
             &RefName::new("refs/heads/main"),
-             false,
-             false,
+            false,
+            false,
             WRITER,
             &rs,
             &head,
@@ -1140,8 +1135,8 @@ mod tests {
         assert!(matches!(
             evaluate_protected_ref_push(
                 &RefName::new("refs/heads/main"),
-                 false,
-                 false,
+                false,
+                false,
                 WRITER,
                 &rs,
                 &head,
@@ -1514,6 +1509,29 @@ mod tests {
         );
         assert_eq!(outbox.outbox_depth(), 0);
         assert_eq!(store.tip(&RefName::new("HEAD")), None);
+    }
+
+    #[test]
+    fn invalid_event_identity_aborts_before_quarantine_promotion() {
+        let mut context = ctx_base();
+        context.tenant = TenantId("bad/tenant".into());
+        let outbox = OutboxStore::new();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+        let store = RefStore::open("core", context, outbox.clone(), minter);
+        let db = InMemoryObjectDb::new();
+        let push = human_push("refs/heads/feature", Oid::zero(), Oid::new("aaaa"));
+
+        let error = store
+            .receive(&push, &db, CrashPoint::None)
+            .expect_err("an invalid event subject must stop the receive");
+        assert!(error.0.contains("canonical Git ref event subject"));
+        assert!(db.is_empty(), "the quarantine must remain untouched");
+        assert_eq!(outbox.committed_count(), 0, "no event may be committed");
+        assert_eq!(
+            store.tip(&RefName::new("refs/heads/feature")),
+            None,
+            "the ref must remain untouched"
+        );
     }
 
     #[test]
