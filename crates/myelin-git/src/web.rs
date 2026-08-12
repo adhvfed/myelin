@@ -218,13 +218,9 @@ fn provider_label(row: &CheckStatusRow) -> &'static str {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChecksPanel {
-    Live {
-        rows: Vec<CheckRowView>,
-    },
+    Live { rows: Vec<CheckRowView> },
     Empty,
-    Loading {
-        skeleton_rows: usize,
-    },
+    Loading { skeleton_rows: usize },
     Error,
 }
 
@@ -272,18 +268,10 @@ impl ChecksPanel {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeReadiness {
-    Ready {
-        approvals: (u32, u32),
-    },
-    Blocked {
-        unmet: Vec<UnmetContext>,
-    },
-    Queued {
-        position: usize,
-    },
-    HitlHold {
-        awaiting: String,
-    },
+    Ready { approvals: (u32, u32) },
+    Blocked { unmet: Vec<UnmetContext> },
+    Queued { position: usize },
+    HitlHold { awaiting: String },
 }
 
 impl MergeReadiness {
@@ -615,9 +603,32 @@ impl std::error::Error for PrCommitCursorError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrCommitCursor {
     scope: [u8; 32],
-    base_oid: Option<String>,
-    head_oid: String,
+    base_oid: Option<CursorOid>,
+    head_oid: CursorOid,
     position: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CursorOid {
+    bytes: [u8; 20],
+    text: String,
+}
+
+impl CursorOid {
+    fn parse(value: &str) -> Result<Self, PrCommitCursorError> {
+        let bytes = parse_cursor_oid(value)?;
+        Ok(Self {
+            bytes,
+            text: value.to_string(),
+        })
+    }
+
+    fn from_bytes(bytes: [u8; 20]) -> Self {
+        Self {
+            text: cursor_oid_string(&bytes),
+            bytes,
+        }
+    }
 }
 
 impl PrCommitCursor {
@@ -627,15 +638,24 @@ impl PrCommitCursor {
         head_oid: &str,
         position: usize,
     ) -> Result<Self, PrCommitCursorError> {
-        let base_oid = base_oid.map(parse_cursor_oid).transpose()?;
-        let head_oid = parse_cursor_oid(head_oid)?;
+        let base_oid = base_oid.map(CursorOid::parse).transpose()?;
+        let head_oid = CursorOid::parse(head_oid)?;
+        Self::from_parts(scope, base_oid, head_oid, position)
+    }
+
+    fn from_parts(
+        scope: [u8; 32],
+        base_oid: Option<CursorOid>,
+        head_oid: CursorOid,
+        position: usize,
+    ) -> Result<Self, PrCommitCursorError> {
         if !(1..=PR_COMMIT_CURSOR_MAX_POSITION).contains(&position) {
             return Err(PrCommitCursorError);
         }
         Ok(Self {
             scope,
-            base_oid: base_oid.map(|bytes| cursor_oid_string(&bytes)),
-            head_oid: cursor_oid_string(&head_oid),
+            base_oid,
+            head_oid,
             position,
         })
     }
@@ -663,7 +683,7 @@ impl PrCommitCursor {
         base_bytes.copy_from_slice(&frame[34..54]);
         let base_oid = match frame[33] {
             0 if base_bytes == [0; 20] => None,
-            1 => Some(cursor_oid_string(&base_bytes)),
+            1 => Some(CursorOid::from_bytes(base_bytes)),
             _ => return Err(PrCommitCursorError),
         };
         let mut head_bytes = [0_u8; 20];
@@ -672,31 +692,24 @@ impl PrCommitCursor {
             frame[74..78].try_into().map_err(|_| PrCommitCursorError)?,
         ))
         .map_err(|_| PrCommitCursorError)?;
-        Self::new(
-            scope,
-            base_oid.as_deref(),
-            &cursor_oid_string(&head_bytes),
-            position,
-        )
+        Self::from_parts(scope, base_oid, CursorOid::from_bytes(head_bytes), position)
     }
 
     pub fn encode(&self) -> String {
         let mut frame = Vec::with_capacity(PR_COMMIT_CURSOR_FRAME_BYTES);
         frame.push(PR_COMMIT_CURSOR_VERSION);
         frame.extend_from_slice(&self.scope);
-        match self.base_oid.as_deref() {
+        match &self.base_oid {
             Some(oid) => {
                 frame.push(1);
-                frame.extend_from_slice(&parse_cursor_oid(oid).expect("validated cursor base oid"));
+                frame.extend_from_slice(&oid.bytes);
             }
             None => {
                 frame.push(0);
                 frame.extend_from_slice(&[0; 20]);
             }
         }
-        frame.extend_from_slice(
-            &parse_cursor_oid(&self.head_oid).expect("validated cursor head oid"),
-        );
+        frame.extend_from_slice(&self.head_oid.bytes);
         frame.extend_from_slice(&(self.position as u32).to_be_bytes());
         debug_assert_eq!(frame.len(), PR_COMMIT_CURSOR_FRAME_BYTES);
         format!(
@@ -710,11 +723,11 @@ impl PrCommitCursor {
     }
 
     pub fn base_oid(&self) -> Option<&str> {
-        self.base_oid.as_deref()
+        self.base_oid.as_ref().map(|oid| oid.text.as_str())
     }
 
     pub fn head_oid(&self) -> &str {
-        &self.head_oid
+        &self.head_oid.text
     }
 
     pub fn position(&self) -> usize {
@@ -779,17 +792,10 @@ impl std::fmt::Display for RepoListRowError {
 impl std::error::Error for RepoListRowError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum RepoListRowState {
-    Populated,
-    Empty,
+pub enum RepoListRow {
+    Populated { slug: String, clone_url: String },
+    Empty { slug: String },
     Restricted,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RepoListRow {
-    state: RepoListRowState,
-    slug: Option<String>,
-    clone_url: Option<String>,
 }
 
 impl RepoListRow {
@@ -799,44 +805,31 @@ impl RepoListRow {
     ) -> Result<Self, RepoListRowError> {
         let slug = validated_repo_list_slug(slug.into())?;
         let clone_url = validated_repo_list_clone_url(clone_url.into())?;
-        Ok(Self {
-            state: RepoListRowState::Populated,
-            slug: Some(slug),
-            clone_url: Some(clone_url),
-        })
+        Ok(Self::Populated { slug, clone_url })
     }
 
     pub fn empty(slug: impl Into<String>) -> Result<Self, RepoListRowError> {
-        Ok(Self {
-            state: RepoListRowState::Empty,
-            slug: Some(validated_repo_list_slug(slug.into())?),
-            clone_url: None,
+        Ok(Self::Empty {
+            slug: validated_repo_list_slug(slug.into())?,
         })
     }
 
     pub fn restricted() -> Self {
-        Self {
-            state: RepoListRowState::Restricted,
-            slug: None,
-            clone_url: None,
-        }
+        Self::Restricted
     }
 
     pub fn to_json(&self) -> Value {
-        match self.state {
-            RepoListRowState::Populated => json!({
+        match self {
+            Self::Populated { slug, clone_url } => json!({
                 "state": "populated",
-                "slug": self.slug.as_deref().expect("validated populated row has a slug"),
-                "clone_url": self
-                    .clone_url
-                    .as_deref()
-                    .expect("validated populated row has a clone URL"),
+                "slug": slug,
+                "clone_url": clone_url,
             }),
-            RepoListRowState::Empty => json!({
+            Self::Empty { slug } => json!({
                 "state": "empty",
-                "slug": self.slug.as_deref().expect("validated empty row has a slug"),
+                "slug": slug,
             }),
-            RepoListRowState::Restricted => json!({ "state": "restricted" }),
+            Self::Restricted => json!({ "state": "restricted" }),
         }
     }
 }
@@ -986,12 +979,8 @@ impl WebEditForm {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebEditOutcome {
-    Committed {
-        new_oid: String,
-    },
-    StaleBase {
-        current_oid: String,
-    },
+    Committed { new_oid: String },
+    StaleBase { current_oid: String },
     Denied,
 }
 
@@ -1122,7 +1111,9 @@ impl MergeReadiness {
                     .map(|u| json!({ "context": u.context.name, "reason": humanise_unmet(u) }))
                     .collect::<Vec<_>>(),
             }),
-            MergeReadiness::Queued { position } => json!({ "state": "queued", "position": position }),
+            MergeReadiness::Queued { position } => {
+                json!({ "state": "queued", "position": position })
+            }
             MergeReadiness::HitlHold { awaiting } => {
                 json!({ "state": "hitl_hold", "awaiting": awaiting })
             }
@@ -1170,7 +1161,12 @@ fn render_hint_json(h: &RenderHint) -> Value {
 impl RepoHome {
     pub fn to_json(&self) -> Value {
         match self {
-            RepoHome::Populated { slug, readme_excerpt, entries, clone_url } => json!({
+            RepoHome::Populated {
+                slug,
+                readme_excerpt,
+                entries,
+                clone_url,
+            } => json!({
                 "state": "populated",
                 "slug": slug,
                 "readme_excerpt": readme_excerpt,

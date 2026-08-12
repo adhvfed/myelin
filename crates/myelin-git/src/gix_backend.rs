@@ -20,16 +20,16 @@ impl RepoPathResolver for RootedResolver {
         validate_path_segment("tenant", &repo.tenant)?;
         validate_path_segment("region", &repo.region)?;
         let repo_dir = validate_repo_slug(&repo.repo)?;
+        let (repo_name, namespaces) = repo_dir.split_last().ok_or_else(|| {
+            GitCoreError::Read("invalid repo slug: empty (fail-closed path resolution)".into())
+        })?;
         let mut path = self.root.clone();
         path.push(&repo.tenant);
         path.push(&repo.region);
-        for piece in &repo_dir {
+        for piece in namespaces {
             path.push(piece);
         }
-        let last = repo_dir
-            .last()
-            .expect("validate_repo_slug returns ≥1 piece or errors");
-        path.set_file_name(format!("{last}.git"));
+        path.push(format!("{repo_name}.git"));
         Ok(path)
     }
 }
@@ -261,9 +261,9 @@ impl<P: RepoPathResolver> ReadBackend for GixCore<P> {
         let odb = r
             .odb()
             .map_err(|e| GitCoreError::Read(format!("open object database: {e}")))?;
-        let (size, kind) = odb
-            .read_header(entry.id())
-            .map_err(|e| GitCoreError::Read(format!("read blame blob header {}: {e}", entry.id())))?;
+        let (size, kind) = odb.read_header(entry.id()).map_err(|e| {
+            GitCoreError::Read(format!("read blame blob header {}: {e}", entry.id()))
+        })?;
         if kind != git2::ObjectType::Blob {
             return Err(GitCoreError::Read(format!(
                 "blame path {path} does not resolve to a blob"
@@ -441,8 +441,18 @@ mod tests {
             std::process::id()
         ));
         let repository = git2::Repository::init_bare(&path).expect("init bare test repository");
-        let left = Oid::new(repository.blob(b"a\n").expect("write left blob").to_string());
-        let right = Oid::new(repository.blob(b"b\n").expect("write right blob").to_string());
+        let left = Oid::new(
+            repository
+                .blob(b"a\n")
+                .expect("write left blob")
+                .to_string(),
+        );
+        let right = Oid::new(
+            repository
+                .blob(b"b\n")
+                .expect("write right blob")
+                .to_string(),
+        );
         drop(repository);
 
         let reader = GixCore::new(FixedResolver(path.clone()));
@@ -451,9 +461,15 @@ mod tests {
             .diff_blobs_bounded(&repo, &left, &right, 2, 2, 2)
             .expect("exact limits are accepted");
         assert_eq!(exact.len(), 2);
-        assert!(reader.diff_blobs_bounded(&repo, &left, &right, 1, 2, 2).is_err());
-        assert!(reader.diff_blobs_bounded(&repo, &left, &right, 2, 1, 2).is_err());
-        assert!(reader.diff_blobs_bounded(&repo, &left, &right, 2, 2, 1).is_err());
+        assert!(reader
+            .diff_blobs_bounded(&repo, &left, &right, 1, 2, 2)
+            .is_err());
+        assert!(reader
+            .diff_blobs_bounded(&repo, &left, &right, 2, 1, 2)
+            .is_err());
+        assert!(reader
+            .diff_blobs_bounded(&repo, &left, &right, 2, 2, 1)
+            .is_err());
 
         std::fs::remove_dir_all(&path).expect("remove isolated test repository");
     }

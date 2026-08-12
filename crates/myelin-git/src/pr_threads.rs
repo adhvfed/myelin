@@ -979,10 +979,13 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         let lock = self.subject_lock(&repo, &object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(&repo, &object_key)?;
-        let (owner_display, already) = match doc.review(&review_id) {
-            None => return Err(DurableError::NotFound(format!("review {review_id}"))),
-            Some(r) => (r.reviewer.display.clone(), !r.is_draft()),
-        };
+        let review_index = doc
+            .reviews
+            .iter()
+            .position(|review| review.id == review_id)
+            .ok_or_else(|| DurableError::NotFound(format!("review {review_id}")))?;
+        let owner_display = doc.reviews[review_index].reviewer.display.clone();
+        let already = !doc.reviews[review_index].is_draft();
         if owner_display != actor.display {
             return Err(DurableError::Forbidden(format!(
                 "review {review_id} belongs to another reviewer"
@@ -1001,11 +1004,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             }
         }
         let review = {
-            let r = doc
-                .reviews
-                .iter_mut()
-                .find(|r| r.id == review_id)
-                .expect("batch present (checked above)");
+            let r = &mut doc.reviews[review_index];
             r.verdict = verdict;
             r.summary_md = summary_md;
             r.submitted_at = Some(now);

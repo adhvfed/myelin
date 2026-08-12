@@ -33,6 +33,23 @@ pub(crate) fn ensure_pr_record_size(size: usize) -> Result<(), DurableError> {
     Ok(())
 }
 
+pub(crate) fn accepted_merge_update_seq(
+    moved: &[(RefName, PushOid, u64)],
+    expected_ref: &RefName,
+    expected_oid: &PushOid,
+) -> Result<u64, DurableError> {
+    match moved {
+        [(ref_name, oid, update_seq)]
+            if ref_name == expected_ref && oid == expected_oid && *update_seq > 0 =>
+        {
+            Ok(*update_seq)
+        }
+        _ => Err(DurableError::Git(
+            "merge ref adapter returned an invalid committed-move witness".into(),
+        )),
+    }
+}
+
 fn ensure_branch_protection_size(size: usize) -> Result<(), DurableError> {
     if size > BRANCH_PROTECTION_MAX_BYTES {
         return Err(DurableError::Git(
@@ -757,7 +774,10 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(DurableError::Io(format!("open {}: {error}", path.display())))
+                return Err(DurableError::Io(format!(
+                    "open {}: {error}",
+                    path.display()
+                )))
             }
         };
         let mut bytes = Vec::new();
@@ -900,10 +920,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                     .and_then(|value| value.to_str())
                     .and_then(|value| value.parse::<u64>().ok())
                     .ok_or_else(|| {
-                        DurableError::Io(format!(
-                            "invalid PR record filename {}",
-                            path.display()
-                        ))
+                        DurableError::Io(format!("invalid PR record filename {}", path.display()))
                     })?;
                 let mut bytes = Vec::new();
                 std::fs::File::open(&path)
@@ -916,9 +933,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                     })?;
                 ensure_pr_record_size(bytes.len())?;
                 total_bytes = total_bytes.checked_add(bytes.len()).ok_or_else(|| {
-                    DurableError::Git(
-                        "pull request list limit exceeded: serialized bytes".into(),
-                    )
+                    DurableError::Git("pull request list limit exceeded: serialized bytes".into())
                 })?;
                 if total_bytes > maximum_bytes {
                     return Err(DurableError::Git(
@@ -974,7 +989,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                 let direction = cursor.direction();
                 let key = cursor.key();
                 let mut rows: Vec<_> = records
-            .into_iter()
+                    .into_iter()
                     .enumerate()
                     .filter(|(_, record)| {
                         let before = pr_record_before_key(record, key, query.sort);
@@ -986,7 +1001,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                             crate::pr_list_pagination::PrListDirection::Older => !before && !equal,
                         }
                     })
-            .collect();
+                    .collect();
                 if direction == crate::pr_list_pagination::PrListDirection::Newer {
                     rows.reverse();
                 }
@@ -1097,7 +1112,7 @@ pub fn merge_pr<P: RepoPathResolver>(
     let head = PushOid::new(rec.head_oid.clone());
     let push = PushSession {
         updates: vec![ProposedRefUpdate {
-            ref_name: base,
+            ref_name: base.clone(),
             expected_old,
             new_oid: head.clone(),
             forced: false,
@@ -1112,7 +1127,7 @@ pub fn merge_pr<P: RepoPathResolver>(
 
     match outcome {
         PushOutcome::Accepted { moved, .. } => {
-            let (_, new_oid, update_seq) = moved.into_iter().next().expect("one moved ref");
+            let update_seq = accepted_merge_update_seq(&moved, &base, &head)?;
             let mut pr = rec.as_pull_request();
             pr.transition(PrTransition::Merge, true)
                 .map_err(|e| DurableError::Git(format!("PR merge transition: {e}")))?;
@@ -1126,7 +1141,7 @@ pub fn merge_pr<P: RepoPathResolver>(
             store.put(repo_loc, &rec)?;
             Ok(MergeAttempt::Merged {
                 base_ref: rec.base_ref,
-                new_oid: new_oid.0,
+                new_oid: head.0,
                 update_seq,
             })
         }
@@ -1374,7 +1389,10 @@ mod tests {
             }));
         }
         for handle in handles {
-            handle.join().expect("writer must not panic").expect("writer must persist");
+            handle
+                .join()
+                .expect("writer must not panic")
+                .expect("writer must persist");
         }
 
         let record = store.get(&loc(), 1).unwrap().unwrap();
@@ -1437,10 +1455,7 @@ mod tests {
             Err(DurableError::Git(message))
                 if message == "pull request list limit exceeded: record count"
         ));
-        assert_eq!(
-            store.list_bounded(&loc(), 2, usize::MAX).unwrap().len(),
-            2
-        );
+        assert_eq!(store.list_bounded(&loc(), 2, usize::MAX).unwrap().len(), 2);
         assert!(matches!(
             store.list_bounded(&loc(), 2, 1),
             Err(DurableError::Git(message))

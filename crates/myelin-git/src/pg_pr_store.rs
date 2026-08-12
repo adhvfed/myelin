@@ -22,9 +22,9 @@ use crate::lifecycle::{BranchProtectionRuleset, PrState};
 use crate::pg_pr_event::co_commit_event;
 use crate::pr_list_pagination::{PrListDirection, PrListPage};
 use crate::pr_store::{
-    ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt, MergeEval,
-    PrCrossListQuery, PrCrossListRecord, PrCrossListSlice, PrListBucket, PrListCounts, PrListQuery,
-    PrListSlice, PrListSort, PrListState, PrRecord, PR_LIST_OFFSET_MAX,
+    accepted_merge_update_seq, ensure_pr_record_size, evaluate_merge, DurablePrStore, MergeAttempt,
+    MergeEval, PrCrossListQuery, PrCrossListRecord, PrCrossListSlice, PrListBucket, PrListCounts,
+    PrListQuery, PrListSlice, PrListSort, PrListState, PrRecord, PR_LIST_OFFSET_MAX,
 };
 use crate::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushProvenance,
@@ -2423,23 +2423,6 @@ impl PgPrStore {
                 Ok(result.into_attempt())
             })).await
         }).map_err(pg_error)
-    }
-}
-
-fn accepted_merge_update_seq(
-    moved: &[(RefName, PushOid, u64)],
-    expected_ref: &RefName,
-    expected_oid: &PushOid,
-) -> Result<u64, DurableError> {
-    match moved {
-        [(ref_name, oid, update_seq)]
-            if ref_name == expected_ref && oid == expected_oid && *update_seq > 0 =>
-        {
-            Ok(*update_seq)
-        }
-        _ => Err(DurableError::Git(
-            "merge ref adapter returned an invalid committed-move witness".into(),
-        )),
     }
 }
 
