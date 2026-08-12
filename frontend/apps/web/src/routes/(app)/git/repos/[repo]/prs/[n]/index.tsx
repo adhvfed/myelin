@@ -46,6 +46,7 @@ import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { Markdown } from "~/components/Markdown";
 import { useContextPane } from "~/components/AppShell";
 import { SharedComposer } from "~/components/SharedComposer";
+import { getPrContext, type PrContextVM } from "~/lib/pr-context";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -89,6 +90,13 @@ export default function PrOverviewScreen() {
 
   const pr = createAsync(
     async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined),
+    { deferStream: true },
+  );
+  const context = createAsync(
+    async () => {
+      const current = pr();
+      return current ? getPrContext(current.ref) : undefined;
+    },
     { deferStream: true },
   );
   // Keep check-projection failures local to the checks panel; authentication redirects still
@@ -138,6 +146,7 @@ export default function PrOverviewScreen() {
       revalidate("git-pr-threads"),
       revalidate("git-pr-checks"),
       revalidate("git-pr"),
+      revalidate("git-pr-context"),
     ]);
   };
 
@@ -146,7 +155,13 @@ export default function PrOverviewScreen() {
   const paneApi = useContextPane();
   createEffect(() => {
     paneApi.setContextPaneLabel("Pull request context");
-    paneApi.setContextPane(() => <PrContextPane checks={checksOrNull(checks())} reviews={threads()?.reviews} />);
+    paneApi.setContextPane(() => (
+      <PrContextPane
+        checks={checksOrNull(checks())}
+        reviews={threads()?.reviews}
+        context={context()}
+      />
+    ));
     onCleanup(() => paneApi.setContextPane(null));
   });
 
@@ -317,9 +332,11 @@ function ChecksPanel(props: { checks: PrChecksVM }) {
 
 // ── the context pane (G-6) ──────────────────────────────────────────────────────────────────────
 
-function PrContextPane(props: { checks: PrChecksVM | null; reviews?: PrReviewVM[] }) {
-  // Linked issue and document data is not available yet, so those sections remain empty. Agent
-  // context appears only when an advisory review exists.
+function PrContextPane(props: {
+  checks: PrChecksVM | null;
+  reviews?: PrReviewVM[];
+  context?: PrContextVM;
+}) {
   const agentReviews = createMemo(() => (props.reviews ?? []).filter((r) => r.advisory));
   const ciVerdict = () =>
     props.checks == null
@@ -338,13 +355,50 @@ function PrContextPane(props: { checks: PrChecksVM | null; reviews?: PrReviewVM[
         </Show>
       </PaneSection>
 
-      <PaneSection label="Linked issue">
-        {/* FLOOR: the viewer-scoped linked-refs resolver (N4) is a named follow-on. */}
-        <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>No linked issue yet.</span>
+      <PaneSection label="Linked issues" busy={props.context === undefined} skeletonRows={1}>
+        <For each={props.context?.issues}>
+          {(issue) => (
+            <Chip
+              type="issue"
+              label={`${issue.key} · ${issue.title}`}
+              statusLabel={issue.state}
+              href={`/issues/${encodeURIComponent(issue.id)}`}
+            />
+          )}
+        </For>
+        <Show when={props.context?.issues.length === 0 && !props.context.issues_unavailable}>
+          <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>No linked issues.</span>
+        </Show>
+        <Show when={props.context?.issues_unavailable}>
+          <span role="note" style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
+            Some linked issues could not be refreshed.
+          </span>
+        </Show>
       </PaneSection>
 
-      <PaneSection label="Linked doc">
-        <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>No linked doc yet.</span>
+      <PaneSection label="Linked documents" busy={props.context === undefined} skeletonRows={1}>
+        <For each={props.context?.documents}>
+          {(document) => (
+            <Chip
+              type="doc"
+              label={document.title}
+              href={`/knowledge?page=${encodeURIComponent(document.id)}`}
+            />
+          )}
+        </For>
+        <Show when={props.context?.documents.length === 0 && !props.context.documents_unavailable}>
+          <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>No linked documents.</span>
+        </Show>
+        <Show when={props.context?.documents_unavailable}>
+          <span role="note" style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
+            Some linked documents could not be refreshed.
+          </span>
+        </Show>
+        <Show when={props.context?.truncated}>
+          <span role="note" style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
+            More linked context is available.
+          </span>
+        </Show>
       </PaneSection>
 
       {/* Agent slot — present ONLY when there is agent activity (advisory review). */}

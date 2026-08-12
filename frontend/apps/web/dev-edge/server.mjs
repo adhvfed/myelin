@@ -1155,6 +1155,52 @@ const server = createServer((req, res) => {
     return send(res, 200, envelope);
   }
 
+  if (method === "GET" && (path === "/v1/refs/links" || path === "/v1/refs/backlinks")) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const keys = [...url.searchParams.keys()];
+    const reference = url.searchParams.get("ref");
+    const limit = url.searchParams.get("limit");
+    const referenceMatch = /^myelin:\/\/acme\/git\/pr\/myelin:([1-9][0-9]*)$/.exec(reference ?? "");
+    if (keys.length !== 2 || !keys.every((key) => ["ref", "limit"].includes(key)) ||
+        url.searchParams.getAll("ref").length !== 1 || url.searchParams.getAll("limit").length !== 1 ||
+        !referenceMatch || !prJson("myelin", Number(referenceMatch[1])) || limit !== "100") {
+      return send(res, 400, { error: { message: "invalid References query", code: "bad_request" } });
+    }
+    const issue = issueRows.find((row) => row.key === "MYL-102");
+    const document = knowledge.list({ limit: 100 }).items.find((page) => page.title === "Engineering principles");
+    const issueRef = issue ? `myelin://acme/issue/issue/${issue.key}` : null;
+    const prRef = reference;
+    const linkedFixture = referenceMatch[1] === "1";
+    const links = linkedFixture && issueRef ? [{
+      ref: issueRef,
+      root_ref: issueRef,
+      source_ref: prRef,
+      source_root_ref: prRef,
+      target_ref: issueRef,
+      target_root_ref: issueRef,
+      relation: "closes",
+      relation_class: "lifecycle",
+      origin_actor: "psn:dev-author",
+    }] : [];
+    const backlinks = linkedFixture && document ? [{
+      ref: document.ref,
+      root_ref: document.ref,
+      source_ref: document.ref,
+      source_root_ref: document.ref,
+      target_ref: prRef,
+      target_root_ref: prRef,
+      relation: "links",
+      relation_class: "reference",
+      origin_actor: "psn:dev-author",
+    }] : [];
+    return send(res, 200, {
+      ref: prRef,
+      root_ref: prRef,
+      items: path.endsWith("/links") ? links : backlinks,
+      page: { next_cursor: null, limit: 100 },
+    }, { "cache-control": "no-store" });
+  }
+
   if (
     method === "GET" &&
     (im = path.match(/^\/v1\/issues\/authorization-requests\/([^/]+)$/))

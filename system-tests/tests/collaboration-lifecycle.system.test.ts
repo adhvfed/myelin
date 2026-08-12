@@ -75,6 +75,21 @@ async function awaitBacklinkGone(
   }, { description: `${relationName} between ${sourceRef} and ${targetRef} to disappear` });
 }
 
+async function awaitLink(
+  sourceRef: string,
+  targetRef: string,
+  relationName: string,
+): Promise<JsonRecord> {
+  return eventually<JsonRecord>(async () => {
+    const response = await systemClient.json(
+      `/v1/refs/links?ref=${encodeURIComponent(sourceRef)}`,
+    );
+    return array(response.body.items, `links from ${sourceRef}`)
+      .map((item) => record(item, "collaboration link"))
+      .find((item) => item.root_ref === targetRef && item.relation === relationName);
+  }, { description: `${sourceRef} to expose its ${relationName} link to ${targetRef}` });
+}
+
 function expectOpaqueIssueAuthor(value: unknown, label: string): string {
   const author = string(value, label);
   const prefix = "issue-author-";
@@ -1565,7 +1580,7 @@ command = ["true"]
     await awaitBacklinkGone(issueRef, pageRef, "links");
   });
 
-  test("lets a pull request promise issue delivery without an integration key", async () => {
+  test("gathers a pull request's delivery promise and living context without integration keys", async () => {
     const issue = await awaitActiveIssue(uniqueName("Deliver the promised change"));
     const issueKey = string(issue.key, "promised delivery issue key");
     const issueRef = string(issue.ref, "promised delivery issue ref");
@@ -1597,8 +1612,10 @@ command = ["true"]
       "promised delivery pull request",
     );
     const pullRequestNumber = integer(pullRequest.number, "promised delivery PR number");
-    const pullRequestRef =
-      `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
+    const pullRequestRef = string(pullRequest.ref, "promised delivery pull request ref");
+    expect(pullRequestRef).toBe(
+      `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`,
+    );
 
     expect(await awaitBacklink(issueRef, pullRequestRef, "closes")).toMatchObject({
       ref: pullRequestRef,
@@ -1607,6 +1624,50 @@ command = ["true"]
       relation: "closes",
       relation_class: "lifecycle",
     });
+    expect(await awaitLink(pullRequestRef, issueRef, "closes")).toMatchObject({
+      ref: issueRef,
+      root_ref: issueRef,
+      source_ref: pullRequestRef,
+      target_ref: issueRef,
+      relation: "closes",
+      relation_class: "lifecycle",
+    });
+
+    const contextTitle = uniqueName("Promised delivery notes");
+    const createdContext = await systemClient.json("/v1/knowledge/pages", {
+      method: "POST",
+      body: { title: contextTitle, template: "blank", visibility: "team" },
+      expectedStatus: 201,
+    });
+    const contextPage = record(createdContext.body.page, "pull request context page");
+    const contextPageId = string(contextPage.id, "pull request context page id");
+    const contextPageRef = string(contextPage.ref, "pull request context page ref");
+    const contextVersion = integer(contextPage.version, "pull request context page version");
+    await systemClient.json(`/v1/knowledge/pages/${encodeURIComponent(contextPageId)}`, {
+      method: "PUT",
+      body: {
+        expected_version: contextVersion,
+        title: contextTitle,
+        visibility: "team",
+        blocks: [{
+          type: "paragraph",
+          markdown: "Keep the reasoning beside the pull request \uFFFC.",
+          references: [pullRequestRef],
+        }],
+      },
+    });
+
+    const contextLink = await awaitBacklink(pullRequestRef, contextPageRef, "links");
+    expect(contextLink).toMatchObject({
+      root_ref: contextPageRef,
+      target_ref: pullRequestRef,
+      relation: "links",
+      relation_class: "reference",
+    });
+    const contextPassageRef = string(contextLink.ref, "linked context passage ref");
+    expect(contextPassageRef.startsWith(`${contextPageRef}#b`)).toBe(true);
+    expect(contextPassageRef.slice(`${contextPageRef}#b`.length)).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(contextLink.source_ref).toBe(contextPassageRef);
   });
 
   test("lets one retry key open pull requests in two repositories", async () => {

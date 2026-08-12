@@ -81,8 +81,13 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(page.getByTestId("merge-button")).toHaveCount(0);
 
     // The shell-owned context pane renders as the 4th region (wide viewport) with its landmark.
-    await expect(page.getByTestId("context-pane")).toBeVisible();
+    const contextPane = page.getByTestId("context-pane");
+    await expect(contextPane).toBeVisible();
     await expect(page.getByRole("complementary", { name: "Pull request context" })).toBeVisible();
+    const issue = contextPane.getByRole("link", { name: /MYL-102.*Close the collaboration feedback loop/ });
+    await expect(issue).toHaveAttribute("href", "/issues/00000000-0000-4000-8000-000000000102");
+    const document = contextPane.getByRole("link", { name: /Engineering principles/ });
+    await expect(document).toHaveAttribute("href", /\/knowledge\?page=[0-9A-HJKMNP-TV-Z]{26}$/);
 
     await expectNoAxeViolations(page, "PR overview");
   });
