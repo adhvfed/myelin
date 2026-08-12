@@ -255,6 +255,10 @@ pub enum SkeletonError {
         run_id: String,
         reason: String,
     },
+    CostSettlementFailed {
+        run_id: String,
+        reason: String,
+    },
 }
 
 impl SkeletonError {
@@ -271,6 +275,7 @@ impl SkeletonError {
             Self::RuntimeStepFailed { error, .. } => error.code(),
             Self::MeteringUsageNotReported { .. } => "metering_usage_not_reported",
             Self::MeteringOverflow { .. } => "metering_overflow",
+            Self::CostSettlementFailed { .. } => "cost_settlement_failed",
         }
     }
 }
@@ -311,6 +316,10 @@ impl core::fmt::Display for SkeletonError {
             SkeletonError::MeteringOverflow { run_id, reason } => write!(
                 f,
                 "SKELETON metering arithmetic overflowed: run={run_id}: {reason} (loud, never a wrap)"
+            ),
+            SkeletonError::CostSettlementFailed { run_id, reason } => write!(
+                f,
+                "SKELETON cost settlement failed: run={run_id}: {reason} (the durable reservation remains retryable)"
             ),
         }
     }
@@ -582,9 +591,12 @@ impl SkeletonAgent {
             .map_err(|e| SkeletonError::CoCommit(format!("{e:?}")))?;
         teardown_guard.telemetry.record_trace();
 
-        let settle = in_flight
-            .settle(sub.ledger, &[])
-            .expect("a freshly-reserved in-flight run always settles (it was reserved this run)");
+        let settle = in_flight.settle(sub.ledger, &[]).map_err(|error| {
+            SkeletonError::CostSettlementFailed {
+                run_id: sub.run_id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
         let settled_total = settle.billed_total.0.saturating_add(settle.refunded.0);
         teardown_guard.telemetry.record_settle(settled_total);
 
@@ -881,6 +893,79 @@ mod tests {
     }
 
     #[test]
+    fn settlement_outage_returns_a_retryable_error_without_crashing_the_worker() {
+        let runtime = SkeletonAgentRuntime::new();
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        ledger.fail_next_settlement_for_test();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut telemetry = SkeletonTelemetry::new();
+        let catalogue = MockToolSurface::new();
+        let executor = MockToolExecutor::new();
+        let mut substrate = substrate(
+            "Rsettlement-outage",
+            &revoker,
+            &catalogue,
+            &executor,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
+        );
+
+        let error = agent_loop
+            .handle_run(
+                &runtime,
+                &mut substrate,
+                &mut telemetry,
+                RunOutcomeKind::Completed,
+            )
+            .expect_err("the settlement outage is a controlled run failure");
+
+        assert!(matches!(
+            error,
+            SkeletonError::CostSettlementFailed { ref run_id, .. }
+                if run_id == "Rsettlement-outage"
+        ));
+        assert_eq!(
+            telemetry.traces_written(),
+            1,
+            "the durable answer was committed"
+        );
+        assert_eq!(
+            telemetry.settled(),
+            0,
+            "the failed settlement was not invented"
+        );
+        assert_eq!(
+            telemetry.runs_completed(),
+            0,
+            "the run was not called complete"
+        );
+        assert_eq!(
+            telemetry.tokens_revoked(),
+            1,
+            "the run credential was torn down"
+        );
+        assert_eq!(
+            substrate
+                .ledger
+                .state_of(&tenant(), &StorageRunId::new("Rsettlement-outage"))
+                .expect("the test ledger remains readable"),
+            Some(myelin_storage::ReservationState::InFlight),
+            "the durable reservation remains available to the workflow retry"
+        );
+    }
+
+    #[test]
     fn ag_d8_killed_run_revokes_token_and_leaks_nothing() {
         let rt = SkeletonAgentRuntime::new();
         let agent_loop = SkeletonAgent::new();
@@ -1166,6 +1251,14 @@ mod tests {
             }
             .code(),
             "metering_usage_not_reported",
+        );
+        assert_eq!(
+            SkeletonError::CostSettlementFailed {
+                run_id: "Rsettle".into(),
+                reason: "storage unavailable".into(),
+            }
+            .code(),
+            "cost_settlement_failed",
         );
     }
 
@@ -1912,12 +2005,22 @@ mod tests {
             reason: "boom".into(),
         }
         .to_string();
+        let settle = SkeletonError::CostSettlementFailed {
+            run_id: "Rx".into(),
+            reason: "database unavailable".into(),
+        }
+        .to_string();
         assert!(cap.contains("spend cap"), "renders the cap: {cap}");
         assert!(cap.contains("post-debit"), "renders the stage: {cap}");
         assert!(nr.contains("fail-closed"), "renders the fail-closed abort: {nr}");
         assert!(ov.contains("overflow") && ov.contains("boom"), "renders the overflow: {ov}");
+        assert!(
+            settle.contains("settlement failed") && settle.contains("remains retryable"),
+            "renders the recoverable settlement failure: {settle}"
+        );
         assert_ne!(cap, nr);
         assert_ne!(nr, ov);
+        assert_ne!(ov, settle);
     }
 
     #[test]

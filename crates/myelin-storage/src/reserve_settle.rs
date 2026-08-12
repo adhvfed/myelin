@@ -197,6 +197,14 @@ impl CostLedger {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_settlement_for_test(&mut self) {
+        let CostBackend::Memory(ledger) = &mut self.backend else {
+            panic!("settlement fault injection requires the in-memory cost ledger");
+        };
+        ledger.fail_next_settlement = true;
+    }
+
     pub fn reserve(
         &mut self,
         tenant: TenantId,
@@ -300,6 +308,7 @@ pub struct MemoryCostLedger {
     reservations: HashMap<(TenantId, RunId), Reservation>,
     cost_events: Vec<CostEvent>,
     inflight_interrupt_count: u64,
+    fail_next_settlement: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -360,6 +369,12 @@ impl MemoryCostLedger {
         run: &RunId,
         units: &[MeteredUnit],
     ) -> Result<SettleOutcome, SettleError> {
+        if self.fail_next_settlement {
+            self.fail_next_settlement = false;
+            return Err(SettleError::StoreUnavailable(LedgerUnavailable::new(
+                "injected settlement outage",
+            )));
+        }
         let key = (tenant.clone(), run.clone());
         let reservation = self
             .reservations
