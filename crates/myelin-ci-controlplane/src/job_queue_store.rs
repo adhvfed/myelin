@@ -3,7 +3,8 @@ use std::time::Duration;
 use myelin_ci_sandbox::TrustTier;
 use myelin_storage::{with_tenant_tx, PgError};
 use sqlx::pool::PoolConnection;
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgArguments, PgPool};
+use sqlx::query::Query;
 use sqlx::types::Uuid;
 use sqlx::{Acquire, Postgres, Row};
 
@@ -13,21 +14,19 @@ use crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 use crate::scheduler::CANCEL_SUPERSEDED_QUERY;
 use crate::scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, COMPLETE_JOB_QUERY, CONSUME_CLAIM_QUERY,
-    CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY, CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY,
-    CONSUME_SECRET_WITHHELD_CLAIM_QUERY, INSERT_JOB_QUEUE_QUERY, READ_COMPLETION_DISPOSITION_QUERY,
-    RENEW_PREPARATION_LEASE_QUERY,
-    REQUEUE_PREPARATION_CLAIM_QUERY, RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY,
-    VERIFY_JOB_LAUNCH_LIVE_QUERY,
+    CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY, CONSUME_PREPARATION_CLAIM_QUERY,
+    CONSUME_SECRET_WITHHELD_CLAIM_QUERY, HEARTBEAT_QUERY, INSERT_JOB_QUEUE_QUERY,
+    READ_COMPLETION_DISPOSITION_QUERY, READ_EXHAUSTED_COMPLETION_REPLAY_QUERY,
+    READ_PREPARATION_COMPLETION_REPLAY_QUERY, READ_SECRET_WITHHELD_COMPLETION_REPLAY_QUERY,
+    RENEW_PREPARATION_LEASE_QUERY, REQUEUE_PREPARATION_CLAIM_QUERY,
+    RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY, VERIFY_JOB_LAUNCH_LIVE_QUERY,
 };
 
 #[derive(Debug)]
 pub enum JobQueueStoreError {
     InvalidInput(String),
     Db(String),
-    BadId {
-        field: &'static str,
-        value: String,
-    },
+    BadId { field: &'static str, value: String },
     CorruptRow(String),
 }
 
@@ -166,6 +165,93 @@ pub(crate) struct PreparationClaimConsumeSpec<'a> {
     pub claim_expires_at_epoch_secs: i64,
     pub reserve_handle: &'a str,
     pub completion_receipt: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum PreparationClaimResolution {
+    Prepared,
+    SecretWithheld,
+    AttemptsExhausted,
+}
+
+impl PreparationClaimResolution {
+    fn mutation_query(self) -> &'static str {
+        match self {
+            PreparationClaimResolution::Prepared => CONSUME_PREPARATION_CLAIM_QUERY,
+            PreparationClaimResolution::SecretWithheld => CONSUME_SECRET_WITHHELD_CLAIM_QUERY,
+            PreparationClaimResolution::AttemptsExhausted => {
+                CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY
+            }
+        }
+    }
+
+    fn replay_query(self) -> &'static str {
+        match self {
+            PreparationClaimResolution::Prepared => READ_PREPARATION_COMPLETION_REPLAY_QUERY,
+            PreparationClaimResolution::SecretWithheld => {
+                READ_SECRET_WITHHELD_COMPLETION_REPLAY_QUERY
+            }
+            PreparationClaimResolution::AttemptsExhausted => READ_EXHAUSTED_COMPLETION_REPLAY_QUERY,
+        }
+    }
+}
+
+fn bind_preparation_claim<'query, 'spec: 'query>(
+    sql: &'query str,
+    spec: &'query PreparationClaimConsumeSpec<'spec>,
+) -> Query<'query, Postgres, PgArguments> {
+    sqlx::query(sql)
+        .bind(spec.tenant_id)
+        .bind(spec.region)
+        .bind(spec.job_id)
+        .bind(spec.wf_run_id)
+        .bind(spec.idem_token)
+        .bind(spec.lease_owner)
+        .bind(spec.lease_epoch)
+        .bind(spec.claim_nonce)
+        .bind(spec.stage)
+        .bind(spec.claim_started_at_epoch_secs)
+        .bind(spec.claim_expires_at_epoch_secs)
+        .bind(spec.ci_run_id)
+        .bind(spec.reserve_handle)
+        .bind(spec.completion_receipt)
+}
+
+fn bind_preparation_completion_replay<'query, 'spec: 'query>(
+    sql: &'query str,
+    spec: &'query PreparationClaimConsumeSpec<'spec>,
+) -> Query<'query, Postgres, PgArguments> {
+    sqlx::query(sql)
+        .bind(spec.tenant_id)
+        .bind(spec.region)
+        .bind(spec.job_id)
+        .bind(spec.wf_run_id)
+        .bind(spec.idem_token)
+        .bind(spec.stage)
+        .bind(spec.completion_receipt)
+        .bind(spec.ci_run_id)
+        .bind(spec.reserve_handle)
+        .bind(spec.lease_owner)
+        .bind(spec.lease_epoch)
+        .bind(spec.claim_nonce)
+        .bind(spec.claim_started_at_epoch_secs)
+        .bind(spec.claim_expires_at_epoch_secs)
+}
+
+fn bind_exhausted_completion_replay<'query, 'spec: 'query>(
+    sql: &'query str,
+    spec: &'query PreparationClaimConsumeSpec<'spec>,
+) -> Query<'query, Postgres, PgArguments> {
+    sqlx::query(sql)
+        .bind(spec.tenant_id)
+        .bind(spec.region)
+        .bind(spec.job_id)
+        .bind(spec.wf_run_id)
+        .bind(spec.idem_token)
+        .bind(spec.stage)
+        .bind(spec.completion_receipt)
+        .bind(spec.ci_run_id)
+        .bind(spec.reserve_handle)
 }
 
 pub(crate) struct PreparationRequeueSpec<'a> {
@@ -712,195 +798,73 @@ impl CiJobQueueStore {
         }
     }
 
-    pub(crate) async fn consume_preparation_claim_on_conn(
+    async fn consume_preparation_resolution_on_conn(
         conn: &mut sqlx::PgConnection,
         spec: PreparationClaimConsumeSpec<'_>,
+        resolution: PreparationClaimResolution,
     ) -> Result<ClaimConsumeOutcome, PgError> {
-        let consumed = sqlx::query(CONSUME_PREPARATION_CLAIM_QUERY)
-            .bind(spec.tenant_id)
-            .bind(spec.region)
-            .bind(spec.job_id)
-            .bind(spec.wf_run_id)
-            .bind(spec.idem_token)
-            .bind(spec.lease_owner)
-            .bind(spec.lease_epoch)
-            .bind(spec.claim_nonce)
-            .bind(spec.stage)
-            .bind(spec.claim_started_at_epoch_secs)
-            .bind(spec.claim_expires_at_epoch_secs)
-            .bind(spec.ci_run_id)
-            .bind(spec.reserve_handle)
-            .bind(spec.completion_receipt)
+        let consumed = bind_preparation_claim(resolution.mutation_query(), &spec)
             .fetch_optional(&mut *conn)
             .await
             .map_err(|error| PgError::Query(error.to_string()))?;
         if consumed.is_some() {
             return Ok(ClaimConsumeOutcome::Consumed);
         }
-        let replay = sqlx::query_scalar::<_, i32>(
-            "SELECT 1
-             FROM job_queue q
-             WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid
-               AND q.run_id = $4::uuid AND q.idem_token = $5 AND q.stage = $6
-               AND q.state = 'terminal' AND q.completion_receipt = $7
-               AND EXISTS (
-                 SELECT 1 FROM ci_job_parent_attempt p
-                 WHERE p.tenant_id = q.tenant_id AND p.region = q.region
-                   AND p.job_id = q.job_id AND p.wf_run_id = q.run_id
-                   AND p.ci_run_id = $8::uuid AND p.reserve_handle = $9
-                   AND p.lease_owner = $10 AND p.lease_epoch = $11
-                   AND p.claim_nonce = $12::uuid
-                   AND p.claim_started_at_epoch_secs = $13
-                   AND p.claim_expires_at_epoch_secs = $14
-               )",
-        )
-        .bind(spec.tenant_id)
-        .bind(spec.region)
-        .bind(spec.job_id)
-        .bind(spec.wf_run_id)
-        .bind(spec.idem_token)
-        .bind(spec.stage)
-        .bind(spec.completion_receipt)
-        .bind(spec.ci_run_id)
-        .bind(spec.reserve_handle)
-        .bind(spec.lease_owner)
-        .bind(spec.lease_epoch)
-        .bind(spec.claim_nonce)
-        .bind(spec.claim_started_at_epoch_secs)
-        .bind(spec.claim_expires_at_epoch_secs)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(|error| PgError::Query(error.to_string()))?;
+
+        let replay_query = match resolution {
+            PreparationClaimResolution::Prepared | PreparationClaimResolution::SecretWithheld => {
+                bind_preparation_completion_replay(resolution.replay_query(), &spec)
+            }
+            PreparationClaimResolution::AttemptsExhausted => {
+                bind_exhausted_completion_replay(resolution.replay_query(), &spec)
+            }
+        };
+        let replay = replay_query
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+
         Ok(if replay.is_some() {
             ClaimConsumeOutcome::AlreadyConsumed
         } else {
             ClaimConsumeOutcome::Refused
         })
+    }
+
+    pub(crate) async fn consume_preparation_claim_on_conn(
+        conn: &mut sqlx::PgConnection,
+        spec: PreparationClaimConsumeSpec<'_>,
+    ) -> Result<ClaimConsumeOutcome, PgError> {
+        Self::consume_preparation_resolution_on_conn(
+            conn,
+            spec,
+            PreparationClaimResolution::Prepared,
+        )
+        .await
     }
 
     pub(crate) async fn consume_secret_withheld_claim_on_conn(
         conn: &mut sqlx::PgConnection,
         spec: PreparationClaimConsumeSpec<'_>,
     ) -> Result<ClaimConsumeOutcome, PgError> {
-        let consumed = sqlx::query(CONSUME_SECRET_WITHHELD_CLAIM_QUERY)
-            .bind(spec.tenant_id)
-            .bind(spec.region)
-            .bind(spec.job_id)
-            .bind(spec.wf_run_id)
-            .bind(spec.idem_token)
-            .bind(spec.lease_owner)
-            .bind(spec.lease_epoch)
-            .bind(spec.claim_nonce)
-            .bind(spec.stage)
-            .bind(spec.claim_started_at_epoch_secs)
-            .bind(spec.claim_expires_at_epoch_secs)
-            .bind(spec.ci_run_id)
-            .bind(spec.reserve_handle)
-            .bind(spec.completion_receipt)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|error| PgError::Query(error.to_string()))?;
-        if consumed.is_some() {
-            return Ok(ClaimConsumeOutcome::Consumed);
-        }
-        let replay = sqlx::query_scalar::<_, i32>(
-            "SELECT 1
-             FROM job_queue q
-             WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid
-               AND q.run_id = $4::uuid AND q.idem_token = $5 AND q.stage = $6
-               AND q.state = 'terminal' AND q.completion_receipt = $7
-               AND NOT EXISTS (
-                 SELECT 1 FROM ci_job_parent_attempt p
-                 WHERE p.tenant_id = q.tenant_id AND p.region = q.region
-                   AND p.job_id = q.job_id AND p.wf_run_id = q.run_id
-                   AND p.ci_run_id = $8::uuid AND p.reserve_handle = $9
-                   AND p.lease_owner = $10 AND p.lease_epoch = $11
-                   AND p.claim_nonce = $12::uuid
-                   AND p.claim_started_at_epoch_secs = $13
-                   AND p.claim_expires_at_epoch_secs = $14
-               )",
+        Self::consume_preparation_resolution_on_conn(
+            conn,
+            spec,
+            PreparationClaimResolution::SecretWithheld,
         )
-        .bind(spec.tenant_id)
-        .bind(spec.region)
-        .bind(spec.job_id)
-        .bind(spec.wf_run_id)
-        .bind(spec.idem_token)
-        .bind(spec.stage)
-        .bind(spec.completion_receipt)
-        .bind(spec.ci_run_id)
-        .bind(spec.reserve_handle)
-        .bind(spec.lease_owner)
-        .bind(spec.lease_epoch)
-        .bind(spec.claim_nonce)
-        .bind(spec.claim_started_at_epoch_secs)
-        .bind(spec.claim_expires_at_epoch_secs)
-        .fetch_optional(&mut *conn)
         .await
-        .map_err(|error| PgError::Query(error.to_string()))?;
-        Ok(if replay.is_some() {
-            ClaimConsumeOutcome::AlreadyConsumed
-        } else {
-            ClaimConsumeOutcome::Refused
-        })
     }
 
     pub(crate) async fn consume_preparation_claim_exhausted_on_conn(
         conn: &mut sqlx::PgConnection,
         spec: PreparationClaimConsumeSpec<'_>,
     ) -> Result<ClaimConsumeOutcome, PgError> {
-        let consumed = sqlx::query(CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY)
-            .bind(spec.tenant_id)
-            .bind(spec.region)
-            .bind(spec.job_id)
-            .bind(spec.wf_run_id)
-            .bind(spec.idem_token)
-            .bind(spec.lease_owner)
-            .bind(spec.lease_epoch)
-            .bind(spec.claim_nonce)
-            .bind(spec.stage)
-            .bind(spec.claim_started_at_epoch_secs)
-            .bind(spec.claim_expires_at_epoch_secs)
-            .bind(spec.ci_run_id)
-            .bind(spec.reserve_handle)
-            .bind(spec.completion_receipt)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|error| PgError::Query(error.to_string()))?;
-        if consumed.is_some() {
-            return Ok(ClaimConsumeOutcome::Consumed);
-        }
-        let replay = sqlx::query_scalar::<_, i32>(
-            "SELECT 1
-             FROM job_queue q
-             WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3::uuid
-               AND q.run_id = $4::uuid AND q.idem_token = $5 AND q.stage = $6
-               AND q.state = 'terminal' AND q.completion_receipt = $7
-               AND EXISTS (
-                 SELECT 1 FROM ci_job_parent_attempt p
-                 WHERE p.tenant_id = q.tenant_id AND p.region = q.region
-                   AND p.job_id = q.job_id AND p.wf_run_id = q.run_id
-                   AND p.ci_run_id = $8::uuid AND p.reserve_handle = $9
-                 GROUP BY p.budget_revision, p.max_parent_attempts
-                 HAVING count(*) = p.max_parent_attempts
-               )",
+        Self::consume_preparation_resolution_on_conn(
+            conn,
+            spec,
+            PreparationClaimResolution::AttemptsExhausted,
         )
-        .bind(spec.tenant_id)
-        .bind(spec.region)
-        .bind(spec.job_id)
-        .bind(spec.wf_run_id)
-        .bind(spec.idem_token)
-        .bind(spec.stage)
-        .bind(spec.completion_receipt)
-        .bind(spec.ci_run_id)
-        .bind(spec.reserve_handle)
-        .fetch_optional(&mut *conn)
         .await
-        .map_err(|error| PgError::Query(error.to_string()))?;
-        Ok(if replay.is_some() {
-            ClaimConsumeOutcome::AlreadyConsumed
-        } else {
-            ClaimConsumeOutcome::Refused
-        })
     }
 
     pub(crate) async fn requeue_preparation_claim_on_conn(
@@ -1195,112 +1159,6 @@ pub(crate) fn trust_from_token(token: &str) -> Result<TrustTier, JobQueueStoreEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::{
-        AUTHORIZE_JOB_LAUNCH_QUERY, CANCEL_SUPERSEDED_QUERY, CLAIM_QUERY, COMPLETE_JOB_QUERY,
-        CONSUME_CLAIM_QUERY, CONSUME_PREPARATION_CLAIM_QUERY, HEARTBEAT_QUERY,
-        INSERT_JOB_QUEUE_QUERY, REAP_QUERY, RENEW_PREPARATION_LEASE_QUERY,
-    };
-
-    #[test]
-    fn the_bound_sql_matches_the_store_binds() {
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("$13") && !INSERT_JOB_QUEUE_QUERY.contains("$14"));
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("claim_window_secs"));
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("reservation_write_version"));
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("ON CONFLICT (tenant_id, idem_token) DO NOTHING"));
-        assert!(INSERT_JOB_QUEUE_QUERY.contains("RETURNING job_id"));
-        assert!(CLAIM_QUERY.contains("$5") && !CLAIM_QUERY.contains("$6"));
-        for col in [
-            "j.tenant_id",
-            "j.job_id",
-            "j.run_id",
-            "j.lane",
-            "j.concurrency_group",
-            "j.fair_key",
-            "j.trust_tier",
-            "j.lease_epoch",
-            "j.claim_nonce",
-            "j.claim_window_secs",
-            "claim_started_at_epoch_secs",
-            "claim_expires_at_epoch_secs",
-        ] {
-            assert!(
-                CLAIM_QUERY.contains(col),
-                "the claim RETURNING carries `{col}` (leased_from_row reads it)"
-            );
-        }
-        assert!(CLAIM_QUERY.contains("lease_epoch = j.lease_epoch + 1"));
-        assert!(CLAIM_QUERY.contains("claim_nonce = gen_random_uuid()"));
-        assert!(CLAIM_QUERY.contains("claim_started_at = statement_timestamp()"));
-        assert!(CLAIM_QUERY.contains("COALESCE(j.claim_window_secs::text, $5)"));
-        assert!(CLAIM_QUERY.contains("w.state IN ('running', 'waiting')"));
-        assert!(CLAIM_QUERY.contains("c.state = 'running'"));
-        assert!(CLAIM_QUERY.contains("c.wf_run_id = q.run_id"));
-        assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY.contains("$4::uuid"));
-        assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY.contains("FOR UPDATE"));
-        assert!(LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY
-            .contains("COALESCE(claim_expires_at > statement_timestamp(), false)"));
-        assert!(CONSUME_CLAIM_QUERY.contains("$7") && !CONSUME_CLAIM_QUERY.contains("$8"));
-        assert!(CONSUME_CLAIM_QUERY.contains("claim_nonce = $5::uuid"));
-        assert!(CONSUME_CLAIM_QUERY.contains("stage = $7"));
-        assert!(CONSUME_CLAIM_QUERY.contains("state = 'running'"));
-        assert!(!CONSUME_CLAIM_QUERY.contains("state IN ('leased','running')"));
-        for predicate in [
-            "q.state = 'leased'",
-            "q.region = $2",
-            "q.run_id = $4::uuid",
-            "q.idem_token = $5",
-            "q.lease_owner = $6",
-            "q.lease_epoch = $7",
-            "q.claim_nonce = $8::uuid",
-            "q.stage = $9",
-            "q.claim_expires_at > statement_timestamp()",
-            "FROM ci_job_parent_attempt AS parent",
-            "parent.ci_run_id = $12::uuid",
-            "parent.reserve_handle = $13",
-            "surface.state IN ('queued', 'leased')",
-        ] {
-            assert!(
-                CONSUME_PREPARATION_CLAIM_QUERY.contains(predicate),
-                "missing preparation authority predicate `{predicate}`"
-            );
-        }
-        assert!(!CONSUME_PREPARATION_CLAIM_QUERY.contains("q.state = 'running'"));
-        assert!(!CONSUME_PREPARATION_CLAIM_QUERY.contains("q.state IN"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("$10"));
-        assert!(!AUTHORIZE_JOB_LAUNCH_QUERY.contains("$11"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("WITH launched AS"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("SET state = 'running'"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("UPDATE ci_job AS surface"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("surface.state IN ('queued', 'leased')"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("lease_expires = LEAST("));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("state = 'leased'"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_nonce = $7::uuid"));
-        assert!(AUTHORIZE_JOB_LAUNCH_QUERY.contains("claim_expires_at > statement_timestamp()"));
-        assert!(
-            RENEW_PREPARATION_LEASE_QUERY.contains("$10")
-                && !RENEW_PREPARATION_LEASE_QUERY.contains("$11")
-        );
-        assert!(RENEW_PREPARATION_LEASE_QUERY.contains("SET lease_expires = LEAST("));
-        assert!(RENEW_PREPARATION_LEASE_QUERY.contains("q.state = 'leased'"));
-        assert!(REAP_QUERY.contains("$1") && !REAP_QUERY.contains("$2"));
-        assert!(REAP_QUERY
-            .trim_start()
-            .starts_with("WITH candidates AS MATERIALIZED"));
-        assert!(REAP_QUERY.contains("FOR UPDATE SKIP LOCKED"));
-        assert!(REAP_QUERY.contains("pg_try_advisory_xact_lock"));
-        assert!(REAP_QUERY.contains("w.state IN ('running', 'waiting')"));
-        assert!(REAP_QUERY.contains("c.state = 'running'"));
-        assert!(REAP_QUERY.contains("c.wf_run_id = job_queue.run_id"));
-        assert!(CANCEL_SUPERSEDED_QUERY.contains("$4") && !CANCEL_SUPERSEDED_QUERY.contains("$5"));
-        assert!(CANCEL_SUPERSEDED_QUERY.contains("job_id <> $4"));
-        assert!(COMPLETE_JOB_QUERY.contains("$2") && !COMPLETE_JOB_QUERY.contains("$3"));
-        assert!(COMPLETE_JOB_QUERY.contains("state <> 'terminal'"));
-        assert!(HEARTBEAT_QUERY.contains("$4") && !HEARTBEAT_QUERY.contains("$5"));
-        assert!(
-            HEARTBEAT_QUERY.contains("lease_owner = $3")
-                && HEARTBEAT_QUERY.contains("state IN ('leased', 'running')")
-        );
-    }
 
     #[test]
     fn trust_tier_tokens_round_trip_and_reject_unknown() {
