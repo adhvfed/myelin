@@ -1,4 +1,6 @@
-use myelin_storage::{GateInputs, GateVerdict, GreenArtifact, KekId, KmsEngine, RestoreVerifyGate};
+use myelin_storage::{
+    GateInputs, GateVerdict, GreenArtifact, KekId, KmsEngine, KmsError, RestoreVerifyGate,
+};
 use myelin_substrate::{DependencyHealth, MetricsHealthSurface, ReadinessReport};
 use myelin_tenancy::{CellId, Region, TenantId};
 
@@ -179,13 +181,13 @@ impl ProvisioningGate {
         tenant: &TenantId,
         region: &Region,
         signals: &mut ProvisioningSignals,
-    ) -> bool {
-        let shredded = kms.destroy_kek(&KekId::new(tenant.clone(), region.clone()));
+    ) -> Result<bool, KmsError> {
+        let shredded = kms.destroy_kek(&KekId::new(tenant.clone(), region.clone()))?;
         if shredded {
             signals.tenants_decommissioned += 1;
             registry.set_placement_status(tenant, PlacementStatus::Offboarding);
         }
-        shredded
+        Ok(shredded)
     }
 
     pub fn tenants_on_unverified_cells(registry: &Registry) -> usize {
@@ -637,7 +639,9 @@ mod tests {
 
         let mut signals = ProvisioningSignals::default();
         let gate = ProvisioningGate::new();
-        let shredded = gate.decommission_tenant(&mut reg, &kms, &tenant, &region(), &mut signals);
+        let shredded = gate
+            .decommission_tenant(&mut reg, &kms, &tenant, &region(), &mut signals)
+            .expect("decommissioning can reach the in-memory key registry");
         assert!(shredded, "a KEK was present to destroy");
         assert_eq!(signals.tenants_decommissioned, 1);
 
@@ -650,7 +654,9 @@ mod tests {
             PlacementStatus::Offboarding
         );
 
-        let again = gate.decommission_tenant(&mut reg, &kms, &tenant, &region(), &mut signals);
+        let again = gate
+            .decommission_tenant(&mut reg, &kms, &tenant, &region(), &mut signals)
+            .expect("repeating decommission can reach the in-memory key registry");
         assert!(
             !again,
             "a second decommission destroys nothing (idempotent)"

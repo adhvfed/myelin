@@ -295,9 +295,21 @@ mod tests {
             assert!(rec.is_green(), "{:?} is green (0 recoverable)", rec.cell);
         }
         let dek = DekId::new(tenant.clone(), KeyClass::Subject(subj.0.clone()));
-        assert!(!kms_b.backup_snapshot().iter().any(|(d, _)| *d == dek));
-        assert!(!kms_c.backup_snapshot().iter().any(|(d, _)| *d == dek));
-        assert!(!kms_d.backup_snapshot().iter().any(|(d, _)| *d == dek));
+        assert!(!kms_b
+            .backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == dek));
+        assert!(!kms_c
+            .backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == dek));
+        assert!(!kms_d
+            .backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == dek));
     }
 
     #[test]
@@ -425,7 +437,11 @@ mod tests {
         );
         let dek = DekId::new(tenant.clone(), KeyClass::Subject(subj.0.clone()));
         assert!(
-            kms_c.backup_snapshot().iter().any(|(d, _)| *d == dek),
+            kms_c
+                .backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == dek),
             "cell-c's DEK is intact (its erase aborted loudly)"
         );
     }

@@ -3,7 +3,7 @@ use std::fmt;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::encryption::SubjectId;
-use crate::kms::{DekId, KeyClass, KmsEngine};
+use crate::kms::{DekId, KeyClass, KmsEngine, KmsError};
 
 pub trait PseudonymShred {
     fn shred_pseudonym(&self, subject: &SubjectId, tenant: &TenantId) -> Result<(), EraseError>;
@@ -48,6 +48,7 @@ pub enum EraseError {
     RefsTombstone(String),
     BusErase(String),
     BlobShredReach(String),
+    Kms(KmsError),
 }
 
 impl fmt::Display for EraseError {
@@ -79,6 +80,7 @@ impl fmt::Display for EraseError {
                  INCOMPLETE (a reflog/bitmap/pack-tier-backup git structure could still be \
                  recoverable from a backup)"
             ),
+            EraseError::Kms(error) => write!(f, "erase KMS step failed: {error}"),
         }
     }
 }
@@ -125,7 +127,10 @@ impl<'a> CryptoShredErase<'a> {
         holders.pseudonym.shred_pseudonym(subject, tenant)?;
 
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
-        let dek_destroyed_now = self.engine.destroy_dek(&subject_dek);
+        let dek_destroyed_now = self
+            .engine
+            .destroy_dek(&subject_dek)
+            .map_err(EraseError::Kms)?;
 
         if let Some(git_reach) = holders.git_reach {
             git_reach.shred_blob_tier(subject, tenant)?;
@@ -140,6 +145,7 @@ impl<'a> CryptoShredErase<'a> {
         let recoverable_in_backup = self
             .engine
             .backup_snapshot()
+            .map_err(EraseError::Kms)?
             .iter()
             .filter(|(d, _)| *d == subject_dek)
             .count();
@@ -348,7 +354,10 @@ mod tests {
 
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the subject DEK is in the backup before erase"
         );
 
@@ -380,7 +389,10 @@ mod tests {
             "column unrecoverable live after crypto-shred"
         );
         assert!(
-            !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            !kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the subject DEK is absent from the backup after erase (0 recoverable, §7.5)"
         );
     }
@@ -467,7 +479,10 @@ mod tests {
         );
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "step 2 never ran - the DEK is intact"
         );
     }

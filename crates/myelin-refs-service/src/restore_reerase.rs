@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use myelin_events::{EventEnvelope, EventHandler};
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_refs::ArtifactRef;
+use myelin_storage::KmsError;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::cache::R2ProjectionCache;
@@ -253,10 +254,8 @@ fn warm_subject_titles(
     cache: &R2ProjectionCache,
     dek: &RefsDekPin,
     subject_id: &str,
-) -> Vec<String> {
-    let key_ref = dek
-        .reserve_subject_backstop(&corpus.tenant, &corpus.region, subject_id)
-        .expect("reserve per-subject DEK backstop");
+) -> Result<Vec<String>, KmsError> {
+    let key_ref = dek.reserve_subject_backstop(&corpus.tenant, &corpus.region, subject_id)?;
     for edge in corpus.edges_of(subject_id) {
         let proj = Projection {
             ref_: edge.source.clone(),
@@ -271,7 +270,7 @@ fn warm_subject_titles(
             .fill(&corpus.tenant, &corpus.region, &edge.source, &proj)
             .expect("warm the subject's cached title");
     }
-    vec![key_ref.to_uri()]
+    Ok(vec![key_ref.to_uri()])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -284,7 +283,7 @@ fn erase_and_record_at_scale(
     subject_id: &str,
     key_refs: &[String],
     now: &str,
-) {
+) -> Result<(), KmsError> {
     let holder = RefsCacheHolder::with_cache(Arc::clone(cache), projection.clone());
     holder
         .erase(EraseScope::Subject {
@@ -293,7 +292,7 @@ fn erase_and_record_at_scale(
         })
         .expect("§4.6 cache-PII purge");
 
-    dek.destroy_subject_backstop(&corpus.tenant, subject_id);
+    dek.destroy_subject_backstop(&corpus.tenant, subject_id)?;
 
     let mut edge_ids = Vec::new();
     for edge in corpus.edges_of(subject_id) {
@@ -314,6 +313,7 @@ fn erase_and_record_at_scale(
         &edge_ids,
         now,
     );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,7 +325,7 @@ pub fn re_erase_at_backup_scale(
     ledger: &RefsErasureLedger,
     subjects_to_erase: &[String],
     now: &str,
-) -> BackupScaleReEraseReport {
+) -> Result<BackupScaleReEraseReport, KmsError> {
     let projection = builder.projection().clone();
 
     for edge in &corpus.edges {
@@ -336,7 +336,7 @@ pub fn re_erase_at_backup_scale(
     }
     let mut subject_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for subject_id in &corpus.subjects {
-        let keys = warm_subject_titles(corpus, cache, dek, subject_id);
+        let keys = warm_subject_titles(corpus, cache, dek, subject_id)?;
         subject_keys.insert(subject_id.clone(), keys);
     }
 
@@ -351,14 +351,13 @@ pub fn re_erase_at_backup_scale(
             subject_id,
             &keys,
             now,
-        );
+        )?;
     }
 
     let mut cached_titles_resurrected_by_restore = 0usize;
     let mut deks_resurrected_by_restore = 0usize;
     for subject_id in subjects_to_erase {
-        dek.reserve_subject_backstop(&corpus.tenant, &corpus.region, subject_id)
-            .expect("restore re-seals the per-subject DEK");
+        dek.reserve_subject_backstop(&corpus.tenant, &corpus.region, subject_id)?;
         deks_resurrected_by_restore += 1;
         for edge in corpus.edges_of(subject_id) {
             let proj = Projection {
@@ -403,7 +402,7 @@ pub fn re_erase_at_backup_scale(
             })
             .expect("re-erase cache purge");
         for _ in &entry.key_refs {
-            dek.destroy_subject_backstop(&corpus.tenant, &entry.subject_id);
+            dek.destroy_subject_backstop(&corpus.tenant, &entry.subject_id)?;
         }
         for edge_id in &entry.edge_ids {
             projection.tombstone(
@@ -442,7 +441,7 @@ pub fn re_erase_at_backup_scale(
         }
     }
 
-    BackupScaleReEraseReport {
+    Ok(BackupScaleReEraseReport {
         tenant: corpus.tenant.clone(),
         region: corpus.region.clone(),
         re_erased_subjects: ledger
@@ -457,7 +456,7 @@ pub fn re_erase_at_backup_scale(
         live_deks_post_reerase,
         live_edges_post_reerase,
         ran_at: now.to_string(),
-    }
+    })
 }
 
 fn subject_ref(subject_id: &str, tenant: &TenantId) -> SubjectRef {

@@ -611,7 +611,7 @@ mod tests {
         let subject_dek =
             myelin_storage::kms::DekId::new(t.clone(), KeyClass::Subject("p-opaque-ada".into()));
         let blob_dek = myelin_storage::kms::DekId::new(t.clone(), KeyClass::Blob);
-        let backup = engine.backup_snapshot();
+        let backup = engine.backup_snapshot().unwrap();
         assert!(
             !backup.iter().any(|(d, _)| *d == subject_dek),
             "subject DEK absent from backup"

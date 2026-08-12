@@ -112,7 +112,10 @@ fn restore_driver_re_erases_a_post_pit_subject_to_zero_resurrected() {
         .unwrap();
     let subject_dek = DekId::new(t.clone(), KeyClass::Subject(subject.0.clone()));
     assert!(
-        kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the restore resurrected the subject's DEK"
     );
 
@@ -141,7 +144,10 @@ fn restore_driver_re_erases_a_post_pit_subject_to_zero_resurrected() {
         "the post-PIT subject was re-erased"
     );
     assert!(
-        !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the resurrected DEK was re-destroyed by the mandatory pass"
     );
     assert!(seams.is_erased(&subject, &t));

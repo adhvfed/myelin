@@ -305,13 +305,15 @@ fn ga_d8_multi_cell_erasure_per_cell_receipt_set() {
 
     let home = CellId::from_token("cell-a");
     let members = vec![CellId::from_token("cell-b"), CellId::from_token("cell-c")];
-    let set = authority.dsr_erase_across_cells(
-        &subject,
-        &TenantId("acme".into()),
-        &home,
-        &members,
-        at("2026-06-24T12:00:00Z"),
-    );
+    let set = authority
+        .dsr_erase_across_cells(
+            &subject,
+            &TenantId("acme".into()),
+            &home,
+            &members,
+            at("2026-06-24T12:00:00Z"),
+        )
+        .expect("all registered cells can reach their key registries");
 
     assert_eq!(
         set.member_cells.len(),
@@ -352,13 +354,15 @@ fn ga_d8_unregistered_member_cell_is_recorded_missed() {
         seeded_engine("acme", &[]),
     ));
     let subject = PrincipalId("p:ada".into());
-    let set = authority.dsr_erase_across_cells(
-        &subject,
-        &TenantId("acme".into()),
-        &CellId::from_token("cell-a"),
-        &[CellId::from_token("cell-ghost")],
-        at("2026-06-24T12:00:00Z"),
-    );
+    let set = authority
+        .dsr_erase_across_cells(
+            &subject,
+            &TenantId("acme".into()),
+            &CellId::from_token("cell-a"),
+            &[CellId::from_token("cell-ghost")],
+            at("2026-06-24T12:00:00Z"),
+        )
+        .expect("the registered cell can reach its key registry");
     assert_eq!(
         set.cells_missed(),
         1,

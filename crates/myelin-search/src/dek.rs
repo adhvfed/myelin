@@ -42,12 +42,20 @@ impl SearchDekPin {
             .ensure_dek(tenant, region, Self::subject_source_dek_class(subject_id))
     }
 
-    pub fn destroy_tenant_index_dek(&self, tenant: &TenantId, region: &Region) -> bool {
+    pub fn destroy_tenant_index_dek(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<bool, KmsError> {
         self.kms
             .destroy_kek(&KekId::new(tenant.clone(), region.clone()))
     }
 
-    pub fn destroy_subject_backstop(&self, tenant: &TenantId, subject_id: &str) -> bool {
+    pub fn destroy_subject_backstop(
+        &self,
+        tenant: &TenantId,
+        subject_id: &str,
+    ) -> Result<bool, KmsError> {
         self.kms.destroy_dek(&DekId::new(
             tenant.clone(),
             Self::subject_source_dek_class(subject_id),
@@ -216,11 +224,11 @@ mod tests {
         );
 
         assert!(
-            pin.destroy_tenant_index_dek(&t(), &r()),
+            pin.destroy_tenant_index_dek(&t(), &r()).unwrap(),
             "destroy is callable + a key was present"
         );
         assert!(
-            !pin.destroy_tenant_index_dek(&t(), &r()),
+            !pin.destroy_tenant_index_dek(&t(), &r()).unwrap(),
             "a second destroy reports nothing left"
         );
 
@@ -245,7 +253,7 @@ mod tests {
             .expect("s2");
 
         assert!(
-            pin.destroy_tenant_index_dek(&t(), &r()),
+            pin.destroy_tenant_index_dek(&t(), &r()).unwrap(),
             "tenant KEK destroyed"
         );
 
@@ -269,11 +277,11 @@ mod tests {
             .expect("s2");
 
         assert!(
-            pin.destroy_subject_backstop(&t(), "u-1"),
+            pin.destroy_subject_backstop(&t(), "u-1").unwrap(),
             "subject backstop present to destroy"
         );
         assert!(
-            !pin.destroy_subject_backstop(&t(), "u-1"),
+            !pin.destroy_subject_backstop(&t(), "u-1").unwrap(),
             "a second destroy finds nothing"
         );
 
@@ -301,11 +309,11 @@ mod tests {
         pin.reserve(&dead, &r()).expect("dead");
 
         assert!(
-            pin.destroy_tenant_index_dek(&dead, &r()),
+            pin.destroy_tenant_index_dek(&dead, &r()).unwrap(),
             "offboard the dead tenant"
         );
 
-        let snap = kms.backup_snapshot();
+        let snap = kms.backup_snapshot().unwrap();
         assert!(
             snap.iter().any(|(d, _)| d.tenant == live),
             "live tenant index DEK backed up"

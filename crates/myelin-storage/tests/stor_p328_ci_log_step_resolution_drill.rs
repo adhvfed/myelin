@@ -112,7 +112,8 @@ fn p328_gate_destroyed_tenant_dek_crypto_shreds_the_ci_log_step_live_and_in_back
     );
 
     assert!(
-        eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant)),
+        eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant))
+            .expect("the in-memory key registry remains available"),
         "the tenant DEK was destroyed (the crypto-shred lever)"
     );
 
@@ -124,7 +125,9 @@ fn p328_gate_destroyed_tenant_dek_crypto_shreds_the_ci_log_step_live_and_in_back
         "live: a crypto-shredded CI log step is unrecoverable (LOUD), never served"
     );
 
-    let snapshot = eng.backup_snapshot();
+    let snapshot = eng
+        .backup_snapshot()
+        .expect("the in-memory key registry remains available");
     let in_backup = snapshot
         .iter()
         .any(|(id, _)| *id == DekId::new(tenant(), KeyClass::Tenant));

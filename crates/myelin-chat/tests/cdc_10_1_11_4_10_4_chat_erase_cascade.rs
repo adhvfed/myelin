@@ -107,14 +107,16 @@ fn cdc_11_4_provider_consumer_per_subject_dek_individual_lever() {
     let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
 
     let mut tx = begin(&outbox, &minter);
-    cascade.erase(
-        &mut tx,
-        &EraseScope::Subject {
-            subject: subject("psn:ada"),
-            tenant: gdpr_tenant(),
-        },
-        &[],
-    );
+    cascade
+        .erase(
+            &mut tx,
+            &EraseScope::Subject {
+                subject: subject("psn:ada"),
+                tenant: gdpr_tenant(),
+            },
+            &[],
+        )
+        .unwrap();
     tx.commit().expect("commit");
 
     assert!(
@@ -142,14 +144,16 @@ fn cdc_10_4_provider_consumer_cascade_rides_the_bus_not_a_backdoor() {
     let cache = UnfurlCache::new();
     let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
     let mut tx = begin(&outbox, &minter);
-    let report = cascade.erase(
-        &mut tx,
-        &EraseScope::Subject {
-            subject: subject("psn:ada"),
-            tenant: gdpr_tenant(),
-        },
-        &[(conv(), m1), (conv(), m2)],
-    );
+    let report = cascade
+        .erase(
+            &mut tx,
+            &EraseScope::Subject {
+                subject: subject("psn:ada"),
+                tenant: gdpr_tenant(),
+            },
+            &[(conv(), m1), (conv(), m2)],
+        )
+        .unwrap();
     tx.commit().expect("commit");
 
     let erased = outbox
@@ -185,7 +189,7 @@ fn cdc_10_1_provider_consumer_complete_holder_receipt_set() {
         tenant: gdpr_tenant(),
     };
     let mut tx = begin(&outbox, &minter);
-    let report = cascade.erase(&mut tx, &scope, &[]);
+    let report = cascade.erase(&mut tx, &scope, &[]).unwrap();
     tx.commit().expect("commit");
 
     assert!(
@@ -215,7 +219,10 @@ fn cdc_11_4_10_1_destroyed_epoch_matches_the_excluded_backup_dek() {
     .expect("seal");
     let dek_id = DekId::new(tenant(), KeyClass::Subject("psn:ada".into()));
     assert!(
-        kms.backup_snapshot().iter().any(|(id, _)| id == &dek_id),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &dek_id),
         "the DEK is in the backup before the erase"
     );
 
@@ -227,14 +234,16 @@ fn cdc_11_4_10_1_destroyed_epoch_matches_the_excluded_backup_dek() {
     let cache = UnfurlCache::new();
     let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
     let mut tx = begin(&outbox, &minter);
-    let report = cascade.erase(
-        &mut tx,
-        &EraseScope::Subject {
-            subject: subject("psn:ada"),
-            tenant: gdpr_tenant(),
-        },
-        &[],
-    );
+    let report = cascade
+        .erase(
+            &mut tx,
+            &EraseScope::Subject {
+                subject: subject("psn:ada"),
+                tenant: gdpr_tenant(),
+            },
+            &[],
+        )
+        .unwrap();
     tx.commit().expect("commit");
 
     assert!(
@@ -242,7 +251,10 @@ fn cdc_11_4_10_1_destroyed_epoch_matches_the_excluded_backup_dek() {
         "the receipt records the destroyed epoch"
     );
     assert!(
-        !kms.backup_snapshot().iter().any(|(id, _)| id == &dek_id),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &dek_id),
         "the shredded DEK is excluded from the backup (stays dead across restore)"
     );
 }

@@ -831,7 +831,7 @@ mod tests {
             .unwrap());
 
         assert!(
-            pin.destroy_tenant_index_dek(&tenant(), &region()),
+            pin.destroy_tenant_index_dek(&tenant(), &region()).unwrap(),
             "the index DEK was present"
         );
 
@@ -1050,7 +1050,7 @@ mod tests {
             .probe_recoverable(&tenant(), &region(), &subject(), 5, "z@5", &key_ref)
             .unwrap());
 
-        assert!(pin.destroy_tenant_index_dek(&tenant(), &region()));
+        assert!(pin.destroy_tenant_index_dek(&tenant(), &region()).unwrap());
         let err = cache
             .probe_recoverable(&tenant(), &region(), &subject(), 5, "z@5", &key_ref)
             .expect_err("a destroyed DEK makes the cached result unrecoverable");

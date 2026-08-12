@@ -60,7 +60,10 @@ fn consumer_decrypts_while_key_lives_then_shred_makes_it_unrecoverable() {
     assert_eq!(opened, plaintext, "the body round-trips exactly");
 
     let dek_id = DekId::new(column.key_ref.tenant.clone(), column.key_ref.class.clone());
-    assert!(eng.destroy_dek(&dek_id), "the per-subject DEK is destroyed");
+    assert!(
+        eng.destroy_dek(&dek_id).unwrap(),
+        "the per-subject DEK is destroyed"
+    );
     assert!(
         decrypt_body(&eng, &region(), &column).is_err(),
         "a shredded DEK makes the body unrecoverable (0 recoverable) - never plaintext"
@@ -94,7 +97,7 @@ fn consumer_distinct_authors_get_distinct_deks() {
         "each author has a DISTINCT per-subject DEK"
     );
     let a_dek = DekId::new(a.key_ref.tenant.clone(), a.key_ref.class.clone());
-    assert!(eng.destroy_dek(&a_dek));
+    assert!(eng.destroy_dek(&a_dek).unwrap());
     assert!(decrypt_body(&eng, &region(), &a).is_err(), "A erased");
     assert_eq!(
         decrypt_body(&eng, &region(), &b).expect("B intact"),

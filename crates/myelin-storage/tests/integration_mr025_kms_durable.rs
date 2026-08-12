@@ -212,7 +212,7 @@ async fn backup_snapshot_restore_recovers_data_and_keeps_a_shredded_key_dead() {
         )
         .await
         .expect("crypto-shred the subject DEK");
-    let snapshot = engine1.backup_snapshot_durable(&seal);
+    let snapshot = engine1.backup_snapshot_durable(&seal).unwrap();
     assert!(
         !snapshot
             .deks
@@ -285,10 +285,12 @@ async fn keys_minted_through_the_default_sync_api_survive_engine_reconstruction(
         .seal(b"minted through the default path");
 
     assert!(
-        engine1.destroy_dek(&myelin_storage::DekId::new(
-            tenant.clone(),
-            KeyClass::Subject("u-doomed".into()),
-        )),
+        engine1
+            .destroy_dek(&myelin_storage::DekId::new(
+                tenant.clone(),
+                KeyClass::Subject("u-doomed".into()),
+            ))
+            .unwrap(),
         "the subject DEK was present to destroy"
     );
 
@@ -353,10 +355,12 @@ async fn running_processes_observe_key_creation_and_crypto_shred_without_restart
         b"visible only while the subject key is live"
     );
 
-    assert!(writer.destroy_dek(&myelin_storage::DekId::new(
-        tenant.clone(),
-        KeyClass::Subject("u-live".into()),
-    )));
+    assert!(writer
+        .destroy_dek(&myelin_storage::DekId::new(
+            tenant.clone(),
+            KeyClass::Subject("u-live".into()),
+        ))
+        .unwrap());
     assert!(
         reader.resolve_dek(&key_ref, &region).is_err(),
         "a reader that cached the key still observes the durable crypto-shred without restarting"
@@ -453,10 +457,12 @@ async fn a_stale_process_cannot_rotate_a_shredded_subject_key_back_into_the_data
         .load_or_generate(&seal)
         .await
         .expect("a second process sees the same durable keys");
-    assert!(shredder.destroy_dek(&myelin_storage::DekId::new(
-        tenant.clone(),
-        KeyClass::Subject("u-shredded".into()),
-    )));
+    assert!(shredder
+        .destroy_dek(&myelin_storage::DekId::new(
+            tenant.clone(),
+            KeyClass::Subject("u-shredded".into()),
+        ))
+        .unwrap());
 
     stale
         .rotate_kek(&KekId::new(tenant.clone(), region.clone()))
@@ -474,6 +480,7 @@ async fn a_stale_process_cannot_rotate_a_shredded_subject_key_back_into_the_data
     assert!(
         stale
             .backup_snapshot_durable(&seal)
+            .unwrap()
             .deks
             .iter()
             .all(|(id, ..)| id.class != KeyClass::Subject("u-shredded".into())),
@@ -482,6 +489,7 @@ async fn a_stale_process_cannot_rotate_a_shredded_subject_key_back_into_the_data
     assert!(
         stale
             .backup_snapshot()
+            .unwrap()
             .iter()
             .all(|(id, _)| id.class != KeyClass::Subject("u-shredded".into())),
         "the application backup path also reads durable membership",

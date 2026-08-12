@@ -202,7 +202,9 @@ fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
         "the restore RESURRECTED the subject's free-text DEK (the GD-14 hazard)"
     );
 
-    let reerase = fanout.re_erase_after_restore(&ledger, "2026-06-23T01:00:00Z");
+    let reerase = fanout
+        .re_erase_after_restore(&ledger, "2026-06-23T01:00:00Z")
+        .unwrap();
     println!(
         "ISS-D11 re-erasure: subjects={} resurrected_by_restore={} re_emitted_tombstones={} resurrected={}",
         reerase.re_erased_subjects,

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, OsRng, Payload};
@@ -152,19 +152,19 @@ impl CellRoot {
         }
     }
 
-    fn wrap_kek(&self, kek_plain: &RawKey) -> WrappedKey {
+    fn wrap_kek(&self, kek_plain: &RawKey) -> Result<WrappedKey, KmsError> {
         let nonce = Aes256Gcm::generate_nonce(OsRng);
         let ct = self
             .root
             .cipher()
             .encrypt(&nonce, kek_plain.0.as_slice())
-            .expect("AES-256-GCM wrap KEK under root");
+            .map_err(|_| KmsError::EncryptFailed("wrap KEK under cell root"))?;
         let mut n = [0u8; NONCE_LEN];
         n.copy_from_slice(nonce.as_slice());
-        WrappedKey {
+        Ok(WrappedKey {
             nonce: n,
             wrapped: ct,
-        }
+        })
     }
 
     fn unwrap_kek(&self, w: &WrappedKey) -> Option<RawKey> {
@@ -410,6 +410,7 @@ pub enum KmsError {
     KekUnavailable(KekId),
     DekUnavailable(DekId),
     UnwrapFailed(DekId),
+    EncryptFailed(&'static str),
     StateUnavailable(&'static str),
     Durability(String),
 }
@@ -439,6 +440,12 @@ impl fmt::Display for KmsError {
                 id.tenant.as_str(),
                 id.class.as_token()
             ),
+            KmsError::EncryptFailed(operation) => {
+                write!(
+                    f,
+                    "KMS: authenticated encryption failed while attempting to {operation}"
+                )
+            }
             KmsError::StateUnavailable(state) => {
                 write!(f, "KMS: {state} state is unavailable - refused")
             }
@@ -453,6 +460,7 @@ impl fmt::Display for KmsError {
 
 impl std::error::Error for KmsError {}
 
+#[derive(Clone)]
 struct StoredKek {
     wrapped: WrappedKey,
     epoch: u64,
@@ -474,8 +482,13 @@ pub struct KmsDurableSnapshot {
 
 pub(crate) struct KmsCore {
     root: CellRoot,
-    keks: Mutex<BTreeMap<KekId, StoredKek>>,
-    deks: Mutex<BTreeMap<DekId, (WrappedDek, u64)>>,
+    state: Mutex<KmsState>,
+}
+
+#[derive(Default)]
+struct KmsState {
+    keks: BTreeMap<KekId, StoredKek>,
+    deks: BTreeMap<DekId, (WrappedDek, u64)>,
 }
 
 impl KmsCore {
@@ -487,8 +500,7 @@ impl KmsCore {
     pub fn from_root(root: CellRoot) -> KmsCore {
         KmsCore {
             root,
-            keks: Mutex::new(BTreeMap::new()),
-            deks: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(KmsState::default()),
         }
     }
 
@@ -498,20 +510,25 @@ impl KmsCore {
         nonce: [u8; NONCE_LEN],
         wrapped: Vec<u8>,
         epoch: u64,
-    ) {
-        let mut keks = self.keks.lock().expect("KMS keks poisoned");
-        keks.insert(
+    ) -> Result<(), KmsError> {
+        self.state()?.keks.insert(
             id,
             StoredKek {
                 wrapped: WrappedKey { nonce, wrapped },
                 epoch,
             },
         );
+        Ok(())
     }
 
-    pub fn install_wrapped_dek(&self, id: DekId, dek: WrappedDek, dek_epoch: u64) {
-        let mut deks = self.deks.lock().expect("KMS deks poisoned");
-        deks.insert(id, (dek, dek_epoch));
+    pub fn install_wrapped_dek(
+        &self,
+        id: DekId,
+        dek: WrappedDek,
+        dek_epoch: u64,
+    ) -> Result<(), KmsError> {
+        self.state()?.deks.insert(id, (dek, dek_epoch));
+        Ok(())
     }
 
     pub(crate) fn replace_tenant_key_state(
@@ -519,13 +536,12 @@ impl KmsCore {
         kek_id: &KekId,
         kek: Option<ExportedKek>,
         durable_deks: Vec<(DekId, WrappedDek, u64)>,
-    ) {
-        let mut keks = self.keks.lock().expect("KMS keks poisoned");
-        let mut deks = self.deks.lock().expect("KMS deks poisoned");
-        keks.remove(kek_id);
-        deks.retain(|id, _| id.tenant != kek_id.tenant);
+    ) -> Result<(), KmsError> {
+        let mut state = self.state()?;
+        state.keks.remove(kek_id);
+        state.deks.retain(|id, _| id.tenant != kek_id.tenant);
         if let Some(kek) = kek {
-            keks.insert(
+            state.keks.insert(
                 kek_id.clone(),
                 StoredKek {
                     wrapped: WrappedKey {
@@ -536,11 +552,12 @@ impl KmsCore {
                 },
             );
         }
-        deks.extend(
+        state.deks.extend(
             durable_deks
                 .into_iter()
                 .map(|(id, wrapped, epoch)| (id, (wrapped, epoch))),
         );
+        Ok(())
     }
 
     pub fn export_sealed_root(&self, seal_key: &SealKey) -> SealedRoot {
@@ -551,44 +568,48 @@ impl KmsCore {
         self.root.blind_index(context, value)
     }
 
-    pub fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {
-        let keks = self.keks.lock().expect("KMS keks poisoned");
-        keks.get(id).map(|sk| ExportedKek {
+    pub fn export_kek(&self, id: &KekId) -> Result<Option<ExportedKek>, KmsError> {
+        Ok(self.state()?.keks.get(id).map(|sk| ExportedKek {
             nonce: sk.wrapped.nonce,
             wrapped: sk.wrapped.wrapped.clone(),
             epoch: sk.epoch,
-        })
+        }))
     }
 
-    pub fn export_dek(&self, id: &DekId) -> Option<(WrappedDek, u64)> {
-        let deks = self.deks.lock().expect("KMS deks poisoned");
-        deks.get(id).map(|(w, e)| (w.clone(), *e))
+    pub fn export_dek(&self, id: &DekId) -> Result<Option<(WrappedDek, u64)>, KmsError> {
+        Ok(self.state()?.deks.get(id).map(|(w, e)| (w.clone(), *e)))
     }
 
-    pub fn export_deks(&self) -> Vec<(DekId, WrappedDek, u64)> {
-        let deks = self.deks.lock().expect("KMS deks poisoned");
-        deks.iter()
+    pub fn export_deks(&self) -> Result<Vec<(DekId, WrappedDek, u64)>, KmsError> {
+        Ok(self
+            .state()?
+            .deks
+            .iter()
             .map(|(id, (w, e))| (id.clone(), w.clone(), *e))
-            .collect()
+            .collect())
     }
 
-    pub fn ensure_kek(&self, id: &KekId) -> u64 {
-        self.ensure_kek_tracked(id).0
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ensure_kek(&self, id: &KekId) -> Result<u64, KmsError> {
+        self.ensure_kek_tracked(id).map(|(epoch, _)| epoch)
     }
 
-    pub fn ensure_kek_tracked(&self, id: &KekId) -> (u64, bool) {
-        let mut keks = self.keks.lock().expect("KMS keks poisoned");
-        if let Some(existing) = keks.get(id) {
-            return (existing.epoch, false);
+    pub fn ensure_kek_tracked(&self, id: &KekId) -> Result<(u64, bool), KmsError> {
+        let mut state = self.state()?;
+        if let Some(existing) = state.keks.get(id) {
+            return Ok((existing.epoch, false));
         }
-        let wrapped = self.root.wrap_kek(&RawKey::generate());
-        keks.insert(id.clone(), StoredKek { wrapped, epoch: 0 });
-        (0, true)
+        let wrapped = self.root.wrap_kek(&RawKey::generate())?;
+        state
+            .keks
+            .insert(id.clone(), StoredKek { wrapped, epoch: 0 });
+        Ok((0, true))
     }
 
     fn open_kek(&self, id: &KekId) -> Result<RawKey, KmsError> {
-        let keks = self.keks.lock().expect("KMS keks poisoned");
-        let kek = keks
+        let state = self.state()?;
+        let kek = state
+            .keks
             .get(id)
             .ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
         self.root
@@ -615,55 +636,35 @@ impl KmsCore {
     ) -> Result<(PiiKeyRef, bool), KmsError> {
         let kek_id = KekId::new(tenant.clone(), region.clone());
         let dek_id = DekId::new(tenant.clone(), class.clone());
-        {
-            let deks = self.deks.lock().expect("KMS deks poisoned");
-            if let Some((_, dek_epoch)) = deks.get(&dek_id) {
-                return Ok((PiiKeyRef::new(tenant.clone(), *dek_epoch, class), false));
-            }
-        }
-        let dek_plain = RawKey::generate();
-        let wrapped = self.wrap_dek(&kek_id, &dek_plain)?;
-        let mut deks = self.deks.lock().expect("KMS deks poisoned");
-        if let Some((_, dek_epoch)) = deks.get(&dek_id) {
+        let mut state = self.state()?;
+        if let Some((_, dek_epoch)) = state.deks.get(&dek_id) {
             return Ok((PiiKeyRef::new(tenant.clone(), *dek_epoch, class), false));
         }
+        let stored_kek = state
+            .keks
+            .get(&kek_id)
+            .ok_or_else(|| KmsError::KekUnavailable(kek_id.clone()))?;
+        let kek = self
+            .root
+            .unwrap_kek(&stored_kek.wrapped)
+            .ok_or(KmsError::KekUnavailable(kek_id))?;
+        let wrapped = wrap_dek(&kek, stored_kek.epoch, &RawKey::generate())?;
         let dek_epoch = 0u64;
-        deks.insert(dek_id, (wrapped, dek_epoch));
+        state.deks.insert(dek_id, (wrapped, dek_epoch));
         Ok((PiiKeyRef::new(tenant.clone(), dek_epoch, class), true))
-    }
-
-    fn wrap_dek(&self, kek_id: &KekId, dek_plain: &RawKey) -> Result<WrappedDek, KmsError> {
-        let kek = self.open_kek(kek_id)?;
-        let kek_epoch = {
-            let keks = self.keks.lock().expect("KMS keks poisoned");
-            keks.get(kek_id)
-                .map(|k| k.epoch)
-                .ok_or_else(|| KmsError::KekUnavailable(kek_id.clone()))?
-        };
-        let nonce = Aes256Gcm::generate_nonce(OsRng);
-        let wrapped = kek
-            .cipher()
-            .encrypt(&nonce, dek_plain.0.as_slice())
-            .expect("AES-256-GCM wrap");
-        let mut n = [0u8; NONCE_LEN];
-        n.copy_from_slice(nonce.as_slice());
-        Ok(WrappedDek {
-            nonce: n,
-            wrapped,
-            kek_epoch,
-        })
     }
 
     pub fn resolve_dek(&self, key_ref: &PiiKeyRef, region: &Region) -> Result<DekHandle, KmsError> {
         let kek_id = KekId::new(key_ref.tenant.clone(), region.clone());
         let dek_id = DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
 
-        let deks = self.deks.lock().expect("KMS deks poisoned");
-        let (wrapped, _epoch) = deks
+        let state = self.state()?;
+        let (wrapped, _epoch) = state
+            .deks
             .get(&dek_id)
             .ok_or_else(|| KmsError::DekUnavailable(dek_id.clone()))?;
         let wrapped = wrapped.clone();
-        drop(deks);
+        drop(state);
 
         let kek = self.open_kek(&kek_id)?;
         let plain = Zeroizing::new(
@@ -683,67 +684,75 @@ impl KmsCore {
     }
 
     pub fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {
-        let dek_ids: Vec<DekId> = {
-            let deks = self.deks.lock().expect("KMS deks poisoned");
-            deks.keys()
-                .filter(|d| d.tenant == id.tenant)
-                .cloned()
-                .collect()
-        };
-        let mut plains: Vec<(DekId, RawKey)> = Vec::with_capacity(dek_ids.len());
-        for dek_id in &dek_ids {
-            let key_ref = PiiKeyRef::new(id.tenant.clone(), 0, dek_id.class.clone());
-            let handle = self.resolve_dek(&key_ref, &id.region)?;
-            plains.push((dek_id.clone(), handle.key));
+        let mut state = self.state()?;
+        let current = state
+            .keks
+            .get(id)
+            .cloned()
+            .ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
+        let old_kek = self
+            .root
+            .unwrap_kek(&current.wrapped)
+            .ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
+        let new_epoch = current
+            .epoch
+            .checked_add(1)
+            .ok_or(KmsError::EncryptFailed("advance exhausted KEK epoch"))?;
+        let new_kek = RawKey::generate();
+        let new_wrapped_kek = self.root.wrap_kek(&new_kek)?;
+        let mut replacements = Vec::new();
+        for (dek_id, (wrapped, dek_epoch)) in state
+            .deks
+            .iter()
+            .filter(|(dek_id, _)| dek_id.tenant == id.tenant)
+        {
+            let plain = unwrap_dek(&old_kek, dek_id, wrapped)?;
+            let next_dek_epoch = dek_epoch
+                .checked_add(1)
+                .ok_or(KmsError::EncryptFailed("advance exhausted DEK epoch"))?;
+            let replacement = wrap_dek(&new_kek, new_epoch, &plain)?;
+            replacements.push((dek_id.clone(), replacement, next_dek_epoch));
         }
-
-        let new_wrapped = self.root.wrap_kek(&RawKey::generate());
-        let new_epoch = {
-            let mut keks = self.keks.lock().expect("KMS keks poisoned");
-            let kek = keks
-                .get_mut(id)
-                .ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
-            kek.wrapped = new_wrapped;
-            kek.epoch += 1;
-            kek.epoch
-        };
-
-        for (dek_id, plain) in plains {
-            let wrapped = self.wrap_dek(id, &plain)?;
-            let mut deks = self.deks.lock().expect("KMS deks poisoned");
-            if let Some((slot, dek_epoch)) = deks.get_mut(&dek_id) {
-                *slot = wrapped;
-                *dek_epoch += 1;
-            }
+        for (dek_id, wrapped, dek_epoch) in replacements {
+            state.deks.insert(dek_id, (wrapped, dek_epoch));
         }
+        state.keks.insert(
+            id.clone(),
+            StoredKek {
+                wrapped: new_wrapped_kek,
+                epoch: new_epoch,
+            },
+        );
         Ok(new_epoch)
     }
 
-    pub fn destroy_kek(&self, id: &KekId) -> bool {
-        let mut keks = self.keks.lock().expect("KMS keks poisoned");
-        keks.remove(id).is_some()
+    pub fn destroy_kek(&self, id: &KekId) -> Result<bool, KmsError> {
+        Ok(self.state()?.keks.remove(id).is_some())
     }
 
-    pub fn destroy_dek(&self, id: &DekId) -> bool {
-        let mut deks = self.deks.lock().expect("KMS deks poisoned");
-        deks.remove(id).is_some()
+    pub fn destroy_dek(&self, id: &DekId) -> Result<bool, KmsError> {
+        Ok(self.state()?.deks.remove(id).is_some())
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn backup_snapshot(&self) -> Vec<(DekId, WrappedDek)> {
-        let keks = self.keks.lock().expect("KMS keks poisoned");
-        let deks = self.deks.lock().expect("KMS deks poisoned");
-        deks.iter()
-            .filter(|(dek_id, _)| keks.keys().any(|k| k.tenant == dek_id.tenant))
+    pub fn backup_snapshot(&self) -> Result<Vec<(DekId, WrappedDek)>, KmsError> {
+        let state = self.state()?;
+        Ok(state
+            .deks
+            .iter()
+            .filter(|(dek_id, _)| state.keks.keys().any(|k| k.tenant == dek_id.tenant))
             .map(|(dek_id, (wrapped, _epoch))| (dek_id.clone(), wrapped.clone()))
-            .collect()
+            .collect())
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn backup_snapshot_durable(&self, seal_key: &SealKey) -> KmsDurableSnapshot {
-        let keks = self.keks.lock().expect("KMS keks poisoned");
-        let deks = self.deks.lock().expect("KMS deks poisoned");
-        let kek_list: Vec<(KekId, ExportedKek)> = keks
+    pub fn backup_snapshot_durable(
+        &self,
+        seal_key: &SealKey,
+    ) -> Result<KmsDurableSnapshot, KmsError> {
+        let state = self.state()?;
+        let kek_list: Vec<(KekId, ExportedKek)> = state
+            .keks
             .iter()
             .map(|(id, sk)| {
                 (
@@ -756,16 +765,17 @@ impl KmsCore {
                 )
             })
             .collect();
-        let dek_list: Vec<(DekId, WrappedDek, u64)> = deks
+        let dek_list: Vec<(DekId, WrappedDek, u64)> = state
+            .deks
             .iter()
-            .filter(|(dek_id, _)| keks.keys().any(|k| k.tenant == dek_id.tenant))
+            .filter(|(dek_id, _)| state.keks.keys().any(|k| k.tenant == dek_id.tenant))
             .map(|(dek_id, (wrapped, epoch))| (dek_id.clone(), wrapped.clone(), *epoch))
             .collect();
-        KmsDurableSnapshot {
+        Ok(KmsDurableSnapshot {
             sealed_root: self.root.seal(seal_key),
             keks: kek_list,
             deks: dek_list,
-        }
+        })
     }
 
     pub fn wrap_dek_material(
@@ -775,14 +785,27 @@ impl KmsCore {
         material: &[u8; KEY_LEN],
     ) -> Result<WrappedDek, KmsError> {
         let kek_id = KekId::new(tenant.clone(), region.clone());
-        self.ensure_kek(&kek_id);
-        self.wrap_dek(&kek_id, &RawKey(*material))
+        let mut state = self.state()?;
+        if !state.keks.contains_key(&kek_id) {
+            let wrapped = self.root.wrap_kek(&RawKey::generate())?;
+            state
+                .keks
+                .insert(kek_id.clone(), StoredKek { wrapped, epoch: 0 });
+        }
+        let stored_kek = state
+            .keks
+            .get(&kek_id)
+            .ok_or_else(|| KmsError::KekUnavailable(kek_id.clone()))?;
+        let kek = self
+            .root
+            .unwrap_kek(&stored_kek.wrapped)
+            .ok_or(KmsError::KekUnavailable(kek_id))?;
+        wrap_dek(&kek, stored_kek.epoch, &RawKey(*material))
     }
 
-    pub fn counts(&self) -> (usize, usize) {
-        let keks = self.keks.lock().map(|k| k.len()).unwrap_or(0);
-        let deks = self.deks.lock().map(|d| d.len()).unwrap_or(0);
-        (keks, deks)
+    pub fn counts(&self) -> Result<(usize, usize), KmsError> {
+        let state = self.state()?;
+        Ok((state.keks.len(), state.deks.len()))
     }
 
     pub fn unwrap_dek_material(
@@ -810,6 +833,44 @@ impl KmsCore {
         bytes.copy_from_slice(plain.as_slice());
         Ok(DekHandle { key: RawKey(bytes) })
     }
+
+    fn state(&self) -> Result<MutexGuard<'_, KmsState>, KmsError> {
+        self.state
+            .lock()
+            .map_err(|_| KmsError::StateUnavailable("key registry"))
+    }
+}
+
+fn unwrap_dek(kek: &RawKey, id: &DekId, wrapped: &WrappedDek) -> Result<RawKey, KmsError> {
+    let plain = Zeroizing::new(
+        kek.cipher()
+            .decrypt(
+                Nonce::from_slice(&wrapped.nonce),
+                wrapped.wrapped.as_slice(),
+            )
+            .map_err(|_| KmsError::UnwrapFailed(id.clone()))?,
+    );
+    if plain.len() != KEY_LEN {
+        return Err(KmsError::UnwrapFailed(id.clone()));
+    }
+    let mut bytes = [0u8; KEY_LEN];
+    bytes.copy_from_slice(plain.as_slice());
+    Ok(RawKey(bytes))
+}
+
+fn wrap_dek(kek: &RawKey, kek_epoch: u64, plain: &RawKey) -> Result<WrappedDek, KmsError> {
+    let nonce = Aes256Gcm::generate_nonce(OsRng);
+    let wrapped = kek
+        .cipher()
+        .encrypt(&nonce, plain.0.as_slice())
+        .map_err(|_| KmsError::EncryptFailed("wrap DEK under rotated tenant KEK"))?;
+    let mut n = [0u8; NONCE_LEN];
+    n.copy_from_slice(nonce.as_slice());
+    Ok(WrappedDek {
+        nonce: n,
+        wrapped,
+        kek_epoch,
+    })
 }
 
 enum KmsBackend {
@@ -864,12 +925,17 @@ impl KmsEngine {
         nonce: [u8; NONCE_LEN],
         wrapped: Vec<u8>,
         epoch: u64,
-    ) {
-        self.core().install_wrapped_kek(id, nonce, wrapped, epoch);
+    ) -> Result<(), KmsError> {
+        self.core().install_wrapped_kek(id, nonce, wrapped, epoch)
     }
 
-    pub fn install_wrapped_dek(&self, id: DekId, dek: WrappedDek, dek_epoch: u64) {
-        self.core().install_wrapped_dek(id, dek, dek_epoch);
+    pub fn install_wrapped_dek(
+        &self,
+        id: DekId,
+        dek: WrappedDek,
+        dek_epoch: u64,
+    ) -> Result<(), KmsError> {
+        self.core().install_wrapped_dek(id, dek, dek_epoch)
     }
 
     pub fn export_sealed_root(&self, seal_key: &SealKey) -> SealedRoot {
@@ -880,7 +946,7 @@ impl KmsEngine {
         self.core().blind_index(context, value)
     }
 
-    pub fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {
+    pub fn export_kek(&self, id: &KekId) -> Result<Option<ExportedKek>, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             KmsBackend::Memory(core) => core.export_kek(id),
@@ -888,7 +954,7 @@ impl KmsEngine {
         }
     }
 
-    pub fn export_dek(&self, id: &DekId) -> Option<(WrappedDek, u64)> {
+    pub fn export_dek(&self, id: &DekId) -> Result<Option<(WrappedDek, u64)>, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             KmsBackend::Memory(core) => core.export_dek(id),
@@ -896,7 +962,7 @@ impl KmsEngine {
         }
     }
 
-    pub fn export_deks(&self) -> Vec<(DekId, WrappedDek, u64)> {
+    pub fn export_deks(&self) -> Result<Vec<(DekId, WrappedDek, u64)>, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             KmsBackend::Memory(core) => core.export_deks(),
@@ -907,7 +973,7 @@ impl KmsEngine {
     pub fn ensure_kek(&self, id: &KekId) -> Result<u64, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => Ok(core.ensure_kek(id)),
+            KmsBackend::Memory(core) => core.ensure_kek(id),
             KmsBackend::Durable(d) => d.ensure_kek(id),
         }
     }
@@ -941,45 +1007,31 @@ impl KmsEngine {
         }
     }
 
-    pub fn destroy_kek(&self, id: &KekId) -> bool {
-        self.try_destroy_kek(id).unwrap_or_else(|error| {
-            panic!(
-                "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of KEK tenant={} \
-                 region={} was refused: {error}",
-                id.tenant.as_str(),
-                id.region.as_str()
-            )
-        })
-    }
-
-    pub fn try_destroy_kek(&self, id: &KekId) -> Result<bool, KmsError> {
+    pub fn destroy_kek(&self, id: &KekId) -> Result<bool, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => Ok(core.destroy_kek(id)),
+            KmsBackend::Memory(core) => core.destroy_kek(id),
             KmsBackend::Durable(d) => d.try_destroy_kek(id),
         }
     }
 
-    pub fn destroy_dek(&self, id: &DekId) -> bool {
-        self.try_destroy_dek(id).unwrap_or_else(|error| {
-            panic!(
-                "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of DEK tenant={} \
-                 class={} was refused: {error}",
-                id.tenant.as_str(),
-                id.class.as_token()
-            )
-        })
+    pub fn try_destroy_kek(&self, id: &KekId) -> Result<bool, KmsError> {
+        self.destroy_kek(id)
     }
 
-    pub fn try_destroy_dek(&self, id: &DekId) -> Result<bool, KmsError> {
+    pub fn destroy_dek(&self, id: &DekId) -> Result<bool, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => Ok(core.destroy_dek(id)),
+            KmsBackend::Memory(core) => core.destroy_dek(id),
             KmsBackend::Durable(d) => d.try_destroy_dek(id),
         }
     }
 
-    pub fn backup_snapshot(&self) -> Vec<(DekId, WrappedDek)> {
+    pub fn try_destroy_dek(&self, id: &DekId) -> Result<bool, KmsError> {
+        self.destroy_dek(id)
+    }
+
+    pub fn backup_snapshot(&self) -> Result<Vec<(DekId, WrappedDek)>, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             KmsBackend::Memory(core) => core.backup_snapshot(),
@@ -987,7 +1039,10 @@ impl KmsEngine {
         }
     }
 
-    pub fn backup_snapshot_durable(&self, _seal_key: &SealKey) -> KmsDurableSnapshot {
+    pub fn backup_snapshot_durable(
+        &self,
+        _seal_key: &SealKey,
+    ) -> Result<KmsDurableSnapshot, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             KmsBackend::Memory(core) => core.backup_snapshot_durable(_seal_key),
@@ -1020,11 +1075,16 @@ impl KmsEngine {
 
 impl fmt::Debug for KmsEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (keks, deks) = self.core().counts();
-        f.debug_struct("KmsEngine")
-            .field("keks", &keks)
-            .field("deks", &deks)
-            .finish_non_exhaustive()
+        let mut debug = f.debug_struct("KmsEngine");
+        match self.core().counts() {
+            Ok((keks, deks)) => {
+                debug.field("keks", &keks).field("deks", &deks);
+            }
+            Err(_) => {
+                debug.field("state", &"unavailable");
+            }
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -1174,7 +1234,10 @@ mod tests {
         assert!(kms.resolve_dek(&tk, &region).is_ok());
         assert!(kms.resolve_dek(&sk, &region).is_ok());
 
-        assert!(kms.destroy_kek(&kek_id), "a KEK was present to destroy");
+        assert!(
+            kms.destroy_kek(&kek_id).unwrap(),
+            "a KEK was present to destroy"
+        );
 
         assert_eq!(
             kms.resolve_dek(&tk, &region).expect_err("the KEK is gone"),
@@ -1203,7 +1266,10 @@ mod tests {
             .expect("s2");
 
         let s1_id = DekId::new(tenant.clone(), KeyClass::Subject("u-1".into()));
-        assert!(kms.destroy_dek(&s1_id), "subject DEK present to destroy");
+        assert!(
+            kms.destroy_dek(&s1_id).unwrap(),
+            "subject DEK present to destroy"
+        );
 
         assert_eq!(
             kms.resolve_dek(&s1, &region)
@@ -1250,6 +1316,77 @@ mod tests {
     }
 
     #[test]
+    fn failed_rotation_leaves_the_entire_key_hierarchy_unchanged() {
+        let kms = KmsEngine::new();
+        let (tenant, region) = (t("acme"), r("eu-west"));
+        let kek_id = KekId::new(tenant.clone(), region.clone());
+        kms.ensure_kek(&kek_id).unwrap();
+        for class in [
+            KeyClass::Tenant,
+            KeyClass::Subject("u-1".into()),
+            KeyClass::Blob,
+        ] {
+            kms.ensure_dek(&tenant, &region, class).unwrap();
+        }
+
+        let corrupt_id = DekId::new(tenant.clone(), KeyClass::Blob);
+        {
+            let mut state = kms.core().state.lock().unwrap();
+            state
+                .deks
+                .get_mut(&corrupt_id)
+                .expect("the blob DEK exists")
+                .0
+                .wrapped[0] ^= 0xff;
+        }
+        let kek_before = kms.export_kek(&kek_id).unwrap();
+        let deks_before = kms.export_deks().unwrap();
+
+        assert_eq!(
+            kms.rotate_kek(&kek_id),
+            Err(KmsError::UnwrapFailed(corrupt_id)),
+            "a single unauthentic DEK rejects the whole rotation"
+        );
+        assert_eq!(
+            kms.export_kek(&kek_id).unwrap(),
+            kek_before,
+            "the KEK epoch and envelope do not advance on a failed rotation"
+        );
+        assert_eq!(
+            kms.export_deks().unwrap(),
+            deks_before,
+            "successfully prepared re-wraps are not partially committed"
+        );
+    }
+
+    #[test]
+    fn poisoned_key_registry_fails_every_operation_closed() {
+        let kms = KmsEngine::new();
+        let tenant = t("acme");
+        let region = r("eu-west");
+        let kek_id = KekId::new(tenant.clone(), region.clone());
+        kms.ensure_kek(&kek_id).unwrap();
+        let key_ref = kms.ensure_dek(&tenant, &region, KeyClass::Tenant).unwrap();
+        let dek_id = DekId::new(tenant, KeyClass::Tenant);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = kms.core().state.lock().unwrap();
+            panic!("poison the unified key registry");
+        }));
+        assert!(poisoned.is_err());
+
+        let unavailable = KmsError::StateUnavailable("key registry");
+        assert_eq!(kms.export_kek(&kek_id), Err(unavailable.clone()));
+        assert_eq!(kms.export_deks(), Err(unavailable.clone()));
+        assert!(matches!(
+            kms.resolve_dek(&key_ref, &region),
+            Err(error) if error == unavailable
+        ));
+        assert_eq!(kms.destroy_dek(&dek_id), Err(unavailable.clone()));
+        assert_eq!(kms.backup_snapshot(), Err(unavailable));
+    }
+
+    #[test]
     fn resolve_with_no_kek_fails_loudly_never_plaintext() {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
@@ -1284,9 +1421,11 @@ mod tests {
         kms.ensure_dek(&dead, &region, KeyClass::Tenant)
             .expect("dead dek");
 
-        assert!(kms.destroy_kek(&KekId::new(dead.clone(), region.clone())));
+        assert!(kms
+            .destroy_kek(&KekId::new(dead.clone(), region.clone()))
+            .unwrap());
 
-        let snap = kms.backup_snapshot();
+        let snap = kms.backup_snapshot().unwrap();
         assert!(
             snap.iter().any(|(d, _)| d.tenant == live),
             "live tenant DEK is backed up"
@@ -1381,7 +1520,7 @@ mod tests {
     fn a_kek_wrapped_under_the_root_survives_a_seal_unseal_cycle() {
         let root = CellRoot::generate();
         let kek_plain = RawKey::generate();
-        let wrapped = root.wrap_kek(&kek_plain);
+        let wrapped = root.wrap_kek(&kek_plain).unwrap();
         let seal = SealKey::from_bytes([9u8; KEY_LEN]);
         let recovered = CellRoot::unseal(&seal, &root.seal(&seal)).expect("unseal");
         let unwrapped = recovered
@@ -1449,9 +1588,11 @@ mod tests {
             .expect("dead dek");
         let (nonce, ct) = kms.resolve_dek(&kr, &region).expect("resolve").seal(b"col");
 
-        assert!(kms.destroy_kek(&KekId::new(dead.clone(), region.clone())));
+        assert!(kms
+            .destroy_kek(&KekId::new(dead.clone(), region.clone()))
+            .unwrap());
         let seal = SealKey::from_bytes([4u8; KEY_LEN]);
-        let snap = kms.backup_snapshot_durable(&seal);
+        let snap = kms.backup_snapshot_durable(&seal).unwrap();
 
         assert!(snap.keks.iter().any(|(id, _)| id.tenant == live));
         assert!(
@@ -1468,10 +1609,12 @@ mod tests {
             CellRoot::unseal(&seal, &snap.sealed_root).expect("unseal the snapshot root"),
         );
         for (id, k) in snap.keks {
-            engine2.install_wrapped_kek(id, k.nonce, k.wrapped, k.epoch);
+            engine2
+                .install_wrapped_kek(id, k.nonce, k.wrapped, k.epoch)
+                .unwrap();
         }
         for (id, w, e) in snap.deks {
-            engine2.install_wrapped_dek(id, w, e);
+            engine2.install_wrapped_dek(id, w, e).unwrap();
         }
         let pt = engine2
             .resolve_dek(&kr, &region)

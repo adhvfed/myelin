@@ -1,7 +1,7 @@
 use myelin_tenancy::{CellId, CrossCellPointer, Region, TenantId};
 
 use crate::backup::{ContinuousArchiver, WalOffset};
-use crate::kms::{KekId, KmsEngine};
+use crate::kms::{KekId, KmsEngine, KmsError};
 use crate::restore::{restore_to_offset, BlobPresence, RestoreError, SourceLog, WalRow};
 
 pub struct CellTenantTiers {
@@ -24,6 +24,7 @@ pub struct CellMigrationRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CellMigrationError {
     TargetRestoreNotWhole(RestoreError),
+    SourceKeyShred(KmsError),
 }
 
 impl core::fmt::Display for CellMigrationError {
@@ -33,7 +34,11 @@ impl core::fmt::Display for CellMigrationError {
                 f,
                 "cell→cell migration ABORTED: the target restore-into (reindex-from-source to the \
                  §7.3 consistency point) is NOT whole - the move is aborted BEFORE any source \
-                 crypto-shred (0 loss: the source is untouched, the tenant keeps serving). Detail: {e}"
+                crypto-shred (0 loss: the source is untouched, the tenant keeps serving). Detail: {e}"
+            ),
+            CellMigrationError::SourceKeyShred(error) => write!(
+                f,
+                "cell→cell migration copied the target but could not shred the source key: {error}"
             ),
         }
     }
@@ -85,7 +90,8 @@ pub fn migrate_cell_to_cell(
 
     let source_key_destroyed = source
         .kms
-        .destroy_kek(&KekId::new(tenant.clone(), region.clone()));
+        .destroy_kek(&KekId::new(tenant.clone(), region.clone()))
+        .map_err(CellMigrationError::SourceKeyShred)?;
 
     Ok(CellMigrationReceipt {
         tenant: tenant.clone(),

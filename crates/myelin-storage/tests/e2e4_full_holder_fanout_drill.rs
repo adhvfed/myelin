@@ -280,7 +280,10 @@ fn e2e4_post_restore_reerase_across_full_holder_set_is_green() {
     let kms = engine_seeded_across_holders(&tenant, &subject);
     let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
     assert!(
-        kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the restore resurrected the subject DEK (it was live at the backup PIT)"
     );
 
@@ -322,7 +325,10 @@ fn e2e4_post_restore_reerase_across_full_holder_set_is_green() {
     assert_eq!(rep.resurrected_count, 0);
     assert!(rep.re_erased_subject(&subject, &tenant));
     assert!(
-        !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the resurrected DEK is re-destroyed across the holder set"
     );
 

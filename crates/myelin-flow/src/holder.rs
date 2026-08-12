@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use myelin_gdpr::{
-    EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
-    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId as GdprTenantId,
+    DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
+    Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
+    TenantId as GdprTenantId,
 };
 use myelin_storage::kms::KmsEngine;
 use myelin_substrate::{
@@ -297,7 +298,9 @@ impl PersonalDataHolder for WfHistoryHolder {
                     EraseScope::Tenant(_) => 0,
                 };
                 let cascade = WfCryptoShred::with_telemetry(&w.kms, w.region.clone(), &w.telemetry);
-                let report = cascade.shred_subject(&scope, inline_pii_rows, 0, 0);
+                let report = cascade
+                    .shred_subject(&scope, inline_pii_rows, 0, 0)
+                    .map_err(|error| DsrError(format!("Flow crypto-shred failed: {error}")))?;
                 return Ok(crate::crypto_shred::aggregate_receipt(&report, &scope));
             }
         }

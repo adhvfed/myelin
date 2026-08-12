@@ -87,7 +87,7 @@ async fn r2_cache_fill_read_bust_and_crypto_shred_on_real_valkey() {
         "decrypts while the DEK lives"
     );
     assert!(
-        dek.destroy_tenant_dek(&t, &region()),
+        dek.destroy_tenant_dek(&t, &region()).unwrap(),
         "tenant offboard: the per-tenant DEK is shredded"
     );
     let after_shred =

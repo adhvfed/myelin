@@ -90,7 +90,10 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
     let kms = restored_copy_with_resurrected_subject(&t, &subject);
     let subject_dek = DekId::new(t.clone(), KeyClass::Subject(subject.0.clone()));
     assert!(
-        kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "precondition: the restore of the older backup RESURRECTED the subject's DEK"
     );
 
@@ -145,7 +148,10 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
         "the subject WAS resurrected by the restore and re-killed by the pass"
     );
     assert!(
-        !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the resurrected DEK is re-destroyed - still erased after restore"
     );
 
@@ -166,7 +172,11 @@ fn stor_d3_without_reerase_the_restore_resurrects() {
     let kms = restored_copy_with_resurrected_subject(&t, &subject);
     let subject_dek = DekId::new(t.clone(), KeyClass::Subject(subject.0.clone()));
 
-    let resurrected = kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek);
+    let resurrected = kms
+        .backup_snapshot()
+        .unwrap()
+        .iter()
+        .any(|(d, _)| *d == subject_dek);
     assert!(
         resurrected,
         "WITHOUT the §7.5 re-erasure pass, the restore RESURRECTS the post-T-erased subject's DEK"

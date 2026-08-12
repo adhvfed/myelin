@@ -38,8 +38,9 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
     slot.pseudonyms()
         .put_mapping(&s, &bob, handle("anon-b", "acme"))
         .unwrap();
-    slot.erase_in(&s, &alice, at("2026-06-19T10:00:00Z"));
-    slot.erase_in(&s, &bob, at("2026-06-19T10:00:01Z"));
+    slot.erase_in(&s, &alice, at("2026-06-19T10:00:00Z"))
+        .unwrap();
+    slot.erase_in(&s, &bob, at("2026-06-19T10:00:01Z")).unwrap();
 
     assert!(slot.pseudonyms().resolve_subject(&s, &alice).is_none());
     assert!(slot.pseudonyms().resolve_subject(&s, &bob).is_none());
@@ -132,7 +133,8 @@ fn id_d8_without_re_erasure_a_restore_resurrects_the_subject() {
     slot.pseudonyms()
         .put_mapping(&s, &alice, handle("anon-a", "acme"))
         .unwrap();
-    slot.erase_in(&s, &alice, at("2026-06-19T10:00:00Z"));
+    slot.erase_in(&s, &alice, at("2026-06-19T10:00:00Z"))
+        .unwrap();
     slot.pseudonyms()
         .put_mapping(&s, &alice, handle("anon-a", "acme"))
         .unwrap();

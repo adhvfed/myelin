@@ -62,7 +62,7 @@ fn erase_destroys_the_dek_and_shreds_the_row_and_records_the_ledger() {
         .put_mapping(&s, &subject, handle("anon-7f3a", "acme"))
         .unwrap();
 
-    let receipt = slot.erase_in(&s, &subject, now());
+    let receipt = slot.erase_in(&s, &subject, now()).unwrap();
     assert!(
         receipt.dek_destroyed,
         "the per-subject DEK was destroyed (crypto-shred)"
@@ -95,10 +95,10 @@ fn erased_subject_real_identity_unrecoverable_but_opaque_id_still_attributes() {
     slot.pseudonyms()
         .put_mapping(&s, &subject, handle("anon-7f3a", "acme"))
         .unwrap();
-    slot.erase_in(&s, &subject, now());
+    slot.erase_in(&s, &subject, now()).unwrap();
 
     assert!(slot.pseudonyms().resolve_subject(&s, &subject).is_none());
-    let receipt = slot.erase_in(&s, &subject, now());
+    let receipt = slot.erase_in(&s, &subject, now()).unwrap();
     assert_eq!(
         receipt.subject, subject,
         "the opaque principal_id survives erasure (it still attributes events)"
@@ -113,7 +113,7 @@ fn resolve_pseudonym_fails_closed_for_an_erased_subject() {
     slot.pseudonyms()
         .put_mapping(&s, &subject, handle("anon-7f3a", "acme"))
         .unwrap();
-    slot.erase_in(&s, &subject, now());
+    slot.erase_in(&s, &subject, now()).unwrap();
 
     let r = slot.resolve_pseudonym_in(&s, &subject);
     assert!(
@@ -144,7 +144,7 @@ fn erase_disables_the_principal_so_no_grants_survive() {
         !slot.revocations().is_revoked(&s, &target, &now()),
         "the principal is not disabled before erase"
     );
-    slot.erase_in(&s, &subject, now());
+    slot.erase_in(&s, &subject, now()).unwrap();
     assert!(
         slot.revocations().is_revoked(&s, &target, &now()),
         "the erased principal is disabled (no resurrected grants past the erasure)"
@@ -161,16 +161,16 @@ fn crypto_shred_is_unrecoverable_in_backups() {
         .unwrap();
     let dek_class = KeyClass::Subject("p:alice".into());
 
-    let pre = slot.kms().backup_snapshot();
+    let pre = slot.kms().backup_snapshot().unwrap();
     assert!(
         pre.iter()
             .any(|(id, _)| id.class == dek_class && id.tenant == *s.tenant()),
         "the subject's DEK is in the backup BEFORE erase"
     );
 
-    slot.erase_in(&s, &subject, now());
+    slot.erase_in(&s, &subject, now()).unwrap();
 
-    let post = slot.kms().backup_snapshot();
+    let post = slot.kms().backup_snapshot().unwrap();
     assert!(
         !post
             .iter()
@@ -187,10 +187,10 @@ fn re_erase_of_an_already_shredded_subject_is_a_noop_but_recorded() {
     slot.pseudonyms()
         .put_mapping(&s, &subject, handle("anon-7f3a", "acme"))
         .unwrap();
-    let first = slot.erase_in(&s, &subject, now());
+    let first = slot.erase_in(&s, &subject, now()).unwrap();
     assert!(first.dek_destroyed && first.row_shredded);
 
-    let second = slot.erase_in(&s, &subject, now());
+    let second = slot.erase_in(&s, &subject, now()).unwrap();
     assert!(
         !second.dek_destroyed,
         "the DEK was already destroyed (no-op)"
@@ -215,7 +215,7 @@ fn erase_is_tenant_scoped() {
         .put_mapping(&globex, &subject, handle("anon-g", "globex"))
         .unwrap();
 
-    slot.erase_in(&acme, &subject, now());
+    slot.erase_in(&acme, &subject, now()).unwrap();
 
     assert!(
         slot.pseudonyms().mapping_of(&acme, &subject).is_none(),

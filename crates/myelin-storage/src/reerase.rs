@@ -130,7 +130,7 @@ impl<'a> ReErasePass<'a> {
                 record.tenant.clone(),
                 KeyClass::Subject(record.subject.0.clone()),
             );
-            let was_resurrected = self.dek_present(&subject_dek);
+            let was_resurrected = self.dek_present(&subject_dek)?;
 
             let receipt = self
                 .eraser
@@ -144,16 +144,16 @@ impl<'a> ReErasePass<'a> {
             });
         }
 
-        let resurrected_count = post_pit
-            .iter()
-            .filter(|record| {
-                let dek = DekId::new(
-                    record.tenant.clone(),
-                    KeyClass::Subject(record.subject.0.clone()),
-                );
-                self.dek_present(&dek)
-            })
-            .count() as u64;
+        let mut resurrected_count = 0;
+        for record in &post_pit {
+            let dek = DekId::new(
+                record.tenant.clone(),
+                KeyClass::Subject(record.subject.0.clone()),
+            );
+            if self.dek_present(&dek)? {
+                resurrected_count += 1;
+            }
+        }
 
         Ok(ReEraseReport {
             restored_to_offset: pit,
@@ -162,8 +162,13 @@ impl<'a> ReErasePass<'a> {
         })
     }
 
-    fn dek_present(&self, dek: &DekId) -> bool {
-        self.engine.backup_snapshot().iter().any(|(d, _)| d == dek)
+    fn dek_present(&self, dek: &DekId) -> Result<bool, EraseError> {
+        Ok(self
+            .engine
+            .backup_snapshot()
+            .map_err(EraseError::Kms)?
+            .iter()
+            .any(|(d, _)| d == dek))
     }
 }
 
@@ -349,7 +354,10 @@ mod tests {
         let kms = engine_with_subject(&tenant, &subject);
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the restored copy RESURRECTED the subject's DEK (it was live at the backup PIT)"
         );
 
@@ -382,7 +390,10 @@ mod tests {
         assert_eq!(rep.resurrected_count, 0, "0 resurrected subjects (§7.5)");
         assert!(rep.is_green());
         assert!(
-            !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            !kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the resurrected DEK is re-destroyed by the pass"
         );
         let calls = seams.calls.borrow();

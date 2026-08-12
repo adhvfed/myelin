@@ -162,7 +162,7 @@ fn cdc_caches_crypto_shred_under_the_index_dek() {
         .unwrap());
 
     assert!(
-        pin.destroy_tenant_index_dek(&tenant(), &region()),
+        pin.destroy_tenant_index_dek(&tenant(), &region()).unwrap(),
         "the index DEK was present"
     );
 

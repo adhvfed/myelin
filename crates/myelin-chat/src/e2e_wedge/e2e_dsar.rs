@@ -6,7 +6,7 @@ use myelin_events::{
 use myelin_gdpr::{EraseScope, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
+use myelin_storage::kms::{DekId, KeyClass, KmsEngine, KmsError};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::dek::{encrypt_body, ChatFreeText};
@@ -101,6 +101,18 @@ fn append(
 }
 
 pub fn run_e2e_4_chat_dsar_holder() -> ChatE2eArtifact {
+    match try_run_e2e_4_chat_dsar_holder() {
+        Ok(artifact) => artifact,
+        Err(error) => ChatE2eArtifact {
+            scenario: E2E_SCENARIO,
+            green: false,
+            evidence: format!("Chat H5 DSAR holder stopped because crypto-shred failed: {error}"),
+            leaks: 1,
+        },
+    }
+}
+
+fn try_run_e2e_4_chat_dsar_holder() -> Result<ChatE2eArtifact, KmsError> {
     let kms = KmsEngine::new();
     let store = MemHotTier::new();
     let outbox = OutboxStore::new();
@@ -120,7 +132,7 @@ pub fn run_e2e_4_chat_dsar_holder() -> ChatE2eArtifact {
     let hot_body = seal_body(&kms, b"my private chat in the hot tier");
     let cold_body = seal_body(&kms, b"my private chat archived in the cold segment");
     let dek_id = DekId::new(tenant(), KeyClass::Subject(SUBJECT.into()));
-    let backup_before = kms.backup_snapshot();
+    let backup_before = kms.backup_snapshot()?;
     let backup_seeded = backup_before.iter().any(|(id, _)| id == &dek_id);
     let pii_recoverable_before = !is_body_unrecoverable(&kms, &region(), &hot_body)
         && !is_body_unrecoverable(&kms, &region(), &cold_body);
@@ -144,12 +156,12 @@ pub fn run_e2e_4_chat_dsar_holder() -> ChatE2eArtifact {
             (conv(), m2.clone()),
             (conv(), m3.clone()),
         ],
-    );
+    )?;
     tx.commit().expect("commit");
 
     let hot_unrecoverable = is_body_unrecoverable(&kms, &region(), &hot_body);
     let cold_unrecoverable = is_body_unrecoverable(&kms, &region(), &cold_body);
-    let backup_after = kms.backup_snapshot();
+    let backup_after = kms.backup_snapshot()?;
     let backup_unrecoverable = !backup_after.iter().any(|(id, _)| id == &dek_id);
     if !hot_unrecoverable {
         leaks += 1;
@@ -193,7 +205,7 @@ pub fn run_e2e_4_chat_dsar_holder() -> ChatE2eArtifact {
         && read_models_purged
         && holder_green;
 
-    ChatE2eArtifact {
+    Ok(ChatE2eArtifact {
         scenario: E2E_SCENARIO,
         green,
         evidence: format!(
@@ -206,5 +218,5 @@ pub fn run_e2e_4_chat_dsar_holder() -> ChatE2eArtifact {
              recorded)={holder_green}; leaks={leaks}",
         ),
         leaks,
-    }
+    })
 }

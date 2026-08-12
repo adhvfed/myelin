@@ -359,8 +359,10 @@ impl<'a> FullHolderFanOut<'a> {
                 1
             } else {
                 match holder.erasure() {
-                    HolderErasure::SubjectDekCryptoShred => self.dek_present(&subject_dek) as usize,
-                    HolderErasure::BlobDekCryptoShred => self.dek_present(&blob_dek) as usize,
+                    HolderErasure::SubjectDekCryptoShred => {
+                        self.dek_present(&subject_dek)? as usize
+                    }
+                    HolderErasure::BlobDekCryptoShred => self.dek_present(&blob_dek)? as usize,
                     _ => 0,
                 }
             };
@@ -389,8 +391,13 @@ impl<'a> FullHolderFanOut<'a> {
         })
     }
 
-    fn dek_present(&self, dek: &DekId) -> bool {
-        self.engine.backup_snapshot().iter().any(|(d, _)| d == dek)
+    fn dek_present(&self, dek: &DekId) -> Result<bool, EraseError> {
+        Ok(self
+            .engine
+            .backup_snapshot()
+            .map_err(EraseError::Kms)?
+            .iter()
+            .any(|(d, _)| d == dek))
     }
 
     pub fn reerase_after_restore(
@@ -697,7 +704,10 @@ mod tests {
         let kms = engine_with_subject(&tenant, &subject);
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the restore resurrected the subject DEK"
         );
 
@@ -736,7 +746,10 @@ mod tests {
         assert_eq!(rep.resurrected_count, 0);
         assert!(rep.re_erased_subject(&subject, &tenant));
         assert!(
-            !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            !kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the resurrected DEK is re-killed"
         );
     }
@@ -976,7 +989,10 @@ mod tests {
         let kms = engine_with_subject(&tenant, &subject);
         let blob_dek = DekId::new(tenant.clone(), KeyClass::Blob);
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == blob_dek),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == blob_dek),
             "the per-tenant blob DEK is present before the erase"
         );
         let fanout = FullHolderFanOut::new(&kms, r());

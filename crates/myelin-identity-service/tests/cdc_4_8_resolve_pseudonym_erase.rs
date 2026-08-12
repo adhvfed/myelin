@@ -58,7 +58,9 @@ fn cdc_4_8_erase_makes_de_pseudonymisation_fail_closed_but_attribution_stands() 
     let baked = git_attribution_for(&svc, &s, &alice).expect("attribute before erase");
     assert_eq!(baked, "anon-7f3a@acme.noreply");
 
-    let receipt = svc.erase_in(&s, &alice, ts("2026-06-19T12:00:00Z"));
+    let receipt = svc
+        .erase_in(&s, &alice, ts("2026-06-19T12:00:00Z"))
+        .unwrap();
     assert!(
         receipt.dek_destroyed && receipt.row_shredded,
         "the provider crypto-shredded the subject"
@@ -85,7 +87,8 @@ fn cdc_4_8_erase_is_tenant_scoped_across_the_seam() {
         .put_mapping(&globex, &alice, handle("anon-g", "globex"))
         .unwrap();
 
-    svc.erase_in(&acme, &alice, ts("2026-06-19T12:00:00Z"));
+    svc.erase_in(&acme, &alice, ts("2026-06-19T12:00:00Z"))
+        .unwrap();
 
     assert!(matches!(
         git_attribution_for(&svc, &acme, &alice),

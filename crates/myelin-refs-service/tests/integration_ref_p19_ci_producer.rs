@@ -316,7 +316,9 @@ fn a_crypto_shredded_ci_log_segment_makes_the_step_anchor_unrecoverable() {
         b"inline-PII-step-log"
     );
 
-    assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant)));
+    assert!(eng
+        .destroy_dek(&DekId::new(tenant(), KeyClass::Tenant))
+        .unwrap());
     let seam = CiLogStepSeam { tier: tier.clone() };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         seam.resolve_step(&ArtifactRef("myelin://acme/ci/run/run-1#step-1".into()))

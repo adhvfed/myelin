@@ -1,6 +1,6 @@
 use myelin_gdpr::{EraseReceipt, EraseScope, ErasureMethod, Receipt, SubjectRef};
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, KeyChoiceError, SubjectId};
-use myelin_storage::kms::{DekId, KekId, KeyClass, KmsEngine};
+use myelin_storage::kms::{DekId, KekId, KeyClass, KmsEngine, KmsError};
 use myelin_tenancy::{Region, TenantId as TenancyTenantId};
 
 use crate::engine::FlowTelemetry;
@@ -84,7 +84,7 @@ impl<'a> WfCryptoShred<'a> {
         inline_pii_rows: usize,
         requested_at_secs: u64,
         now_secs: u64,
-    ) -> WfShredReport {
+    ) -> Result<WfShredReport, KmsError> {
         let crypto_shred_lag_secs = now_secs.saturating_sub(requested_at_secs);
 
         let destroyed_key_epoch = match scope {
@@ -92,8 +92,8 @@ impl<'a> WfCryptoShred<'a> {
                 let sid = subject_token(subject);
                 let tenancy_tenant = TenancyTenantId(tenant.0.clone());
                 let dek_id = subject_dek_id(&tenancy_tenant, &sid);
-                let epoch = self.dek_epoch(&tenancy_tenant, &sid, &dek_id);
-                self.kms.destroy_dek(&dek_id);
+                let epoch = self.dek_epoch(&tenancy_tenant, &sid, &dek_id)?;
+                self.kms.destroy_dek(&dek_id)?;
                 epoch
             }
             EraseScope::Tenant(_) => None,
@@ -105,26 +105,32 @@ impl<'a> WfCryptoShred<'a> {
             }
         }
 
-        WfShredReport {
+        Ok(WfShredReport {
             destroyed_key_epoch,
             inline_pii_rows_shredded: inline_pii_rows,
             crypto_shred_lag_secs,
-        }
+        })
     }
 
-    fn dek_epoch(&self, tenant: &TenancyTenantId, sid: &str, dek_id: &DekId) -> Option<u64> {
+    fn dek_epoch(
+        &self,
+        tenant: &TenancyTenantId,
+        sid: &str,
+        dek_id: &DekId,
+    ) -> Result<Option<u64>, KmsError> {
         let present = self
             .kms
-            .backup_snapshot()
+            .backup_snapshot()?
             .into_iter()
             .any(|(id, _)| &id == dek_id);
         if !present {
-            return None;
+            return Ok(None);
         }
-        self.kms
+        Ok(self
+            .kms
             .ensure_dek(tenant, &self.region, KeyClass::Subject(sid.to_string()))
             .ok()
-            .map(|key_ref| key_ref.dek_epoch)
+            .map(|key_ref| key_ref.dek_epoch))
     }
 }
 
@@ -222,15 +228,17 @@ mod tests {
         );
 
         let shred = WfCryptoShred::new(&kms, region());
-        let report = shred.shred_subject(
-            &EraseScope::Subject {
-                subject: subject("psn:ada"),
-                tenant: tenant(),
-            },
-            1,
-            100,
-            103,
-        );
+        let report = shred
+            .shred_subject(
+                &EraseScope::Subject {
+                    subject: subject("psn:ada"),
+                    tenant: tenant(),
+                },
+                1,
+                100,
+                103,
+            )
+            .unwrap();
         assert_eq!(
             report.destroyed_key_epoch,
             Some(0),
@@ -241,7 +249,7 @@ mod tests {
             is_inline_pii_unrecoverable(&kms, &region(), &column),
             "0 recoverable: the inline PII is unrecoverable after the per-subject DEK shred"
         );
-        let snapshot = kms.backup_snapshot();
+        let snapshot = kms.backup_snapshot().unwrap();
         assert!(
             !snapshot
                 .into_iter()
@@ -270,15 +278,17 @@ mod tests {
         };
 
         let shred = WfCryptoShred::new(&kms, region());
-        shred.shred_subject(
-            &EraseScope::Subject {
-                subject: subject("u-1"),
-                tenant: tenant(),
-            },
-            1,
-            0,
-            0,
-        );
+        shred
+            .shred_subject(
+                &EraseScope::Subject {
+                    subject: subject("u-1"),
+                    tenant: tenant(),
+                },
+                1,
+                0,
+                0,
+            )
+            .unwrap();
 
         assert!(
             is_inline_pii_unrecoverable(&kms, &region(), &col1),
@@ -301,15 +311,17 @@ mod tests {
             seal_inline_pii(&kms, &region(), &tenancy(), &sid("u-lag"), b"pii").expect("seal");
         let telemetry = FlowTelemetry::new();
         let shred = WfCryptoShred::with_telemetry(&kms, region(), &telemetry);
-        let report = shred.shred_subject(
-            &EraseScope::Subject {
-                subject: subject("u-lag"),
-                tenant: tenant(),
-            },
-            1,
-            1000,
-            1005,
-        );
+        let report = shred
+            .shred_subject(
+                &EraseScope::Subject {
+                    subject: subject("u-lag"),
+                    tenant: tenant(),
+                },
+                1,
+                1000,
+                1005,
+            )
+            .unwrap();
         assert_eq!(report.crypto_shred_lag_secs, 5, "lag = now − requested");
         assert_eq!(
             telemetry.crypto_shred_lag_secs(),
@@ -328,15 +340,17 @@ mod tests {
         let kms = KmsEngine::new();
         let telemetry = FlowTelemetry::new();
         let shred = WfCryptoShred::with_telemetry(&kms, region(), &telemetry);
-        let report = shred.shred_subject(
-            &EraseScope::Subject {
-                subject: subject("u-none"),
-                tenant: tenant(),
-            },
-            0,
-            0,
-            0,
-        );
+        let report = shred
+            .shred_subject(
+                &EraseScope::Subject {
+                    subject: subject("u-none"),
+                    tenant: tenant(),
+                },
+                0,
+                0,
+                0,
+            )
+            .unwrap();
         assert_eq!(
             report.destroyed_key_epoch, None,
             "no inline-PII DEK → nothing to shred (refs-stored rows tombstone for free)"
@@ -367,15 +381,17 @@ mod tests {
         let before = journal.history_in_tenant(&TenancyTenantId::from_token("acme"));
 
         let shred = WfCryptoShred::new(&kms, region());
-        shred.shred_subject(
-            &EraseScope::Subject {
-                subject: subject("u-keep"),
-                tenant: tenant(),
-            },
-            1,
-            0,
-            0,
-        );
+        shred
+            .shred_subject(
+                &EraseScope::Subject {
+                    subject: subject("u-keep"),
+                    tenant: tenant(),
+                },
+                1,
+                0,
+                0,
+            )
+            .unwrap();
 
         let after = journal.history_in_tenant(&TenancyTenantId::from_token("acme"));
         assert_eq!(
@@ -393,7 +409,7 @@ mod tests {
         let kms = KmsEngine::new();
         let shred = WfCryptoShred::new(&kms, region());
         let scope = EraseScope::Tenant(tenant());
-        let report = shred.shred_subject(&scope, 0, 0, 0);
+        let report = shred.shred_subject(&scope, 0, 0, 0).unwrap();
         assert_eq!(report.destroyed_key_epoch, None);
         let agg = aggregate_receipt(&report, &scope);
         assert_eq!(agg.receipt.operation, "erase");
@@ -410,7 +426,7 @@ mod tests {
             subject: subject("u-r"),
             tenant: tenant(),
         };
-        let report = shred.shred_subject(&scope, 1, 0, 0);
+        let report = shred.shred_subject(&scope, 1, 0, 0).unwrap();
         let agg = aggregate_receipt(&report, &scope);
         assert_eq!(agg.receipt.operation, "erase");
         assert_eq!(agg.receipt.key_epoch_destroyed, report.destroyed_key_epoch);

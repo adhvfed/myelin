@@ -59,7 +59,9 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
         .expect("seed the in-memory KEK");
     kms.ensure_dek(&erased, &region(), KeyClass::Tenant)
         .unwrap();
-    assert!(kms.destroy_kek(&KekId::new(erased.clone(), region())));
+    assert!(kms
+        .destroy_kek(&KekId::new(erased.clone(), region()))
+        .unwrap());
 
     let arch = reachable_archiver(300);
     let objects = vec![

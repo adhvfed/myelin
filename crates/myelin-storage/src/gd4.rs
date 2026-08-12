@@ -3,7 +3,7 @@ use myelin_tenancy::{Region, TenantId};
 
 use crate::encryption::{key_class_for, KeyChoiceError, SubjectId};
 use crate::erase::EraseHolders;
-use crate::kms::{DekId, KekId, KeyClass, KmsEngine};
+use crate::kms::{DekId, KekId, KeyClass, KmsEngine, KmsError};
 
 pub const RESIDUAL_POSTURE_REF: &str =
     "the residual is handled per the platform erasure posture in 00-reconciliation §X-7 (contract 10.9)";
@@ -107,36 +107,35 @@ impl<'a> StructuralErasureFloor<'a> {
         StructuralErasureFloor { engine, region }
     }
 
-    pub fn verify(&self, subject: &SubjectId, tenant: &TenantId) -> StructuralFloorReport {
+    pub fn verify(
+        &self,
+        subject: &SubjectId,
+        tenant: &TenantId,
+    ) -> Result<StructuralFloorReport, KmsError> {
         self.engine
-            .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()))
-            .expect("ensure the tenant KEK");
-        let key_ref = self
-            .engine
-            .ensure_dek(tenant, &self.region, KeyClass::Subject(subject.0.clone()))
-            .expect("ensure the per-subject DEK");
+            .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()))?;
+        let key_ref =
+            self.engine
+                .ensure_dek(tenant, &self.region, KeyClass::Subject(subject.0.clone()))?;
 
-        let dek = self
-            .engine
-            .resolve_dek(&key_ref, &self.region)
-            .expect("resolve the per-subject DEK before the shred");
+        let dek = self.engine.resolve_dek(&key_ref, &self.region)?;
         let marker = b"the-subject-free-text-marker";
         let (nonce, ciphertext) = dek.seal(marker);
 
         let subject_dek = DekId::new(tenant.clone(), KeyClass::Subject(subject.0.clone()));
-        let destroyed = self.engine.destroy_dek(&subject_dek);
+        let destroyed = self.engine.destroy_dek(&subject_dek)?;
 
         let lever_works = self.engine.resolve_dek(&key_ref, &self.region).is_err();
         let ciphertext_not_plaintext = !ciphertext.windows(marker.len()).any(|w| w == marker);
 
         let recoverable_in_backup = self
             .engine
-            .backup_snapshot()
+            .backup_snapshot()?
             .iter()
             .filter(|(d, _)| *d == subject_dek)
             .count();
 
-        StructuralFloorReport {
+        Ok(StructuralFloorReport {
             subject: subject.0.clone(),
             tenant: tenant.clone(),
             lever_destroyed_dek: destroyed,
@@ -144,7 +143,7 @@ impl<'a> StructuralErasureFloor<'a> {
             recoverable_in_backup,
             pseudonym_shred_is_the_id_step: true,
             nonce,
-        }
+        })
     }
 
     pub fn region(&self) -> &Region {
@@ -300,7 +299,9 @@ mod tests {
         let tenant = t("acme");
         let kms = engine_for(&tenant);
         let floor = StructuralErasureFloor::new(&kms, r());
-        let report = floor.verify(&SubjectId::new("u-erase"), &tenant);
+        let report = floor
+            .verify(&SubjectId::new("u-erase"), &tenant)
+            .expect("the in-memory key registry remains available");
 
         assert!(
             report.lever_destroyed_dek,
@@ -394,14 +395,19 @@ mod tests {
             .ensure_dek(&tenant, &r(), KeyClass::Subject("u-keep".into()))
             .unwrap();
         let floor = StructuralErasureFloor::new(&kms, r());
-        let report = floor.verify(&SubjectId::new("u-erase"), &tenant);
+        let report = floor
+            .verify(&SubjectId::new("u-erase"), &tenant)
+            .expect("the in-memory key registry remains available");
         assert_eq!(
             report.recoverable_in_backup, 0,
             "the erased subject's DEK is 0 in the backup"
         );
         let kept = DekId::new(tenant.clone(), KeyClass::Subject("u-keep".into()));
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == kept),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == kept),
             "the non-erased subject's DEK is untouched (per-subject isolation)"
         );
     }
@@ -411,7 +417,9 @@ mod tests {
         let tenant = t("acme");
         let kms = engine_for(&tenant);
         let floor = StructuralErasureFloor::new(&kms, r());
-        let report = floor.verify(&SubjectId::new("u-x"), &tenant);
+        let report = floor
+            .verify(&SubjectId::new("u-x"), &tenant)
+            .expect("the in-memory key registry remains available");
         let key_ref =
             crate::kms::PiiKeyRef::new(tenant.clone(), 0, KeyClass::Subject("u-x".into()));
         assert!(

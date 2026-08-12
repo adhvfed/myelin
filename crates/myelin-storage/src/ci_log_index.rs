@@ -840,7 +840,9 @@ mod tests {
             "resolves before the shred"
         );
 
-        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant)));
+        assert!(eng
+            .destroy_dek(&DekId::new(tenant(), KeyClass::Tenant))
+            .unwrap());
         let res =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.resolve_step("run-1", 1)));
         assert!(
@@ -927,7 +929,9 @@ mod tests {
         assert_eq!(t.resolve_step("run-1", 2).unwrap(), b"BOB-PII");
         assert_eq!(t.resolve_step("run-1", 3).unwrap(), b"INTERLEAVED");
 
-        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Subject(alice.0.clone()))));
+        assert!(eng
+            .destroy_dek(&DekId::new(tenant(), KeyClass::Subject(alice.0.clone())))
+            .unwrap());
 
         let alice_after =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.resolve_step("run-1", 1)));
@@ -960,7 +964,9 @@ mod tests {
         t.seal_ci_batch(&[(2, CiLogFrame::new("run-1", 2, b"INTERLEAVED".to_vec()))])
             .expect("seal interleaved");
 
-        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant)));
+        assert!(eng
+            .destroy_dek(&DekId::new(tenant(), KeyClass::Tenant))
+            .unwrap());
         assert_eq!(
             t.resolve_step("run-1", 1).unwrap(),
             b"ALICE-PII",

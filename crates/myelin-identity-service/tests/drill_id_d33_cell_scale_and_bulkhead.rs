@@ -118,7 +118,7 @@ impl Cell {
                 svc.pseudonyms()
                     .put_mapping(&s, &subj, handle(&format!("anon-{i}"), tenant))
                     .unwrap();
-                svc.erase_in(&s, &subj, at("2026-06-20T10:00:00Z"));
+                svc.erase_in(&s, &subj, at("2026-06-20T10:00:00Z")).unwrap();
                 svc.pseudonyms()
                     .put_mapping(&s, &subj, handle(&format!("anon-{i}"), tenant))
                     .unwrap();

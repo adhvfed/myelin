@@ -1,6 +1,6 @@
 use myelin_gdpr::{EraseReceipt, EraseScope, Receipt, SubjectRef, TenantId};
 use myelin_storage::encryption::EncryptedColumn;
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
+use myelin_storage::kms::{DekId, KeyClass, KmsEngine, KmsError};
 use myelin_tenancy::Region;
 
 use crate::composer::DraftStore;
@@ -71,7 +71,7 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
         tx: &mut OutboxTx,
         scope: &EraseScope,
         authored: &[(ConversationId, MessageId)],
-    ) -> ChatEraseReport {
+    ) -> Result<ChatEraseReport, KmsError> {
         let (subject_token, tenant) = match scope {
             EraseScope::Subject { subject, tenant } => {
                 (Some(subject_token(subject)), tenant.clone())
@@ -82,8 +82,8 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
         let destroyed_key_epoch = match &subject_token {
             Some(sid) => {
                 let dek_id = DekId::new(tenant.clone(), KeyClass::Subject(sid.clone()));
-                let epoch = self.dek_epoch(&tenant, sid, &dek_id);
-                self.kms.destroy_dek(&dek_id);
+                let epoch = self.dek_epoch(&tenant, sid, &dek_id)?;
+                self.kms.destroy_dek(&dek_id)?;
                 epoch
             }
             None => None,
@@ -115,31 +115,37 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
             destroyed_key_epoch,
         );
 
-        ChatEraseReport {
+        Ok(ChatEraseReport {
             store_receipts,
             destroyed_key_epoch,
             records_tombstoned,
             cascade_published,
-        }
+        })
     }
 
-    fn dek_epoch(&self, tenant: &TenantId, subject_token: &str, dek_id: &DekId) -> Option<u64> {
+    fn dek_epoch(
+        &self,
+        tenant: &TenantId,
+        subject_token: &str,
+        dek_id: &DekId,
+    ) -> Result<Option<u64>, KmsError> {
         let present = self
             .kms
-            .backup_snapshot()
+            .backup_snapshot()?
             .into_iter()
             .any(|(id, _)| &id == dek_id);
         if !present {
-            return None;
+            return Ok(None);
         }
-        self.kms
+        Ok(self
+            .kms
             .ensure_dek(
                 tenant,
                 &self.region,
                 KeyClass::Subject(subject_token.to_string()),
             )
             .ok()
-            .map(|key_ref| key_ref.dek_epoch)
+            .map(|key_ref| key_ref.dek_epoch))
     }
 
     fn store_receipts(
@@ -325,14 +331,16 @@ mod tests {
         let cache = UnfurlCache::new();
         let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
         let mut tx = begin_tx(&outbox, &minter);
-        let report = cascade.erase(
-            &mut tx,
-            &EraseScope::Subject {
-                subject: subject("psn:ada"),
-                tenant: tenant(),
-            },
-            &[],
-        );
+        let report = cascade
+            .erase(
+                &mut tx,
+                &EraseScope::Subject {
+                    subject: subject("psn:ada"),
+                    tenant: tenant(),
+                },
+                &[],
+            )
+            .unwrap();
         tx.commit().expect("commit");
 
         assert!(
@@ -341,6 +349,7 @@ mod tests {
         );
         assert!(
             !kms.backup_snapshot()
+                .unwrap()
                 .into_iter()
                 .any(|(id, _)| id == DekId::new(tenant(), KeyClass::Subject("psn:ada".into()))),
             "the crypto-shredded DEK is EXCLUDED from backups (it stays dead across restore, §7.5)"
@@ -366,14 +375,16 @@ mod tests {
         let cache = UnfurlCache::new();
         let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
         let mut tx = begin_tx(&outbox, &minter);
-        let report = cascade.erase(
-            &mut tx,
-            &EraseScope::Subject {
-                subject: subject("psn:ada"),
-                tenant: tenant(),
-            },
-            &[(conv(), m1.clone()), (conv(), m2.clone())],
-        );
+        let report = cascade
+            .erase(
+                &mut tx,
+                &EraseScope::Subject {
+                    subject: subject("psn:ada"),
+                    tenant: tenant(),
+                },
+                &[(conv(), m1.clone()), (conv(), m2.clone())],
+            )
+            .unwrap();
         tx.commit().expect("commit");
 
         assert_eq!(report.records_tombstoned, 2, "both records tombstoned");
@@ -433,14 +444,16 @@ mod tests {
 
         let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
         let mut tx = begin_tx(&outbox, &minter);
-        cascade.erase(
-            &mut tx,
-            &EraseScope::Subject {
-                subject: subject("psn:ada"),
-                tenant: tenant(),
-            },
-            &[],
-        );
+        cascade
+            .erase(
+                &mut tx,
+                &EraseScope::Subject {
+                    subject: subject("psn:ada"),
+                    tenant: tenant(),
+                },
+                &[],
+            )
+            .unwrap();
         tx.commit().expect("commit");
 
         assert!(
@@ -466,14 +479,16 @@ mod tests {
         let cache = UnfurlCache::new();
         let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
         let mut tx = begin_tx(&outbox, &minter);
-        let report = cascade.erase(
-            &mut tx,
-            &EraseScope::Subject {
-                subject: subject("psn:ada"),
-                tenant: tenant(),
-            },
-            &[],
-        );
+        let report = cascade
+            .erase(
+                &mut tx,
+                &EraseScope::Subject {
+                    subject: subject("psn:ada"),
+                    tenant: tenant(),
+                },
+                &[],
+            )
+            .unwrap();
         tx.commit().expect("commit");
 
         assert!(
@@ -521,7 +536,7 @@ mod tests {
         let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
         let mut tx = begin_tx(&outbox, &minter);
         let scope = EraseScope::Tenant(tenant());
-        let report = cascade.erase(&mut tx, &scope, &[]);
+        let report = cascade.erase(&mut tx, &scope, &[]).unwrap();
         tx.commit().expect("commit");
         assert!(report.receipts_complete());
         let agg = aggregate_receipt(&report, &scope);
@@ -544,7 +559,7 @@ mod tests {
             subject: subject("psn:ada"),
             tenant: tenant(),
         };
-        let report = cascade.erase(&mut tx, &scope, &[]);
+        let report = cascade.erase(&mut tx, &scope, &[]).unwrap();
         tx.commit().expect("commit");
         let agg = aggregate_receipt(&report, &scope);
         assert_eq!(agg.receipt.operation, "erase");

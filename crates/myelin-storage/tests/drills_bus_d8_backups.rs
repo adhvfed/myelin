@@ -101,6 +101,7 @@ fn bus_d8_crypto_shred_reaches_backups_zero_recoverable_after_restore() {
 
     assert!(
         kms.backup_snapshot()
+            .unwrap()
             .iter()
             .any(|(d, _)| *d == dek_id_for("u42")),
         "precondition: u42's DEK is in the backup before erase"
@@ -142,6 +143,7 @@ fn bus_d8_crypto_shred_reaches_backups_zero_recoverable_after_restore() {
 
     let recoverable_in_backup = kms
         .backup_snapshot()
+        .unwrap()
         .iter()
         .filter(|(d, _)| *d == dek_id_for("u42"))
         .count();
@@ -195,6 +197,7 @@ fn bus_d8_crypto_shred_reaches_backups_zero_recoverable_after_restore() {
     );
     assert!(
         kms.backup_snapshot()
+            .unwrap()
             .iter()
             .any(|(d, _)| *d == dek_id_for("keep_me")),
         "isolation: keep_me's DEK is still in the backup"
@@ -219,6 +222,7 @@ fn bus_d8_without_erase_the_backup_still_carries_the_subject() {
     let _ = mint_subject_dek(&kms, "u42");
     let recoverable_in_backup = kms
         .backup_snapshot()
+        .unwrap()
         .iter()
         .filter(|(d, _)| *d == dek_id_for("u42"))
         .count();

@@ -120,6 +120,7 @@ fn stor_d4_c1_erasing_a_subject_crypto_shreds_their_ci_log_zero_recoverable_in_b
     let dek_of = |s: &SubjectId| DekId::new(tenant(), KeyClass::Subject(s.0.clone()));
     assert!(
         kms.backup_snapshot()
+            .unwrap()
             .iter()
             .any(|(k, _)| *k == dek_of(&erase_me)),
         "erase_me DEK is in the backup before erase"
@@ -153,6 +154,7 @@ fn stor_d4_c1_erasing_a_subject_crypto_shreds_their_ci_log_zero_recoverable_in_b
 
     let recoverable_in_backup = kms
         .backup_snapshot()
+        .unwrap()
         .iter()
         .filter(|(k, _)| *k == dek_of(&erase_me))
         .count();
@@ -180,6 +182,7 @@ fn stor_d4_c1_erasing_a_subject_crypto_shreds_their_ci_log_zero_recoverable_in_b
     );
     assert!(
         kms.backup_snapshot()
+            .unwrap()
             .iter()
             .any(|(k, _)| *k == dek_of(&keep)),
         "keep's DEK is still in the backup (isolation held)"

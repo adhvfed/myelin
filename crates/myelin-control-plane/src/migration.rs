@@ -3,8 +3,8 @@ use std::sync::Arc;
 use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{DurableExecutor, ExecutorError, FlowExecutor, RunId, StartSpec};
 use myelin_storage::{
-    restore_to_offset, BlobPresence, ContinuousArchiver, KekId, KmsEngine, ReindexFromSource,
-    RestoreError, SourceLog, WalRow,
+    restore_to_offset, BlobPresence, ContinuousArchiver, KekId, KmsEngine, KmsError,
+    ReindexFromSource, RestoreError, SourceLog, WalRow,
 };
 use myelin_tenancy::{ArtifactRef, CellId, Region, TenantId};
 
@@ -39,6 +39,7 @@ pub enum MigrationError {
         actual_home: CellId,
     },
     TargetRebuildFailed(RestoreError),
+    SourceKeyShredFailed(KmsError),
     Executor(ExecutorError),
 }
 
@@ -73,6 +74,12 @@ impl std::fmt::Display for MigrationError {
                 "live migration ABORTED: the target rebuild (reindex-from-source) is NOT whole - the \
                  move is aborted BEFORE any cut-over or source crypto-shred (0 loss: the source is \
                  untouched). Detail: {e}"
+            ),
+            MigrationError::SourceKeyShredFailed(e) => write!(
+                f,
+                "live migration INCOMPLETE: cut-over succeeded, but the source key could not be \
+                 crypto-shredded. The source must remain quarantined until erasure succeeds. \
+                 Detail: {e}"
             ),
             MigrationError::Executor(e) => {
                 write!(f, "live migration REJECTED by the durable executor: {e}")
@@ -225,7 +232,8 @@ impl<E: DurableExecutor> LiveMigration<E> {
 
         let source_key_destroyed = source
             .kms
-            .destroy_kek(&KekId::new(tenant.clone(), placement.region.clone()));
+            .destroy_kek(&KekId::new(tenant.clone(), placement.region.clone()))
+            .map_err(MigrationError::SourceKeyShredFailed)?;
 
         Ok(MigrationReceipt {
             tenant: tenant.clone(),

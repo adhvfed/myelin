@@ -551,7 +551,9 @@ fn e2e4_dsar_fanout_pseudonym_shred_and_s8_holder_zero_missed() {
 
     let mut holders_visited: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
-    let receipt = svc.erase_in(&acme, &erasee, ts("2026-06-24T01:00:00Z"));
+    let receipt = svc
+        .erase_in(&acme, &erasee, ts("2026-06-24T01:00:00Z"))
+        .unwrap();
     holders_visited.insert("S2_pseudonym_map");
     assert!(
         receipt.dek_destroyed,
@@ -694,7 +696,9 @@ fn id_is_the_authz_spine_of_all_four_e2e_scenarios() {
             PseudonymHandle::new("anon-e", "acme").unwrap(),
         )
         .unwrap();
-    let receipt = svc.erase_in(&acme, &subj, ts("2026-06-24T02:00:00Z"));
+    let receipt = svc
+        .erase_in(&acme, &subj, ts("2026-06-24T02:00:00Z"))
+        .unwrap();
     assert!(
         receipt.dek_destroyed && svc.pseudonyms().resolve_subject(&acme, &subj).is_none(),
         "spine E2E-4: the pseudonym shred destroys the DEK → the real identity is unrecoverable"

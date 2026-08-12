@@ -313,7 +313,7 @@ fn cdc_r2_holder_is_dek_sealed_and_crypto_shred_able() {
     );
 
     assert!(
-        dek.destroy_tenant_dek(&tenant(), &region()),
+        dek.destroy_tenant_dek(&tenant(), &region()).unwrap(),
         "the per-tenant DEK is shredded"
     );
     assert!(

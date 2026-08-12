@@ -108,6 +108,7 @@ impl BlobPresence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RestoreError {
     PitrUnreachable(crate::backup::BackupError),
+    Kms(crate::kms::KmsError),
     DanglingBlobRef {
         row_id: String,
         missing: ContentHash,
@@ -120,6 +121,7 @@ impl core::fmt::Display for RestoreError {
             RestoreError::PitrUnreachable(e) => {
                 write!(f, "restore target unreachable from backups: {e}")
             }
+            RestoreError::Kms(error) => write!(f, "restore KMS snapshot failed: {error}"),
             RestoreError::DanglingBlobRef { row_id, missing } => write!(
                 f,
                 "DANGLING BLOB REF: restored row {row_id} references content {} which is ABSENT \
@@ -181,7 +183,7 @@ pub fn restore_to_offset(
 
     let derived = ReindexFromSource::reindex(source, target);
 
-    let restored_keys = kms.backup_snapshot();
+    let restored_keys = kms.backup_snapshot().map_err(RestoreError::Kms)?;
 
     Ok(RestoreReport {
         restored_to_offset: target,
@@ -428,7 +430,7 @@ mod tests {
         kms.ensure_dek(&shredded, &region_eu(), KeyClass::Tenant)
             .unwrap();
 
-        assert!(kms.destroy_kek(&shredded_kek));
+        assert!(kms.destroy_kek(&shredded_kek).unwrap());
 
         let report = restore_to_offset(&arch, 100, &[], &blobs, &source, &kms).unwrap();
         assert!(

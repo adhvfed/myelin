@@ -288,7 +288,10 @@ mod tests {
             column.key_ref.tenant.clone(),
             column.key_ref.class.clone(),
         );
-        assert!(eng.destroy_dek(&dek_id), "destroy the per-subject DEK");
+        assert!(
+            eng.destroy_dek(&dek_id).unwrap(),
+            "destroy the per-subject DEK"
+        );
         assert!(
             decrypt_body(&eng, &region(), &column).is_err(),
             "a shredded DEK makes the body unrecoverable (0 recoverable)"

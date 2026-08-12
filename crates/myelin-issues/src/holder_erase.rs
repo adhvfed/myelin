@@ -2,7 +2,7 @@ use crate::events::{COMMENT_ERASED, ISSUE_ERASED};
 use crate::holder::{IssueStoreClass, RestrictionFlag, ISSUE_OLTP_STORE};
 use myelin_gdpr::{EraseReceipt, Receipt, TenantId};
 use myelin_identity::{IdentityService, PrincipalId};
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
+use myelin_storage::kms::{DekId, KeyClass, KmsEngine, KmsError};
 use myelin_tenancy::Region;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -167,6 +167,7 @@ impl IssueReErasureReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EraseFanoutError {
     PseudonymShredFailed { subject: String, why: String },
+    Kms(KmsError),
 }
 
 impl core::fmt::Display for EraseFanoutError {
@@ -177,6 +178,9 @@ impl core::fmt::Display for EraseFanoutError {
                 "pseudonym-map shred failed for subject `{subject}` ({why}) - the Issues erase aborts \
                  as INCOMPLETE (never a false-green receipt); the DSR retries"
             ),
+            EraseFanoutError::Kms(error) => {
+                write!(f, "Issues erase KMS operation failed: {error}")
+            }
         }
     }
 }
@@ -244,7 +248,10 @@ impl<'a, Id: IdentityService> IssueEraseFanout<'a, Id> {
         ));
 
         let free_text_dek = Self::free_text_dek(tenant, subject);
-        let destroyed_ft = self.engine.destroy_dek(&free_text_dek);
+        let destroyed_ft = self
+            .engine
+            .destroy_dek(&free_text_dek)
+            .map_err(EraseFanoutError::Kms)?;
         let epoch = if destroyed_ft { Some(0) } else { None };
         shredded_deks.push(free_text_dek.clone());
         per_holder.push(self.receipt(
@@ -258,7 +265,10 @@ impl<'a, Id: IdentityService> IssueEraseFanout<'a, Id> {
         ));
 
         let blob_dek = Self::attachment_blob_dek(tenant, subject);
-        let destroyed_blob = self.engine.destroy_dek(&blob_dek);
+        let destroyed_blob = self
+            .engine
+            .destroy_dek(&blob_dek)
+            .map_err(EraseFanoutError::Kms)?;
         shredded_deks.push(blob_dek.clone());
         per_holder.push(self.receipt(
             HolderTarget::AttachmentBlob,
@@ -357,7 +367,7 @@ impl<'a, Id: IdentityService> IssueEraseFanout<'a, Id> {
         &self,
         ledger: &IssueErasureLedger,
         at: &str,
-    ) -> IssueReErasureReceipt {
+    ) -> Result<IssueReErasureReceipt, EraseFanoutError> {
         let entries = ledger.entries();
 
         let deks_resurrected_by_restore = self.count_live(&entries);
@@ -365,7 +375,9 @@ impl<'a, Id: IdentityService> IssueEraseFanout<'a, Id> {
         let mut tombstones_re_emitted = 0usize;
         for entry in &entries {
             for dek in &entry.shredded_deks {
-                self.engine.destroy_dek(dek);
+                self.engine
+                    .destroy_dek(dek)
+                    .map_err(EraseFanoutError::Kms)?;
             }
             self.restriction.set(&entry.subject, true);
             tombstones_re_emitted += 3;
@@ -373,7 +385,7 @@ impl<'a, Id: IdentityService> IssueEraseFanout<'a, Id> {
 
         let resurrected = self.count_live(&entries);
 
-        IssueReErasureReceipt {
+        Ok(IssueReErasureReceipt {
             tenant: ledger.tenant().clone(),
             region: ledger.region().clone(),
             re_erased_subjects: entries.len(),
@@ -381,7 +393,7 @@ impl<'a, Id: IdentityService> IssueEraseFanout<'a, Id> {
             tombstones_re_emitted,
             resurrected,
             ran_at: at.to_string(),
-        }
+        })
     }
 
     fn count_live(&self, entries: &[IssueErasedSubject]) -> usize {
@@ -708,7 +720,9 @@ mod tests {
             "the restore RESURRECTED the subject's free-text DEK"
         );
 
-        let receipt = fanout.re_erase_after_restore(&ledger, "2026-06-23T01:00:00Z");
+        let receipt = fanout
+            .re_erase_after_restore(&ledger, "2026-06-23T01:00:00Z")
+            .unwrap();
         assert_eq!(receipt.re_erased_subjects, 1);
         assert_eq!(
             receipt.deks_resurrected_by_restore, 2,
@@ -734,7 +748,9 @@ mod tests {
         let fanout = IssueEraseFanout::new(&eng, region(), RestrictionFlag::new(), &id);
         let ledger = IssueErasureLedger::new(tenant(), region());
         fanout.erase(subject, &tenant(), &ledger, at()).unwrap();
-        let receipt = fanout.re_erase_after_restore(&ledger, "2026-06-23T02:00:00Z");
+        let receipt = fanout
+            .re_erase_after_restore(&ledger, "2026-06-23T02:00:00Z")
+            .unwrap();
         assert_eq!(
             receipt.deks_resurrected_by_restore, 0,
             "nothing resurrected"

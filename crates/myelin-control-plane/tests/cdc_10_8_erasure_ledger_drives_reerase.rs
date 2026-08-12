@@ -271,7 +271,10 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
         KeyClass::Subject(storage_subject.0.clone()),
     );
     assert!(
-        kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the restore of T=100 RESURRECTED the subject's DEK (it was live at the older backup PIT)"
     );
 
@@ -306,7 +309,10 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
         "the post-PIT subject was re-erased FROM the ledger"
     );
     assert!(
-        !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the resurrected DEK is re-destroyed by the pass"
     );
 }
@@ -390,7 +396,10 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
         KeyClass::Subject(storage_subject.0.clone()),
     );
     assert!(
-        kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the restore of the OLDER backup resurrected the subject's DEK"
     );
 
@@ -442,7 +451,10 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
         "the re-erasure re-recorded the erasure"
     );
     assert!(
-        !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "the resurrected DEK is re-destroyed - the restore did NOT resurrect the subject"
     );
 }

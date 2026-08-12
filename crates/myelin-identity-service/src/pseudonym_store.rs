@@ -747,7 +747,7 @@ mod tests {
             .unwrap();
         let dek_id = myelin_storage::DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
         assert!(
-            store.kms.destroy_dek(&dek_id),
+            store.kms.destroy_dek(&dek_id).unwrap(),
             "the per-subject DEK is destroyed (crypto-shred)"
         );
 

@@ -74,7 +74,7 @@ describe.sequential("Code search lifecycle", () => {
     ]);
   });
 
-  test("keeps feature-branch content out of default-branch results until promotion", async () => {
+  test("keeps feature-branch content out of default-branch results", async () => {
     await project.updateFile(
       "feature/search-lifecycle",
       sourcePath,
@@ -84,7 +84,9 @@ describe.sequential("Code search lifecycle", () => {
 
     expect((await project.searchCode(featureToken)).items).toEqual([]);
     expect((await project.searchCode(replacementToken)).items).toHaveLength(1);
+  });
 
+  test("finds feature work once it reaches the default branch", async () => {
     mainOid = (await project.updateFile(
       "main",
       sourcePath,

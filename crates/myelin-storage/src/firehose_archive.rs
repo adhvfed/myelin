@@ -527,7 +527,9 @@ mod tests {
             "reads before the shred"
         );
 
-        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant)));
+        assert!(eng
+            .destroy_dek(&DekId::new(tenant(), KeyClass::Tenant))
+            .unwrap());
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             arch.read_segment(&seg.content_hash)
@@ -554,14 +556,17 @@ mod tests {
             frames(&[1])
         );
 
-        eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant));
+        eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant))
+            .unwrap();
         assert_eq!(
             arch.read_segment(&seg.content_hash)
                 .expect("read after tenant-DEK destroy"),
             frames(&[1]),
             "the subject-keyed segment is not shredded by the tenant DEK destroy"
         );
-        assert!(eng.destroy_dek(&DekId::new(tenant(), KeyClass::Subject("u-alice".into()))));
+        assert!(eng
+            .destroy_dek(&DekId::new(tenant(), KeyClass::Subject("u-alice".into())))
+            .unwrap());
         let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             arch.read_segment(&seg.content_hash)
         }));

@@ -27,7 +27,9 @@ impl InlinePiiShredder for KmsBusShredder {
             return Err(ShredError::KmsUnavailable(key_ref.clone()));
         };
         let dek_id = DekId::new(parsed.tenant.clone(), parsed.class.clone());
-        self.engine.destroy_dek(&dek_id);
+        self.engine
+            .destroy_dek(&dek_id)
+            .map_err(|_| ShredError::KmsUnavailable(key_ref.clone()))?;
         Ok(())
     }
 
@@ -109,13 +111,19 @@ mod tests {
         let parsed = KmsPiiKeyRef::parse(&kref.0).unwrap();
         let dek_id = DekId::new(parsed.tenant.clone(), parsed.class.clone());
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == dek_id),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == dek_id),
             "the subject DEK is in the backup before erase"
         );
         let shredder = KmsBusShredder::new(kms.clone(), region());
         shredder.destroy_key(&kref).expect("destroy");
         assert!(
-            !kms.backup_snapshot().iter().any(|(d, _)| *d == dek_id),
+            !kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == dek_id),
             "the destroyed subject DEK is EXCLUDED from the backup snapshot (§7.5)"
         );
     }

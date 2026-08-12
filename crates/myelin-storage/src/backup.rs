@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::kms::{DekId, KmsEngine, WrappedDek};
+use crate::kms::{DekId, KmsEngine, KmsError, WrappedDek};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StoreTier {
@@ -68,6 +68,7 @@ pub enum BackupError {
         earliest_base: Option<WalOffset>,
         latest_archived: Option<WalOffset>,
     },
+    Kms(KmsError),
 }
 
 impl core::fmt::Display for BackupError {
@@ -91,8 +92,9 @@ impl core::fmt::Display for BackupError {
             } => write!(
                 f,
                 "PITR target offset {target} is unreachable (earliest base {earliest_base:?}, \
-                 latest archived {latest_archived:?}) - restore cannot land, NOT a silent partial"
+                latest archived {latest_archived:?}) - restore cannot land, NOT a silent partial"
             ),
+            BackupError::Kms(error) => write!(f, "KMS backup snapshot failed: {error}"),
         }
     }
 }
@@ -275,12 +277,12 @@ pub struct BackupSet {
 }
 
 impl BackupSet {
-    pub fn new(at_offset: WalOffset, kms: &KmsEngine) -> BackupSet {
-        BackupSet {
+    pub fn new(at_offset: WalOffset, kms: &KmsEngine) -> Result<BackupSet, BackupError> {
+        Ok(BackupSet {
             at_offset,
             backed_tiers: Vec::new(),
-            kms_keys: kms.backup_snapshot(),
-        }
+            kms_keys: kms.backup_snapshot().map_err(BackupError::Kms)?,
+        })
     }
 
     pub fn snapshot_tier(&mut self, tier: StoreTier) -> Result<(), BackupError> {
@@ -347,7 +349,7 @@ mod tests {
     #[test]
     fn a_derived_store_has_no_backup_restore_path() {
         let kms = KmsEngine::new();
-        let mut set = BackupSet::new(0, &kms);
+        let mut set = BackupSet::new(0, &kms).unwrap();
         for derived in [StoreTier::Olap, StoreTier::Cache, StoreTier::DerivedIndex] {
             let err = set
                 .snapshot_tier(derived)
@@ -510,13 +512,13 @@ mod tests {
         kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
             .unwrap();
 
-        let before = BackupSet::new(100, &kms);
+        let before = BackupSet::new(100, &kms).unwrap();
         assert!(before.contains_key_for_tenant(&live));
         assert!(before.contains_key_for_tenant(&shredded));
 
-        assert!(kms.destroy_kek(&shredded_kek));
+        assert!(kms.destroy_kek(&shredded_kek).unwrap());
 
-        let after = BackupSet::new(200, &kms);
+        let after = BackupSet::new(200, &kms).unwrap();
         assert!(
             after.contains_key_for_tenant(&live),
             "the live tenant's key is still backed up"

@@ -79,7 +79,7 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
     for s in [&erase_me, &keep_a, &keep_b] {
         let d = dek_of(s);
         assert!(
-            kms.backup_snapshot().iter().any(|(k, _)| *k == d),
+            kms.backup_snapshot().unwrap().iter().any(|(k, _)| *k == d),
             "subject {} DEK is in the backup before erase",
             s.as_str()
         );
@@ -106,6 +106,7 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
 
     let recoverable_in_backup = kms
         .backup_snapshot()
+        .unwrap()
         .iter()
         .filter(|(k, _)| *k == dek_of(&erase_me))
         .count();
@@ -128,7 +129,10 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
             s.as_str()
         );
         assert!(
-            kms.backup_snapshot().iter().any(|(k, _)| *k == dek_of(s)),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(k, _)| *k == dek_of(s)),
             "kept subject {} DEK is still in the backup (per-subject isolation)",
             s.as_str()
         );

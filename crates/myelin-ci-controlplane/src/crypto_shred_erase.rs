@@ -2,7 +2,7 @@ use crate::holder::{CiStoreClass, CI_RESIDUAL_POSTURE_REF, ERASED_OUTCOME_NONE_R
 use crate::surfacing::ArtifactStore;
 use myelin_events::ArtifactRef;
 use myelin_gdpr::{EraseReceipt, EraseScope, Receipt};
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine, PiiKeyRef};
+use myelin_storage::kms::{DekId, KeyClass, KmsEngine, KmsError, PiiKeyRef};
 use myelin_tenancy::{Region, TenantId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,6 +13,7 @@ pub const CI_ERASED_VERB: &str = "erased";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiShredError {
     KmsUnavailable { tenant: String, class: String },
+    KeyRegistryUnavailable(KmsError),
 }
 
 impl std::fmt::Display for CiShredError {
@@ -21,6 +22,10 @@ impl std::fmt::Display for CiShredError {
             CiShredError::KmsUnavailable { tenant, class } => write!(
                 f,
                 "CI crypto-shred: KMS could not destroy DEK ({tenant}/{class}) - erase INCOMPLETE, retry"
+            ),
+            CiShredError::KeyRegistryUnavailable(error) => write!(
+                f,
+                "CI crypto-shred: key registry unavailable - erase INCOMPLETE, retry: {error}"
             ),
         }
     }
@@ -146,8 +151,10 @@ impl<'a> CiEraseFanOut<'a> {
                 .or_insert_with(|| (dek_id, row.pii_key_ref.clone()));
         }
         for (dek_id, _) in distinct_deks.values() {
-            self.kms.destroy_dek(dek_id);
-            if self.dek_is_live(dek_id) {
+            self.kms
+                .destroy_dek(dek_id)
+                .map_err(CiShredError::KeyRegistryUnavailable)?;
+            if self.dek_is_live(dek_id)? {
                 return Err(CiShredError::KmsUnavailable {
                     tenant: dek_id.tenant.0.clone(),
                     class: dek_id.class.as_token(),
@@ -178,7 +185,7 @@ impl<'a> CiEraseFanOut<'a> {
             .iter()
             .filter(|row| self.key_ref_resolves(&row.pii_key_ref))
             .count();
-        let restored = self.backup_restored_dek_ids();
+        let restored = self.backup_restored_dek_ids()?;
         let recoverable_after_restore = self.count_recoverable(footprint, &restored);
 
         let receipt = CiEraseReceipt {
@@ -241,24 +248,28 @@ impl<'a> CiEraseFanOut<'a> {
         self.kms.resolve_dek(key_ref, &self.region).is_ok()
     }
 
-    fn dek_is_live(&self, dek_id: &DekId) -> bool {
-        self.live_dek_ids().contains(dek_id)
+    fn dek_is_live(&self, dek_id: &DekId) -> Result<bool, CiShredError> {
+        Ok(self.live_dek_ids()?.contains(dek_id))
     }
 
-    fn live_dek_ids(&self) -> BTreeSet<DekId> {
-        self.kms
+    fn live_dek_ids(&self) -> Result<BTreeSet<DekId>, CiShredError> {
+        Ok(self
+            .kms
             .backup_snapshot()
+            .map_err(CiShredError::KeyRegistryUnavailable)?
             .into_iter()
             .map(|(dek_id, _wrapped)| dek_id)
-            .collect()
+            .collect())
     }
 
-    fn backup_restored_dek_ids(&self) -> BTreeSet<DekId> {
-        self.kms
+    fn backup_restored_dek_ids(&self) -> Result<BTreeSet<DekId>, CiShredError> {
+        Ok(self
+            .kms
             .backup_snapshot()
+            .map_err(CiShredError::KeyRegistryUnavailable)?
             .into_iter()
             .map(|(dek_id, _wrapped)| dek_id)
-            .collect()
+            .collect())
     }
 
     fn count_recoverable(
@@ -342,7 +353,7 @@ pub fn drive_ci_d3_erasure_reaches_every_holder(
     let fanout = CiEraseFanOut::new(kms, region.clone());
     let (receipt, tombstones) = fanout.erase_subject(subject, tenant, footprint, store)?;
 
-    let live_dek_ids = fanout.live_dek_ids();
+    let live_dek_ids = fanout.live_dek_ids()?;
     let recoverable_live = footprint
         .rows()
         .iter()
@@ -464,7 +475,11 @@ mod tests {
         let kms = seeded_kms(&footprint);
         let subj_dek = DekId::new(tenant(), KeyClass::Subject("psn:ci-7".into()));
         let tenant_dek = DekId::new(tenant(), KeyClass::Tenant);
-        assert!(kms.backup_snapshot().iter().any(|(d, _)| *d == subj_dek));
+        assert!(kms
+            .backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subj_dek));
 
         let fanout = CiEraseFanOut::new(&kms, region());
         let mut store = ArtifactStore::new();
@@ -483,8 +498,16 @@ mod tests {
         assert!(receipt.is_fully_erased(), "the CI-D3 gate is green");
 
         assert_eq!(receipt.deks_shredded, 2, "per-subject + per-tenant DEK");
-        assert!(!kms.backup_snapshot().iter().any(|(d, _)| *d == subj_dek));
-        assert!(!kms.backup_snapshot().iter().any(|(d, _)| *d == tenant_dek));
+        assert!(!kms
+            .backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subj_dek));
+        assert!(!kms
+            .backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == tenant_dek));
 
         assert_eq!(receipt.classes_reached, footprint.classes_covered());
         assert_eq!(
@@ -536,7 +559,10 @@ mod tests {
             .expect("erase");
 
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == other_dek),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == other_dek),
             "a different subject's per-subject DEK survives the erase"
         );
     }

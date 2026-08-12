@@ -250,7 +250,10 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         KeyClass::Subject(subject.principal.principal_id.0.clone()),
     );
     assert!(
-        kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "alice's per-subject DEK is in the backup BEFORE erase"
     );
 
@@ -327,7 +330,10 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         "the trace content is UNRECOVERABLE after the crypto-shred"
     );
     assert!(
-        !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == subject_dek),
         "alice's DEK is ABSENT from the backup after the trace erase (stays dead across a restore)"
     );
     assert_eq!(

@@ -312,11 +312,13 @@ impl EraseEngine {
         scope: &TenantScope,
         subject: &PrincipalId,
         dek_class: &myelin_storage::KeyClass,
-    ) -> (bool, bool, String) {
+    ) -> Result<(bool, bool, String), PseudonymError> {
         let dek_id = DekId::new(scope.tenant().clone(), dek_class.clone());
-        let dek_destroyed = kms.destroy_dek(&dek_id);
+        let dek_destroyed = kms
+            .destroy_dek(&dek_id)
+            .map_err(|error| PseudonymError::Storage(error.to_string()))?;
         let row_shredded = store.shred_row(scope, subject);
-        (dek_destroyed, row_shredded, dek_class.as_token())
+        Ok((dek_destroyed, row_shredded, dek_class.as_token()))
     }
 }
 

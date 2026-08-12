@@ -141,7 +141,9 @@ fn flow_d9_crypto_shred_reaches_history_zero_recoverable_incl_backups() {
         "0 recoverable: ada's inline PII (col2) is unrecoverable"
     );
 
-    let snapshot = kms.backup_snapshot();
+    let snapshot = kms
+        .backup_snapshot()
+        .expect("the in-memory key registry remains available");
     assert!(
         !snapshot
             .iter()

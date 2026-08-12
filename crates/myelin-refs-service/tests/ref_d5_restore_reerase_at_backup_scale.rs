@@ -34,7 +34,8 @@ fn ref_d5_restore_then_reerase_leaves_zero_recoverable_pii_at_backup_scale() {
     let targets: Vec<String> = corpus.subjects.iter().take(subjects / 2).cloned().collect();
 
     let now = "2026-06-24T00:00:00Z";
-    let report = re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, now);
+    let report =
+        re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, now).unwrap();
 
     assert_eq!(
         report.cached_titles_resurrected_by_restore,

@@ -432,10 +432,12 @@ mod tests {
             .unwrap();
         assert!(cryptor.decrypt(&col).is_ok(), "decrypts before the shred");
 
-        assert!(kms.destroy_dek(&crate::kms::DekId::new(
-            tenant.clone(),
-            KeyClass::Subject("u-erase".into())
-        )));
+        assert!(kms
+            .destroy_dek(&crate::kms::DekId::new(
+                tenant.clone(),
+                KeyClass::Subject("u-erase".into())
+            ))
+            .unwrap());
 
         assert!(matches!(cryptor.decrypt(&col), Err(KeyChoiceError::Kms(_))));
     }
@@ -480,10 +482,12 @@ mod tests {
         assert_eq!(h, ContentHash::blake3(plaintext));
         assert_eq!(store.get(&tenant, &h).expect("get"), plaintext);
 
-        assert!(kms.destroy_dek(&crate::kms::DekId::new(
-            tenant.clone(),
-            KeyClass::Subject("u-avatar".into())
-        )));
+        assert!(kms
+            .destroy_dek(&crate::kms::DekId::new(
+                tenant.clone(),
+                KeyClass::Subject("u-avatar".into())
+            ))
+            .unwrap());
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.get(&tenant, &h)));
         assert!(

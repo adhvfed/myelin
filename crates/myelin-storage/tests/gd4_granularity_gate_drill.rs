@@ -55,7 +55,9 @@ fn gd4_granularity_gate_zero_misrouted_classes_and_structural_floor_holds() {
     kms.ensure_kek(&KekId::new(tenant.clone(), region()))
         .expect("seed the in-memory KEK");
     let floor = StructuralErasureFloor::new(&kms, region());
-    let report = floor.verify(&SubjectId::new("u-structural"), &tenant);
+    let report = floor
+        .verify(&SubjectId::new("u-structural"), &tenant)
+        .expect("the in-memory key registry remains available");
     assert!(
         report.lever_renders_unrecoverable,
         "STRUCTURAL FLOOR RED: the per-subject DEK shred did not render the subject unrecoverable"

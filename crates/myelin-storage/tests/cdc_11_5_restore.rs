@@ -152,7 +152,10 @@ fn restore_caller_does_not_resurrect_a_shredded_tenant() {
     kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
     kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
         .unwrap();
-    assert!(kms.destroy_kek(&shredded_kek), "crypto-shred the tenant");
+    assert!(
+        kms.destroy_kek(&shredded_kek).unwrap(),
+        "crypto-shred the tenant"
+    );
 
     let job = RestoreVerifyJob::boot(&kms, 300);
     let report = job

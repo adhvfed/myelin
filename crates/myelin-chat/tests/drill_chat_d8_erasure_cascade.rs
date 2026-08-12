@@ -114,7 +114,7 @@ fn chat_d8_chained_erase_zero_recoverable_pii_complete_receipts() {
 
     let hot_body = seal_body(&kms, b"my private chat in the hot tier");
     let cold_body = seal_body(&kms, b"my private chat archived in the cold segment");
-    let backup_before = kms.backup_snapshot();
+    let backup_before = kms.backup_snapshot().unwrap();
     let dek_id = DekId::new(tenant(), KeyClass::Subject(SUBJECT.into()));
     assert!(
         backup_before.iter().any(|(id, _)| id == &dek_id),
@@ -131,18 +131,20 @@ fn chat_d8_chained_erase_zero_recoverable_pii_complete_receipts() {
 
     let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
     let mut tx = begin(&outbox, &minter);
-    let report = cascade.erase(
-        &mut tx,
-        &EraseScope::Subject {
-            subject: subject(),
-            tenant: gdpr_tenant(),
-        },
-        &[
-            (conv(), m1.clone()),
-            (conv(), m2.clone()),
-            (conv(), m3.clone()),
-        ],
-    );
+    let report = cascade
+        .erase(
+            &mut tx,
+            &EraseScope::Subject {
+                subject: subject(),
+                tenant: gdpr_tenant(),
+            },
+            &[
+                (conv(), m1.clone()),
+                (conv(), m2.clone()),
+                (conv(), m3.clone()),
+            ],
+        )
+        .unwrap();
     tx.commit().expect("commit");
 
     assert!(
@@ -153,7 +155,7 @@ fn chat_d8_chained_erase_zero_recoverable_pii_complete_receipts() {
         is_body_unrecoverable(&kms, &region(), &cold_body),
         "COLD: 0 recoverable - the archived cold-segment body is unrecoverable too"
     );
-    let backup_after = kms.backup_snapshot();
+    let backup_after = kms.backup_snapshot().unwrap();
     assert!(
         !backup_after.iter().any(|(id, _)| id == &dek_id),
         "BACKUP: the crypto-shredded DEK is excluded - a restore cannot resurrect the body"
@@ -223,14 +225,16 @@ fn chat_d8_cascade_is_bus_only_no_backdoor() {
 
     let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
     let mut tx = begin(&outbox, &minter);
-    cascade.erase(
-        &mut tx,
-        &EraseScope::Subject {
-            subject: subject(),
-            tenant: gdpr_tenant(),
-        },
-        &[(conv(), m1)],
-    );
+    cascade
+        .erase(
+            &mut tx,
+            &EraseScope::Subject {
+                subject: subject(),
+                tenant: gdpr_tenant(),
+            },
+            &[(conv(), m1)],
+        )
+        .unwrap();
     tx.commit().expect("commit");
 
     assert_eq!(
@@ -336,14 +340,16 @@ fn chat_d8_tombstone_reason_is_subject_erased_and_idempotent() {
 
     let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
     let mut tx = begin(&outbox, &minter);
-    cascade.erase(
-        &mut tx,
-        &EraseScope::Subject {
-            subject: subject(),
-            tenant: gdpr_tenant(),
-        },
-        &[(conv(), m1.clone())],
-    );
+    cascade
+        .erase(
+            &mut tx,
+            &EraseScope::Subject {
+                subject: subject(),
+                tenant: gdpr_tenant(),
+            },
+            &[(conv(), m1.clone())],
+        )
+        .unwrap();
     tx.commit().expect("commit");
 
     let rows = store

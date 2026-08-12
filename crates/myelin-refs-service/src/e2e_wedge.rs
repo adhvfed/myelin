@@ -428,7 +428,7 @@ pub fn run_e2e_4_dsar_fanout() -> E2eArtifact {
         .cloned()
         .unwrap_or_else(|| subject.clone());
 
-    let report = re_erase_at_backup_scale(
+    let report = match re_erase_at_backup_scale(
         &corpus,
         &builder,
         &cache,
@@ -436,7 +436,19 @@ pub fn run_e2e_4_dsar_fanout() -> E2eArtifact {
         &ledger,
         std::slice::from_ref(&target_subject),
         "2026-06-25T00:00:00Z",
-    );
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            return E2eArtifact {
+                scenario: "E2E-4",
+                green: false,
+                evidence: format!(
+                    "DSAR fan-out (Refs side) stopped because crypto-shred was unavailable: {error}"
+                ),
+                leaks: 1,
+            };
+        }
+    };
 
     let zero_recoverable = report.is_ref_d5_backup_scale_green();
     let leaks: u64 = if zero_recoverable { 0 } else { 1 };

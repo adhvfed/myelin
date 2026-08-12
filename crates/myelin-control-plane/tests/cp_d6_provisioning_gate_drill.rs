@@ -230,7 +230,8 @@ fn cp_d6_decommission_crypto_shreds_the_kek() {
 
     let mut signals = ProvisioningSignals::default();
     assert!(
-        gate.decommission_tenant(&mut reg, &kms, &tenant, &region(), &mut signals),
+        gate.decommission_tenant(&mut reg, &kms, &tenant, &region(), &mut signals)
+            .expect("decommissioning can reach the in-memory key registry"),
         "a live tenant's KEK is present to crypto-shred"
     );
     assert!(

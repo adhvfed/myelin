@@ -161,7 +161,9 @@ fn consumer_dsr_drives_the_full_issues_erase_fanout() {
 
     eng.ensure_dek(&tenant(), &region(), KeyClass::Subject(subject.to_string()))
         .expect("restore resurrects");
-    let reerase = fanout.re_erase_after_restore(&ledger, "2026-06-23T01:00:00Z");
+    let reerase = fanout
+        .re_erase_after_restore(&ledger, "2026-06-23T01:00:00Z")
+        .unwrap();
     assert_eq!(reerase.resurrected, 0, "0 resurrected post-restore (GD-14)");
     assert!(reerase.is_green());
 }

@@ -709,7 +709,9 @@ mod tests {
             .expect("seed the in-memory KEK");
         kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
             .unwrap();
-        assert!(kms.destroy_kek(&KekId::new(shredded.clone(), region())));
+        assert!(kms
+            .destroy_kek(&KekId::new(shredded.clone(), region()))
+            .unwrap());
 
         let arch = reachable_archiver(300);
         let objects: Vec<RestoredObject> = vec![];
@@ -817,7 +819,9 @@ mod tests {
             .expect("seed the in-memory KEK");
         kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
             .unwrap();
-        assert!(kms.destroy_kek(&KekId::new(shredded.clone(), region())));
+        assert!(kms
+            .destroy_kek(&KekId::new(shredded.clone(), region()))
+            .unwrap());
         let arch = reachable_archiver(300);
         let objects: Vec<RestoredObject> = vec![];
         let source = SourceLog::new();

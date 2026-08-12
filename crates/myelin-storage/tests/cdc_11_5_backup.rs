@@ -33,7 +33,7 @@ impl<'a> OpsBackupJob<'a> {
 
     fn snapshot(&self, tiers: &[StoreTier]) -> Result<BackupSet, BackupError> {
         let offset = self.archiver.latest_archived_offset().unwrap_or(0);
-        let mut set = BackupSet::new(offset, self.kms);
+        let mut set = BackupSet::new(offset, self.kms)?;
         for t in tiers {
             set.snapshot_tier(*t)?;
         }
@@ -114,7 +114,7 @@ fn ops_callers_backup_excludes_a_crypto_shredded_tenant() {
         .unwrap()
         .contains_key_for_tenant(&gone));
 
-    assert!(kms.destroy_kek(&gone_kek));
+    assert!(kms.destroy_kek(&gone_kek).unwrap());
 
     let after = job.snapshot(&[StoreTier::Kms]).unwrap();
     assert!(

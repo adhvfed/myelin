@@ -376,7 +376,7 @@ mod tests {
         );
 
         assert!(
-            dek.destroy_tenant_dek(&tenant(), &region()),
+            dek.destroy_tenant_dek(&tenant(), &region()).unwrap(),
             "the per-tenant DEK is shredded"
         );
         let after = c.read(&tenant(), &region(), &ref_);

@@ -221,8 +221,12 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
         .put_mapping(&s, &bob, handle_b.clone())
         .expect("seed bob");
 
-    engine1.erase_in(&s, &alice, at("2026-06-19T10:00:00Z"));
-    engine1.erase_in(&s, &bob, at("2026-06-19T10:00:01Z"));
+    engine1
+        .erase_in(&s, &alice, at("2026-06-19T10:00:00Z"))
+        .unwrap();
+    engine1
+        .erase_in(&s, &bob, at("2026-06-19T10:00:01Z"))
+        .unwrap();
     assert!(
         engine1.pseudonyms().mapping_of(&s, &alice).is_none(),
         "the full erase DELETEd the durable map row (the resolvable mapping is gone)"

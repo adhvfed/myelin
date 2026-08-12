@@ -101,7 +101,7 @@ impl KeyOrigin for PlatformManaged<'_> {
     }
 
     fn destroy(&self, key_id: KeyId) -> Result<(), KeyOriginError> {
-        self.engine.destroy_dek(&key_id);
+        self.engine.destroy_dek(&key_id)?;
         Ok(())
     }
 }
@@ -146,7 +146,7 @@ impl KeyOrigin for Byok<'_> {
     }
 
     fn destroy(&self, key_id: KeyId) -> Result<(), KeyOriginError> {
-        self.engine.destroy_dek(&key_id);
+        self.engine.destroy_dek(&key_id)?;
         Ok(())
     }
 }

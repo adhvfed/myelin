@@ -107,12 +107,17 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         );
     }
     assert!(
-        kms.backup_snapshot().iter().any(|(d, _)| *d == blob_dek),
+        kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == blob_dek),
         "the per-tenant blob DEK is in the backup before the git crypto-shred"
     );
 
     let git_reach = GitCryptoShredReach::new(&kms, region());
-    let git_receipt = git_reach.shred_git_structures(&tenant);
+    let git_receipt = git_reach
+        .shred_git_structures(&tenant)
+        .expect("the in-memory key registry remains available");
     assert!(
         git_receipt.blob_dek_destroyed_now,
         "the GIT-D2 reach destroyed the per-tenant blob DEK"
@@ -145,7 +150,12 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         }
     }
 
-    if kms.backup_snapshot().iter().any(|(d, _)| *d == blob_dek) {
+    if kms
+        .backup_snapshot()
+        .unwrap()
+        .iter()
+        .any(|(d, _)| *d == blob_dek)
+    {
         panic!(
             "GIT-D2 BREACH: the per-tenant blob DEK is STILL in the backup snapshot - a backup \
              could resurrect a git reflog/bitmap/pack object (0-recoverable-in-backup violated)"

@@ -365,7 +365,10 @@ mod tests {
             KeyClass::Subject(subject.principal.principal_id.0.clone()),
         );
         assert!(
-            kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the subject's per-subject DEK is in the backup BEFORE erase"
         );
 
@@ -418,7 +421,10 @@ mod tests {
             "the subject's free-text is UNRECOVERABLE live after the crypto-shred"
         );
         assert!(
-            !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
+            !kms.backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == subject_dek),
             "the subject's DEK is ABSENT from the backup after erase (0 recoverable, §7.5)"
         );
 

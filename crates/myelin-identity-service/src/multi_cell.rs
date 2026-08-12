@@ -297,7 +297,7 @@ impl MultiCellAuthority {
         home_cell: &CellId,
         member_cells: &[CellId],
         now: myelin_events::Timestamp,
-    ) -> MultiCellDsrReceiptSet {
+    ) -> Result<MultiCellDsrReceiptSet, crate::pseudonym_store::PseudonymError> {
         let mut fan_out: Vec<CellId> = Vec::new();
         for c in std::iter::once(home_cell).chain(member_cells.iter()) {
             if !fan_out.contains(c) {
@@ -317,16 +317,16 @@ impl MultiCellAuthority {
                 );
                 let scope =
                     TenantScope::from_verified_token(&scope_principal, partition.region.clone());
-                let receipt = partition.engine.erase_in(&scope, subject, now.clone());
+                let receipt = partition.engine.erase_in(&scope, subject, now.clone())?;
                 per_cell.push((cell_id.clone(), receipt));
             }
         }
-        MultiCellDsrReceiptSet {
+        Ok(MultiCellDsrReceiptSet {
             subject: subject.clone(),
             tenant: tenant.clone(),
             member_cells: fan_out,
             per_cell,
             ran_at: now,
-        }
+        })
     }
 }

@@ -105,7 +105,10 @@ fn cdc_git_reach_runs_in_the_erase_crypto_shred_step_for_a_commit_author() {
 
     let blob_dek = myelin_storage::DekId::new(tenant.clone(), KeyClass::Blob);
     assert!(
-        !kms.backup_snapshot().iter().any(|(d, _)| *d == blob_dek),
+        !kms.backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == blob_dek),
         "the git crypto-shred reach destroyed the per-tenant blob DEK (0 recoverable in backup)"
     );
 }
@@ -123,7 +126,9 @@ fn cdc_git_reach_post_condition_is_verified_not_assumed() {
 
     assert!(git_reach.shred_blob_tier(&subject, &tenant).is_ok());
 
-    let receipt = git_reach.shred_git_structures(&tenant);
+    let receipt = git_reach
+        .shred_git_structures(&tenant)
+        .expect("the in-memory key registry remains available");
     assert_eq!(receipt.residual, GitResidual::PseudonymousByDefault);
     assert!(receipt.is_green());
 }

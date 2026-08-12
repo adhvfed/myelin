@@ -106,7 +106,9 @@ fn p147_gate_destroyed_tenant_dek_crypto_shreds_the_segment_live_and_in_backups(
         "the segment reads before the shred"
     );
 
-    let destroyed = eng.destroy_dek(&DekId::new(tenant(), KeyClass::Tenant));
+    let destroyed = eng
+        .destroy_dek(&DekId::new(tenant(), KeyClass::Tenant))
+        .expect("the in-memory key registry remains available");
     assert!(
         destroyed,
         "the tenant DEK was destroyed (the crypto-shred lever)"
@@ -120,7 +122,9 @@ fn p147_gate_destroyed_tenant_dek_crypto_shreds_the_segment_live_and_in_backups(
         "live: a crypto-shredded segment is unrecoverable (LOUD), never served"
     );
 
-    let snapshot = eng.backup_snapshot();
+    let snapshot = eng
+        .backup_snapshot()
+        .expect("the in-memory key registry remains available");
     let tenant_dek_in_backup = snapshot
         .iter()
         .any(|(id, _)| *id == DekId::new(tenant(), KeyClass::Tenant));

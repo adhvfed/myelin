@@ -317,6 +317,7 @@ impl BackupScaleEraseArtifact {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackupScaleEraseFailure {
     LiveEraseFailed(String),
+    KmsUnavailable(String),
     LiveDocsRemain(usize),
     OrphanEmbedding,
     BackupRecoverableAfterShred(usize),
@@ -329,6 +330,10 @@ impl core::fmt::Display for BackupScaleEraseFailure {
             BackupScaleEraseFailure::LiveEraseFailed(e) => write!(
                 f,
                 "SEARCH BACKUP-SCALE ERASE FAIL - the live erase failed: {e}"
+            ),
+            BackupScaleEraseFailure::KmsUnavailable(error) => write!(
+                f,
+                "SEARCH BACKUP-SCALE ERASE FAIL - KMS unavailable during shred: {error}"
             ),
             BackupScaleEraseFailure::LiveDocsRemain(n) => write!(
                 f,
@@ -434,9 +439,17 @@ impl BackupScaleEraseGate {
         }
 
         if let Some(subject_id) = &inputs.subject_backstop_id {
-            inputs.dek.destroy_subject_backstop(&tenant, subject_id);
+            if let Err(error) = inputs.dek.destroy_subject_backstop(&tenant, subject_id) {
+                return BackupScaleEraseVerdict::Red(BackupScaleEraseFailure::KmsUnavailable(
+                    error.to_string(),
+                ));
+            }
         }
-        inputs.dek.destroy_tenant_index_dek(&tenant, &region);
+        if let Err(error) = inputs.dek.destroy_tenant_index_dek(&tenant, &region) {
+            return BackupScaleEraseVerdict::Red(BackupScaleEraseFailure::KmsUnavailable(
+                error.to_string(),
+            ));
+        }
 
         let backup_segments_recoverable_after_shred =
             match inputs.dek.resolve(&inputs.index_key_ref, &region) {
@@ -856,7 +869,7 @@ mod tests {
             Some(&b"secret index segment"[..]),
             "the backup is recoverable while the DEK lives"
         );
-        assert!(pin.destroy_tenant_index_dek(&tenant(), &region()));
+        assert!(pin.destroy_tenant_index_dek(&tenant(), &region()).unwrap());
         assert!(
             pin.resolve(&key_ref, &region()).is_err(),
             "the shredded DEK does not resolve - the backup ciphertext is dead (§7.5)"
@@ -918,7 +931,7 @@ mod tests {
         let verdict = BackupScaleEraseGate::new().run(&mut inputs);
         assert!(verdict.is_green(), "verdict: {:?}", verdict.failure());
         assert!(
-            !pin.destroy_subject_backstop(&tenant(), "u-target"),
+            !pin.destroy_subject_backstop(&tenant(), "u-target").unwrap(),
             "the per-subject backstop was destroyed by the gate (a re-destroy is a no-op)"
         );
     }

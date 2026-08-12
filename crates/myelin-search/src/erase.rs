@@ -127,13 +127,19 @@ impl SearchEraseHolder {
         })
     }
 
-    pub fn erase_tenant(&self, tenant: &TenantId) -> EraseOutcome {
-        let shredded = self.dek.destroy_tenant_index_dek(tenant, &self.region);
-        EraseOutcome {
+    pub fn erase_tenant(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<EraseOutcome, crate::engine::IndexError> {
+        let shredded = self
+            .dek
+            .destroy_tenant_index_dek(tenant, &self.region)
+            .map_err(|error| crate::engine::IndexError::Engine(error.to_string()))?;
+        Ok(EraseOutcome {
             docs_purged: 0,
             zero_orphan_embedding: true,
             key_epoch_destroyed: shredded.then_some(0),
-        }
+        })
     }
 
     fn erased_event(
@@ -248,7 +254,9 @@ impl PersonalDataHolder for SearchEraseHolder {
                 (Self::subject_id(subject), tenant.0.clone(), outcome)
             }
             EraseScope::Tenant(tenant) => {
-                let outcome = self.erase_tenant(tenant);
+                let outcome = self
+                    .erase_tenant(tenant)
+                    .map_err(|e| DsrError(format!("Search tenant erase failed: {e}")))?;
                 (String::new(), tenant.0.clone(), outcome)
             }
         };

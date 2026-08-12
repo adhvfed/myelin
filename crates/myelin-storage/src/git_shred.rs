@@ -1,7 +1,7 @@
 use myelin_tenancy::{Region, TenantId};
 
 use crate::erase::{BlobShredReach, EraseError};
-use crate::kms::{DekId, KeyClass, KmsEngine};
+use crate::kms::{DekId, KeyClass, KmsEngine, KmsError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum GitShreddable {
@@ -72,25 +72,25 @@ impl<'a> GitCryptoShredReach<'a> {
         DekId::new(tenant.clone(), KeyClass::Blob)
     }
 
-    pub fn shred_git_structures(&self, tenant: &TenantId) -> GitShredReceipt {
+    pub fn shred_git_structures(&self, tenant: &TenantId) -> Result<GitShredReceipt, KmsError> {
         let blob_dek = Self::blob_dek_id(tenant);
 
-        let blob_dek_destroyed_now = self.engine.destroy_dek(&blob_dek);
+        let blob_dek_destroyed_now = self.engine.destroy_dek(&blob_dek)?;
 
         let recoverable_in_backup = self
             .engine
-            .backup_snapshot()
+            .backup_snapshot()?
             .iter()
             .filter(|(d, _)| *d == blob_dek)
             .count();
 
-        GitShredReceipt {
+        Ok(GitShredReceipt {
             tenant: tenant.clone(),
             blob_dek_destroyed_now,
             recoverable_in_backup,
             structures_reached: GitShreddable::ALL.to_vec(),
             residual: GitResidual::PseudonymousByDefault,
-        }
+        })
     }
 }
 
@@ -100,7 +100,7 @@ impl BlobShredReach for GitCryptoShredReach<'_> {
         _subject: &crate::encryption::SubjectId,
         tenant: &TenantId,
     ) -> Result<(), EraseError> {
-        let receipt = self.shred_git_structures(tenant);
+        let receipt = self.shred_git_structures(tenant).map_err(EraseError::Kms)?;
         if receipt.is_green() {
             Ok(())
         } else {
@@ -168,12 +168,18 @@ mod tests {
 
         let blob_dek = DekId::new(tenant.clone(), KeyClass::Blob);
         assert!(
-            engine.backup_snapshot().iter().any(|(d, _)| *d == blob_dek),
+            engine
+                .backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == blob_dek),
             "the blob DEK is in the backup before the git shred"
         );
 
         let reach = GitCryptoShredReach::new(&engine, r());
-        let receipt = reach.shred_git_structures(&tenant);
+        let receipt = reach
+            .shred_git_structures(&tenant)
+            .expect("the in-memory key registry remains available");
 
         assert!(
             receipt.blob_dek_destroyed_now,
@@ -187,7 +193,11 @@ mod tests {
         assert!(receipt.is_green(), "GIT-D2 (storage half) green");
 
         assert!(
-            !engine.backup_snapshot().iter().any(|(d, _)| *d == blob_dek),
+            !engine
+                .backup_snapshot()
+                .unwrap()
+                .iter()
+                .any(|(d, _)| *d == blob_dek),
             "the blob DEK is absent from the backup after the git shred (0 recoverable, §7.5)"
         );
         assert!(
@@ -201,7 +211,9 @@ mod tests {
         let tenant = t();
         let engine = engine_with_blob_dek(&tenant);
         let reach = GitCryptoShredReach::new(&engine, r());
-        let receipt = reach.shred_git_structures(&tenant);
+        let receipt = reach
+            .shred_git_structures(&tenant)
+            .expect("the in-memory key registry remains available");
 
         assert_eq!(receipt.structures_reached, GitShreddable::ALL.to_vec());
         assert!(receipt.structures_reached.contains(&GitShreddable::Reflog));
@@ -218,14 +230,18 @@ mod tests {
         let engine = engine_with_blob_dek(&tenant);
         let reach = GitCryptoShredReach::new(&engine, r());
 
-        let r1 = reach.shred_git_structures(&tenant);
+        let r1 = reach
+            .shred_git_structures(&tenant)
+            .expect("the in-memory key registry remains available");
         assert!(
             r1.blob_dek_destroyed_now,
             "first shred destroys the blob DEK"
         );
         assert!(r1.is_green());
 
-        let r2 = reach.shred_git_structures(&tenant);
+        let r2 = reach
+            .shred_git_structures(&tenant)
+            .expect("the in-memory key registry remains available");
         assert!(
             !r2.blob_dek_destroyed_now,
             "the blob DEK was already destroyed (idempotent re-run)"
@@ -245,7 +261,11 @@ mod tests {
             "the git shred reach as the erase seam succeeds when green"
         );
         let blob_dek = DekId::new(tenant.clone(), KeyClass::Blob);
-        assert!(!engine.backup_snapshot().iter().any(|(d, _)| *d == blob_dek));
+        assert!(!engine
+            .backup_snapshot()
+            .unwrap()
+            .iter()
+            .any(|(d, _)| *d == blob_dek));
     }
 
     #[test]

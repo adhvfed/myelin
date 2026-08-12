@@ -183,7 +183,7 @@ fn git_d2_complete_erase_reaches_every_holder_residual_is_the_posture_backups_sh
     );
     let subj_dek = DekId::new(t.clone(), KeyClass::Subject(SUBJECT.into()));
     assert!(
-        !eng.backup_snapshot().iter().any(|(d, _)| *d == subj_dek),
+        !eng.backup_snapshot().unwrap().iter().any(|(d, _)| *d == subj_dek),
         "the per-subject DEK is ABSENT from the backup snapshot (crypto-shred reaches backups, §7.5)"
     );
 
@@ -193,7 +193,7 @@ fn git_d2_complete_erase_reaches_every_holder_residual_is_the_posture_backups_sh
     );
     let blob_dek_id = DekId::new(t.clone(), KeyClass::Blob);
     assert!(
-        !eng.backup_snapshot().iter().any(|(d, _)| *d == blob_dek_id),
+        !eng.backup_snapshot().unwrap().iter().any(|(d, _)| *d == blob_dek_id),
         "the per-tenant blob DEK is ABSENT from the backup snapshot (reflog/bitmap/pack/LFS shredded)"
     );
 

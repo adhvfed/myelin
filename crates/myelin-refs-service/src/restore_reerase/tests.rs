@@ -84,7 +84,8 @@ fn restore_then_reerase_leaves_zero_recoverable_pii_at_backup_scale() {
 
     let targets: Vec<String> = corpus.subjects.iter().take(5).cloned().collect();
 
-    let report = re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
+    let report =
+        re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW).unwrap();
 
     assert_eq!(
         report.cached_titles_resurrected_by_restore, 20,
@@ -129,7 +130,7 @@ fn non_erased_subject_is_untouched_by_the_reerase() {
     let corpus = build_backup_scale_corpus(&tenant(), &region(), 6, 2);
     let targets: Vec<String> = corpus.subjects.iter().take(2).cloned().collect();
 
-    re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
+    re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW).unwrap();
 
     let survivor = corpus.subjects.last().unwrap().clone();
     assert!(!targets.contains(&survivor));
@@ -159,10 +160,12 @@ fn reerase_is_idempotent() {
     let corpus = build_backup_scale_corpus(&tenant(), &region(), 3, 2);
     let targets: Vec<String> = corpus.subjects.clone();
 
-    let first = re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
+    let first =
+        re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW).unwrap();
     assert!(first.is_ref_d5_backup_scale_green());
 
-    let again = re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
+    let again =
+        re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW).unwrap();
     assert_eq!(again.recoverable_pii, 0, "idempotent: still 0 recoverable");
     assert_eq!(again.live_deks_post_reerase, 0);
     assert_eq!(again.live_edges_post_reerase, 0);
@@ -193,7 +196,7 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
             tenant: tenant(),
         })
         .unwrap();
-    dek.destroy_subject_backstop(&tenant(), &forgotten);
+    dek.destroy_subject_backstop(&tenant(), &forgotten).unwrap();
     for edge in corpus.edges_of(&forgotten) {
         projection.tombstone(&tenant(), &region(), &edge.edge_id, "erased");
     }
@@ -239,7 +242,7 @@ fn warm_subject_titles_test(
     dek: &RefsDekPin,
     subject_id: &str,
 ) {
-    super::warm_subject_titles(corpus, cache, dek, subject_id);
+    super::warm_subject_titles(corpus, cache, dek, subject_id).unwrap();
 }
 
 #[test]

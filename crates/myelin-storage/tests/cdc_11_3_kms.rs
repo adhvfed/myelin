@@ -67,7 +67,8 @@ fn cdc_11_3_encrypted_store_wraps_and_unwraps_through_the_kms() {
 
     let alice_dek = DekId::new(tenant, KeyClass::Subject("alice".into()));
     assert!(
-        kms.destroy_dek(&alice_dek),
+        kms.destroy_dek(&alice_dek)
+            .expect("the in-memory key registry remains available"),
         "provider: per-subject DEK present to shred"
     );
 

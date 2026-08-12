@@ -258,7 +258,7 @@ mod tests {
         );
 
         assert!(
-            pin.destroy_tenant_index_dek(&t(), &r()),
+            pin.destroy_tenant_index_dek(&t(), &r()).unwrap(),
             "the per-tenant index DEK is destroyable (the tenant-decommission shred lever fires)"
         );
 

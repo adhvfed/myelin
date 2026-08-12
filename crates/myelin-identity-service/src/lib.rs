@@ -579,7 +579,7 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         subject: &myelin_identity::PrincipalId,
         now: myelin_events::Timestamp,
-    ) -> pseudonym_erase::ErasureReceipt {
+    ) -> Result<pseudonym_erase::ErasureReceipt, PseudonymError> {
         let dek_class = PseudonymStore::subject_dek_class(subject);
         let (dek_destroyed, row_shredded, shredded_class) = pseudonym_erase::EraseEngine::shred(
             &self.pseudonyms,
@@ -587,12 +587,12 @@ impl StoreBackedCheck {
             scope,
             subject,
             &dek_class,
-        );
+        )?;
         self.revocations
             .disable_principal(scope, subject, now.clone());
         self.erasure_ledger
             .record(scope, subject, dek_class.clone(), now.clone());
-        pseudonym_erase::ErasureReceipt::for_erase(
+        Ok(pseudonym_erase::ErasureReceipt::for_erase(
             subject.clone(),
             scope.tenant().clone(),
             scope.region().clone(),
@@ -600,7 +600,7 @@ impl StoreBackedCheck {
             dek_destroyed,
             row_shredded,
             now,
-        )
+        ))
     }
 
     pub fn re_erase_after_restore(
@@ -619,13 +619,14 @@ impl StoreBackedCheck {
             if live_before {
                 resurrected += 1;
             }
-            let (dek_destroyed, row_shredded, shredded_class) = pseudonym_erase::EraseEngine::shred(
-                &self.pseudonyms,
-                &self.kms,
-                scope,
-                &entry.subject,
-                &entry.dek_class,
-            );
+            let (dek_destroyed, row_shredded, shredded_class) =
+                pseudonym_erase::EraseEngine::shred(
+                    &self.pseudonyms,
+                    &self.kms,
+                    scope,
+                    &entry.subject,
+                    &entry.dek_class,
+                )?;
             self.revocations
                 .disable_principal(scope, &entry.subject, now.clone());
             per_subject.push(pseudonym_erase::ErasureReceipt::for_erase(
