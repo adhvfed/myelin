@@ -879,11 +879,13 @@ mod tests {
         cgroup
             .place_child(command.command_mut())
             .expect("place launch guard in the real gVisor cgroup");
-        command.kill_cgroup_on_liveness_loss(
-            cgroup
-                .kill_file()
-                .expect("open the real whole-cgroup kill switch"),
-        );
+        command
+            .kill_cgroup_on_liveness_loss(
+                cgroup
+                    .kill_file()
+                    .expect("open the real whole-cgroup kill switch"),
+            )
+            .unwrap();
         let mut child = command.spawn().expect("release detached-descendant probe");
         let runtime_group = child.id() as i32;
         let deadline = Instant::now() + Duration::from_secs(1);

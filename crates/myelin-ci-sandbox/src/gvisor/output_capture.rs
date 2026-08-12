@@ -138,7 +138,11 @@ fn run_and_capture_impl(
         .map_err(|error| RunFailure::uncommitted(format!("prepare runsc launch gate: {error}")))?;
     let fenced = sandbox_command.is_fenced();
     if fenced && stdin.is_some() {
-        sandbox_command.return_stdin_to_caller_after_gate();
+        sandbox_command
+            .return_stdin_to_caller_after_gate()
+            .map_err(|error| {
+                RunFailure::uncommitted(format!("retain runsc stdin after launch gate: {error}"))
+            })?;
     }
     {
         let cmd = sandbox_command.command_mut();
@@ -165,7 +169,11 @@ fn run_and_capture_impl(
         let kill_file = cgroup.kill_file().map_err(|error| {
             RunFailure::uncommitted(format!("open runsc cgroup kill switch: {error}"))
         })?;
-        sandbox_command.kill_cgroup_on_liveness_loss(kill_file);
+        sandbox_command
+            .kill_cgroup_on_liveness_loss(kill_file)
+            .map_err(|error| {
+                RunFailure::uncommitted(format!("arm runsc cgroup kill switch: {error}"))
+            })?;
     }
     let mut child = sandbox_command.spawn().map_err(|spawn_failure| {
         let message = format!("spawn runsc: {}", spawn_failure.message());

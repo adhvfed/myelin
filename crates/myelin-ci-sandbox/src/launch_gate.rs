@@ -12,23 +12,30 @@ IFS= read -r myelin_launch_gate || exit 125
 exec "$@"
 "#;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostGateStdin {
-    #[default]
     Close,
     ReturnToCaller,
 }
 
 pub(crate) struct SandboxCommand {
     command: Command,
-    permit: Option<LaunchPermit>,
-    liveness_read: Option<OwnedFd>,
-    liveness_write: Option<OwnedFd>,
-    ready_read: Option<OwnedFd>,
-    ready_write: Option<OwnedFd>,
+    fence: LaunchFence,
+}
+
+enum LaunchFence {
+    Unfenced,
+    Fenced(FencedLaunch),
+}
+
+struct FencedLaunch {
+    permit: LaunchPermit,
+    liveness_read: OwnedFd,
+    liveness_write: OwnedFd,
+    ready_read: OwnedFd,
+    ready_write: OwnedFd,
     cgroup_kill: Option<File>,
-    watchdog_timeout: Option<Duration>,
-    fenced: bool,
+    watchdog_timeout: Duration,
     post_gate_stdin: PostGateStdin,
 }
 
@@ -47,15 +54,7 @@ impl SandboxCommand {
             }
             return Ok(Self {
                 command: Command::new(program),
-                permit: None,
-                liveness_read: None,
-                liveness_write: None,
-                ready_read: None,
-                ready_write: None,
-                cgroup_kill: None,
-                watchdog_timeout: None,
-                fenced: false,
-                post_gate_stdin: PostGateStdin::Close,
+                fence: LaunchFence::Unfenced,
             });
         };
         let watchdog_timeout = watchdog_timeout
@@ -79,15 +78,16 @@ impl SandboxCommand {
 
         Ok(Self {
             command,
-            permit: Some(permit),
-            liveness_read: Some(liveness_read),
-            liveness_write: Some(liveness_write),
-            ready_read: Some(ready_read),
-            ready_write: Some(ready_write),
-            cgroup_kill: None,
-            watchdog_timeout: Some(watchdog_timeout),
-            fenced: true,
-            post_gate_stdin: PostGateStdin::Close,
+            fence: LaunchFence::Fenced(FencedLaunch {
+                permit,
+                liveness_read,
+                liveness_write,
+                ready_read,
+                ready_write,
+                cgroup_kill: None,
+                watchdog_timeout,
+                post_gate_stdin: PostGateStdin::Close,
+            }),
         })
     }
 
@@ -96,211 +96,209 @@ impl SandboxCommand {
     }
 
     pub(crate) fn is_fenced(&self) -> bool {
-        self.fenced
+        matches!(self.fence, LaunchFence::Fenced(_))
     }
 
-    pub(crate) fn return_stdin_to_caller_after_gate(&mut self) {
-        assert!(
-            self.fenced,
-            "only a fenced sandbox command has a launch-gate pipe to retain"
-        );
-        self.post_gate_stdin = PostGateStdin::ReturnToCaller;
-    }
-
-    pub(crate) fn kill_cgroup_on_liveness_loss(&mut self, kill_file: File) {
-        self.cgroup_kill = Some(kill_file);
-    }
-
-    pub(crate) fn spawn(mut self) -> Result<SandboxChild, SpawnFailure> {
-        let watchdog_timer = if self.fenced {
-            Some(
-                boottime_timer(
-                    self.watchdog_timeout
-                        .expect("fenced sandbox command owns a watchdog deadline"),
-                )
-                .map_err(|error| {
-                    SpawnFailure::uncommitted(
-                        format!("arm sandbox launch watchdog deadline: {error}"),
-                        DirectChildRetirement::NoChildReturned,
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
-        if self.fenced {
-            let liveness_fd = self
-                .liveness_read
-                .as_ref()
-                .expect("fenced sandbox command owns a liveness pipe")
-                .as_raw_fd();
-            let liveness_write_fd = self
-                .liveness_write
-                .as_ref()
-                .expect("fenced sandbox command owns a liveness writer")
-                .as_raw_fd();
-            let ready_fd = self
-                .ready_write
-                .as_ref()
-                .expect("fenced sandbox command owns a readiness writer")
-                .as_raw_fd();
-            let timer_fd = watchdog_timer
-                .as_ref()
-                .expect("fenced sandbox command owns a watchdog timer")
-                .as_raw_fd();
-            let cgroup_kill_fd = self.cgroup_kill.as_ref().map_or(-1, AsRawFd::as_raw_fd);
-            unsafe {
-                self.command.pre_exec(move || {
-                    if libc::setpgid(0, 0) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let process_group = libc::getpid();
-                    let watchdog = libc::fork();
-                    if watchdog == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if watchdog == 0 {
-                        if libc::setpgid(0, 0) == -1 {
-                            libc::_exit(126);
-                        }
-                        native_watchdog(
-                            liveness_fd,
-                            liveness_write_fd,
-                            ready_fd,
-                            timer_fd,
-                            cgroup_kill_fd,
-                            process_group,
-                        );
-                    }
-                    Ok(())
-                });
+    pub(crate) fn return_stdin_to_caller_after_gate(&mut self) -> io::Result<()> {
+        match &mut self.fence {
+            LaunchFence::Fenced(fence) => {
+                fence.post_gate_stdin = PostGateStdin::ReturnToCaller;
+                Ok(())
             }
+            LaunchFence::Unfenced => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only a fenced sandbox command has a launch-gate pipe to retain",
+            )),
         }
-        let mut executed_at = (!self.fenced).then(Instant::now);
-        let mut child = self.command.spawn().map_err(|error| {
-            SpawnFailure::uncommitted(
-                format!("spawn sandbox process: {error}"),
-                DirectChildRetirement::NoChildReturned,
-            )
-        })?;
-        drop(self.liveness_read.take());
-        drop(self.ready_write.take());
-        drop(self.cgroup_kill.take());
+    }
 
-        if self.fenced {
-            let group_id = child.id() as i32;
-            let mut gate = match child.stdin.take() {
-                Some(gate) => gate,
-                None => {
-                    kill_process_group(group_id);
-                    let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
-                    return Err(SpawnFailure::uncommitted(
-                        "launch guard gate pipe unavailable".to_string(),
-                        child_retirement,
-                    ));
+    pub(crate) fn kill_cgroup_on_liveness_loss(&mut self, kill_file: File) -> io::Result<()> {
+        match &mut self.fence {
+            LaunchFence::Fenced(fence) => {
+                fence.cgroup_kill = Some(kill_file);
+                Ok(())
+            }
+            LaunchFence::Unfenced => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only a fenced sandbox command has a liveness watchdog",
+            )),
+        }
+    }
+
+    pub(crate) fn spawn(self) -> Result<SandboxChild, SpawnFailure> {
+        match self.fence {
+            LaunchFence::Unfenced => spawn_unfenced(self.command),
+            LaunchFence::Fenced(fence) => spawn_fenced(self.command, fence),
+        }
+    }
+}
+
+fn spawn_unfenced(mut command: Command) -> Result<SandboxChild, SpawnFailure> {
+    let executed_at = Instant::now();
+    let child = command.spawn().map_err(|error| {
+        SpawnFailure::uncommitted(
+            format!("spawn sandbox process: {error}"),
+            DirectChildRetirement::NoChildReturned,
+        )
+    })?;
+    Ok(SandboxChild {
+        child,
+        liveness_write: None,
+        watchdog_timer: None,
+        process_group: None,
+        executed_at,
+    })
+}
+
+fn spawn_fenced(mut command: Command, fence: FencedLaunch) -> Result<SandboxChild, SpawnFailure> {
+    let FencedLaunch {
+        permit,
+        liveness_read,
+        liveness_write,
+        mut ready_read,
+        ready_write,
+        cgroup_kill,
+        watchdog_timeout,
+        post_gate_stdin,
+    } = fence;
+    let watchdog_timer = boottime_timer(watchdog_timeout).map_err(|error| {
+        SpawnFailure::uncommitted(
+            format!("arm sandbox launch watchdog deadline: {error}"),
+            DirectChildRetirement::NoChildReturned,
+        )
+    })?;
+    let liveness_fd = liveness_read.as_raw_fd();
+    let liveness_write_fd = liveness_write.as_raw_fd();
+    let ready_fd = ready_write.as_raw_fd();
+    let timer_fd = watchdog_timer.as_raw_fd();
+    let cgroup_kill_fd = cgroup_kill.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let process_group = libc::getpid();
+            let watchdog = libc::fork();
+            if watchdog == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if watchdog == 0 {
+                if libc::setpgid(0, 0) == -1 {
+                    libc::_exit(126);
                 }
-            };
-            let ready_result = wait_until_ready(
-                self.ready_read
-                    .as_mut()
-                    .expect("fenced sandbox command owns a readiness pipe"),
-            );
-            drop(self.ready_read.take());
-            if let Err(error) = ready_result {
-                drop(gate);
+                native_watchdog(
+                    liveness_fd,
+                    liveness_write_fd,
+                    ready_fd,
+                    timer_fd,
+                    cgroup_kill_fd,
+                    process_group,
+                );
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| {
+        SpawnFailure::uncommitted(
+            format!("spawn sandbox process: {error}"),
+            DirectChildRetirement::NoChildReturned,
+        )
+    })?;
+    drop(liveness_read);
+    drop(ready_write);
+    drop(cgroup_kill);
+
+    let group_id = child.id() as i32;
+    let mut gate = match child.stdin.take() {
+        Some(gate) => gate,
+        None => {
+            kill_process_group(group_id);
+            let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
+            return Err(SpawnFailure::uncommitted(
+                "launch guard gate pipe unavailable".to_string(),
+                child_retirement,
+            ));
+        }
+    };
+    let ready_result = wait_until_ready(&mut ready_read);
+    drop(ready_read);
+    if let Err(error) = ready_result {
+        drop(gate);
+        kill_process_group(group_id);
+        let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
+        return Err(SpawnFailure::uncommitted(
+            format!("launch guard failed to arm liveness watchdog: {error}"),
+            child_retirement,
+        ));
+    }
+    let ownership = match permit.commit() {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            drop(gate);
+            kill_process_group(group_id);
+            let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
+            return Err(SpawnFailure::commit_outcome_unknown(
+                format!("durable launch commit returned an error before sandbox exec: {error}"),
+                child_retirement,
+            ));
+        }
+    };
+    let ownership = match ownership.validate() {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            drop(gate);
+            kill_process_group(group_id);
+            let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
+            return Err(SpawnFailure::committed_but_not_executed(
+                format!("durable launch ownership was lost before sandbox exec: {error}"),
+                child_retirement,
+            ));
+        }
+    };
+    let executed_at = Instant::now();
+    if let Err(error) = gate.write_all(b"launch\n") {
+        drop(gate);
+        kill_process_group(group_id);
+        let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
+        return Err(SpawnFailure::committed_but_not_executed(
+            format!("release sandbox after durable launch commit: {error}"),
+            child_retirement,
+        ));
+    }
+    match post_gate_stdin {
+        PostGateStdin::Close => {
+            drop(gate);
+            if let Err(error) = ownership.release() {
                 kill_process_group(group_id);
                 let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
-                return Err(SpawnFailure::uncommitted(
-                    format!("launch guard failed to arm liveness watchdog: {error}"),
+                return Err(SpawnFailure::executed(
+                    format!("release durable launch ownership after sandbox exec handoff: {error}"),
+                    executed_at,
                     child_retirement,
                 ));
             }
-            let permit = self
-                .permit
-                .take()
-                .expect("fenced sandbox command owns one launch permit");
-            let ownership = match permit.commit() {
-                Ok(ownership) => ownership,
-                Err(error) => {
-                    drop(gate);
-                    kill_process_group(group_id);
-                    let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
-                    return Err(SpawnFailure::commit_outcome_unknown(
-                        format!(
-                            "durable launch commit returned an error before sandbox exec: {error}"
-                        ),
-                        child_retirement,
-                    ));
-                }
-            };
-            let ownership = match ownership.validate() {
-                Ok(ownership) => ownership,
-                Err(error) => {
-                    drop(gate);
-                    kill_process_group(group_id);
-                    let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
-                    return Err(SpawnFailure::committed_but_not_executed(
-                        format!("durable launch ownership was lost before sandbox exec: {error}"),
-                        child_retirement,
-                    ));
-                }
-            };
-            let release_at = Instant::now();
-            if let Err(error) = gate.write_all(b"launch\n") {
+        }
+        PostGateStdin::ReturnToCaller => match ownership.release() {
+            Ok(()) => child.stdin = Some(gate),
+            Err(error) => {
                 drop(gate);
                 kill_process_group(group_id);
                 let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
-                return Err(SpawnFailure::committed_but_not_executed(
-                    format!("release sandbox after durable launch commit: {error}"),
+                return Err(SpawnFailure::executed(
+                    format!("release durable launch ownership after sandbox exec handoff: {error}"),
+                    executed_at,
                     child_retirement,
                 ));
             }
-            executed_at = Some(release_at);
-            match self.post_gate_stdin {
-                PostGateStdin::Close => {
-                    drop(gate);
-                    if let Err(error) = ownership.release() {
-                        kill_process_group(group_id);
-                        let child_retirement =
-                            DirectChildRetirement::from_wait_result(child.wait());
-                        return Err(SpawnFailure::executed(
-                            format!(
-                                "release durable launch ownership after sandbox exec handoff: {error}"
-                            ),
-                            executed_at.expect("executed_at was just set above"),
-                            child_retirement,
-                        ));
-                    }
-                }
-                PostGateStdin::ReturnToCaller => match ownership.release() {
-                    Ok(()) => child.stdin = Some(gate),
-                    Err(error) => {
-                        drop(gate);
-                        kill_process_group(group_id);
-                        let child_retirement =
-                            DirectChildRetirement::from_wait_result(child.wait());
-                        return Err(SpawnFailure::executed(
-                            format!(
-                                "release durable launch ownership after sandbox exec handoff: {error}"
-                            ),
-                            executed_at.expect("executed_at was just set above"),
-                            child_retirement,
-                        ));
-                    }
-                },
-            }
-        }
-
-        let process_group = self.fenced.then_some(child.id() as i32);
-        Ok(SandboxChild {
-            child,
-            liveness_write: self.liveness_write,
-            watchdog_timer,
-            process_group,
-            executed_at: executed_at
-                .expect("executed_at is always set (pre-spawn if unfenced, pre-gate-write if fenced) by the time spawn succeeds"),
-        })
+        },
     }
+    Ok(SandboxChild {
+        child,
+        liveness_write: Some(liveness_write),
+        watchdog_timer: Some(watchdog_timer),
+        process_group: Some(group_id),
+        executed_at,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -950,7 +948,7 @@ mod tests {
         let marker = marker_path("retained-live-pipe");
         let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
         let mut command = marker_command(&marker, "cat > \"$1\"", permit);
-        command.return_stdin_to_caller_after_gate();
+        command.return_stdin_to_caller_after_gate().unwrap();
         let mut child = command.spawn().expect("durable commit releases runtime");
         let pipe = child
             .stdin()
@@ -969,7 +967,7 @@ mod tests {
         let marker = marker_path(label);
         let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
         let mut command = marker_command(&marker, "cat > \"$1\"", permit);
-        command.return_stdin_to_caller_after_gate();
+        command.return_stdin_to_caller_after_gate().unwrap();
         let mut child = command.spawn().expect("durable commit releases runtime");
         let mut pipe = child
             .stdin()
@@ -1016,7 +1014,7 @@ mod tests {
             }))
         });
         let mut command = marker_command(&marker, "cat > \"$1\"", permit);
-        command.return_stdin_to_caller_after_gate();
+        command.return_stdin_to_caller_after_gate().unwrap();
         let start = Instant::now();
         let error = command.spawn().expect_err(
             "lost post-commit ownership must refuse gate release even in retained mode",
@@ -1041,7 +1039,7 @@ mod tests {
             Err(HookError("injected commit failure".into()))
         });
         let mut command = marker_command(&marker, "cat > \"$1\"", permit);
-        command.return_stdin_to_caller_after_gate();
+        command.return_stdin_to_caller_after_gate().unwrap();
         let error = command
             .spawn()
             .expect_err("failed commit must refuse launch even in retained mode");
@@ -1064,7 +1062,7 @@ mod tests {
             "sleep 0.25; printf escaped > \"$1\"; sleep 5",
             permit,
         );
-        command.return_stdin_to_caller_after_gate();
+        command.return_stdin_to_caller_after_gate().unwrap();
         let start = Instant::now();
         let error = command
             .spawn()
@@ -1087,7 +1085,7 @@ mod tests {
         let permit = LaunchPermit::retained(|| Ok(crate::LaunchOwnership::immediate()));
         let mut command =
             SandboxCommand::new("/bin/sh", Some(permit), Some(Duration::from_millis(750))).unwrap();
-        command.return_stdin_to_caller_after_gate();
+        command.return_stdin_to_caller_after_gate().unwrap();
         command
             .command_mut()
             .arg("-c")
