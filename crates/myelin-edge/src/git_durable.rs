@@ -2763,14 +2763,17 @@ impl DurableGitBackend {
 
     pub fn create_thread(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         operation_nonce: &str,
         body: &Value,
-        principal: &Principal,
     ) -> Result<Value, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         let rec = self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);

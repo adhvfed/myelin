@@ -2196,13 +2196,15 @@ impl Handler for DPrThreadCreate {
         let vm = self
             .be
             .create_thread(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 &operation_nonce,
                 &body,
-                ctx.principal,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -5358,16 +5360,12 @@ mod pr_thread_tests {
         let (be, reviewer, head) = setup_diff("anchors");
         let new_side = be
             .create_thread(
-                TENANT,
-                REGION,
-                SLUG,
-                1,
+                RepoActorContext::new(TENANT, REGION, SLUG, &reviewer).for_pr(1),
                 "new-side-anchor",
                 &json!({
                     "body_md": "new-side note",
                     "anchor": { "path": "file.txt", "line": 4, "side": "new" },
                 }),
-                &reviewer,
             )
             .expect("a displayed new-side line resolves");
         assert_eq!(new_side["anchor"]["side"], "new");
@@ -5376,16 +5374,12 @@ mod pr_thread_tests {
 
         let old_side = be
             .create_thread(
-                TENANT,
-                REGION,
-                SLUG,
-                1,
+                RepoActorContext::new(TENANT, REGION, SLUG, &reviewer).for_pr(1),
                 "old-side-anchor",
                 &json!({
                     "body_md": "old-side note",
                     "anchor": { "path": "file.txt", "line": 2, "side": "old" },
                 }),
-                &reviewer,
             )
             .expect("a displayed old-side line resolves");
         assert_eq!(old_side["anchor"]["side"], "old");
@@ -5400,13 +5394,9 @@ mod pr_thread_tests {
         {
             let error = be
                 .create_thread(
-                    TENANT,
-                    REGION,
-                    SLUG,
-                    1,
+                    RepoActorContext::new(TENANT, REGION, SLUG, &reviewer).for_pr(1),
                     &format!("invalid-anchor-{index}"),
                     &invalid,
-                    &reviewer,
                 )
                 .expect_err("malformed or stale anchor must be rejected");
             assert!(error.to_string().contains("anchor"), "got {error:?}");

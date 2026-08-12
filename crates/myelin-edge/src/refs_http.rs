@@ -151,14 +151,14 @@ enum EdgeDirection {
 }
 
 impl EdgeDirection {
-    fn related_ref<'a>(self, edge: &'a StoredEdge) -> &'a str {
+    fn related_ref(self, edge: &StoredEdge) -> &str {
         match self {
             Self::Inbound => &edge.source,
             Self::Outbound => &edge.target,
         }
     }
 
-    fn related_root<'a>(self, edge: &'a StoredEdge) -> &'a str {
+    fn related_root(self, edge: &StoredEdge) -> &str {
         match self {
             Self::Inbound => &edge.source_root,
             Self::Outbound => &edge.target_root,
