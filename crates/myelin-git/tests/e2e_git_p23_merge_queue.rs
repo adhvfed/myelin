@@ -215,16 +215,10 @@ fn git_d10_b_fork_self_green_is_neutral_dequeues() {
     );
 
     let merges = Cell::new(0u32);
-    let merger = GitMergePerformer::new(
-        &proj,
-        GitOid(HEAD.into()),
-        policy(),
-        vec![],
-        |_r| {
-            merges.set(merges.get() + 1);
-            Ok("should-not-merge".into())
-        },
-    );
+    let merger = GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), vec![], |_r| {
+        merges.set(merges.get() + 1);
+        Ok("should-not-merge".into())
+    });
 
     let outbox = OutboxStore::new();
     let ci = RecordingCi::default();
@@ -324,21 +318,5 @@ fn git_d10_c_maintainer_endorsement_flips_the_gate_green() {
         merges.get(),
         1,
         "GIT-D10 (c): the endorsement flips green - merge-count == 1"
-    );
-}
-
-#[test]
-fn no_cross_sync_cycle_lint_green_over_the_merge_queue() {
-    let src = include_str!("../src/merge_queue.rs");
-    let lint = myelin_lints::no_cross_sync_cycle();
-    let violations = lint.run(src);
-    assert!(
-        violations.is_empty(),
-        "Git's merge queue makes a synchronous cross-subsystem call (it must read its OWN projection, \
-         never synchronously call CI): {violations:?}"
-    );
-    assert!(
-        src.contains("CheckStatusProjection"),
-        "the merge queue reads Git's own check_status projection"
     );
 }

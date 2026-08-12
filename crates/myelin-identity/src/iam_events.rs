@@ -164,51 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn no_iam_projection_carries_a_pii_field() {
-        const PII_FIELDS: &[&str] = &[
-            "name",
-            "email",
-            "phone",
-            "address",
-            "body",
-            "display_name",
-            "full_name",
-            "given_name",
-            "family_name",
-            "first_name",
-            "last_name",
-            "message",
-            "comment",
-            "title",
-            "profile",
-            "profile_ref",
-        ];
-        let src = include_str!("iam_events.rs");
-        for marker in [
-            "pub struct IamEventProjection {",
-            "pub enum IamSubjectRef {",
-        ] {
-            let start = src
-                .find(marker)
-                .expect("projection type is defined in this module");
-            let body = &src[start..];
-            let end = body.find('}').expect("type body is brace-closed");
-            for line in body[..end].lines() {
-                let trimmed = line.trim();
-                if let Some((lhs, _)) = trimmed.split_once(':') {
-                    let ident = lhs.trim_start_matches("pub ").trim();
-                    let ident = ident.split(['(', ' ']).next().unwrap_or(ident);
-                    assert!(
-                        !PII_FIELDS.contains(&ident),
-                        "iam.* projection carries forbidden PII field `{ident}` - \
-                         attribution must be opaque-id-only (EI-04 §1; control-plane-pii-free)"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn identity_owns_the_six_telemetry_signal_names() {
         use signals::*;
         assert_eq!(

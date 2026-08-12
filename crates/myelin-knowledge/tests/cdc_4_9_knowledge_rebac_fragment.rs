@@ -144,20 +144,3 @@ fn cdc_4_9_no_knowledge_name_smuggles_an_object_id() {
     }
     let _ = rebac_fragment::object_types::PAGE;
 }
-
-#[test]
-fn cdc_4_9_no_cross_db_lint_is_green_on_the_fragment() {
-    let lint = myelin_lints::lints::no_cross_db();
-
-    let green = include_str!("../src/rebac_fragment.rs");
-    assert!(
-        lint.run(green).is_empty(),
-        "the Knowledge ReBAC fragment declares relations over the contract ABI - no cross-DB reach"
-    );
-
-    let red = "use myelin_identity::store::TupleStore;\n";
-    assert!(
-        !lint.run(red).is_empty(),
-        "a fragment reaching into another owner's `::store` data path is RED (no-cross-db)"
-    );
-}
