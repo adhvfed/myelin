@@ -417,6 +417,22 @@ mod tests {
             ),
             "safe recovery guidance remains actionable"
         );
+        assert_eq!(
+            deny_durable_error(DurableError::Conflict(
+                "branch protection refused the direct write; open a pull request".into(),
+            )),
+            EffectResult::Denied(
+                "branch protection refused the direct write; open a pull request".into(),
+            ),
+            "policy conflicts tell the agent how to recover"
+        );
+        assert_eq!(
+            deny_durable_error(DurableError::Forbidden(
+                "secret policy matched a private detector".into(),
+            )),
+            EffectResult::Denied("forbidden".into()),
+            "forbidden policy internals stay private"
+        );
     }
 
     #[test]

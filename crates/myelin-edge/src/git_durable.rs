@@ -1772,8 +1772,9 @@ impl DurableGitBackend {
             &endorsed,
         )
         .map_err(|reason| {
-            DurableError::Forbidden(format!(
-                "branch protection refused a direct file write to `{}`: {reason:?}",
+            DurableError::Conflict(format!(
+                "branch protection refused a direct file write to `{}`: {reason:?}; write to an \
+                 unprotected working branch and open a pull request",
                 ref_name.0
             ))
         })
@@ -4360,7 +4361,10 @@ mod agent_file_write_tests {
                 operation_id: &protected_operation,
             })
             .unwrap_err();
-        assert!(matches!(protected, DurableError::Forbidden(_)));
+        assert!(matches!(protected, DurableError::Conflict(_)));
+        assert!(protected
+            .to_string()
+            .contains("write to an unprotected working branch and open a pull request"));
         assert_eq!(
             repo.read_ref("refs/heads/main").unwrap(),
             Some(main_commit),
