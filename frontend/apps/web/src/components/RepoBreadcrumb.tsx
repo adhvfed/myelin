@@ -1,8 +1,4 @@
-// The ref-carrying breadcrumb (R3.4 / findings 13, 6): Repositories / {repo} / {ref-pill} / seg / seg…
-// The repo, the ref, and EVERY path segment are individual links (ref → tree root at ref; each segment
-// → tree at that sub-path). The last segment is the current node (`aria-current`, not a link). The ref
-// is NEVER reset to a hardcoded 'main' — it is the ref the surface was reached with. Mono runs are
-// bidi-isolated for RTL. Semantic tokens only.
+// Repository breadcrumb that preserves the selected ref through each path segment.
 import { For, Show } from "solid-js";
 import { A } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";

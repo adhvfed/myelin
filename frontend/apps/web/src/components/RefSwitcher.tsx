@@ -1,8 +1,4 @@
-// The branch/tag switcher (R3.4 / G-1) — a scoped in-context picker (NOT the ⌘K palette): a Popover
-// trigger showing the current ref, unfurling a search input + pinned/branch/tag groups. Selecting
-// a ref rewrites the current route's `[ref]` (the caller supplies `hrefFor`) and preserves the path.
-// The filter-input wrapper carries a `:focus-within` focus ring (the gate fix — never a bare
-// `outline:none`). Options are real links (keyboard-reachable, axe-clean). Semantic tokens only.
+// Searchable branch/tag picker. Callers provide links that preserve the current repository path.
 import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { A } from "@solidjs/router";
 import { Icon, Popover } from "@myelin/design-system";

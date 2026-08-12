@@ -1,7 +1,4 @@
-// PrHeader — the shared PR header + tabs segment across the three PR routes (Overview · Files changed
-// · Checks · Commits), per the 03-pr-diff NOTES §1 (a shared layout segment). Active tab = the R1
-// `--surface-hover` fill + brighter text. The diff (G-7) and overview (G-6) both render this so the
-// tab strip and identity strip never diverge. Status is TEXT (StatusPill); semantic tokens only.
+// Shared PR identity header and route tabs.
 import { Show } from "solid-js";
 import { A } from "@solidjs/router";
 import { Icon, StatusPill } from "@myelin/design-system";

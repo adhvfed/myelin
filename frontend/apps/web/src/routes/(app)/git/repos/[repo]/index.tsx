@@ -1,8 +1,4 @@
-// Repo home (R3.4 / G-1) — `/git/repos/{repo}`. The enriched RepoHome ViewModel: title + branch/tag
-// counts, the branch/tag switcher, a latest-commit bar, a clickable file tree (dirs → tree route,
-// files → blob route) with per-row activity, and the FULL README render (sanitized markdown floor,
-// never a <pre> dump). default_branch drives every link (no hardcoded 'main'). The dignified error
-// trio replaces the raw err.message fallback. Semantic tokens only; a11y per the design manual.
+// Repository overview with refs, recent commit, root tree, and rendered README.
 import { ErrorBoundary, For, Show, Suspense, Switch, Match } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams } from "@solidjs/router";

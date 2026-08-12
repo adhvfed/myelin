@@ -1,9 +1,5 @@
-// Blob view (R3.4 / G-2) — `/git/repos/{repo}/blob/{ref}/{...path}` (nested path). Full-path
-// breadcrumb; a Raw + Download toolbar (gateway-proxied, in-region — Download forces an attachment via
-// the /git-raw proxy) + line attribution for previewable text. Body: a BINARY file renders the
-// download fallback (NEVER split('\n') a binary into a garbled dump); a large file whose object was
-// not inflated shows an explicit metadata-only fallback; otherwise the line-numbered code view. A directory requested
-// here (the edge's redirect_to_tree hint) client-redirects to the tree route. Semantic tokens only.
+// Blob preview with raw/download links and line attribution. Binary and oversized files use a
+// download or metadata fallback; directory responses redirect to the tree route.
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, Navigate, createAsync, useParams } from "@solidjs/router";

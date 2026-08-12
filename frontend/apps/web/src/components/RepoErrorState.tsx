@@ -1,8 +1,5 @@
-// The shared dignified error trio (R3.4 / R-21) — no-access · not-found · retryable-error. Spec'd
-// ONCE and reused by every repo-browsing route so the distinction is enforced uniformly and the raw
-// `String(err.message ?? err)` fallback (findings 7) is never rendered as content. Anti-oracle: the
-// edge serves the 0-leak 404 on a Pull deny, so no-access can be indistinguishable from not-found —
-// the copy never claims more than the signal warrants. Semantic tokens only; a11y per the manual.
+// Shared repository error states. Access denials may be collapsed to 404, so the copy does not
+// distinguish absence from withheld access unless the server does.
 import { Show } from "solid-js";
 import { A } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";

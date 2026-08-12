@@ -1,8 +1,4 @@
-// Tree-at-path (R3.4 / G-2) — `/git/repos/{repo}/tree/{ref}/{...path}`. The `[...path]` splat matches
-// the tree ROOT (empty) AND any nested dir. Renders the ref+every-segment breadcrumb, a parent-dir
-// row, clickable dir/file rows (shared TreeList), and a subtree README. A file requested here (the
-// edge's `redirect_to_blob` hint — kind mismatch) client-redirects to the blob route. The dignified
-// error trio replaces raw err.message. Semantic tokens only; a11y per the manual.
+// Repository tree for the selected ref and path. File responses redirect to the blob route.
 import { ErrorBoundary, Show, Suspense, createEffect, createSignal, onCleanup } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, Navigate, createAsync, useNavigate, useParams, useSearchParams } from "@solidjs/router";

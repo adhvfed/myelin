@@ -1,6 +1,4 @@
-// PR list view-model mapping (R3.1) — pure, DOM-free (node vitest). Proves the honest mappings: the
-// `#number` title fallback, the leak-free tab counts, the per-viewer review marker, and the
-// filtered-no-results vs truly-empty distinction.
+// PR list view-model mapping (Node/Vitest): title fallback, links, tabs, review markers, and filters.
 import { describe, it, expect } from "vitest";
 import {
   prTitleText,

@@ -1,10 +1,5 @@
-// PR diff / files-changed (R3.2 · G-7) — `/git/repos/{repo}/prs/{n}/diff`. The densest engineer
-// surface: the three-dot `merge-base(base, head) … head` diff on the shared <DiffViewer>, with
-// line-anchored comment threads (the R3.3 thread store), viewed marks (client-local, localStorage
-// keyed pr+head_oid), the W4 deep-link anchor (?file=&line=&side=) with an honest banner, split/
-// unified (unified-only <720px), the restricted count-only row, and load-remaining-files paging.
-// Full R-21 states. Keyboard/SR live in <DiffViewer> (j/k line · F7 change · n/p file · c comment ·
-// v viewed); this route wires the data + threads + composer. Semantic tokens only; status is TEXT.
+// PR files view. It supplies diff data, threads, viewed state, deep links, and pagination to the
+// shared diff viewer.
 import { ErrorBoundary, For, Show, Suspense, createMemo, createSignal } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, revalidate, useAction, useParams, useSearchParams } from "@solidjs/router";
@@ -51,17 +46,14 @@ export default function PrDiffScreen() {
 
   // Layout: ?view= wins; else split ≥960px, unified below; <720px forces unified (the switcher hides).
   const viewParam = () => (typeof search.view === "string" && (search.view === "split" || search.view === "unified") ? search.view : undefined);
-  // The MR-014 file cursor (?cursor=) — the "Load remaining files" link SETS it; the query must READ
-  // it (mirrors the PR-list route) or a >50-file PR can never page. `getPrDiff` accepts it.
+  // Read the file cursor set by the "Load remaining files" link.
   const cursor = () => (typeof search.cursor === "string" ? search.cursor : undefined);
 
   const pr = createAsync(
     async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined),
     { deferStream: true },
   );
-  // NB: the diff query does NOT depend on `view` — layout (split/unified) is a CLIENT concern; the
-  // server is layout-agnostic, so toggling the view never refetches (and never remounts the grid). It
-  // DOES depend on `cursor` — a new page is a real refetch keyed by the file cursor.
+  // Layout changes are client-only; cursor changes fetch another file page.
   const diffResult = createAsync(
     async () =>
       ready() ? getPrDiff({ repo: repo(), n: n(), cursor: cursor() }) : undefined,
@@ -80,12 +72,7 @@ export default function PrDiffScreen() {
     { deferStream: true },
   );
 
-  // View is a stable LOCAL signal (source of truth for rendering — decoupled from navigation so a
-  // toggle never re-suspends the grid), seeded from the shareable `?view=` (default split). Toggling
-  // updates the signal immediately AND mirrors the URL for shareability.
-  // FLOOR (R3): auto-responsive layout (split≥960 / unified<720, switcher hidden on mobile) is a
-  // fast-follow — the reactive media-query wiring flapped the switcher; the user toggle + `?view=`
-  // are the R3 path. The <720px unified-only rule lands with that follow-on.
+  // Keep view selection local to avoid re-suspending the grid, and mirror it in the URL.
   const [viewOverride, setViewOverride] = createSignal<"split" | "unified" | undefined>(viewParam());
   const view = (): "split" | "unified" => viewOverride() ?? viewParam() ?? "split";
   const setView = (v: "split" | "unified") => {
@@ -93,7 +80,7 @@ export default function PrDiffScreen() {
     setSearch({ view: v });
   };
 
-  // Viewed marks — client-local (R3 Q6 floor), keyed pr + head_oid so a rebase resets them.
+  // Key local viewed marks by PR and head so a rebase resets them.
   const viewedKey = (d: PrDiffVM) => `myelin:viewed:${repo()}:${n()}:${d.head_oid}`;
   const [viewedTick, setViewedTick] = createSignal(0);
   const readViewed = (d: PrDiffVM): Set<string> => {
@@ -207,8 +194,7 @@ export default function PrDiffScreen() {
     await reload();
   };
 
-  // The W4 deep-link anchor (?file=&line=&side=). Honest: if the line no longer exists in the diff, the
-  // banner says the check ran against an older head — never a silent nearest-line guess.
+  // If a deep-linked line no longer exists, report an older head instead of selecting a nearby line.
   const deepLink = createMemo(() => {
     const f = typeof search.file === "string" ? search.file : null;
     const l = typeof search.line === "string" ? Number(search.line) : NaN;
@@ -383,8 +369,7 @@ const barBtn = {
   "font-size": "var(--fs-caption)",
 } as const;
 
-/** A compact anchored-thread card (the diff's inline face of the R3.3 thread store). An `outdated`
- *  thread carries the honest detach pill — "Outdated — was on former line N" — never a wrong line. */
+/** An anchored-thread card. Outdated anchors retain their former line number. */
 function ThreadCard(props: { thread: PrThreadVM; outdated?: boolean }) {
   return (
     <div style={{ ...card, "margin-block": "var(--space-1)" }} data-testid="line-thread">

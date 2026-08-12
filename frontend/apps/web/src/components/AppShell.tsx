@@ -367,8 +367,7 @@ export function AppShell(props: AppShellProps) {
             padding: "var(--space-2)",
             "border-inline-end": "var(--hairline) solid var(--border)",
             background: "var(--surface-raised)",
-            // doc 10 §1 names the nav aside as a transformed ancestor — proving the overlays MUST
-            // portal to body to anchor correctly.
+            // Keep this transformed ancestor as coverage for overlays that portal to document.body.
             transform: "translateZ(0)",
           }}
         >
@@ -490,8 +489,7 @@ export function AppShell(props: AppShellProps) {
 }
 
 function ResidencyCue(props: { region: string; tenant: string }) {
-  // The data-region indicator the design manual specifies — glyph + TEXT label (never color-only), so
-  // the operator always knows which residency region their data lives in (a sovereignty-as-UX cue).
+  // Use a visible label as well as the region glyph.
   return (
     <span
       class="residency-cue"

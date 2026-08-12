@@ -1,14 +1,5 @@
-// PR overview (R3.3 · G-6 wedge flagship + G-8 review verdicts + G-9 checks panel) —
-// `/git/repos/{repo}/prs/{n}`. Composes the durable PR record (title/body/state/refs/author) with:
-//   • the shell-owned CONTEXT PANE (linked issue / CI / doc / agent slots, via `useContextPane`);
-//   • the CHECKS panel in its OWN local ErrorBoundary — a checks projection failure degrades to
-//     "Checks unavailable" and the PR stays live (ux-git finding 5: never "PR not available");
-//   • the discussion (threads with anchor null) inline, with a composer + reply;
-//   • the reviews with glyph+label verdicts + the BATCHED review bar (Start review → pending comments
-//     → Submit with a verdict) — ONE event on submit, the human verdict feeds the gate;
-//   • the merge card that REFLECTS the server's authoritative `gate_admitted` (never recomputes policy)
-//     with a ConfirmDialog (alertdialog, safe-action default focus) that re-verifies on a 409.
-// Semantic tokens only; status is TEXT never colour-alone; every unglamorous state is first-class.
+// PR overview with discussion, reviews, checks, linked context, and merge controls. Checks have an
+// independent error boundary, and merge eligibility comes from the server's `gate_admitted` value.
 import {
   ErrorBoundary,
   For,
@@ -100,9 +91,8 @@ export default function PrOverviewScreen() {
     async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined),
     { deferStream: true },
   );
-  // The checks resource degrades LOCALLY (ux-git finding 5): a projection failure resolves to an
-  // `{ unavailable }` sentinel — NEVER a throw that would fail the whole PR page. The 401→/login
-  // redirect (a thrown Response) still propagates; only a mapped edge failure becomes the sentinel.
+  // Keep check-projection failures local to the checks panel; authentication redirects still
+  // propagate to the route.
   const checks = createAsync(
     async (): Promise<ChecksState> => {
       if (!ready()) return undefined;
@@ -270,11 +260,7 @@ export default function PrOverviewScreen() {
 
 // ── header ──────────────────────────────────────────────────────────────────────────────────────
 
-// ── checks panel (G-9) + its local failure state ──────────────────────────────────────────────────
-
 function ChecksUnavailable(props: { onRetry: () => void }) {
-  // ux-git finding 5: a system-blaming one-liner scoped to the checks region, with a retry — the PR
-  // stays live around it (never "PR not available").
   return (
     <section aria-labelledby="checks-heading" data-testid="checks-unavailable" style={{ ...card }}>
       <h2 id="checks-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>Checks</h2>
@@ -332,10 +318,8 @@ function ChecksPanel(props: { checks: PrChecksVM }) {
 // ── the context pane (G-6) ──────────────────────────────────────────────────────────────────────
 
 function PrContextPane(props: { checks: PrChecksVM | null; reviews?: PrReviewVM[] }) {
-  // The CI slot is fed from the checks projection (a live artifact); linked issue/doc slots are honest
-  // FLOORS — the viewer-scoped linked-refs resolver (N4) is a named follow-on, so the slots render an
-  // honest empty state, never a fabricated link. The agent slot is ABSENT unless an agent review
-  // exists (Q8 — absent when no agent activity; not a fake "no agent" for a permitted-and-none tenant).
+  // Linked issue and document data is not available yet, so those sections remain empty. Agent
+  // context appears only when an advisory review exists.
   const agentReviews = createMemo(() => (props.reviews ?? []).filter((r) => r.advisory));
   const ciVerdict = () =>
     props.checks == null
@@ -392,10 +376,8 @@ function ReviewsSection(props: {
   const submitted = createMemo(() => props.reviews.filter((r) => r.verdict !== "in_progress"));
 
   // Rehydrate the in-progress batch from the server (finding #18): `threads().reviews` returns the
-  // viewer's OWN un-submitted draft (the projection hides other reviewers' drafts — pr_threads.rs
-  // `view_for`), so on load/reload we RESUME it instead of leaving "Start a review" to double-create a
-  // second orphan batch. Only seeds while `draft()` is null, so it never clobbers live local edits;
-  // submit/discard clear the draft AFTER the reviews refetch, so a resolved batch is not resurrected.
+  // Resume the viewer's existing draft after reload. Do not replace local edits or restore a draft
+  // after submit/discard.
   createEffect(() => {
     if (draft()) return;
     const resumable = props.reviews.find((r) => r.verdict === "in_progress");
@@ -916,7 +898,7 @@ const barBtn = {
 const barBtnPrimary = {
   ...barBtn,
   // The primary CTA: accent as a LABELLED-button background (the §3.1-allowed accent use) with
-  // on-accent text — AA-contrast by construction, unlike text-primary on --surface-hover.
+  // Use the paired foreground token for the accent background.
   background: "var(--accent)",
   color: "var(--on-accent)",
   "border-color": "var(--accent)",

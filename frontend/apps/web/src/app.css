@@ -1,6 +1,4 @@
-/* The app's global skin — SEMANTIC tokens only (doc 10 §4). The design-system tokens.css owns the
-   actual values + the three-theme re-skin + the single :focus-visible rule; this file only applies
-   the semantic surface to the document root. Never a hex, never a primitive var here. */
+/* Global application styles built on the design-system token layer. */
 @import "@myelin/design-system/tokens.css";
 @import "./chat.css";
 @import "@myelin/design-system/block-editor.css";

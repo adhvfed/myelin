@@ -1,15 +1,9 @@
-// A sanitized-by-construction Markdown renderer (R3.4 — the NAMED FLOOR). The gate calls for the
-// BlockEditor read-path if it renders markdown today; it does NOT exist on this surface yet, so this
-// is the explicit floor: a small block/inline parser that emits Solid ELEMENTS (text nodes + known
-// tags) and NEVER `innerHTML` / raw-HTML injection — so untrusted README bytes cannot inject markup
-// or script by construction. Covers headings, fenced code, lists, blockquotes, paragraphs, and inline
-// code / bold / italic / links (http(s)/relative only). Richer markdown (tables, images) degrades to
-// text — an honest floor, replaced when the editor read-path lands on this surface. Semantic tokens.
+// Small Markdown renderer for repository content. It emits known Solid elements rather than raw
+// HTML, permits only HTTP(S) and relative links, and treats unsupported syntax as text.
 import { For, type JSX } from "solid-js";
 
 export function Markdown(props: { source: string; headingOffset?: number }): JSX.Element {
-  // README headings are DEMOTED (default +1) so a README `#` never competes with the page's own h1 —
-  // the README is a subsection of the surface, not its title.
+  // Keep README headings below the page heading.
   const offset = () => props.headingOffset ?? 1;
   return (
     <div data-testid="readme-render" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
@@ -148,8 +142,7 @@ function renderBlock(b: Block, headingOffset = 1): JSX.Element {
   }
 }
 
-// Inline parsing → an array of text/element nodes (NEVER innerHTML). Order: inline code, links, bold,
-// italic. A link URL is allowed only if http(s) or relative (never `javascript:` etc.).
+// Inline parsing order: code, links, bold, italic.
 function inline(text: string): JSX.Element {
   return <>{parseInline(text)}</>;
 }
@@ -174,9 +167,7 @@ function parseInline(text: string): (string | JSX.Element)[] {
 
 function safeHref(url: string): string | undefined {
   const u = url.trim();
-  // A protocol-relative URL (`//evil.com`) is an OFF-SITE link disguised as relative — an
-  // open-redirect/phishing vector in a rendered README (R3.4 verifier finding 2). Exclude it from
-  // the "relative" branch; a same-origin path is a single leading slash NOT followed by another.
+  // Protocol-relative URLs are external, not same-origin relative paths.
   if (u.startsWith("//")) return undefined;
   if (/^https?:\/\//i.test(u) || u.startsWith("/") || u.startsWith("#") || u.startsWith("./") || u.startsWith("../")) {
     return u;

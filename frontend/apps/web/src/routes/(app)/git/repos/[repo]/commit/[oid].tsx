@@ -1,8 +1,4 @@
-// Commit diff (GT-004 · G-3) — `/git/repos/{repo}/commit/{oid}`. Renders the edge's CommitDiff
-// ViewModel (libgit2 tree-to-tree diff over the durable repo) on the SHARED <DiffViewer> (R3.2 · G-7)
-// — the bespoke FileDiff/DiffRow are retired (G-3 "commit detail = diff, reuses G-7"). The diff is
-// a11y-accessible by construction in the viewer: change kind + line numbers are announced as TEXT,
-// never colour alone (WCAG 1.4.1); the line grid is one tab stop. Semantic tokens only.
+// Commit details rendered through the shared diff viewer.
 import { ErrorBoundary, Show, Suspense, createSignal } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams, useSearchParams } from "@solidjs/router";
@@ -11,7 +7,7 @@ import { getCommit, type DiffFileVM } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 
-/** The commit-diff VM carries flat `lines[]` (no hunks); wrap them in ONE synthetic hunk so the shared
+/** The commit-diff VM carries flat `lines[]`; wrap them in a synthetic hunk so the shared
  *  DiffViewer (hunk-structured) renders them. Line numbers are absent on this legacy shape — the viewer
  *  tolerates their absence (the gutters render empty, the SR prefix says "line ?"). */
 function toViewerFile(f: DiffFileVM): DiffViewerFile {

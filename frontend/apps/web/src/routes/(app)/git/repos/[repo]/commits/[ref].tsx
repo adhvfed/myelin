@@ -1,8 +1,5 @@
-// Commit log (R3.4 / G-3) — `/git/repos/{repo}/commits/{ref}`. The ref-carrying breadcrumb (no
-// hardcoded 'main'), the paginated revwalk, and a bidirectional pager: Newer / Older with an honest
-// position readout ("Commits 31–60 · page 2" — range + page, NO fabricated total). The position is an
-// aria-live polite region so paging is announced. First-page Newer is present-disabled (the boundary
-// is legible). Semantic tokens only.
+// Paginated commit log for a ref. The pager reports the visible range and page without inventing a
+// total, and announces position changes through a polite live region.
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams, useSearchParams } from "@solidjs/router";

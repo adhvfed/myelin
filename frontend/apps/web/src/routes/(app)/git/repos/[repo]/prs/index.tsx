@@ -1,10 +1,5 @@
-// PR list (R3.1) — `/git/repos/{repo}/prs`. The missing front door to G-6: the per-repo PR index,
-// the sibling of the commit log. Renders the leak-free edge list (the `Pull` object guard is the
-// `pull_request.view = parent_repo->pull` prefilter; a viewer who cannot pull gets the dignified
-// no-access state, never a leak). States: populated · empty(teaching) · skeleton · no-access · error ·
-// filtered-no-results. Filter = ARIA tablist (state); sort = Menu; pager = bidirectional cursor. The
-// list is a roving-tabindex composite (one Tab stop; arrows + j/k re-rove; Enter opens). Semantic
-// tokens only; StatusPill (design-system) carries every status as glyph+label, never colour alone.
+// Repository PR list with filtering, sorting, cursor pagination, and roving keyboard focus. The
+// server applies repository visibility before returning rows.
 import { ErrorBoundary, For, Show, Suspense, createSignal, createEffect } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useParams, useSearchParams, useNavigate } from "@solidjs/router";
@@ -114,7 +109,7 @@ export default function RepoPrListScreen() {
                 <Show
                   when={!("restricted" in result)}
                   fallback={
-                    // No-access (403-analogue): dignified, never leaks that PRs exist or their count.
+                    // Do not reveal whether the repository contains PRs.
                     <div role="note" data-testid="prs-restricted" style={stateBox}>
                       <Icon name="gate" title="Restricted" />
                       <div>
@@ -158,13 +153,11 @@ function PopulatedOrEmpty(props: {
   const total = () => props.page.page.total ?? items().length;
   const offset = () => props.page.page.offset ?? 0;
 
-  // Roving-tabindex composite: ONE Tab stop for the whole list; arrows + j/k re-rove; Enter/click open
-  // the focused PR (the row is a real <a>, so Enter navigates natively). Never a trap — Tab exits.
+  // The list has one tab stop; arrows and j/k move it, and Tab exits the list.
   const [active, setActive] = createSignal(0);
   const rowEls: (HTMLAnchorElement | undefined)[] = [];
   createEffect(() => {
-    // Reset the roving index whenever the list identity changes (new page/filter). The ref array is
-    // NOT wiped here (the effect runs AFTER the row refs are assigned — wiping would drop them).
+    // Reset the index after pagination or filtering without clearing the assigned row refs.
     items();
     setActive(0);
   });

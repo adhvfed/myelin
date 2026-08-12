@@ -1,8 +1,5 @@
-// Cross-repo PR front door (R3.1) — `/prs`. The "what needs me" surface across repos: two buckets,
-// "Needs your review" (the attention job) and "Your PRs", each a saved query on the one PR list. NOT a
-// sixth rail item (PRs are part of Code — P1); reached from the Code-landing header, the repo headers,
-// the inbox, and ⌘K. Prefiltered leak-free by the `visible_repos` list_objects seam server-side (a
-// repo the viewer cannot pull never contributes a PR). Semantic tokens only; StatusPill for status.
+// Cross-repository PR lists for review requests and the viewer's own PRs. Visibility filtering is
+// applied by the server before rows reach this route.
 import { ErrorBoundary, For, Show, Suspense, createSignal, createEffect } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync } from "@solidjs/router";
