@@ -1,5 +1,6 @@
 use std::io::{Read as _, Seek as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::core::{Oid, RepoLoc};
 use crate::durable::{DurableError, DurableGitRepo, DurableGitStore};
@@ -16,6 +17,7 @@ const MAX_BACKUP_REFS: usize = crate::durable::WIRE_MAX_REFS;
 const MAX_BACKUP_PACK_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BACKUP_REF_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BACKUP_ARTIFACT_BYTES: usize = MAX_BACKUP_PACK_BYTES + MAX_BACKUP_REF_FRAME_BYTES;
+static RESTORE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitBackupError {
@@ -315,11 +317,11 @@ impl GitRepoBackup {
         self.pack.len()
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Result<Vec<u8>, GitBackupError> {
         let mut out = Vec::with_capacity(MAGIC.len() + 16 + self.pack.len() + CHECKSUM_LEN);
         self.write_frame(&mut out)
-            .expect("writing a backup frame into Vec cannot fail");
-        out
+            .map_err(|error| GitBackupError::Io(format!("serialize backup artifact: {error}")))?;
+        Ok(out)
     }
 
     fn write_frame(&self, writer: &mut impl std::io::Write) -> Result<(), std::io::Error> {
@@ -858,29 +860,38 @@ fn restore_repo_staged<P: RepoPathResolver>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let sequence = RESTORE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let staging_loc = RepoLoc::new(
         loc.tenant.clone(),
         loc.region.clone(),
-        format!("{}.restoring.{nanos}.tmp", loc.repo),
+        format!(
+            "{}.restoring.{}.{nanos}.{sequence}.tmp",
+            loc.repo,
+            std::process::id()
+        ),
     );
     let staging_path = store.repo_path(&staging_loc)?;
+    let staging = RestoreStaging::new(staging_path)?;
 
     let build_result = store
         .create_repo(&staging_loc)
         .map_err(GitBackupError::Durable)
         .and_then(|repo| build(&repo));
     if let Err(e) = build_result {
-        let _ = std::fs::remove_dir_all(&staging_path);
-        return Err(e);
+        return Err(staging.discard_after(e));
     }
 
-    if let Err(e) = std::fs::rename(&staging_path, &final_path) {
-        let _ = std::fs::remove_dir_all(&staging_path);
-        return Err(GitBackupError::Io(format!(
+    if let Err(error) = staging.retire_creation_coordination() {
+        return Err(staging.discard_after(error));
+    }
+
+    if let Err(e) = std::fs::rename(staging.repo_path(), &final_path) {
+        let error = GitBackupError::Io(format!(
             "atomic publish rename {} -> {} failed: {e}",
-            staging_path.display(),
+            staging.repo_path().display(),
             final_path.display()
-        )));
+        ));
+        return Err(staging.discard_after(error));
     }
     let parent = final_path.parent().ok_or_else(|| {
         GitBackupError::Io(format!(
@@ -898,6 +909,116 @@ fn restore_repo_staged<P: RepoPathResolver>(
         })?;
 
     store.open_repo(loc).map_err(GitBackupError::Durable)
+}
+
+struct RestoreStaging {
+    repo_path: PathBuf,
+    owner_path: PathBuf,
+    lock_path: PathBuf,
+    parent: PathBuf,
+}
+
+impl RestoreStaging {
+    fn new(repo_path: PathBuf) -> Result<Self, GitBackupError> {
+        let parent = repo_path
+            .parent()
+            .ok_or_else(|| {
+                GitBackupError::Io(format!(
+                    "restore staging path {} has no parent directory",
+                    repo_path.display()
+                ))
+            })?
+            .to_path_buf();
+        let repo_name = repo_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                GitBackupError::Io(format!(
+                    "restore staging path {} has no UTF-8 file name",
+                    repo_path.display()
+                ))
+            })?;
+        let owner_path = parent.join(format!(".{repo_name}.creation-owner"));
+        let lock_path = parent.join(format!(".{repo_name}.creation.lock"));
+        Ok(Self {
+            repo_path,
+            owner_path,
+            lock_path,
+            parent,
+        })
+    }
+
+    fn repo_path(&self) -> &Path {
+        &self.repo_path
+    }
+
+    fn retire_creation_coordination(&self) -> Result<(), GitBackupError> {
+        let errors = [
+            remove_file_if_present(&self.owner_path),
+            remove_file_if_present(&self.lock_path),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        self.finish_cleanup(errors)
+    }
+
+    fn discard(&self) -> Result<(), GitBackupError> {
+        let mut errors = Vec::new();
+        match std::fs::remove_dir_all(&self.repo_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!(
+                "remove restore staging repository {}: {error}",
+                self.repo_path.display()
+            )),
+        }
+        errors.extend(
+            [
+                remove_file_if_present(&self.owner_path),
+                remove_file_if_present(&self.lock_path),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        self.finish_cleanup(errors)
+    }
+
+    fn discard_after(&self, operation_error: GitBackupError) -> GitBackupError {
+        match self.discard() {
+            Ok(()) => operation_error,
+            Err(cleanup_error) => GitBackupError::Io(format!(
+                "{operation_error}; restore staging cleanup also failed: {cleanup_error}"
+            )),
+        }
+    }
+
+    fn finish_cleanup(&self, mut errors: Vec<String>) -> Result<(), GitBackupError> {
+        if let Err(error) =
+            std::fs::File::open(&self.parent).and_then(|directory| directory.sync_all())
+        {
+            errors.push(format!(
+                "sync restore staging directory {}: {error}",
+                self.parent.display()
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(GitBackupError::Io(errors.join("; ")))
+        }
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> Option<String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(format!(
+            "remove restore staging file {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn build_repo_from_memory(
@@ -1051,7 +1172,7 @@ mod tests {
             "a real packfile, not an empty modeled blob"
         );
 
-        let bytes = backup.serialize();
+        let bytes = backup.serialize().unwrap();
         let back = GitRepoBackup::deserialize(&bytes).unwrap();
         assert_eq!(
             back, backup,
@@ -1085,14 +1206,14 @@ mod tests {
             refs: Vec::new(),
             pack: Vec::new(),
         };
-        let mut trailing = empty.serialize();
+        let mut trailing = empty.serialize().unwrap();
         trailing.extend_from_slice(b"garbage");
         assert!(matches!(
             GitRepoBackup::deserialize(&trailing),
             Err(GitBackupError::BadArtifact(_))
         ));
 
-        let mut valid = empty.serialize();
+        let mut valid = empty.serialize().unwrap();
         let ref_count_offset = MAGIC.len();
         valid[ref_count_offset + 3] ^= 1;
         assert!(matches!(
@@ -1122,7 +1243,7 @@ mod tests {
         std::fs::remove_dir_all(&legacy_restore_root).ok();
 
         let corrupt_file = temp_root("corrupt-v2-file");
-        let mut corrupt_v2 = empty.serialize();
+        let mut corrupt_v2 = empty.serialize().unwrap();
         *corrupt_v2.last_mut().unwrap() ^= 1;
         std::fs::write(&corrupt_file, corrupt_v2).unwrap();
         assert!(matches!(
