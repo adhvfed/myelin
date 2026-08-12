@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, onTestFinished, test } from "vitest";
 
 import { findAutomation } from "../src/automations.js";
 import {
@@ -147,6 +147,13 @@ describe("collaboration lifecycle", () => {
     });
     const trigger = record(created.body.trigger, "created CI trigger");
     const triggerId = string(trigger.id, "CI trigger id");
+    onTestFinished(async () => {
+      await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}/disable`, {
+        method: "POST",
+        body: {},
+        expectedStatus: 200,
+      });
+    });
     expect(created.body).toMatchObject({ created: true, durable: true });
     expect(trigger).toMatchObject({
       run_as_agent_id: agentId,
