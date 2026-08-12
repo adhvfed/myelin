@@ -514,6 +514,10 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
         myelin_storage::AgentTriggerFiringState::Terminal
     );
     assert_eq!(history[0].run_id.as_deref(), Some(run.run_id.as_str()));
+    assert_eq!(
+        history[0].terminal_reason, None,
+        "successful work needs no failure guidance",
+    );
     clean_hosted_run(&app, &run.tenant).await;
 }
 
@@ -586,6 +590,11 @@ async fn failed_hosted_work_releases_its_organization_budget_when_history_catche
             Some(myelin_storage::agent_trigger_durable::AgentTriggerRunOutcome::Failed),
         ),
         "history says failed only after the stranded budget has been released",
+    );
+    assert_eq!(
+        history[0].terminal_reason.as_deref(),
+        Some("agent run failed; retry it or inspect the hosted-agent service diagnostics"),
+        "the founder gets a safe next step instead of a provider response body",
     );
     assert_eq!(
         run.triggers

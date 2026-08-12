@@ -109,11 +109,14 @@ impl AgentRuntime for MeteredBrain {
     }
 }
 impl MeteredRuntime for MeteredBrain {
-    fn step_metered(&self, conv: &Conversation) -> MeteredStep {
-        MeteredStep {
+    fn step_metered(
+        &self,
+        conv: &Conversation,
+    ) -> Result<MeteredStep, myelin_agent::RuntimeStepError> {
+        Ok(MeteredStep {
             outcome: self.step(conv),
             usage: TEST_USAGE,
-        }
+        })
     }
 }
 

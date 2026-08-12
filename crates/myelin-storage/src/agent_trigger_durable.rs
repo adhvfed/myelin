@@ -30,6 +30,12 @@ use crate::provider::{ProviderError, SubstrateProvider};
 use crate::reserve_settle::RunId as CostRunId;
 use crate::reserve_settle_durable::DurableCostLedger;
 
+const FAILED_RUN_TERMINAL_REASON: &str =
+    "agent run failed; retry it or inspect the hosted-agent service diagnostics";
+const TERMINATED_RUN_TERMINAL_REASON: &str = "agent run was terminated";
+const NONDETERMINISTIC_RUN_TERMINAL_REASON: &str =
+    "agent run stopped because durable replay diverged";
+
 #[derive(Clone)]
 pub struct DurableAgentTriggerBacking {
     provider: SubstrateProvider,
@@ -876,7 +882,8 @@ impl DurableAgentTriggerBacking {
                 Box::pin(async move {
                     let terminal_run_ids = sqlx::query_scalar::<_, String>(
                         "WITH terminal AS (\
-                            SELECT firing.binding_id, firing.event_id, firing.run_id \
+                            SELECT firing.binding_id, firing.event_id, firing.run_id, \
+                                   run.state AS workflow_state \
                               FROM agent_trigger_firing firing \
                               JOIN workflow_run run ON run.tenant_id = firing.tenant_id \
                                AND run.region = firing.region \
@@ -887,7 +894,13 @@ impl DurableAgentTriggerBacking {
                              ORDER BY firing.created_at, firing.binding_id, firing.event_id \
                              FOR UPDATE OF firing SKIP LOCKED LIMIT $3\
                          ) \
-                         UPDATE agent_trigger_firing firing SET state = 'terminal' \
+                         UPDATE agent_trigger_firing firing SET state = 'terminal', \
+                           terminal_reason = CASE terminal.workflow_state \
+                               WHEN 'completed' THEN NULL \
+                               WHEN 'failed' THEN $4 \
+                               WHEN 'terminated' THEN $5 \
+                               WHEN 'nondeterministic' THEN $6 \
+                           END \
                            FROM terminal \
                           WHERE firing.tenant_id = $1 AND firing.region = $2 \
                             AND firing.binding_id = terminal.binding_id \
@@ -898,6 +911,9 @@ impl DurableAgentTriggerBacking {
                     .bind(&tenant)
                     .bind(&region)
                     .bind(limit)
+                    .bind(FAILED_RUN_TERMINAL_REASON)
+                    .bind(TERMINATED_RUN_TERMINAL_REASON)
+                    .bind(NONDETERMINISTIC_RUN_TERMINAL_REASON)
                     .fetch_all(&mut *conn)
                     .await
                     .map_err(query_error("reconcile terminal governed agent firings"))?;

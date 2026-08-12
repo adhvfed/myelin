@@ -3,8 +3,8 @@ use crate::client::{
     ToolSpec, Usage,
 };
 use myelin_agent::{
-    AgentRuntime, Conversation, MeteredRuntime, MeteredStep, StepOutcome, Submission, TokenUsage,
-    ToolCall, ToolCallId, ToolName, Turn,
+    AgentRuntime, Conversation, MeteredRuntime, MeteredStep, RuntimeStepError, StepOutcome,
+    Submission, TokenUsage, ToolCall, ToolCallId, ToolName, Turn,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,26 +47,34 @@ impl AgentRuntime for LlmAgentRuntime {
         match self.try_step(conv) {
             Ok(report) => report.outcome,
             Err(e) => StepOutcome::Submit(Submission(format!(
-                "agent runtime error (fail-closed, run aborted): {e}"
+                "agent runtime error (fail-closed, run aborted): {}",
+                runtime_step_error(&e),
             ))),
         }
     }
 }
 
 impl MeteredRuntime for LlmAgentRuntime {
-    fn step_metered(&self, conv: &Conversation) -> MeteredStep {
+    fn step_metered(&self, conv: &Conversation) -> Result<MeteredStep, RuntimeStepError> {
         match self.try_step(conv) {
-            Ok(report) => MeteredStep {
+            Ok(report) => Ok(MeteredStep {
                 outcome: report.outcome,
                 usage: map_usage(report.usage),
-            },
-            Err(e) => MeteredStep {
-                outcome: StepOutcome::Submit(Submission(format!(
-                    "agent runtime error (fail-closed, run aborted): {e}"
-                ))),
-                usage: TokenUsage::NotReported,
-            },
+            }),
+            Err(error) => Err(runtime_step_error(&error)),
         }
+    }
+}
+
+fn runtime_step_error(error: &ModelError) -> RuntimeStepError {
+    match error {
+        ModelError::MissingApiKey => RuntimeStepError::Misconfigured,
+        ModelError::Transport(_) => RuntimeStepError::Unavailable,
+        ModelError::Http { status, .. } => RuntimeStepError::Rejected {
+            status: Some(*status),
+        },
+        ModelError::Parse(_) => RuntimeStepError::InvalidResponse,
+        ModelError::UnsafeReplay(_) => RuntimeStepError::UnsafeReplay,
     }
 }
 
@@ -325,7 +333,9 @@ mod tests {
             },
         });
         let runtime = LlmAgentRuntime::new(Box::new(client));
-        let metered = runtime.step_metered(&conv_with_tools());
+        let metered = runtime
+            .step_metered(&conv_with_tools())
+            .expect("the provider completes the metered step");
         assert_eq!(
             metered.outcome,
             StepOutcome::Submit(Submission("the bug is at foo.rs:10".into()))
@@ -350,24 +360,27 @@ mod tests {
         });
         let runtime = LlmAgentRuntime::new(Box::new(client));
         assert_eq!(
-            runtime.step_metered(&conv_with_tools()).usage,
+            runtime
+                .step_metered(&conv_with_tools())
+                .expect("the provider completes without reporting usage")
+                .usage,
             TokenUsage::NotReported
         );
     }
 
     #[test]
-    fn step_metered_fails_closed_on_model_error_with_not_reported() {
+    fn step_metered_preserves_provider_failure_without_exposing_its_body() {
         let client = MockModelClient::err(ModelError::Http {
             status: 500,
-            body: "upstream boom".into(),
+            body: "secret upstream diagnostics".into(),
         });
         let runtime = LlmAgentRuntime::new(Box::new(client));
-        let metered = runtime.step_metered(&conv_with_tools());
-        match metered.outcome {
-            StepOutcome::Submit(Submission(text)) => assert!(text.contains("fail-closed")),
-            other => panic!("expected a fail-closed Submit, got {other:?}"),
-        }
-        assert_eq!(metered.usage, TokenUsage::NotReported);
+        let error = runtime
+            .step_metered(&conv_with_tools())
+            .expect_err("a provider failure is not a model submission");
+        assert_eq!(error, RuntimeStepError::Rejected { status: Some(500) });
+        assert_eq!(error.code(), "runtime_rejected");
+        assert!(!error.to_string().contains("secret upstream diagnostics"));
     }
 
     #[test]

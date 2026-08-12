@@ -3,7 +3,7 @@ use crate::metering::{price, LUNA_RATES};
 use crate::tool_exec::{ToolExecError, ToolExecutionContext, ToolExecutor};
 use myelin_agent::{
     Agent, AgentRuntime, Conversation, InboxEvent, MeteredRuntime, MeteredStep, RunOutcome,
-    StepOutcome, Submission, TokenUsage, ToolOutcome, ToolSurface, Turn,
+    RuntimeStepError, StepOutcome, Submission, TokenUsage, ToolOutcome, ToolSurface, Turn,
 };
 use myelin_content::{Block, Inline, Span};
 use myelin_events::{
@@ -244,6 +244,10 @@ pub enum SkeletonError {
         run_id: String,
         stage: SpendCapStage,
     },
+    RuntimeStepFailed {
+        run_id: String,
+        error: RuntimeStepError,
+    },
     MeteringUsageNotReported {
         run_id: String,
     },
@@ -275,6 +279,11 @@ impl core::fmt::Display for SkeletonError {
                 f,
                 "SKELETON metering spend cap reached: run={run_id} halted gracefully at the {stage} \
                  (no overspend, reservation left in-flight)"
+            ),
+            SkeletonError::RuntimeStepFailed { run_id, error } => write!(
+                f,
+                "SKELETON runtime step failed: run={run_id} code={}: {error} (fail-closed)",
+                error.code(),
             ),
             SkeletonError::MeteringUsageNotReported { run_id } => write!(
                 f,
@@ -439,7 +448,13 @@ impl SkeletonAgent {
                 }
             }
 
-            let MeteredStep { outcome, usage } = runtime.step_metered(&conv);
+            let MeteredStep { outcome, usage } =
+                runtime
+                    .step_metered(&conv)
+                    .map_err(|error| SkeletonError::RuntimeStepFailed {
+                        run_id: sub.run_id.clone(),
+                        error,
+                    })?;
             teardown_guard.telemetry.record_token_usage(&usage);
 
             if let Some(wallet) = sub.wallet {
@@ -1428,15 +1443,18 @@ mod tests {
             }
         }
         impl MeteredRuntime for MeteredBrain {
-            fn step_metered(&self, conv: &Conversation) -> MeteredStep {
-                MeteredStep {
+            fn step_metered(
+                &self,
+                conv: &Conversation,
+            ) -> Result<MeteredStep, RuntimeStepError> {
+                Ok(MeteredStep {
                     outcome: self.step(conv),
                     usage: TokenUsage::Reported {
                         input: 100,
                         cached_input: 20,
                         output: 5,
                     },
-                }
+                })
             }
         }
         fn model_turns(conv: &Conversation) -> usize {
@@ -1586,13 +1604,16 @@ mod tests {
         }
     }
     impl MeteredRuntime for MeteredScriptBrain {
-        fn step_metered(&self, conv: &Conversation) -> MeteredStep {
+        fn step_metered(
+            &self,
+            conv: &Conversation,
+        ) -> Result<MeteredStep, RuntimeStepError> {
             self.steps
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            MeteredStep {
+            Ok(MeteredStep {
                 outcome: self.step(conv),
                 usage: self.usage,
-            }
+            })
         }
     }
 
@@ -1735,6 +1756,64 @@ mod tests {
         assert_eq!(tele.tokens_revoked(), 1, "torn down on the fail-closed path");
         assert_eq!(tele.traces_written(), 0);
         assert_eq!(tele.runs_completed(), 0);
+    }
+
+    #[test]
+    fn failed_runtime_step_keeps_its_cause_and_never_becomes_a_metering_error() {
+        struct UnavailableRuntime;
+
+        impl AgentRuntime for UnavailableRuntime {
+            fn step(&self, _conv: &Conversation) -> StepOutcome {
+                unreachable!("paid runs use the fallible metered boundary")
+            }
+        }
+
+        impl MeteredRuntime for UnavailableRuntime {
+            fn step_metered(
+                &self,
+                _conv: &Conversation,
+            ) -> Result<MeteredStep, RuntimeStepError> {
+                Err(RuntimeStepError::Unavailable)
+            }
+        }
+
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::new();
+        let exec = MockToolExecutor::new();
+        let wallet = FakeWallet::new(10_000);
+        let mut sub = substrate(
+            "Rprovider", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+        sub.wallet = Some(&wallet);
+
+        let error = agent_loop
+            .handle_run(
+                &UnavailableRuntime,
+                &mut sub,
+                &mut tele,
+                RunOutcomeKind::Completed,
+            )
+            .expect_err("an unavailable runtime fails the run");
+
+        assert_eq!(
+            error,
+            SkeletonError::RuntimeStepFailed {
+                run_id: "Rprovider".into(),
+                error: RuntimeStepError::Unavailable,
+            },
+        );
+        assert!(wallet.debit_rows().is_empty(), "a failed call has no usage to debit");
+        assert_eq!(tele.turns_usage_not_reported(), 0);
+        assert_eq!(tele.tokens_revoked(), 1, "the failed run still tears down its token");
     }
 
     #[test]

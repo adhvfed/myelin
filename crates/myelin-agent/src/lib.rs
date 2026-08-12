@@ -326,12 +326,54 @@ pub struct MeteredStep {
     pub usage: TokenUsage,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeStepError {
+    Misconfigured,
+    Unavailable,
+    Rejected { status: Option<u16> },
+    InvalidResponse,
+    UnsafeReplay,
+}
+
+impl RuntimeStepError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "runtime_misconfigured",
+            Self::Unavailable => "runtime_unavailable",
+            Self::Rejected { .. } => "runtime_rejected",
+            Self::InvalidResponse => "runtime_invalid_response",
+            Self::UnsafeReplay => "runtime_unsafe_replay",
+        }
+    }
+}
+
+impl core::fmt::Display for RuntimeStepError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Misconfigured => write!(f, "the agent runtime is not configured"),
+            Self::Unavailable => write!(f, "the agent runtime is unavailable"),
+            Self::Rejected {
+                status: Some(status),
+            } => write!(f, "the agent runtime rejected the step (HTTP {status})"),
+            Self::Rejected { status: None } => {
+                write!(f, "the agent runtime rejected the step")
+            }
+            Self::InvalidResponse => {
+                write!(f, "the agent runtime returned an invalid response")
+            }
+            Self::UnsafeReplay => write!(f, "the agent runtime refused an unsafe replay"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeStepError {}
+
 pub trait MeteredRuntime: AgentRuntime {
-    fn step_metered(&self, conv: &Conversation) -> MeteredStep {
-        MeteredStep {
+    fn step_metered(&self, conv: &Conversation) -> Result<MeteredStep, RuntimeStepError> {
+        Ok(MeteredStep {
             outcome: self.step(conv),
             usage: TokenUsage::NotReported,
-        }
+        })
     }
 }
 
@@ -513,7 +555,9 @@ mod tests {
     #[test]
     fn metered_runtime_default_step_is_not_reported() {
         let m = Mock { catalogue: vec![] };
-        let metered = m.step_metered(&Conversation::default());
+        let metered = m
+            .step_metered(&Conversation::default())
+            .expect("the default runtime completes its step");
         assert_eq!(
             metered.outcome,
             StepOutcome::Submit(Submission("ok".into()))
