@@ -172,6 +172,12 @@ ALTER TABLE agent_trigger_binding
     );
 "#;
 
+pub const AGENT_TRIGGER_OWNER_LIST_MIGRATION: &str = r#"
+CREATE INDEX IF NOT EXISTS agent_trigger_binding_owner_recency
+    ON agent_trigger_binding
+       (tenant_id, region, owner_principal_id, created_at DESC, binding_id DESC);
+"#;
+
 pub fn agent_trigger_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0090_agent_trigger", AGENT_TRIGGER_MIGRATION),
@@ -197,6 +203,13 @@ pub fn agent_trigger_evaluation_diagnostic_migrations() -> Migrations {
     Migrations::of([Migration::plain(
         "0109_agent_trigger_evaluation_diagnostic",
         AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION,
+    )])
+}
+
+pub fn agent_trigger_owner_list_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0110_agent_trigger_owner_list",
+        AGENT_TRIGGER_OWNER_LIST_MIGRATION,
     )])
 }
 
@@ -232,6 +245,7 @@ mod tests {
         );
         assert!(AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION
             .contains("octet_length(last_evaluation_error_detail) BETWEEN 1 AND 1024"));
+        assert!(AGENT_TRIGGER_OWNER_LIST_MIGRATION.contains("created_at DESC, binding_id DESC"));
         assert_eq!(
             AGENT_TRIGGER_RLS_POLICY
                 .matches("FORCE ROW LEVEL SECURITY")

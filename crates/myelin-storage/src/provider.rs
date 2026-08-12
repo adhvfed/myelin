@@ -181,6 +181,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_trace_durable::agent_trace_encrypted_only_migrations(),
         crate::agent_trace_durable::agent_trace_erasure_progress_migrations(),
         crate::agent_trigger_durable::agent_trigger_evaluation_diagnostic_migrations(),
+        crate::agent_trigger_durable::agent_trigger_owner_list_migrations(),
     ]
 }
 
@@ -763,10 +764,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(
-            *ids.last().unwrap(),
-            "0109_agent_trigger_evaluation_diagnostic"
-        );
+        assert_eq!(*ids.last().unwrap(), "0110_agent_trigger_owner_list");
     }
 
     #[test]

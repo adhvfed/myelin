@@ -13,6 +13,7 @@ use myelin_storage::{
 };
 use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
+use std::time::Duration;
 
 fn admin_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
@@ -203,6 +204,79 @@ fn red_mainline_binding(agent_id: Uuid) -> NewAgentTriggerBinding {
         require_human_approval: false,
         created_at: Utc::now(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_automation_roster_starts_with_recent_work_and_pages_from_there() {
+    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
+        Ok(provider) => provider,
+        Err(_) => {
+            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
+            return;
+        }
+    };
+    admin
+        .migrate_foundation()
+        .await
+        .expect("the event foundation is present");
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .expect("the governed trigger schema migrates with the durable platform");
+
+    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+        .await
+        .expect("open the constrained app provider");
+    let tenant = unique_tenant();
+    let agent_id = Uuid::new_v4();
+    seed_people_and_agent(&app, &tenant, agent_id, "hosted:luna").await;
+    let triggers = DurableAgentTriggerBacking::new(app.clone());
+    let now = Utc::now();
+    let older = Uuid::parse_str("f0000000-0000-4000-8000-000000000001").unwrap();
+    let middle = Uuid::parse_str("10000000-0000-4000-8000-000000000002").unwrap();
+    let newest = Uuid::parse_str("80000000-0000-4000-8000-000000000003").unwrap();
+
+    for (binding_id, client_nonce, created_at) in [
+        (older, "roster-older", now - Duration::from_secs(2)),
+        (middle, "roster-middle", now - Duration::from_secs(1)),
+        (newest, "roster-newest", now),
+    ] {
+        let mut proposal = red_mainline_binding(agent_id);
+        proposal.binding_id = binding_id;
+        proposal.client_nonce = client_nonce.into();
+        proposal.created_at = created_at;
+        assert!(matches!(
+            triggers.create(&tenant, proposal).await.unwrap(),
+            CreateAgentTriggerBindingOutcome::Created(_)
+        ));
+    }
+
+    let first_page = triggers
+        .list_for_owner(&tenant, "founder", None, 2)
+        .await
+        .expect("the owner opens their automation roster");
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|binding| binding.binding_id.as_str())
+            .collect::<Vec<_>>(),
+        [newest.to_string(), middle.to_string()],
+        "the roster follows human recency rather than random UUID order"
+    );
+    let second_page = triggers
+        .list_for_owner(&tenant, "founder", Some(middle), 2)
+        .await
+        .expect("the owner continues from the last visible automation");
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|binding| binding.binding_id.as_str())
+            .collect::<Vec<_>>(),
+        [older.to_string()],
+        "the recency cursor neither repeats nor skips older work"
+    );
+
+    clean_tenant(&app, &tenant).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

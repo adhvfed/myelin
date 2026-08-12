@@ -15,10 +15,11 @@ pub use model::{
 };
 pub use schema::{
     agent_trigger_durable_migrations, agent_trigger_evaluation_diagnostic_migrations,
-    agent_trigger_terminal_reason_migrations, AGENT_TRIGGER_APPROVAL_MIGRATION,
-    AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION,
-    AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION, AGENT_TRIGGER_MIGRATION,
-    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
+    agent_trigger_owner_list_migrations, agent_trigger_terminal_reason_migrations,
+    AGENT_TRIGGER_APPROVAL_MIGRATION, AGENT_TRIGGER_BUDGET_MIGRATION,
+    AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION,
+    AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_OWNER_LIST_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
+    AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
 };
 
 use sqlx::types::chrono::{DateTime, Utc};
@@ -338,17 +339,24 @@ impl DurableAgentTriggerBacking {
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
                     let rows = sqlx::query(
-                        "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
-                                event_type, matcher, task, delegation_caveats, \
-                                budget_minor_units, max_firings, \
-                                firings_used, max_causal_depth, require_no_personal_data, \
-                                require_human_approval, state, created_at, \
-                                last_evaluation_error_code, last_evaluation_error_detail, \
-                                last_evaluation_error_event_id, last_evaluation_error_at \
-                           FROM agent_trigger_binding \
-                          WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3 \
-                            AND ($4::uuid IS NULL OR binding_id > $4::uuid) \
-                          ORDER BY binding_id LIMIT $5",
+                        "SELECT b.binding_id, b.owner_principal_id, b.run_as_agent_id, \
+                                b.client_nonce, b.event_type, b.matcher, b.task, \
+                                b.delegation_caveats, b.budget_minor_units, b.max_firings, \
+                                b.firings_used, b.max_causal_depth, b.require_no_personal_data, \
+                                b.require_human_approval, b.state, b.created_at, \
+                                b.last_evaluation_error_code, b.last_evaluation_error_detail, \
+                                b.last_evaluation_error_event_id, b.last_evaluation_error_at \
+                           FROM agent_trigger_binding b \
+                          WHERE b.tenant_id = $1 AND b.region = $2 \
+                            AND b.owner_principal_id = $3 \
+                            AND ($4::uuid IS NULL OR (b.created_at, b.binding_id) < ( \
+                                SELECT cursor.created_at, cursor.binding_id \
+                                  FROM agent_trigger_binding cursor \
+                                 WHERE cursor.tenant_id = $1 AND cursor.region = $2 \
+                                   AND cursor.owner_principal_id = $3 \
+                                   AND cursor.binding_id = $4::uuid \
+                            )) \
+                          ORDER BY b.created_at DESC, b.binding_id DESC LIMIT $5",
                     )
                     .bind(&tenant)
                     .bind(&region)
