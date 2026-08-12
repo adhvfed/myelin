@@ -6,9 +6,29 @@ import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { systemTestConfig } from "../src/config.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
-import { array, record, string } from "../src/json.js";
+import { array, record, string, type JsonRecord } from "../src/json.js";
 
 const oid = /^[0-9a-f]{40}$/;
+
+async function findRepository(slug: string): Promise<JsonRecord | undefined> {
+  let cursor: string | undefined;
+  const visited = new Set<string>();
+  do {
+    const query = new URLSearchParams({ limit: "100" });
+    if (cursor) query.set("cursor", cursor);
+    const response = await systemClient.json(`/v1/git/repos?${query}`);
+    const match = array(response.body.items, "repository list page")
+      .map((item) => record(item, "repository list item"))
+      .find((item) => string(item.slug, "repository slug").endsWith(`/${slug}`));
+    if (match) return match;
+
+    const next = record(response.body.page, "repository list cursor").next_cursor;
+    cursor = next === null ? undefined : string(next, "next repository cursor");
+    if (cursor && visited.has(cursor)) throw new Error("repository list repeated its cursor");
+    if (cursor) visited.add(cursor);
+  } while (cursor);
+  return undefined;
+}
 
 describe.sequential("Git engineering lifecycle", () => {
   const slug = uniqueName("system-git");
@@ -90,10 +110,10 @@ describe.sequential("Git engineering lifecycle", () => {
     const home = await systemClient.json(project.path);
     expect(home.body).toMatchObject({ state: "empty", slug: expect.stringContaining(slug) });
 
-    const repositories = await systemClient.json("/v1/git/repos?limit=100");
-    expect(array(repositories.body.items, "repository list items")).toEqual(
-      expect.arrayContaining([expect.objectContaining({ slug: expect.stringContaining(slug) })]),
-    );
+    expect(await findRepository(slug)).toMatchObject({
+      slug: expect.stringContaining(slug),
+      state: "empty",
+    });
   });
 
   test("keeps every repository namespace outside another repository's storage", async () => {
