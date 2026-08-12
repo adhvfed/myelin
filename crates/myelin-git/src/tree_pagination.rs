@@ -289,8 +289,8 @@ impl DurableGitRepo {
 
         let snapshot_git_oid = commit.id();
         let tree_git_oid = tree.id();
-        let snapshot_cursor_oid = oid_frame(snapshot_git_oid);
-        let tree_cursor_oid = oid_frame(tree_git_oid);
+        let snapshot_cursor_oid = oid_frame(snapshot_git_oid)?;
+        let tree_cursor_oid = oid_frame(tree_git_oid)?;
         let scope = self.tree_scope_hash(ref_name, clean_path, query.as_deref())?;
         let cursor = request.cursor.as_deref().map(Cursor::parse).transpose()?;
         if cursor.as_ref().is_some_and(|value| value.scope != scope) {
@@ -370,10 +370,10 @@ impl DurableGitRepo {
     }
 }
 
-fn oid_frame(oid: git2::Oid) -> [u8; 20] {
-    oid.as_bytes()
-        .try_into()
-        .expect("libgit2 object ids are SHA-1 frames")
+fn oid_frame(oid: git2::Oid) -> Result<[u8; 20], TreePageError> {
+    oid.as_bytes().try_into().map_err(|_| {
+        DurableError::Git("unsupported Git object identifier width in tree cursor".into()).into()
+    })
 }
 
 fn hash_field(hash: &mut blake3::Hasher, value: &[u8]) {
@@ -964,7 +964,7 @@ mod tests {
         drop(git);
         let secret_commit = fixture.commit_tree(secret_tree, &[], "unreachable");
         let mut forged = Cursor::parse(&cursor).expect("cursor frame");
-        forged.tree_oid = oid_frame(secret_tree);
+        forged.tree_oid = oid_frame(secret_tree).unwrap();
         assert!(matches!(
             fixture.repo.tree_page(
                 "main",
@@ -977,7 +977,7 @@ mod tests {
             ),
             Err(TreePageError::CursorStale)
         ));
-        forged.snapshot_oid = oid_frame(secret_commit);
+        forged.snapshot_oid = oid_frame(secret_commit).unwrap();
         assert!(matches!(
             fixture.repo.tree_page(
                 "main",
@@ -1121,61 +1121,52 @@ mod tests {
         let fixture = Fixture::new("scan-bounds");
         let (tree_oid, _) = fixture.flat_files(3);
         let git = fixture.git();
-        let tree =
-            find_tree_bounded(&git, tree_oid, TREE_OBJECT_MAX_BYTES).expect("bounded tree");
-        assert!(
-            scan_tree(
-                &tree,
-                None,
-                None,
-                2,
-                ScanLimits {
-                    entries: 2,
-                    ..WIRE_SCAN_LIMITS
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            scan_tree(
-                &tree,
-                None,
-                None,
-                2,
-                ScanLimits {
-                    one_name_bytes: 4,
-                    ..WIRE_SCAN_LIMITS
-                }
-            )
-            .is_err()
-        );
+        let tree = find_tree_bounded(&git, tree_oid, TREE_OBJECT_MAX_BYTES).expect("bounded tree");
+        assert!(scan_tree(
+            &tree,
+            None,
+            None,
+            2,
+            ScanLimits {
+                entries: 2,
+                ..WIRE_SCAN_LIMITS
+            }
+        )
+        .is_err());
+        assert!(scan_tree(
+            &tree,
+            None,
+            None,
+            2,
+            ScanLimits {
+                one_name_bytes: 4,
+                ..WIRE_SCAN_LIMITS
+            }
+        )
+        .is_err());
         let total: usize = tree.iter().map(|entry| entry.name_bytes().len()).sum();
-        assert!(
-            scan_tree(
-                &tree,
-                None,
-                None,
-                2,
-                ScanLimits {
-                    total_name_bytes: total,
-                    ..WIRE_SCAN_LIMITS
-                }
-            )
-            .is_ok()
-        );
-        assert!(
-            scan_tree(
-                &tree,
-                None,
-                None,
-                2,
-                ScanLimits {
-                    total_name_bytes: total - 1,
-                    ..WIRE_SCAN_LIMITS
-                }
-            )
-            .is_err()
-        );
+        assert!(scan_tree(
+            &tree,
+            None,
+            None,
+            2,
+            ScanLimits {
+                total_name_bytes: total,
+                ..WIRE_SCAN_LIMITS
+            }
+        )
+        .is_ok());
+        assert!(scan_tree(
+            &tree,
+            None,
+            None,
+            2,
+            ScanLimits {
+                total_name_bytes: total - 1,
+                ..WIRE_SCAN_LIMITS
+            }
+        )
+        .is_err());
         assert!(find_tree_bounded(&git, tree_oid, 1).is_err());
     }
 
@@ -1254,39 +1245,33 @@ mod tests {
             };
             TREE_PAGE_MAX_LIMIT + 1
         ];
-        assert!(
-            fixture
-                .repo
-                .latest_commits_for_entries_at_snapshot(
-                    &page.snapshot_oid,
-                    "",
-                    &too_many,
-                    TREE_PAGE_LATEST_COMMIT_WALK_MAX,
-                )
-                .is_err()
-        );
-        assert!(
-            fixture
-                .repo
-                .latest_commits_for_entries_at_snapshot(
-                    &page.snapshot_oid,
-                    "",
-                    &page.entries,
-                    TREE_PAGE_LATEST_COMMIT_WALK_MAX + 1,
-                )
-                .is_err()
-        );
-        assert!(
-            fixture
-                .repo
-                .latest_commits_for_entries_at_snapshot(
-                    &page.snapshot_oid,
-                    "/unsafe",
-                    &page.entries,
-                    TREE_PAGE_LATEST_COMMIT_WALK_MAX,
-                )
-                .is_err()
-        );
+        assert!(fixture
+            .repo
+            .latest_commits_for_entries_at_snapshot(
+                &page.snapshot_oid,
+                "",
+                &too_many,
+                TREE_PAGE_LATEST_COMMIT_WALK_MAX,
+            )
+            .is_err());
+        assert!(fixture
+            .repo
+            .latest_commits_for_entries_at_snapshot(
+                &page.snapshot_oid,
+                "",
+                &page.entries,
+                TREE_PAGE_LATEST_COMMIT_WALK_MAX + 1,
+            )
+            .is_err());
+        assert!(fixture
+            .repo
+            .latest_commits_for_entries_at_snapshot(
+                &page.snapshot_oid,
+                "/unsafe",
+                &page.entries,
+                TREE_PAGE_LATEST_COMMIT_WALK_MAX,
+            )
+            .is_err());
     }
 
     #[test]

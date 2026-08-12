@@ -11,8 +11,7 @@ pub use crate::refs_pagination::{
 pub use crate::tree_pagination::{
     TreePage, TreePageError, TreePageLookup, TreePageRequest, TREE_PAGE_DEFAULT_LIMIT,
     TREE_PAGE_LATEST_COMMIT_WALK_MAX, TREE_PAGE_MAX_LIMIT, TREE_PAGE_MAX_QUERY_BYTES,
-    TREE_PAGE_SCAN_MAX_ENTRIES, TREE_PAGE_SCAN_MAX_NAME_BYTES,
-    TREE_PAGE_SCAN_MAX_TOTAL_NAME_BYTES,
+    TREE_PAGE_SCAN_MAX_ENTRIES, TREE_PAGE_SCAN_MAX_NAME_BYTES, TREE_PAGE_SCAN_MAX_TOTAL_NAME_BYTES,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,14 +57,9 @@ fn git_err(ctx: &str, e: git2::Error) -> DurableError {
     DurableError::Git(format!("{ctx}: {e}"))
 }
 
-static ATOMIC_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static ATOMIC_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn write_file_atomic(
-    dir: &Path,
-    file: &Path,
-    bytes: &[u8],
-) -> Result<(), DurableError> {
+pub(crate) fn write_file_atomic(dir: &Path, file: &Path, bytes: &[u8]) -> Result<(), DurableError> {
     write_file_atomic_with(dir, file, |handle| {
         handle
             .write_all(bytes)
@@ -81,7 +75,10 @@ pub(crate) fn write_file_atomic_with(
     std::fs::create_dir_all(dir)
         .map_err(|e| DurableError::Io(format!("create dir {}: {e}", dir.display())))?;
     let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = file.file_name().and_then(|value| value.to_str()).unwrap_or("record");
+    let name = file
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("record");
     let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
     let result = (|| {
         let mut handle = std::fs::OpenOptions::new()
@@ -95,7 +92,11 @@ pub(crate) fn write_file_atomic_with(
             .sync_all()
             .map_err(|e| DurableError::Io(format!("sync {}: {e}", tmp.display())))?;
         std::fs::rename(&tmp, file).map_err(|e| {
-            DurableError::Io(format!("rename {} to {}: {e}", tmp.display(), file.display()))
+            DurableError::Io(format!(
+                "rename {} to {}: {e}",
+                tmp.display(),
+                file.display()
+            ))
         })?;
         std::fs::File::open(dir)
             .and_then(|directory| directory.sync_all())
@@ -129,7 +130,9 @@ fn read_ref_generation(cfg: &git2::Config, ref_name: &str) -> Result<u64, Durabl
 }
 
 pub(crate) fn next_ref_generation(current: u64) -> Option<u64> {
-    current.checked_add(1).filter(|next| i64::try_from(*next).is_ok())
+    current
+        .checked_add(1)
+        .filter(|next| i64::try_from(*next).is_ok())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,14 +405,8 @@ fn commit_meta(c: &git2::Commit<'_>) -> CommitMeta {
             message.lines().next().unwrap_or(""),
             COMMIT_META_MAX_SUMMARY_BYTES,
         ),
-        author_name: utf8_prefix(
-            author.name().unwrap_or(""),
-            COMMIT_META_MAX_IDENTITY_BYTES,
-        ),
-        author_email: utf8_prefix(
-            author.email().unwrap_or(""),
-            COMMIT_META_MAX_IDENTITY_BYTES,
-        ),
+        author_name: utf8_prefix(author.name().unwrap_or(""), COMMIT_META_MAX_IDENTITY_BYTES),
+        author_email: utf8_prefix(author.email().unwrap_or(""), COMMIT_META_MAX_IDENTITY_BYTES),
         time: c.time().seconds(),
         parents: c
             .parent_ids()
@@ -494,10 +491,16 @@ impl DurableGitRepo {
             .write(true)
             .open(&lock_path)
             .map_err(|e| {
-                DurableError::Io(format!("open durable ref lock {}: {e}", lock_path.display()))
+                DurableError::Io(format!(
+                    "open durable ref lock {}: {e}",
+                    lock_path.display()
+                ))
             })?;
         fs4::fs_std::FileExt::lock_exclusive(&file).map_err(|e| {
-            DurableError::Io(format!("acquire durable ref lock {}: {e}", lock_path.display()))
+            DurableError::Io(format!(
+                "acquire durable ref lock {}: {e}",
+                lock_path.display()
+            ))
         })?;
         Ok(file)
     }
@@ -576,7 +579,9 @@ impl DurableGitRepo {
 
     pub fn write_tree(&self, entries: &[(&str, &Oid)]) -> Result<Oid, DurableError> {
         let repo = self.open_git()?;
-        let mut builder = repo.treebuilder(None).map_err(|e| git_err("treebuilder", e))?;
+        let mut builder = repo
+            .treebuilder(None)
+            .map_err(|e| git_err("treebuilder", e))?;
         for (name, blob) in entries {
             builder
                 .insert(name, Self::parse_oid(blob)?, 0o100644)
@@ -596,9 +601,11 @@ impl DurableGitRepo {
     ) -> Result<Oid, DurableError> {
         let repo = self.open_git()?;
         let tree_oid = Self::parse_oid(tree)?;
-        let tree_obj = repo.find_tree(tree_oid).map_err(|e| git_err("find tree", e))?;
-        let sig = git2::Signature::now(author_name, author_email)
-            .map_err(|e| git_err("signature", e))?;
+        let tree_obj = repo
+            .find_tree(tree_oid)
+            .map_err(|e| git_err("find tree", e))?;
+        let sig =
+            git2::Signature::now(author_name, author_email).map_err(|e| git_err("signature", e))?;
         let parent_commits: Vec<git2::Commit<'_>> = parents
             .iter()
             .map(|p| {
@@ -661,10 +668,7 @@ impl DurableGitRepo {
         }
     }
 
-    pub fn list_refs_bounded(
-        &self,
-        maximum: usize,
-    ) -> Result<Vec<(String, Oid)>, DurableError> {
+    pub fn list_refs_bounded(&self, maximum: usize) -> Result<Vec<(String, Oid)>, DurableError> {
         let repo = self.open_git()?;
         let refs = repo.references().map_err(|e| git_err("references", e))?;
         let mut out = Vec::new();
@@ -676,9 +680,9 @@ impl DurableGitRepo {
                         "wire ref limit exceeded: direct ref count".into(),
                     ));
                 }
-                let name = r.name().map_err(|_| {
-                    DurableError::Git("reference name is not valid UTF-8".into())
-                })?;
+                let name = r
+                    .name()
+                    .map_err(|_| DurableError::Git("reference name is not valid UTF-8".into()))?;
                 out.push((name.to_string(), Oid::new(oid.to_string())));
             }
         }
@@ -706,11 +710,12 @@ impl DurableGitRepo {
         }
 
         if !matches!((expected, new), (None, None)) {
-            let cfg = repo.config().map_err(|e| git_err("config (refgen preflight)", e))?;
+            let cfg = repo
+                .config()
+                .map_err(|e| git_err("config (refgen preflight)", e))?;
             let current = read_ref_generation(&cfg, name)?;
-            next_ref_generation(current).ok_or_else(|| {
-                DurableError::Git(format!("ref generation exhausted for {name}"))
-            })?;
+            next_ref_generation(current)
+                .ok_or_else(|| DurableError::Git(format!("ref generation exhausted for {name}")))?;
         }
 
         {
@@ -748,7 +753,8 @@ impl DurableGitRepo {
                         actual: cur.map(|o| o.0),
                     });
                 }
-                r.delete().map_err(|e| git_err(&format!("delete ref {name}"), e))?;
+                r.delete()
+                    .map_err(|e| git_err(&format!("delete ref {name}"), e))?;
             }
             (None, None) => {}
         }
@@ -763,10 +769,11 @@ impl DurableGitRepo {
         let key = refgen_key(name);
         let mut cfg = repo.config().map_err(|e| git_err("config (refgen)", e))?;
         let current = read_ref_generation(&cfg, name)?;
-        let next = next_ref_generation(current).ok_or_else(|| {
-            DurableError::Git(format!("ref generation exhausted for {name}"))
+        let next = next_ref_generation(current)
+            .ok_or_else(|| DurableError::Git(format!("ref generation exhausted for {name}")))?;
+        let next = i64::try_from(next).map_err(|_| {
+            DurableError::Git(format!("ref generation exceeds durable range for {name}"))
         })?;
-        let next = i64::try_from(next).expect("next_ref_generation guarantees signed range");
         cfg.set_i64(&key, next)
             .map_err(|e| git_err(&format!("set refgen for {name}"), e))?;
         Ok(())
@@ -891,17 +898,24 @@ impl DurableGitRepo {
                 DurableError::Git("audit reflog limit exceeded: on-disk bytes".into())
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let cfg = repo.config().map_err(|e| git_err("config (reflog audit)", e))?;
+                let cfg = repo
+                    .config()
+                    .map_err(|e| git_err("config (reflog audit)", e))?;
                 return Ok((Vec::new(), 0, read_ref_generation(&cfg, name)?));
             }
             Err(error) => {
-                return Err(DurableError::Io(format!("stat {}: {error}", path.display())));
+                return Err(DurableError::Io(format!(
+                    "stat {}: {error}",
+                    path.display()
+                )));
             }
         };
         let log = match repo.reflog(name) {
             Ok(log) => log,
             Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                let cfg = repo.config().map_err(|error| git_err("config (reflog audit)", error))?;
+                let cfg = repo
+                    .config()
+                    .map_err(|error| git_err("config (reflog audit)", error))?;
                 return Ok((Vec::new(), 0, read_ref_generation(&cfg, name)?));
             }
             Err(e) => return Err(git_err(&format!("reflog {name}"), e)),
@@ -942,7 +956,9 @@ impl DurableGitRepo {
                 "audit reflog changed while it was read".into(),
             ));
         }
-        let cfg = repo.config().map_err(|e| git_err("config (reflog audit)", e))?;
+        let cfg = repo
+            .config()
+            .map_err(|e| git_err("config (reflog audit)", e))?;
         let generation = read_ref_generation(&cfg, name)?;
         Ok((out, on_disk_bytes, generation))
     }
@@ -983,7 +999,11 @@ impl DurableGitRepo {
         Ok(commit.map(|commit| Oid::new(commit.id().to_string())))
     }
 
-    fn tip_commit(&self, repo: &git2::Repository, ref_name: &str) -> Result<Option<git2::Oid>, DurableError> {
+    fn tip_commit(
+        &self,
+        repo: &git2::Repository,
+        ref_name: &str,
+    ) -> Result<Option<git2::Oid>, DurableError> {
         match repo.find_reference(ref_name) {
             Ok(r) => Ok(r.target()),
             Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
@@ -1003,7 +1023,9 @@ impl DurableGitRepo {
         let commit = match repo.find_commit(oid) {
             Ok(commit) => commit,
             Err(error) if error.code() == git2::ErrorCode::NotFound => {
-                return Err(DurableError::Git(format!("exact commit {oid_text} not found")))
+                return Err(DurableError::Git(format!(
+                    "exact commit {oid_text} not found"
+                )))
             }
             Err(error) => return Err(git_err("find exact commit", error)),
         };
@@ -1058,9 +1080,12 @@ impl DurableGitRepo {
         match entry.kind() {
             Some(git2::ObjectType::Blob) => {
                 let odb = repo.odb().map_err(|e| git_err("open object database", e))?;
-                let (object_size, object_kind) = odb.read_header(entry.id())
+                let (object_size, object_kind) = odb
+                    .read_header(entry.id())
                     .map_err(|e| git_err("read object header", e))?;
-                if object_kind != git2::ObjectType::Blob { return Ok(BlobPathLookup::Missing); }
+                if object_kind != git2::ObjectType::Blob {
+                    return Ok(BlobPathLookup::Missing);
+                }
                 if object_size > maximum_bytes {
                     return Ok(BlobPathLookup::TooLarge {
                         size: object_size as u64,
@@ -1068,7 +1093,9 @@ impl DurableGitRepo {
                         oid: Oid::new(entry.id().to_string()),
                     });
                 }
-                let obj = entry.to_object(repo).map_err(|e| git_err("entry object", e))?;
+                let obj = entry
+                    .to_object(repo)
+                    .map_err(|e| git_err("entry object", e))?;
                 let blob = obj
                     .as_blob()
                     .ok_or_else(|| DurableError::Git("blob object not a blob".into()))?;
@@ -1189,7 +1216,8 @@ impl DurableGitRepo {
         let requested: std::collections::BTreeSet<&str> =
             entries.iter().map(|entry| entry.name.as_str()).collect();
         let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
-        walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
+        walk.set_sorting(git2::Sort::TIME)
+            .map_err(|e| git_err("revwalk sort", e))?;
         walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
         let mut out: std::collections::BTreeMap<String, CommitMeta> = Default::default();
         for (seen, oid_res) in walk.enumerate() {
@@ -1197,7 +1225,9 @@ impl DurableGitRepo {
                 break;
             }
             let oid = oid_res.map_err(|e| git_err("revwalk next", e))?;
-            let commit = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
+            let commit = repo
+                .find_commit(oid)
+                .map_err(|e| git_err("find_commit", e))?;
             let tree = commit.tree().map_err(|e| git_err("commit tree", e))?;
             let parent_tree = if commit.parent_count() > 0 {
                 Some(
@@ -1263,7 +1293,8 @@ impl DurableGitRepo {
             return Ok((Vec::new(), false));
         };
         let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
-        walk.set_sorting(git2::Sort::TIME).map_err(|e| git_err("revwalk sort", e))?;
+        walk.set_sorting(git2::Sort::TIME)
+            .map_err(|e| git_err("revwalk sort", e))?;
         walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
         let mut seen = 0usize;
         let mut out = Vec::new();
@@ -1278,7 +1309,9 @@ impl DurableGitRepo {
                 has_more = true;
                 break;
             }
-            let c = repo.find_commit(oid).map_err(|e| git_err("find_commit", e))?;
+            let c = repo
+                .find_commit(oid)
+                .map_err(|e| git_err("find_commit", e))?;
             out.push(commit_meta(&c));
             seen += 1;
         }
@@ -1604,7 +1637,9 @@ impl DurableGitRepo {
         let head_tree = head_commit.tree().map_err(|e| git_err("head tree", e))?;
         let base_tree = match base_oid {
             Some(o) => {
-                let base_commit = repo.find_commit(o).map_err(|e| git_err("find base commit", e))?;
+                let base_commit = repo
+                    .find_commit(o)
+                    .map_err(|e| git_err("find base commit", e))?;
                 Some(base_commit.tree().map_err(|e| git_err("base tree", e))?)
             }
             None => None,
@@ -1654,13 +1689,18 @@ impl DurableGitRepo {
                 FileKind::Text
             };
             let new_oid = delta.new_file().id();
-            let new_blob_oid = if status != 'D' && kind != FileKind::Submodule && !new_oid.is_zero() {
+            let new_blob_oid = if status != 'D' && kind != FileKind::Submodule && !new_oid.is_zero()
+            {
                 Some(new_oid.to_string())
             } else {
                 None
             };
             let size_bytes = delta.new_file().size();
-            let size_bytes = if size_bytes > 0 { Some(size_bytes) } else { None };
+            let size_bytes = if size_bytes > 0 {
+                Some(size_bytes)
+            } else {
+                None
+            };
             files.borrow_mut().push(PrFileDelta {
                 path,
                 old_path,
@@ -1699,54 +1739,53 @@ impl DurableGitRepo {
             }
             true
         };
-        let mut line_cb = |_d: git2::DiffDelta<'_>,
-                           _h: Option<git2::DiffHunk<'_>>,
-                           line: git2::DiffLine<'_>| {
-            let origin = line.origin();
-            if !matches!(origin, '+' | '-' | ' ') {
-                return true;
-            }
-            let mut fs = files.borrow_mut();
-            if let Some(f) = fs.last_mut() {
-                match origin {
-                    '+' => f.additions += 1,
-                    '-' => f.deletions += 1,
-                    _ => {}
+        let mut line_cb =
+            |_d: git2::DiffDelta<'_>, _h: Option<git2::DiffHunk<'_>>, line: git2::DiffLine<'_>| {
+                let origin = line.origin();
+                if !matches!(origin, '+' | '-' | ' ') {
+                    return true;
                 }
-                let mut r = rendered.borrow_mut();
-                if per_file_line_cap > 0 && *r >= per_file_line_cap {
-                    f.truncated = true;
-                } else {
-                    let content = String::from_utf8_lossy(line.content())
-                        .trim_end_matches('\n')
-                        .to_string();
-                    let next_bytes = rendered_bytes.get().checked_add(content.len());
-                    if content.len() > maximum_line_bytes
-                        || next_bytes.is_none_or(|bytes| bytes > maximum_rendered_bytes)
-                    {
-                        limit_exceeded.set(true);
-                        return false;
+                let mut fs = files.borrow_mut();
+                if let Some(f) = fs.last_mut() {
+                    match origin {
+                        '+' => f.additions += 1,
+                        '-' => f.deletions += 1,
+                        _ => {}
                     }
-                    rendered_bytes.set(next_bytes.unwrap_or(maximum_rendered_bytes));
-                    if f.kind == FileKind::Text
-                        && origin == '+'
-                        && content.starts_with("version https://git-lfs")
-                    {
-                        f.kind = FileKind::Lfs;
-                    }
-                    if let Some(h) = f.hunks.last_mut() {
-                        h.lines.push(DiffLineDelta {
-                            origin,
-                            content,
-                            old_no: line.old_lineno(),
-                            new_no: line.new_lineno(),
-                        });
-                        *r += 1;
+                    let mut r = rendered.borrow_mut();
+                    if per_file_line_cap > 0 && *r >= per_file_line_cap {
+                        f.truncated = true;
+                    } else {
+                        let content = String::from_utf8_lossy(line.content())
+                            .trim_end_matches('\n')
+                            .to_string();
+                        let next_bytes = rendered_bytes.get().checked_add(content.len());
+                        if content.len() > maximum_line_bytes
+                            || next_bytes.is_none_or(|bytes| bytes > maximum_rendered_bytes)
+                        {
+                            limit_exceeded.set(true);
+                            return false;
+                        }
+                        rendered_bytes.set(next_bytes.unwrap_or(maximum_rendered_bytes));
+                        if f.kind == FileKind::Text
+                            && origin == '+'
+                            && content.starts_with("version https://git-lfs")
+                        {
+                            f.kind = FileKind::Lfs;
+                        }
+                        if let Some(h) = f.hunks.last_mut() {
+                            h.lines.push(DiffLineDelta {
+                                origin,
+                                content,
+                                old_no: line.old_lineno(),
+                                new_no: line.new_lineno(),
+                            });
+                            *r += 1;
+                        }
                     }
                 }
-            }
-            true
-        };
+                true
+            };
         let traversal = diff.foreach(
             &mut file_cb,
             Some(&mut binary_cb),
@@ -1829,9 +1868,7 @@ impl DurableGitRepo {
         }
         let blob = match repo.find_blob(goid) {
             Ok(b) => b,
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                return Ok(FileLinesLookup::Missing)
-            }
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(FileLinesLookup::Missing),
             Err(e) => return Err(git_err("find blob", e)),
         };
         if blob.is_binary() {
@@ -2017,7 +2054,9 @@ impl DurableGitRepo {
     }
 
     pub fn object_is_commit(&self, oid: &Oid) -> bool {
-        let Ok(repo) = self.open_git() else { return false };
+        let Ok(repo) = self.open_git() else {
+            return false;
+        };
         let Ok(goid) = git2::Oid::from_str(oid.as_str()) else {
             return false;
         };
@@ -2278,18 +2317,19 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
         }
         let owner = blake3::hash(owner.as_bytes()).to_hex().to_string();
         let repo_path = self.repo_path(repo)?;
-        let parent = repo_path.parent().ok_or_else(|| {
-            DurableError::Io("repository path has no parent directory".into())
-        })?;
+        let parent = repo_path
+            .parent()
+            .ok_or_else(|| DurableError::Io("repository path has no parent directory".into()))?;
         std::fs::create_dir_all(parent).map_err(|error| {
             DurableError::Io(format!(
                 "create repository parent {}: {error}",
                 parent.display()
             ))
         })?;
-        let repo_name = repo_path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-            DurableError::Io("repository path has no UTF-8 file name".into())
-        })?;
+        let repo_name = repo_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| DurableError::Io("repository path has no UTF-8 file name".into()))?;
         let lock_path = parent.join(format!(".{repo_name}.creation.lock"));
         let owner_path = parent.join(format!(".{repo_name}.creation-owner"));
         let lock = std::fs::OpenOptions::new()
@@ -2334,7 +2374,9 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Ok(repository) = git2::Repository::open(&repo_path) {
                     drop(repository);
-                    return Ok(RepoCreationClaim::Existing(DurableGitRepo { path: repo_path }));
+                    return Ok(RepoCreationClaim::Existing(DurableGitRepo {
+                        path: repo_path,
+                    }));
                 }
                 write_file_atomic(parent, &owner_path, owner.as_bytes())?;
             }
@@ -2389,8 +2431,14 @@ mod tests {
     fn seed_commit(repo: &DurableGitRepo, content: &[u8]) -> Oid {
         let blob = repo.write_blob(content).expect("blob");
         let tree = repo.write_tree(&[("file.txt", &blob)]).expect("tree");
-        repo.write_commit(&tree, &[], "feat: seed", "psn-7@acme.noreply", "psn-7@acme.noreply")
-            .expect("commit")
+        repo.write_commit(
+            &tree,
+            &[],
+            "feat: seed",
+            "psn-7@acme.noreply",
+            "psn-7@acme.noreply",
+        )
+        .expect("commit")
     }
 
     #[test]
@@ -2458,7 +2506,10 @@ mod tests {
             .find_commit(DurableGitRepo::parse_oid(&feature).expect("feature oid"))
             .expect("feature commit");
         assert_eq!(commit.parent_count(), 1);
-        assert_eq!(commit.parent_id(0).expect("first parent").to_string(), main.0);
+        assert_eq!(
+            commit.parent_id(0).expect("first parent").to_string(),
+            main.0
+        );
         assert!(
             commit
                 .tree()
@@ -2505,7 +2556,9 @@ mod tests {
         let root = temp_root("ref-lock");
         let store = DurableGitStore::rooted(&root);
         let first_repo = store.create_repo(&loc()).expect("create");
-        let second_repo = store.open_repo(&loc()).expect("second process-style handle");
+        let second_repo = store
+            .open_repo(&loc())
+            .expect("second process-style handle");
         let first_lock = first_repo
             .lock_ref_exclusive("refs/heads/main")
             .expect("first lock");
@@ -2542,8 +2595,14 @@ mod tests {
         assert!(!store.repo_exists(&loc()), "absent before create");
 
         let repo = store.create_repo(&loc()).expect("create");
-        assert_eq!(repo.path(), root.join("acme").join("fr-par").join("core.git"));
-        assert!(repo.path().is_dir(), "the bare repo is a real on-disk directory");
+        assert_eq!(
+            repo.path(),
+            root.join("acme").join("fr-par").join("core.git")
+        );
+        assert!(
+            repo.path().is_dir(),
+            "the bare repo is a real on-disk directory"
+        );
         assert!(store.repo_exists(&loc()), "present after create");
         assert!(store.create_repo(&loc()).is_ok());
 
@@ -2564,7 +2623,10 @@ mod tests {
         let on_disk_claim = std::fs::read_to_string(&interrupted.owner_path)
             .expect("the durable claim is readable");
         assert_eq!(on_disk_claim.len(), 64);
-        assert!(!on_disk_claim.contains("alice"), "the claim stores only an owner fingerprint");
+        assert!(
+            !on_disk_claim.contains("alice"),
+            "the claim stores only an owner fingerprint"
+        );
         interrupted
             .initialize()
             .expect("Git initialization reached disk");
@@ -2581,7 +2643,9 @@ mod tests {
             RepoCreationClaim::Acquired(claim) => claim,
             RepoCreationClaim::Existing(_) => panic!("the durable claim still marks it unfinished"),
         };
-        resumed.create().expect("the original creator finishes the repository");
+        resumed
+            .create()
+            .expect("the original creator finishes the repository");
         assert!(matches!(
             store
                 .claim_repo_creation(&loc(), "principal:bob")
@@ -2599,11 +2663,20 @@ mod tests {
         let repo = store.create_repo(&loc()).expect("create");
 
         let g = git2::Repository::open(repo.path()).unwrap();
-        assert!(g.head().is_err(), "fresh init_bare HEAD dangles (a clone would warn)");
+        assert!(
+            g.head().is_err(),
+            "fresh init_bare HEAD dangles (a clone would warn)"
+        );
 
         let c = seed_commit(&repo, b"first push\n");
-        repo.update_ref_cas("refs/heads/main", None, Some(&c), "create", "psn@acme.noreply")
-            .expect("create main");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&c),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("create main");
         assert!(
             git2::Repository::open(repo.path()).unwrap().head().is_err(),
             "HEAD still dangles after the push until it is healed"
@@ -2621,7 +2694,12 @@ mod tests {
 
         repo.heal_head_symref().expect("heal is idempotent");
         assert_eq!(
-            git2::Repository::open(repo.path()).unwrap().head().unwrap().name().unwrap(),
+            git2::Repository::open(repo.path())
+                .unwrap()
+                .head()
+                .unwrap()
+                .name()
+                .unwrap(),
             "refs/heads/main"
         );
 
@@ -2634,11 +2712,22 @@ mod tests {
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
         let c = seed_commit(&repo, b"develop\n");
-        repo.update_ref_cas("refs/heads/develop", None, Some(&c), "create", "psn@acme.noreply")
-            .expect("create develop");
+        repo.update_ref_cas(
+            "refs/heads/develop",
+            None,
+            Some(&c),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("create develop");
         repo.heal_head_symref().expect("heal");
         assert_eq!(
-            git2::Repository::open(repo.path()).unwrap().head().unwrap().name().unwrap(),
+            git2::Repository::open(repo.path())
+                .unwrap()
+                .head()
+                .unwrap()
+                .name()
+                .unwrap(),
             "refs/heads/develop",
             "F9: with no main, HEAD follows the first branch pushed"
         );
@@ -2678,7 +2767,9 @@ mod tests {
             .read_object_bounded(&commit, 64 * 1024 * 1024)
             .expect("read object");
         assert!(
-            std::str::from_utf8(&bytes).unwrap().contains("psn-7@acme.noreply"),
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("psn-7@acme.noreply"),
             "the durable commit carries the pseudonymous author"
         );
         assert_eq!(
@@ -2712,10 +2803,16 @@ mod tests {
         let target_loc = RepoLoc::new("acme", "fr-par", "core");
         let source = store.create_repo(&source_loc).expect("create source");
         let target = store.create_repo(&target_loc).expect("create target");
-        assert_ne!(source.path(), target.path(), "the proof must use distinct ODBs");
+        assert_ne!(
+            source.path(),
+            target.path(),
+            "the proof must use distinct ODBs"
+        );
 
         let parent = seed_commit(&source, b"parent from fork\n");
-        let child_blob = source.write_blob(b"locked fork head\n").expect("child blob");
+        let child_blob = source
+            .write_blob(b"locked fork head\n")
+            .expect("child blob");
         let child_tree = source
             .write_tree(&[("file.txt", &child_blob)])
             .expect("child tree");
@@ -2746,7 +2843,10 @@ mod tests {
 
         assert!(target.object_is_commit(&child), "locked head imported");
         assert!(target.object_is_commit(&parent), "parent ancestry imported");
-        assert!(target.has_object(&child_blob), "referenced tree/blob closure imported");
+        assert!(
+            target.has_object(&child_blob),
+            "referenced tree/blob closure imported"
+        );
         assert_eq!(
             target
                 .read_ref("refs/heads/contributor/change")
@@ -2754,7 +2854,9 @@ mod tests {
             None,
             "object import must not copy or create source refs"
         );
-        assert!(target.commit_tree_complete(&child).expect("target connectivity"));
+        assert!(target
+            .commit_tree_complete(&child)
+            .expect("target connectivity"));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2768,18 +2870,42 @@ mod tests {
         let b1 = repo.write_blob(b"line one\n").unwrap();
         let t1 = repo.write_tree(&[("file.txt", &b1)]).unwrap();
         let c1 = repo
-            .write_commit(&t1, &[], "feat: first", "psn@acme.noreply", "psn@acme.noreply")
+            .write_commit(
+                &t1,
+                &[],
+                "feat: first",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
-        repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&c1),
+            "create",
+            "psn@acme.noreply",
+        )
+        .unwrap();
 
         let b2 = repo.write_blob(b"line one\nline two\n").unwrap();
         let t2 = repo.write_tree(&[("file.txt", &b2)]).unwrap();
         let c2 = repo
-            .write_commit(&t2, &[&c1], "feat: second", "psn@acme.noreply", "psn@acme.noreply")
+            .write_commit(
+                &t2,
+                &[&c1],
+                "feat: second",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
-        repo.update_ref_cas("refs/heads/main", Some(&c1), Some(&c2), "ff", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            Some(&c1),
+            Some(&c2),
+            "ff",
+            "psn@acme.noreply",
+        )
+        .unwrap();
 
         let (rows, more) = repo.commit_log("refs/heads/main", 0, 10).expect("log");
         assert!(!more);
@@ -2813,11 +2939,26 @@ mod tests {
             .any(|(o, c)| *o == '+' && c == "line two"));
 
         for limits in [
-            CommitDiffLimits { files: 0, ..COMMIT_DIFF_LIMITS },
-            CommitDiffLimits { lines_per_file: 0, ..COMMIT_DIFF_LIMITS },
-            CommitDiffLimits { line_bytes: 1, ..COMMIT_DIFF_LIMITS },
-            CommitDiffLimits { rendered_bytes: 1, ..COMMIT_DIFF_LIMITS },
-            CommitDiffLimits { message_bytes: 1, ..COMMIT_DIFF_LIMITS },
+            CommitDiffLimits {
+                files: 0,
+                ..COMMIT_DIFF_LIMITS
+            },
+            CommitDiffLimits {
+                lines_per_file: 0,
+                ..COMMIT_DIFF_LIMITS
+            },
+            CommitDiffLimits {
+                line_bytes: 1,
+                ..COMMIT_DIFF_LIMITS
+            },
+            CommitDiffLimits {
+                rendered_bytes: 1,
+                ..COMMIT_DIFF_LIMITS
+            },
+            CommitDiffLimits {
+                message_bytes: 1,
+                ..COMMIT_DIFF_LIMITS
+            },
         ] {
             assert!(matches!(
                 repo.commit_detail_bounded(&c2.0, limits),
@@ -3139,27 +3280,65 @@ mod tests {
         let base = repo
             .write_commit(&t0, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
             .unwrap();
-        repo.update_ref_cas("refs/heads/main", None, Some(&base), "create", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&base),
+            "create",
+            "psn@acme.noreply",
+        )
+        .unwrap();
 
         let bh = repo.write_blob(b"a\nB\nc\nd\n").unwrap();
         let th = repo.write_tree(&[("file.txt", &bh)]).unwrap();
         let head = repo
-            .write_commit(&th, &[&base], "head", "psn@acme.noreply", "psn@acme.noreply")
+            .write_commit(
+                &th,
+                &[&base],
+                "head",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
 
         let bd = repo.write_blob(b"unrelated\n").unwrap();
-        let td = repo.write_tree(&[("file.txt", &b0), ("other.txt", &bd)]).unwrap();
+        let td = repo
+            .write_tree(&[("file.txt", &b0), ("other.txt", &bd)])
+            .unwrap();
         let drift = repo
-            .write_commit(&td, &[&base], "drift on main", "psn@acme.noreply", "psn@acme.noreply")
+            .write_commit(
+                &td,
+                &[&base],
+                "drift on main",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
-        repo.update_ref_cas("refs/heads/main", Some(&base), Some(&drift), "ff", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            Some(&base),
+            Some(&drift),
+            "ff",
+            "psn@acme.noreply",
+        )
+        .unwrap();
 
-        let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
-        assert!(diff.three_dot, "durable repos are libgit2-backed → real merge-base");
-        assert_eq!(diff.base_oid, base.0, "base = merge-base(main, head), NOT main's tip");
-        assert_eq!(diff.total_files, 1, "three-dot shows only the PR's own files");
+        let diff = repo
+            .pr_diff("refs/heads/main", &head.0, 4000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            diff.three_dot,
+            "durable repos are libgit2-backed → real merge-base"
+        );
+        assert_eq!(
+            diff.base_oid, base.0,
+            "base = merge-base(main, head), NOT main's tip"
+        );
+        assert_eq!(
+            diff.total_files, 1,
+            "three-dot shows only the PR's own files"
+        );
         assert_eq!(diff.files[0].path, "file.txt");
         assert_eq!(diff.files[0].status, 'M');
         assert_eq!(diff.files[0].kind, FileKind::Text);
@@ -3177,16 +3356,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["B", "c"]
         );
-        assert_eq!(diff.files[0].additions, 2, "line 2 changed (+B) + line 4 added (+d)");
+        assert_eq!(
+            diff.files[0].additions, 2,
+            "line 2 changed (+B) + line 4 added (+d)"
+        );
         assert_eq!(diff.files[0].deletions, 1, "line 2's old (-b)");
         let hunk = &diff.files[0].hunks[0];
-        let added_d = hunk.lines.iter().find(|l| l.origin == '+' && l.content == "d").unwrap();
+        let added_d = hunk
+            .lines
+            .iter()
+            .find(|l| l.origin == '+' && l.content == "d")
+            .unwrap();
         assert_eq!(added_d.new_no, Some(4));
         assert_eq!(added_d.old_no, None);
-        let removed_b = hunk.lines.iter().find(|l| l.origin == '-' && l.content == "b").unwrap();
+        let removed_b = hunk
+            .lines
+            .iter()
+            .find(|l| l.origin == '-' && l.content == "b")
+            .unwrap();
         assert_eq!(removed_b.old_no, Some(2));
         assert_eq!(removed_b.new_no, None);
-        let ctx_a = hunk.lines.iter().find(|l| l.origin == ' ' && l.content == "a").unwrap();
+        let ctx_a = hunk
+            .lines
+            .iter()
+            .find(|l| l.origin == ' ' && l.content == "a")
+            .unwrap();
         assert_eq!(ctx_a.old_no, Some(1));
         assert_eq!(ctx_a.new_no, Some(1));
 
@@ -3201,10 +3395,8 @@ mod tests {
             ),
             Err(DurableError::Git(message)) if message.starts_with("pr diff computation limit exceeded:")
         ));
-        for (line_bytes, rendered_bytes) in [
-            (0, DIFF_MAX_RENDERED_BYTES),
-            (DIFF_MAX_LINE_BYTES, 1),
-        ] {
+        for (line_bytes, rendered_bytes) in [(0, DIFF_MAX_RENDERED_BYTES), (DIFF_MAX_LINE_BYTES, 1)]
+        {
             assert!(matches!(
                 repo.pr_diff_bounded(
                     "refs/heads/main",
@@ -3218,7 +3410,10 @@ mod tests {
             ));
         }
 
-        assert!(repo.pr_diff("refs/heads/main", "not-an-oid", 4000).unwrap().is_none());
+        assert!(repo
+            .pr_diff("refs/heads/main", "not-an-oid", 4000)
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3232,26 +3427,50 @@ mod tests {
         let base = repo
             .write_commit(&t0, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
             .unwrap();
-        repo.update_ref_cas("refs/heads/main", None, Some(&base), "create", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&base),
+            "create",
+            "psn@acme.noreply",
+        )
+        .unwrap();
 
         let big: String = (0..5000).map(|i| format!("line {i}\n")).collect();
         let bh = repo.write_blob(big.as_bytes()).unwrap();
         let th = repo.write_tree(&[("big.txt", &bh)]).unwrap();
         let head = repo
-            .write_commit(&th, &[&base], "add big", "psn@acme.noreply", "psn@acme.noreply")
+            .write_commit(
+                &th,
+                &[&base],
+                "add big",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
 
         let cap = 100;
-        let diff = repo.pr_diff("refs/heads/main", &head.0, cap).unwrap().unwrap();
+        let diff = repo
+            .pr_diff("refs/heads/main", &head.0, cap)
+            .unwrap()
+            .unwrap();
         assert_eq!(diff.total_files, 1);
         let f = &diff.files[0];
         assert_eq!(f.path, "big.txt");
         assert!(f.truncated, "a file over the cap MUST be flagged truncated");
         let rendered: usize = f.hunks.iter().map(|h| h.lines.len()).sum();
-        assert!(rendered <= cap, "rendered lines ({rendered}) must not exceed the cap ({cap})");
-        assert_eq!(f.additions, 5000, "the diffstat still reports the TRUE addition count");
-        let full = repo.pr_diff("refs/heads/main", &head.0, 0).unwrap().unwrap();
+        assert!(
+            rendered <= cap,
+            "rendered lines ({rendered}) must not exceed the cap ({cap})"
+        );
+        assert_eq!(
+            f.additions, 5000,
+            "the diffstat still reports the TRUE addition count"
+        );
+        let full = repo
+            .pr_diff("refs/heads/main", &head.0, 0)
+            .unwrap()
+            .unwrap();
         let full_rendered: usize = full.files[0].hunks.iter().map(|h| h.lines.len()).sum();
         assert_eq!(full_rendered, 5000, "cap=0 is uncapped");
         assert!(!full.files[0].truncated);
@@ -3264,18 +3483,37 @@ mod tests {
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
         let base = seed_commit(&repo, b"a\n");
-        repo.update_ref_cas("refs/heads/main", None, Some(&base), "c", "psn@acme.noreply").unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&base),
+            "c",
+            "psn@acme.noreply",
+        )
+        .unwrap();
         let bin = repo.write_blob(&[0u8, 1, 2, 0, 255, 3]).unwrap();
         let tb = repo.write_tree(&[("logo.png", &bin)]).unwrap();
         let head = repo
-            .write_commit(&tb, &[&base], "add binary", "psn@acme.noreply", "psn@acme.noreply")
+            .write_commit(
+                &tb,
+                &[&base],
+                "add binary",
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
             .unwrap();
-        let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
+        let diff = repo
+            .pr_diff("refs/heads/main", &head.0, 4000)
+            .unwrap()
+            .unwrap();
         let f = diff.files.iter().find(|f| f.path == "logo.png").unwrap();
         assert_eq!(f.kind, FileKind::Binary);
         assert_eq!(f.new_blob_oid.as_deref(), Some(bin.0.as_str()));
         assert!(f.hunks.is_empty(), "a binary file carries NO text hunks");
-        assert!(f.size_bytes.is_some(), "the size is available for the binary row");
+        assert!(
+            f.size_bytes.is_some(),
+            "the size is available for the binary row"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3285,8 +3523,14 @@ mod tests {
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
         let base = seed_commit(&repo, b"removed\n");
-        repo.update_ref_cas("refs/heads/main", None, Some(&base), "c", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&base),
+            "c",
+            "psn@acme.noreply",
+        )
+        .unwrap();
         let empty = repo.write_tree(&[]).unwrap();
         let head = repo
             .write_commit(
@@ -3297,7 +3541,10 @@ mod tests {
                 "psn@acme.noreply",
             )
             .unwrap();
-        let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
+        let diff = repo
+            .pr_diff("refs/heads/main", &head.0, 4000)
+            .unwrap()
+            .unwrap();
         assert_eq!(diff.files[0].status, 'D');
         assert_eq!(diff.files[0].new_blob_oid, None);
         std::fs::remove_dir_all(&root).ok();
@@ -3328,13 +3575,19 @@ mod tests {
             panic!("the exact line-range cap must remain valid")
         };
         assert_eq!(exact_lines.len(), FILE_LINES_MAX_RANGE);
-        assert_eq!(exact_lines.last().unwrap().new_no, Some(FILE_LINES_MAX_RANGE as u32));
+        assert_eq!(
+            exact_lines.last().unwrap().new_no,
+            Some(FILE_LINES_MAX_RANGE as u32)
+        );
         assert_eq!(
             repo.file_lines("not-an-oid", 1, 10).unwrap(),
             FileLinesLookup::Missing,
         );
         let bin = repo.write_blob(&[0u8, 1, 2, 0]).unwrap();
-        assert_eq!(repo.file_lines(&bin.0, 1, 10).unwrap(), FileLinesLookup::Binary);
+        assert_eq!(
+            repo.file_lines(&bin.0, 1, 10).unwrap(),
+            FileLinesLookup::Binary
+        );
 
         let large = repo
             .write_blob(&vec![b'x'; FILE_LINES_MAX_BLOB_BYTES + 1])
@@ -3357,8 +3610,14 @@ mod tests {
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
         let commit = seed_commit(&repo, b"fsck me\n");
-        repo.update_ref_cas("refs/heads/main", None, Some(&commit), "create", "psn@acme.noreply")
-            .expect("ref");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&commit),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("ref");
         repo.fsck().expect("fsck clean on a valid repo");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3375,8 +3634,14 @@ mod tests {
             .write_commit(&tree2, &[&c1], "v2", "psn@acme.noreply", "psn@acme.noreply")
             .unwrap();
 
-        repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply")
-            .expect("create");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&c1),
+            "create",
+            "psn@acme.noreply",
+        )
+        .expect("create");
 
         let stale = repo.update_ref_cas(
             "refs/heads/main",
@@ -3400,7 +3665,11 @@ mod tests {
         )
         .expect("ff update");
         assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(c2));
-        assert_eq!(repo.reflog_len("refs/heads/main"), Ok(2), "two updates logged");
+        assert_eq!(
+            repo.reflog_len("refs/heads/main"),
+            Ok(2),
+            "two updates logged"
+        );
         assert!(matches!(
             repo.reflog_entries_bounded("refs/heads/main", 1, REFLOG_MAX_BYTES_PER_REF),
             Err(DurableError::Git(message))
@@ -3469,7 +3738,10 @@ mod tests {
             .find_reflog_commit_by_trailer("refs/heads/main", trailer)
             .unwrap()
             .unwrap();
-        assert_eq!(found.oid, first, "a copied trailer cannot shadow its origin");
+        assert_eq!(
+            found.oid, first,
+            "a copied trailer cannot shadow its origin"
+        );
         assert!(repo
             .find_reflog_commit_by_trailer("refs/heads/main", "Myelin-Operation: opaque")
             .unwrap()
@@ -3488,12 +3760,21 @@ mod tests {
         let repo_a = store.create_repo(&a).expect("create a");
         let commit = seed_commit(&repo_a, b"tenant a private\n");
         repo_a
-            .update_ref_cas("refs/heads/main", None, Some(&commit), "create", "psn@tenant-a.noreply")
+            .update_ref_cas(
+                "refs/heads/main",
+                None,
+                Some(&commit),
+                "create",
+                "psn@tenant-a.noreply",
+            )
             .expect("ref a");
 
         assert_ne!(store.repo_path(&a).unwrap(), store.repo_path(&b).unwrap());
         assert!(store.repo_exists(&a));
-        assert!(!store.repo_exists(&b), "tenant B cannot reach A's repo by path");
+        assert!(
+            !store.repo_exists(&b),
+            "tenant B cannot reach A's repo by path"
+        );
         let repo_b = store.create_repo(&b).expect("create b");
         assert!(
             !repo_b.has_object(&commit),
@@ -3514,22 +3795,48 @@ mod tests {
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
         let c1 = seed_commit(&repo, b"x\n");
-        repo.update_ref_cas("refs/heads/tmp", None, Some(&c1), "create", "psn@acme.noreply")
-            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/tmp",
+            None,
+            Some(&c1),
+            "create",
+            "psn@acme.noreply",
+        )
+        .unwrap();
         assert_eq!(repo.read_ref("refs/heads/tmp").unwrap(), Some(c1.clone()));
-        assert_eq!(repo.ref_generation("refs/heads/tmp"), Ok(1), "create is generation 1");
+        assert_eq!(
+            repo.ref_generation("refs/heads/tmp"),
+            Ok(1),
+            "create is generation 1"
+        );
 
-        repo.update_ref_cas("refs/heads/tmp", Some(&c1), None, "delete", "psn@acme.noreply")
-            .expect("delete");
-        assert_eq!(repo.read_ref("refs/heads/tmp").unwrap(), None, "ref deleted");
+        repo.update_ref_cas(
+            "refs/heads/tmp",
+            Some(&c1),
+            None,
+            "delete",
+            "psn@acme.noreply",
+        )
+        .expect("delete");
+        assert_eq!(
+            repo.read_ref("refs/heads/tmp").unwrap(),
+            None,
+            "ref deleted"
+        );
         assert_eq!(
             repo.ref_generation("refs/heads/tmp"),
             Ok(2),
             "the delete ADVANCES the durable generation (a delete is a generation-advancing event)"
         );
 
-        repo.update_ref_cas("refs/heads/tmp", None, Some(&c1), "recreate", "psn@acme.noreply")
-            .expect("recreate");
+        repo.update_ref_cas(
+            "refs/heads/tmp",
+            None,
+            Some(&c1),
+            "recreate",
+            "psn@acme.noreply",
+        )
+        .expect("recreate");
         assert_eq!(
             repo.reflog_len("refs/heads/tmp"),
             Ok(1),
@@ -3558,7 +3865,11 @@ mod tests {
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
         let ref_name = "refs/heads/main";
-        assert_eq!(repo.ref_generation(ref_name), Ok(0), "an absent counter starts at zero");
+        assert_eq!(
+            repo.ref_generation(ref_name),
+            Ok(0),
+            "an absent counter starts at zero"
+        );
 
         let raw = repo.open_git().expect("open raw repo");
         let mut cfg = raw.config().expect("open config");
@@ -3569,10 +3880,13 @@ mod tests {
             "a malformed counter must not be treated as generation zero"
         );
 
-        cfg.set_i64(&refgen_key(ref_name), -1).expect("write negative fixture");
+        cfg.set_i64(&refgen_key(ref_name), -1)
+            .expect("write negative fixture");
         assert_eq!(
             repo.ref_generation(ref_name),
-            Err(DurableError::Git(format!("negative ref generation stored for {ref_name}")))
+            Err(DurableError::Git(format!(
+                "negative ref generation stored for {ref_name}"
+            )))
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3636,11 +3950,7 @@ mod tests {
 
         assert!(
             matches!(
-                repo.reflog_entries_bounded(
-                    "refs/heads/main",
-                    10,
-                    REFLOG_MAX_BYTES_PER_REF
-                ),
+                repo.reflog_entries_bounded("refs/heads/main", 10, REFLOG_MAX_BYTES_PER_REF),
                 Err(DurableError::Git(_))
             ),
             "invalid audit identity bytes must not become an empty committer"
@@ -3652,14 +3962,18 @@ mod tests {
         let bytes = src
             .read_object_bounded(oid, 64 * 1024 * 1024)
             .expect("read src object");
-        let written = dst.write_raw_object(kind, &bytes).expect("write dst object");
+        let written = dst
+            .write_raw_object(kind, &bytes)
+            .expect("write dst object");
         assert_eq!(written.0, oid.0, "the re-hashed copy keeps the same oid");
     }
 
     #[allow(clippy::type_complexity)]
     fn seed_three_commit_history() -> (PathBuf, DurableGitRepo, Vec<(Oid, Oid, Oid)>) {
         let root = temp_root("conn-src");
-        let repo = DurableGitStore::rooted(&root).create_repo(&loc()).expect("create src");
+        let repo = DurableGitStore::rooted(&root)
+            .create_repo(&loc())
+            .expect("create src");
         let mut chain: Vec<(Oid, Oid, Oid)> = Vec::new();
         let mut parent: Option<Oid> = None;
         for i in 0..3u8 {
@@ -3667,7 +3981,13 @@ mod tests {
             let tree = repo.write_tree(&[("file.txt", &blob)]).unwrap();
             let parents: Vec<&Oid> = parent.iter().collect();
             let commit = repo
-                .write_commit(&tree, &parents, &format!("c{i}"), "psn@acme.noreply", "psn@acme.noreply")
+                .write_commit(
+                    &tree,
+                    &parents,
+                    &format!("c{i}"),
+                    "psn@acme.noreply",
+                    "psn@acme.noreply",
+                )
                 .unwrap();
             parent = Some(commit.clone());
             chain.push((blob, tree, commit));
@@ -3683,7 +4003,9 @@ mod tests {
         let (b3, t3, c3) = chain[2].clone();
 
         let dst_root = temp_root("conn-dst-missing");
-        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        let dst = DurableGitStore::rooted(&dst_root)
+            .create_repo(&loc())
+            .expect("create dst");
         copy_object(&src, &dst, &b1, "blob");
         copy_object(&src, &dst, &t1, "tree");
         copy_object(&src, &dst, &b2, "blob");
@@ -3692,7 +4014,10 @@ mod tests {
         copy_object(&src, &dst, &t3, "tree");
         copy_object(&src, &dst, &c2, "commit");
         copy_object(&src, &dst, &c3, "commit");
-        assert!(!dst.has_object(&c1), "the ancestor commit is absent from the target odb");
+        assert!(
+            !dst.has_object(&c1),
+            "the ancestor commit is absent from the target odb"
+        );
 
         assert!(
             dst.commit_tree_complete(&c3).unwrap(),
@@ -3711,7 +4036,9 @@ mod tests {
     fn history_connectivity_accepts_full_history() {
         let (src_root, src, chain) = seed_three_commit_history();
         let dst_root = temp_root("conn-dst-full");
-        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        let dst = DurableGitStore::rooted(&dst_root)
+            .create_repo(&loc())
+            .expect("create dst");
         for (b, t, c) in &chain {
             copy_object(&src, &dst, b, "blob");
             copy_object(&src, &dst, t, "tree");
@@ -3730,7 +4057,9 @@ mod tests {
     fn history_connectivity_thin_push_hides_existing_tips() {
         let (src_root, src, chain) = seed_three_commit_history();
         let dst_root = temp_root("conn-dst-thin");
-        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        let dst = DurableGitStore::rooted(&dst_root)
+            .create_repo(&loc())
+            .expect("create dst");
         for (b, t, c) in &chain {
             copy_object(&src, &dst, b, "blob");
             copy_object(&src, &dst, t, "tree");
@@ -3746,7 +4075,8 @@ mod tests {
         );
         let bogus = Oid::new("0".repeat(39) + "1");
         assert!(
-            dst.history_connectivity_complete(&c3, &[c2, bogus]).unwrap(),
+            dst.history_connectivity_complete(&c3, &[c2, bogus])
+                .unwrap(),
             "hiding a non-existent existing tip is graceful (skipped, never an error)"
         );
         std::fs::remove_dir_all(&src_root).ok();
@@ -3760,13 +4090,18 @@ mod tests {
         let (b3, t3, c3) = chain[2].clone();
 
         let dst_root = temp_root("conn-dst-thin-missing");
-        let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
+        let dst = DurableGitStore::rooted(&dst_root)
+            .create_repo(&loc())
+            .expect("create dst");
         copy_object(&src, &dst, &b2, "blob");
         copy_object(&src, &dst, &t2, "tree");
         copy_object(&src, &dst, &b3, "blob");
         copy_object(&src, &dst, &t3, "tree");
         copy_object(&src, &dst, &c3, "commit");
-        assert!(!dst.has_object(&c2), "the new tip's parent commit is absent");
+        assert!(
+            !dst.has_object(&c2),
+            "the new tip's parent commit is absent"
+        );
 
         assert!(
             !dst.history_connectivity_complete(&c3, &[c2]).unwrap(),
@@ -3788,7 +4123,9 @@ mod tests {
 
         let readme = git.blob(b"# nested repo\n\nhello\n").unwrap();
         let deep = git.blob(b"pub fn deep() {}\n").unwrap();
-        let binary = git.blob(&[0x89, b'P', b'N', b'G', 0x00, 0x01, 0x02, 0x00, 0xff]).unwrap();
+        let binary = git
+            .blob(&[0x89, b'P', b'N', b'G', 0x00, 0x01, 0x02, 0x00, 0xff])
+            .unwrap();
 
         let mut b = git.treebuilder(None).unwrap();
         b.insert("deep.rs", deep, 0o100644).unwrap();
@@ -3835,7 +4172,8 @@ mod tests {
         let repo = seed_nested_repo(&root);
         let tree_spec = "main^{tree}";
         assert!(matches!(
-            repo.read_blob_at_path_bounded(tree_spec, "README.md", 1024).unwrap(),
+            repo.read_blob_at_path_bounded(tree_spec, "README.md", 1024)
+                .unwrap(),
             BlobPathLookup::Missing
         ));
         std::fs::remove_dir_all(&root).ok();
@@ -3846,8 +4184,14 @@ mod tests {
         let root = temp_root("blob-nested");
         let repo = seed_nested_repo(&root);
 
-        let BlobPathLookup::Found { bytes, oid, is_binary, size } =
-            repo.read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1024).unwrap()
+        let BlobPathLookup::Found {
+            bytes,
+            oid,
+            is_binary,
+            size,
+        } = repo
+            .read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1024)
+            .unwrap()
         else {
             panic!("deep.rs is a blob");
         };
@@ -3855,7 +4199,8 @@ mod tests {
         assert_eq!(size as usize, bytes.len());
         assert!(String::from_utf8_lossy(&bytes).contains("deep"));
         assert_eq!(
-            repo.blob_oid_at_path("main", "crates/inner/deep.rs").unwrap(),
+            repo.blob_oid_at_path("main", "crates/inner/deep.rs")
+                .unwrap(),
             Some(oid)
         );
         assert!(matches!(
@@ -3863,15 +4208,20 @@ mod tests {
             BlobPathLookup::TooLarge { size, maximum: 1, oid } if size > 1 && oid.as_str().len() == 40
         ));
 
-        let BlobPathLookup::Found { is_binary, .. } =
-            repo.read_blob_at_path_bounded("main", "assets/logo.bin", 1024).unwrap()
+        let BlobPathLookup::Found { is_binary, .. } = repo
+            .read_blob_at_path_bounded("main", "assets/logo.bin", 1024)
+            .unwrap()
         else {
             panic!("logo.bin is a blob");
         };
-        assert!(is_binary, "a file with NUL bytes is detected binary server-side");
+        assert!(
+            is_binary,
+            "a file with NUL bytes is detected binary server-side"
+        );
 
         assert!(matches!(
-            repo.read_blob_at_path_bounded("main", "crates/inner", 1024).unwrap(),
+            repo.read_blob_at_path_bounded("main", "crates/inner", 1024)
+                .unwrap(),
             BlobPathLookup::IsDir
         ));
         assert!(matches!(
@@ -3879,7 +4229,8 @@ mod tests {
             BlobPathLookup::IsDir
         ));
         assert!(matches!(
-            repo.read_blob_at_path_bounded("main", "no/such/file", 1024).unwrap(),
+            repo.read_blob_at_path_bounded("main", "no/such/file", 1024)
+                .unwrap(),
             BlobPathLookup::Missing
         ));
         std::fs::remove_dir_all(&root).ok();
@@ -3897,7 +4248,11 @@ mod tests {
         ] {
             if escape.contains("etc/passwd") || escape.contains("secret") {
                 assert!(
-                    matches!(repo.read_blob_at_path_bounded("main", escape, 1024).unwrap(), BlobPathLookup::Missing),
+                    matches!(
+                        repo.read_blob_at_path_bounded("main", escape, 1024)
+                            .unwrap(),
+                        BlobPathLookup::Missing
+                    ),
                     "traversal `{escape}` must not read host bytes"
                 );
             }
@@ -3914,13 +4269,7 @@ mod tests {
         let tree = repo.write_tree(&[("x.txt", &blob)]).expect("tree");
         let message = format!("{}é\nbody", "x".repeat(COMMIT_META_MAX_SUMMARY_BYTES - 1));
         let commit = repo
-            .write_commit(
-                &tree,
-                &[],
-                &message,
-                "psn@acme.noreply",
-                "psn@acme.noreply",
-            )
+            .write_commit(&tree, &[], &message, "psn@acme.noreply", "psn@acme.noreply")
             .expect("commit");
         repo.update_ref_cas(
             "refs/heads/main",
