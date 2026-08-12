@@ -882,7 +882,14 @@ impl DurableKms {
         }
         self.core.destroy_kek(id);
         let (epoch, _) = self.core.ensure_kek_tracked(id);
-        let candidate = self.core.export_kek(id).expect("fresh KEK is exportable");
+        let Some(candidate) = self.core.export_kek(id) else {
+            self.core.destroy_kek(id);
+            return Err(KmsError::Durability(format!(
+                "freshly minted KEK was unavailable before persistence for tenant={} region={}",
+                id.tenant.as_str(),
+                id.region.as_str()
+            )));
+        };
         if let Err(error) = self.block(self.backing.insert_kek_if_absent(id, &candidate)) {
             self.core.destroy_kek(id);
             return Err(KmsError::Durability(format!(
@@ -933,10 +940,14 @@ impl DurableKms {
         let (candidate_ref, _) = self
             .core
             .ensure_dek_tracked(tenant, region, class.clone())?;
-        let (candidate, candidate_epoch) = self
-            .core
-            .export_dek(&dek_id)
-            .expect("fresh DEK is exportable");
+        let Some((candidate, candidate_epoch)) = self.core.export_dek(&dek_id) else {
+            self.core.destroy_dek(&dek_id);
+            return Err(KmsError::Durability(format!(
+                "freshly minted DEK was unavailable before persistence for tenant={} class={}",
+                tenant.as_str(),
+                class.as_token()
+            )));
+        };
         if let Err(error) = self.block(self.backing.insert_dek_if_absent(
             &dek_id,
             &candidate,

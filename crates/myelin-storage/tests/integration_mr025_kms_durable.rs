@@ -43,20 +43,16 @@ fn seal_k() -> SealKey {
     SealKey::from_encoded(SEAL_K_HEX).expect("valid 32-byte hex seal key K")
 }
 
-async fn admin_provider() -> Option<SubstrateProvider> {
+async fn admin_provider() -> SubstrateProvider {
     let cfg = admin_config(&test_config());
-    let provider = match SubstrateProvider::connect(cfg, 6).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+    let provider = SubstrateProvider::connect(cfg, 6)
+        .await
+        .expect("connect to the Postgres required by durable KMS integration tests");
     provider
         .migrate(&kms_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the KMS migrations (kms_sealed_root + kms_wrapped_kek + kms_wrapped_dek)");
-    Some(provider)
+    provider
 }
 
 async fn fresh_pool() -> sqlx::postgres::PgPool {
@@ -69,9 +65,7 @@ async fn fresh_pool() -> sqlx::postgres::PgPool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dek_provisioned_before_restart_decrypts_after_via_a_fresh_engine() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0KMS{suffix}"));
@@ -113,9 +107,7 @@ async fn dek_provisioned_before_restart_decrypts_after_via_a_fresh_engine() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0WRG{suffix}"));
@@ -182,9 +174,7 @@ async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backup_snapshot_restore_recovers_data_and_keeps_a_shredded_key_dead() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0BAK{suffix}"));
@@ -267,9 +257,7 @@ async fn backup_snapshot_restore_recovers_data_and_keeps_a_shredded_key_dead() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keys_minted_through_the_default_sync_api_survive_engine_reconstruction() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0W5D{suffix}"));
@@ -330,9 +318,7 @@ async fn keys_minted_through_the_default_sync_api_survive_engine_reconstruction(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_processes_observe_key_creation_and_crypto_shred_without_restart() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0LIVE{suffix}"));
@@ -385,9 +371,7 @@ async fn running_processes_observe_key_creation_and_crypto_shred_without_restart
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_processes_converge_on_one_new_subject_key() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0RACE{suffix}"));
@@ -452,9 +436,7 @@ async fn concurrent_processes_converge_on_one_new_subject_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_process_cannot_rotate_a_shredded_subject_key_back_into_the_database() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0SHRED{suffix}"));
@@ -518,9 +500,7 @@ async fn a_stale_process_cannot_rotate_a_shredded_subject_key_back_into_the_data
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_restart() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0W5R{suffix}"));
@@ -602,9 +582,7 @@ async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_re
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_database_outage_refuses_new_keys_without_taking_the_worker_down() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell = format!("cell-{suffix}");
     let tenant = TenantId(format!("01J0DOWN{suffix}"));
