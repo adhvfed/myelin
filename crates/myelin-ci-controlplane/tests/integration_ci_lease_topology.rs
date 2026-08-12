@@ -11,10 +11,10 @@ use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     claim_window_secs_for_template, durable_spec_resolver_test_support,
     resolve_prelaunch_usage_on_conn, CiJobLaunchClaim, CiJobSpecStore, CiJobTokenIssueError,
-    CiJobTokenIssuer, CiJobTokenRequest, CiPipelineReporterFactory,
-    CiPipelineReporterFactoryError, CiPipelineReporterRouter, CiPrelaunchParentExpectation,
-    CiPrelaunchSettlementIdentity, CiPrelaunchUnresolvedPolicy, DurableCiJobLaunchTemplate,
-    DurableEnqueue, Lane, CI_RUNNER_EXECUTION_LEASE_TTL_SECS, MAX_CI_JOB_CLAIM_WINDOW_SECS,
+    CiJobTokenIssuer, CiJobTokenRequest, CiPipelineReporterFactory, CiPipelineReporterFactoryError,
+    CiPipelineReporterRouter, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
+    CiPrelaunchUnresolvedPolicy, DurableCiJobLaunchTemplate, DurableEnqueue, Lane,
+    CI_RUNNER_EXECUTION_LEASE_TTL_SECS, MAX_CI_JOB_CLAIM_WINDOW_SECS,
 };
 use myelin_ci_sandbox::{
     EgressPolicy, IdemToken, ImageRef, JobKind, JobSpecTemplate, MeterTarget, ResourceLimits,
@@ -33,8 +33,7 @@ const COMMIT_OID: &str = "deadbeef00deadbeef00deadbeef00deadbeef00";
 const RESERVE_HANDLE: &str = "ci-reserve:v2:lease-topology";
 
 fn unused_secret_terminal_reporter() -> CiPipelineReporterRouter {
-    let factory: CiPipelineReporterFactory =
-        Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
+    let factory: CiPipelineReporterFactory = Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
     CiPipelineReporterRouter::new(Region(REGION.into()), factory).unwrap()
 }
 
@@ -251,67 +250,71 @@ async fn deadlines(admin: &PgPool, job_id: &str) -> (i64, i64, Option<i64>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_claim_sizes_the_immutable_ceiling_from_topology_and_the_lease_per_execution() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin, app) = migrated_schema("claim").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let specs = ci_job_spec_store(app.clone());
-        let region_store = ci_region_queue_store_test_support(admin.clone());
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin, app) = migrated_schema("claim").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let specs = ci_job_spec_store(app.clone());
+                let region_store = ci_region_queue_store_test_support(admin.clone());
 
-        let cases: [(u32, bool, i64); 5] = [
-            (1, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
-            (2 * 60 * 60, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
-            (6 * 60 * 60, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
-            (2 * 60 * 60, true, 4 * (7_200 + 600)),
-            (6 * 60 * 60, true, MAX_CI_JOB_CLAIM_WINDOW_SECS as i64),
-        ];
-        for (index, (timeout_secs, checkout, expected)) in cases.into_iter().enumerate() {
-            let seed = 100 + index as u64;
-            let label = format!("lane-{seed}");
-            let (job_id, _, _, derived) =
-                dispatch(&admin, &specs, seed, &label, timeout_secs, checkout).await;
-            assert_eq!(derived, expected, "case {index}: derivation");
+                let cases: [(u32, bool, i64); 5] = [
+                    (1, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
+                    (2 * 60 * 60, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
+                    (6 * 60 * 60, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
+                    (2 * 60 * 60, true, 4 * (7_200 + 600)),
+                    (6 * 60 * 60, true, MAX_CI_JOB_CLAIM_WINDOW_SECS as i64),
+                ];
+                for (index, (timeout_secs, checkout, expected)) in cases.into_iter().enumerate() {
+                    let seed = 100 + index as u64;
+                    let label = format!("lane-{seed}");
+                    let (job_id, _, _, derived) =
+                        dispatch(&admin, &specs, seed, &label, timeout_secs, checkout).await;
+                    assert_eq!(derived, expected, "case {index}: derivation");
 
-            let leased = region_store
-                .claim(
-                    REGION,
-                    std::slice::from_ref(&label),
-                    &[TrustTier::Trusted],
-                    &format!("runner-{seed}"),
-                    CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
-                )
-                .await
-                .unwrap()
-                .expect("the dispatched job claims");
-            assert_eq!(leased.job_id.to_string(), job_id);
-            assert_eq!(
-                leased.claim_window_secs,
-                Some(expected),
-                "case {index}: the claim returns the durable window"
-            );
-            assert_eq!(
-                leased.claim_expires_at_epoch_secs - leased.claim_started_at_epoch_secs,
-                expected,
-                "case {index}: the immutable ceiling is the durable window"
-            );
+                    let leased = region_store
+                        .claim(
+                            REGION,
+                            std::slice::from_ref(&label),
+                            &[TrustTier::Trusted],
+                            &format!("runner-{seed}"),
+                            CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
+                        )
+                        .await
+                        .unwrap()
+                        .expect("the dispatched job claims");
+                    assert_eq!(leased.job_id.to_string(), job_id);
+                    assert_eq!(
+                        leased.claim_window_secs,
+                        Some(expected),
+                        "case {index}: the claim returns the durable window"
+                    );
+                    assert_eq!(
+                        leased.claim_expires_at_epoch_secs - leased.claim_started_at_epoch_secs,
+                        expected,
+                        "case {index}: the immutable ceiling is the durable window"
+                    );
 
-            let (claim_span, lease_span, stored_window) = deadlines(&admin, &job_id).await;
-            assert_eq!(claim_span, expected);
-            assert_eq!(stored_window, Some(expected));
-            assert_eq!(
+                    let (claim_span, lease_span, stored_window) = deadlines(&admin, &job_id).await;
+                    assert_eq!(claim_span, expected);
+                    assert_eq!(stored_window, Some(expected));
+                    assert_eq!(
                 lease_span, CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
                 "case {index}: the EXECUTION lease is one execution slot, never the whole window"
             );
-        }
+                }
 
-        let (flat_claim, flat_lease, _) = deadlines(&admin, &uuid(0x40, 102)).await;
-        let (checkout_claim, checkout_lease, _) = deadlines(&admin, &uuid(0x40, 104)).await;
-        assert_eq!(flat_claim, 22_200);
-        assert_eq!(checkout_claim, 88_800);
-        assert_eq!(flat_lease, checkout_lease);
-        assert_eq!(flat_lease, CI_RUNNER_EXECUTION_LEASE_TTL_SECS);
-    })
-    .await;
-    })
+                let (flat_claim, flat_lease, _) = deadlines(&admin, &uuid(0x40, 102)).await;
+                let (checkout_claim, checkout_lease, _) = deadlines(&admin, &uuid(0x40, 104)).await;
+                assert_eq!(flat_claim, 22_200);
+                assert_eq!(checkout_claim, 88_800);
+                assert_eq!(flat_lease, checkout_lease);
+                assert_eq!(flat_lease, CI_RUNNER_EXECUTION_LEASE_TTL_SECS);
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -334,111 +337,116 @@ impl CiJobTokenIssuer for NeverMintIssuer {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mint() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin, app) = migrated_schema("legacy").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let specs = ci_job_spec_store(app.clone());
-        let queue = ci_job_queue_store(app.clone());
-        let region_store = ci_region_queue_store_test_support(admin.clone());
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin, app) = migrated_schema("legacy").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let specs = ci_job_spec_store(app.clone());
+                let queue = ci_job_queue_store(app.clone());
+                let region_store = ci_region_queue_store_test_support(admin.clone());
 
-        for (seed, label, checkout) in [
-            (200_u64, "legacy-compute", false),
-            (201, "legacy-ckout", true),
-        ] {
-            let (job_id, _, _, _) = dispatch(&admin, &specs, seed, label, 600, checkout).await;
-            sqlx::query(
-                "UPDATE job_queue SET claim_window_secs = NULL
+                for (seed, label, checkout) in [
+                    (200_u64, "legacy-compute", false),
+                    (201, "legacy-ckout", true),
+                ] {
+                    let (job_id, _, _, _) =
+                        dispatch(&admin, &specs, seed, label, 600, checkout).await;
+                    sqlx::query(
+                        "UPDATE job_queue SET claim_window_secs = NULL
                  WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
-            )
-            .bind(TENANT)
-            .bind(REGION)
-            .bind(&job_id)
-            .execute(&admin)
-            .await
-            .unwrap();
-        }
+                    )
+                    .bind(TENANT)
+                    .bind(REGION)
+                    .bind(&job_id)
+                    .execute(&admin)
+                    .await
+                    .unwrap();
+                }
 
-        let mints = Arc::new(std::sync::Mutex::new(0_u32));
-        let resolver = durable_spec_resolver_test_support(
-            specs.clone(),
-            REGION,
-            tokio::runtime::Handle::current(),
-            Arc::new(NeverMintIssuer(mints.clone())),
-            myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
-            unused_secret_terminal_reporter(),
-        );
+                let mints = Arc::new(std::sync::Mutex::new(0_u32));
+                let resolver = durable_spec_resolver_test_support(
+                    specs.clone(),
+                    REGION,
+                    tokio::runtime::Handle::current(),
+                    Arc::new(NeverMintIssuer(mints.clone())),
+                    myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+                    unused_secret_terminal_reporter(),
+                );
 
-        let compute = region_store
-            .claim(
-                REGION,
-                &["legacy-compute".to_string()],
-                &[TrustTier::Trusted],
-                "runner-legacy-compute",
-                CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
-            )
-            .await
-            .unwrap()
-            .expect("the legacy compute row still claims");
-        assert_eq!(compute.claim_window_secs, None);
-        assert_eq!(
+                let compute = region_store
+                    .claim(
+                        REGION,
+                        &["legacy-compute".to_string()],
+                        &[TrustTier::Trusted],
+                        "runner-legacy-compute",
+                        CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the legacy compute row still claims");
+                assert_eq!(compute.claim_window_secs, None);
+                assert_eq!(
             compute.claim_expires_at_epoch_secs - compute.claim_started_at_epoch_secs,
             CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
             "a legacy row COALESCEs to the flat execution-lease TTL, byte-identical to before"
         );
-        let resolved = {
-            let resolver = resolver.clone();
-            tokio::task::spawn_blocking(move || resolver(&compute))
-                .await
-                .unwrap()
-        };
-        assert!(
-            resolved.is_ok(),
-            "a legacy NON-checkout row is still resolvable: {resolved:?}"
-        );
-        assert_eq!(*mints.lock().unwrap(), 1, "the compute job did mint");
+                let resolved = {
+                    let resolver = resolver.clone();
+                    tokio::task::spawn_blocking(move || resolver(&compute))
+                        .await
+                        .unwrap()
+                };
+                assert!(
+                    resolved.is_ok(),
+                    "a legacy NON-checkout row is still resolvable: {resolved:?}"
+                );
+                assert_eq!(*mints.lock().unwrap(), 1, "the compute job did mint");
 
-        let checkout = region_store
-            .claim(
-                REGION,
-                &["legacy-ckout".to_string()],
-                &[TrustTier::Trusted],
-                "runner-legacy-checkout",
-                CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
-            )
-            .await
-            .unwrap()
-            .expect("the legacy checkout row claims before the resolver refuses it");
-        assert_eq!(checkout.claim_window_secs, None);
-        let checkout_job_id = checkout.job_id.to_string();
-        let refused = {
-            let resolver = resolver.clone();
-            tokio::task::spawn_blocking(move || resolver(&checkout))
+                let checkout = region_store
+                    .claim(
+                        REGION,
+                        &["legacy-ckout".to_string()],
+                        &[TrustTier::Trusted],
+                        "runner-legacy-checkout",
+                        CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the legacy checkout row claims before the resolver refuses it");
+                assert_eq!(checkout.claim_window_secs, None);
+                let checkout_job_id = checkout.job_id.to_string();
+                let refused = {
+                    let resolver = resolver.clone();
+                    tokio::task::spawn_blocking(move || resolver(&checkout))
+                        .await
+                        .unwrap()
+                };
+                let error = refused.expect_err("a checkout-bearing legacy row must not resolve");
+                assert!(
+                    error.contains("no durable claim window"),
+                    "unexpected refusal: {error}"
+                );
+                assert_eq!(
+                    *mints.lock().unwrap(),
+                    1,
+                    "the refusal happens BEFORE the mint - no second credential was requested"
+                );
+                let state: String = sqlx::query_scalar(
+                    "SELECT state FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
+                )
+                .bind(TENANT)
+                .bind(&checkout_job_id)
+                .fetch_one(&admin)
                 .await
-                .unwrap()
-        };
-        let error = refused.expect_err("a checkout-bearing legacy row must not resolve");
-        assert!(
-            error.contains("no durable claim window"),
-            "unexpected refusal: {error}"
-        );
-        assert_eq!(
-            *mints.lock().unwrap(),
-            1,
-            "the refusal happens BEFORE the mint - no second credential was requested"
-        );
-        let state: String = sqlx::query_scalar(
-            "SELECT state FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&checkout_job_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert_eq!(state, "leased", "the refused row is left for the reaper");
-        drop(queue);
-    })
-    .await;
-    })
+                .unwrap();
+                assert_eq!(state, "leased", "the refused row is left for the reaper");
+                drop(queue);
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -592,73 +600,78 @@ async fn phase_status(admin: &PgPool, job_id: &str, lease_epoch: i64, phase: &st
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin, app) = migrated_schema("renew").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let specs = ci_job_spec_store(app.clone());
-        let queue = ci_job_queue_store(app.clone());
-        let now = chrono::Utc::now().timestamp();
-        let claim = seed_leased_generation(
-            &admin,
-            &specs,
-            300,
-            "renew-lane",
-            1,
-            &uuid(0x60, 300),
-            now - 10,
-            now + 80_000,
-            now + 30,
-            true,
-        )
-        .await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin, app) = migrated_schema("renew").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let specs = ci_job_spec_store(app.clone());
+                let queue = ci_job_queue_store(app.clone());
+                let now = chrono::Utc::now().timestamp();
+                let claim = seed_leased_generation(
+                    &admin,
+                    &specs,
+                    300,
+                    "renew-lane",
+                    1,
+                    &uuid(0x60, 300),
+                    now - 10,
+                    now + 80_000,
+                    now + 30,
+                    true,
+                )
+                .await;
 
-        assert!(queue.renew_preparation_lease(&claim).await.unwrap());
-        let lease_ahead: i64 = sqlx::query_scalar(
-            "SELECT EXTRACT(EPOCH FROM (lease_expires - statement_timestamp()))::bigint
+                assert!(queue.renew_preparation_lease(&claim).await.unwrap());
+                let lease_ahead: i64 = sqlx::query_scalar(
+                    "SELECT EXTRACT(EPOCH FROM (lease_expires - statement_timestamp()))::bigint
              FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&claim.job_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert!(
-            (CI_RUNNER_EXECUTION_LEASE_TTL_SECS - 60..=CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
-                .contains(&lease_ahead),
-            "the renewal installs one execution slot, got {lease_ahead}s"
-        );
-
-        type ClaimMutation = fn(&mut CiJobLaunchClaim);
-        let mutations: [(&str, ClaimMutation); 8] = [
-            ("tenant", |c| c.tenant_id = "other-tenant".into()),
-            ("region", |c| c.region = "de-fra".into()),
-            ("job", |c| c.job_id = uuid(0x40, 999)),
-            ("workflow run", |c| c.wf_run_id = uuid(0x20, 999)),
-            ("owner", |c| c.lease_owner = "other-runner".into()),
-            ("epoch", |c| c.lease_epoch += 1),
-            ("nonce", |c| c.claim_nonce = uuid(0x61, 999)),
-            ("claim start", |c| c.claim_started_at_epoch_secs += 1),
-        ];
-        for (name, mutate) in mutations {
-            let mut divergent = claim.clone();
-            mutate(&mut divergent);
-            assert!(
-                !queue.renew_preparation_lease(&divergent).await.unwrap(),
-                "a divergent {name} must lose ownership"
-            );
-        }
-        let mut divergent_expiry = claim.clone();
-        divergent_expiry.claim_expires_at_epoch_secs += 1;
-        assert!(
-            !queue
-                .renew_preparation_lease(&divergent_expiry)
+                )
+                .bind(TENANT)
+                .bind(&claim.job_id)
+                .fetch_one(&admin)
                 .await
-                .unwrap(),
-            "a divergent claim expiry must lose ownership"
-        );
+                .unwrap();
+                assert!(
+                    (CI_RUNNER_EXECUTION_LEASE_TTL_SECS - 60..=CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
+                        .contains(&lease_ahead),
+                    "the renewal installs one execution slot, got {lease_ahead}s"
+                );
 
-        for (queue_state, refuses) in [("running", true), ("terminal", true), ("leased", false)] {
-            sqlx::query(
+                type ClaimMutation = fn(&mut CiJobLaunchClaim);
+                let mutations: [(&str, ClaimMutation); 8] = [
+                    ("tenant", |c| c.tenant_id = "other-tenant".into()),
+                    ("region", |c| c.region = "de-fra".into()),
+                    ("job", |c| c.job_id = uuid(0x40, 999)),
+                    ("workflow run", |c| c.wf_run_id = uuid(0x20, 999)),
+                    ("owner", |c| c.lease_owner = "other-runner".into()),
+                    ("epoch", |c| c.lease_epoch += 1),
+                    ("nonce", |c| c.claim_nonce = uuid(0x61, 999)),
+                    ("claim start", |c| c.claim_started_at_epoch_secs += 1),
+                ];
+                for (name, mutate) in mutations {
+                    let mut divergent = claim.clone();
+                    mutate(&mut divergent);
+                    assert!(
+                        !queue.renew_preparation_lease(&divergent).await.unwrap(),
+                        "a divergent {name} must lose ownership"
+                    );
+                }
+                let mut divergent_expiry = claim.clone();
+                divergent_expiry.claim_expires_at_epoch_secs += 1;
+                assert!(
+                    !queue
+                        .renew_preparation_lease(&divergent_expiry)
+                        .await
+                        .unwrap(),
+                    "a divergent claim expiry must lose ownership"
+                );
+
+                for (queue_state, refuses) in
+                    [("running", true), ("terminal", true), ("leased", false)]
+                {
+                    sqlx::query(
                 "UPDATE job_queue SET state = $1 WHERE tenant_id = $2 AND job_id = $3::uuid",
             )
             .bind(queue_state)
@@ -667,45 +680,47 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
             .execute(&admin)
             .await
             .unwrap();
-            assert_eq!(
-                !queue.renew_preparation_lease(&claim).await.unwrap(),
-                refuses,
-                "queue state `{queue_state}` renewal expectation"
-            );
-        }
-        for (surface_state, refuses) in [
-            ("running", true),
-            ("succeeded", true),
-            ("failed", true),
-            ("cancelled", true),
-            ("reaped", true),
-            ("leased", false),
-            ("queued", false),
-        ] {
-            sqlx::query("UPDATE ci_job SET state = $1 WHERE tenant_id = $2 AND job_id = $3::uuid")
-                .bind(surface_state)
-                .bind(TENANT)
-                .bind(&claim.job_id)
-                .execute(&admin)
-                .await
-                .unwrap();
-            assert_eq!(
-                !queue.renew_preparation_lease(&claim).await.unwrap(),
-                refuses,
-                "surface state `{surface_state}` renewal expectation"
-            );
-        }
-        sqlx::query("DELETE FROM ci_job WHERE tenant_id = $1 AND job_id = $2::uuid")
-            .bind(TENANT)
-            .bind(&claim.job_id)
-            .execute(&admin)
-            .await
-            .unwrap();
-        assert!(
-            !queue.renew_preparation_lease(&claim).await.unwrap(),
-            "a missing public surface row must lose ownership"
-        );
-        sqlx::query(
+                    assert_eq!(
+                        !queue.renew_preparation_lease(&claim).await.unwrap(),
+                        refuses,
+                        "queue state `{queue_state}` renewal expectation"
+                    );
+                }
+                for (surface_state, refuses) in [
+                    ("running", true),
+                    ("succeeded", true),
+                    ("failed", true),
+                    ("cancelled", true),
+                    ("reaped", true),
+                    ("leased", false),
+                    ("queued", false),
+                ] {
+                    sqlx::query(
+                        "UPDATE ci_job SET state = $1 WHERE tenant_id = $2 AND job_id = $3::uuid",
+                    )
+                    .bind(surface_state)
+                    .bind(TENANT)
+                    .bind(&claim.job_id)
+                    .execute(&admin)
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        !queue.renew_preparation_lease(&claim).await.unwrap(),
+                        refuses,
+                        "surface state `{surface_state}` renewal expectation"
+                    );
+                }
+                sqlx::query("DELETE FROM ci_job WHERE tenant_id = $1 AND job_id = $2::uuid")
+                    .bind(TENANT)
+                    .bind(&claim.job_id)
+                    .execute(&admin)
+                    .await
+                    .unwrap();
+                assert!(
+                    !queue.renew_preparation_lease(&claim).await.unwrap(),
+                    "a missing public surface row must lose ownership"
+                );
+                sqlx::query(
             "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, spec_ref, state)
              SELECT $1, $2, $3::uuid, run_id, 'build', 'build', 'spec', 'queued'
              FROM ci_run WHERE tenant_id = $1 AND wf_run_id = $4::uuid",
@@ -718,187 +733,195 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
         .await
         .unwrap();
 
-        sqlx::query(
-            "UPDATE job_queue SET completion_receipt = 'receipt'
+                sqlx::query(
+                    "UPDATE job_queue SET completion_receipt = 'receipt'
              WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&claim.job_id)
-        .execute(&admin)
-        .await
-        .unwrap();
-        assert!(!queue.renew_preparation_lease(&claim).await.unwrap());
-        sqlx::query(
-            "UPDATE job_queue SET completion_receipt = NULL
+                )
+                .bind(TENANT)
+                .bind(&claim.job_id)
+                .execute(&admin)
+                .await
+                .unwrap();
+                assert!(!queue.renew_preparation_lease(&claim).await.unwrap());
+                sqlx::query(
+                    "UPDATE job_queue SET completion_receipt = NULL
              WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&claim.job_id)
-        .execute(&admin)
-        .await
-        .unwrap();
+                )
+                .bind(TENANT)
+                .bind(&claim.job_id)
+                .execute(&admin)
+                .await
+                .unwrap();
 
-        assert!(
-            queue.renew_preparation_lease(&claim).await.unwrap(),
-            "the restored generation renews again"
-        );
+                assert!(
+                    queue.renew_preparation_lease(&claim).await.unwrap(),
+                    "the restored generation renews again"
+                );
 
-        let unadmitted = seed_leased_generation(
-            &admin,
-            &specs,
-            302,
-            "renew-unadmitted",
-            1,
-            &uuid(0x60, 302),
-            now - 10,
-            now + 80_000,
-            now + 30,
-            false,
-        )
-        .await;
-        assert!(
-            !queue.renew_preparation_lease(&unadmitted).await.unwrap(),
-            "no durable parent attempt means no preparation to renew for"
-        );
+                let unadmitted = seed_leased_generation(
+                    &admin,
+                    &specs,
+                    302,
+                    "renew-unadmitted",
+                    1,
+                    &uuid(0x60, 302),
+                    now - 10,
+                    now + 80_000,
+                    now + 30,
+                    false,
+                )
+                .await;
+                assert!(
+                    !queue.renew_preparation_lease(&unadmitted).await.unwrap(),
+                    "no durable parent attempt means no preparation to renew for"
+                );
 
-        let expired_claim = seed_leased_generation(
-            &admin,
-            &specs,
-            301,
-            "renew-expired",
-            1,
-            &uuid(0x60, 301),
-            now - 100,
-            now - 1,
-            now - 1,
-            true,
-        )
-        .await;
-        assert!(
-            !queue.renew_preparation_lease(&expired_claim).await.unwrap(),
-            "an expired immutable window is the hard ceiling; renewal cannot reopen it"
-        );
-    })
-    .await;
-    })
+                let expired_claim = seed_leased_generation(
+                    &admin,
+                    &specs,
+                    301,
+                    "renew-expired",
+                    1,
+                    &uuid(0x60, 301),
+                    now - 100,
+                    now - 1,
+                    now - 1,
+                    true,
+                )
+                .await;
+                assert!(
+                    !queue.renew_preparation_lease(&expired_claim).await.unwrap(),
+                    "an expired immutable window is the hard ceiling; renewal cannot reopen it"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_renewal_is_capped_at_the_immutable_claim_expiry() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin, app) = migrated_schema("cap").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let specs = ci_job_spec_store(app.clone());
-        let queue = ci_job_queue_store(app.clone());
-        let now = chrono::Utc::now().timestamp();
-        let claim = seed_leased_generation(
-            &admin,
-            &specs,
-            400,
-            "cap-lane",
-            1,
-            &uuid(0x60, 400),
-            now - 10,
-            now + 60,
-            now + 5,
-            true,
-        )
-        .await;
-        assert!(queue.renew_preparation_lease(&claim).await.unwrap());
-        let (lease_epoch_secs, claim_epoch_secs): (i64, i64) = sqlx::query_as(
-            "SELECT FLOOR(EXTRACT(EPOCH FROM lease_expires))::bigint,
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin, app) = migrated_schema("cap").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let specs = ci_job_spec_store(app.clone());
+                let queue = ci_job_queue_store(app.clone());
+                let now = chrono::Utc::now().timestamp();
+                let claim = seed_leased_generation(
+                    &admin,
+                    &specs,
+                    400,
+                    "cap-lane",
+                    1,
+                    &uuid(0x60, 400),
+                    now - 10,
+                    now + 60,
+                    now + 5,
+                    true,
+                )
+                .await;
+                assert!(queue.renew_preparation_lease(&claim).await.unwrap());
+                let (lease_epoch_secs, claim_epoch_secs): (i64, i64) = sqlx::query_as(
+                    "SELECT FLOOR(EXTRACT(EPOCH FROM lease_expires))::bigint,
                     FLOOR(EXTRACT(EPOCH FROM claim_expires_at))::bigint
              FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&claim.job_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert_eq!(
-            lease_epoch_secs, claim_epoch_secs,
-            "the renewed execution lease is clamped to the immutable claim expiry"
-        );
-    })
-    .await;
-    })
+                )
+                .bind(TENANT)
+                .bind(&claim.job_id)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+                assert_eq!(
+                    lease_epoch_secs, claim_epoch_secs,
+                    "the renewed execution lease is clamped to the immutable claim expiry"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_failed_seal() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin, app) = migrated_schema("reap").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let specs = ci_job_spec_store(app.clone());
-        let region_store = ci_region_queue_store_test_support(admin.clone());
-        let now = chrono::Utc::now().timestamp();
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin, app) = migrated_schema("reap").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let specs = ci_job_spec_store(app.clone());
+                let region_store = ci_region_queue_store_test_support(admin.clone());
+                let now = chrono::Utc::now().timestamp();
 
-        let reapable = seed_leased_generation(
-            &admin,
-            &specs,
-            500,
-            "reap-lane",
-            2,
-            &uuid(0x60, 500),
-            now - 100,
-            now + 80_000,
-            now - 1,
-            true,
-        )
-        .await;
-        insert_parent_attempt(
-            &admin,
-            &reapable.job_id,
-            &reapable.wf_run_id,
-            &uuid(0x10, 500),
-            "runner-500",
-            1,
-            &uuid(0x62, 500),
-            now - 200,
-            now + 79_000,
-        )
-        .await;
-        insert_started_phase(
-            &admin,
-            &reapable.job_id,
-            2,
-            &uuid(0x60, 500),
-            "checkout_transport",
-        )
-        .await;
-        insert_started_phase(
-            &admin,
-            &reapable.job_id,
-            2,
-            &uuid(0x60, 500),
-            "checkout_materialization",
-        )
-        .await;
-        insert_started_phase(
-            &admin,
-            &reapable.job_id,
-            1,
-            &uuid(0x62, 500),
-            "checkout_transport",
-        )
-        .await;
-        sqlx::query(
-            "UPDATE ci_job_prelaunch_usage
+                let reapable = seed_leased_generation(
+                    &admin,
+                    &specs,
+                    500,
+                    "reap-lane",
+                    2,
+                    &uuid(0x60, 500),
+                    now - 100,
+                    now + 80_000,
+                    now - 1,
+                    true,
+                )
+                .await;
+                insert_parent_attempt(
+                    &admin,
+                    &reapable.job_id,
+                    &reapable.wf_run_id,
+                    &uuid(0x10, 500),
+                    "runner-500",
+                    1,
+                    &uuid(0x62, 500),
+                    now - 200,
+                    now + 79_000,
+                )
+                .await;
+                insert_started_phase(
+                    &admin,
+                    &reapable.job_id,
+                    2,
+                    &uuid(0x60, 500),
+                    "checkout_transport",
+                )
+                .await;
+                insert_started_phase(
+                    &admin,
+                    &reapable.job_id,
+                    2,
+                    &uuid(0x60, 500),
+                    "checkout_materialization",
+                )
+                .await;
+                insert_started_phase(
+                    &admin,
+                    &reapable.job_id,
+                    1,
+                    &uuid(0x62, 500),
+                    "checkout_transport",
+                )
+                .await;
+                sqlx::query(
+                    "UPDATE ci_job_prelaunch_usage
              SET status = 'measured', exact_cpu_seconds = 3, exact_mem_byte_seconds = 4,
                  resolved_at = statement_timestamp()
              WHERE tenant_id = $1 AND job_id = $2::uuid AND lease_epoch = 2
                AND phase = 'checkout_materialization'",
-        )
-        .bind(TENANT)
-        .bind(&reapable.job_id)
-        .execute(&admin)
-        .await
-        .unwrap();
-        sqlx::query(
+                )
+                .bind(TENANT)
+                .bind(&reapable.job_id)
+                .execute(&admin)
+                .await
+                .unwrap();
+                sqlx::query(
             "UPDATE ci_job SET state = 'running' WHERE tenant_id = $1 AND job_id = $2::uuid",
         )
         .bind(TENANT)
@@ -907,29 +930,29 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
         .await
         .unwrap();
 
-        let live = seed_leased_generation(
-            &admin,
-            &specs,
-            501,
-            "live-lane",
-            1,
-            &uuid(0x60, 501),
-            now - 10,
-            now + 80_000,
-            now + 10_000,
-            true,
-        )
-        .await;
-        insert_started_phase(
-            &admin,
-            &live.job_id,
-            1,
-            &uuid(0x60, 501),
-            "checkout_transport",
-        )
-        .await;
+                let live = seed_leased_generation(
+                    &admin,
+                    &specs,
+                    501,
+                    "live-lane",
+                    1,
+                    &uuid(0x60, 501),
+                    now - 10,
+                    now + 80_000,
+                    now + 10_000,
+                    true,
+                )
+                .await;
+                insert_started_phase(
+                    &admin,
+                    &live.job_id,
+                    1,
+                    &uuid(0x60, 501),
+                    "checkout_transport",
+                )
+                .await;
 
-        admin
+                admin
             .execute(
                 "CREATE FUNCTION myelin_test_refuse_seal() RETURNS trigger LANGUAGE plpgsql AS $$
                  BEGIN
@@ -944,170 +967,174 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
             )
             .await
             .unwrap();
-        let failed = region_store.reap(REGION).await;
-        assert!(failed.is_err(), "the injected seal failure must surface");
-        let (state, owner, epoch, nonce): (String, Option<String>, i64, Option<String>) =
-            sqlx::query_as(
-                "SELECT state, lease_owner, lease_epoch, claim_nonce::text
+                let failed = region_store.reap(REGION).await;
+                assert!(failed.is_err(), "the injected seal failure must surface");
+                let (state, owner, epoch, nonce): (String, Option<String>, i64, Option<String>) =
+                    sqlx::query_as(
+                        "SELECT state, lease_owner, lease_epoch, claim_nonce::text
                  FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
-            )
-            .bind(TENANT)
-            .bind(&reapable.job_id)
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-        assert_eq!(state, "leased", "the requeue rolled back with the seal");
-        assert_eq!(owner.as_deref(), Some("runner-500"));
-        assert_eq!(epoch, 2);
-        assert_eq!(nonce.as_deref(), Some(uuid(0x60, 500).as_str()));
-        assert_eq!(
-            phase_status(&admin, &reapable.job_id, 2, "checkout_transport").await,
-            "started",
-            "the phase is unchanged after the rolled-back sweep"
-        );
-        let surface: String = sqlx::query_scalar(
-            "SELECT state FROM ci_job WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&reapable.job_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert_eq!(surface, "running", "the surface reset rolled back too");
+                    )
+                    .bind(TENANT)
+                    .bind(&reapable.job_id)
+                    .fetch_one(&admin)
+                    .await
+                    .unwrap();
+                assert_eq!(state, "leased", "the requeue rolled back with the seal");
+                assert_eq!(owner.as_deref(), Some("runner-500"));
+                assert_eq!(epoch, 2);
+                assert_eq!(nonce.as_deref(), Some(uuid(0x60, 500).as_str()));
+                assert_eq!(
+                    phase_status(&admin, &reapable.job_id, 2, "checkout_transport").await,
+                    "started",
+                    "the phase is unchanged after the rolled-back sweep"
+                );
+                let surface: String = sqlx::query_scalar(
+                    "SELECT state FROM ci_job WHERE tenant_id = $1 AND job_id = $2::uuid",
+                )
+                .bind(TENANT)
+                .bind(&reapable.job_id)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+                assert_eq!(surface, "running", "the surface reset rolled back too");
 
-        admin
-            .execute(
-                "DROP TRIGGER myelin_test_refuse_seal ON ci_job_prelaunch_usage;
+                admin
+                    .execute(
+                        "DROP TRIGGER myelin_test_refuse_seal ON ci_job_prelaunch_usage;
                  DROP FUNCTION myelin_test_refuse_seal();",
-            )
-            .await
-            .unwrap();
-        assert_eq!(region_store.reap(REGION).await.unwrap(), 1);
-        let (state, owner, nonce): (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT state, lease_owner, claim_nonce::text
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(region_store.reap(REGION).await.unwrap(), 1);
+                let (state, owner, nonce): (String, Option<String>, Option<String>) =
+                    sqlx::query_as(
+                        "SELECT state, lease_owner, claim_nonce::text
              FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&reapable.job_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert_eq!(state, "queued");
-        assert_eq!(owner, None);
-        assert_eq!(nonce, None);
-        assert_eq!(
-            phase_status(&admin, &reapable.job_id, 2, "checkout_transport").await,
-            "sealed_ceiling",
-            "the reaped generation's unresolved phase is sealed in the same transaction"
-        );
-        assert_eq!(
-            phase_status(&admin, &reapable.job_id, 2, "checkout_materialization").await,
-            "measured",
-            "an already-measured phase is never overwritten by the seal"
-        );
-        assert_eq!(
-            phase_status(&admin, &reapable.job_id, 1, "checkout_transport").await,
-            "started",
-            "a NEIGHBOURING generation of the same job is never touched"
-        );
-        assert_eq!(
-            phase_status(&admin, &live.job_id, 1, "checkout_transport").await,
-            "started",
-            "a job whose lease has not lapsed is never touched"
-        );
-        let surface: String = sqlx::query_scalar(
-            "SELECT state FROM ci_job WHERE tenant_id = $1 AND job_id = $2::uuid",
-        )
-        .bind(TENANT)
-        .bind(&reapable.job_id)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert_eq!(
-            surface, "queued",
-            "the surface is reset after a successful seal"
-        );
+                    )
+                    .bind(TENANT)
+                    .bind(&reapable.job_id)
+                    .fetch_one(&admin)
+                    .await
+                    .unwrap();
+                assert_eq!(state, "queued");
+                assert_eq!(owner, None);
+                assert_eq!(nonce, None);
+                assert_eq!(
+                    phase_status(&admin, &reapable.job_id, 2, "checkout_transport").await,
+                    "sealed_ceiling",
+                    "the reaped generation's unresolved phase is sealed in the same transaction"
+                );
+                assert_eq!(
+                    phase_status(&admin, &reapable.job_id, 2, "checkout_materialization").await,
+                    "measured",
+                    "an already-measured phase is never overwritten by the seal"
+                );
+                assert_eq!(
+                    phase_status(&admin, &reapable.job_id, 1, "checkout_transport").await,
+                    "started",
+                    "a NEIGHBOURING generation of the same job is never touched"
+                );
+                assert_eq!(
+                    phase_status(&admin, &live.job_id, 1, "checkout_transport").await,
+                    "started",
+                    "a job whose lease has not lapsed is never touched"
+                );
+                let surface: String = sqlx::query_scalar(
+                    "SELECT state FROM ci_job WHERE tenant_id = $1 AND job_id = $2::uuid",
+                )
+                .bind(TENANT)
+                .bind(&reapable.job_id)
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+                assert_eq!(
+                    surface, "queued",
+                    "the surface is reset after a successful seal"
+                );
 
-        sqlx::query(
-            "UPDATE ci_job_prelaunch_usage
+                sqlx::query(
+                    "UPDATE ci_job_prelaunch_usage
              SET status = 'sealed_ceiling', resolved_at = statement_timestamp()
              WHERE tenant_id = $1 AND job_id = $2::uuid AND lease_epoch = 1",
-        )
-        .bind(TENANT)
-        .bind(&reapable.job_id)
-        .execute(&admin)
-        .await
-        .unwrap();
-        let replacement_nonce = uuid(0x63, 500);
-        insert_parent_attempt(
-            &admin,
-            &reapable.job_id,
-            &reapable.wf_run_id,
-            &uuid(0x10, 500),
-            "runner-replacement",
-            3,
-            &replacement_nonce,
-            now + 1,
-            now + 80_001,
-        )
-        .await;
-        insert_started_phase(
-            &admin,
-            &reapable.job_id,
-            3,
-            &replacement_nonce,
-            "checkout_transport",
-        )
-        .await;
-        sqlx::query(
-            "UPDATE ci_job_prelaunch_usage
+                )
+                .bind(TENANT)
+                .bind(&reapable.job_id)
+                .execute(&admin)
+                .await
+                .unwrap();
+                let replacement_nonce = uuid(0x63, 500);
+                insert_parent_attempt(
+                    &admin,
+                    &reapable.job_id,
+                    &reapable.wf_run_id,
+                    &uuid(0x10, 500),
+                    "runner-replacement",
+                    3,
+                    &replacement_nonce,
+                    now + 1,
+                    now + 80_001,
+                )
+                .await;
+                insert_started_phase(
+                    &admin,
+                    &reapable.job_id,
+                    3,
+                    &replacement_nonce,
+                    "checkout_transport",
+                )
+                .await;
+                sqlx::query(
+                    "UPDATE ci_job_prelaunch_usage
              SET status = 'measured', exact_cpu_seconds = 1, exact_mem_byte_seconds = 2,
                  resolved_at = statement_timestamp()
              WHERE tenant_id = $1 AND job_id = $2::uuid AND lease_epoch = 3",
-        )
-        .bind(TENANT)
-        .bind(&reapable.job_id)
-        .execute(&admin)
-        .await
-        .unwrap();
+                )
+                .bind(TENANT)
+                .bind(&reapable.job_id)
+                .execute(&admin)
+                .await
+                .unwrap();
 
-        let mut settle = app.begin().await.unwrap();
-        sqlx::query(
-            "SELECT set_config('myelin.tenant_id', $1, true),
+                let mut settle = app.begin().await.unwrap();
+                sqlx::query(
+                    "SELECT set_config('myelin.tenant_id', $1, true),
                     set_config('myelin.region', $2, true)",
-        )
-        .bind(TENANT)
-        .bind(REGION)
-        .execute(&mut *settle)
-        .await
-        .unwrap();
-        let accrual = resolve_prelaunch_usage_on_conn(
-            &mut settle,
-            CiPrelaunchSettlementIdentity {
-                tenant_id: TENANT,
-                region: REGION,
-                job_id: &reapable.job_id,
-                wf_run_id: &reapable.wf_run_id,
-                ci_run_id: &uuid(0x10, 500),
-                reserve_handle: RESERVE_HANDLE,
-            },
-            CiPrelaunchParentExpectation::Required,
-            CiPrelaunchUnresolvedPolicy::Refuse,
-        )
-        .await
-        .expect("a ceiling-sealed old generation never blocks the replacement's settlement");
-        settle.commit().await.unwrap();
-        assert_eq!(accrual.parent_attempts, 3);
-        assert_eq!(accrual.measured_phases, 2, "the two measured phases");
-        assert_eq!(accrual.sealed_phases, 2, "both ceiling-sealed phases");
-        assert_eq!(
-            accrual.usage.cpu_seconds,
-            10 + 10 + 3 + 1,
-            "two ceilings plus two exact measurements, counted exactly once each"
-        );
-    })
-    .await;
-    })
+                )
+                .bind(TENANT)
+                .bind(REGION)
+                .execute(&mut *settle)
+                .await
+                .unwrap();
+                let accrual = resolve_prelaunch_usage_on_conn(
+                    &mut settle,
+                    CiPrelaunchSettlementIdentity {
+                        tenant_id: TENANT,
+                        region: REGION,
+                        job_id: &reapable.job_id,
+                        wf_run_id: &reapable.wf_run_id,
+                        ci_run_id: &uuid(0x10, 500),
+                        reserve_handle: RESERVE_HANDLE,
+                    },
+                    CiPrelaunchParentExpectation::Required,
+                    CiPrelaunchUnresolvedPolicy::Refuse,
+                )
+                .await
+                .expect(
+                    "a ceiling-sealed old generation never blocks the replacement's settlement",
+                );
+                settle.commit().await.unwrap();
+                assert_eq!(accrual.parent_attempts, 3);
+                assert_eq!(accrual.measured_phases, 2, "the two measured phases");
+                assert_eq!(accrual.sealed_phases, 2, "both ceiling-sealed phases");
+                assert_eq!(
+                    accrual.usage.cpu_seconds,
+                    10 + 10 + 3 + 1,
+                    "two ceilings plus two exact measurements, counted exactly once each"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -1201,86 +1228,95 @@ async fn the_claim_window_expand_upgrades_a_populated_queue_without_touching_exi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_claim_window_expand_refuses_a_divergent_same_named_constraint() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let schema = schema_name("divergent");
-    let bootstrap = pinned_pool(&admin_url(), "public").await;
-    bootstrap
-        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-        .await
-        .unwrap();
-    bootstrap
-        .execute(format!("CREATE SCHEMA {schema} AUTHORIZATION myelin_admin").as_str())
-        .await
-        .unwrap();
-    let cleanup = bootstrap.clone();
-    let schema_for_cleanup = schema.clone();
-    with_schema_cleanup(&cleanup, &schema_for_cleanup, || async move {
-        let admin = pinned_pool(&admin_url(), &schema).await;
-        for ddl in [
-            myelin_ci_controlplane::CREATE_JOB_QUEUE_DDL,
-            myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-            myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
-            myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-            myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-        ] {
-            admin.execute(ddl).await.expect("pre-expand job_queue shape");
-        }
-        admin
-            .execute(
-                "ALTER TABLE job_queue ADD COLUMN claim_window_secs bigint;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let schema = schema_name("divergent");
+            let bootstrap = pinned_pool(&admin_url(), "public").await;
+            bootstrap
+                .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                .await
+                .unwrap();
+            bootstrap
+                .execute(format!("CREATE SCHEMA {schema} AUTHORIZATION myelin_admin").as_str())
+                .await
+                .unwrap();
+            let cleanup = bootstrap.clone();
+            let schema_for_cleanup = schema.clone();
+            with_schema_cleanup(&cleanup, &schema_for_cleanup, || async move {
+                let admin = pinned_pool(&admin_url(), &schema).await;
+                for ddl in [
+                    myelin_ci_controlplane::CREATE_JOB_QUEUE_DDL,
+                    myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
+                    myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+                    myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
+                    myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
+                ] {
+                    admin
+                        .execute(ddl)
+                        .await
+                        .expect("pre-expand job_queue shape");
+                }
+                admin
+                    .execute(
+                        "ALTER TABLE job_queue ADD COLUMN claim_window_secs bigint;
                  ALTER TABLE job_queue
                    ADD CONSTRAINT job_queue_claim_window_range
                    CHECK (claim_window_secs BETWEEN 1 AND 999999) NOT VALID;",
-            )
-            .await
-            .expect("seed the divergent constraint");
+                    )
+                    .await
+                    .expect("seed the divergent constraint");
 
-        let refused = admin
-            .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
-            .await
-            .expect_err("the expand must refuse a divergent same-named constraint");
-        let message = refused.to_string();
-        assert!(
-            message.contains("DIVERGENT definition"),
-            "the refusal must name the divergence; got: {message}"
-        );
-        assert!(
-            message.contains("999999"),
-            "the refusal must show the constraint it found; got: {message}"
-        );
+                let refused = admin
+                    .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
+                    .await
+                    .expect_err("the expand must refuse a divergent same-named constraint");
+                let message = refused.to_string();
+                assert!(
+                    message.contains("DIVERGENT definition"),
+                    "the refusal must name the divergence; got: {message}"
+                );
+                assert!(
+                    message.contains("999999"),
+                    "the refusal must show the constraint it found; got: {message}"
+                );
 
-        let still_divergent: String = sqlx::query_scalar(
-            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                let still_divergent: String = sqlx::query_scalar(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint
              WHERE conrelid = 'job_queue'::regclass AND conname = 'job_queue_claim_window_range'",
-        )
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert!(still_divergent.contains("999999"));
+                )
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+                assert!(still_divergent.contains("999999"));
 
-        admin
-            .execute(
-                "ALTER TABLE job_queue DROP CONSTRAINT job_queue_claim_window_range;
+                admin
+                    .execute(
+                        "ALTER TABLE job_queue DROP CONSTRAINT job_queue_claim_window_range;
                  ALTER TABLE job_queue
                    ADD CONSTRAINT job_queue_claim_window_range
                    CHECK (claim_window_secs BETWEEN 1 AND 88800) NOT VALID;",
-            )
-            .await
-            .unwrap();
-        admin
-            .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
-            .await
-            .expect("the matching NOT VALID constraint is accepted as already-applied");
-        admin
-            .execute(myelin_ci_controlplane::VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL)
-            .await
-            .unwrap();
-        admin
-            .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
-            .await
-            .expect("the same constraint post-VALIDATE is still recognized as already-applied");
-    })
-    .await;
-    })
+                    )
+                    .await
+                    .unwrap();
+                admin
+                    .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
+                    .await
+                    .expect("the matching NOT VALID constraint is accepted as already-applied");
+                admin
+                    .execute(myelin_ci_controlplane::VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL)
+                    .await
+                    .unwrap();
+                admin
+                    .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
+                    .await
+                    .expect(
+                        "the same constraint post-VALIDATE is still recognized as already-applied",
+                    );
+            })
+            .await;
+        },
+    )
     .await;
 }

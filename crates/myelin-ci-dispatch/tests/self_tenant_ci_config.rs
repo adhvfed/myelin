@@ -46,7 +46,8 @@ impl GitConfigReader for CheckedInRepo {
         );
         match path {
             ".myelin/ci.toml" | "Cargo.lock" => Ok(Some(
-                fs::read(workspace_root().join(path)).expect("checked-in repo file must be readable"),
+                fs::read(workspace_root().join(path))
+                    .expect("checked-in repo file must be readable"),
             )),
             _ => Ok(None),
         }
@@ -110,7 +111,11 @@ fn checked_in_pipeline_is_a_resolvable_build_test_clippy_dag() {
     }
     assert_eq!(definition.on, OnTrigger::Push);
 
-    assert_eq!(definition.jobs.len(), 4, "build + test + clippy + architecture");
+    assert_eq!(
+        definition.jobs.len(),
+        4,
+        "build + test + clippy + architecture"
+    );
     let authored: Vec<String> = definition.jobs.iter().map(|j| j.name.clone()).collect();
     assert_eq!(
         authored,
@@ -132,7 +137,10 @@ fn checked_in_pipeline_is_a_resolvable_build_test_clippy_dag() {
         authored_job("build").build.as_ref().unwrap(),
         &recipe(&["build", "--locked"])
     );
-    assert!(authored_job("build").needs.is_empty(), "build is the DAG root");
+    assert!(
+        authored_job("build").needs.is_empty(),
+        "build is the DAG root"
+    );
     assert_eq!(
         authored_job("test").build.as_ref().unwrap(),
         &recipe(&["test", "--locked", "--workspace", "--all-targets"])
@@ -261,10 +269,17 @@ fn checked_in_pipeline_is_a_resolvable_build_test_clippy_dag() {
         );
     }
 
-    let build_argv = resolved_job("build").build.as_ref().unwrap().platform_argv();
+    let build_argv = resolved_job("build")
+        .build
+        .as_ref()
+        .unwrap()
+        .platform_argv();
     assert!(build_argv.starts_with(&["cargo", "build", "--locked"].map(String::from)));
     assert_eq!(
-        build_argv.iter().filter(|a| a.as_str() == "--config").count(),
+        build_argv
+            .iter()
+            .filter(|a| a.as_str() == "--config")
+            .count(),
         2,
         "the platform injects its two vendor --config pairs"
     );
@@ -275,7 +290,14 @@ fn checked_in_pipeline_is_a_resolvable_build_test_clippy_dag() {
         .unwrap()
         .platform_argv();
     assert!(clippy_argv.starts_with(
-        &["cargo", "clippy", "--locked", "--workspace", "--all-targets"].map(String::from)
+        &[
+            "cargo",
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets"
+        ]
+        .map(String::from)
     ));
     assert!(
         clippy_argv.ends_with(&["--", "-D", "warnings"].map(String::from)),

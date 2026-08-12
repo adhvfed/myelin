@@ -5,8 +5,8 @@ use myelin_ci_sandbox::ResourceUsage;
 use myelin_events::OutboxRow;
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{
-    with_tenant_tx, with_tenant_tx_error, DurableCostLedger, MicroUsd, PgError,
-    RunId as CostRunId, TenantScope,
+    with_tenant_tx, with_tenant_tx_error, DurableCostLedger, MicroUsd, PgError, RunId as CostRunId,
+    TenantScope,
 };
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
@@ -240,9 +240,7 @@ pub enum CiRunStoreError {
     InvalidCausalDepth,
     InvalidConcurrencyGroup,
     InvalidPrHeadGeneration,
-    ReplayCollision {
-        differing_fields: Vec<&'static str>,
-    },
+    ReplayCollision { differing_fields: Vec<&'static str> },
     ConflictNotVisible,
     NoCoCommitTx,
     InvalidFinalization(&'static str),

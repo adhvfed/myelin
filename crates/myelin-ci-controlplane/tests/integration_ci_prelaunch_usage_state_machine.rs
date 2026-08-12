@@ -11,13 +11,12 @@ use myelin_ci_controlplane::{
     resolve_prelaunch_usage_on_conn, CiAttemptBudgetPolicy, CiAttemptBudgetRevision,
     CiDriveManifestStore, CiDriveManifestV1, CiJobBudgetReservationProvider,
     CiJobRuntimeAuthorityRequest, CiJobSpecStore, CiJobTokenRequest, CiManifestLaneV1,
-    CiParentAttemptAdmission,
     CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
-    CiPrelaunchJournalOutcome, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
-    CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageJournal, CiPrelaunchUsageJournalError,
-    CiPrelaunchUsagePhase, DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane,
-    ManifestBoundCiJobTokenAuthority, OperationalReservationWriteVersion,
-    PgTierPCiJobBudgetReservation,
+    CiParentAttemptAdmission, CiPrelaunchJournalOutcome, CiPrelaunchParentExpectation,
+    CiPrelaunchSettlementIdentity, CiPrelaunchUnresolvedPolicy, CiPrelaunchUsageJournal,
+    CiPrelaunchUsageJournalError, CiPrelaunchUsagePhase, DurableCiJobLaunchTemplate,
+    DurableEnqueue, GrantedCiJobV1, Lane, ManifestBoundCiJobTokenAuthority,
+    OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation,
 };
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, EgressPolicy, IdemToken, ImageRef, JobKind,
@@ -144,8 +143,8 @@ async fn seed_fixture(
     let original_handle = provider
         .reserve_batch(vec![authority.clone()])
         .await
-    .unwrap()
-    .remove(0);
+        .unwrap()
+        .remove(0);
     let reserve_handle = match mutation {
         FixtureMutation::ReservationDigest => {
             let mut tampered = original_handle.clone();
@@ -1044,7 +1043,10 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         .fetch_one(&admin)
         .await
         .unwrap();
-        assert_eq!(epoch_one_rows, 0, "the refused generation has no parent row");
+        assert_eq!(
+            epoch_one_rows, 0,
+            "the refused generation has no parent row"
+        );
 
         for forced in ["settled", "cancelled"] {
             sqlx::query(

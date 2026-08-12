@@ -10,8 +10,8 @@ use myelin_ci_sandbox::{
     resolved_gvisor_cargo_vendor_workspace, resolved_gvisor_rootfs, resolved_gvisor_rust_rootfs,
     verified_gvisor_git_rootfs, ImageRef, JobKind, JobSpec, LeaseStore, QueuedJob, RunnerError,
     RunnerHooks, TrustTier, CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256,
-    CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256,
-    LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
+    CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256,
+    GVISOR_GIT_ROOTFS_SHA256, LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
@@ -88,19 +88,11 @@ pub const CI_RUNNER_EXECUTION_LEASE_TTL_SECS: i64 = MAX_JOB_TIMEOUT_SECS as i64 
 pub type JobSpecResolver = Arc<dyn Fn(&LeasedJob) -> Result<JobSpec, String> + Send + Sync>;
 
 trait SecretWithholdTerminalizer {
-    fn terminalize(
-        &self,
-        claim: &CiJobTokenRequest,
-        diagnostic: &str,
-    ) -> Result<(), String>;
+    fn terminalize(&self, claim: &CiJobTokenRequest, diagnostic: &str) -> Result<(), String>;
 }
 
 impl SecretWithholdTerminalizer for CiPipelineReporterRouter {
-    fn terminalize(
-        &self,
-        claim: &CiJobTokenRequest,
-        diagnostic: &str,
-    ) -> Result<(), String> {
+    fn terminalize(&self, claim: &CiJobTokenRequest, diagnostic: &str) -> Result<(), String> {
         use myelin_ci_sandbox::{
             PreparationPhase, PreparationReportClaim, PreparationTerminalDisposition,
             TerminalReporter,
@@ -678,7 +670,8 @@ fn durable_spec_resolver_with_issuer(
             &launch.spec.meter_to.reserve_id,
             checkout.as_ref(),
         );
-        let run_token = bridge(&rt, token_issuer.mint(request.clone())).map_err(|e| e.to_string())?;
+        let run_token =
+            bridge(&rt, token_issuer.mint(request.clone())).map_err(|e| e.to_string())?;
         validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
         let resolution = resolve_claim_launch_secrets(
             &TenantId(leased.tenant_id.clone()),
@@ -842,11 +835,7 @@ mod secret_withhold_terminal_tests {
     }
 
     impl SecretWithholdTerminalizer for RecordingTerminalizer {
-        fn terminalize(
-            &self,
-            _claim: &CiJobTokenRequest,
-            diagnostic: &str,
-        ) -> Result<(), String> {
+        fn terminalize(&self, _claim: &CiJobTokenRequest, diagnostic: &str) -> Result<(), String> {
             *self.terminal.lock().unwrap() = true;
             *self.failed_job_done.lock().unwrap() = true;
             *self.accounting_settled.lock().unwrap() = true;

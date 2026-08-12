@@ -317,10 +317,9 @@ impl<'a, C: SecretCapability, I: IdentityService> SecretBroker<'a, C, I> {
             .outcomes
             .into_iter()
             .filter_map(|outcome| match outcome {
-                SecretOutcome::Resolved(secret) => Some(ResolvedSecretEnv::from_zeroizing(
-                    secret.name,
-                    secret.value,
-                )),
+                SecretOutcome::Resolved(secret) => {
+                    Some(ResolvedSecretEnv::from_zeroizing(secret.name, secret.value))
+                }
                 SecretOutcome::Withheld { .. } => None,
             })
             .collect();

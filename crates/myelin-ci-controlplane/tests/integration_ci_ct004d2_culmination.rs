@@ -21,8 +21,8 @@ use myelin_ci_controlplane::{
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
     ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL,
-    CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
+    CREATE_CI_JOB_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_DDL, CREATE_FAIR_DEFICIT_DDL,
+    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -49,8 +49,7 @@ use tokio::sync::Mutex as AsyncMutex;
 static TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 fn unused_secret_terminal_reporter(region: &str) -> CiPipelineReporterRouter {
-    let factory: CiPipelineReporterFactory =
-        Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
+    let factory: CiPipelineReporterFactory = Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
     CiPipelineReporterRouter::new(Region(region.into()), factory).unwrap()
 }
 
@@ -279,40 +278,40 @@ fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
 fn durable_launch_hooks(queue_store: CiJobQueueStore, rt: tokio::runtime::Handle) -> RunnerHooks {
     common::with_stage_b_compute_admission_for_legacy_runsc_test(
         RunnerHooks::new_with_launch_fence(
-        myelin_ci_sandbox::CompletionSettlementOwner::Hook,
-        Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
-        Box::new(|_spec, _h, _u| Ok(())),
-        Box::new(move |spec| {
-            let RunTokenAuthorizationContext::CiJob(context) = spec
-                .run_token_authorization
-                .clone()
-                .ok_or_else(|| HookError("test launch is missing durable claim facts".into()))?;
-            let claim = CiJobLaunchClaim {
-                tenant_id: context.tenant_id,
-                region: context.region,
-                wf_run_id: context.wf_run_id,
-                job_id: context.job_id,
-                lease_owner: context.lease_owner,
-                lease_epoch: context.lease_epoch,
-                claim_nonce: context.claim_nonce,
-                claim_started_at_epoch_secs: context.claim_started_at_epoch_secs,
-                claim_expires_at_epoch_secs: context.claim_expires_at_epoch_secs,
-            };
-            let queue_store = queue_store.clone();
-            let rt = rt.clone();
-            Ok(LaunchPermit::retained(move || {
-                let authorized =
-                    bridge(&rt, queue_store.authorize_launch(&claim)).map_err(|error| {
-                        HookError(format!("authorize durable test launch: {error}"))
+            myelin_ci_sandbox::CompletionSettlementOwner::Hook,
+            Box::new(|spec| Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))),
+            Box::new(|_spec, _h, _u| Ok(())),
+            Box::new(move |spec| {
+                let RunTokenAuthorizationContext::CiJob(context) =
+                    spec.run_token_authorization.clone().ok_or_else(|| {
+                        HookError("test launch is missing durable claim facts".into())
                     })?;
-                if !authorized {
-                    return Err(HookError(
-                        "durable test launch claim was no longer live".into(),
-                    ));
-                }
-                Ok(LaunchOwnership::immediate())
-            }))
-        }),
+                let claim = CiJobLaunchClaim {
+                    tenant_id: context.tenant_id,
+                    region: context.region,
+                    wf_run_id: context.wf_run_id,
+                    job_id: context.job_id,
+                    lease_owner: context.lease_owner,
+                    lease_epoch: context.lease_epoch,
+                    claim_nonce: context.claim_nonce,
+                    claim_started_at_epoch_secs: context.claim_started_at_epoch_secs,
+                    claim_expires_at_epoch_secs: context.claim_expires_at_epoch_secs,
+                };
+                let queue_store = queue_store.clone();
+                let rt = rt.clone();
+                Ok(LaunchPermit::retained(move || {
+                    let authorized =
+                        bridge(&rt, queue_store.authorize_launch(&claim)).map_err(|error| {
+                            HookError(format!("authorize durable test launch: {error}"))
+                        })?;
+                    if !authorized {
+                        return Err(HookError(
+                            "durable test launch claim was no longer live".into(),
+                        ));
+                    }
+                    Ok(LaunchOwnership::immediate())
+                }))
+            }),
             Box::new(|_s| Ok(())),
         ),
     )
@@ -973,247 +972,248 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     let cleanup_admin = admin_pool(&schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let region = "fr-par";
-    let tenant = "tenantA";
-    let admin = admin_pool(&schema).await;
-    create_schema(&admin, &schema).await;
-    let ci_run_store = ci_run_store_factory(admin.clone());
-    let build_spec = fixed_command_spec_builder(&pinned_image().reference, vec!["true".into()], 60)
-        .expect("pinned image");
-    let driver = CiPipelineDriver::new(
-        TenantId(tenant.into()),
-        region,
-        ci_job_spec_store(admin.clone()),
-        tokio::runtime::Handle::current(),
-        build_spec,
-        OutboxStore::new(),
-    );
-    let tid = TenantId(tenant.into());
-    let usage = || ResourceUsage {
-        cpu_seconds: 17,
-        mem_byte_seconds: 4_096,
-    };
-    let pass = || TerminalReport {
-        passed: true,
-        timed_out: false,
-        usage: usage(),
-        result_refs: vec![],
-    };
-
-    let (run, job_id, idem) =
-        arm_and_dispatch(&admin, &ci_run_store, &driver, tenant, region, "cbc-main").await;
-    let wf_run = run.0.clone();
-    let reporter = driver.reporter();
-
-    let forged_nonce = Uuid::nil().to_string();
-    let forged = reporter.report_done(
-        &completion_claim(
-            &tid,
-            &run,
-            &job_id,
-            &idem,
-            "worker-forger",
-            1,
-            &forged_nonce,
-        ),
-        &pass(),
-    );
-    assert!(
-        matches!(forged, Err(ExecutorError::InvalidInput(_))),
-        "a valid tuple with no claim is refused, got {forged:?}"
-    );
-    assert_eq!(
-        driver.executor().signals().count_for_run(&tid, &wf_run),
-        0,
-        "a refused forgery signals nothing"
-    );
-
-    let claim = claim_job(&admin, &wf_run, "worker-real", 1).await;
-
-    let leased_completion = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-        &pass(),
-    );
-    assert!(
-        matches!(leased_completion, Err(ExecutorError::InvalidInput(_))),
-        "possession of a merely leased claim cannot invent completed execution"
-    );
-    authorize_test_launch(&admin, claim.launch_claim(tenant, region, &wf_run, &job_id)).await;
-
-    let wrong_nonce = uid("wrong-completion-claim").to_string();
-    let wrong_nonce_result = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &wrong_nonce),
-        &pass(),
-    );
-    assert!(
-        matches!(wrong_nonce_result, Err(ExecutorError::InvalidInput(_))),
-        "the unguessable claim nonce is required"
-    );
-
-    let contradictory = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-        &TerminalReport {
+        let region = "fr-par";
+        let tenant = "tenantA";
+        let admin = admin_pool(&schema).await;
+        create_schema(&admin, &schema).await;
+        let ci_run_store = ci_run_store_factory(admin.clone());
+        let build_spec =
+            fixed_command_spec_builder(&pinned_image().reference, vec!["true".into()], 60)
+                .expect("pinned image");
+        let driver = CiPipelineDriver::new(
+            TenantId(tenant.into()),
+            region,
+            ci_job_spec_store(admin.clone()),
+            tokio::runtime::Handle::current(),
+            build_spec,
+            OutboxStore::new(),
+        );
+        let tid = TenantId(tenant.into());
+        let usage = || ResourceUsage {
+            cpu_seconds: 17,
+            mem_byte_seconds: 4_096,
+        };
+        let pass = || TerminalReport {
             passed: true,
-            timed_out: true,
-            usage: usage(),
-            result_refs: vec![],
-        },
-    );
-    assert!(
-        matches!(contradictory, Err(ExecutorError::InvalidInput(_))),
-        "a timed-out job cannot forge a passing verdict"
-    );
-
-    let invalid_ref = TerminalReport {
-        passed: true,
-        timed_out: false,
-        usage: usage(),
-        result_refs: vec![ArtifactRef("myelin://acme/ci/run/deep/not-scoped".into())],
-    };
-    let invalid = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-        &invalid_ref,
-    );
-    assert!(
-        invalid.is_err(),
-        "invalid refs fail the typed signal contract"
-    );
-    let before_success: (String, Option<String>) =
-        sqlx::query_as("SELECT state, completion_receipt FROM job_queue WHERE run_id = $1")
-            .bind(Uuid::parse_str(&wf_run).unwrap())
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-    assert_eq!(
-        before_success,
-        ("running".into(), None),
-        "typed-signal failure rolls back running-claim consumption"
-    );
-
-    let stale = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 0, &claim.nonce),
-        &pass(),
-    );
-    assert!(
-        matches!(stale, Err(ExecutorError::InvalidInput(_))),
-        "a stale epoch is refused, got {stale:?}"
-    );
-    let wrong_owner = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-evil", 1, &claim.nonce),
-        &pass(),
-    );
-    assert!(
-        matches!(wrong_owner, Err(ExecutorError::InvalidInput(_))),
-        "a wrong lease owner is refused, got {wrong_owner:?}"
-    );
-    assert_eq!(
-        driver.executor().signals().count_for_run(&tid, &wf_run),
-        0,
-        "no refused delivery signalled"
-    );
-
-    let ok = reporter
-        .report_done(
-            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-            &pass(),
-        )
-        .expect("the owning running claim consumes + signals");
-    assert_eq!(ok, SignalOutcome::Buffered);
-    let (state, receipt): (String, Option<String>) =
-        sqlx::query_as("SELECT state, completion_receipt FROM job_queue WHERE run_id = $1")
-            .bind(Uuid::parse_str(&wf_run).unwrap())
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-    assert_eq!(state, "terminal", "the claim was consumed to terminal");
-    assert!(receipt.is_some(), "a completion receipt was recorded");
-
-    let retry = reporter
-        .report_done(
-            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-            &pass(),
-        )
-        .expect("an identical redelivery is idempotent");
-    assert_eq!(
-        retry,
-        SignalOutcome::Duplicate,
-        "the redelivery is a wake-once no-op"
-    );
-
-    let flipped = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-        &TerminalReport {
-            passed: false,
             timed_out: false,
             usage: usage(),
             result_refs: vec![],
-        },
-    );
-    assert!(
-        matches!(flipped, Err(ExecutorError::InvalidInput(_))),
-        "a flipped-verdict replay with a valid receipt is refused, got {flipped:?}"
-    );
-    let divergent_refs = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-        &TerminalReport {
-            passed: true,
-            timed_out: false,
-            usage: usage(),
-            result_refs: vec![ArtifactRef("myelin://acme/ci/artifact/build-output".into())],
-        },
-    );
-    assert!(
-        matches!(divergent_refs, Err(ExecutorError::InvalidInput(_))),
-        "an ordered result-ref divergence changes the receipt and is refused"
-    );
-    let divergent_usage = reporter.report_done(
-        &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
-        &TerminalReport {
-            passed: true,
-            timed_out: false,
-            usage: ResourceUsage {
-                cpu_seconds: usage().cpu_seconds + 1,
-                ..usage()
+        };
+
+        let (run, job_id, idem) =
+            arm_and_dispatch(&admin, &ci_run_store, &driver, tenant, region, "cbc-main").await;
+        let wf_run = run.0.clone();
+        let reporter = driver.reporter();
+
+        let forged_nonce = Uuid::nil().to_string();
+        let forged = reporter.report_done(
+            &completion_claim(
+                &tid,
+                &run,
+                &job_id,
+                &idem,
+                "worker-forger",
+                1,
+                &forged_nonce,
+            ),
+            &pass(),
+        );
+        assert!(
+            matches!(forged, Err(ExecutorError::InvalidInput(_))),
+            "a valid tuple with no claim is refused, got {forged:?}"
+        );
+        assert_eq!(
+            driver.executor().signals().count_for_run(&tid, &wf_run),
+            0,
+            "a refused forgery signals nothing"
+        );
+
+        let claim = claim_job(&admin, &wf_run, "worker-real", 1).await;
+
+        let leased_completion = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+            &pass(),
+        );
+        assert!(
+            matches!(leased_completion, Err(ExecutorError::InvalidInput(_))),
+            "possession of a merely leased claim cannot invent completed execution"
+        );
+        authorize_test_launch(&admin, claim.launch_claim(tenant, region, &wf_run, &job_id)).await;
+
+        let wrong_nonce = uid("wrong-completion-claim").to_string();
+        let wrong_nonce_result = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &wrong_nonce),
+            &pass(),
+        );
+        assert!(
+            matches!(wrong_nonce_result, Err(ExecutorError::InvalidInput(_))),
+            "the unguessable claim nonce is required"
+        );
+
+        let contradictory = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+            &TerminalReport {
+                passed: true,
+                timed_out: true,
+                usage: usage(),
+                result_refs: vec![],
             },
-            result_refs: vec![],
-        },
-    );
-    assert!(
-        matches!(divergent_usage, Err(ExecutorError::InvalidInput(_))),
-        "an actual-usage divergence changes the receipt and is refused"
-    );
+        );
+        assert!(
+            matches!(contradictory, Err(ExecutorError::InvalidInput(_))),
+            "a timed-out job cannot forge a passing verdict"
+        );
 
-    let (run2, job2, idem2) =
-        arm_and_dispatch(&admin, &ci_run_store, &driver, tenant, region, "cbc-quar").await;
-    let wf_run2 = run2.0.clone();
-    sqlx::query("UPDATE ci_job_spec SET stage = NULL WHERE run_id = $1")
-        .bind(uid("cbc-quar-wf-run"))
-        .execute(&admin)
-        .await
-        .expect("null the stage (simulate a pre-rewire historical row)");
-    let claim2 = claim_job(&admin, &wf_run2, "worker-real", 1).await;
-    authorize_test_launch(&admin, claim2.launch_claim(tenant, region, &wf_run2, &job2)).await;
-    let refused = reporter.report_done(
-        &completion_claim(&tid, &run2, &job2, &idem2, "worker-real", 1, &claim2.nonce),
-        &pass(),
-    );
-    assert!(refused.is_err(), "a NULL-stage completion fails closed");
-    assert_eq!(
-        driver.executor().signals().count_for_run(&tid, &wf_run2),
-        0,
-        "a refused NULL-stage job signals no verdict"
-    );
-    let q_state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE run_id = $1")
-        .bind(Uuid::parse_str(&wf_run2).unwrap())
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-    assert_eq!(
+        let invalid_ref = TerminalReport {
+            passed: true,
+            timed_out: false,
+            usage: usage(),
+            result_refs: vec![ArtifactRef("myelin://acme/ci/run/deep/not-scoped".into())],
+        };
+        let invalid = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+            &invalid_ref,
+        );
+        assert!(
+            invalid.is_err(),
+            "invalid refs fail the typed signal contract"
+        );
+        let before_success: (String, Option<String>) =
+            sqlx::query_as("SELECT state, completion_receipt FROM job_queue WHERE run_id = $1")
+                .bind(Uuid::parse_str(&wf_run).unwrap())
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        assert_eq!(
+            before_success,
+            ("running".into(), None),
+            "typed-signal failure rolls back running-claim consumption"
+        );
+
+        let stale = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 0, &claim.nonce),
+            &pass(),
+        );
+        assert!(
+            matches!(stale, Err(ExecutorError::InvalidInput(_))),
+            "a stale epoch is refused, got {stale:?}"
+        );
+        let wrong_owner = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-evil", 1, &claim.nonce),
+            &pass(),
+        );
+        assert!(
+            matches!(wrong_owner, Err(ExecutorError::InvalidInput(_))),
+            "a wrong lease owner is refused, got {wrong_owner:?}"
+        );
+        assert_eq!(
+            driver.executor().signals().count_for_run(&tid, &wf_run),
+            0,
+            "no refused delivery signalled"
+        );
+
+        let ok = reporter
+            .report_done(
+                &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+                &pass(),
+            )
+            .expect("the owning running claim consumes + signals");
+        assert_eq!(ok, SignalOutcome::Buffered);
+        let (state, receipt): (String, Option<String>) =
+            sqlx::query_as("SELECT state, completion_receipt FROM job_queue WHERE run_id = $1")
+                .bind(Uuid::parse_str(&wf_run).unwrap())
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        assert_eq!(state, "terminal", "the claim was consumed to terminal");
+        assert!(receipt.is_some(), "a completion receipt was recorded");
+
+        let retry = reporter
+            .report_done(
+                &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+                &pass(),
+            )
+            .expect("an identical redelivery is idempotent");
+        assert_eq!(
+            retry,
+            SignalOutcome::Duplicate,
+            "the redelivery is a wake-once no-op"
+        );
+
+        let flipped = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+            &TerminalReport {
+                passed: false,
+                timed_out: false,
+                usage: usage(),
+                result_refs: vec![],
+            },
+        );
+        assert!(
+            matches!(flipped, Err(ExecutorError::InvalidInput(_))),
+            "a flipped-verdict replay with a valid receipt is refused, got {flipped:?}"
+        );
+        let divergent_refs = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+            &TerminalReport {
+                passed: true,
+                timed_out: false,
+                usage: usage(),
+                result_refs: vec![ArtifactRef("myelin://acme/ci/artifact/build-output".into())],
+            },
+        );
+        assert!(
+            matches!(divergent_refs, Err(ExecutorError::InvalidInput(_))),
+            "an ordered result-ref divergence changes the receipt and is refused"
+        );
+        let divergent_usage = reporter.report_done(
+            &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
+            &TerminalReport {
+                passed: true,
+                timed_out: false,
+                usage: ResourceUsage {
+                    cpu_seconds: usage().cpu_seconds + 1,
+                    ..usage()
+                },
+                result_refs: vec![],
+            },
+        );
+        assert!(
+            matches!(divergent_usage, Err(ExecutorError::InvalidInput(_))),
+            "an actual-usage divergence changes the receipt and is refused"
+        );
+
+        let (run2, job2, idem2) =
+            arm_and_dispatch(&admin, &ci_run_store, &driver, tenant, region, "cbc-quar").await;
+        let wf_run2 = run2.0.clone();
+        sqlx::query("UPDATE ci_job_spec SET stage = NULL WHERE run_id = $1")
+            .bind(uid("cbc-quar-wf-run"))
+            .execute(&admin)
+            .await
+            .expect("null the stage (simulate a pre-rewire historical row)");
+        let claim2 = claim_job(&admin, &wf_run2, "worker-real", 1).await;
+        authorize_test_launch(&admin, claim2.launch_claim(tenant, region, &wf_run2, &job2)).await;
+        let refused = reporter.report_done(
+            &completion_claim(&tid, &run2, &job2, &idem2, "worker-real", 1, &claim2.nonce),
+            &pass(),
+        );
+        assert!(refused.is_err(), "a NULL-stage completion fails closed");
+        assert_eq!(
+            driver.executor().signals().count_for_run(&tid, &wf_run2),
+            0,
+            "a refused NULL-stage job signals no verdict"
+        );
+        let q_state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE run_id = $1")
+            .bind(Uuid::parse_str(&wf_run2).unwrap())
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(
         q_state, "running",
         "the atomic transaction leaves the launched generation live for operator-visible recovery"
     );
 
-    drop_schema(&admin, &schema).await;
+        drop_schema(&admin, &schema).await;
     })
     .await;
 }

@@ -745,8 +745,7 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         job_update_claim_started_at: row.get("job_update_claim_started_at"),
         job_update_claim_expires_at: row.get("job_update_claim_expires_at"),
         job_update_claim_window: row.get("job_update_claim_window"),
-        job_update_reservation_write_version: row
-            .get("job_update_reservation_write_version"),
+        job_update_reservation_write_version: row.get("job_update_reservation_write_version"),
         fair_select: row.get("fair_select"),
         run_select_tenant: row.get("run_select_tenant"),
         run_select_region: row.get("run_select_region"),

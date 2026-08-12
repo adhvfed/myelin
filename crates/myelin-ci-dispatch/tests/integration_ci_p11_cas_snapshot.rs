@@ -8,7 +8,8 @@ use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 
 const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
-const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
+const PINNED_TEST: &str =
+    "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 
 #[tokio::test]
 async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_refused() {

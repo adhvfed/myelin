@@ -11,7 +11,8 @@ use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
 
 const PINNED_BUILD: &str = "registry.example/build@sha256:abc123def4560000000000000000000000000000000000000000000000000000";
-const PINNED_TEST: &str = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
+const PINNED_TEST: &str =
+    "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000";
 
 fn tenant() -> TenantId {
     TenantId("acme".into())
@@ -52,7 +53,11 @@ fn cdc_11_2_consumer_snapshot_is_content_addressed_through_blobstore() {
     let bytes = store
         .get(&tenant(), &addr)
         .expect("the CAS blob is present");
-    assert_eq!(bytes, snap.canonical_bytes().unwrap(), "get returns the put bytes");
+    assert_eq!(
+        bytes,
+        snap.canonical_bytes().unwrap(),
+        "get returns the put bytes"
+    );
     assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes().unwrap()));
 
     let (_snap2, addr2) =

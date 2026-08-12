@@ -299,8 +299,7 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
         .find(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_RUN_SUCCEEDED)
         .expect("the successful run publishes its terminal fact");
     assert_eq!(
-        terminal.envelope.payload["source_ref"],
-        "refs/heads/main",
+        terminal.envelope.payload["source_ref"], "refs/heads/main",
         "an automation can match the branch that actually triggered this run"
     );
     assert_eq!(

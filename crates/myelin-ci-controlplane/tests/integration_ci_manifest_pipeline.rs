@@ -8,17 +8,17 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use futures::FutureExt;
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, decode_resolved_ci_manifest,
-    register_durable_ci_manifest_pipeline, run_ci_manifest_pipeline, BUMP_CHECK_ATTEMPT_SQL,
-    CiExecutionProfileV1, CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore,
-    CiLaunchAuthorityError, CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1,
-    CiManifestDurableJobRunner, CiManifestInputResolver, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiRunFinalization, CiRunFinalizationOutcome, CiRunFinalizationWrite,
-    CiRunFinalizer, CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter,
-    PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
+    register_durable_ci_manifest_pipeline, run_ci_manifest_pipeline, CiExecutionProfileV1,
+    CiExecutionRequestV1, CiJobLaunchGrantV1, CiJobSpecStore, CiLaunchAuthorityError,
+    CiLaunchAuthorityMaterializer, CiLaunchAuthorityV1, CiManifestDurableJobRunner,
+    CiManifestInputResolver, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
+    CiRunFinalization, CiRunFinalizationOutcome, CiRunFinalizationWrite, CiRunFinalizer,
+    CiRunStoreError, CiWorkflowDefinitionPin, PgCiPipelineStarter, PreparedRunPlanV2,
+    ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome, BUMP_CHECK_ATTEMPT_SQL,
 };
-use futures::FutureExt;
 use myelin_ci_sandbox::TrustTier;
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, MonotonicMinter};
@@ -198,7 +198,12 @@ fn definition() -> CiWorkflowDefinitionPin {
     CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap()
 }
 
-async fn reserve_test_check_attempts(pool: &PgPool, run_id: &str, repo_ref: &str, commit_oid: &str) {
+async fn reserve_test_check_attempts(
+    pool: &PgPool,
+    run_id: &str,
+    repo_ref: &str,
+    commit_oid: &str,
+) {
     let run_id = sqlx::types::Uuid::parse_str(run_id).expect("test run UUID");
     for context in ["build", "package", "test"] {
         let attempt: i32 = sqlx::query_scalar(BUMP_CHECK_ATTEMPT_SQL)

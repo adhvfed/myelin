@@ -654,15 +654,9 @@ impl Projected {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectError {
-    NotACiArtifact {
-        reference: String,
-    },
-    UnknownCiType {
-        ty: String,
-    },
-    NotFound {
-        reference: String,
-    },
+    NotACiArtifact { reference: String },
+    UnknownCiType { ty: String },
+    NotFound { reference: String },
 }
 
 impl std::fmt::Display for ProjectError {
@@ -776,8 +770,7 @@ impl<I: IdentityService> Projector<I> {
         };
         let permission = Permission(VIEW.to_string());
         match self.id.check(viewer, &permission, &acl_object, &at, None) {
-            Ok(Decision::Allow) => {
-            }
+            Ok(Decision::Allow) => {}
             Ok(Decision::Deny) | Ok(Decision::Conditional) | Err(_) => {
                 return Ok(Projected::Tombstoned(Tombstone {
                     reason: TombstoneReason::Unauthorized,

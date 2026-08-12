@@ -29,9 +29,7 @@ use crate::job_queue_store::DurableEnqueue;
 use crate::job_spec_store::{CiJobSpecStore, DurableCiJobLaunchTemplate};
 use crate::scheduler::Lane;
 use crate::CI_PIPELINE_WF_TYPE;
-use crate::{
-    SecretBroker, SecretCapability, SecretLaunchError, WithheldSecret, WithholdReason,
-};
+use crate::{SecretBroker, SecretCapability, SecretLaunchError, WithheldSecret, WithholdReason};
 
 pub type CiJobSecretResolver =
     Arc<dyn Fn(&TenantId, JobSpec) -> Result<JobSpec, SecretLaunchError> + Send + Sync>;

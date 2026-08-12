@@ -7,13 +7,18 @@ use base64::Engine as _;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     List(CiRunPageRequest),
-    View { run_id: String },
+    View {
+        run_id: String,
+    },
     Logs {
         run_id: String,
         job_id: String,
         range: CiLogRangeRequest,
     },
-    Watch { run_id: String, job_id: String },
+    Watch {
+        run_id: String,
+        job_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

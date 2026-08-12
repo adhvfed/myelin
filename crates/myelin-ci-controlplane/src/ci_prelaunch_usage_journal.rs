@@ -166,7 +166,9 @@ pub enum CiParentAttemptAdmission {
         attempt: CiJobParentAttempt,
         outcome: CiPrelaunchJournalOutcome,
     },
-    AttemptsExhausted { reserve_handle: String },
+    AttemptsExhausted {
+        reserve_handle: String,
+    },
 }
 
 #[derive(Clone)]
@@ -303,7 +305,12 @@ impl CiPrelaunchUsageJournal {
         claim: &CiJobTokenRequest,
         reserve_handle: &str,
     ) -> Result<
-        (CiJobTokenRequest, String, CiDriveManifestStore, CiJobSpecStore),
+        (
+            CiJobTokenRequest,
+            String,
+            CiDriveManifestStore,
+            CiJobSpecStore,
+        ),
         CiPrelaunchUsageJournalError,
     > {
         claim
@@ -1293,9 +1300,7 @@ mod tests {
                 timeout_secs: 10,
             },
             reserve_id: Some("ci-reserve:v2:fixture".into()),
-            checkout_commit: checkout
-                .as_ref()
-                .map(|scope| scope.commit_hex().to_owned()),
+            checkout_commit: checkout.as_ref().map(|scope| scope.commit_hex().to_owned()),
             checkout,
         }
     }

@@ -81,9 +81,7 @@ pub fn derive_cache_scope(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SegmentPii {
-    IsolableSubject {
-        subject_id: String,
-    },
+    IsolableSubject { subject_id: String },
     NotIsolable,
 }
 

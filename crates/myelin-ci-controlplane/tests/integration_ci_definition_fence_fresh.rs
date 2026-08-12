@@ -80,8 +80,8 @@ async fn seed_job_queue_row(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the disposable container from drill-ci-definition-fence-fresh-postgres.sh"]
-async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_non_superuser_migrator()
-{
+async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_non_superuser_migrator(
+) {
     let migrator = pool(&migration_url()).await;
     let admin = pool(&admin_url()).await;
     let app = pool(&app_url()).await;
@@ -155,7 +155,10 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
     .fetch_one(&migrator)
     .await
     .unwrap();
-    assert_eq!((still_hash, still_status), (sentinel_hash, "retired".into()));
+    assert_eq!(
+        (still_hash, still_status),
+        (sentinel_hash, "retired".into())
+    );
 
     let (schema_owner, fn_owner, config, body, secdef, volatility): (
         String,
@@ -214,7 +217,10 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
         .fetch_one(&migrator)
         .await
         .unwrap();
-        assert!(!visible, "the fence role must not read the `{payload}` column");
+        assert!(
+            !visible,
+            "the fence role must not read the `{payload}` column"
+        );
     }
     let table_level: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) acl
@@ -224,7 +230,10 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
     .fetch_one(&migrator)
     .await
     .unwrap();
-    assert_eq!(table_level, 0, "no table-level privilege, only column grants");
+    assert_eq!(
+        table_level, 0,
+        "no table-level privilege, only column grants"
+    );
 
     let probe_oid: i64 = sqlx::query_scalar(
         "SELECT p.oid::bigint FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -248,11 +257,12 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
             .await
             .unwrap();
     assert!(app_execute, "the runtime role executes the probe");
-    let migrator_usage: bool =
-        sqlx::query_scalar("SELECT has_schema_privilege(current_user, 'myelin_ci_security', 'USAGE')")
-            .fetch_one(&migrator)
-            .await
-            .unwrap();
+    let migrator_usage: bool = sqlx::query_scalar(
+        "SELECT has_schema_privilege(current_user, 'myelin_ci_security', 'USAGE')",
+    )
+    .fetch_one(&migrator)
+    .await
+    .unwrap();
     assert!(
         !migrator_usage,
         "the migration role must NOT retain standing access to the security schema - it adopts the \
@@ -289,7 +299,10 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
     );
     assert!(rp_secdef, "SECURITY DEFINER");
     assert_eq!(rp_volatility, "s", "STABLE");
-    assert_eq!(rp_rettype, "bigint", "the readiness probe returns an aggregate count");
+    assert_eq!(
+        rp_rettype, "bigint",
+        "the readiness probe returns an aggregate count"
+    );
     assert!(rp_body.contains("FROM public.job_queue"));
     assert!(rp_body.contains("state <> 'terminal'"));
     assert!(rp_body.contains("reservation_write_version IS DISTINCT FROM 2"));
@@ -336,7 +349,10 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
     .fetch_one(&migrator)
     .await
     .unwrap();
-    assert_eq!(rp_table_level, 0, "no table-level privilege on job_queue, only column grants");
+    assert_eq!(
+        rp_table_level, 0,
+        "no table-level privilege on job_queue, only column grants"
+    );
 
     let rp_oid: i64 = sqlx::query_scalar(
         "SELECT p.oid::bigint FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -352,14 +368,20 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
             .fetch_one(&migrator)
             .await
             .unwrap();
-    assert!(!rp_public_execute, "PUBLIC must never execute the readiness probe");
+    assert!(
+        !rp_public_execute,
+        "PUBLIC must never execute the readiness probe"
+    );
     let rp_app_execute: bool =
         sqlx::query_scalar("SELECT has_function_privilege('myelin_app', $1::oid, 'EXECUTE')")
             .bind(rp_oid)
             .fetch_one(&migrator)
             .await
             .unwrap();
-    assert!(rp_app_execute, "the runtime role executes the readiness probe");
+    assert!(
+        rp_app_execute,
+        "the runtime role executes the readiness probe"
+    );
 
     let before_oid = probe_oid;
     sqlx::query(
@@ -383,7 +405,10 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
     .fetch_one(&migrator)
     .await
     .unwrap();
-    assert_eq!(after_oid, before_oid, "the probe was ADOPTED, not recreated");
+    assert_eq!(
+        after_oid, before_oid,
+        "the probe was ADOPTED, not recreated"
+    );
     let ledger: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM myelin_applied_migration
           WHERE id='ci_0020h_ci_pipeline_version_backlog_probe'",
@@ -466,8 +491,13 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
         "the restored body is byte-identical to the original"
     );
 
-    seed_workflow_run(&admin, "fresh-live-v2", CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, "running")
-        .await;
+    seed_workflow_run(
+        &admin,
+        "fresh-live-v2",
+        CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+        "running",
+    )
+    .await;
     let app_direct: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM workflow_run WHERE wf_type='ci.pipeline' AND wf_version=$1",
     )
@@ -483,13 +513,23 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
     let probe_sees: bool = sqlx::query_scalar(
         "SELECT myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs($1)",
     )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .fetch_one(&app)
-        .await
-        .expect("the app role executes the probe");
-    assert!(probe_sees, "the probe must see the live v2 run database-wide");
+    .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+    .fetch_one(&app)
+    .await
+    .expect("the app role executes the probe");
+    assert!(
+        probe_sees,
+        "the probe must see the live v2 run database-wide"
+    );
 
-    seed_job_queue_row(&admin, "11111111-1111-1111-1111-111111111111", None, Some(2), "queued").await;
+    seed_job_queue_row(
+        &admin,
+        "11111111-1111-1111-1111-111111111111",
+        None,
+        Some(2),
+        "queued",
+    )
+    .await;
     let app_direct_jobs: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM job_queue WHERE state <> 'terminal' \
          AND (claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2)",
@@ -567,10 +607,10 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
     let probe_after: bool = sqlx::query_scalar(
         "SELECT myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs($1)",
     )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .fetch_one(&app)
-        .await
-        .unwrap();
+    .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+    .fetch_one(&app)
+    .await
+    .unwrap();
     assert!(!probe_after, "cancelling the run clears the backlog");
 
     factory

@@ -203,18 +203,10 @@ pub struct Sbom {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerificationFailure {
-    FloatingTag {
-        reference: String,
-    },
-    Unsigned {
-        component_digest: String,
-    },
-    SignatureMismatch {
-        component_digest: String,
-    },
-    NotInTransparencyLog {
-        component_digest: String,
-    },
+    FloatingTag { reference: String },
+    Unsigned { component_digest: String },
+    SignatureMismatch { component_digest: String },
+    NotInTransparencyLog { component_digest: String },
 }
 
 impl std::fmt::Display for VerificationFailure {

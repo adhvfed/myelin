@@ -13,9 +13,8 @@ use myelin_ci_controlplane::{
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
     ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
-    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL,
-    CREATE_LOG_SEGMENT_DDL,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -772,56 +771,56 @@ async fn region_a_runner_never_claims_region_b_job() {
     let cleanup_admin = admin.clone();
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let tenant = "tenantA";
-    create_schema(&admin, &schema).await;
-    let store = ci_job_queue_store(admin.clone());
-    let region_store = ci_region_queue_store_test_support(admin.clone());
+        let tenant = "tenantA";
+        create_schema(&admin, &schema).await;
+        let store = ci_job_queue_store(admin.clone());
+        let region_store = ci_region_queue_store_test_support(admin.clone());
 
-    let jb = enq(
-        tenant,
-        "de-fra",
-        "rb-job",
-        "rb-run",
-        TrustTier::Trusted,
-        &["linux"],
-        "idem-rb",
-    );
-    store.enqueue(&jb).await.expect("enqueue region-B job");
-    activate_job_owner(&admin, &jb).await;
+        let jb = enq(
+            tenant,
+            "de-fra",
+            "rb-job",
+            "rb-run",
+            TrustTier::Trusted,
+            &["linux"],
+            "idem-rb",
+        );
+        store.enqueue(&jb).await.expect("enqueue region-B job");
+        activate_job_owner(&admin, &jb).await;
 
-    let resolve: JobSpecResolver = Arc::new(|l: &LeasedJob| {
-        panic!(
-            "SECURITY BREACH: a region-A runner leased a region-B job {}!",
-            l.job_id
-        )
-    });
-    let adapter = DurableLeaseAdapter::new(
-        region_store,
-        store.clone(),
-        "fr-par",
-        tokio::runtime::Handle::current(),
-        resolve,
-    );
-    let claimed = adapter.claim_for_labels(
-        "fr-par-worker",
-        &["linux".to_string()],
-        &[TrustTier::Trusted],
-        &Region("fr-par".into()),
-        1000,
-        30,
-    );
-    assert!(
+        let resolve: JobSpecResolver = Arc::new(|l: &LeasedJob| {
+            panic!(
+                "SECURITY BREACH: a region-A runner leased a region-B job {}!",
+                l.job_id
+            )
+        });
+        let adapter = DurableLeaseAdapter::new(
+            region_store,
+            store.clone(),
+            "fr-par",
+            tokio::runtime::Handle::current(),
+            resolve,
+        );
+        let claimed = adapter.claim_for_labels(
+            "fr-par-worker",
+            &["linux".to_string()],
+            &[TrustTier::Trusted],
+            &Region("fr-par".into()),
+            1000,
+            30,
+        );
+        assert!(
         claimed.is_none(),
         "SECURITY(b): a region-A runner NEVER claims a region-B job (residency, no global pool)"
     );
-    let state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
-        .bind(uid("rb-job"))
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-    assert_eq!(state, "queued", "the region-B job stays queued");
+        let state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
+            .bind(uid("rb-job"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(state, "queued", "the region-B job stays queued");
 
-    println!("[CT-004c.2] PASS SECURITY(b): region isolation survives the durable adapter");
+        println!("[CT-004c.2] PASS SECURITY(b): region isolation survives the durable adapter");
     })
     .await;
 }

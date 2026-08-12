@@ -16,9 +16,7 @@ enum StartupRefusal {
     RunnerHostPreflight(String),
     InvalidWorkspaceMode(String),
     NonUnicodeWorkspaceMode(OsString),
-    NonTerminalNullStageBacklog {
-        count: i64,
-    },
+    NonTerminalNullStageBacklog { count: i64 },
     UnknownRunnerExecutionProfile(String),
     NonUnicodeRunnerExecutionProfiles(OsString),
     EmptyRunnerExecutionProfiles,
@@ -96,7 +94,9 @@ fn resolve_runner_execution_profiles(
 ) -> Result<Vec<myelin_ci_controlplane::CiExecutionProfileV1>, StartupRefusal> {
     let value = match setting {
         Err(std::env::VarError::NotPresent) => {
-            return Ok(vec![myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1]);
+            return Ok(vec![
+                myelin_ci_controlplane::CiExecutionProfileV1::LinuxSmallV1,
+            ]);
         }
         Err(std::env::VarError::NotUnicode(value)) => {
             return Err(StartupRefusal::NonUnicodeRunnerExecutionProfiles(value));
@@ -104,12 +104,18 @@ fn resolve_runner_execution_profiles(
         Ok(value) => value,
     };
     let mut profiles = Vec::new();
-    for token in value.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+    for token in value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
         match myelin_ci_controlplane::CiExecutionProfileV1::from_label(token) {
             Some(profile) if !profiles.contains(&profile) => profiles.push(profile),
             Some(_) => {}
             None => {
-                return Err(StartupRefusal::UnknownRunnerExecutionProfile(token.to_owned()));
+                return Err(StartupRefusal::UnknownRunnerExecutionProfile(
+                    token.to_owned(),
+                ));
             }
         }
     }
@@ -165,8 +171,8 @@ fn parse_workspace_activation_given(
             explicit_policy: None,
         });
     }
-    let required_absolute_path = |name: &'static str, value: Result<String, std::env::VarError>| {
-        match value {
+    let required_absolute_path =
+        |name: &'static str, value: Result<String, std::env::VarError>| match value {
             Ok(v) if !v.is_empty() => {
                 let path = std::path::PathBuf::from(&v);
                 if path.is_absolute() {
@@ -185,8 +191,7 @@ fn parse_workspace_activation_given(
             Err(std::env::VarError::NotUnicode(_)) => Err(StartupRefusal::RunnerHostPreflight(
                 format!("{name} must be valid Unicode"),
             )),
-        }
-    };
+        };
     let runsc_root = required_absolute_path(
         myelin_ci_sandbox::gvisor::ENV_EXPLICIT_USERNS_RUNSC_ROOT,
         explicit_userns_runsc_root(),
@@ -813,10 +818,9 @@ mod tests {
 
     #[test]
     fn runner_profiles_dedupe_and_ignore_blank_entries() {
-        let profiles = resolve_runner_execution_profiles(Ok(
-            " linux-build-v1 , , linux-build-v1 ".to_owned()
-        ))
-        .unwrap();
+        let profiles =
+            resolve_runner_execution_profiles(Ok(" linux-build-v1 , , linux-build-v1 ".to_owned()))
+                .unwrap();
         assert_eq!(profiles, vec![CiExecutionProfileV1::LinuxBuildV1]);
     }
 
@@ -956,8 +960,13 @@ mod tests {
         panic!("must not be read when MYELIN_CI_WORKSPACE_MODE is unset/disabled")
     }
 
-    fn valid_enabled_inputs() -> (EnvVarResult, EnvVarResult, EnvVarResult, EnvVarResult, EnvVarResult)
-    {
+    fn valid_enabled_inputs() -> (
+        EnvVarResult,
+        EnvVarResult,
+        EnvVarResult,
+        EnvVarResult,
+        EnvVarResult,
+    ) {
         (
             Ok("/opt/myelin/gvisor-runsc-root".to_owned()),
             Ok("/var/lib/myelin/userns-leases".to_owned()),
@@ -978,7 +987,9 @@ mod tests {
                 panics_if_called,
                 panics_if_called,
             )
-            .expect("unset/disabled mode must never fail, and must never read Enabled-only variables");
+            .expect(
+                "unset/disabled mode must never fail, and must never read Enabled-only variables",
+            );
             assert!(matches!(
                 parsed.workspace_config,
                 GvisorWorkspaceConfig::Disabled
@@ -998,8 +1009,13 @@ mod tests {
             panics_if_called,
         )
         .expect_err("a typo must never silently downgrade to Disabled");
-        assert_eq!(refusal, StartupRefusal::InvalidWorkspaceMode("enable".to_owned()));
-        assert!(refusal.to_string().contains("allowed values are `enabled`, `disabled`, or unset"));
+        assert_eq!(
+            refusal,
+            StartupRefusal::InvalidWorkspaceMode("enable".to_owned())
+        );
+        assert!(refusal
+            .to_string()
+            .contains("allowed values are `enabled`, `disabled`, or unset"));
     }
 
     #[cfg(unix)]
@@ -1022,8 +1038,7 @@ mod tests {
 
     #[test]
     fn enabled_mode_requires_every_variable() {
-        let (runsc_root, leases_dir, workspaces_dir, capacity, helper_dir) =
-            valid_enabled_inputs();
+        let (runsc_root, leases_dir, workspaces_dir, capacity, helper_dir) = valid_enabled_inputs();
         let cases: [(&str, EnvVarResult, EnvVarResult, EnvVarResult, EnvVarResult); 4] = [
             (
                 myelin_ci_sandbox::gvisor::ENV_EXPLICIT_USERNS_RUNSC_ROOT,
@@ -1143,8 +1158,15 @@ mod tests {
         let policy = parsed
             .explicit_policy
             .expect("Enabled mode must carry the explicit-userns preflight paths");
-        assert_eq!(policy.runsc_root, PathBuf::from("/opt/myelin/gvisor-runsc-root"));
-        assert_eq!(policy.helper_dir, PathBuf::from("/usr/bin"), "unset helper dir must default");
+        assert_eq!(
+            policy.runsc_root,
+            PathBuf::from("/opt/myelin/gvisor-runsc-root")
+        );
+        assert_eq!(
+            policy.helper_dir,
+            PathBuf::from("/usr/bin"),
+            "unset helper dir must default"
+        );
     }
 
     #[test]
@@ -1309,7 +1331,10 @@ mod tests {
             },
         )
         .expect_err("a parse failure must propagate directly");
-        assert_eq!(refusal, StartupRefusal::InvalidWorkspaceMode("enable".to_owned()));
+        assert_eq!(
+            refusal,
+            StartupRefusal::InvalidWorkspaceMode("enable".to_owned())
+        );
         assert!(!explicit_called.get());
         assert!(!rootless_called.get());
     }

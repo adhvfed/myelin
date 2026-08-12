@@ -13,10 +13,7 @@ pub const MAX_CI_JOB_CLAIM_WINDOW_SECS: u64 = CI_CHECKOUT_PARENT_ATTEMPT_EXECUTI
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiClaimWindowError {
     MalformedWorkspace(String),
-    TimeoutTooLong {
-        requested: u32,
-        ceiling: u32,
-    },
+    TimeoutTooLong { requested: u32, ceiling: u32 },
 }
 
 impl core::fmt::Display for CiClaimWindowError {

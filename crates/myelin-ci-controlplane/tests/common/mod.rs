@@ -46,11 +46,7 @@ impl SandboxBackend for LegacyStreamingGvisor<'_> {
     }
 }
 
-pub fn legacy_streaming_hooks(
-    real: RunnerHooks,
-    repo_ref: String,
-    commit: String,
-) -> RunnerHooks {
+pub fn legacy_streaming_hooks(real: RunnerHooks, repo_ref: String, commit: String) -> RunnerHooks {
     assert_eq!(
         real.completion_settlement_owner(),
         CompletionSettlementOwner::TerminalReporter
@@ -109,9 +105,7 @@ impl myelin_ci_sandbox::checkout_orchestration::AttemptAuthority
         panic!("compute must not seal a checkout preparation phase")
     }
 
-    fn renew_preparation_lease(
-        &self,
-    ) -> Result<(), myelin_ci_sandbox::PreparationLeaseLost> {
+    fn renew_preparation_lease(&self) -> Result<(), myelin_ci_sandbox::PreparationLeaseLost> {
         panic!("compute must not renew a checkout preparation lease")
     }
 
@@ -322,9 +316,7 @@ pub async fn with_fixture_migration_lock<Fut>(
         .await
         .expect("take the privilege-fixture advisory lock for migration");
 
-    let migrated = std::panic::AssertUnwindSafe(migrate())
-        .catch_unwind()
-        .await;
+    let migrated = std::panic::AssertUnwindSafe(migrate()).catch_unwind().await;
     let revoked = std::panic::AssertUnwindSafe(revoke_scheduler_grants(admin, schema))
         .catch_unwind()
         .await;
@@ -379,7 +371,10 @@ async fn revoke_scheduler_grants(admin: &PgPool, schema: &str) {
          END
          $revoke$;"
     );
-    admin.execute(statement.as_str()).await.unwrap_or_else(|error| {
-        panic!("revoke scheduler grants from fixture schema `{schema}`: {error}")
-    });
+    admin
+        .execute(statement.as_str())
+        .await
+        .unwrap_or_else(|error| {
+            panic!("revoke scheduler grants from fixture schema `{schema}`: {error}")
+        });
 }

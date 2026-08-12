@@ -851,8 +851,11 @@ build = {{ tool = "cargo", args = ["build", "--locked"] }}
             panic!("structured builds require the V2 wire")
         };
         assert!(plan.jobs.iter().all(|job| job.build.is_some()));
-        assert!(plan.jobs.iter().all(|job| job.selected_cargo_vendor.as_deref()
-            == Some(myelin_ci_sandbox::cargo_vendor_smoke_reference().as_str())));
+        assert!(plan
+            .jobs
+            .iter()
+            .all(|job| job.selected_cargo_vendor.as_deref()
+                == Some(myelin_ci_sandbox::cargo_vendor_smoke_reference().as_str())));
 
         let rejected = format!(
             "schema_version = 2\non = \"push\"\n[execution]\nprofile = \"linux-build-v1\"\n{}",

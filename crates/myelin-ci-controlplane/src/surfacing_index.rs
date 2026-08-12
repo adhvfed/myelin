@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use myelin_query::FieldType;
 use myelin_search::{IncrementalIndexer, IndexSpec, MockEmbeddingAdapter, ProjectFetcher};
 
-pub use myelin_ci_sandbox::replay::{CiReindexSource, CiReplayKind};
 pub use myelin_ci_sandbox::notif_rules::{
     ci_summary, register_ci_summary_templates, summary_template_key, CheckVerdict, CiSummary,
     CI_SUMMARY_TEMPLATES,
 };
+pub use myelin_ci_sandbox::replay::{CiReindexSource, CiReplayKind};
 
 pub const CI_SUBSYSTEM: &str = "ci";
 

@@ -135,9 +135,11 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         .all(|handle| handle.starts_with("ci-reserve:v2:10000000-0000-0000-0000-000000000001:")));
     let rows = reservation_rows(&admin, "personal").await;
     assert_eq!(rows.len(), 2);
-    assert!(rows.iter().all(|(run_id, amount, state)| *amount == 150_000_000
-        && state == "reserved"
-        && run_id.starts_with("ci-reserve:v2:")));
+    assert!(rows
+        .iter()
+        .all(|(run_id, amount, state)| *amount == 150_000_000
+            && state == "reserved"
+            && run_id.starts_with("ci-reserve:v2:")));
 
     sqlx::query(
         "UPDATE cost_reservation SET state = CASE run_id \

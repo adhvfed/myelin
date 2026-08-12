@@ -244,82 +244,82 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     let cleanup_admin = pool(&admin_url(), &schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let admin = pool(&admin_url(), &schema).await;
-    setup_schema(&admin, &schema).await;
-    let app = pool(&app_url(), &schema).await;
+        let admin = pool(&admin_url(), &schema).await;
+        setup_schema(&admin, &schema).await;
+        let app = pool(&app_url(), &schema).await;
 
-    let tenant = TenantId::from_token("acme-ct004f");
-    let region = Region::new("fr-par");
-    let run = uid("ct004f-run");
-    let workflow_run = uid("ct004f-workflow-run");
-    let job = uid("ct004f-job");
-    seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
+        let tenant = TenantId::from_token("acme-ct004f");
+        let region = Region::new("fr-par");
+        let run = uid("ct004f-run");
+        let workflow_run = uid("ct004f-workflow-run");
+        let job = uid("ct004f-job");
+        seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
 
-    let app_for_thread = app.clone();
-    let rt = tokio::runtime::Handle::current();
-    let (run_c, job_c, tenant_c, region_c) = (
-        workflow_run.clone(),
-        job.clone(),
-        tenant.clone(),
-        region.clone(),
-    );
-    let (live_tx, live_rx) = std::sync::mpsc::channel();
-    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
-    let runner = std::thread::spawn(move || {
-        let persist = DurableLogPersist::with_pg(app_for_thread, rt);
-        let sink = LogPipelineSink::new(region_c, Arc::new(FsBlobStore::new()), persist);
-        sink.ship_frame(
-            &run_c,
-            &job_c,
-            &tenant_c,
-            b"compiling crate\nrunning tests\nall green\n",
-        )
-        .expect("incremental checkpoint persists before finish");
-        live_tx.send(()).unwrap();
-        finish_rx.recv().unwrap();
-        sink.finish(&run_c, &job_c, &tenant_c, true)
-            .expect("terminal anchor persists");
-    });
+        let app_for_thread = app.clone();
+        let rt = tokio::runtime::Handle::current();
+        let (run_c, job_c, tenant_c, region_c) = (
+            workflow_run.clone(),
+            job.clone(),
+            tenant.clone(),
+            region.clone(),
+        );
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let persist = DurableLogPersist::with_pg(app_for_thread, rt);
+            let sink = LogPipelineSink::new(region_c, Arc::new(FsBlobStore::new()), persist);
+            sink.ship_frame(
+                &run_c,
+                &job_c,
+                &tenant_c,
+                b"compiling crate\nrunning tests\nall green\n",
+            )
+            .expect("incremental checkpoint persists before finish");
+            live_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            sink.finish(&run_c, &job_c, &tenant_c, true)
+                .expect("terminal anchor persists");
+        });
 
-    live_rx.recv().expect("live checkpoint committed");
-    let (live_segments, live_status, live_byte_end, live_dangling) =
-        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert_eq!(live_segments, 1, "one segment is visible before finish");
-    assert_eq!(live_status, "running");
-    assert_eq!(
-        live_byte_end, None,
-        "the job has not reached terminal finish"
-    );
-    assert_eq!(live_dangling, 0);
-    assert_eq!(
-        outbox_count(&app, &run, &job).await,
-        1,
-        "the live pointer co-committed with the segment"
-    );
-    finish_tx.send(()).unwrap();
-    runner.join().expect("the runner thread joins");
+        live_rx.recv().expect("live checkpoint committed");
+        let (live_segments, live_status, live_byte_end, live_dangling) =
+            read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+        assert_eq!(live_segments, 1, "one segment is visible before finish");
+        assert_eq!(live_status, "running");
+        assert_eq!(
+            live_byte_end, None,
+            "the job has not reached terminal finish"
+        );
+        assert_eq!(live_dangling, 0);
+        assert_eq!(
+            outbox_count(&app, &run, &job).await,
+            1,
+            "the live pointer co-committed with the segment"
+        );
+        finish_tx.send(()).unwrap();
+        runner.join().expect("the runner thread joins");
 
-    let (seg_count, status, byte_end, dangling) =
-        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert!(
-        seg_count >= 1,
-        "at least one sealed segment landed (got {seg_count})"
-    );
-    assert_eq!(status, "passed", "the step anchor closed as passed");
-    assert!(
-        byte_end.is_some(),
-        "the finished step's anchor is closed (byte_end set)"
-    );
-    assert_eq!(
-        dangling, 0,
-        "0 dangling anchors - every anchor's span is within the sealed bytes"
-    );
-    assert!(
-        outbox_count(&app, &run, &job).await >= 1,
-        "a ci.log.available pointer landed in the outbox (co-committed with the index)"
-    );
-    app.close().await;
-    admin.close().await;
+        let (seg_count, status, byte_end, dangling) =
+            read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+        assert!(
+            seg_count >= 1,
+            "at least one sealed segment landed (got {seg_count})"
+        );
+        assert_eq!(status, "passed", "the step anchor closed as passed");
+        assert!(
+            byte_end.is_some(),
+            "the finished step's anchor is closed (byte_end set)"
+        );
+        assert_eq!(
+            dangling, 0,
+            "0 dangling anchors - every anchor's span is within the sealed bytes"
+        );
+        assert!(
+            outbox_count(&app, &run, &job).await >= 1,
+            "a ci.log.available pointer landed in the outbox (co-committed with the index)"
+        );
+        app.close().await;
+        admin.close().await;
     })
     .await;
 }
@@ -330,90 +330,90 @@ async fn retried_sink_appends_after_the_committed_live_prefix() {
     let cleanup_admin = pool(&admin_url(), &schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let admin = pool(&admin_url(), &schema).await;
-    setup_schema(&admin, &schema).await;
-    let app = pool(&app_url(), &schema).await;
+        let admin = pool(&admin_url(), &schema).await;
+        setup_schema(&admin, &schema).await;
+        let app = pool(&app_url(), &schema).await;
 
-    let tenant = TenantId::from_token("acme-ct004f-resume");
-    let region = Region::new("fr-par");
-    let run = uid("ct004f-resume-run");
-    let workflow_run = uid("ct004f-resume-workflow-run");
-    let job = uid("ct004f-resume-job");
-    seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
-    let app_for_thread = app.clone();
-    let rt = tokio::runtime::Handle::current();
-    let blobs = Arc::new(FsBlobStore::new());
-    let (tenant_c, region_c, run_c, job_c) =
-        (tenant.clone(), region.clone(), workflow_run, job.clone());
+        let tenant = TenantId::from_token("acme-ct004f-resume");
+        let region = Region::new("fr-par");
+        let run = uid("ct004f-resume-run");
+        let workflow_run = uid("ct004f-resume-workflow-run");
+        let job = uid("ct004f-resume-job");
+        seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
+        let app_for_thread = app.clone();
+        let rt = tokio::runtime::Handle::current();
+        let blobs = Arc::new(FsBlobStore::new());
+        let (tenant_c, region_c, run_c, job_c) =
+            (tenant.clone(), region.clone(), workflow_run, job.clone());
 
-    std::thread::spawn(move || {
-        let first = LogPipelineSink::new(
-            region_c.clone(),
-            blobs.clone(),
-            DurableLogPersist::with_pg(app_for_thread.clone(), rt.clone()),
-        );
-        first
-            .ship_frame(&run_c, &job_c, &tenant_c, b"attempt-one\n")
-            .expect("first attempt commits its live prefix");
-        drop(first);
+        std::thread::spawn(move || {
+            let first = LogPipelineSink::new(
+                region_c.clone(),
+                blobs.clone(),
+                DurableLogPersist::with_pg(app_for_thread.clone(), rt.clone()),
+            );
+            first
+                .ship_frame(&run_c, &job_c, &tenant_c, b"attempt-one\n")
+                .expect("first attempt commits its live prefix");
+            drop(first);
 
-        let retry = LogPipelineSink::new(
-            region_c,
-            blobs,
-            DurableLogPersist::with_pg(app_for_thread, rt),
-        );
-        retry
-            .ship_frame(&run_c, &job_c, &tenant_c, b"attempt-two\n")
-            .expect("retry recovers and appends after the durable head");
-        retry
-            .finish(&run_c, &job_c, &tenant_c, true)
-            .expect("retry reaches terminal");
-    })
-    .join()
-    .expect("retry runner thread joins");
-
-    let mut conn = app.acquire().await.unwrap();
-    sqlx::query(
-        "SELECT set_config('myelin.tenant_id', $1, false), \
-                set_config('myelin.region', $2, false)",
-    )
-    .bind(tenant.as_str())
-    .bind(region.as_str())
-    .execute(&mut *conn)
-    .await
-    .unwrap();
-    let rows = sqlx::query(
-        "SELECT segment_seq, byte_start, byte_end FROM log_segment \
-         WHERE run_id = $1::uuid AND job_id = $2::uuid ORDER BY segment_seq",
-    )
-    .bind(&run)
-    .bind(&job)
-    .fetch_all(&mut *conn)
-    .await
-    .unwrap();
-    let coordinates: Vec<(i32, i64, i64)> = rows
-        .iter()
-        .map(|row| {
-            (
-                row.get("segment_seq"),
-                row.get("byte_start"),
-                row.get("byte_end"),
-            )
+            let retry = LogPipelineSink::new(
+                region_c,
+                blobs,
+                DurableLogPersist::with_pg(app_for_thread, rt),
+            );
+            retry
+                .ship_frame(&run_c, &job_c, &tenant_c, b"attempt-two\n")
+                .expect("retry recovers and appends after the durable head");
+            retry
+                .finish(&run_c, &job_c, &tenant_c, true)
+                .expect("retry reaches terminal");
         })
-        .collect();
-    assert_eq!(
-        coordinates,
-        vec![(0, 0, 12), (1, 12, 24)],
-        "retry appends without overwriting or opening a byte/sequence gap"
-    );
-    drop(conn);
-    let (_, status, byte_end, dangling) =
-        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert_eq!(status, "passed");
-    assert_eq!(byte_end, Some(24));
-    assert_eq!(dangling, 0);
-    app.close().await;
-    admin.close().await;
+        .join()
+        .expect("retry runner thread joins");
+
+        let mut conn = app.acquire().await.unwrap();
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, false), \
+                set_config('myelin.region', $2, false)",
+        )
+        .bind(tenant.as_str())
+        .bind(region.as_str())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let rows = sqlx::query(
+            "SELECT segment_seq, byte_start, byte_end FROM log_segment \
+         WHERE run_id = $1::uuid AND job_id = $2::uuid ORDER BY segment_seq",
+        )
+        .bind(&run)
+        .bind(&job)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        let coordinates: Vec<(i32, i64, i64)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get("segment_seq"),
+                    row.get("byte_start"),
+                    row.get("byte_end"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            coordinates,
+            vec![(0, 0, 12), (1, 12, 24)],
+            "retry appends without overwriting or opening a byte/sequence gap"
+        );
+        drop(conn);
+        let (_, status, byte_end, dangling) =
+            read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+        assert_eq!(status, "passed");
+        assert_eq!(byte_end, Some(24));
+        assert_eq!(dangling, 0);
+        app.close().await;
+        admin.close().await;
     })
     .await;
 }
@@ -424,45 +424,21 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
     let cleanup_admin = pool(&admin_url(), &schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let admin = pool(&admin_url(), &schema).await;
-    setup_schema(&admin, &schema).await;
-    let app = pool(&app_url(), &schema).await;
+        let admin = pool(&admin_url(), &schema).await;
+        setup_schema(&admin, &schema).await;
+        let app = pool(&app_url(), &schema).await;
 
-    let tenant = TenantId::from_token("acme-ct004f-concurrent-resume");
-    let region = Region::new("fr-par");
-    let run = uid("ct004f-concurrent-resume-run");
-    let workflow_run = uid("ct004f-concurrent-resume-workflow-run");
-    let job = uid("ct004f-concurrent-resume-job");
-    seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
-    let rt = tokio::runtime::Handle::current();
-    let blobs = Arc::new(FsBlobStore::new());
-    let prefix = b"prefix\n";
+        let tenant = TenantId::from_token("acme-ct004f-concurrent-resume");
+        let region = Region::new("fr-par");
+        let run = uid("ct004f-concurrent-resume-run");
+        let workflow_run = uid("ct004f-concurrent-resume-workflow-run");
+        let job = uid("ct004f-concurrent-resume-job");
+        seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
+        let rt = tokio::runtime::Handle::current();
+        let blobs = Arc::new(FsBlobStore::new());
+        let prefix = b"prefix\n";
 
-    {
-        let app = app.clone();
-        let tenant = tenant.clone();
-        let region = region.clone();
-        let run = workflow_run.clone();
-        let job = job.clone();
-        let blobs = blobs.clone();
-        let rt = rt.clone();
-        std::thread::spawn(move || {
-            let sink = LogPipelineSink::new(region, blobs, DurableLogPersist::with_pg(app, rt));
-            sink.ship_frame(&run, &job, &tenant, prefix)
-                .expect("the common prefix commits");
-        })
-        .join()
-        .expect("prefix writer joins");
-    }
-
-    let both_resumed = Arc::new(Barrier::new(2));
-    let attempts = [
-        ("alpha", b"alpha\n".as_slice()),
-        ("beta-long", b"beta-long\n".as_slice()),
-    ];
-    let handles: Vec<_> = attempts
-        .into_iter()
-        .map(|(name, bytes)| {
+        {
             let app = app.clone();
             let tenant = tenant.clone();
             let region = region.clone();
@@ -470,133 +446,157 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
             let job = job.clone();
             let blobs = blobs.clone();
             let rt = rt.clone();
-            let both_resumed = both_resumed.clone();
             std::thread::spawn(move || {
-                let sink = LogPipelineSink::new(
-                    region,
-                    blobs,
-                    SynchronizedResumePersist {
-                        inner: DurableLogPersist::with_pg(app, rt),
-                        both_resumed,
-                    },
-                );
-                (
-                    name,
-                    bytes.len() as i64,
-                    sink.ship_frame(&run, &job, &tenant, bytes),
-                )
+                let sink = LogPipelineSink::new(region, blobs, DurableLogPersist::with_pg(app, rt));
+                sink.ship_frame(&run, &job, &tenant, prefix)
+                    .expect("the common prefix commits");
             })
-        })
-        .collect();
-    let results: Vec<_> = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("concurrent writer joins"))
-        .collect();
-    let winners: Vec<_> = results
-        .iter()
-        .filter(|(_, _, result)| result.is_ok())
-        .collect();
-    let losers: Vec<_> = results
-        .iter()
-        .filter(|(_, _, result)| result.is_err())
-        .collect();
-    assert_eq!(winners.len(), 1, "exactly one stale candidate may append");
-    assert_eq!(losers.len(), 1, "the competing stale candidate is refused");
-    assert!(
-        losers[0]
-            .2
-            .as_ref()
-            .unwrap_err()
-            .contains("immutable committed segment"),
-        "the refusal names immutable-prefix divergence: {:?}",
-        losers[0].2
-    );
+            .join()
+            .expect("prefix writer joins");
+        }
 
-    let mut conn = app.acquire().await.unwrap();
-    sqlx::query(
-        "SELECT set_config('myelin.tenant_id', $1, false), \
-                set_config('myelin.region', $2, false)",
-    )
-    .bind(tenant.as_str())
-    .bind(region.as_str())
-    .execute(&mut *conn)
-    .await
-    .unwrap();
-    let rows = sqlx::query(
-        "SELECT segment_seq, byte_start, byte_end FROM log_segment \
-         WHERE run_id = $1::uuid AND job_id = $2::uuid ORDER BY segment_seq",
-    )
-    .bind(&run)
-    .bind(&job)
-    .fetch_all(&mut *conn)
-    .await
-    .unwrap();
-    assert_eq!(rows.len(), 2, "the losing retry created no third segment");
-    assert_eq!(rows[0].get::<i32, _>("segment_seq"), 0);
-    assert_eq!(rows[0].get::<i64, _>("byte_start"), 0);
-    assert_eq!(rows[0].get::<i64, _>("byte_end"), prefix.len() as i64);
-    assert_eq!(rows[1].get::<i32, _>("segment_seq"), 1);
-    assert_eq!(rows[1].get::<i64, _>("byte_start"), prefix.len() as i64);
-    assert_eq!(
-        rows[1].get::<i64, _>("byte_end"),
-        prefix.len() as i64 + winners[0].1,
-        "the committed winner remains authoritative; the later loser cannot overwrite it"
-    );
-    drop(conn);
-
-    let app_for_finish = app.clone();
-    let tenant_for_finish = tenant.clone();
-    let region_for_finish = region.clone();
-    let run_for_finish = workflow_run;
-    let job_for_finish = job.clone();
-    std::thread::spawn(move || {
-        let sink = LogPipelineSink::new(
-            region_for_finish,
-            blobs,
-            DurableLogPersist::with_pg(app_for_finish, rt),
+        let both_resumed = Arc::new(Barrier::new(2));
+        let attempts = [
+            ("alpha", b"alpha\n".as_slice()),
+            ("beta-long", b"beta-long\n".as_slice()),
+        ];
+        let handles: Vec<_> = attempts
+            .into_iter()
+            .map(|(name, bytes)| {
+                let app = app.clone();
+                let tenant = tenant.clone();
+                let region = region.clone();
+                let run = workflow_run.clone();
+                let job = job.clone();
+                let blobs = blobs.clone();
+                let rt = rt.clone();
+                let both_resumed = both_resumed.clone();
+                std::thread::spawn(move || {
+                    let sink = LogPipelineSink::new(
+                        region,
+                        blobs,
+                        SynchronizedResumePersist {
+                            inner: DurableLogPersist::with_pg(app, rt),
+                            both_resumed,
+                        },
+                    );
+                    (
+                        name,
+                        bytes.len() as i64,
+                        sink.ship_frame(&run, &job, &tenant, bytes),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("concurrent writer joins"))
+            .collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, _, result)| result.is_ok())
+            .collect();
+        let losers: Vec<_> = results
+            .iter()
+            .filter(|(_, _, result)| result.is_err())
+            .collect();
+        assert_eq!(winners.len(), 1, "exactly one stale candidate may append");
+        assert_eq!(losers.len(), 1, "the competing stale candidate is refused");
+        assert!(
+            losers[0]
+                .2
+                .as_ref()
+                .unwrap_err()
+                .contains("immutable committed segment"),
+            "the refusal names immutable-prefix divergence: {:?}",
+            losers[0].2
         );
-        sink.finish(&run_for_finish, &job_for_finish, &tenant_for_finish, true)
-            .expect("the serialized winner can close the terminal anchor");
-    })
-    .join()
-    .expect("terminal writer joins");
 
-    let stale = FlushedJobLogs {
-        run_id: run.clone(),
-        job_id: job.clone(),
-        segments: vec![],
-        anchors: vec![LogAnchorRow {
-            tenant_id: tenant.as_str().to_string(),
-            region: region.as_str().to_string(),
+        let mut conn = app.acquire().await.unwrap();
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id', $1, false), \
+                set_config('myelin.region', $2, false)",
+        )
+        .bind(tenant.as_str())
+        .bind(region.as_str())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let rows = sqlx::query(
+            "SELECT segment_seq, byte_start, byte_end FROM log_segment \
+         WHERE run_id = $1::uuid AND job_id = $2::uuid ORDER BY segment_seq",
+        )
+        .bind(&run)
+        .bind(&job)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "the losing retry created no third segment");
+        assert_eq!(rows[0].get::<i32, _>("segment_seq"), 0);
+        assert_eq!(rows[0].get::<i64, _>("byte_start"), 0);
+        assert_eq!(rows[0].get::<i64, _>("byte_end"), prefix.len() as i64);
+        assert_eq!(rows[1].get::<i32, _>("segment_seq"), 1);
+        assert_eq!(rows[1].get::<i64, _>("byte_start"), prefix.len() as i64);
+        assert_eq!(
+            rows[1].get::<i64, _>("byte_end"),
+            prefix.len() as i64 + winners[0].1,
+            "the committed winner remains authoritative; the later loser cannot overwrite it"
+        );
+        drop(conn);
+
+        let app_for_finish = app.clone();
+        let tenant_for_finish = tenant.clone();
+        let region_for_finish = region.clone();
+        let run_for_finish = workflow_run;
+        let job_for_finish = job.clone();
+        std::thread::spawn(move || {
+            let sink = LogPipelineSink::new(
+                region_for_finish,
+                blobs,
+                DurableLogPersist::with_pg(app_for_finish, rt),
+            );
+            sink.finish(&run_for_finish, &job_for_finish, &tenant_for_finish, true)
+                .expect("the serialized winner can close the terminal anchor");
+        })
+        .join()
+        .expect("terminal writer joins");
+
+        let stale = FlushedJobLogs {
             run_id: run.clone(),
             job_id: job.clone(),
-            step_id: SINGLE_STEP_ID.into(),
-            byte_start: 0,
-            byte_end: None,
-            status: AnchorStatus::Running,
-        }],
-        pointers: vec![],
-    };
-    let app_for_stale = app.clone();
-    let tenant_for_stale = tenant.clone();
-    let rt_for_stale = tokio::runtime::Handle::current();
-    let stale_error = std::thread::spawn(move || {
-        DurableLogPersist::with_pg(app_for_stale, rt_for_stale)
-            .persist(&tenant_for_stale, stale)
-            .expect_err("a stale running checkpoint cannot regress a terminal anchor")
-            .to_string()
-    })
-    .join()
-    .expect("stale writer joins");
-    assert!(
-        stale_error.contains("immutable terminal checkpoint"),
-        "{stale_error}"
-    );
-    let (_, status, _, _) = read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert_eq!(status, "passed", "terminal anchor state is monotone");
+            segments: vec![],
+            anchors: vec![LogAnchorRow {
+                tenant_id: tenant.as_str().to_string(),
+                region: region.as_str().to_string(),
+                run_id: run.clone(),
+                job_id: job.clone(),
+                step_id: SINGLE_STEP_ID.into(),
+                byte_start: 0,
+                byte_end: None,
+                status: AnchorStatus::Running,
+            }],
+            pointers: vec![],
+        };
+        let app_for_stale = app.clone();
+        let tenant_for_stale = tenant.clone();
+        let rt_for_stale = tokio::runtime::Handle::current();
+        let stale_error = std::thread::spawn(move || {
+            DurableLogPersist::with_pg(app_for_stale, rt_for_stale)
+                .persist(&tenant_for_stale, stale)
+                .expect_err("a stale running checkpoint cannot regress a terminal anchor")
+                .to_string()
+        })
+        .join()
+        .expect("stale writer joins");
+        assert!(
+            stale_error.contains("immutable terminal checkpoint"),
+            "{stale_error}"
+        );
+        let (_, status, _, _) = read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+        assert_eq!(status, "passed", "terminal anchor state is monotone");
 
-    app.close().await;
-    admin.close().await;
+        app.close().await;
+        admin.close().await;
     })
     .await;
 }
@@ -607,79 +607,79 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     let cleanup_admin = pool(&admin_url(), &schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let admin = pool(&admin_url(), &schema).await;
-    setup_schema(&admin, &schema).await;
-    let app = pool(&app_url(), &schema).await;
+        let admin = pool(&admin_url(), &schema).await;
+        setup_schema(&admin, &schema).await;
+        let app = pool(&app_url(), &schema).await;
 
-    let tenant = TenantId::from_token("acme-ct004f-idem");
-    let region = Region::new("fr-par");
-    let run = uid("ct004f-idem-run");
-    let job = uid("ct004f-idem-job");
+        let tenant = TenantId::from_token("acme-ct004f-idem");
+        let region = Region::new("fr-par");
+        let run = uid("ct004f-idem-run");
+        let job = uid("ct004f-idem-job");
 
-    let flushed = {
-        let mut p = LogPipeline::new(
-            tenant.clone(),
-            region.clone(),
-            FsBlobStore::new(),
-            SecretRedactor::default(),
-        )
-        .with_thresholds(
-            CoalesceBudget::default(),
-            SealThreshold { seal_at_bytes: 8 },
+        let flushed = {
+            let mut p = LogPipeline::new(
+                tenant.clone(),
+                region.clone(),
+                FsBlobStore::new(),
+                SecretRedactor::default(),
+            )
+            .with_thresholds(
+                CoalesceBudget::default(),
+                SealThreshold { seal_at_bytes: 8 },
+            );
+            let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
+            for _ in 0..5 {
+                p.ship_line(&coord, "0123456789").expect("ship");
+            }
+            p.close_step(&coord, AnchorStatus::Passed).expect("close");
+            p.flush_job(&run, &job, SINGLE_STEP_ID).expect("flush");
+            FlushedJobLogs {
+                run_id: run.clone(),
+                job_id: job.clone(),
+                segments: p.segment_rows().to_vec(),
+                anchors: p.anchor_rows().into_iter().cloned().collect(),
+                pointers: p.drain_pointers(),
+            }
+        };
+        assert!(
+            flushed.segments.len() >= 2,
+            "multiple segments to exercise the PK"
         );
-        let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
-        for _ in 0..5 {
-            p.ship_line(&coord, "0123456789").expect("ship");
-        }
-        p.close_step(&coord, AnchorStatus::Passed).expect("close");
-        p.flush_job(&run, &job, SINGLE_STEP_ID).expect("flush");
-        FlushedJobLogs {
-            run_id: run.clone(),
-            job_id: job.clone(),
-            segments: p.segment_rows().to_vec(),
-            anchors: p.anchor_rows().into_iter().cloned().collect(),
-            pointers: p.drain_pointers(),
-        }
-    };
-    assert!(
-        flushed.segments.len() >= 2,
-        "multiple segments to exercise the PK"
-    );
 
-    let app_for_thread = app.clone();
-    let rt = tokio::runtime::Handle::current();
-    let (t1, f1) = (tenant.clone(), flushed.clone());
-    let (t2, f2) = (tenant.clone(), flushed.clone());
-    std::thread::spawn(move || {
-        let persist = DurableLogPersist::with_pg(app_for_thread, rt);
-        persist.persist(&t1, f1).expect("first persist");
-        persist
-            .persist(&t2, f2)
-            .expect("re-delivered persist (idempotent)");
-    })
-    .join()
-    .expect("the persist thread joins");
+        let app_for_thread = app.clone();
+        let rt = tokio::runtime::Handle::current();
+        let (t1, f1) = (tenant.clone(), flushed.clone());
+        let (t2, f2) = (tenant.clone(), flushed.clone());
+        std::thread::spawn(move || {
+            let persist = DurableLogPersist::with_pg(app_for_thread, rt);
+            persist.persist(&t1, f1).expect("first persist");
+            persist
+                .persist(&t2, f2)
+                .expect("re-delivered persist (idempotent)");
+        })
+        .join()
+        .expect("the persist thread joins");
 
-    let (seg_count, status, _byte_end, dangling) =
-        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert_eq!(
-        seg_count as usize,
-        flushed.segments.len(),
-        "re-delivery did NOT duplicate segment rows (ON CONFLICT upsert)"
-    );
-    assert_eq!(status, "passed");
-    assert_eq!(dangling, 0);
-    assert_eq!(
-        outbox_count(&app, &run, &job).await as usize,
-        flushed.pointers.len(),
-        "re-delivery did NOT duplicate ci.log.available outbox rows"
-    );
-    assert!(
-        !flushed.pointers.is_empty(),
-        "the flush produced at least one pointer"
-    );
-    app.close().await;
-    admin.close().await;
+        let (seg_count, status, _byte_end, dangling) =
+            read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+        assert_eq!(
+            seg_count as usize,
+            flushed.segments.len(),
+            "re-delivery did NOT duplicate segment rows (ON CONFLICT upsert)"
+        );
+        assert_eq!(status, "passed");
+        assert_eq!(dangling, 0);
+        assert_eq!(
+            outbox_count(&app, &run, &job).await as usize,
+            flushed.pointers.len(),
+            "re-delivery did NOT duplicate ci.log.available outbox rows"
+        );
+        assert!(
+            !flushed.pointers.is_empty(),
+            "the flush produced at least one pointer"
+        );
+        app.close().await;
+        admin.close().await;
     })
     .await;
 }
@@ -690,76 +690,76 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
     let cleanup_admin = pool(&admin_url(), &schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let admin = pool(&admin_url(), &schema).await;
-    setup_schema(&admin, &schema).await;
-    let app = pool(&app_url(), &schema).await;
+        let admin = pool(&admin_url(), &schema).await;
+        setup_schema(&admin, &schema).await;
+        let app = pool(&app_url(), &schema).await;
 
-    let tenant = TenantId::from_token("acme-ct004f-coalesce");
-    let region = Region::new("fr-par");
-    let run = uid("ct004f-coalesce-run");
-    let job = uid("ct004f-coalesce-job");
+        let tenant = TenantId::from_token("acme-ct004f-coalesce");
+        let region = Region::new("fr-par");
+        let run = uid("ct004f-coalesce-run");
+        let job = uid("ct004f-coalesce-job");
 
-    let flushed = {
-        let mut p = LogPipeline::new(
-            tenant.clone(),
-            region.clone(),
-            FsBlobStore::new(),
-            SecretRedactor::default(),
-        )
-        .with_thresholds(
-            CoalesceBudget {
-                bytes_per_pointer: 10,
-            },
-            SealThreshold {
-                seal_at_bytes: 1_000_000,
-            },
+        let flushed = {
+            let mut p = LogPipeline::new(
+                tenant.clone(),
+                region.clone(),
+                FsBlobStore::new(),
+                SecretRedactor::default(),
+            )
+            .with_thresholds(
+                CoalesceBudget {
+                    bytes_per_pointer: 10,
+                },
+                SealThreshold {
+                    seal_at_bytes: 1_000_000,
+                },
+            );
+            let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
+            for _ in 0..4 {
+                p.ship_line(&coord, "0123456789").expect("ship");
+            }
+            p.close_step(&coord, AnchorStatus::Passed).expect("close");
+            let pointers = p.drain_pointers();
+            assert!(
+                pointers.iter().any(|pt| pt.segment_ref.is_none()),
+                "a coalesce pointer with NO sealed-segment ref was produced"
+            );
+            FlushedJobLogs {
+                run_id: run.clone(),
+                job_id: job.clone(),
+                segments: p.segment_rows().to_vec(),
+                anchors: p.anchor_rows().into_iter().cloned().collect(),
+                pointers,
+            }
+        };
+        let pointer_count = flushed.pointers.len();
+
+        let app_for_thread = app.clone();
+        let rt = tokio::runtime::Handle::current();
+        let (t1, f1) = (tenant.clone(), flushed);
+        std::thread::spawn(move || {
+            let persist = DurableLogPersist::with_pg(app_for_thread, rt);
+            persist
+                .persist(&t1, f1)
+                .expect("persist the coalesce-only index");
+        })
+        .join()
+        .expect("the persist thread joins");
+
+        assert_eq!(
+            outbox_count(&app, &run, &job).await as usize,
+            pointer_count,
+            "the coalesce pointer(s) landed in the outbox"
         );
-        let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
-        for _ in 0..4 {
-            p.ship_line(&coord, "0123456789").expect("ship");
-        }
-        p.close_step(&coord, AnchorStatus::Passed).expect("close");
-        let pointers = p.drain_pointers();
-        assert!(
-            pointers.iter().any(|pt| pt.segment_ref.is_none()),
-            "a coalesce pointer with NO sealed-segment ref was produced"
+        let (_seg, status, byte_end, _dangling) =
+            read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
+        assert_eq!(
+            status, "passed",
+            "the anchor closed even with no sealed segment"
         );
-        FlushedJobLogs {
-            run_id: run.clone(),
-            job_id: job.clone(),
-            segments: p.segment_rows().to_vec(),
-            anchors: p.anchor_rows().into_iter().cloned().collect(),
-            pointers,
-        }
-    };
-    let pointer_count = flushed.pointers.len();
-
-    let app_for_thread = app.clone();
-    let rt = tokio::runtime::Handle::current();
-    let (t1, f1) = (tenant.clone(), flushed);
-    std::thread::spawn(move || {
-        let persist = DurableLogPersist::with_pg(app_for_thread, rt);
-        persist
-            .persist(&t1, f1)
-            .expect("persist the coalesce-only index");
-    })
-    .join()
-    .expect("the persist thread joins");
-
-    assert_eq!(
-        outbox_count(&app, &run, &job).await as usize,
-        pointer_count,
-        "the coalesce pointer(s) landed in the outbox"
-    );
-    let (_seg, status, byte_end, _dangling) =
-        read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
-    assert_eq!(
-        status, "passed",
-        "the anchor closed even with no sealed segment"
-    );
-    assert!(byte_end.is_some());
-    app.close().await;
-    admin.close().await;
+        assert!(byte_end.is_some());
+        app.close().await;
+        admin.close().await;
     })
     .await;
 }

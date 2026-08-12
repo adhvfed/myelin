@@ -59,9 +59,11 @@ pub const CI_RESIDUAL_POSTURE_REF: &str =
 pub type CiHolderRegistration = HolderRegistration;
 
 pub fn ci_store_classifier() -> StoreClassifier {
-    StoreClassifier::of([
-        myelin_substrate::StoreHolder::new(StoreKind::Oltp, CI_OLTP_STORE, Holder::H2Ci),
-    ])
+    StoreClassifier::of([myelin_substrate::StoreHolder::new(
+        StoreKind::Oltp,
+        CI_OLTP_STORE,
+        Holder::H2Ci,
+    )])
 }
 
 pub fn register_ci_holders() -> HolderRegistry {

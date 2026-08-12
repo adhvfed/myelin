@@ -277,8 +277,7 @@ impl FleetAdapter for GenericEuIaasAdapter {
             .collect()
     }
 
-    fn deprovision_hosts(&self, _host_ids: &[String]) {
-    }
+    fn deprovision_hosts(&self, _host_ids: &[String]) {}
 }
 
 #[derive(Clone, Debug, Default)]
@@ -295,8 +294,7 @@ impl FleetAdapter for BareMetalPxeAdapter {
             .collect()
     }
 
-    fn deprovision_hosts(&self, _host_ids: &[String]) {
-    }
+    fn deprovision_hosts(&self, _host_ids: &[String]) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -592,8 +590,7 @@ mod tests {
 
     #[test]
     fn autoscale_tracks_queue_depth_and_scales_to_zero_at_idle() {
-        let policy =
-            AutoscalePolicy::new( 2,  0,  20);
+        let policy = AutoscalePolicy::new(2, 0, 20);
 
         assert_eq!(policy.target(0, 0), 0, "idle → 0 (scale-to-zero)");
 
@@ -606,7 +603,7 @@ mod tests {
 
         assert_eq!(policy.target(100, 0), 20, "capped at max=20");
 
-        let warm = AutoscalePolicy::new(1,  2, 20);
+        let warm = AutoscalePolicy::new(1, 2, 20);
         assert_eq!(warm.target(0, 0), 2, "idle but min_warm=2 keeps 2 hot");
     }
 
@@ -614,8 +611,7 @@ mod tests {
     fn prewarm_buffer_is_sized_from_the_measured_arrival_rate() {
         let ci_surge = myelin_substrate::thresholds::CiSurge::default();
 
-        let busy =
-            AutoscalePolicy::from_measured_arrival_rate(&ci_surge,  100, 0, 200);
+        let busy = AutoscalePolicy::from_measured_arrival_rate(&ci_surge, 100, 0, 200);
         assert_eq!(
             busy.warm_buffer, 10,
             "10% of a 100-arrival rate = a 10-VM warm buffer"
@@ -626,16 +622,13 @@ mod tests {
             "5 queued + 10 warm (sized to the arrival rate)"
         );
 
-        let idle =
-            AutoscalePolicy::from_measured_arrival_rate(&ci_surge,  0, 0, 200);
+        let idle = AutoscalePolicy::from_measured_arrival_rate(&ci_surge, 0, 0, 200);
         assert_eq!(
             idle.warm_buffer, 0,
             "an idle pool pre-warms nothing (scale-to-zero ready)"
         );
 
-        let burst = AutoscalePolicy::from_measured_arrival_rate(
-            &ci_surge,  100_000, 0, 200,
-        );
+        let burst = AutoscalePolicy::from_measured_arrival_rate(&ci_surge, 100_000, 0, 200);
         assert_eq!(
             burst.warm_buffer, 16,
             "the warm buffer is clamped at the per-VM-memory ceiling"
@@ -647,32 +640,20 @@ mod tests {
         let auto = Autoscaler::new(AutoscalePolicy::new(1, 0, 50));
         let key = PoolKey::new(fr_par(), linux_class());
 
-        let up = auto.reconcile(
-            key.clone(),
-             2,
-             9,
-             0,
-        );
+        let up = auto.reconcile(key.clone(), 2, 9, 0);
         assert_eq!(up.desired, 10, "9 queued + 1 warm buffer");
         assert_eq!(up.delta(), 8, "provision 8 more");
         assert_eq!(up.provision_count(), 8);
         assert_eq!(up.deprovision_count(), 0);
         assert!(!up.is_scale_to_zero());
 
-        let down = auto.reconcile(
-            key.clone(),
-             10,
-             0,
-             0,
-        );
+        let down = auto.reconcile(key.clone(), 10, 0, 0);
         assert_eq!(down.desired, 0, "idle → scale-to-zero");
         assert_eq!(down.delta(), -10, "deprovision all 10");
         assert_eq!(down.deprovision_count(), 10);
         assert!(down.is_scale_to_zero(), "idle drains to zero");
 
-        let steady = auto.reconcile(
-            key,  6,  5,  0,
-        );
+        let steady = auto.reconcile(key, 6, 5, 0);
         assert_eq!(steady.desired, 6, "5 queued + 1 warm = 6 == current");
         assert_eq!(steady.delta(), 0, "steady state is a no-op");
     }
@@ -682,12 +663,7 @@ mod tests {
         let mut fleet = EuFleetProvider::new(GenericEuIaasAdapter, "01J0ACME", fr_par(), 100);
         let auto = Autoscaler::new(AutoscalePolicy::new(1, 0, 50));
 
-        let plan = auto.reconcile(
-            PoolKey::new(fr_par(), linux_class()),
-             0,
-             4,
-             0,
-        );
+        let plan = auto.reconcile(PoolKey::new(fr_par(), linux_class()), 0, 4, 0);
         let hosts = fleet.apply(&plan).expect("apply the in-region plan");
         assert_eq!(hosts.len(), 5, "provisioned 5 hosts (4 queued + 1 warm)");
         for h in &hosts {

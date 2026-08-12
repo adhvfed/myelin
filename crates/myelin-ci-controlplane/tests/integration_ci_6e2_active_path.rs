@@ -10,13 +10,12 @@ use myelin_ci_controlplane::ci_runner_composition::ci_runner_v2_wiring;
 use myelin_ci_controlplane::runner_bind::JobSpecResolver;
 use myelin_ci_controlplane::{
     ci_production_runtime_factory, ci_runner_identity_authorities, claim_window_secs_for_template,
-    CiDriveManifestStore,
-    CiDriveManifestV1, CiJobBudgetReservationProvider, CiJobRuntimeAuthorityRequest,
-    CiJobSpecStore, CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1,
-    CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1, CiRunRecord,
-    DurableCiJobLaunchTemplate, DurableEnqueue, GrantedCiJobV1, Lane, LeasedJob,
-    ManifestBoundCiJobTokenAuthority, OperationalReservationWriteVersion,
-    PgTierPCiJobBudgetReservation, CiPipelineReporterRouter,
+    CiDriveManifestStore, CiDriveManifestV1, CiJobBudgetReservationProvider,
+    CiJobRuntimeAuthorityRequest, CiJobSpecStore, CiJobTokenRequest, CiManifestLaneV1,
+    CiManifestLimitsV1, CiManifestSchedulingV1, CiManifestTrustTierV1, CiManifestWorkspaceV1,
+    CiPipelineReporterRouter, CiRunRecord, DurableCiJobLaunchTemplate, DurableEnqueue,
+    GrantedCiJobV1, Lane, LeasedJob, ManifestBoundCiJobTokenAuthority,
+    OperationalReservationWriteVersion, PgTierPCiJobBudgetReservation,
 };
 use myelin_ci_sandbox::checkout_orchestration::CheckoutContinuationOutcome;
 use myelin_ci_sandbox::gvisor::checkout_transport_test_support::{
@@ -223,9 +222,7 @@ async fn seed_fixture(
         policy_revision: "linux-small-v1:1".into(),
         limits: limits.clone(),
         reserve_id: None,
-        checkout_commit: checkout
-            .as_ref()
-            .map(|scope| scope.commit_hex().to_owned()),
+        checkout_commit: checkout.as_ref().map(|scope| scope.commit_hex().to_owned()),
         checkout,
     };
     let reserve_handle = PgTierPCiJobBudgetReservation::new(
@@ -445,9 +442,7 @@ async fn seed_fixture(
     }
 }
 
-async fn real_v2_wiring(
-    schema: &str,
-) -> (JobSpecResolver, RunnerHooks, CiPipelineReporterRouter) {
+async fn real_v2_wiring(schema: &str) -> (JobSpecResolver, RunnerHooks, CiPipelineReporterRouter) {
     let mut config = MyelinConfig::dev();
     config.database_url = scoped_url(&app_url(), schema);
     config.region = REGION.into();
@@ -463,18 +458,19 @@ async fn real_v2_wiring(
     )
     .await
     .expect("compose the production Identity authorities");
-    let reporter = ci_production_runtime_factory(provider.clone(), tokio::runtime::Handle::current())
-        .expect("compose production V4 runtime")
-        .reporter_router()
-        .expect("compose production V4 reporter router");
+    let reporter =
+        ci_production_runtime_factory(provider.clone(), tokio::runtime::Handle::current())
+            .expect("compose production V4 runtime")
+            .reporter_router()
+            .expect("compose production V4 reporter router");
     let wiring = ci_runner_v2_wiring(
         provider,
         &identity,
         tokio::runtime::Handle::current(),
         reporter.clone(),
     )
-        .expect("compose the dormant V2 runner wiring")
-        .into_parts();
+    .expect("compose the dormant V2 runner wiring")
+    .into_parts();
     (wiring.0, wiring.1, reporter)
 }
 
@@ -616,7 +612,12 @@ async fn v4_accounting_final(admin: &PgPool, fixture: &Fixture) -> Option<(Strin
     .fetch_optional(admin)
     .await
     .unwrap()
-    .map(|row| (row.get("terminal_disposition"), row.get("completion_receipt_v4")))
+    .map(|row| {
+        (
+            row.get("terminal_disposition"),
+            row.get("completion_receipt_v4"),
+        )
+    })
 }
 
 async fn parent_row_count(admin: &PgPool, fixture: &Fixture) -> i64 {
@@ -799,7 +800,10 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             .await
             .expect("the V4 accounting-final row exists");
         assert_eq!(disposition, "workload_passed");
-        assert!(receipt.starts_with("v4:"), "authoritative V4 receipt: {receipt}");
+        assert!(
+            receipt.starts_with("v4:"),
+            "authoritative V4 receipt: {receipt}"
+        );
         assert_eq!(
             reservation_state(&admin, &fixture.reserve_handle).await,
             "settled",

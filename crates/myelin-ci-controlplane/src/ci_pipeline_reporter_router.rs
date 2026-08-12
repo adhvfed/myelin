@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use myelin_ci_sandbox::{
     CompletionClaim, CompletionSettlementOwner, PreparationReportClaim, PreparationRetryReport,
-    PreparationTerminalDisposition, RetryableAttemptFailure, RetryableAttemptOutcome, TerminalReport,
-    TerminalReporter,
+    PreparationTerminalDisposition, RetryableAttemptFailure, RetryableAttemptOutcome,
+    TerminalReport, TerminalReporter,
 };
 use myelin_flow::{ExecutorError, SignalOutcome};
 use myelin_tenancy::{Region, TenantId};
@@ -71,7 +71,8 @@ impl CiPipelineReporterRouter {
         let tenant = TenantId(tenant_id.to_string());
         let reporter = (self.factory)(&tenant, &self.region).map_err(|_| {
             ExecutorError::InvalidInput(
-                "ci.pipeline preparation report refused: exact-tenant reporter is unavailable".into(),
+                "ci.pipeline preparation report refused: exact-tenant reporter is unavailable"
+                    .into(),
             )
         })?;
         if reporter.tenant() != &tenant

@@ -112,8 +112,7 @@ pub fn drive_ci_r3_residency(
         cross_region_writes_admitted += 1;
     }
 
-    let eligible_within_eu: Vec<&CdnEdgePop> =
-        CdnEdgeSet.eligible_for( true, cdn_candidates);
+    let eligible_within_eu: Vec<&CdnEdgePop> = CdnEdgeSet.eligible_for(true, cdn_candidates);
     let extra_eu_cdn_edges_admitted =
         eligible_within_eu.iter().filter(|p| !p.within_eu).count() as u64;
     let within_eu_cdn_edges = eligible_within_eu.iter().filter(|p| p.within_eu).count() as u64;

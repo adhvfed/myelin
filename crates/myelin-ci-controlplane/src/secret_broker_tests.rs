@@ -134,10 +134,7 @@ impl IdentityService for FakeIdentity {
         _cav: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         self.checks.lock().unwrap().push(o.0.clone());
-        self.subjects
-            .lock()
-            .unwrap()
-            .push(s.principal_id.0.clone());
+        self.subjects.lock().unwrap().push(s.principal_id.0.clone());
         assert_eq!(
             p.0, SECRET_READ_PERMISSION,
             "broker checks only `secret.read`"

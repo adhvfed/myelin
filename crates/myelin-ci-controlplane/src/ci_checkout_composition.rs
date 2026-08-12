@@ -67,7 +67,8 @@ fn reconstruct_claim(
         Some(RunTokenAuthorizationContext::CiJob(context)) => context,
         None => {
             return Err(HookError(
-                "V2 parent-attempt admission requires a resolved CI-job authorization context".into(),
+                "V2 parent-attempt admission requires a resolved CI-job authorization context"
+                    .into(),
             ))
         }
     };
@@ -79,8 +80,12 @@ fn reconstruct_claim(
                 .into(),
         )
     })?;
-    let derived_scope = derive_checkout_authorization_scope(spec.kind, &spec.workspace)
-        .map_err(|reason| HookError(format!("deriving the spec's checkout scope failed: {reason}")))?;
+    let derived_scope =
+        derive_checkout_authorization_scope(spec.kind, &spec.workspace).map_err(|reason| {
+            HookError(format!(
+                "deriving the spec's checkout scope failed: {reason}"
+            ))
+        })?;
     if derived_scope != context.checkout_scope {
         return Err(HookError(
             "V2 parent-attempt admission refused: the checkout scope derived from the spec's \
@@ -197,9 +202,8 @@ impl V2CheckoutComposition {
         let purpose = initial_phase_purpose(checkout);
         let minted = bridge(
             &self.rt,
-            self.credential_store.mint_phase_credential_for_checkout_scope(
-                claim, purpose, checkout,
-            ),
+            self.credential_store
+                .mint_phase_credential_for_checkout_scope(claim, purpose, checkout),
         )
         .map_err(|error| AttemptAuthorityError(error.to_string()))?;
         let context = ci_job_phase_authorization_context(
@@ -273,8 +277,14 @@ impl DurableAttemptAuthority {
     fn mint(
         &self,
         purpose: CiCredentialPurpose,
-    ) -> Result<(myelin_ci_sandbox::RunTokenCredential, RunTokenAuthorizationContext, String), AttemptAuthorityError>
-    {
+    ) -> Result<
+        (
+            myelin_ci_sandbox::RunTokenCredential,
+            RunTokenAuthorizationContext,
+            String,
+        ),
+        AttemptAuthorityError,
+    > {
         let minted = bridge(
             &self.rt,
             self.credential_store
@@ -299,7 +309,8 @@ impl AttemptAuthority for DurableAttemptAuthority {
     fn begin_phase(&self, phase: PreparationPhase) -> Result<(), AttemptAuthorityError> {
         bridge(
             &self.rt,
-            self.journal.begin_phase(&self.attempt, journal_phase(phase)),
+            self.journal
+                .begin_phase(&self.attempt, journal_phase(phase)),
         )
         .map(|_outcome| ())
         .map_err(|error| AttemptAuthorityError(error.to_string()))
@@ -337,12 +348,20 @@ impl AttemptAuthority for DurableAttemptAuthority {
         phase: CheckoutPhase,
     ) -> Result<PhaseCredentialCarrier, AttemptAuthorityError> {
         let (credential, context, generation_id) = self.mint(phase_purpose(phase))?;
-        Ok(PhaseCredentialCarrier::new(credential, context, generation_id))
+        Ok(PhaseCredentialCarrier::new(
+            credential,
+            context,
+            generation_id,
+        ))
     }
 
     fn mint_workload_credential(&self) -> Result<WorkloadCredentialCarrier, AttemptAuthorityError> {
         let (credential, context, generation_id) = self.mint(CiCredentialPurpose::Workload)?;
-        Ok(WorkloadCredentialCarrier::new(credential, context, generation_id))
+        Ok(WorkloadCredentialCarrier::new(
+            credential,
+            context,
+            generation_id,
+        ))
     }
 
     fn should_requeue(&self) -> bool {
@@ -359,8 +378,8 @@ impl AttemptAuthority for DurableAttemptAuthority {
 mod tests {
     use super::*;
     use myelin_ci_sandbox::{
-        CiJobAuthorizationContext, CiJobCredentialBinding, EgressPolicy, ImageRef, IdemToken, JobKind,
-        MeterTarget, ResourceLimits, RunTokenCredential, TrustTier, WorkspaceSpec,
+        CiJobAuthorizationContext, CiJobCredentialBinding, EgressPolicy, IdemToken, ImageRef,
+        JobKind, MeterTarget, ResourceLimits, RunTokenCredential, TrustTier, WorkspaceSpec,
     };
 
     fn checkout_workspace() -> WorkspaceSpec {
@@ -473,7 +492,10 @@ mod tests {
         let mut context = v2_context();
         context.credential_binding = None;
         let spec = spec_with_context(Some(RunTokenAuthorizationContext::CiJob(context)));
-        assert!(reconstruct_claim(&spec).is_err(), "a V1 shape has no claim identity to reconstruct");
+        assert!(
+            reconstruct_claim(&spec).is_err(),
+            "a V1 shape has no claim identity to reconstruct"
+        );
     }
 
     #[test]

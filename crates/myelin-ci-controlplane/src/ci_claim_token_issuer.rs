@@ -226,8 +226,7 @@ pub(crate) fn authority_from_durable_claim(
         || launch_template.token_authority_handle != job.token_authority_handle
         || launch_template.spec.idem_token.0 != claim.idem_token
         || launch_template.spec.meter_to.reserve_id != job.reserve_handle
-        || launch_template.spec.workspace.commit.as_deref()
-            != authority.checkout_commit.as_deref()
+        || launch_template.spec.workspace.commit.as_deref() != authority.checkout_commit.as_deref()
     {
         return Err(refused(
             "durable ci_job_spec launch template identity differs from the locked claim/run/manifest",
@@ -235,21 +234,29 @@ pub(crate) fn authority_from_durable_claim(
     }
     verify_dispatched_spec_matches_granted_workspace(&launch_template.spec, &job.workspace)?;
     let mut handle_authority = authority.clone();
-    if claim.token_authority_handle.starts_with("ci-token-authority:v1:")
-        || claim.token_authority_handle.starts_with("ci-token-authority:v2:")
+    if claim
+        .token_authority_handle
+        .starts_with("ci-token-authority:v1:")
+        || claim
+            .token_authority_handle
+            .starts_with("ci-token-authority:v2:")
     {
         handle_authority.reserve_id = None;
     }
-    if claim.token_authority_handle.starts_with("ci-token-authority:v1:")
-        || claim.token_authority_handle.starts_with("ci-token-authority:v2:")
-        || claim.token_authority_handle.starts_with("ci-token-authority:v3:")
+    if claim
+        .token_authority_handle
+        .starts_with("ci-token-authority:v1:")
+        || claim
+            .token_authority_handle
+            .starts_with("ci-token-authority:v2:")
+        || claim
+            .token_authority_handle
+            .starts_with("ci-token-authority:v3:")
     {
         handle_authority.checkout_commit = None;
     }
-    if !ManifestBoundCiJobTokenAuthority::verifies(
-        &handle_authority,
-        &claim.token_authority_handle,
-    ) {
+    if !ManifestBoundCiJobTokenAuthority::verifies(&handle_authority, &claim.token_authority_handle)
+    {
         return Err(refused(
             "manifest-bound CI token authority verification failed",
         ));
@@ -312,9 +319,7 @@ pub fn runtime_authorities_from_durable_claim(
             policy_revision: manifest.authority_policy_revision.clone(),
             limits: job.limits.clone(),
             reserve_id: Some(job.reserve_handle.clone()),
-            checkout_commit: checkout
-                .as_ref()
-                .map(|scope| scope.commit_hex().to_owned()),
+            checkout_commit: checkout.as_ref().map(|scope| scope.commit_hex().to_owned()),
             checkout,
         });
     }
@@ -529,9 +534,7 @@ mod tests {
             policy_revision: "linux-small-v1:1".into(),
             limits: limits(),
             reserve_id: Some("reserve:test".into()),
-            checkout_commit: checkout
-                .as_ref()
-                .map(|scope| scope.commit_hex().to_owned()),
+            checkout_commit: checkout.as_ref().map(|scope| scope.commit_hex().to_owned()),
             checkout,
         };
         let token_authority_handle = ManifestBoundCiJobTokenAuthority::handle_for(&authority);
@@ -765,13 +768,9 @@ mod tests {
 
         let mut substituted_reserve = default_launch_template(&claim);
         substituted_reserve.spec.meter_to.reserve_id = "reserve:substituted".into();
-        assert!(authority_from_durable_claim(
-            &claim,
-            &run(),
-            &manifest,
-            &substituted_reserve,
-        )
-        .is_err());
+        assert!(
+            authority_from_durable_claim(&claim, &run(), &manifest, &substituted_reserve,).is_err()
+        );
 
         let mut substituted_checkout_commit = default_launch_template(&claim);
         substituted_checkout_commit.spec.workspace.commit = Some("f".repeat(40));
@@ -955,13 +954,9 @@ mod tests {
         let (manifest, claim) = manifest_and_claim();
         let mut launch_template = default_launch_template(&claim);
         launch_template.spec.meter_to.reserve_id = "reserve:substituted-after-dispatch".into();
-        assert!(authority_from_durable_claim(
-            &claim,
-            &run(),
-            &manifest,
-            &launch_template,
-        )
-        .is_err());
+        assert!(
+            authority_from_durable_claim(&claim, &run(), &manifest, &launch_template,).is_err()
+        );
     }
 
     #[test]
@@ -1146,9 +1141,7 @@ mod tests {
             ..base
         };
         assert_ne!(
-            crate::ci_launch_authority::token_authority_digest_v4(
-                &golden_v4_checkout_authority()
-            ),
+            crate::ci_launch_authority::token_authority_digest_v4(&golden_v4_checkout_authority()),
             crate::ci_launch_authority::token_authority_digest_v4(&other)
         );
         assert!(!ManifestBoundCiJobTokenAuthority::verifies(&other, &handle));

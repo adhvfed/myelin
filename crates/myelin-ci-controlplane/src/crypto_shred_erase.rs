@@ -12,10 +12,7 @@ pub const CI_ERASED_VERB: &str = "erased";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiShredError {
-    KmsUnavailable {
-        tenant: String,
-        class: String,
-    },
+    KmsUnavailable { tenant: String, class: String },
 }
 
 impl std::fmt::Display for CiShredError {

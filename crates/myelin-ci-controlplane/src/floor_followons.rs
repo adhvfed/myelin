@@ -1,11 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TriggerStatus {
-    NotFired {
-        as_of: &'static str,
-    },
-    Fired {
-        evidence: &'static str,
-    },
+    NotFired { as_of: &'static str },
+    Fired { evidence: &'static str },
 }
 
 impl TriggerStatus {

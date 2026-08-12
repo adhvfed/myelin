@@ -11,21 +11,21 @@ use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_job_spec_store, ci_region_queue_store_test_support,
     durable_spec_resolver_test_support, CiJobSpecStoreError, CiJobTokenIssueError,
-    CiJobTokenIssuer, CiJobTokenRequest, CiPipelineReporterFactory,
-    CiPipelineReporterFactoryError, CiPipelineReporterRouter, DurableCiJobLaunchTemplate,
-    DurableEnqueue, DurableLeaseAdapter, EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    CI_RUNNER_EXECUTION_LEASE_TTL_SECS, CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL,
-    CREATE_JOB_QUEUE_DDL, CREATE_JOB_QUEUE_INDEXES_DDL, MAX_JOB_TIMEOUT_SECS,
+    CiJobTokenIssuer, CiJobTokenRequest, CiPipelineReporterFactory, CiPipelineReporterFactoryError,
+    CiPipelineReporterRouter, DurableCiJobLaunchTemplate, DurableEnqueue, DurableLeaseAdapter,
+    EnqueueOutcome, Lane, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
+    CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, MAX_JOB_TIMEOUT_SECS,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
-    LeaseStore, MeterTarget, ResourceLimits, RunTokenCredential, RunnerAgent,
-    RunnerHooks, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
+    LeaseStore, MeterTarget, ResourceLimits, RunTokenCredential, RunnerAgent, RunnerHooks,
+    TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_events::{IdMinter, Ulid};
 use myelin_flow::{
@@ -43,8 +43,7 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 fn unused_secret_terminal_reporter(region: &str) -> CiPipelineReporterRouter {
-    let factory: CiPipelineReporterFactory =
-        Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
+    let factory: CiPipelineReporterFactory = Arc::new(|_, _| Err(CiPipelineReporterFactoryError));
     CiPipelineReporterRouter::new(Region(region.into()), factory).unwrap()
 }
 fn schema_name(tag: &str) -> String {
@@ -653,79 +652,79 @@ async fn dispatch_replay_requires_exact_queue_and_spec_identity() {
     let cleanup_admin = admin.clone();
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    create_schema(&admin, &schema).await;
-    let store = ci_job_spec_store(admin.clone());
-    let idem = "exact-replay-idem";
-    let original = enq(
-        "tenantA",
-        "fr-par",
-        "exact-job",
-        "exact-run",
-        TrustTier::Trusted,
-        &["linux"],
-        idem,
-    );
-    let spec = compute_spec(vec!["true".into()], TrustTier::Trusted, idem);
-    store
-        .co_persist_dispatch(&original, &spec, "build")
-        .await
-        .expect("persist original dispatch");
-
-    let colliding_job = enq(
-        "tenantA",
-        "fr-par",
-        "forged-job",
-        "exact-run",
-        TrustTier::Trusted,
-        &["linux"],
-        idem,
-    );
-    let collision = store
-        .co_persist_dispatch(&colliding_job, &spec, "build")
-        .await
-        .expect_err("one idem token cannot be rebound to another job UUID");
-    assert!(collision
-        .to_string()
-        .contains("replay conflicts with the existing queue/spec identity"));
-
-    let mut drifted = original.clone();
-    drifted.fair_key = "forged-fair-key".into();
-    let drift = store
-        .co_persist_dispatch(&drifted, &spec, "build")
-        .await
-        .expect_err("an exact job replay cannot change scheduling authority");
-    assert!(drift
-        .to_string()
-        .contains("replay conflicts with the existing queue/spec identity"));
-
-    let mut v2_marker_replay = original.clone();
-    v2_marker_replay.reservation_write_version =
-        myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
-            "ci-reserve:v2:run:budget-v1:a1:batch:job:digest",
+        create_schema(&admin, &schema).await;
+        let store = ci_job_spec_store(admin.clone());
+        let idem = "exact-replay-idem";
+        let original = enq(
+            "tenantA",
+            "fr-par",
+            "exact-job",
+            "exact-run",
+            TrustTier::Trusted,
+            &["linux"],
+            idem,
         );
-    let marker_drift = store
-        .co_persist_dispatch(&v2_marker_replay, &spec, "build")
-        .await
-        .expect_err("a legacy NULL marker can never exact-replay as a V2 marker");
-    assert!(marker_drift
-        .to_string()
-        .contains("replay conflicts with the existing queue/spec identity"));
-
-    let counts: (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM job_queue), (SELECT count(*) FROM ci_job_spec)",
-    )
-    .fetch_one(&admin)
-    .await
-    .unwrap();
-    assert_eq!(counts, (1, 1), "both divergent transactions rolled back");
-    assert_eq!(
+        let spec = compute_spec(vec!["true".into()], TrustTier::Trusted, idem);
         store
-            .get_launch_template("tenantA", "fr-par", &original.job_id)
+            .co_persist_dispatch(&original, &spec, "build")
             .await
-            .unwrap(),
-        spec,
-        "the original executable spec remains authoritative"
-    );
+            .expect("persist original dispatch");
+
+        let colliding_job = enq(
+            "tenantA",
+            "fr-par",
+            "forged-job",
+            "exact-run",
+            TrustTier::Trusted,
+            &["linux"],
+            idem,
+        );
+        let collision = store
+            .co_persist_dispatch(&colliding_job, &spec, "build")
+            .await
+            .expect_err("one idem token cannot be rebound to another job UUID");
+        assert!(collision
+            .to_string()
+            .contains("replay conflicts with the existing queue/spec identity"));
+
+        let mut drifted = original.clone();
+        drifted.fair_key = "forged-fair-key".into();
+        let drift = store
+            .co_persist_dispatch(&drifted, &spec, "build")
+            .await
+            .expect_err("an exact job replay cannot change scheduling authority");
+        assert!(drift
+            .to_string()
+            .contains("replay conflicts with the existing queue/spec identity"));
+
+        let mut v2_marker_replay = original.clone();
+        v2_marker_replay.reservation_write_version =
+            myelin_ci_controlplane::ReservationWriteVersionMarker::derive_from_reserve_handle(
+                "ci-reserve:v2:run:budget-v1:a1:batch:job:digest",
+            );
+        let marker_drift = store
+            .co_persist_dispatch(&v2_marker_replay, &spec, "build")
+            .await
+            .expect_err("a legacy NULL marker can never exact-replay as a V2 marker");
+        assert!(marker_drift
+            .to_string()
+            .contains("replay conflicts with the existing queue/spec identity"));
+
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM job_queue), (SELECT count(*) FROM ci_job_spec)",
+        )
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 1), "both divergent transactions rolled back");
+        assert_eq!(
+            store
+                .get_launch_template("tenantA", "fr-par", &original.job_id)
+                .await
+                .unwrap(),
+            spec,
+            "the original executable spec remains authoritative"
+        );
     })
     .await;
 }
@@ -737,68 +736,68 @@ async fn trusted_runner_never_executes_a_dispatched_untrusted_fork() {
     let cleanup_admin = admin.clone();
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let region = "fr-par";
-    let tenant = "tenantA";
-    create_schema(&admin, &schema).await;
-    let queue = ci_job_queue_store(admin.clone());
-    let specs = ci_job_spec_store(admin.clone());
+        let region = "fr-par";
+        let tenant = "tenantA";
+        create_schema(&admin, &schema).await;
+        let queue = ci_job_queue_store(admin.clone());
+        let specs = ci_job_spec_store(admin.clone());
 
-    let fork_spec = compute_spec(vec!["true".into()], TrustTier::UntrustedFork, "fork-idem");
-    let terms = enq(
-        tenant,
-        region,
-        "fork-job",
-        "fork-run",
-        TrustTier::UntrustedFork,
-        &["linux"],
-        "fork-idem",
-    );
-    specs
-        .co_persist_dispatch(&terms, &fork_spec, "build")
-        .await
-        .expect("dispatch the fork stage");
-    activate_job_owner(&admin, &terms).await;
+        let fork_spec = compute_spec(vec!["true".into()], TrustTier::UntrustedFork, "fork-idem");
+        let terms = enq(
+            tenant,
+            region,
+            "fork-job",
+            "fork-run",
+            TrustTier::UntrustedFork,
+            &["linux"],
+            "fork-idem",
+        );
+        specs
+            .co_persist_dispatch(&terms, &fork_spec, "build")
+            .await
+            .expect("dispatch the fork stage");
+        activate_job_owner(&admin, &terms).await;
 
-    let resolver = durable_spec_resolver_test_support(
-        specs.clone(),
-        region,
-        tokio::runtime::Handle::current(),
-        claim_token_issuer(),
-        myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
-        unused_secret_terminal_reporter(region),
-    );
-    let adapter = DurableLeaseAdapter::new(
-        ci_region_queue_store_test_support(admin.clone()),
-        queue.clone(),
-        region,
-        tokio::runtime::Handle::current(),
-        resolver,
-    );
-    let claimed = adapter.claim_for_labels(
-        "trusted-worker",
-        &["linux".to_string()],
-        &[TrustTier::Trusted],
-        &Region(region.into()),
-        1000,
-        CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
-    );
-    assert!(
+        let resolver = durable_spec_resolver_test_support(
+            specs.clone(),
+            region,
+            tokio::runtime::Handle::current(),
+            claim_token_issuer(),
+            myelin_ci_controlplane::unavailable_ci_job_secret_resolver(),
+            unused_secret_terminal_reporter(region),
+        );
+        let adapter = DurableLeaseAdapter::new(
+            ci_region_queue_store_test_support(admin.clone()),
+            queue.clone(),
+            region,
+            tokio::runtime::Handle::current(),
+            resolver,
+        );
+        let claimed = adapter.claim_for_labels(
+            "trusted-worker",
+            &["linux".to_string()],
+            &[TrustTier::Trusted],
+            &Region(region.into()),
+            1000,
+            CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
+        );
+        assert!(
         claimed.is_none(),
         "SECURITY REGRESSION: a trusted-only runner NEVER claims a dispatched untrusted_fork job"
     );
-    let state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
-        .bind(uid("fork-job"))
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-    assert_eq!(
-        state, "queued",
-        "the untrusted_fork stage stays queued (unclaimed by the trusted-only runner)"
-    );
+        let state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
+            .bind(uid("fork-job"))
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "queued",
+            "the untrusted_fork stage stays queued (unclaimed by the trusted-only runner)"
+        );
 
-    println!(
-        "[CT-004d.1] PASS: the trust-tier gate survives the real dispatch + real resolver path"
-    );
+        println!(
+            "[CT-004d.1] PASS: the trust-tier gate survives the real dispatch + real resolver path"
+        );
     })
     .await;
 }

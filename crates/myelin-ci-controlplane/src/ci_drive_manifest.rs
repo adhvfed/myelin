@@ -973,7 +973,8 @@ mod tests {
     fn source_ref_is_an_optional_canonical_branch_not_mutable_head_state() {
         let mut push = manifest();
         push.source_ref = Some("refs/heads/main".into());
-        push.validate().expect("a canonical source branch is preserved");
+        push.validate()
+            .expect("a canonical source branch is preserved");
 
         push.source_ref = Some("refs/tags/release".into());
         assert!(matches!(

@@ -107,8 +107,9 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
-        {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.as_mut().poll(cx)
+        })) {
             Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Err(payload) => std::task::Poll::Ready(Err(payload)),
@@ -599,47 +600,47 @@ async fn h1_test_fixture_outbox_absorb_closes_the_livelock() {
     let oid = "1234000000000000000000000000000000005678";
     let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
     with_schema_cleanup(&p, &schema, || async {
-    let rt = tokio::runtime::Handle::current();
+        let rt = tokio::runtime::Handle::current();
 
-    let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
-    let store = OutboxReserveStore::new(outbox, Arc::new(UlidMinter::new()));
+        let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(p.clone(), rt.clone())));
+        let store = OutboxReserveStore::new(outbox, Arc::new(UlidMinter::new()));
 
-    let ev = push_envelope("ev-livelock-1", repo, oid);
-    let armed = armed_for(&ev, repo, oid);
+        let ev = push_envelope("ev-livelock-1", repo, oid);
+        let armed = armed_for(&ev, repo, oid);
 
-    let mut htx = HandlerTx::none();
-    store
-        .persist(&armed, &mut htx)
-        .expect("first persist commits the events");
+        let mut htx = HandlerTx::none();
+        store
+            .persist(&armed, &mut htx)
+            .expect("first persist commits the events");
 
-    let mut htx2 = HandlerTx::none();
-    store
-        .persist(&armed, &mut htx2)
-        .expect("H1: the deterministic re-emit is ABSORBED (no livelock), not Err");
+        let mut htx2 = HandlerTx::none();
+        store
+            .persist(&armed, &mut htx2)
+            .expect("H1: the deterministic re-emit is ABSORBED (no livelock), not Err");
 
-    let total: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox")
-        .fetch_one(&p)
-        .await
-        .unwrap();
-    assert_eq!(
-        total, 3,
-        "exactly 3 outbox rows (1 started + 2 checks) - the absorb added no duplicates"
-    );
-    let envelopes: Vec<serde_json::Value> =
-        sqlx::query_scalar("SELECT envelope FROM outbox ORDER BY aggregate, seq")
-            .fetch_all(&p)
+        let total: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox")
+            .fetch_one(&p)
             .await
             .unwrap();
-    assert!(
-        envelopes.iter().all(|envelope| {
-            envelope["causation_id"] == ev.event_id.0
-                && envelope["correlation_id"] == ev.correlation_id.0
-                && envelope["depth"] == ev.depth + 1
-        }),
-        "every reserve/start fact preserves the trigger's immediate parent, root, and depth"
-    );
+        assert_eq!(
+            total, 3,
+            "exactly 3 outbox rows (1 started + 2 checks) - the absorb added no duplicates"
+        );
+        let envelopes: Vec<serde_json::Value> =
+            sqlx::query_scalar("SELECT envelope FROM outbox ORDER BY aggregate, seq")
+                .fetch_all(&p)
+                .await
+                .unwrap();
+        assert!(
+            envelopes.iter().all(|envelope| {
+                envelope["causation_id"] == ev.event_id.0
+                    && envelope["correlation_id"] == ev.correlation_id.0
+                    && envelope["depth"] == ev.depth + 1
+            }),
+            "every reserve/start fact preserves the trigger's immediate parent, root, and depth"
+        );
 
-    println!("[H1/3] PASS test-fixture absorb: deterministic re-emit remains exactly once.");
+        println!("[H1/3] PASS test-fixture absorb: deterministic re-emit remains exactly once.");
     })
     .await;
 }
@@ -769,62 +770,63 @@ async fn production_pr_cocommit_persists_canonical_concurrency_identity() {
     let oid = "aa11bb22cc33000000000000000000000000dd44";
     let p = setup_schema(&schema, OUTBOX_MIGRATION).await;
     with_schema_cleanup(&p, &schema, || async {
-    let rt = tokio::runtime::Handle::current();
-    let reader: Arc<dyn GitConfigReader> = Arc::new(PrFixtureGitReader {
-        repo: repo.into(),
-        oid: oid.into(),
-    });
-    let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
-    let store = Arc::new(CoCommitReserveStore::new(
-        ci_run_store_factory(p.clone()),
-        Arc::new(UlidMinter::new()),
-        rt.clone(),
-    ));
-    let handler = CiTriggerHandler::new(reader, blobs, store);
-    let cname = handler.consumer_name().to_string();
-    let ledger = DedupLedger::durable(Arc::new(DurableDedupBacking::new(p.clone(), rt.clone())));
-    let sub = Subscription::bind(
-        ConsumerName(cname),
-        &["myelin://acme/git/"],
-        PrefetchBound::DEFAULT,
-    )
-    .unwrap();
-    let consumer = Consumer::new(handler, sub, ledger);
-    let ev = pr_envelope("ev-chunk4-pr", repo, number, oid);
-    let run_id = match plan_dispatch(
-        &ev,
-        &PrFixtureGitReader {
+        let rt = tokio::runtime::Handle::current();
+        let reader: Arc<dyn GitConfigReader> = Arc::new(PrFixtureGitReader {
             repo: repo.into(),
             oid: oid.into(),
-        },
-        &FsBlobStore::new(),
-    ) {
-        DispatchOutcome::Arm(armed) => armed.handoff.run_write.run_id,
-        other => panic!("validated PR must arm, got {other:?}"),
-    };
-    let msg = Message {
-        subject: ev.subject.0.clone(),
-        envelope: ev,
-    };
+        });
+        let blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(FsBlobStore::new());
+        let store = Arc::new(CoCommitReserveStore::new(
+            ci_run_store_factory(p.clone()),
+            Arc::new(UlidMinter::new()),
+            rt.clone(),
+        ));
+        let handler = CiTriggerHandler::new(reader, blobs, store);
+        let cname = handler.consumer_name().to_string();
+        let ledger =
+            DedupLedger::durable(Arc::new(DurableDedupBacking::new(p.clone(), rt.clone())));
+        let sub = Subscription::bind(
+            ConsumerName(cname),
+            &["myelin://acme/git/"],
+            PrefetchBound::DEFAULT,
+        )
+        .unwrap();
+        let consumer = Consumer::new(handler, sub, ledger);
+        let ev = pr_envelope("ev-chunk4-pr", repo, number, oid);
+        let run_id = match plan_dispatch(
+            &ev,
+            &PrFixtureGitReader {
+                repo: repo.into(),
+                oid: oid.into(),
+            },
+            &FsBlobStore::new(),
+        ) {
+            DispatchOutcome::Arm(armed) => armed.handoff.run_write.run_id,
+            other => panic!("validated PR must arm, got {other:?}"),
+        };
+        let msg = Message {
+            subject: ev.subject.0.clone(),
+            envelope: ev,
+        };
 
-    assert_eq!(
-        tokio::task::block_in_place(|| consumer.deliver(&msg)),
-        Delivered::Acked
-    );
-    let row = sqlx::query(
-        "SELECT trigger_kind, concurrency_group, pr_head_generation \
+        assert_eq!(
+            tokio::task::block_in_place(|| consumer.deliver(&msg)),
+            Delivered::Acked
+        );
+        let row = sqlx::query(
+            "SELECT trigger_kind, concurrency_group, pr_head_generation \
            FROM ci_run WHERE run_id = $1::uuid",
-    )
-    .bind(run_id)
-    .fetch_one(&p)
-    .await
-    .unwrap();
-    assert_eq!(row.get::<String, _>("trigger_kind"), "pull_request");
-    assert_eq!(
-        row.get::<Option<String>, _>("concurrency_group").as_deref(),
-        Some("pr:team/web:42")
-    );
-    assert_eq!(row.get::<Option<i64>, _>("pr_head_generation"), Some(1));
+        )
+        .bind(run_id)
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("trigger_kind"), "pull_request");
+        assert_eq!(
+            row.get::<Option<String>, _>("concurrency_group").as_deref(),
+            Some("pr:team/web:42")
+        );
+        assert_eq!(row.get::<Option<i64>, _>("pr_head_generation"), Some(1));
     })
     .await;
 }
@@ -965,81 +967,81 @@ async fn production_reserve_and_replay_need_no_update_grant_on_immutable_attempt
     let schema = schema_name(uniq());
     let admin = setup_schema(&schema, OUTBOX_MIGRATION).await;
     with_schema_cleanup(&admin, &schema, || async {
-    sqlx::raw_sql(&format!(
-        "GRANT USAGE ON SCHEMA {schema} TO myelin_app;
+        sqlx::raw_sql(&format!(
+            "GRANT USAGE ON SCHEMA {schema} TO myelin_app;
          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO myelin_app;
          REVOKE UPDATE, DELETE ON {schema}.ci_run_check_attempt FROM myelin_app;"
-    ))
-    .execute(&admin)
-    .await
-    .expect("install the production-shaped runtime grants");
-
-    let can_select: bool =
-        sqlx::query_scalar("SELECT has_table_privilege('myelin_app', $1, 'SELECT')")
-            .bind(format!("{schema}.ci_run_check_attempt"))
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-    let can_update: bool =
-        sqlx::query_scalar("SELECT has_table_privilege('myelin_app', $1, 'UPDATE')")
-            .bind(format!("{schema}.ci_run_check_attempt"))
-            .fetch_one(&admin)
-            .await
-            .unwrap();
-    assert!(can_select);
-    assert!(
-        !can_update,
-        "the immutable attempt authority stays non-updatable"
-    );
-
-    let app = reopen_app(&schema).await;
-    let rt = tokio::runtime::Handle::current();
-    let ledger = DedupLedger::durable(
-        Arc::new(DurableDedupBacking::new(app.clone(), rt.clone())) as Arc<dyn DurableDedup>
-    );
-    let store = CoCommitReserveStore::new(
-        ci_run_store_factory(app.clone()),
-        Arc::new(UlidMinter::new()),
-        rt,
-    );
-    let cname = ConsumerName("ci-dispatch.trigger".into());
-    let tenant = TenantId("acme".into());
-    let region = Region("fr-par".into());
-    let event = push_envelope(
-        "ev-runtime-immutable-attempt",
-        "web",
-        "1234567890abcdef1234567890abcdef12345678",
-    );
-    let armed = armed_for(&event, "web", "1234567890abcdef1234567890abcdef12345678");
-
-    for event_id in [
-        EventId("ev-runtime-immutable-attempt".into()),
-        EventId("ev-runtime-immutable-attempt-replay".into()),
-    ] {
-        tokio::task::block_in_place(|| {
-            let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &event_id, &tenant, &region);
-            assert!(fresh);
-            {
-                let conn = cotx.connection().expect("co-commit connection");
-                let mut tx = HandlerTx::with_connection(conn);
-                store
-                    .persist(&armed, &mut tx)
-                    .expect("reserve/replay under SELECT+INSERT attempt authority");
-            }
-            cotx.commit().expect("commit the production-shaped reserve");
-        });
-    }
-
-    let issued: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run_check_attempt")
-        .fetch_one(&admin)
+        ))
+        .execute(&admin)
         .await
-        .unwrap();
-    assert_eq!(
-        issued, 2,
-        "one immutable authority per configured check context"
-    );
+        .expect("install the production-shaped runtime grants");
 
-    app.close().await;
+        let can_select: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('myelin_app', $1, 'SELECT')")
+                .bind(format!("{schema}.ci_run_check_attempt"))
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        let can_update: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('myelin_app', $1, 'UPDATE')")
+                .bind(format!("{schema}.ci_run_check_attempt"))
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+        assert!(can_select);
+        assert!(
+            !can_update,
+            "the immutable attempt authority stays non-updatable"
+        );
+
+        let app = reopen_app(&schema).await;
+        let rt = tokio::runtime::Handle::current();
+        let ledger =
+            DedupLedger::durable(Arc::new(DurableDedupBacking::new(app.clone(), rt.clone()))
+                as Arc<dyn DurableDedup>);
+        let store = CoCommitReserveStore::new(
+            ci_run_store_factory(app.clone()),
+            Arc::new(UlidMinter::new()),
+            rt,
+        );
+        let cname = ConsumerName("ci-dispatch.trigger".into());
+        let tenant = TenantId("acme".into());
+        let region = Region("fr-par".into());
+        let event = push_envelope(
+            "ev-runtime-immutable-attempt",
+            "web",
+            "1234567890abcdef1234567890abcdef12345678",
+        );
+        let armed = armed_for(&event, "web", "1234567890abcdef1234567890abcdef12345678");
+
+        for event_id in [
+            EventId("ev-runtime-immutable-attempt".into()),
+            EventId("ev-runtime-immutable-attempt-replay".into()),
+        ] {
+            tokio::task::block_in_place(|| {
+                let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &event_id, &tenant, &region);
+                assert!(fresh);
+                {
+                    let conn = cotx.connection().expect("co-commit connection");
+                    let mut tx = HandlerTx::with_connection(conn);
+                    store
+                        .persist(&armed, &mut tx)
+                        .expect("reserve/replay under SELECT+INSERT attempt authority");
+                }
+                cotx.commit().expect("commit the production-shaped reserve");
+            });
+        }
+
+        let issued: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run_check_attempt")
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+        assert_eq!(
+            issued, 2,
+            "one immutable authority per configured check context"
+        );
+
+        app.close().await;
     })
     .await;
 }

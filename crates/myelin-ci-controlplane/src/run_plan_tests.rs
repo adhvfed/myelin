@@ -300,7 +300,9 @@ fn selected_cargo_vendor_is_additive_and_byte_stable_on_the_v2_wire() {
     let mut selected = structured_cargo_plan_v2();
     let reference = myelin_ci_sandbox::cargo_vendor_smoke_reference();
     selected.jobs[0].selected_cargo_vendor = Some(reference.clone());
-    let selected_bytes = selected.canonical_bytes().expect("selected V2 canonical bytes");
+    let selected_bytes = selected
+        .canonical_bytes()
+        .expect("selected V2 canonical bytes");
     assert!(String::from_utf8_lossy(&selected_bytes)
         .contains(&format!("\"selected_cargo_vendor\":\"{reference}\"")));
     let decoded = decode_resolved_run_plan(&selected_bytes).expect("selected V2 decodes");
@@ -370,8 +372,7 @@ fn structured_build_validation_admits_full_workspace_checks() {
         ],
     ] {
         let mut plan = structured_cargo_plan_v2();
-        plan.jobs[0].build.as_mut().unwrap().args =
-            args.into_iter().map(String::from).collect();
+        plan.jobs[0].build.as_mut().unwrap().args = args.into_iter().map(String::from).collect();
         plan.canonical_bytes()
             .expect("full-workspace test and lint recipes are supported");
     }

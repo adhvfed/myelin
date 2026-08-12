@@ -695,7 +695,10 @@ impl ManifestBoundCiJobTokenAuthority {
     pub fn verifies(request: &CiJobRuntimeAuthorityRequest, handle: &str) -> bool {
         if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V4_HANDLE_PREFIX) {
             if request.checkout_commit.as_deref()
-                != request.checkout.as_ref().map(CheckoutAuthorizationScope::commit_hex)
+                != request
+                    .checkout
+                    .as_ref()
+                    .map(CheckoutAuthorizationScope::commit_hex)
             {
                 return false;
             }
@@ -866,9 +869,7 @@ fn prepare_linux_small_requests(
             policy_revision: profile_policy.policy_revision.into(),
             limits: profile_policy.limits.clone(),
             reserve_id: None,
-            checkout_commit: checkout
-                .as_ref()
-                .map(|scope| scope.commit_hex().to_owned()),
+            checkout_commit: checkout.as_ref().map(|scope| scope.commit_hex().to_owned()),
             checkout: checkout.clone(),
         });
     }
@@ -2311,7 +2312,10 @@ mod tests {
     fn v1_reservation_ceiling_is_an_upper_bound_on_the_tier_p_settlement_price() {
         let limits = linux_small_limits();
         let reserved = operational_reservation_amount(&limits).unwrap();
-        assert_eq!(reserved, 7_500_000, "linux-small v1 reservation, in micro-USD");
+        assert_eq!(
+            reserved, 7_500_000,
+            "linux-small v1 reservation, in micro-USD"
+        );
 
         let ceiling = raw_execution_ceiling(&limits).unwrap();
         let priced = TierPOperationalCiJobPricer

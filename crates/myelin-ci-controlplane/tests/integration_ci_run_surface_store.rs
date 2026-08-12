@@ -205,242 +205,242 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
     let cleanup_admin = pool(&admin_url(), &schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
-    let admin = pool(&admin_url(), &schema).await;
-    setup_schema(&admin, &schema).await;
-    let app = pool(&app_url(), &schema).await;
-    let cursor_key = myelin_storage::SealKey::from_bytes([0x61; 32])
-        .derive_service_key("myelin test ci run surface cursor v1");
-    let store = CiRunStore::with_pg_surface_cursor_key(app.clone(), cursor_key);
+        let admin = pool(&admin_url(), &schema).await;
+        setup_schema(&admin, &schema).await;
+        let app = pool(&app_url(), &schema).await;
+        let cursor_key = myelin_storage::SealKey::from_bytes([0x61; 32])
+            .derive_service_key("myelin test ci run surface cursor v1");
+        let store = CiRunStore::with_pg_surface_cursor_key(app.clone(), cursor_key);
 
-    insert_run(
-        &app,
-        TENANT,
-        RUN_1,
-        ALPHA,
-        "succeeded",
-        "2026-07-24T10:00:00Z",
-    )
-    .await;
-    insert_run(&app, TENANT, RUN_2, BETA, "failed", "2026-07-24T11:00:00Z").await;
-    insert_run(
-        &app,
-        TENANT,
-        RUN_3,
-        ALPHA,
-        "running",
-        "2026-07-24T12:00:00Z",
-    )
-    .await;
-    insert_run(
-        &app,
-        TENANT,
-        RUN_HIDDEN,
-        HIDDEN,
-        "failed",
-        "2026-07-24T13:00:00Z",
-    )
-    .await;
-    insert_run(
-        &app,
-        OTHER_TENANT,
-        RUN_1,
-        "myelin://ci_surface_other/git/repo/alpha",
-        "failed",
-        "2026-07-24T14:00:00Z",
-    )
-    .await;
-    insert_detail(&app).await;
-
-    let visible = vec![BETA.to_owned(), ALPHA.to_owned(), ALPHA.to_owned()];
-    let first = store
-        .list_surface_runs(
+        insert_run(
+            &app,
             TENANT,
-            REGION,
-            &visible,
-            CiRunPageRequest::new(CiRunStateFilter::All, 2, None).unwrap(),
-        )
-        .await
-        .expect("first visible page");
-    assert_eq!(
-        first
-            .items
-            .iter()
-            .map(|run| run.run_id.as_str())
-            .collect::<Vec<_>>(),
-        [RUN_3, RUN_2]
-    );
-    let cursor = first.next_cursor.expect("one older visible run remains");
-
-    insert_run(
-        &app,
-        TENANT,
-        RUN_NEWER,
-        ALPHA,
-        "running",
-        "2026-07-24T15:00:00Z",
-    )
-    .await;
-    let second = store
-        .list_surface_runs(
-            TENANT,
-            REGION,
-            &visible,
-            CiRunPageRequest::new(CiRunStateFilter::All, 2, Some(cursor.clone())).unwrap(),
-        )
-        .await
-        .expect("keyset continuation");
-    assert_eq!(
-        second
-            .items
-            .iter()
-            .map(|run| run.run_id.as_str())
-            .collect::<Vec<_>>(),
-        [RUN_1]
-    );
-    assert!(second.next_cursor.is_none());
-    assert!(
-        first.items.iter().all(|run| run.run_id != RUN_HIDDEN)
-            && second.items.iter().all(|run| run.run_id != RUN_HIDDEN),
-        "a non-visible parent repository never enters pagination"
-    );
-
-    let stale = store
-        .list_surface_runs(
-            TENANT,
-            REGION,
-            &[ALPHA.to_owned()],
-            CiRunPageRequest::new(CiRunStateFilter::All, 2, Some(cursor.clone())).unwrap(),
-        )
-        .await
-        .expect_err("visibility-set changes stale the cursor");
-    assert_eq!(stale, CiRunSurfaceError::CursorStale);
-    let stale = store
-        .list_surface_runs(
-            TENANT,
-            REGION,
-            &visible,
-            CiRunPageRequest::new(CiRunStateFilter::Failed, 2, Some(cursor)).unwrap(),
-        )
-        .await
-        .expect_err("state-filter changes stale the cursor");
-    assert_eq!(stale, CiRunSurfaceError::CursorStale);
-
-    let detail = store
-        .get_surface_run(TENANT, REGION, RUN_2, BETA)
-        .await
-        .expect("detail read")
-        .expect("visible tenant run exists");
-    assert_eq!(detail.run.repo_ref, BETA);
-    assert_eq!(detail.jobs.len(), 1);
-    assert_eq!(detail.jobs[0].name, "test");
-    assert_eq!(detail.jobs[0].needs, Vec::<String>::new());
-    assert_eq!(detail.steps.len(), 1);
-    assert_eq!(detail.steps[0].step_id, "compile");
-    assert_eq!(detail.steps[0].byte_end, Some(48));
-
-    let archive = store
-        .get_surface_log_archive(
-            TENANT,
-            REGION,
-            RUN_2,
-            JOB,
-            BETA,
-            CiLogRangeRequest::new(12, 16).unwrap(),
-        )
-        .await
-        .expect("archive read")
-        .expect("repo-bound job exists");
-    assert_eq!(archive.total_end, 50);
-    assert_eq!(archive.segments.len(), 2);
-    assert_eq!(
-        archive
-            .segments
-            .iter()
-            .map(|segment| (segment.byte_start, segment.byte_end))
-            .collect::<Vec<_>>(),
-        [(0, 20), (20, 50)]
-    );
-    assert!(store
-        .get_surface_log_archive(
-            TENANT,
-            REGION,
-            RUN_2,
-            JOB,
+            RUN_1,
             ALPHA,
-            CiLogRangeRequest::new(0, 16).unwrap(),
+            "succeeded",
+            "2026-07-24T10:00:00Z",
         )
-        .await
-        .expect("wrong parent is an ordinary miss")
-        .is_none());
-    assert!(store
-        .get_surface_log_archive(
+        .await;
+        insert_run(&app, TENANT, RUN_2, BETA, "failed", "2026-07-24T11:00:00Z").await;
+        insert_run(
+            &app,
+            TENANT,
+            RUN_3,
+            ALPHA,
+            "running",
+            "2026-07-24T12:00:00Z",
+        )
+        .await;
+        insert_run(
+            &app,
+            TENANT,
+            RUN_HIDDEN,
+            HIDDEN,
+            "failed",
+            "2026-07-24T13:00:00Z",
+        )
+        .await;
+        insert_run(
+            &app,
             OTHER_TENANT,
-            REGION,
-            RUN_2,
-            JOB,
-            BETA,
-            CiLogRangeRequest::new(0, 16).unwrap(),
+            RUN_1,
+            "myelin://ci_surface_other/git/repo/alpha",
+            "failed",
+            "2026-07-24T14:00:00Z",
         )
-        .await
-        .expect("cross-tenant archive read returns no row")
-        .is_none());
+        .await;
+        insert_detail(&app).await;
 
-    assert!(
-        store
-            .get_surface_run(TENANT, REGION, RUN_HIDDEN, HIDDEN)
+        let visible = vec![BETA.to_owned(), ALPHA.to_owned(), ALPHA.to_owned()];
+        let first = store
+            .list_surface_runs(
+                TENANT,
+                REGION,
+                &visible,
+                CiRunPageRequest::new(CiRunStateFilter::All, 2, None).unwrap(),
+            )
             .await
-            .expect("same-tenant hidden row is an internal store fact")
-            .is_some(),
-        "Edge, not the transport-agnostic store, owns parent-repository authorization"
-    );
-    assert!(
-        store
-            .get_surface_run(OTHER_TENANT, REGION, RUN_2, BETA)
-            .await
-            .expect("cross-tenant read returns no row")
-            .is_none(),
-        "explicit scope and FORCE RLS hide another tenant's run"
-    );
+            .expect("first visible page");
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            [RUN_3, RUN_2]
+        );
+        let cursor = first.next_cursor.expect("one older visible run remains");
 
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-    let raced_store = store
-        .clone()
-        .with_surface_detail_test_barrier(barrier.clone());
-    let snapshot = raced_store.get_surface_run(TENANT, REGION, RUN_2, BETA);
-    let move_parent = async {
-        barrier.wait().await;
-        sqlx::query(
-            "UPDATE ci_run
-                SET repo_ref = $1
-              WHERE tenant_id = $2 AND region = $3 AND run_id = $4::uuid",
+        insert_run(
+            &app,
+            TENANT,
+            RUN_NEWER,
+            ALPHA,
+            "running",
+            "2026-07-24T15:00:00Z",
         )
-        .bind(HIDDEN)
-        .bind(TENANT)
-        .bind(REGION)
-        .bind(RUN_2)
-        .execute(&admin)
-        .await
-        .expect("move the parent during detail materialization");
-        barrier.wait().await;
-    };
-    let (snapshot, ()) = tokio::join!(snapshot, move_parent);
-    let snapshot = snapshot
-        .expect("repeatable-read detail snapshot")
-        .expect("authorized parent existed at the snapshot instant");
-    assert_eq!(snapshot.run.repo_ref, BETA);
-    assert_eq!(snapshot.jobs.len(), 1);
-    assert_eq!(snapshot.steps.len(), 1);
-    assert!(
-        store
+        .await;
+        let second = store
+            .list_surface_runs(
+                TENANT,
+                REGION,
+                &visible,
+                CiRunPageRequest::new(CiRunStateFilter::All, 2, Some(cursor.clone())).unwrap(),
+            )
+            .await
+            .expect("keyset continuation");
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            [RUN_1]
+        );
+        assert!(second.next_cursor.is_none());
+        assert!(
+            first.items.iter().all(|run| run.run_id != RUN_HIDDEN)
+                && second.items.iter().all(|run| run.run_id != RUN_HIDDEN),
+            "a non-visible parent repository never enters pagination"
+        );
+
+        let stale = store
+            .list_surface_runs(
+                TENANT,
+                REGION,
+                &[ALPHA.to_owned()],
+                CiRunPageRequest::new(CiRunStateFilter::All, 2, Some(cursor.clone())).unwrap(),
+            )
+            .await
+            .expect_err("visibility-set changes stale the cursor");
+        assert_eq!(stale, CiRunSurfaceError::CursorStale);
+        let stale = store
+            .list_surface_runs(
+                TENANT,
+                REGION,
+                &visible,
+                CiRunPageRequest::new(CiRunStateFilter::Failed, 2, Some(cursor)).unwrap(),
+            )
+            .await
+            .expect_err("state-filter changes stale the cursor");
+        assert_eq!(stale, CiRunSurfaceError::CursorStale);
+
+        let detail = store
             .get_surface_run(TENANT, REGION, RUN_2, BETA)
             .await
-            .expect("repo-bound detail read")
-            .is_none(),
-        "the returned detail is atomically bound to the exact authorized parent repository"
-    );
+            .expect("detail read")
+            .expect("visible tenant run exists");
+        assert_eq!(detail.run.repo_ref, BETA);
+        assert_eq!(detail.jobs.len(), 1);
+        assert_eq!(detail.jobs[0].name, "test");
+        assert_eq!(detail.jobs[0].needs, Vec::<String>::new());
+        assert_eq!(detail.steps.len(), 1);
+        assert_eq!(detail.steps[0].step_id, "compile");
+        assert_eq!(detail.steps[0].byte_end, Some(48));
 
-    let index_shape: (bool, String, Vec<String>, Option<String>) = sqlx::query_as(
-        "SELECT i.indisready
+        let archive = store
+            .get_surface_log_archive(
+                TENANT,
+                REGION,
+                RUN_2,
+                JOB,
+                BETA,
+                CiLogRangeRequest::new(12, 16).unwrap(),
+            )
+            .await
+            .expect("archive read")
+            .expect("repo-bound job exists");
+        assert_eq!(archive.total_end, 50);
+        assert_eq!(archive.segments.len(), 2);
+        assert_eq!(
+            archive
+                .segments
+                .iter()
+                .map(|segment| (segment.byte_start, segment.byte_end))
+                .collect::<Vec<_>>(),
+            [(0, 20), (20, 50)]
+        );
+        assert!(store
+            .get_surface_log_archive(
+                TENANT,
+                REGION,
+                RUN_2,
+                JOB,
+                ALPHA,
+                CiLogRangeRequest::new(0, 16).unwrap(),
+            )
+            .await
+            .expect("wrong parent is an ordinary miss")
+            .is_none());
+        assert!(store
+            .get_surface_log_archive(
+                OTHER_TENANT,
+                REGION,
+                RUN_2,
+                JOB,
+                BETA,
+                CiLogRangeRequest::new(0, 16).unwrap(),
+            )
+            .await
+            .expect("cross-tenant archive read returns no row")
+            .is_none());
+
+        assert!(
+            store
+                .get_surface_run(TENANT, REGION, RUN_HIDDEN, HIDDEN)
+                .await
+                .expect("same-tenant hidden row is an internal store fact")
+                .is_some(),
+            "Edge, not the transport-agnostic store, owns parent-repository authorization"
+        );
+        assert!(
+            store
+                .get_surface_run(OTHER_TENANT, REGION, RUN_2, BETA)
+                .await
+                .expect("cross-tenant read returns no row")
+                .is_none(),
+            "explicit scope and FORCE RLS hide another tenant's run"
+        );
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let raced_store = store
+            .clone()
+            .with_surface_detail_test_barrier(barrier.clone());
+        let snapshot = raced_store.get_surface_run(TENANT, REGION, RUN_2, BETA);
+        let move_parent = async {
+            barrier.wait().await;
+            sqlx::query(
+                "UPDATE ci_run
+                SET repo_ref = $1
+              WHERE tenant_id = $2 AND region = $3 AND run_id = $4::uuid",
+            )
+            .bind(HIDDEN)
+            .bind(TENANT)
+            .bind(REGION)
+            .bind(RUN_2)
+            .execute(&admin)
+            .await
+            .expect("move the parent during detail materialization");
+            barrier.wait().await;
+        };
+        let (snapshot, ()) = tokio::join!(snapshot, move_parent);
+        let snapshot = snapshot
+            .expect("repeatable-read detail snapshot")
+            .expect("authorized parent existed at the snapshot instant");
+        assert_eq!(snapshot.run.repo_ref, BETA);
+        assert_eq!(snapshot.jobs.len(), 1);
+        assert_eq!(snapshot.steps.len(), 1);
+        assert!(
+            store
+                .get_surface_run(TENANT, REGION, RUN_2, BETA)
+                .await
+                .expect("repo-bound detail read")
+                .is_none(),
+            "the returned detail is atomically bound to the exact authorized parent repository"
+        );
+
+        let index_shape: (bool, String, Vec<String>, Option<String>) = sqlx::query_as(
+            "SELECT i.indisready
                     AND i.indisvalid
                     AND i.indislive
                     AND NOT i.indcheckxmin,
@@ -470,30 +470,30 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
            JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
            JOIN pg_class table_class ON table_class.oid = i.indrelid
           WHERE index_namespace.nspname = current_schema() AND index_class.relname = $1",
-    )
-    .bind(CI_RUN_SURFACE_REPO_CREATED_INDEX)
-    .fetch_one(&admin)
-    .await
-    .expect("inspect run-list index");
-    assert_eq!(
-        index_shape,
-        (
-            true,
-            "ci_run".into(),
-            vec![
-                "tenant_id".into(),
-                "region".into(),
-                "repo_ref".into(),
-                "created_at DESC".into(),
-                "run_id DESC".into(),
-            ],
-            Some("(repo_ref IS NOT NULL)".into()),
-        ),
-        "the serving index is ready and has the exact table/key/predicate identity"
-    );
+        )
+        .bind(CI_RUN_SURFACE_REPO_CREATED_INDEX)
+        .fetch_one(&admin)
+        .await
+        .expect("inspect run-list index");
+        assert_eq!(
+            index_shape,
+            (
+                true,
+                "ci_run".into(),
+                vec![
+                    "tenant_id".into(),
+                    "region".into(),
+                    "repo_ref".into(),
+                    "created_at DESC".into(),
+                    "run_id DESC".into(),
+                ],
+                Some("(repo_ref IS NOT NULL)".into()),
+            ),
+            "the serving index is ready and has the exact table/key/predicate identity"
+        );
 
-    app.close().await;
-    admin.close().await;
+        app.close().await;
+        admin.close().await;
     })
     .await;
 }
