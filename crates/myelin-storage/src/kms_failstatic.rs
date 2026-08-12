@@ -167,7 +167,9 @@ impl<A: KmsAdapter, C: Clock> KmsReadPath<A, C> {
             Ok(handle) => {
                 let now = self.clock.now_secs();
                 {
-                    let mut cache = self.cache.lock().expect("kms read cache poisoned");
+                    let Ok(mut cache) = self.cache.lock() else {
+                        return self.cache_unavailable();
+                    };
                     cache.insert(
                         cache_key,
                         Entry {
@@ -189,7 +191,9 @@ impl<A: KmsAdapter, C: Clock> KmsReadPath<A, C> {
 
     fn serve_from_cache(&self, cache_key: &(PiiKeyRef, Region), cause: KmsError) -> KmsReadResult {
         let now = self.clock.now_secs();
-        let cache = self.cache.lock().expect("kms read cache poisoned");
+        let Ok(cache) = self.cache.lock() else {
+            return self.cache_unavailable();
+        };
         let Some(entry) = cache.get(cache_key) else {
             drop(cache);
             self.not_ready.fetch_add(1, Ordering::SeqCst);
@@ -219,6 +223,11 @@ impl<A: KmsAdapter, C: Clock> KmsReadPath<A, C> {
             self.not_ready.fetch_add(1, Ordering::SeqCst);
             KmsReadResult::NotReady(cause)
         }
+    }
+
+    fn cache_unavailable(&self) -> KmsReadResult {
+        self.not_ready.fetch_add(1, Ordering::SeqCst);
+        KmsReadResult::NotReady(KmsError::StateUnavailable("resolved-DEK cache"))
     }
 
     pub fn signals(&self) -> KmsFailStaticSignals {
@@ -372,6 +381,26 @@ mod tests {
             "cold outage with no cache → not-ready, never fail open"
         );
         assert_eq!(path.signals().fresh, 0);
+        assert_eq!(path.signals().fail_open, 0);
+    }
+
+    #[test]
+    fn poisoned_resolved_dek_cache_is_not_ready_on_fresh_and_degraded_paths() {
+        let (kms, kr, region) = provisioned();
+        let path = KmsReadPath::with_clock(FlakyKms::new(kms), 30, 300, TestClock::at(0));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = path.cache.lock().unwrap();
+            panic!("poison the test resolved-DEK cache");
+        }));
+
+        for down in [false, true] {
+            path.engine.set_down(down);
+            assert!(matches!(
+                path.resolve(&kr, &region),
+                KmsReadResult::NotReady(KmsError::StateUnavailable("resolved-DEK cache"))
+            ));
+        }
+        assert_eq!(path.signals().not_ready, 2);
         assert_eq!(path.signals().fail_open, 0);
     }
 

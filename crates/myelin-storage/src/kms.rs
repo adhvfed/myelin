@@ -410,6 +410,7 @@ pub enum KmsError {
     KekUnavailable(KekId),
     DekUnavailable(DekId),
     UnwrapFailed(DekId),
+    StateUnavailable(&'static str),
     Durability(String),
 }
 
@@ -438,6 +439,9 @@ impl fmt::Display for KmsError {
                 id.tenant.as_str(),
                 id.class.as_token()
             ),
+            KmsError::StateUnavailable(state) => {
+                write!(f, "KMS: {state} state is unavailable - refused")
+            }
             KmsError::Durability(e) => write!(
                 f,
                 "KMS: durable key operation FAILED and was refused (no unpersisted key material \
