@@ -27,6 +27,8 @@ use sqlx::Row;
 
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
+use crate::reserve_settle::RunId as CostRunId;
+use crate::reserve_settle_durable::DurableCostLedger;
 
 #[derive(Clone)]
 pub struct DurableAgentTriggerBacking {
@@ -868,12 +870,13 @@ impl DurableAgentTriggerBacking {
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         let limit = i64::from(limit.clamp(1, 1_001));
+        let ledger = DurableCostLedger::new(self.provider.clone());
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    let updated = sqlx::query(
+                    let terminal_run_ids = sqlx::query_scalar::<_, String>(
                         "WITH terminal AS (\
-                            SELECT firing.binding_id, firing.event_id \
+                            SELECT firing.binding_id, firing.event_id, firing.run_id \
                               FROM agent_trigger_firing firing \
                               JOIN workflow_run run ON run.tenant_id = firing.tenant_id \
                                AND run.region = firing.region \
@@ -889,16 +892,30 @@ impl DurableAgentTriggerBacking {
                           WHERE firing.tenant_id = $1 AND firing.region = $2 \
                             AND firing.binding_id = terminal.binding_id \
                             AND firing.event_id = terminal.event_id \
-                            AND firing.state = 'started'",
+                            AND firing.state = 'started' \
+                      RETURNING firing.run_id::text",
                     )
                     .bind(&tenant)
                     .bind(&region)
                     .bind(limit)
-                    .execute(&mut *conn)
+                    .fetch_all(&mut *conn)
                     .await
-                    .map_err(query_error("reconcile terminal governed agent firings"))?
-                    .rows_affected();
-                    Ok(updated)
+                    .map_err(query_error("reconcile terminal governed agent firings"))?;
+                    for run_id in &terminal_run_ids {
+                        ledger
+                            .stop_if_present_in_tx(
+                                conn,
+                                &myelin_tenancy::TenantId(tenant.clone()),
+                                &CostRunId::new(run_id),
+                            )
+                            .await
+                            .map_err(|error| {
+                                PgError::Query(format!(
+                                    "settle terminal governed agent firing: {error}"
+                                ))
+                            })?;
+                    }
+                    Ok(terminal_run_ids.len() as u64)
                 })
             })
             .await
