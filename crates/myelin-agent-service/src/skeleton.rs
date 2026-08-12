@@ -235,7 +235,9 @@ pub enum SkeletonError {
     CoCommit(String),
     ToolValidationRejected(String),
     ToolExecFailed(String),
-    ApprovalRequired { gate_id: String },
+    ApprovalRequired {
+        gate_id: String,
+    },
     MaxTurnsExhausted {
         run_id: String,
         turns: usize,
@@ -438,7 +440,9 @@ impl SkeletonAgent {
                 sub.available,
             )
             .map_err(SkeletonError::from)?;
-        teardown_guard.telemetry.record_reserve(in_flight.reserved().0);
+        teardown_guard
+            .telemetry
+            .record_reserve(in_flight.reserved().0);
 
         let _child_env = ChildEnv::for_run(&token.jti);
 
@@ -459,7 +463,7 @@ impl SkeletonAgent {
             sub.run_id.clone(),
             "agent.run",
             format!("skeleton-now:{}", sub.now_secs),
-             0,
+            0,
         );
 
         let mut conv = Conversation::default();
@@ -518,7 +522,8 @@ impl SkeletonAgent {
                                 )))
                             }
                         };
-                        let effect_key = crate::tool_exec::logical_tool_effect_key(turn, call_index);
+                        let effect_key =
+                            crate::tool_exec::logical_tool_effect_key(turn, call_index);
                         let tool_context = ToolExecutionContext {
                             run_id: &sub.run_id,
                             run_token: &token,
@@ -633,19 +638,23 @@ impl SkeletonAgent {
             run_id: run_id.to_string(),
             reason: e.to_string(),
         })?;
-        let charge = priced.total().ok_or_else(|| SkeletonError::MeteringOverflow {
-            run_id: run_id.to_string(),
-            reason: "priced wholesale + markup overflowed u64".into(),
-        })?;
+        let charge = priced
+            .total()
+            .ok_or_else(|| SkeletonError::MeteringOverflow {
+                run_id: run_id.to_string(),
+                reason: "priced wholesale + markup overflowed u64".into(),
+            })?;
         match wallet.debit_once(tenant, charge, run_id, charge_key) {
             Ok(DebitOutcome::Applied(_new_balance) | DebitOutcome::Replayed(_new_balance)) => {
                 telemetry.record_charge(charge);
                 Ok(())
             }
-            Err(WalletError::InsufficientBalance { .. }) => Err(SkeletonError::WalletSpendCapReached {
-                run_id: run_id.to_string(),
-                stage: SpendCapStage::PostDebit,
-            }),
+            Err(WalletError::InsufficientBalance { .. }) => {
+                Err(SkeletonError::WalletSpendCapReached {
+                    run_id: run_id.to_string(),
+                    stage: SpendCapStage::PostDebit,
+                })
+            }
             Err(other) => Err(SkeletonError::MeteringOverflow {
                 run_id: run_id.to_string(),
                 reason: other.to_string(),
@@ -843,9 +852,9 @@ mod tests {
             &mut gate,
             &mut ledger,
             &outbox,
-             100,
-             10,
-             1000,
+            100,
+            10,
+            1000,
         );
 
         let out = agent_loop
@@ -1066,7 +1075,16 @@ mod tests {
         let cat = MockToolSurface::new();
         let exec = MockToolExecutor::new();
         let mut sub = substrate(
-            "R3", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 1, 10, 1000,
+            "R3",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            1,
+            10,
+            1000,
         );
 
         let err = agent_loop
@@ -1338,7 +1356,16 @@ mod tests {
         let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
         let exec = MockToolExecutor::new();
         let mut sub = substrate(
-            "Rtools", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rtools",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
 
         let out = agent_loop
@@ -1357,7 +1384,11 @@ mod tests {
             "each tool turn appended a ToolResults turn the next step reads"
         );
         let submit_outcomes = brain.outcomes_at_submit.lock().unwrap().clone();
-        assert_eq!(submit_outcomes.len(), 2, "both tool round-trips accumulated");
+        assert_eq!(
+            submit_outcomes.len(),
+            2,
+            "both tool round-trips accumulated"
+        );
         assert_eq!(submit_outcomes[0].call_id, ToolCallId("call:search".into()));
         assert_eq!(
             submit_outcomes[0].result,
@@ -1400,7 +1431,16 @@ mod tests {
         let cat = MockToolSurface::with([tool_def("loop")]);
         let exec = MockToolExecutor::new();
         let mut sub = substrate(
-            "Rmax", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rmax",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
 
         let err = agent_loop
@@ -1440,7 +1480,16 @@ mod tests {
         let cat = MockToolSurface::new();
         let exec = MockToolExecutor::new();
         let mut sub = substrate(
-            "Rbad", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rbad",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
 
         let err = agent_loop
@@ -1451,7 +1500,11 @@ mod tests {
             "fail-closed on validation: {err}"
         );
         assert_eq!(exec.call_count(), 0, "0 dispatch on a validation failure");
-        assert_eq!(tele.tokens_revoked(), 1, "torn down on the validation-abort path");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "torn down on the validation-abort path"
+        );
         assert_eq!(tele.traces_written(), 0);
         assert_eq!(tele.runs_completed(), 0);
     }
@@ -1470,9 +1523,19 @@ mod tests {
         let outbox = myelin_events::OutboxStore::new();
         let mut tele = SkeletonTelemetry::new();
         let cat = MockToolSurface::with([tool_def("read")]);
-        let exec = MockToolExecutor::with_results([Err(ToolExecError::Failed("subsystem down".into()))]);
+        let exec =
+            MockToolExecutor::with_results([Err(ToolExecError::Failed("subsystem down".into()))]);
         let mut sub = substrate(
-            "Rerr", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rerr",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
 
         let err = agent_loop
@@ -1483,7 +1546,11 @@ mod tests {
             "loud executor failure: {err}"
         );
         assert_eq!(exec.call_count(), 1, "the failing call was attempted once");
-        assert_eq!(tele.tokens_revoked(), 1, "torn down on the executor-error path");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "torn down on the executor-error path"
+        );
         assert_eq!(tele.traces_written(), 0);
         assert_eq!(tele.runs_completed(), 0);
     }
@@ -1506,7 +1573,16 @@ mod tests {
             gate_id: "gate-merge-42".into(),
         })]);
         let mut sub = substrate(
-            "Rgate", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rgate",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
 
         let error = agent_loop
@@ -1522,8 +1598,16 @@ mod tests {
         assert_eq!(exec.call_count(), 1, "the proposed effect was planned once");
         assert_eq!(tele.reserved(), 10, "the run remains admitted for a resume");
         assert_eq!(tele.settled(), 0, "a parked run is not called complete");
-        assert_eq!(tele.tokens_revoked(), 1, "the runtime credential is torn down");
-        assert_eq!(tele.traces_written(), 0, "the unfinished run has no final trace");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "the runtime credential is torn down"
+        );
+        assert_eq!(
+            tele.traces_written(),
+            0,
+            "the unfinished run has no final trace"
+        );
         assert_eq!(tele.runs_completed(), 0);
     }
 
@@ -1543,7 +1627,16 @@ mod tests {
         let cat = MockToolSurface::new();
         let exec = MockToolExecutor::new();
         let mut sub = substrate(
-            "Rtok0", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rtok0",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
 
         agent_loop
@@ -1577,10 +1670,7 @@ mod tests {
             }
         }
         impl MeteredRuntime for MeteredBrain {
-            fn step_metered(
-                &self,
-                conv: &Conversation,
-            ) -> Result<MeteredStep, RuntimeStepError> {
+            fn step_metered(&self, conv: &Conversation) -> Result<MeteredStep, RuntimeStepError> {
                 Ok(MeteredStep {
                     outcome: self.step(conv),
                     usage: TokenUsage::Reported {
@@ -1612,7 +1702,16 @@ mod tests {
         let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
         let exec = MockToolExecutor::new();
         let mut sub = substrate(
-            "Rtok", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rtok",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
 
         let out = agent_loop
@@ -1695,7 +1794,10 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((amount.0, run_id.to_string()));
-                    self.charge_keys.lock().unwrap().push(charge_key.to_string());
+                    self.charge_keys
+                        .lock()
+                        .unwrap()
+                        .push(charge_key.to_string());
                     Ok(DebitOutcome::Applied(MicroUsd(new_balance)))
                 }
                 None => Err(WalletError::InsufficientBalance {
@@ -1738,12 +1840,8 @@ mod tests {
         }
     }
     impl MeteredRuntime for MeteredScriptBrain {
-        fn step_metered(
-            &self,
-            conv: &Conversation,
-        ) -> Result<MeteredStep, RuntimeStepError> {
-            self.steps
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        fn step_metered(&self, conv: &Conversation) -> Result<MeteredStep, RuntimeStepError> {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(MeteredStep {
                 outcome: self.step(conv),
                 usage: self.usage,
@@ -1775,7 +1873,16 @@ mod tests {
         let exec = MockToolExecutor::new();
         let wallet = FakeWallet::new(10_000);
         let mut sub = substrate(
-            "Rmeter", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rmeter",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
         sub.wallet = Some(&wallet);
 
@@ -1785,9 +1892,16 @@ mod tests {
         assert!(out.0.contains("completed"), "the run completed: {out:?}");
 
         let rows = wallet.debit_rows();
-        assert_eq!(rows.len(), 3, "one debit per turn (no double-charge, no skip)");
+        assert_eq!(
+            rows.len(),
+            3,
+            "one debit per turn (no double-charge, no skip)"
+        );
         for (amount, run_id) in &rows {
-            assert_eq!(*amount, TEST_CHARGE_PER_TURN, "each turn debits wholesale+markup");
+            assert_eq!(
+                *amount, TEST_CHARGE_PER_TURN,
+                "each turn debits wholesale+markup"
+            );
             assert_eq!(run_id, "Rmeter", "every debit is run_id-linked");
         }
         assert_eq!(
@@ -1830,7 +1944,16 @@ mod tests {
         let exec = MockToolExecutor::new();
         let wallet = FakeWallet::new(1_000);
         let mut sub = substrate(
-            "Rdry", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rdry",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
         sub.wallet = Some(&wallet);
 
@@ -1840,11 +1963,19 @@ mod tests {
         match err {
             SkeletonError::WalletSpendCapReached { run_id, stage } => {
                 assert_eq!(run_id, "Rdry");
-                assert_eq!(stage, SpendCapStage::PostDebit, "the mid-run debit was refused");
+                assert_eq!(
+                    stage,
+                    SpendCapStage::PostDebit,
+                    "the mid-run debit was refused"
+                );
             }
             other => panic!("expected WalletSpendCapReached, got {other:?}"),
         }
-        assert_eq!(wallet.debit_rows().len(), 2, "only the funded turns debited");
+        assert_eq!(
+            wallet.debit_rows().len(),
+            2,
+            "only the funded turns debited"
+        );
         assert_eq!(
             wallet.balance_now(),
             1_000 - 2 * TEST_CHARGE_PER_TURN,
@@ -1873,7 +2004,16 @@ mod tests {
         let exec = MockToolExecutor::new();
         let wallet = FakeWallet::new(10_000);
         let mut sub = substrate(
-            "Rnr", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rnr",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
         sub.wallet = Some(&wallet);
 
@@ -1884,10 +2024,17 @@ mod tests {
             SkeletonError::MeteringUsageNotReported { run_id } => assert_eq!(run_id, "Rnr"),
             other => panic!("expected MeteringUsageNotReported, got {other:?}"),
         }
-        assert!(wallet.debit_rows().is_empty(), "0 debit on a NotReported turn");
+        assert!(
+            wallet.debit_rows().is_empty(),
+            "0 debit on a NotReported turn"
+        );
         assert_eq!(wallet.balance_now(), 10_000, "balance untouched");
         assert_eq!(tele.charged_micro(), 0);
-        assert_eq!(tele.tokens_revoked(), 1, "torn down on the fail-closed path");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "torn down on the fail-closed path"
+        );
         assert_eq!(tele.traces_written(), 0);
         assert_eq!(tele.runs_completed(), 0);
     }
@@ -1903,10 +2050,7 @@ mod tests {
         }
 
         impl MeteredRuntime for UnavailableRuntime {
-            fn step_metered(
-                &self,
-                _conv: &Conversation,
-            ) -> Result<MeteredStep, RuntimeStepError> {
+            fn step_metered(&self, _conv: &Conversation) -> Result<MeteredStep, RuntimeStepError> {
                 Err(RuntimeStepError::Unavailable)
             }
         }
@@ -1925,7 +2069,16 @@ mod tests {
         let exec = MockToolExecutor::new();
         let wallet = FakeWallet::new(10_000);
         let mut sub = substrate(
-            "Rprovider", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rprovider",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
         sub.wallet = Some(&wallet);
 
@@ -1945,9 +2098,16 @@ mod tests {
                 error: RuntimeStepError::Unavailable,
             },
         );
-        assert!(wallet.debit_rows().is_empty(), "a failed call has no usage to debit");
+        assert!(
+            wallet.debit_rows().is_empty(),
+            "a failed call has no usage to debit"
+        );
         assert_eq!(tele.turns_usage_not_reported(), 0);
-        assert_eq!(tele.tokens_revoked(), 1, "the failed run still tears down its token");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "the failed run still tears down its token"
+        );
     }
 
     #[test]
@@ -1967,7 +2127,16 @@ mod tests {
         let exec = MockToolExecutor::new();
         let wallet = FakeWallet::new(0);
         let mut sub = substrate(
-            "Rzero", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+            "Rzero",
+            &revoker,
+            &cat,
+            &exec,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1000,
         );
         sub.wallet = Some(&wallet);
 
@@ -1977,14 +2146,25 @@ mod tests {
         match err {
             SkeletonError::WalletSpendCapReached { run_id, stage } => {
                 assert_eq!(run_id, "Rzero");
-                assert_eq!(stage, SpendCapStage::PreStepGate, "halted at the pre-step gate");
+                assert_eq!(
+                    stage,
+                    SpendCapStage::PreStepGate,
+                    "halted at the pre-step gate"
+                );
             }
             other => panic!("expected WalletSpendCapReached(PreStepGate), got {other:?}"),
         }
         assert_eq!(brain.steps_taken(), 0, "the paid model call was never made");
-        assert!(wallet.debit_rows().is_empty(), "0 debit - the call was blocked");
+        assert!(
+            wallet.debit_rows().is_empty(),
+            "0 debit - the call was blocked"
+        );
         assert_eq!(tele.charged_micro(), 0);
-        assert_eq!(tele.tokens_revoked(), 1, "torn down on the pre-step-gate path");
+        assert_eq!(
+            tele.tokens_revoked(),
+            1,
+            "torn down on the pre-step-gate path"
+        );
         assert_eq!(tele.traces_written(), 0);
         assert_eq!(tele.runs_completed(), 0);
     }
@@ -2012,8 +2192,14 @@ mod tests {
         .to_string();
         assert!(cap.contains("spend cap"), "renders the cap: {cap}");
         assert!(cap.contains("post-debit"), "renders the stage: {cap}");
-        assert!(nr.contains("fail-closed"), "renders the fail-closed abort: {nr}");
-        assert!(ov.contains("overflow") && ov.contains("boom"), "renders the overflow: {ov}");
+        assert!(
+            nr.contains("fail-closed"),
+            "renders the fail-closed abort: {nr}"
+        );
+        assert!(
+            ov.contains("overflow") && ov.contains("boom"),
+            "renders the overflow: {ov}"
+        );
         assert!(
             settle.contains("settlement failed") && settle.contains("remains retryable"),
             "renders the recoverable settlement failure: {settle}"
@@ -2046,7 +2232,16 @@ mod tests {
             let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
             let exec = MockToolExecutor::new();
             let mut sub = substrate(
-                run_id, &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, now,
+                run_id,
+                &revoker,
+                &cat,
+                &exec,
+                &mut gate,
+                &mut ledger,
+                &outbox,
+                100,
+                10,
+                now,
             );
             sub.wallet = wallet;
             let _ = agent_loop.handle_run(runtime, &mut sub, &mut tele, kill);
@@ -2079,7 +2274,10 @@ mod tests {
             1,
             "kill path: revoked EXACTLY once (never zero, never twice)"
         );
-        assert!(killed.max_revocation_lag() <= w as u64, "lag within bound W");
+        assert!(
+            killed.max_revocation_lag() <= w as u64,
+            "lag within bound W"
+        );
 
         let brain = MeteredScriptBrain::new(TEST_USAGE);
         let wallet = FakeWallet::new(1_000);
@@ -2099,6 +2297,9 @@ mod tests {
             1,
             "insufficient-balance abort: revoked EXACTLY once (never zero, never twice)"
         );
-        assert!(capped.max_revocation_lag() <= w as u64, "lag within bound W");
+        assert!(
+            capped.max_revocation_lag() <= w as u64,
+            "lag within bound W"
+        );
     }
 }

@@ -1528,9 +1528,9 @@ mod tests {
         let EdgeResponse::Bytes { headers, .. } = &limited else {
             panic!("a device authorization response is JSON")
         };
-        assert!(headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("retry-after") && value == "600"
-        }));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| { name.eq_ignore_ascii_case("retry-after") && value == "600" }));
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("cache-control") && value == "no-store"
         }));

@@ -175,7 +175,6 @@ impl RepoBootstrapGrants for TupleRepoBootstrap {
             .map(|_zookie| ())
             .map_err(|e| e.to_string())
     }
-
 }
 
 fn now_rfc3339() -> Timestamp {

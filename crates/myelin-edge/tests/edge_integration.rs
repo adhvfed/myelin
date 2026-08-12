@@ -38,7 +38,10 @@ impl Handler for SlowGitWireHandler {
     fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         SLOW_GIT_STARTED.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(500));
-        Ok(EdgeResponse::json(200, &serde_json::json!({ "status": "ok" })))
+        Ok(EdgeResponse::json(
+            200,
+            &serde_json::json!({ "status": "ok" }),
+        ))
     }
 }
 
@@ -48,7 +51,10 @@ impl Handler for SlowJsonHandler {
     fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         SLOW_JSON_STARTED.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(500));
-        Ok(EdgeResponse::json(200, &serde_json::json!({ "status": "ok" })))
+        Ok(EdgeResponse::json(
+            200,
+            &serde_json::json!({ "status": "ok" }),
+        ))
     }
 }
 
@@ -64,11 +70,10 @@ struct InvalidResponseHandler;
 
 impl Handler for InvalidResponseHandler {
     fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        Ok(EdgeResponse::json(
-            200,
-            &serde_json::json!({ "false": "success" }),
+        Ok(
+            EdgeResponse::json(200, &serde_json::json!({ "false": "success" }))
+                .with_header("content-length", "0"),
         )
-        .with_header("content-length", "0"))
     }
 }
 
@@ -416,7 +421,10 @@ async fn handler_panic_is_a_generic_500_and_the_listener_survives() {
     assert!(!body.contains("intentional handler panic"));
 
     let (live, _) = http(addr, "GET", "/livez", &[], vec![]).await;
-    assert_eq!(live, 200, "a contained handler panic must not kill the listener");
+    assert_eq!(
+        live, 200,
+        "a contained handler panic must not kill the listener"
+    );
 }
 
 #[tokio::test]
@@ -426,14 +434,7 @@ async fn invalid_handler_response_metadata_fails_closed_without_false_success() 
     let headers = bearer(&token);
     let addr = spawn(gateway).await;
 
-    let response = open(
-        addr,
-        "GET",
-        "/v1/invalid-response",
-        &hdr(&headers),
-        vec![],
-    )
-    .await;
+    let response = open(addr, "GET", "/v1/invalid-response", &hdr(&headers), vec![]).await;
     assert_eq!(response.status(), 500);
     assert_eq!(response.headers()["content-type"], "application/json");
     assert_eq!(response.headers()["cache-control"], "no-store");
@@ -442,7 +443,9 @@ async fn invalid_handler_response_metadata_fails_closed_without_false_success() 
     let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(envelope["error"]["code"], "internal");
     assert_eq!(envelope["error"]["message"], "internal error");
-    assert!(!body.windows(b"false".len()).any(|window| window == b"false"));
+    assert!(!body
+        .windows(b"false".len())
+        .any(|window| window == b"false"));
 }
 
 #[tokio::test]
@@ -469,13 +472,10 @@ async fn sse_endpoint_streams_a_frame() {
     let mut body = resp.into_body();
 
     let scope = sse_scope_for_tenant(TENANT);
-    let frame = receive_product_sse_frame(
-        &mut body,
-        || {
-            gw.sse_hub()
-                .broadcast("edge", &scope, SseEvent::typed("ping", "{\"hello\":true}"));
-        },
-    )
+    let frame = receive_product_sse_frame(&mut body, || {
+        gw.sse_hub()
+            .broadcast("edge", &scope, SseEvent::typed("ping", "{\"hello\":true}"));
+    })
     .await
     .expect("the product SSE frame should stream after the connected comment");
     assert!(
@@ -509,20 +509,17 @@ async fn scoped_sse_route_isolates_per_object() {
     let coarse = sse_scope_for_tenant(TENANT);
     let other = sse_scope_for_resource(TENANT, "repo", "secrets");
     let widgets = sse_scope_for_resource(TENANT, "repo", "widgets");
-    let frame = receive_product_sse_frame(
-        &mut body,
-        || {
-            gw.sse_hub()
-                .broadcast("git", &coarse, SseEvent::typed("leak", "{\"coarse\":true}"));
-            gw.sse_hub()
-                .broadcast("git", &other, SseEvent::typed("leak", "{\"other\":true}"));
-            gw.sse_hub().broadcast(
-                "git",
-                &widgets,
-                SseEvent::typed("push", "{\"repo\":\"widgets\"}"),
-            );
-        },
-    )
+    let frame = receive_product_sse_frame(&mut body, || {
+        gw.sse_hub()
+            .broadcast("git", &coarse, SseEvent::typed("leak", "{\"coarse\":true}"));
+        gw.sse_hub()
+            .broadcast("git", &other, SseEvent::typed("leak", "{\"other\":true}"));
+        gw.sse_hub().broadcast(
+            "git",
+            &widgets,
+            SseEvent::typed("push", "{\"repo\":\"widgets\"}"),
+        );
+    })
     .await
     .expect("the per-object product SSE frame should stream after the connected comment");
     assert!(
@@ -578,7 +575,12 @@ async fn health_endpoints_split_dependency_free_liveness_from_readiness() {
     let not_ready = not_ready_response.status().as_u16();
     assert_eq!(not_ready_response.headers()["retry-after"], "5");
     let not_ready_body = String::from_utf8_lossy(
-        &not_ready_response.into_body().collect().await.unwrap().to_bytes(),
+        &not_ready_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
     )
     .to_string();
     assert_eq!((live, live_body.as_str()), (200, "{\"status\":\"ok\"}"));
@@ -603,11 +605,21 @@ async fn every_response_carries_a_fresh_server_request_id() {
     let (gateway, _cell, _revocations) = build_gateway();
     let addr = spawn(gateway).await;
 
-    let first = open(addr, "GET", "/livez", &[("x-request-id", "attacker-value")], vec![]).await;
+    let first = open(
+        addr,
+        "GET",
+        "/livez",
+        &[("x-request-id", "attacker-value")],
+        vec![],
+    )
+    .await;
     let second = open(addr, "GET", "/does-not-exist", &[], vec![]).await;
     let first_id = first.headers()["x-request-id"].to_str().unwrap();
     let second_id = second.headers()["x-request-id"].to_str().unwrap();
-    assert_ne!(first_id, "attacker-value", "client request IDs are never trusted");
+    assert_ne!(
+        first_id, "attacker-value",
+        "client request IDs are never trusted"
+    );
     assert_ne!(first_id, second_id);
     for id in [first_id, second_id] {
         assert_eq!(id.len(), 40);

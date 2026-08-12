@@ -163,7 +163,10 @@ async fn open(
     if method == "POST" && path == "/v1/issues" {
         builder = builder.header(
             "idempotency-key",
-            format!("issue-route-test-{}", REQUEST_NONCE.fetch_add(1, Ordering::SeqCst)),
+            format!(
+                "issue-route-test-{}",
+                REQUEST_NONCE.fetch_add(1, Ordering::SeqCst)
+            ),
         );
     }
     sender
@@ -1180,7 +1183,10 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     delete_tenant_outbox_despite_concurrent_relay_quarantine(&admin, &foreign_tenant).await;
 }
 
-async fn delete_tenant_outbox_despite_concurrent_relay_quarantine(admin: &sqlx::PgPool, tenant: &str) {
+async fn delete_tenant_outbox_despite_concurrent_relay_quarantine(
+    admin: &sqlx::PgPool,
+    tenant: &str,
+) {
     const ATTEMPTS: u32 = 20;
     for attempt in 0..ATTEMPTS {
         sqlx::query(

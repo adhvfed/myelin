@@ -150,8 +150,9 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
-        {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.as_mut().poll(cx)
+        })) {
             Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Err(payload) => std::task::Poll::Ready(Err(payload)),
@@ -571,475 +572,475 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     with_schema_cleanup(&admin, &schema, || async {
-    let app = pool(&app_url(), &schema).await;
-    insert_run(&app, VISIBLE_RUN, "alpha", "2026-07-24T10:00:00Z").await;
-    insert_run(&app, HIDDEN_RUN, "hidden", "2026-07-24T11:00:00Z").await;
-    let blobs = Arc::new(FsBlobStore::new());
-    let tenant = TenantId(TENANT.into());
-    let first = b"alpha\n";
-    let second = b"beta\n";
-    let first_ref = blobs
-        .put(&tenant, first)
-        .expect("store first sealed log segment")
-        .to_multihash_string();
-    let second_ref = blobs
-        .put(&tenant, second)
-        .expect("store second sealed log segment")
-        .to_multihash_string();
-    insert_job_and_segments(
-        &app,
-        VISIBLE_RUN,
-        VISIBLE_JOB,
-        &[
-            (first_ref.clone(), 0, first.len() as i64),
-            (
-                second_ref.clone(),
-                first.len() as i64,
-                (first.len() + second.len()) as i64,
+        let app = pool(&app_url(), &schema).await;
+        insert_run(&app, VISIBLE_RUN, "alpha", "2026-07-24T10:00:00Z").await;
+        insert_run(&app, HIDDEN_RUN, "hidden", "2026-07-24T11:00:00Z").await;
+        let blobs = Arc::new(FsBlobStore::new());
+        let tenant = TenantId(TENANT.into());
+        let first = b"alpha\n";
+        let second = b"beta\n";
+        let first_ref = blobs
+            .put(&tenant, first)
+            .expect("store first sealed log segment")
+            .to_multihash_string();
+        let second_ref = blobs
+            .put(&tenant, second)
+            .expect("store second sealed log segment")
+            .to_multihash_string();
+        insert_job_and_segments(
+            &app,
+            VISIBLE_RUN,
+            VISIBLE_JOB,
+            &[
+                (first_ref.clone(), 0, first.len() as i64),
+                (
+                    second_ref.clone(),
+                    first.len() as i64,
+                    (first.len() + second.len()) as i64,
+                ),
+            ],
+        )
+        .await;
+        insert_job_and_segments(
+            &app,
+            HIDDEN_RUN,
+            HIDDEN_JOB,
+            &[(
+                ContentHash::blake3(b"hidden archive").to_multihash_string(),
+                0,
+                14,
+            )],
+        )
+        .await;
+        insert_job_and_segments(
+            &app,
+            VISIBLE_RUN,
+            CORRUPT_JOB,
+            &[(
+                ContentHash::blake3(b"not present").to_multihash_string(),
+                0,
+                11,
+            )],
+        )
+        .await;
+        let boundary_segments = (0..65)
+            .map(|sequence| {
+                let byte_start = if sequence == 64 {
+                    257
+                } else {
+                    i64::from(sequence) * 4
+                };
+                (
+                    ContentHash::blake3(format!("boundary-{sequence}").as_bytes())
+                        .to_multihash_string(),
+                    byte_start,
+                    byte_start + 4,
+                )
+            })
+            .collect::<Vec<_>>();
+        insert_job_and_segments(&app, VISIBLE_RUN, BOUNDARY_JOB, &boundary_segments).await;
+
+        let root = std::env::temp_dir().join(format!("{schema}_git"));
+        let repo_dir = root.join(TENANT).join(REGION);
+        std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
+        std::fs::create_dir_all(repo_dir.join("hidden.git")).expect("create hidden repo");
+        let (gateway, cell, direct, viewer, alpha_enabled) =
+            authenticated_gateway(app.clone(), &root, blobs.clone());
+        let token = mint(&cell);
+
+        let list = get(&gateway, &token, "/v1/ci/runs");
+        assert_eq!(list.status(), 200);
+        let list_body = list.json_body().expect("list JSON");
+        let items = list_body["items"].as_array().expect("list items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["run_id"], VISIBLE_RUN);
+        assert!(
+            list_body.to_string().find(HIDDEN_RUN).is_none(),
+            "the denied parent never enters the handler response"
+        );
+
+        let visible = get(&gateway, &token, &format!("/v1/ci/runs/{VISIBLE_RUN}"));
+        assert_eq!(visible.status(), 200);
+        assert_eq!(
+            visible.json_body().expect("visible detail JSON")["run"]["run_id"],
+            VISIBLE_RUN
+        );
+        assert_eq!(
+            direct
+                .read_run(&viewer, VISIBLE_RUN)
+                .expect("direct visible run"),
+            visible.json_body().expect("HTTP visible detail JSON"),
+            "HTTP and agent/MCP use the same permission-checked durable read adapter"
+        );
+
+        let hidden = get(&gateway, &token, &format!("/v1/ci/runs/{HIDDEN_RUN}"));
+        let absent = get(&gateway, &token, &format!("/v1/ci/runs/{ABSENT_RUN}"));
+        assert_eq!(hidden.status(), 404);
+        assert_eq!(absent.status(), 404);
+        assert_eq!(
+            hidden.json_body(),
+            absent.json_body(),
+            "denied and absent detail are the same public response"
+        );
+        assert!(matches!(
+            direct.read_run(&viewer, HIDDEN_RUN),
+            Err(EdgeError::NotFound(_))
+        ));
+
+        let log = get_query(
+            &gateway,
+            &token,
+            &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{VISIBLE_JOB}/log"),
+            "start=3&limit=6",
+        );
+        assert_eq!(log.status(), 200);
+        let log_body = log.json_body().expect("log JSON");
+        assert_eq!(log_body["byte_start"], 3);
+        assert_eq!(log_body["byte_end"], 9);
+        assert_eq!(log_body["total_end"], 11);
+        assert_eq!(log_body["next_offset"], 9);
+        assert_eq!(log_body["encoding"], "base64");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(log_body["data"].as_str().expect("base64 log bytes"))
+                .expect("decode log bytes"),
+            b"ha\nbet"
+        );
+        assert_eq!(
+            direct
+                .read_log(&viewer, VISIBLE_RUN, VISIBLE_JOB, 3, 6)
+                .expect("direct visible log"),
+            log_body,
+            "HTTP and agent/MCP share exact archived-log materialization"
+        );
+
+        let live_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{VISIBLE_JOB}/log/live");
+        let live = get_query_headers(
+            &gateway,
+            &token,
+            &live_path,
+            "",
+            vec![("Last-Event-ID".into(), "0".into())],
+        );
+        let mut live_rx = match live {
+            myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+            other => panic!(
+                "visible live tail must stream, got status {}",
+                other.status()
             ),
-        ],
-    )
-    .await;
-    insert_job_and_segments(
-        &app,
-        HIDDEN_RUN,
-        HIDDEN_JOB,
-        &[(
-            ContentHash::blake3(b"hidden archive").to_multihash_string(),
-            0,
-            14,
-        )],
-    )
-    .await;
-    insert_job_and_segments(
-        &app,
-        VISIBLE_RUN,
-        CORRUPT_JOB,
-        &[(
-            ContentHash::blake3(b"not present").to_multihash_string(),
-            0,
-            11,
-        )],
-    )
-    .await;
-    let boundary_segments = (0..65)
-        .map(|sequence| {
-            let byte_start = if sequence == 64 {
-                257
-            } else {
-                i64::from(sequence) * 4
-            };
-            (
-                ContentHash::blake3(format!("boundary-{sequence}").as_bytes())
-                    .to_multihash_string(),
-                byte_start,
-                byte_start + 4,
-            )
-        })
-        .collect::<Vec<_>>();
-    insert_job_and_segments(&app, VISIBLE_RUN, BOUNDARY_JOB, &boundary_segments).await;
+        };
+        let first_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("first live pointer deadline")
+            .expect("first live pointer");
+        let second_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("second live pointer deadline")
+            .expect("second live pointer");
+        assert_eq!(first_live.id.as_deref(), Some("1"));
+        assert_eq!(second_live.id.as_deref(), Some("2"));
+        assert_eq!(first_live.event.as_deref(), Some("ci.log.appended"));
+        let first_pointer: serde_json::Value =
+            serde_json::from_str(&first_live.data).expect("first pointer JSON");
+        assert_eq!(first_pointer["byte_start"], 0);
+        assert_eq!(first_pointer["byte_end"], 6);
+        assert!(
+            first_pointer.get("blob_ref").is_none() && first_pointer.get("data").is_none(),
+            "SSE carries a bounded archive coordinate, never a content address or log bytes"
+        );
 
-    let root = std::env::temp_dir().join(format!("{schema}_git"));
-    let repo_dir = root.join(TENANT).join(REGION);
-    std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
-    std::fs::create_dir_all(repo_dir.join("hidden.git")).expect("create hidden repo");
-    let (gateway, cell, direct, viewer, alpha_enabled) =
-        authenticated_gateway(app.clone(), &root, blobs.clone());
-    let token = mint(&cell);
+        let fresh = get(&gateway, &token, &live_path);
+        let mut fresh_rx = match fresh {
+            myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+            other => panic!(
+                "fresh live tail must stream from the current head, got status {}",
+                other.status()
+            ),
+        };
+        let checkpoint = tokio::time::timeout(Duration::from_secs(2), fresh_rx.recv())
+            .await
+            .expect("fresh subscription checkpoint deadline")
+            .expect("fresh subscription checkpoint");
+        assert_eq!(checkpoint.event.as_deref(), Some("ci.log.ready"));
+        assert_eq!(
+            checkpoint.id.as_deref(),
+            Some("2"),
+            "a fresh subscription checkpoints the current head without backfilling"
+        );
 
-    let list = get(&gateway, &token, "/v1/ci/runs");
-    assert_eq!(list.status(), 200);
-    let list_body = list.json_body().expect("list JSON");
-    let items = list_body["items"].as_array().expect("list items");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["run_id"], VISIBLE_RUN);
-    assert!(
-        list_body.to_string().find(HIDDEN_RUN).is_none(),
-        "the denied parent never enters the handler response"
-    );
+        let third = b"gamma\n";
+        let third_ref = blobs
+            .put(&TenantId(TENANT.into()), third)
+            .expect("store third live segment")
+            .to_multihash_string();
+        insert_segment(&app, VISIBLE_RUN, VISIBLE_JOB, 2, third_ref, 11, 17).await;
+        let third_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("cross-service live pointer deadline")
+            .expect("cross-service live pointer");
+        assert_eq!(third_live.id.as_deref(), Some("3"));
+        let fresh_third = tokio::time::timeout(Duration::from_secs(2), fresh_rx.recv())
+            .await
+            .expect("fresh subscription live pointer deadline")
+            .expect("fresh subscription live pointer");
+        assert_eq!(
+            fresh_third.id.as_deref(),
+            Some("3"),
+            "a fresh subscription observes only segments appended after it opened"
+        );
 
-    let visible = get(&gateway, &token, &format!("/v1/ci/runs/{VISIBLE_RUN}"));
-    assert_eq!(visible.status(), 200);
-    assert_eq!(
-        visible.json_body().expect("visible detail JSON")["run"]["run_id"],
-        VISIBLE_RUN
-    );
-    assert_eq!(
-        direct
-            .read_run(&viewer, VISIBLE_RUN)
-            .expect("direct visible run"),
-        visible.json_body().expect("HTTP visible detail JSON"),
-        "HTTP and agent/MCP use the same permission-checked durable read adapter"
-    );
-
-    let hidden = get(&gateway, &token, &format!("/v1/ci/runs/{HIDDEN_RUN}"));
-    let absent = get(&gateway, &token, &format!("/v1/ci/runs/{ABSENT_RUN}"));
-    assert_eq!(hidden.status(), 404);
-    assert_eq!(absent.status(), 404);
-    assert_eq!(
-        hidden.json_body(),
-        absent.json_body(),
-        "denied and absent detail are the same public response"
-    );
-    assert!(matches!(
-        direct.read_run(&viewer, HIDDEN_RUN),
-        Err(EdgeError::NotFound(_))
-    ));
-
-    let log = get_query(
-        &gateway,
-        &token,
-        &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{VISIBLE_JOB}/log"),
-        "start=3&limit=6",
-    );
-    assert_eq!(log.status(), 200);
-    let log_body = log.json_body().expect("log JSON");
-    assert_eq!(log_body["byte_start"], 3);
-    assert_eq!(log_body["byte_end"], 9);
-    assert_eq!(log_body["total_end"], 11);
-    assert_eq!(log_body["next_offset"], 9);
-    assert_eq!(log_body["encoding"], "base64");
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(log_body["data"].as_str().expect("base64 log bytes"))
-            .expect("decode log bytes"),
-        b"ha\nbet"
-    );
-    assert_eq!(
-        direct
-            .read_log(&viewer, VISIBLE_RUN, VISIBLE_JOB, 3, 6)
-            .expect("direct visible log"),
-        log_body,
-        "HTTP and agent/MCP share exact archived-log materialization"
-    );
-
-    let live_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{VISIBLE_JOB}/log/live");
-    let live = get_query_headers(
-        &gateway,
-        &token,
-        &live_path,
-        "",
-        vec![("Last-Event-ID".into(), "0".into())],
-    );
-    let mut live_rx = match live {
-        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-        other => panic!(
-            "visible live tail must stream, got status {}",
-            other.status()
-        ),
-    };
-    let first_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
-        .await
-        .expect("first live pointer deadline")
-        .expect("first live pointer");
-    let second_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
-        .await
-        .expect("second live pointer deadline")
-        .expect("second live pointer");
-    assert_eq!(first_live.id.as_deref(), Some("1"));
-    assert_eq!(second_live.id.as_deref(), Some("2"));
-    assert_eq!(first_live.event.as_deref(), Some("ci.log.appended"));
-    let first_pointer: serde_json::Value =
-        serde_json::from_str(&first_live.data).expect("first pointer JSON");
-    assert_eq!(first_pointer["byte_start"], 0);
-    assert_eq!(first_pointer["byte_end"], 6);
-    assert!(
-        first_pointer.get("blob_ref").is_none() && first_pointer.get("data").is_none(),
-        "SSE carries a bounded archive coordinate, never a content address or log bytes"
-    );
-
-    let fresh = get(&gateway, &token, &live_path);
-    let mut fresh_rx = match fresh {
-        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-        other => panic!(
-            "fresh live tail must stream from the current head, got status {}",
-            other.status()
-        ),
-    };
-    let checkpoint = tokio::time::timeout(Duration::from_secs(2), fresh_rx.recv())
-        .await
-        .expect("fresh subscription checkpoint deadline")
-        .expect("fresh subscription checkpoint");
-    assert_eq!(checkpoint.event.as_deref(), Some("ci.log.ready"));
-    assert_eq!(
-        checkpoint.id.as_deref(),
-        Some("2"),
-        "a fresh subscription checkpoints the current head without backfilling"
-    );
-
-    let third = b"gamma\n";
-    let third_ref = blobs
-        .put(&TenantId(TENANT.into()), third)
-        .expect("store third live segment")
-        .to_multihash_string();
-    insert_segment(&app, VISIBLE_RUN, VISIBLE_JOB, 2, third_ref, 11, 17).await;
-    let third_live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
-        .await
-        .expect("cross-service live pointer deadline")
-        .expect("cross-service live pointer");
-    assert_eq!(third_live.id.as_deref(), Some("3"));
-    let fresh_third = tokio::time::timeout(Duration::from_secs(2), fresh_rx.recv())
-        .await
-        .expect("fresh subscription live pointer deadline")
-        .expect("fresh subscription live pointer");
-    assert_eq!(
-        fresh_third.id.as_deref(),
-        Some("3"),
-        "a fresh subscription observes only segments appended after it opened"
-    );
-
-    sqlx::query(
-        "UPDATE ci_job SET state = 'succeeded'
+        sqlx::query(
+            "UPDATE ci_job SET state = 'succeeded'
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
-    )
-    .bind(TENANT)
-    .bind(REGION)
-    .bind(VISIBLE_RUN)
-    .bind(VISIBLE_JOB)
-    .execute(&admin)
-    .await
-    .expect("terminalize visible job");
-    let complete = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(VISIBLE_RUN)
+        .bind(VISIBLE_JOB)
+        .execute(&admin)
         .await
-        .expect("terminal live event deadline")
-        .expect("terminal live event");
-    assert_eq!(complete.event.as_deref(), Some("ci.log.complete"));
-    assert_eq!(complete.id.as_deref(), Some("3"));
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&complete.data).unwrap()["byte_end"],
-        17
-    );
+        .expect("terminalize visible job");
+        let complete = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("terminal live event deadline")
+            .expect("terminal live event");
+        assert_eq!(complete.event.as_deref(), Some("ci.log.complete"));
+        assert_eq!(complete.id.as_deref(), Some("3"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&complete.data).unwrap()["byte_end"],
+            17
+        );
 
-    let resumed = get_query_headers(
-        &gateway,
-        &token,
-        &live_path,
-        "",
-        vec![("Last-Event-ID".into(), "1".into())],
-    );
-    let mut resumed_rx = match resumed {
-        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-        other => panic!(
-            "resumed live tail must stream, got status {}",
-            other.status()
-        ),
-    };
-    let resumed_first = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
-        .await
-        .expect("resume deadline")
-        .expect("resume pointer");
-    assert_eq!(
-        resumed_first.id.as_deref(),
-        Some("2"),
-        "resume backfills strictly after Last-Event-ID without duplicating cursor 1"
-    );
+        let resumed = get_query_headers(
+            &gateway,
+            &token,
+            &live_path,
+            "",
+            vec![("Last-Event-ID".into(), "1".into())],
+        );
+        let mut resumed_rx = match resumed {
+            myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+            other => panic!(
+                "resumed live tail must stream, got status {}",
+                other.status()
+            ),
+        };
+        let resumed_first = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
+            .await
+            .expect("resume deadline")
+            .expect("resume pointer");
+        assert_eq!(
+            resumed_first.id.as_deref(),
+            Some("2"),
+            "resume backfills strictly after Last-Event-ID without duplicating cursor 1"
+        );
 
-    let revocable_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{CORRUPT_JOB}/log/live");
-    let revocable = get_query_headers(
-        &gateway,
-        &token,
-        &revocable_path,
-        "",
-        vec![("Last-Event-ID".into(), "1".into())],
-    );
-    let mut revocable_rx = match revocable {
-        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-        other => panic!(
-            "revocation proof tail must initially open, got status {}",
-            other.status()
-        ),
-    };
-    alpha_enabled.store(false, Ordering::SeqCst);
-    insert_segment(
-        &app,
-        VISIBLE_RUN,
-        CORRUPT_JOB,
-        1,
-        ContentHash::blake3(b"not exposed after revoke").to_multihash_string(),
-        11,
-        35,
-    )
-    .await;
-    let revoked = tokio::time::timeout(Duration::from_secs(2), revocable_rx.recv())
-        .await
-        .expect("revoked stream closes by the next authorization poll");
-    assert!(
-        revoked.is_err(),
-        "revoking parent Pull closes the open stream before the appended pointer is exposed"
-    );
-    alpha_enabled.store(true, Ordering::SeqCst);
+        let revocable_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{CORRUPT_JOB}/log/live");
+        let revocable = get_query_headers(
+            &gateway,
+            &token,
+            &revocable_path,
+            "",
+            vec![("Last-Event-ID".into(), "1".into())],
+        );
+        let mut revocable_rx = match revocable {
+            myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+            other => panic!(
+                "revocation proof tail must initially open, got status {}",
+                other.status()
+            ),
+        };
+        alpha_enabled.store(false, Ordering::SeqCst);
+        insert_segment(
+            &app,
+            VISIBLE_RUN,
+            CORRUPT_JOB,
+            1,
+            ContentHash::blake3(b"not exposed after revoke").to_multihash_string(),
+            11,
+            35,
+        )
+        .await;
+        let revoked = tokio::time::timeout(Duration::from_secs(2), revocable_rx.recv())
+            .await
+            .expect("revoked stream closes by the next authorization poll");
+        assert!(
+            revoked.is_err(),
+            "revoking parent Pull closes the open stream before the appended pointer is exposed"
+        );
+        alpha_enabled.store(true, Ordering::SeqCst);
 
-    let hidden_live = get(
-        &gateway,
-        &token,
-        &format!("/v1/ci/runs/{HIDDEN_RUN}/jobs/{HIDDEN_JOB}/log/live"),
-    );
-    let absent_live = get(
-        &gateway,
-        &token,
-        &format!("/v1/ci/runs/{ABSENT_RUN}/jobs/{ABSENT_JOB}/log/live"),
-    );
-    assert_eq!(hidden_live.status(), 404);
-    assert_eq!(hidden_live.json_body(), absent_live.json_body());
+        let hidden_live = get(
+            &gateway,
+            &token,
+            &format!("/v1/ci/runs/{HIDDEN_RUN}/jobs/{HIDDEN_JOB}/log/live"),
+        );
+        let absent_live = get(
+            &gateway,
+            &token,
+            &format!("/v1/ci/runs/{ABSENT_RUN}/jobs/{ABSENT_JOB}/log/live"),
+        );
+        assert_eq!(hidden_live.status(), 404);
+        assert_eq!(hidden_live.json_body(), absent_live.json_body());
 
-    sqlx::query(
-        "DELETE FROM log_segment
+        sqlx::query(
+            "DELETE FROM log_segment
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
            AND job_id = $4::uuid AND segment_seq = 0",
-    )
-    .bind(TENANT)
-    .bind(REGION)
-    .bind(VISIBLE_RUN)
-    .bind(VISIBLE_JOB)
-    .execute(&admin)
-    .await
-    .expect("simulate retention floor advancement");
-    let stale = get_query_headers(
-        &gateway,
-        &token,
-        &live_path,
-        "",
-        vec![("Last-Event-ID".into(), "0".into())],
-    );
-    assert_eq!(stale.status(), 409);
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(VISIBLE_RUN)
+        .bind(VISIBLE_JOB)
+        .execute(&admin)
+        .await
+        .expect("simulate retention floor advancement");
+        let stale = get_query_headers(
+            &gateway,
+            &token,
+            &live_path,
+            "",
+            vec![("Last-Event-ID".into(), "0".into())],
+        );
+        assert_eq!(stale.status(), 409);
 
-    insert_segment(
-        &app,
-        VISIBLE_RUN,
-        VISIBLE_JOB,
-        0,
-        first_ref,
-        0,
-        first.len() as i64,
-    )
-    .await;
-    sqlx::query(
-        "DELETE FROM log_segment
+        insert_segment(
+            &app,
+            VISIBLE_RUN,
+            VISIBLE_JOB,
+            0,
+            first_ref,
+            0,
+            first.len() as i64,
+        )
+        .await;
+        sqlx::query(
+            "DELETE FROM log_segment
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
            AND job_id = $4::uuid AND segment_seq = 1",
-    )
-    .bind(TENANT)
-    .bind(REGION)
-    .bind(VISIBLE_RUN)
-    .bind(VISIBLE_JOB)
-    .execute(&admin)
-    .await
-    .expect("simulate an internal archive gap");
-    let discontinuous = get_query_headers(
-        &gateway,
-        &token,
-        &live_path,
-        "",
-        vec![("Last-Event-ID".into(), "0".into())],
-    );
-    assert_eq!(
-        discontinuous.status(),
-        503,
-        "a missing durable segment never becomes a successful cursor jump"
-    );
-    let discontinuous_predecessor = get_query_headers(
-        &gateway,
-        &token,
-        &live_path,
-        "",
-        vec![("Last-Event-ID".into(), "2".into())],
-    );
-    assert_eq!(
-        discontinuous_predecessor.status(),
-        503,
-        "a claimed cursor cannot bypass its missing internal predecessor"
-    );
-
-    sqlx::query(
-        "DELETE FROM log_segment
-         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
-    )
-    .bind(TENANT)
-    .bind(REGION)
-    .bind(VISIBLE_RUN)
-    .bind(VISIBLE_JOB)
-    .execute(&admin)
-    .await
-    .expect("simulate full retention pruning");
-    let fully_pruned = get_query_headers(
-        &gateway,
-        &token,
-        &live_path,
-        "",
-        vec![("Last-Event-ID".into(), "0".into())],
-    );
-    assert_eq!(
-        fully_pruned.status(),
-        409,
-        "an explicit cursor over a fully pruned archive requires resynchronization"
-    );
-
-    let boundary_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{BOUNDARY_JOB}/log/live");
-    let boundary = get_query_headers(
-        &gateway,
-        &token,
-        &boundary_path,
-        "",
-        vec![("Last-Event-ID".into(), "0".into())],
-    );
-    let mut boundary_rx = match boundary {
-        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-        other => panic!(
-            "the first bounded batch must open before the boundary gap, got status {}",
-            other.status()
-        ),
-    };
-    for expected_cursor in 1..=64 {
-        let expected_id = expected_cursor.to_string();
-        let pointer = tokio::time::timeout(Duration::from_secs(2), boundary_rx.recv())
-            .await
-            .expect("bounded batch pointer deadline")
-            .expect("bounded batch pointer");
-        assert_eq!(pointer.id.as_deref(), Some(expected_id.as_str()));
-    }
-    let boundary_closed = tokio::time::timeout(Duration::from_secs(2), boundary_rx.recv())
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(VISIBLE_RUN)
+        .bind(VISIBLE_JOB)
+        .execute(&admin)
         .await
-        .expect("cross-batch discontinuity closes the stream");
-    assert!(
-        boundary_closed.is_err(),
-        "byte discontinuity at the producer's second poll fails closed"
-    );
+        .expect("simulate an internal archive gap");
+        let discontinuous = get_query_headers(
+            &gateway,
+            &token,
+            &live_path,
+            "",
+            vec![("Last-Event-ID".into(), "0".into())],
+        );
+        assert_eq!(
+            discontinuous.status(),
+            503,
+            "a missing durable segment never becomes a successful cursor jump"
+        );
+        let discontinuous_predecessor = get_query_headers(
+            &gateway,
+            &token,
+            &live_path,
+            "",
+            vec![("Last-Event-ID".into(), "2".into())],
+        );
+        assert_eq!(
+            discontinuous_predecessor.status(),
+            503,
+            "a claimed cursor cannot bypass its missing internal predecessor"
+        );
 
-    let absent_job = get(
-        &gateway,
-        &token,
-        &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{ABSENT_JOB}/log"),
-    );
-    let hidden_log = get(
-        &gateway,
-        &token,
-        &format!("/v1/ci/runs/{HIDDEN_RUN}/jobs/{HIDDEN_JOB}/log"),
-    );
-    assert_eq!(absent_job.status(), 404);
-    assert_eq!(hidden_log.status(), 404);
-    assert_eq!(
-        absent_job.json_body(),
-        hidden_log.json_body(),
-        "a denied parent and absent child are the same public response"
-    );
+        sqlx::query(
+            "DELETE FROM log_segment
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(VISIBLE_RUN)
+        .bind(VISIBLE_JOB)
+        .execute(&admin)
+        .await
+        .expect("simulate full retention pruning");
+        let fully_pruned = get_query_headers(
+            &gateway,
+            &token,
+            &live_path,
+            "",
+            vec![("Last-Event-ID".into(), "0".into())],
+        );
+        assert_eq!(
+            fully_pruned.status(),
+            409,
+            "an explicit cursor over a fully pruned archive requires resynchronization"
+        );
 
-    let corrupt = get(
-        &gateway,
-        &token,
-        &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{CORRUPT_JOB}/log"),
-    );
-    assert_eq!(corrupt.status(), 503);
-    let corrupt_body = corrupt.json_body().expect("generic unavailable JSON");
-    assert_eq!(
-        corrupt_body["error"]["message"],
-        "CI log data is temporarily unavailable"
-    );
-    assert!(
-        !corrupt_body.to_string().contains("blake3:"),
-        "content addresses never enter the public error"
-    );
+        let boundary_path = format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{BOUNDARY_JOB}/log/live");
+        let boundary = get_query_headers(
+            &gateway,
+            &token,
+            &boundary_path,
+            "",
+            vec![("Last-Event-ID".into(), "0".into())],
+        );
+        let mut boundary_rx = match boundary {
+            myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+            other => panic!(
+                "the first bounded batch must open before the boundary gap, got status {}",
+                other.status()
+            ),
+        };
+        for expected_cursor in 1..=64 {
+            let expected_id = expected_cursor.to_string();
+            let pointer = tokio::time::timeout(Duration::from_secs(2), boundary_rx.recv())
+                .await
+                .expect("bounded batch pointer deadline")
+                .expect("bounded batch pointer");
+            assert_eq!(pointer.id.as_deref(), Some(expected_id.as_str()));
+        }
+        let boundary_closed = tokio::time::timeout(Duration::from_secs(2), boundary_rx.recv())
+            .await
+            .expect("cross-batch discontinuity closes the stream");
+        assert!(
+            boundary_closed.is_err(),
+            "byte discontinuity at the producer's second poll fails closed"
+        );
 
-    app.close().await;
+        let absent_job = get(
+            &gateway,
+            &token,
+            &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{ABSENT_JOB}/log"),
+        );
+        let hidden_log = get(
+            &gateway,
+            &token,
+            &format!("/v1/ci/runs/{HIDDEN_RUN}/jobs/{HIDDEN_JOB}/log"),
+        );
+        assert_eq!(absent_job.status(), 404);
+        assert_eq!(hidden_log.status(), 404);
+        assert_eq!(
+            absent_job.json_body(),
+            hidden_log.json_body(),
+            "a denied parent and absent child are the same public response"
+        );
+
+        let corrupt = get(
+            &gateway,
+            &token,
+            &format!("/v1/ci/runs/{VISIBLE_RUN}/jobs/{CORRUPT_JOB}/log"),
+        );
+        assert_eq!(corrupt.status(), 503);
+        let corrupt_body = corrupt.json_body().expect("generic unavailable JSON");
+        assert_eq!(
+            corrupt_body["error"]["message"],
+            "CI log data is temporarily unavailable"
+        );
+        assert!(
+            !corrupt_body.to_string().contains("blake3:"),
+            "content addresses never enter the public error"
+        );
+
+        app.close().await;
     })
     .await;
     admin.close().await;
@@ -1058,170 +1059,172 @@ async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     with_schema_cleanup(&admin, &schema, || async {
-    let app = pool(&app_url(), &schema).await;
-    insert_run(&app, RUN, "alpha", "2026-07-24T13:00:00Z").await;
-    insert_job_and_segments(&app, RUN, JOB, &[]).await;
-    seed_log_route(&admin, TENANT, REGION, JOB, RUN).await;
+        let app = pool(&app_url(), &schema).await;
+        insert_run(&app, RUN, "alpha", "2026-07-24T13:00:00Z").await;
+        insert_job_and_segments(&app, RUN, JOB, &[]).await;
+        seed_log_route(&admin, TENANT, REGION, JOB, RUN).await;
 
-    let blobs = S3BlobStore::connect(&MyelinConfig::dev().s3, tokio::runtime::Handle::current());
-    let edge_blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(blobs.clone());
-    let root = std::env::temp_dir().join(format!("{schema}_git"));
-    let repo_dir = root.join(TENANT).join(REGION);
-    std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
-    let (gateway, cell, _, _, _) = authenticated_gateway(app.clone(), &root, edge_blobs.clone());
-    let token = mint(&cell);
-    let live_path = format!("/v1/ci/runs/{RUN}/jobs/{JOB}/log/live");
+        let blobs =
+            S3BlobStore::connect(&MyelinConfig::dev().s3, tokio::runtime::Handle::current());
+        let edge_blobs: Arc<dyn BlobStore + Send + Sync> = Arc::new(blobs.clone());
+        let root = std::env::temp_dir().join(format!("{schema}_git"));
+        let repo_dir = root.join(TENANT).join(REGION);
+        std::fs::create_dir_all(repo_dir.join("alpha.git")).expect("create visible repo");
+        let (gateway, cell, _, _, _) =
+            authenticated_gateway(app.clone(), &root, edge_blobs.clone());
+        let token = mint(&cell);
+        let live_path = format!("/v1/ci/runs/{RUN}/jobs/{JOB}/log/live");
 
-    let live = get(&gateway, &token, &live_path);
-    let mut live_rx = match live {
-        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-        other => panic!(
-            "fresh composed live tail returned status {}",
-            other.status()
-        ),
-    };
-    let ready = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
-        .await
-        .expect("initial checkpoint deadline")
-        .expect("initial checkpoint");
-    assert_eq!(ready.event.as_deref(), Some("ci.log.ready"));
-    assert_eq!(ready.id.as_deref(), Some("0"));
+        let live = get(&gateway, &token, &live_path);
+        let mut live_rx = match live {
+            myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+            other => panic!(
+                "fresh composed live tail returned status {}",
+                other.status()
+            ),
+        };
+        let ready = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("initial checkpoint deadline")
+            .expect("initial checkpoint");
+        assert_eq!(ready.event.as_deref(), Some("ci.log.ready"));
+        assert_eq!(ready.id.as_deref(), Some("0"));
 
-    let runtime = tokio::runtime::Handle::current();
-    let first_app = app.clone();
-    let first_blobs = blobs.clone();
-    std::thread::spawn(move || {
-        let sink = LogPipelineSink::new(
-            Region(REGION.into()),
-            first_blobs,
-            DurableLogPersist::with_pg(first_app, runtime),
+        let runtime = tokio::runtime::Handle::current();
+        let first_app = app.clone();
+        let first_blobs = blobs.clone();
+        std::thread::spawn(move || {
+            let sink = LogPipelineSink::new(
+                Region(REGION.into()),
+                first_blobs,
+                DurableLogPersist::with_pg(first_app, runtime),
+            );
+            sink.ship_frame(RUN, JOB, &TenantId(TENANT.into()), FIRST)
+                .expect("first production sink commits before service loss");
+        })
+        .join()
+        .expect("first producer service joins");
+
+        let first_pointer = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("first live pointer deadline")
+            .expect("first live pointer");
+        assert_eq!(first_pointer.event.as_deref(), Some("ci.log.appended"));
+        assert_eq!(first_pointer.id.as_deref(), Some("1"));
+        let first_data: serde_json::Value =
+            serde_json::from_str(&first_pointer.data).expect("first pointer JSON");
+        assert_eq!(first_data["byte_start"], 0);
+        assert_eq!(first_data["byte_end"], FIRST.len() as i64);
+
+        drop(live_rx);
+        drop(gateway);
+
+        let runtime = tokio::runtime::Handle::current();
+        let second_app = app.clone();
+        let second_blobs = blobs.clone();
+        std::thread::spawn(move || {
+            let sink = LogPipelineSink::new(
+                Region(REGION.into()),
+                second_blobs,
+                DurableLogPersist::with_pg(second_app, runtime),
+            );
+            sink.ship_frame(RUN, JOB, &TenantId(TENANT.into()), SECOND)
+                .expect("restarted production sink appends after the durable prefix");
+            sink.finish(RUN, JOB, &TenantId(TENANT.into()), true)
+                .expect("restarted production sink closes its durable anchor");
+        })
+        .join()
+        .expect("restarted producer service joins");
+
+        let (gateway, cell, _, _, _) = authenticated_gateway(app.clone(), &root, edge_blobs);
+        let token = mint(&cell);
+        let resumed = get_query_headers(
+            &gateway,
+            &token,
+            &live_path,
+            "",
+            vec![("Last-Event-ID".into(), "1".into())],
         );
-        sink.ship_frame(RUN, JOB, &TenantId(TENANT.into()), FIRST)
-            .expect("first production sink commits before service loss");
-    })
-    .join()
-    .expect("first producer service joins");
-
-    let first_pointer = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
-        .await
-        .expect("first live pointer deadline")
-        .expect("first live pointer");
-    assert_eq!(first_pointer.event.as_deref(), Some("ci.log.appended"));
-    assert_eq!(first_pointer.id.as_deref(), Some("1"));
-    let first_data: serde_json::Value =
-        serde_json::from_str(&first_pointer.data).expect("first pointer JSON");
-    assert_eq!(first_data["byte_start"], 0);
-    assert_eq!(first_data["byte_end"], FIRST.len() as i64);
-
-    drop(live_rx);
-    drop(gateway);
-
-    let runtime = tokio::runtime::Handle::current();
-    let second_app = app.clone();
-    let second_blobs = blobs.clone();
-    std::thread::spawn(move || {
-        let sink = LogPipelineSink::new(
-            Region(REGION.into()),
-            second_blobs,
-            DurableLogPersist::with_pg(second_app, runtime),
+        let mut resumed_rx = match resumed {
+            myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+            other => panic!(
+                "resumed composed live tail returned status {}",
+                other.status()
+            ),
+        };
+        let second_pointer = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
+            .await
+            .expect("resumed pointer deadline")
+            .expect("resumed pointer");
+        assert_eq!(second_pointer.event.as_deref(), Some("ci.log.appended"));
+        assert_eq!(
+            second_pointer.id.as_deref(),
+            Some("2"),
+            "resume starts strictly after the acknowledged pointer; id 1 is not duplicated"
         );
-        sink.ship_frame(RUN, JOB, &TenantId(TENANT.into()), SECOND)
-            .expect("restarted production sink appends after the durable prefix");
-        sink.finish(RUN, JOB, &TenantId(TENANT.into()), true)
-            .expect("restarted production sink closes its durable anchor");
-    })
-    .join()
-    .expect("restarted producer service joins");
+        let second_data: serde_json::Value =
+            serde_json::from_str(&second_pointer.data).expect("second pointer JSON");
+        assert_eq!(second_data["byte_start"], FIRST.len() as i64);
+        assert_eq!(second_data["byte_end"], (FIRST.len() + SECOND.len()) as i64);
 
-    let (gateway, cell, _, _, _) = authenticated_gateway(app.clone(), &root, edge_blobs);
-    let token = mint(&cell);
-    let resumed = get_query_headers(
-        &gateway,
-        &token,
-        &live_path,
-        "",
-        vec![("Last-Event-ID".into(), "1".into())],
-    );
-    let mut resumed_rx = match resumed {
-        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-        other => panic!(
-            "resumed composed live tail returned status {}",
-            other.status()
-        ),
-    };
-    let second_pointer = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
-        .await
-        .expect("resumed pointer deadline")
-        .expect("resumed pointer");
-    assert_eq!(second_pointer.event.as_deref(), Some("ci.log.appended"));
-    assert_eq!(
-        second_pointer.id.as_deref(),
-        Some("2"),
-        "resume starts strictly after the acknowledged pointer; id 1 is not duplicated"
-    );
-    let second_data: serde_json::Value =
-        serde_json::from_str(&second_pointer.data).expect("second pointer JSON");
-    assert_eq!(second_data["byte_start"], FIRST.len() as i64);
-    assert_eq!(second_data["byte_end"], (FIRST.len() + SECOND.len()) as i64);
+        let archive = get_query(
+            &gateway,
+            &token,
+            &format!("/v1/ci/runs/{RUN}/jobs/{JOB}/log"),
+            &format!("start=0&limit={}", FIRST.len() + SECOND.len()),
+        );
+        assert_eq!(archive.status(), 200);
+        let archive = archive.json_body().expect("composed archive JSON");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(archive["data"].as_str().expect("archive base64"))
+            .expect("decode composed archive");
+        assert_eq!(
+            bytes,
+            [FIRST, SECOND].concat(),
+            "producer restart plus viewer resume loses and duplicates zero bytes"
+        );
 
-    let archive = get_query(
-        &gateway,
-        &token,
-        &format!("/v1/ci/runs/{RUN}/jobs/{JOB}/log"),
-        &format!("start=0&limit={}", FIRST.len() + SECOND.len()),
-    );
-    assert_eq!(archive.status(), 200);
-    let archive = archive.json_body().expect("composed archive JSON");
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(archive["data"].as_str().expect("archive base64"))
-        .expect("decode composed archive");
-    assert_eq!(
-        bytes,
-        [FIRST, SECOND].concat(),
-        "producer restart plus viewer resume loses and duplicates zero bytes"
-    );
-
-    let coordinates = sqlx::query_as::<_, (i32, i64, i64)>(
-        "SELECT segment_seq, byte_start, byte_end FROM log_segment
+        let coordinates = sqlx::query_as::<_, (i32, i64, i64)>(
+            "SELECT segment_seq, byte_start, byte_end FROM log_segment
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid
          ORDER BY segment_seq",
-    )
-    .bind(TENANT)
-    .bind(REGION)
-    .bind(RUN)
-    .bind(JOB)
-    .fetch_all(&admin)
-    .await
-    .expect("read composed durable coordinates");
-    assert_eq!(
-        coordinates,
-        vec![
-            (0, 0, FIRST.len() as i64),
-            (1, FIRST.len() as i64, (FIRST.len() + SECOND.len()) as i64)
-        ]
-    );
-
-    sqlx::query(
-        "UPDATE ci_job SET state = 'succeeded'
-         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
-    )
-    .bind(TENANT)
-    .bind(REGION)
-    .bind(RUN)
-    .bind(JOB)
-    .execute(&admin)
-    .await
-    .expect("terminalize composed job");
-    let complete = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(RUN)
+        .bind(JOB)
+        .fetch_all(&admin)
         .await
-        .expect("composed completion deadline")
-        .expect("composed completion");
-    assert_eq!(complete.event.as_deref(), Some("ci.log.complete"));
-    assert_eq!(complete.id.as_deref(), Some("2"));
+        .expect("read composed durable coordinates");
+        assert_eq!(
+            coordinates,
+            vec![
+                (0, 0, FIRST.len() as i64),
+                (1, FIRST.len() as i64, (FIRST.len() + SECOND.len()) as i64)
+            ]
+        );
 
-    drop(resumed_rx);
-    drop(gateway);
-    app.close().await;
+        sqlx::query(
+            "UPDATE ci_job SET state = 'succeeded'
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND job_id = $4::uuid",
+        )
+        .bind(TENANT)
+        .bind(REGION)
+        .bind(RUN)
+        .bind(JOB)
+        .execute(&admin)
+        .await
+        .expect("terminalize composed job");
+        let complete = tokio::time::timeout(Duration::from_secs(2), resumed_rx.recv())
+            .await
+            .expect("composed completion deadline")
+            .expect("composed completion");
+        assert_eq!(complete.event.as_deref(), Some("ci.log.complete"));
+        assert_eq!(complete.id.as_deref(), Some("2"));
+
+        drop(resumed_rx);
+        drop(gateway);
+        app.close().await;
     })
     .await;
     admin.close().await;
@@ -1240,201 +1243,202 @@ async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
     let admin = pool(&admin_url(), &schema).await;
     setup_schema(&admin, &schema).await;
     with_schema_cleanup(&admin, &schema, || async {
-    let app = pool(&app_url(), &schema).await;
-    let blobs = Arc::new(FsBlobStore::new());
-    let log = "prep\ncafé\nfailed\n".as_bytes();
-    let blob_ref = blobs
-        .put(&TenantId(TENANT.into()), log)
-        .expect("store golden archived log")
-        .to_multihash_string();
-    let live_log = b"boot\n";
-    let live_blob_ref = blobs
-        .put(&TenantId(TENANT.into()), live_log)
-        .expect("store golden live log")
-        .to_multihash_string();
-    insert_golden_ci_surface(
-        &app,
-        blob_ref,
-        log.len() as i64,
-        live_blob_ref,
-        live_log.len() as i64,
-    )
-    .await;
+        let app = pool(&app_url(), &schema).await;
+        let blobs = Arc::new(FsBlobStore::new());
+        let log = "prep\ncafé\nfailed\n".as_bytes();
+        let blob_ref = blobs
+            .put(&TenantId(TENANT.into()), log)
+            .expect("store golden archived log")
+            .to_multihash_string();
+        let live_log = b"boot\n";
+        let live_blob_ref = blobs
+            .put(&TenantId(TENANT.into()), live_log)
+            .expect("store golden live log")
+            .to_multihash_string();
+        insert_golden_ci_surface(
+            &app,
+            blob_ref,
+            log.len() as i64,
+            live_blob_ref,
+            live_log.len() as i64,
+        )
+        .await;
 
-    let root = std::env::temp_dir().join(format!("{schema}_git"));
-    let repo_dir = root.join(TENANT).join(REGION);
-    for repo in ["😀", "alpha", "é", "e\u{301}"] {
-        std::fs::create_dir_all(repo_dir.join(format!("{repo}.git")))
-            .expect("create golden visible repo");
-    }
-    let (gateway, cell, _direct, _viewer, _alpha_enabled) =
-        authenticated_gateway(app.clone(), &root, blobs);
-    let token = mint(&cell);
-    let mut cursors = BTreeMap::<String, String>::new();
-
-    for vector in golden["vectors"].as_array().expect("golden vectors") {
-        let id = vector["id"].as_str().expect("vector id");
-        let endpoint = vector["endpoint"].as_str().expect("vector endpoint");
-        let request = &vector["request"];
-        if vector["mutation"].as_str() == Some("add-visible-repo") {
-            std::fs::create_dir_all(repo_dir.join("z.git")).expect("add golden visible repository");
+        let root = std::env::temp_dir().join(format!("{schema}_git"));
+        let repo_dir = root.join(TENANT).join(REGION);
+        for repo in ["😀", "alpha", "é", "e\u{301}"] {
+            std::fs::create_dir_all(repo_dir.join(format!("{repo}.git")))
+                .expect("create golden visible repo");
         }
-        if vector["mutation"].as_str() == Some("prune-live-log") {
-            sqlx::query(
-                "DELETE FROM log_segment
+        let (gateway, cell, _direct, _viewer, _alpha_enabled) =
+            authenticated_gateway(app.clone(), &root, blobs);
+        let token = mint(&cell);
+        let mut cursors = BTreeMap::<String, String>::new();
+
+        for vector in golden["vectors"].as_array().expect("golden vectors") {
+            let id = vector["id"].as_str().expect("vector id");
+            let endpoint = vector["endpoint"].as_str().expect("vector endpoint");
+            let request = &vector["request"];
+            if vector["mutation"].as_str() == Some("add-visible-repo") {
+                std::fs::create_dir_all(repo_dir.join("z.git"))
+                    .expect("add golden visible repository");
+            }
+            if vector["mutation"].as_str() == Some("prune-live-log") {
+                sqlx::query(
+                    "DELETE FROM log_segment
                  WHERE tenant_id = $1 AND region = $2
                    AND run_id = $3::uuid AND job_id = $4::uuid",
-            )
-            .bind(TENANT)
-            .bind(REGION)
-            .bind(GOLDEN_OLDER_RUN)
-            .bind(GOLDEN_LIVE_JOB)
-            .execute(&admin)
-            .await
-            .expect("prune golden live-log cursor authority");
-        }
-        if endpoint == "visibility" {
-            let visible = request["visible_repo_refs"]
-                .as_array()
-                .expect("visible repository vector")
-                .iter()
-                .map(|value| value.as_str().expect("visible repository ref").to_string())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                serde_json::json!({
-                    "status": 200,
-                    "visible_repo_refs": canonical_visible_repo_refs(&visible)
-                        .expect("canonical visible repository set"),
-                }),
-                vector["expected"],
-                "golden vector {id}"
-            );
-            continue;
-        }
-        let after = vector["after"].as_str();
-        let cursor = after.map(|source| {
-            cursors
-                .get(source)
-                .unwrap_or_else(|| panic!("missing cursor from {source}"))
-                .as_str()
-        });
-
-        if endpoint == "live" {
-            let path = format!(
-                "/v1/ci/runs/{}/jobs/{}/log/live",
-                request["run_id"].as_str().expect("live run id"),
-                request["job_id"].as_str().expect("live job id")
-            );
-            let extra_headers = request["last_event_id"]
-                .as_str()
-                .map(|value| vec![("Last-Event-ID".into(), value.to_string())])
-                .unwrap_or_default();
-            let response = get_query_headers(&gateway, &token, &path, "", extra_headers);
-            let status = response.status();
-            let mut normalized = serde_json::Map::new();
-            normalized.insert("status".into(), serde_json::json!(status));
-            if status == 200 {
-                let expected_events = vector["expected"]["events"]
+                )
+                .bind(TENANT)
+                .bind(REGION)
+                .bind(GOLDEN_OLDER_RUN)
+                .bind(GOLDEN_LIVE_JOB)
+                .execute(&admin)
+                .await
+                .expect("prune golden live-log cursor authority");
+            }
+            if endpoint == "visibility" {
+                let visible = request["visible_repo_refs"]
                     .as_array()
-                    .expect("golden live events");
-                let mut receiver = match response {
-                    myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
-                    myelin_edge::EdgeResponse::Bytes { .. } => {
-                        panic!("golden live vector {id} returned bytes")
+                    .expect("visible repository vector")
+                    .iter()
+                    .map(|value| value.as_str().expect("visible repository ref").to_string())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    serde_json::json!({
+                        "status": 200,
+                        "visible_repo_refs": canonical_visible_repo_refs(&visible)
+                            .expect("canonical visible repository set"),
+                    }),
+                    vector["expected"],
+                    "golden vector {id}"
+                );
+                continue;
+            }
+            let after = vector["after"].as_str();
+            let cursor = after.map(|source| {
+                cursors
+                    .get(source)
+                    .unwrap_or_else(|| panic!("missing cursor from {source}"))
+                    .as_str()
+            });
+
+            if endpoint == "live" {
+                let path = format!(
+                    "/v1/ci/runs/{}/jobs/{}/log/live",
+                    request["run_id"].as_str().expect("live run id"),
+                    request["job_id"].as_str().expect("live job id")
+                );
+                let extra_headers = request["last_event_id"]
+                    .as_str()
+                    .map(|value| vec![("Last-Event-ID".into(), value.to_string())])
+                    .unwrap_or_default();
+                let response = get_query_headers(&gateway, &token, &path, "", extra_headers);
+                let status = response.status();
+                let mut normalized = serde_json::Map::new();
+                normalized.insert("status".into(), serde_json::json!(status));
+                if status == 200 {
+                    let expected_events = vector["expected"]["events"]
+                        .as_array()
+                        .expect("golden live events");
+                    let mut receiver = match response {
+                        myelin_edge::EdgeResponse::Sse { sub, .. } => sub.into_receiver(),
+                        myelin_edge::EdgeResponse::Bytes { .. } => {
+                            panic!("golden live vector {id} returned bytes")
+                        }
+                    };
+                    let mut events = Vec::with_capacity(expected_events.len());
+                    for _ in expected_events {
+                        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                            .await
+                            .unwrap_or_else(|_| panic!("golden live vector {id} event deadline"))
+                            .unwrap_or_else(|error| {
+                                panic!("golden live vector {id} receive failed: {error}")
+                            });
+                        events.push(serde_json::json!({
+                            "event": event.event,
+                            "id": event.id,
+                            "data": serde_json::from_str::<serde_json::Value>(&event.data)
+                                .expect("golden live event JSON"),
+                        }));
                     }
-                };
-                let mut events = Vec::with_capacity(expected_events.len());
-                for _ in expected_events {
-                    let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
-                        .await
-                        .unwrap_or_else(|_| panic!("golden live vector {id} event deadline"))
-                        .unwrap_or_else(|error| {
-                            panic!("golden live vector {id} receive failed: {error}")
-                        });
-                    events.push(serde_json::json!({
-                        "event": event.event,
-                        "id": event.id,
-                        "data": serde_json::from_str::<serde_json::Value>(&event.data)
-                            .expect("golden live event JSON"),
-                    }));
+                    normalized.insert("events".into(), serde_json::Value::Array(events));
                 }
-                normalized.insert("events".into(), serde_json::Value::Array(events));
+                assert_eq!(
+                    serde_json::Value::Object(normalized),
+                    vector["expected"],
+                    "golden vector {id}"
+                );
+                continue;
+            }
+
+            let response = match endpoint {
+                "runs" => {
+                    let mut query = vec![
+                        format!("state={}", request["state"].as_str().expect("list state")),
+                        format!("limit={}", request["limit"].as_u64().expect("list limit")),
+                    ];
+                    if let Some(cursor) = cursor {
+                        query.push(format!("cursor={cursor}"));
+                    }
+                    get_query(&gateway, &token, "/v1/ci/runs", &query.join("&"))
+                }
+                "run" => get(
+                    &gateway,
+                    &token,
+                    &format!(
+                        "/v1/ci/runs/{}",
+                        request["run_id"].as_str().expect("run id")
+                    ),
+                ),
+                "log" => get_query(
+                    &gateway,
+                    &token,
+                    &format!(
+                        "/v1/ci/runs/{}/jobs/{}/log",
+                        request["run_id"].as_str().expect("log run id"),
+                        request["job_id"].as_str().expect("log job id")
+                    ),
+                    &format!(
+                        "start={}&limit={}",
+                        request["start"].as_u64().expect("log start"),
+                        request["limit"].as_u64().expect("log limit")
+                    ),
+                ),
+                other => panic!("unknown golden endpoint {other}"),
+            };
+
+            let mut normalized = serde_json::Map::new();
+            normalized.insert("status".into(), serde_json::json!(response.status()));
+            if response.status() == 200 {
+                let body = response.json_body().expect("golden response JSON");
+                for (key, value) in body.as_object().expect("golden response object") {
+                    normalized.insert(key.clone(), value.clone());
+                }
+                if endpoint == "runs" {
+                    let next = normalized["page"]["next_cursor"]
+                        .as_str()
+                        .map(str::to_string);
+                    if let Some(next) = next {
+                        assert!(next.starts_with("cr1_"), "canonical opaque CI cursor");
+                        cursors.insert(id.to_string(), next);
+                        normalized
+                            .get_mut("page")
+                            .expect("page")
+                            .as_object_mut()
+                            .expect("page object")
+                            .insert("next_cursor".into(), serde_json::json!("cr1_<opaque>"));
+                    }
+                }
             }
             assert_eq!(
                 serde_json::Value::Object(normalized),
                 vector["expected"],
                 "golden vector {id}"
             );
-            continue;
         }
 
-        let response = match endpoint {
-            "runs" => {
-                let mut query = vec![
-                    format!("state={}", request["state"].as_str().expect("list state")),
-                    format!("limit={}", request["limit"].as_u64().expect("list limit")),
-                ];
-                if let Some(cursor) = cursor {
-                    query.push(format!("cursor={cursor}"));
-                }
-                get_query(&gateway, &token, "/v1/ci/runs", &query.join("&"))
-            }
-            "run" => get(
-                &gateway,
-                &token,
-                &format!(
-                    "/v1/ci/runs/{}",
-                    request["run_id"].as_str().expect("run id")
-                ),
-            ),
-            "log" => get_query(
-                &gateway,
-                &token,
-                &format!(
-                    "/v1/ci/runs/{}/jobs/{}/log",
-                    request["run_id"].as_str().expect("log run id"),
-                    request["job_id"].as_str().expect("log job id")
-                ),
-                &format!(
-                    "start={}&limit={}",
-                    request["start"].as_u64().expect("log start"),
-                    request["limit"].as_u64().expect("log limit")
-                ),
-            ),
-            other => panic!("unknown golden endpoint {other}"),
-        };
-
-        let mut normalized = serde_json::Map::new();
-        normalized.insert("status".into(), serde_json::json!(response.status()));
-        if response.status() == 200 {
-            let body = response.json_body().expect("golden response JSON");
-            for (key, value) in body.as_object().expect("golden response object") {
-                normalized.insert(key.clone(), value.clone());
-            }
-            if endpoint == "runs" {
-                let next = normalized["page"]["next_cursor"]
-                    .as_str()
-                    .map(str::to_string);
-                if let Some(next) = next {
-                    assert!(next.starts_with("cr1_"), "canonical opaque CI cursor");
-                    cursors.insert(id.to_string(), next);
-                    normalized
-                        .get_mut("page")
-                        .expect("page")
-                        .as_object_mut()
-                        .expect("page object")
-                        .insert("next_cursor".into(), serde_json::json!("cr1_<opaque>"));
-                }
-            }
-        }
-        assert_eq!(
-            serde_json::Value::Object(normalized),
-            vector["expected"],
-            "golden vector {id}"
-        );
-    }
-
-    app.close().await;
+        app.close().await;
     })
     .await;
     admin.close().await;

@@ -86,12 +86,7 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
             .with_repo("acme", "alpha", repo("acme/alpha"))
             .with_repo("acme", "beta", repo("acme/beta"))
             .with_repo("acme", "gamma", repo("acme/gamma"))
-            .with_pr(
-                "acme",
-                "alpha",
-                1,
-                representative_pr_page("acme"),
-            )
+            .with_pr("acme", "alpha", 1, representative_pr_page("acme"))
             .with_blob(
                 "acme",
                 "alpha",
@@ -105,12 +100,7 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
                 },
             )
             .with_repo("globex", "zeta", repo("globex/zeta"))
-            .with_pr(
-                "globex",
-                "zeta",
-                7,
-                representative_pr_page("globex"),
-            ),
+            .with_pr("globex", "zeta", 7, representative_pr_page("globex")),
     );
 
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(

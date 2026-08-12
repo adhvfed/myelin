@@ -482,7 +482,10 @@ pub fn validate_tool_arguments(def: &ToolDef, arguments: &serde_json::Value) -> 
     validate_schema(&def.input_schema, &input_json)
 }
 
-pub fn validate_call<S: ToolSurface + ?Sized>(catalogue: &S, call: &ToolCall) -> Result<(), String> {
+pub fn validate_call<S: ToolSurface + ?Sized>(
+    catalogue: &S,
+    call: &ToolCall,
+) -> Result<(), String> {
     let def = catalogue
         .resolve(&call.name)
         .ok_or_else(|| format!("tool `{}` is not registered in the catalogue", call.name.0))?;
@@ -1180,8 +1183,14 @@ mod tests {
             matches!(outcome, EffectResult::Denied(ref reason) if reason.contains("minor-unit range")),
             "{outcome:?}"
         );
-        assert!(endpoint.applied.borrow().is_empty(), "overflowing cost must not mutate");
-        assert_eq!(budget.settles, 0, "overflowing cost must not reach settlement");
+        assert!(
+            endpoint.applied.borrow().is_empty(),
+            "overflowing cost must not mutate"
+        );
+        assert_eq!(
+            budget.settles, 0,
+            "overflowing cost must not reach settlement"
+        );
         assert_eq!(budget.billed, 0);
     }
 
@@ -1248,8 +1257,9 @@ mod tests {
         };
         let mut signals2 = PipelineSignals::new();
         let the_plan = plan("git.merge", r#"{"title":"x"}"#);
-        let approved: BTreeSet<String> =
-            [effect_gate_key(&the_plan.tool, &the_plan.object)].into_iter().collect();
+        let approved: BTreeSet<String> = [effect_gate_key(&the_plan.tool, &the_plan.object)]
+            .into_iter()
+            .collect();
         let mut p2 = pipeline(
             &cat,
             &check,
@@ -1299,12 +1309,24 @@ mod tests {
         let mut plan_b = plan("git.merge", r#"{"title":"b"}"#);
         plan_b.object = ArtifactRef("myelin://acme/git/pr/41".into());
 
-        let approved: BTreeSet<String> =
-            [effect_gate_key(&plan_a.tool, &plan_a.object)].into_iter().collect();
-        let mut budget = Budget { remaining: 100, billed: 0, settles: 0 };
+        let approved: BTreeSet<String> = [effect_gate_key(&plan_a.tool, &plan_a.object)]
+            .into_iter()
+            .collect();
+        let mut budget = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals = PipelineSignals::new();
         let mut p = pipeline(
-            &cat, &check, &del, &tenant, &endpoint, &mut budget, approved, &mut signals,
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget,
+            approved,
+            &mut signals,
         );
         assert!(
             matches!(p.apply_planned(&plan_a), EffectResult::Applied(_)),
@@ -1314,13 +1336,28 @@ mod tests {
             matches!(p.apply_planned(&plan_b), EffectResult::Gated(_)),
             "the sibling (pr 41) sharing the tool name still GATES - approval never transfers"
         );
-        assert_eq!(endpoint.applied.borrow().len(), 1, "exactly the approved effect mutated");
+        assert_eq!(
+            endpoint.applied.borrow().len(),
+            1,
+            "exactly the approved effect mutated"
+        );
 
         let by_name: BTreeSet<String> = ["git.merge".to_string()].into_iter().collect();
-        let mut budget2 = Budget { remaining: 100, billed: 0, settles: 0 };
+        let mut budget2 = Budget {
+            remaining: 100,
+            billed: 0,
+            settles: 0,
+        };
         let mut signals2 = PipelineSignals::new();
         let mut p2 = pipeline(
-            &cat, &check, &del, &tenant, &endpoint, &mut budget2, by_name, &mut signals2,
+            &cat,
+            &check,
+            &del,
+            &tenant,
+            &endpoint,
+            &mut budget2,
+            by_name,
+            &mut signals2,
         );
         assert!(
             matches!(p2.apply_planned(&plan_b), EffectResult::Gated(_)),

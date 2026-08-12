@@ -49,11 +49,7 @@ mod tests {
                 .iter()
                 .map(ToolDef::canonical_name)
                 .collect::<Vec<_>>(),
-            [
-                "git.list_repositories",
-                "git.read_file",
-                "git.search_code"
-            ]
+            ["git.list_repositories", "git.read_file", "git.search_code"]
         );
         for definition in definitions {
             definition.validate().unwrap();

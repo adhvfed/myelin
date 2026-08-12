@@ -63,7 +63,7 @@ fn no_code_executing_git_tool_runs_without_a_green_attestation_for_the_git_tool_
 
 #[test]
 fn a_red_drill_on_the_git_tool_image_mints_no_attestation() {
-    let minted = attestation_for(GIT_TOOL_IMAGE_ROOTFS_SHA,  true);
+    let minted = attestation_for(GIT_TOOL_IMAGE_ROOTFS_SHA, true);
     assert!(
         minted.is_err(),
         "a red drill on the git tool image mints NO green attestation"

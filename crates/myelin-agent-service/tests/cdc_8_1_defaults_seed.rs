@@ -79,7 +79,7 @@ fn cdc_8_1_cross_subsystem_effect_inherits_the_landing_default() {
 
 #[test]
 fn cdc_8_1_no_silent_loosening_gate() {
-    let loosened = raw("git", "merge",  false);
+    let loosened = raw("git", "merge", false);
     assert!(
         assert_no_silent_loosening(&loosened, &[]).is_err(),
         "a silent yes→no loosening of a consequential action is rejected (VISION §3)"

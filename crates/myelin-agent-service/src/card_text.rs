@@ -182,10 +182,7 @@ pub struct RenderedCard {
     pub approver_count: usize,
 }
 
-pub fn humanise_card(
-    ctx: &RenderCtx<'_>,
-    card: &HitlCard,
-) -> Result<RenderedCard, RawAgentString> {
+pub fn humanise_card(ctx: &RenderCtx<'_>, card: &HitlCard) -> Result<RenderedCard, RawAgentString> {
     let risk_text = humanise_risk_summary(ctx, &card.risk_summary)?;
     Ok(RenderedCard {
         risk_text,

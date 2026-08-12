@@ -70,7 +70,7 @@ fn no_untrusted_compute_on_the_prod_image_without_a_green_reconfirm_attestation(
 
 #[test]
 fn a_red_reconfirm_on_the_prod_image_mints_no_attestation() {
-    let minted = prod_image_attestation(PROD_RUNNER_IMAGE_ROOTFS_SHA,  true);
+    let minted = prod_image_attestation(PROD_RUNNER_IMAGE_ROOTFS_SHA, true);
     assert!(
         minted.is_err(),
         "a red re-confirm drill on the prod image mints NO green attestation"

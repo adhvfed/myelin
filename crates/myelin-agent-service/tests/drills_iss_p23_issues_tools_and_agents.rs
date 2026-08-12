@@ -1,26 +1,10 @@
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
 use myelin_agent_service::escape_gate::{AgentExecGate, ProductionBackendId};
 use myelin_agent_service::{
-    close_tool_def,
-    create_tool_def,
-    full_issues_tool_defs,
-    register_full_issues_tools,
-    replay_forecast_agent,
-    transition_caveat,
-    transition_tool_def,
-    triage_suggestion_strip,
-    ApplyError,
-    CapabilityCheck,
-    DelegationLookup,
-    EffectBudget,
-    EffectCost,
-    ForecastInput,
-    LinearForecast,
-    PipelineSignals,
-    PlanThenApply,
-    PlannedEffect,
-    SubsystemApply,
-    TenantGuard,
+    close_tool_def, create_tool_def, full_issues_tool_defs, register_full_issues_tools,
+    replay_forecast_agent, transition_caveat, transition_tool_def, triage_suggestion_strip,
+    ApplyError, CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, ForecastInput,
+    LinearForecast, PipelineSignals, PlanThenApply, PlannedEffect, SubsystemApply, TenantGuard,
 };
 use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
 use myelin_ci_sandbox::{
@@ -275,10 +259,12 @@ fn ag_d5_governed_transition_withheld_then_applies_once() {
         "AG-D5: 0 mutation before approval (the green counter)"
     );
 
-    let approved: BTreeSet<String> =
-        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
-            .into_iter()
-            .collect();
+    let approved: BTreeSet<String> = [myelin_agent_service::effect_gate_key(
+        &plan.tool,
+        &plan.object,
+    )]
+    .into_iter()
+    .collect();
     let (applied, muts1) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(applied, EffectResult::Applied(_)),
@@ -315,10 +301,12 @@ fn ag_d5_governed_transition_without_approver_context_is_denied() {
             markup: 5,
         },
     };
-    let approved: BTreeSet<String> =
-        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
-            .into_iter()
-            .collect();
+    let approved: BTreeSet<String> = [myelin_agent_service::effect_gate_key(
+        &plan.tool,
+        &plan.object,
+    )]
+    .into_iter()
+    .collect();
     let (out, muts) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(out, EffectResult::Denied(_)),

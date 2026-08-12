@@ -156,12 +156,14 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
 
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin count tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(tenant)
-        .bind(region)
-        .execute(&mut *tx)
-        .await
-        .expect("scope count tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope count tx");
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_wallet_ledger \
          WHERE tenant_id = $1 AND region = $2 AND kind = 'debit' AND run_id = $3",

@@ -2,8 +2,7 @@ use myelin_agent::{GateId, ToolName};
 use myelin_agent_service::{assert_no_raw_agent_surface, humanise_agent_message};
 use myelin_agent_service::{
     humanise_card, humanise_risk_summary, register_agent_templates, surface_card, AgentMessage,
-    RenderCtx,
-    EffectCost, HitlGate, PlannedEffect, RiskSummary,
+    EffectCost, HitlGate, PlannedEffect, RenderCtx, RiskSummary,
 };
 use myelin_identity::{
     Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie,

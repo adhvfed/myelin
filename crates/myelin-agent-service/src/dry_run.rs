@@ -4,8 +4,8 @@ use crate::effect_api::{
 };
 use crate::mock::{build_conversation, MockScript, TraceHistory, MOCK_MAX_STEPS};
 use myelin_agent::{
-    AgentRuntime, DryRun, InboxEvent, ProposedEffect, StepOutcome, ToolName, ToolOutcome, ToolResult,
-    ToolSurface,
+    AgentRuntime, DryRun, InboxEvent, ProposedEffect, StepOutcome, ToolName, ToolOutcome,
+    ToolResult, ToolSurface,
 };
 
 pub fn proposed_effect_sequence<F>(
@@ -350,10 +350,7 @@ mod tests {
     fn merge_then_post_script() -> MockScript {
         MockScript::new(
             SystemContext("you are agent-7".into()),
-            vec![
-                schema("git.merge"),
-                schema("chat.post_message"),
-            ],
+            vec![schema("git.merge"), schema("chat.post_message")],
             BudgetView(100),
             vec![
                 StepOutcome::UseTools(vec![call("git.merge")]),
@@ -374,13 +371,8 @@ mod tests {
     fn catalogue() -> Catalogue {
         Catalogue {
             defs: vec![
-                tool_def("git", "git.merge", &["git.merge"],  true),
-                tool_def(
-                    "chat",
-                    "chat.post_message",
-                    &["chat.post"],
-                     false,
-                ),
+                tool_def("git", "git.merge", &["git.merge"], true),
+                tool_def("chat", "chat.post_message", &["chat.post"], false),
             ],
         }
     }

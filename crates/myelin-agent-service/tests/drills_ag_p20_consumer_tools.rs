@@ -1,41 +1,13 @@
 use myelin_agent::GateId;
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
 use myelin_agent_service::{
-    chat_tool_defs,
-    ci_tool_defs,
-    classify,
-    deploy_tool_def,
-    forecast_tool_def,
-    issues_tool_defs,
-    landing_requires_approval,
-    post_message_tool_def,
-    react_tool_def,
-    register_chat_tools,
-    register_ci_tools,
-    register_issues_tools,
-    run_pipeline_tool_def,
-    transition_caveat,
-    transition_tool_def,
-    ApplyError,
-    ApplyLedger,
-    ApprovedTools,
-    BatchApprovalCard,
-    BatchGatedEffect,
-    CapabilityCheck,
-    DecisionScript,
-    DelegationLookup,
-    DispatchCounter,
-    DispatchDecision,
-    DispatchTrigger,
-    EffectBudget,
-    EffectCost,
-    PipelineSignals,
-    PlanThenApply,
-    PlannedEffect,
-    RiskSummary,
-    SubsystemApply,
-    TenantGuard,
-    WaitDecision,
+    chat_tool_defs, ci_tool_defs, classify, deploy_tool_def, forecast_tool_def, issues_tool_defs,
+    landing_requires_approval, post_message_tool_def, react_tool_def, register_chat_tools,
+    register_ci_tools, register_issues_tools, run_pipeline_tool_def, transition_caveat,
+    transition_tool_def, ApplyError, ApplyLedger, ApprovedTools, BatchApprovalCard,
+    BatchGatedEffect, CapabilityCheck, DecisionScript, DelegationLookup, DispatchCounter,
+    DispatchDecision, DispatchTrigger, EffectBudget, EffectCost, PipelineSignals, PlanThenApply,
+    PlannedEffect, RiskSummary, SubsystemApply, TenantGuard, WaitDecision,
 };
 use myelin_identity::{
     CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
@@ -340,10 +312,12 @@ fn iss_d12_governed_transition_withheld_then_approved_applies_once() {
     );
     assert_eq!(muts0, 0, "ISS-D12: 0 mutation before approval (AG-8)");
 
-    let approved: BTreeSet<String> =
-        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
-            .into_iter()
-            .collect();
+    let approved: BTreeSet<String> = [myelin_agent_service::effect_gate_key(
+        &plan.tool,
+        &plan.object,
+    )]
+    .into_iter()
+    .collect();
     let (applied, muts1) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(applied, EffectResult::Applied(_)),
@@ -380,10 +354,12 @@ fn iss_d12_sla_bound_transition_without_approver_context_is_denied() {
             markup: 5,
         },
     };
-    let approved: BTreeSet<String> =
-        [myelin_agent_service::effect_gate_key(&plan.tool, &plan.object)]
-            .into_iter()
-            .collect();
+    let approved: BTreeSet<String> = [myelin_agent_service::effect_gate_key(
+        &plan.tool,
+        &plan.object,
+    )]
+    .into_iter()
+    .collect();
     let (out, muts) = apply_once(&cat, &endpoint, &check, caps, approved, &plan);
     assert!(
         matches!(out, EffectResult::Denied(_)),

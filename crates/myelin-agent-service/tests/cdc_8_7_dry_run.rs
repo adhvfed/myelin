@@ -172,8 +172,8 @@ fn script() -> MockScript {
 fn cdc_8_7_dry_run_returns_the_plan_with_unchanged_wallet() {
     let cat = Catalogue {
         defs: vec![
-            tool_def("merge", &["merge"],  true),
-            tool_def("post", &["post"],  false),
+            tool_def("merge", &["merge"], true),
+            tool_def("post", &["post"], false),
         ],
     };
     let check = AllowAll;

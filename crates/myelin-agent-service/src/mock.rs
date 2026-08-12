@@ -433,7 +433,7 @@ mod tests {
             }
         }
         let framing = MockScript::new(SystemContext("sys".into()), vec![], BudgetView(0), vec![]);
-        let rec = replay_bounded(&NeverSubmits, &framing,  5);
+        let rec = replay_bounded(&NeverSubmits, &framing, 5);
         assert!(
             !rec.terminated,
             "a non-terminating brain trips the ceiling (never hangs)"

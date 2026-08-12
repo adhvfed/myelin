@@ -317,11 +317,7 @@ fn cdc_4_5_consumer_delegation_intersection_confines() {
 #[test]
 fn cdc_8_2_unbound_glue_trait_body_denies_without_mutating() {
     let cat = Catalogue {
-        defs: vec![tool(
-            "git.merge",
-            &["git.merge"],
-             true,
-        )],
+        defs: vec![tool("git.merge", &["git.merge"], true)],
     };
     let check = ProviderCheck {
         allow: ["git.merge".to_string()].into_iter().collect(),

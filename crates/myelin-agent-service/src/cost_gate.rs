@@ -4,14 +4,8 @@ use myelin_storage::reserve_settle::MicroUsd;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunawayStep {
-    Admitted {
-        reserved: u64,
-        settled: u64,
-    },
-    Refused {
-        requested: u64,
-        available: u64,
-    },
+    Admitted { reserved: u64, settled: u64 },
+    Refused { requested: u64, available: u64 },
 }
 
 impl RunawayStep {
@@ -67,12 +61,7 @@ impl RunawaySelfLimiter {
         mut drive_one: F,
     ) -> Vec<RunawayStep>
     where
-        F: FnMut(
-            String,
-            MicroUsd,
-            MicroUsd,
-            &mut SkeletonTelemetry,
-        ) -> Result<u64, SkeletonError>,
+        F: FnMut(String, MicroUsd, MicroUsd, &mut SkeletonTelemetry) -> Result<u64, SkeletonError>,
     {
         let _ = brain;
         let mut steps = Vec::with_capacity(attempts as usize);

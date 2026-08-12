@@ -256,7 +256,11 @@ mod tests {
             &LUNA_RATES,
         )
         .unwrap();
-        assert_eq!(priced.wholesale, MicroUsd::ZERO, "0.2 micro-USD rounds down to 0");
+        assert_eq!(
+            priced.wholesale,
+            MicroUsd::ZERO,
+            "0.2 micro-USD rounds down to 0"
+        );
         let out1 = price(
             &TokenUsage::Reported {
                 input: 0,
@@ -266,6 +270,10 @@ mod tests {
             &LUNA_RATES,
         )
         .unwrap();
-        assert_eq!(out1.wholesale, MicroUsd(1), "1.2 micro-USD rounds down to 1");
+        assert_eq!(
+            out1.wholesale,
+            MicroUsd(1),
+            "1.2 micro-USD rounds down to 1"
+        );
     }
 }
