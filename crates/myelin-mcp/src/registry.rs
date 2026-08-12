@@ -260,12 +260,14 @@ mod tests {
         let old = ToolRegistry::for_cursors(&[
             "issues.create.v1".into(),
             "issues.view.v1".into(),
+            "knowledge.link_work.v1".into(),
             "knowledge.read_page.v1".into(),
         ])
         .unwrap();
         let current = ToolRegistry::for_cursors(&[
             "issues.create.v2".into(),
             "issues.view.v2".into(),
+            "knowledge.link_work.v2".into(),
             "knowledge.read_page.v2".into(),
         ])
         .unwrap();
@@ -291,6 +293,12 @@ mod tests {
         assert_eq!(current_page.cursor(), "knowledge.read_page.v2");
         assert!(old_page.definition().input_schema.contains("page_id"));
         assert!(current_page.definition().input_schema.contains("page_ref"));
+        let old_link = old.resolve("knowledge.link_work").unwrap();
+        let current_link = current.resolve("knowledge.link_work").unwrap();
+        assert_eq!(old_link.cursor(), "knowledge.link_work.v1");
+        assert_eq!(current_link.cursor(), "knowledge.link_work.v2");
+        assert!(old_link.definition().input_schema.contains("page_id"));
+        assert!(current_link.definition().input_schema.contains("page_ref"));
     }
 
     #[test]

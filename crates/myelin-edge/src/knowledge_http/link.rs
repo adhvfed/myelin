@@ -22,6 +22,19 @@ pub struct KnowledgeLinkOutcome {
 }
 
 impl DurableKnowledgeMutationApi {
+    pub fn link_work_ref(
+        &self,
+        actor: &Principal,
+        owner: &Principal,
+        page_reference: &str,
+        request: KnowledgeLinkRequest,
+        idempotency_key: &str,
+    ) -> Result<KnowledgeLinkOutcome, EdgeError> {
+        validate_link_principals(actor, owner)?;
+        let page_id = page_id_from_ref(owner, page_reference)?;
+        self.link_work(actor, owner, &page_id, request, idempotency_key)
+    }
+
     pub fn link_work(
         &self,
         actor: &Principal,

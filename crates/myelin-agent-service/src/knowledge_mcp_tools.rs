@@ -6,6 +6,7 @@ pub const LIST_PAGES_TOOL: &str = "list_pages";
 pub const READ_PAGE_TOOL: &str = "read_page";
 pub const READ_PAGE_TOOL_VERSION: u32 = 2;
 pub const LINK_WORK_TOOL: &str = "link_work";
+pub const LINK_WORK_TOOL_VERSION: u32 = 2;
 
 fn read_tool(name: &str, version: u32, input_schema: &str) -> ToolDef {
     ToolDef {
@@ -21,18 +22,25 @@ fn read_tool(name: &str, version: u32, input_schema: &str) -> ToolDef {
     }
 }
 
-pub fn link_work_tool_def() -> ToolDef {
+fn link_work_tool_def_for(version: u32, input_schema: &str) -> ToolDef {
     ToolDef {
         name: ToolName(LINK_WORK_TOOL.into()),
         subsystem: KNOWLEDGE_SUBSYSTEM.into(),
-        version: KNOWLEDGE_TOOL_VERSION,
-        input_schema: r#"{"type":"object","required":["page_id","reference"],"properties":{"page_id":{"type":"string","pattern":"^[0-9A-HJKMNP-TV-Z]{26}$"},"reference":{"type":"string","minLength":1,"maxLength":1024,"description":"Canonical myelin:// reference to related work"},"note":{"type":"string","minLength":1,"maxLength":4096,"description":"Short context shown before the related-work link"}},"additionalProperties":false}"#.into(),
+        version,
+        input_schema: input_schema.into(),
         required_caps: vec!["knowledge.edit".into()],
         effect_kind: EffectKind::Mutate,
         side_effecting: true,
         requires_approval: false,
         exposed_over_mcp: true,
     }
+}
+
+pub fn link_work_tool_def() -> ToolDef {
+    link_work_tool_def_for(
+        LINK_WORK_TOOL_VERSION,
+        r#"{"type":"object","required":["page_ref","reference"],"properties":{"page_ref":{"type":"string","pattern":"^myelin://[^/]+/knowledge/page/[0-9A-HJKMNP-TV-Z]{26}$"},"reference":{"type":"string","minLength":1,"maxLength":1024,"description":"Canonical myelin:// reference to related work"},"note":{"type":"string","minLength":1,"maxLength":4096,"description":"Short context shown before the related-work link"}},"additionalProperties":false}"#,
+    )
 }
 
 pub fn knowledge_mcp_tool_defs() -> Vec<ToolDef> {
@@ -52,6 +60,10 @@ pub fn knowledge_mcp_tool_defs() -> Vec<ToolDef> {
             READ_PAGE_TOOL_VERSION,
             r#"{"type":"object","required":["page_ref"],"properties":{"page_ref":{"type":"string","pattern":"^myelin://[^/]+/knowledge/page/[0-9A-HJKMNP-TV-Z]{26}$"}},"additionalProperties":false}"#,
         ),
+        link_work_tool_def_for(
+            KNOWLEDGE_TOOL_VERSION,
+            r#"{"type":"object","required":["page_id","reference"],"properties":{"page_id":{"type":"string","pattern":"^[0-9A-HJKMNP-TV-Z]{26}$"},"reference":{"type":"string","minLength":1,"maxLength":1024,"description":"Canonical myelin:// reference to related work"},"note":{"type":"string","minLength":1,"maxLength":4096,"description":"Short context shown before the related-work link"}},"additionalProperties":false}"#,
+        ),
         link_work_tool_def(),
     ]
 }
@@ -62,7 +74,7 @@ mod tests {
     use crate::defaults::requires_approval_default;
 
     #[test]
-    fn knowledge_reads_keep_old_ids_beside_the_reference_native_surface() {
+    fn knowledge_tools_keep_old_ids_beside_the_reference_native_surface() {
         let definitions = knowledge_mcp_tool_defs();
         assert_eq!(
             definitions
@@ -76,6 +88,7 @@ mod tests {
                 "knowledge.read_page.v1",
                 "knowledge.read_page.v2",
                 "knowledge.link_work.v1",
+                "knowledge.link_work.v2",
             ]
         );
         for definition in &definitions {
@@ -100,10 +113,20 @@ mod tests {
         assert_eq!(schema["required"], serde_json::json!(["page_ref"]));
         assert!(schema["properties"].get("page_id").is_none());
 
-        let link = &definitions[3];
-        assert_eq!(link.required_caps, ["knowledge.edit"]);
-        assert_eq!(link.effect_kind, EffectKind::Mutate);
-        assert!(link.side_effecting);
-        assert!(!link.requires_approval, "adding a link is reversible");
+        let links = &definitions[3..];
+        assert!(links.iter().all(|link| {
+            link.required_caps == ["knowledge.edit"]
+                && link.effect_kind == EffectKind::Mutate
+                && link.side_effecting
+                && !link.requires_approval
+        }));
+        let current_link = links.last().unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&current_link.input_schema).unwrap();
+        assert_eq!(current_link.version, LINK_WORK_TOOL_VERSION);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["page_ref", "reference"])
+        );
+        assert!(schema["properties"].get("page_id").is_none());
     }
 }

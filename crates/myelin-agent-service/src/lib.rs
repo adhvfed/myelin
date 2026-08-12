@@ -128,8 +128,8 @@ pub use issues_read_tools::{
 };
 
 pub use knowledge_mcp_tools::{
-    knowledge_mcp_tool_defs, link_work_tool_def, LINK_WORK_TOOL, LIST_PAGES_TOOL, READ_PAGE_TOOL,
-    READ_PAGE_TOOL_VERSION,
+    knowledge_mcp_tool_defs, link_work_tool_def, LINK_WORK_TOOL, LINK_WORK_TOOL_VERSION,
+    LIST_PAGES_TOOL, READ_PAGE_TOOL, READ_PAGE_TOOL_VERSION,
 };
 
 pub use project_read_tools::{

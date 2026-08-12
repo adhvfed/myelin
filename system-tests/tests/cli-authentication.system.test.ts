@@ -628,7 +628,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.create", version: 2 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 2 },
-            { name: "knowledge.link_work", version: 1 },
+            { name: "knowledge.link_work", version: 2 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 2 },
             { name: "projects.list", version: 1 },
@@ -974,7 +974,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.create", version: 2 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 2 },
-            { name: "knowledge.link_work", version: 1 },
+            { name: "knowledge.link_work", version: 2 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 2 },
             { name: "projects.list", version: 1 },
@@ -1141,7 +1141,7 @@ describe("the CLI authentication journey", () => {
       });
       expect(schemaFor("knowledge.link_work")).toMatchObject({
         type: "object",
-        required: ["page_id", "reference"],
+        required: ["page_ref", "reference"],
         additionalProperties: false,
       });
       expect(schemaFor("knowledge.list_pages")).toMatchObject({
@@ -2204,7 +2204,7 @@ describe("the CLI authentication journey", () => {
         21,
         "knowledge.link_work",
         {
-          page_id: knowledgePageId,
+          page_ref: agentVisiblePageRef,
           reference: agentPullRequestRef,
           note: "Implementation is reviewed in",
         },
@@ -2215,7 +2215,7 @@ describe("the CLI authentication journey", () => {
         22,
         "knowledge.link_work",
         {
-          page_id: knowledgePageId,
+          page_ref: agentVisiblePageRef,
           reference: agentPullRequestRef,
           note: "Implementation is reviewed in",
         },

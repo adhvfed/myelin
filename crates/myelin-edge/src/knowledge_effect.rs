@@ -20,8 +20,24 @@ pub struct KnowledgeEffectApi {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum KnowledgeLinkArguments {
+    Reference(KnowledgeLinkByReference),
+    LegacyId(KnowledgeLinkById),
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KnowledgeLinkArguments {
+struct KnowledgeLinkByReference {
+    page_ref: String,
+    reference: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeLinkById {
     page_id: String,
     reference: String,
     #[serde(default)]
@@ -95,17 +111,29 @@ impl KnowledgeEffectApi {
                 ))
             }
         };
-        let request = KnowledgeLinkRequest {
-            reference: arguments.reference,
-            note: arguments.note,
+        let outcome = match arguments {
+            KnowledgeLinkArguments::Reference(arguments) => self.knowledge.link_work_ref(
+                &self.principal,
+                &self.delegator,
+                &arguments.page_ref,
+                KnowledgeLinkRequest {
+                    reference: arguments.reference,
+                    note: arguments.note,
+                },
+                idempotency_key,
+            ),
+            KnowledgeLinkArguments::LegacyId(arguments) => self.knowledge.link_work(
+                &self.principal,
+                &self.delegator,
+                &arguments.page_id,
+                KnowledgeLinkRequest {
+                    reference: arguments.reference,
+                    note: arguments.note,
+                },
+                idempotency_key,
+            ),
         };
-        match self.knowledge.link_work(
-            &self.principal,
-            &self.delegator,
-            &arguments.page_id,
-            request,
-            idempotency_key,
-        ) {
+        match outcome {
             Ok(outcome) => EffectResult::AppliedResource {
                 event_id: EventId(format!("knowledge.link:{}|{}", outcome.block_id, run.0)),
                 resource: EffectResource::new(
@@ -152,14 +180,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proposed_knowledge_links_are_strict_json_carriers() {
-        let (tool, arguments) = parse_proposed(
+    fn proposed_knowledge_links_accept_one_versioned_identity_without_aliasing() {
+        for carrier in [
+            r#"tool:knowledge.link_work|args:{"page_ref":"myelin://acme/knowledge/page/01J00000000000000000000000","reference":"myelin://acme/issue/issue/ENG-41","note":"Delivery issue"}"#,
             r#"tool:knowledge.link_work|args:{"page_id":"01J00000000000000000000000","reference":"myelin://acme/issue/issue/ENG-41","note":"Delivery issue"}"#,
+        ] {
+            let (tool, arguments) = parse_proposed(carrier).unwrap();
+            assert_eq!(tool, "knowledge.link_work");
+            serde_json::from_value::<KnowledgeLinkArguments>(arguments).unwrap();
+        }
+        let (_, ambiguous) = parse_proposed(
+            r#"tool:knowledge.link_work|args:{"page_ref":"myelin://acme/knowledge/page/01J00000000000000000000000","page_id":"01J00000000000000000000000","reference":"myelin://acme/issue/issue/ENG-41"}"#,
         )
         .unwrap();
-        assert_eq!(tool, "knowledge.link_work");
-        let arguments: KnowledgeLinkArguments = serde_json::from_value(arguments).unwrap();
-        assert_eq!(arguments.note.as_deref(), Some("Delivery issue"));
+        assert!(serde_json::from_value::<KnowledgeLinkArguments>(ambiguous).is_err());
         assert!(parse_proposed("garbage").is_none());
         assert!(parse_proposed("tool:knowledge.link_work|args:not-json").is_none());
     }
