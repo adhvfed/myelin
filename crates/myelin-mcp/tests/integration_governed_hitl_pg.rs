@@ -202,6 +202,47 @@ fn router_with_audit(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_store_outage_withholds_the_effect_without_killing_the_router() {
+    let provider = SubstrateProvider::connect(test_config(), 1)
+        .await
+        .expect("open the application pool for the outage story");
+    let region = provider.config().region.clone();
+    let applies = Arc::new(AppliedEffects::default());
+    let router = router(
+        provider.clone(),
+        "mcp-hitl-outage",
+        &region,
+        "run:outage-proof",
+        "agent:mcp-outage",
+        applies.clone(),
+    );
+    provider.db_pool().close().await;
+
+    let registry = ToolRegistry::with_git();
+    let outcome = router.call(
+        registry.resolve("git.merge").unwrap(),
+        &serde_json::json!({"repo":"alpha","number":1}),
+        "outage-proof-merge-1",
+        &Timestamp("2026-07-18T00:00:00Z".into()),
+        None,
+    );
+
+    assert!(
+        matches!(outcome, CallOutcome::Indeterminate { .. }),
+        "an unreadable approval store is indeterminate, never permission or a missing gate: {outcome:?}"
+    );
+    assert_eq!(
+        applies.count(),
+        0,
+        "the governed effect remains untouched while approval state is unknowable"
+    );
+    assert!(
+        !router.is_fatal(),
+        "a transient pre-mutation outage leaves this session retryable after recovery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let admin = SubstrateProvider::connect(admin_config(), 4)
         .await
@@ -305,12 +346,14 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         expiry_store
             .fetch(&expiry_scope, &exact_gate)
             .unwrap()
+            .unwrap()
             .state,
         GateState::Expired
     );
     assert_eq!(
         expiry_store
             .fetch(&expiry_scope, &unrelated_gate)
+            .unwrap()
             .unwrap()
             .state,
         GateState::Waiting,

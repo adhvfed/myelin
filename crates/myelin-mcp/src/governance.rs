@@ -20,8 +20,8 @@ use myelin_identity_service::mint::{
     attenuate_for_caveats, repository_scope_grant, RunTokenMinter, REPOSITORY_SCOPE_GRANT_PREFIX,
 };
 use myelin_storage::hitl_gate_durable::{
-    gate_ref_token, opaque_gate_id, GateDecideError, GateRecord, GateState, HitlVerdictStore,
-    DEFAULT_HITL_GATE_TTL_SECS,
+    gate_ref_token, opaque_gate_id, GateConsumeError, GateDecideError, GateRecord, GateState,
+    GateStoreUnavailable, HitlVerdictStore, DEFAULT_HITL_GATE_TTL_SECS,
 };
 use myelin_storage::{ContentHash, TenantScope};
 
@@ -992,13 +992,24 @@ impl GovernedRouter {
         let mut approval_grant = ApprovalGrant::NotRequired;
         if tool.requires_approval() {
             let effect_key = mcp_effect_key_for_call(tool.name(), args, idempotency_key);
-            let expired = self.verdicts.borrow_mut().expire_due_for_effect(
+            let expired = match self.verdicts.borrow_mut().expire_due_for_effect(
                 &self.principal.scope,
                 &self.principal.run_id.0,
                 &self.principal.agent_id.0,
                 &effect_key,
                 now_unix,
-            );
+            ) {
+                Ok(expired) => expired,
+                Err(_) => {
+                    return self.push_local_audit(
+                        tool.name(),
+                        CallOutcome::Indeterminate {
+                            reason: "durable HITL state is unavailable; effect withheld".into(),
+                            jti,
+                        },
+                    )
+                }
+            };
             if !expired.is_empty() && self.record_expired_gates(&expired, now).is_err() {
                 self.state.borrow_mut().fatal = true;
                 return self.push_local_audit(
@@ -1012,12 +1023,24 @@ impl GovernedRouter {
             }
             match presented_gate_id {
                 None => {
-                    let approved = self.verdicts.borrow().find_approved(
+                    let approved = match self.verdicts.borrow().find_approved(
                         &self.principal.scope,
                         &self.principal.run_id.0,
                         &self.principal.agent_id.0,
                         &effect_key,
-                    );
+                    ) {
+                        Ok(approved) => approved,
+                        Err(_) => {
+                            return self.push_local_audit(
+                                tool.name(),
+                                CallOutcome::Indeterminate {
+                                    reason: "durable HITL state is unavailable; effect withheld"
+                                        .into(),
+                                    jti,
+                                },
+                            )
+                        }
+                    };
                     if let Some(record) = approved {
                         if !record.authorizes(
                             &effect_key,
@@ -1091,7 +1114,7 @@ impl GovernedRouter {
                 Some(gid) => {
                     let verdict = self.verdicts.borrow().fetch(&self.principal.scope, gid);
                     match verdict {
-                        Some(rec)
+                        Ok(Some(rec))
                             if rec.authorizes(
                                 &effect_key,
                                 &self.principal.run_id.0,
@@ -1100,7 +1123,7 @@ impl GovernedRouter {
                         {
                             approval_grant = ApprovalGrant::Consume(gid.to_string());
                         }
-                        Some(rec)
+                        Ok(Some(rec))
                             if rec.authorizes_replay(
                                 &effect_key,
                                 &self.principal.run_id.0,
@@ -1109,7 +1132,7 @@ impl GovernedRouter {
                         {
                             approval_grant = ApprovalGrant::Replay;
                         }
-                        Some(rec)
+                        Ok(Some(rec))
                             if rec.state == GateState::Waiting
                                 && rec.effect_id == effect_key
                                 && rec.run_id == self.principal.run_id.0
@@ -1124,7 +1147,17 @@ impl GovernedRouter {
                                 now,
                             );
                         }
-                        _ => {
+                        Err(_) => {
+                            return self.push_local_audit(
+                                tool.name(),
+                                CallOutcome::Indeterminate {
+                                    reason: "durable HITL state is unavailable; effect withheld"
+                                        .into(),
+                                    jti,
+                                },
+                            );
+                        }
+                        Ok(None) | Ok(Some(_)) => {
                             return self.record(
                                 tool.name(),
                                 CallOutcome::Denied {
@@ -1181,14 +1214,18 @@ impl GovernedRouter {
                     &self.principal.agent_id.0,
                     now_unix,
                 ) {
-                    return self.record(
-                        tool.name(),
+                    let outcome = if error == GateConsumeError::StorageUnavailable {
+                        CallOutcome::Indeterminate {
+                            reason: "durable HITL state is unavailable; effect withheld".into(),
+                            jti,
+                        }
+                    } else {
                         CallOutcome::Denied {
                             reason: format!("HITL approval consumption refused: {error}"),
                             jti,
-                        },
-                        now,
-                    );
+                        }
+                    };
+                    return self.record(tool.name(), outcome, now);
                 }
                 EffectApproval::HumanApproved
             }
@@ -1245,12 +1282,15 @@ impl GovernedRouter {
             );
         }
         let mut verdicts = self.verdicts.borrow_mut();
-        if let Some(existing) = verdicts.find_waiting(
-            &self.principal.scope,
-            &self.principal.run_id.0,
-            &requested_by,
-            effect_key,
-        ) {
+        if let Some(existing) = verdicts
+            .find_waiting(
+                &self.principal.scope,
+                &self.principal.run_id.0,
+                &requested_by,
+                effect_key,
+            )
+            .map_err(|_| "durable HITL state is unavailable; effect withheld".to_string())?
+        {
             return Ok((existing.gate_id, false));
         }
         let gate_id = opaque_gate_id();
@@ -1310,7 +1350,7 @@ impl GovernedRouter {
         )
     }
 
-    pub fn gate_verdict(&self, gate_id: &str) -> Option<GateRecord> {
+    pub fn gate_verdict(&self, gate_id: &str) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         self.verdicts.borrow().fetch(&self.principal.scope, gate_id)
     }
 

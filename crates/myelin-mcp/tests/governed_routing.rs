@@ -1049,6 +1049,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     let router = server.router().unwrap();
     let rec = router
         .gate_verdict(&gate_id)
+        .expect("the in-memory gate store is available")
         .expect("the gate is a server-side row");
     assert_eq!(rec.state, GateState::Waiting);
     assert_eq!(rec.requested_by, "agent:claude");
@@ -1070,7 +1071,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
         "a distinct MACHINE principal is refused - the gate requires a HUMAN approver"
     );
     assert_eq!(
-        router.gate_verdict(&gate_id).unwrap().state,
+        router.gate_verdict(&gate_id).unwrap().unwrap().state,
         GateState::Waiting,
         "the machine-refused approval left the gate undecided"
     );
@@ -1092,7 +1093,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     router
         .approve_gate(&human_principal("human:operator", "acme"), &gate_id, &now())
         .expect("a distinct eligible human approves");
-    let rec = router.gate_verdict(&gate_id).unwrap();
+    let rec = router.gate_verdict(&gate_id).unwrap().unwrap();
     assert_eq!(rec.state, GateState::Approved);
     assert_eq!(rec.decided_by.as_deref(), Some("human:operator"));
 
@@ -1108,6 +1109,7 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     assert!(
         router
             .gate_verdict(&gate_id)
+            .unwrap()
             .unwrap()
             .approval_consumed_at_unix
             .is_some(),
@@ -1453,7 +1455,7 @@ fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session()
         CallOutcome::Indeterminate { .. }
     ));
     assert_eq!(
-        router.gate_verdict(&gate_id).unwrap().state,
+        router.gate_verdict(&gate_id).unwrap().unwrap().state,
         GateState::Expired
     );
     assert!(router.is_fatal());
@@ -1532,11 +1534,15 @@ fn mcp_expiry_leaves_unrelated_shared_gate_untouched_and_audits_exact_gate() {
         CallOutcome::Gated { .. }
     ));
     assert_eq!(
-        router.gate_verdict("gate:mcp-due").unwrap().state,
+        router.gate_verdict("gate:mcp-due").unwrap().unwrap().state,
         GateState::Expired
     );
     assert_eq!(
-        router.gate_verdict("gate:shared-due").unwrap().state,
+        router
+            .gate_verdict("gate:shared-due")
+            .unwrap()
+            .unwrap()
+            .state,
         GateState::Waiting
     );
     let due_gate_ref = format!(":hitl-gate:{}", gate_ref_token("gate:mcp-due"));

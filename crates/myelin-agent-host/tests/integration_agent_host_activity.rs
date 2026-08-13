@@ -711,6 +711,7 @@ async fn terminal_hosted_approvals_settle_once_even_when_their_wake_signal_is_lo
         .expect("recovery closes every durable surface against live time");
     let expired_gate = HitlVerdictStore::with_pg(app.clone())
         .fetch(&expired.scope, &expired.gate_id)
+        .expect("the durable gate store is available")
         .expect("the gate remains queryable");
     assert_eq!(expired_gate.state, GateState::Expired);
     assert_eq!(
@@ -775,6 +776,7 @@ async fn terminal_hosted_approvals_settle_once_even_when_their_wake_signal_is_lo
     );
     let durable_rejection = HitlVerdictStore::with_pg(app.clone())
         .fetch(&rejected.scope, &rejected.gate_id)
+        .expect("the durable gate store is available")
         .expect("the rejected gate remains queryable");
     assert_eq!(durable_rejection.state, GateState::Rejected);
     assert_eq!(durable_rejection.decided_at_unix, Some(95));

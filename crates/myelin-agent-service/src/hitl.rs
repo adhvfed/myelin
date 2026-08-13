@@ -729,6 +729,7 @@ mod tests {
 
         let rec = store
             .fetch(&scope(), &gate.gate_id.0)
+            .expect("the in-memory gate store is available")
             .expect("the gate row is lookup-able by gate_id");
         assert_eq!(rec.state, DurableGateState::Waiting);
         assert_eq!(
@@ -756,7 +757,7 @@ mod tests {
         g.approve().unwrap();
         persist_gate_decision(&mut store, &scope(), &g, Some(&human_principal("psn:lead")))
             .expect("approves");
-        let rec = store.fetch(&scope(), &g.gate_id.0).unwrap();
+        let rec = store.fetch(&scope(), &g.gate_id.0).unwrap().unwrap();
         assert_eq!(rec.state, DurableGateState::Approved);
         assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
         assert!(rec.authorizes(&rec.effect_id.clone(), &rec.run_id.clone(), "agent:claude"));
@@ -776,7 +777,7 @@ mod tests {
             "the requesting agent cannot approve its own gate - even through the persist path"
         );
         assert_eq!(
-            s2.fetch(&scope(), &g2.gate_id.0).unwrap().state,
+            s2.fetch(&scope(), &g2.gate_id.0).unwrap().unwrap().state,
             DurableGateState::Waiting,
             "the refused self-approval left the durable row undecided"
         );
@@ -798,7 +799,7 @@ mod tests {
             "a distinct, in-filter MACHINE approver is refused (distinct-HUMAN, R2.4b)"
         );
         assert_eq!(
-            sm.fetch(&scope(), &gm.gate_id.0).unwrap().state,
+            sm.fetch(&scope(), &gm.gate_id.0).unwrap().unwrap().state,
             DurableGateState::Waiting,
             "the machine-refused approval left the durable row undecided"
         );
@@ -836,6 +837,7 @@ mod tests {
                 denied_store
                     .fetch(&scope(), &denied_gate.gate_id.0)
                     .unwrap()
+                    .unwrap()
                     .state,
                 DurableGateState::Waiting
             );
@@ -846,7 +848,7 @@ mod tests {
         g3.reject("no").unwrap();
         persist_gate_decision(&mut s3, &scope(), &g3, Some(&human_principal("psn:lead"))).unwrap();
         assert_eq!(
-            s3.fetch(&scope(), &g3.gate_id.0).unwrap().state,
+            s3.fetch(&scope(), &g3.gate_id.0).unwrap().unwrap().state,
             DurableGateState::Rejected
         );
 
@@ -855,7 +857,7 @@ mod tests {
         persist_gate_open(&mut s4, &scope(), &g4, "agent:claude").unwrap();
         g4.expire().unwrap();
         persist_gate_decision(&mut s4, &scope(), &g4, None).unwrap();
-        let rec = s4.fetch(&scope(), &g4.gate_id.0).unwrap();
+        let rec = s4.fetch(&scope(), &g4.gate_id.0).unwrap().unwrap();
         assert_eq!(rec.state, DurableGateState::Expired);
         assert_eq!(rec.decided_by, None);
     }

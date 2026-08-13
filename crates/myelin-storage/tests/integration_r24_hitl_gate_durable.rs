@@ -3,8 +3,8 @@
 use myelin_config::MyelinConfig;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::hitl_gate_durable::{
-    hitl_gate_durable_migrations, DurableHitlGateBacking, GateDecideError, GateOpenError,
-    GateRecord, GateState, HitlVerdictStore,
+    hitl_gate_durable_migrations, DurableHitlGateBacking, GateConsumeError, GateDecideError,
+    GateOpenError, GateRecord, GateState, GateStoreUnavailable, HitlVerdictStore,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{SubstrateProvider, TenantScope};
@@ -132,6 +132,7 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     let mut store2 = HitlVerdictStore::with_pg(app2);
     let rec = store2
         .fetch(&scope, &gate_id)
+        .expect("the durable gate store is available")
         .expect("the gate row is visible across store instances/pools");
     assert_eq!(rec.state, GateState::Waiting);
     assert_eq!(rec.requested_by, "agent:claude");
@@ -162,14 +163,14 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         Err(GateDecideError::NotEligible)
     );
     assert_eq!(
-        store1.fetch(&scope, &gate_id).unwrap().state,
+        store1.fetch(&scope, &gate_id).unwrap().unwrap().state,
         GateState::Waiting
     );
 
     store2
         .approve(&scope, &gate_id, "psn:lead", PrincipalKind::Human)
         .expect("a distinct eligible human approves");
-    let rec = store1.fetch(&scope, &gate_id).unwrap();
+    let rec = store1.fetch(&scope, &gate_id).unwrap().unwrap();
     assert_eq!(rec.state, GateState::Approved);
     assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
     assert!(rec.authorizes(effect, &rec.run_id, "agent:claude"));
@@ -194,7 +195,7 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     store1
         .reject(&scope, &gate2, "psn:lead", PrincipalKind::Human)
         .expect("rejects");
-    let rec2 = store2.fetch(&scope, &gate2).unwrap();
+    let rec2 = store2.fetch(&scope, &gate2).unwrap().unwrap();
     assert_eq!(rec2.state, GateState::Rejected);
     assert!(
         !rec2.authorizes(effect2, &rec2.run_id, "agent:claude"),
@@ -268,6 +269,53 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         .expect("the expiry replay transaction succeeds")
         .expect("expiry is retry-idempotent");
     assert!(!expiry_replay.changed);
+
+    let unavailable_app = SubstrateProvider::connect(app_config(), 1)
+        .await
+        .expect("open a pool for the storage-outage story");
+    let mut unavailable_store = HitlVerdictStore::with_pg(unavailable_app.clone());
+    unavailable_app.db_pool().close().await;
+    assert_eq!(
+        unavailable_store.fetch(&scope, &gate_id),
+        Err(GateStoreUnavailable),
+        "a read outage is explicit rather than looking like a missing approval"
+    );
+    assert_eq!(
+        unavailable_store.open(
+            &scope,
+            waiting(&suffix, &format!("gate:{suffix}-unavailable"), effect),
+        ),
+        Err(GateOpenError::StorageUnavailable),
+        "opening a gate during an outage cannot panic the multi-tenant process"
+    );
+    assert_eq!(
+        unavailable_store.approve(&scope, &gate_id, "psn:lead", PrincipalKind::Human),
+        Err(GateDecideError::StorageUnavailable),
+        "a decision outage remains distinct from a missing or rejected gate"
+    );
+    assert_eq!(
+        unavailable_store.consume_approval(
+            &scope,
+            &gate_id,
+            effect,
+            &format!("run-{suffix}"),
+            "agent:claude",
+            300,
+        ),
+        Err(GateConsumeError::StorageUnavailable),
+        "approval consumption fails closed without terminating the process"
+    );
+    assert_eq!(
+        unavailable_store.expire_due_for_effect(
+            &scope,
+            &format!("run-{suffix}"),
+            "agent:claude",
+            effect,
+            300,
+        ),
+        Err(GateStoreUnavailable),
+        "expiry reconciliation remains retryable after storage recovers"
+    );
 
     let _ = sqlx::query("DELETE FROM agent_hitl_gate WHERE tenant_id = $1 AND region = $2")
         .bind(&tenant)

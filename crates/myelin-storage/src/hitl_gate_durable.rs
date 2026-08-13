@@ -197,6 +197,7 @@ pub enum GateOpenError {
     Duplicate,
     NotWaiting,
     CostOutOfRange,
+    StorageUnavailable,
 }
 
 impl core::fmt::Display for GateOpenError {
@@ -208,6 +209,9 @@ impl core::fmt::Display for GateOpenError {
             GateOpenError::NotWaiting => write!(f, "a gate must open in the waiting state"),
             GateOpenError::CostOutOfRange => {
                 write!(f, "a gate cost estimate must fit PostgreSQL bigint")
+            }
+            GateOpenError::StorageUnavailable => {
+                write!(f, "the durable approval gate store is unavailable")
             }
         }
     }
@@ -223,6 +227,7 @@ pub enum GateDecideError {
     SelfApproval,
     MachineApproverRefused,
     ApprovalWindowExpired,
+    StorageUnavailable,
 }
 
 impl core::fmt::Display for GateDecideError {
@@ -247,6 +252,9 @@ impl core::fmt::Display for GateDecideError {
             GateDecideError::ApprovalWindowExpired => {
                 write!(f, "the hitl gate approval window has expired")
             }
+            GateDecideError::StorageUnavailable => {
+                write!(f, "the durable approval gate store is unavailable")
+            }
         }
     }
 }
@@ -260,6 +268,7 @@ pub enum GateConsumeError {
     BindingMismatch,
     AlreadyConsumed,
     Expired,
+    StorageUnavailable,
 }
 
 impl core::fmt::Display for GateConsumeError {
@@ -275,11 +284,25 @@ impl core::fmt::Display for GateConsumeError {
             }
             GateConsumeError::AlreadyConsumed => write!(f, "hitl approval was already consumed"),
             GateConsumeError::Expired => write!(f, "hitl approval has expired"),
+            GateConsumeError::StorageUnavailable => {
+                write!(f, "the durable approval gate store is unavailable")
+            }
         }
     }
 }
 
 impl std::error::Error for GateConsumeError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateStoreUnavailable;
+
+impl core::fmt::Display for GateStoreUnavailable {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("the durable approval gate store is unavailable")
+    }
+}
+
+impl std::error::Error for GateStoreUnavailable {}
 
 pub struct HitlVerdictStore {
     backend: HitlVerdictBackend,
@@ -444,11 +467,11 @@ impl HitlVerdictStore {
         requester: &str,
         effect_id: &str,
         now_unix: i64,
-    ) -> Vec<GateRecord> {
+    ) -> Result<Vec<GateRecord>, GateStoreUnavailable> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
             HitlVerdictBackend::Memory(m) => {
-                m.expire_due_for_effect(scope, run_id, requester, effect_id, now_unix)
+                Ok(m.expire_due_for_effect(scope, run_id, requester, effect_id, now_unix))
             }
             HitlVerdictBackend::Durable(d) => {
                 d.expire_due_for_effect(scope, run_id, requester, effect_id, now_unix)
@@ -461,10 +484,10 @@ impl HitlVerdictStore {
         scope: &TenantScope,
         gate_id: &str,
         now_unix: i64,
-    ) -> Option<GateRecord> {
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.expire_if_due(scope, gate_id, now_unix),
+            HitlVerdictBackend::Memory(m) => Ok(m.expire_if_due(scope, gate_id, now_unix)),
             HitlVerdictBackend::Durable(d) => d.expire_if_due(scope, gate_id, now_unix),
         }
     }
@@ -489,10 +512,14 @@ impl HitlVerdictStore {
         }
     }
 
-    pub fn fetch(&self, scope: &TenantScope, gate_id: &str) -> Option<GateRecord> {
+    pub fn fetch(
+        &self,
+        scope: &TenantScope,
+        gate_id: &str,
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.fetch(scope, gate_id),
+            HitlVerdictBackend::Memory(m) => Ok(m.fetch(scope, gate_id)),
             HitlVerdictBackend::Durable(d) => d.fetch(scope, gate_id),
         }
     }
@@ -503,10 +530,12 @@ impl HitlVerdictStore {
         run_id: &str,
         requester: &str,
         effect_id: &str,
-    ) -> Option<GateRecord> {
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.find_waiting(scope, run_id, requester, effect_id),
+            HitlVerdictBackend::Memory(m) => {
+                Ok(m.find_waiting(scope, run_id, requester, effect_id))
+            }
             HitlVerdictBackend::Durable(d) => d.find_waiting(scope, run_id, requester, effect_id),
         }
     }
@@ -517,10 +546,12 @@ impl HitlVerdictStore {
         run_id: &str,
         requester: &str,
         effect_id: &str,
-    ) -> Option<GateRecord> {
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.find_approved(scope, run_id, requester, effect_id),
+            HitlVerdictBackend::Memory(m) => {
+                Ok(m.find_approved(scope, run_id, requester, effect_id))
+            }
             HitlVerdictBackend::Durable(d) => d.find_approved(scope, run_id, requester, effect_id),
         }
     }
@@ -1006,9 +1037,10 @@ impl DurableHitlGates {
     fn block<T>(
         &self,
         fut: impl std::future::Future<Output = Result<T, crate::provider::ProviderError>>,
-    ) -> T {
-        tokio::task::block_in_place(|| self.rt.block_on(fut)).unwrap_or_else(|e| {
-            panic!("FAIL-STATIC: durable hitl gate store fault (the gate row did not commit): {e}")
+    ) -> Result<T, GateStoreUnavailable> {
+        tokio::task::block_in_place(|| self.rt.block_on(fut)).map_err(|error| {
+            eprintln!("durable approval gate store is unavailable: {error}");
+            GateStoreUnavailable
         })
     }
 
@@ -1059,6 +1091,7 @@ impl DurableHitlGates {
                 Ok(Ok(()))
             })
         }))
+        .map_err(|_| GateOpenError::StorageUnavailable)?
     }
 
     fn decide(
@@ -1122,9 +1155,14 @@ impl DurableHitlGates {
                     })
                 }),
         )
+        .map_err(|_| GateDecideError::StorageUnavailable)?
     }
 
-    fn fetch(&self, scope: &TenantScope, gate_id: &str) -> Option<GateRecord> {
+    fn fetch(
+        &self,
+        scope: &TenantScope,
+        gate_id: &str,
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let gate_id = gate_id.to_string();
@@ -1157,7 +1195,7 @@ impl DurableHitlGates {
         run_id: &str,
         requester: &str,
         effect_id: &str,
-    ) -> Option<GateRecord> {
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let run_id = run_id.to_string();
@@ -1202,7 +1240,7 @@ impl DurableHitlGates {
         run_id: &str,
         requester: &str,
         effect_id: &str,
-    ) -> Option<GateRecord> {
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let run_id = run_id.to_string();
@@ -1250,7 +1288,7 @@ impl DurableHitlGates {
         requester: &str,
         effect_id: &str,
         now_unix: i64,
-    ) -> Vec<GateRecord> {
+    ) -> Result<Vec<GateRecord>, GateStoreUnavailable> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let run_id = run_id.to_string();
@@ -1300,7 +1338,7 @@ impl DurableHitlGates {
         scope: &TenantScope,
         gate_id: &str,
         now_unix: i64,
-    ) -> Option<GateRecord> {
+    ) -> Result<Option<GateRecord>, GateStoreUnavailable> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let gate_id = gate_id.to_string();
@@ -1398,6 +1436,7 @@ impl DurableHitlGates {
                     })
                 }),
         )
+        .map_err(|_| GateConsumeError::StorageUnavailable)?
     }
 }
 
@@ -1498,13 +1537,22 @@ mod tests {
     }
 
     fn expire_mcp_due(store: &mut HitlVerdictStore, now_unix: i64) -> Vec<GateRecord> {
-        store.expire_due_for_effect(
-            &scope(),
-            "mcp-run-1",
-            "agent:claude",
-            "gate:git.merge:myelin://acme/git/pr/40",
-            now_unix,
-        )
+        store
+            .expire_due_for_effect(
+                &scope(),
+                "mcp-run-1",
+                "agent:claude",
+                "gate:git.merge:myelin://acme/git/pr/40",
+                now_unix,
+            )
+            .expect("the in-memory gate store is available")
+    }
+
+    fn stored_gate(store: &HitlVerdictStore, gate_id: &str) -> GateRecord {
+        store
+            .fetch(&scope(), gate_id)
+            .expect("the in-memory gate store is available")
+            .expect("the gate exists")
     }
 
     #[test]
@@ -1531,16 +1579,17 @@ mod tests {
             Err(GateOpenError::CostOutOfRange),
             "an unsigned estimate cannot wrap into a negative PostgreSQL bigint"
         );
-        assert!(store.fetch(&scope(), "gate:too-expensive").is_none());
+        assert!(store
+            .fetch(&scope(), "gate:too-expensive")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn open_inserts_waiting_and_is_fetchable_by_gate_id() {
         let mut s = HitlVerdictStore::new();
         s.open(&scope(), waiting("gate:abc123")).expect("opens");
-        let rec = s
-            .fetch(&scope(), "gate:abc123")
-            .expect("lookup-able by gate_id");
+        let rec = stored_gate(&s, "gate:abc123");
         assert_eq!(rec.state, GateState::Waiting);
         assert_eq!(rec.requested_by, "agent:claude");
         assert_eq!(
@@ -1564,7 +1613,7 @@ mod tests {
     #[test]
     fn a_made_up_gate_id_is_nothing() {
         let mut s = HitlVerdictStore::new();
-        assert!(s.fetch(&scope(), "gate:forged").is_none());
+        assert!(s.fetch(&scope(), "gate:forged").unwrap().is_none());
         assert_eq!(
             s.approve(&scope(), "gate:forged", "psn:lead", PrincipalKind::Human),
             Err(GateDecideError::NotFound)
@@ -1590,7 +1639,7 @@ mod tests {
         );
         s.approve(&scope(), "gate:abc", "psn:lead", PrincipalKind::Human)
             .expect("an eligible distinct human approves");
-        let rec = s.fetch(&scope(), "gate:abc").unwrap();
+        let rec = stored_gate(&s, "gate:abc");
         assert_eq!(rec.state, GateState::Approved);
         assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
     }
@@ -1614,10 +1663,7 @@ mod tests {
                 Err(GateDecideError::MachineApproverRefused),
                 "a distinct, in-filter MACHINE approver is still refused (distinct-HUMAN rule)"
             );
-            assert_eq!(
-                s.fetch(&scope(), "gate:m").unwrap().state,
-                GateState::Waiting
-            );
+            assert_eq!(stored_gate(&s, "gate:m").state, GateState::Waiting);
         }
 
         let mut s = HitlVerdictStore::new();
@@ -1626,10 +1672,7 @@ mod tests {
         s.open(&scope(), rec).unwrap();
         s.approve(&scope(), "gate:m2", "psn:lead", PrincipalKind::Human)
             .expect("a human approver clears the gate");
-        assert_eq!(
-            s.fetch(&scope(), "gate:m2").unwrap().state,
-            GateState::Approved
-        );
+        assert_eq!(stored_gate(&s, "gate:m2").state, GateState::Approved);
     }
 
     #[test]
@@ -1671,7 +1714,7 @@ mod tests {
             );
         }
         assert_eq!(
-            store.fetch(&scope(), "gate:reject").unwrap().state,
+            stored_gate(&store, "gate:reject").state,
             GateState::Waiting,
             "every refused reject leaves the gate waiting"
         );
@@ -1679,7 +1722,7 @@ mod tests {
             .reject(&scope(), "gate:reject", "psn:lead", PrincipalKind::Human)
             .expect("eligible distinct Human may reject");
         assert_eq!(
-            store.fetch(&scope(), "gate:reject").unwrap().state,
+            stored_gate(&store, "gate:reject").state,
             GateState::Rejected
         );
     }
@@ -1715,7 +1758,7 @@ mod tests {
         let mut s = HitlVerdictStore::new();
         s.open(&scope(), waiting("gate:a")).unwrap();
 
-        let rec = s.fetch(&scope(), "gate:a").unwrap();
+        let rec = stored_gate(&s, "gate:a");
         assert!(!rec.authorizes(
             "gate:git.merge:myelin://acme/git/pr/40",
             "mcp-run-1",
@@ -1724,7 +1767,7 @@ mod tests {
 
         s.approve(&scope(), "gate:a", "psn:lead", PrincipalKind::Human)
             .unwrap();
-        let rec = s.fetch(&scope(), "gate:a").unwrap();
+        let rec = stored_gate(&s, "gate:a");
         assert!(
             rec.authorizes(
                 "gate:git.merge:myelin://acme/git/pr/40",
@@ -1754,7 +1797,7 @@ mod tests {
         s2.open(&scope(), waiting("gate:b")).unwrap();
         s2.reject(&scope(), "gate:b", "psn:lead", PrincipalKind::Human)
             .unwrap();
-        let rec = s2.fetch(&scope(), "gate:b").unwrap();
+        let rec = stored_gate(&s2, "gate:b");
         assert!(!rec.authorizes(
             "gate:git.merge:myelin://acme/git/pr/40",
             "mcp-run-1",
@@ -1812,12 +1855,8 @@ mod tests {
             ),
             Err(GateConsumeError::AlreadyConsumed)
         );
-        assert!(!store.fetch(&scope(), "gate:once").unwrap().authorizes(
-            effect,
-            "mcp-run-1",
-            "agent:claude"
-        ));
-        let consumed = store.fetch(&scope(), "gate:once").unwrap();
+        assert!(!stored_gate(&store, "gate:once").authorizes(effect, "mcp-run-1", "agent:claude"));
+        let consumed = stored_gate(&store, "gate:once");
         assert!(consumed.authorizes_replay(effect, "mcp-run-1", "agent:claude"));
         assert!(!consumed.authorizes_replay(
             "gate:git.merge:myelin://acme/git/pr/41",
@@ -1844,10 +1883,7 @@ mod tests {
         assert_eq!(expired[0].opened_at_unix, 100);
         assert_eq!(expired[0].decided_at_unix, Some(200));
         assert_eq!(
-            store
-                .fetch(&scope(), "gate:shared-agent-service")
-                .unwrap()
-                .state,
+            stored_gate(&store, "gate:shared-agent-service").state,
             GateState::Waiting,
             "exact MCP ownership selection must not mutate an unrelated due gate"
         );
@@ -1856,13 +1892,20 @@ mod tests {
         let mut targeted = waiting("gate:targeted");
         targeted.expires_at_unix = 400;
         store.open(&scope(), targeted).unwrap();
-        assert_eq!(store.expire_if_due(&scope(), "gate:targeted", 399), None);
+        assert_eq!(
+            store.expire_if_due(&scope(), "gate:targeted", 399).unwrap(),
+            None
+        );
         let expired = store
             .expire_if_due(&scope(), "gate:targeted", 400)
+            .expect("the in-memory gate store is available")
             .expect("the operator path settles the exact due row");
         assert_eq!(expired.state, GateState::Expired);
         assert_eq!(expired.decided_at_unix, Some(400));
-        assert_eq!(store.expire_if_due(&scope(), "gate:targeted", 401), None);
+        assert_eq!(
+            store.expire_if_due(&scope(), "gate:targeted", 401).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1906,7 +1949,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expire_mcp_due(&mut store, 300), Vec::new());
-        let row = store.fetch(&scope(), "gate:consumed").unwrap();
+        let row = stored_gate(&store, "gate:consumed");
         assert_eq!(row.state, GateState::Approved);
         assert_eq!(row.approval_consumed_at_unix, Some(220));
     }
@@ -1922,11 +1965,12 @@ mod tests {
                 "agent:claude",
                 "gate:git.merge:myelin://acme/git/pr/40",
             )
+            .expect("the in-memory gate store is available")
             .expect("the pending gate is resurfaced (no duplicate spawn)");
         assert_eq!(found.gate_id, "gate:a");
 
         s.expire(&scope(), "gate:a").unwrap();
-        let rec = s.fetch(&scope(), "gate:a").unwrap();
+        let rec = stored_gate(&s, "gate:a");
         assert_eq!(rec.state, GateState::Expired);
         assert_eq!(rec.decided_by, None, "an expiry has no decider");
         assert!(
@@ -1936,6 +1980,7 @@ mod tests {
                 "agent:claude",
                 "gate:git.merge:myelin://acme/git/pr/40"
             )
+            .unwrap()
             .is_none(),
             "a decided gate is no longer waiting"
         );

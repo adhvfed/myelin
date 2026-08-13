@@ -831,6 +831,9 @@ fn map_gate_decision_error(error: GateDecideError) -> EdgeError {
         GateDecideError::ApprovalWindowExpired => {
             EdgeError::Conflict("agent approval window has expired".into())
         }
+        GateDecideError::StorageUnavailable => {
+            EdgeError::Unavailable("agent approval decision is unavailable".into())
+        }
         GateDecideError::AlreadyDecided(state) => {
             EdgeError::Conflict(format!("agent approval is already {}", state.as_str()))
         }
