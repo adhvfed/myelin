@@ -277,13 +277,15 @@ fn iss_d3_zero_leak_under_zookie_staleness() {
         at_least: z_mark.clone(),
         mode: ConsistencyMode::Strong,
     };
-    let result = lo.list_objects_consistent(
-        &s,
-        &principal("acme", "p:alice"),
-        &Permission(ISSUE_VIEW.into()),
-        &ObjectType("issue".into()),
-        &post_mark,
-    );
+    let result = lo
+        .list_objects_consistent(
+            &s,
+            &principal("acme", "p:alice"),
+            &Permission(ISSUE_VIEW.into()),
+            &ObjectType("issue".into()),
+            &post_mark,
+        )
+        .expect("read relationships for the post-confidentiality fallback");
 
     let stale_leaks: i64 = match result {
         ListObjectsResult::Ids { ids, .. } => i64::from(ids.iter().any(|o| o.0 == "issue:hot")),

@@ -163,7 +163,9 @@ fn id_d7_revoke_then_reread_no_stale_allow() {
         }
     }
 
-    let consistent = lo.list_objects_consistent(&s, &alice, &read, &repo, &post_revoke);
+    let consistent = lo
+        .list_objects_consistent(&s, &alice, &read, &repo, &post_revoke)
+        .expect("read relationships for the post-revocation fallback");
     match consistent {
         ListObjectsResult::Ids { ids, .. } => {
             if ids.iter().any(|o| o.0 == "repo:core") {

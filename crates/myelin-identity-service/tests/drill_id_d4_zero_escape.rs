@@ -121,7 +121,9 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
 
     let mut escapes: i64 = 0;
 
-    let ids_result = lo.list_objects(&s, &intruder, &read, &repo, &at_latest());
+    let ids_result = lo
+        .list_objects(&s, &intruder, &read, &repo, &at_latest())
+        .expect("read relationships for the materialized authorization set");
     if let ListObjectsResult::Ids { ids, .. } = &ids_result {
         if ids.iter().any(|o| o.0 == "repo:secret") {
             escapes += 1;
@@ -138,7 +140,9 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
             add("repo:public", "reader", "p:intruder"),
         ],
     );
-    let filter_result = lo_filter.list_objects(&s, &intruder, &read, &repo, &at_latest());
+    let filter_result = lo_filter
+        .list_objects(&s, &intruder, &read, &repo, &at_latest())
+        .expect("read relationships for the pushed-down authorization set");
     match filter_result {
         ListObjectsResult::Filter { set_expr, .. } => {
             let via = myelin_identity::ColRef {
@@ -165,7 +169,9 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
         at_least: Zookie("zk-00000000000000999999".into()),
         mode: ConsistencyMode::Strong,
     };
-    let consistent = lo.list_objects_consistent(&s, &intruder, &read, &repo, &stale_pin);
+    let consistent = lo
+        .list_objects_consistent(&s, &intruder, &read, &repo, &stale_pin)
+        .expect("read relationships for the stale-index fallback");
     if let ListObjectsResult::Ids { ids, .. } = &consistent {
         if ids.iter().any(|o| o.0 == "repo:secret") {
             escapes += 1;

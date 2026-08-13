@@ -182,13 +182,15 @@ fn cdc_4_9_board_conjoins_in_one_query() {
         grants.push(add(&format!("issue:b-{i}"), CONFIDENTIAL_GRANT, "p:alice"));
     }
     let lo = wired(2, &s, &grants);
-    let result = lo.list_objects(
-        &s,
-        &subject("p:alice"),
-        &Permission(ISSUE_VIEW.into()),
-        &ObjectType("issue".into()),
-        &at_latest(),
-    );
+    let result = lo
+        .list_objects(
+            &s,
+            &subject("p:alice"),
+            &Permission(ISSUE_VIEW.into()),
+            &ObjectType("issue".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the pushed-down issue board");
     match result {
         ListObjectsResult::Filter { set_expr, .. } => match set_expr {
             SetExpr::InRelation { via_column, .. } => {
@@ -220,13 +222,15 @@ fn cdc_4_9_board_materialise_is_leak_free_confidential_absent() {
         add("issue:secret", CONFIDENTIAL, "p:alice"),
     ];
     let lo = wired(100, &s, &grants);
-    let result = lo.list_objects(
-        &s,
-        &subject("p:alice"),
-        &Permission(ISSUE_VIEW.into()),
-        &ObjectType("issue".into()),
-        &at_latest(),
-    );
+    let result = lo
+        .list_objects(
+            &s,
+            &subject("p:alice"),
+            &Permission(ISSUE_VIEW.into()),
+            &ObjectType("issue".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the materialized issue board");
     let ids = match result {
         ListObjectsResult::Ids { ids, .. } => ids.into_iter().map(|o| o.0).collect::<Vec<String>>(),
         ListObjectsResult::Filter { .. } => panic!("below the cap the board materialises Ids"),

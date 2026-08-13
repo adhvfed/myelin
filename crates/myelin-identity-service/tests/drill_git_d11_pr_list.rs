@@ -99,13 +99,15 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
 
     let (lo_filter, _ix1) = wired(VISIBLE - 1, &s, &grants);
     let viewer = principal("acme", "p:viewer");
-    let r = lo_filter.list_objects(
-        &s,
-        &viewer,
-        &Permission("review".into()),
-        &ObjectType("pull_request".into()),
-        &at_latest(),
-    );
+    let r = lo_filter
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission("review".into()),
+            &ObjectType("pull_request".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the pushed-down PR list");
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
         ListObjectsResult::Ids { .. } => {
@@ -134,13 +136,15 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
     );
 
     let (lo_ids, ix2) = wired(VISIBLE + 100, &s, &grants);
-    let r2 = lo_ids.list_objects(
-        &s,
-        &viewer,
-        &Permission("review".into()),
-        &ObjectType("pull_request".into()),
-        &at_latest(),
-    );
+    let r2 = lo_ids
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission("review".into()),
+            &ObjectType("pull_request".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the materialized PR list");
     let ids = match r2 {
         ListObjectsResult::Ids { ids, .. } => ids,
         ListObjectsResult::Filter { .. } => {
@@ -180,13 +184,15 @@ fn git_d11_partial_visibility_100k_pr_list_one_query_zero_leak() {
         },
         &post_revoke,
     );
-    let r3 = lo_ids.list_objects(
-        &s,
-        &viewer,
-        &Permission("review".into()),
-        &ObjectType("pull_request".into()),
-        &at_latest(),
-    );
+    let r3 = lo_ids
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission("review".into()),
+            &ObjectType("pull_request".into()),
+            &at_latest(),
+        )
+        .expect("read relationships after revoking the PR grant");
     let ids_after = match r3 {
         ListObjectsResult::Ids { ids, .. } => ids,
         ListObjectsResult::Filter { .. } => panic!("the post-revoke set is still small → Ids"),

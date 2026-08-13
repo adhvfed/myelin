@@ -94,13 +94,15 @@ fn cdc_4_3_identity_filter_lowers_to_one_git_pr_query() {
     let lo = wired(1, &s, &grants);
     let viewer = principal("acme", "p:viewer");
 
-    let r = lo.list_objects(
-        &s,
-        &viewer,
-        &Permission(PR_PRODUCER_PERMISSION.into()),
-        &ObjectType("pull_request".into()),
-        &at_latest(),
-    );
+    let r = lo
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission(PR_PRODUCER_PERMISSION.into()),
+            &ObjectType("pull_request".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the PR authorization filter");
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
         ListObjectsResult::Ids { .. } => panic!("above the cap the producer pushes down to Filter"),
@@ -134,13 +136,15 @@ fn cdc_6_1_code_search_pre_filter_keys_on_repo() {
     ];
     let lo = wired(1, &s, &grants);
     let viewer = principal("acme", "p:viewer");
-    let r = lo.list_objects(
-        &s,
-        &viewer,
-        &Permission(REPO_PRODUCER_PERMISSION.into()),
-        &ObjectType("repo".into()),
-        &at_latest(),
-    );
+    let r = lo
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission(REPO_PRODUCER_PERMISSION.into()),
+            &ObjectType("repo".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the repository authorization filter");
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
         ListObjectsResult::Ids { .. } => {
@@ -174,13 +178,15 @@ fn git_d11_chained_grant_list_zero_leak_one_query_then_revoke_reflected() {
     grants.push(add("pull_request:pr-secret", "reviewer", "p:other"));
     let lo = wired(VISIBLE - 1, &s, &grants);
 
-    let r = lo.list_objects(
-        &s,
-        &viewer,
-        &Permission(PR_PRODUCER_PERMISSION.into()),
-        &ObjectType("pull_request".into()),
-        &at_latest(),
-    );
+    let r = lo
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission(PR_PRODUCER_PERMISSION.into()),
+            &ObjectType("pull_request".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the partial-visibility PR list");
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
         ListObjectsResult::Ids { .. } => {

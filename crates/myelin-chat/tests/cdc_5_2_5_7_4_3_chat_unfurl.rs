@@ -181,13 +181,15 @@ fn cdc_4_3_list_objects_filter_lowers_to_one_unfurl_join() {
     let lo = list_objects_engine(1, &grants);
     let viewer = principal("p:viewer");
 
-    let r = lo.list_objects(
-        &scope_of(&principal("p-admin")),
-        &viewer,
-        &Permission("read".into()),
-        &ObjectType("channel".into()),
-        &strong(),
-    );
+    let r = lo
+        .list_objects(
+            &scope_of(&principal("p-admin")),
+            &viewer,
+            &Permission("read".into()),
+            &ObjectType("channel".into()),
+            &strong(),
+        )
+        .expect("read channel relationships");
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
         ListObjectsResult::Ids { .. } => panic!("above the cap the producer pushes down to Filter"),

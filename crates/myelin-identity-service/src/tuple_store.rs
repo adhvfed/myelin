@@ -111,6 +111,8 @@ struct Inner {
 pub struct TupleStore {
     backend: TupleBackend,
     revision: Arc<AtomicU64>,
+    #[cfg(test)]
+    read_failure: Option<TupleReadError>,
     #[cfg(any(test, feature = "test-support"))]
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
@@ -157,6 +159,8 @@ impl TupleStore {
         TupleStore {
             backend: TupleBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
             revision: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            read_failure: None,
             outbox,
             minter,
             holder,
@@ -184,6 +188,8 @@ impl TupleStore {
                 watermark: PgZookieWatermark::default(),
             }),
             revision: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            read_failure: None,
             #[cfg(any(test, feature = "test-support"))]
             outbox: OutboxStore::new(),
             minter,
@@ -201,6 +207,12 @@ impl TupleStore {
 
     pub fn current_zookie(&self) -> Zookie {
         Self::zookie_of(self.revision.load(Ordering::SeqCst))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_unavailable_reads(mut self, detail: impl Into<String>) -> TupleStore {
+        self.read_failure = Some(TupleReadError(detail.into()));
+        self
     }
 
     fn zookie_of(rev: u64) -> Zookie {
@@ -235,6 +247,11 @@ impl TupleStore {
     }
 
     pub fn tuples_in(&self, scope: &TenantScope) -> Result<Vec<StoredTuple>, TupleReadError> {
+        #[cfg(test)]
+        if let Some(error) = &self.read_failure {
+            return Err(error.clone());
+        }
+
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]

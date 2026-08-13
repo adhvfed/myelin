@@ -197,13 +197,15 @@ fn cdc_4_9_channel_list_conjoins_in_one_query() {
         grants.push(add(&format!("channel:c-{i}"), CHANNEL_MEMBER, "p:alice"));
     }
     let lo = wired(2, &s, &grants);
-    let result = lo.list_objects(
-        &s,
-        &subject("p:alice"),
-        &Permission(CHANNEL_READ.into()),
-        &ObjectType("channel".into()),
-        &at_latest(),
-    );
+    let result = lo
+        .list_objects(
+            &s,
+            &subject("p:alice"),
+            &Permission(CHANNEL_READ.into()),
+            &ObjectType("channel".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the pushed-down channel list");
     match result {
         ListObjectsResult::Filter { set_expr, .. } => match set_expr {
             SetExpr::InRelation { via_column, .. } => {
@@ -236,13 +238,15 @@ fn cdc_4_9_non_member_channel_list_is_leak_free() {
         add("channel:secret", CHANNEL_MEMBER, "p:other"),
     ];
     let lo = wired(100, &s, &grants);
-    let result = lo.list_objects(
-        &s,
-        &subject("p:alice"),
-        &Permission(CHANNEL_READ.into()),
-        &ObjectType("channel".into()),
-        &at_latest(),
-    );
+    let result = lo
+        .list_objects(
+            &s,
+            &subject("p:alice"),
+            &Permission(CHANNEL_READ.into()),
+            &ObjectType("channel".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the materialized channel list");
     let ids = match result {
         ListObjectsResult::Ids { ids, .. } => ids.into_iter().map(|o| o.0).collect::<Vec<String>>(),
         ListObjectsResult::Filter { .. } => {

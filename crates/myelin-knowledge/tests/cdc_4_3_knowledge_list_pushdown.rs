@@ -94,13 +94,15 @@ fn cdc_4_3_identity_filter_lowers_to_one_knowledge_view_and_count_query() {
     let lo = wired(1, &s, &grants);
     let viewer = principal("acme", "p:viewer");
 
-    let r = lo.list_objects(
-        &s,
-        &viewer,
-        &Permission(ROW_PRODUCER_PERMISSION.into()),
-        &ObjectType("database_row".into()),
-        &at_latest(),
-    );
+    let r = lo
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission(ROW_PRODUCER_PERMISSION.into()),
+            &ObjectType("database_row".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the Knowledge authorization filter");
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
         ListObjectsResult::Ids { .. } => panic!("above the cap the producer pushes down to Filter"),
@@ -163,13 +165,15 @@ fn kn_d5_chained_grant_list_zero_leak_zero_count_leak_one_query_then_revoke_refl
     grants.push(add("database_row:row-secret", "direct_reader", "p:other"));
     let lo = wired(VISIBLE - 1, &s, &grants);
 
-    let r = lo.list_objects(
-        &s,
-        &viewer,
-        &Permission(ROW_PRODUCER_PERMISSION.into()),
-        &ObjectType("database_row".into()),
-        &at_latest(),
-    );
+    let r = lo
+        .list_objects(
+            &s,
+            &viewer,
+            &Permission(ROW_PRODUCER_PERMISSION.into()),
+            &ObjectType("database_row".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the partial-visibility Knowledge list");
     let set_expr = match r {
         ListObjectsResult::Filter { set_expr, .. } => set_expr,
         ListObjectsResult::Ids { .. } => {

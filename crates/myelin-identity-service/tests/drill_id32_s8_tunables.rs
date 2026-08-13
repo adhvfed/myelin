@@ -136,13 +136,16 @@ fn id32_cardinality_cap_finalised_at_measured_crossover() {
             continue;
         }
         let lo = wired_with_grants(n + 1, &s, "p:alice", n);
-        let realised = match lo.list_objects(
-            &s,
-            &subject("p:alice", "acme"),
-            &Permission("read".into()),
-            &ObjectType("repo".into()),
-            &latest(),
-        ) {
+        let realised = match lo
+            .list_objects(
+                &s,
+                &subject("p:alice", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("read the cost-curve relationship snapshot")
+        {
             ListObjectsResult::Ids { ids, .. } => ids.len(),
             ListObjectsResult::Filter { .. } => {
                 panic!("with a generous cap the cost-curve sample must materialise as Ids")
@@ -172,13 +175,16 @@ fn id32_cardinality_cap_finalised_at_measured_crossover() {
 
     let small_cap = 3usize;
     let at = wired_with_grants(small_cap, &s, "p:atcap", small_cap);
-    match at.list_objects(
-        &s,
-        &subject("p:atcap", "acme"),
-        &Permission("read".into()),
-        &ObjectType("repo".into()),
-        &latest(),
-    ) {
+    match at
+        .list_objects(
+            &s,
+            &subject("p:atcap", "acme"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        )
+        .expect("read the at-cap relationship snapshot")
+    {
         ListObjectsResult::Ids { ids, .. } => assert_eq!(
             ids.len(),
             small_cap,
@@ -187,13 +193,16 @@ fn id32_cardinality_cap_finalised_at_measured_crossover() {
         ListObjectsResult::Filter { .. } => panic!("AT the cap must dispatch to Ids"),
     }
     let over = wired_with_grants(small_cap, &s, "p:overcap", small_cap + 1);
-    match over.list_objects(
-        &s,
-        &subject("p:overcap", "acme"),
-        &Permission("read".into()),
-        &ObjectType("repo".into()),
-        &latest(),
-    ) {
+    match over
+        .list_objects(
+            &s,
+            &subject("p:overcap", "acme"),
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &latest(),
+        )
+        .expect("read the over-cap relationship snapshot")
+    {
         ListObjectsResult::Filter { set_expr, .. } => match set_expr {
             SetExpr::InRelation { relation, .. } => assert_eq!(
                 relation,
@@ -361,7 +370,8 @@ fn id32_cap_dispatch_boundary_is_exact() {
                 &Permission("read".into()),
                 &ObjectType("repo".into()),
                 &latest(),
-            ),
+            )
+            .expect("read the exact-cap relationship snapshot"),
             ListObjectsResult::Ids { .. }
         ),
         "a reachable set of EXACTLY the cap materialises (the <= boundary, not <)"
@@ -375,7 +385,8 @@ fn id32_cap_dispatch_boundary_is_exact() {
                 &Permission("read".into()),
                 &ObjectType("repo".into()),
                 &latest(),
-            ),
+            )
+            .expect("read the cap-plus-one relationship snapshot"),
             ListObjectsResult::Filter { .. }
         ),
         "a reachable set of cap+1 pushes down (the > boundary)"

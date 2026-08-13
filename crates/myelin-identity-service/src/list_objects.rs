@@ -55,28 +55,28 @@ impl ListObjects {
         permission: &Permission,
         ty: &ObjectType,
         at: &Consistency,
-    ) -> ListObjectsResult {
+    ) -> myelin_identity::Result<ListObjectsResult> {
         let zookie = self.read_zookie(scope, at);
 
         if subject.status != PrincipalStatus::Active {
-            return ListObjectsResult::Ids {
+            return Ok(ListObjectsResult::Ids {
                 ids: Vec::new(),
                 zookie,
-            };
+            });
         }
 
-        let reachable = self.reachable_set(scope, subject, permission, ty, at);
+        let reachable = self.reachable_set(scope, subject, permission, ty, at)?;
 
         if reachable.len() <= self.cap {
-            ListObjectsResult::Ids {
+            Ok(ListObjectsResult::Ids {
                 ids: reachable.into_iter().map(ObjectId).collect(),
                 zookie,
-            }
+            })
         } else {
-            ListObjectsResult::Filter {
+            Ok(ListObjectsResult::Filter {
                 set_expr: self.filter_set_expr(subject, permission, ty),
                 zookie,
-            }
+            })
         }
     }
 
@@ -87,11 +87,9 @@ impl ListObjects {
         permission: &Permission,
         ty: &ObjectType,
         at: &Consistency,
-    ) -> BTreeSet<String> {
+    ) -> myelin_identity::Result<BTreeSet<String>> {
         let candidates = self.candidate_objects(scope, subject, ty);
-        let Ok(snapshot) = self.engine.snapshot(scope, &at.at_least) else {
-            return BTreeSet::new();
-        };
+        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
 
         let mut reachable: BTreeSet<String> = BTreeSet::new();
         for obj in candidates {
@@ -111,7 +109,7 @@ impl ListObjects {
                 break;
             }
         }
-        reachable
+        Ok(reachable)
     }
 
     fn candidate_objects(
@@ -165,10 +163,10 @@ impl ListObjects {
         permission: &Permission,
         ty: &ObjectType,
         at: &Consistency,
-    ) -> ListObjectsResult {
-        let result = self.list_objects(scope, subject, permission, ty, at);
+    ) -> myelin_identity::Result<ListObjectsResult> {
+        let result = self.list_objects(scope, subject, permission, ty, at)?;
         match result {
-            ListObjectsResult::Ids { .. } => result,
+            ListObjectsResult::Ids { .. } => Ok(result),
             ListObjectsResult::Filter {
                 ref set_expr,
                 ref zookie,
@@ -192,12 +190,12 @@ impl ListObjects {
                         &candidates,
                         at,
                     );
-                    ListObjectsResult::Ids {
+                    Ok(ListObjectsResult::Ids {
                         ids: allowed,
                         zookie: zookie.clone(),
-                    }
+                    })
                 } else {
-                    result
+                    Ok(result)
                 }
             }
         }
@@ -338,13 +336,15 @@ mod tests {
                 add("repo:secret", "reader", "p:bob"),
             ],
         );
-        let r = lo.list_objects(
-            &s,
-            &subject("p:alice", "acme"),
-            &Permission("read".into()),
-            &ObjectType("repo".into()),
-            &latest(),
-        );
+        let r = lo
+            .list_objects(
+                &s,
+                &subject("p:alice", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("read relationships for the small object set");
         match r {
             ListObjectsResult::Ids { mut ids, .. } => {
                 ids.sort_by(|a, b| a.0.cmp(&b.0));
@@ -366,13 +366,15 @@ mod tests {
             add("repo:web", "reader", "p:alice"),
         ];
         let lo = wired(1, &s, &grants);
-        let r = lo.list_objects(
-            &s,
-            &subject("p:alice", "acme"),
-            &Permission("read".into()),
-            &ObjectType("repo".into()),
-            &latest(),
-        );
+        let r = lo
+            .list_objects(
+                &s,
+                &subject("p:alice", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("read relationships for the over-cap object set");
         match r {
             ListObjectsResult::Filter { set_expr, .. } => match set_expr {
                 SetExpr::InRelation {
@@ -403,13 +405,15 @@ mod tests {
     fn no_grants_returns_empty_ids() {
         let s = scope("acme");
         let lo = wired(10, &s, &[add("repo:core", "reader", "p:alice")]);
-        let r = lo.list_objects(
-            &s,
-            &subject("p:nobody", "acme"),
-            &Permission("read".into()),
-            &ObjectType("repo".into()),
-            &latest(),
-        );
+        let r = lo
+            .list_objects(
+                &s,
+                &subject("p:nobody", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("read relationships for the ungranted subject");
         match r {
             ListObjectsResult::Ids { ids, .. } => {
                 assert!(ids.is_empty(), "no grants → the empty set, never All")
@@ -419,18 +423,51 @@ mod tests {
     }
 
     #[test]
-    fn suspended_subject_sees_empty_set() {
+    fn relationship_outage_is_not_reported_as_an_empty_authorization_set() {
         let s = scope("acme");
-        let lo = wired(10, &s, &[add("repo:core", "reader", "p:alice")]);
-        let mut suspended = subject("p:alice", "acme");
-        suspended.status = PrincipalStatus::Disabled;
-        let r = lo.list_objects(
+        let store = TupleStore::new(OutboxStore::new())
+            .with_unavailable_reads("relationship database is offline");
+        let lo = ListObjects::new(
+            store,
+            NamespaceEngine::with_core_hierarchy(),
+            ReverseIndex::new(),
+        );
+
+        let result = lo.list_objects(
             &s,
-            &suspended,
+            &subject("p:alice", "acme"),
             &Permission("read".into()),
             &ObjectType("repo".into()),
             &latest(),
         );
+
+        assert!(
+            matches!(result, Err(myelin_identity::AuthzError::Unavailable(_))),
+            "an unavailable relationship snapshot is operational failure, not an empty set"
+        );
+    }
+
+    #[test]
+    fn suspended_subject_sees_empty_set() {
+        let s = scope("acme");
+        let store = TupleStore::new(OutboxStore::new())
+            .with_unavailable_reads("relationship database is offline");
+        let lo = ListObjects::new(
+            store,
+            NamespaceEngine::with_core_hierarchy(),
+            ReverseIndex::new(),
+        );
+        let mut suspended = subject("p:alice", "acme");
+        suspended.status = PrincipalStatus::Disabled;
+        let r = lo
+            .list_objects(
+                &s,
+                &suspended,
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("resolve the disabled subject without reading a grant");
         match r {
             ListObjectsResult::Ids { ids, .. } => {
                 assert!(ids.is_empty(), "a disabled subject sees nothing (ID-D1)")
@@ -443,13 +480,15 @@ mod tests {
     fn ids_carry_the_s8_watermark_zookie() {
         let s = scope("acme");
         let lo = wired(10, &s, &[add("repo:core", "reader", "p:alice")]);
-        let r = lo.list_objects(
-            &s,
-            &subject("p:alice", "acme"),
-            &Permission("read".into()),
-            &ObjectType("repo".into()),
-            &latest(),
-        );
+        let r = lo
+            .list_objects(
+                &s,
+                &subject("p:alice", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("read relationships at the reverse-index watermark");
         let zookie = match r {
             ListObjectsResult::Ids { zookie, .. } => zookie,
             ListObjectsResult::Filter { zookie, .. } => zookie,
@@ -470,13 +509,15 @@ mod tests {
         let acme = scope("acme");
         let lo = wired(10, &acme, &[add("repo:core", "reader", "p:alice")]);
         let globex = scope("globex");
-        let r = lo.list_objects(
-            &globex,
-            &subject("p:alice", "globex"),
-            &Permission("read".into()),
-            &ObjectType("repo".into()),
-            &latest(),
-        );
+        let r = lo
+            .list_objects(
+                &globex,
+                &subject("p:alice", "globex"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("read only the other tenant's relationship partition");
         match r {
             ListObjectsResult::Ids { ids, .. } => {
                 assert!(ids.is_empty(), "a grant in acme does not list under globex")
@@ -538,13 +579,15 @@ mod tests {
             }],
         });
         let lo = ListObjects::with_cap(store, namespace, index, 10);
-        let r = lo.list_objects(
-            &s,
-            &subject("p:alice", "acme"),
-            &Permission("read".into()),
-            &ObjectType("repo".into()),
-            &latest(),
-        );
+        let r = lo
+            .list_objects(
+                &s,
+                &subject("p:alice", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("read the indexed candidate's relationship snapshot");
         match r {
             ListObjectsResult::Ids { ids, .. } => {
                 assert_eq!(ids, vec![ObjectId("repo:core".into())])

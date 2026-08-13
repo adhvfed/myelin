@@ -188,13 +188,15 @@ fn chat_search_as_non_member_zero_results() {
     ];
     let lo = wired(100, &acme, &grants);
 
-    let result = lo.list_objects(
-        &acme,
-        &principal("acme", "p:outsider"),
-        &Permission(CHANNEL_READ.into()),
-        &ObjectType("channel".into()),
-        &at_latest(),
-    );
+    let result = lo
+        .list_objects(
+            &acme,
+            &principal("acme", "p:outsider"),
+            &Permission(CHANNEL_READ.into()),
+            &ObjectType("channel".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the non-member channel search");
     let ids = match result {
         ListObjectsResult::Ids { ids, .. } => ids.into_iter().map(|o| o.0).collect::<Vec<String>>(),
         ListObjectsResult::Filter { .. } => {

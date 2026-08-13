@@ -676,13 +676,15 @@ fn id_is_the_authz_spine_of_all_four_e2e_scenarios() {
     );
 
     let (lo, _ix, _st) = rebuild_from_cold(&acme, &[add("lineage:n", "reader", "p:v")]);
-    let r = lo.list_objects(
-        &acme,
-        &human("acme", "p:v"),
-        &Permission("read".into()),
-        &ObjectType("lineage".into()),
-        &at_latest(),
-    );
+    let r = lo
+        .list_objects(
+            &acme,
+            &human("acme", "p:v"),
+            &Permission("read".into()),
+            &ObjectType("lineage".into()),
+            &at_latest(),
+        )
+        .expect("read lineage relationships");
     assert!(
         matches!(r, ListObjectsResult::Filter { .. }),
         "spine E2E-3: list_objects is the permission-filtered set source (Filter → S8 JOIN)"
