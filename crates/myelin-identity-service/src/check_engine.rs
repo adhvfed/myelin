@@ -43,13 +43,16 @@ impl CheckEngine {
         at_least: &Zookie,
     ) -> myelin_identity::Result<CheckSnapshot> {
         let mut by_object: HashMap<String, Vec<SnapTuple>> = HashMap::new();
-        let tuples = self.tuples.tuples_in(scope).map_err(|_| {
+        let snapshot = self.tuples.snapshot_in(scope).map_err(|_| {
             AuthzError::Unavailable("relationship tuple snapshot unavailable".into())
         })?;
-        for st in tuples {
-            if !at_least.0.is_empty() && st.zookie.0 > at_least.0 {
-                continue;
-            }
+        if !at_least.0.is_empty() && snapshot.zookie.0 < at_least.0 {
+            return Err(AuthzError::Unavailable(format!(
+                "relationship tuple snapshot is at {}, behind the required {}",
+                snapshot.zookie.0, at_least.0
+            )));
+        }
+        for st in snapshot.tuples {
             let stored_key = myelin_refs::object_key(&ArtifactRef(st.tuple.object.0.clone()))
                 .map(|k| k.tuple_key())
                 .unwrap_or_else(|| st.tuple.object.0.clone());
@@ -58,15 +61,23 @@ impl CheckEngine {
                 subject: st.tuple.subject.0,
             });
         }
-        Ok(CheckSnapshot { by_object })
+        Ok(CheckSnapshot {
+            by_object,
+            zookie: snapshot.zookie,
+        })
     }
 }
 
 pub(crate) struct CheckSnapshot {
     by_object: HashMap<String, Vec<SnapTuple>>,
+    zookie: Zookie,
 }
 
 impl CheckSnapshot {
+    pub(crate) fn zookie(&self) -> &Zookie {
+        &self.zookie
+    }
+
     pub(crate) fn check(
         &self,
         subject: &Principal,
@@ -454,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn check_at_older_zookie_does_not_see_newer_tuple() {
+    fn at_least_is_a_lower_bound_not_a_historical_snapshot() {
         let s = scope("acme");
         let store = TupleStore::new(OutboxStore::new());
         let actor = subject("p-admin");
@@ -480,8 +491,8 @@ mod tests {
                 &at(&z0.0),
                 None
             ),
-            Decision::Deny,
-            "a check at the pre-grant zookie does not see the grant written after it"
+            Decision::Allow,
+            "a newer authoritative snapshot satisfies an older lower bound"
         );
         assert_eq!(
             eng.check(
@@ -494,6 +505,15 @@ mod tests {
             ),
             Decision::Allow,
             "a check at-or-after the grant zookie sees the grant"
+        );
+
+        let future = Zookie("zk-00000000000000000002".into());
+        assert!(
+            matches!(
+                eng.snapshot(&s, &future),
+                Err(myelin_identity::AuthzError::Unavailable(_))
+            ),
+            "a store behind the requested lower bound reports unavailability instead of evaluating stale relationships"
         );
     }
 

@@ -65,6 +65,12 @@ pub struct StoredTuple {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TupleSnapshot {
+    pub(crate) tuples: Vec<StoredTuple>,
+    pub(crate) zookie: Zookie,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TupleReadError(String);
 
 impl core::fmt::Display for TupleReadError {
@@ -241,7 +247,7 @@ impl TupleStore {
         }
     }
 
-    pub fn tuples_in(&self, scope: &TenantScope) -> Result<Vec<StoredTuple>, TupleReadError> {
+    pub(crate) fn snapshot_in(&self, scope: &TenantScope) -> Result<TupleSnapshot, TupleReadError> {
         #[cfg(test)]
         if let Some(error) = &self.read_failure {
             return Err(error.clone());
@@ -252,11 +258,13 @@ impl TupleStore {
             #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
                 let inner = Self::mem_lock(inner_arc);
-                Ok(inner
+                let tuples = inner
                     .partitions
                     .get(&Self::part_key(scope))
                     .map(|p| p.values().cloned().collect())
-                    .unwrap_or_default())
+                    .unwrap_or_default();
+                let zookie = self.current_zookie();
+                Ok(TupleSnapshot { tuples, zookie })
             }
             TupleBackend::Pg(pg) => {
                 let tenant = scope.tenant().0.clone();
@@ -265,7 +273,7 @@ impl TupleStore {
                     .block(pg.backing.snapshot_in(&tenant, &region))
                     .map_err(|error| TupleReadError(error.to_string()))?;
                 self.revision.fetch_max(snapshot.revision, Ordering::SeqCst);
-                Ok(snapshot
+                let tuples = snapshot
                     .edges
                     .into_iter()
                     .map(|edge| StoredTuple {
@@ -280,9 +288,17 @@ impl TupleStore {
                         zookie: Self::zookie_of(edge.revision),
                         expires_at: None,
                     })
-                    .collect())
+                    .collect();
+                Ok(TupleSnapshot {
+                    tuples,
+                    zookie: Self::zookie_of(snapshot.revision),
+                })
             }
         }
+    }
+
+    pub fn tuples_in(&self, scope: &TenantScope) -> Result<Vec<StoredTuple>, TupleReadError> {
+        self.snapshot_in(scope).map(|snapshot| snapshot.tuples)
     }
 
     #[cfg_attr(not(any(test, feature = "test-support")), allow(unused_variables))]

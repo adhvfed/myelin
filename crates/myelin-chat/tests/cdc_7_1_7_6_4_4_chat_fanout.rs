@@ -3,14 +3,13 @@ use myelin_chat::fanout::{
     SignalSink, WatcherDirectory, WriteFanoutReason,
 };
 
-use myelin_events::{BusTransport, EventHandler, InProcessBus, OutboxStore, Relay, Timestamp};
+use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
     Consistency, ConsistencyMode, ObjectId, ObjectType, Permission, Principal, PrincipalId,
     PrincipalKind, RelName, RelationTuple, TupleDelta, Zookie,
 };
 use myelin_identity_service::expand::Expand;
 use myelin_identity_service::namespace::NamespaceEngine;
-use myelin_identity_service::reverse_index::{ReverseIndex, ReverseIndexConsumer};
 use myelin_identity_service::tuple_store::TupleStore;
 use myelin_notif::list_inbox::AllowAllAuthorize;
 use myelin_notif::{
@@ -56,10 +55,7 @@ fn add(object: &str, relation: &str, subject: &str) -> TupleDelta {
 
 fn seed_engine(deltas: &[TupleDelta]) -> Expand {
     let scope = scope();
-    let outbox = OutboxStore::new();
-    let store = TupleStore::new(outbox.clone());
-    let index = ReverseIndex::new();
-    let consumer = ReverseIndexConsumer::new(index.clone());
+    let store = TupleStore::new(OutboxStore::new());
     store
         .write_tuples(
             &scope,
@@ -70,13 +66,7 @@ fn seed_engine(deltas: &[TupleDelta]) -> Expand {
             Timestamp("2026-06-21T00:00:00Z".into()),
         )
         .expect("seed write_tuples");
-    let bus = InProcessBus::new();
-    let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
-    relay.drain_to_empty();
-    for env in bus.consume("") {
-        consumer.handle(&env, &mut myelin_events::HandlerTx::none());
-    }
-    Expand::new(store, NamespaceEngine::with_core_hierarchy(), index)
+    Expand::new(store, NamespaceEngine::with_core_hierarchy())
 }
 
 struct EngineWatchers {

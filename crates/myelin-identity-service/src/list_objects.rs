@@ -3,8 +3,8 @@ use crate::namespace::NamespaceEngine;
 use crate::reverse_index::ReverseIndex;
 use crate::tuple_store::TupleStore;
 use myelin_identity::{
-    ColRef, Consistency, ListObjectsResult, ObjectId, ObjectType, Permission, Principal,
-    PrincipalStatus, RelName, SetExpr, Zookie,
+    ColRef, Consistency, ConsistencyMode, ListObjectsResult, ObjectId, ObjectType, Permission,
+    Principal, PrincipalStatus, RelName, SetExpr, Zookie,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::ArtifactRef;
@@ -56,19 +56,7 @@ impl ListObjects {
         ty: &ObjectType,
         at: &Consistency,
     ) -> myelin_identity::Result<ListObjectsResult> {
-        let zookie = self.read_zookie(scope, at);
-
-        if subject.status != PrincipalStatus::Active {
-            return Ok(ListObjectsResult::Ids {
-                ids: Vec::new(),
-                zookie,
-            });
-        }
-
-        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
-        let candidates = self.candidate_objects(scope, subject, ty);
-        Ok(self
-            .result_from_indexed_candidates(&snapshot, subject, permission, ty, candidates, zookie))
+        self.list_objects_consistent(scope, subject, permission, ty, at)
     }
 
     fn reachable_set(
@@ -183,11 +171,25 @@ impl ListObjects {
             });
         }
 
+        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
+        let projection_floor = if at.mode == ConsistencyMode::Strong && at.at_least.0.is_empty() {
+            snapshot.zookie().clone()
+        } else {
+            at.at_least.clone()
+        };
+        let projection_consistency = Consistency {
+            at_least: projection_floor,
+            mode: at.mode,
+        };
         let set_expr = self.filter_set_expr(subject, permission, ty);
         let via = via_column_for(ty);
         let lowered = crate::lowering::lower(&set_expr, subject, &via);
-        let verdict = crate::lowering::watermark_verdict(&self.index, scope, &lowered, at);
-        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
+        let verdict = crate::lowering::watermark_verdict(
+            &self.index,
+            scope,
+            &lowered,
+            &projection_consistency,
+        );
 
         if crate::lowering::is_fall_back(&verdict) {
             let reachable = self.reachable_set(
@@ -199,9 +201,14 @@ impl ListObjects {
             );
             Ok(ListObjectsResult::Ids {
                 ids: reachable.into_iter().map(ObjectId).collect(),
-                zookie,
+                zookie: snapshot.zookie().clone(),
             })
         } else {
+            let zookie = if at.mode == ConsistencyMode::Strong && at.at_least.0.is_empty() {
+                snapshot.zookie().clone()
+            } else {
+                zookie
+            };
             let candidates = self.candidate_objects(scope, subject, ty);
             Ok(self.result_from_indexed_candidates(
                 &snapshot, subject, permission, ty, candidates, zookie,
@@ -682,5 +689,52 @@ mod tests {
                 panic!("a lagging index is never returned as an authorization filter")
             }
         }
+    }
+
+    #[test]
+    fn a_strong_unpinned_list_does_not_trust_a_cold_projection() {
+        let s = scope("acme");
+        let store = TupleStore::new(OutboxStore::new());
+        let grant = store
+            .write_tuples(
+                &s,
+                &actor_in("acme"),
+                &[add("repo:core", "reader", "p:alice")],
+                None,
+                None,
+                now(),
+            )
+            .expect("grant a repository before the projection starts");
+
+        let mut namespace = NamespaceEngine::with_core_hierarchy();
+        use crate::namespace::{FragmentDef, PermissionRule, Userset};
+        let _ = namespace.admit(&FragmentDef {
+            object_type: ObjectType("repo".into()),
+            relations: vec![RelName("reader".into())],
+            permissions: vec![PermissionRule {
+                permission: Permission("read".into()),
+                rewrite: Userset::Relation(RelName("reader".into())),
+            }],
+        });
+        let list = ListObjects::new(store, namespace, ReverseIndex::new());
+
+        let result = list
+            .list_objects_consistent(
+                &s,
+                &subject("p:alice", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &latest(),
+            )
+            .expect("serve a strong read from the authoritative snapshot");
+
+        assert_eq!(
+            result,
+            ListObjectsResult::Ids {
+                ids: vec![ObjectId("repo:core".into())],
+                zookie: grant,
+            },
+            "a cold reverse index cannot turn an existing grant into an empty authorization set"
+        );
     }
 }

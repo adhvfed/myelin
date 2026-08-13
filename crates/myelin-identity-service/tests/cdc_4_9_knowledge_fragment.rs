@@ -49,16 +49,18 @@ fn provider(scope: &TenantScope, tuples: &[TupleDelta]) -> StoreBackedCheck {
     let store = TupleStore::new(outbox.clone());
     let index = ReverseIndex::new();
     let consumer = ReverseIndexConsumer::new(index.clone());
-    store
-        .write_tuples(
-            scope,
-            &subject("p-admin"),
-            tuples,
-            None,
-            None,
-            Timestamp("2026-06-21T00:00:00Z".into()),
-        )
-        .expect("seed tuples");
+    if !tuples.is_empty() {
+        store
+            .write_tuples(
+                scope,
+                &subject("p-admin"),
+                tuples,
+                None,
+                None,
+                Timestamp("2026-06-21T00:00:00Z".into()),
+            )
+            .expect("seed tuples");
+    }
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
     relay.drain_to_empty();

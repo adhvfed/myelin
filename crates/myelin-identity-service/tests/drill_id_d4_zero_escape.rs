@@ -165,18 +165,18 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
     }
     let _ = index_filter;
 
-    let stale_pin = Consistency {
+    let future_pin = Consistency {
         at_least: Zookie("zk-00000000000000999999".into()),
         mode: ConsistencyMode::Strong,
     };
-    let consistent = lo
-        .list_objects_consistent(&s, &intruder, &read, &repo, &stale_pin)
-        .expect("read relationships for the stale-index fallback");
-    if let ListObjectsResult::Ids { ids, .. } = &consistent {
-        if ids.iter().any(|o| o.0 == "repo:secret") {
-            escapes += 1;
-        }
-    }
+    let consistent = lo.list_objects_consistent(&s, &intruder, &read, &repo, &future_pin);
+    assert!(
+        matches!(
+            consistent,
+            Err(myelin_identity::AuthzError::Unavailable(_))
+        ),
+        "a request ahead of the authoritative relationship store fails closed instead of claiming to honour a future revision"
+    );
     {
         let via = myelin_identity::ColRef {
             table: "repo".into(),
@@ -190,10 +190,10 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
             &intruder,
             &via,
         );
-        let verdict = watermark_verdict(&index, &s, &join_lowered, &stale_pin);
+        let verdict = watermark_verdict(&index, &s, &join_lowered, &future_pin);
         assert!(
             matches!(verdict, WatermarkVerdict::FallBackToCheck { .. }),
-            "a scan pinned ahead of the S8 watermark engages the fall-back guard, never serves stale: {verdict:?}"
+            "a scan pinned ahead of the projection engages its guard before the authoritative store rejects the future revision: {verdict:?}"
         );
     }
 
@@ -203,13 +203,13 @@ fn id_d4_confidential_object_absent_from_every_list_path() {
         .expect_green();
     assert_eq!(
         escapes, 0,
-        "0 confidential-object escapes across Ids + Filter + staleness (ID-D4)"
+        "0 confidential-object escapes across Ids + Filter + unavailable future revision (ID-D4)"
     );
 
     println!(
         "[P-070 DRILL GREEN 2026-06-19] ID-D4 zero-escape list_objects leak: \
          viewer=p:intruder confidential=repo:secret (owner=p:owner) → zero-escape=0 across the Ids \
-         materialise path, the Filter-lowered S8 JOIN (cap=0), and under zookie staleness \
-         (fall-back-to-check engaged) - the leak-free pre-filter holds (§7.2; EI-01 §2)"
+         materialise path, the Filter-lowered S8 JOIN (cap=0), and a request beyond the \
+         authoritative zookie (failed closed) - the leak-free pre-filter holds (§7.2; EI-01 §2)"
     );
 }

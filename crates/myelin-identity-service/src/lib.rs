@@ -936,7 +936,7 @@ impl StoreBackedCheck {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let expand = Expand::new(self.tuples.clone(), namespace, self.index.clone());
+        let expand = Expand::new(self.tuples.clone(), namespace);
         let object_type = ObjectType(infer_object_type(&object.0));
         expand.list_subjects(scope, object, &object_type, permission, at)
     }
@@ -963,7 +963,7 @@ impl StoreBackedCheck {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let expand = Expand::new(self.tuples.clone(), namespace, self.index.clone());
+        let expand = Expand::new(self.tuples.clone(), namespace);
         let object_type = ObjectType(infer_object_type(&object.0));
         expand.explain(scope, subject, object, &object_type, permission, at)
     }

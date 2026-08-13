@@ -1,10 +1,8 @@
 use crate::check_engine::{CheckEngine, CheckSnapshot};
 use crate::namespace::{NamespaceEngine, Userset};
-use crate::reverse_index::ReverseIndex;
 use crate::tuple_store::TupleStore;
 use myelin_identity::{
     Consistency, ObjectId, ObjectType, Permission, PrincipalId, RelName, RewriteTrace, SubjectTree,
-    Zookie,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::ArtifactRef;
@@ -14,15 +12,13 @@ use std::collections::BTreeSet;
 pub struct Expand {
     engine: CheckEngine,
     namespace: NamespaceEngine,
-    index: ReverseIndex,
 }
 
 impl Expand {
-    pub fn new(tuples: TupleStore, namespace: NamespaceEngine, index: ReverseIndex) -> Expand {
+    pub fn new(tuples: TupleStore, namespace: NamespaceEngine) -> Expand {
         Expand {
             engine: CheckEngine::new(tuples),
             namespace,
-            index,
         }
     }
 
@@ -50,7 +46,7 @@ impl Expand {
             object: object.clone(),
             relation: RelName(permission.0.clone()),
             members: members.into_iter().map(PrincipalId).collect(),
-            zookie: self.read_zookie(scope, at),
+            zookie: snapshot.zookie().clone(),
         })
     }
 
@@ -70,7 +66,7 @@ impl Expand {
             object.0,
             permission.0,
             subject.0,
-            self.read_zookie(scope, at).0
+            snapshot.zookie().0
         ));
         let mut members: BTreeSet<String> = BTreeSet::new();
         self.expand_into(
@@ -92,14 +88,6 @@ impl Expand {
             members.len()
         ));
         Ok(RewriteTrace { steps })
-    }
-
-    fn read_zookie(&self, scope: &TenantScope, at: &Consistency) -> Zookie {
-        if at.at_least.0.is_empty() {
-            self.index.watermark(scope)
-        } else {
-            at.at_least.clone()
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -138,27 +126,11 @@ impl Expand {
                         describe_userset(&rewrite)
                     ));
                 }
-                self.expand_userset(
-                    scope,
-                    snapshot,
-                    object_id,
-                    object_type,
-                    &rewrite,
-                    depth,
-                    members,
-                    trace,
-                );
+                self.expand_userset(scope, snapshot, object_id, &rewrite, depth, members, trace);
             }
             None => {
                 self.expand_direct_relation(
-                    scope,
-                    snapshot,
-                    object_id,
-                    object_type,
-                    permission,
-                    depth,
-                    members,
-                    trace,
+                    scope, snapshot, object_id, permission, depth, members, trace,
                 );
             }
         }
@@ -170,7 +142,6 @@ impl Expand {
         scope: &TenantScope,
         snapshot: &CheckSnapshot,
         object_id: &str,
-        object_type: &ObjectType,
         rewrite: &Userset,
         depth: usize,
         members: &mut BTreeSet<String>,
@@ -182,14 +153,7 @@ impl Expand {
         match rewrite {
             Userset::Relation(r) => {
                 self.expand_direct_relation(
-                    scope,
-                    snapshot,
-                    object_id,
-                    object_type,
-                    &r.0,
-                    depth,
-                    members,
-                    trace,
+                    scope, snapshot, object_id, &r.0, depth, members, trace,
                 );
             }
             Userset::Union(arms) => {
@@ -197,16 +161,7 @@ impl Expand {
                     trace.push(format!("  union of {} arm(s) on {}", arms.len(), object_id));
                 }
                 for arm in arms {
-                    self.expand_userset(
-                        scope,
-                        snapshot,
-                        object_id,
-                        object_type,
-                        arm,
-                        depth + 1,
-                        members,
-                        trace,
-                    );
+                    self.expand_userset(scope, snapshot, object_id, arm, depth + 1, members, trace);
                 }
             }
             Userset::Intersect(arms) => {
@@ -224,7 +179,6 @@ impl Expand {
                         scope,
                         snapshot,
                         object_id,
-                        object_type,
                         arm,
                         depth + 1,
                         &mut arm_set,
@@ -248,7 +202,6 @@ impl Expand {
                     scope,
                     snapshot,
                     object_id,
-                    object_type,
                     base,
                     depth + 1,
                     &mut base_set,
@@ -259,7 +212,6 @@ impl Expand {
                     scope,
                     snapshot,
                     object_id,
-                    object_type,
                     subtracted,
                     depth + 1,
                     &mut sub_set,
@@ -308,7 +260,6 @@ impl Expand {
         scope: &TenantScope,
         snapshot: &CheckSnapshot,
         object_id: &str,
-        object_type: &ObjectType,
         relation: &str,
         depth: usize,
         members: &mut BTreeSet<String>,
@@ -318,15 +269,9 @@ impl Expand {
             return;
         }
         let rel = RelName(relation.to_string());
-
-        let direct = self.index.subjects_for(scope, object_type, object_id, &rel);
-        let direct_count = direct.len();
-        for s in direct {
-            members.insert(s.0);
-        }
-
         let object_ref = ArtifactRef(object_id.to_string());
         let snapshot_subjects = snapshot.direct_subjects(&object_ref, &rel);
+        let mut direct_count = 0usize;
         let mut userset_count = 0usize;
         for s in snapshot_subjects {
             if let Some((obj2, rel2)) = crate::check_engine::parse_userset(&s) {
@@ -342,12 +287,15 @@ impl Expand {
                     members,
                     trace,
                 );
+            } else {
+                direct_count += 1;
+                members.insert(s);
             }
         }
 
         if !trace.is_empty() {
             trace.push(format!(
-                "  relation {}#{}: {} direct subject(s) via S8 + {} inherited userset(s)",
+                "  relation {}#{}: {} direct subject(s) + {} inherited userset(s)",
                 object_id, relation, direct_count, userset_count
             ));
         }
@@ -395,11 +343,10 @@ fn type_of_object_id(object_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::namespace::NamespaceEngine;
-    use crate::reverse_index::{ReverseIndexConsumer, ReverseRow};
-    use myelin_events::{
-        BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp,
+    use myelin_events::{OutboxStore, Timestamp};
+    use myelin_identity::{
+        ConsistencyMode, Principal, PrincipalKind, RelationTuple, TupleDelta, Zookie,
     };
-    use myelin_identity::{ConsistencyMode, Principal, PrincipalKind, RelationTuple, TupleDelta};
     use myelin_tenancy::{Region, TenantId};
 
     fn scope(tenant: &str) -> TenantScope {
@@ -439,14 +386,8 @@ mod tests {
         }
     }
 
-    fn seed(
-        scope: &TenantScope,
-        deltas: &[TupleDelta],
-    ) -> (TupleStore, ReverseIndex, NamespaceEngine) {
-        let outbox = OutboxStore::new();
-        let store = TupleStore::new(outbox.clone());
-        let index = ReverseIndex::new();
-        let consumer = ReverseIndexConsumer::new(index.clone());
+    fn seed(scope: &TenantScope, deltas: &[TupleDelta]) -> (TupleStore, NamespaceEngine) {
+        let store = TupleStore::new(OutboxStore::new());
         store
             .write_tuples(
                 scope,
@@ -457,19 +398,13 @@ mod tests {
                 now(),
             )
             .expect("seed write");
-        let bus = InProcessBus::new();
-        let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
-        relay.drain_to_empty();
-        for env in bus.consume("") {
-            consumer.handle(&env, &mut myelin_events::HandlerTx::none());
-        }
-        (store, index, NamespaceEngine::with_core_hierarchy())
+        (store, NamespaceEngine::with_core_hierarchy())
     }
 
     #[test]
-    fn list_subjects_expands_direct_relation_via_s8() {
+    fn list_subjects_expands_direct_relation_from_one_snapshot() {
         let s = scope("acme");
-        let (store, index, ns) = seed(
+        let (store, ns) = seed(
             &s,
             &[
                 add("channel:general", "watcher", "p:alice"),
@@ -478,7 +413,7 @@ mod tests {
                 add("channel:random", "watcher", "p:dave"),
             ],
         );
-        let expand = Expand::new(store, ns, index);
+        let expand = Expand::new(store, ns);
         let tree = expand
             .list_subjects(
                 &s,
@@ -492,7 +427,7 @@ mod tests {
         assert_eq!(
             got,
             vec!["p:alice".to_string(), "p:bob".into(), "p:carol".into()],
-            "list_subjects returns the channel's direct watchers (and only them), via S8"
+            "list_subjects returns the channel's direct watchers from the same snapshot as inherited relationships"
         );
         assert_eq!(tree.object, ObjectId("channel:general".into()));
         assert_eq!(tree.relation, RelName("watcher".into()));
@@ -501,7 +436,7 @@ mod tests {
     #[test]
     fn list_subjects_expands_compiled_permission_with_inheritance() {
         let s = scope("acme");
-        let (store, index, ns) = seed(
+        let (store, ns) = seed(
             &s,
             &[
                 add("project:web", "reader", "p:reader"),
@@ -510,7 +445,7 @@ mod tests {
                 add("team:eng", "member", "p:teammember"),
             ],
         );
-        let expand = Expand::new(store, ns, index);
+        let expand = Expand::new(store, ns);
         let tree = expand
             .list_subjects(
                 &s,
@@ -538,10 +473,7 @@ mod tests {
     #[test]
     fn list_subjects_honours_exclusion() {
         let s = scope("acme");
-        let outbox = OutboxStore::new();
-        let store = TupleStore::new(outbox.clone());
-        let index = ReverseIndex::new();
-        let consumer = ReverseIndexConsumer::new(index.clone());
+        let store = TupleStore::new(OutboxStore::new());
         let mut ns = NamespaceEngine::new();
         let frag = crate::namespace::FragmentDef {
             object_type: ObjectType("doc".into()),
@@ -572,12 +504,7 @@ mod tests {
                 now(),
             )
             .expect("seed");
-        let bus = InProcessBus::new();
-        Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into())).drain_to_empty();
-        for env in bus.consume("") {
-            consumer.handle(&env, &mut myelin_events::HandlerTx::none());
-        }
-        let expand = Expand::new(store, ns, index);
+        let expand = Expand::new(store, ns);
         let tree = expand
             .list_subjects(
                 &s,
@@ -601,14 +528,14 @@ mod tests {
     #[test]
     fn explain_returns_non_empty_correct_trace_for_allow() {
         let s = scope("acme");
-        let (store, index, ns) = seed(
+        let (store, ns) = seed(
             &s,
             &[
                 add("project:web", "parent_team", "team:eng#view"),
                 add("team:eng", "member", "p:alice"),
             ],
         );
-        let expand = Expand::new(store, ns, index);
+        let expand = Expand::new(store, ns);
         let trace = expand
             .explain(
                 &s,
@@ -638,14 +565,14 @@ mod tests {
     #[test]
     fn explain_denies_non_member_never_silent_allow() {
         let s = scope("acme");
-        let (store, index, ns) = seed(
+        let (store, ns) = seed(
             &s,
             &[
                 add("project:web", "parent_team", "team:eng#view"),
                 add("team:eng", "member", "p:alice"),
             ],
         );
-        let expand = Expand::new(store, ns, index);
+        let expand = Expand::new(store, ns);
         let trace = expand
             .explain(
                 &s,
@@ -669,11 +596,7 @@ mod tests {
         let s = scope("acme");
         let store = TupleStore::new(OutboxStore::new())
             .with_unavailable_reads("relationship database is offline");
-        let expand = Expand::new(
-            store,
-            NamespaceEngine::with_core_hierarchy(),
-            ReverseIndex::new(),
-        );
+        let expand = Expand::new(store, NamespaceEngine::with_core_hierarchy());
         let object = ObjectId("project:web".into());
         let object_type = ObjectType("project".into());
         let permission = Permission("view".into());
@@ -704,8 +627,8 @@ mod tests {
     #[test]
     fn no_cross_tenant_list_subjects() {
         let acme = scope("acme");
-        let (store, index, ns) = seed(&acme, &[add("channel:general", "watcher", "p:alice")]);
-        let expand = Expand::new(store, ns, index);
+        let (store, ns) = seed(&acme, &[add("channel:general", "watcher", "p:alice")]);
+        let expand = Expand::new(store, ns);
         let globex = scope("globex");
         let tree = expand
             .list_subjects(
@@ -735,8 +658,8 @@ mod tests {
             ));
         }
         deltas.push(add(&format!("project:level_{n}"), "reader", "p:deep"));
-        let (store, index, ns) = seed(&s, &deltas);
-        let expand = Expand::new(store, ns, index);
+        let (store, ns) = seed(&s, &deltas);
+        let expand = Expand::new(store, ns);
         let tree = expand
             .list_subjects(
                 &s,
@@ -755,14 +678,14 @@ mod tests {
     #[test]
     fn inheritance_edge_requires_matching_computed_relation() {
         let s = scope("acme");
-        let (store, index, ns) = seed(
+        let (store, ns) = seed(
             &s,
             &[
                 add("project:web", "parent_team", "team:eng#member"),
                 add("team:eng", "member", "p:teammember"),
             ],
         );
-        let expand = Expand::new(store, ns, index);
+        let expand = Expand::new(store, ns);
         let tree = expand
             .list_subjects(
                 &s,
@@ -782,7 +705,7 @@ mod tests {
     #[test]
     fn explain_trace_records_each_operator_step() {
         let s = scope("acme");
-        let (store, index, ns) = seed(
+        let (store, ns) = seed(
             &s,
             &[
                 add("project:web", "reader", "p:reader"),
@@ -790,7 +713,7 @@ mod tests {
                 add("team:eng", "member", "p:alice"),
             ],
         );
-        let expand = Expand::new(store, ns, index);
+        let expand = Expand::new(store, ns);
         let trace = expand
             .explain(
                 &s,
@@ -811,8 +734,8 @@ mod tests {
             "the trace names the inheritance edge: {joined}"
         );
         assert!(
-            joined.contains("direct subject(s) via S8"),
-            "the trace records the S8 density lookup of a direct relation: {joined}"
+            joined.contains("direct subject(s)"),
+            "the trace records the direct relation read from the relationship snapshot: {joined}"
         );
     }
 
@@ -820,24 +743,15 @@ mod tests {
     fn list_subjects_50k_member_density_within_budget() {
         use std::time::Instant;
         let s = scope("acme");
-        let index = ReverseIndex::new();
         const MEMBERS: usize = 50_000;
-        let z = Zookie("zk-00000000000000000001".into());
-        for i in 0..MEMBERS {
-            index.apply_delta(
-                &s,
-                "add",
-                &ObjectType("channel".into()),
-                ReverseRow {
-                    subject: PrincipalId(format!("p:user{i:06}")),
-                    relation: RelName("watcher".into()),
-                    object_id: ObjectId("channel:huge".into()),
-                },
-                &z,
-            );
-        }
         let store = TupleStore::new(OutboxStore::new());
-        let expand = Expand::new(store, NamespaceEngine::with_core_hierarchy(), index);
+        let deltas: Vec<TupleDelta> = (0..MEMBERS)
+            .map(|i| add("channel:huge", "watcher", &format!("p:user{i:06}")))
+            .collect();
+        store
+            .write_tuples(&s, &actor_in("acme"), &deltas, None, None, now())
+            .expect("store every high-density watcher in the authoritative graph");
+        let expand = Expand::new(store, NamespaceEngine::with_core_hierarchy());
 
         let start = Instant::now();
         let tree = expand
@@ -854,14 +768,14 @@ mod tests {
         assert_eq!(
             tree.members.len(),
             MEMBERS,
-            "the 50k-member channel expands to all 50k watchers (served by S8)"
+            "the 50k-member channel expands to all 50k authoritative watchers"
         );
         const DENSITY_BUDGET_MS: u128 = 250;
         if myelin_substrate::perf_budget_enforced() {
             assert!(
                 elapsed_ms < DENSITY_BUDGET_MS,
                 "50k-density list_subjects took {elapsed_ms} ms, over the {DENSITY_BUDGET_MS} ms budget \
-                 (it must be served by S8 at density, not a per-member scan)"
+                 (the coherent relationship snapshot must remain efficient at density)"
             );
         }
     }

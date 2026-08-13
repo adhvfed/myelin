@@ -6,10 +6,15 @@ use myelin_config::MyelinConfig;
 use myelin_events::{EventEnvelope, Timestamp};
 use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{
-    DataRole, ObjectId, Precondition, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
-    RelName, RelationTuple, TupleDelta, Zookie,
+    Consistency, ConsistencyMode, DataRole, FragmentAdmit, ListObjectsResult, ObjectId, ObjectType,
+    Permission, Precondition, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
+    RelationTuple, TupleDelta, Zookie,
 };
+use myelin_identity_service::expand::Expand;
+use myelin_identity_service::list_objects::ListObjects;
+use myelin_identity_service::namespace::{FragmentDef, NamespaceEngine, PermissionRule, Userset};
 use myelin_identity_service::principal_store::{PrincipalProfile, PrincipalStore};
+use myelin_identity_service::reverse_index::ReverseIndex;
 use myelin_identity_service::tuple_store::TupleStore;
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
@@ -666,6 +671,149 @@ async fn two_identity_instances_share_one_monotonic_relationship_clock() {
         restarted.current_zookie(),
         latest,
         "reading durable state restores the process-local high-water mark"
+    );
+
+    for sql in [
+        "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM rebac_object_revision WHERE tenant_id = $1",
+        "DELETE FROM rebac_revision WHERE tenant_id = $1",
+    ] {
+        let _ = sqlx::query(sql)
+            .bind(&tenant)
+            .execute(admin.db_pool())
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM outbox WHERE aggregate LIKE $1")
+        .bind(format!("identity:tuple:{tenant}:%"))
+        .execute(admin.db_pool())
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_identity_serves_strong_relationship_reads_before_its_projection_is_warm() {
+    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
+        Ok(provider) => provider,
+        Err(_) => {
+            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
+            return;
+        }
+    };
+    admin
+        .migrate(&identity_durable_migrations(), &HotTables::none())
+        .await
+        .expect("identity durable migrations");
+    admin
+        .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
+        .await
+        .expect("durable relationship revisions migrate");
+    admin
+        .migrate_foundation()
+        .await
+        .expect("foundation (outbox) migration");
+    let Some(app) = app_provider().await else {
+        return;
+    };
+    let region = app.config().region.clone();
+    let handle = tokio::runtime::Handle::current();
+    let suffix = uniq();
+    let tenant = format!("mr007-cold-projection-{suffix}");
+    let tenant_scope = scope(&tenant, &region);
+    let writer = TupleStore::with_pg_minter(
+        Arc::new(UniqueMinter::new(format!("{suffix}cold"))),
+        DurableTupleBacking::new(app.clone()),
+        handle.clone(),
+    );
+    let committed = writer
+        .write_tuples(
+            &tenant_scope,
+            &actor(&tenant),
+            &[
+                TupleDelta::Add(tuple("repo:core", "reader", "p:alice")),
+                TupleDelta::Add(tuple("channel:eng", "watcher", "p:alice")),
+            ],
+            None,
+            None,
+            Timestamp("2026-06-26T00:03:00Z".into()),
+        )
+        .expect("commit repository and channel relationships");
+    drop(writer);
+
+    let restarted = TupleStore::with_pg(DurableTupleBacking::new(app), handle);
+    let alice = Principal::stub(
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        TenantId(tenant.clone()),
+    );
+    let strong = Consistency {
+        at_least: Zookie(String::new()),
+        mode: ConsistencyMode::Strong,
+    };
+    let mut namespace = NamespaceEngine::with_core_hierarchy();
+    assert!(matches!(
+        namespace.admit(&FragmentDef {
+            object_type: ObjectType("repo".into()),
+            relations: vec![RelName("reader".into())],
+            permissions: vec![PermissionRule {
+                permission: Permission("read".into()),
+                rewrite: Userset::Relation(RelName("reader".into())),
+            }],
+        }),
+        FragmentAdmit::Admitted { .. }
+    ));
+    let repositories = ListObjects::new(restarted.clone(), namespace, ReverseIndex::new())
+        .list_objects(
+            &tenant_scope,
+            &alice,
+            &Permission("read".into()),
+            &ObjectType("repo".into()),
+            &strong,
+        )
+        .expect("a strong list falls back to the durable graph while the projection is cold");
+    assert_eq!(
+        repositories,
+        ListObjectsResult::Ids {
+            ids: vec![ObjectId("repo:core".into())],
+            zookie: committed.clone(),
+        },
+        "restart does not turn a durable repository grant into an empty list"
+    );
+
+    let watchers = Expand::new(restarted.clone(), NamespaceEngine::with_core_hierarchy())
+        .list_subjects(
+            &tenant_scope,
+            &ObjectId("channel:eng".into()),
+            &ObjectType("channel".into()),
+            &Permission("watcher".into()),
+            &strong,
+        )
+        .expect("subject expansion reads the same durable snapshot as checks");
+    assert_eq!(watchers.members, vec![PrincipalId("p:alice".into())]);
+    assert_eq!(
+        watchers.zookie, committed,
+        "the response reports the authoritative revision it evaluated"
+    );
+
+    let future = Consistency {
+        at_least: Zookie("zk-99999999999999999999".into()),
+        mode: ConsistencyMode::Strong,
+    };
+    assert!(
+        matches!(
+            ListObjects::new(
+                restarted,
+                NamespaceEngine::with_core_hierarchy(),
+                ReverseIndex::new(),
+            )
+            .list_objects(
+                &tenant_scope,
+                &alice,
+                &Permission("reader".into()),
+                &ObjectType("repo".into()),
+                &future,
+            ),
+            Err(myelin_identity::AuthzError::Unavailable(_))
+        ),
+        "the restarted service never claims to have reached an uncommitted future revision"
     );
 
     for sql in [
