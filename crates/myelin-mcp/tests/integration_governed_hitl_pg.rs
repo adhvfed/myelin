@@ -4,23 +4,21 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
+#[path = "support/issued_run.rs"]
+mod issued_run_support;
 #[path = "support/registry.rs"]
 mod registry_support;
 
+use issued_run_support::{issue_test_run, TestRunIdentity};
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
 use myelin_config::MyelinConfig;
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
-use myelin_identity::{
-    DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RunId, RuntimeRef,
-};
+use myelin_identity::{DelegationCaveats, Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_identity_service::delegation::DelegationInput;
-use myelin_identity_service::machine_auth::{Authority, MachineKind};
+use myelin_identity_service::machine_auth::Authority;
 use myelin_identity_service::mint::{RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::revocation::RevocationStore;
-use myelin_identity_service::ResolvedDelegationPolicy;
-use myelin_mcp::{
-    CallOutcome, GateApproverPolicy, GovernedRouter, OutboxGovernanceAudit, RunPrincipal,
-};
+use myelin_mcp::{CallOutcome, GateApproverPolicy, GovernedRouter, OutboxGovernanceAudit};
 use myelin_storage::hitl_gate_durable::{
     gate_ref_token, hitl_gate_durable_migrations, GateDecideError, GateRecord, GateState,
     HitlVerdictStore,
@@ -166,38 +164,24 @@ fn router_with_audit(
         RunTokenMinter::with_signer_and_tuples(s7, None, Arc::new(StructuralTokenSigner::new()));
     let agent = principal(agent_id, tenant, region, false);
     let trigger = principal("human:trigger", tenant, region, true);
-    let scope = TenantScope::from_verified_token(&trigger, Region(region.into()));
     let grants = ["pull_request.merge"];
-    let run_id = RunId(run_id.into());
-    let resolved_policy = ResolvedDelegationPolicy::synthetic_for_test(
-        run_id.clone(),
-        agent.principal_id.clone(),
-        trigger.principal_id.clone(),
-        DelegationInput {
-            agent_policy: Authority::of(grants),
-            delegation: Authority::of(grants),
-            tenant_policy: Authority::of(grants),
-            trigger_actor_held: Authority::of(grants),
-        },
-        1,
+    let input = DelegationInput {
+        agent_policy: Authority::of(grants),
+        delegation: Authority::of(grants),
+        tenant_policy: Authority::of(grants),
+        trigger_actor_held: Authority::of(grants),
+    };
+    let issued = issue_test_run(
+        &minter,
+        TestRunIdentity::new(agent, trigger, run_id),
+        input,
+        DelegationCaveats(vec!["pull_request.merge".into()]),
+        300,
+        &Timestamp("2026-07-18T00:00:00Z".into()),
     );
-    GovernedRouter::with_approver_policy(
+    GovernedRouter::with_issued_run(
         minter,
-        RunPrincipal {
-            scope,
-            agent_id: agent.principal_id.clone(),
-            agent,
-            trigger_actor: trigger,
-            trigger_credential_jti: "trigger-jti".into(),
-            trigger_expires_at_unix: i64::MAX,
-            run_id,
-            resolved_policy,
-            caveats: DelegationCaveats(vec!["pull_request.merge".into()]),
-            kind: MachineKind::Agent,
-            ttl: FailStaticBound {
-                static_max_secs: 300,
-            },
-        },
+        issued,
         Box::new(CountingEffectApi(applies)),
         HitlVerdictStore::with_pg(provider),
         Arc::new(TestApprovers(vec![PrincipalId("human:lead".into())])),

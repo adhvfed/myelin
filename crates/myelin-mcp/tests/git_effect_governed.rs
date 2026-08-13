@@ -2,29 +2,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "support/issued_run.rs"]
+mod issued_run_support;
 #[path = "support/registry.rs"]
 mod registry_support;
 
+use issued_run_support::{issue_test_run, TestRunIdentity};
 use registry_support::registry_for_subsystems;
 
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
-use myelin_identity::{
-    DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RunId, RuntimeRef,
-};
+use myelin_identity::{DelegationCaveats, Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_identity_service::delegation::DelegationInput;
-use myelin_identity_service::machine_auth::{Authority, MachineKind, StructuralTokenVerifier};
+use myelin_identity_service::machine_auth::{Authority, StructuralTokenVerifier};
 use myelin_identity_service::mint::{RunTokenAuthorizer, RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::revocation::RevocationStore;
-use myelin_identity_service::ResolvedDelegationPolicy;
-use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
 #[cfg(feature = "integration")]
 use myelin_edge::{recover_placed_git_at_boot, GitDatabaseProviders};
 use myelin_edge::{DenyAllRepos, DurableGitBackend, GitEffectApi, GrantBackedRepos};
-use myelin_mcp::{
-    GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
-};
+use myelin_mcp::{GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit};
 
 const TENANT: &str = "acme";
 const REGION: &str = "eu-west";
@@ -152,8 +149,6 @@ fn governed_git_server_with_grants_scoped_at(
     let agent = agent_principal_in("agent:claude", tenant, region);
     let trigger = human_principal_in("human:operator", tenant, region);
     let delegator = trigger.clone();
-    let scope = TenantScope::from_verified_token(&trigger, Region(region.into()));
-
     let input = DelegationInput {
         agent_policy: Authority::of(grants.iter().copied()),
         delegation: Authority::of(grants.iter().copied()),
@@ -161,30 +156,14 @@ fn governed_git_server_with_grants_scoped_at(
         trigger_actor_held: Authority::of(grants.iter().copied()),
     };
 
-    let run_id = RunId("mcp-run-1".into());
-    let agent_id = PrincipalId("agent:claude".into());
-    let resolved_policy = ResolvedDelegationPolicy::synthetic_for_test(
-        run_id.clone(),
-        agent_id.clone(),
-        trigger.principal_id.clone(),
+    let issued = issue_test_run(
+        &minter,
+        TestRunIdentity::new(agent.clone(), trigger, "mcp-run-1"),
         input,
-        1,
+        DelegationCaveats(grants.iter().map(|grant| (*grant).to_string()).collect()),
+        300,
+        &current,
     );
-    let principal = RunPrincipal {
-        scope,
-        agent_id,
-        agent: agent.clone(),
-        trigger_actor: trigger,
-        trigger_credential_jti: "trigger-jti".into(),
-        trigger_expires_at_unix: i64::MAX,
-        run_id,
-        resolved_policy,
-        caveats: DelegationCaveats(grants.iter().map(|g| (*g).to_string()).collect()),
-        kind: MachineKind::Agent,
-        ttl: FailStaticBound {
-            static_max_secs: 300,
-        },
-    };
 
     let effect = GitEffectApi::new(
         backend,
@@ -194,9 +173,9 @@ fn governed_git_server_with_grants_scoped_at(
         delegator,
         boundary_authorizer,
     );
-    let router = GovernedRouter::with_approver_policy(
+    let router = GovernedRouter::with_issued_run(
         minter,
-        principal,
+        issued,
         Box::new(effect),
         myelin_storage::hitl_gate_durable::HitlVerdictStore::new(),
         Arc::new(TestApprovers(vec![PrincipalId("human:operator".into())])),

@@ -10,15 +10,8 @@ use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EventDraft, EventType, IdMinter,
     OutboxStore, OutboxTx, Timestamp, Ulid, Visibility,
 };
-use myelin_identity::{
-    DelegationCaveats, FailStaticBound, Principal, PrincipalId, RevokeTarget, RunId, RunToken,
-};
-use myelin_identity_service::delegation::authority_of;
-use myelin_identity_service::delegation_policy::ResolvedDelegationPolicy;
-use myelin_identity_service::machine_auth::MachineKind;
-use myelin_identity_service::mint::{
-    attenuate_for_caveats, repository_scope_grant, RunTokenMinter, REPOSITORY_SCOPE_GRANT_PREFIX,
-};
+use myelin_identity::{Principal, PrincipalId, RunId, RunToken};
+use myelin_identity_service::mint::{RunTokenMinter, REPOSITORY_SCOPE_GRANT_PREFIX};
 use myelin_storage::hitl_gate_durable::{
     gate_ref_token, opaque_gate_id, GateConsumeError, GateDecideError, GateRecord, GateState,
     GateStoreUnavailable, HitlVerdictStore, DEFAULT_HITL_GATE_TTL_SECS,
@@ -26,20 +19,6 @@ use myelin_storage::hitl_gate_durable::{
 use myelin_storage::{ContentHash, TenantScope};
 
 use crate::registry::{RegisteredTool, ToolRegistry};
-
-pub struct RunPrincipal {
-    pub scope: TenantScope,
-    pub agent_id: PrincipalId,
-    pub agent: Principal,
-    pub trigger_actor: Principal,
-    pub trigger_credential_jti: String,
-    pub trigger_expires_at_unix: i64,
-    pub run_id: RunId,
-    pub resolved_policy: ResolvedDelegationPolicy,
-    pub caveats: DelegationCaveats,
-    pub kind: MachineKind,
-    pub ttl: FailStaticBound,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GovernedRun {
@@ -50,15 +29,6 @@ pub struct GovernedRun {
 }
 
 impl GovernedRun {
-    fn from_minting_principal(principal: &RunPrincipal) -> Self {
-        Self {
-            scope: principal.scope.clone(),
-            agent_id: principal.agent_id.clone(),
-            agent: principal.agent.clone(),
-            run_id: principal.run_id.clone(),
-        }
-    }
-
     fn validate(&self) -> Result<(), String> {
         if self.agent_id != self.agent.principal_id {
             return Err("governed run agent id does not match its authenticated principal".into());
@@ -598,9 +568,8 @@ fn read_audit_target(resource_ref: Option<&ArtifactRef>) -> GovernanceAuditTarge
     resource_ref.map_or(GovernanceAuditTarget::Run, GovernanceAuditTarget::Resource)
 }
 
-#[derive(Default)]
 struct RunState {
-    token: Option<RunToken>,
+    token: RunToken,
     effective_grants: std::collections::BTreeSet<String>,
     audit: Vec<AuditEntry>,
     fatal: bool,
@@ -632,7 +601,6 @@ pub trait GateApproverPolicy: Send + Sync {
 pub struct GovernedRouter {
     minter: RunTokenMinter,
     principal: GovernedRun,
-    minting_principal: Option<RunPrincipal>,
     effect_api: Box<dyn EffectApi>,
     state: RefCell<RunState>,
     verdicts: RefCell<HitlVerdictStore>,
@@ -641,30 +609,6 @@ pub struct GovernedRouter {
 }
 
 impl GovernedRouter {
-    pub fn with_approver_policy(
-        minter: RunTokenMinter,
-        principal: RunPrincipal,
-        effect_api: Box<dyn EffectApi>,
-        verdicts: HitlVerdictStore,
-        approver_policy: Arc<dyn GateApproverPolicy>,
-        audit_sink: Arc<dyn GovernanceAudit>,
-    ) -> GovernedRouter {
-        let governed_run = GovernedRun::from_minting_principal(&principal);
-        governed_run
-            .validate()
-            .expect("an internally minted run must have one coherent principal");
-        GovernedRouter {
-            minter,
-            principal: governed_run,
-            minting_principal: Some(principal),
-            effect_api,
-            state: RefCell::new(RunState::default()),
-            verdicts: RefCell::new(verdicts),
-            approver_policy,
-            audit_sink,
-        }
-    }
-
     pub fn with_issued_run(
         minter: RunTokenMinter,
         issued: IssuedGovernedRun,
@@ -681,12 +625,12 @@ impl GovernedRouter {
         GovernedRouter {
             minter,
             principal,
-            minting_principal: None,
             effect_api,
             state: RefCell::new(RunState {
-                token: Some(token),
+                token,
                 effective_grants,
-                ..RunState::default()
+                audit: Vec::new(),
+                fatal: false,
             }),
             verdicts: RefCell::new(verdicts),
             approver_policy,
@@ -702,7 +646,7 @@ impl GovernedRouter {
         &self.principal
     }
 
-    pub fn current_token(&self) -> Option<RunToken> {
+    pub fn current_token(&self) -> RunToken {
         self.state.borrow().token.clone()
     }
 
@@ -711,9 +655,8 @@ impl GovernedRouter {
     }
 
     pub fn teardown(&self, now: &Timestamp) {
-        if let Some(token) = self.current_token() {
-            self.minter.teardown(&self.principal.scope, &token, now);
-        }
+        self.minter
+            .teardown(&self.principal.scope, &self.current_token(), now);
     }
 
     pub fn audit(&self) -> Vec<AuditEntry> {
@@ -725,7 +668,7 @@ impl GovernedRouter {
         registry: &ToolRegistry,
         now: &Timestamp,
     ) -> Result<BTreeSet<String>, String> {
-        let token = self.ensure_run_token(now)?;
+        let token = self.current_token();
         if !self.minter.is_live(&self.principal.scope, &token, now) {
             return Err("run token is revoked or expired; tool discovery is denied".into());
         }
@@ -741,66 +684,6 @@ impl GovernedRouter {
             })
             .map(|tool| tool.name().to_string())
             .collect())
-    }
-
-    fn ensure_run_token(&self, now: &Timestamp) -> Result<RunToken, String> {
-        if let Some(t) = self.state.borrow().token.clone() {
-            return Ok(t);
-        }
-        let p = self
-            .minting_principal
-            .as_ref()
-            .ok_or_else(|| "issued run token is unavailable".to_string())?;
-        let now_unix = chrono::DateTime::parse_from_rfc3339(&now.0)
-            .map_err(|_| "current time is not a valid RFC3339 instant".to_string())?
-            .timestamp();
-        if now_unix >= p.trigger_expires_at_unix {
-            return Err("authenticated MCP trigger credential is expired".into());
-        }
-        if self.minter.revocations().is_revoked(
-            &p.scope,
-            &RevokeTarget::Jti(p.trigger_credential_jti.clone()),
-            now,
-        ) {
-            return Err("authenticated MCP trigger credential is revoked".into());
-        }
-        let remaining = u64::try_from(p.trigger_expires_at_unix - now_unix)
-            .map_err(|_| "trigger credential remaining lifetime is invalid".to_string())?;
-        let ttl = FailStaticBound {
-            static_max_secs: p.ttl.static_max_secs.min(remaining),
-        };
-        let attenuated = attenuate_for_caveats(
-            authority_of(p.resolved_policy.effective_policy()),
-            &p.caveats,
-            &p.scope,
-            &p.run_id,
-            &p.trigger_actor,
-        )
-        .map_err(|error| format!("per-run delegation caveat refused: {error}"))?;
-        let token = self
-            .minter
-            .mint_from_resolved_policy(
-                &p.scope,
-                &p.agent_id,
-                &p.run_id,
-                &p.agent,
-                &p.trigger_actor,
-                &p.resolved_policy,
-                &p.caveats,
-                p.kind,
-                &ttl,
-                now,
-            )
-            .map_err(|e| format!("per-run token mint refused: {e}"))?;
-        let mut state = self.state.borrow_mut();
-        state.effective_grants = attenuated
-            .capabilities()
-            .grants()
-            .map(str::to_string)
-            .chain(attenuated.repositories().map(repository_scope_grant))
-            .collect();
-        state.token = Some(token.clone());
-        Ok(token)
     }
 
     pub fn authorize_read(
@@ -821,7 +704,7 @@ impl GovernedRouter {
                         "tool `{}` is not a registered non-side-effecting direct read",
                         tool.name()
                     ),
-                    jti: "<unminted>".into(),
+                    jti: self.current_token().jti.clone(),
                 },
             ));
         }
@@ -908,9 +791,7 @@ impl GovernedRouter {
         tool: &RegisteredTool,
         now: &Timestamp,
     ) -> Result<RunToken, (String, String)> {
-        let token = self
-            .ensure_run_token(now)
-            .map_err(|reason| (reason, "<unminted>".into()))?;
+        let token = self.current_token();
         let jti = token.jti.clone();
         if !self.minter.is_live(&self.principal.scope, &token, now) {
             return Err((
@@ -983,7 +864,7 @@ impl GovernedRouter {
                     tool.name(),
                     CallOutcome::Denied {
                         reason,
-                        jti: "<unminted>".into(),
+                        jti: self.current_token().jti.clone(),
                     },
                 )
             }

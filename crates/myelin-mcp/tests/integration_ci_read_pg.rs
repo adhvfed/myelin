@@ -5,10 +5,13 @@ use std::sync::Arc;
 
 #[path = "support/effect.rs"]
 mod effect_support;
+#[path = "support/issued_run.rs"]
+mod issued_run_support;
 #[path = "support/registry.rs"]
 mod registry_support;
 
 use effect_support::ApplyingEffectApi;
+use issued_run_support::{issue_test_run, TestRunIdentity};
 use registry_support::registry_for_subsystems;
 
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
@@ -16,18 +19,15 @@ use myelin_edge::repo_authz::GrantBackedRepos;
 use myelin_edge::{DurableCiReadApi, DurableGitBackend, McpReadExecutor};
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{
-    DataRole, DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind,
-    PrincipalStatus, RunId, RuntimeRef,
+    DataRole, DelegationCaveats, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef,
 };
 use myelin_identity_service::delegation::DelegationInput;
-use myelin_identity_service::machine_auth::{Authority, MachineKind, StructuralTokenVerifier};
+use myelin_identity_service::machine_auth::{Authority, StructuralTokenVerifier};
 use myelin_identity_service::mint::{RunTokenAuthorizer, RunTokenMinter, StructuralTokenSigner};
-use myelin_identity_service::{ResolvedDelegationPolicy, RevocationStore};
-use myelin_mcp::{
-    GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
-};
+use myelin_identity_service::RevocationStore;
+use myelin_mcp::{GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit};
 use myelin_storage::hitl_gate_durable::HitlVerdictStore;
-use myelin_storage::{with_tenant_tx, FsBlobStore, PgError, TenantScope};
+use myelin_storage::{with_tenant_tx, FsBlobStore, PgError};
 use myelin_tenancy::{Region, TenantId};
 use serde_json::{json, Value};
 use sqlx::{Executor, PgPool};
@@ -206,43 +206,29 @@ fn server(
         PrincipalStatus::Active,
     );
     let delegator = trigger.clone();
-    let scope = TenantScope::from_verified_token(&agent, Region(REGION.into()));
     let grants = ["run.view"];
-    let run_id = RunId("run:mcp-ci-read-integration".into());
-    let resolved_policy = ResolvedDelegationPolicy::synthetic_for_test(
-        run_id.clone(),
-        agent.principal_id.clone(),
-        trigger.principal_id.clone(),
-        DelegationInput {
-            agent_policy: Authority::of(grants),
-            delegation: Authority::of(grants),
-            tenant_policy: Authority::of(grants),
-            trigger_actor_held: Authority::of(grants),
-        },
-        1,
-    );
+    let input = DelegationInput {
+        agent_policy: Authority::of(grants),
+        delegation: Authority::of(grants),
+        tenant_policy: Authority::of(grants),
+        trigger_actor_held: Authority::of(grants),
+    };
     let minter = RunTokenMinter::with_signer_and_tuples(
         router_revocations,
         None,
         Arc::new(StructuralTokenSigner::new()),
     );
-    let router = GovernedRouter::with_approver_policy(
+    let issued = issue_test_run(
+        &minter,
+        TestRunIdentity::new(agent, trigger, "run:mcp-ci-read-integration"),
+        input,
+        DelegationCaveats(vec!["run.view".into()]),
+        300,
+        &Timestamp(NOW.into()),
+    );
+    let router = GovernedRouter::with_issued_run(
         minter,
-        RunPrincipal {
-            scope,
-            agent_id: agent.principal_id.clone(),
-            agent,
-            trigger_actor: trigger,
-            trigger_credential_jti: "trigger:mcp-ci-read".into(),
-            trigger_expires_at_unix: i64::MAX,
-            run_id,
-            resolved_policy,
-            caveats: DelegationCaveats(vec!["run.view".into()]),
-            kind: MachineKind::Agent,
-            ttl: FailStaticBound {
-                static_max_secs: 300,
-            },
-        },
+        issued,
         Box::new(ApplyingEffectApi),
         HitlVerdictStore::new(),
         Arc::new(NoApprovers),

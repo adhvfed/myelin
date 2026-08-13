@@ -3,10 +3,13 @@ use std::sync::Arc;
 
 #[path = "support/effect.rs"]
 mod effect_support;
+#[path = "support/issued_run.rs"]
+mod issued_run_support;
 #[path = "support/registry.rs"]
 mod registry_support;
 
 use effect_support::ApplyingEffectApi;
+use issued_run_support::{issue_test_run, TestRunIdentity};
 use registry_support::registry_for_subsystems;
 
 struct FailingWriter;
@@ -25,23 +28,18 @@ impl std::io::Write for FailingWriter {
 }
 
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
-use myelin_identity::{
-    DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RevokeTarget, RunId,
-    RuntimeRef,
-};
+use myelin_identity::{DelegationCaveats, Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_identity_service::delegation::DelegationInput;
-use myelin_identity_service::machine_auth::{Authority, MachineKind};
+use myelin_identity_service::machine_auth::Authority;
 use myelin_identity_service::mint::{RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::revocation::RevocationStore;
-use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
 use myelin_mcp::{
     AuditPhase, CallOutcome, DirectReadError, DirectReadExecutor, GateApproverPolicy,
     GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter,
-    IssuedGovernedRun, McpServer, OutboxGovernanceAudit, ReadAuthorization, RunPrincipal,
-    ToolRegistry,
+    IssuedGovernedRun, McpServer, OutboxGovernanceAudit, ReadAuthorization, ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::{
     gate_ref_token, GateDecideError, GateRecord, GateState, HitlVerdictStore,
@@ -162,18 +160,8 @@ fn governed_router() -> GovernedRouter {
 }
 
 fn governed_router_with_input(input: DelegationInput) -> GovernedRouter {
-    governed_router_with_trigger(input, "trigger-jti", i64::MAX)
-}
-
-fn governed_router_with_trigger(
-    input: DelegationInput,
-    trigger_jti: &str,
-    trigger_expires_at_unix: i64,
-) -> GovernedRouter {
-    governed_router_with_trigger_and_audit(
+    governed_router_with_audit(
         input,
-        trigger_jti,
-        trigger_expires_at_unix,
         Arc::new(OutboxGovernanceAudit::new(
             OutboxStore::new(),
             Arc::new(MonotonicMinter::new()),
@@ -181,63 +169,34 @@ fn governed_router_with_trigger(
     )
 }
 
-fn governed_router_with_trigger_and_audit(
+fn governed_router_with_audit(
     input: DelegationInput,
-    trigger_jti: &str,
-    trigger_expires_at_unix: i64,
     audit: Arc<dyn GovernanceAudit>,
 ) -> GovernedRouter {
-    governed_router_with_trigger_audit_and_ttl(
-        input,
-        trigger_jti,
-        trigger_expires_at_unix,
-        audit,
-        300,
-    )
+    governed_router_with_ttl(input, audit, 300)
 }
 
-fn governed_router_with_trigger_audit_and_ttl(
+fn governed_router_with_ttl(
     input: DelegationInput,
-    trigger_jti: &str,
-    trigger_expires_at_unix: i64,
     audit: Arc<dyn GovernanceAudit>,
     run_ttl_secs: u64,
 ) -> GovernedRouter {
-    governed_router_with_verdicts(
-        input,
-        trigger_jti,
-        trigger_expires_at_unix,
-        audit,
-        run_ttl_secs,
-        HitlVerdictStore::new(),
-    )
+    governed_router_with_verdicts(input, audit, run_ttl_secs, HitlVerdictStore::new())
 }
 
 fn governed_router_with_verdicts(
     input: DelegationInput,
-    trigger_jti: &str,
-    trigger_expires_at_unix: i64,
     audit: Arc<dyn GovernanceAudit>,
     run_ttl_secs: u64,
     verdicts: HitlVerdictStore,
 ) -> GovernedRouter {
     let caveats = DelegationCaveats(input.delegation.grants().map(str::to_string).collect());
-    governed_router_with_caveats_and_verdicts(
-        input,
-        caveats,
-        trigger_jti,
-        trigger_expires_at_unix,
-        audit,
-        run_ttl_secs,
-        verdicts,
-    )
+    governed_router_with_caveats_and_verdicts(input, caveats, audit, run_ttl_secs, verdicts)
 }
 
 fn governed_router_with_caveats_and_verdicts(
     input: DelegationInput,
     caveats: DelegationCaveats,
-    trigger_jti: &str,
-    trigger_expires_at_unix: i64,
     audit: Arc<dyn GovernanceAudit>,
     run_ttl_secs: u64,
     verdicts: HitlVerdictStore,
@@ -248,40 +207,22 @@ fn governed_router_with_caveats_and_verdicts(
 
     let agent = agent_principal("agent:claude", "acme");
     let trigger = human_principal("human:operator", "acme");
-    let scope = TenantScope::from_verified_token(&trigger, Region("eu-west".into()));
-
-    let run_id = RunId("mcp-run-1".into());
-    let agent_id = PrincipalId("agent:claude".into());
-    let resolved_policy = ResolvedDelegationPolicy::synthetic_for_test(
-        run_id.clone(),
-        agent_id.clone(),
-        trigger.principal_id.clone(),
+    let issued = issue_test_run(
+        &minter,
+        TestRunIdentity::new(agent, trigger, "mcp-run-1"),
         input,
-        1,
-    );
-    let principal = RunPrincipal {
-        scope,
-        agent_id,
-        agent,
-        trigger_actor: trigger,
-        trigger_credential_jti: trigger_jti.into(),
-        trigger_expires_at_unix,
-        run_id,
-        resolved_policy,
         caveats,
-        kind: MachineKind::Agent,
-        ttl: FailStaticBound {
-            static_max_secs: run_ttl_secs,
-        },
-    };
+        run_ttl_secs,
+        &now(),
+    );
 
     let approvers = vec![
         PrincipalId("human:operator".into()),
         PrincipalId("agent:claude".into()),
     ];
-    GovernedRouter::with_approver_policy(
+    GovernedRouter::with_issued_run(
         minter,
-        principal,
+        issued,
         Box::new(ApplyingEffectApi),
         verdicts,
         Arc::new(TestApprovers(approvers)),
@@ -353,7 +294,7 @@ fn ci_read_router_with_audit(grants: &[&str], audit: Arc<dyn GovernanceAudit>) -
         tenant_policy: Authority::of(grants.iter().copied()),
         trigger_actor_held: Authority::of(grants.iter().copied()),
     };
-    governed_router_with_trigger_and_audit(input, "trigger-jti", i64::MAX, audit)
+    governed_router_with_audit(input, audit)
 }
 
 fn caveated_router(grants: &[&str], caveats: &[&str]) -> GovernedRouter {
@@ -366,8 +307,6 @@ fn caveated_router(grants: &[&str], caveats: &[&str]) -> GovernedRouter {
     governed_router_with_caveats_and_verdicts(
         input,
         DelegationCaveats(caveats.iter().map(|caveat| (*caveat).to_string()).collect()),
-        "trigger-jti",
-        i64::MAX,
         Arc::new(OutboxGovernanceAudit::new(
             OutboxStore::new(),
             Arc::new(MonotonicMinter::new()),
@@ -556,22 +495,22 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
         ]
     );
     assert!(
-        server.router().unwrap().current_token().is_some(),
+        !server.router().unwrap().current_token().jti.is_empty(),
         "discovery itself belongs to an attributed per-run identity"
     );
 }
 
 #[test]
 fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection() {
-    let minting_router = ci_read_router(&["repo.push", "run.view"]);
-    minting_router
+    let issuing_fixture = ci_read_router(&["repo.push", "run.view"]);
+    issuing_fixture
         .permitted_tool_names(&git_and_ci_registry(), &now())
         .unwrap();
-    let issued_token = minting_router.current_token().unwrap();
+    let issued_token = issuing_fixture.current_token();
     let router = GovernedRouter::with_issued_run(
-        minting_router.minter().clone(),
+        issuing_fixture.minter().clone(),
         IssuedGovernedRun::new(
-            minting_router.principal().clone(),
+            issuing_fixture.principal().clone(),
             issued_token.clone(),
             ["repo.push".into(), "run.view".into()],
         )
@@ -586,7 +525,7 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
     );
     assert_eq!(
         router.current_token(),
-        Some(issued_token),
+        issued_token,
         "Edge's authenticated bearer is installed before the first MCP frame"
     );
 
@@ -615,12 +554,12 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
 
 #[test]
 fn an_edge_issued_run_binds_identity_bearer_and_grants_before_routing() {
-    let minting_router = ci_read_router(&["run.view"]);
-    minting_router
+    let issuing_fixture = ci_read_router(&["run.view"]);
+    issuing_fixture
         .permitted_tool_names(&git_and_ci_registry(), &now())
         .unwrap();
-    let principal = minting_router.principal().clone();
-    let token = minting_router.current_token().unwrap();
+    let principal = issuing_fixture.principal().clone();
+    let token = issuing_fixture.current_token();
 
     assert!(IssuedGovernedRun::new(principal.clone(), token.clone(), Vec::new()).is_err());
     assert!(IssuedGovernedRun::new(
@@ -633,29 +572,6 @@ fn an_edge_issued_run_binds_identity_bearer_and_grants_before_routing() {
     let mut missing_bearer = token;
     missing_bearer.token.clear();
     assert!(IssuedGovernedRun::new(principal, missing_bearer, ["run.view".into()]).is_err());
-}
-
-#[test]
-fn tools_list_refuses_an_expired_trigger_before_disclosing_the_catalogue() {
-    let grants = ["repo.push"];
-    let router = governed_router_with_trigger(
-        DelegationInput {
-            agent_policy: Authority::of(grants),
-            delegation: Authority::of(grants),
-            tenant_policy: Authority::of(grants),
-            trigger_actor_held: Authority::of(grants),
-        },
-        "expired-trigger",
-        1,
-    );
-    let server = McpServer::with_router_and_clock(git_registry(), router, Arc::new(now));
-
-    let response = drive(
-        &server,
-        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#],
-    );
-    assert_eq!(response[0]["error"]["code"], -32001);
-    assert!(response[0].get("result").is_none());
 }
 
 #[test]
@@ -904,7 +820,7 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
     );
     assert_eq!(first[0]["result"]["isError"], false);
     let router = revoked.router().unwrap();
-    let token = router.current_token().unwrap();
+    let token = router.current_token();
     router
         .minter()
         .teardown(&router.principal().scope, &token, &now());
@@ -923,7 +839,7 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
 }
 
 #[test]
-fn non_gated_tool_mints_a_run_token_and_routes_through_effect_api() {
+fn non_gated_tool_routes_under_the_issued_run_token() {
     let server = governed_server();
     let resps = drive(
         &server,
@@ -951,10 +867,7 @@ fn non_gated_tool_mints_a_run_token_and_routes_through_effect_api() {
     assert!(event_id.contains("tool:git.submit_review"));
 
     let router = server.router().unwrap();
-    assert!(
-        router.current_token().is_some(),
-        "a per-run token was minted"
-    );
+    assert_eq!(router.current_token().jti, jti);
     let audit = router.audit();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].principal, "agent:claude");
@@ -1229,7 +1142,7 @@ fn a_revoked_run_token_is_denied_never_routed() {
     assert_eq!(first["result"]["isError"], false);
 
     let router = server.router().unwrap();
-    let token = router.current_token().unwrap();
+    let token = router.current_token();
     router
         .minter()
         .teardown(&router.principal().scope, &token, &now());
@@ -1250,71 +1163,6 @@ fn a_revoked_run_token_is_denied_never_routed() {
 }
 
 #[test]
-fn lazy_mint_refuses_expired_or_revoked_trigger_and_clamps_run_life() {
-    let input = || DelegationInput {
-        agent_policy: Authority::of(["repo.push"]),
-        delegation: Authority::of(["repo.push"]),
-        tenant_policy: Authority::of(["repo.push"]),
-        trigger_actor_held: Authority::of(["repo.push"]),
-    };
-    let at = Timestamp("2026-06-26T00:00:00Z".into());
-    let at_unix = chrono::DateTime::parse_from_rfc3339(&at.0)
-        .unwrap()
-        .timestamp();
-    let registry = git_registry();
-    let tool = registry.resolve("git.open_pr").unwrap();
-    let args = serde_json::json!({"repo":"alpha"});
-
-    let expired = governed_router_with_trigger(input(), "expired-trigger", at_unix);
-    assert!(matches!(
-        expired.call(tool, &args, "expired-trigger", &at, None),
-        CallOutcome::Denied { reason, .. } if reason.contains("trigger credential is expired")
-    ));
-    assert!(expired.current_token().is_none());
-
-    let revoked = governed_router_with_trigger(input(), "revoked-trigger", at_unix + 60);
-    revoked.minter().revocations().revoke(
-        &revoked.principal().scope,
-        &RevokeTarget::Jti("revoked-trigger".into()),
-        at.clone(),
-    );
-    assert!(matches!(
-        revoked.call(tool, &args, "revoked-trigger", &at, None),
-        CallOutcome::Denied { reason, .. } if reason.contains("trigger credential is revoked")
-    ));
-    assert!(revoked.current_token().is_none());
-
-    let clamped = governed_router_with_trigger(input(), "short-trigger", at_unix + 2);
-    assert!(matches!(
-        clamped.call(tool, &args, "clamped-trigger", &at, None),
-        CallOutcome::Applied { .. }
-    ));
-    let token = clamped.current_token().unwrap();
-    clamped.minter().revocations().revoke(
-        &clamped.principal().scope,
-        &RevokeTarget::Jti("short-trigger".into()),
-        at.clone(),
-    );
-    assert!(matches!(
-        clamped.call(
-            tool,
-            &args,
-            "clamped-trigger",
-            &Timestamp("2026-06-26T00:00:01Z".into()),
-            None,
-        ),
-        CallOutcome::Applied { .. }
-    ));
-    let after_trigger = Timestamp("2026-06-26T00:00:03Z".into());
-    assert!(
-        !clamped
-            .minter()
-            .is_live(&clamped.principal().scope, &token, &after_trigger),
-        "run token must not outlive its authenticated trigger credential"
-    );
-}
-
-#[test]
 fn malformed_request_is_a_jsonrpc_error_no_panic() {
     let server = governed_server();
     let resps = drive(&server, &["{ not valid json"]);
@@ -1325,7 +1173,7 @@ fn malformed_request_is_a_jsonrpc_error_no_panic() {
 }
 
 #[test]
-fn stdio_eof_tears_down_the_minted_run_token() {
+fn stdio_eof_tears_down_the_issued_run_token() {
     let server = governed_server();
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":1,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
     let mut output = Vec::new();
@@ -1337,9 +1185,7 @@ fn stdio_eof_tears_down_the_minted_run_token() {
     let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(response["result"]["isError"], false);
     let router = server.router().unwrap();
-    let token = router
-        .current_token()
-        .expect("the session minted a run token");
+    let token = router.current_token();
     assert!(
         !router
             .minter()
@@ -1349,7 +1195,7 @@ fn stdio_eof_tears_down_the_minted_run_token() {
 }
 
 #[test]
-fn stdio_output_error_still_tears_down_the_minted_run_token() {
+fn stdio_output_error_still_tears_down_the_issued_run_token() {
     let server = governed_server();
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":1,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
     let error = server
@@ -1357,9 +1203,7 @@ fn stdio_output_error_still_tears_down_the_minted_run_token() {
         .expect_err("broken stdout must surface");
     assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     let router = server.router().unwrap();
-    let token = router
-        .current_token()
-        .expect("request minted before write failed");
+    let token = router.current_token();
     assert!(
         !router
             .minter()
@@ -1371,15 +1215,13 @@ fn stdio_output_error_still_tears_down_the_minted_run_token() {
 #[test]
 fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
     let grants = ["repo.push"];
-    let router = governed_router_with_trigger_and_audit(
+    let router = governed_router_with_audit(
         DelegationInput {
             agent_policy: Authority::of(grants),
             delegation: Authority::of(grants),
             tenant_policy: Authority::of(grants),
             trigger_actor_held: Authority::of(grants),
         },
-        "trigger-jti",
-        i64::MAX,
         Arc::new(FailOutcomeAudit),
     );
     let server = McpServer::with_router_and_clock(git_registry(), router, Arc::new(now));
@@ -1394,7 +1236,7 @@ fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
     assert_eq!(response["result"]["_meta"]["fatal"], true);
     let router = server.router().unwrap();
     assert!(router.is_fatal());
-    let token = router.current_token().unwrap();
+    let token = router.current_token();
     assert!(
         !router
             .minter()
@@ -1406,15 +1248,13 @@ fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
 #[test]
 fn post_gate_open_audit_failure_is_also_indeterminate_and_terminal() {
     let grants = ["pull_request.merge"];
-    let router = governed_router_with_trigger_and_audit(
+    let router = governed_router_with_audit(
         DelegationInput {
             agent_policy: Authority::of(grants),
             delegation: Authority::of(grants),
             tenant_policy: Authority::of(grants),
             trigger_actor_held: Authority::of(grants),
         },
-        "trigger-jti",
-        i64::MAX,
         Arc::new(FailOutcomeAudit),
     );
     let registry = git_registry();
@@ -1432,15 +1272,13 @@ fn post_gate_open_audit_failure_is_also_indeterminate_and_terminal() {
 #[test]
 fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session() {
     let grants = ["pull_request.merge"];
-    let router = governed_router_with_trigger_audit_and_ttl(
+    let router = governed_router_with_ttl(
         DelegationInput {
             agent_policy: Authority::of(grants),
             delegation: Authority::of(grants),
             tenant_policy: Authority::of(grants),
             trigger_actor_held: Authority::of(grants),
         },
-        "trigger-jti",
-        i64::MAX,
         Arc::new(FailExpiryAudit),
         7_200,
     );
@@ -1528,8 +1366,6 @@ fn mcp_expiry_leaves_unrelated_shared_gate_untouched_and_audits_exact_gate() {
             tenant_policy: Authority::of(grants),
             trigger_actor_held: Authority::of(grants),
         },
-        "trigger-jti",
-        i64::MAX,
         Arc::new(OutboxGovernanceAudit::new(
             audit_store.clone(),
             Arc::new(MonotonicMinter::new()),
