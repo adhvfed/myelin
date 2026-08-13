@@ -136,14 +136,16 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
         GdprTenantId::from_token("acmeP411"),
     ));
     let mut tx = outbox.begin(minter.clone(), ctx_base());
-    let report = cascade.erase(
-        &mut tx,
-        &EraseScope::Subject {
-            subject,
-            tenant: GdprTenantId::from_token("acmeP411"),
-        },
-        &[(conv, MessageId("01J0MSG411".into()))],
-    );
+    let report = cascade
+        .erase(
+            &mut tx,
+            &EraseScope::Subject {
+                subject,
+                tenant: GdprTenantId::from_token("acmeP411"),
+            },
+            &[(conv, MessageId("01J0MSG411".into()))],
+        )
+        .expect("the durable chat erasure cascade succeeds");
     tx.commit().expect("commit the cascade transaction");
 
     let row_after = sqlx::query(&format!(

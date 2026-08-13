@@ -4271,10 +4271,12 @@ mod tests {
             "all lifecycle envelopes remain PII-free"
         );
 
-        assert!(kms.destroy_dek(&DekId::new(
-            TenantId(tenant_a.clone()),
-            KeyClass::Subject(actor.principal_id.0.clone()),
-        )));
+        assert!(kms
+            .destroy_dek(&DekId::new(
+                TenantId(tenant_a.clone()),
+                KeyClass::Subject(actor.principal_id.0.clone()),
+            ))
+            .expect("destroy the pull-request actor's durable DEK"));
         assert!(store.get(&scope_a, repo, opened.number).is_err());
 
         sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant'=$1")

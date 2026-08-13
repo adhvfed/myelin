@@ -164,7 +164,11 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
         .shred_key_for(&s, &alice)
         .expect("the subject has a per-subject shred key");
     let dek_id = DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
-    assert!(kms.destroy_dek(&dek_id), "the per-subject DEK is destroyed");
+    assert!(
+        kms.destroy_dek(&dek_id)
+            .expect("the per-subject DEK destruction is persisted"),
+        "the per-subject DEK is destroyed"
+    );
 
     let Some(app3) = app_provider().await else {
         return;

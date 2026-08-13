@@ -131,7 +131,9 @@ async fn chat_body_per_subject_dek_zero_plaintext_at_rest_in_real_postgres() {
         from_db.key_ref.class.clone(),
     );
     assert!(
-        engine.destroy_dek(&dek_id),
+        engine
+            .destroy_dek(&dek_id)
+            .expect("the per-subject DEK destruction is persisted"),
         "the per-subject DEK is destroyed"
     );
     assert!(
