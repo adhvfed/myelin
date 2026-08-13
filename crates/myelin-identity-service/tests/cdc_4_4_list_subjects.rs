@@ -105,12 +105,14 @@ fn cdc_4_4_list_subjects_flattens_membership_inspector_renders_it() {
             grant("issue:PROJ-2", "approver", "p:dave"),
         ],
     );
-    let tree = svc.list_subjects_in(
-        &s,
-        &ObjectId("issue:PROJ-1".into()),
-        &Permission("approve".into()),
-        &at_latest(),
-    );
+    let tree = svc
+        .list_subjects_in(
+            &s,
+            &ObjectId("issue:PROJ-1".into()),
+            &Permission("approve".into()),
+            &at_latest(),
+        )
+        .expect("read issue approval relationships");
     let rendered = admin_inspector_renders(&tree);
     assert_eq!(
         rendered,
@@ -129,12 +131,14 @@ fn cdc_4_4_hitl_approver_set_admits_only_members() {
             grant("issue:PROJ-1", "lead", "p:carol"),
         ],
     );
-    let tree = svc.list_subjects_in(
-        &s,
-        &ObjectId("issue:PROJ-1".into()),
-        &Permission("approve".into()),
-        &at_latest(),
-    );
+    let tree = svc
+        .list_subjects_in(
+            &s,
+            &ObjectId("issue:PROJ-1".into()),
+            &Permission("approve".into()),
+            &at_latest(),
+        )
+        .expect("read HITL approver relationships");
     assert!(
         hitl_approver_set_admits(&tree, "p:alice"),
         "an approver may approve (in the approver set)"
@@ -154,13 +158,15 @@ fn cdc_4_4_explain_trace_is_non_empty_and_correct() {
     let s = scope("acme");
     let svc = provider(&s, &[grant("issue:PROJ-1", "approver", "p:alice")]);
 
-    let allow_trace = svc.explain_in(
-        &s,
-        &PrincipalId("p:alice".into()),
-        &Permission("approve".into()),
-        &ObjectId("issue:PROJ-1".into()),
-        &at_latest(),
-    );
+    let allow_trace = svc
+        .explain_in(
+            &s,
+            &PrincipalId("p:alice".into()),
+            &Permission("approve".into()),
+            &ObjectId("issue:PROJ-1".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the allow explanation");
     let rendered = inspector_renders_trace(&allow_trace);
     assert!(
         !rendered.is_empty(),
@@ -171,13 +177,15 @@ fn cdc_4_4_explain_trace_is_non_empty_and_correct() {
         "an approver's trace ends in ALLOW: {rendered:?}"
     );
 
-    let deny_trace = svc.explain_in(
-        &s,
-        &PrincipalId("p:mallory".into()),
-        &Permission("approve".into()),
-        &ObjectId("issue:PROJ-1".into()),
-        &at_latest(),
-    );
+    let deny_trace = svc
+        .explain_in(
+            &s,
+            &PrincipalId("p:mallory".into()),
+            &Permission("approve".into()),
+            &ObjectId("issue:PROJ-1".into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the deny explanation");
     assert!(
         deny_trace.steps.last().unwrap().starts_with("DENY"),
         "a non-approver's trace ends in DENY (never a silent allow): {:?}",
@@ -197,7 +205,9 @@ fn cdc_4_4_notif_read_fanout_flattens_the_watcher_set() {
             grant("issue:PROJ-2", WATCHER_RELATION, "p:dave"),
         ],
     );
-    let tree = svc.list_watchers_in(&s, &ObjectId("issue:PROJ-1".into()), &at_latest());
+    let tree = svc
+        .list_watchers_in(&s, &ObjectId("issue:PROJ-1".into()), &at_latest())
+        .expect("read issue watcher relationships");
     assert_eq!(
         tree.relation,
         RelName(WATCHER_RELATION.into()),
@@ -216,12 +226,14 @@ fn cdc_4_4_no_cross_tenant_membership() {
     let acme = scope("acme");
     let svc = provider(&acme, &[grant("issue:PROJ-1", "approver", "p:alice")]);
     let globex = scope("globex");
-    let tree = svc.list_subjects_in(
-        &globex,
-        &ObjectId("issue:PROJ-1".into()),
-        &Permission("approve".into()),
-        &at_latest(),
-    );
+    let tree = svc
+        .list_subjects_in(
+            &globex,
+            &ObjectId("issue:PROJ-1".into()),
+            &Permission("approve".into()),
+            &at_latest(),
+        )
+        .expect("read the other tenant's relationship partition");
     assert!(
         admin_inspector_renders(&tree).is_empty(),
         "0 cross-tenant approvers - a globex inspector sees none of acme's membership"

@@ -1,4 +1,4 @@
-use crate::check_engine::CheckEngine;
+use crate::check_engine::{CheckEngine, CheckSnapshot};
 use crate::namespace::{NamespaceEngine, Userset};
 use crate::reverse_index::ReverseIndex;
 use crate::tuple_store::TupleStore;
@@ -33,24 +33,25 @@ impl Expand {
         object_type: &ObjectType,
         permission: &Permission,
         at: &Consistency,
-    ) -> SubjectTree {
+    ) -> myelin_identity::Result<SubjectTree> {
+        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
         let mut members: BTreeSet<String> = BTreeSet::new();
         self.expand_into(
             scope,
+            &snapshot,
             &object.0,
             object_type,
             &permission.0,
-            at,
             0,
             &mut members,
             &mut Vec::new(),
         );
-        SubjectTree {
+        Ok(SubjectTree {
             object: object.clone(),
             relation: RelName(permission.0.clone()),
             members: members.into_iter().map(PrincipalId).collect(),
             zookie: self.read_zookie(scope, at),
-        }
+        })
     }
 
     pub fn explain(
@@ -61,7 +62,8 @@ impl Expand {
         object_type: &ObjectType,
         permission: &Permission,
         at: &Consistency,
-    ) -> RewriteTrace {
+    ) -> myelin_identity::Result<RewriteTrace> {
+        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
         let mut steps: Vec<String> = Vec::new();
         steps.push(format!(
             "expand {}#{} for subject {} @ {}",
@@ -73,10 +75,10 @@ impl Expand {
         let mut members: BTreeSet<String> = BTreeSet::new();
         self.expand_into(
             scope,
+            &snapshot,
             &object.0,
             object_type,
             &permission.0,
-            at,
             0,
             &mut members,
             &mut steps,
@@ -89,7 +91,7 @@ impl Expand {
             if granted { "is" } else { "is NOT" },
             members.len()
         ));
-        RewriteTrace { steps }
+        Ok(RewriteTrace { steps })
     }
 
     fn read_zookie(&self, scope: &TenantScope, at: &Consistency) -> Zookie {
@@ -104,10 +106,10 @@ impl Expand {
     fn expand_into(
         &self,
         scope: &TenantScope,
+        snapshot: &CheckSnapshot,
         object_id: &str,
         object_type: &ObjectType,
         permission: &str,
-        at: &Consistency,
         depth: usize,
         members: &mut BTreeSet<String>,
         trace: &mut Vec<String>,
@@ -138,9 +140,9 @@ impl Expand {
                 }
                 self.expand_userset(
                     scope,
+                    snapshot,
                     object_id,
                     object_type,
-                    at,
                     &rewrite,
                     depth,
                     members,
@@ -150,10 +152,10 @@ impl Expand {
             None => {
                 self.expand_direct_relation(
                     scope,
+                    snapshot,
                     object_id,
                     object_type,
                     permission,
-                    at,
                     depth,
                     members,
                     trace,
@@ -166,9 +168,9 @@ impl Expand {
     fn expand_userset(
         &self,
         scope: &TenantScope,
+        snapshot: &CheckSnapshot,
         object_id: &str,
         object_type: &ObjectType,
-        at: &Consistency,
         rewrite: &Userset,
         depth: usize,
         members: &mut BTreeSet<String>,
@@ -181,10 +183,10 @@ impl Expand {
             Userset::Relation(r) => {
                 self.expand_direct_relation(
                     scope,
+                    snapshot,
                     object_id,
                     object_type,
                     &r.0,
-                    at,
                     depth,
                     members,
                     trace,
@@ -197,9 +199,9 @@ impl Expand {
                 for arm in arms {
                     self.expand_userset(
                         scope,
+                        snapshot,
                         object_id,
                         object_type,
-                        at,
                         arm,
                         depth + 1,
                         members,
@@ -220,9 +222,9 @@ impl Expand {
                     let mut arm_set: BTreeSet<String> = BTreeSet::new();
                     self.expand_userset(
                         scope,
+                        snapshot,
                         object_id,
                         object_type,
-                        at,
                         arm,
                         depth + 1,
                         &mut arm_set,
@@ -244,9 +246,9 @@ impl Expand {
                 let mut base_set: BTreeSet<String> = BTreeSet::new();
                 self.expand_userset(
                     scope,
+                    snapshot,
                     object_id,
                     object_type,
-                    at,
                     base,
                     depth + 1,
                     &mut base_set,
@@ -255,9 +257,9 @@ impl Expand {
                 let mut sub_set: BTreeSet<String> = BTreeSet::new();
                 self.expand_userset(
                     scope,
+                    snapshot,
                     object_id,
                     object_type,
-                    at,
                     subtracted,
                     depth + 1,
                     &mut sub_set,
@@ -273,19 +275,17 @@ impl Expand {
                     ));
                 }
                 let object_ref = ArtifactRef(object_id.to_string());
-                let parents = self
-                    .engine
-                    .direct_subjects(scope, &object_ref, tupleset, at);
+                let parents = snapshot.direct_subjects(&object_ref, tupleset);
                 for parent_subject in parents {
                     match crate::check_engine::parse_userset(&parent_subject) {
                         Some((parent_id, parent_rel)) if parent_rel == computed.0 => {
                             let parent_type = ObjectType(type_of_object_id(parent_id));
                             self.expand_into(
                                 scope,
+                                snapshot,
                                 parent_id,
                                 &parent_type,
                                 &computed.0,
-                                at,
                                 depth + 1,
                                 members,
                                 trace,
@@ -306,10 +306,10 @@ impl Expand {
     fn expand_direct_relation(
         &self,
         scope: &TenantScope,
+        snapshot: &CheckSnapshot,
         object_id: &str,
         object_type: &ObjectType,
         relation: &str,
-        at: &Consistency,
         depth: usize,
         members: &mut BTreeSet<String>,
         trace: &mut Vec<String>,
@@ -326,13 +326,22 @@ impl Expand {
         }
 
         let object_ref = ArtifactRef(object_id.to_string());
-        let snapshot_subjects = self.engine.direct_subjects(scope, &object_ref, &rel, at);
+        let snapshot_subjects = snapshot.direct_subjects(&object_ref, &rel);
         let mut userset_count = 0usize;
         for s in snapshot_subjects {
             if let Some((obj2, rel2)) = crate::check_engine::parse_userset(&s) {
                 userset_count += 1;
                 let obj2_type = ObjectType(type_of_object_id(obj2));
-                self.expand_into(scope, obj2, &obj2_type, rel2, at, depth + 1, members, trace);
+                self.expand_into(
+                    scope,
+                    snapshot,
+                    obj2,
+                    &obj2_type,
+                    rel2,
+                    depth + 1,
+                    members,
+                    trace,
+                );
             }
         }
 
@@ -470,13 +479,15 @@ mod tests {
             ],
         );
         let expand = Expand::new(store, ns, index);
-        let tree = expand.list_subjects(
-            &s,
-            &ObjectId("channel:general".into()),
-            &ObjectType("channel".into()),
-            &Permission("watcher".into()),
-            &latest(),
-        );
+        let tree = expand
+            .list_subjects(
+                &s,
+                &ObjectId("channel:general".into()),
+                &ObjectType("channel".into()),
+                &Permission("watcher".into()),
+                &latest(),
+            )
+            .expect("read channel watcher relationships");
         let got: Vec<String> = tree.members.iter().map(|m| m.0.clone()).collect();
         assert_eq!(
             got,
@@ -500,13 +511,15 @@ mod tests {
             ],
         );
         let expand = Expand::new(store, ns, index);
-        let tree = expand.list_subjects(
-            &s,
-            &ObjectId("project:web".into()),
-            &ObjectType("project".into()),
-            &Permission("view".into()),
-            &latest(),
-        );
+        let tree = expand
+            .list_subjects(
+                &s,
+                &ObjectId("project:web".into()),
+                &ObjectType("project".into()),
+                &Permission("view".into()),
+                &latest(),
+            )
+            .expect("read inherited project relationships");
         let got: BTreeSet<String> = tree.members.iter().map(|m| m.0.clone()).collect();
         assert!(
             got.contains("p:reader"),
@@ -565,13 +578,15 @@ mod tests {
             consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
         let expand = Expand::new(store, ns, index);
-        let tree = expand.list_subjects(
-            &s,
-            &ObjectId("doc:1".into()),
-            &ObjectType("doc".into()),
-            &Permission("view".into()),
-            &latest(),
-        );
+        let tree = expand
+            .list_subjects(
+                &s,
+                &ObjectId("doc:1".into()),
+                &ObjectType("doc".into()),
+                &Permission("view".into()),
+                &latest(),
+            )
+            .expect("read document relationships");
         let got: BTreeSet<String> = tree.members.iter().map(|m| m.0.clone()).collect();
         assert!(
             got.contains("p:alice"),
@@ -594,14 +609,16 @@ mod tests {
             ],
         );
         let expand = Expand::new(store, ns, index);
-        let trace = expand.explain(
-            &s,
-            &PrincipalId("p:alice".into()),
-            &ObjectId("project:web".into()),
-            &ObjectType("project".into()),
-            &Permission("view".into()),
-            &latest(),
-        );
+        let trace = expand
+            .explain(
+                &s,
+                &PrincipalId("p:alice".into()),
+                &ObjectId("project:web".into()),
+                &ObjectType("project".into()),
+                &Permission("view".into()),
+                &latest(),
+            )
+            .expect("read relationships for the allow explanation");
         assert!(!trace.steps.is_empty(), "the trace is non-empty");
         assert!(
             trace.steps.last().unwrap().starts_with("ALLOW"),
@@ -629,14 +646,16 @@ mod tests {
             ],
         );
         let expand = Expand::new(store, ns, index);
-        let trace = expand.explain(
-            &s,
-            &PrincipalId("p:bob".into()),
-            &ObjectId("project:web".into()),
-            &ObjectType("project".into()),
-            &Permission("view".into()),
-            &latest(),
-        );
+        let trace = expand
+            .explain(
+                &s,
+                &PrincipalId("p:bob".into()),
+                &ObjectId("project:web".into()),
+                &ObjectType("project".into()),
+                &Permission("view".into()),
+                &latest(),
+            )
+            .expect("read relationships for the deny explanation");
         assert!(!trace.steps.is_empty(), "the deny trace is non-empty");
         assert!(
             trace.steps.last().unwrap().starts_with("DENY"),
@@ -646,18 +665,57 @@ mod tests {
     }
 
     #[test]
+    fn relationship_outage_is_neither_an_empty_subject_set_nor_a_deny_explanation() {
+        let s = scope("acme");
+        let store = TupleStore::new(OutboxStore::new())
+            .with_unavailable_reads("relationship database is offline");
+        let expand = Expand::new(
+            store,
+            NamespaceEngine::with_core_hierarchy(),
+            ReverseIndex::new(),
+        );
+        let object = ObjectId("project:web".into());
+        let object_type = ObjectType("project".into());
+        let permission = Permission("view".into());
+
+        let subjects = expand.list_subjects(&s, &object, &object_type, &permission, &latest());
+        let explanation = expand.explain(
+            &s,
+            &PrincipalId("p:alice".into()),
+            &object,
+            &object_type,
+            &permission,
+            &latest(),
+        );
+
+        assert!(
+            matches!(subjects, Err(myelin_identity::AuthzError::Unavailable(_))),
+            "an unavailable relationship snapshot is not an empty subject set"
+        );
+        assert!(
+            matches!(
+                explanation,
+                Err(myelin_identity::AuthzError::Unavailable(_))
+            ),
+            "an unavailable relationship snapshot cannot fabricate a DENY explanation"
+        );
+    }
+
+    #[test]
     fn no_cross_tenant_list_subjects() {
         let acme = scope("acme");
         let (store, index, ns) = seed(&acme, &[add("channel:general", "watcher", "p:alice")]);
         let expand = Expand::new(store, ns, index);
         let globex = scope("globex");
-        let tree = expand.list_subjects(
-            &globex,
-            &ObjectId("channel:general".into()),
-            &ObjectType("channel".into()),
-            &Permission("watcher".into()),
-            &latest(),
-        );
+        let tree = expand
+            .list_subjects(
+                &globex,
+                &ObjectId("channel:general".into()),
+                &ObjectType("channel".into()),
+                &Permission("watcher".into()),
+                &latest(),
+            )
+            .expect("read the other tenant's relationship partition");
         assert!(
             tree.members.is_empty(),
             "an acme channel's watchers are invisible to a globex expand (0 cross-tenant subjects)"
@@ -679,13 +737,15 @@ mod tests {
         deltas.push(add(&format!("project:level_{n}"), "reader", "p:deep"));
         let (store, index, ns) = seed(&s, &deltas);
         let expand = Expand::new(store, ns, index);
-        let tree = expand.list_subjects(
-            &s,
-            &ObjectId("project:level_0".into()),
-            &ObjectType("project".into()),
-            &Permission("view".into()),
-            &latest(),
-        );
+        let tree = expand
+            .list_subjects(
+                &s,
+                &ObjectId("project:level_0".into()),
+                &ObjectType("project".into()),
+                &Permission("view".into()),
+                &latest(),
+            )
+            .expect("read the depth-bounded relationship graph");
         assert!(
             !tree.members.iter().any(|m| m.0 == "p:deep"),
             "a member beyond the depth bound is NOT expanded (fail-closed, never an unbounded scan)"
@@ -703,13 +763,15 @@ mod tests {
             ],
         );
         let expand = Expand::new(store, ns, index);
-        let tree = expand.list_subjects(
-            &s,
-            &ObjectId("project:web".into()),
-            &ObjectType("project".into()),
-            &Permission("view".into()),
-            &latest(),
-        );
+        let tree = expand
+            .list_subjects(
+                &s,
+                &ObjectId("project:web".into()),
+                &ObjectType("project".into()),
+                &Permission("view".into()),
+                &latest(),
+            )
+            .expect("read the mismatched inheritance relationship graph");
         assert!(
             !tree.members.iter().any(|m| m.0 == "p:teammember"),
             "an inheritance edge whose computed relation (member) ≠ the rewrite's (view) is NOT \
@@ -729,14 +791,16 @@ mod tests {
             ],
         );
         let expand = Expand::new(store, ns, index);
-        let trace = expand.explain(
-            &s,
-            &PrincipalId("p:alice".into()),
-            &ObjectId("project:web".into()),
-            &ObjectType("project".into()),
-            &Permission("view".into()),
-            &latest(),
-        );
+        let trace = expand
+            .explain(
+                &s,
+                &PrincipalId("p:alice".into()),
+                &ObjectId("project:web".into()),
+                &ObjectType("project".into()),
+                &Permission("view".into()),
+                &latest(),
+            )
+            .expect("read relationships for the operator trace");
         let joined = trace.steps.join("\n");
         assert!(
             joined.contains("union of"),
@@ -776,13 +840,15 @@ mod tests {
         let expand = Expand::new(store, NamespaceEngine::with_core_hierarchy(), index);
 
         let start = Instant::now();
-        let tree = expand.list_subjects(
-            &s,
-            &ObjectId("channel:huge".into()),
-            &ObjectType("channel".into()),
-            &Permission("watcher".into()),
-            &latest(),
-        );
+        let tree = expand
+            .list_subjects(
+                &s,
+                &ObjectId("channel:huge".into()),
+                &ObjectType("channel".into()),
+                &Permission("watcher".into()),
+                &latest(),
+            )
+            .expect("read the high-density watcher relationships");
         let elapsed_ms = start.elapsed().as_millis();
 
         assert_eq!(

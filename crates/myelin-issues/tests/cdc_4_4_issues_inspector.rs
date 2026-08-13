@@ -91,6 +91,7 @@ impl PermissionResolver for IdentityExpandResolver {
     ) -> SubjectTree {
         self.svc
             .list_subjects_in(&self.scope, object, permission, at)
+            .expect("read relationships for the inspector test adapter")
     }
 
     fn explain(
@@ -102,6 +103,7 @@ impl PermissionResolver for IdentityExpandResolver {
     ) -> RewriteTrace {
         self.svc
             .explain_in(&self.scope, subject, permission, object, at)
+            .expect("read relationships for the inspector explanation adapter")
     }
 }
 
@@ -121,7 +123,9 @@ fn cdc_4_4_inspector_membership_equals_list_subjects() {
     let perm = Permission("approve".into());
     let at = at_latest();
 
-    let tree = svc.list_subjects_in(&s, &object, &perm, &at);
+    let tree = svc
+        .list_subjects_in(&s, &object, &perm, &at)
+        .expect("read issue approval relationships");
 
     let inspector = PermissionInspector::new(IdentityExpandResolver {
         svc,
@@ -163,8 +167,12 @@ fn cdc_4_4_inspector_why_equals_explain() {
     let alice = PrincipalId("p:alice".into());
     let mallory = PrincipalId("p:mallory".into());
 
-    let provider_allow = svc.explain_in(&s, &alice, &perm, &object, &at);
-    let provider_deny = svc.explain_in(&s, &mallory, &perm, &object, &at);
+    let provider_allow = svc
+        .explain_in(&s, &alice, &perm, &object, &at)
+        .expect("read relationships for the allow explanation");
+    let provider_deny = svc
+        .explain_in(&s, &mallory, &perm, &object, &at)
+        .expect("read relationships for the deny explanation");
 
     let inspector = PermissionInspector::new(IdentityExpandResolver {
         svc,

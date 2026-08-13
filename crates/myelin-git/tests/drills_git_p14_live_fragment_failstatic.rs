@@ -69,9 +69,8 @@ impl IdentityService for BreakableId {
                 "forced Id break (drill)".into(),
             ));
         }
-        Ok(self
-            .inner
-            .list_subjects_in(&self.scope, object, permission, at))
+        self.inner
+            .list_subjects_in(&self.scope, object, permission, at)
     }
     fn explain(
         &self,

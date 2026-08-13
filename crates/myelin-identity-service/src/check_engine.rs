@@ -37,18 +37,6 @@ impl CheckEngine {
         snapshot.check(subject, permission, object, caveat)
     }
 
-    pub fn direct_subjects(
-        &self,
-        scope: &TenantScope,
-        object: &ArtifactRef,
-        relation: &RelName,
-        at: &Consistency,
-    ) -> Vec<String> {
-        self.snapshot(scope, &at.at_least)
-            .map(|snapshot| snapshot.direct_subjects(object, relation))
-            .unwrap_or_default()
-    }
-
     pub(crate) fn snapshot(
         &self,
         scope: &TenantScope,

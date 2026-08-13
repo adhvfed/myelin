@@ -206,7 +206,9 @@ fn cdc_4_9_codeowners_glob_compiles_to_resolvable_reviewer_tuples() {
     let svc = provider(&s, &deltas);
 
     let ref_obj = ObjectId("ref:repo:core::/src/payments/**".into());
-    let owners = svc.list_subjects_in(&s, &ref_obj, &Permission("code_owner".into()), &at_latest());
+    let owners = svc
+        .list_subjects_in(&s, &ref_obj, &Permission("code_owner".into()), &at_latest())
+        .expect("read code-owner relationships");
     let members: Vec<&str> = owners.members.iter().map(|m| m.0.as_str()).collect();
     assert!(
         members.contains(&"p:alice"),

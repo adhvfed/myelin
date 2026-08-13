@@ -93,6 +93,7 @@ impl WatcherDirectory for EngineWatchers {
                 &Permission(myelin_chat::WATCHER_RELATION.into()),
                 at,
             )
+            .expect("read channel watcher relationships")
             .members
     }
 }

@@ -930,7 +930,7 @@ impl StoreBackedCheck {
         object: &myelin_identity::ObjectId,
         permission: &Permission,
         at: &Consistency,
-    ) -> myelin_identity::SubjectTree {
+    ) -> myelin_identity::Result<myelin_identity::SubjectTree> {
         let namespace = self
             .namespace
             .lock()
@@ -946,7 +946,7 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         object: &myelin_identity::ObjectId,
         at: &Consistency,
-    ) -> myelin_identity::SubjectTree {
+    ) -> myelin_identity::Result<myelin_identity::SubjectTree> {
         self.list_subjects_in(scope, object, &Permission(WATCHER_RELATION.to_string()), at)
     }
 
@@ -957,7 +957,7 @@ impl StoreBackedCheck {
         permission: &Permission,
         object: &myelin_identity::ObjectId,
         at: &Consistency,
-    ) -> myelin_identity::RewriteTrace {
+    ) -> myelin_identity::Result<myelin_identity::RewriteTrace> {
         let namespace = self
             .namespace
             .lock()

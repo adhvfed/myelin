@@ -243,7 +243,9 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
         leaks += 1;
     }
 
-    let watchers = id.list_watchers_in(&s, &ObjectId("channel:general".into()), &at_latest());
+    let watchers = id
+        .list_watchers_in(&s, &ObjectId("channel:general".into()), &at_latest())
+        .expect("read channel watcher relationships");
     let watcher_ids: Vec<String> = watchers.members.iter().map(|m| m.0.clone()).collect();
     assert_eq!(
         watchers.relation,

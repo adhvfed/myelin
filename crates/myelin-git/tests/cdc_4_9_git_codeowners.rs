@@ -132,7 +132,9 @@ fn cdc_4_9_codeowners_resolves_zero_mis_resolved_via_list_subjects() {
         );
 
         let ref_obj = ObjectId(format!("ref:{REPO_ID}::{expected_glob}"));
-        let tree = svc.list_subjects_in(&s, &ref_obj, &code_owner, &at_latest());
+        let tree = svc
+            .list_subjects_in(&s, &ref_obj, &code_owner, &at_latest())
+            .expect("read code-owner relationships");
         assert_eq!(
             tree.relation,
             RelName(git_fragment::CODE_OWNER.into()),
@@ -163,12 +165,14 @@ fn cdc_4_9_unowned_path_requires_no_codeowner() {
     );
 
     let other = ObjectId(format!("ref:{REPO_ID}::*"));
-    let tree = svc.list_subjects_in(
-        &s,
-        &other,
-        &Permission(git_fragment::CODE_OWNER.into()),
-        &at_latest(),
-    );
+    let tree = svc
+        .list_subjects_in(
+            &s,
+            &other,
+            &Permission(git_fragment::CODE_OWNER.into()),
+            &at_latest(),
+        )
+        .expect("read relationships for the unowned path");
     assert!(
         tree.members.is_empty(),
         "no code_owner tuple on a glob the unowned path matches (no spurious requirement)"

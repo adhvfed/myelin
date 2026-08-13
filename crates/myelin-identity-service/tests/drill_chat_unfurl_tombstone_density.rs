@@ -261,7 +261,9 @@ fn chat_list_subjects_watcher_50k_density_within_budget() {
     }
 
     let started = std::time::Instant::now();
-    let watchers = svc.list_watchers_in(&acme, &ObjectId("channel:wide".into()), &at_latest());
+    let watchers = svc
+        .list_watchers_in(&acme, &ObjectId("channel:wide".into()), &at_latest())
+        .expect("read channel watcher relationships");
     let elapsed = started.elapsed();
 
     assert_eq!(
