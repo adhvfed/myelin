@@ -38,12 +38,25 @@ ALTER TABLE agent_hitl_gate
   ADD COLUMN IF NOT EXISTS expires_at_unix bigint NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS approval_consumed_at_unix bigint;";
 
+pub const AGENT_HITL_GATE_VALUE_INVARIANTS_MIGRATION: &str = "\
+ALTER TABLE agent_hitl_gate
+  DROP CONSTRAINT IF EXISTS agent_hitl_gate_cost_estimate_nonnegative;
+ALTER TABLE agent_hitl_gate
+  ADD CONSTRAINT agent_hitl_gate_cost_estimate_nonnegative
+  CHECK (cost_estimate >= 0) NOT VALID;
+ALTER TABLE agent_hitl_gate
+  VALIDATE CONSTRAINT agent_hitl_gate_cost_estimate_nonnegative;";
+
 pub fn hitl_gate_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0054_agent_hitl_gate", AGENT_HITL_GATE_MIGRATION),
         Migration::plain(
             "0055_agent_hitl_gate_lifetime",
             AGENT_HITL_GATE_LIFETIME_MIGRATION,
+        ),
+        Migration::plain(
+            "0056_agent_hitl_gate_value_invariants",
+            AGENT_HITL_GATE_VALUE_INVARIANTS_MIGRATION,
         ),
     ])
 }
@@ -183,6 +196,7 @@ impl GateRecord {
 pub enum GateOpenError {
     Duplicate,
     NotWaiting,
+    CostOutOfRange,
 }
 
 impl core::fmt::Display for GateOpenError {
@@ -192,6 +206,9 @@ impl core::fmt::Display for GateOpenError {
                 write!(f, "agent_hitl_gate row already exists for this gate_id")
             }
             GateOpenError::NotWaiting => write!(f, "a gate must open in the waiting state"),
+            GateOpenError::CostOutOfRange => {
+                write!(f, "a gate cost estimate must fit PostgreSQL bigint")
+            }
         }
     }
 }
@@ -298,6 +315,9 @@ impl HitlVerdictStore {
     pub fn open(&mut self, scope: &TenantScope, record: GateRecord) -> Result<(), GateOpenError> {
         if record.state != GateState::Waiting {
             return Err(GateOpenError::NotWaiting);
+        }
+        if !crate::money::MicroUsd(record.cost_estimate).fits_bigint() {
+            return Err(GateOpenError::CostOutOfRange);
         }
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -995,6 +1015,9 @@ impl DurableHitlGates {
     fn open(&self, scope: &TenantScope, record: GateRecord) -> Result<(), GateOpenError> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
+        let cost_estimate = crate::money::MicroUsd(record.cost_estimate)
+            .to_bigint()
+            .expect("HitlVerdictStore validates gate costs before durable storage");
         self.block(self.provider.with_tenant_tx(&scope.tenant().0, move |conn| {
             Box::pin(async move {
                 let exists: bool = sqlx::query_scalar(
@@ -1023,7 +1046,7 @@ impl DurableHitlGates {
                 .bind(&record.run_id)
                 .bind(&record.effect_id)
                 .bind(&record.risk_summary)
-                .bind(record.cost_estimate as i64)
+                .bind(cost_estimate)
                 .bind(&record.approver_filter)
                 .bind(GateState::Waiting.as_str())
                 .bind(&record.card_ref)
@@ -1394,9 +1417,10 @@ fn row_to_record(
             .try_get::<Option<Vec<u8>>, _>("risk_summary")
             .map_err(hitl_row_decode)?
             .unwrap_or_default(),
-        cost_estimate: row
-            .try_get::<i64, _>("cost_estimate")
-            .map_err(hitl_row_decode)? as u64,
+        cost_estimate: gate_cost_from_bigint(
+            row.try_get::<i64, _>("cost_estimate")
+                .map_err(hitl_row_decode)?,
+        )?,
         approver_filter: row.try_get("approver_filter").map_err(hitl_row_decode)?,
         state,
         card_ref: row
@@ -1419,6 +1443,14 @@ fn row_to_record(
 
 fn hitl_row_decode(error: sqlx::Error) -> crate::pg::PgError {
     crate::pg::PgError::Query(format!("agent_hitl_gate row decode failed: {error}"))
+}
+
+fn gate_cost_from_bigint(value: i64) -> Result<u64, crate::pg::PgError> {
+    crate::money::MicroUsd::from_bigint(value)
+        .map(|cost| cost.0)
+        .ok_or_else(|| {
+            crate::pg::PgError::Query("agent_hitl_gate has a negative cost estimate".into())
+        })
 }
 
 #[cfg(test)]
@@ -1484,6 +1516,22 @@ mod tests {
             "agent_hitl_gate row has an invalid state"
         );
         assert!(!error.to_string().contains("attacker-controlled-state"));
+    }
+
+    #[test]
+    fn gate_costs_never_wrap_across_the_bigint_boundary() {
+        assert_eq!(gate_cost_from_bigint(i64::MAX).unwrap(), i64::MAX as u64);
+        assert!(gate_cost_from_bigint(-1).is_err());
+
+        let mut store = HitlVerdictStore::new();
+        let mut gate = waiting("gate:too-expensive");
+        gate.cost_estimate = i64::MAX as u64 + 1;
+        assert_eq!(
+            store.open(&scope(), gate),
+            Err(GateOpenError::CostOutOfRange),
+            "an unsigned estimate cannot wrap into a negative PostgreSQL bigint"
+        );
+        assert!(store.fetch(&scope(), "gate:too-expensive").is_none());
     }
 
     #[test]
@@ -1901,9 +1949,10 @@ mod tests {
     #[test]
     fn migration_0054_carries_the_gate_shape_and_rls() {
         let m = hitl_gate_durable_migrations();
-        assert_eq!(m.0.len(), 2);
+        assert_eq!(m.0.len(), 3);
         assert_eq!(m.0[0].id, "0054_agent_hitl_gate");
         assert_eq!(m.0[1].id, "0055_agent_hitl_gate_lifetime");
+        assert_eq!(m.0[2].id, "0056_agent_hitl_gate_value_invariants");
         for col in [
             "gate_id",
             "run_id",
@@ -1936,5 +1985,9 @@ mod tests {
             assert!(AGENT_HITL_GATE_LIFETIME_MIGRATION.contains(column));
             assert!(!AGENT_HITL_GATE_MIGRATION.contains(column));
         }
+        assert!(AGENT_HITL_GATE_VALUE_INVARIANTS_MIGRATION
+            .contains("CHECK (cost_estimate >= 0) NOT VALID"));
+        assert!(AGENT_HITL_GATE_VALUE_INVARIANTS_MIGRATION
+            .contains("VALIDATE CONSTRAINT agent_hitl_gate_cost_estimate_nonnegative"));
     }
 }

@@ -3,8 +3,8 @@
 use myelin_config::MyelinConfig;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::hitl_gate_durable::{
-    hitl_gate_durable_migrations, DurableHitlGateBacking, GateDecideError, GateRecord, GateState,
-    HitlVerdictStore,
+    hitl_gate_durable_migrations, DurableHitlGateBacking, GateDecideError, GateOpenError,
+    GateRecord, GateState, HitlVerdictStore,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{SubstrateProvider, TenantScope};
@@ -85,10 +85,43 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     let tenant = format!("r24-hitl-{suffix}");
     let scope = scope_for(&tenant, &region);
 
+    let negative_gate = format!("gate:{suffix}-negative");
+    let negative_insert = sqlx::query(
+        "INSERT INTO agent_hitl_gate \
+           (tenant_id, region, gate_id, run_id, effect_id, risk_summary, cost_estimate, \
+            approver_filter, state, requested_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, -1, $7, 'waiting', $8)",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .bind(&negative_gate)
+    .bind(format!("run-{suffix}-negative"))
+    .bind("gate:git.merge:myelin://acme/git/pr/negative")
+    .bind(Vec::<u8>::new())
+    .bind(vec!["psn:lead"])
+    .bind("agent:claude")
+    .execute(admin.db_pool())
+    .await
+    .expect_err("the database rejects a negative approval cost");
+    assert!(
+        negative_insert
+            .as_database_error()
+            .and_then(|error| error.constraint())
+            .is_some_and(|name| name == "agent_hitl_gate_cost_estimate_nonnegative"),
+        "the named cost invariant rejected the corrupt row: {negative_insert}"
+    );
+
     let gate_id = format!("gate:{suffix}");
     let effect = "gate:git.merge:myelin://acme/git/pr/40";
 
     let mut store1 = HitlVerdictStore::with_pg(app.clone());
+    let mut oversized = waiting(&suffix, &format!("gate:{suffix}-oversized"), effect);
+    oversized.cost_estimate = i64::MAX as u64 + 1;
+    assert_eq!(
+        store1.open(&scope, oversized),
+        Err(GateOpenError::CostOutOfRange),
+        "the application refuses an estimate that PostgreSQL cannot represent"
+    );
     store1
         .open(&scope, waiting(&suffix, &gate_id, effect))
         .expect("the pending gate row INSERTs");
