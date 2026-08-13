@@ -43,7 +43,9 @@ fed start
 
 Fed prints the allocated web and edge URLs when the stack is ready. Use `fed ports list`
 to inspect the checkout's allocations at any time; ports are deliberately assigned by Fed
-rather than fixed in application documentation.
+rather than fixed in application documentation. Each service accepts
+`MYELIN_DATABASE_MAX_CONNECTIONS` as a positive per-process Postgres pool budget; the Fed stack
+sets a deliberately smaller budget because its services share one local database.
 
 The test entry points have separate responsibilities:
 

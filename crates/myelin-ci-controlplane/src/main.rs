@@ -1,9 +1,7 @@
 use myelin_ci_controlplane::run_controlplane_until_shutdown;
 use myelin_config::{Mode, MyelinConfig};
 use myelin_events::OutboxStore;
-use myelin_storage::{
-    all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking, DEFAULT_MAX_CONNECTIONS,
-};
+use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
 use std::ffi::OsString;
 use std::fmt;
@@ -406,7 +404,7 @@ async fn run(runner_host_requested: bool) {
                 std::process::exit(1);
             }
         };
-    let bootstrap = match PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS).await {
+    let bootstrap = match PgBootstrap::connect_configured(platform_config).await {
         Ok(bootstrap) => bootstrap,
         Err(e) => {
             eprintln!("ci-controlplane: database bootstrap refused to start: {e}");

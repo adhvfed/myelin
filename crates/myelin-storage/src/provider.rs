@@ -11,6 +11,36 @@ use crate::tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
 
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 32;
 
+pub const DATABASE_MAX_CONNECTIONS_ENV: &str = "MYELIN_DATABASE_MAX_CONNECTIONS";
+
+fn configured_database_max_connections() -> Result<u32, ConfigError> {
+    match std::env::var(DATABASE_MAX_CONNECTIONS_ENV) {
+        Ok(value) => parse_database_max_connections(&value),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_CONNECTIONS),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::Invalid {
+            var: DATABASE_MAX_CONNECTIONS_ENV,
+            reason: "must be valid UTF-8".into(),
+        }),
+    }
+}
+
+fn parse_database_max_connections(value: &str) -> Result<u32, ConfigError> {
+    let parsed = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| ConfigError::Invalid {
+            var: DATABASE_MAX_CONNECTIONS_ENV,
+            reason: "must be a positive integer".into(),
+        })?;
+    if parsed == 0 {
+        return Err(ConfigError::Invalid {
+            var: DATABASE_MAX_CONNECTIONS_ENV,
+            reason: "must be greater than zero".into(),
+        });
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug)]
 pub enum ProviderError {
     Config(ConfigError),
@@ -435,7 +465,11 @@ type IndexReadinessRow = (
 
 impl PgBootstrap {
     pub async fn from_env(mode: Mode) -> Result<PgBootstrap, ProviderError> {
-        Self::connect(MyelinConfig::from_env(mode)?, DEFAULT_MAX_CONNECTIONS).await
+        Self::connect_configured(MyelinConfig::from_env(mode)?).await
+    }
+
+    pub async fn connect_configured(config: MyelinConfig) -> Result<PgBootstrap, ProviderError> {
+        Self::connect(config, configured_database_max_connections()?).await
     }
 
     pub async fn connect(
@@ -644,7 +678,7 @@ impl SubstrateProvider {
         let pool = connect_pool_with_reset(
             &config.database_url,
             &config.region,
-            DEFAULT_MAX_CONNECTIONS,
+            configured_database_max_connections()?,
         )
         .await?;
         Ok(SubstrateProvider {
@@ -803,6 +837,24 @@ mod boot_migrations_tests {
             assert!(
                 !agg.contains(&f),
                 "foundation id {f:?} must NOT be in the durable aggregate"
+            );
+        }
+    }
+
+    #[test]
+    fn database_pool_budget_accepts_only_positive_connection_counts() {
+        assert_eq!(parse_database_max_connections("8"), Ok(8));
+        assert_eq!(parse_database_max_connections(" 12 "), Ok(12));
+        for invalid in ["", "0", "many", "-1"] {
+            assert!(
+                matches!(
+                    parse_database_max_connections(invalid),
+                    Err(ConfigError::Invalid {
+                        var: DATABASE_MAX_CONNECTIONS_ENV,
+                        ..
+                    })
+                ),
+                "{invalid:?} must not become a database pool budget"
             );
         }
     }
