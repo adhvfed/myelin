@@ -156,7 +156,11 @@ fn apply_once(
 fn cdc_8_1_full_issues_catalogue_registers_into_the_one_surface() {
     let mut cat = Catalogue { defs: vec![] };
     let defs = register_full_issues_tools(&mut cat).expect("seeded defs admit");
-    assert_eq!(defs.len(), 12, "8 CRUD + 4 agent tools (arch §8)");
+    assert_eq!(
+        defs.len(),
+        13,
+        "the compatibility create contract remains beside 8 current CRUD and 4 advisory tools"
+    );
 
     for name in [
         "create",
@@ -331,7 +335,7 @@ fn close_is_withheld_until_approval() {
     let plan = PlannedEffect {
         tool: ToolName("close".into()),
         object: ArtifactRef("myelin://acme/issue/issue/ENG-7".into()),
-        input_json: r#"{"issue":"ENG-7","reason":"done"}"#.into(),
+        input_json: r#"{"issue_ref":"myelin://acme/issue/issue/ENG-7"}"#.into(),
         field: None,
         transition: None,
         cost: EffectCost {
@@ -361,10 +365,11 @@ fn create_applies_directly_no_gate() {
         transition_needs_approver: false,
     };
     let caps = vec!["issue.create".to_string()];
+    let project_ref = "myelin://acme/identity/project/01234567-89ab-cdef-0123-456789abcdef";
     let plan = PlannedEffect {
         tool: ToolName("create".into()),
-        object: ArtifactRef("myelin://acme/issue/project/ENG".into()),
-        input_json: r#"{"project":"ENG","title":"a bug"}"#.into(),
+        object: ArtifactRef(project_ref.into()),
+        input_json: format!(r#"{{"project_ref":"{project_ref}","title":"a bug"}}"#),
         field: None,
         transition: None,
         cost: EffectCost {

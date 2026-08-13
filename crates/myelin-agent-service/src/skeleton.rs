@@ -389,23 +389,6 @@ impl SkeletonAgent {
         SkeletonAgent
     }
 
-    pub fn resume_run(
-        &self,
-        identity: &mut crate::RunIdentity,
-        revoker: &dyn RunTokenRevoker,
-        resume_at_secs: i64,
-        telemetry: &mut SkeletonTelemetry,
-    ) -> Result<String, SkeletonError> {
-        let jti = identity
-            .remint_on_resume(resume_at_secs)
-            .map_err(|e| SkeletonError::MintFailed(e.to_string()))?
-            .jti
-            .clone();
-        let lag = identity.revoke_on_teardown(revoker, resume_at_secs, resume_at_secs);
-        telemetry.record_revoke(lag);
-        Ok(jti)
-    }
-
     pub fn handle_run(
         &self,
         runtime: &dyn MeteredRuntime,

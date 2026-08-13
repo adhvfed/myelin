@@ -19,7 +19,6 @@ pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
 pub mod hosted_run_contract;
-pub mod identity;
 pub mod issues_agents;
 pub mod issues_read_tools;
 pub mod issues_tools;
@@ -65,8 +64,6 @@ pub use tool_exec::{MockToolExecutor, MockToolSurface};
 pub use tool_exec::{ToolExecError, ToolExecutionContext, ToolExecutor};
 
 pub use cost_gate::{runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep};
-
-pub use identity::{AttributionWindow, RunIdentity, FAIL_STATIC_W_SECS};
 
 pub use mock::{
     build_conversation, model_turns_taken, replay, replay_bounded, select_runtime, HistoryEntry,
