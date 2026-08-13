@@ -10,7 +10,7 @@ use myelin_storage::reserve_settle::{
     CostLedger, MeteredUnit, MicroUsd, ReservationState, ReserveError, RunId, SettleError,
 };
 use myelin_storage::reserve_settle_durable::{
-    reserve_settle_durable_migrations, DurableCostLedger,
+    cost_ledger_value_invariant_migrations, reserve_settle_durable_migrations, DurableCostLedger,
 };
 use myelin_storage::restore_verify::{ErasureLedger, GateFailure, GateInputs, RestoreVerifyGate};
 use myelin_storage::restore_verify_durable::{
@@ -67,6 +67,13 @@ async fn migrate_admin() -> SubstrateProvider {
         .migrate(&post_pit_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the post-pit-erasure-ledger migration (0052)");
+    admin
+        .migrate(
+            &cost_ledger_value_invariant_migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("install and validate the cost-ledger value invariants (0111-0112)");
     admin
 }
 
@@ -472,6 +479,121 @@ async fn mr009b_w6b_storage_ledgers_durable() {
             .execute(admin.db_pool())
             .await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cost_ledger_never_turns_out_of_range_money_into_credit() {
+    let admin = migrate_admin().await;
+    let app = app_provider().await;
+    let suffix = uniq();
+    let tenant = TenantId(format!("01J0COSTBOUND{suffix}"));
+    let oversized_run = RunId::new(format!("oversized-reservation-{suffix}"));
+    let settlement_run = RunId::new(format!("oversized-settlement-{suffix}"));
+    let too_large_for_postgres = MicroUsd(i64::MAX as u64 + 1);
+    let ledger = DurableCostLedger::new(app);
+
+    assert_eq!(
+        ledger.reserve(
+            tenant.clone(),
+            oversized_run.clone(),
+            too_large_for_postgres,
+            too_large_for_postgres,
+        ),
+        Err(ReserveError::AmountOverflow),
+        "an unsigned amount cannot wrap into a negative durable reservation",
+    );
+    assert_eq!(
+        ledger.reservation_of(&tenant, &oversized_run),
+        Ok(None),
+        "a refused amount leaves no reservation behind",
+    );
+
+    ledger
+        .reserve(
+            tenant.clone(),
+            settlement_run.clone(),
+            MicroUsd(1_000),
+            MicroUsd(1_000),
+        )
+        .expect("reserve an ordinary run");
+    ledger
+        .begin(&tenant, &settlement_run)
+        .expect("start the ordinary run");
+    assert_eq!(
+        ledger.settle(
+            &tenant,
+            &settlement_run,
+            &[MeteredUnit {
+                unit: "llm.tokens",
+                wholesale: too_large_for_postgres,
+                markup: MicroUsd::ZERO,
+            }],
+        ),
+        Err(SettleError::AmountOverflow),
+        "an unsigned cost cannot wrap into a negative durable event",
+    );
+    assert_eq!(
+        ledger.state_of(&tenant, &settlement_run),
+        Ok(Some(ReservationState::InFlight)),
+        "a refused settlement leaves the reservation retryable",
+    );
+    assert!(
+        ledger
+            .cost_events_for(&tenant, &settlement_run)
+            .expect("read the untouched event ledger")
+            .is_empty(),
+        "validation happens before the first cost event is written",
+    );
+
+    let negative_reservation = sqlx::query(
+        "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state) \
+         VALUES ($1, $2, $3, -1, 'reserved')",
+    )
+    .bind(&tenant.0)
+    .bind(admin.config().region.as_str())
+    .bind(format!("negative-reservation-{suffix}"))
+    .execute(admin.db_pool())
+    .await;
+    assert_check_violation(
+        negative_reservation,
+        "Postgres rejects negative reservations even outside the Rust API",
+    );
+
+    let negative_event = sqlx::query(
+        "INSERT INTO cost_event \
+           (tenant_id, region, run_id, ord, unit, wholesale, markup) \
+         VALUES ($1, $2, $3, 0, 'llm.tokens', -1, 0)",
+    )
+    .bind(&tenant.0)
+    .bind(admin.config().region.as_str())
+    .bind(format!("negative-event-{suffix}"))
+    .execute(admin.db_pool())
+    .await;
+    assert_check_violation(
+        negative_event,
+        "Postgres rejects negative cost events even outside the Rust API",
+    );
+
+    for table in ["cost_event", "cost_reservation"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE tenant_id = $1"))
+            .bind(&tenant.0)
+            .execute(admin.db_pool())
+            .await
+            .expect("clean the isolated ledger story");
+    }
+}
+
+fn assert_check_violation(result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>, story: &str) {
+    let error = result.expect_err(story);
+    let sqlstate = error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .map(|code| code.into_owned());
+    assert_eq!(
+        sqlstate.as_deref(),
+        Some("23514"),
+        "{story}; the refusal comes from the ledger CHECK constraint: {error}",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

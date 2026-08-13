@@ -46,8 +46,52 @@ CREATE POLICY myelin_tenant_isolation ON cost_event \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
+pub const COST_LEDGER_VALUE_INVARIANTS_EXPAND_MIGRATION: &str = "\
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'cost_reservation'::regclass
+           AND conname = 'cost_reservation_value_shape'
+    ) THEN
+        ALTER TABLE cost_reservation
+            ADD CONSTRAINT cost_reservation_value_shape
+            CHECK (reserved >= 0
+                   AND state IN ('reserved', 'inflight', 'settled', 'cancelled'))
+            NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'cost_event'::regclass
+           AND conname = 'cost_event_value_shape'
+    ) THEN
+        ALTER TABLE cost_event
+            ADD CONSTRAINT cost_event_value_shape
+            CHECK (ord >= 0 AND wholesale >= 0 AND markup >= 0)
+            NOT VALID;
+    END IF;
+END
+$$;";
+
+pub const COST_LEDGER_VALUE_INVARIANTS_VALIDATE_MIGRATION: &str = "\
+ALTER TABLE cost_reservation VALIDATE CONSTRAINT cost_reservation_value_shape;
+ALTER TABLE cost_event VALIDATE CONSTRAINT cost_event_value_shape;";
+
 pub fn reserve_settle_durable_migrations() -> Migrations {
     Migrations::of([Migration::plain("0050_cost_ledger", COST_LEDGER_MIGRATION)])
+}
+
+pub fn cost_ledger_value_invariant_migrations() -> Migrations {
+    Migrations::of([
+        Migration::plain(
+            "0111_cost_ledger_value_invariants_expand",
+            COST_LEDGER_VALUE_INVARIANTS_EXPAND_MIGRATION,
+        ),
+        Migration::plain(
+            "0112_cost_ledger_value_invariants_validate",
+            COST_LEDGER_VALUE_INVARIANTS_VALIDATE_MIGRATION,
+        ),
+    ])
 }
 
 fn state_token(s: ReservationState) -> &'static str {
@@ -147,6 +191,10 @@ impl DurableCostLedger {
                         if exists {
                             return Ok(Err(ReserveError::DuplicateReservation));
                         }
+                        let amount_bigint = match amount.to_bigint() {
+                            Some(amount) => amount,
+                            None => return Ok(Err(ReserveError::AmountOverflow)),
+                        };
                         if available < amount {
                             return Ok(Err(ReserveError::InsufficientBalance {
                                 requested: amount,
@@ -160,7 +208,7 @@ impl DurableCostLedger {
                     .bind(&tenant_s)
                     .bind(&region)
                     .bind(&run_s)
-                    .bind(amount.0 as i64)
+                    .bind(amount_bigint)
                     .bind(state_token(ReservationState::Reserved))
                     .execute(&mut *conn)
                     .await
@@ -293,10 +341,12 @@ impl DurableCostLedger {
         .await
         .map_err(|_| DurableSettleError::Store)?
         .ok_or(DurableSettleError::Ledger(SettleError::NoSuchReservation))?;
-        let reserved = MicroUsd(
+        let reserved = decode_amount(
+            "reservation",
             row.try_get::<i64, _>("reserved")
-                .map_err(|_| DurableSettleError::Store)? as u64,
-        );
+                .map_err(|_| DurableSettleError::Store)?,
+        )
+        .map_err(|_| DurableSettleError::Store)?;
         let state = row
             .try_get::<String, _>("state")
             .map_err(|_| DurableSettleError::Store)?;
@@ -345,8 +395,10 @@ impl DurableCostLedger {
                 let Some(row) = row else {
                     return Ok(Err(SettleError::NoSuchReservation));
                 };
-                let reserved =
-                    MicroUsd(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
+                let reserved = decode_amount(
+                    "reservation",
+                    row.try_get::<i64, _>("reserved").map_err(cost_row_decode)?,
+                )?;
                 let state = row.try_get::<String, _>("state").map_err(cost_row_decode)?;
                 match parse_state(&state)? {
                     ReservationState::Reserved => {
@@ -409,7 +461,7 @@ impl DurableCostLedger {
                 Ok(Some(Reservation {
                     tenant: TenantId(tenant_s),
                     run: RunId(run_s),
-                    reserved: MicroUsd(reserved as u64),
+                    reserved: decode_amount("reservation", reserved)?,
                     state: parse_state(&state)?,
                 }))
             })
@@ -439,7 +491,9 @@ impl DurableCostLedger {
                 })
             }))
             .map_err(ReserveError::StoreUnavailable)?;
-        Ok(MicroUsd(sum as u64))
+        decode_amount("outstanding reservation sum", sum).map_err(|error| {
+            ReserveError::StoreUnavailable(LedgerUnavailable::new(error.to_string()))
+        })
     }
 
     pub fn cost_events_for(
@@ -528,7 +582,10 @@ async fn settle_on_conn(
     let Some(row) = row else {
         return Ok(Err(SettleError::NoSuchReservation));
     };
-    let reserved = MicroUsd(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
+    let reserved = decode_amount(
+        "reservation",
+        row.try_get::<i64, _>("reserved").map_err(cost_row_decode)?,
+    )?;
     let state = row.try_get::<String, _>("state").map_err(cost_row_decode)?;
     let state = parse_state(&state)?;
 
@@ -558,11 +615,22 @@ async fn settle_on_conn(
         Err(error) => return Ok(Err(error)),
     };
 
-    for (ord, event) in events.iter().enumerate() {
-        let ord = match i32::try_from(ord) {
-            Ok(ord) => ord,
-            Err(_) => return Ok(Err(SettleError::AmountOverflow)),
-        };
+    let durable_values = events
+        .iter()
+        .enumerate()
+        .map(|(ord, event)| {
+            Some((
+                i32::try_from(ord).ok()?,
+                event.wholesale.to_bigint()?,
+                event.markup.to_bigint()?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(durable_values) = durable_values else {
+        return Ok(Err(SettleError::AmountOverflow));
+    };
+
+    for (event, (ord, wholesale, markup)) in events.iter().zip(durable_values) {
         sqlx::query(
             "INSERT INTO cost_event \
                (tenant_id, region, run_id, ord, unit, wholesale, markup) \
@@ -573,8 +641,8 @@ async fn settle_on_conn(
         .bind(run_s)
         .bind(ord)
         .bind(event.unit.as_str())
-        .bind(event.wholesale.0 as i64)
-        .bind(event.markup.0 as i64)
+        .bind(wholesale)
+        .bind(markup)
         .execute(&mut *conn)
         .await
         .map_err(|error| PgError::Query(error.to_string()))?;
@@ -658,13 +726,25 @@ fn rows_to_events(
                 tenant: TenantId(tenant_s.to_string()),
                 run: RunId(run_s.to_string()),
                 unit,
-                wholesale: MicroUsd(
-                    r.try_get::<i64, _>("wholesale").map_err(cost_row_decode)? as u64
-                ),
-                markup: MicroUsd(r.try_get::<i64, _>("markup").map_err(cost_row_decode)? as u64),
+                wholesale: decode_amount(
+                    "cost event wholesale amount",
+                    r.try_get::<i64, _>("wholesale").map_err(cost_row_decode)?,
+                )?,
+                markup: decode_amount(
+                    "cost event markup amount",
+                    r.try_get::<i64, _>("markup").map_err(cost_row_decode)?,
+                )?,
             })
         })
         .collect()
+}
+
+fn decode_amount(field: &'static str, value: i64) -> Result<MicroUsd, PgError> {
+    MicroUsd::from_bigint(value).ok_or_else(|| {
+        PgError::Query(format!(
+            "cost ledger {field} is negative despite its non-negative storage constraint"
+        ))
+    })
 }
 
 fn cost_row_decode(error: sqlx::Error) -> PgError {
@@ -673,7 +753,7 @@ fn cost_row_decode(error: sqlx::Error) -> PgError {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_state;
+    use super::{decode_amount, parse_state};
 
     #[test]
     fn unknown_durable_state_is_a_redacted_error_not_a_panic() {
@@ -683,5 +763,13 @@ mod tests {
             .to_string()
             .contains("cost_reservation row has an invalid state"));
         assert!(!error.to_string().contains("attacker-controlled-state"));
+    }
+
+    #[test]
+    fn negative_durable_money_is_a_redacted_error_not_a_large_credit() {
+        let error =
+            decode_amount("reservation", -1).expect_err("negative durable money must fail closed");
+        assert!(error.to_string().contains("reservation is negative"));
+        assert!(!error.to_string().contains("-1"));
     }
 }

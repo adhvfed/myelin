@@ -299,7 +299,9 @@ pub use reerase_durable::{
     post_pit_durable_migrations, DurablePostPitLedger, POST_PIT_ERASURE_LEDGER_MIGRATION,
 };
 pub use reserve_settle_durable::{
-    reserve_settle_durable_migrations, DurableCostLedger, DurableSettleError, COST_LEDGER_MIGRATION,
+    cost_ledger_value_invariant_migrations, reserve_settle_durable_migrations, DurableCostLedger,
+    DurableSettleError, COST_LEDGER_MIGRATION, COST_LEDGER_VALUE_INVARIANTS_EXPAND_MIGRATION,
+    COST_LEDGER_VALUE_INVARIANTS_VALIDATE_MIGRATION,
 };
 pub use restore_verify_durable::{
     restore_verify_durable_migrations, DurableRestoreErasureLedger,
