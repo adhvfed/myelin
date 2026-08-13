@@ -180,25 +180,18 @@ pub fn fall_back_to_check(
     ty: &ObjectType,
     candidates: &[ObjectId],
     at: &Consistency,
-) -> Vec<ObjectId> {
+) -> myelin_identity::Result<Vec<ObjectId>> {
     let _ = ty;
-    candidates
+    let snapshot = engine.snapshot(scope, &at.at_least)?;
+    Ok(candidates
         .iter()
         .filter(|obj| {
             let object_ref = ArtifactRef(obj.0.clone());
             let object_type = type_of_object_id(&obj.0);
-            namespace.permits(
-                engine,
-                scope,
-                subject,
-                &object_type,
-                &permission.0,
-                &object_ref,
-                at,
-            )
+            namespace.permits_snapshot(&snapshot, subject, &object_type, &permission.0, &object_ref)
         })
         .cloned()
-        .collect()
+        .collect())
 }
 
 fn type_of_object_id(object_id: &str) -> String {

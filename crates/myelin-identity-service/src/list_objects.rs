@@ -1,4 +1,4 @@
-use crate::check_engine::CheckEngine;
+use crate::check_engine::{CheckEngine, CheckSnapshot};
 use crate::namespace::NamespaceEngine;
 use crate::reverse_index::ReverseIndex;
 use crate::tuple_store::TupleStore;
@@ -65,38 +65,26 @@ impl ListObjects {
             });
         }
 
-        let reachable = self.reachable_set(scope, subject, permission, ty, at)?;
-
-        if reachable.len() <= self.cap {
-            Ok(ListObjectsResult::Ids {
-                ids: reachable.into_iter().map(ObjectId).collect(),
-                zookie,
-            })
-        } else {
-            Ok(ListObjectsResult::Filter {
-                set_expr: self.filter_set_expr(subject, permission, ty),
-                zookie,
-            })
-        }
+        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
+        let candidates = self.candidate_objects(scope, subject, ty);
+        Ok(self
+            .result_from_indexed_candidates(&snapshot, subject, permission, ty, candidates, zookie))
     }
 
     fn reachable_set(
         &self,
-        scope: &TenantScope,
+        snapshot: &CheckSnapshot,
         subject: &Principal,
         permission: &Permission,
-        ty: &ObjectType,
-        at: &Consistency,
-    ) -> myelin_identity::Result<BTreeSet<String>> {
-        let candidates = self.candidate_objects(scope, subject, ty);
-        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
-
+        candidates: impl IntoIterator<Item = String>,
+        stop_after_cap: bool,
+    ) -> BTreeSet<String> {
         let mut reachable: BTreeSet<String> = BTreeSet::new();
         for obj in candidates {
             let object_ref = ArtifactRef(obj.clone());
             let object_type = type_of_object_id(&obj);
             let granted = self.namespace.permits_snapshot(
-                &snapshot,
+                snapshot,
                 subject,
                 &object_type,
                 &permission.0,
@@ -105,11 +93,34 @@ impl ListObjects {
             if granted {
                 reachable.insert(obj);
             }
-            if reachable.len() > self.cap {
+            if stop_after_cap && reachable.len() > self.cap {
                 break;
             }
         }
-        Ok(reachable)
+        reachable
+    }
+
+    fn result_from_indexed_candidates(
+        &self,
+        snapshot: &CheckSnapshot,
+        subject: &Principal,
+        permission: &Permission,
+        ty: &ObjectType,
+        candidates: BTreeSet<String>,
+        zookie: Zookie,
+    ) -> ListObjectsResult {
+        let reachable = self.reachable_set(snapshot, subject, permission, candidates, true);
+        if reachable.len() <= self.cap {
+            ListObjectsResult::Ids {
+                ids: reachable.into_iter().map(ObjectId).collect(),
+                zookie,
+            }
+        } else {
+            ListObjectsResult::Filter {
+                set_expr: self.filter_set_expr(subject, permission, ty),
+                zookie,
+            }
+        }
     }
 
     fn candidate_objects(
@@ -164,40 +175,37 @@ impl ListObjects {
         ty: &ObjectType,
         at: &Consistency,
     ) -> myelin_identity::Result<ListObjectsResult> {
-        let result = self.list_objects(scope, subject, permission, ty, at)?;
-        match result {
-            ListObjectsResult::Ids { .. } => Ok(result),
-            ListObjectsResult::Filter {
-                ref set_expr,
-                ref zookie,
-            } => {
-                let via = via_column_for(ty);
-                let lowered = crate::lowering::lower(set_expr, subject, &via);
-                let verdict = crate::lowering::watermark_verdict(&self.index, scope, &lowered, at);
-                if crate::lowering::is_fall_back(&verdict) {
-                    let candidates: Vec<ObjectId> = self
-                        .candidate_objects(scope, subject, ty)
-                        .into_iter()
-                        .map(ObjectId)
-                        .collect();
-                    let allowed = crate::lowering::fall_back_to_check(
-                        &self.engine,
-                        &self.namespace,
-                        scope,
-                        subject,
-                        permission,
-                        ty,
-                        &candidates,
-                        at,
-                    );
-                    Ok(ListObjectsResult::Ids {
-                        ids: allowed,
-                        zookie: zookie.clone(),
-                    })
-                } else {
-                    Ok(result)
-                }
-            }
+        let zookie = self.read_zookie(scope, at);
+        if subject.status != PrincipalStatus::Active {
+            return Ok(ListObjectsResult::Ids {
+                ids: Vec::new(),
+                zookie,
+            });
+        }
+
+        let set_expr = self.filter_set_expr(subject, permission, ty);
+        let via = via_column_for(ty);
+        let lowered = crate::lowering::lower(&set_expr, subject, &via);
+        let verdict = crate::lowering::watermark_verdict(&self.index, scope, &lowered, at);
+        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
+
+        if crate::lowering::is_fall_back(&verdict) {
+            let reachable = self.reachable_set(
+                &snapshot,
+                subject,
+                permission,
+                snapshot.objects_of_type(ty),
+                false,
+            );
+            Ok(ListObjectsResult::Ids {
+                ids: reachable.into_iter().map(ObjectId).collect(),
+                zookie,
+            })
+        } else {
+            let candidates = self.candidate_objects(scope, subject, ty);
+            Ok(self.result_from_indexed_candidates(
+                &snapshot, subject, permission, ty, candidates, zookie,
+            ))
         }
     }
 
@@ -593,6 +601,86 @@ mod tests {
                 assert_eq!(ids, vec![ObjectId("repo:core".into())])
             }
             ListObjectsResult::Filter { .. } => panic!("a single candidate materialises as Ids"),
+        }
+    }
+
+    #[test]
+    fn a_pinned_list_reads_fresh_grants_from_the_authoritative_snapshot() {
+        let s = scope("acme");
+        let store = TupleStore::new(OutboxStore::new());
+        let index = ReverseIndex::new();
+        let first_grant = store
+            .write_tuples(
+                &s,
+                &actor_in("acme"),
+                &[add("repo:core", "reader", "p:alice")],
+                None,
+                None,
+                now(),
+            )
+            .expect("grant the indexed repository");
+        index.apply_delta(
+            &s,
+            "add",
+            &ObjectType("repo".into()),
+            ReverseRow {
+                subject: PrincipalId("p:alice".into()),
+                relation: RelName("reader".into()),
+                object_id: ObjectId("repo:core".into()),
+            },
+            &first_grant,
+        );
+        let fresh_grant = store
+            .write_tuples(
+                &s,
+                &actor_in("acme"),
+                &[add("repo:web", "reader", "p:alice")],
+                None,
+                None,
+                now(),
+            )
+            .expect("grant the repository not projected yet");
+
+        let mut namespace = NamespaceEngine::with_core_hierarchy();
+        use crate::namespace::{FragmentDef, PermissionRule, Userset};
+        let _ = namespace.admit(&FragmentDef {
+            object_type: ObjectType("repo".into()),
+            relations: vec![RelName("reader".into())],
+            permissions: vec![PermissionRule {
+                permission: Permission("read".into()),
+                rewrite: Userset::Relation(RelName("reader".into())),
+            }],
+        });
+        let list = ListObjects::with_cap(store, namespace, index, 0);
+
+        let result = list
+            .list_objects_consistent(
+                &s,
+                &subject("p:alice", "acme"),
+                &Permission("read".into()),
+                &ObjectType("repo".into()),
+                &Consistency {
+                    at_least: fresh_grant.clone(),
+                    mode: ConsistencyMode::Strong,
+                },
+            )
+            .expect("honour the grant revision while the reverse index catches up");
+
+        match result {
+            ListObjectsResult::Ids { ids, zookie } => {
+                assert_eq!(
+                    ids,
+                    vec![ObjectId("repo:core".into()), ObjectId("repo:web".into())],
+                    "the authoritative snapshot includes both the projected and fresh grant"
+                );
+                assert_eq!(
+                    zookie, fresh_grant,
+                    "the result carries the requested revision"
+                );
+            }
+            ListObjectsResult::Filter { .. } => {
+                panic!("a lagging index is never returned as an authorization filter")
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::tuple_store::TupleStore;
 use myelin_identity::{
-    AuthzError, CaveatContext, Consistency, Decision, Literal, Principal, PrincipalStatus, RelName,
-    Zookie,
+    AuthzError, CaveatContext, Consistency, Decision, Literal, ObjectType, Principal,
+    PrincipalStatus, RelName, Zookie,
 };
 use myelin_query::{CmpOp, EvalContext, EvalError, Expr, Predicate, QueryAst};
 use myelin_storage::TenantScope;
@@ -119,6 +119,19 @@ impl CheckSnapshot {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn objects_of_type(&self, object_type: &ObjectType) -> Vec<String> {
+        self.by_object
+            .keys()
+            .filter(|object_id| {
+                object_id
+                    .split_once(':')
+                    .map(|(candidate_type, _)| candidate_type == object_type.0)
+                    .unwrap_or_else(|| object_id.as_str() == object_type.0)
+            })
+            .cloned()
+            .collect()
     }
 }
 

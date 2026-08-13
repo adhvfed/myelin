@@ -1066,7 +1066,7 @@ impl IdentityService for StoreBackedCheck {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let lo = ListObjects::new(self.tuples.clone(), namespace, self.index.clone());
-        lo.list_objects(&scope, subject, permission, ty, at)
+        lo.list_objects_consistent(&scope, subject, permission, ty, at)
     }
 
     fn list_subjects(
