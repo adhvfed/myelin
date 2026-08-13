@@ -606,6 +606,21 @@ struct RunState {
     fatal: bool,
 }
 
+enum ApprovalGrant {
+    NotRequired,
+    Consume { gate_id: String, effect_key: String },
+    Replay,
+}
+
+struct CallContext<'a> {
+    tool: &'a RegisteredTool,
+    args: &'a serde_json::Value,
+    idempotency_key: &'a str,
+    now: &'a Timestamp,
+    now_unix: i64,
+    presented_gate_id: Option<&'a str>,
+}
+
 pub trait GateApproverPolicy: Send + Sync {
     fn eligible_approvers(
         &self,
@@ -983,203 +998,262 @@ impl GovernedRouter {
         if let Err(reason) = self.authorize_resource_scope(tool, args) {
             return self.record(tool.name(), CallOutcome::Denied { reason, jti }, now);
         }
+        let context = CallContext {
+            tool,
+            args,
+            idempotency_key,
+            now,
+            now_unix,
+            presented_gate_id,
+        };
+        let approval_grant = match self.approval_grant_for_call(&context, &jti) {
+            Ok(grant) => grant,
+            Err(outcome) => return outcome,
+        };
+        self.apply_with_approval(&context, token, approval_grant)
+    }
 
-        enum ApprovalGrant {
-            NotRequired,
-            Consume(String),
-            Replay,
+    fn approval_grant_for_call(
+        &self,
+        context: &CallContext<'_>,
+        jti: &str,
+    ) -> Result<ApprovalGrant, CallOutcome> {
+        let CallContext {
+            tool,
+            args,
+            idempotency_key,
+            now,
+            now_unix,
+            presented_gate_id,
+        } = context;
+        if !tool.requires_approval() {
+            return Ok(ApprovalGrant::NotRequired);
         }
-        let mut approval_grant = ApprovalGrant::NotRequired;
-        if tool.requires_approval() {
-            let effect_key = mcp_effect_key_for_call(tool.name(), args, idempotency_key);
-            let expired = match self.verdicts.borrow_mut().expire_due_for_effect(
+        let effect_key = mcp_effect_key_for_call(tool.name(), args, idempotency_key);
+        let expired = self
+            .verdicts
+            .borrow_mut()
+            .expire_due_for_effect(
                 &self.principal.scope,
                 &self.principal.run_id.0,
                 &self.principal.agent_id.0,
                 &effect_key,
-                now_unix,
-            ) {
-                Ok(expired) => expired,
-                Err(_) => {
-                    return self.push_local_audit(
-                        tool.name(),
-                        CallOutcome::Indeterminate {
-                            reason: "durable HITL state is unavailable; effect withheld".into(),
-                            jti,
-                        },
-                    )
-                }
-            };
-            if !expired.is_empty() && self.record_expired_gates(&expired, now).is_err() {
-                self.state.borrow_mut().fatal = true;
-                return self.push_local_audit(
+                *now_unix,
+            )
+            .map_err(|_| {
+                self.push_local_audit(
                     tool.name(),
                     CallOutcome::Indeterminate {
-                        reason: "HITL expiry committed but its governance audit did not; session terminated"
-                            .into(),
-                        jti,
+                        reason: "durable HITL state is unavailable; effect withheld".into(),
+                        jti: jti.to_string(),
                     },
-                );
-            }
-            match presented_gate_id {
-                None => {
-                    let approved = match self.verdicts.borrow().find_approved(
-                        &self.principal.scope,
-                        &self.principal.run_id.0,
-                        &self.principal.agent_id.0,
-                        &effect_key,
-                    ) {
-                        Ok(approved) => approved,
-                        Err(_) => {
-                            return self.push_local_audit(
-                                tool.name(),
-                                CallOutcome::Indeterminate {
-                                    reason: "durable HITL state is unavailable; effect withheld"
-                                        .into(),
-                                    jti,
-                                },
-                            )
-                        }
-                    };
-                    if let Some(record) = approved {
-                        if !record.authorizes(
-                            &effect_key,
-                            &self.principal.run_id.0,
-                            &self.principal.agent_id.0,
-                        ) {
-                            return self.record(
-                                tool.name(),
-                                CallOutcome::Denied {
-                                    reason: "stored HITL approval failed its exact effect binding"
-                                        .into(),
-                                    jti,
-                                },
-                                now,
-                            );
-                        }
-                        approval_grant = ApprovalGrant::Consume(record.gate_id);
-                    }
-                    if matches!(&approval_grant, ApprovalGrant::NotRequired) {
-                        if self
-                            .audit_sink
-                            .record(GovernanceAuditRecord {
-                                scope: &self.principal.scope,
-                                actor: &self.principal.agent,
-                                run_id: &self.principal.run_id,
-                                target: GovernanceAuditTarget::Run,
-                                tool: tool.name(),
-                                jti: &jti,
-                                phase: AuditPhase::Attempt,
-                                outcome: None,
-                                now,
-                            })
-                            .is_err()
-                        {
-                            return self.push_local_audit(
-                                tool.name(),
-                                CallOutcome::Denied {
-                                    reason:
-                                        "durable pre-gate audit is unavailable; effect withheld"
-                                            .into(),
-                                    jti,
-                                },
-                            );
-                        }
-                        let gate_id = match self.open_or_resurface_gate(
-                            tool.name(),
-                            args,
-                            &effect_key,
-                            now_unix,
-                        ) {
-                            Ok(gate) => gate,
-                            Err(reason) => {
-                                return self.record(
-                                    tool.name(),
-                                    CallOutcome::Denied { reason, jti },
-                                    now,
-                                )
-                            }
-                        };
-                        let outcome = CallOutcome::Gated {
-                            gate_id: gate_id.0,
-                            jti,
-                        };
-                        return if gate_id.1 {
-                            self.record_after_mutation(tool.name(), outcome, now)
-                        } else {
-                            self.record(tool.name(), outcome, now)
-                        };
-                    }
-                }
-                Some(gid) => {
-                    let verdict = self.verdicts.borrow().fetch(&self.principal.scope, gid);
-                    match verdict {
-                        Ok(Some(rec))
-                            if rec.authorizes(
-                                &effect_key,
-                                &self.principal.run_id.0,
-                                &self.principal.agent_id.0,
-                            ) =>
-                        {
-                            approval_grant = ApprovalGrant::Consume(gid.to_string());
-                        }
-                        Ok(Some(rec))
-                            if rec.authorizes_replay(
-                                &effect_key,
-                                &self.principal.run_id.0,
-                                &self.principal.agent_id.0,
-                            ) =>
-                        {
-                            approval_grant = ApprovalGrant::Replay;
-                        }
-                        Ok(Some(rec))
-                            if rec.state == GateState::Waiting
-                                && rec.effect_id == effect_key
-                                && rec.run_id == self.principal.run_id.0
-                                && rec.requested_by == self.principal.agent_id.0 =>
-                        {
-                            return self.record(
-                                tool.name(),
-                                CallOutcome::Gated {
-                                    gate_id: gid.to_string(),
-                                    jti,
-                                },
-                                now,
-                            );
-                        }
-                        Err(_) => {
-                            return self.push_local_audit(
-                                tool.name(),
-                                CallOutcome::Indeterminate {
-                                    reason: "durable HITL state is unavailable; effect withheld"
-                                        .into(),
-                                    jti,
-                                },
-                            );
-                        }
-                        Ok(None) | Ok(Some(_)) => {
-                            return self.record(
-                                tool.name(),
-                                CallOutcome::Denied {
-                                    reason: format!(
-                                        "HITL approval not granted server-side for gate `{gid}` \
-                                         on `{}` - the gate must be Approved in the verdict store \
-                                         for this exact effect by a distinct human principal; a \
-                                         caller-supplied approval is never trusted (R2.4)",
-                                        tool.name()
-                                    ),
-                                    jti,
-                                },
-                                now,
-                            );
-                        }
-                    }
-                }
-            }
+                )
+            })?;
+        if !expired.is_empty() && self.record_expired_gates(&expired, now).is_err() {
+            self.state.borrow_mut().fatal = true;
+            return Err(self.push_local_audit(
+                tool.name(),
+                CallOutcome::Indeterminate {
+                    reason:
+                        "HITL expiry committed but its governance audit did not; session terminated"
+                            .into(),
+                    jti: jti.to_string(),
+                },
+            ));
         }
+        match *presented_gate_id {
+            Some(gate_id) => {
+                self.approval_grant_from_presented_gate(tool, &effect_key, gate_id, now, jti)
+            }
+            None => self.approval_grant_without_presented_gate(
+                tool,
+                args,
+                &effect_key,
+                now,
+                *now_unix,
+                jti,
+            ),
+        }
+    }
 
-        let run_ctx = run_ctx_for(&jti, &self.principal.agent_id.0, tool.name());
-        let effect = proposed_effect_for(tool.name(), args);
+    fn approval_grant_without_presented_gate(
+        &self,
+        tool: &RegisteredTool,
+        args: &serde_json::Value,
+        effect_key: &str,
+        now: &Timestamp,
+        now_unix: i64,
+        jti: &str,
+    ) -> Result<ApprovalGrant, CallOutcome> {
+        let approved = self
+            .verdicts
+            .borrow()
+            .find_approved(
+                &self.principal.scope,
+                &self.principal.run_id.0,
+                &self.principal.agent_id.0,
+                effect_key,
+            )
+            .map_err(|_| {
+                self.push_local_audit(
+                    tool.name(),
+                    CallOutcome::Indeterminate {
+                        reason: "durable HITL state is unavailable; effect withheld".into(),
+                        jti: jti.to_string(),
+                    },
+                )
+            })?;
+        if let Some(record) = approved {
+            if !record.authorizes(
+                effect_key,
+                &self.principal.run_id.0,
+                &self.principal.agent_id.0,
+            ) {
+                return Err(self.record(
+                    tool.name(),
+                    CallOutcome::Denied {
+                        reason: "stored HITL approval failed its exact effect binding".into(),
+                        jti: jti.to_string(),
+                    },
+                    now,
+                ));
+            }
+            return Ok(ApprovalGrant::Consume {
+                gate_id: record.gate_id,
+                effect_key: effect_key.to_string(),
+            });
+        }
+        if self
+            .audit_sink
+            .record(GovernanceAuditRecord {
+                scope: &self.principal.scope,
+                actor: &self.principal.agent,
+                run_id: &self.principal.run_id,
+                target: GovernanceAuditTarget::Run,
+                tool: tool.name(),
+                jti,
+                phase: AuditPhase::Attempt,
+                outcome: None,
+                now,
+            })
+            .is_err()
+        {
+            return Err(self.push_local_audit(
+                tool.name(),
+                CallOutcome::Denied {
+                    reason: "durable pre-gate audit is unavailable; effect withheld".into(),
+                    jti: jti.to_string(),
+                },
+            ));
+        }
+        let (gate_id, opened) = self
+            .open_or_resurface_gate(tool.name(), args, effect_key, now_unix)
+            .map_err(|reason| {
+                self.record(
+                    tool.name(),
+                    CallOutcome::Denied {
+                        reason,
+                        jti: jti.to_string(),
+                    },
+                    now,
+                )
+            })?;
+        let outcome = CallOutcome::Gated {
+            gate_id,
+            jti: jti.to_string(),
+        };
+        Err(if opened {
+            self.record_after_mutation(tool.name(), outcome, now)
+        } else {
+            self.record(tool.name(), outcome, now)
+        })
+    }
+
+    fn approval_grant_from_presented_gate(
+        &self,
+        tool: &RegisteredTool,
+        effect_key: &str,
+        gate_id: &str,
+        now: &Timestamp,
+        jti: &str,
+    ) -> Result<ApprovalGrant, CallOutcome> {
+        let verdict = self.verdicts.borrow().fetch(&self.principal.scope, gate_id);
+        match verdict {
+            Ok(Some(record))
+                if record.authorizes(
+                    effect_key,
+                    &self.principal.run_id.0,
+                    &self.principal.agent_id.0,
+                ) =>
+            {
+                Ok(ApprovalGrant::Consume {
+                    gate_id: gate_id.to_string(),
+                    effect_key: effect_key.to_string(),
+                })
+            }
+            Ok(Some(record))
+                if record.authorizes_replay(
+                    effect_key,
+                    &self.principal.run_id.0,
+                    &self.principal.agent_id.0,
+                ) =>
+            {
+                Ok(ApprovalGrant::Replay)
+            }
+            Ok(Some(record))
+                if record.state == GateState::Waiting
+                    && record.effect_id == effect_key
+                    && record.run_id == self.principal.run_id.0
+                    && record.requested_by == self.principal.agent_id.0 =>
+            {
+                Err(self.record(
+                    tool.name(),
+                    CallOutcome::Gated {
+                        gate_id: gate_id.to_string(),
+                        jti: jti.to_string(),
+                    },
+                    now,
+                ))
+            }
+            Err(_) => Err(self.push_local_audit(
+                tool.name(),
+                CallOutcome::Indeterminate {
+                    reason: "durable HITL state is unavailable; effect withheld".into(),
+                    jti: jti.to_string(),
+                },
+            )),
+            Ok(None) | Ok(Some(_)) => Err(self.record(
+                tool.name(),
+                CallOutcome::Denied {
+                    reason: format!(
+                        "HITL approval not granted server-side for gate `{gate_id}` on `{}` - the \
+                         gate must be Approved in the verdict store for this exact effect by a \
+                         distinct human principal; a caller-supplied approval is never trusted \
+                         (R2.4)",
+                        tool.name()
+                    ),
+                    jti: jti.to_string(),
+                },
+                now,
+            )),
+        }
+    }
+
+    fn apply_with_approval(
+        &self,
+        context: &CallContext<'_>,
+        token: RunToken,
+        approval_grant: ApprovalGrant,
+    ) -> CallOutcome {
+        let CallContext {
+            tool,
+            args,
+            idempotency_key,
+            now,
+            now_unix,
+            ..
+        } = context;
+        let jti = token.jti.clone();
         if self
             .audit_sink
             .record(GovernanceAuditRecord {
@@ -1205,14 +1279,17 @@ impl GovernedRouter {
             );
         }
         let approval = match approval_grant {
-            ApprovalGrant::Consume(gate_id) => {
+            ApprovalGrant::Consume {
+                gate_id,
+                effect_key,
+            } => {
                 if let Err(error) = self.verdicts.borrow_mut().consume_approval(
                     &self.principal.scope,
                     &gate_id,
-                    &mcp_effect_key_for_call(tool.name(), args, idempotency_key),
+                    &effect_key,
                     &self.principal.run_id.0,
                     &self.principal.agent_id.0,
-                    now_unix,
+                    *now_unix,
                 ) {
                     let outcome = if error == GateConsumeError::StorageUnavailable {
                         CallOutcome::Indeterminate {
@@ -1232,6 +1309,8 @@ impl GovernedRouter {
             ApprovalGrant::Replay => EffectApproval::HumanApproved,
             ApprovalGrant::NotRequired => EffectApproval::NotRequired,
         };
+        let run_ctx = run_ctx_for(&jti, &self.principal.agent_id.0, tool.name());
+        let effect = proposed_effect_for(tool.name(), args);
         let authority = EffectAuthority {
             run_token: token,
             principal_id: self.principal.agent_id.clone(),
