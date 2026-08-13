@@ -99,6 +99,13 @@ async fn durable_bootstrap_grant_admits_creator_via_a_separate_check_store() {
         .await
         .expect("identity durable migrations execute against the live DB");
     admin
+        .migrate(
+            &myelin_storage::identity_tuple_revision_migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("durable relationship revisions migrate");
+    admin
         .migrate_foundation()
         .await
         .expect("foundation (outbox) migration");

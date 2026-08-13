@@ -13,8 +13,8 @@ use myelin_identity_service::principal_store::{PrincipalProfile, PrincipalStore}
 use myelin_identity_service::tuple_store::TupleStore;
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
-    identity_durable_migrations, DurablePrincipalBacking, DurableTupleBacking, KmsEngine,
-    SubstrateProvider,
+    identity_durable_migrations, identity_tuple_revision_migrations, DurablePrincipalBacking,
+    DurableTupleBacking, KmsEngine, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -46,11 +46,11 @@ fn scope(tenant: &str, region: &str) -> myelin_storage::TenantScope {
     myelin_storage::TenantScope::from_verified_token(&p, Region(region.into()))
 }
 
-fn actor() -> Principal {
+fn actor(tenant: &str) -> Principal {
     Principal::stub(
         PrincipalId("p:writer".into()),
         PrincipalKind::Human,
-        TenantId("acme".into()),
+        TenantId(tenant.into()),
     )
 }
 
@@ -125,6 +125,10 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations execute against the live DB");
+    admin
+        .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
+        .await
+        .expect("durable relationship revisions migrate");
 
     let Some(app) = app_provider().await else {
         return;
@@ -177,7 +181,7 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
     let z = tstore1
         .write_tuples(
             &s,
-            &actor(),
+            &actor(&tenant),
             &[
                 TupleDelta::Add(tuple("repo:core", "reader", "p:alice")),
                 TupleDelta::Add(tuple("repo:core", "writer", "p:bob")),
@@ -221,9 +225,21 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         "the profile round-trips"
     );
 
-    let mut edges: Vec<(String, String, String)> = tstore2
+    let durable_edges = tstore2
         .tuples_in(&s)
-        .expect("read durable tuples through the fresh store")
+        .expect("read durable tuples through the fresh store");
+    assert!(
+        durable_edges.iter().all(|tuple| tuple.zookie == z),
+        "a fresh store reads each edge at the revision committed by the original writer"
+    );
+    assert_eq!(
+        tstore2
+            .object_zookie(&s, "repo:core")
+            .expect("read the durable object revision"),
+        z,
+        "the object watermark survives a fresh TupleStore"
+    );
+    let mut edges: Vec<(String, String, String)> = durable_edges
         .into_iter()
         .map(|t| (t.tuple.object.0, t.tuple.relation.0, t.tuple.subject.0))
         .collect();
@@ -238,8 +254,25 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
     );
     assert!(!z.0.is_empty(), "the write returned a monotonic zookie");
 
+    let next = tstore2
+        .write_tuples(
+            &s,
+            &actor(&tenant),
+            &[TupleDelta::Add(tuple("repo:web", "reader", "p:alice"))],
+            None,
+            None,
+            Timestamp("2026-06-26T00:01:00Z".into()),
+        )
+        .expect("a fresh writer advances the durable revision");
+    assert!(
+        next.0 > z.0,
+        "a restarted writer advances instead of minting revision one again"
+    );
+
     for sql in [
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM rebac_object_revision WHERE tenant_id = $1",
+        "DELETE FROM rebac_revision WHERE tenant_id = $1",
         "DELETE FROM principal WHERE tenant_id = $1",
         "DELETE FROM credential_link WHERE tenant_id = $1",
     ] {
@@ -270,6 +303,10 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations");
+    admin
+        .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
+        .await
+        .expect("durable relationship revisions migrate");
 
     let Some(app) = app_provider().await else {
         return;
@@ -308,7 +345,7 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
     tstore
         .write_tuples(
             &sa,
-            &actor(),
+            &actor(&tenant_a),
             &[TupleDelta::Add(tuple("repo:secret", "reader", "p:alice"))],
             None,
             None,
@@ -376,6 +413,8 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
 
     for sql in [
         "DELETE FROM rebac_tuple WHERE tenant_id = $1 OR tenant_id = $2",
+        "DELETE FROM rebac_object_revision WHERE tenant_id = $1 OR tenant_id = $2",
+        "DELETE FROM rebac_revision WHERE tenant_id = $1 OR tenant_id = $2",
         "DELETE FROM principal WHERE tenant_id = $1 OR tenant_id = $2",
         "DELETE FROM credential_link WHERE tenant_id = $1 OR tenant_id = $2",
         "DELETE FROM outbox WHERE aggregate LIKE 'identity:tuple:' || $1 || ':%' \
@@ -403,6 +442,10 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations");
+    admin
+        .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
+        .await
+        .expect("durable relationship revisions migrate");
     admin
         .migrate_foundation()
         .await
@@ -445,7 +488,7 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
     let z = tstore
         .write_tuples(
             &s,
-            &actor(),
+            &actor(&tenant),
             &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))],
             None,
             None,
@@ -488,7 +531,7 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
     let err = tstore
         .write_tuples(
             &s,
-            &actor(),
+            &actor(&tenant),
             &[TupleDelta::Add(tuple("repo:core", "writer", "p:bob"))],
             Some(&Precondition {
                 expected_zookie: Some(stale),
@@ -512,6 +555,8 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
 
     for sql in [
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM rebac_object_revision WHERE tenant_id = $1",
+        "DELETE FROM rebac_revision WHERE tenant_id = $1",
         "DELETE FROM outbox WHERE aggregate = $1",
     ] {
         let bind = if sql.contains("outbox") {
@@ -525,4 +570,116 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         "OK [3]: a committed durable tuple write co-commits EXACTLY one identity.tuple.written row into \
          the SAME-DB outbox; an aborted write co-commits none (0 ghost)."
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_identity_instances_share_one_monotonic_relationship_clock() {
+    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
+        Ok(provider) => provider,
+        Err(_) => {
+            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
+            return;
+        }
+    };
+    admin
+        .migrate(&identity_durable_migrations(), &HotTables::none())
+        .await
+        .expect("identity durable migrations");
+    admin
+        .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
+        .await
+        .expect("durable relationship revisions migrate");
+    admin
+        .migrate_foundation()
+        .await
+        .expect("foundation (outbox) migration");
+    let Some(app) = app_provider().await else {
+        return;
+    };
+    let region = app.config().region.clone();
+    let handle = tokio::runtime::Handle::current();
+    let suffix = uniq();
+    let tenant = format!("mr007-clock-{suffix}");
+    let tenant_scope = scope(&tenant, &region);
+
+    let first = TupleStore::with_pg_minter(
+        Arc::new(UniqueMinter::new(format!("{suffix}a"))),
+        DurableTupleBacking::new(app.clone()),
+        handle.clone(),
+    );
+    let second = TupleStore::with_pg_minter(
+        Arc::new(UniqueMinter::new(format!("{suffix}b"))),
+        DurableTupleBacking::new(app.clone()),
+        handle.clone(),
+    );
+    let first_scope = tenant_scope.clone();
+    let second_scope = tenant_scope.clone();
+    let first_actor = actor(&tenant);
+    let second_actor = actor(&tenant);
+
+    let first_write = tokio::spawn(async move {
+        first.write_tuples(
+            &first_scope,
+            &first_actor,
+            &[TupleDelta::Add(tuple("repo:first", "reader", "p:alice"))],
+            None,
+            None,
+            Timestamp("2026-06-26T00:02:00Z".into()),
+        )
+    });
+    let second_write = tokio::spawn(async move {
+        second.write_tuples(
+            &second_scope,
+            &second_actor,
+            &[TupleDelta::Add(tuple("repo:second", "reader", "p:bob"))],
+            None,
+            None,
+            Timestamp("2026-06-26T00:02:00Z".into()),
+        )
+    });
+    let (first_revision, second_revision) = tokio::join!(first_write, second_write);
+    let first_revision = first_revision
+        .expect("the first writer task completes")
+        .expect("the first writer commits");
+    let second_revision = second_revision
+        .expect("the second writer task completes")
+        .expect("the second writer commits");
+    assert_ne!(
+        first_revision, second_revision,
+        "two live instances never mint the same relationship revision"
+    );
+
+    let restarted = TupleStore::with_pg(DurableTupleBacking::new(app), handle);
+    let tuples = restarted
+        .tuples_in(&tenant_scope)
+        .expect("a restarted reader sees both concurrent writes");
+    assert_eq!(
+        tuples.len(),
+        2,
+        "both independently committed grants survive"
+    );
+    let latest = [first_revision.clone(), second_revision.clone()]
+        .into_iter()
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .expect("two revisions have a maximum");
+    assert_eq!(
+        restarted.current_zookie(),
+        latest,
+        "reading durable state restores the process-local high-water mark"
+    );
+
+    for sql in [
+        "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM rebac_object_revision WHERE tenant_id = $1",
+        "DELETE FROM rebac_revision WHERE tenant_id = $1",
+    ] {
+        let _ = sqlx::query(sql)
+            .bind(&tenant)
+            .execute(admin.db_pool())
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM outbox WHERE aggregate LIKE $1")
+        .bind(format!("identity:tuple:{tenant}:%"))
+        .execute(admin.db_pool())
+        .await;
 }

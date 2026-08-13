@@ -52,7 +52,9 @@ fn cdc_4_6_write_tuples_provider_emits_consumer_stamps_zookie() {
         )
         .expect("the provider write_tuples returns the zookie");
 
-    let stamped = provider.object_zookie(&s, "org:acme");
+    let stamped = provider
+        .object_zookie(&s, "org:acme")
+        .expect("read back the relationship object revision");
     assert_eq!(
         stamped, zookie,
         "the consumer stamps + reads back exactly the provider's zookie"

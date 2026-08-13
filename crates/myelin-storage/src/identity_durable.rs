@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
+
 use sqlx::Row;
 
 use myelin_events::EventEnvelope;
 
 use crate::migration::{Migration, Migrations};
-use crate::pg::PgStore;
+use crate::pg::{PgError, PgStore};
 use crate::pgrelay::PgRelay;
 use crate::provider::{ProviderError, SubstrateProvider};
 
@@ -192,6 +194,45 @@ CREATE POLICY myelin_tenant_isolation ON rebac_tuple \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
+pub const REBAC_REVISION_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS rebac_revision (
+    tenant_id text NOT NULL,
+    region text NOT NULL,
+    revision bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    PRIMARY KEY (tenant_id, region)
+);
+CREATE TABLE IF NOT EXISTS rebac_object_revision (
+    tenant_id text NOT NULL,
+    region text NOT NULL,
+    object_id text NOT NULL,
+    revision bigint NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    PRIMARY KEY (tenant_id, region, object_id)
+);
+INSERT INTO rebac_revision (tenant_id, region, revision)
+SELECT DISTINCT tenant_id, region, 0 FROM rebac_tuple
+ON CONFLICT DO NOTHING;
+INSERT INTO rebac_object_revision (tenant_id, region, object_id, revision)
+SELECT DISTINCT tenant_id, region, object_id, 0 FROM rebac_tuple
+ON CONFLICT DO NOTHING;";
+
+pub const REBAC_REVISION_RLS_POLICY: &str = "\
+ALTER TABLE rebac_revision ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rebac_revision FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON rebac_revision;
+CREATE POLICY myelin_tenant_isolation ON rebac_revision
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+ALTER TABLE rebac_object_revision ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rebac_object_revision FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON rebac_object_revision;
+CREATE POLICY myelin_tenant_isolation ON rebac_object_revision
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));";
+
 pub fn identity_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0010_rebac_tuple", crate::pg::REBAC_TUPLE_MIGRATION),
@@ -204,6 +245,13 @@ pub fn identity_durable_migrations() -> Migrations {
         Migration::plain("0017_revocation_rls", REVOCATION_RLS_POLICY),
         Migration::plain("0018_run_token_teardown", RUN_TOKEN_TEARDOWN_MIGRATION),
         Migration::plain("0019_run_token_teardown_rls", RUN_TOKEN_TEARDOWN_RLS_POLICY),
+    ])
+}
+
+pub fn identity_tuple_revision_migrations() -> Migrations {
+    Migrations::of([
+        Migration::plain("0113_rebac_revision", REBAC_REVISION_MIGRATION),
+        Migration::plain("0114_rebac_revision_rls", REBAC_REVISION_RLS_POLICY),
     ])
 }
 
@@ -234,6 +282,26 @@ pub enum TupleEdgeOp {
     Remove,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableTupleEdge {
+    pub object: String,
+    pub relation: String,
+    pub subject: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableTupleSnapshot {
+    pub edges: Vec<DurableTupleEdge>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableTupleWriteOutcome {
+    Committed { revision: u64 },
+    PreconditionFailed { actual_revision: u64 },
+}
+
 #[derive(Clone)]
 pub struct DurableTupleBacking {
     provider: SubstrateProvider,
@@ -244,21 +312,83 @@ impl DurableTupleBacking {
         DurableTupleBacking { provider }
     }
 
-    pub async fn apply_deltas_co_commit(
+    pub async fn apply_deltas_co_commit<F>(
         &self,
         tenant: &str,
         region: &str,
         deltas: Vec<(TupleEdgeOp, String, String, String)>,
-        aggregate: &str,
-        envelope: &EventEnvelope,
-    ) -> Result<(), ProviderError> {
+        expected_revision: Option<String>,
+        event_for_revision: F,
+    ) -> Result<DurableTupleWriteOutcome, ProviderError>
+    where
+        F: FnOnce(u64) -> (String, EventEnvelope) + Send + 'static,
+    {
         let tenant_owned = tenant.to_string();
         let region_owned = region.to_string();
-        let aggregate_owned = aggregate.to_string();
-        let envelope_owned = envelope.clone();
         self.provider
             .with_tenant_tx(tenant, move |conn| {
                 Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO rebac_revision (tenant_id, region, revision) \
+                         VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region_owned)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
+
+                    let objects: Vec<String> = deltas
+                        .iter()
+                        .map(|(_, object, _, _)| object.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let tenant_revision: i64 = sqlx::query_scalar(
+                        "SELECT revision FROM rebac_revision \
+                         WHERE tenant_id = $1 AND region = $2 FOR UPDATE",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region_owned)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
+                    let object_revision: Option<i64> = if objects.is_empty() {
+                        None
+                    } else {
+                        sqlx::query_scalar(
+                            "SELECT MAX(revision) FROM rebac_object_revision \
+                             WHERE tenant_id = $1 AND region = $2 AND object_id = ANY($3)",
+                        )
+                        .bind(&tenant_owned)
+                        .bind(&region_owned)
+                        .bind(&objects)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .map_err(|error| PgError::Query(error.to_string()))?
+                    };
+                    let actual_revision = decode_revision(
+                        "relationship precondition revision",
+                        object_revision.unwrap_or(tenant_revision),
+                    )?;
+                    if expected_revision
+                        .as_deref()
+                        .is_some_and(|expected| expected != format_revision(actual_revision))
+                    {
+                        return Ok(DurableTupleWriteOutcome::PreconditionFailed {
+                            actual_revision,
+                        });
+                    }
+
+                    let revision: i64 = sqlx::query_scalar(
+                        "UPDATE rebac_revision SET revision = revision + 1 \
+                         WHERE tenant_id = $1 AND region = $2 RETURNING revision",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region_owned)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
                     for (op, object, relation, subject) in &deltas {
                         match op {
                             TupleEdgeOp::Add => {
@@ -285,28 +415,137 @@ impl DurableTupleBacking {
                             }
                         }
                     }
-                    PgRelay::co_commit_in_tx(conn, &aggregate_owned, &envelope_owned).await?;
-                    Ok(())
+                    for object in &objects {
+                        sqlx::query(
+                            "INSERT INTO rebac_object_revision \
+                             (tenant_id, region, object_id, revision) VALUES ($1, $2, $3, $4) \
+                             ON CONFLICT (tenant_id, region, object_id) DO UPDATE \
+                             SET revision = EXCLUDED.revision",
+                        )
+                        .bind(&tenant_owned)
+                        .bind(&region_owned)
+                        .bind(object)
+                        .bind(revision)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|error| PgError::Query(error.to_string()))?;
+                    }
+                    let revision = decode_revision("committed relationship revision", revision)?;
+                    let (aggregate, envelope) = event_for_revision(revision);
+                    PgRelay::co_commit_in_tx(conn, &aggregate, &envelope).await?;
+                    Ok(DurableTupleWriteOutcome::Committed { revision })
                 })
             })
             .await
     }
 
-    pub async fn edges_in(
+    pub async fn snapshot_in(
         &self,
         tenant: &str,
         region: &str,
-    ) -> Result<Vec<(String, String, String)>, ProviderError> {
+    ) -> Result<DurableTupleSnapshot, ProviderError> {
         let tenant_owned = tenant.to_string();
         let region_owned = region.to_string();
         self.provider
             .with_tenant_tx(tenant, move |conn| {
                 Box::pin(async move {
-                    PgStore::tuples_on_conn(conn, &tenant_owned, &region_owned).await
+                    let rows = sqlx::query(
+                        "SELECT NULL::text AS object_id, NULL::text AS relation, \
+                                NULL::text AS subject, \
+                                COALESCE((SELECT revision FROM rebac_revision \
+                                          WHERE tenant_id = $1 AND region = $2), 0) AS revision, \
+                                true AS is_snapshot \
+                         UNION ALL \
+                         SELECT t.object_id, t.relation, t.subject, \
+                                COALESCE(r.revision, 0) AS revision, false AS is_snapshot \
+                         FROM rebac_tuple t \
+                         LEFT JOIN rebac_object_revision r \
+                           ON r.tenant_id = t.tenant_id AND r.region = t.region \
+                          AND r.object_id = t.object_id \
+                         WHERE t.tenant_id = $1 AND t.region = $2 \
+                         ORDER BY is_snapshot DESC, object_id, relation, subject",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region_owned)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
+                    use sqlx::Row as _;
+                    let revision = rows
+                        .first()
+                        .ok_or_else(|| {
+                            PgError::Query("relationship snapshot has no cursor row".into())
+                        })?
+                        .get::<i64, _>("revision");
+                    let edges = rows
+                        .iter()
+                        .skip(1)
+                        .map(|row| {
+                            Ok(DurableTupleEdge {
+                                object: row.get::<Option<String>, _>("object_id").ok_or_else(
+                                    || PgError::Query("relationship edge has no object".into()),
+                                )?,
+                                relation: row.get::<Option<String>, _>("relation").ok_or_else(
+                                    || PgError::Query("relationship edge has no relation".into()),
+                                )?,
+                                subject: row.get::<Option<String>, _>("subject").ok_or_else(
+                                    || PgError::Query("relationship edge has no subject".into()),
+                                )?,
+                                revision: decode_revision(
+                                    "relationship object revision",
+                                    row.get::<i64, _>("revision"),
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, PgError>>()?;
+                    Ok(DurableTupleSnapshot {
+                        edges,
+                        revision: decode_revision("relationship snapshot revision", revision)?,
+                    })
                 })
             })
             .await
     }
+
+    pub async fn object_revision(
+        &self,
+        tenant: &str,
+        region: &str,
+        object: &str,
+    ) -> Result<u64, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region_owned = region.to_string();
+        let object_owned = object.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    let revision: i64 = sqlx::query_scalar(
+                        "SELECT COALESCE( \
+                            (SELECT revision FROM rebac_object_revision \
+                             WHERE tenant_id = $1 AND region = $2 AND object_id = $3), \
+                            (SELECT revision FROM rebac_revision \
+                             WHERE tenant_id = $1 AND region = $2), 0)",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region_owned)
+                    .bind(&object_owned)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))?;
+                    decode_revision("relationship object revision", revision)
+                })
+            })
+            .await
+    }
+}
+
+fn format_revision(revision: u64) -> String {
+    format!("zk-{revision:020}")
+}
+
+fn decode_revision(field: &str, revision: i64) -> Result<u64, PgError> {
+    u64::try_from(revision)
+        .map_err(|_| PgError::Query(format!("{field} is outside its non-negative range")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

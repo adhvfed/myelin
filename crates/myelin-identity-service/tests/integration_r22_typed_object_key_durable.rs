@@ -84,6 +84,13 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations execute against the live DB");
+    admin
+        .migrate(
+            &myelin_storage::identity_tuple_revision_migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("durable relationship revisions migrate");
     let app = match SubstrateProvider::connect(MyelinConfig::dev(), 6).await {
         Ok(p) => p,
         Err(_) => {

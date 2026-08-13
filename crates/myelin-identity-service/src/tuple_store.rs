@@ -10,9 +10,12 @@ use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
 use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
 use myelin_tenancy::{Region, TenantId};
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Mutex;
 
 pub const S3_TABLE: &str = "rebac_tuple";
 
@@ -20,6 +23,7 @@ pub const S3_HOLDER: &str = "identity_rebac_tuples";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteError {
+    EmptyWrite,
     PreconditionFailed { expected: Zookie, actual: Zookie },
     CrossTenant { detail: String },
     CommitFailed(String),
@@ -28,6 +32,7 @@ pub enum WriteError {
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            WriteError::EmptyWrite => write!(f, "write_tuples requires at least one relationship delta"),
             WriteError::PreconditionFailed { expected, actual } => write!(
                 f,
                 "write_tuples precondition failed: expected object zookie {expected:?} but the \
@@ -35,7 +40,7 @@ impl core::fmt::Display for WriteError {
             ),
             WriteError::CrossTenant { detail } => write!(
                 f,
-                "write_tuples rejected a cross-tenant delta: {detail} (there is no cross-tenant \
+                "write_tuples rejected a cross-tenant relationship write: {detail} (there is no cross-tenant \
                  tuple and no cross-tenant query path, identity §6)"
             ),
             WriteError::CommitFailed(why) => {
@@ -130,20 +135,6 @@ enum TupleBackend {
 struct PgTupleBacking {
     backing: Arc<myelin_storage::DurableTupleBacking>,
     rt: tokio::runtime::Handle,
-    watermark: PgZookieWatermark,
-}
-
-#[derive(Clone, Default)]
-struct PgZookieWatermark {
-    inner: Arc<Mutex<ZookieWatermarks>>,
-}
-
-type ZookieWatermarks = HashMap<(String, String, String), Zookie>;
-
-impl PgZookieWatermark {
-    fn lock(&self) -> std::sync::MutexGuard<'_, ZookieWatermarks> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
 }
 
 impl TupleStore {
@@ -185,7 +176,6 @@ impl TupleStore {
             backend: TupleBackend::Pg(PgTupleBacking {
                 backing: Arc::new(backing),
                 rt,
-                watermark: PgZookieWatermark::default(),
             }),
             revision: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -219,14 +209,18 @@ impl TupleStore {
         Zookie(format!("zk-{rev:020}"))
     }
 
-    pub fn object_zookie(&self, scope: &TenantScope, object: &str) -> Zookie {
+    pub fn object_zookie(
+        &self,
+        scope: &TenantScope,
+        object: &str,
+    ) -> Result<Zookie, TupleReadError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
         let part_key = Self::part_key(scope);
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
                 let inner = Self::mem_lock(inner_arc);
-                inner
+                Ok(inner
                     .partitions
                     .get(&part_key)
                     .and_then(|p| {
@@ -235,13 +229,14 @@ impl TupleStore {
                             .max_by(|a, b| a.zookie.0.cmp(&b.zookie.0))
                             .map(|t| t.zookie.clone())
                     })
-                    .unwrap_or_else(|| self.current_zookie())
+                    .unwrap_or_else(|| self.current_zookie()))
             }
             TupleBackend::Pg(pg) => {
-                let zk = pg.watermark.lock();
-                zk.get(&(part_key.0, part_key.1, object.to_string()))
-                    .cloned()
-                    .unwrap_or_else(|| self.current_zookie())
+                let revision = pg
+                    .block(pg.backing.object_revision(&part_key.0, &part_key.1, object))
+                    .map_err(|error| TupleReadError(error.to_string()))?;
+                self.revision.fetch_max(revision, Ordering::SeqCst);
+                Ok(Self::zookie_of(revision))
             }
         }
     }
@@ -266,29 +261,24 @@ impl TupleStore {
             TupleBackend::Pg(pg) => {
                 let tenant = scope.tenant().0.clone();
                 let region = scope.region().0.clone();
-                let edges = pg
-                    .block(pg.backing.edges_in(&tenant, &region))
+                let snapshot = pg
+                    .block(pg.backing.snapshot_in(&tenant, &region))
                     .map_err(|error| TupleReadError(error.to_string()))?;
-                let zk = pg.watermark.lock();
-                Ok(edges
+                self.revision.fetch_max(snapshot.revision, Ordering::SeqCst);
+                Ok(snapshot
+                    .edges
                     .into_iter()
-                    .map(|(object, relation, subject)| {
-                        let zookie = zk
-                            .get(&(tenant.clone(), region.clone(), object.clone()))
-                            .cloned()
-                            .unwrap_or_else(|| self.current_zookie());
-                        StoredTuple {
-                            tenant: scope.tenant().clone(),
-                            region: scope.region().clone(),
-                            tuple: myelin_identity::RelationTuple {
-                                object: myelin_identity::ObjectId(object),
-                                relation: myelin_identity::RelName(relation),
-                                subject: myelin_identity::PrincipalId(subject),
-                                caveat: None,
-                            },
-                            zookie,
-                            expires_at: None,
-                        }
+                    .map(|edge| StoredTuple {
+                        tenant: scope.tenant().clone(),
+                        region: scope.region().clone(),
+                        tuple: myelin_identity::RelationTuple {
+                            object: myelin_identity::ObjectId(edge.object),
+                            relation: myelin_identity::RelName(edge.relation),
+                            subject: myelin_identity::PrincipalId(edge.subject),
+                            caveat: None,
+                        },
+                        zookie: Self::zookie_of(edge.revision),
+                        expires_at: None,
                     })
                     .collect())
             }
@@ -306,6 +296,7 @@ impl TupleStore {
         occurred_at: Timestamp,
     ) -> Result<Zookie, WriteError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
+        self.validate_write_scope(scope, actor, deltas)?;
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => self.write_tuples_memory(
@@ -321,6 +312,46 @@ impl TupleStore {
                 self.write_tuples_pg(pg, scope, actor, deltas, precondition, &occurred_at)
             }
         }
+    }
+
+    fn validate_write_scope(
+        &self,
+        scope: &TenantScope,
+        actor: &Principal,
+        deltas: &[TupleDelta],
+    ) -> Result<(), WriteError> {
+        if deltas.is_empty() {
+            return Err(WriteError::EmptyWrite);
+        }
+        if &actor.tenant != scope.tenant() {
+            return Err(WriteError::CrossTenant {
+                detail: "the attributed actor is outside the verified tenant scope".into(),
+            });
+        }
+        for delta in deltas {
+            let tuple = match delta {
+                TupleDelta::Add(tuple) | TupleDelta::Remove(tuple) => tuple,
+            };
+            self.reject_foreign_object(scope, &tuple.object.0)?;
+            if let Some((userset_object, _)) = tuple.subject.0.rsplit_once('#') {
+                self.reject_foreign_object(scope, userset_object)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_foreign_object(&self, scope: &TenantScope, object: &str) -> Result<(), WriteError> {
+        let tenant =
+            myelin_refs::object_key(&EvArtifactRef(object.to_string())).and_then(|key| key.tenant);
+        if tenant
+            .as_deref()
+            .is_some_and(|tenant| tenant != scope.tenant().0)
+        {
+            return Err(WriteError::CrossTenant {
+                detail: "a relationship object names a different tenant".into(),
+            });
+        }
+        Ok(())
     }
 
     fn derive_tuple_event(
@@ -446,26 +477,7 @@ impl TupleStore {
     ) -> Result<Zookie, WriteError> {
         let tenant = scope.tenant().0.clone();
         let region = scope.region().0.clone();
-
-        if let Some(pre) = precondition {
-            if let Some(expected) = &pre.expected_zookie {
-                let actual = self
-                    .pg_object_zookie(pg, &tenant, &region, deltas)
-                    .unwrap_or_else(|| Self::zookie_of(self.revision.load(Ordering::SeqCst)));
-                if &actual != expected {
-                    return Err(WriteError::PreconditionFailed {
-                        expected: expected.clone(),
-                        actual,
-                    });
-                }
-            }
-        }
-
-        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        let zookie = Self::zookie_of(new_rev);
-
-        let (aggregate, envelope) =
-            self.derive_tuple_event(scope, actor, deltas, &zookie, occurred_at);
+        let expected = precondition.and_then(|value| value.expected_zookie.clone());
 
         let edge_deltas: Vec<(myelin_storage::TupleEdgeOp, String, String, String)> = deltas
             .iter()
@@ -484,45 +496,43 @@ impl TupleStore {
                 ),
             })
             .collect();
-        pg.block(pg.backing.apply_deltas_co_commit(
-            &tenant,
-            &region,
-            edge_deltas,
-            &aggregate.0,
-            &envelope,
-        ))
-        .map_err(|e| WriteError::CommitFailed(e.to_string()))?;
+        let event_store = self.clone();
+        let event_scope = scope.clone();
+        let event_actor = actor.clone();
+        let event_deltas = deltas.to_vec();
+        let event_time = occurred_at.clone();
+        let outcome = pg
+            .block(pg.backing.apply_deltas_co_commit(
+                &tenant,
+                &region,
+                edge_deltas,
+                expected.as_ref().map(|zookie| zookie.0.clone()),
+                move |revision| {
+                    let (aggregate, envelope) = event_store.derive_tuple_event(
+                        &event_scope,
+                        &event_actor,
+                        &event_deltas,
+                        &Self::zookie_of(revision),
+                        &event_time,
+                    );
+                    (aggregate.0, envelope)
+                },
+            ))
+            .map_err(|error| WriteError::CommitFailed(error.to_string()))?;
 
-        {
-            let mut zk = pg.watermark.lock();
-            for d in deltas {
-                let obj = match d {
-                    TupleDelta::Add(t) | TupleDelta::Remove(t) => t.object.0.clone(),
-                };
-                zk.insert((tenant.clone(), region.clone(), obj), zookie.clone());
+        match outcome {
+            myelin_storage::DurableTupleWriteOutcome::Committed { revision } => {
+                self.revision.fetch_max(revision, Ordering::SeqCst);
+                Ok(Self::zookie_of(revision))
+            }
+            myelin_storage::DurableTupleWriteOutcome::PreconditionFailed { actual_revision } => {
+                Err(WriteError::PreconditionFailed {
+                    expected: expected
+                        .expect("the durable store only compares a supplied revision"),
+                    actual: Self::zookie_of(actual_revision),
+                })
             }
         }
-        Ok(zookie)
-    }
-
-    fn pg_object_zookie(
-        &self,
-        pg: &PgTupleBacking,
-        tenant: &str,
-        region: &str,
-        deltas: &[TupleDelta],
-    ) -> Option<Zookie> {
-        let zk = pg.watermark.lock();
-        deltas
-            .iter()
-            .filter_map(|d| {
-                let obj = match d {
-                    TupleDelta::Add(t) | TupleDelta::Remove(t) => t.object.0.clone(),
-                };
-                zk.get(&(tenant.to_string(), region.to_string(), obj))
-                    .cloned()
-            })
-            .max_by(|a, b| a.0.cmp(&b.0))
     }
 
     fn tuple_written_draft(
@@ -701,7 +711,26 @@ mod tests {
         );
         let tuples = store.tuples_in(&s).expect("read both stored tuples");
         assert_eq!(tuples.len(), 2, "both adds are durable");
-        assert_eq!(store.object_zookie(&s, "repo:core"), z1);
+        assert_eq!(
+            store
+                .object_zookie(&s, "repo:core")
+                .expect("read the object revision"),
+            z1
+        );
+    }
+
+    #[test]
+    fn an_empty_relationship_write_is_not_a_revision_or_event() {
+        let outbox = OutboxStore::new();
+        let store = TupleStore::new(outbox.clone());
+        let result = store.write_tuples(&scope("acme"), &actor(), &[], None, None, now());
+
+        assert_eq!(result, Err(WriteError::EmptyWrite));
+        assert_eq!(
+            store.current_zookie(),
+            Zookie("zk-00000000000000000000".into())
+        );
+        assert_eq!(outbox.outbox_depth(), 0);
     }
 
     #[test]
@@ -959,6 +988,68 @@ mod tests {
     }
 
     #[test]
+    fn a_relationship_write_cannot_attribute_or_smuggle_another_tenant() {
+        let outbox = OutboxStore::new();
+        let store = TupleStore::new(outbox.clone());
+        let acme = scope("acme");
+        let globex = scope("globex");
+
+        let attempts = [
+            store.write_tuples(
+                &globex,
+                &actor(),
+                &[TupleDelta::Add(tuple("repo:core", "reader", "p:alice"))],
+                None,
+                None,
+                now(),
+            ),
+            store.write_tuples(
+                &acme,
+                &actor(),
+                &[TupleDelta::Add(tuple(
+                    "myelin://globex/git/repo/core",
+                    "reader",
+                    "p:alice",
+                ))],
+                None,
+                None,
+                now(),
+            ),
+            store.write_tuples(
+                &acme,
+                &actor(),
+                &[TupleDelta::Add(tuple(
+                    "repo:core",
+                    "reader",
+                    "myelin://globex/identity/team/reviewers#member",
+                ))],
+                None,
+                None,
+                now(),
+            ),
+        ];
+
+        assert!(
+            attempts
+                .iter()
+                .all(|result| matches!(result, Err(WriteError::CrossTenant { .. }))),
+            "actor attribution, relationship objects, and usersets all stay in the verified tenant"
+        );
+        assert!(
+            store
+                .tuples_in(&acme)
+                .expect("inspect the rejected write partition")
+                .is_empty(),
+            "no rejected relationship is stored"
+        );
+        assert_eq!(
+            outbox.outbox_depth(),
+            0,
+            "a rejected relationship emits no poisoned projection event"
+        );
+    }
+
+    #[test]
     fn s3_store_registers_as_a_personal_data_holder() {
         let store = TupleStore::new(OutboxStore::new());
         assert_eq!(
@@ -1062,7 +1153,12 @@ mod tests {
                 now(),
             )
             .expect("the role-compile caller writes the grant");
-        assert_eq!(store.object_zookie(&s, "org:acme"), zookie);
+        assert_eq!(
+            store
+                .object_zookie(&s, "org:acme")
+                .expect("read the object revision"),
+            zookie
+        );
         let row = outbox
             .row(&{
                 let inner_count = outbox.committed_count();
