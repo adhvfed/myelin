@@ -1,17 +1,18 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolResult};
+use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema};
 use myelin_agent_host::{
-    dispatch_test_run_with_synthetic_identity, git_check_status_read_tool_def,
-    git_check_status_read_tool_schema, DebitOutcome, LlmRunTask, MicroUsd, RunSubstrateWiring,
-    RunWallet, ToolCatalogue, Tools, WalletError, GIT_READ_CHECK_STATUS_TOOL,
+    dispatch_test_run_with_synthetic_identity, DebitOutcome, LlmRunTask, MicroUsd,
+    RunSubstrateWiring, RunWallet, ToolCatalogue, Tools, WalletError,
 };
 use myelin_agent_model::{
     ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn, ToolCallRequest,
     Usage,
 };
-use myelin_agent_service::{price, ToolExecError, ToolExecutor, LUNA_RATES};
+use myelin_agent_service::{
+    git_read_tool_defs, price, ToolExecError, ToolExecutor, LUNA_RATES, READ_FILE_TOOL,
+};
 use myelin_events::{MonotonicMinter, OutboxStore};
 use myelin_flow::WfJournal;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
@@ -19,7 +20,9 @@ use myelin_storage::reserve_settle::CostLedger;
 use myelin_tenancy::{Region, TenantId};
 
 const REPO: &str = "myelin://01J0HOSTTOOL/git/repo/core";
-const COMMIT: &str = "abc123def456";
+const REVISION: &str = "main";
+const PATH: &str = ".myelin/ci.yml";
+const READ_FILE: &str = "git.read_file";
 
 const USAGE: Usage = Usage::Reported {
     input: 1_000,
@@ -96,8 +99,12 @@ impl ModelClient for ScriptedToolBrain {
             None => Ok(ModelResponse {
                 reply: ModelReply::ToolCalls(vec![ToolCallRequest {
                     id: "call-check-1".into(),
-                    name: GIT_READ_CHECK_STATUS_TOOL.into(),
-                    arguments: serde_json::json!({ "repo": REPO, "commit": COMMIT }),
+                    name: READ_FILE.into(),
+                    arguments: serde_json::json!({
+                        "repo": REPO,
+                        "ref": REVISION,
+                        "path": PATH,
+                    }),
                 }]),
                 usage: USAGE,
             }),
@@ -119,16 +126,25 @@ impl ToolExecutor for FakeCheckReadExecutor {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         assert_eq!(def.effect_kind, EffectKind::Read);
         let repo = call.arguments.get("repo").and_then(|v| v.as_str()).unwrap();
-        let commit = call
-            .arguments
-            .get("commit")
-            .and_then(|v| v.as_str())
-            .unwrap();
+        let revision = call.arguments.get("ref").and_then(|v| v.as_str()).unwrap();
+        let path = call.arguments.get("path").and_then(|v| v.as_str()).unwrap();
         Ok(ToolResult::Succeeded(format!(
-            "check status for commit {commit} in repo {repo}: \
-             ci/build = Success (run attempt 1, Trusted, cost_settled=true)"
+            "{path} in {repo} at {revision} runs cargo test and cargo clippy"
         )))
     }
+}
+
+fn read_file_tool() -> (ToolDef, ToolSchema) {
+    let definition = git_read_tool_defs()
+        .into_iter()
+        .find(|definition| definition.name.0 == READ_FILE_TOOL)
+        .expect("the platform exposes its repository file reader");
+    let schema = ToolSchema {
+        name: ToolName(definition.canonical_name()),
+        description: "Read a file from a repository at a named revision.".into(),
+        input_schema: definition.input_schema.clone(),
+    };
+    (definition, schema)
 }
 
 fn agent_principal(tenant: &TenantId) -> Principal {
@@ -143,7 +159,7 @@ fn agent_principal(tenant: &TenantId) -> Principal {
 }
 
 #[test]
-fn mock_tool_run_invokes_the_read_tool_and_meters_two_turns() {
+fn an_agent_reads_a_repository_file_then_answers_and_pays_for_both_turns() {
     let tenant = TenantId("01J0HOSTTOOL".into());
     let region = Region("fr-par".into());
     let run_id = "Rtool-mock-1";
@@ -162,8 +178,9 @@ fn mock_tool_run_invokes_the_read_tool_and_meters_two_turns() {
 
     let wallet = MemWallet::with_balance(1_000_000);
 
-    let catalogue = ToolCatalogue::new([git_check_status_read_tool_def()]);
-    let advertised = [git_check_status_read_tool_schema()];
+    let (definition, schema) = read_file_tool();
+    let catalogue = ToolCatalogue::new([definition]);
+    let advertised = [schema];
     let executor = FakeCheckReadExecutor {
         invocations: AtomicUsize::new(0),
     };
@@ -183,9 +200,7 @@ fn mock_tool_run_invokes_the_read_tool_and_meters_two_turns() {
         "psn:host-agent",
         run_id,
         "You are a hosted agent with tools. Use the read tool when asked, then answer.",
-        format!(
-            "Read the CI checks for repo {REPO} at commit {COMMIT} and report the build state."
-        ),
+        format!("Read {PATH} from {REPO} at {REVISION} and summarize its checks."),
     )
     .with_max_output_tokens(64)
     .with_now_secs(1000);
@@ -211,8 +226,8 @@ fn mock_tool_run_invokes_the_read_tool_and_meters_two_turns() {
     );
 
     assert!(
-        report.answer.contains("ci/build = Success"),
-        "the answer reflects the seeded tool result: {:?}",
+        report.answer.contains("cargo test") && report.answer.contains("cargo clippy"),
+        "the answer reflects the repository content: {:?}",
         report.answer
     );
     assert!(report.outcome.0.contains("completed"), "loop completed");
@@ -242,8 +257,8 @@ fn invalid_tool_arguments_are_rejected_before_the_executor_runs() {
             Ok(ModelResponse {
                 reply: ModelReply::ToolCalls(vec![ToolCallRequest {
                     id: "call-bad".into(),
-                    name: GIT_READ_CHECK_STATUS_TOOL.into(),
-                    arguments: serde_json::json!({ "repo": REPO }),
+                    name: READ_FILE.into(),
+                    arguments: serde_json::json!({ "repo": REPO, "ref": REVISION }),
                 }]),
                 usage: USAGE,
             })
@@ -253,8 +268,9 @@ fn invalid_tool_arguments_are_rejected_before_the_executor_runs() {
     let tenant = TenantId("01J0HOSTTOOLBAD".into());
     let region = Region("fr-par".into());
     let wallet = MemWallet::with_balance(1_000_000);
-    let catalogue = ToolCatalogue::new([git_check_status_read_tool_def()]);
-    let advertised = [git_check_status_read_tool_schema()];
+    let (definition, schema) = read_file_tool();
+    let catalogue = ToolCatalogue::new([definition]);
+    let advertised = [schema];
     let executor = FakeCheckReadExecutor {
         invocations: AtomicUsize::new(0),
     };
@@ -297,7 +313,7 @@ fn invalid_tool_arguments_are_rejected_before_the_executor_runs() {
     );
     let msg = err.to_string();
     assert!(
-        msg.contains("commit") || msg.to_lowercase().contains("valid"),
+        msg.contains("path") || msg.to_lowercase().contains("valid"),
         "loud validation rejection: {msg}"
     );
     assert!(wallet.balance(&tenant).0 <= 1_000_000);

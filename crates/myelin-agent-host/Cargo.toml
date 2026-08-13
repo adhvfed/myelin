@@ -17,7 +17,6 @@ myelin-agent = { path = "../myelin-agent" }
 myelin-mcp = { path = "../myelin-mcp" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-storage = { path = "../myelin-storage" }
-myelin-git = { path = "../myelin-git" }
 tokio = { workspace = true }
 myelin-flow = { path = "../myelin-flow" }
 myelin-events = { path = "../myelin-events" }

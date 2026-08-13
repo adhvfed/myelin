@@ -12,12 +12,6 @@ pub use activity_executor::{
 };
 pub use tool_broker::EdgeMcpToolExecutor;
 
-pub mod git_read_tool;
-pub use git_read_tool::{
-    git_check_status_read_tool_def, git_check_status_read_tool_schema, GitCheckStatusReadExecutor,
-    GIT_READ_CHECK_STATUS_TOOL,
-};
-
 pub mod identity;
 pub use identity::timestamp_from_epoch;
 pub mod workflow;
@@ -42,9 +36,7 @@ use myelin_agent_service::{
 };
 use myelin_events::{IdMinter, OutboxStore};
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter, WfJournal};
-use myelin_identity::{
-    Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
-};
+use myelin_identity::Principal;
 use myelin_storage::agent_wallet::AgentWallet;
 use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::{
@@ -55,7 +47,7 @@ use myelin_storage::{
     DurableCellRootBacking, DurableDelegationPolicyBacking, DurableKmsBacking,
     DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
 };
-use myelin_tenancy::{ArtifactRef, Region, TenantId};
+use myelin_tenancy::{Region, TenantId};
 
 use myelin_identity_service::{
     CellTokenAuthority, DelegationPolicySource, PasetoCapabilitySigner, RevocationStore,
@@ -370,98 +362,6 @@ fn tool_schema_to_spec(schema: &ToolSchema) -> ToolSpec {
         description: schema.description.clone(),
         input_schema: serde_json::from_str(&schema.input_schema)
             .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
-    }
-}
-
-type ToolResourceResolver = dyn Fn(&ToolDef, &ToolCall) -> Option<ArtifactRef> + Send + Sync;
-
-pub fn git_read_check_status_resource(_def: &ToolDef, call: &ToolCall) -> Option<ArtifactRef> {
-    call.arguments
-        .get("repo")
-        .and_then(|v| v.as_str())
-        .map(|repo| ArtifactRef(repo.to_string()))
-}
-
-fn strong_latest() -> Consistency {
-    Consistency {
-        at_least: Zookie(String::new()),
-        mode: ConsistencyMode::Strong,
-    }
-}
-
-pub struct CapEnforcingExecutor<'a> {
-    identity: Arc<dyn IdentityService + Send + Sync>,
-    principal: Principal,
-    inner: &'a dyn ToolExecutor,
-    resource_of: Box<ToolResourceResolver>,
-}
-
-impl<'a> CapEnforcingExecutor<'a> {
-    pub fn new(
-        identity: Arc<dyn IdentityService + Send + Sync>,
-        principal: Principal,
-        inner: &'a dyn ToolExecutor,
-        resource_of: Box<ToolResourceResolver>,
-    ) -> CapEnforcingExecutor<'a> {
-        CapEnforcingExecutor {
-            identity,
-            principal,
-            inner,
-            resource_of,
-        }
-    }
-
-    pub fn for_git_read_tool(
-        identity: Arc<dyn IdentityService + Send + Sync>,
-        principal: Principal,
-        inner: &'a dyn ToolExecutor,
-    ) -> CapEnforcingExecutor<'a> {
-        CapEnforcingExecutor::new(
-            identity,
-            principal,
-            inner,
-            Box::new(git_read_check_status_resource),
-        )
-    }
-}
-
-impl ToolExecutor for CapEnforcingExecutor<'_> {
-    fn execute(
-        &self,
-        context: &myelin_agent_service::ToolExecutionContext<'_>,
-        def: &ToolDef,
-        call: &ToolCall,
-    ) -> Result<ToolResult, ToolExecError> {
-        for cap in &def.required_caps {
-            let resource = (self.resource_of)(def, call).ok_or_else(|| {
-                ToolExecError::Failed(format!(
-                    "cap-enforcement DENY: no ReBAC resource for `{}` (cap `{cap}`)",
-                    def.name.0
-                ))
-            })?;
-            match self.identity.check(
-                &self.principal,
-                &Permission(cap.clone()),
-                &resource,
-                &strong_latest(),
-                None,
-            ) {
-                Ok(Decision::Allow) => {}
-                Ok(other) => {
-                    return Err(ToolExecError::Failed(format!(
-                        "cap-enforcement DENY: `{}` not authorized for `{cap}` on `{}` ({other:?})",
-                        self.principal.principal_id.0, resource.0
-                    )))
-                }
-                Err(e) => {
-                    return Err(ToolExecError::Failed(format!(
-                        "cap-enforcement DENY: ReBAC check for `{cap}` on `{}` failed ({e:?})",
-                        resource.0
-                    )))
-                }
-            }
-        }
-        self.inner.execute(context, def, call)
     }
 }
 
@@ -781,6 +681,19 @@ mod tests {
     use super::*;
     use myelin_agent_model::{ModelReply, Usage};
 
+    fn platform_read_file_tool() -> (ToolDef, ToolSchema) {
+        let definition = myelin_agent_service::git_read_tool_defs()
+            .into_iter()
+            .find(|definition| definition.name.0 == myelin_agent_service::READ_FILE_TOOL)
+            .expect("the platform exposes its repository file reader");
+        let schema = ToolSchema {
+            name: ToolName(definition.canonical_name()),
+            description: "Read a file from a repository at a named revision.".into(),
+            input_schema: definition.input_schema.clone(),
+        };
+        (definition, schema)
+    }
+
     struct Spy {
         seen: Mutex<Vec<ModelRequest>>,
         answer: String,
@@ -890,7 +803,8 @@ mod tests {
     #[test]
     fn host_client_injects_tool_specs_on_every_step() {
         let spy = Spy::new("ok", Usage::NotReported);
-        let specs = vec![tool_schema_to_spec(&git_check_status_read_tool_schema())];
+        let (_, schema) = platform_read_file_tool();
+        let specs = vec![tool_schema_to_spec(&schema)];
         let (client, _) = HostModelClient::wrap(
             "SYS".into(),
             "task".into(),
@@ -910,16 +824,15 @@ mod tests {
         assert_eq!(seen.len(), 2);
         for req in seen.iter() {
             assert_eq!(req.tools.len(), 1);
-            assert_eq!(req.tools[0].name, GIT_READ_CHECK_STATUS_TOOL);
+            assert_eq!(req.tools[0].name, "git.read_file");
         }
     }
 
     #[test]
     fn tool_catalogue_resolves_registered_tools() {
-        let cat = ToolCatalogue::new([git_check_status_read_tool_def()]);
-        assert!(cat
-            .resolve(&ToolName(GIT_READ_CHECK_STATUS_TOOL.into()))
-            .is_some());
+        let (definition, _) = platform_read_file_tool();
+        let cat = ToolCatalogue::new([definition]);
+        assert!(cat.resolve(&ToolName("git.read_file".into())).is_some());
         assert!(cat.resolve(&ToolName("nope".into())).is_none());
     }
 
