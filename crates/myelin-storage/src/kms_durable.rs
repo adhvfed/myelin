@@ -1,3 +1,5 @@
+use std::sync::{Mutex, MutexGuard};
+
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 use zeroize::Zeroizing;
@@ -167,6 +169,7 @@ impl DurableKmsBacking {
             core,
             backing: self.clone(),
             rt: tokio::runtime::Handle::current(),
+            cache_sync: Mutex::new(()),
         }))
     }
 
@@ -301,18 +304,6 @@ impl DurableKmsBacking {
         .execute(ex)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(())
-    }
-
-    pub async fn persist_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<(), KmsDurableError> {
-        let k = engine.export_kek(id)?.ok_or_else(|| {
-            KmsDurableError::Db(PgError::Query(format!(
-                "no KEK to persist for tenant={} region={}",
-                id.tenant.as_str(),
-                id.region.as_str()
-            )))
-        })?;
-        self.upsert_kek_row(id, &k).await?;
         Ok(())
     }
 
@@ -691,18 +682,6 @@ impl DurableKmsBacking {
         Ok(())
     }
 
-    pub async fn persist_dek(&self, engine: &KmsEngine, id: &DekId) -> Result<(), KmsDurableError> {
-        let (w, dek_epoch) = engine.export_dek(id)?.ok_or_else(|| {
-            KmsDurableError::Db(PgError::Query(format!(
-                "no DEK to persist for tenant={} class={}",
-                id.tenant.as_str(),
-                id.class.as_token()
-            )))
-        })?;
-        self.upsert_dek_row(id, &w, dek_epoch).await?;
-        Ok(())
-    }
-
     async fn delete_dek_row(&self, id: &DekId) -> Result<bool, PgError> {
         let deleted = sqlx::query(
             "DELETE FROM kms_wrapped_dek WHERE cell_id = $1 AND tenant_id = $2 AND class = $3",
@@ -716,72 +695,6 @@ impl DurableKmsBacking {
         Ok(deleted.rows_affected() > 0)
     }
 
-    pub async fn ensure_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<u64, KmsDurableError> {
-        let epoch = engine.ensure_kek(id).map_err(KmsDurableError::Kms)?;
-        self.persist_kek(engine, id).await?;
-        Ok(epoch)
-    }
-
-    pub async fn ensure_dek(
-        &self,
-        engine: &KmsEngine,
-        tenant: &TenantId,
-        region: &Region,
-        class: KeyClass,
-    ) -> Result<PiiKeyRef, KmsDurableError> {
-        let key_ref = engine
-            .ensure_dek(tenant, region, class)
-            .map_err(KmsDurableError::Kms)?;
-        self.persist_dek(engine, &DekId::new(tenant.clone(), key_ref.class.clone()))
-            .await?;
-        Ok(key_ref)
-    }
-
-    pub async fn rotate_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<u64, KmsDurableError> {
-        let epoch = engine.rotate_kek(id).map_err(KmsDurableError::Kms)?;
-        if self
-            .read_kek(id)
-            .await?
-            .is_some_and(|kek| kek.epoch == epoch)
-        {
-            return Ok(epoch);
-        }
-        let kek = engine.export_kek(id)?.ok_or_else(|| {
-            KmsDurableError::Db(PgError::Query(format!(
-                "no KEK to persist after rotation for tenant={} region={}",
-                id.tenant.as_str(),
-                id.region.as_str()
-            )))
-        })?;
-        let deks: Vec<_> = engine
-            .export_deks()?
-            .into_iter()
-            .filter(|(d, _, _)| d.tenant == id.tenant)
-            .collect();
-        self.persist_rotation(id, &kek, &deks).await?;
-        Ok(epoch)
-    }
-
-    pub async fn destroy_kek(
-        &self,
-        engine: &KmsEngine,
-        id: &KekId,
-    ) -> Result<bool, KmsDurableError> {
-        let removed = engine.destroy_kek(id)?;
-        let durable_removed = self.delete_kek_row(id).await?;
-        Ok(removed || durable_removed)
-    }
-
-    pub async fn destroy_dek(
-        &self,
-        engine: &KmsEngine,
-        id: &DekId,
-    ) -> Result<bool, KmsDurableError> {
-        let removed = engine.destroy_dek(id)?;
-        let durable_removed = self.delete_dek_row(id).await?;
-        Ok(removed || durable_removed)
-    }
-
     pub async fn restore(&self, snap: &KmsDurableSnapshot) -> Result<(), KmsDurableError> {
         self.upsert_sealed_root(&snap.sealed_root).await?;
         for (id, k) in &snap.keks {
@@ -792,21 +705,13 @@ impl DurableKmsBacking {
         }
         Ok(())
     }
-
-    pub async fn persist(
-        &self,
-        engine: &KmsEngine,
-        seal_key: &SealKey,
-    ) -> Result<(), KmsDurableError> {
-        self.restore(&engine.backup_snapshot_durable(seal_key)?)
-            .await
-    }
 }
 
 pub(crate) struct DurableKms {
     pub(crate) core: KmsCore,
     pub(crate) backing: DurableKmsBacking,
     pub(crate) rt: tokio::runtime::Handle,
+    cache_sync: Mutex<()>,
 }
 
 impl DurableKms {
@@ -814,7 +719,14 @@ impl DurableKms {
         &self.core
     }
 
+    fn synchronize_cache(&self) -> Result<MutexGuard<'_, ()>, KmsError> {
+        self.cache_sync
+            .lock()
+            .map_err(|_| KmsError::StateUnavailable("durable KMS cache synchronization"))
+    }
+
     pub(crate) fn export_kek(&self, id: &KekId) -> Result<Option<ExportedKek>, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let durable = self
             .block(self.backing.read_kek(id))
             .map_err(|error| KmsError::Durability(error.to_string()))?;
@@ -836,6 +748,7 @@ impl DurableKms {
     }
 
     pub(crate) fn export_dek(&self, id: &DekId) -> Result<Option<(WrappedDek, u64)>, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let durable = self
             .block(self.backing.read_dek(id))
             .map_err(|error| KmsError::Durability(error.to_string()))?;
@@ -879,6 +792,11 @@ impl DurableKms {
     }
 
     pub(crate) fn ensure_kek(&self, id: &KekId) -> Result<u64, KmsError> {
+        let _cache = self.synchronize_cache()?;
+        self.ensure_kek_while_synchronized(id)
+    }
+
+    fn ensure_kek_while_synchronized(&self, id: &KekId) -> Result<u64, KmsError> {
         if let Some(stored) = self
             .block(self.backing.read_kek(id))
             .map_err(|error| KmsError::Durability(error.to_string()))?
@@ -935,8 +853,9 @@ impl DurableKms {
         region: &Region,
         class: KeyClass,
     ) -> Result<PiiKeyRef, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let kek_id = KekId::new(tenant.clone(), region.clone());
-        self.ensure_kek(&kek_id)?;
+        self.ensure_kek_while_synchronized(&kek_id)?;
         let dek_id = DekId::new(tenant.clone(), class.clone());
         if let Some((kek, dek, dek_epoch)) = self
             .block(self.backing.read_dek_material(&dek_id, region))
@@ -986,6 +905,7 @@ impl DurableKms {
         key_ref: &PiiKeyRef,
         region: &Region,
     ) -> Result<crate::kms::DekHandle, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let dek_id = DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
         let material = self
             .block(self.backing.read_dek_material(&dek_id, region))
@@ -1005,37 +925,26 @@ impl DurableKms {
     }
 
     pub(crate) fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let durable_kek = self
             .block(self.backing.read_kek(id))
             .map_err(|error| KmsError::Durability(error.to_string()))?;
         let durable_deks = self
             .block(self.backing.read_deks_for_tenant(&id.tenant))
             .map_err(|error| KmsError::Durability(error.to_string()))?;
-        self.core
-            .replace_tenant_key_state(id, durable_kek, durable_deks)?;
-        let epoch = self.core.rotate_kek(id)?;
-        let res = self.block(async {
-            let kek = self.core.export_kek(id)?.ok_or_else(|| {
-                KmsDurableError::Db(PgError::Query(format!(
-                    "no KEK to persist after rotation for tenant={} region={}",
-                    id.tenant.as_str(),
-                    id.region.as_str()
-                )))
-            })?;
-            let deks: Vec<_> = self
-                .core
-                .export_deks()?
-                .into_iter()
-                .filter(|(d, _, _)| d.tenant == id.tenant)
-                .collect();
-            self.backing.persist_rotation(id, &kek, &deks).await?;
-            Ok::<(), KmsDurableError>(())
-        });
-        res.map_err(|e| KmsError::Durability(e.to_string()))?;
-        Ok(epoch)
+        let current = durable_kek.ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
+        let rotation = self.core.prepare_kek_rotation(id, current, durable_deks)?;
+        self.block(
+            self.backing
+                .persist_rotation(id, &rotation.kek, &rotation.deks),
+        )
+        .map_err(|error| KmsError::Durability(error.to_string()))?;
+        self.core.publish_kek_rotation(id, &rotation)?;
+        Ok(rotation.epoch())
     }
 
     pub(crate) fn try_destroy_kek(&self, id: &KekId) -> Result<bool, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let durable_removed = self
             .block(self.backing.delete_kek_row(id))
             .map_err(|error| KmsError::Durability(error.to_string()))?;
@@ -1043,6 +952,7 @@ impl DurableKms {
     }
 
     pub(crate) fn try_destroy_dek(&self, id: &DekId) -> Result<bool, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let durable_removed = self
             .block(self.backing.delete_dek_row(id))
             .map_err(|error| KmsError::Durability(error.to_string()))?;
@@ -1055,8 +965,9 @@ impl DurableKms {
         region: &Region,
         material: &[u8; KEY_LEN],
     ) -> Result<WrappedDek, KmsError> {
+        let _cache = self.synchronize_cache()?;
         let kek_id = KekId::new(tenant.clone(), region.clone());
-        self.ensure_kek(&kek_id)?;
+        self.ensure_kek_while_synchronized(&kek_id)?;
         self.core.wrap_dek_material(tenant, region, material)
     }
 }

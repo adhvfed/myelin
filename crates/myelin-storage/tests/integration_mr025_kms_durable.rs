@@ -77,13 +77,11 @@ async fn dek_provisioned_before_restart_decrypts_after_via_a_fresh_engine() {
         .load_or_generate(&seal)
         .await
         .expect("engine #1 boots (first boot generates + seals the root)");
-    backing1
-        .ensure_kek(&engine1, &KekId::new(tenant.clone(), region.clone()))
-        .await
+    engine1
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
         .expect("ensure + persist KEK");
-    let key_ref = backing1
-        .ensure_dek(&engine1, &tenant, &region, KeyClass::Tenant)
-        .await
+    let key_ref = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Tenant)
         .expect("ensure + persist DEK");
     let dek = engine1.resolve_dek(&key_ref, &region).expect("resolve DEK");
     let (nonce, ct) = dek.seal(b"a personal-data column value");
@@ -119,13 +117,11 @@ async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
         .load_or_generate(&seal)
         .await
         .expect("first boot under K");
-    backing
-        .ensure_kek(&engine1, &KekId::new(tenant.clone(), region.clone()))
-        .await
+    engine1
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
         .expect("kek");
-    let key_ref = backing
-        .ensure_dek(&engine1, &tenant, &region, KeyClass::Tenant)
-        .await
+    let key_ref = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Tenant)
         .expect("dek");
     let (nonce, ct) = engine1
         .resolve_dek(&key_ref, &region)
@@ -183,34 +179,25 @@ async fn backup_snapshot_restore_recovers_data_and_keeps_a_shredded_key_dead() {
 
     let backing = DurableKmsBacking::new(provider.db_pool().clone(), &cell);
     let engine1 = backing.load_or_generate(&seal).await.expect("first boot");
-    backing
-        .ensure_kek(&engine1, &KekId::new(tenant.clone(), region.clone()))
-        .await
+    engine1
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
         .expect("kek");
-    let live_ref = backing
-        .ensure_dek(&engine1, &tenant, &region, KeyClass::Tenant)
-        .await
+    let live_ref = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Tenant)
         .expect("tenant dek");
-    let doomed_ref = backing
-        .ensure_dek(
-            &engine1,
-            &tenant,
-            &region,
-            KeyClass::Subject("u-doomed".into()),
-        )
-        .await
+    let doomed_ref = engine1
+        .ensure_dek(&tenant, &region, KeyClass::Subject("u-doomed".into()))
         .expect("subject dek");
     let (nonce, ct) = engine1
         .resolve_dek(&live_ref, &region)
         .expect("resolve")
         .seal(b"value to recover via restore");
 
-    backing
-        .destroy_dek(
-            &engine1,
-            &myelin_storage::DekId::new(tenant.clone(), KeyClass::Subject("u-doomed".into())),
-        )
-        .await
+    engine1
+        .destroy_dek(&myelin_storage::DekId::new(
+            tenant.clone(),
+            KeyClass::Subject("u-doomed".into()),
+        ))
         .expect("crypto-shred the subject DEK");
     let snapshot = engine1.backup_snapshot_durable(&seal).unwrap();
     assert!(
@@ -611,6 +598,113 @@ async fn a_database_outage_refuses_new_keys_without_taking_the_worker_down() {
 
     cleanup(provider.db_pool(), &cell).await;
     println!("OK [8]: a database outage refuses key provisioning and leaves the worker alive.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rotation_never_publishes_keys_the_database_did_not_commit() {
+    let provider = admin_provider().await;
+    let suffix = uniq();
+    let cell = format!("cell-{suffix}");
+    let tenant = TenantId(format!("01J0ROTFAIL{suffix}"));
+    let region = Region("eu-west".into());
+    let backing = DurableKmsBacking::new(provider.db_pool().clone(), &cell);
+    let engine = backing
+        .load_or_generate(&seal_k())
+        .await
+        .expect("the worker boots with its durable key store");
+    let kek_id = KekId::new(tenant.clone(), region.clone());
+
+    let tenant_ref = engine
+        .ensure_dek(&tenant, &region, KeyClass::Tenant)
+        .expect("mint the tenant DEK");
+    engine
+        .ensure_dek(&tenant, &region, KeyClass::Subject("rotation-owner".into()))
+        .expect("mint a subject DEK");
+    let (nonce, ciphertext) = engine
+        .resolve_dek(&tenant_ref, &region)
+        .expect("resolve the key before rotation")
+        .seal(b"data written before a rejected rotation");
+    let before = engine
+        .cached_tenant_key_state_for_test(&kek_id)
+        .expect("inspect the worker cache before rotation");
+    let previous_epoch = before.kek.as_ref().expect("the tenant KEK exists").epoch;
+
+    let failure = ForcedKekUpdateFailure::install(provider.db_pool(), &cell, &suffix).await;
+    let refusal = engine.rotate_kek(&kek_id);
+    failure.remove().await;
+
+    assert!(
+        matches!(refusal, Err(myelin_storage::KmsError::Durability(_))),
+        "the rejected durable transaction refuses rotation: {refusal:?}",
+    );
+    assert_eq!(
+        engine
+            .cached_tenant_key_state_for_test(&kek_id)
+            .expect("inspect the worker cache after the refusal"),
+        before,
+        "neither the KEK nor a DEK candidate becomes visible before commit",
+    );
+
+    let committed_epoch = engine
+        .rotate_kek(&kek_id)
+        .expect("the same worker can rotate once Postgres accepts the transaction");
+    assert_eq!(committed_epoch, previous_epoch + 1);
+    let plaintext = engine
+        .resolve_dek(&tenant_ref, &region)
+        .expect("the committed envelopes still unwrap the tenant key")
+        .open(&nonce, &ciphertext)
+        .expect("data written before rotation remains readable");
+    assert_eq!(plaintext, b"data written before a rejected rotation");
+
+    cleanup(provider.db_pool(), &cell).await;
+}
+
+struct ForcedKekUpdateFailure<'a> {
+    pool: &'a sqlx::postgres::PgPool,
+    trigger: String,
+    function: String,
+}
+
+impl<'a> ForcedKekUpdateFailure<'a> {
+    async fn install(pool: &'a sqlx::postgres::PgPool, cell: &str, suffix: &str) -> Self {
+        let function = format!("fail_kms_rotation_{suffix}");
+        let trigger = format!("fail_kms_rotation_{suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION \"{function}\"() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'forced KMS rotation failure'; END $$"
+        ))
+        .execute(pool)
+        .await
+        .expect("install the deliberate rotation failure");
+        sqlx::query(&format!(
+            "CREATE TRIGGER \"{trigger}\" BEFORE UPDATE ON kms_wrapped_kek \
+             FOR EACH ROW WHEN (NEW.cell_id = '{}') \
+             EXECUTE FUNCTION \"{function}\"()",
+            cell.replace('\'', "''"),
+        ))
+        .execute(pool)
+        .await
+        .expect("route this cell's KEK updates through the failure");
+        Self {
+            pool,
+            trigger,
+            function,
+        }
+    }
+
+    async fn remove(self) {
+        sqlx::query(&format!(
+            "DROP TRIGGER \"{}\" ON kms_wrapped_kek",
+            self.trigger
+        ))
+        .execute(self.pool)
+        .await
+        .expect("remove the deliberate rotation failure");
+        sqlx::query(&format!("DROP FUNCTION \"{}\"", self.function))
+            .execute(self.pool)
+            .await
+            .expect("remove the failure function");
+    }
 }
 
 async fn cleanup(pool: &sqlx::postgres::PgPool, cell: &str) {

@@ -480,6 +480,24 @@ pub struct KmsDurableSnapshot {
     pub deks: Vec<(DekId, WrappedDek, u64)>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, PartialEq, Eq)]
+pub struct CachedTenantKeyState {
+    pub kek: Option<ExportedKek>,
+    pub deks: Vec<(DekId, WrappedDek, u64)>,
+}
+
+pub(crate) struct PreparedKekRotation {
+    pub(crate) kek: ExportedKek,
+    pub(crate) deks: Vec<(DekId, WrappedDek, u64)>,
+}
+
+impl PreparedKekRotation {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.kek.epoch
+    }
+}
+
 pub(crate) struct KmsCore {
     root: CellRoot,
     state: Mutex<KmsState>,
@@ -528,35 +546,6 @@ impl KmsCore {
         dek_epoch: u64,
     ) -> Result<(), KmsError> {
         self.state()?.deks.insert(id, (dek, dek_epoch));
-        Ok(())
-    }
-
-    pub(crate) fn replace_tenant_key_state(
-        &self,
-        kek_id: &KekId,
-        kek: Option<ExportedKek>,
-        durable_deks: Vec<(DekId, WrappedDek, u64)>,
-    ) -> Result<(), KmsError> {
-        let mut state = self.state()?;
-        state.keks.remove(kek_id);
-        state.deks.retain(|id, _| id.tenant != kek_id.tenant);
-        if let Some(kek) = kek {
-            state.keks.insert(
-                kek_id.clone(),
-                StoredKek {
-                    wrapped: WrappedKey {
-                        nonce: kek.nonce,
-                        wrapped: kek.wrapped,
-                    },
-                    epoch: kek.epoch,
-                },
-            );
-        }
-        state.deks.extend(
-            durable_deks
-                .into_iter()
-                .map(|(id, wrapped, epoch)| (id, (wrapped, epoch))),
-        );
         Ok(())
     }
 
@@ -690,6 +679,35 @@ impl KmsCore {
             .get(id)
             .cloned()
             .ok_or_else(|| KmsError::KekUnavailable(id.clone()))?;
+        let deks = state
+            .deks
+            .iter()
+            .filter(|(dek_id, _)| dek_id.tenant == id.tenant)
+            .map(|(dek_id, (wrapped, epoch))| (dek_id.clone(), wrapped.clone(), *epoch))
+            .collect();
+        let rotation = self.prepare_kek_rotation(id, exported_kek(&current), deks)?;
+        Self::install_rotation(&mut state, id, &rotation);
+        Ok(rotation.epoch())
+    }
+
+    pub(crate) fn prepare_kek_rotation(
+        &self,
+        id: &KekId,
+        current: ExportedKek,
+        deks: Vec<(DekId, WrappedDek, u64)>,
+    ) -> Result<PreparedKekRotation, KmsError> {
+        if deks.iter().any(|(dek_id, _, _)| dek_id.tenant != id.tenant) {
+            return Err(KmsError::EncryptFailed(
+                "rotate a KEK with another tenant's DEK",
+            ));
+        }
+        let current = StoredKek {
+            wrapped: WrappedKey {
+                nonce: current.nonce,
+                wrapped: current.wrapped,
+            },
+            epoch: current.epoch,
+        };
         let old_kek = self
             .root
             .unwrap_kek(&current.wrapped)
@@ -700,30 +718,52 @@ impl KmsCore {
             .ok_or(KmsError::EncryptFailed("advance exhausted KEK epoch"))?;
         let new_kek = RawKey::generate();
         let new_wrapped_kek = self.root.wrap_kek(&new_kek)?;
-        let mut replacements = Vec::new();
-        for (dek_id, (wrapped, dek_epoch)) in state
-            .deks
-            .iter()
-            .filter(|(dek_id, _)| dek_id.tenant == id.tenant)
-        {
-            let plain = unwrap_dek(&old_kek, dek_id, wrapped)?;
+        let mut replacements = Vec::with_capacity(deks.len());
+        for (dek_id, wrapped, dek_epoch) in deks {
+            let plain = unwrap_dek(&old_kek, &dek_id, &wrapped)?;
             let next_dek_epoch = dek_epoch
                 .checked_add(1)
                 .ok_or(KmsError::EncryptFailed("advance exhausted DEK epoch"))?;
             let replacement = wrap_dek(&new_kek, new_epoch, &plain)?;
-            replacements.push((dek_id.clone(), replacement, next_dek_epoch));
+            replacements.push((dek_id, replacement, next_dek_epoch));
         }
-        for (dek_id, wrapped, dek_epoch) in replacements {
-            state.deks.insert(dek_id, (wrapped, dek_epoch));
+        Ok(PreparedKekRotation {
+            kek: ExportedKek {
+                nonce: new_wrapped_kek.nonce,
+                wrapped: new_wrapped_kek.wrapped,
+                epoch: new_epoch,
+            },
+            deks: replacements,
+        })
+    }
+
+    pub(crate) fn publish_kek_rotation(
+        &self,
+        id: &KekId,
+        rotation: &PreparedKekRotation,
+    ) -> Result<(), KmsError> {
+        let mut state = self.state()?;
+        Self::install_rotation(&mut state, id, rotation);
+        Ok(())
+    }
+
+    fn install_rotation(state: &mut KmsState, id: &KekId, rotation: &PreparedKekRotation) {
+        state.deks.retain(|dek_id, _| dek_id.tenant != id.tenant);
+        for (dek_id, wrapped, dek_epoch) in &rotation.deks {
+            state
+                .deks
+                .insert(dek_id.clone(), (wrapped.clone(), *dek_epoch));
         }
         state.keks.insert(
             id.clone(),
             StoredKek {
-                wrapped: new_wrapped_kek,
-                epoch: new_epoch,
+                wrapped: WrappedKey {
+                    nonce: rotation.kek.nonce,
+                    wrapped: rotation.kek.wrapped.clone(),
+                },
+                epoch: rotation.kek.epoch,
             },
         );
-        Ok(new_epoch)
     }
 
     pub fn destroy_kek(&self, id: &KekId) -> Result<bool, KmsError> {
@@ -873,6 +913,14 @@ fn wrap_dek(kek: &RawKey, kek_epoch: u64, plain: &RawKey) -> Result<WrappedDek, 
     })
 }
 
+fn exported_kek(stored: &StoredKek) -> ExportedKek {
+    ExportedKek {
+        nonce: stored.wrapped.nonce,
+        wrapped: stored.wrapped.wrapped.clone(),
+        epoch: stored.epoch,
+    }
+}
+
 enum KmsBackend {
     #[cfg(any(test, feature = "test-support"))]
     Memory(KmsCore),
@@ -968,6 +1016,22 @@ impl KmsEngine {
             KmsBackend::Memory(core) => core.export_deks(),
             KmsBackend::Durable(durable) => durable.export_deks(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cached_tenant_key_state_for_test(
+        &self,
+        id: &KekId,
+    ) -> Result<CachedTenantKeyState, KmsError> {
+        let kek = self.core().export_kek(id)?;
+        let mut deks: Vec<_> = self
+            .core()
+            .export_deks()?
+            .into_iter()
+            .filter(|(dek_id, _, _)| dek_id.tenant == id.tenant)
+            .collect();
+        deks.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(CachedTenantKeyState { kek, deks })
     }
 
     pub fn ensure_kek(&self, id: &KekId) -> Result<u64, KmsError> {
