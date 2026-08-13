@@ -967,6 +967,49 @@ impl StoreBackedCheck {
         let object_type = ObjectType(infer_object_type(&object.0));
         expand.explain(scope, subject, object, &object_type, permission, at)
     }
+
+    pub fn check_many(
+        &self,
+        subject: &Principal,
+        permission: &Permission,
+        objects: &[ArtifactRef],
+        at: &Consistency,
+        caveat: Option<&CaveatContext>,
+    ) -> myelin_identity::Result<Vec<Decision>> {
+        if objects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope =
+            myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
+        let revoke_target = myelin_identity::RevokeTarget::Principal(subject.principal_id.clone());
+        if self.revocations.is_revoked(
+            &scope,
+            &revoke_target,
+            &myelin_events::Timestamp(String::new()),
+        ) {
+            return Ok(vec![Decision::Deny; objects.len()]);
+        }
+
+        let snapshot = self.engine.snapshot(&scope, &at.at_least)?;
+        let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(objects
+            .iter()
+            .map(|object| {
+                let granted = namespace.permits_snapshot(
+                    &snapshot,
+                    subject,
+                    &namespace::type_of_object_ref(object),
+                    &permission.0,
+                    object,
+                );
+                match (granted, caveat) {
+                    (false, _) => Decision::Deny,
+                    (true, None) => Decision::Allow,
+                    (true, Some(caveat)) => check_engine::eval_caveat(caveat),
+                }
+            })
+            .collect())
+    }
 }
 
 fn infer_object_type(object_id: &str) -> String {
@@ -994,39 +1037,18 @@ impl IdentityService for StoreBackedCheck {
         at: &Consistency,
         caveat: Option<&CaveatContext>,
     ) -> myelin_identity::Result<Decision> {
-        let scope =
-            myelin_storage::TenantScope::from_verified_token(subject, subject.region.clone());
-
-        let revoke_target = myelin_identity::RevokeTarget::Principal(subject.principal_id.clone());
-        if self.revocations.is_revoked(
-            &scope,
-            &revoke_target,
-            &myelin_events::Timestamp(String::new()),
-        ) {
-            return Ok(Decision::Deny);
-        }
-
-        let object_type = namespace::type_of_object_ref(object);
-        let granted = self
-            .namespace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .permits(
-                &self.engine,
-                &scope,
-                subject,
-                &object_type,
-                &permission.0,
-                object,
-                at,
-            );
-        if !granted {
-            return Ok(Decision::Deny);
-        }
-        match caveat {
-            None => Ok(Decision::Allow),
-            Some(cav) => Ok(check_engine::eval_caveat(cav)),
-        }
+        self.check_many(
+            subject,
+            permission,
+            std::slice::from_ref(object),
+            at,
+            caveat,
+        )
+        .and_then(|mut decisions| {
+            decisions
+                .pop()
+                .ok_or_else(|| AuthzError::FailClosed("identity batch returned no decision".into()))
+        })
     }
 
     fn list_objects(

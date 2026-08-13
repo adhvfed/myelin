@@ -14,7 +14,7 @@ async function findRepository(slug: string): Promise<JsonRecord | undefined> {
   let cursor: string | undefined;
   const visited = new Set<string>();
   do {
-    const query = new URLSearchParams({ limit: "100" });
+    const query = new URLSearchParams({ view: "summary", limit: "100" });
     if (cursor) query.set("cursor", cursor);
     const response = await systemClient.json(`/v1/git/repos?${query}`);
     const match = array(response.body.items, "repository list page")

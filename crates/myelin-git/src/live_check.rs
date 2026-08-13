@@ -91,6 +91,23 @@ impl<I: IdentityService, C: Clock> GitCheckGate<I, C> {
         })
     }
 
+    pub fn check_failstatic_result(
+        &self,
+        subject: &Principal,
+        permission: &Permission,
+        object: &ArtifactRef,
+        at: &Consistency,
+        subject_revoked: bool,
+        result: myelin_identity::Result<Decision>,
+    ) -> AuthzDecision {
+        let key = cache_key(subject, permission, object);
+        self.failstatic.serve(key, at, subject_revoked, || {
+            result
+                .clone()
+                .map_err(|error| ServeError(format!("git→Id check hiccup: {error:?}")))
+        })
+    }
+
     pub fn front_door_check(
         &self,
         subject: &Principal,
@@ -523,6 +540,35 @@ mod tests {
             s.last_staleness_secs <= g.static_max(),
             "staleness ≤ static_max (≤ revocation SLA)"
         );
+    }
+
+    #[test]
+    fn a_batched_identity_answer_keeps_the_same_bounded_static_fallback() {
+        let g = gate(StubId::new(), TestClock::at(1_000));
+        let repo = repo_ref("core");
+        let pull = Permission(perm::PULL.into());
+        let alice = subject("p:alice");
+        let at = bounded_stale_at(Zookie(String::new()));
+
+        let fresh =
+            g.check_failstatic_result(&alice, &pull, &repo, &at, false, Ok(Decision::Allow));
+        assert!(is_allow(&fresh));
+        assert_eq!(fresh.served, AuthzServed::Fresh);
+
+        g.clock().advance(31);
+        let degraded = g.check_failstatic_result(
+            &alice,
+            &pull,
+            &repo,
+            &at,
+            false,
+            Err(AuthzError::Unavailable("batch snapshot unavailable".into())),
+        );
+        assert!(
+            is_allow(&degraded),
+            "a cached grant survives the same bounded outage"
+        );
+        assert_eq!(degraded.served, AuthzServed::Static);
     }
 
     #[test]

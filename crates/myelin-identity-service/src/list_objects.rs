@@ -89,19 +89,20 @@ impl ListObjects {
         at: &Consistency,
     ) -> BTreeSet<String> {
         let candidates = self.candidate_objects(scope, subject, ty);
+        let Ok(snapshot) = self.engine.snapshot(scope, &at.at_least) else {
+            return BTreeSet::new();
+        };
 
         let mut reachable: BTreeSet<String> = BTreeSet::new();
         for obj in candidates {
             let object_ref = ArtifactRef(obj.clone());
             let object_type = type_of_object_id(&obj);
-            let granted = self.namespace.permits(
-                &self.engine,
-                scope,
+            let granted = self.namespace.permits_snapshot(
+                &snapshot,
                 subject,
                 &object_type,
                 &permission.0,
                 &object_ref,
-                at,
             );
             if granted {
                 reachable.insert(obj);

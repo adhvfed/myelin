@@ -3,14 +3,13 @@ use myelin_events::Timestamp;
 use myelin_git::core::RepoLoc;
 use myelin_git::live_check::{bounded_stale_at, is_allow, perm, strong_at, GitCheckGate};
 use myelin_identity::{
-    IdentityService, ListObjectsResult, ObjectId, ObjectType, Permission, Principal, RelName,
-    RelationTuple, RevokeTarget, TupleDelta, Zookie,
+    AuthzError, ObjectId, Permission, Principal, RelName, RelationTuple, RevokeTarget, TupleDelta,
+    Zookie,
 };
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
 use myelin_storage::TenantScope;
 use myelin_substrate::{FailStaticError, FailStaticThreshold, Seconds, SystemClock};
 use myelin_tenancy::ArtifactRef;
-use std::collections::BTreeSet;
 
 pub const REPO_ADMIN_RELATION: &str = "admin";
 
@@ -94,32 +93,45 @@ impl RepoAuthorizer for CheckBackedRepoAuthorizer {
         &self,
         principal: &Principal,
         tenant: &str,
-        region: &str,
+        _region: &str,
         candidates: &[String],
     ) -> Vec<String> {
         if principal.tenant.0 != tenant {
             return Vec::new();
         }
-        let ids: BTreeSet<String> = match self.gate.id_ref().list_objects(
-            principal,
-            &Permission(perm::PULL.to_string()),
-            &ObjectType("repo".to_string()),
-            &bounded_stale_at(Zookie(String::new())),
-        ) {
-            Ok(ListObjectsResult::Ids { ids, .. }) => ids.into_iter().map(|o| o.0).collect(),
-            _ => BTreeSet::new(),
-        };
+        let permission = Permission(perm::PULL.to_string());
+        let consistency = bounded_stale_at(Zookie(String::new()));
+        let objects = candidates
+            .iter()
+            .map(|slug| repo_object_ref(slug))
+            .collect::<Vec<_>>();
+        let decisions =
+            self.gate
+                .id_ref()
+                .check_many(principal, &permission, &objects, &consistency, None);
+        let subject_revoked = self.subject_revoked(principal);
         candidates
             .iter()
-            .filter(|slug| {
-                ids.contains(&repo_object_id(slug))
-                    || self.authorize_repo_permission(
-                        principal,
-                        &RepoLoc::new(tenant, region, slug.as_str()),
-                        RepoPermission::Pull,
-                    )
+            .zip(objects)
+            .enumerate()
+            .filter_map(|(index, (slug, object))| {
+                let result = decisions.as_ref().map_err(Clone::clone).and_then(|values| {
+                    values.get(index).copied().ok_or_else(|| {
+                        AuthzError::FailClosed(
+                            "identity batch returned fewer decisions than repositories".into(),
+                        )
+                    })
+                });
+                is_allow(&self.gate.check_failstatic_result(
+                    principal,
+                    &permission,
+                    &object,
+                    &consistency,
+                    subject_revoked,
+                    result,
+                ))
+                .then(|| slug.clone())
             })
-            .cloned()
             .collect()
     }
 }
@@ -468,32 +480,39 @@ mod tests {
     }
 
     #[test]
-    fn visible_repos_ids_fast_path_over_a_fed_index() {
-        use myelin_events::{BusTransport, EventHandler as _, InProcessBus, Relay};
-        let outbox = OutboxStore::new();
-        let tuples = TupleStore::new(outbox.clone());
-        let index = myelin_identity_service::ReverseIndex::new();
-        let consumer = myelin_identity_service::ReverseIndexConsumer::new(index.clone());
-        let sbc = StoreBackedCheck::with_index(tuples, index);
-        for admit in sbc.admit_git_fragment() {
-            assert!(matches!(admit, FragmentAdmit::Admitted { .. }));
-        }
+    fn one_relationship_snapshot_finds_access_inherited_from_a_project() {
+        let sbc = check_with_git_fragment();
         let creator = principal("svc:creator", "acme");
-        TupleRepoBootstrap::new(sbc.tuples().clone())
-            .grant_creator(&creator, &RepoLoc::new("acme", "eu-west", "alpha"))
-            .expect("grant on alpha");
-        let bus = InProcessBus::new();
-        let relay = Relay::new(outbox, bus.clone(), || Timestamp("t".into()));
-        relay.drain_to_empty();
-        for env in bus.consume("") {
-            let _ = consumer.handle(&env, &mut myelin_events::HandlerTx::none());
-        }
+        let scope = TenantScope::from_verified_token(&creator, creator.region.clone());
+        sbc.tuples()
+            .write_tuples(
+                &scope,
+                &creator,
+                &[
+                    TupleDelta::Add(RelationTuple {
+                        object: ObjectId("project:delivery".into()),
+                        relation: RelName("reader".into()),
+                        subject: creator.principal_id.clone(),
+                        caveat: None,
+                    }),
+                    TupleDelta::Add(RelationTuple {
+                        object: ObjectId(repo_object_id("alpha")),
+                        relation: RelName("parent_project".into()),
+                        subject: PrincipalId("project:delivery#view".into()),
+                        caveat: None,
+                    }),
+                ],
+                None,
+                None,
+                now_rfc3339(),
+            )
+            .expect("link a visible project to its repository");
         let authz = authorizer(sbc);
         let candidates = vec!["alpha".to_string(), "beta".to_string()];
         assert_eq!(
             authz.visible_repos(&creator, "acme", "eu-west", &candidates),
             vec!["alpha".to_string()],
-            "the fed-index Ids path admits the granted repo and still hides `beta`"
+            "project membership reveals its repository without revealing an unrelated one"
         );
     }
 

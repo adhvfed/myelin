@@ -59,6 +59,15 @@ pub struct StoredTuple {
     pub expires_at: Option<Timestamp>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TupleReadError(String);
+
+impl core::fmt::Display for TupleReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "relationship tuple snapshot unavailable: {}", self.0)
+    }
+}
+
 impl StoredTuple {
     pub fn partition_bucket(&self, buckets: u64) -> u64 {
         debug_assert!(buckets > 0, "partition bucket count must be non-zero");
@@ -224,25 +233,32 @@ impl TupleStore {
     }
 
     pub fn tuples_in(&self, scope: &TenantScope) -> Vec<StoredTuple> {
+        self.try_tuples_in(scope).unwrap_or_default()
+    }
+
+    pub(crate) fn try_tuples_in(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<Vec<StoredTuple>, TupleReadError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
                 let inner = Self::mem_lock(inner_arc);
-                inner
+                Ok(inner
                     .partitions
                     .get(&Self::part_key(scope))
                     .map(|p| p.values().cloned().collect())
-                    .unwrap_or_default()
+                    .unwrap_or_default())
             }
             TupleBackend::Pg(pg) => {
                 let tenant = scope.tenant().0.clone();
                 let region = scope.region().0.clone();
                 let edges = pg
                     .block(pg.backing.edges_in(&tenant, &region))
-                    .unwrap_or_default();
+                    .map_err(|error| TupleReadError(error.to_string()))?;
                 let zk = pg.watermark.lock();
-                edges
+                Ok(edges
                     .into_iter()
                     .map(|(object, relation, subject)| {
                         let zookie = zk
@@ -262,7 +278,7 @@ impl TupleStore {
                             expires_at: None,
                         }
                     })
-                    .collect()
+                    .collect())
             }
         }
     }

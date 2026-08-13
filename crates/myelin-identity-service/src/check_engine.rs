@@ -1,6 +1,7 @@
 use crate::tuple_store::TupleStore;
 use myelin_identity::{
-    CaveatContext, Consistency, Decision, Literal, Principal, PrincipalStatus, RelName, Zookie,
+    AuthzError, CaveatContext, Consistency, Decision, Literal, Principal, PrincipalStatus, RelName,
+    Zookie,
 };
 use myelin_query::{CmpOp, EvalContext, EvalError, Expr, Predicate, QueryAst};
 use myelin_storage::TenantScope;
@@ -30,6 +31,61 @@ impl CheckEngine {
         at: &Consistency,
         caveat: Option<&CaveatContext>,
     ) -> Decision {
+        let Ok(snapshot) = self.snapshot(scope, &at.at_least) else {
+            return Decision::Deny;
+        };
+        snapshot.check(subject, permission, object, caveat)
+    }
+
+    pub fn direct_subjects(
+        &self,
+        scope: &TenantScope,
+        object: &ArtifactRef,
+        relation: &RelName,
+        at: &Consistency,
+    ) -> Vec<String> {
+        self.snapshot(scope, &at.at_least)
+            .map(|snapshot| snapshot.direct_subjects(object, relation))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        scope: &TenantScope,
+        at_least: &Zookie,
+    ) -> myelin_identity::Result<CheckSnapshot> {
+        let mut by_object: HashMap<String, Vec<SnapTuple>> = HashMap::new();
+        let tuples = self.tuples.try_tuples_in(scope).map_err(|_| {
+            AuthzError::Unavailable("relationship tuple snapshot unavailable".into())
+        })?;
+        for st in tuples {
+            if !at_least.0.is_empty() && st.zookie.0 > at_least.0 {
+                continue;
+            }
+            let stored_key = myelin_refs::object_key(&ArtifactRef(st.tuple.object.0.clone()))
+                .map(|k| k.tuple_key())
+                .unwrap_or_else(|| st.tuple.object.0.clone());
+            by_object.entry(stored_key).or_default().push(SnapTuple {
+                relation: st.tuple.relation.0,
+                subject: st.tuple.subject.0,
+            });
+        }
+        Ok(CheckSnapshot { by_object })
+    }
+}
+
+pub(crate) struct CheckSnapshot {
+    by_object: HashMap<String, Vec<SnapTuple>>,
+}
+
+impl CheckSnapshot {
+    pub(crate) fn check(
+        &self,
+        subject: &Principal,
+        permission: &RelName,
+        object: &ArtifactRef,
+        caveat: Option<&CaveatContext>,
+    ) -> Decision {
         if subject.status != PrincipalStatus::Active {
             return Decision::Deny;
         }
@@ -41,10 +97,8 @@ impl CheckEngine {
             None => return Decision::Deny,
         };
 
-        let snapshot = self.snapshot_view(scope, &at.at_least);
-
         let mut memo: HashMap<MemoKey, bool> = HashMap::new();
-        let granted = snapshot.has_relation(
+        let granted = self.has_relation(
             &subject.principal_id.0,
             &permission.0,
             &object_id,
@@ -62,20 +116,12 @@ impl CheckEngine {
         }
     }
 
-    pub fn direct_subjects(
-        &self,
-        scope: &TenantScope,
-        object: &ArtifactRef,
-        relation: &RelName,
-        at: &Consistency,
-    ) -> Vec<String> {
+    pub(crate) fn direct_subjects(&self, object: &ArtifactRef, relation: &RelName) -> Vec<String> {
         let object_id = match object_id_of(object) {
             Some(id) => id,
             None => return Vec::new(),
         };
-        let snapshot = self.snapshot_view(scope, &at.at_least);
-        snapshot
-            .by_object
+        self.by_object
             .get(&object_id)
             .map(|tuples| {
                 tuples
@@ -85,23 +131,6 @@ impl CheckEngine {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn snapshot_view(&self, scope: &TenantScope, at_least: &Zookie) -> SnapshotView {
-        let mut by_object: HashMap<String, Vec<SnapTuple>> = HashMap::new();
-        for st in self.tuples.tuples_in(scope) {
-            if !at_least.0.is_empty() && st.zookie.0 > at_least.0 {
-                continue;
-            }
-            let stored_key = myelin_refs::object_key(&ArtifactRef(st.tuple.object.0.clone()))
-                .map(|k| k.tuple_key())
-                .unwrap_or_else(|| st.tuple.object.0.clone());
-            by_object.entry(stored_key).or_default().push(SnapTuple {
-                relation: st.tuple.relation.0.clone(),
-                subject: st.tuple.subject.0.clone(),
-            });
-        }
-        SnapshotView { by_object }
     }
 }
 
@@ -118,11 +147,7 @@ struct SnapTuple {
     subject: String,
 }
 
-struct SnapshotView {
-    by_object: HashMap<String, Vec<SnapTuple>>,
-}
-
-impl SnapshotView {
+impl CheckSnapshot {
     fn has_relation(
         &self,
         subject: &str,
@@ -546,7 +571,9 @@ mod tests {
             "the diamond resolves to Allow"
         );
 
-        let view = eng.snapshot_view(&s, &Zookie(String::new()));
+        let view = eng
+            .snapshot(&s, &Zookie(String::new()))
+            .expect("relationship snapshot");
         let mut memo: HashMap<MemoKey, bool> = HashMap::new();
         let granted = view.has_relation("p:alice", "m", "top", 0, &mut memo);
         assert!(granted, "the diamond grants");

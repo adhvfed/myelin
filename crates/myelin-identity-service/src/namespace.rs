@@ -1,4 +1,4 @@
-use crate::check_engine::{CheckEngine, USERSET_SEP};
+use crate::check_engine::{CheckEngine, CheckSnapshot, USERSET_SEP};
 use myelin_identity::{
     FragmentAdmit, NamespaceFragment, ObjectType, Permission, Principal, RelName,
 };
@@ -367,57 +367,49 @@ impl NamespaceEngine {
         object: &ArtifactRef,
         at: &myelin_identity::Consistency,
     ) -> bool {
-        self.eval(
-            engine,
-            scope,
-            subject,
-            object_type,
-            permission,
-            object,
-            at,
-            0,
-        )
+        let Ok(snapshot) = engine.snapshot(scope, &at.at_least) else {
+            return false;
+        };
+        self.permits_snapshot(&snapshot, subject, object_type, permission, object)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn eval(
+    pub(crate) fn permits_snapshot(
         &self,
-        engine: &CheckEngine,
-        scope: &TenantScope,
+        snapshot: &CheckSnapshot,
         subject: &Principal,
         object_type: &str,
         permission: &str,
         object: &ArtifactRef,
-        at: &myelin_identity::Consistency,
+    ) -> bool {
+        self.eval(snapshot, subject, object_type, permission, object, 0)
+    }
+
+    fn eval(
+        &self,
+        snapshot: &CheckSnapshot,
+        subject: &Principal,
+        object_type: &str,
+        permission: &str,
+        object: &ArtifactRef,
         depth: usize,
     ) -> bool {
         if depth > MAX_RULE_DEPTH {
             return false;
         }
         match self.resolve_permission(object_type, permission) {
-            Some(rewrite) => self.eval_userset(engine, scope, subject, object, at, &rewrite, depth),
+            Some(rewrite) => self.eval_userset(snapshot, subject, object, &rewrite, depth),
             None => matches!(
-                engine.check(
-                    scope,
-                    subject,
-                    &RelName(permission.to_string()),
-                    object,
-                    at,
-                    None
-                ),
+                snapshot.check(subject, &RelName(permission.to_string()), object, None),
                 myelin_identity::Decision::Allow
             ),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn eval_userset(
         &self,
-        engine: &CheckEngine,
-        scope: &TenantScope,
+        snapshot: &CheckSnapshot,
         subject: &Principal,
         object: &ArtifactRef,
-        at: &myelin_identity::Consistency,
         rewrite: &Userset,
         depth: usize,
     ) -> bool {
@@ -427,52 +419,48 @@ impl NamespaceEngine {
         match rewrite {
             Userset::Relation(r) => {
                 if matches!(
-                    engine.check(scope, subject, r, object, at, None),
+                    snapshot.check(subject, r, object, None),
                     myelin_identity::Decision::Allow
                 ) {
                     return true;
                 }
-                engine
-                    .direct_subjects(scope, object, r, at)
+                snapshot
+                    .direct_subjects(object, r)
                     .iter()
                     .filter_map(|userset| crate::check_engine::parse_userset(userset))
                     .any(|(parent_id, parent_relation)| {
                         self.eval(
-                            engine,
-                            scope,
+                            snapshot,
                             subject,
                             &type_of_object_id(parent_id),
                             parent_relation,
                             &ArtifactRef(parent_id.into()),
-                            at,
                             depth + 1,
                         )
                     })
             }
             Userset::Union(arms) => arms
                 .iter()
-                .any(|a| self.eval_userset(engine, scope, subject, object, at, a, depth + 1)),
+                .any(|a| self.eval_userset(snapshot, subject, object, a, depth + 1)),
             Userset::Intersect(arms) => arms
                 .iter()
-                .all(|a| self.eval_userset(engine, scope, subject, object, at, a, depth + 1)),
+                .all(|a| self.eval_userset(snapshot, subject, object, a, depth + 1)),
             Userset::Exclusion { base, subtracted } => {
-                self.eval_userset(engine, scope, subject, object, at, base, depth + 1)
-                    && !self.eval_userset(engine, scope, subject, object, at, subtracted, depth + 1)
+                self.eval_userset(snapshot, subject, object, base, depth + 1)
+                    && !self.eval_userset(snapshot, subject, object, subtracted, depth + 1)
             }
             Userset::TupleToUserset { tupleset, computed } => {
-                let parents = engine.direct_subjects(scope, object, tupleset, at);
+                let parents = snapshot.direct_subjects(object, tupleset);
                 parents.iter().any(|parent_subject| {
                     match crate::check_engine::parse_userset(parent_subject) {
                         Some((parent_id, parent_rel)) if parent_rel == computed.0 => {
                             let parent_type = type_of_object_id(parent_id);
                             self.eval(
-                                engine,
-                                scope,
+                                snapshot,
                                 subject,
                                 &parent_type,
                                 computed.0.as_str(),
                                 &ArtifactRef(parent_id.to_string()),
-                                at,
                                 depth + 1,
                             )
                         }
