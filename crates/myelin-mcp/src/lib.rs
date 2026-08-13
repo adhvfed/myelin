@@ -8,7 +8,7 @@ pub use governance::{
     GateApproverPolicy, GateAuditMinter, GovernanceAudit, GovernanceAuditOutcome,
     GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter, GovernedRun, IssuedGovernedRun,
     OutboxGovernanceAudit, ReadAuditOutcome, ReadAuthorization, ReadRefusalCategory, RunPrincipal,
-    SkeletonEffectApi, GOVERNED_DIRECT_READ_TOOLS,
+    GOVERNED_DIRECT_READ_TOOLS,
 };
 pub use registry::{RegisteredTool, ToolRegistry};
 pub use server::{Clock, DirectReadError, DirectReadExecutor, McpServer, MAX_FRAME_BYTES};

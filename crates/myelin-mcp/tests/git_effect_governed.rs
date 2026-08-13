@@ -2,6 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "support/registry.rs"]
+mod registry_support;
+
+use registry_support::registry_for_subsystems;
+
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{
     DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RunId, RuntimeRef,
@@ -19,7 +24,6 @@ use myelin_edge::{recover_placed_git_at_boot, GitDatabaseProviders};
 use myelin_edge::{DenyAllRepos, DurableGitBackend, GitEffectApi, GrantBackedRepos};
 use myelin_mcp::{
     GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
-    ToolRegistry,
 };
 
 const TENANT: &str = "acme";
@@ -202,7 +206,7 @@ fn governed_git_server_with_grants_scoped_at(
         )),
     );
     McpServer::with_router_and_clock(
-        ToolRegistry::with_git(),
+        registry_for_subsystems(&["git"]),
         router,
         Arc::new(move || current.clone()),
     )
@@ -468,10 +472,18 @@ fn agent_file_write_creates_a_branch_and_replays_from_git_provenance() {
     )
     .unwrap();
     assert_eq!(conflicting["result"]["isError"], true);
-    assert!(conflicting["result"]["_meta"]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("different file write"));
+    assert_eq!(
+        conflicting["result"]["_meta"]["reason"], "internal error",
+        "the MCP boundary does not disclose durable Git conflict details"
+    );
+    assert!(
+        matches!(
+            repo.read_blob_at_path_bounded("refs/heads/agent/fix", "src/release.ts", 1024)
+                .unwrap(),
+            BlobPathLookup::Found { bytes, .. } if bytes == b"export const ready = true;\n"
+        ),
+        "reusing an operation key for different content leaves the first durable write intact"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

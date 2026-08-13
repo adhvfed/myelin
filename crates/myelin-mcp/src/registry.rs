@@ -120,30 +120,6 @@ impl ToolRegistry {
         Ok(Self::from_definitions(selected))
     }
 
-    pub fn with_git() -> ToolRegistry {
-        Self::filtered_platform(|definition| definition.subsystem == "git")
-            .expect("the built-in Git MCP catalogue must be valid")
-    }
-
-    pub fn with_git_and_ci_reads() -> Result<ToolRegistry, RegistryError> {
-        Self::filtered_platform(|definition| {
-            definition.subsystem == "git" || definition.subsystem == "ci"
-        })
-    }
-
-    fn filtered_platform(
-        include: impl Fn(&ToolDef) -> bool,
-    ) -> Result<ToolRegistry, RegistryError> {
-        let catalogue = platform_catalogue()?;
-        Ok(Self::from_definitions(
-            catalogue
-                .latest_definitions()
-                .into_iter()
-                .filter(|definition| definition.exposed_over_mcp && include(definition))
-                .cloned(),
-        ))
-    }
-
     fn from_definitions(definitions: impl IntoIterator<Item = ToolDef>) -> Self {
         let mut tools = definitions
             .into_iter()
@@ -303,8 +279,16 @@ mod tests {
 
     #[test]
     fn git_and_ci_contracts_preserve_the_provider_schemas_exactly() {
-        let registry = ToolRegistry::with_git_and_ci_reads().unwrap();
         let catalogue = PlatformToolCatalogue::platform().unwrap();
+        let cursors = catalogue
+            .latest_definitions()
+            .into_iter()
+            .filter(|definition| {
+                definition.exposed_over_mcp && matches!(definition.subsystem.as_str(), "git" | "ci")
+            })
+            .map(catalogue_cursor)
+            .collect::<Vec<_>>();
+        let registry = ToolRegistry::for_cursors(&cursors).unwrap();
         for tool in registry.tools() {
             let provider = catalogue.resolve(tool.name()).unwrap();
             assert_eq!(tool.cursor(), catalogue_cursor(provider));

@@ -1,11 +1,14 @@
 use myelin_agent::EffectKind;
 use myelin_ci_controlplane::ci_tool_def;
-use myelin_mcp::ToolRegistry;
+#[path = "support/registry.rs"]
+mod registry_support;
+
+use registry_support::registry_for_subsystems;
 use serde_json::Value;
 
 #[test]
 fn cdc_8_1_ci_provider_and_mcp_consumer_are_byte_aligned() {
-    let registry = ToolRegistry::with_git_and_ci_reads().expect("valid shared catalogue");
+    let registry = registry_for_subsystems(&["git", "ci"]);
     for name in ["read_run", "read_log"] {
         let provider = ci_tool_def(name);
         let consumer = registry

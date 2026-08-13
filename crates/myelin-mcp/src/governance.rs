@@ -1666,41 +1666,6 @@ pub fn proposed_effect_for(tool: &str, args: &serde_json::Value) -> ProposedEffe
     ProposedEffect(format!("tool:{tool}|args:{args}"))
 }
 
-#[derive(Default)]
-pub struct SkeletonEffectApi {
-    calls: RefCell<Vec<(String, String)>>,
-}
-
-impl SkeletonEffectApi {
-    pub fn new() -> SkeletonEffectApi {
-        SkeletonEffectApi {
-            calls: RefCell::new(Vec::new()),
-        }
-    }
-
-    pub fn recorded(&self) -> Vec<(String, String)> {
-        self.calls.borrow().clone()
-    }
-}
-
-impl EffectApi for SkeletonEffectApi {
-    fn apply(&self, run: &RunCtx, effect: ProposedEffect) -> EffectResult {
-        self.calls
-            .borrow_mut()
-            .push((run.0.clone(), effect.0.clone()));
-        EffectResult::Applied(myelin_agent::EventId(format!("evt:{}", run.0)))
-    }
-
-    fn apply_authorized(
-        &self,
-        run: &RunCtx,
-        _authority: &EffectAuthority,
-        effect: ProposedEffect,
-    ) -> EffectResult {
-        self.apply(run, effect)
-    }
-}
-
 #[cfg(test)]
 mod security_tests {
     use myelin_events::IdMinter;

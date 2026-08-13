@@ -1,6 +1,14 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[path = "support/effect.rs"]
+mod effect_support;
+#[path = "support/registry.rs"]
+mod registry_support;
+
+use effect_support::ApplyingEffectApi;
+use registry_support::registry_for_subsystems;
+
 struct FailingWriter;
 
 impl std::io::Write for FailingWriter {
@@ -29,7 +37,6 @@ use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
-use myelin_mcp::governance::SkeletonEffectApi;
 use myelin_mcp::{
     AuditPhase, CallOutcome, DirectReadError, DirectReadExecutor, GateApproverPolicy,
     GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter,
@@ -42,6 +49,14 @@ use myelin_storage::hitl_gate_durable::{
 
 fn now() -> Timestamp {
     Timestamp("2026-06-26T00:00:00Z".into())
+}
+
+fn git_registry() -> ToolRegistry {
+    registry_for_subsystems(&["git"])
+}
+
+fn git_and_ci_registry() -> ToolRegistry {
+    registry_for_subsystems(&["git", "ci"])
 }
 
 struct TestApprovers(Vec<PrincipalId>);
@@ -267,7 +282,7 @@ fn governed_router_with_caveats_and_verdicts(
     GovernedRouter::with_approver_policy(
         minter,
         principal,
-        Box::new(SkeletonEffectApi::new()),
+        Box::new(ApplyingEffectApi),
         verdicts,
         Arc::new(TestApprovers(approvers)),
         audit,
@@ -275,7 +290,7 @@ fn governed_router_with_caveats_and_verdicts(
 }
 
 fn governed_server() -> McpServer {
-    McpServer::with_router_and_clock(ToolRegistry::with_git(), governed_router(), Arc::new(now))
+    McpServer::with_router_and_clock(git_registry(), governed_router(), Arc::new(now))
 }
 
 struct RecordingReadExecutor {
@@ -364,7 +379,7 @@ fn caveated_router(grants: &[&str], caveats: &[&str]) -> GovernedRouter {
 
 #[test]
 fn declared_caps_fail_closed_for_missing_and_attenuated_delegation() {
-    let registry = ToolRegistry::with_git();
+    let registry = git_registry();
     let open_pr = registry.resolve("git.open_pr").expect("registered tool");
 
     let no_grant = governed_router_with_input(DelegationInput {
@@ -512,7 +527,7 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
         trigger_actor_held: Authority::of(grants),
     });
     let server = McpServer::with_router_reads_and_clock(
-        ToolRegistry::with_git_and_ci_reads().unwrap(),
+        git_and_ci_registry(),
         router,
         Arc::new(RecordingReadExecutor {
             calls: AtomicUsize::new(0),
@@ -550,7 +565,7 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
 fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection() {
     let minting_router = ci_read_router(&["repo.push", "run.view"]);
     minting_router
-        .permitted_tool_names(&ToolRegistry::with_git_and_ci_reads().unwrap(), &now())
+        .permitted_tool_names(&git_and_ci_registry(), &now())
         .unwrap();
     let issued_token = minting_router.current_token().unwrap();
     let router = GovernedRouter::with_issued_run(
@@ -561,7 +576,7 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
             ["repo.push".into(), "run.view".into()],
         )
         .unwrap(),
-        Box::new(SkeletonEffectApi::new()),
+        Box::new(ApplyingEffectApi),
         HitlVerdictStore::new(),
         Arc::new(TestApprovers(vec![PrincipalId("human:operator".into())])),
         Arc::new(OutboxGovernanceAudit::new(
@@ -602,7 +617,7 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
 fn an_edge_issued_run_binds_identity_bearer_and_grants_before_routing() {
     let minting_router = ci_read_router(&["run.view"]);
     minting_router
-        .permitted_tool_names(&ToolRegistry::with_git_and_ci_reads().unwrap(), &now())
+        .permitted_tool_names(&git_and_ci_registry(), &now())
         .unwrap();
     let principal = minting_router.principal().clone();
     let token = minting_router.current_token().unwrap();
@@ -633,7 +648,7 @@ fn tools_list_refuses_an_expired_trigger_before_disclosing_the_catalogue() {
         "expired-trigger",
         1,
     );
-    let server = McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now));
+    let server = McpServer::with_router_and_clock(git_registry(), router, Arc::new(now));
 
     let response = drive(
         &server,
@@ -648,7 +663,7 @@ fn ci_read_projects_shared_schema_and_routes_directly_without_idempotency() {
     let recorder = Arc::new(RecordingReadExecutor {
         calls: AtomicUsize::new(0),
     });
-    let registry = ToolRegistry::with_git_and_ci_reads().unwrap();
+    let registry = git_and_ci_registry();
     let server = McpServer::with_router_reads_and_clock(
         registry,
         ci_read_router(&["run.view"]),
@@ -854,7 +869,7 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
         calls: AtomicUsize::new(0),
     });
     let denied = McpServer::with_router_reads_and_clock(
-        ToolRegistry::with_git_and_ci_reads().unwrap(),
+        git_and_ci_registry(),
         ci_read_router(&["repo.push"]),
         denied_recorder.clone(),
         Arc::new(now),
@@ -876,7 +891,7 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
         calls: AtomicUsize::new(0),
     });
     let revoked = McpServer::with_router_reads_and_clock(
-        ToolRegistry::with_git_and_ci_reads().unwrap(),
+        git_and_ci_registry(),
         ci_read_router(&["run.view"]),
         revoked_recorder.clone(),
         Arc::new(now),
@@ -1246,7 +1261,7 @@ fn lazy_mint_refuses_expired_or_revoked_trigger_and_clamps_run_life() {
     let at_unix = chrono::DateTime::parse_from_rfc3339(&at.0)
         .unwrap()
         .timestamp();
-    let registry = ToolRegistry::with_git();
+    let registry = git_registry();
     let tool = registry.resolve("git.open_pr").unwrap();
     let args = serde_json::json!({"repo":"alpha"});
 
@@ -1367,7 +1382,7 @@ fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
         i64::MAX,
         Arc::new(FailOutcomeAudit),
     );
-    let server = McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now));
+    let server = McpServer::with_router_and_clock(git_registry(), router, Arc::new(now));
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha","title":"Open alpha"},"_meta":{"com.myelin/idempotencyKey":"open-alpha"}}}"#;
     let mut output = Vec::new();
     let error = server
@@ -1402,7 +1417,7 @@ fn post_gate_open_audit_failure_is_also_indeterminate_and_terminal() {
         i64::MAX,
         Arc::new(FailOutcomeAudit),
     );
-    let registry = ToolRegistry::with_git();
+    let registry = git_registry();
     let outcome = router.call(
         registry.resolve("git.merge").unwrap(),
         &serde_json::json!({"repo":"alpha","number":1}),
@@ -1429,7 +1444,7 @@ fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session()
         Arc::new(FailExpiryAudit),
         7_200,
     );
-    let registry = ToolRegistry::with_git();
+    let registry = git_registry();
     let merge = registry.resolve("git.merge").unwrap();
     let opened_at = Timestamp("2026-06-26T00:00:00Z".into());
     let gate_id = match router.call(
@@ -1522,7 +1537,7 @@ fn mcp_expiry_leaves_unrelated_shared_gate_untouched_and_audits_exact_gate() {
         7_200,
         verdicts,
     );
-    let registry = ToolRegistry::with_git();
+    let registry = git_registry();
     assert!(matches!(
         router.call(
             registry.resolve("git.merge").unwrap(),
@@ -1563,8 +1578,7 @@ fn governed_calls_read_the_clock_afresh() {
             Timestamp("2026-06-26T00:05:01Z".into())
         }
     });
-    let server =
-        McpServer::with_router_and_clock(ToolRegistry::with_git(), governed_router(), clock);
+    let server = McpServer::with_router_and_clock(git_registry(), governed_router(), clock);
     let call = |id| {
         format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"git.submit_review","arguments":{{"repo":"alpha","number":{id},"verdict":"comment"}},"_meta":{{"com.myelin/idempotencyKey":"review-{id}"}}}}}}"#

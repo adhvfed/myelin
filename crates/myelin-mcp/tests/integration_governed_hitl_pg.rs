@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
+#[path = "support/registry.rs"]
+mod registry_support;
+
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
 use myelin_config::MyelinConfig;
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
@@ -17,7 +20,6 @@ use myelin_identity_service::revocation::RevocationStore;
 use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_mcp::{
     CallOutcome, GateApproverPolicy, GovernedRouter, OutboxGovernanceAudit, RunPrincipal,
-    ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::{
     gate_ref_token, hitl_gate_durable_migrations, GateDecideError, GateRecord, GateState,
@@ -28,6 +30,11 @@ use myelin_storage::{
     SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
+use registry_support::registry_for_subsystems;
+
+fn git_registry() -> myelin_mcp::ToolRegistry {
+    registry_for_subsystems(&["git"])
+}
 
 fn test_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
@@ -218,7 +225,7 @@ async fn an_approval_store_outage_withholds_the_effect_without_killing_the_route
     );
     provider.db_pool().close().await;
 
-    let registry = ToolRegistry::with_git();
+    let registry = git_registry();
     let outcome = router.call(
         registry.resolve("git.merge").unwrap(),
         &serde_json::json!({"repo":"alpha","number":1}),
@@ -272,7 +279,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     );
     let tenant = format!("mcp-hitl-{suffix}");
     let other_tenant = format!("mcp-hitl-other-{suffix}");
-    let registry = ToolRegistry::with_git();
+    let registry = git_registry();
     let merge = registry.resolve("git.merge").unwrap();
     let now = Timestamp("2026-07-18T00:00:00Z".into());
     let applies = Arc::new(AppliedEffects::default());
@@ -517,7 +524,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         let now = now.clone();
         let applies = applies.clone();
         racers.push(tokio::task::spawn_blocking(move || {
-            let registry = ToolRegistry::with_git();
+            let registry = git_registry();
             let merge = registry.resolve("git.merge").unwrap();
             let racer = router(
                 provider,

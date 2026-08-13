@@ -3,6 +3,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[path = "support/effect.rs"]
+mod effect_support;
+#[path = "support/registry.rs"]
+mod registry_support;
+
+use effect_support::ApplyingEffectApi;
+use registry_support::registry_for_subsystems;
+
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
 use myelin_edge::repo_authz::GrantBackedRepos;
 use myelin_edge::{DurableCiReadApi, DurableGitBackend, McpReadExecutor};
@@ -17,7 +25,6 @@ use myelin_identity_service::mint::{RunTokenAuthorizer, RunTokenMinter, Structur
 use myelin_identity_service::{ResolvedDelegationPolicy, RevocationStore};
 use myelin_mcp::{
     GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
-    SkeletonEffectApi, ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::HitlVerdictStore;
 use myelin_storage::{with_tenant_tx, FsBlobStore, PgError, TenantScope};
@@ -236,7 +243,7 @@ fn server(
                 static_max_secs: 300,
             },
         },
-        Box::new(SkeletonEffectApi::new()),
+        Box::new(ApplyingEffectApi),
         HitlVerdictStore::new(),
         Arc::new(NoApprovers),
         Arc::new(OutboxGovernanceAudit::new(
@@ -253,7 +260,7 @@ fn server(
     );
     let reads = Arc::new(McpReadExecutor::new(api, boundary, delegator));
     McpServer::with_router_reads_and_clock(
-        ToolRegistry::with_git_and_ci_reads().expect("valid shared catalogue"),
+        registry_for_subsystems(&["git", "ci"]),
         router,
         reads,
         Arc::new(|| Timestamp(NOW.into())),
