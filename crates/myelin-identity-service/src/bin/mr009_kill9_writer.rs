@@ -254,10 +254,6 @@ async fn identity_family(
                 Some(&profile),
             )
             .map_err(|e| format!("put_principal: {e}"))?;
-        kms_backing
-            .persist(&engine, &seal)
-            .await
-            .map_err(|e| format!("persist kms after seal: {e}"))?;
         tstore
             .write_tuples(
                 &s,
@@ -509,13 +505,11 @@ async fn kms_family(
         .map_err(|e| format!("load_or_generate: {e}"))?;
 
     if writing {
-        backing
-            .ensure_kek(&engine, &KekId::new(tenant.clone(), region.clone()))
-            .await
+        engine
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
             .map_err(|e| format!("ensure_kek: {e}"))?;
-        let key_ref = backing
-            .ensure_dek(&engine, &tenant, &region, KeyClass::Tenant)
-            .await
+        let key_ref = engine
+            .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .map_err(|e| format!("ensure_dek: {e}"))?;
         let dek = engine
             .resolve_dek(&key_ref, &region)
