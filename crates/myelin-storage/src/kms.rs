@@ -569,6 +569,7 @@ impl KmsCore {
         Ok(self.state()?.deks.get(id).map(|(w, e)| (w.clone(), *e)))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn export_deks(&self) -> Result<Vec<(DekId, WrappedDek, u64)>, KmsError> {
         Ok(self
             .state()?
@@ -672,6 +673,7 @@ impl KmsCore {
         Ok(DekHandle { key: RawKey(bytes) })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {
         let mut state = self.state()?;
         let current = state
@@ -913,6 +915,7 @@ fn wrap_dek(kek: &RawKey, kek_epoch: u64, plain: &RawKey) -> Result<WrappedDek, 
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn exported_kek(stored: &StoredKek) -> ExportedKek {
     ExportedKek {
         nonce: stored.wrapped.nonce,
