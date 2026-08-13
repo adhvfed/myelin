@@ -20,6 +20,10 @@ use myelin_storage::{ContentHash, TenantScope};
 
 use crate::registry::{RegisteredTool, ToolRegistry};
 
+mod audit_taxonomy;
+
+use audit_taxonomy::EffectAuditOutcome;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GovernedRun {
     pub scope: TenantScope,
@@ -402,106 +406,27 @@ fn audit_event_type(
         let contract = McpApprovalContract::for_tool(tool).ok_or_else(|| {
             "governance audit refused an unregistered approval contract".to_string()
         })?;
-        return approval_audit_event_type(contract, phase);
+        return audit_taxonomy::approval_event_type(contract, phase);
     }
-    let suffix = match (phase, outcome) {
-        (AuditPhase::Attempt, None) => "attempted",
+    let effect_outcome = match (phase, outcome) {
+        (AuditPhase::Attempt, None) => EffectAuditOutcome::Attempted,
         (
             AuditPhase::Outcome,
             Some(GovernanceAuditOutcome::Effect(CallOutcome::Applied { .. })),
-        ) => "applied",
+        ) => EffectAuditOutcome::Applied,
         (AuditPhase::Outcome, Some(GovernanceAuditOutcome::Effect(CallOutcome::Gated { .. }))) => {
-            "gated"
+            EffectAuditOutcome::Gated
         }
         (AuditPhase::Outcome, Some(GovernanceAuditOutcome::Effect(CallOutcome::Denied { .. }))) => {
-            "denied"
+            EffectAuditOutcome::Denied
         }
         (
             AuditPhase::Outcome,
             Some(GovernanceAuditOutcome::Effect(CallOutcome::Indeterminate { .. })),
-        ) => "indeterminate",
+        ) => EffectAuditOutcome::Indeterminate,
         _ => return Err("invalid governance audit phase/outcome pairing".into()),
     };
-    match (tool, suffix) {
-        ("git.merge", "attempted") => Ok(myelin_git::events::GIT_MERGE_ATTEMPTED),
-        ("git.merge", "applied") => Ok(myelin_git::events::GIT_MERGE_APPLIED),
-        ("git.merge", "gated") => Ok(myelin_git::events::GIT_MERGE_GATED),
-        ("git.merge", "denied") => Ok(myelin_git::events::GIT_MERGE_DENIED),
-        ("git.merge", "indeterminate") => Ok(myelin_git::events::GIT_MERGE_INDETERMINATE),
-        ("git.open_pr", "attempted") => Ok(myelin_git::events::GIT_OPEN_PR_ATTEMPTED),
-        ("git.open_pr", "applied") => Ok(myelin_git::events::GIT_OPEN_PR_APPLIED),
-        ("git.open_pr", "gated") => Ok(myelin_git::events::GIT_OPEN_PR_GATED),
-        ("git.open_pr", "denied") => Ok(myelin_git::events::GIT_OPEN_PR_DENIED),
-        ("git.open_pr", "indeterminate") => Ok(myelin_git::events::GIT_OPEN_PR_INDETERMINATE),
-        ("git.write_file", "attempted") => Ok(myelin_git::events::GIT_WRITE_FILE_ATTEMPTED),
-        ("git.write_file", "applied") => Ok(myelin_git::events::GIT_WRITE_FILE_APPLIED),
-        ("git.write_file", "gated") => Ok(myelin_git::events::GIT_WRITE_FILE_GATED),
-        ("git.write_file", "denied") => Ok(myelin_git::events::GIT_WRITE_FILE_DENIED),
-        ("git.write_file", "indeterminate") => Ok(myelin_git::events::GIT_WRITE_FILE_INDETERMINATE),
-        ("git.submit_review", "attempted") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_ATTEMPTED),
-        ("git.submit_review", "applied") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_APPLIED),
-        ("git.submit_review", "gated") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_GATED),
-        ("git.submit_review", "denied") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_DENIED),
-        ("git.submit_review", "indeterminate") => {
-            Ok(myelin_git::events::GIT_SUBMIT_REVIEW_INDETERMINATE)
-        }
-        ("git.endorse_fork_ci", "attempted") => {
-            Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_ATTEMPTED)
-        }
-        ("git.endorse_fork_ci", "applied") => Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_APPLIED),
-        ("git.endorse_fork_ci", "gated") => Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_GATED),
-        ("git.endorse_fork_ci", "denied") => Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_DENIED),
-        ("git.endorse_fork_ci", "indeterminate") => {
-            Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_INDETERMINATE)
-        }
-        ("chat.post", "attempted") => Ok(myelin_chat::events::CHAT_POST_ATTEMPTED),
-        ("chat.post", "applied") => Ok(myelin_chat::events::CHAT_POST_APPLIED),
-        ("chat.post", "gated") => Ok(myelin_chat::events::CHAT_POST_GATED),
-        ("chat.post", "denied") => Ok(myelin_chat::events::CHAT_POST_DENIED),
-        ("chat.post", "indeterminate") => Ok(myelin_chat::events::CHAT_POST_INDETERMINATE),
-        ("issues.create", "attempted") => Ok(myelin_issues::events::ISSUE_CREATE_ATTEMPTED),
-        ("issues.create", "applied") => Ok(myelin_issues::events::ISSUE_CREATE_APPLIED),
-        ("issues.create", "gated") => Ok(myelin_issues::events::ISSUE_CREATE_GATED),
-        ("issues.create", "denied") => Ok(myelin_issues::events::ISSUE_CREATE_DENIED),
-        ("issues.create", "indeterminate") => Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE),
-        ("issues.close", "attempted") => Ok(myelin_issues::events::ISSUE_CLOSE_ATTEMPTED),
-        ("issues.close", "applied") => Ok(myelin_issues::events::ISSUE_CLOSE_APPLIED),
-        ("issues.close", "gated") => Ok(myelin_issues::events::ISSUE_CLOSE_GATED),
-        ("issues.close", "denied") => Ok(myelin_issues::events::ISSUE_CLOSE_DENIED),
-        ("issues.close", "indeterminate") => Ok(myelin_issues::events::ISSUE_CLOSE_INDETERMINATE),
-        ("knowledge.link_work", "attempted") => {
-            Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_ATTEMPTED)
-        }
-        ("knowledge.link_work", "applied") => {
-            Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_APPLIED)
-        }
-        ("knowledge.link_work", "gated") => Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_GATED),
-        ("knowledge.link_work", "denied") => Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_DENIED),
-        ("knowledge.link_work", "indeterminate") => {
-            Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_INDETERMINATE)
-        }
-        _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
-    }
-}
-
-fn approval_audit_event_type(
-    contract: McpApprovalContract,
-    phase: AuditPhase,
-) -> Result<&'static str, String> {
-    match contract {
-        McpApprovalContract::GitMerge => match phase {
-            AuditPhase::Approved => Ok(myelin_git::events::GIT_MERGE_APPROVED),
-            AuditPhase::Rejected => Ok(myelin_git::events::GIT_MERGE_REJECTED),
-            AuditPhase::Expired => Ok(myelin_git::events::GIT_MERGE_EXPIRED),
-            _ => Err("invalid approval audit phase".into()),
-        },
-        McpApprovalContract::IssuesClose => match phase {
-            AuditPhase::Approved => Ok(myelin_issues::events::ISSUE_CLOSE_APPROVED),
-            AuditPhase::Rejected => Ok(myelin_issues::events::ISSUE_CLOSE_REJECTED),
-            AuditPhase::Expired => Ok(myelin_issues::events::ISSUE_CLOSE_EXPIRED),
-            _ => Err("invalid approval audit phase".into()),
-        },
-    }
+    audit_taxonomy::effect_event_type(tool, effect_outcome)
 }
 
 pub const GOVERNED_DIRECT_READ_TOOLS: &[&str] = &[
