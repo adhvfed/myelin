@@ -2145,7 +2145,9 @@ mod tests {
                 &ts("2026-06-19T00:00:00Z"),
             )
             .expect("mint");
-        let stored = tuples.tuples_in(&acme);
+        let stored = tuples
+            .tuples_in(&acme)
+            .expect("read the minted run relationship");
         let grant = stored
             .iter()
             .find(|t| t.tuple.object.0 == "run:run-77")

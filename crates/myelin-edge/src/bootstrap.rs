@@ -220,7 +220,10 @@ mod tests {
         assert!(store
             .get_principal(&scope(), &PrincipalId("founder".into()))
             .is_none());
-        assert!(tuples.tuples_in(&scope()).is_empty());
+        assert!(tuples
+            .tuples_in(&scope())
+            .expect("read tuples after rejected bootstrap")
+            .is_empty());
     }
 
     #[test]
@@ -237,7 +240,9 @@ mod tests {
             bootstrap_principal_and_mint(&store, &tuples, &cell, &params(PROJECT), 1_700_000_001)
                 .unwrap();
         assert_ne!(first.jti, second.jti);
-        let edges = tuples.tuples_in(&scope());
+        let edges = tuples
+            .tuples_in(&scope())
+            .expect("read the bootstrap relationship");
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].tuple.object.0, format!("project:{PROJECT}"));
         assert_eq!(edges[0].tuple.relation.0, "reader");

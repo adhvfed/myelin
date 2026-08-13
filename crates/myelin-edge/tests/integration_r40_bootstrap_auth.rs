@@ -154,7 +154,9 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     let founder_scope = TenantScope::from_verified_token(&founder, Region::new(REGION));
     let restarted_tuples =
         TupleStore::with_pg(DurableTupleBacking::new(provider.clone()), handle.clone());
-    let durable_edges = restarted_tuples.tuples_in(&founder_scope);
+    let durable_edges = restarted_tuples
+        .tuples_in(&founder_scope)
+        .expect("read the durable bootstrap relationship after restart");
     assert_eq!(
         durable_edges.len(),
         1,

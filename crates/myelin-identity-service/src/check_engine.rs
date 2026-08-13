@@ -55,7 +55,7 @@ impl CheckEngine {
         at_least: &Zookie,
     ) -> myelin_identity::Result<CheckSnapshot> {
         let mut by_object: HashMap<String, Vec<SnapTuple>> = HashMap::new();
-        let tuples = self.tuples.try_tuples_in(scope).map_err(|_| {
+        let tuples = self.tuples.tuples_in(scope).map_err(|_| {
             AuthzError::Unavailable("relationship tuple snapshot unavailable".into())
         })?;
         for st in tuples {

@@ -60,13 +60,15 @@ pub struct StoredTuple {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TupleReadError(String);
+pub struct TupleReadError(String);
 
 impl core::fmt::Display for TupleReadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "relationship tuple snapshot unavailable: {}", self.0)
     }
 }
+
+impl std::error::Error for TupleReadError {}
 
 impl StoredTuple {
     pub fn partition_bucket(&self, buckets: u64) -> u64 {
@@ -232,14 +234,7 @@ impl TupleStore {
         }
     }
 
-    pub fn tuples_in(&self, scope: &TenantScope) -> Vec<StoredTuple> {
-        self.try_tuples_in(scope).unwrap_or_default()
-    }
-
-    pub(crate) fn try_tuples_in(
-        &self,
-        scope: &TenantScope,
-    ) -> Result<Vec<StoredTuple>, TupleReadError> {
+    pub fn tuples_in(&self, scope: &TenantScope) -> Result<Vec<StoredTuple>, TupleReadError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -687,7 +682,7 @@ mod tests {
             z1.0 > z0.0,
             "the zookie advances monotonically: {z1:?} must sort after {z0:?}"
         );
-        let tuples = store.tuples_in(&s);
+        let tuples = store.tuples_in(&s).expect("read both stored tuples");
         assert_eq!(tuples.len(), 2, "both adds are durable");
         assert_eq!(store.object_zookie(&s, "repo:core"), z1);
     }
@@ -732,7 +727,10 @@ mod tests {
             other => panic!("expected PreconditionFailed, got {other:?}"),
         }
         assert_eq!(
-            store.tuples_in(&s).len(),
+            store
+                .tuples_in(&s)
+                .expect("read tuples after the rejected write")
+                .len(),
             1,
             "the aborted write added no tuple"
         );
@@ -770,7 +768,13 @@ mod tests {
             )
             .expect("a matching precondition proceeds");
         assert!(z1.0 > z0.0);
-        assert_eq!(store.tuples_in(&s).len(), 2);
+        assert_eq!(
+            store
+                .tuples_in(&s)
+                .expect("read tuples after the matching write")
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -873,6 +877,7 @@ mod tests {
             .expect("per-run grant write");
         let grant = store
             .tuples_in(&s)
+            .expect("read the per-run grant")
             .into_iter()
             .find(|t| t.tuple.object.0 == "run:R1")
             .expect("the grant is stored");
@@ -893,6 +898,7 @@ mod tests {
             .expect("durable grant");
         let durable = store
             .tuples_in(&s)
+            .expect("read the durable grant")
             .into_iter()
             .find(|t| t.tuple.object.0 == "repo:core")
             .expect("the durable grant is stored");
@@ -920,10 +926,19 @@ mod tests {
             .expect("acme write");
 
         assert!(
-            store.tuples_in(&globex).is_empty(),
+            store
+                .tuples_in(&globex)
+                .expect("read the other tenant's partition")
+                .is_empty(),
             "no cross-tenant read path"
         );
-        assert_eq!(store.tuples_in(&acme).len(), 1);
+        assert_eq!(
+            store
+                .tuples_in(&acme)
+                .expect("read the owning tenant's partition")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -963,7 +978,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.tuples_in(&s).len(),
+            store
+                .tuples_in(&s)
+                .expect("read the idempotently added edge")
+                .len(),
             1,
             "re-adding the same edge is idempotent"
         );
@@ -978,7 +996,10 @@ mod tests {
             )
             .unwrap();
         assert!(
-            store.tuples_in(&s).is_empty(),
+            store
+                .tuples_in(&s)
+                .expect("read tuples after removing the edge")
+                .is_empty(),
             "the remove deleted the edge"
         );
     }

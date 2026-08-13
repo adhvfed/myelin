@@ -223,6 +223,7 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
 
     let mut edges: Vec<(String, String, String)> = tstore2
         .tuples_in(&s)
+        .expect("read durable tuples through the fresh store")
         .into_iter()
         .map(|t| (t.tuple.object.0, t.tuple.relation.0, t.tuple.subject.0))
         .collect();
@@ -320,7 +321,14 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         1,
         "tenant A sees its principal"
     );
-    assert_eq!(tstore.tuples_in(&sa).len(), 1, "tenant A sees its tuple");
+    assert_eq!(
+        tstore
+            .tuples_in(&sa)
+            .expect("read tenant A's tuple partition")
+            .len(),
+        1,
+        "tenant A sees its tuple"
+    );
 
     assert!(
         pstore.get_principal(&sb, &alice).is_none(),
@@ -331,7 +339,10 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         "tenant B's principal partition is empty"
     );
     assert!(
-        tstore.tuples_in(&sb).is_empty(),
+        tstore
+            .tuples_in(&sb)
+            .expect("read tenant B's tuple partition")
+            .is_empty(),
         "tenant B cannot see tenant A's tuple (RLS)"
     );
 

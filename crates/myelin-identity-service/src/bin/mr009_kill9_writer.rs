@@ -285,6 +285,7 @@ async fn identity_family(
         .ok_or_else(|| "profile not durable".to_string())?;
     let tuple_present = tstore
         .tuples_in(&s)
+        .map_err(|e| format!("read tuples: {e}"))?
         .into_iter()
         .any(|t| t.tuple.object.0 == "repo:core" && t.tuple.subject.0 == "p:alice");
     Ok(Outcome::Read(serde_json::json!({
