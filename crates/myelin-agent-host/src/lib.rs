@@ -13,7 +13,7 @@ pub use activity_executor::{
 pub use tool_broker::EdgeMcpToolExecutor;
 
 pub mod identity;
-pub use identity::timestamp_from_epoch;
+pub use identity::{timestamp_from_epoch, TimestampOutOfRange};
 pub mod workflow;
 use durable_model::DurableModelClient;
 use durable_tool::DurableToolExecutor;
@@ -601,7 +601,8 @@ impl AgentHost {
     ) -> Result<(Arc<dyn RunTokenMinter + Send + Sync>, IdentityRunRevoker), AgentHostError> {
         let id = &self.identity;
         let scope = TenantScope::from_verified_token(&task.agent, self.region.clone());
-        let now = timestamp_from_epoch(task.now_secs);
+        let now = timestamp_from_epoch(task.now_secs)
+            .map_err(|error| AgentHostError::Identity(error.to_string()))?;
         let resolved_policy = bridge(
             &self.runtime,
             id.policies.resolve_for_run(

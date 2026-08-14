@@ -12,10 +12,27 @@ use myelin_identity_service::{
 };
 use myelin_storage::TenantScope;
 
-pub fn timestamp_from_epoch(secs: i64) -> Timestamp {
-    let dt = DateTime::<Utc>::from_timestamp(secs, 0)
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).expect("epoch 0 is in range"));
-    Timestamp(dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimestampOutOfRange {
+    seconds: i64,
+}
+
+impl core::fmt::Display for TimestampOutOfRange {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "epoch seconds {} are outside the supported timestamp range",
+            self.seconds
+        )
+    }
+}
+
+impl std::error::Error for TimestampOutOfRange {}
+
+pub fn timestamp_from_epoch(secs: i64) -> Result<Timestamp, TimestampOutOfRange> {
+    DateTime::<Utc>::from_timestamp(secs, 0)
+        .map(|instant| Timestamp(instant.to_rfc3339_opts(SecondsFormat::Secs, true)))
+        .ok_or(TimestampOutOfRange { seconds: secs })
 }
 
 pub struct IdentityRunMinter {
@@ -113,17 +130,42 @@ impl IdentityRunRevoker {
 
 impl RunTokenRevoker for IdentityRunRevoker {
     fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> u64 {
-        self.revocations
-            .tear_down_run_token(&self.scope, jti, timestamp_from_epoch(now_secs));
-        (now_secs - teardown_secs).max(0) as u64
+        let now = timestamp_from_epoch(now_secs)
+            .unwrap_or_else(|_| Timestamp("9999-12-31T23:59:59Z".into()));
+        self.revocations.tear_down_run_token(&self.scope, jti, now);
+        now_secs.saturating_sub(teardown_secs).max(0) as u64
     }
 
     fn is_dead(&self, jti: &str, now_secs: i64) -> bool {
+        let Ok(now) = timestamp_from_epoch(now_secs) else {
+            return true;
+        };
         let state = self.revocations.run_token_state(
             &self.scope,
             &RevokeTarget::Jti(jti.to_string()),
-            &timestamp_from_epoch(now_secs),
+            &now,
         );
         state != RunTokenState::LiveWithinRunLife
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_conversion_refuses_unrepresentable_instants() {
+        assert_eq!(
+            timestamp_from_epoch(0),
+            Ok(Timestamp("1970-01-01T00:00:00Z".into()))
+        );
+        assert_eq!(
+            timestamp_from_epoch(i64::MAX),
+            Err(TimestampOutOfRange { seconds: i64::MAX })
+        );
+        assert_eq!(
+            timestamp_from_epoch(i64::MIN),
+            Err(TimestampOutOfRange { seconds: i64::MIN })
+        );
     }
 }
