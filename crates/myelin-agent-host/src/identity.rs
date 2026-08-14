@@ -129,11 +129,13 @@ impl IdentityRunRevoker {
 }
 
 impl RunTokenRevoker for IdentityRunRevoker {
-    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> u64 {
+    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
         let now = timestamp_from_epoch(now_secs)
             .unwrap_or_else(|_| Timestamp("9999-12-31T23:59:59Z".into()));
-        self.revocations.tear_down_run_token(&self.scope, jti, now);
-        now_secs.saturating_sub(teardown_secs).max(0) as u64
+        self.revocations
+            .try_tear_down_run_token(&self.scope, jti, now)
+            .map_err(|error| error.to_string())?;
+        Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
     }
 
     fn is_dead(&self, jti: &str, now_secs: i64) -> bool {

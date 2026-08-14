@@ -151,6 +151,17 @@ impl RevocationStore {
     }
 
     pub fn tear_down_run_token(&self, scope: &TenantScope, jti: &str, now: Timestamp) {
+        self.try_tear_down_run_token(scope, jti, now).expect(
+            "durable run-token teardown must persist (fail-closed: never a silent lost teardown)",
+        );
+    }
+
+    pub fn try_tear_down_run_token(
+        &self,
+        scope: &TenantScope,
+        jti: &str,
+        now: Timestamp,
+    ) -> Result<(), myelin_storage::ProviderError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
@@ -162,12 +173,12 @@ impl RevocationStore {
                 ));
             }
             RevocationBackend::Pg(pg) => {
-                pg.block(pg.backing.insert_teardown(&scope.tenant().0, jti))
-                    .expect("durable run-token teardown must persist (fail-closed: never a silent lost teardown)");
+                pg.block(pg.backing.insert_teardown(&scope.tenant().0, jti))?;
             }
         }
         let _ = now;
         self.telemetry.observe();
+        Ok(())
     }
 
     pub fn run_token_state(

@@ -100,7 +100,7 @@ impl AgentRuntime for SkeletonAgentRuntime {
 impl MeteredRuntime for SkeletonAgentRuntime {}
 
 pub trait RunTokenRevoker {
-    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> u64;
+    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String>;
 
     fn is_dead(&self, jti: &str, now_secs: i64) -> bool;
 }
@@ -261,6 +261,10 @@ pub enum SkeletonError {
         run_id: String,
         reason: String,
     },
+    TokenRevocationFailed {
+        run_id: String,
+        reason: String,
+    },
 }
 
 impl SkeletonError {
@@ -278,6 +282,7 @@ impl SkeletonError {
             Self::MeteringUsageNotReported { .. } => "metering_usage_not_reported",
             Self::MeteringOverflow { .. } => "metering_overflow",
             Self::CostSettlementFailed { .. } => "cost_settlement_failed",
+            Self::TokenRevocationFailed { .. } => "run_token_revocation_failed",
         }
     }
 }
@@ -323,6 +328,10 @@ impl core::fmt::Display for SkeletonError {
                 f,
                 "SKELETON cost settlement failed: run={run_id}: {reason} (the durable reservation remains retryable)"
             ),
+            SkeletonError::TokenRevocationFailed { run_id, reason } => write!(
+                f,
+                "SKELETON run-token teardown failed: run={run_id}: {reason} (the token remains bounded by its fail-static lifetime)"
+            ),
         }
     }
 }
@@ -365,23 +374,6 @@ pub struct RunSubstrate<'a> {
     pub now_secs: i64,
 }
 
-struct RunTeardown<'a> {
-    revoker: &'a dyn RunTokenRevoker,
-    token: &'a RunTokenHandle,
-    now_secs: i64,
-    teardown_at: i64,
-    telemetry: &'a mut SkeletonTelemetry,
-}
-
-impl Drop for RunTeardown<'_> {
-    fn drop(&mut self) {
-        let lag = self
-            .revoker
-            .revoke(&self.token.jti, self.now_secs, self.teardown_at);
-        self.telemetry.record_revoke(lag);
-    }
-}
-
 pub struct SkeletonAgent;
 
 impl SkeletonAgent {
@@ -403,15 +395,39 @@ impl SkeletonAgent {
             .mint_run_token(&sub.agent_id, &sub.run_id, &caveats, sub.token_ttl_secs)
             .map_err(SkeletonError::from)?;
         let teardown_at = sub.now_secs;
+        let result = self.handle_minted_run(runtime, sub, telemetry, kill, &token);
+        match sub.revoker.revoke(&token.jti, sub.now_secs, teardown_at) {
+            Ok(lag) => {
+                telemetry.record_revoke(lag);
+                if result.is_ok() {
+                    match kill {
+                        RunOutcomeKind::Completed => {
+                            telemetry.runs_completed = telemetry.runs_completed.saturating_add(1)
+                        }
+                        RunOutcomeKind::KilledMidFlight => {
+                            telemetry.runs_killed = telemetry.runs_killed.saturating_add(1)
+                        }
+                    }
+                }
+            }
+            Err(reason) => {
+                return Err(SkeletonError::TokenRevocationFailed {
+                    run_id: sub.run_id.clone(),
+                    reason,
+                })
+            }
+        }
+        result
+    }
 
-        let teardown_guard = RunTeardown {
-            revoker: sub.revoker,
-            token: &token,
-            now_secs: sub.now_secs,
-            teardown_at,
-            telemetry,
-        };
-
+    fn handle_minted_run(
+        &self,
+        runtime: &dyn MeteredRuntime,
+        sub: &mut RunSubstrate<'_>,
+        telemetry: &mut SkeletonTelemetry,
+        kill: RunOutcomeKind,
+        token: &RunTokenHandle,
+    ) -> Result<RunOutcome, SkeletonError> {
         let storage_run = StorageRunId::new(sub.run_id.clone());
         let in_flight = sub
             .gate
@@ -423,9 +439,7 @@ impl SkeletonAgent {
                 sub.available,
             )
             .map_err(SkeletonError::from)?;
-        teardown_guard
-            .telemetry
-            .record_reserve(in_flight.reserved().0);
+        telemetry.record_reserve(in_flight.reserved().0);
 
         let _child_env = ChildEnv::for_run(&token.jti);
 
@@ -469,7 +483,7 @@ impl SkeletonAgent {
                         run_id: sub.run_id.clone(),
                         error,
                     })?;
-            teardown_guard.telemetry.record_token_usage(&usage);
+            telemetry.record_token_usage(&usage);
 
             if let Some(wallet) = sub.wallet {
                 self.meter_turn(
@@ -478,7 +492,7 @@ impl SkeletonAgent {
                     &usage,
                     &sub.run_id,
                     &format!("{}/model-turn/{turn}", sub.run_id),
-                    teardown_guard.telemetry,
+                    telemetry,
                 )?;
             }
 
@@ -509,7 +523,7 @@ impl SkeletonAgent {
                             crate::tool_exec::logical_tool_effect_key(turn, call_index);
                         let tool_context = ToolExecutionContext {
                             run_id: &sub.run_id,
-                            run_token: &token,
+                            run_token: token,
                             effect_key: &effect_key,
                         };
                         match sub.executor.execute(&tool_context, def, call) {
@@ -541,15 +555,13 @@ impl SkeletonAgent {
         };
 
         if kill == RunOutcomeKind::KilledMidFlight {
-            teardown_guard.telemetry.runs_killed =
-                teardown_guard.telemetry.runs_killed.saturating_add(1);
             return Ok(RunOutcome(format!(
                 "killed-mid-flight: run={} token-revoked (no trace, reservation left in-flight)",
                 sub.run_id
             )));
         }
 
-        let trace = completed_trace(sub, &submission, teardown_guard.telemetry);
+        let trace = completed_trace(sub, &submission, telemetry);
         let trace_artifact = sub
             .trace_writer
             .write(&sub.tenant, trace)
@@ -577,7 +589,7 @@ impl SkeletonAgent {
 
         ctx.commit()
             .map_err(|e| SkeletonError::CoCommit(format!("{e:?}")))?;
-        teardown_guard.telemetry.record_trace();
+        telemetry.record_trace();
 
         let settle = in_flight.settle(sub.ledger, &[]).map_err(|error| {
             SkeletonError::CostSettlementFailed {
@@ -586,10 +598,7 @@ impl SkeletonAgent {
             }
         })?;
         let settled_total = settle.billed_total.0.saturating_add(settle.refunded.0);
-        teardown_guard.telemetry.record_settle(settled_total);
-
-        teardown_guard.telemetry.runs_completed =
-            teardown_guard.telemetry.runs_completed.saturating_add(1);
+        telemetry.record_settle(settled_total);
 
         Ok(RunOutcome(format!(
             "completed: run={} trace={} reserved={} settled={} token-revoked",
@@ -734,13 +743,13 @@ mod tests {
         minted_at: i64,
     }
     impl RunTokenRevoker for FakeRevoker {
-        fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> u64 {
+        fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
             let mut g = self.revoked.lock().unwrap();
             if g.contains_key(jti) {
-                return 0;
+                return Ok(0);
             }
             g.insert(jti.to_string(), now_secs);
-            (now_secs - teardown_secs).max(0) as u64
+            Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
         }
         fn is_dead(&self, jti: &str, now_secs: i64) -> bool {
             self.revoked.lock().unwrap().contains_key(jti)
@@ -768,7 +777,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn substrate<'a>(
         run_id: &str,
-        revoker: &'a FakeRevoker,
+        revoker: &'a dyn RunTokenRevoker,
         catalogue: &'a dyn ToolSurface,
         executor: &'a dyn ToolExecutor,
         gate: &'a mut AgentRunGate,
@@ -2193,7 +2202,7 @@ mod tests {
     }
 
     #[test]
-    fn teardown_guard_revokes_exactly_once_on_every_exit() {
+    fn every_run_exit_revokes_its_token_exactly_once() {
         let agent_loop = SkeletonAgent::new();
         let w: i64 = 300;
         let now: i64 = 1_000;
@@ -2284,5 +2293,52 @@ mod tests {
             capped.max_revocation_lag() <= w as u64,
             "lag within bound W"
         );
+    }
+
+    struct FailingRevoker;
+
+    impl RunTokenRevoker for FailingRevoker {
+        fn revoke(&self, _jti: &str, _now_secs: i64, _teardown_secs: i64) -> Result<u64, String> {
+            Err("revocation store unavailable".into())
+        }
+
+        fn is_dead(&self, _jti: &str, _now_secs: i64) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_teardown_outage_fails_the_run_without_panicking() {
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut telemetry = SkeletonTelemetry::new();
+        let catalogue = MockToolSurface::new();
+        let executor = MockToolExecutor::new();
+        let mut sub = substrate(
+            "R-revoke-outage",
+            &FailingRevoker,
+            &catalogue,
+            &executor,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1_000,
+        );
+
+        let error = SkeletonAgent::new()
+            .handle_run(
+                &SkeletonAgentRuntime::new(),
+                &mut sub,
+                &mut telemetry,
+                RunOutcomeKind::Completed,
+            )
+            .expect_err("a run cannot claim success when its token remains live");
+
+        assert_eq!(error.code(), "run_token_revocation_failed");
+        assert_eq!(telemetry.tokens_revoked(), 0);
+        assert_eq!(telemetry.runs_completed(), 0);
     }
 }
