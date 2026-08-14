@@ -106,9 +106,13 @@ impl DurableGitBackend {
         let author = Self::thread_principal(tenant, principal);
         let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix())?;
         let outcome = self.threads.create_thread(&loc, &key, anchor, comment)?;
-        if outcome.applied {
-            self.bump_pr_updated(&loc, number, principal);
-        }
+        self.reconcile_conversation_projection(
+            &loc,
+            number,
+            principal,
+            operation_nonce,
+            outcome.applied,
+        )?;
         Ok(thread_json(&outcome.value))
     }
 
@@ -133,9 +137,13 @@ impl DurableGitBackend {
         let author = Self::thread_principal(tenant, principal);
         let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix())?;
         let outcome = self.threads.add_comment(&loc, &key, thread_id, comment)?;
-        if outcome.applied {
-            self.bump_pr_updated(&loc, number, principal);
-        }
+        self.reconcile_conversation_projection(
+            &loc,
+            number,
+            principal,
+            operation_nonce,
+            outcome.applied,
+        )?;
         Ok(comment_json(&outcome.value))
     }
 
@@ -282,19 +290,13 @@ impl DurableGitBackend {
             .as_ref()
             .is_some_and(|batch| batch.review.advisory || verdict == BatchVerdict::Commented)
         {
-            let projection_operation = PrOperationId::derive(
-                "myelin.git.review-batch-projection.v1",
-                &[operation_id.digest().as_bytes()],
+            self.reconcile_conversation_projection(
+                &loc,
+                number,
+                principal,
+                operation_nonce,
+                submitted.applied,
             )?;
-            if reconcile_projection {
-                self.pr_mutate(
-                    &loc,
-                    number,
-                    PrMutation::Touch,
-                    &projection_operation,
-                    principal,
-                )?;
-            }
         }
         Ok(json!({
             "emitted": submitted.value.is_some(),
@@ -323,9 +325,22 @@ impl DurableGitBackend {
         Ok(json!({ "discarded": review_id }))
     }
 
-    fn bump_pr_updated(&self, loc: &RepoLoc, number: u64, principal: &Principal) {
-        if let Ok(operation_id) = self.fresh_operation_id() {
-            let _ = self.pr_mutate(loc, number, PrMutation::Touch, &operation_id, principal);
+    fn reconcile_conversation_projection(
+        &self,
+        loc: &RepoLoc,
+        number: u64,
+        principal: &Principal,
+        operation_nonce: &str,
+        applied: bool,
+    ) -> Result<(), DurableError> {
+        if !applied && self.pg_prs.is_none() {
+            return Ok(());
         }
+        let operation_id = PrOperationId::derive(
+            "myelin.git.conversation-projection.v1",
+            &[operation_nonce.as_bytes()],
+        )?;
+        self.pr_mutate(loc, number, PrMutation::Touch, &operation_id, principal)?;
+        Ok(())
     }
 }
