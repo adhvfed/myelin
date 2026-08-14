@@ -10,7 +10,7 @@ fn region() -> Region {
 }
 
 #[test]
-fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
+fn classified_data_uses_the_right_keys_and_stores_only_ciphertext() {
     let tenant = TenantId("acme".into());
     let kms = Arc::new(KmsEngine::new());
     kms.ensure_kek(&KekId::new(tenant.clone(), region()))
@@ -79,19 +79,11 @@ fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
         bulk_plain
     );
 
-    let plaintext_at_rest = cryptor.plaintext_at_rest_count();
-    assert_eq!(
-        plaintext_at_rest, 0,
-        "GATE leg 3: plaintext_at_rest_count MUST be 0 for tagged columns"
-    );
-
     println!(
         "[P-095 DRILL GREEN 2026-06-19] encryption gate: subject-column→{:?} tenant-column→{:?} \
-         subject-blob→ciphertext({stored_len}B>{}B); plaintext_at_rest_count={plaintext_at_rest} \
-         (0 plaintext-at-rest for {} tagged surfaces).",
+         subject-blob→ciphertext({stored_len}B>{}B).",
         subject_col.key_ref.class,
         bulk_col.key_ref.class,
         blob_plain.len(),
-        3,
     );
 }

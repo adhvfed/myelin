@@ -83,11 +83,6 @@ fn cdc_11_1_encrypted_column_round_trips_and_is_ciphertext_at_rest() {
 
     assert_eq!(col.key_ref.class, KeyClass::Subject("u-alice".into()));
     assert!(!col.contains_plaintext(plaintext), "ciphertext-at-rest");
-    assert_eq!(
-        cryptor.plaintext_at_rest_count(),
-        0,
-        "0 plaintext-at-rest for the tagged column"
-    );
     assert_eq!(cryptor.decrypt(&col).expect("decrypt"), plaintext);
 }
 

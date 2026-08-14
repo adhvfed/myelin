@@ -104,16 +104,11 @@ impl EncryptedColumn {
 pub struct ColumnCryptor<'a> {
     engine: &'a KmsEngine,
     region: Region,
-    plaintext_at_rest: std::sync::atomic::AtomicU64,
 }
 
 impl<'a> ColumnCryptor<'a> {
     pub fn new(engine: &'a KmsEngine, region: Region) -> ColumnCryptor<'a> {
-        ColumnCryptor {
-            engine,
-            region,
-            plaintext_at_rest: std::sync::atomic::AtomicU64::new(0),
-        }
+        ColumnCryptor { engine, region }
     }
 
     pub fn encrypt(
@@ -168,16 +163,6 @@ impl<'a> ColumnCryptor<'a> {
             .ok_or(KeyChoiceError::Kms(KmsError::UnwrapFailed(
                 crate::kms::DekId::new(column.key_ref.tenant.clone(), column.key_ref.class.clone()),
             )))
-    }
-
-    pub fn audit_plaintext(&self) {
-        self.plaintext_at_rest
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub fn plaintext_at_rest_count(&self) -> u64 {
-        self.plaintext_at_rest
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -369,8 +354,6 @@ mod tests {
             !col.contains_plaintext(plaintext),
             "a tagged column must be ciphertext-at-rest (the plaintext-at-rest floor is closed)"
         );
-        assert_eq!(cryptor.plaintext_at_rest_count(), 0);
-
         assert_eq!(cryptor.decrypt(&col).expect("decrypt"), plaintext);
     }
 
@@ -572,19 +555,5 @@ mod tests {
         assert!(e.to_string().contains("zzz") && e.to_string().contains("erasure-reach bug"));
         let e = KeyChoiceError::Kms(KmsError::KekUnavailable(KekId::new(t("acme"), r())));
         assert!(e.to_string().contains("classify→key-choice"));
-    }
-
-    #[test]
-    fn audit_plaintext_is_the_defence_in_depth_counter() {
-        let tenant = t("acme");
-        let kms = engine_for(&tenant);
-        let cryptor = ColumnCryptor::new(&kms, r());
-        assert_eq!(cryptor.plaintext_at_rest_count(), 0);
-        cryptor.audit_plaintext();
-        assert_eq!(
-            cryptor.plaintext_at_rest_count(),
-            1,
-            "the leak detector counts a plaintext-at-rest"
-        );
     }
 }
