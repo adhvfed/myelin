@@ -483,6 +483,7 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
             "run_id",
             "pipeline_id",
             "repo_ref",
+            "source_ref",
             "commit_oid",
             "trigger_kind",
             "trust_tier",
@@ -496,6 +497,16 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
     canonical_uuid_field(run, "run_id", "run summary")?;
     canonical_uuid_field(run, "pipeline_id", "run summary")?;
     bounded_string_field(run, "repo_ref", "run summary", 1_024)?;
+    if !(run["source_ref"].is_null()
+        || run["source_ref"].as_str().is_some_and(|source_ref| {
+            bounded_string(source_ref, 1_024)
+                && myelin_git::receive_pack::RefName::new(source_ref)
+                    .validate()
+                    .is_ok()
+        }))
+    {
+        return malformed_ci("run summary source ref is invalid");
+    }
     if !run["trigger_kind"].as_str().is_some_and(valid_trigger_kind)
         || !run["trust_tier"].as_str().is_some_and(valid_trust_tier)
     {
@@ -1136,6 +1147,22 @@ mod tests {
         let mut extra_field = response;
         extra_field["page"]["offset"] = json!(1);
         assert!(validate_ci_success(&call, &extra_field).is_err());
+    }
+
+    #[test]
+    fn ci_run_source_refs_are_optional_but_canonical() {
+        let call = get("/v1/ci/runs", Some("state=all&limit=1"));
+        let mut response = golden_expected("runs-first-page-keyset");
+        response["page"]["next_cursor"] = json!(canonical_cursor());
+
+        for accepted in [json!(null), json!("refs/heads/main")] {
+            response["items"][0]["source_ref"] = accepted;
+            validate_ci_success(&call, &response).unwrap();
+        }
+        for refused in [json!("main"), json!("refs/heads/../secret"), json!("")] {
+            response["items"][0]["source_ref"] = refused;
+            assert!(validate_ci_success(&call, &response).is_err());
+        }
     }
 
     #[test]
