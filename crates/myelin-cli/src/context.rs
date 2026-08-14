@@ -9,10 +9,26 @@ use std::path::Path;
 
 pub async fn inspect(edge: &EdgeConfig, token: &str) -> Result<ProfileContext, CliError> {
     let identity = execute(edge, token, &identity_call()).await?;
+    let identity = decode_identity(&identity)?;
     Ok(ProfileContext {
-        tenant: identity_field(&identity, "tenant")?.into(),
-        region: identity_field(&identity, "region")?.into(),
+        tenant: identity.tenant,
+        region: identity.region,
         project: None,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Identity {
+    pub principal_id: String,
+    pub tenant: String,
+    pub region: String,
+}
+
+pub(crate) fn decode_identity(identity: &Value) -> Result<Identity, CliError> {
+    Ok(Identity {
+        principal_id: identity_field(identity, "principal_id")?.into(),
+        tenant: identity_field(identity, "tenant")?.into(),
+        region: identity_field(identity, "region")?.into(),
     })
 }
 
@@ -84,6 +100,7 @@ pub async fn current(
         scheme: selected.credential.scheme.clone(),
     };
     let identity = execute(&edge, &selected.credential.token, &identity_call()).await?;
+    decode_identity(&identity)?;
     let project = saved_profiles(getenv, read_file)?
         .into_iter()
         .find(|profile| profile.name == selected.profile_name)
@@ -135,7 +152,7 @@ pub fn select(
     Ok(())
 }
 
-fn identity_call() -> EdgeCall {
+pub(crate) fn identity_call() -> EdgeCall {
     EdgeCall {
         method: HttpMethod::Get,
         path: "/v1/whoami".into(),
@@ -168,7 +185,15 @@ mod tests {
 
     #[test]
     fn context_identity_fields_are_bounded_and_terminal_safe() {
-        let identity = json!({ "tenant": "acme", "region": "eu-north" });
+        let identity = json!({
+            "principal_id": "human:alice",
+            "tenant": "acme",
+            "region": "eu-north"
+        });
+        assert_eq!(
+            decode_identity(&identity).unwrap().principal_id,
+            "human:alice"
+        );
         assert_eq!(identity_field(&identity, "tenant").unwrap(), "acme");
         for identity in [
             json!({ "tenant": "two words" }),

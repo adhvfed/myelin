@@ -80,6 +80,7 @@ myelin context use customer-a
 myelin context use --project 11111111-1111-1111-1111-111111111111
 myelin context current
 myelin auth configure-git
+myelin doctor
 
 myelin tool list
 myelin tool show ci.read_run

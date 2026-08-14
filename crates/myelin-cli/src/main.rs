@@ -70,6 +70,8 @@ enum Command {
     },
     /// Show the principal authenticated by the selected credential.
     Whoami,
+    /// Diagnose the saved development context without changing it.
+    Doctor,
     #[command(hide = true)]
     Git {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -247,6 +249,7 @@ async fn run() -> Result<(), CliError> {
             run_call_with_effect(&cli, &getenv, &read_file, call, command_key, effect).await
         }
         Command::Whoami => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
+        Command::Doctor => doctor(&cli, &getenv, &read_file).await,
         Command::Git { args } => {
             let (call, command_key) = dispatch_command(args, git_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
@@ -315,6 +318,27 @@ async fn run() -> Result<(), CliError> {
             McpCommand::Serve { agent_id } => serve_mcp(&cli, agent_id, &getenv, &read_file).await,
         },
     }
+}
+
+async fn doctor(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Result<(), CliError> {
+    if cli.edge.is_some()
+        || cli.token.is_some()
+        || cli.scheme.is_some()
+        || cli.project.is_some()
+        || cli.idempotency_key.is_some()
+    {
+        return Err(CliError::Usage(
+            "doctor inspects a saved browser-approved context and accepts only --profile and --json"
+                .into(),
+        ));
+    }
+    let report = myelin_cli::doctor::diagnose(cli.profile.as_deref(), getenv, read_file).await?;
+    print!("{}", report.render(cli.json));
+    Ok(())
 }
 
 async fn serve_mcp(
@@ -954,6 +978,7 @@ mod tests {
                 "--as",
                 "11111111-1111-1111-1111-111111111111",
             ][..],
+            &["myelin", "doctor"][..],
             &["myelin", "issue", "list"][..],
             &["myelin", "inbox", "list"][..],
             &["myelin", "doc", "page", "list"][..],

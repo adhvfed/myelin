@@ -93,6 +93,13 @@ pub struct GitConfiguration {
     legacy_helper: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitConfigurationStatus {
+    Configured,
+    DifferentProfile,
+    Missing,
+}
+
 impl GitConfiguration {
     pub fn new(
         scope: &CredentialScope,
@@ -128,6 +135,16 @@ impl GitConfiguration {
             || helper
                 .strip_prefix(&self.owned_prefix)
                 .is_some_and(|suffix| suffix.ends_with(" auth git-credential"))
+    }
+
+    fn status_among(&self, registered: &[String]) -> GitConfigurationStatus {
+        if registered.iter().any(|helper| helper == &self.helper) {
+            GitConfigurationStatus::Configured
+        } else if registered.iter().any(|helper| self.owns(helper)) {
+            GitConfigurationStatus::DifferentProfile
+        } else {
+            GitConfigurationStatus::Missing
+        }
     }
 }
 
@@ -193,6 +210,11 @@ pub fn unconfigure(configuration: &GitConfiguration) -> Result<bool, CliError> {
         remove_helper(configuration, helper)?;
     }
     Ok(!owned.is_empty())
+}
+
+/** Inspect the exact Edge/profile helper without changing the user's Git configuration. */
+pub fn inspect(configuration: &GitConfiguration) -> Result<GitConfigurationStatus, CliError> {
+    Ok(configuration.status_among(&registered_helpers(configuration)?))
 }
 
 fn remove_helper(configuration: &GitConfiguration, helper: &str) -> Result<(), CliError> {
@@ -498,5 +520,27 @@ mod tests {
         assert!(config
             .owns("!'/opt/Myelin'\"'\"'s tools/myelin' --profile 'other' auth git-credential"));
         assert!(!config.owns("!'/somewhere/else/myelin' auth git-credential"));
+    }
+
+    #[test]
+    fn configuration_status_distinguishes_the_selected_profile_from_other_myelin_helpers() {
+        let scope = CredentialScope::from_edge_url("https://edge.example").unwrap();
+        let config =
+            GitConfiguration::new(&scope, &PathBuf::from("/opt/myelin"), "session", "work")
+                .unwrap();
+
+        assert_eq!(
+            config.status_among(std::slice::from_ref(&config.helper)),
+            GitConfigurationStatus::Configured
+        );
+        assert_eq!(
+            config
+                .status_among(&["!'/opt/myelin' --profile 'personal' auth git-credential".into()]),
+            GitConfigurationStatus::DifferentProfile
+        );
+        assert_eq!(
+            config.status_among(&["cache --timeout=300".into()]),
+            GitConfigurationStatus::Missing
+        );
     }
 }

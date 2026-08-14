@@ -5,6 +5,7 @@ pub mod context;
 mod credential_store;
 pub mod device_auth;
 pub mod dispatch;
+pub mod doctor;
 pub mod error;
 pub mod git_credential;
 pub mod mcp_bridge;
