@@ -5,6 +5,7 @@ import {
   parseAppliedMerge,
   parseAppliedReview,
   parseAppliedThread,
+  parseAppliedThreadResolution,
   parseIssue,
   parseIssueAuthorizationStatus,
   parseIssueCreateReceipt,
@@ -33,6 +34,26 @@ const comment = {
   review_id: null,
   pending: false,
 };
+
+describe("parseAppliedThreadResolution", () => {
+  it("accepts only a canonical resolution receipt", () => {
+    expect(parseAppliedThreadResolution({
+      applied: {
+        action: "git.pr.thread.resolve",
+        result: { thread_id: "t-7", resolved: true, internal: "drop" },
+      },
+      durable: true,
+    })).toEqual({ thread_id: "t-7", resolved: true });
+    expect(parseAppliedThreadResolution({
+      applied: { action: "git.pr.thread.resolve", result: { thread_id: "r-7", resolved: true } },
+      durable: true,
+    })).toBeNull();
+    expect(parseAppliedThreadResolution({
+      applied: { action: "git.pr.thread.resolve", result: { thread_id: "t-7", resolved: "yes" } },
+      durable: true,
+    })).toBeNull();
+  });
+});
 
 describe("issue mutation response decoders", () => {
   const summary = { id: UUID, ref: "myelin://acme/issue/issue/MY-42", key: "MY-42", project_id: PROJECT };

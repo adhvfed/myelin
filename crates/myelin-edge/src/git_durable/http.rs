@@ -2255,6 +2255,9 @@ impl Handler for DPrThreadResolve {
         } else {
             ctx.request.json_body()?
         };
+        let operation = self
+            .be
+            .required_request_operation(ctx.request, ctx.principal)?;
         let vm = self
             .be
             .resolve_thread(
@@ -2266,6 +2269,7 @@ impl Handler for DPrThreadResolve {
                 )
                 .for_pr(num_param(ctx, "n")?),
                 param(ctx, "tid")?,
+                &operation.nonce,
                 &body,
             )
             .map_err(map_durable_err)?;
@@ -2287,11 +2291,13 @@ impl Handler for DPrReviewStart {
         let vm = self
             .be
             .start_review_batch(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
-                ctx.principal,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 &operation.nonce,
             )
             .map_err(map_durable_err)?;
@@ -2374,15 +2380,21 @@ struct DPrReviewDiscard {
 }
 impl Handler for DPrReviewDiscard {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let operation = self
+            .be
+            .required_request_operation(ctx.request, ctx.principal)?;
         let vm = self
             .be
             .discard_review_batch(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 param(ctx, "rid")?,
-                ctx.principal,
+                &operation.nonce,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(

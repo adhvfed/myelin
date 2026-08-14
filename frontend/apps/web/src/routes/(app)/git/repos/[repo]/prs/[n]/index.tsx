@@ -242,6 +242,7 @@ export default function PrOverviewScreen() {
                     threads={(threads()?.discussion ?? []) as PrThreadVM[]}
                     loading={threads() === undefined}
                     onChange={reload}
+                    toast={toast}
                   />
 
                   {/* MERGE card — reflects the authoritative gate; ConfirmDialog re-verifies on 409.
@@ -482,7 +483,8 @@ function ReviewsSection(props: {
       // Drop the server draft so the rehydrate effect can't resurrect it, THEN clear the local draft.
       await props.onChange();
     } catch {
-      /* a discard failure is non-fatal — the draft is the reviewer's private state */
+      props.toast.show({ title: "Could not discard the review draft", variant: "danger" });
+      return;
     }
     setDraft(null);
     setVerdictOpen(false);
@@ -746,6 +748,7 @@ function DiscussionSection(props: {
   threads: PrThreadVM[];
   loading: boolean;
   onChange: () => Promise<void>;
+  toast: ReturnType<typeof useToast>;
 }) {
   const doMutate = useAction(prMutate);
   // CONTROLLED via a signal (finding #19): `value` is bound so a successful post that clears the signal
@@ -760,7 +763,7 @@ function DiscussionSection(props: {
       setComposer("");
       await props.onChange();
     } catch {
-      /* the composer text is preserved on failure (the ref keeps it, never lost) */
+      props.toast.show({ title: "Could not start the discussion", variant: "danger" });
     }
   };
   return (
@@ -770,7 +773,15 @@ function DiscussionSection(props: {
         <Show when={props.threads.length > 0} fallback={<p style={{ color: "var(--text-muted)", margin: "0" }}>No discussion yet.</p>}>
           <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
             <For each={props.threads}>
-              {(t) => <ThreadView repo={props.repo} n={props.n} thread={t} onChange={props.onChange} />}
+              {(t) => (
+                <ThreadView
+                  repo={props.repo}
+                  n={props.n}
+                  thread={t}
+                  onChange={props.onChange}
+                  toast={props.toast}
+                />
+              )}
             </For>
           </ul>
         </Show>
@@ -784,9 +795,16 @@ function DiscussionSection(props: {
   );
 }
 
-function ThreadView(props: { repo: string; n: number; thread: PrThreadVM; onChange: () => Promise<void> }) {
+function ThreadView(props: {
+  repo: string;
+  n: number;
+  thread: PrThreadVM;
+  onChange: () => Promise<void>;
+  toast: ReturnType<typeof useToast>;
+}) {
   const doMutate = useAction(prMutate);
   const [reply, setReply] = createSignal("");
+  const [updatingResolution, setUpdatingResolution] = createSignal(false);
   const send = async () => {
     const text = reply().trim();
     if (!text) return;
@@ -795,11 +813,53 @@ function ThreadView(props: { repo: string; n: number; thread: PrThreadVM; onChan
       setReply("");
       await props.onChange();
     } catch {
-      /* keep the reply text */
+      props.toast.show({ title: "Could not post the reply", variant: "danger" });
+    }
+  };
+  const toggleResolution = async () => {
+    if (updatingResolution()) return;
+    const resolved = !props.thread.resolved;
+    setUpdatingResolution(true);
+    try {
+      await doMutate({
+        op: "resolve",
+        repo: props.repo,
+        n: props.n,
+        threadId: props.thread.id,
+        resolved,
+      });
+      await props.onChange();
+      props.toast.show({
+        title: resolved ? "Discussion resolved" : "Discussion reopened",
+        variant: "success",
+      });
+    } catch {
+      props.toast.show({
+        title: resolved ? "Could not resolve the discussion" : "Could not reopen the discussion",
+        variant: "danger",
+      });
+    } finally {
+      setUpdatingResolution(false);
     }
   };
   return (
     <li style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-2)", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+      <div style={{ display: "flex", "justify-content": "space-between", "align-items": "center", gap: "var(--space-2)" }}>
+        <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
+          {props.thread.resolved ? "Resolved discussion" : "Open discussion"}
+        </span>
+        <button
+          type="button"
+          class="btn-secondary"
+          style={barBtn}
+          disabled={updatingResolution()}
+          onClick={() => void toggleResolution()}
+        >
+          {updatingResolution()
+            ? "Saving…"
+            : props.thread.resolved ? "Reopen" : "Resolve"}
+        </button>
+      </div>
       <For each={props.thread.comments}>
         {(c) => (
           <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>

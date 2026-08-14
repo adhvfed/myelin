@@ -13,6 +13,7 @@ import {
   parseAppliedComment,
   parseAppliedMerge,
   parseAppliedReview,
+  parseAppliedThreadResolution,
   parseAppliedThread,
   parsePrChecks,
   parsePrThreads,
@@ -1123,6 +1124,17 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
         const comment = parseAppliedComment(response, "git.pr.comment.create");
         if (!comment) throw new RepoRouteError("error");
         return { comment };
+      }
+      case "resolve": {
+        const response = await edgePost(
+          `${base}/threads/${seg(parsed.threadId)}/resolve`,
+          { resolved: parsed.resolved },
+          mutationOptions,
+        );
+        const resolution = parseAppliedThreadResolution(response);
+        if (!resolution || resolution.thread_id !== parsed.threadId ||
+            resolution.resolved !== parsed.resolved) throw new RepoRouteError("error");
+        return { ok: true };
       }
       case "review-start": {
         const response = await edgePost(`${base}/reviews/start`, {}, mutationOptions);

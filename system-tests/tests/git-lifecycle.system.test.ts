@@ -452,6 +452,36 @@ describe.sequential("Git engineering lifecycle", () => {
     expect(array(discussion?.comments, "discussion comments").map((value) => record(value, "comment").id))
       .toEqual([openingCommentId, commentId]);
 
+    const resolutionPath = `${base}/threads/${encodeURIComponent(threadId)}/resolve`;
+    const resolutionRetryKey = `discussion-resolve-${randomUUID()}`;
+    const resolved = await reviewerClient.json(resolutionPath, {
+      method: "POST",
+      body: { resolved: true },
+      idempotencyKey: resolutionRetryKey,
+    });
+    expect(resolved.body).toMatchObject({
+      durable: true,
+      applied: {
+        action: "git.pr.thread.resolve",
+        result: { thread_id: threadId, resolved: true },
+      },
+    });
+    expect((await reviewerClient.json(resolutionPath, {
+      method: "POST",
+      body: { resolved: true },
+      idempotencyKey: resolutionRetryKey,
+    })).body).toEqual(resolved.body);
+    await reviewerClient.json(resolutionPath, {
+      method: "POST",
+      body: { resolved: false },
+      idempotencyKey: resolutionRetryKey,
+      expectedStatus: 409,
+    });
+    const resolvedConversation = await reviewerClient.json(`${base}/threads`);
+    expect(array(resolvedConversation.body.discussion, "resolved discussion threads")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: threadId, resolved: true })]),
+    );
+
     const reviewStartRetryKey = `review-start-${randomUUID()}`;
     const reviewStart = await reviewerClient.json(`${base}/reviews/start`, {
       method: "POST",
@@ -563,6 +593,61 @@ describe.sequential("Git engineering lifecycle", () => {
       current_approvals: 1,
       gate_admitted: true,
     });
+  });
+
+  test("lets a reviewer discard a private draft without a retry resurrecting it", async () => {
+    const base = `${project.path}/prs/${pullRequestNumber}`;
+    const startRetryKey = `discarded-review-start-${randomUUID()}`;
+    const started = await reviewerClient.json(`${base}/reviews/start`, {
+      method: "POST",
+      body: {},
+      idempotencyKey: startRetryKey,
+      expectedStatus: 201,
+    });
+    const review = record(
+      record(started.body.applied, "discarded review start.applied").review,
+      "discarded review start.applied.review",
+    );
+    const reviewId = string(review.id, "discarded review id");
+    await reviewerClient.json(`${base}/reviews/${encodeURIComponent(reviewId)}/comments`, {
+      method: "POST",
+      body: { body_md: "A private thought that I chose not to publish." },
+      idempotencyKey: `discarded-review-comment-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+
+    const discardPath = `${base}/reviews/${encodeURIComponent(reviewId)}/discard`;
+    const discardRetryKey = `discard-review-${randomUUID()}`;
+    const discarded = await reviewerClient.json(discardPath, {
+      method: "POST",
+      body: {},
+      idempotencyKey: discardRetryKey,
+    });
+    expect(discarded.body).toMatchObject({
+      durable: true,
+      applied: {
+        action: "git.pr.review.discard",
+        result: { discarded: reviewId },
+      },
+    });
+    expect((await reviewerClient.json(discardPath, {
+      method: "POST",
+      body: {},
+      idempotencyKey: discardRetryKey,
+    })).body).toEqual(discarded.body);
+
+    await reviewerClient.json(`${base}/reviews/start`, {
+      method: "POST",
+      body: {},
+      idempotencyKey: startRetryKey,
+      expectedStatus: 409,
+    });
+    const conversation = await reviewerClient.json(`${base}/threads`);
+    expect(array(conversation.body.reviews, "reviews after discard")
+      .some((candidate) => record(candidate, "review after discard").id === reviewId)).toBe(false);
+    expect(array(conversation.body.threads, "threads after discard")
+      .flatMap((candidate) => array(record(candidate, "thread after discard").comments, "comments after discard"))
+      .some((candidate) => record(candidate, "comment after discard").review_id === reviewId)).toBe(false);
   });
 
   test("merges the approved pull request and exposes the result on the base ref", async () => {

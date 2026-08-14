@@ -151,6 +151,7 @@ impl DurableGitBackend {
         &self,
         target: PrActorContext<'_>,
         thread_id: &str,
+        operation_nonce: &str,
         body: &Value,
     ) -> Result<Value, DurableError> {
         let PrActorContext { repo, number } = target;
@@ -167,20 +168,31 @@ impl DurableGitBackend {
             .get("resolved")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        self.threads
-            .resolve_thread(&loc, &key, thread_id, resolved)?;
-        Ok(json!({ "thread_id": thread_id, "resolved": resolved }))
+        let outcome =
+            self.threads
+                .resolve_thread(&loc, &key, thread_id, resolved, operation_nonce)?;
+        self.reconcile_conversation_projection(
+            &loc,
+            number,
+            principal,
+            operation_nonce,
+            outcome.applied,
+        )?;
+        Ok(json!({ "thread_id": thread_id, "resolved": outcome.value }))
     }
 
     pub fn start_review_batch(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
-        principal: &Principal,
+        target: PrActorContext<'_>,
         operation_nonce: &str,
     ) -> Result<Value, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
@@ -310,19 +322,25 @@ impl DurableGitBackend {
 
     pub fn discard_review_batch(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         review_id: &str,
-        principal: &Principal,
+        operation_nonce: &str,
     ) -> Result<Value, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let actor = Self::thread_principal(tenant, principal);
-        self.threads.discard_review(&loc, &key, review_id, &actor)?;
-        Ok(json!({ "discarded": review_id }))
+        let outcome =
+            self.threads
+                .discard_review(&loc, &key, review_id, &actor, operation_nonce)?;
+        Ok(json!({ "discarded": outcome.value }))
     }
 
     fn reconcile_conversation_projection(

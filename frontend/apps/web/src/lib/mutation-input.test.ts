@@ -56,6 +56,19 @@ describe("parsePrMutation", () => {
       body_md: "review this",
       anchor: { path: "src/lib.rs", line: 7, side: "new" },
     });
+    expect(parsePrMutation({
+      op: "resolve",
+      repo: "team/core",
+      n: 42,
+      threadId: "t-7",
+      resolved: true,
+    })).toEqual({
+      op: "resolve",
+      repo: "team/core",
+      n: 42,
+      threadId: "t-7",
+      resolved: true,
+    });
   });
 
   it.each([
@@ -67,6 +80,7 @@ describe("parsePrMutation", () => {
     { op: "merge", repo: "core", n: Number.MAX_SAFE_INTEGER + 1 },
     { op: "merge", repo: "core", n: 1, surprise: true },
     { op: "comment", repo: "core", n: 1, threadId: "r-1", body_md: "x" },
+    { op: "resolve", repo: "core", n: 1, threadId: "t-1", resolved: "yes" },
     { op: "review-discard", repo: "core", n: 1, reviewId: "t-1" },
     { op: "review-submit", repo: "core", n: 1, reviewId: "r-1", verdict: "dismissed" },
     { op: "thread", repo: "core", n: 1, body_md: "x", anchor: { path: "src/x", line: 1 } },

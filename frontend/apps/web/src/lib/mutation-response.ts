@@ -234,6 +234,18 @@ export function parseAppliedReview(value: unknown): PrReviewVM | null {
   return payload ? review(payload.review) : null;
 }
 
+export function parseAppliedThreadResolution(
+  value: unknown,
+): { thread_id: string; resolved: boolean } | null {
+  const payload = applied(value, "git.pr.thread.resolve");
+  const result = record(payload?.result);
+  if (!result || typeof result.thread_id !== "string" ||
+      !/^t-[1-9][0-9]{0,19}$/.test(result.thread_id) || typeof result.resolved !== "boolean") {
+    return null;
+  }
+  return { thread_id: result.thread_id, resolved: result.resolved };
+}
+
 function threadArray(value: unknown, expected: "discussion" | "anchored" | "all"): PrThreadVM[] | null {
   if (!Array.isArray(value) || value.length > 4_096) return null;
   const parsed = value.map(thread);

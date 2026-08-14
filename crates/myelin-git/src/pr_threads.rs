@@ -15,6 +15,7 @@ pub const MAX_THREAD_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_THREADS_PER_SUBJECT: usize = 4_096;
 pub const MAX_COMMENTS_PER_SUBJECT: usize = 8_192;
 pub const MAX_REVIEWS_PER_SUBJECT: usize = 1_024;
+pub const MAX_CONVERSATION_COMMANDS_PER_SUBJECT: usize = 16_384;
 pub const MAX_REVIEW_COMMANDS_PER_SUBJECT: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +172,13 @@ fn reply_request_hash(
     ))
 }
 
+fn resolve_thread_request_hash(thread_id: &str, resolved: bool) -> String {
+    digest_parts(
+        "myelin.git.thread-resolve.request.v1",
+        &[thread_id.as_bytes(), &[u8::from(resolved)]],
+    )
+}
+
 fn pending_comment_request_hash(
     review_id: &str,
     anchor: &Option<ThreadAnchor>,
@@ -215,6 +223,17 @@ fn review_submit_request_hash(
             verdict.as_str().as_bytes(),
             summary.as_slice(),
         ],
+    ))
+}
+
+fn review_discard_request_hash(
+    review_id: &str,
+    actor: &ThreadPrincipal,
+) -> Result<String, DurableError> {
+    let actor = encode_author(actor)?;
+    Ok(digest_parts(
+        "myelin.git.review-discard.request.v1",
+        &[review_id.as_bytes(), actor.as_slice()],
     ))
 }
 
@@ -540,13 +559,57 @@ struct ConversationCommand {
     thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     comment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved: Option<bool>,
+}
+
+impl ConversationCommand {
+    fn created_thread(request_hash: String, thread_id: String) -> Self {
+        Self {
+            request_hash,
+            thread_id: Some(thread_id),
+            comment_id: None,
+            resolved: None,
+        }
+    }
+
+    fn created_comment(request_hash: String, comment_id: String) -> Self {
+        Self {
+            request_hash,
+            thread_id: None,
+            comment_id: Some(comment_id),
+            resolved: None,
+        }
+    }
+
+    fn resolved_thread(request_hash: String, thread_id: String, resolved: bool) -> Self {
+        Self {
+            request_hash,
+            thread_id: Some(thread_id),
+            comment_id: None,
+            resolved: Some(resolved),
+        }
+    }
+
+    fn has_valid_result(&self) -> bool {
+        matches!(
+            (
+                self.thread_id.is_some(),
+                self.comment_id.is_some(),
+                self.resolved.is_some(),
+            ),
+            (true, false, false) | (false, true, false) | (true, false, true)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ReviewCommandKind {
     Start,
+    DiscardedStart,
     Submit,
+    Discard,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,7 +642,7 @@ impl SubjectThreads {
         if self.threads.len() > MAX_THREADS_PER_SUBJECT
             || self.comment_count() > MAX_COMMENTS_PER_SUBJECT
             || self.reviews.len() > MAX_REVIEWS_PER_SUBJECT
-            || self.conversation_commands.len() > MAX_COMMENTS_PER_SUBJECT
+            || self.conversation_commands.len() > MAX_CONVERSATION_COMMANDS_PER_SUBJECT
             || self.review_commands.len() > MAX_REVIEW_COMMANDS_PER_SUBJECT
         {
             return Err(DurableError::Git(
@@ -588,17 +651,25 @@ impl SubjectThreads {
         }
         if self
             .conversation_commands
-            .values()
-            .any(|command| command.thread_id.is_some() == command.comment_id.is_some())
+            .iter()
+            .any(|(operation_id, command)| {
+                !canonical_digest(operation_id)
+                    || !canonical_digest(&command.request_hash)
+                    || !command.has_valid_result()
+            })
         {
             return Err(DurableError::Git(
                 "PR conversation contains a malformed command receipt".into(),
             ));
         }
         if self.review_commands.iter().any(|(operation_id, command)| {
+            let target_exists = self.review(&command.review_id).is_some();
             !canonical_digest(operation_id)
                 || !canonical_digest(&command.request_hash)
-                || self.review(&command.review_id).is_none()
+                || match command.kind {
+                    ReviewCommandKind::Start | ReviewCommandKind::Submit => !target_exists,
+                    ReviewCommandKind::DiscardedStart | ReviewCommandKind::Discard => target_exists,
+                }
         }) {
             return Err(DurableError::Git(
                 "PR conversation contains a malformed review command receipt".into(),
@@ -856,11 +927,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         doc.threads.push(thread.clone());
         doc.conversation_commands.insert(
             operation_id,
-            ConversationCommand {
-                request_hash,
-                thread_id: Some(thread.id.clone()),
-                comment_id: None,
-            },
+            ConversationCommand::created_thread(request_hash, thread.id.clone()),
         );
         self.save(repo, &doc)?;
         Ok(CommandOutcome::applied(thread))
@@ -931,11 +998,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         thread.comments.push(comment.clone());
         doc.conversation_commands.insert(
             operation_id,
-            ConversationCommand {
-                request_hash,
-                thread_id: None,
-                comment_id: Some(comment.id.clone()),
-            },
+            ConversationCommand::created_comment(request_hash, comment.id.clone()),
         );
         self.save(repo, &doc)?;
         Ok(CommandOutcome::applied(comment))
@@ -947,18 +1010,49 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         object_key: &str,
         thread_id: &str,
         resolved: bool,
-    ) -> Result<(), DurableError> {
+        operation_nonce: &str,
+    ) -> Result<CommandOutcome<bool>, DurableError> {
+        let operation_id = operation_digest(operation_nonce)?;
+        let request_hash = resolve_thread_request_hash(thread_id, resolved);
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if let Some(command) = doc.conversation_commands.get(&operation_id) {
+            if command.request_hash != request_hash {
+                return Err(DurableError::Conflict(
+                    "idempotency key is already bound to a different conversation write".into(),
+                ));
+            }
+            let receipt_thread_id = command.thread_id.as_deref().ok_or_else(|| {
+                DurableError::Io("thread-resolution receipt contains the wrong result type".into())
+            })?;
+            if receipt_thread_id != thread_id {
+                return Err(DurableError::Io(
+                    "thread-resolution receipt references the wrong thread".into(),
+                ));
+            }
+            let receipt = command.resolved.ok_or_else(|| {
+                DurableError::Io("thread-resolution receipt is missing its state".into())
+            })?;
+            return Ok(CommandOutcome::replayed(receipt));
+        }
+        if doc.conversation_commands.len() >= MAX_CONVERSATION_COMMANDS_PER_SUBJECT {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its command limit".into(),
+            ));
+        }
         let thread = doc
             .threads
             .iter_mut()
             .find(|t| t.id == thread_id)
             .ok_or_else(|| DurableError::NotFound(format!("thread {thread_id}")))?;
         thread.resolved = resolved;
+        doc.conversation_commands.insert(
+            operation_id,
+            ConversationCommand::resolved_thread(request_hash, thread_id.to_string(), resolved),
+        );
         self.save(repo, &doc)?;
-        Ok(())
+        Ok(CommandOutcome::applied(resolved))
     }
 
     pub fn start_review(
@@ -986,7 +1080,9 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             })?;
             return Ok(review);
         }
-        if doc.review_commands.len() >= MAX_REVIEW_COMMANDS_PER_SUBJECT {
+        // Leave room for the terminal discard receipt. Otherwise a caller could fill the ledger
+        // with equivalent start keys and make its own private draft impossible to remove safely.
+        if doc.review_commands.len() >= MAX_REVIEW_COMMANDS_PER_SUBJECT - 1 {
             return Err(DurableError::Git(
                 "PR conversation exceeds its review-command limit".into(),
             ));
@@ -1117,11 +1213,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         });
         doc.conversation_commands.insert(
             operation_id,
-            ConversationCommand {
-                request_hash,
-                thread_id: None,
-                comment_id: Some(comment.id.clone()),
-            },
+            ConversationCommand::created_comment(request_hash, comment.id.clone()),
         );
         self.save(&repo, &doc)?;
         Ok(comment)
@@ -1212,10 +1304,21 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         object_key: &str,
         review_id: &str,
         actor: &ThreadPrincipal,
-    ) -> Result<(), DurableError> {
+        operation_nonce: &str,
+    ) -> Result<CommandOutcome<String>, DurableError> {
+        let operation_id = operation_digest(operation_nonce)?;
+        let request_hash = review_discard_request_hash(review_id, actor)?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if let Some(command) = doc.review_commands.get(&operation_id) {
+            if command.kind != ReviewCommandKind::Discard || command.request_hash != request_hash {
+                return Err(DurableError::Conflict(
+                    "idempotency key is already bound to a different review command".into(),
+                ));
+            }
+            return Ok(CommandOutcome::replayed(command.review_id.clone()));
+        }
         match doc.review(review_id) {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
             Some(r) if !r.is_draft() => {
@@ -1249,10 +1352,26 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
                 .as_ref()
                 .is_none_or(|comment_id| !discarded_comment_ids.contains(comment_id))
         });
-        doc.review_commands
-            .retain(|_, command| command.review_id != review_id);
+        doc.review_commands.retain(|_, command| {
+            command.review_id != review_id || command.kind == ReviewCommandKind::Start
+        });
+        for command in doc
+            .review_commands
+            .values_mut()
+            .filter(|command| command.review_id == review_id)
+        {
+            command.kind = ReviewCommandKind::DiscardedStart;
+        }
+        doc.review_commands.insert(
+            operation_id,
+            ReviewCommand {
+                request_hash,
+                kind: ReviewCommandKind::Discard,
+                review_id: review_id.to_string(),
+            },
+        );
         self.save(repo, &doc)?;
-        Ok(())
+        Ok(CommandOutcome::applied(review_id.to_string()))
     }
 }
 
@@ -1707,8 +1826,8 @@ mod tests {
                 }]
             }],
             "pending_comment_commands": {
-                "operation-digest": {
-                    "request_hash": "request-digest",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                    "request_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "comment_id": "c-1"
                 }
             }
@@ -1720,7 +1839,8 @@ mod tests {
         let upgraded = serde_json::to_value(document).unwrap();
         assert!(upgraded.get("pending_comment_commands").is_none());
         assert_eq!(
-            upgraded["conversation_commands"]["operation-digest"]["comment_id"],
+            upgraded["conversation_commands"]
+                ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]["comment_id"],
             "c-1"
         );
     }
@@ -1859,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn discard_removes_a_draft_but_not_a_submitted_batch() {
+    fn discard_returns_its_receipt_after_removing_a_private_draft() {
         let root = temp_root("discard");
         let store = DurablePrThreadStore::rooted(&root);
         let batch = store
@@ -1868,9 +1988,20 @@ mod tests {
         store
             .add_pending_comment(pending_comment(&batch.id, human("psn:r@acme"), "draft", 1))
             .unwrap();
-        store
-            .discard_review(&loc(), KEY, &batch.id, &human("psn:r@acme"))
+        let first = store
+            .discard_review(&loc(), KEY, &batch.id, &human("psn:r@acme"), "discard-once")
             .unwrap();
+        assert!(first.applied);
+        assert_eq!(first.value, batch.id);
+        let replayed = DurablePrThreadStore::rooted(&root)
+            .discard_review(&loc(), KEY, &batch.id, &human("psn:r@acme"), "discard-once")
+            .unwrap();
+        assert!(!replayed.applied);
+        assert_eq!(replayed.value, batch.id);
+        assert!(matches!(
+            store.start_review(&loc(), KEY, human("psn:r@acme"), "discarded-review",),
+            Err(DurableError::Conflict(_))
+        ));
         let doc = store.load(&loc(), KEY).unwrap();
         assert_eq!(doc.threads.len(), 0, "discard removes the draft's threads");
         assert_eq!(doc.reviews.len(), 0);
@@ -1888,7 +2019,13 @@ mod tests {
             ))
             .unwrap();
         assert!(matches!(
-            store.discard_review(&loc(), KEY, &b2.id, &human("psn:r@acme")),
+            store.discard_review(
+                &loc(),
+                KEY,
+                &b2.id,
+                &human("psn:r@acme"),
+                "cannot-discard-submitted",
+            ),
             Err(DurableError::Forbidden(_))
         ));
         std::fs::remove_dir_all(&root).ok();
@@ -1923,7 +2060,7 @@ mod tests {
             Err(DurableError::Forbidden(_))
         ));
         assert!(matches!(
-            store.discard_review(&loc(), KEY, &batch.id, &attacker),
+            store.discard_review(&loc(), KEY, &batch.id, &attacker, "attacker-discard"),
             Err(DurableError::Forbidden(_))
         ));
         assert!(matches!(
@@ -1959,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_thread_persists() {
+    fn resolve_thread_persists_and_replays_its_original_receipt() {
         let root = temp_root("resolve");
         let store = DurablePrThreadStore::rooted(&root);
         let t = store
@@ -1971,7 +2108,18 @@ mod tests {
             )
             .unwrap()
             .value;
-        store.resolve_thread(&loc(), KEY, &t.id, true).unwrap();
+        let first = store
+            .resolve_thread(&loc(), KEY, &t.id, true, "resolve-once")
+            .unwrap();
+        assert_eq!(first, CommandOutcome::applied(true));
+        let replayed = DurablePrThreadStore::rooted(&root)
+            .resolve_thread(&loc(), KEY, &t.id, true, "resolve-once")
+            .unwrap();
+        assert_eq!(replayed, CommandOutcome::replayed(true));
+        assert!(matches!(
+            store.resolve_thread(&loc(), KEY, &t.id, false, "resolve-once"),
+            Err(DurableError::Conflict(_))
+        ));
         let doc = store.load(&loc(), KEY).unwrap();
         assert!(doc.threads[0].resolved);
         std::fs::remove_dir_all(&root).ok();

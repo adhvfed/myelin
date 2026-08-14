@@ -15,6 +15,7 @@ export type IssueMutation =
 export type PrMutation =
   | { op: "thread"; repo: string; n: number; body_md: string; anchor?: PrAnchor }
   | { op: "comment"; repo: string; n: number; threadId: string; body_md: string }
+  | { op: "resolve"; repo: string; n: number; threadId: string; resolved: boolean }
   | { op: "review-start"; repo: string; n: number }
   | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string }
   | { op: "review-submit"; repo: string; n: number; reviewId: string; verdict: ReviewVerdict; summary_md?: string }
@@ -155,6 +156,11 @@ export function parsePrMutation(value: unknown): PrMutation | null {
       const body_md = markdown(input.body_md, true);
       return body_md === null ? null : { op: "comment", ...base, threadId: input.threadId, body_md };
     }
+    case "resolve":
+      return exactKeys(input, ["op", "repo", "n", "threadId", "resolved"]) &&
+          threadId(input.threadId) && typeof input.resolved === "boolean"
+        ? { op: "resolve", ...base, threadId: input.threadId, resolved: input.resolved }
+        : null;
     case "review-start":
       return exactKeys(input, ["op", "repo", "n"]) ? { op: "review-start", ...base } : null;
     case "review-comment": {
