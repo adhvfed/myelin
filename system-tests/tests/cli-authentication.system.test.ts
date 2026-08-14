@@ -13,6 +13,14 @@ import { eventually } from "../src/eventually.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
+import {
+  cliEnvironment,
+  finish,
+  runCli,
+  runCliWith,
+  startCli,
+  waitForCode,
+} from "../src/myelin-cli.js";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -172,84 +180,6 @@ function gitBlobOid(contents: string): string {
     .digest("hex");
 }
 
-function cliEnvironment(
-  configDirectory: string,
-  additions: NodeJS.ProcessEnv = {},
-): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = {
-    ...process.env,
-    MYELIN_CONFIG_DIR: configDirectory,
-    MYELIN_TEST_CREDENTIAL_STORE: "file",
-  };
-  delete environment.MYELIN_TOKEN;
-  delete environment.MYELIN_TOKEN_SCHEME;
-  delete environment.MYELIN_EDGE;
-  delete environment.MYELIN_PROFILE;
-  return { ...environment, ...additions };
-}
-
-function startCli(configDirectory: string, ...args: string[]): ChildProcessWithoutNullStreams {
-  return spawn(
-    "cargo",
-    ["run", "--quiet", "-p", "myelin-cli", "--", ...args],
-    {
-      cwd: repository,
-      env: cliEnvironment(configDirectory),
-      stdio: "pipe",
-    },
-  );
-}
-
-async function waitForCode(
-  child: ChildProcessWithoutNullStreams,
-): Promise<{ code: string; stdout: () => string; stderr: () => string }> {
-  let stdout = "";
-  let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-
-  const code = await new Promise<string>((resolveCode, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error(`CLI did not print an approval code; stdout=${stdout} stderr=${stderr}`));
-    }, 30_000);
-    const inspect = () => {
-      const match = stdout.match(/Confirm this code in your browser: ([A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4})/);
-      if (!match) return;
-      clearTimeout(timeout);
-      resolveCode(match[1]!);
-    };
-    child.stdout.on("data", inspect);
-    child.once("exit", (exitCode) => {
-      clearTimeout(timeout);
-      reject(new Error(`CLI exited ${exitCode} before approval; stdout=${stdout} stderr=${stderr}`));
-    });
-    inspect();
-  });
-  return { code, stdout: () => stdout, stderr: () => stderr };
-}
-
-async function finish(
-  child: ChildProcessWithoutNullStreams,
-  output: { stdout: () => string; stderr: () => string },
-): Promise<string> {
-  const exitCode = await new Promise<number | null>((resolveExit, reject) => {
-    const timeout = setTimeout(() => reject(new Error("CLI did not finish after approval")), 15_000);
-    child.once("error", reject);
-    child.once("exit", (code) => {
-      clearTimeout(timeout);
-      resolveExit(code);
-    });
-  });
-  expect(exitCode, `stderr=${output.stderr()}`).toBe(0);
-  return output.stdout();
-}
-
-async function runCli(configDirectory: string, ...args: string[]) {
-  return runCliWith(configDirectory, {}, args);
-}
-
 async function findThroughEveryCliPage(
   configDirectory: string,
   resource: "agent" | "automation",
@@ -274,30 +204,6 @@ async function findThroughEveryCliPage(
     if (visited.has(cursor)) throw new Error(`${resource} roster repeated cursor ${cursor}`);
     visited.add(cursor);
   }
-}
-
-async function runCliWith(
-  configDirectory: string,
-  options: { environment?: NodeJS.ProcessEnv; input?: string },
-  args: string[],
-) {
-  const child = spawn("cargo", ["run", "--quiet", "-p", "myelin-cli", "--", ...args], {
-    cwd: repository,
-    env: cliEnvironment(configDirectory, options.environment),
-    stdio: "pipe",
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
-  child.stdin.end(options.input);
-  const exitCode = await new Promise<number | null>((resolveExit, reject) => {
-    child.once("error", reject);
-    child.once("exit", resolveExit);
-  });
-  return { exitCode, stdout, stderr };
 }
 
 async function askGitForCredential(
