@@ -5,8 +5,8 @@ use serde_json::Value;
 use sqlx::Row;
 
 use crate::agent_journal_privacy::{
-    agent_subject_status, open_journal_payload, seal_journal_payload, AgentSubjectStatus,
-    JournalPayloadContext, JournalPayloadKind,
+    agent_subject_status, open_journal_payload, seal_journal_payload, AgentSubjectLocator,
+    AgentSubjectStatus, JournalPayloadContext, JournalPayloadKind,
 };
 use crate::kms::KmsEngine;
 use crate::migration::{Migration, Migrations};
@@ -90,6 +90,24 @@ pub enum ModelStepCompletion {
     Replayed,
 }
 
+enum StoredModelStepBegin {
+    Started,
+    Completed(StoredModelResponse),
+    InDoubt,
+    Unreplayable,
+}
+
+enum StoredModelStepCompletion {
+    Applied,
+    Replayed(StoredModelResponse),
+}
+
+struct StoredModelResponse {
+    key_ref: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelStepError {
     InvalidInput(&'static str),
@@ -168,27 +186,30 @@ impl AgentModelStepStore {
         requested_by: &str,
     ) -> Result<ModelStepBegin, ModelStepError> {
         validate_identity(run_id, step_key, request_hash, requested_by)?;
-        let region = self.region();
-        let tenant_s = tenant.0.clone();
-        let run_id = run_id.to_string();
-        let step_key = step_key.to_string();
-        let request_hash = request_hash.to_string();
-        let requested_by = requested_by.to_string();
-        let kms = self.kms.clone();
-        self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
+        let context = JournalPayloadContext::new(
+            &tenant.0,
+            &self.region(),
+            run_id,
+            step_key,
+            request_hash,
+            requested_by,
+            JournalPayloadKind::ModelResponse,
+        );
+        let locator = context.subject_locator(&self.kms);
+        let transaction_context = context.clone();
+        let stored = self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                let context = JournalPayloadContext {
-                    tenant: &tenant_s,
-                    region: &region,
-                    run_id: &run_id,
-                    position_key: &step_key,
-                    request_hash: &request_hash,
-                    requested_by: &requested_by,
-                    kind: JournalPayloadKind::ModelResponse,
-                };
-                begin_on_connection(connection, &context, &kms).await
+                begin_on_connection(connection, &transaction_context, &locator).await
             })
-        }))?
+        }))??;
+        match stored {
+            StoredModelStepBegin::Started => Ok(ModelStepBegin::Started),
+            StoredModelStepBegin::InDoubt => Ok(ModelStepBegin::InDoubt),
+            StoredModelStepBegin::Unreplayable => Ok(ModelStepBegin::Unreplayable),
+            StoredModelStepBegin::Completed(payload) => {
+                open_model_response(payload, &self.kms, &context).map(ModelStepBegin::Completed)
+            }
+        }
     }
 
     pub fn complete(
@@ -206,28 +227,35 @@ impl AgentModelStepStore {
         if encoded.len() > MAX_RESPONSE_BYTES {
             return Err(ModelStepError::InvalidInput("response exceeds four MiB"));
         }
-        let region = self.region();
-        let tenant_s = tenant.0.clone();
-        let run_id = run_id.to_string();
-        let step_key = step_key.to_string();
-        let request_hash = request_hash.to_string();
-        let requested_by = requested_by.to_string();
         let response = response.clone();
+        let context = JournalPayloadContext::new(
+            &tenant.0,
+            &self.region(),
+            run_id,
+            step_key,
+            request_hash,
+            requested_by,
+            JournalPayloadKind::ModelResponse,
+        );
+        let locator = context.subject_locator(&self.kms);
+        let transaction_context = context.clone();
         let kms = self.kms.clone();
-        self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
+        let stored = self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                let context = JournalPayloadContext {
-                    tenant: &tenant_s,
-                    region: &region,
-                    run_id: &run_id,
-                    position_key: &step_key,
-                    request_hash: &request_hash,
-                    requested_by: &requested_by,
-                    kind: JournalPayloadKind::ModelResponse,
-                };
-                complete_on_connection(connection, &context, &response, &kms).await
+                complete_on_connection(connection, &transaction_context, &encoded, &locator, &kms)
+                    .await
             })
-        }))?
+        }))??;
+        match stored {
+            StoredModelStepCompletion::Applied => Ok(ModelStepCompletion::Applied),
+            StoredModelStepCompletion::Replayed(payload) => {
+                if open_model_response(payload, &self.kms, &context)? == response {
+                    Ok(ModelStepCompletion::Replayed)
+                } else {
+                    Err(ModelStepError::Conflict)
+                }
+            }
+        }
     }
 }
 
@@ -264,18 +292,10 @@ fn validate_identity(
 
 async fn begin_on_connection(
     connection: &mut sqlx::PgConnection,
-    context: &JournalPayloadContext<'_>,
-    kms: &KmsEngine,
-) -> Result<Result<ModelStepBegin, ModelStepError>, PgError> {
-    match agent_subject_status(
-        connection,
-        context.tenant,
-        context.region,
-        context.requested_by,
-        kms,
-    )
-    .await?
-    {
+    context: &JournalPayloadContext,
+    locator: &AgentSubjectLocator,
+) -> Result<Result<StoredModelStepBegin, ModelStepError>, PgError> {
+    match agent_subject_status(connection, &context.tenant, &context.region, locator).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ModelStepError::Erased))
@@ -287,17 +307,17 @@ async fn begin_on_connection(
            (tenant_id, region, run_id, step_key, request_hash, requested_by, state)
          VALUES ($1, $2, $3, $4, $5, $6, 'started') ON CONFLICT DO NOTHING",
     )
-    .bind(context.tenant)
-    .bind(context.region)
-    .bind(context.run_id)
-    .bind(context.position_key)
-    .bind(context.request_hash)
-    .bind(context.requested_by)
+    .bind(&context.tenant)
+    .bind(&context.region)
+    .bind(&context.run_id)
+    .bind(&context.position_key)
+    .bind(&context.request_hash)
+    .bind(&context.requested_by)
     .execute(&mut *connection)
     .await
     .map_err(store_query)?;
     if inserted.rows_affected() == 1 {
-        return Ok(Ok(ModelStepBegin::Started));
+        return Ok(Ok(StoredModelStepBegin::Started));
     }
 
     let row = sqlx::query(
@@ -305,10 +325,10 @@ async fn begin_on_connection(
                 response_ciphertext FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4",
     )
-    .bind(context.tenant)
-    .bind(context.region)
-    .bind(context.run_id)
-    .bind(context.position_key)
+    .bind(&context.tenant)
+    .bind(&context.region)
+    .bind(&context.run_id)
+    .bind(&context.position_key)
     .fetch_one(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -322,10 +342,10 @@ async fn begin_on_connection(
         .map_err(store_query)?
         .as_str()
     {
-        "started" => Ok(Ok(ModelStepBegin::InDoubt)),
-        "redacted" => Ok(Ok(ModelStepBegin::Unreplayable)),
-        "completed" => model_response_from_row(&row, kms, context)
-            .map(ModelStepBegin::Completed)
+        "started" => Ok(Ok(StoredModelStepBegin::InDoubt)),
+        "redacted" => Ok(Ok(StoredModelStepBegin::Unreplayable)),
+        "completed" => stored_model_response_from_row(&row)
+            .map(StoredModelStepBegin::Completed)
             .map(Ok),
         _ => Err(PgError::Query("model step has an invalid state".into())),
     }
@@ -333,19 +353,12 @@ async fn begin_on_connection(
 
 async fn complete_on_connection(
     connection: &mut sqlx::PgConnection,
-    context: &JournalPayloadContext<'_>,
-    response: &Value,
+    context: &JournalPayloadContext,
+    encoded_response: &[u8],
+    locator: &AgentSubjectLocator,
     kms: &KmsEngine,
-) -> Result<Result<ModelStepCompletion, ModelStepError>, PgError> {
-    match agent_subject_status(
-        connection,
-        context.tenant,
-        context.region,
-        context.requested_by,
-        kms,
-    )
-    .await?
-    {
+) -> Result<Result<StoredModelStepCompletion, ModelStepError>, PgError> {
+    match agent_subject_status(connection, &context.tenant, &context.region, locator).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ModelStepError::Erased))
@@ -357,10 +370,10 @@ async fn complete_on_connection(
                 response_ciphertext FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4 FOR UPDATE",
     )
-    .bind(context.tenant)
-    .bind(context.region)
-    .bind(context.run_id)
-    .bind(context.position_key)
+    .bind(&context.tenant)
+    .bind(&context.region)
+    .bind(&context.run_id)
+    .bind(&context.position_key)
     .fetch_optional(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -374,20 +387,14 @@ async fn complete_on_connection(
     }
     let state: String = row.try_get("state").map_err(store_query)?;
     if state == "completed" {
-        let stored = model_response_from_row(&row, kms, context)?;
-        return Ok(if stored == *response {
-            Ok(ModelStepCompletion::Replayed)
-        } else {
-            Err(ModelStepError::Conflict)
-        });
+        return stored_model_response_from_row(&row)
+            .map(StoredModelStepCompletion::Replayed)
+            .map(Ok);
     }
     if state != "started" {
         return Ok(Err(ModelStepError::Conflict));
     }
-
-    let plaintext = serde_json::to_vec(response)
-        .map_err(|_| PgError::Query("model response failed canonical serialization".into()))?;
-    let sealed = seal_journal_payload(kms, context, &plaintext)?;
+    let sealed = seal_journal_payload(kms, context, encoded_response)?;
 
     sqlx::query(
         "UPDATE agent_model_step \
@@ -395,24 +402,22 @@ async fn complete_on_connection(
                 response_nonce = $6, response_ciphertext = $7, completed_at = now()
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4",
     )
-    .bind(context.tenant)
-    .bind(context.region)
-    .bind(context.run_id)
-    .bind(context.position_key)
+    .bind(&context.tenant)
+    .bind(&context.region)
+    .bind(&context.run_id)
+    .bind(&context.position_key)
     .bind(sealed.key_ref.to_uri())
     .bind(sealed.nonce.as_slice())
-    .bind(sealed.ciphertext)
+    .bind(&sealed.ciphertext)
     .execute(connection)
     .await
     .map_err(store_query)?;
-    Ok(Ok(ModelStepCompletion::Applied))
+    Ok(Ok(StoredModelStepCompletion::Applied))
 }
 
-fn model_response_from_row(
+fn stored_model_response_from_row(
     row: &sqlx::postgres::PgRow,
-    kms: &KmsEngine,
-    context: &JournalPayloadContext<'_>,
-) -> Result<Value, PgError> {
+) -> Result<StoredModelResponse, PgError> {
     let key_ref = row
         .try_get::<Option<String>, _>("response_key_ref")
         .map_err(store_query)?
@@ -425,9 +430,28 @@ fn model_response_from_row(
         .try_get::<Option<Vec<u8>>, _>("response_ciphertext")
         .map_err(store_query)?
         .ok_or_else(|| PgError::Query("completed model step has no ciphertext".into()))?;
-    let plaintext = open_journal_payload(kms, context, &key_ref, &nonce, ciphertext)?;
+    Ok(StoredModelResponse {
+        key_ref,
+        nonce,
+        ciphertext,
+    })
+}
+
+fn open_model_response(
+    payload: StoredModelResponse,
+    kms: &KmsEngine,
+    context: &JournalPayloadContext,
+) -> Result<Value, ModelStepError> {
+    let plaintext = open_journal_payload(
+        kms,
+        context,
+        &payload.key_ref,
+        &payload.nonce,
+        payload.ciphertext,
+    )
+    .map_err(|error| ModelStepError::Storage(error.to_string()))?;
     serde_json::from_slice(&plaintext)
-        .map_err(|_| PgError::Query("decrypted model response is invalid JSON".into()))
+        .map_err(|_| ModelStepError::Storage("decrypted model response is invalid JSON".into()))
 }
 
 fn store_query(error: sqlx::Error) -> PgError {

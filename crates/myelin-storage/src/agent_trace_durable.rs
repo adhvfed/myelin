@@ -660,24 +660,17 @@ impl DurableAgentTraceStore {
         let tenant = tenant.to_string();
         let requested_by = requested_by.to_string();
         let region = self.provider.config().region.clone();
-        let kms = self.kms.clone();
+        let locator = AgentSubjectLocator::new(&self.kms, &tenant, &region, &requested_by);
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    let state = match agent_subject_status(
-                        connection,
-                        &tenant,
-                        &region,
-                        &requested_by,
-                        &kms,
-                    )
-                    .await?
-                    {
-                        AgentSubjectStatus::Active => AgentTraceSubjectState::Active,
-                        AgentSubjectStatus::Restricted => AgentTraceSubjectState::Restricted,
-                        AgentSubjectStatus::Erasing => AgentTraceSubjectState::Erasing,
-                        AgentSubjectStatus::Erased => AgentTraceSubjectState::Erased,
-                    };
+                    let state =
+                        match agent_subject_status(connection, &tenant, &region, &locator).await? {
+                            AgentSubjectStatus::Active => AgentTraceSubjectState::Active,
+                            AgentSubjectStatus::Restricted => AgentTraceSubjectState::Restricted,
+                            AgentSubjectStatus::Erasing => AgentTraceSubjectState::Erasing,
+                            AgentSubjectStatus::Erased => AgentTraceSubjectState::Erased,
+                        };
                     let recoverable_records = count_subject_records_on_connection(
                         connection,
                         &tenant,
@@ -849,6 +842,7 @@ impl DurableAgentTraceStore {
         let tenant_id = tenant.0.clone();
         let region = self.provider.config().region.clone();
         let artifact_ref = trace.artifact_ref(tenant)?;
+        let locator = AgentSubjectLocator::new(&self.kms, &tenant_id, &region, &trace.requested_by);
         let persisted_ref = artifact_ref.clone();
         let provider = self.provider.clone();
         let kms = self.kms.clone();
@@ -861,6 +855,7 @@ impl DurableAgentTraceStore {
                     &region,
                     &persisted_ref,
                     &trace,
+                    &locator,
                     &kms,
                 )
                 .await
@@ -1024,9 +1019,10 @@ async fn write_on_connection(
     region: &str,
     artifact_ref: &ArtifactRef,
     trace: &AgentTraceWrite,
+    locator: &AgentSubjectLocator,
     kms: &KmsEngine,
 ) -> Result<Result<bool, AgentTraceError>, PgError> {
-    match agent_subject_status(connection, tenant, region, &trace.requested_by, kms).await? {
+    match agent_subject_status(connection, tenant, region, locator).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(AgentTraceError::Erased))

@@ -232,25 +232,52 @@ impl JournalPayloadKind {
     }
 }
 
-pub(crate) struct JournalPayloadContext<'a> {
-    pub tenant: &'a str,
-    pub region: &'a str,
-    pub run_id: &'a str,
-    pub position_key: &'a str,
-    pub request_hash: &'a str,
-    pub requested_by: &'a str,
+#[derive(Clone)]
+pub(crate) struct JournalPayloadContext {
+    pub tenant: String,
+    pub region: String,
+    pub run_id: String,
+    pub position_key: String,
+    pub request_hash: String,
+    pub requested_by: String,
     pub kind: JournalPayloadKind,
+}
+
+impl JournalPayloadContext {
+    pub(crate) fn new(
+        tenant: &str,
+        region: &str,
+        run_id: &str,
+        position_key: &str,
+        request_hash: &str,
+        requested_by: &str,
+        kind: JournalPayloadKind,
+    ) -> Self {
+        Self {
+            tenant: tenant.to_string(),
+            region: region.to_string(),
+            run_id: run_id.to_string(),
+            position_key: position_key.to_string(),
+            request_hash: request_hash.to_string(),
+            requested_by: requested_by.to_string(),
+            kind,
+        }
+    }
+
+    pub(crate) fn subject_locator(&self, kms: &KmsEngine) -> AgentSubjectLocator {
+        AgentSubjectLocator::new(kms, &self.tenant, &self.region, &self.requested_by)
+    }
 }
 
 pub(crate) fn seal_journal_payload(
     kms: &KmsEngine,
-    context: &JournalPayloadContext<'_>,
+    context: &JournalPayloadContext,
     plaintext: &[u8],
 ) -> Result<EncryptedColumn, PgError> {
     ColumnCryptor::new(kms, Region(context.region.to_string()))
         .encrypt_with_aad(
-            &TenantId(context.tenant.to_string()),
-            Some(&SubjectId::new(context.requested_by)),
+            &TenantId(context.tenant.clone()),
+            Some(&SubjectId::new(&context.requested_by)),
             &ErasureMethod::CryptoShred("subject_dek".into()),
             plaintext,
             &journal_payload_aad(context),
@@ -260,7 +287,7 @@ pub(crate) fn seal_journal_payload(
 
 pub(crate) fn open_journal_payload(
     kms: &KmsEngine,
-    context: &JournalPayloadContext<'_>,
+    context: &JournalPayloadContext,
     key_ref: &str,
     nonce: &[u8],
     ciphertext: Vec<u8>,
@@ -290,17 +317,17 @@ pub(crate) fn open_journal_payload(
         .map_err(|error| PgError::Query(format!("agent journal decryption failed: {error}")))
 }
 
-fn journal_payload_aad(context: &JournalPayloadContext<'_>) -> Vec<u8> {
+fn journal_payload_aad(context: &JournalPayloadContext) -> Vec<u8> {
     let mut aad = Vec::new();
     for field in [
         "myelin.agent-journal.payload.v1",
         context.kind.token(),
-        context.tenant,
-        context.region,
-        context.run_id,
-        context.position_key,
-        context.request_hash,
-        context.requested_by,
+        context.tenant.as_str(),
+        context.region.as_str(),
+        context.run_id.as_str(),
+        context.position_key.as_str(),
+        context.request_hash.as_str(),
+        context.requested_by.as_str(),
     ] {
         aad.extend_from_slice(&(field.len() as u64).to_be_bytes());
         aad.extend_from_slice(field.as_bytes());
@@ -361,10 +388,8 @@ pub(crate) async fn agent_subject_status(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
-    requested_by: &str,
-    kms: &KmsEngine,
+    locator: &AgentSubjectLocator,
 ) -> Result<AgentSubjectStatus, PgError> {
-    let locator = AgentSubjectLocator::new(kms, tenant, region, requested_by);
     locator.lock(connection, tenant, region).await?;
     let row = sqlx::query(
         "SELECT \
@@ -461,17 +486,17 @@ mod tests {
     #[test]
     fn journal_aad_is_injective_across_record_identity() {
         let context = JournalPayloadContext {
-            tenant: "acme",
-            region: "eu",
-            run_id: "run-1",
-            position_key: "model-turn/0",
-            request_hash: "hash",
-            requested_by: "founder",
+            tenant: "acme".into(),
+            region: "eu".into(),
+            run_id: "run-1".into(),
+            position_key: "model-turn/0".into(),
+            request_hash: "hash".into(),
+            requested_by: "founder".into(),
             kind: JournalPayloadKind::ModelResponse,
         };
         let first = journal_payload_aad(&context);
         let moved = journal_payload_aad(&JournalPayloadContext {
-            run_id: "run-2",
+            run_id: "run-2".into(),
             ..context
         });
         assert_ne!(first, moved);

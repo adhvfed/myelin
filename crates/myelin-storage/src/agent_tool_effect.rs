@@ -4,8 +4,8 @@ use myelin_tenancy::TenantId;
 use sqlx::Row;
 
 use crate::agent_journal_privacy::{
-    agent_subject_status, open_journal_payload, seal_journal_payload, AgentSubjectStatus,
-    JournalPayloadContext, JournalPayloadKind,
+    agent_subject_status, open_journal_payload, seal_journal_payload, AgentSubjectLocator,
+    AgentSubjectStatus, JournalPayloadContext, JournalPayloadKind,
 };
 use crate::kms::KmsEngine;
 use crate::migration::{Migration, Migrations};
@@ -91,6 +91,23 @@ pub enum ToolEffectCompletion {
     Replayed(String),
 }
 
+enum StoredToolEffectBegin {
+    Execute,
+    Completed(StoredToolResult),
+    Unreplayable,
+}
+
+enum StoredToolEffectCompletion {
+    Applied,
+    Replayed(StoredToolResult),
+}
+
+struct StoredToolResult {
+    key_ref: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolEffectError {
     InvalidInput(&'static str),
@@ -156,27 +173,29 @@ impl AgentToolEffectStore {
         requested_by: &str,
     ) -> Result<ToolEffectBegin, ToolEffectError> {
         validate_identity(run_id, effect_key, request_hash, requested_by)?;
-        let region = self.provider.config().region.clone();
-        let tenant_id = tenant.0.clone();
-        let run_id = run_id.to_string();
-        let effect_key = effect_key.to_string();
-        let request_hash = request_hash.to_string();
-        let requested_by = requested_by.to_string();
-        let kms = self.kms.clone();
-        self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
+        let context = JournalPayloadContext::new(
+            &tenant.0,
+            &self.provider.config().region,
+            run_id,
+            effect_key,
+            request_hash,
+            requested_by,
+            JournalPayloadKind::ToolResult,
+        );
+        let locator = context.subject_locator(&self.kms);
+        let transaction_context = context.clone();
+        let stored = self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                let context = JournalPayloadContext {
-                    tenant: &tenant_id,
-                    region: &region,
-                    run_id: &run_id,
-                    position_key: &effect_key,
-                    request_hash: &request_hash,
-                    requested_by: &requested_by,
-                    kind: JournalPayloadKind::ToolResult,
-                };
-                begin_on_connection(connection, &context, &kms).await
+                begin_on_connection(connection, &transaction_context, &locator).await
             })
-        }))?
+        }))??;
+        match stored {
+            StoredToolEffectBegin::Execute => Ok(ToolEffectBegin::Execute),
+            StoredToolEffectBegin::Unreplayable => Ok(ToolEffectBegin::Unreplayable),
+            StoredToolEffectBegin::Completed(payload) => {
+                open_tool_result(payload, &self.kms, &context).map(ToolEffectBegin::Completed)
+            }
+        }
     }
 
     pub fn complete(
@@ -194,28 +213,31 @@ impl AgentToolEffectStore {
                 "result exceeds its 256 KiB bound",
             ));
         }
-        let region = self.provider.config().region.clone();
-        let tenant_id = tenant.0.clone();
-        let run_id = run_id.to_string();
-        let effect_key = effect_key.to_string();
-        let request_hash = request_hash.to_string();
-        let requested_by = requested_by.to_string();
         let result = result.to_string();
+        let context = JournalPayloadContext::new(
+            &tenant.0,
+            &self.provider.config().region,
+            run_id,
+            effect_key,
+            request_hash,
+            requested_by,
+            JournalPayloadKind::ToolResult,
+        );
+        let locator = context.subject_locator(&self.kms);
+        let transaction_context = context.clone();
         let kms = self.kms.clone();
-        self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
+        let stored = self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                let context = JournalPayloadContext {
-                    tenant: &tenant_id,
-                    region: &region,
-                    run_id: &run_id,
-                    position_key: &effect_key,
-                    request_hash: &request_hash,
-                    requested_by: &requested_by,
-                    kind: JournalPayloadKind::ToolResult,
-                };
-                complete_on_connection(connection, &context, &result, &kms).await
+                complete_on_connection(connection, &transaction_context, &result, &locator, &kms)
+                    .await
             })
-        }))?
+        }))??;
+        match stored {
+            StoredToolEffectCompletion::Applied => Ok(ToolEffectCompletion::Applied),
+            StoredToolEffectCompletion::Replayed(payload) => {
+                open_tool_result(payload, &self.kms, &context).map(ToolEffectCompletion::Replayed)
+            }
+        }
     }
 
     fn block<T>(
@@ -263,18 +285,10 @@ fn validate_identity(
 
 async fn begin_on_connection(
     connection: &mut sqlx::PgConnection,
-    context: &JournalPayloadContext<'_>,
-    kms: &KmsEngine,
-) -> Result<Result<ToolEffectBegin, ToolEffectError>, PgError> {
-    match agent_subject_status(
-        connection,
-        context.tenant,
-        context.region,
-        context.requested_by,
-        kms,
-    )
-    .await?
-    {
+    context: &JournalPayloadContext,
+    locator: &AgentSubjectLocator,
+) -> Result<Result<StoredToolEffectBegin, ToolEffectError>, PgError> {
+    match agent_subject_status(connection, &context.tenant, &context.region, locator).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ToolEffectError::Erased))
@@ -286,17 +300,17 @@ async fn begin_on_connection(
            (tenant_id, region, run_id, effect_key, request_hash, requested_by, state)
          VALUES ($1, $2, $3, $4, $5, $6, 'started') ON CONFLICT DO NOTHING",
     )
-    .bind(context.tenant)
-    .bind(context.region)
-    .bind(context.run_id)
-    .bind(context.position_key)
-    .bind(context.request_hash)
-    .bind(context.requested_by)
+    .bind(&context.tenant)
+    .bind(&context.region)
+    .bind(&context.run_id)
+    .bind(&context.position_key)
+    .bind(&context.request_hash)
+    .bind(&context.requested_by)
     .execute(&mut *connection)
     .await
     .map_err(store_query)?;
     if inserted.rows_affected() == 1 {
-        return Ok(Ok(ToolEffectBegin::Execute));
+        return Ok(Ok(StoredToolEffectBegin::Execute));
     }
 
     let row = sqlx::query(
@@ -304,10 +318,10 @@ async fn begin_on_connection(
                 result_ciphertext FROM agent_tool_effect
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4",
     )
-    .bind(context.tenant)
-    .bind(context.region)
-    .bind(context.run_id)
-    .bind(context.position_key)
+    .bind(&context.tenant)
+    .bind(&context.region)
+    .bind(&context.run_id)
+    .bind(&context.position_key)
     .fetch_one(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -327,10 +341,10 @@ async fn begin_on_connection(
         .map_err(store_query)?
         .as_str()
     {
-        "started" => Ok(Ok(ToolEffectBegin::Execute)),
-        "redacted" => Ok(Ok(ToolEffectBegin::Unreplayable)),
-        "completed" => tool_result_from_row(&row, kms, context)
-            .map(ToolEffectBegin::Completed)
+        "started" => Ok(Ok(StoredToolEffectBegin::Execute)),
+        "redacted" => Ok(Ok(StoredToolEffectBegin::Unreplayable)),
+        "completed" => stored_tool_result_from_row(&row)
+            .map(StoredToolEffectBegin::Completed)
             .map(Ok),
         _ => Err(PgError::Query("tool effect has an invalid state".into())),
     }
@@ -338,19 +352,12 @@ async fn begin_on_connection(
 
 async fn complete_on_connection(
     connection: &mut sqlx::PgConnection,
-    context: &JournalPayloadContext<'_>,
+    context: &JournalPayloadContext,
     result: &str,
+    locator: &AgentSubjectLocator,
     kms: &KmsEngine,
-) -> Result<Result<ToolEffectCompletion, ToolEffectError>, PgError> {
-    match agent_subject_status(
-        connection,
-        context.tenant,
-        context.region,
-        context.requested_by,
-        kms,
-    )
-    .await?
-    {
+) -> Result<Result<StoredToolEffectCompletion, ToolEffectError>, PgError> {
+    match agent_subject_status(connection, &context.tenant, &context.region, locator).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ToolEffectError::Erased))
@@ -362,10 +369,10 @@ async fn complete_on_connection(
                 result_ciphertext FROM agent_tool_effect
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4 FOR UPDATE",
     )
-    .bind(context.tenant)
-    .bind(context.region)
-    .bind(context.run_id)
-    .bind(context.position_key)
+    .bind(&context.tenant)
+    .bind(&context.region)
+    .bind(&context.run_id)
+    .bind(&context.position_key)
     .fetch_optional(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -388,10 +395,9 @@ async fn complete_on_connection(
         .map_err(store_query)?
         .as_str()
     {
-        "completed" => {
-            let stored = tool_result_from_row(&row, kms, context)?;
-            Ok(Ok(ToolEffectCompletion::Replayed(stored)))
-        }
+        "completed" => stored_tool_result_from_row(&row)
+            .map(StoredToolEffectCompletion::Replayed)
+            .map(Ok),
         "started" => {
             let sealed = seal_journal_payload(kms, context, result.as_bytes())?;
             sqlx::query(
@@ -400,28 +406,24 @@ async fn complete_on_connection(
                         result_nonce = $6, result_ciphertext = $7, completed_at = now()
                   WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4",
             )
-            .bind(context.tenant)
-            .bind(context.region)
-            .bind(context.run_id)
-            .bind(context.position_key)
+            .bind(&context.tenant)
+            .bind(&context.region)
+            .bind(&context.run_id)
+            .bind(&context.position_key)
             .bind(sealed.key_ref.to_uri())
             .bind(sealed.nonce.as_slice())
-            .bind(sealed.ciphertext)
+            .bind(&sealed.ciphertext)
             .execute(connection)
             .await
             .map_err(store_query)?;
-            Ok(Ok(ToolEffectCompletion::Applied))
+            Ok(Ok(StoredToolEffectCompletion::Applied))
         }
         "redacted" => Ok(Err(ToolEffectError::Unreplayable)),
         _ => Err(PgError::Query("tool effect has an invalid state".into())),
     }
 }
 
-fn tool_result_from_row(
-    row: &sqlx::postgres::PgRow,
-    kms: &KmsEngine,
-    context: &JournalPayloadContext<'_>,
-) -> Result<String, PgError> {
+fn stored_tool_result_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredToolResult, PgError> {
     let key_ref = row
         .try_get::<Option<String>, _>("result_key_ref")
         .map_err(store_query)?
@@ -434,10 +436,28 @@ fn tool_result_from_row(
         .try_get::<Option<Vec<u8>>, _>("result_ciphertext")
         .map_err(store_query)?
         .ok_or_else(|| PgError::Query("completed tool effect has no ciphertext".into()))?;
-    String::from_utf8(open_journal_payload(
-        kms, context, &key_ref, &nonce, ciphertext,
-    )?)
-    .map_err(|_| PgError::Query("decrypted tool result is not UTF-8".into()))
+    Ok(StoredToolResult {
+        key_ref,
+        nonce,
+        ciphertext,
+    })
+}
+
+fn open_tool_result(
+    payload: StoredToolResult,
+    kms: &KmsEngine,
+    context: &JournalPayloadContext,
+) -> Result<String, ToolEffectError> {
+    let plaintext = open_journal_payload(
+        kms,
+        context,
+        &payload.key_ref,
+        &payload.nonce,
+        payload.ciphertext,
+    )
+    .map_err(|error| ToolEffectError::Storage(error.to_string()))?;
+    String::from_utf8(plaintext)
+        .map_err(|_| ToolEffectError::Storage("decrypted tool result is not UTF-8".into()))
 }
 
 fn store_query(error: sqlx::Error) -> PgError {
