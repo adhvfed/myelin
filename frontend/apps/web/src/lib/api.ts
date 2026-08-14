@@ -1103,41 +1103,54 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
   if (!parsed) throw new RepoRouteError("error");
   const base = `/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}`;
   return authed(async () => {
+    const mutationOptions = { idempotencyKey: crypto.randomUUID() };
     switch (parsed.op) {
       case "thread": {
         const response = await edgePost(`${base}/threads`, {
           body_md: parsed.body_md,
           ...(parsed.anchor ? { anchor: parsed.anchor } : {}),
-        });
+        }, mutationOptions);
         const thread = parseAppliedThread(response);
         if (!thread) throw new RepoRouteError("error");
         return { thread };
       }
       case "comment": {
-        const response = await edgePost(`${base}/threads/${seg(parsed.threadId)}/comments`, { body_md: parsed.body_md });
+        const response = await edgePost(
+          `${base}/threads/${seg(parsed.threadId)}/comments`,
+          { body_md: parsed.body_md },
+          mutationOptions,
+        );
         const comment = parseAppliedComment(response, "git.pr.comment.create");
         if (!comment) throw new RepoRouteError("error");
         return { comment };
       }
       case "review-start": {
-        const response = await edgePost(`${base}/reviews/start`, {});
+        const response = await edgePost(`${base}/reviews/start`, {}, mutationOptions);
         const review = parseAppliedReview(response);
         if (!review) throw new RepoRouteError("error");
         return { review };
       }
       case "review-comment": {
-        const response = await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/comments`, { body_md: parsed.body_md });
+        const response = await edgePost(
+          `${base}/reviews/${seg(parsed.reviewId)}/comments`,
+          { body_md: parsed.body_md },
+          mutationOptions,
+        );
         const comment = parseAppliedComment(response, "git.pr.review.comment");
         if (!comment) throw new RepoRouteError("error");
         return { comment };
       }
       case "review-submit": {
-        const response = await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/submit`, { verdict: parsed.verdict, summary_md: parsed.summary_md });
+        const response = await edgePost(
+          `${base}/reviews/${seg(parsed.reviewId)}/submit`,
+          { verdict: parsed.verdict, summary_md: parsed.summary_md },
+          mutationOptions,
+        );
         if (!hasAppliedAction(response, "git.pr.review.submit")) throw new RepoRouteError("error");
         return { ok: true };
       }
       case "review-discard": {
-        const response = await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/discard`, {});
+        const response = await edgePost(`${base}/reviews/${seg(parsed.reviewId)}/discard`, {}, mutationOptions);
         if (!hasAppliedAction(response, "git.pr.review.discard")) throw new RepoRouteError("error");
         return { ok: true };
       }
@@ -1146,7 +1159,7 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
           const response = await edgePost(
             `${base}/merge`,
             {},
-            { idempotencyKey: crypto.randomUUID() },
+            mutationOptions,
           );
           const merged = parseAppliedMerge(response);
           if (!merged) throw new RepoRouteError("error");

@@ -388,7 +388,7 @@ describe.sequential("Git engineering lifecycle", () => {
     await reviewerClient.json(`${unrelatedBase}/diff?view=split&limit=100`, { expectedStatus: 404 });
   });
 
-  test("persists discussion threads and a batched review from another principal", async () => {
+  test("keeps discussion and a batched review retry-safe for another principal", async () => {
     const base = `${project.path}/prs/${pullRequestNumber}`;
     const threadPath = `${base}/threads`;
     const threadRetryKey = `discussion-${randomUUID()}`;
@@ -452,9 +452,11 @@ describe.sequential("Git engineering lifecycle", () => {
     expect(array(discussion?.comments, "discussion comments").map((value) => record(value, "comment").id))
       .toEqual([openingCommentId, commentId]);
 
+    const reviewStartRetryKey = `review-start-${randomUUID()}`;
     const reviewStart = await reviewerClient.json(`${base}/reviews/start`, {
       method: "POST",
       body: {},
+      idempotencyKey: reviewStartRetryKey,
       expectedStatus: 201,
     });
     const review = record(
@@ -494,9 +496,13 @@ describe.sequential("Git engineering lifecycle", () => {
       },
     });
 
-    const submitted = await reviewerClient.json(`${base}/reviews/${encodeURIComponent(reviewId)}/submit`, {
+    const submitPath = `${base}/reviews/${encodeURIComponent(reviewId)}/submit`;
+    const submitRetryKey = `review-submit-${randomUUID()}`;
+    const submitBody = { verdict: "approved", summary_md: "The full backend path is sound." };
+    const submitted = await reviewerClient.json(submitPath, {
       method: "POST",
-      body: { verdict: "approved", summary_md: "The full backend path is sound." },
+      body: submitBody,
+      idempotencyKey: submitRetryKey,
     });
     expect(submitted.body).toMatchObject({
       durable: true,
@@ -508,6 +514,29 @@ describe.sequential("Git engineering lifecycle", () => {
     );
     expect(array(submittedResult.comment_ids, "submitted review comment ids"))
       .toEqual([pendingCommentId]);
+
+    const retriedStart = await reviewerClient.json(`${base}/reviews/start`, {
+      method: "POST",
+      body: {},
+      idempotencyKey: reviewStartRetryKey,
+      expectedStatus: 201,
+    });
+    expect(retriedStart.body).toMatchObject({
+      applied: { action: "git.pr.review.start", review: { id: reviewId, verdict: "approved" } },
+    });
+
+    const retriedSubmit = await reviewerClient.json(submitPath, {
+      method: "POST",
+      body: submitBody,
+      idempotencyKey: submitRetryKey,
+    });
+    expect(retriedSubmit.body).toEqual(submitted.body);
+    await reviewerClient.json(submitPath, {
+      method: "POST",
+      body: { ...submitBody, summary_md: "A different decision under the same retry key." },
+      idempotencyKey: submitRetryKey,
+      expectedStatus: 409,
+    });
 
     const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
     const completedRequest = await eventually(async () => {
@@ -528,10 +557,12 @@ describe.sequential("Git engineering lifecycle", () => {
       expect.arrayContaining([expect.objectContaining({ id: threadId })]),
     );
     expect(array(threads.body.reviews, "pull request reviews")).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ id: reviewId, verdict: "approved" }),
-      ]),
+      [expect.objectContaining({ id: reviewId, verdict: "approved" })],
     );
+    expect((await systemClient.json(`${base}/checks`)).body).toMatchObject({
+      current_approvals: 1,
+      gate_admitted: true,
+    });
   });
 
   test("merges the approved pull request and exposes the result on the base ref", async () => {

@@ -42,8 +42,8 @@ use myelin_git::pr_store::{
 };
 use myelin_git::pr_threads::{
     AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, CommentWrite,
-    DurablePrThreadStore, PendingCommentRequest, PrincipalRole, ReviewBatch, SubmitReviewRequest,
-    ThreadAnchor, ThreadPrincipal, ThreadRecord, ViewedThreads,
+    DurablePrThreadStore, PendingCommentRequest, PrincipalRole, ReviewBatch, ReviewDecision,
+    SubmitReviewRequest, ThreadAnchor, ThreadPrincipal, ThreadRecord, ViewedThreads,
 };
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, Oid as PushOid, ProposedRefUpdate, PushOutcome,
@@ -152,6 +152,11 @@ struct FileCommit<'a> {
     start_ref: Option<&'a str>,
     message: &'a str,
     actor_is_agent: bool,
+}
+
+struct RequestOperation {
+    nonce: String,
+    pr_id: PrOperationId,
 }
 
 const AGENT_FILE_WRITE_MAX_BYTES: usize = 1024 * 1024;
@@ -421,6 +426,17 @@ impl DurableGitBackend {
         let nonce = request.stable_idempotency_nonce(&principal.principal_id.0)?;
         PrOperationId::parse(&nonce)
             .map_err(|_| EdgeError::BadRequest("invalid `Idempotency-Key` header".into()))
+    }
+
+    fn required_request_operation(
+        &self,
+        request: &EdgeRequest,
+        principal: &Principal,
+    ) -> Result<RequestOperation, EdgeError> {
+        let nonce = request.stable_idempotency_nonce(&principal.principal_id.0)?;
+        let pr_id = PrOperationId::parse(&nonce)
+            .map_err(|_| EdgeError::BadRequest("invalid `Idempotency-Key` header".into()))?;
+        Ok(RequestOperation { nonce, pr_id })
     }
 
     fn pseudonym(tenant: &str, principal: &Principal) -> String {

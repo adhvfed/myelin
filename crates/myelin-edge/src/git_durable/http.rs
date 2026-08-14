@@ -2281,6 +2281,9 @@ struct DPrReviewStart {
 }
 impl Handler for DPrReviewStart {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let operation = self
+            .be
+            .required_request_operation(ctx.request, ctx.principal)?;
         let vm = self
             .be
             .start_review_batch(
@@ -2289,6 +2292,7 @@ impl Handler for DPrReviewStart {
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
                 ctx.principal,
+                &operation.nonce,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -2339,6 +2343,9 @@ impl Handler for DPrReviewSubmit {
         } else {
             ctx.request.json_body()?
         };
+        let operation = self
+            .be
+            .required_request_operation(ctx.request, ctx.principal)?;
         let vm = self
             .be
             .submit_review_batch(
@@ -2351,6 +2358,8 @@ impl Handler for DPrReviewSubmit {
                 .for_pr(num_param(ctx, "n")?),
                 param(ctx, "rid")?,
                 &body,
+                &operation.nonce,
+                &operation.pr_id,
             )
             .map_err(map_durable_err)?;
         Ok(EdgeResponse::json(
@@ -5146,7 +5155,7 @@ mod pr_thread_tests {
     }
 
     #[test]
-    fn pending_comment_is_private_and_submit_emits_one_event() {
+    fn pending_comment_is_private_and_submit_replays_its_receipt() {
         let (be, writer, reader) = setup("pending", &"0".repeat(40));
         let threads = Arc::new(DPrThreads { be: be.clone() });
         let start = Arc::new(DPrReviewStart { be: be.clone() });
@@ -5210,10 +5219,7 @@ mod pr_thread_tests {
             json!({ "verdict": "commented" }),
         )
         .unwrap();
-        assert_eq!(
-            again["applied"]["result"]["emitted"], false,
-            "no double event"
-        );
+        assert_eq!(again, first, "a retry returns the first durable receipt");
 
         let seen = serve(
             &*threads,

@@ -15,6 +15,7 @@ pub const MAX_THREAD_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_THREADS_PER_SUBJECT: usize = 4_096;
 pub const MAX_COMMENTS_PER_SUBJECT: usize = 8_192;
 pub const MAX_REVIEWS_PER_SUBJECT: usize = 1_024;
+pub const MAX_REVIEW_COMMANDS_PER_SUBJECT: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOutcome<T> {
@@ -189,6 +190,34 @@ fn pending_comment_request_hash(
     ))
 }
 
+fn review_start_request_hash(reviewer: &ThreadPrincipal) -> Result<String, DurableError> {
+    let reviewer = encode_author(reviewer)?;
+    Ok(digest_parts(
+        "myelin.git.review-start.request.v1",
+        &[reviewer.as_slice()],
+    ))
+}
+
+fn review_submit_request_hash(
+    review_id: &str,
+    actor: &ThreadPrincipal,
+    verdict: BatchVerdict,
+    summary_md: &Option<String>,
+) -> Result<String, DurableError> {
+    let actor = encode_author(actor)?;
+    let summary = serde_json::to_vec(summary_md)
+        .map_err(|_| DurableError::Git("encode review summary".into()))?;
+    Ok(digest_parts(
+        "myelin.git.review-submit.request.v1",
+        &[
+            review_id.as_bytes(),
+            actor.as_slice(),
+            verdict.as_str().as_bytes(),
+            summary.as_slice(),
+        ],
+    ))
+}
+
 fn encode_anchor_intent(anchor: &Option<ThreadAnchor>) -> Result<Vec<u8>, DurableError> {
     let intent = anchor
         .as_ref()
@@ -210,6 +239,44 @@ fn digest_parts(domain: &str, parts: &[&[u8]]) -> String {
     digest.finalize().to_hex().to_string()
 }
 
+fn canonical_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReviewDecision {
+    verdict: BatchVerdict,
+    summary_md: Option<String>,
+}
+
+impl core::fmt::Debug for ReviewDecision {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReviewDecision")
+            .field("verdict", &self.verdict)
+            .field(
+                "summary_md",
+                &self.summary_md.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl ReviewDecision {
+    pub fn new(verdict: BatchVerdict, summary_md: Option<String>) -> Result<Self, DurableError> {
+        let summary_md = summary_md
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| validate_markdown(summary, MAX_REVIEW_SUMMARY_BYTES, "review summary"))
+            .transpose()?;
+        Ok(Self {
+            verdict,
+            summary_md,
+        })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct SubmitReviewRequest {
     repo: RepoLoc,
@@ -218,6 +285,8 @@ pub struct SubmitReviewRequest {
     actor: ThreadPrincipal,
     verdict: BatchVerdict,
     summary_md: Option<String>,
+    operation_id: String,
+    request_hash: String,
     now: i64,
 }
 
@@ -227,17 +296,19 @@ impl SubmitReviewRequest {
         object_key: impl Into<String>,
         review_id: impl Into<String>,
         actor: ThreadPrincipal,
-        verdict: BatchVerdict,
-        summary_md: Option<String>,
+        decision: ReviewDecision,
+        operation_nonce: &str,
         now: i64,
     ) -> Result<Self, DurableError> {
         let object_key = object_key.into();
         let review_id = review_id.into();
-        let summary_md = summary_md
-            .filter(|summary| !summary.trim().is_empty())
-            .map(|summary| validate_markdown(summary, MAX_REVIEW_SUMMARY_BYTES, "review summary"))
-            .transpose()?;
+        let ReviewDecision {
+            verdict,
+            summary_md,
+        } = decision;
         validate_review_target(&repo, &object_key, &review_id)?;
+        let operation_id = operation_digest(operation_nonce)?;
+        let request_hash = review_submit_request_hash(&review_id, &actor, verdict, &summary_md)?;
         Ok(Self {
             repo,
             object_key,
@@ -245,6 +316,8 @@ impl SubmitReviewRequest {
             actor,
             verdict,
             summary_md,
+            operation_id,
+            request_hash,
             now,
         })
     }
@@ -274,6 +347,7 @@ impl core::fmt::Debug for SubmitReviewRequest {
                 "summary_md",
                 &self.summary_md.as_ref().map(|_| "<redacted>"),
             )
+            .field("operation_id", &self.operation_id)
             .field("now", &self.now)
             .finish()
     }
@@ -455,6 +529,8 @@ pub struct SubjectThreads {
     pub seq: u64,
     #[serde(default, alias = "pending_comment_commands")]
     conversation_commands: BTreeMap<String, ConversationCommand>,
+    #[serde(default)]
+    review_commands: BTreeMap<String, ReviewCommand>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +540,20 @@ struct ConversationCommand {
     thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     comment_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReviewCommandKind {
+    Start,
+    Submit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ReviewCommand {
+    request_hash: String,
+    kind: ReviewCommandKind,
+    review_id: String,
 }
 
 impl SubjectThreads {
@@ -490,6 +580,7 @@ impl SubjectThreads {
             || self.comment_count() > MAX_COMMENTS_PER_SUBJECT
             || self.reviews.len() > MAX_REVIEWS_PER_SUBJECT
             || self.conversation_commands.len() > MAX_COMMENTS_PER_SUBJECT
+            || self.review_commands.len() > MAX_REVIEW_COMMANDS_PER_SUBJECT
         {
             return Err(DurableError::Git(
                 "PR conversation exceeds its cardinality limit".into(),
@@ -502,6 +593,15 @@ impl SubjectThreads {
         {
             return Err(DurableError::Git(
                 "PR conversation contains a malformed command receipt".into(),
+            ));
+        }
+        if self.review_commands.iter().any(|(operation_id, command)| {
+            !canonical_digest(operation_id)
+                || !canonical_digest(&command.request_hash)
+                || self.review(&command.review_id).is_none()
+        }) {
+            return Err(DurableError::Git(
+                "PR conversation contains a malformed review command receipt".into(),
             ));
         }
         Ok(())
@@ -549,6 +649,31 @@ pub struct ViewedThreads {
 pub struct SubmittedBatch {
     pub review: ReviewBatch,
     pub comment_ids: Vec<String>,
+}
+
+fn submitted_batch(
+    document: &SubjectThreads,
+    review_id: &str,
+) -> Result<SubmittedBatch, DurableError> {
+    let review = document.review(review_id).cloned().ok_or_else(|| {
+        DurableError::Io("review-submit idempotency receipt references a missing review".into())
+    })?;
+    if review.is_draft() {
+        return Err(DurableError::Io(
+            "review-submit idempotency receipt references a draft review".into(),
+        ));
+    }
+    let comment_ids = document
+        .threads
+        .iter()
+        .flat_map(|thread| thread.comments.iter())
+        .filter(|comment| comment.review_id.as_deref() == Some(review_id))
+        .map(|comment| comment.id.clone())
+        .collect();
+    Ok(SubmittedBatch {
+        review,
+        comment_ids,
+    })
 }
 
 pub struct DurablePrThreadStore<P: RepoPathResolver = RootedResolver> {
@@ -841,16 +966,47 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         repo: &RepoLoc,
         object_key: &str,
         reviewer: ThreadPrincipal,
+        operation_nonce: &str,
     ) -> Result<ReviewBatch, DurableError> {
+        let operation_id = operation_digest(operation_nonce)?;
+        let request_hash = review_start_request_hash(&reviewer)?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if let Some(command) = doc.review_commands.get(&operation_id) {
+            if command.kind != ReviewCommandKind::Start || command.request_hash != request_hash {
+                return Err(DurableError::Conflict(
+                    "idempotency key is already bound to a different review command".into(),
+                ));
+            }
+            let review = doc.review(&command.review_id).cloned().ok_or_else(|| {
+                DurableError::Io(
+                    "review-start idempotency receipt references a missing review".into(),
+                )
+            })?;
+            return Ok(review);
+        }
+        if doc.review_commands.len() >= MAX_REVIEW_COMMANDS_PER_SUBJECT {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its review-command limit".into(),
+            ));
+        }
         if let Some(existing) = doc
             .reviews
             .iter()
             .find(|review| review.is_draft() && review.reviewer.display == reviewer.display)
+            .cloned()
         {
-            return Ok(existing.clone());
+            doc.review_commands.insert(
+                operation_id,
+                ReviewCommand {
+                    request_hash,
+                    kind: ReviewCommandKind::Start,
+                    review_id: existing.id.clone(),
+                },
+            );
+            self.save(repo, &doc)?;
+            return Ok(existing);
         }
         if doc.reviews.len() >= MAX_REVIEWS_PER_SUBJECT {
             return Err(DurableError::Git(
@@ -867,6 +1023,14 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             summary_md: None,
         };
         doc.reviews.push(batch.clone());
+        doc.review_commands.insert(
+            operation_id,
+            ReviewCommand {
+                request_hash,
+                kind: ReviewCommandKind::Start,
+                review_id: batch.id.clone(),
+            },
+        );
         self.save(repo, &doc)?;
         Ok(batch)
     }
@@ -966,7 +1130,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
     pub fn submit_review(
         &self,
         request: SubmitReviewRequest,
-    ) -> Result<Option<SubmittedBatch>, DurableError> {
+    ) -> Result<CommandOutcome<Option<SubmittedBatch>>, DurableError> {
         let SubmitReviewRequest {
             repo,
             object_key,
@@ -974,11 +1138,27 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             actor,
             verdict,
             summary_md,
+            operation_id,
+            request_hash,
             now,
         } = request;
         let lock = self.subject_lock(&repo, &object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(&repo, &object_key)?;
+        if let Some(command) = doc.review_commands.get(&operation_id) {
+            if command.kind != ReviewCommandKind::Submit || command.request_hash != request_hash {
+                return Err(DurableError::Conflict(
+                    "idempotency key is already bound to a different review command".into(),
+                ));
+            }
+            let submitted = submitted_batch(&doc, &command.review_id)?;
+            return Ok(CommandOutcome::replayed(Some(submitted)));
+        }
+        if doc.review_commands.len() >= MAX_REVIEW_COMMANDS_PER_SUBJECT {
+            return Err(DurableError::Git(
+                "PR conversation exceeds its review-command limit".into(),
+            ));
+        }
         let review_index = doc
             .reviews
             .iter()
@@ -992,7 +1172,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             )));
         }
         if already {
-            return Ok(None);
+            return Ok(CommandOutcome::replayed(None));
         }
         let mut comment_ids = Vec::new();
         for t in &mut doc.threads {
@@ -1010,11 +1190,20 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             r.submitted_at = Some(now);
             r.clone()
         };
-        self.save(&repo, &doc)?;
-        Ok(Some(SubmittedBatch {
+        let submitted = SubmittedBatch {
             review,
             comment_ids,
-        }))
+        };
+        doc.review_commands.insert(
+            operation_id,
+            ReviewCommand {
+                request_hash,
+                kind: ReviewCommandKind::Submit,
+                review_id,
+            },
+        );
+        self.save(&repo, &doc)?;
+        Ok(CommandOutcome::applied(Some(submitted)))
     }
 
     pub fn discard_review(
@@ -1060,6 +1249,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
                 .as_ref()
                 .is_none_or(|comment_id| !discarded_comment_ids.contains(comment_id))
         });
+        doc.review_commands
+            .retain(|_, command| command.review_id != review_id);
         self.save(repo, &doc)?;
         Ok(())
     }
@@ -1121,7 +1312,16 @@ mod tests {
         summary_md: Option<String>,
         now: i64,
     ) -> SubmitReviewRequest {
-        SubmitReviewRequest::new(loc(), KEY, review_id, actor, verdict, summary_md, now).unwrap()
+        SubmitReviewRequest::new(
+            loc(),
+            KEY,
+            review_id,
+            actor,
+            ReviewDecision::new(verdict, summary_md).unwrap(),
+            &format!("submit-{now}"),
+            now,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1148,8 +1348,8 @@ mod tests {
             KEY,
             "r-secret",
             human("psn:secret-reviewer@acme"),
-            BatchVerdict::Approved,
-            Some("sensitive summary".into()),
+            ReviewDecision::new(BatchVerdict::Approved, Some("sensitive summary".into())).unwrap(),
+            "secret-submit-operation",
             2,
         )
         .unwrap();
@@ -1170,8 +1370,8 @@ mod tests {
             " ",
             "r-1",
             human("psn:r@acme"),
-            BatchVerdict::Commented,
-            None,
+            ReviewDecision::new(BatchVerdict::Commented, None).unwrap(),
+            "incomplete-submit-target",
             4,
         )
         .is_err());
@@ -1182,14 +1382,9 @@ mod tests {
             5,
         )
         .is_err());
-        assert!(SubmitReviewRequest::new(
-            loc(),
-            KEY,
-            "r-1",
-            human("psn:r@acme"),
+        assert!(ReviewDecision::new(
             BatchVerdict::Commented,
             Some("x".repeat(MAX_REVIEW_SUMMARY_BYTES + 1)),
-            6,
         )
         .is_err());
     }
@@ -1200,8 +1395,12 @@ mod tests {
         let store = DurablePrThreadStore::rooted(&root);
         let reviewer = human("psn:reviewer@acme");
 
-        let first = store.start_review(&loc(), KEY, reviewer.clone()).unwrap();
-        let retry = store.start_review(&loc(), KEY, reviewer).unwrap();
+        let first = store
+            .start_review(&loc(), KEY, reviewer.clone(), "start-once")
+            .unwrap();
+        let retry = store
+            .start_review(&loc(), KEY, reviewer, "start-once")
+            .unwrap();
 
         assert_eq!(retry.id, first.id);
         assert_eq!(store.load(&loc(), KEY).unwrap().reviews.len(), 1);
@@ -1213,7 +1412,9 @@ mod tests {
         let root = temp_root("pending-comment-retry");
         let store = DurablePrThreadStore::rooted(&root);
         let reviewer = human("psn:reviewer@acme");
-        let review = store.start_review(&loc(), KEY, reviewer.clone()).unwrap();
+        let review = store
+            .start_review(&loc(), KEY, reviewer.clone(), "pending-review")
+            .unwrap();
 
         let request = |body: &str, now| {
             PendingCommentRequest::new(
@@ -1529,7 +1730,7 @@ mod tests {
         let root = temp_root("pending");
         let store = DurablePrThreadStore::rooted(&root);
         let batch = store
-            .start_review(&loc(), KEY, human("psn:reviewer@acme"))
+            .start_review(&loc(), KEY, human("psn:reviewer@acme"), "private-review")
             .unwrap();
         store
             .add_pending_comment(pending_comment(
@@ -1578,11 +1779,11 @@ mod tests {
     }
 
     #[test]
-    fn submit_emits_one_batch_event_and_is_idempotent() {
+    fn review_commands_return_their_original_receipts_after_submission() {
         let root = temp_root("onevent");
         let store = DurablePrThreadStore::rooted(&root);
         let batch = store
-            .start_review(&loc(), KEY, human("psn:reviewer@acme"))
+            .start_review(&loc(), KEY, human("psn:reviewer@acme"), "one-event-review")
             .unwrap();
         for i in 0..3 {
             store
@@ -1594,16 +1795,25 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let first = store
-            .submit_review(submitted_review(
+        let submission = |verdict, summary_md, now| {
+            SubmitReviewRequest::new(
+                loc(),
+                KEY,
                 &batch.id,
                 human("psn:reviewer@acme"),
-                BatchVerdict::Approved,
-                Some("LGTM".into()),
-                400,
-            ))
+                ReviewDecision::new(verdict, summary_md).unwrap(),
+                "submit-once",
+                now,
+            )
+            .unwrap()
+        };
+        let first = store
+            .submit_review(submission(BatchVerdict::Approved, Some("LGTM".into()), 400))
             .unwrap();
-        let ev = first.expect("first submit yields exactly one batch event");
+        assert!(first.applied);
+        let ev = first
+            .value
+            .expect("first submit yields exactly one batch event");
         assert_eq!(
             ev.comment_ids.len(),
             3,
@@ -1611,16 +1821,24 @@ mod tests {
         );
         assert_eq!(ev.review.verdict, BatchVerdict::Approved);
         assert_eq!(ev.review.summary_md.as_deref(), Some("LGTM"));
-        let second = store
-            .submit_review(submitted_review(
-                &batch.id,
-                human("psn:reviewer@acme"),
-                BatchVerdict::Commented,
-                None,
-                500,
-            ))
+        let replayed = DurablePrThreadStore::rooted(&root)
+            .submit_review(submission(BatchVerdict::Approved, Some("LGTM".into()), 999))
             .unwrap();
-        assert!(second.is_none(), "a re-submit must NOT emit a second event");
+        assert!(!replayed.applied);
+        assert_eq!(replayed.value, Some(ev.clone()));
+        assert!(matches!(
+            store.submit_review(submission(BatchVerdict::Commented, None, 500)),
+            Err(DurableError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .start_review(&loc(), KEY, human("psn:reviewer@acme"), "one-event-review",)
+                .unwrap()
+                .id,
+            batch.id,
+            "a response-loss retry must not open a new draft after submit"
+        );
+        assert_eq!(store.load(&loc(), KEY).unwrap().reviews.len(), 1);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1633,6 +1851,7 @@ mod tests {
                 &loc(),
                 KEY,
                 ThreadPrincipal::plain(PrincipalRole::Agent, "ReviewBot@acme"),
+                "agent-review",
             )
             .unwrap();
         assert!(batch.advisory, "an agent batch must be advisory");
@@ -1644,7 +1863,7 @@ mod tests {
         let root = temp_root("discard");
         let store = DurablePrThreadStore::rooted(&root);
         let batch = store
-            .start_review(&loc(), KEY, human("psn:r@acme"))
+            .start_review(&loc(), KEY, human("psn:r@acme"), "discarded-review")
             .unwrap();
         store
             .add_pending_comment(pending_comment(&batch.id, human("psn:r@acme"), "draft", 1))
@@ -1657,7 +1876,7 @@ mod tests {
         assert_eq!(doc.reviews.len(), 0);
 
         let b2 = store
-            .start_review(&loc(), KEY, human("psn:r@acme"))
+            .start_review(&loc(), KEY, human("psn:r@acme"), "submitted-review")
             .unwrap();
         store
             .submit_review(submitted_review(
@@ -1681,7 +1900,9 @@ mod tests {
         let store = DurablePrThreadStore::rooted(&root);
         let author = human("psn:author@acme");
         let attacker = human("psn:attacker@acme");
-        let batch = store.start_review(&loc(), KEY, author.clone()).unwrap();
+        let batch = store
+            .start_review(&loc(), KEY, author.clone(), "owned-review")
+            .unwrap();
         store
             .add_pending_comment(pending_comment(
                 &batch.id,
@@ -1731,7 +1952,7 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            submitted.is_some(),
+            submitted.value.is_some(),
             "the real author can still submit their own batch"
         );
         std::fs::remove_dir_all(&root).ok();

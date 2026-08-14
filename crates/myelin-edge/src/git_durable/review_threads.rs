@@ -171,12 +171,15 @@ impl DurableGitBackend {
         slug: &str,
         number: u64,
         principal: &Principal,
+        operation_nonce: &str,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         self.require_pr(&loc, number, principal)?;
         let key = Self::pr_object_key(slug, number);
         let reviewer = Self::thread_principal(tenant, principal);
-        let batch = self.threads.start_review(&loc, &key, reviewer)?;
+        let batch = self
+            .threads
+            .start_review(&loc, &key, reviewer, operation_nonce)?;
         Ok(review_batch_json(&batch))
     }
 
@@ -213,6 +216,8 @@ impl DurableGitBackend {
         target: PrActorContext<'_>,
         review_id: &str,
         body: &Value,
+        operation_nonce: &str,
+        operation_id: &PrOperationId,
     ) -> Result<Value, DurableError> {
         let PrActorContext { repo, number } = target;
         let RepoActorContext {
@@ -241,33 +246,60 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .map(str::to_string);
         let actor = Self::thread_principal(tenant, principal);
+        let decision = ReviewDecision::new(verdict, summary_md)?;
         let request = SubmitReviewRequest::new(
             loc.clone(),
             key,
             review_id,
             actor,
-            verdict,
-            summary_md,
+            decision,
+            operation_nonce,
             now_unix(),
         )?;
         let submitted = self.threads.submit_review(request)?;
-        if let Some(ref batch) = submitted {
+        // Production PR mutations have their own command ledger, so replaying this projection is
+        // how a retry repairs a failure after the conversation document was already committed. The
+        // in-memory test backend has no such ledger and must only project the first application.
+        let reconcile_projection = submitted.applied || self.pg_prs.is_some();
+        if let Some(ref batch) = submitted.value {
             if !batch.review.advisory {
                 let gate_verdict = match verdict {
                     BatchVerdict::Approved => Some("approve"),
                     BatchVerdict::ChangesRequested => Some("request-changes"),
                     _ => None,
                 };
-                if let Some(v) = gate_verdict {
-                    let _ = self.submit_review(tenant, region, slug, number, v, principal);
+                if let Some(v) = gate_verdict.filter(|_| reconcile_projection) {
+                    self.submit_review_with_operation(
+                        RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
+                        v,
+                        operation_id,
+                    )?;
                 }
             }
         }
-        self.bump_pr_updated(&loc, number, principal);
+        if submitted
+            .value
+            .as_ref()
+            .is_some_and(|batch| batch.review.advisory || verdict == BatchVerdict::Commented)
+        {
+            let projection_operation = PrOperationId::derive(
+                "myelin.git.review-batch-projection.v1",
+                &[operation_id.digest().as_bytes()],
+            )?;
+            if reconcile_projection {
+                self.pr_mutate(
+                    &loc,
+                    number,
+                    PrMutation::Touch,
+                    &projection_operation,
+                    principal,
+                )?;
+            }
+        }
         Ok(json!({
-            "emitted": submitted.is_some(),
-            "review": submitted.as_ref().map(|b| review_batch_json(&b.review)),
-            "comment_ids": submitted
+            "emitted": submitted.value.is_some(),
+            "review": submitted.value.as_ref().map(|b| review_batch_json(&b.review)),
+            "comment_ids": submitted.value
                 .as_ref()
                 .map(|b| b.comment_ids.clone())
                 .unwrap_or_default(),
