@@ -88,7 +88,7 @@
             "run_id": "91000000-0000-4000-8000-000000000002",
             "pipeline_id": "93000000-0000-4000-8000-000000000001",
             "repo_ref": "myelin://acme/git/repo/alpha",
-            "source_ref": "refs/heads/main",
+            "source_ref": null,
             "commit_oid": "fedcba9876543210",
             "trigger_kind": "pull_request",
             "trust_tier": "trusted",

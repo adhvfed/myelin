@@ -12,6 +12,7 @@ import type {
   PrVM,
 } from "./api";
 import { parseArtifactRef } from "./artifact-ref";
+import { isBranchRef } from "./git-ref";
 
 type WireRecord = Record<string, unknown>;
 const utf8 = new TextEncoder();
@@ -55,12 +56,6 @@ function safePath(value: unknown): value is string {
     }) && value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
 }
 
-function branchRef(value: unknown): value is string {
-  return bounded(value, 4 * 1024) && value.startsWith("refs/heads/") && !value.includes("\\") &&
-    ![...value].some((character) => character.codePointAt(0)! <= 0x20) &&
-    value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
-}
-
 function repo(value: unknown): value is string {
   return bounded(value, 255) && value.split("/").every((part) =>
     part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
@@ -92,7 +87,7 @@ function prListRow(value: unknown): PrListRowVM | null {
   if (!input || !positive(input.number) ||
       !(input.title === null || bounded(input.title, 512)) ||
       !["draft", "open", "merged", "closed"].includes(input.pr_state as string) ||
-      !branchRef(input.base_ref) || !branchRef(input.head_ref) || !bounded(input.author, 4 * 1024) ||
+      !isBranchRef(input.base_ref) || !isBranchRef(input.head_ref) || !bounded(input.author, 4 * 1024) ||
       typeof input.author_is_agent !== "boolean" || !uint(input.reviews) ||
       !["requested", "approved", "changes", "none"].includes(input.review_state as string) ||
       typeof input.you_are_requested !== "boolean" || !summary ||
@@ -153,7 +148,7 @@ export function parsePr(value: unknown): PrVM | null {
       !["draft", "open", "merged", "closed"].includes(input.pr_state as string) ||
       !(input.title === null || bounded(input.title, 512)) ||
       !(input.body_md === null || bounded(input.body_md, 64 * 1024, true)) ||
-      !branchRef(input.base_ref) || !branchRef(input.head_ref) || !oid(input.head_oid) ||
+      !isBranchRef(input.base_ref) || !isBranchRef(input.head_ref) || !oid(input.head_oid) ||
       !bounded(input.author, 4 * 1024) ||
       (input.author_is_agent !== undefined && typeof input.author_is_agent !== "boolean") ||
       !uint(input.reviews) || !(input.created_at === null || uint(input.created_at)) ||
@@ -243,7 +238,7 @@ function diffFile(value: unknown): PrDiffFileVM | null {
 export function parsePrDiff(value: unknown): PrDiffVM | null {
   const input = record(value);
   const page = record(input?.page);
-  if (!input || !positive(input.number) || !branchRef(input.base_ref) || !oid(input.base_oid) ||
+  if (!input || !positive(input.number) || !isBranchRef(input.base_ref) || !oid(input.base_oid) ||
       !shortOid(input.short_base_oid, input.base_oid) || !oid(input.head_oid) ||
       !shortOid(input.short_head_oid, input.head_oid) || typeof input.three_dot !== "boolean" ||
       !Array.isArray(input.files) || input.files.length > 100 || !uint(input.restricted_files) ||

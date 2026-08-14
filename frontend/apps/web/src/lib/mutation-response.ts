@@ -16,12 +16,13 @@ import type {
   IssuesPage,
 } from "./issue-api";
 import { parseArtifactRef } from "./artifact-ref";
+import { isBranchRef } from "./git-ref";
 
 type WireRecord = Record<string, unknown>;
 
 const MAX_MARKDOWN_BYTES = 64 * 1024;
 const MAX_DISPLAY_BYTES = 4 * 1024;
-const MAX_REF_BYTES = 4 * 1024;
+const MAX_PATH_BYTES = 4 * 1024;
 const MAX_CHECK_CONTEXTS = 4_096;
 const utf8 = new TextEncoder();
 
@@ -55,12 +56,6 @@ function canonicalUlid(value: unknown): value is string {
 
 function oid(value: unknown): value is string {
   return typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
-}
-
-function branchRef(value: unknown): value is string {
-  if (!boundedString(value, MAX_REF_BYTES) || !value.startsWith("refs/heads/") ||
-      value.includes("\\") || [...value].some((character) => character.charCodeAt(0) <= 0x20)) return false;
-  return value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
 }
 
 function issueSummary(value: unknown): IssueCreateReceipt["issue"] | null {
@@ -174,7 +169,7 @@ function comment(value: unknown): PrCommentVM | null {
 function anchor(value: unknown): PrThreadVM["anchor"] | null | undefined {
   if (value === null) return null;
   const input = record(value);
-  if (!input || !boundedString(input.path, MAX_REF_BYTES) ||
+  if (!input || !boundedString(input.path, MAX_PATH_BYTES) ||
       !(input.line === null || (Number.isSafeInteger(input.line) && (input.line as number) > 0)) ||
       !(input.side === null || input.side === "old" || input.side === "new") ||
       !(input.base_oid === null || oid(input.base_oid)) || !(input.head_oid === null || oid(input.head_oid)) ||
@@ -274,7 +269,7 @@ export function hasAppliedAction(value: unknown, action: "git.pr.review.submit" 
 
 export function parseAppliedMerge(value: unknown): { base_ref: string; new_oid: string } | null {
   const payload = applied(value, "git.pr.merge");
-  if (!payload || payload.merged !== true || !branchRef(payload.base_ref) || !oid(payload.new_oid)) return null;
+  if (!payload || payload.merged !== true || !isBranchRef(payload.base_ref) || !oid(payload.new_oid)) return null;
   return { base_ref: payload.base_ref, new_oid: payload.new_oid };
 }
 

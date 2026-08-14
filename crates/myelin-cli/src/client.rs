@@ -497,9 +497,15 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
     canonical_uuid_field(run, "run_id", "run summary")?;
     canonical_uuid_field(run, "pipeline_id", "run summary")?;
     bounded_string_field(run, "repo_ref", "run summary", 1_024)?;
+    let trigger_kind = run["trigger_kind"]
+        .as_str()
+        .filter(|value| valid_trigger_kind(value))
+        .ok_or_else(|| malformed_ci_error("run summary trigger kind is invalid"))?;
     if !(run["source_ref"].is_null()
         || run["source_ref"].as_str().is_some_and(|source_ref| {
-            bounded_string(source_ref, 1_024)
+            trigger_kind == "push"
+                && source_ref.starts_with("refs/heads/")
+                && bounded_string(source_ref, 1_024)
                 && myelin_git::receive_pack::RefName::new(source_ref)
                     .validate()
                     .is_ok()
@@ -507,10 +513,8 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
     {
         return malformed_ci("run summary source ref is invalid");
     }
-    if !run["trigger_kind"].as_str().is_some_and(valid_trigger_kind)
-        || !run["trust_tier"].as_str().is_some_and(valid_trust_tier)
-    {
-        return malformed_ci("run summary trigger kind or trust tier is invalid");
+    if !run["trust_tier"].as_str().is_some_and(valid_trust_tier) {
+        return malformed_ci("run summary trust tier is invalid");
     }
     if !run["state"]
         .as_str()
@@ -1163,6 +1167,9 @@ mod tests {
             response["items"][0]["source_ref"] = refused;
             assert!(validate_ci_success(&call, &response).is_err());
         }
+        response["items"][0]["source_ref"] = json!("refs/heads/main");
+        response["items"][0]["trigger_kind"] = json!("pull_request");
+        assert!(validate_ci_success(&call, &response).is_err());
     }
 
     #[test]

@@ -22,6 +22,7 @@ function run() {
     run_id: RUN,
     pipeline_id: PIPELINE,
     repo_ref: "myelin://acme/git/repo/alpha",
+    source_ref: "refs/heads/main",
     commit_oid: "0123456789abcdef",
     trigger_kind: "push",
     trust_tier: "trusted",
@@ -38,6 +39,10 @@ describe("CI read responses", () => {
       items: [run()],
       page: { next_cursor: cursor(), limit: 1 },
     })?.items).toEqual([run()]);
+    expect(parseCiRunsPage({
+      items: [{ ...run(), trigger_kind: "pull_request", source_ref: null }],
+      page: { next_cursor: null, limit: 1 },
+    })?.items).toHaveLength(1);
 
     expect(parseCiRunDetail({
       run: run(),
@@ -100,6 +105,8 @@ describe("CI read responses", () => {
     { items: [run(), run()], page: { next_cursor: null, limit: 1 } },
     { items: [{ ...run(), internal: true }], page: { next_cursor: null, limit: 1 } },
     { items: [{ ...run(), state: "leased" }], page: { next_cursor: null, limit: 1 } },
+    { items: [{ ...run(), source_ref: "refs/tags/release" }], page: { next_cursor: null, limit: 1 } },
+    { items: [{ ...run(), trigger_kind: "pull_request" }], page: { next_cursor: null, limit: 1 } },
   ])("rejects malformed list payload %#", (value) => {
     expect(parseCiRunsPage(value)).toBeNull();
   });

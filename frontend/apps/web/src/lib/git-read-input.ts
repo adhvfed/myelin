@@ -1,3 +1,7 @@
+import { isFullGitRef } from "./git-ref";
+
+export { isFullGitRef } from "./git-ref";
+
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
@@ -128,20 +132,6 @@ export function isPrCommitCursor(value: unknown): value is string {
   } catch {
     return false;
   }
-}
-
-export function isFullGitRef(value: unknown): value is string {
-  if (!bounded(value, 4 * 1024) || hasControl(value)) return false;
-  const name = value.startsWith("refs/heads/")
-    ? value.slice("refs/heads/".length)
-    : value.startsWith("refs/tags/")
-      ? value.slice("refs/tags/".length)
-      : "";
-  const components = name.split("/");
-  return name.length > 0 && name !== "@" && !name.endsWith(".") &&
-    components.every((component) => component.length > 0 && !component.startsWith(".") &&
-      !component.endsWith(".lock")) && !name.includes("..") && !name.includes("@{") &&
-    ![" ", "~", "^", ":", "?", "*", "[", "\\"].some((character) => name.includes(character));
 }
 
 function prNumber(value: unknown): value is number {

@@ -1,4 +1,5 @@
 import { isCiRunCursor, isCiUuid } from "./ci-read-input";
+import { isBranchRef } from "./git-ref";
 
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
@@ -15,6 +16,7 @@ export interface CiRunVM {
   run_id: string;
   pipeline_id: string;
   repo_ref: string;
+  source_ref: string | null;
   commit_oid: string | null;
   trigger_kind: "push" | "pull_request" | "issue_transition" | "manual" | "agent" | "schedule";
   trust_tier: "trusted" | "untrusted_fork" | "self_hosted";
@@ -101,10 +103,12 @@ function safeNonNegative(value: unknown): value is number {
 function run(value: unknown): CiRunVM | null {
   const row = record(value);
   if (!row || !exact(row, [
-    "run_id", "pipeline_id", "repo_ref", "commit_oid", "trigger_kind", "trust_tier",
+    "run_id", "pipeline_id", "repo_ref", "source_ref", "commit_oid", "trigger_kind", "trust_tier",
     "state", "cost_settled", "created_at", "finished_at",
   ]) || !isCiUuid(row.run_id) || !isCiUuid(row.pipeline_id) ||
       !bounded(row.repo_ref, 1_024) ||
+      (row.source_ref !== null &&
+        (row.trigger_kind !== "push" || !bounded(row.source_ref, 1_024) || !isBranchRef(row.source_ref))) ||
       (row.commit_oid !== null && !bounded(row.commit_oid, 256)) ||
       !["push", "pull_request", "issue_transition", "manual", "agent", "schedule"]
         .includes(row.trigger_kind as string) ||
