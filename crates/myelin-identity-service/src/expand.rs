@@ -229,26 +229,22 @@ impl Expand {
                 let object_ref = ArtifactRef(object_id.to_string());
                 let parents = snapshot.direct_subjects(&object_ref, tupleset);
                 for parent_subject in parents {
-                    match crate::check_engine::parse_userset(&parent_subject) {
-                        Some((parent_id, parent_rel)) if parent_rel == computed.0 => {
-                            let parent_type = ObjectType(type_of_object_id(parent_id));
-                            self.expand_into(
-                                scope,
-                                snapshot,
-                                parent_id,
-                                &parent_type,
-                                &computed.0,
-                                depth + 1,
-                                members,
-                                trace,
-                            );
-                        }
-                        _ => {
-                            if !parent_subject.contains(crate::check_engine::USERSET_SEP) {
-                                members.insert(parent_subject);
-                            }
-                        }
-                    }
+                    let Some(parent_id) =
+                        crate::namespace::tupleset_parent(&parent_subject, &computed.0)
+                    else {
+                        continue;
+                    };
+                    let parent_type = ObjectType(type_of_object_id(parent_id));
+                    self.expand_into(
+                        scope,
+                        snapshot,
+                        parent_id,
+                        &parent_type,
+                        &computed.0,
+                        depth + 1,
+                        members,
+                        trace,
+                    );
                 }
             }
         }
@@ -468,6 +464,42 @@ mod tests {
             got.contains("p:teammember"),
             "the parent-team member inherits view (parent_team->view) and is a subject"
         );
+    }
+
+    #[test]
+    fn tuple_to_userset_expansion_never_reinterprets_a_direct_subject_as_a_parent() {
+        let s = scope("acme");
+        let (store, ns) = seed(
+            &s,
+            &[
+                add("project:direct", "parent_team", "p:alice"),
+                add("project:wrong-relation", "parent_team", "team:eng#member"),
+                add("project:exact", "parent_team", "team:eng#view"),
+                add("team:eng", "member", "p:alice"),
+            ],
+        );
+        let expand = Expand::new(store, ns);
+
+        for (project, expected) in [
+            ("project:direct", false),
+            ("project:wrong-relation", false),
+            ("project:exact", true),
+        ] {
+            let tree = expand
+                .list_subjects(
+                    &s,
+                    &ObjectId(project.into()),
+                    &ObjectType("project".into()),
+                    &Permission("view".into()),
+                    &latest(),
+                )
+                .expect("expand the project view permission");
+            assert_eq!(
+                tree.members.contains(&PrincipalId("p:alice".into())),
+                expected,
+                "list_subjects and point checks must share exact tuple-to-userset semantics"
+            );
+        }
     }
 
     #[test]

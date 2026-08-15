@@ -451,24 +451,29 @@ impl NamespaceEngine {
             }
             Userset::TupleToUserset { tupleset, computed } => {
                 let parents = snapshot.direct_subjects(object, tupleset);
-                parents.iter().any(|parent_subject| {
-                    match crate::check_engine::parse_userset(parent_subject) {
-                        Some((parent_id, parent_rel)) if parent_rel == computed.0 => {
-                            let parent_type = type_of_object_id(parent_id);
-                            self.eval(
-                                snapshot,
-                                subject,
-                                &parent_type,
-                                computed.0.as_str(),
-                                &ArtifactRef(parent_id.to_string()),
-                                depth + 1,
-                            )
-                        }
-                        _ => parent_subject == &subject.principal_id.0,
-                    }
-                })
+                parents
+                    .iter()
+                    .filter_map(|parent| tupleset_parent(parent, &computed.0))
+                    .any(|parent_id| {
+                        let parent_type = type_of_object_id(parent_id);
+                        self.eval(
+                            snapshot,
+                            subject,
+                            &parent_type,
+                            computed.0.as_str(),
+                            &ArtifactRef(parent_id.to_string()),
+                            depth + 1,
+                        )
+                    })
             }
         }
+    }
+}
+
+pub(crate) fn tupleset_parent<'a>(subject: &'a str, computed: &str) -> Option<&'a str> {
+    match crate::check_engine::parse_userset(subject) {
+        Some((parent, relation)) if relation == computed => Some(parent),
+        _ => None,
     }
 }
 
@@ -794,6 +799,41 @@ mod tests {
             !ns.permits(&eng, &s, &subject("p:bob"), "doc", "view", &obj1, &latest()),
             "exclusion: a blocked reader is excluded (− blocked)"
         );
+    }
+
+    #[test]
+    fn tuple_to_userset_requires_an_exact_computed_parent_reference() {
+        let ns = NamespaceEngine::with_core_hierarchy();
+        let s = scope("acme");
+        let eng = engine_with(
+            &s,
+            &[
+                add("project:direct", "parent_team", "p:alice"),
+                add("project:wrong-relation", "parent_team", "team:eng#member"),
+                add("project:exact", "parent_team", "team:eng#view"),
+                add("team:eng", "member", "p:alice"),
+            ],
+        );
+
+        for (project, expected) in [
+            ("project:direct", false),
+            ("project:wrong-relation", false),
+            ("project:exact", true),
+        ] {
+            assert_eq!(
+                ns.permits(
+                    &eng,
+                    &s,
+                    &subject("p:alice"),
+                    "project",
+                    "view",
+                    &ArtifactRef(project.into()),
+                    &latest(),
+                ),
+                expected,
+                "parent inheritance must follow only an exact `parent#computed` userset"
+            );
+        }
     }
 
     #[test]
