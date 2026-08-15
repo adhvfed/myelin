@@ -45,6 +45,8 @@ export function ConfirmDialog(props: ConfirmDialogProps): JSX.Element {
   const confirmFg = () =>
     local.variant === "destructive" ? "var(--c-btn-danger-text)" : "var(--c-btn-primary-text)";
 
+  // Destructive confirmation pairs the danger token with a glyph and label; color never carries
+  // the consequence alone (WCAG 1.4.1).
   return (
     <Dialog
       open={local.open}
@@ -90,7 +92,6 @@ export function ConfirmDialog(props: ConfirmDialogProps): JSX.Element {
               cursor: "pointer",
             }}
           >
-            {/* destructive pairs the danger token with a glyph + label — never colour alone (§7b). */}
             <Show when={local.variant === "destructive"}>
               <Icon name="check-fail" size={14} />
             </Show>
