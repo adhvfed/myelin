@@ -298,6 +298,18 @@ async fn dedicated_capability_publishes_and_quarantines_but_cannot_mutate_outbox
     .bind(&invalid_id).bind(format!("invalid:publisher:{suffix}"))
     .bind("myelin://publisher-live/issue/issue/invalid").execute(&admin).await.unwrap();
 
+    let mut foreign_rows = admin.begin().await.unwrap();
+    sqlx::query(
+        "SELECT event_id FROM outbox
+         WHERE published_at IS NULL AND event_id NOT IN ($1, $2)
+         FOR UPDATE",
+    )
+    .bind(&valid_id)
+    .bind(&invalid_id)
+    .fetch_all(&mut *foreign_rows)
+    .await
+    .expect("isolate this publisher pass without mutating unrelated pending rows");
+
     let config = PublisherConfig::from_env().expect("publisher config");
     let provider = PublisherDbProvider::connect(&config)
         .await
@@ -323,6 +335,7 @@ async fn dedicated_capability_publishes_and_quarantines_but_cannot_mutate_outbox
     .unwrap();
     assert!(row.get::<bool, _>("published"));
     assert!(row.get::<bool, _>("quarantined"));
+    foreign_rows.rollback().await.unwrap();
 
     let publisher_url = std::env::var("MYELIN_OUTBOX_PUBLISHER_DATABASE_URL").unwrap();
     let direct = sqlx::postgres::PgPoolOptions::new()
