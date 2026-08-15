@@ -2,6 +2,7 @@
 import { For, Show } from "solid-js";
 import { A } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";
+import { gitRepositoryPath } from "~/lib/git-route";
 
 export interface RepoBreadcrumbProps {
   repo: string;
@@ -20,6 +21,7 @@ const mono = { "font-family": "var(--font-mono)", "unicode-bidi": "isolate", dir
 
 export function RepoBreadcrumb(props: RepoBreadcrumbProps) {
   const segs = () => (props.path ?? "").split("/").filter((s) => s.length > 0);
+  const repoPath = () => gitRepositoryPath(props.repo);
   const r = () => encodeURIComponent(props.refName);
   const encPath = (parts: string[]) => parts.map(encodeURIComponent).join("/");
 
@@ -27,11 +29,11 @@ export function RepoBreadcrumb(props: RepoBreadcrumbProps) {
     <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)", display: "flex", "align-items": "center", "flex-wrap": "wrap", gap: "var(--space-1)" }}>
       <A href="/git/repos" style={{ color: "var(--text-muted)" }}>Repositories</A>
       {sep}
-      <A href={`/git/repos/${props.repo}`} style={{ color: "var(--text-muted)", ...mono }}>{props.repo}</A>
+      <A href={repoPath()} style={{ color: "var(--text-muted)", ...mono }}>{props.repo}</A>
       {sep}
       {/* The ref pill — a link back to the tree root at this ref. */}
       <A
-        href={`/git/repos/${props.repo}/tree/${r()}`}
+        href={`${repoPath()}/tree/${r()}`}
         style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)", border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-pill)", padding: "0 var(--space-2)", ...mono }}
       >
         <Icon name="branch" size={12} /> {props.refName}
@@ -49,7 +51,7 @@ export function RepoBreadcrumb(props: RepoBreadcrumbProps) {
                   <span aria-current="page" style={{ color: "var(--text-primary)", ...mono }}>{segment}</span>
                 }
               >
-                <A href={`/git/repos/${props.repo}/tree/${r()}/${encPath(upto())}`} style={{ color: "var(--text-muted)", ...mono }}>{segment}</A>
+                <A href={`${repoPath()}/tree/${r()}/${encPath(upto())}`} style={{ color: "var(--text-muted)", ...mono }}>{segment}</A>
               </Show>
             </>
           );

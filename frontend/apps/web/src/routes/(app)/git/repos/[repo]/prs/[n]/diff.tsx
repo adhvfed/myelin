@@ -26,6 +26,11 @@ import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { Markdown } from "~/components/Markdown";
 import { SharedComposer } from "~/components/SharedComposer";
+import {
+  gitRepositoryPath,
+  parseGitPullRequestRouteParam,
+  parseGitRepositoryRouteParam,
+} from "~/lib/git-route";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -40,9 +45,10 @@ type CommentAt = { path: string; side: "old" | "new"; line: number };
 export default function PrDiffScreen() {
   const params = useParams();
   const [search, setSearch] = useSearchParams();
-  const ready = () => Boolean(params.repo && params.n && Number.isFinite(Number(params.n)));
-  const repo = () => params.repo ?? "";
-  const n = () => Number(params.n);
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const n = () => parseGitPullRequestRouteParam(params.n) ?? 0;
+  const ready = () => repo() !== "" && n() > 0;
+  const repoPath = () => gitRepositoryPath(repo());
 
   // Layout: ?view= wins; else split ≥960px, unified below; <720px forces unified (the switcher hides).
   const viewParam = () => (typeof search.view === "string" && (search.view === "split" || search.view === "unified") ? search.view : undefined);
@@ -226,26 +232,26 @@ export default function PrDiffScreen() {
 
   return (
     <section aria-labelledby="pr-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-      <Title>Files changed · #{params.n} · {params.repo} · Myelin</Title>
+      <Title>Files changed · #{params.n} · {repo()} · Myelin</Title>
       <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)", display: "flex", gap: "var(--space-1)", "flex-wrap": "wrap" }}>
         <A href="/git/repos" style={{ color: "var(--text-muted)" }}>Repositories</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}`} style={{ color: "var(--text-muted)" }}>{params.repo}</A>
+        <A href={repoPath()} style={{ color: "var(--text-muted)" }}>{repo()}</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}/prs/${params.n}`} style={{ color: "var(--text-muted)" }}>#{params.n}</A>
+        <A href={`${repoPath()}/prs/${params.n}`} style={{ color: "var(--text-muted)" }}>#{params.n}</A>
       </nav>
 
       <ErrorBoundary
         fallback={(err, retry) => (
           <RepoErrorState
             kind={errKind(err)}
-            repo={params.repo}
+            repo={repo()}
             prNumber={n()}
             onRetry={retry}
           />
         )}
       >
-        <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
+        <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={repo()} />}>
           {/* The header/tabs render as soon as PrVM resolves (independent regions). */}
           <Suspense fallback={<SkeletonBlock height="4rem" />}>
             <Show when={pr()}>{(p) => <PrHeader pr={p()} repo={repo()} active="diff" filesCount={diff()?.total_files ?? null} commitsCount={p().commits_count ?? null} />}</Show>
@@ -361,7 +367,7 @@ export default function PrDiffScreen() {
                     <Show when={d.page.next_cursor}>
                       <p data-testid="load-remaining" style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
                         {d.total_files - d.files.length} more {d.total_files - d.files.length === 1 ? "file wasn't" : "files weren't"} rendered.{" "}
-                        <A href={`/git/repos/${repo()}/prs/${n()}/diff?cursor=${d.page.next_cursor}${viewParam() ? `&view=${viewParam()}` : ""}`} style={{ color: "var(--text-primary)" }}>Load remaining files</A>
+                        <A href={`${repoPath()}/prs/${n()}/diff?cursor=${d.page.next_cursor}${viewParam() ? `&view=${viewParam()}` : ""}`} style={{ color: "var(--text-primary)" }}>Load remaining files</A>
                       </p>
                     </Show>
                   </Show>

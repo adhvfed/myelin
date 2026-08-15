@@ -5,6 +5,7 @@ import { Icon } from "@myelin/design-system";
 import type { BlameHunkVM, BlameVM } from "~/lib/blame-response";
 import { splitRepositoryLines } from "~/lib/blame-response";
 import { fmtDate } from "~/lib/format";
+import { gitRepositoryPath } from "~/lib/git-route";
 
 interface BlameViewerProps {
   repo: string;
@@ -14,6 +15,7 @@ interface BlameViewerProps {
 const mono = { "font-family": "var(--font-mono)" } as const;
 
 export function BlameViewer(props: BlameViewerProps) {
+  const repoPath = () => gitRepositoryPath(props.repo);
   const lines = createMemo(() => splitRepositoryLines(props.blame.contents));
   const hunkLines = (hunk: BlameHunkVM) =>
     lines().slice(hunk.start_line - 1, hunk.start_line - 1 + hunk.line_count);
@@ -45,7 +47,7 @@ export function BlameViewer(props: BlameViewerProps) {
                         >
                           <div style={{ display: "grid", gap: "var(--space-1)" }}>
                             <A
-                              href={`/git/repos/${props.repo}/commit/${hunk.commit.oid}?ref=${encodeURIComponent(props.blame.ref)}`}
+                              href={`${repoPath()}/commit/${hunk.commit.oid}?ref=${encodeURIComponent(props.blame.ref)}`}
                               style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--accent)", ...mono }}
                               title={hunk.commit.oid}
                             >

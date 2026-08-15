@@ -9,6 +9,7 @@ import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { ReposEmptyState } from "~/components/ReposEmptyState";
 import { repoListHref, repoListInputFromSearch } from "~/lib/repo-list-state";
 import { RepoCreateDialog } from "~/components/repos/RepoCreateDialog";
+import { gitRepositoryPath } from "~/lib/git-route";
 
 export default function ReposScreen() {
   const [search] = useSearchParams();
@@ -77,7 +78,7 @@ export default function ReposScreen() {
       <RepoCreateDialog
         open={createOpen()}
         onClose={() => setCreateOpen(false)}
-        onCreated={(slug) => navigate(`/git/repos/${encodeURIComponent(slug)}`)}
+        onCreated={(slug) => navigate(gitRepositoryPath(slug))}
       />
     </section>
   );
@@ -102,7 +103,7 @@ function RepoRow(props: { repo: RepoListRowVM }) {
         <Match when={empty()} keyed>
           {(repo) => (
             <A
-              href={`/git/repos/${bareRepo(repo.slug)}`}
+              href={gitRepositoryPath(bareRepo(repo.slug))}
               style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)" }}
             >
               <Icon name="repo" />
@@ -115,7 +116,7 @@ function RepoRow(props: { repo: RepoListRowVM }) {
           {(repo) => (
             <>
               <A
-                href={`/git/repos/${bareRepo(repo.slug)}`}
+                href={gitRepositoryPath(bareRepo(repo.slug))}
                 style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)" }}
               >
                 <Icon name="repo" />

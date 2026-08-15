@@ -6,6 +6,7 @@ import { A, createAsync } from "@solidjs/router";
 import { Icon, Skeleton, SkeletonBlock, StatusPill } from "@myelin/design-system";
 import { getMyPrs, type PrListRowVM, type PrListPage } from "~/lib/api";
 import { prTitleText, isTitleFallback, updatedLabel, reviewMarker, bucketPageSummary } from "~/lib/pr-view";
+import { gitRepositoryPath } from "~/lib/git-route";
 
 export default function CrossRepoPrsScreen() {
   const needsReview = createAsync(
@@ -147,7 +148,7 @@ function CrossRow(props: { row: PrListRowVM; active: boolean; setRef: (el: HTMLA
   return (
     <A
       ref={props.setRef}
-      href={`/git/repos/${encodeURIComponent(repo())}/prs/${row().number}`}
+      href={`${gitRepositoryPath(repo())}/prs/${row().number}`}
       tabindex={props.active ? 0 : -1}
       onFocus={props.onFocus}
       onKeyDown={props.onKeyDown}

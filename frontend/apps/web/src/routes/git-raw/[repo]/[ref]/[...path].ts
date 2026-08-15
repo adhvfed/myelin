@@ -6,10 +6,12 @@
 // `?d=attachment` selects a forced download; anything else is the inert inline `raw` variant.
 import type { APIEvent } from "@solidjs/start/server";
 import { rawResponseHeaders } from "~/lib/raw-response";
+import { parseGitRepositoryRouteParam } from "~/lib/git-route";
 import { edgeGetRaw, isUnauthorized } from "~/server/gateway";
 
 export async function GET(event: APIEvent) {
-  const { repo, ref } = event.params;
+  const { ref } = event.params;
+  const repo = parseGitRepositoryRouteParam(event.params.repo);
   const path = (event.params as Record<string, string>).path ?? "";
   const url = new URL(event.request.url);
   const attachment = url.searchParams.get("d") === "attachment";

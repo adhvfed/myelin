@@ -12,6 +12,7 @@ import { CloneUrl, GitSetupGuide } from "~/components/GitCloneSetup";
 import { repoHomeContinuationHref } from "~/lib/tree-browse-state";
 import { useAppViewer } from "~/components/AppShell";
 import { CopyArtifactRef } from "~/components/CopyArtifactRef";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -22,8 +23,10 @@ const card = {
 
 export default function RepoHomeScreen() {
   const params = useParams();
+  const routeRepo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const repoPath = () => gitRepositoryPath(routeRepo());
   const repo = createAsync(
-    async () => (params.repo ? getRepo(params.repo) : undefined),
+    async () => (routeRepo() ? getRepo(routeRepo()) : undefined),
     { deferStream: true },
   );
   const viewer = useAppViewer();
@@ -35,16 +38,16 @@ export default function RepoHomeScreen() {
 
   return (
     <section aria-labelledby="repo-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
-      <Title>{params.repo} · Code · Myelin</Title>
+      <Title>{routeRepo()} · Code · Myelin</Title>
       <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)" }}>
         <A href="/git/repos" style={{ color: "var(--text-primary)", "text-decoration": "underline" }}>Repositories</A>
         <span aria-hidden="true" style={{ color: "var(--text-subtle)", margin: "0 var(--space-1)" }}>/</span>
-        <span style={{ color: "var(--text-primary)", "font-family": "var(--font-mono)" }}>{params.repo}</span>
+        <span style={{ color: "var(--text-primary)", "font-family": "var(--font-mono)" }}>{routeRepo()}</span>
       </nav>
 
       <ErrorBoundary
         fallback={(err, reset) => (
-          <RepoErrorState kind={errKind(err)} repo={params.repo} onRetry={reset} />
+          <RepoErrorState kind={errKind(err)} repo={routeRepo()} onRetry={reset} />
         )}
       >
         <Suspense
@@ -56,12 +59,12 @@ export default function RepoHomeScreen() {
             </Skeleton>
           }
         >
-          <Show when={params.repo} fallback={<RepoErrorState kind="not-found" />}>
+          <Show when={routeRepo()} fallback={<RepoErrorState kind="not-found" />}>
             <Show when={repo()} keyed>
               {(home) => (
                 <Switch>
                   <Match when={home.state === "restricted"}>
-                    <RepoErrorState kind="no-access" repo={params.repo} />
+                    <RepoErrorState kind="no-access" repo={routeRepo()} />
                   </Match>
 
                   <Match when={home.state === "empty" ? home : undefined} keyed>
@@ -106,10 +109,10 @@ export default function RepoHomeScreen() {
                       </div>
                       <div style={{ display: "flex", gap: "var(--space-3)", "align-items": "center", "flex-wrap": "wrap" }}>
                         <RefSwitcher
-                          repo={params.repo!}
+                          repo={routeRepo()}
                           currentRef={defaultBranch()}
                           currentFullRef={`refs/heads/${defaultBranch()}`}
-                          hrefFor={(ref) => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref)}`}
+                          hrefFor={(ref) => `${repoPath()}/tree/${encodeURIComponent(ref)}`}
                         />
                         <Show when={populated.clone_url} keyed>
                           {(cloneUrl) => <>
@@ -122,11 +125,11 @@ export default function RepoHomeScreen() {
                             />
                           </>}
                         </Show>
-                        <A href={`/git/repos/${params.repo}/commits/${encodeURIComponent(defaultBranch())}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
+                        <A href={`${repoPath()}/commits/${encodeURIComponent(defaultBranch())}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
                           <Icon name="commit" /> Commits
                         </A>
                         {/* R3.1 — the missing front door: mirror the Commits link (ux-git critical #1). */}
-                        <A href={`/git/repos/${params.repo}/prs`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
+                        <A href={`${repoPath()}/prs`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
                           <Icon name="pull-request" /> Pull requests
                         </A>
                       </div>
@@ -137,7 +140,7 @@ export default function RepoHomeScreen() {
                       {(lc) => (
                         <div data-testid="latest-commit" style={{ ...card, display: "flex", "align-items": "center", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
                           <Icon name="commit" />
-                          <A href={`/git/repos/${params.repo}/commit/${lc().oid ?? lc().short_oid}`} style={{ "font-family": "var(--font-mono)", color: "var(--text-primary)", "text-decoration": "underline" }}>{lc().short_oid}</A>
+                          <A href={`${repoPath()}/commit/${lc().oid ?? lc().short_oid}`} style={{ "font-family": "var(--font-mono)", color: "var(--text-primary)", "text-decoration": "underline" }}>{lc().short_oid}</A>
                           <strong style={{ flex: "1", "min-width": "10rem" }}>{lc().summary}</strong>
                           <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>{lc().author} · {fmtDate(lc().committed_at)}</span>
                         </div>
@@ -145,12 +148,12 @@ export default function RepoHomeScreen() {
                     </Show>
 
                     <TreeList
-                      repo={params.repo!}
+                      repo={routeRepo()}
                       refName={populated.entries_page?.ref ?? defaultBranch()}
                       entries={populated.entries ?? []}
                       heading={`Files on ${defaultBranch()}`}
                     />
-                    <Show when={populated.entries_page && repoHomeContinuationHref(params.repo!, populated.entries_page)}>
+                    <Show when={populated.entries_page && repoHomeContinuationHref(routeRepo(), populated.entries_page)}>
                       {(href) => (
                         <A
                           data-testid="repo-tree-next-page"
@@ -196,6 +199,7 @@ export function TreeList(props: {
   parentHref?: string;
 }) {
   const r = () => encodeURIComponent(props.refName);
+  const repoPath = () => gitRepositoryPath(props.repo);
   const encPath = (p: string) => p.split("/").map(encodeURIComponent).join("/");
   return (
     <section aria-labelledby="tree-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
@@ -217,13 +221,13 @@ export function TreeList(props: {
                 <Show
                   when={!entry.is_dir}
                   fallback={
-                    <A href={`/git/repos/${props.repo}/tree/${r()}/${encPath(entry.path)}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)", flex: "1" }}>
+                    <A href={`${repoPath()}/tree/${r()}/${encPath(entry.path)}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)", flex: "1" }}>
                       <Icon name="folder" title="Folder" />
                       <code style={{ "font-family": "var(--font-mono)" }}>{name()}/</code>
                     </A>
                   }
                 >
-                  <A href={`/git/repos/${props.repo}/blob/${r()}/${encPath(entry.path)}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)", flex: "1" }}>
+                  <A href={`${repoPath()}/blob/${r()}/${encPath(entry.path)}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-2)", color: "var(--text-primary)", flex: "1" }}>
                     <Icon name="file" title="File" />
                     <code style={{ "font-family": "var(--font-mono)" }}>{name()}</code>
                   </A>

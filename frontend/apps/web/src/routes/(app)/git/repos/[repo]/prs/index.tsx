@@ -7,6 +7,7 @@ import { Icon, Skeleton, SkeletonBlock, StatusPill, Menu, type MenuItemSpec } fr
 import { getRepoPrs, type PrListRowVM, type PrListPage } from "~/lib/api";
 import { prTitleText, isTitleFallback, updatedLabel, stateTabs, reviewMarker, isFilteredNoResults } from "~/lib/pr-view";
 import { NotAvailable } from "~/components/NotAvailable";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 const STATES = ["open", "merged", "closed", "all"] as const;
 
@@ -21,12 +22,15 @@ export default function RepoPrListScreen() {
   };
   const sort = () => (search.sort === "created" ? "created" : "updated");
   const cursor = () => (typeof search.cursor === "string" ? search.cursor : undefined);
-  const ready = () => Boolean(params.repo);
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const repoPath = () => gitRepositoryPath(repo());
+  const ready = () => repo() !== "";
 
   const data = createAsync(
     async () => {
-      const repo = params.repo;
-      return repo ? getRepoPrs({ repo, state: state(), sort: sort(), cursor: cursor() }) : undefined;
+      return ready()
+        ? getRepoPrs({ repo: repo(), state: state(), sort: sort(), cursor: cursor() })
+        : undefined;
     },
     { deferStream: true },
   );
@@ -39,7 +43,7 @@ export default function RepoPrListScreen() {
     if (nextSort !== "updated") p.set("sort", nextSort);
     if (patch.cursor) p.set("cursor", patch.cursor);
     const q = p.toString();
-    return `/git/repos/${params.repo}/prs${q ? `?${q}` : ""}`;
+    return `${repoPath()}/prs${q ? `?${q}` : ""}`;
   };
 
   const sortItems = (): MenuItemSpec[] => [
@@ -49,11 +53,11 @@ export default function RepoPrListScreen() {
 
   return (
     <section aria-labelledby="prs-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-      <Title>Pull requests · {params.repo} · Myelin</Title>
+      <Title>Pull requests · {repo()} · Myelin</Title>
       <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)", display: "flex", gap: "var(--space-1)" }}>
         <A href="/git/repos" style={{ color: "var(--text-muted)" }}>Repositories</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}`} style={{ color: "var(--text-muted)" }}>{params.repo}</A>
+        <A href={repoPath()} style={{ color: "var(--text-muted)" }}>{repo()}</A>
         <span aria-hidden="true">/</span>
         <span aria-current="page" style={{ color: "var(--text-muted)" }}>Pull requests</span>
       </nav>
@@ -63,7 +67,7 @@ export default function RepoPrListScreen() {
           <Icon name="pull-request" /> Pull requests
         </h1>
         <div style={{ flex: "1" }} />
-        <A href={`/git/repos/${params.repo}/commits/main`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)", "text-decoration": "none" }}>
+        <A href={`${repoPath()}/commits/main`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)", "text-decoration": "none" }}>
           <Icon name="commit" /> Commits
         </A>
       </div>
@@ -115,7 +119,7 @@ export default function RepoPrListScreen() {
                       <div>
                         <strong style={{ display: "block", color: "var(--text-primary)" }}>Pull requests are not available to you</strong>
                         <span style={{ color: "var(--text-muted)" }}>
-                          You don't have access to pull requests in <code style={mono}>{params.repo}</code>. If you think this is wrong, ask a repository admin for the <code style={mono}>view</code> permission.
+                          You don't have access to pull requests in <code style={mono}>{repo()}</code>. If you think this is wrong, ask a repository admin for the <code style={mono}>view</code> permission.
                         </span>
                       </div>
                     </div>
@@ -123,7 +127,7 @@ export default function RepoPrListScreen() {
                 >
                   <PopulatedOrEmpty
                     page={result as PrListPage}
-                    repo={params.repo!}
+                    repo={repo()}
                     activeState={state()}
                     hrefFor={href}
                     sortItems={sortItems()}
@@ -323,7 +327,7 @@ function PrRow(props: {
   return (
     <A
       ref={props.setRef}
-      href={`/git/repos/${props.repo}/prs/${row().number}`}
+      href={`${gitRepositoryPath(props.repo)}/prs/${row().number}`}
       tabindex={props.active ? 0 : -1}
       onFocus={props.onFocus}
       onKeyDown={props.onKeyDown}

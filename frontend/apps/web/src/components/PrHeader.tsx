@@ -5,6 +5,7 @@ import { Icon, StatusPill } from "@myelin/design-system";
 import { fmtDate } from "~/lib/format";
 import type { PrVM } from "~/lib/api";
 import { CopyArtifactRef } from "~/components/CopyArtifactRef";
+import { gitRepositoryPath } from "~/lib/git-route";
 
 export type PrTab = "overview" | "diff" | "checks" | "commits";
 
@@ -27,7 +28,7 @@ export function PrHeader(props: {
   filesCount?: number | null;
 }) {
   const title = () => props.pr.title ?? `#${props.pr.number}`;
-  const base = () => `/git/repos/${props.repo}/prs/${props.pr.number}`;
+  const base = () => `${gitRepositoryPath(props.repo)}/prs/${props.pr.number}`;
   return (
     <header style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
       <div style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", "flex-wrap": "wrap" }}>

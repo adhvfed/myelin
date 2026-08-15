@@ -8,34 +8,37 @@ import { getCommits } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { RepoBreadcrumb } from "~/components/RepoBreadcrumb";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 export default function CommitLogScreen() {
   const params = useParams();
   const [search] = useSearchParams();
   const cursor = () => (typeof search.cursor === "string" ? search.cursor : undefined);
-  const ready = () => Boolean(params.repo && params.ref);
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const repoPath = () => gitRepositoryPath(repo());
+  const ready = () => Boolean(repo() && params.ref);
   const commits = createAsync(
     async () =>
-      ready() ? getCommits({ repo: params.repo!, ref: params.ref!, cursor: cursor() }) : undefined,
+      ready() ? getCommits({ repo: repo(), ref: params.ref!, cursor: cursor() }) : undefined,
     { deferStream: true },
   );
 
   const linkTo = (c?: string | null) => {
-    const base = `/git/repos/${params.repo}/commits/${encodeURIComponent(params.ref!)}`;
+    const base = `${repoPath()}/commits/${encodeURIComponent(params.ref!)}`;
     return c ? `${base}?cursor=${encodeURIComponent(c)}` : base;
   };
 
   return (
     <section aria-labelledby="log-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-      <Title>Commits · {params.repo} · Myelin</Title>
-      <RepoBreadcrumb repo={params.repo!} refName={params.ref!} kind="tree" />
+      <Title>Commits · {repo()} · Myelin</Title>
+      <RepoBreadcrumb repo={repo()} refName={params.ref!} kind="tree" />
       <h1 id="log-heading" style={{ "font-size": "var(--fs-h1)", margin: "0", display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
         <Icon name="commit" /> Commits <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>on {params.ref}</span>
       </h1>
 
-      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={params.repo} onRetry={reset} />}>
+      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={repo()} onRetry={reset} />}>
         <Suspense fallback={<Skeleton label="Loading commits…" rows={6} rowHeight="3rem" data-testid="commits-loading" />}>
-          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
+          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={repo()} />}>
             <Show when={commits()} keyed>
               {(page) => (
                 <Show
@@ -47,7 +50,7 @@ export default function CommitLogScreen() {
                       {(c) => (
                         <li style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-3)", background: "var(--surface-raised)", display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
                           <span style={{ display: "flex", "align-items": "center", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
-                            <A href={`/git/repos/${params.repo}/commit/${c.oid}?ref=${encodeURIComponent(params.ref!)}`} style={{ "font-family": "var(--font-mono)", color: "var(--text-primary)", "text-decoration": "underline" }}>{c.short_oid}</A>
+                            <A href={`${repoPath()}/commit/${c.oid}?ref=${encodeURIComponent(params.ref!)}`} style={{ "font-family": "var(--font-mono)", color: "var(--text-primary)", "text-decoration": "underline" }}>{c.short_oid}</A>
                             <strong>{c.summary}</strong>
                             <Show when={c.parents.length > 1}>
                               <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>

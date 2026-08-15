@@ -47,6 +47,11 @@ import { Markdown } from "~/components/Markdown";
 import { useContextPane } from "~/components/AppShell";
 import { SharedComposer } from "~/components/SharedComposer";
 import { getPrContext, type PrContextVM } from "~/lib/pr-context";
+import {
+  gitRepositoryPath,
+  parseGitPullRequestRouteParam,
+  parseGitRepositoryRouteParam,
+} from "~/lib/git-route";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -84,9 +89,10 @@ const VERDICT: Record<PrReviewVM["verdict"], { icon: IconName; label: string; co
 export default function PrOverviewScreen() {
   const params = useParams();
   const toast = useToast();
-  const ready = () => Boolean(params.repo && params.n && Number.isFinite(Number(params.n)));
-  const repo = () => params.repo ?? "";
-  const n = () => Number(params.n);
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const n = () => parseGitPullRequestRouteParam(params.n) ?? 0;
+  const ready = () => repo() !== "" && n() > 0;
+  const repoPath = () => gitRepositoryPath(repo());
 
   const pr = createAsync(
     async () => (ready() ? getPr({ repo: repo(), n: n() }) : undefined),
@@ -167,19 +173,19 @@ export default function PrOverviewScreen() {
 
   return (
     <section aria-labelledby="pr-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
-      <Title>PR #{params.n} · {params.repo} · Myelin</Title>
+      <Title>PR #{params.n} · {repo()} · Myelin</Title>
       <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)", display: "flex", gap: "var(--space-1)" }}>
         <A href="/git/repos" style={{ color: "var(--text-muted)" }}>Repositories</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}`} style={{ color: "var(--text-muted)" }}>{params.repo}</A>
+        <A href={repoPath()} style={{ color: "var(--text-muted)" }}>{repo()}</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}/prs`} style={{ color: "var(--text-muted)" }}>Pull requests</A>
+        <A href={`${repoPath()}/prs`} style={{ color: "var(--text-muted)" }}>Pull requests</A>
       </nav>
 
       {/* Route-level failure: the dignified not-found / no-access / error trio (anti-oracle — a 404
           PR is indistinguishable from a no-pull-grant one; never a raw err.message). */}
       <ErrorBoundary
-        fallback={(err) => <RepoErrorState kind={errKind(err)} repo={params.repo} />}
+        fallback={(err) => <RepoErrorState kind={errKind(err)} repo={repo()} />}
       >
         <Suspense
           fallback={
@@ -709,7 +715,7 @@ function CommitsSection(props: { repo: string; n: number; initial: PrCommitsStat
               {(c) => (
                 <li data-commit-oid={c.oid} style={{ display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
                   <Icon name="commit" />
-                  <A href={`/git/repos/${props.repo}/commit/${c.oid}`} style={{ "font-family": "var(--font-mono)", "font-size": "var(--fs-caption)" }}>{c.short_oid}</A>
+                  <A href={`${gitRepositoryPath(props.repo)}/commit/${c.oid}`} style={{ "font-family": "var(--font-mono)", "font-size": "var(--fs-caption)" }}>{c.short_oid}</A>
                   <span>{c.summary}</span>
                   <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>{c.author}</span>
                 </li>

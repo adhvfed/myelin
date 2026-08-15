@@ -1095,8 +1095,8 @@ const server = createServer((req, res) => {
       reason: "approval_requested",
       class: "direct",
       subsystem: "git",
-      subject: "myelin://acme/git/pr/platform/myelin:42",
-      subject_root: "myelin://acme/git/pr/platform/myelin:42",
+      subject: "myelin://acme/git/pr/platform/myelin:1",
+      subject_root: "myelin://acme/git/pr/platform/myelin:1",
       coalesce_count: 1,
       state: state.inboxAgentApprovalState,
       snooze_until: null,
@@ -1113,8 +1113,8 @@ const server = createServer((req, res) => {
       reason: "mentioned",
       class: "direct",
       subsystem: "git",
-      subject: "myelin://acme/git/pr/platform/myelin:43",
-      subject_root: "myelin://acme/git/pr/platform/myelin:43",
+      subject: "myelin://acme/git/pr/platform/myelin:2",
+      subject_root: "myelin://acme/git/pr/platform/myelin:2",
       coalesce_count: 1,
       state: "unread",
       snooze_until: null,
@@ -1126,8 +1126,8 @@ const server = createServer((req, res) => {
       reason: "mentioned",
       class: "direct",
       subsystem: "git",
-      subject: "myelin://acme/git/pr/platform/myelin:42",
-      subject_root: "myelin://acme/git/pr/platform/myelin:42",
+      subject: "myelin://acme/git/pr/platform/myelin:1",
+      subject_root: "myelin://acme/git/pr/platform/myelin:1",
       coalesce_count: 1,
       state: "unread",
       snooze_until: null,
@@ -1304,17 +1304,19 @@ const server = createServer((req, res) => {
     const keys = [...url.searchParams.keys()];
     const reference = url.searchParams.get("ref");
     const limit = url.searchParams.get("limit");
-    const referenceMatch = /^myelin:\/\/acme\/git\/pr\/myelin:([1-9][0-9]*)$/.exec(reference ?? "");
+    const referenceMatch = /^myelin:\/\/acme\/git\/pr\/(.+):([1-9][0-9]*)$/.exec(reference ?? "");
+    const referenceRepo = referenceMatch?.[1];
+    const referenceNumber = Number(referenceMatch?.[2]);
     if (keys.length !== 2 || !keys.every((key) => ["ref", "limit"].includes(key)) ||
         url.searchParams.getAll("ref").length !== 1 || url.searchParams.getAll("limit").length !== 1 ||
-        !referenceMatch || !prJson("myelin", Number(referenceMatch[1])) || limit !== "100") {
+        !referenceRepo || !prJson(referenceRepo, referenceNumber) || limit !== "100") {
       return send(res, 400, { error: { message: "invalid References query", code: "bad_request" } });
     }
     const issue = issueRows.find((row) => row.key === "MYL-102");
     const document = knowledge.list({ limit: 100 }).items.find((page) => page.title === "Engineering principles");
     const issueRef = issue ? `myelin://acme/issue/issue/${issue.key}` : null;
     const prRef = reference;
-    const linkedFixture = referenceMatch[1] === "1";
+    const linkedFixture = referenceNumber === 1;
     const links = linkedFixture && issueRef ? [{
       ref: issueRef,
       root_ref: issueRef,
@@ -1422,7 +1424,7 @@ const server = createServer((req, res) => {
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/diff$/))) {
       const repo = seg(m[1]);
       const number = Number(m[2]);
-      if (repo === "myelin" && number === 5) {
+      if (number === 5 && prJson(repo, number)) {
         return send(res, 413, prDiffCapacityEnvelope());
       }
       const v = prDiffJson(repo, number, url.searchParams.get("cursor") ?? undefined);

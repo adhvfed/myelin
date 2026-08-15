@@ -128,7 +128,7 @@ export function InboxDialog(props: InboxDialogProps) {
                         fallback={<code>{item.subject}</code>}
                       >
                         {(href) => (
-                          <a href={href()} title={item.subject}>
+                          <a href={href()} title={item.subject} onClick={props.onClose}>
                             <code>{artifactRefLabel(item.subject)}</code>
                           </a>
                         )}

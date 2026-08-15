@@ -121,7 +121,8 @@ export function parsePrListPage(value: unknown, scope: "repo" | "cross"): PrList
       (page.offset !== undefined && !uint(page.offset)) ||
       (page.total !== undefined && !uint(page.total))) return null;
   const items = input.items.map(prListRow);
-  if (!items.every((item): item is PrListRowVM => item !== null)) return null;
+  if (!items.every((item): item is PrListRowVM => item !== null) ||
+      items.some((item) => scope === "cross" ? item.repo === null : item.repo !== null)) return null;
   return {
     items,
     page: {

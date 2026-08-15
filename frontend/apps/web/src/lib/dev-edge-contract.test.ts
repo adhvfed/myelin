@@ -4,9 +4,12 @@ import { describe, expect, it } from "vitest";
 import {
   parseRepoSummaryQuery,
   parsePrCommitsQuery,
+  prChecksJson,
   prDiffCapacityEnvelope,
   prCommitCursorExpiredEnvelope,
   prCommitsEnvelope,
+  prJson,
+  prThreadsJson,
   parseTreeQuery,
   fileLinesJson,
   refsJson,
@@ -45,6 +48,19 @@ const gitReadGolden = JSON.parse(readFileSync(
 };
 
 describe("the dev Edge PR commit pagination contract", () => {
+  it("keeps namespaced PR coordinates openable across every overview read", () => {
+    const repo = "platform/myelin";
+    expect(prJson(repo, 1)).toMatchObject({
+      number: 1,
+      ref: "myelin://acme/git/pr/platform/myelin:1",
+    });
+    expect(prChecksJson(repo, 1)).toMatchObject({ gate_admitted: false });
+    expect(prThreadsJson(repo, 1)).toMatchObject({ durable: true });
+    expect(prCommitsEnvelope(repo, 1, { limit: 20, position: 0 }))
+      .toMatchObject({ items: expect.any(Array), page: { limit: 20 } });
+    expect(prJson("platform.git/myelin", 1)).toBeNull();
+  });
+
   it("mints canonical fixed-frame cursors and serves a distinct terminal page", () => {
     const firstInput = parsePrCommitsQuery("myelin", 1, "limit=20");
     expect(firstInput).toEqual({ limit: 20, position: 0 });

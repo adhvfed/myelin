@@ -7,6 +7,7 @@ import { BlameViewer } from "~/components/BlameViewer";
 import { RepoBreadcrumb } from "~/components/RepoBreadcrumb";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { getBlame } from "~/lib/api";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 export default function BlameScreen() {
   const params = useParams();
@@ -18,20 +19,22 @@ export default function BlameScreen() {
     }
   };
   const path = () => params.path ?? "";
-  const ready = () => Boolean(params.repo && ref() && path());
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const repoPath = () => gitRepositoryPath(repo());
+  const ready = () => Boolean(repo() && ref() && path());
   const blame = createAsync(
-    async () => ready() ? getBlame({ repo: params.repo!, ref: ref(), path: path() }) : undefined,
+    async () => ready() ? getBlame({ repo: repo(), ref: ref(), path: path() }) : undefined,
     { deferStream: true },
   );
   const blobHref = () =>
-    `/git/repos/${params.repo}/blob/${encodeURIComponent(ref())}/${path().split("/").map(encodeURIComponent).join("/")}`;
+    `${repoPath()}/blob/${encodeURIComponent(ref())}/${path().split("/").map(encodeURIComponent).join("/")}`;
 
   return (
     <section aria-labelledby="blame-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-      <Title>Blame {path()} · {params.repo} · Myelin</Title>
-      <RepoBreadcrumb repo={params.repo!} refName={ref()} path={path()} kind="blob" />
+      <Title>Blame {path()} · {repo()} · Myelin</Title>
+      <RepoBreadcrumb repo={repo()} refName={ref()} path={path()} kind="blob" />
 
-      <ErrorBoundary fallback={(error, reset) => <RepoErrorState kind={errKind(error)} repo={params.repo} onRetry={reset} />}>
+      <ErrorBoundary fallback={(error, reset) => <RepoErrorState kind={errKind(error)} repo={repo()} onRetry={reset} />}>
         <Suspense
           fallback={
             <Skeleton label="Tracing line history…" data-testid="blame-loading">
@@ -40,7 +43,7 @@ export default function BlameScreen() {
             </Skeleton>
           }
         >
-          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
+          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={repo()} />}>
             <Show when={blame()} keyed>
               {(view) => (
                 <>
@@ -57,7 +60,7 @@ export default function BlameScreen() {
                   <p style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
                     Attribution is pinned to snapshot <code style={{ "font-family": "var(--font-mono)" }} title={view.snapshot_oid}>{view.snapshot_oid.slice(0, 12)}</code> on {view.ref}.
                   </p>
-                  <BlameViewer repo={params.repo!} blame={view} />
+                  <BlameViewer repo={repo()} blame={view} />
                 </>
               )}
             </Show>

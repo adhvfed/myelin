@@ -7,6 +7,7 @@ import { Icon, Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { getBlob } from "~/lib/api";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { RepoBreadcrumb } from "~/components/RepoBreadcrumb";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 function fmtBytes(n?: number): string {
   if (!n && n !== 0) return "";
@@ -25,18 +26,20 @@ export default function BlobScreen() {
     }
   };
   const path = () => params.path ?? "";
-  const ready = () => Boolean(params.repo && ref() && path());
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const repoPath = () => gitRepositoryPath(repo());
+  const ready = () => Boolean(repo() && ref() && path());
   const blob = createAsync(
     async () =>
-      ready() ? getBlob({ repo: params.repo!, ref: ref(), path: path() }) : undefined,
+      ready() ? getBlob({ repo: repo(), ref: ref(), path: path() }) : undefined,
     { deferStream: true },
   );
 
   const encPath = () => path().split("/").map(encodeURIComponent).join("/");
-  const rawHref = () => `/git-raw/${params.repo}/${encodeURIComponent(ref())}/${encPath()}?d=inline`;
-  const downloadHref = () => `/git-raw/${params.repo}/${encodeURIComponent(ref())}/${encPath()}?d=attachment`;
-  const treeHref = () => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref())}/${encPath()}`;
-  const blameHref = () => `/git/repos/${params.repo}/blame/${encodeURIComponent(ref())}/${encPath()}`;
+  const rawHref = () => `/git-raw/${encodeURIComponent(repo())}/${encodeURIComponent(ref())}/${encPath()}?d=inline`;
+  const downloadHref = () => `/git-raw/${encodeURIComponent(repo())}/${encodeURIComponent(ref())}/${encPath()}?d=attachment`;
+  const treeHref = () => `${repoPath()}/tree/${encodeURIComponent(ref())}/${encPath()}`;
+  const blameHref = () => `${repoPath()}/blame/${encodeURIComponent(ref())}/${encPath()}`;
 
   const toolbarBtn = {
     display: "inline-flex", "align-items": "center", gap: "var(--space-1)",
@@ -46,10 +49,10 @@ export default function BlobScreen() {
 
   return (
     <section aria-labelledby="blob-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-      <Title>{path()} · {params.repo} · Myelin</Title>
-      <RepoBreadcrumb repo={params.repo!} refName={ref()} path={path()} kind="blob" />
+      <Title>{path()} · {repo()} · Myelin</Title>
+      <RepoBreadcrumb repo={repo()} refName={ref()} path={path()} kind="blob" />
 
-      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={params.repo} onRetry={reset} />}>
+      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={repo()} onRetry={reset} />}>
         <Suspense
           fallback={
             <Skeleton label="Loading file…" data-testid="blob-loading">
@@ -58,7 +61,7 @@ export default function BlobScreen() {
             </Skeleton>
           }
         >
-          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
+          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={repo()} />}>
             <Show when={blob()} keyed>
               {(file) => (
                 <Show when={!file.redirect_to_tree} fallback={<Navigate href={treeHref()} />}>

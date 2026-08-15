@@ -8,6 +8,11 @@ export const DEV_ACCESS_TOKEN = "dev.access.myelin-shell-e2e";
 export const DEV_REFRESH_TOKEN = "dev.refresh.myelin-shell-e2e";
 export const DEV_SCHEME = "pat";
 
+const SEED_POPULATED_REPOSITORIES = new Set(["myelin", "platform/myelin"]);
+function hasSeedPopulatedRepository(repo) {
+  return SEED_POPULATED_REPOSITORIES.has(repo);
+}
+
 export const DEV_PRINCIPAL = {
   principalId: "u_dev_operator",
   displayName: "Dev Operator",
@@ -186,7 +191,16 @@ function bareName(slug) {
 
 /** GET /v1/git/repos/{repo} → the RepoHome ViewModel (null = 404). */
 export function repoHomeJson(repo) {
-  return SEED_REPO_HOMES.find((r) => bareName(r.slug) === repo) ?? null;
+  const exact = SEED_REPO_HOMES.find((r) => bareName(r.slug) === repo);
+  if (exact) return exact;
+  if (!hasSeedPopulatedRepository(repo)) return null;
+  const populated = SEED_REPO_HOMES.find((row) => row.state === "populated");
+  return populated ? {
+    ...populated,
+    slug: `acme/${repo}`,
+    ref: `myelin://acme/git/repo/${repo}`,
+    clone_url: `/acme/eu-west/${repo}.git`,
+  } : null;
 }
 
 // ── R3.4: the ref switcher + nested tree + enriched blob (all keyed off MYELIN_TREE) ──
@@ -285,7 +299,7 @@ function decodeRefsCursor(cursor) {
  * @param {Array<object>} [namespace] Injectable only so the contract test can move the ref namespace.
  */
 export function refsJson(repo, options = {}, namespace = SEED_REFS) {
-  if (repo !== "myelin") return null;
+  if (!hasSeedPopulatedRepository(repo)) return null;
   const { limit = 100, cursor, q = "", current } = options;
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
     return { __status: 400 };
@@ -399,7 +413,7 @@ function decodeTreeCursor(cursor) {
 
 /** GET /v1/git/repos/{repo}/tree/{ref}/{...path} → the modern paginated TreeVM. */
 export function treeJson(repo, ref, path, options = {}) {
-  if (repo !== "myelin") return null;
+  if (!hasSeedPopulatedRepository(repo)) return null;
   const hit = walkTree(path);
   if (!hit) return { __status: 404 };
   if (hit.kind === "file") return { redirect_to_blob: true, ref, path };
@@ -439,7 +453,7 @@ export function treeJson(repo, ref, path, options = {}) {
 
 /** GET /v1/git/repos/{repo}/blob/{ref}/{...path} → the enriched BlobVM (null = 404). */
 export function blobJson(repo, ref, path) {
-  if (repo !== "myelin") return null;
+  if (!hasSeedPopulatedRepository(repo)) return null;
   const hit = walkTree(path);
   if (!hit) return { __status: 404 };
   if (hit.kind === "dir") return { redirect_to_tree: true, ref, path };
@@ -460,7 +474,7 @@ export function blobJson(repo, ref, path) {
 
 /** GET /v1/git/repos/{repo}/blame/{ref}/{...path} → snapshot-pinned line attribution. */
 export function blameJson(repo, ref, path) {
-  if (repo !== "myelin") return null;
+  if (!hasSeedPopulatedRepository(repo)) return null;
   const hit = walkTree(path);
   if (!hit || hit.kind !== "file" || hit.node.binary) return { __status: 404 };
   const contents = hit.node.file ?? "";
@@ -489,7 +503,7 @@ export function blameJson(repo, ref, path) {
 
 /** GET raw/download bytes (R3.4) — returns `{ body, contentType, attachment }` (null = 404). */
 export function rawBytes(repo, _ref, path, attachment) {
-  if (repo !== "myelin") return null;
+  if (!hasSeedPopulatedRepository(repo)) return null;
   const hit = walkTree(path);
   if (!hit || hit.kind !== "file") return null;
   const filename = path.split("/").pop() || "download";
@@ -528,7 +542,7 @@ const SEED_COMMITS = {
 
 /** GET /v1/git/repos/{repo}/commits/{ref} with bidirectional cursors and no synthetic total. */
 export function commitsEnvelope(repo, limit = 50, cursor) {
-  const all = SEED_COMMITS[repo];
+  const all = hasSeedPopulatedRepository(repo) ? SEED_COMMITS.myelin : undefined;
   if (!all) return null;
   const offset = Number.parseInt(cursor ?? "0", 10) || 0;
   const items = all.slice(offset, offset + limit);
@@ -590,7 +604,7 @@ const SEED_DIFFS = {
 
 /** GET /v1/git/repos/{repo}/commit/{oid} → the CommitDiff ViewModel (null = 404). */
 export function commitDiffJson(repo, oid) {
-  return SEED_DIFFS[oid] ?? null;
+  return hasSeedPopulatedRepository(repo) ? SEED_DIFFS[oid] ?? null : null;
 }
 
 // ── R3.2 · G-7 — the PR three-dot diff + expand-context fixtures ──────────────────────────────────
@@ -685,7 +699,7 @@ const SEED_ANCHORED = {
 
 /** GET /v1/git/repos/{repo}/prs/{n}/diff?cursor= → the PrDiffVM (null = 404). PR #4 pages by cursor. */
 export function prDiffJson(repo, n, cursor) {
-  if (repo !== "myelin" || !SEED_PRS[n]) return null;
+  if (!hasSeedPullRequest(repo, n)) return null;
   if (n === 4) return pagedDiff(cursor);
   return SEED_PR_DIFFS[n] ?? {
     number: n,
@@ -716,7 +730,7 @@ export function prDiffCapacityEnvelope() {
 
 /** GET /v1/git/repos/{repo}/file-lines/{oid} → expand-context lines (context, origin " "). */
 export function fileLinesJson(repo, oid, start, end) {
-  if (repo !== "myelin" || oid !== BLOB_LIST_FILTER) return null;
+  if (!hasSeedPopulatedRepository(repo) || oid !== BLOB_LIST_FILTER) return null;
   const lines = [];
   for (let i = start; i <= (end || start + 10); i++) {
     lines.push({ origin: " ", content: `    // context line ${i}`, old_no: null, new_no: i });
@@ -854,6 +868,12 @@ const SEED_PRS = {
   },
 };
 
+// Keep one namespaced repository in the browser contract. Both coordinates deliberately share the
+// same PR records; the test double is proving transport and routing semantics, not modelling storage.
+function hasSeedPullRequest(repo, n) {
+  return hasSeedPopulatedRepository(repo) && Boolean(SEED_PRS[n]);
+}
+
 // PR #4's paged diff: 60 changed files served 50-per-page via the file cursor. Page 1 (no cursor)
 // carries files 0–49 + `next_cursor: "c50"`; page 2 (?cursor=c50) carries files 50–59 + no cursor.
 const PAGED_TOTAL_FILES = 60;
@@ -925,7 +945,7 @@ function subjectDoc(repo, n) {
 /** GET …/threads → the viewer-scoped envelope (the dev-edge treats the dev operator as the viewer, so
  *  pending comments authored by them are visible to them; a real edge filters per principal). */
 export function prThreadsJson(repo, n, viewer = "u_dev_operator@acme.noreply") {
-  if (repo !== "myelin" || !SEED_PRS[n]) return null;
+  if (!hasSeedPullRequest(repo, n)) return null;
   const doc = subjectDoc(repo, n);
   const visible = doc.threads
     .map((t) => ({
@@ -1067,7 +1087,7 @@ export function parsePrCommitsQuery(repo, n, rawQuery) {
 
 /** GET …/prs/{n}/commits → the exact snapshot-paged MR-014 commits envelope. */
 export function prCommitsEnvelope(repo, n, input) {
-  if (repo !== "myelin" || !SEED_PRS[n]) return null;
+  if (!hasSeedPullRequest(repo, n)) return null;
   if (input.snapshot && (
     input.snapshot.base_oid !== C1 || input.snapshot.head_oid !== SEED_PRS[n].pr.head_oid
   )) return { expired: true };
@@ -1099,7 +1119,7 @@ export function validPrOperationId(value) {
 
 /** POST handlers (stateful). Return the same `{ applied: … }` envelope the edge does. */
 export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.noreply") {
-  if (repo !== "myelin" || !SEED_PRS[n]) return { status: 404 };
+  if (!hasSeedPullRequest(repo, n)) return { status: 404 };
   const doc = subjectDoc(repo, n);
   const who = { kind: "human", display: viewer, on_behalf_of: null, trigger: null };
   const id = (p) => `${p}-${++threadSeq}`;
@@ -1174,7 +1194,7 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
 
 /** GET /v1/git/repos/{repo}/prs/{n} → the durable PR record (null = 404). */
 export function prJson(repo, n) {
-  return repo === "myelin" && SEED_PRS[n]
+  return hasSeedPullRequest(repo, n)
     ? { ...SEED_PRS[n].pr, ref: `myelin://acme/git/pr/${repo}:${n}` }
     : null;
 }
@@ -1183,8 +1203,8 @@ export function prJson(repo, n) {
  *  deliberately 404s its checks (the record exists) so the e2e can drive the LOCAL checks-degrade
  *  state (the PR stays live around a "Checks unavailable" region — ux-git finding 5). */
 export function prChecksJson(repo, n) {
-  if (repo === "myelin" && n === 3) return null;
-  return repo === "myelin" && SEED_PRS[n] ? SEED_PRS[n].checks : null;
+  if (!hasSeedPullRequest(repo, n) || n === 3) return null;
+  return SEED_PRS[n].checks;
 }
 
 // ── R3.1 PR-list rows (PrListRowVM) — a spread that exercises the states the screens render:
@@ -1225,15 +1245,16 @@ const SEED_PR_ROWS = [
   },
 ];
 
-// FIXTURES-MIRROR-CONTRACT (peer-review #20): the real edge emits `PrListRowVM.repo` as the BARE repo
-// slug (`e.repo_slug` = a single-segment `scan_repo_slugs` name like `myelin`/`sandbox`), and the repo
-// route param is that bare name. A tenant-qualified `owner/repo` here (the prior `myelin/myelin`) makes
-// every cross-repo row's link 404 against the harness — a divergence invisible in e2e because the
-// fixture is self-consistent. Fail LOUD at load if a fixture row re-introduces a non-bare slug.
+// Cross-repository rows carry the exact route slug emitted by the edge. Keep the fixture honest about
+// the same bounded, path-safe hierarchical grammar accepted by production.
 for (const r of SEED_PR_ROWS) {
-  if (typeof r.repo !== "string" || r.repo.includes("/")) {
+  const parts = typeof r.repo === "string" ? r.repo.split("/") : [];
+  if (parts.length === 0 || new TextEncoder().encode(r.repo).byteLength > 255 ||
+      !parts.every((part) => part !== "" && part !== "." && part !== ".." &&
+        /^[A-Za-z0-9._-]+$/.test(part)) ||
+      parts.slice(0, -1).some((part) => part.toLowerCase().endsWith(".git"))) {
     throw new Error(
-      `dev-contract SEED_PR_ROWS: repo must be a BARE slug to mirror the edge (PrListRowVM.repo = e.repo_slug); got ${JSON.stringify(r.repo)} on PR #${r.number}`,
+      `dev-contract SEED_PR_ROWS: invalid repository slug ${JSON.stringify(r.repo)} on PR #${r.number}`,
     );
   }
 }
@@ -1249,8 +1270,8 @@ function countBy(rows) {
 
 /** GET /v1/git/repos/{repo}/prs?state=&sort= → the PrListPage (null = 404, the no-access analogue). */
 export function repoPrsEnvelope(repo, state = "open", limit = 50) {
-  // `sandbox` (the seeded empty repo) → an empty list (the teaching empty state); `myelin` → the seed;
-  // anything else → a 0-leak 404 (the no-access / absent-repo analogue).
+  // `sandbox` is the teaching empty state; populated fixtures share the bounded PR spread; anything
+  // else is the 0-leak no-access / absent-repository analogue.
   if (repo === "sandbox") {
     return {
       items: [],
@@ -1258,14 +1279,16 @@ export function repoPrsEnvelope(repo, state = "open", limit = 50) {
       counts: { open: 0, merged: 0, closed: 0, all: 0, yours: 0, needs_review: 0 },
     };
   }
-  if (repo !== "myelin") return null;
+  if (!hasSeedPopulatedRepository(repo)) return null;
   const counts = countBy(SEED_PR_ROWS);
   const wanted =
     state === "merged" ? ["merged"]
     : state === "closed" ? ["closed"]
     : state === "all" ? ["draft", "open", "merged", "closed"]
     : ["draft", "open"];
-  const items = SEED_PR_ROWS.filter((r) => wanted.includes(r.pr_state));
+  const items = SEED_PR_ROWS
+    .filter((r) => wanted.includes(r.pr_state))
+    .map((row) => ({ ...row, repo: null }));
   return {
     items,
     page: { next_cursor: null, prev_cursor: null, limit, offset: 0, total: items.length },

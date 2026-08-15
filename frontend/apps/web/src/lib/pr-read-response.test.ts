@@ -23,12 +23,12 @@ const row = {
 describe("PR read response projection", () => {
   it("projects list pages and drops nested surplus fields", () => {
     expect(parsePrListPage({
-      items: [{ ...row, secret: "drop", checks_summary: { ...row.checks_summary, secret: "drop" } }],
+      items: [{ ...row, repo: null, secret: "drop", checks_summary: { ...row.checks_summary, secret: "drop" } }],
       page: { next_cursor: null, prev_cursor: "0", limit: 50, offset: 50, total: 51, secret: "drop" },
       counts: { open: 1, merged: 0, closed: 0, all: 1, yours: 1, needs_review: 0, secret: 9 },
       secret: "drop",
     }, "repo")).toEqual({
-      items: [row],
+      items: [{ ...row, repo: null }],
       page: { next_cursor: null, prev_cursor: "0", limit: 50, offset: 50, total: 51 },
       counts: { open: 1, merged: 0, closed: 0, all: 1, yours: 1, needs_review: 0 },
     });
@@ -130,6 +130,7 @@ describe("PR read response projection", () => {
 
   it.each([
     () => parsePrListPage({ items: [row], page: { next_cursor: null, prev_cursor: null, limit: 50 }, counts: { bucket: 1 } }, "repo"),
+    () => parsePrListPage({ items: [{ ...row, repo: null }], page: { next_cursor: null, prev_cursor: null, limit: 50 }, counts: { bucket: 1 } }, "cross"),
     () => parsePrListPage({ items: [{ ...row, checks_summary: { verdict: "pass", passing: 2, failing: 1, total: 2 } }], page: { next_cursor: null, prev_cursor: null, limit: 50 }, counts: { bucket: 1 } }, "cross"),
     () => parsePr({ number: 1, durable: false }),
     () => parsePr({

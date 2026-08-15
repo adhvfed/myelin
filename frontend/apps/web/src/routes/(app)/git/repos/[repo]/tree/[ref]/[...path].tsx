@@ -19,6 +19,7 @@ import {
   treeSearchValue,
 } from "~/lib/tree-browse-state";
 import { TreeList } from "../../index";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 export default function TreeScreen() {
   const params = useParams();
@@ -34,14 +35,16 @@ export default function TreeScreen() {
     }
   };
   const path = () => params.path ?? "";
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const repoPath = () => gitRepositoryPath(repo());
   const query = () => treeSearchValue(search.q);
   const cursor = () => treeCursorValue(search.cursor);
   const limit = () => treeLimitValue(search.limit);
   const [searchDraft, setSearchDraft] = createSignal(query());
   const initialTreeReader = new InitialTreeReader(getTree);
-  const ready = () => Boolean(params.repo && ref());
+  const ready = () => Boolean(repo() && ref());
   const location = (overrides: { q?: string; cursor?: string } = {}) => treeHref({
-    repo: params.repo!,
+    repo: repo(),
     ref: ref(),
     path: path(),
     limit: limit(),
@@ -59,7 +62,7 @@ export default function TreeScreen() {
   });
   const initialTree = createAsync(
     async () => ready()
-      ? initialTreeReader.read({ repo: params.repo!, ref: ref(), path: path() })
+      ? initialTreeReader.read({ repo: repo(), ref: ref(), path: path() })
       : undefined,
     { deferStream: true },
   );
@@ -67,7 +70,7 @@ export default function TreeScreen() {
     async () =>
       ready()
         ? getTree({
-            repo: params.repo!,
+            repo: repo(),
             ref: ref(),
             path: path(),
             limit: limit(),
@@ -79,7 +82,7 @@ export default function TreeScreen() {
   );
 
   const staleCursorReloadHref = () => treeReloadHref({
-    repo: params.repo!,
+    repo: repo(),
     ref: ref(),
     path: path(),
     limit: limit(),
@@ -90,32 +93,32 @@ export default function TreeScreen() {
   const parentHref = () => {
     const segs = path().split("/").filter(Boolean);
     if (segs.length === 0) return undefined; // the root has no parent row
-    const parent = segs.slice(0, -1).map(encodeURIComponent).join("/");
-    return treeHref({ repo: params.repo!, ref: ref(), path: parent });
+    const parent = segs.slice(0, -1).join("/");
+    return treeHref({ repo: repo(), ref: ref(), path: parent });
   };
 
   const blobHrefForFile = () =>
-    `/git/repos/${params.repo}/blob/${encodeURIComponent(ref())}/${path()
+    `${repoPath()}/blob/${encodeURIComponent(ref())}/${path()
       .split("/")
       .map(encodeURIComponent)
       .join("/")}`;
 
   return (
     <section aria-labelledby="tree-title" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
-      <Title>{path() || ref()} · {params.repo} · Myelin</Title>
+      <Title>{path() || ref()} · {repo()} · Myelin</Title>
       <div style={{ display: "flex", "align-items": "center", gap: "var(--space-3)", "flex-wrap": "wrap" }}>
-        <RepoBreadcrumb repo={params.repo!} refName={ref()} path={path()} kind="tree" />
-        <Show when={params.repo && ref()}>
+        <RepoBreadcrumb repo={repo()} refName={ref()} path={path()} kind="tree" />
+        <Show when={repo() && ref()}>
           <RefSwitcher
-            repo={params.repo!}
+            repo={repo()}
             currentRef={ref()}
             currentFullRef={isFullGitRef(ref()) ? ref() : undefined}
-            hrefFor={(ref) => treeHref({ repo: params.repo!, ref, path: path() })}
+            hrefFor={(ref) => treeHref({ repo: repo(), ref, path: path() })}
           />
         </Show>
       </div>
       <h1 id="tree-title" class="sr-only" style={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden", clip: "rect(0 0 0 0)" }}>
-        {params.repo} tree {path() ? `/ ${path()}` : ""} at {ref()}
+        {repo()} tree {path() ? `/ ${path()}` : ""} at {ref()}
       </h1>
 
       <div class="ref-filter" style={{ "max-width": "24rem" }}>
@@ -136,14 +139,14 @@ export default function TreeScreen() {
         return (
           <RepoErrorState
             kind={kind}
-            repo={params.repo}
+            repo={repo()}
             retryHref={kind === "stale-tree" ? staleCursorReloadHref() : undefined}
             onRetry={kind === "stale-tree" ? undefined : reset}
           />
         );
       }}>
         <Suspense fallback={<Skeleton label="Loading directory…" rows={6} rowHeight="2rem" data-testid="tree-loading" />}>
-          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
+          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={repo()} />}>
             <Show when={tree()} keyed>
               {(vm) => (
                 <Show
@@ -155,7 +158,7 @@ export default function TreeScreen() {
                     fallback={<p data-testid="tree-empty" style={{ color: "var(--text-muted)" }}>This directory is empty.</p>}
                   >
                     <TreeList
-                      repo={params.repo!}
+                      repo={repo()}
                       refName={vm.ref ?? ref()}
                       path={path()}
                       entries={vm.entries ?? []}

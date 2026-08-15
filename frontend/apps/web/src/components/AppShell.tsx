@@ -19,6 +19,7 @@ import { codeSearchHref } from "../lib/code-search";
 import { CommandPalette, type Command } from "./CommandPalette";
 import { InboxDialog } from "./InboxDialog";
 import { cycleTheme as cycleAppearance } from "../lib/theme";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "../lib/git-route";
 
 /** The shell context a nested route uses to fill the shell-owned context-pane region (§1b). A route
  *  calls `setContextPane(() => <Pane/>)` in an effect (with `onCleanup(() => setContextPane(null))`);
@@ -108,7 +109,7 @@ export function AppShell(props: AppShellProps) {
   // entry. `undefined` off a repo route.
   const currentRepo = (): string | undefined => {
     const m = /^\/git\/repos\/([^/]+)/.exec(location.pathname);
-    return m?.[1];
+    return parseGitRepositoryRouteParam(m?.[1]) ?? undefined;
   };
 
   const [paletteOpen, setPaletteOpen] = createSignal(false);
@@ -195,7 +196,7 @@ export function AppShell(props: AppShellProps) {
             id: "pr:repo",
             label: "Go to pull requests",
             icon: "pull-request" as IconName,
-            run: () => navigate(`/git/repos/${currentRepo()}/prs`),
+            run: () => navigate(`${gitRepositoryPath(currentRepo()!)}/prs`),
           },
         ]
       : []),

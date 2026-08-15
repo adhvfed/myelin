@@ -199,7 +199,7 @@ test.describe("R3.5 first-run — honest inbox", () => {
     await expectNoAxeViolations(page, "a recovered inbox approval");
   });
 
-  test("loads the rest of a long inbox without replacing what is already visible", async ({ page }) => {
+  test("keeps a long inbox intact and opens its namespaced Git destination", async ({ page }) => {
     await setEdgeConfig({ inboxPagination: true });
     await page.goto("/login");
     await page.waitForLoadState("networkidle");
@@ -210,21 +210,37 @@ test.describe("R3.5 first-run — honest inbox", () => {
     await expect(inboxButton).toHaveAttribute("aria-label", /1 unread notification/i);
     await inboxButton.click();
     const dialog = page.getByRole("dialog", { name: "Inbox" });
-    const firstPullRequest = dialog.getByRole("link", { name: "platform/myelin #42" });
-    await expect(firstPullRequest).toHaveAttribute("href", "/git/repos/platform%2Fmyelin/prs/42");
+    const firstPullRequest = dialog.getByRole("link", { name: "platform/myelin #1" });
+    await expect(firstPullRequest).toHaveAttribute("href", "/git/repos/platform%2Fmyelin/prs/1");
     await expect(firstPullRequest).toHaveAttribute(
       "title",
-      "myelin://acme/git/pr/platform/myelin:42",
+      "myelin://acme/git/pr/platform/myelin:1",
     );
-    await expect(dialog.getByRole("link", { name: "platform/myelin #43" })).toHaveCount(0);
+    await expect(dialog.getByRole("link", { name: "platform/myelin #2" })).toHaveCount(0);
 
     await dialog.getByRole("button", { name: "Load more" }).click();
     await expect(firstPullRequest).toBeVisible();
-    await expect(dialog.getByRole("link", { name: "platform/myelin #43" }))
-      .toHaveAttribute("href", "/git/repos/platform%2Fmyelin/prs/43");
+    await expect(dialog.getByRole("link", { name: "platform/myelin #2" }))
+      .toHaveAttribute("href", "/git/repos/platform%2Fmyelin/prs/2");
     await expect(dialog.getByRole("button", { name: "Load more" })).toHaveCount(0);
     await expect(inboxButton).toHaveAttribute("aria-label", /2 unread notifications/i);
     await expectNoAxeViolations(page, "a paged inbox");
+
+    await firstPullRequest.click();
+    await page.waitForURL("**/git/repos/platform%2Fmyelin/prs/1");
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "R3.3 PR overview + context pane" }))
+      .toBeVisible();
+    const breadcrumb = page.getByRole("navigation", { name: "Breadcrumb" });
+    const repository = breadcrumb.getByRole("link", { name: "platform/myelin" });
+    await expect(repository).toHaveAttribute("href", "/git/repos/platform%2Fmyelin");
+
+    await repository.click();
+    await page.waitForURL("**/git/repos/platform%2Fmyelin");
+    await expect(page.getByRole("heading", { name: "acme/platform/myelin" })).toBeVisible();
+    await page.getByRole("link", { name: "README.md" }).click();
+    await page.waitForURL("**/git/repos/platform%2Fmyelin/blob/**/README.md");
+    await expect(page.getByRole("heading", { name: /README\.md/ })).toBeVisible();
   });
 });
 

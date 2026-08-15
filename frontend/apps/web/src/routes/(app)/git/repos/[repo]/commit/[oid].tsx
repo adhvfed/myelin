@@ -6,6 +6,7 @@ import { Skeleton, SkeletonBlock, DiffViewer, type DiffViewerFile } from "@myeli
 import { getCommit, type DiffFileVM } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
+import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 /** The commit-diff VM carries flat `lines[]`; wrap them in a synthetic hunk so the shared
  *  DiffViewer (hunk-structured) renders them. Line numbers are absent on this legacy shape — the viewer
@@ -37,28 +38,29 @@ export default function CommitDiffScreen() {
   const [view, setView] = createSignal<"split" | "unified">("unified");
   // The commit diff KEEPS the arrival ref (finding 6: never reset the breadcrumb to a hardcoded 'main').
   const arrivalRef = () => (typeof search.ref === "string" && search.ref ? search.ref : "main");
-  const ready = () => Boolean(params.repo && params.oid);
+  const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
+  const repoPath = () => gitRepositoryPath(repo());
+  const ready = () => Boolean(repo() && params.oid);
   const commit = createAsync(
     async () => {
-      const repo = params.repo;
       const oid = params.oid;
-      return repo && oid ? getCommit({ repo, oid }) : undefined;
+      return ready() && oid ? getCommit({ repo: repo(), oid }) : undefined;
     },
     { deferStream: true },
   );
 
   return (
     <section aria-labelledby="diff-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-      <Title>{(params.oid ?? "commit").slice(0, 12)} · {params.repo} · Myelin</Title>
+      <Title>{(params.oid ?? "commit").slice(0, 12)} · {repo()} · Myelin</Title>
       <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)", display: "flex", gap: "var(--space-1)", "align-items": "center", "flex-wrap": "wrap" }}>
         <A href="/git/repos" style={{ color: "var(--text-muted)" }}>Repositories</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}`} style={{ color: "var(--text-muted)" }}>{params.repo}</A>
+        <A href={repoPath()} style={{ color: "var(--text-muted)" }}>{repo()}</A>
         <span aria-hidden="true">/</span>
-        <A href={`/git/repos/${params.repo}/commits/${encodeURIComponent(arrivalRef())}`} style={{ color: "var(--text-muted)" }}>commits on {arrivalRef()}</A>
+        <A href={`${repoPath()}/commits/${encodeURIComponent(arrivalRef())}`} style={{ color: "var(--text-muted)" }}>commits on {arrivalRef()}</A>
       </nav>
 
-      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={params.repo} onRetry={reset} />}>
+      <ErrorBoundary fallback={(err, reset) => <RepoErrorState kind={errKind(err)} repo={repo()} onRetry={reset} />}>
         <Suspense
           fallback={
             <Skeleton label="Loading commit…" data-testid="commit-loading">
@@ -67,7 +69,7 @@ export default function CommitDiffScreen() {
             </Skeleton>
           }
         >
-          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={params.repo} />}>
+          <Show when={ready()} fallback={<RepoErrorState kind="not-found" repo={repo()} />}>
             <Show when={commit()} keyed>
               {(c) => (
                 <>

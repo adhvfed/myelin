@@ -3,6 +3,7 @@
 import { Show } from "solid-js";
 import { A } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";
+import { gitRepositoryPath } from "~/lib/git-route";
 import { REPO_ERR_PREFIX, RepoRouteError, type RepoErrorKind } from "~/lib/api";
 
 /** Extract the mapped kind from a thrown error (the `RepoRouteError.kind`, or the `REPO_ERR:<kind>`
@@ -89,7 +90,7 @@ function NotFoundStaleOrError(props: RepoErrorStateProps) {
         </p>
         <div style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap", "justify-content": "center" }}>
           <Show when={props.repo}>
-            <A href={`/git/repos/${props.repo}`} style={btn}>
+            <A href={gitRepositoryPath(props.repo!)} style={btn}>
               <Icon name="repo" /> Repo home
             </A>
           </Show>
@@ -116,12 +117,12 @@ function DiffCapacityStaleOrError(props: RepoErrorStateProps) {
         </p>
         <div style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap", "justify-content": "center" }}>
           <Show when={props.repo && props.prNumber}>
-            <A href={`/git/repos/${props.repo}/prs/${props.prNumber}`} style={btn}>
+            <A href={`${gitRepositoryPath(props.repo!)}/prs/${props.prNumber}`} style={btn}>
               <Icon name="repo" /> Pull request overview
             </A>
           </Show>
           <Show when={props.repo}>
-            <A href={`/git/repos/${props.repo}`} style={btn}>
+            <A href={gitRepositoryPath(props.repo!)} style={btn}>
               <Icon name="nav-code" /> Repo home
             </A>
           </Show>
