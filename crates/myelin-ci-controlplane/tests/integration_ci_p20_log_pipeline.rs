@@ -43,7 +43,7 @@ async fn sealed_segment_flushes_to_real_rustfs_and_round_trips() {
                     CoalesceBudget::default(),
                     SealThreshold { seal_at_bytes: 1 },
                 );
-            let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+            let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
             p.ship_line(&coord, &line_for_thread)
                 .expect("in-region ship");
             assert_eq!(p.segment_rows().len(), 1, "one sealed segment");
@@ -131,7 +131,7 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
     let coord = LogCoord::new(
         "33333333-3333-3333-3333-333333333333",
         "44444444-4444-4444-4444-444444444444",
-        "1",
+        1,
     );
     for _ in 0..8 {
         p.ship_line(&coord, "0123456789").expect("ship");

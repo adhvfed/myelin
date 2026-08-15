@@ -10,7 +10,7 @@ use crate::log_pipeline::{
     SealThreshold, SecretRedactor,
 };
 
-pub const SINGLE_STEP_ID: &str = "0";
+pub const SINGLE_STEP_NO: u32 = 0;
 
 pub const PRODUCTION_LOG_SEGMENT_MAX_BYTES: usize =
     SealThreshold::DEFAULT_SEAL_AT_BYTES as usize + 3 * myelin_ci_sandbox::SANDBOX_CAPTURE_BOUND;
@@ -141,7 +141,7 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
                     SecretRedactor::for_job(std::iter::empty::<String>()),
                 );
                 pipeline.resume_stream(
-                    &LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_ID),
+                    &LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_NO),
                     resume.step_byte_start,
                     resume.next_byte_offset,
                     resume.next_segment_seq,
@@ -151,7 +151,7 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
                     pipeline,
                 }
             });
-            let coord = LogCoord::new(&open.canonical_run_id, job_id, SINGLE_STEP_ID);
+            let coord = LogCoord::new(&open.canonical_run_id, job_id, SINGLE_STEP_NO);
             open.pipeline
                 .ship_frame(&coord, frame)
                 .map_err(|error| error.to_string())?;
@@ -211,7 +211,7 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
                     &LogCoord::new(
                         resume.canonical_run_id.as_deref().unwrap_or(run_id),
                         job_id,
-                        SINGLE_STEP_ID,
+                        SINGLE_STEP_NO,
                     ),
                     resume.step_byte_start,
                     resume.next_byte_offset,
@@ -225,7 +225,7 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
                 }
             }
         };
-        let coord = LogCoord::new(&open.canonical_run_id, job_id, SINGLE_STEP_ID);
+        let coord = LogCoord::new(&open.canonical_run_id, job_id, SINGLE_STEP_NO);
         let status = if passed {
             AnchorStatus::Passed
         } else {
@@ -235,7 +235,7 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
             .close_step(&coord, status)
             .map_err(|error| error.to_string())?;
         open.pipeline
-            .flush_job(&open.canonical_run_id, job_id, SINGLE_STEP_ID)
+            .flush_job(&open.canonical_run_id, job_id, SINGLE_STEP_NO)
             .map_err(|error| error.to_string())?;
         let flushed = FlushedJobLogs {
             run_id: open.canonical_run_id,
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(job.anchors.len(), 1, "one step anchor");
         let anchor = &job.anchors[0];
         assert_eq!(anchor.status, AnchorStatus::Passed);
-        assert_eq!(anchor.step_id, SINGLE_STEP_ID);
+        assert_eq!(anchor.step_id, SINGLE_STEP_NO.to_string());
         assert!(
             anchor.byte_end.is_some(),
             "a finished step's anchor is closed"

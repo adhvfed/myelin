@@ -8,7 +8,7 @@ use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::log_pipeline::{LogAvailablePointer, INSERT_LOG_SEGMENT_QUERY, UPSERT_LOG_ANCHOR_QUERY};
-use crate::log_sink::{FlushedJobLogs, LogPersist, LogResume, SINGLE_STEP_ID};
+use crate::log_sink::{FlushedJobLogs, LogPersist, LogResume, SINGLE_STEP_NO};
 
 pub struct DurableLogPersist {
     pool: PgPool,
@@ -105,7 +105,7 @@ impl DurableLogPersist {
                 .bind(&region_bind)
                 .bind(run)
                 .bind(job)
-                .bind(SINGLE_STEP_ID)
+                .bind(SINGLE_STEP_NO.to_string())
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|error| PgError::Query(error.to_string()))?;
@@ -342,7 +342,9 @@ impl DurableLogPersist {
                     }
                 }
                 for ptr in &flushed.pointers {
-                    let envelope = ci_log_available_envelope(&tenant_owned, &region_owned, ptr);
+                    let envelope =
+                        ci_log_available_envelope(&tenant_owned, &region_owned, ptr)
+                            .map_err(|error| PgError::Query(error.to_string()))?;
                     let aggregate = envelope.aggregate.0.clone();
                     PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &envelope)
                         .await
@@ -359,8 +361,8 @@ fn ci_log_available_envelope(
     tenant: &TenantId,
     region: &str,
     ptr: &LogAvailablePointer,
-) -> EventEnvelope {
-    let draft = ptr.to_draft();
+) -> Result<EventEnvelope, crate::log_pipeline::LogReferenceError> {
+    let draft = ptr.to_draft(tenant)?;
     let ctx = EmitContext {
         event_id: ci_log_event_id(tenant, ptr),
         tenant: tenant.clone(),
@@ -375,7 +377,7 @@ fn ci_log_available_envelope(
         recorded_at: Timestamp("2026-07-17T00:00:00Z".into()),
         caused_by: None,
     };
-    derive_envelope(draft, ctx, None)
+    Ok(derive_envelope(draft, ctx, None))
 }
 
 fn ci_log_event_id(tenant: &TenantId, ptr: &LogAvailablePointer) -> EventId {
@@ -389,7 +391,7 @@ fn ci_log_event_id(tenant: &TenantId, ptr: &LogAvailablePointer) -> EventId {
         tenant.as_str(),
         canon(&ptr.coord.run_id),
         canon(&ptr.coord.job_id),
-        ptr.coord.step_id,
+        ptr.coord.step_no,
         ptr.byte_start,
         ptr.byte_end,
     );

@@ -4,6 +4,7 @@ use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::{Region, TenantId};
 
 use myelin_ci_sandbox::events::CI_LOG_AVAILABLE;
+use myelin_refs::{mint, parse, ParseError, Sub};
 
 // @residency-write — the residency-pin write-boundary (layer-3) leg arms on this file: a log_segment /
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,19 +148,50 @@ impl SecretRedactor {
 pub struct LogCoord {
     pub run_id: String,
     pub job_id: String,
-    pub step_id: String,
+    pub step_no: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogReferenceError {
+    InvalidCoordinate {
+        component: &'static str,
+        reason: &'static str,
+    },
+    InvalidReference(ParseError),
+}
+
+impl std::fmt::Display for LogReferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogReferenceError::InvalidCoordinate { component, reason } => {
+                write!(f, "invalid CI log {component}: {reason}")
+            }
+            LogReferenceError::InvalidReference(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for LogReferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LogReferenceError::InvalidCoordinate { .. } => None,
+            LogReferenceError::InvalidReference(error) => Some(error),
+        }
+    }
+}
+
+impl From<ParseError> for LogReferenceError {
+    fn from(error: ParseError) -> Self {
+        LogReferenceError::InvalidReference(error)
+    }
 }
 
 impl LogCoord {
-    pub fn new(
-        run_id: impl Into<String>,
-        job_id: impl Into<String>,
-        step_id: impl Into<String>,
-    ) -> LogCoord {
+    pub fn new(run_id: impl Into<String>, job_id: impl Into<String>, step_no: u32) -> LogCoord {
         LogCoord {
             run_id: run_id.into(),
             job_id: job_id.into(),
-            step_id: step_id.into(),
+            step_no,
         }
     }
 
@@ -167,11 +199,46 @@ impl LogCoord {
         FirehoseScope::parse(&format!("run:{}", self.run_id))
     }
 
-    pub fn details_ref(&self) -> ArtifactRef {
-        ArtifactRef(format!(
-            "myelin://ci/run/{}/job/{}#step-{}",
-            self.run_id, self.job_id, self.step_id
-        ))
+    pub fn log_ref(&self, tenant: &TenantId) -> Result<ArtifactRef, LogReferenceError> {
+        self.validate_identity()?;
+        Ok(parse(&format!(
+            "myelin://{}/ci/log/{}:{}:{}",
+            tenant.as_str(),
+            self.run_id,
+            self.job_id,
+            self.step_no
+        ))?)
+    }
+
+    pub fn details_ref(&self, tenant: &TenantId) -> Result<ArtifactRef, LogReferenceError> {
+        self.validate_identity()?;
+        let run = parse(&format!(
+            "myelin://{}/ci/run/{}",
+            tenant.as_str(),
+            self.run_id
+        ))?;
+        Ok(mint(&run, Sub::Step(u64::from(self.step_no)))?)
+    }
+
+    fn validate_identity(&self) -> Result<(), LogReferenceError> {
+        for (component, value) in [("run id", self.run_id.as_str()), ("job id", &self.job_id)] {
+            if value.is_empty() {
+                return Err(LogReferenceError::InvalidCoordinate {
+                    component,
+                    reason: "the id is empty",
+                });
+            }
+            if value
+                .chars()
+                .any(|character| matches!(character, ':' | '/' | '#') || character.is_whitespace())
+            {
+                return Err(LogReferenceError::InvalidCoordinate {
+                    component,
+                    reason: "the id contains whitespace or a reserved `:`, `/`, or `#` delimiter",
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -296,23 +363,23 @@ pub struct LogAvailablePointer {
 }
 
 impl LogAvailablePointer {
-    pub fn subject(&self) -> ArtifactRef {
-        self.coord.details_ref()
+    pub fn subject(&self, tenant: &TenantId) -> Result<ArtifactRef, LogReferenceError> {
+        self.coord.log_ref(tenant)
     }
 
-    pub fn to_draft(&self) -> EventDraft {
+    pub fn to_draft(&self, tenant: &TenantId) -> Result<EventDraft, LogReferenceError> {
         let payload = serde_json::json!({
             "run": format!("ci/run/{}", self.coord.run_id),
             "job": self.coord.job_id,
-            "step": self.coord.step_id,
+            "step": self.coord.step_no,
             "byte_start": self.byte_start,
             "byte_end": self.byte_end,
             "segment_ref": self.segment_ref,
-            "details_ref": self.coord.details_ref().0,
+            "details_ref": self.coord.details_ref(tenant)?.0,
         });
-        EventDraft {
+        Ok(EventDraft {
             type_: EventType(CI_LOG_AVAILABLE.to_string()),
-            subject: self.subject(),
+            subject: self.subject(tenant)?,
             aggregate: myelin_events::AggregateKey(format!(
                 "ci/run/{}/job/{}",
                 self.coord.run_id, self.coord.job_id
@@ -322,7 +389,7 @@ impl LogAvailablePointer {
             visibility: Visibility::Internal,
             contains_personal_data: false,
             pii_key_ref: None,
-        }
+        })
     }
 }
 
@@ -409,14 +476,14 @@ impl<B: BlobStore> LogPipeline<B> {
             (
                 coord.run_id.clone(),
                 coord.job_id.clone(),
-                coord.step_id.clone(),
+                coord.step_no.to_string(),
             ),
             LogAnchorRow {
                 tenant_id: self.tenant.as_str().to_string(),
                 region: self.region.as_str().to_string(),
                 run_id: coord.run_id.clone(),
                 job_id: coord.job_id.clone(),
-                step_id: coord.step_id.clone(),
+                step_id: coord.step_no.to_string(),
                 byte_start: step_byte_start,
                 byte_end: None,
                 status: AnchorStatus::Running,
@@ -454,7 +521,7 @@ impl<B: BlobStore> LogPipeline<B> {
                 "ci/run/{}/job/{}/step/{}@{}:{}",
                 coord.run_id,
                 coord.job_id,
-                coord.step_id,
+                coord.step_no,
                 offset,
                 offset + len
             );
@@ -505,7 +572,7 @@ impl<B: BlobStore> LogPipeline<B> {
         let akey = (
             coord.run_id.clone(),
             coord.job_id.clone(),
-            coord.step_id.clone(),
+            coord.step_no.to_string(),
         );
         let st_start = self
             .streams
@@ -519,7 +586,7 @@ impl<B: BlobStore> LogPipeline<B> {
                 region: self.region.as_str().to_string(),
                 run_id: coord.run_id.clone(),
                 job_id: coord.job_id.clone(),
-                step_id: coord.step_id.clone(),
+                step_id: coord.step_no.to_string(),
                 byte_start: st_start,
                 byte_end: None,
                 status: AnchorStatus::Running,
@@ -540,7 +607,7 @@ impl<B: BlobStore> LogPipeline<B> {
         let akey = (
             coord.run_id.clone(),
             coord.job_id.clone(),
-            coord.step_id.clone(),
+            coord.step_no.to_string(),
         );
         if let Some(anchor) = self.anchor_rows.get_mut(&akey) {
             anchor.byte_end = Some(end);
@@ -553,7 +620,7 @@ impl<B: BlobStore> LogPipeline<B> {
                     region: self.region.as_str().to_string(),
                     run_id: coord.run_id.clone(),
                     job_id: coord.job_id.clone(),
-                    step_id: coord.step_id.clone(),
+                    step_id: coord.step_no.to_string(),
                     byte_start: end,
                     byte_end: Some(end),
                     status,
@@ -644,9 +711,9 @@ impl<B: BlobStore> LogPipeline<B> {
         &mut self,
         run_id: &str,
         job_id: &str,
-        step_id: &str,
+        step_no: u32,
     ) -> Result<(), LogPipelineError> {
-        let coord = LogCoord::new(run_id, job_id, step_id);
+        let coord = LogCoord::new(run_id, job_id, step_no);
         self.seal_open_segment(&coord)?;
         Ok(())
     }

@@ -28,7 +28,7 @@ fn pipeline(coalesce_bytes: u64, seal_bytes: u64) -> LogPipeline<FsBlobStore> {
 }
 
 fn coord() -> LogCoord {
-    LogCoord::new("run-1", "job-1", "step-1")
+    LogCoord::new("run-1", "job-1", 1)
 }
 
 #[test]
@@ -201,8 +201,7 @@ fn flush_job_seals_the_trailing_partial_segment() {
         p.segment_rows().is_empty(),
         "nothing sealed yet (below the threshold)"
     );
-    p.flush_job("run-1", "job-1", "step-1")
-        .expect("flush in-region");
+    p.flush_job("run-1", "job-1", 1).expect("flush in-region");
     assert_eq!(
         p.segment_rows().len(),
         1,
@@ -313,7 +312,7 @@ fn the_log_available_pointer_is_references_not_payloads() {
         byte_end: 4096,
         segment_ref: Some("blake3:abc".into()),
     };
-    let draft = ptr.to_draft();
+    let draft = ptr.to_draft(&tenant()).expect("canonical log pointer");
     assert_eq!(
         draft.type_.0, CI_LOG_AVAILABLE,
         "the type is the durable log token"
@@ -330,13 +329,17 @@ fn the_log_available_pointer_is_references_not_payloads() {
         draft.aggregate.0, "ci/run/run-1/job/job-1",
         "per-(run, job)-aggregate ordering"
     );
+    assert_eq!(
+        draft.subject.0, "myelin://01J0ACME/ci/log/run-1:job-1:1",
+        "the searchable document identity is canonical and tenant-bound"
+    );
     let payload = draft.payload.as_object().expect("object payload");
     assert_eq!(payload["byte_start"], 0);
     assert_eq!(payload["byte_end"], 4096);
     assert_eq!(payload["segment_ref"], "blake3:abc");
-    assert!(
-        payload.get("details_ref").is_some(),
-        "carries the jump-to-failure ref"
+    assert_eq!(
+        payload["details_ref"], "myelin://01J0ACME/ci/run/run-1#step-1",
+        "the separate human deep link is canonical and tenant-bound"
     );
 }
 
@@ -380,10 +383,10 @@ fn every_shipped_line_is_a_firehose_frame_on_a_bounded_scope() {
 #[test]
 fn the_firehose_stream_is_the_fixed_ci_log_stream() {
     assert_eq!(CI_LOG_STREAM, "ci-log");
-    let c = LogCoord::new("run-x", "job-y", "3");
+    let c = LogCoord::new("run-x", "job-y", 3);
     assert_eq!(
-        c.details_ref().0,
-        "myelin://ci/run/run-x/job/job-y#step-3",
+        c.details_ref(&tenant()).expect("canonical details ref").0,
+        "myelin://01J0ACME/ci/run/run-x#step-3",
         "the details_ref is the #step-<n> jump-to-failure ref (CI-P21 resolves it)"
     );
 }
@@ -427,7 +430,7 @@ fn the_buffered_index_rows_carry_the_cell_region_and_no_bytes() {
 #[test]
 fn malformed_run_coordinates_are_refused_without_mutating_log_state() {
     let mut p = pipeline(1 << 20, 1);
-    let invalid = LogCoord::new("", "job-1", "step-1");
+    let invalid = LogCoord::new("", "job-1", 1);
 
     assert!(matches!(
         p.ship_line(&invalid, "untrusted output"),
@@ -436,4 +439,25 @@ fn malformed_run_coordinates_are_refused_without_mutating_log_state() {
     assert!(p.segment_rows().is_empty());
     assert!(p.anchor_rows().is_empty());
     assert!(p.drain_pointers().is_empty());
+}
+
+#[test]
+fn ambiguous_log_coordinates_never_become_durable_subjects() {
+    for coord in [
+        LogCoord::new("", "job-1", 1),
+        LogCoord::new("run-1", "", 1),
+        LogCoord::new("run:1", "job-1", 1),
+        LogCoord::new("run-1", "job/1", 1),
+    ] {
+        let pointer = LogAvailablePointer {
+            coord,
+            byte_start: 0,
+            byte_end: 1,
+            segment_ref: None,
+        };
+        assert!(matches!(
+            pointer.to_draft(&tenant()),
+            Err(LogReferenceError::InvalidCoordinate { .. })
+        ));
+    }
 }

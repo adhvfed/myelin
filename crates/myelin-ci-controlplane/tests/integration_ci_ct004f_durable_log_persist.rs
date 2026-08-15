@@ -10,7 +10,7 @@ use myelin_ci_controlplane::{
     ci_controlplane_migrations, log_pipeline::AnchorStatus, log_pipeline::CoalesceBudget,
     log_pipeline::LogAnchorRow, log_pipeline::LogCoord, log_pipeline::LogPipeline,
     log_pipeline::SealThreshold, log_pipeline::SecretRedactor, DurableLogPersist, FlushedJobLogs,
-    LogPersist, LogPipelineSink, CREATE_CI_JOB_SPEC_DDL, CREATE_JOB_QUEUE_DDL, SINGLE_STEP_ID,
+    LogPersist, LogPipelineSink, CREATE_CI_JOB_SPEC_DDL, CREATE_JOB_QUEUE_DDL, SINGLE_STEP_NO,
 };
 use myelin_ci_sandbox::FirehoseSink;
 use myelin_events::OUTBOX_MIGRATION;
@@ -209,7 +209,7 @@ async fn read_back(
     )
     .bind(run)
     .bind(job)
-    .bind(SINGLE_STEP_ID)
+    .bind(SINGLE_STEP_NO.to_string())
     .fetch_one(&mut *conn)
     .await
     .expect("the closed anchor is present");
@@ -570,7 +570,7 @@ async fn concurrent_retries_cannot_overwrite_the_same_committed_append_position(
                 region: region.as_str().to_string(),
                 run_id: run.clone(),
                 job_id: job.clone(),
-                step_id: SINGLE_STEP_ID.into(),
+                step_id: SINGLE_STEP_NO.to_string(),
                 byte_start: 0,
                 byte_end: None,
                 status: AnchorStatus::Running,
@@ -627,12 +627,12 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
                 CoalesceBudget::default(),
                 SealThreshold { seal_at_bytes: 8 },
             );
-            let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
+            let coord = LogCoord::new(&run, &job, SINGLE_STEP_NO);
             for _ in 0..5 {
                 p.ship_line(&coord, "0123456789").expect("ship");
             }
             p.close_step(&coord, AnchorStatus::Passed).expect("close");
-            p.flush_job(&run, &job, SINGLE_STEP_ID).expect("flush");
+            p.flush_job(&run, &job, SINGLE_STEP_NO).expect("flush");
             FlushedJobLogs {
                 run_id: run.clone(),
                 job_id: job.clone(),
@@ -714,7 +714,7 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
                     seal_at_bytes: 1_000_000,
                 },
             );
-            let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
+            let coord = LogCoord::new(&run, &job, SINGLE_STEP_NO);
             for _ in 0..4 {
                 p.ship_line(&coord, "0123456789").expect("ship");
             }

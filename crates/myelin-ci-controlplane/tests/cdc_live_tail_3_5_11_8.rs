@@ -16,7 +16,7 @@ fn region() -> Region {
 #[test]
 fn cdc_3_5_viewer_resume_backfills_the_gap_through_the_real_firehose() {
     let mut fh = Firehose::new();
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord
         .firehose_scope()
         .expect("the bounded run:<id> the transport admits");
@@ -41,7 +41,7 @@ fn cdc_3_5_viewer_resume_backfills_the_gap_through_the_real_firehose() {
 #[test]
 fn cdc_3_5_viewer_decodes_resync_required_over_window() {
     let mut fh = Firehose::with_limits(3, myelin_events::firehose::DEFAULT_INFLIGHT_CAP);
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..6u64 {
         fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
@@ -83,18 +83,18 @@ fn cdc_11_8_details_ref_decodes_through_the_job_step_byte_range_index() {
         CoalesceBudget::default(),
         SealThreshold { seal_at_bytes: 20 },
     );
-    let c = LogCoord::new("01J0RUN", "01J0JOB", "9");
+    let c = LogCoord::new("01J0RUN", "01J0JOB", 9);
     for _ in 0..5 {
         p.ship_line(&c, "0123456789").expect("ship");
     }
     p.close_step(&c, AnchorStatus::Failed).expect("close");
-    p.flush_job("01J0RUN", "01J0JOB", "9").expect("flush");
+    p.flush_job("01J0RUN", "01J0JOB", 9).expect("flush");
 
     let anchors = p.anchor_rows().into_iter().cloned().collect();
     let segments = p.segment_rows().to_vec();
     let resolver = DetailsRefResolver::new(anchors, segments);
 
-    let details_ref = c.details_ref().0;
+    let details_ref = c.details_ref(&tenant()).expect("canonical details ref").0;
     let range = resolver
         .resolve(&details_ref)
         .expect("the producer-written #step-9 anchor decodes (11.8 no-drift)");

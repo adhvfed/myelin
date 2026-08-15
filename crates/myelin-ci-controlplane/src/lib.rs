@@ -216,12 +216,13 @@ pub use crypto_shred_erase::{
 
 pub use log_pipeline::{
     AnchorStatus, CoalesceBudget, CrossRegionLogWrite, LogAnchorRow, LogAvailablePointer, LogCoord,
-    LogPipeline, LogPipelineError, LogSegmentRow, LogWritePin, SealThreshold, SecretRedactor,
-    CI_LOG_STREAM, INSERT_LOG_SEGMENT_QUERY, REDACTION_MARKER, UPSERT_LOG_ANCHOR_QUERY,
+    LogPipeline, LogPipelineError, LogReferenceError, LogSegmentRow, LogWritePin, SealThreshold,
+    SecretRedactor, CI_LOG_STREAM, INSERT_LOG_SEGMENT_QUERY, REDACTION_MARKER,
+    UPSERT_LOG_ANCHOR_QUERY,
 };
 
 pub use log_sink::{
-    FlushedJobLogs, LogPersist, LogPipelineSink, PRODUCTION_LOG_SEGMENT_MAX_BYTES, SINGLE_STEP_ID,
+    FlushedJobLogs, LogPersist, LogPipelineSink, PRODUCTION_LOG_SEGMENT_MAX_BYTES, SINGLE_STEP_NO,
 };
 pub use log_sink_durable::DurableLogPersist;
 

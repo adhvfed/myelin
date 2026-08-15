@@ -1,8 +1,16 @@
+use std::sync::Arc;
+
 use myelin_ci_controlplane::{
-    AnchorStatus, CoalesceBudget, LogCoord, LogPipeline, SealThreshold, SecretRedactor,
-    CI_LOG_STREAM,
+    AnchorStatus, CoalesceBudget, LogAvailablePointer, LogCoord, LogPipeline, SealThreshold,
+    SecretRedactor, CI_LOG_STREAM,
 };
 use myelin_events::firehose::Firehose;
+use myelin_events::{derive_envelope, Actor, EmitContext, EventId, Timestamp};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_search::{
+    ci_log_index_specs, ci_log_search_projection, AclFilter, CiLogProjectionInput,
+    IncrementalIndexer, MapFetcher, MockEmbeddingAdapter,
+};
 use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
 
@@ -26,7 +34,7 @@ fn cdc_11_2_sealed_segment_blob_round_trips_through_blobstore_get() {
         CoalesceBudget::default(),
         SealThreshold { seal_at_bytes: 1 },
     );
-    let c = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let c = LogCoord::new("01J0RUN", "01J0JOB", 1);
     p.ship_line(&c, "the build log line")
         .expect("in-region ship");
 
@@ -72,7 +80,7 @@ fn cdc_11_8_sealed_segment_writes_the_job_step_byte_range_index() {
         CoalesceBudget::default(),
         SealThreshold { seal_at_bytes: 40 },
     );
-    let c = LogCoord::new("01J0RUN", "01J0JOB", "7");
+    let c = LogCoord::new("01J0RUN", "01J0JOB", 7);
     for _ in 0..8 {
         p.ship_line(&c, "0123456789").expect("ship");
     }
@@ -102,9 +110,9 @@ fn cdc_11_8_sealed_segment_writes_the_job_step_byte_range_index() {
         "a terminal anchor closes its byte_end"
     );
     assert_eq!(
-        c.details_ref().0,
-        "myelin://ci/run/01J0RUN/job/01J0JOB#step-7",
-        "the details_ref addresses the (job, step) anchor (the jump-to-failure path)"
+        c.details_ref(&tenant()).expect("canonical details ref").0,
+        "myelin://01J0ACME/ci/run/01J0RUN#step-7",
+        "the details_ref is the canonical tenant-bound jump-to-failure path"
     );
     for seg in p.segment_rows() {
         assert!(
@@ -120,7 +128,7 @@ fn cdc_11_8_sealed_segment_writes_the_job_step_byte_range_index() {
 
 #[test]
 fn cdc_3_5_live_tail_rides_the_firehose_on_a_bounded_run_scope() {
-    let c = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let c = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = c.firehose_scope().expect("a bounded run:<id> scope");
     assert_eq!(
         scope.selector(),
@@ -171,11 +179,11 @@ fn cdc_producer_end_to_end_rides_all_three_consumed_surfaces() {
             seal_at_bytes: 4096,
         },
     );
-    let c = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let c = LogCoord::new("01J0RUN", "01J0JOB", 1);
     for _ in 0..1000 {
         p.ship_line(&c, "a sixteen-byte!!").expect("ship");
     }
-    p.flush_job("01J0RUN", "01J0JOB", "1").expect("flush");
+    p.flush_job("01J0RUN", "01J0JOB", 1).expect("flush");
 
     assert_eq!(
         p.lines_shipped(),
@@ -200,4 +208,72 @@ fn cdc_producer_end_to_end_rides_all_three_consumed_surfaces() {
         p.admitted_log_writes() > 0,
         "the residency-pin admitted only in-region writes"
     );
+}
+
+#[test]
+fn ci_log_available_from_the_real_producer_is_searchable_under_its_parent_run_grant() {
+    let pointer = LogAvailablePointer {
+        coord: LogCoord::new("01J0RUN", "01J0JOB", 7),
+        byte_start: 0,
+        byte_end: 21,
+        segment_ref: Some("blake3:segment".into()),
+    };
+    let draft = pointer
+        .to_draft(&tenant())
+        .expect("the producer mints one canonical tenant-bound event");
+    assert_eq!(
+        draft.subject.0, "myelin://01J0ACME/ci/log/01J0RUN:01J0JOB:7",
+        "the event subject is the searchable log document, not a scope-less deep link"
+    );
+    assert_eq!(
+        draft.payload["details_ref"], "myelin://01J0ACME/ci/run/01J0RUN#step-7",
+        "the payload separately carries the human jump-to-step link"
+    );
+
+    let projection = ci_log_search_projection(&CiLogProjectionInput {
+        run_id: "myelin://01J0ACME/ci/run/01J0RUN".into(),
+        job_id: "01J0JOB".into(),
+        step_no: 7,
+        log_text: "compile failed in scheduler".into(),
+        lang: None,
+    });
+    let fetcher = Arc::new(MapFetcher::new([(draft.subject.0.clone(), projection)]));
+    let indexer = IncrementalIndexer::new(
+        ci_log_index_specs(),
+        fetcher,
+        Arc::new(MockEmbeddingAdapter::new(8)),
+    );
+    let event = derive_envelope(
+        draft,
+        EmitContext {
+            event_id: EventId("ci-log-available-7".into()),
+            tenant: tenant(),
+            region: region(),
+            actor: Actor(Principal::stub(
+                PrincipalId("ci-controlplane".into()),
+                PrincipalKind::Service,
+                tenant(),
+            )),
+            schema_ver: 1,
+            occurred_at: Timestamp("2026-08-15T00:00:00Z".into()),
+            recorded_at: Timestamp("2026-08-15T00:00:00Z".into()),
+            caused_by: None,
+        },
+        None,
+    );
+
+    indexer
+        .index(&event)
+        .expect("Search accepts the exact event CI persists");
+    let hits = indexer
+        .search_ft(
+            &tenant(),
+            &region(),
+            &AclFilter::ids(["myelin://01J0ACME/ci/run/01J0RUN"]),
+            "scheduler",
+            10,
+        )
+        .expect("the parent-authorized query succeeds");
+    assert_eq!(hits.len(), 1, "one run grant reveals its failing log step");
+    assert_eq!(hits[0].doc_id, event.subject.0);
 }

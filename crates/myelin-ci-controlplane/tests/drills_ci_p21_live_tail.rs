@@ -17,7 +17,7 @@ fn region() -> Region {
 #[test]
 fn ci_d11_reconnect_mid_run_loses_zero_lines() {
     let mut fh = Firehose::new();
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded run:<id>");
 
     let mut tail = LiveTail::new(&mut fh, SegmentIndex::default());
@@ -71,7 +71,7 @@ fn ci_d11_reconnect_mid_run_loses_zero_lines() {
 #[test]
 fn ci_d11_out_of_window_last_seq_falls_back_to_a_range_read() {
     let mut fh = Firehose::with_limits(4, DEFAULT_INFLIGHT_CAP);
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 1..=12u64 {
         fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")));
@@ -112,7 +112,7 @@ fn ci_d11_out_of_window_last_seq_falls_back_to_a_range_read() {
 
 #[test]
 fn ci_d11_scope_stays_bounded_never_star() {
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded run:<id>");
     assert_eq!(
         scope.selector(),
@@ -149,18 +149,18 @@ fn ci_d11_details_ref_jump_to_failure_resolves_zero_dangling_anchors() {
         SealThreshold { seal_at_bytes: 16 },
     );
 
-    let s1 = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let s1 = LogCoord::new("01J0RUN", "01J0JOB", 1);
     for _ in 0..4 {
         p.ship_line(&s1, "0123456789").expect("ship");
     }
     p.close_step(&s1, AnchorStatus::Passed).expect("close");
 
-    let s2 = LogCoord::new("01J0RUN", "01J0JOB", "2");
+    let s2 = LogCoord::new("01J0RUN", "01J0JOB", 2);
     for _ in 0..3 {
         p.ship_line(&s2, "FAIL-LINE!").expect("ship");
     }
     p.close_step(&s2, AnchorStatus::Failed).expect("close");
-    p.flush_job("01J0RUN", "01J0JOB", "2").expect("flush");
+    p.flush_job("01J0RUN", "01J0JOB", 2).expect("flush");
 
     assert_eq!(
         p.dangling_anchor_count(),
@@ -172,8 +172,8 @@ fn ci_d11_details_ref_jump_to_failure_resolves_zero_dangling_anchors() {
     let segments = p.segment_rows().to_vec();
     let resolver = DetailsRefResolver::new(anchors, segments);
 
-    let ref1 = s1.details_ref().0;
-    let ref2 = s2.details_ref().0;
+    let ref1 = s1.details_ref(&tenant()).expect("canonical step 1 ref").0;
+    let ref2 = s2.details_ref(&tenant()).expect("canonical step 2 ref").0;
     assert_eq!(
         resolver.dangling_anchor_count([ref1.as_str(), ref2.as_str()]),
         0,

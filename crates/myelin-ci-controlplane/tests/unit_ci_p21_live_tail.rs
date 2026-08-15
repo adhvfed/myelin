@@ -38,7 +38,7 @@ fn anchor(
 #[test]
 fn resume_backfills_the_gap_then_goes_live_losing_zero_lines() {
     let mut fh = Firehose::new();
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded run:<id>");
 
     fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-1"));
@@ -77,7 +77,7 @@ fn resume_backfills_the_gap_then_goes_live_losing_zero_lines() {
 #[test]
 fn subscribe_with_no_cursor_starts_live_from_now() {
     let mut fh = Firehose::new();
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("old-1"));
     fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("old-2"));
@@ -98,7 +98,7 @@ fn subscribe_with_no_cursor_starts_live_from_now() {
 #[test]
 fn resume_at_head_is_a_no_op_backfill() {
     let mut fh = Firehose::new();
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..5 {
         fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
@@ -117,7 +117,7 @@ fn resume_at_head_is_a_no_op_backfill() {
 #[test]
 fn out_of_window_last_seq_yields_resync_required_then_range_reads_the_archive() {
     let mut fh = Firehose::with_limits(3, myelin_events::firehose::DEFAULT_INFLIGHT_CAP);
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..6 {
         fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
@@ -181,7 +181,7 @@ fn out_of_window_last_seq_yields_resync_required_then_range_reads_the_archive() 
 #[test]
 fn the_window_floor_boundary_backfills_not_resyncs() {
     let mut fh = Firehose::with_limits(3, myelin_events::firehose::DEFAULT_INFLIGHT_CAP);
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..6 {
         fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
@@ -203,7 +203,7 @@ fn the_window_floor_boundary_backfills_not_resyncs() {
 
 #[test]
 fn the_viewer_scope_is_bounded_run_id_never_star() {
-    let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded run:<id>");
     assert_eq!(
         scope.selector(),
@@ -259,8 +259,11 @@ fn details_ref_resolves_through_the_anchor_to_a_byte_range() {
     }];
     let resolver = DetailsRefResolver::new(anchors, segments);
 
-    let details_ref = LogCoord::new("01J0RUN", "01J0JOB", "7").details_ref().0;
-    assert_eq!(details_ref, "myelin://ci/run/01J0RUN/job/01J0JOB#step-7");
+    let details_ref = LogCoord::new("01J0RUN", "01J0JOB", 7)
+        .details_ref(&tenant())
+        .expect("canonical details ref")
+        .0;
+    assert_eq!(details_ref, "myelin://01J0ACME/ci/run/01J0RUN#step-7");
 
     let range = resolver
         .resolve(&details_ref)
@@ -400,15 +403,15 @@ fn producer_to_viewer_round_trip_reads_the_failed_steps_bytes() {
         SealThreshold { seal_at_bytes: 1 },
     );
 
-    let s1 = LogCoord::new("01J0RUN", "01J0JOB", "1");
+    let s1 = LogCoord::new("01J0RUN", "01J0JOB", 1);
     p.ship_line(&s1, "AAAAAAAAAA").expect("ship");
     p.ship_line(&s1, "BBBBBBBBBB").expect("ship");
     p.close_step(&s1, AnchorStatus::Passed).expect("close");
 
-    let s2 = LogCoord::new("01J0RUN", "01J0JOB", "2");
+    let s2 = LogCoord::new("01J0RUN", "01J0JOB", 2);
     p.ship_line(&s2, "CCCCCCCCCC").expect("ship");
     p.close_step(&s2, AnchorStatus::Failed).expect("close");
-    p.flush_job("01J0RUN", "01J0JOB", "2").expect("flush");
+    p.flush_job("01J0RUN", "01J0JOB", 2).expect("flush");
 
     assert_eq!(p.dangling_anchor_count(), 0);
 
@@ -416,7 +419,7 @@ fn producer_to_viewer_round_trip_reads_the_failed_steps_bytes() {
     let segments: Vec<_> = p.segment_rows().to_vec();
     let resolver = DetailsRefResolver::new(anchors, segments.clone());
 
-    let details_ref = s2.details_ref().0;
+    let details_ref = s2.details_ref(&tenant()).expect("canonical details ref").0;
     let range = resolver
         .resolve(&details_ref)
         .expect("the failed step resolves");
