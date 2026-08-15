@@ -26,10 +26,61 @@ pub struct IssueDraft {
     pub reporter_pseudonym: String,
 }
 
+/// The durable body of an issue update and the projection metadata it invalidates.
+///
+/// Keeping these values together prevents the write path from publishing an `issue.updated`
+/// event that downstream facet projections cannot interpret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueUpdate {
+    delta: Vec<u8>,
+    type_id: String,
+    changed_facets: Vec<String>,
+}
+
+impl IssueUpdate {
+    pub fn new<I, S>(
+        delta: Vec<u8>,
+        type_id: impl Into<String>,
+        changed_facets: I,
+    ) -> Result<IssueUpdate, WriteError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let update = IssueUpdate {
+            delta,
+            type_id: type_id.into(),
+            changed_facets: changed_facets.into_iter().map(Into::into).collect(),
+        };
+        update.validate()?;
+        Ok(update)
+    }
+
+    pub fn delta(&self) -> &[u8] {
+        &self.delta
+    }
+
+    pub fn type_id(&self) -> &str {
+        &self.type_id
+    }
+
+    pub fn changed_facets(&self) -> &[String] {
+        &self.changed_facets
+    }
+
+    fn validate(&self) -> Result<(), WriteError> {
+        if self.delta.is_empty() {
+            return Err(WriteError::Invalid("update delta must not be empty".into()));
+        }
+        validate_type_id(&self.type_id).map_err(WriteError::Invalid)?;
+        validate_changed_facets(&self.changed_facets).map_err(WriteError::Invalid)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutationKind {
     Create(IssueDraft),
-    Update { delta: Vec<u8> },
+    Update(IssueUpdate),
     Transition { from: String, to: String },
     Assign { assignee_pseudonym: String },
     Watch { watcher_pseudonym: String },
@@ -40,7 +91,7 @@ impl MutationKind {
     pub fn permission(&self) -> Permission {
         match self {
             MutationKind::Create(_)
-            | MutationKind::Update { .. }
+            | MutationKind::Update(_)
             | MutationKind::Assign { .. }
             | MutationKind::ConfidentialGrant { .. } => Permission(PERM_MANAGE.into()),
             MutationKind::Transition { .. } => Permission(PERM_PERFORM_TRANSITION.into()),
@@ -51,7 +102,7 @@ impl MutationKind {
     pub fn event_token(&self) -> Option<&'static str> {
         match self {
             MutationKind::Create(_) => Some(events::ISSUE_CREATED),
-            MutationKind::Update { .. } => Some(events::ISSUE_UPDATED),
+            MutationKind::Update(_) => Some(events::ISSUE_UPDATED),
             MutationKind::Transition { .. } => Some(events::ISSUE_TRANSITIONED),
             MutationKind::Assign { .. } => Some(events::ISSUE_ASSIGNED),
             MutationKind::Watch { .. } | MutationKind::ConfidentialGrant { .. } => None,
@@ -76,7 +127,7 @@ impl MutationKind {
     }
 
     fn carries_personal_data(&self) -> bool {
-        matches!(self, MutationKind::Create(_) | MutationKind::Update { .. })
+        matches!(self, MutationKind::Create(_) | MutationKind::Update(_))
     }
 }
 
@@ -103,6 +154,52 @@ impl std::fmt::Display for WriteError {
 }
 
 impl std::error::Error for WriteError {}
+
+pub(crate) const MAX_CHANGED_FACETS: usize = 256;
+pub(crate) const MAX_FACET_ID_BYTES: usize = 255;
+
+pub(crate) fn validate_type_id(type_id: &str) -> Result<(), String> {
+    if crate::api::is_canonical_uuid(type_id) {
+        Ok(())
+    } else {
+        Err("update type_id must be a canonical lowercase UUID".into())
+    }
+}
+
+pub(crate) fn validate_facet_id(field_id: &str) -> Result<(), String> {
+    if field_id.is_empty() || field_id.len() > MAX_FACET_ID_BYTES {
+        return Err(format!(
+            "changed facet ids must contain 1..={MAX_FACET_ID_BYTES} bytes"
+        ));
+    }
+    if !field_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(
+            "changed facet ids may contain only ASCII letters, digits, `_`, `-`, and `.`".into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_changed_facets(changed_facets: &[String]) -> Result<(), String> {
+    if changed_facets.len() > MAX_CHANGED_FACETS {
+        return Err(format!(
+            "an update may name at most {MAX_CHANGED_FACETS} changed facets"
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for field_id in changed_facets {
+        validate_facet_id(field_id)?;
+        if !seen.insert(field_id) {
+            return Err(format!(
+                "changed facet `{field_id}` must appear at most once"
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteOutcome {
@@ -220,13 +317,7 @@ fn validate(mutation: &MutationKind) -> Result<(), WriteError> {
     };
     match mutation {
         MutationKind::Create(draft) => nonempty("reporter_pseudonym", &draft.reporter_pseudonym),
-        MutationKind::Update { delta } => {
-            if delta.is_empty() {
-                Err(WriteError::Invalid("update delta must not be empty".into()))
-            } else {
-                Ok(())
-            }
-        }
+        MutationKind::Update(update) => update.validate(),
         MutationKind::Transition { from, to } => {
             nonempty("transition.from", from)?;
             nonempty("transition.to", to)?;
@@ -291,6 +382,17 @@ fn event_draft(
         "issue_local_id": issue_local_id,
     });
     match mutation {
+        MutationKind::Update(update) => {
+            payload["type_id"] = serde_json::Value::String(update.type_id.clone());
+            payload["changed_facets"] = serde_json::Value::Array(
+                update
+                    .changed_facets
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
         MutationKind::Transition { from, to } => {
             payload["from"] = serde_json::Value::String(from.clone());
             payload["to"] = serde_json::Value::String(to.clone());
@@ -322,7 +424,7 @@ fn event_draft(
 fn state_change_description(mutation: &MutationKind, issue_local_id: &str) -> String {
     match mutation {
         MutationKind::Create(_) => format!("issue {issue_local_id} created"),
-        MutationKind::Update { .. } => format!("issue {issue_local_id} updated"),
+        MutationKind::Update(_) => format!("issue {issue_local_id} updated"),
         MutationKind::Transition { from, to } => {
             format!("issue {issue_local_id} transitioned {from} -> {to}")
         }
@@ -475,7 +577,8 @@ mod tests {
     use super::*;
     use crate::keys::{HiLoKeyAllocator, InMemoryPrefixCounter};
     use myelin_events::{
-        Actor, CausedBy, EventEnvelope, MonotonicMinter, Region, TenantId, Timestamp,
+        Actor, CausedBy, EventEnvelope, EventHandler, HandleOutcome, MonotonicMinter, Region,
+        TenantId, Timestamp,
     };
     use myelin_identity::{
         AuthzError, Credential, EffectivePolicy, FragmentAdmit, ListObjectsResult,
@@ -486,6 +589,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type IdResult<T> = myelin_identity::Result<T>;
+    const BUG_TYPE_ID: &str = "22222222-2222-2222-2222-222222222222";
 
     struct StubId {
         allow: HashMap<String, Decision>,
@@ -744,9 +848,10 @@ mod tests {
             &id,
             &actor(),
             "ENG-1",
-            &MutationKind::Update {
-                delta: b"priority: 2 -> 1".to_vec(),
-            },
+            &MutationKind::Update(
+                IssueUpdate::new(b"priority: 2 -> 1".to_vec(), BUG_TYPE_ID, ["priority"])
+                    .expect("valid update metadata"),
+            ),
             None,
         )
         .expect("update commits");
@@ -796,6 +901,74 @@ mod tests {
             3,
             "every emitted event carries a distinct stable id"
         );
+    }
+
+    #[test]
+    fn issue_update_rejects_projection_metadata_that_cannot_be_consumed() {
+        assert!(matches!(
+            IssueUpdate::new(Vec::new(), BUG_TYPE_ID, ["severity"]),
+            Err(WriteError::Invalid(_))
+        ));
+        assert!(matches!(
+            IssueUpdate::new(b"delta".to_vec(), "bug", ["severity"]),
+            Err(WriteError::Invalid(_))
+        ));
+        assert!(matches!(
+            IssueUpdate::new(b"delta".to_vec(), BUG_TYPE_ID, ["severity", "severity"]),
+            Err(WriteError::Invalid(_))
+        ));
+        assert!(matches!(
+            IssueUpdate::new(b"delta".to_vec(), BUG_TYPE_ID, ["not a field"]),
+            Err(WriteError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_written_update_drives_its_hot_facet_projection_end_to_end() {
+        use crate::projection_feeder::{CollectionKey, FacetKey, ProjectionFeeder};
+
+        let store = OutboxStore::new();
+        let object = issue_ref("acme", "ENG-8");
+        let id = StubId::new().allowing(PERM_MANAGE, &object);
+        let update = IssueUpdate::new(b"severity: 2 -> 1".to_vec(), BUG_TYPE_ID, ["severity"])
+            .expect("valid update metadata");
+
+        let outcome = apply_mutation(
+            &store,
+            minter(),
+            ctx_base(),
+            &id,
+            &actor(),
+            "ENG-8",
+            &MutationKind::Update(update),
+            None,
+        )
+        .expect("the issue update commits");
+        let row = store
+            .row(&outcome.event_id.expect("an update emits"))
+            .expect("the event co-committed");
+        assert_eq!(row.envelope.subject, object);
+        assert_eq!(row.envelope.payload["issue"], object.0);
+        assert_eq!(row.envelope.payload["issue_local_id"], "ENG-8");
+        assert_eq!(row.envelope.payload["type_id"], BUG_TYPE_ID);
+        assert_eq!(
+            row.envelope.payload["changed_facets"],
+            serde_json::json!(["severity"])
+        );
+
+        let feeder = ProjectionFeeder::new();
+        let collection = CollectionKey::new("acme", BUG_TYPE_ID);
+        for _ in 0..20 {
+            feeder.record_view_execution(&collection, &["severity"]);
+        }
+        for _ in 0..80 {
+            feeder.record_view_execution(&collection, &[]);
+        }
+        assert_eq!(
+            feeder.handle(&row.envelope, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
+        assert!(feeder.is_promoted(&FacetKey::new("acme", BUG_TYPE_ID, "severity")));
     }
 
     #[test]

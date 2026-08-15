@@ -8,6 +8,8 @@ use myelin_issues::events::ISSUE_UPDATED;
 use myelin_issues::projection_feeder::{CollectionKey, FacetKey, ProjectionFeeder};
 use myelin_tenancy::{Region, TenantId};
 
+const BUG_TYPE_ID: &str = "22222222-2222-2222-2222-222222222222";
+
 fn principal() -> Principal {
     Principal::stub(
         PrincipalId("p".into()),
@@ -16,7 +18,8 @@ fn principal() -> Principal {
     )
 }
 
-fn updated_event(event_id: &str, type_: &str, changed_fields: &[&str]) -> EventEnvelope {
+fn updated_event(event_id: &str, type_id: &str, changed_facets: &[&str]) -> EventEnvelope {
+    let issue = "myelin://acme/issue/issue/ENG-1";
     EventEnvelope {
         event_id: EventId(event_id.into()),
         type_: EventType(ISSUE_UPDATED.into()),
@@ -24,7 +27,7 @@ fn updated_event(event_id: &str, type_: &str, changed_fields: &[&str]) -> EventE
         tenant: TenantId("acme".into()),
         region: Region("eu-west".into()),
         actor: Actor(principal()),
-        subject: ArtifactRef("myelin://acme/issue/issue/ENG-1".into()),
+        subject: ArtifactRef(issue.into()),
         aggregate: AggregateKey("issue:ENG-1".into()),
         causation_id: None,
         correlation_id: CorrelationId("root".into()),
@@ -36,7 +39,12 @@ fn updated_event(event_id: &str, type_: &str, changed_fields: &[&str]) -> EventE
         pii_key_ref: None,
         occurred_at: Timestamp("2026-06-21T10:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T10:00:01Z".into()),
-        payload: serde_json::json!({ "type": type_, "changed_fields": changed_fields }),
+        payload: serde_json::json!({
+            "issue": issue,
+            "issue_local_id": "ENG-1",
+            "type_id": type_id,
+            "changed_facets": changed_facets,
+        }),
     }
 }
 
@@ -52,7 +60,7 @@ fn producer_issues_authors_a_star_free_issue_updated_handler() {
         "the feeder NEVER binds a wildcard subscription (BUS-3)"
     );
     let outcome = feeder.handle(
-        &updated_event("p-1", "bug", &["severity"]),
+        &updated_event("p-1", BUG_TYPE_ID, &["severity"]),
         &mut myelin_events::HandlerTx::none(),
     );
     assert_eq!(outcome, HandleOutcome::Done);
@@ -70,7 +78,7 @@ fn consumer_bus_admits_and_drives_the_feeder() {
 
     let msg = Message {
         subject: ISSUE_UPDATED.into(),
-        envelope: updated_event("c-1", "bug", &["severity"]),
+        envelope: updated_event("c-1", BUG_TYPE_ID, &["severity"]),
     };
     assert_eq!(
         consumer.deliver(&msg),
@@ -84,7 +92,7 @@ fn consumer_bus_admits_and_drives_the_feeder() {
 #[test]
 fn consumer_drives_the_measured_promotion_through_the_runtime() {
     let feeder = ProjectionFeeder::new();
-    let coll = CollectionKey::new("acme", "bug");
+    let coll = CollectionKey::new("acme", BUG_TYPE_ID);
     for _ in 0..20 {
         feeder.record_view_execution(&coll, &["severity"]);
     }
@@ -99,10 +107,10 @@ fn consumer_drives_the_measured_promotion_through_the_runtime() {
 
     let msg = Message {
         subject: ISSUE_UPDATED.into(),
-        envelope: updated_event("c-2", "bug", &["severity"]),
+        envelope: updated_event("c-2", BUG_TYPE_ID, &["severity"]),
     };
     assert_eq!(consumer.deliver(&msg), Delivered::Acked);
-    let facet = FacetKey::new("acme", "bug", "severity");
+    let facet = FacetKey::new("acme", BUG_TYPE_ID, "severity");
     assert!(
         consumer.handler().is_promoted(&facet),
         "the hot facet is promoted off the bus (Tier 2) once its issue.updated delivers"

@@ -88,8 +88,8 @@ pub use pg_issue_store::{
 pub use pg_issue_store::{ImportIssue, ImportIssueReceipt};
 
 pub use write_path::{
-    apply_mutation, issue_aggregate_key, issue_ref, IssueDraft, MutationKind, WriteError,
-    WriteOutcome, PERM_COMMENT, PERM_MANAGE, PERM_PERFORM_TRANSITION, PERM_TRANSITION,
+    apply_mutation, issue_aggregate_key, issue_ref, IssueDraft, IssueUpdate, MutationKind,
+    WriteError, WriteOutcome, PERM_COMMENT, PERM_MANAGE, PERM_PERFORM_TRANSITION, PERM_TRANSITION,
 };
 
 pub use dek::{

@@ -124,14 +124,14 @@ pub struct IndexProvisioning {
 
 impl IndexProvisioning {
     pub fn for_facet(facet: &FacetKey) -> IndexProvisioning {
-        let index_name = format!("issue_facet_{}", sanitize_ident(&facet.field_id));
+        let index_name = index_name_for(facet);
+        let field = sql_literal(&facet.field_id);
+        let tenant = sql_literal(&facet.tenant);
+        let type_ = sql_literal(&facet.type_);
         let ddl = format!(
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} \
-             ON {ISSUE_HOT_TABLE} ((props ->> '{field}')) \
-             WHERE tenant_id = '{tenant}' AND type_id::text = '{type_}' AND deleted_at IS NULL",
-            field = facet.field_id,
-            tenant = facet.tenant,
-            type_ = facet.type_,
+             ON {ISSUE_HOT_TABLE} ((props ->> {field})) \
+             WHERE tenant_id = {tenant} AND type_id::text = {type_} AND deleted_at IS NULL",
         );
         IndexProvisioning {
             facet: facet.clone(),
@@ -154,6 +154,7 @@ impl IndexProvisioning {
 fn sanitize_ident(field_id: &str) -> String {
     field_id
         .chars()
+        .take(22)
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
                 c.to_ascii_lowercase()
@@ -162,6 +163,25 @@ fn sanitize_ident(field_id: &str) -> String {
             }
         })
         .collect()
+}
+
+fn index_name_for(facet: &FacetKey) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"myelin.issue.facet-index.v1\0");
+    for part in [&facet.tenant, &facet.type_, &facet.field_id] {
+        hash.update(&(part.len() as u64).to_be_bytes());
+        hash.update(part.as_bytes());
+    }
+    let digest = hash.finalize().to_hex();
+    format!(
+        "issue_facet_{}_{:.24}",
+        sanitize_ident(&facet.field_id),
+        digest
+    )
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,24 +290,58 @@ impl ProjectionFeeder {
         state.promoted.contains(facet)
     }
 
-    fn facets_in_event(ev: &EventEnvelope) -> Vec<FacetKey> {
-        let tenant = ev.tenant.0.clone();
-        let Some(obj) = ev.payload.as_object() else {
-            return Vec::new();
+    fn facets_in_event(ev: &EventEnvelope) -> Result<Vec<FacetKey>, String> {
+        let subject = myelin_refs::parse_scoped(&ev.subject.0)
+            .map_err(|error| format!("invalid issue subject: {error}"))?;
+        if subject.artifact_ref != ev.subject {
+            return Err("issue subject must use its exact canonical representation".into());
+        }
+        if subject.tenant != ev.tenant {
+            return Err("issue subject belongs to another tenant".into());
+        }
+        if subject.subsystem != "issue" || subject.type_ != "issue" || subject.sub.is_some() {
+            return Err("issue.updated subject must identify an issue root".into());
+        }
+
+        let obj = ev
+            .payload
+            .as_object()
+            .ok_or_else(|| "issue.updated payload must be an object".to_string())?;
+        let required_string = |key: &str| {
+            obj.get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("issue.updated payload `{key}` must be a string"))
         };
-        let type_ = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let Some(changed) = obj.get("changed_fields").and_then(|v| v.as_array()) else {
-            return Vec::new();
-        };
-        changed
+
+        let payload_issue = required_string("issue")?;
+        if payload_issue != ev.subject.0 {
+            return Err("issue.updated payload `issue` must equal the envelope subject".into());
+        }
+        let issue_local_id = required_string("issue_local_id")?;
+        if issue_local_id != subject.id {
+            return Err("issue.updated payload `issue_local_id` must equal the subject id".into());
+        }
+
+        let type_id = required_string("type_id")?.to_string();
+        crate::write_path::validate_type_id(&type_id)?;
+        let changed = obj
+            .get("changed_facets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "issue.updated payload `changed_facets` must be an array".to_string())?;
+        let changed_facets = changed
             .iter()
-            .filter_map(|v| v.as_str())
-            .map(|field_id| FacetKey::new(tenant.clone(), type_.clone(), field_id))
-            .collect()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    "issue.updated payload `changed_facets` must contain only strings".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::write_path::validate_changed_facets(&changed_facets)?;
+
+        Ok(changed_facets
+            .into_iter()
+            .map(|field_id| FacetKey::new(ev.tenant.0.clone(), type_id.clone(), field_id))
+            .collect())
     }
 }
 
@@ -309,11 +363,19 @@ impl EventHandler for ProjectionFeeder {
                 ev.type_.0
             )));
         }
+        let facets = match Self::facets_in_event(ev) {
+            Ok(facets) => facets,
+            Err(error) => {
+                return HandleOutcome::NonRetryable(Reason(format!(
+                    "malformed `{ISSUE_UPDATED}` event: {error}"
+                )))
+            }
+        };
         let mut state = self.state.lock().expect("feeder state lock");
         if !state.seen_events.insert(ev.event_id.0.clone()) {
             return HandleOutcome::Done;
         }
-        for facet in Self::facets_in_event(ev) {
+        for facet in facets {
             let _ = Self::evaluate_facet_locked(&mut state, self.threshold, &facet);
         }
         HandleOutcome::Done

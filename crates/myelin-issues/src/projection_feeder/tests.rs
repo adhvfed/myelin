@@ -6,6 +6,8 @@ use myelin_events::{
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 
+const BUG_TYPE_ID: &str = "22222222-2222-2222-2222-222222222222";
+
 fn principal() -> Principal {
     Principal::stub(
         PrincipalId("p".into()),
@@ -17,9 +19,10 @@ fn principal() -> Principal {
 fn updated_event(
     event_id: &str,
     tenant: &str,
-    type_: &str,
-    changed_fields: &[&str],
+    type_id: &str,
+    changed_facets: &[&str],
 ) -> EventEnvelope {
+    let issue = format!("myelin://{tenant}/issue/issue/ENG-1");
     EventEnvelope {
         event_id: EventId(event_id.into()),
         type_: EventType(ISSUE_UPDATED.into()),
@@ -27,7 +30,7 @@ fn updated_event(
         tenant: TenantId(tenant.into()),
         region: Region("eu-west".into()),
         actor: Actor(principal()),
-        subject: ArtifactRef(format!("myelin://{tenant}/issue/issue/ENG-1")),
+        subject: ArtifactRef(issue.clone()),
         aggregate: AggregateKey("issue:ENG-1".into()),
         causation_id: None,
         correlation_id: CorrelationId("root".into()),
@@ -39,7 +42,12 @@ fn updated_event(
         pii_key_ref: None,
         occurred_at: Timestamp("2026-06-21T10:00:00Z".into()),
         recorded_at: Timestamp("2026-06-21T10:00:01Z".into()),
-        payload: serde_json::json!({ "type": type_, "changed_fields": changed_fields }),
+        payload: serde_json::json!({
+            "issue": issue,
+            "issue_local_id": "ENG-1",
+            "type_id": type_id,
+            "changed_facets": changed_facets,
+        }),
     }
 }
 
@@ -151,7 +159,8 @@ fn above_threshold_facet_provisions_a_generated_index() {
     );
     assert!(provisioning.ddl.contains("CREATE INDEX CONCURRENTLY"));
     assert_eq!(provisioning.table, ISSUE_HOT_TABLE);
-    assert_eq!(provisioning.index_name, "issue_facet_severity");
+    assert!(provisioning.index_name.starts_with("issue_facet_severity_"));
+    assert!(provisioning.index_name.len() <= 63);
     assert!(feeder.is_promoted(&facet));
     assert_eq!(
         feeder.catalog_snapshot().posture("severity"),
@@ -214,7 +223,7 @@ fn subjects_whitelist_is_issue_updated_never_star() {
 #[test]
 fn handle_is_idempotent_on_event_id() {
     let feeder = ProjectionFeeder::new();
-    let ev = updated_event("ev-1", "acme", "bug", &["severity"]);
+    let ev = updated_event("ev-1", "acme", BUG_TYPE_ID, &["severity"]);
     assert_eq!(
         feeder.handle(&ev, &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done
@@ -223,13 +232,13 @@ fn handle_is_idempotent_on_event_id() {
         feeder.handle(&ev, &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done
     );
-    assert!(!feeder.is_promoted(&FacetKey::new("acme", "bug", "severity")));
+    assert!(!feeder.is_promoted(&FacetKey::new("acme", BUG_TYPE_ID, "severity")));
 }
 
 #[test]
 fn a_misrouted_event_is_non_retryable() {
     let feeder = ProjectionFeeder::new();
-    let mut ev = updated_event("ev-2", "acme", "bug", &["severity"]);
+    let mut ev = updated_event("ev-2", "acme", BUG_TYPE_ID, &["severity"]);
     ev.type_ = EventType("issue.issue.created".into());
     match feeder.handle(&ev, &mut myelin_events::HandlerTx::none()) {
         HandleOutcome::NonRetryable(_) => {}
@@ -240,8 +249,8 @@ fn a_misrouted_event_is_non_retryable() {
 #[test]
 fn handle_promotes_a_hot_facet_off_the_bus() {
     let feeder = ProjectionFeeder::new();
-    let coll = CollectionKey::new("acme", "bug");
-    let facet = FacetKey::new("acme", "bug", "severity");
+    let coll = CollectionKey::new("acme", BUG_TYPE_ID);
+    let facet = FacetKey::new("acme", BUG_TYPE_ID, "severity");
     for _ in 0..20 {
         feeder.record_view_execution(&coll, &["severity"]);
     }
@@ -251,7 +260,7 @@ fn handle_promotes_a_hot_facet_off_the_bus() {
     assert!(!feeder.is_promoted(&facet), "not yet seen on the bus");
     assert_eq!(
         feeder.handle(
-            &updated_event("ev-3", "acme", "bug", &["severity"]),
+            &updated_event("ev-3", "acme", BUG_TYPE_ID, &["severity"]),
             &mut myelin_events::HandlerTx::none()
         ),
         HandleOutcome::Done
@@ -267,15 +276,59 @@ fn handle_promotes_a_hot_facet_off_the_bus() {
 }
 
 #[test]
-fn an_event_without_field_deltas_promotes_nothing() {
+fn an_event_without_projection_metadata_is_rejected() {
     let feeder = ProjectionFeeder::new();
-    let mut ev = updated_event("ev-4", "acme", "bug", &[]);
+    let mut ev = updated_event("ev-4", "acme", BUG_TYPE_ID, &[]);
     ev.payload = serde_json::json!({ "ref": "myelin://acme/issue/issue/ENG-1" });
-    assert_eq!(
+    assert!(matches!(
         feeder.handle(&ev, &mut myelin_events::HandlerTx::none()),
-        HandleOutcome::Done
+        HandleOutcome::NonRetryable(_)
+    ));
+    assert!(!feeder.is_promoted(&FacetKey::new("acme", BUG_TYPE_ID, "severity")));
+}
+
+#[test]
+fn a_malformed_facet_array_has_no_partial_effect_and_does_not_poison_replay() {
+    let feeder = ProjectionFeeder::new();
+    let collection = CollectionKey::new("acme", BUG_TYPE_ID);
+    let severity = FacetKey::new("acme", BUG_TYPE_ID, "severity");
+    for _ in 0..20 {
+        feeder.record_view_execution(&collection, &["severity"]);
+    }
+    for _ in 0..80 {
+        feeder.record_view_execution(&collection, &[]);
+    }
+
+    let mut malformed = updated_event("ev-poison", "acme", BUG_TYPE_ID, &["severity"]);
+    malformed.payload["changed_facets"] = serde_json::json!(["severity", 7]);
+    assert!(matches!(
+        feeder.handle(&malformed, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::NonRetryable(_)
+    ));
+    assert!(
+        !feeder.is_promoted(&severity),
+        "the valid prefix of a malformed array must have no effect"
     );
-    assert!(!feeder.is_promoted(&FacetKey::new("acme", "bug", "severity")));
+
+    let corrected = updated_event("ev-poison", "acme", BUG_TYPE_ID, &["severity"]);
+    assert_eq!(
+        feeder.handle(&corrected, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done,
+        "validation must happen before the feeder records the event id"
+    );
+    assert!(feeder.is_promoted(&severity));
+}
+
+#[test]
+fn an_issue_subject_cannot_cross_the_envelope_tenant() {
+    let feeder = ProjectionFeeder::new();
+    let mut event = updated_event("ev-foreign", "acme", BUG_TYPE_ID, &["severity"]);
+    event.subject = ArtifactRef("myelin://globex/issue/issue/ENG-1".into());
+    event.payload["issue"] = serde_json::Value::String(event.subject.0.clone());
+
+    let outcome = feeder.handle(&event, &mut myelin_events::HandlerTx::none());
+    assert!(matches!(outcome, HandleOutcome::NonRetryable(_)));
+    assert!(!feeder.is_promoted(&FacetKey::new("acme", BUG_TYPE_ID, "severity")));
 }
 
 #[test]
@@ -357,8 +410,43 @@ fn is_promoted_distinguishes_the_decision_variants() {
 fn the_index_name_is_a_sanitised_identifier() {
     let facet = FacetKey::new("acme", "bug", "Customer-Tier!");
     let p = IndexProvisioning::for_facet(&facet);
-    assert_eq!(p.index_name, "issue_facet_customer_tier_");
+    assert!(p.index_name.starts_with("issue_facet_customer_tier__"));
+    assert!(
+        p.index_name.len() <= 63,
+        "PostgreSQL identifiers are bounded"
+    );
+    assert!(p
+        .index_name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'));
     assert!(p.ddl.contains("Customer-Tier!"));
+}
+
+#[test]
+fn index_names_are_stable_and_unique_across_the_whole_facet_scope() {
+    let original =
+        IndexProvisioning::for_facet(&FacetKey::new("acme", BUG_TYPE_ID, "Customer-Tier!"));
+    let replay = IndexProvisioning::for_facet(&original.facet);
+    let same_stem =
+        IndexProvisioning::for_facet(&FacetKey::new("acme", BUG_TYPE_ID, "Customer@Tier!"));
+    let other_tenant =
+        IndexProvisioning::for_facet(&FacetKey::new("globex", BUG_TYPE_ID, "Customer-Tier!"));
+
+    assert_eq!(original.index_name, replay.index_name);
+    assert_ne!(original.index_name, same_stem.index_name);
+    assert_ne!(original.index_name, other_tenant.index_name);
+}
+
+#[test]
+fn every_dynamic_sql_value_is_quoted_as_data() {
+    let p = IndexProvisioning::for_facet(&FacetKey::new(
+        "tenant' OR TRUE --",
+        "type' OR TRUE --",
+        "owner'); DROP TABLE issue; --",
+    ));
+    assert!(p.ddl.contains("tenant_id = 'tenant'' OR TRUE --'"));
+    assert!(p.ddl.contains("type_id::text = 'type'' OR TRUE --'"));
+    assert!(p.ddl.contains("props ->> 'owner''); DROP TABLE issue; --'"));
 }
 
 #[test]
