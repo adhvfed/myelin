@@ -72,6 +72,30 @@ test.describe("Chat workspace", () => {
     await expectAccessible(page, "created Chat topic");
   });
 
+  test("a response-lost retry keeps one durable message", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { emptyChat: true, chatPostResponseLosses: 1 },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await page.getByRole("button", { name: "Create the first topic" }).click();
+    await page.getByRole("textbox", { name: "Channel", exact: true }).fill("reliability");
+    await page.getByRole("textbox", { name: "Topic", exact: true }).fill("retry identity");
+    await page.getByRole("button", { name: "Create topic" }).click();
+
+    const message = "Commit once even when the acknowledgement disappears.";
+    await page.getByLabel("Message retry identity").fill(message);
+    await page.getByRole("button", { name: "Send" }).click();
+    await expect(page.getByRole("alert")).toContainText("retrying this draft is safe");
+
+    await page.getByRole("button", { name: "Send" }).click();
+    await expect(page.getByText(message, { exact: true })).toHaveCount(1);
+    await page.reload();
+    await expect(page.getByText(message, { exact: true })).toHaveCount(1);
+  });
+
   test("the narrow layout moves cleanly between topic navigation and the composer", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 760 });
     await devLogin(page);

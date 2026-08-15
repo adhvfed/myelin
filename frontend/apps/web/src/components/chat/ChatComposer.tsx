@@ -17,17 +17,18 @@ function errorCopy(kind: ChatErrorKind): string {
     case "not-found":
       return "This topic is no longer available.";
     case "unavailable":
-      return "Chat is temporarily unavailable. Your message was not confirmed.";
+      return "Chat is temporarily unavailable. Your message was not confirmed; retrying this draft is safe.";
     case "conflict":
       return "That send was already handled. Refreshing the conversation may reveal it.";
     default:
-      return "We couldn’t confirm the send. Refresh before trying again.";
+      return "We couldn’t confirm the send. This draft keeps its retry identity until you edit it.";
   }
 }
 
 export function ChatComposer(props: ChatComposerProps) {
   const mutate = useAction(chatMutate);
   const [content, setContent] = createSignal("");
+  const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [error, setError] = createSignal<string | null>(null);
   const [sending, setSending] = createSignal(false);
   const [interactive, setInteractive] = createSignal(false);
@@ -48,7 +49,7 @@ export function ChatComposer(props: ChatComposerProps) {
         op: "post-message",
         conversationId: props.conversationId,
         content: sentContent,
-        clientNonce: crypto.randomUUID(),
+        clientNonce: clientNonce(),
       });
       if (!result.ok) {
         setError(errorCopy(result.error));
@@ -59,6 +60,7 @@ export function ChatComposer(props: ChatComposerProps) {
         return;
       }
       setContent("");
+      setClientNonce(crypto.randomUUID());
       await props.onPosted();
     } catch {
       setError(errorCopy("error"));
@@ -79,6 +81,7 @@ export function ChatComposer(props: ChatComposerProps) {
           onSubmit={() => void send()}
           onChange={(blocks) => {
             setContent(blocks.map((block) => block.markdown).join("\n"));
+            setClientNonce(crypto.randomUUID());
             setError(null);
           }}
         />

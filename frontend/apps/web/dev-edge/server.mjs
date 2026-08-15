@@ -109,6 +109,7 @@ const state = {
   prCommitContinuationMalformedPages: 0,
   prCommitContinuationRequests: 0,
   emptyChat: false,
+  chatPostResponseLosses: 0,
   emptyKnowledge: false,
   // CT-005 CI read-surface controls. Cursors bind the canonicalized concrete visible-repository set,
   // just as production does; tests mutate membership rather than a synthetic generation counter.
@@ -397,11 +398,16 @@ const server = createServer((req, res) => {
         if (body.resetIssues === true) resetIssues();
         if (body.resetChat === true) {
           state.emptyChat = false;
+          state.chatPostResponseLosses = 0;
           chat.reset();
         }
         if (typeof body.emptyChat === "boolean") {
           state.emptyChat = body.emptyChat;
+          state.chatPostResponseLosses = 0;
           chat.reset({ empty: body.emptyChat });
+        }
+        if (Number.isInteger(body.chatPostResponseLosses) && body.chatPostResponseLosses >= 0) {
+          state.chatPostResponseLosses = body.chatPostResponseLosses;
         }
         if (body.resetKnowledge === true) {
           state.emptyKnowledge = false;
@@ -555,6 +561,12 @@ const server = createServer((req, res) => {
       if (output.status === 404) return send(res, 404, notFoundEnvelope("conversation"));
       if (output.status === 400) {
         return send(res, 400, { error: { message: "invalid Chat message body", code: "bad_request" } });
+      }
+      if (state.chatPostResponseLosses > 0) {
+        state.chatPostResponseLosses -= 1;
+        return send(res, 503, {
+          error: { message: "Chat committed but its response was lost", code: "unavailable" },
+        });
       }
       return send(res, output.status, output.json, { "cache-control": "no-store" });
     });
