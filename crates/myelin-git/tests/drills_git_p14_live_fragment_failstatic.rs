@@ -165,16 +165,18 @@ const REVOCATION_SLA: u64 = 300;
 fn engine_with_git_fragment(scope: &TenantScope, tuples: &[TupleDelta]) -> StoreBackedCheck {
     let store = TupleStore::new(OutboxStore::new());
     let admin = subject("p-admin", scope.tenant().as_str());
-    store
-        .write_tuples(
-            scope,
-            &admin,
-            tuples,
-            None,
-            None,
-            Timestamp("2026-06-21T00:00:00Z".into()),
-        )
-        .expect("seed tuples");
+    if !tuples.is_empty() {
+        store
+            .write_tuples(
+                scope,
+                &admin,
+                tuples,
+                None,
+                None,
+                Timestamp("2026-06-21T00:00:00Z".into()),
+            )
+            .expect("seed tuples");
+    }
     let svc = StoreBackedCheck::new(store);
     for admit in svc.admit_git_fragment() {
         assert!(
