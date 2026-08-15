@@ -4,6 +4,7 @@ import { A, createAsync, revalidate, useAction, useParams, useSearchParams } fro
 import { ConfirmDialog, Icon, Skeleton, useToast } from "@myelin/design-system";
 import { AutomationErrorState, automationErrorKind } from "~/components/AutomationErrorState";
 import { AutomationStateLabel } from "~/components/AutomationStateLabel";
+import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 import {
   changeAutomationLifecycle,
   getAutomation,
@@ -88,7 +89,14 @@ export default function AutomationDetail() {
                     <p class="automation-eyebrow">{view.automation.event_type}</p>
                     <h1 id="automation-heading">{view.automation.task}</h1>
                   </div>
-                  <Show when={current()}>{(item) => <AutomationStateLabel state={item().state} />}</Show>
+                  <Show when={current()}>
+                    {(item) => (
+                      <div class="automation-detail-header-actions">
+                        <CopyArtifactRef reference={item().ref} />
+                        <AutomationStateLabel state={item().state} />
+                      </div>
+                    )}
+                  </Show>
                 </header>
 
                 <Show when={current()}>

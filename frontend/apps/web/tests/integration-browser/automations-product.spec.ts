@@ -117,6 +117,8 @@ test("an automation owner governs durable agent work without configuring an inte
   await row.click();
   await page.waitForURL(`**/automations/${automationId}`);
   await expect(page.getByRole("heading", { level: 1, name: task })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy reference" }))
+    .toHaveAttribute("title", String(automation.ref));
   await expect(page.getByText("Required", { exact: true })).toBeVisible();
   await expect(page.getByText("Refused", { exact: true })).toBeVisible();
   await expect(page.getByText("No matching events have reserved work yet.")).toBeVisible();

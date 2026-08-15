@@ -3,6 +3,7 @@ import { Title } from "@solidjs/meta";
 import { A, createAsync, useAction, useParams } from "@solidjs/router";
 import { ConfirmDialog, Icon, Skeleton, useToast } from "@myelin/design-system";
 import { AutomationErrorState, automationErrorKind } from "~/components/AutomationErrorState";
+import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 import { eraseAutomationResult, getAutomationResult } from "~/lib/automation-api";
 import type { AutomationErasureVM } from "~/lib/automation-response";
 
@@ -69,9 +70,12 @@ export default function AutomationResult() {
                         <p class="automation-eyebrow">Immutable hosted-agent work product</p>
                         <h1 id="automation-result-heading">Agent result</h1>
                       </div>
-                      <span class="automation-status" data-state="succeeded">
-                        <Icon name="check-pass" /> Complete
-                      </span>
+                      <div class="automation-detail-header-actions">
+                        <CopyArtifactRef reference={view.run_ref} />
+                        <span class="automation-status" data-state="succeeded">
+                          <Icon name="check-pass" /> Complete
+                        </span>
+                      </div>
                     </header>
                     <pre data-testid="automation-result-answer">{view.answer}</pre>
                     <dl class="automation-facts">
@@ -120,6 +124,7 @@ export default function AutomationResult() {
                       No result remains available for run <code>{receipt().run_id}</code>. Its durable
                       tombstone prevents recreation by a retry.
                     </p>
+                    <CopyArtifactRef reference={receipt().run_ref} />
                     <A href={`/automations/${automationId()}`} class="automation-button automation-button-secondary">
                       Back to firing history
                     </A>
