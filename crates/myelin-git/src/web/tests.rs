@@ -391,6 +391,7 @@ fn repository_list_rows_reject_unsafe_or_oversized_fields() {
         "/repo",
         "acme/",
         "acme/../repo",
+        "acme.git/repo",
         "acme/re po",
         "acme/repo\\escape",
     ] {
@@ -419,7 +420,7 @@ fn repository_list_rows_reject_unsafe_or_oversized_fields() {
 
 #[test]
 fn repository_list_cursor_codec_is_canonical_bounded_and_round_trips() {
-    let cursor = RepoListCursor::new([7; 32], "alpha").unwrap();
+    let cursor = RepoListCursor::new([7; 32], "platform/alpha").unwrap();
     let encoded = cursor.encode();
     assert!(encoded.starts_with(REPO_LIST_CURSOR_PREFIX));
     assert!(!encoded.contains('='), "the base64url token is unpadded");
@@ -434,7 +435,7 @@ fn repository_list_cursor_codec_is_canonical_bounded_and_round_trips() {
     ] {
         assert_eq!(RepoListCursor::parse(&malformed), Err(RepoListCursorError));
     }
-    for slug in ["", ".", "..", "a/b", "white space"] {
+    for slug in ["", ".", "..", "platform.git/api", "white space"] {
         assert_eq!(RepoListCursor::new([0; 32], slug), Err(RepoListCursorError));
     }
 }

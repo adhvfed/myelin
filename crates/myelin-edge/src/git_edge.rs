@@ -126,10 +126,16 @@ pub(crate) fn param<'a>(ctx: &'a HandlerCtx<'_>, name: &str) -> Result<&'a str, 
         .ok_or_else(|| EdgeError::BadRequest(format!("missing path param `{name}`")))
 }
 
-pub(crate) fn num_param(ctx: &HandlerCtx<'_>, name: &str) -> Result<u64, EdgeError> {
+pub(crate) fn pull_request_number_param(
+    ctx: &HandlerCtx<'_>,
+    name: &str,
+) -> Result<u64, EdgeError> {
     let raw = param(ctx, name)?;
-    raw.parse::<u64>()
-        .map_err(|_| EdgeError::BadRequest(format!("path param `{name}` is not a number: `{raw}`")))
+    myelin_git::coordinate::parse_pull_request_number(raw).ok_or_else(|| {
+        EdgeError::BadRequest(format!(
+            "path param `{name}` must be a canonical positive pull-request number"
+        ))
+    })
 }
 
 fn deferred_write(applied: Value) -> EdgeResponse {
@@ -179,7 +185,7 @@ impl Handler for PrOverviewHandler {
         let key = (
             tenant_of(ctx).to_string(),
             param(ctx, "repo")?.to_string(),
-            num_param(ctx, "n")?,
+            pull_request_number_param(ctx, "n")?,
         );
         let page = self
             .state
@@ -198,7 +204,7 @@ impl Handler for PrChecksHandler {
         let key = (
             tenant_of(ctx).to_string(),
             param(ctx, "repo")?.to_string(),
-            num_param(ctx, "n")?,
+            pull_request_number_param(ctx, "n")?,
         );
         let page = self
             .state
@@ -438,6 +444,54 @@ pub fn register_git(mut b: GatewayBuilder, state: Arc<GitEdgeState>) -> GatewayB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route_pull_request_number(raw: &str) -> Result<u64, EdgeError> {
+        use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+        use myelin_tenancy::TenantId;
+
+        let principal = Principal::stub(
+            PrincipalId("reader".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
+        let scope =
+            myelin_storage::TenantScope::from_verified_token(&principal, principal.region.clone());
+        let identity = crate::catalogue::test_request_identity(&principal, &scope);
+        let params = BTreeMap::from([("n".into(), raw.into())]);
+        let request = crate::request::EdgeRequest::new(
+            "GET",
+            format!("/v1/git/repos/api/prs/{raw}"),
+            "",
+            vec![],
+            vec![],
+        );
+        let page = crate::catalogue::Page::from_request(&request);
+        pull_request_number_param(
+            &HandlerCtx {
+                identity: &identity,
+                principal: &principal,
+                scope: &scope,
+                params: &params,
+                page: &page,
+                request: &request,
+            },
+            "n",
+        )
+    }
+
+    #[test]
+    fn pull_request_routes_have_one_positive_decimal_identity() {
+        assert_eq!(route_pull_request_number("42").unwrap(), 42);
+        for alias in ["0", "00", "01", "+1", "1.0"] {
+            assert!(
+                matches!(
+                    route_pull_request_number(alias),
+                    Err(EdgeError::BadRequest(_))
+                ),
+                "route alias was admitted: {alias}"
+            );
+        }
+    }
 
     #[test]
     fn reroot_maps_api_git_to_v1_git() {

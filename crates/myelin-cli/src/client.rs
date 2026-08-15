@@ -513,7 +513,7 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
         .ok_or_else(|| malformed_ci_error("run summary trigger kind is invalid"))?;
     if !(run["source_ref"].is_null()
         || run["source_ref"].as_str().is_some_and(|source_ref| {
-            trigger_kind == "push"
+            matches!(trigger_kind, "push" | "pull_request")
                 && source_ref.starts_with("refs/heads/")
                 && bounded_string(source_ref, 1_024)
                 && myelin_git::receive_pack::RefName::new(source_ref)
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_run_source_refs_are_optional_but_canonical() {
+    fn ci_run_source_refs_are_optional_canonical_and_branch_triggered() {
         let call = get("/v1/ci/runs", Some("state=all&limit=1"));
         let mut response = golden_expected("runs-first-page-keyset");
         response["page"]["next_cursor"] = json!(canonical_cursor());
@@ -1179,6 +1179,9 @@ mod tests {
         }
         response["items"][0]["source_ref"] = json!("refs/heads/main");
         response["items"][0]["trigger_kind"] = json!("pull_request");
+        validate_ci_success(&call, &response).unwrap();
+
+        response["items"][0]["trigger_kind"] = json!("issue_transition");
         assert!(validate_ci_success(&call, &response).is_err());
 
         response["items"][0]["trigger_kind"] = json!("push");

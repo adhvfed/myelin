@@ -625,7 +625,7 @@ fn validate_fact_provenance(event: &EventEnvelope, fact: &CheckStatus) -> Result
             "CheckStatus repository slug is not canonical".into(),
         ));
     }
-    crate::gix_backend::validate_repo_slug(slug)
+    crate::coordinate::RepositorySlug::parse(slug)
         .map_err(|_| Reason("CheckStatus repository slug is not canonical".into()))?;
     if fact.context.provider != crate::check_status::CheckProvider::Ci {
         return Err(Reason(

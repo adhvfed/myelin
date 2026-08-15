@@ -490,7 +490,7 @@ fn pr_state_label(s: PrState) -> &'static str {
     }
 }
 
-pub const REPO_LIST_ROW_MAX_SLUG_BYTES: usize = 255;
+pub const REPO_LIST_ROW_MAX_SLUG_BYTES: usize = crate::coordinate::MAX_REPOSITORY_SLUG_BYTES;
 pub const REPO_LIST_ROW_MAX_CLONE_URL_BYTES: usize = 4 * 1024;
 pub const REPO_LIST_CURSOR_PREFIX: &str = "rl1_";
 pub const REPO_LIST_CURSOR_MAX_BYTES: usize = 512;
@@ -580,13 +580,7 @@ impl RepoListCursor {
 }
 
 fn valid_repo_list_cursor_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= REPO_LIST_ROW_MAX_SLUG_BYTES
-        && slug != "."
-        && slug != ".."
-        && slug
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    crate::coordinate::RepositorySlug::parse(slug).is_ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -835,16 +829,7 @@ impl RepoListRow {
 }
 
 fn validated_repo_list_slug(slug: String) -> Result<String, RepoListRowError> {
-    let valid = !slug.is_empty()
-        && slug.len() <= REPO_LIST_ROW_MAX_SLUG_BYTES
-        && slug.split('/').all(|part| {
-            !part.is_empty()
-                && part != "."
-                && part != ".."
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        });
+    let valid = crate::coordinate::RepositorySlug::parse(&slug).is_ok();
     valid.then_some(slug).ok_or(RepoListRowError::InvalidSlug)
 }
 

@@ -1451,7 +1451,7 @@ fn mcp_effect_key_from_material(
         if let Some(repo) = args
             .get("repo")
             .and_then(serde_json::Value::as_str)
-            .filter(|repo| !repo.is_empty() && repo.len() <= 255)
+            .filter(|repo| myelin_git::coordinate::RepositorySlug::parse(repo).is_ok())
         {
             return format!(
                 "mcp:v1:git.merge:repohex:{}:{digest}",
@@ -1473,7 +1473,7 @@ pub fn git_merge_repo_from_effect_key(effect_key: &str) -> Option<String> {
         return None;
     }
     let repo = String::from_utf8(bytes).ok()?;
-    myelin_git::gix_backend::validate_repo_slug(&repo).ok()?;
+    myelin_git::coordinate::RepositorySlug::parse(&repo).ok()?;
     Some(repo)
 }
 
@@ -1645,6 +1645,11 @@ mod security_tests {
             &serde_json::json!({"repo":"../secrets","number":1}),
         );
         assert!(git_merge_repo_from_effect_key(&traversal).is_none());
+        let bare_ancestor = mcp_effect_key(
+            "git.merge",
+            &serde_json::json!({"repo":"platform.git/api","number":1}),
+        );
+        assert!(git_merge_repo_from_effect_key(&bare_ancestor).is_none());
         assert!(git_merge_repo_from_effect_key(
             "mcp:v1:git.merge:repohex:zz:blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         )

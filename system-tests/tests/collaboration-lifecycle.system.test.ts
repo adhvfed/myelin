@@ -14,6 +14,30 @@ import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
+import type { SystemTestClient } from "../src/client.js";
+
+async function findProject(
+  client: SystemTestClient,
+  projectId: string,
+): Promise<JsonRecord | undefined> {
+  let cursor: string | undefined;
+  const visited = new Set<string>();
+  do {
+    const query = new URLSearchParams({ limit: "100" });
+    if (cursor) query.set("cursor", cursor);
+    const response = await client.json(`/v1/projects?${query}`);
+    const project = array(response.body.items, "project roster page")
+      .map((item) => record(item, "project roster item"))
+      .find((item) => item.id === projectId);
+    if (project) return project;
+
+    const next = record(response.body.page, "project roster cursor").next_cursor;
+    cursor = next === null ? undefined : string(next, "next project cursor");
+    if (cursor && visited.has(cursor)) throw new Error("project roster repeated its cursor");
+    if (cursor) visited.add(cursor);
+  } while (cursor);
+  return undefined;
+}
 
 async function awaitActiveIssue(title: string): Promise<JsonRecord> {
   const proposed = await systemClient.json("/v1/issues", {
@@ -1088,10 +1112,11 @@ command = ["true"]
     const rediscovered = await systemClient.json(`/v1/projects/${projectId}`);
     expect(rediscovered.body).toMatchObject({ project: { id: projectId, ref: projectRef, name } });
 
-    const listed = await systemClient.json("/v1/projects?limit=100");
-    expect(array(listed.body.items, "founder's projects")).toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: projectId, ref: projectRef, name })]),
-    );
+    await expect(findProject(systemClient, projectId)).resolves.toMatchObject({
+      id: projectId,
+      ref: projectRef,
+      name,
+    });
 
     const firstIssueTitle = uniqueName("Make the first project useful");
     const firstIssueRetryKey = `first-project-issue-${randomUUID()}`;
@@ -1138,10 +1163,7 @@ command = ["true"]
       expectedStatus: 404,
     });
     expect(hiddenFromPeer.body).toMatchObject({ error: { code: "not_found" } });
-    const peerProjects = await reviewerClient.json("/v1/projects?limit=100");
-    expect(array(peerProjects.body.items, "peer's projects")).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: projectId })]),
-    );
+    await expect(findProject(reviewerClient, projectId)).resolves.toBeUndefined();
   });
 
   test("lets project collaborators talk while private project rooms stay private", async () => {

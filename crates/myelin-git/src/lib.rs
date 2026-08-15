@@ -9,6 +9,9 @@ pub mod check_status_store;
 pub mod code_projection;
 pub mod code_tools;
 pub mod commit;
+pub mod coordinate {
+    pub use myelin_refs::git_coordinate::*;
+}
 pub mod core;
 pub mod cross_cell;
 pub mod durable;

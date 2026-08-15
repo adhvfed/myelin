@@ -1,5 +1,6 @@
 use myelin_ci_sandbox::{validate_wire_repo_slug, validate_wire_segment};
-use myelin_git::gix_backend::{validate_path_segment, validate_repo_slug};
+use myelin_git::gix_backend::validate_path_segment;
+use myelin_refs::git_coordinate::RepositorySlug;
 
 const SEGMENT_CORPUS: &[&str] = &[
     "acme",
@@ -53,6 +54,9 @@ const SLUG_CORPUS: &[&str] = &[
     "nul\0slug",
     "團隊/app",
     "ok-1/ok_2/v1.0",
+    "release.git",
+    "namespace.git/repo",
+    "NAMESPACE.GIT/repo",
     ".",
     "..",
     "",
@@ -73,27 +77,29 @@ fn wire_segment_validator_mirrors_the_git_canon_byte_for_byte() {
 }
 
 #[test]
-fn wire_repo_slug_validator_mirrors_the_git_canon_byte_for_byte() {
+fn wire_repo_slug_adapter_preserves_the_shared_coordinate() {
     for &slug in SLUG_CORPUS {
-        let canon = validate_repo_slug(slug);
+        let canon = RepositorySlug::parse(slug)
+            .map(|slug| slug.segments().map(str::to_owned).collect::<Vec<String>>());
         let replica = validate_wire_repo_slug(slug);
         assert_eq!(
             canon.is_ok(),
             replica.is_ok(),
-            "DRIFT: slug {slug:?} - git canon accept={}, sandbox replica accept={}. The replica MUST \
-             mirror myelin_git::gix_backend::validate_repo_slug exactly. Re-sync gvisor.rs.",
+            "wire slug {slug:?} disagrees with the shared coordinate: canonical accept={}, wire accept={}",
             canon.is_ok(),
             replica.is_ok()
         );
         if let (Ok(c), Ok(r)) = (canon, replica) {
             assert_eq!(
                 c, r,
-                "DRIFT: slug {slug:?} accepted by both but decomposed to different pieces \
-                 (canon={c:?}, replica={r:?}) - the resolved on-disk path would differ across the \
-                 wire vs read/durable paths."
+                "wire slug {slug:?} changed the shared segments (canonical={c:?}, wire={r:?})"
             );
         }
     }
+
+    let oversized = "x".repeat(myelin_refs::git_coordinate::MAX_REPOSITORY_SLUG_BYTES + 1);
+    assert!(RepositorySlug::parse(&oversized).is_err());
+    assert!(validate_wire_repo_slug(&oversized).is_err());
 }
 
 #[test]

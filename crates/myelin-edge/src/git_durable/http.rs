@@ -1338,7 +1338,7 @@ impl Handler for DPrOverview {
         let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
         let rec = self
             .be
-            .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
+            .pr_get(&loc, pull_request_number_param(ctx, "n")?, ctx.principal)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
         let mut vm = DurableGitBackend::pr_json(tenant_of(ctx), param(ctx, "repo")?, &rec);
@@ -1451,7 +1451,7 @@ impl Handler for DPrCommits {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let query = parse_pr_commit_query(&ctx.request.query)?;
         let repo_slug = param(ctx, "repo")?;
-        let number = num_param(ctx, "n")?;
+        let number = pull_request_number_param(ctx, "n")?;
         let scope = pr_commit_cursor_scope(tenant_of(ctx), region_of(ctx), repo_slug, number);
         let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), repo_slug);
         let rec = self
@@ -2017,7 +2017,7 @@ impl Handler for DPrDiff {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 offset,
                 limit,
             )
@@ -2189,7 +2189,7 @@ impl Handler for DPrThreads {
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                pull_request_number_param(ctx, "n")?,
                 ctx.principal,
             )
             .map_err(map_durable_err)?;
@@ -2215,7 +2215,7 @@ impl Handler for DPrThreadCreate {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 &operation_nonce,
                 &body,
             )
@@ -2245,7 +2245,7 @@ impl Handler for DPrThreadComment {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 param(ctx, "tid")?,
                 &operation_nonce,
                 &body,
@@ -2280,7 +2280,7 @@ impl Handler for DPrThreadResolve {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 param(ctx, "tid")?,
                 &operation.nonce,
                 &body,
@@ -2310,7 +2310,7 @@ impl Handler for DPrReviewStart {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 &operation.nonce,
             )
             .map_err(map_durable_err)?;
@@ -2339,7 +2339,7 @@ impl Handler for DPrReviewComment {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 param(ctx, "rid")?,
                 &operation_nonce,
                 &body,
@@ -2374,7 +2374,7 @@ impl Handler for DPrReviewSubmit {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 param(ctx, "rid")?,
                 &body,
                 &operation.nonce,
@@ -2405,7 +2405,7 @@ impl Handler for DPrReviewDiscard {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 param(ctx, "rid")?,
                 &operation.nonce,
             )
@@ -2425,7 +2425,7 @@ impl Handler for DPrChecks {
         let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
         let rec = self
             .be
-            .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
+            .pr_get(&loc, pull_request_number_param(ctx, "n")?, ctx.principal)
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
         let vm = self
@@ -2610,7 +2610,7 @@ impl Handler for DPrReview {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 verdict,
                 &operation_id,
             )
@@ -2642,7 +2642,7 @@ impl Handler for DEndorse {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 &body,
                 &operation_id,
             )
@@ -2666,7 +2666,7 @@ impl Handler for DMerge {
                 tenant_of(ctx),
                 region_of(ctx),
                 param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                pull_request_number_param(ctx, "n")?,
                 ctx.principal,
                 &operation_id,
             )
@@ -2689,7 +2689,7 @@ impl Handler for DMerge {
                     DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
                 let checks = self
                     .be
-                    .pr_get(&loc, num_param(ctx, "n")?, ctx.principal)
+                    .pr_get(&loc, pull_request_number_param(ctx, "n")?, ctx.principal)
                     .ok()
                     .flatten()
                     .and_then(|rec| self.be.pr_checks_json(&loc, &rec, ctx.principal).ok());
@@ -2752,7 +2752,7 @@ impl Handler for DReportChecks {
                     param(ctx, "repo")?,
                     ctx.principal,
                 )
-                .for_pr(num_param(ctx, "n")?),
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 &body,
                 &operation_id,
             )
@@ -3048,7 +3048,7 @@ struct PrReadGuard {
 impl Handler for PrReadGuard {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let slug = param(ctx, "repo")?;
-        let number = num_param(ctx, "n")?;
+        let number = pull_request_number_param(ctx, "n")?;
         let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), slug);
         let can_pull = self.be.repo_authorizer().authorize_repo_permission(
             ctx.principal,
@@ -3080,7 +3080,7 @@ fn pr_read_guarded(be: &Arc<DurableGitBackend>, inner: Arc<dyn Handler>) -> Arc<
 impl Handler for PrReviewGuard {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let slug = param(ctx, "repo")?;
-        let number = num_param(ctx, "n")?;
+        let number = pull_request_number_param(ctx, "n")?;
         if !self
             .be
             .authorize_pr_review(tenant_of(ctx), region_of(ctx), slug, number, ctx.principal)

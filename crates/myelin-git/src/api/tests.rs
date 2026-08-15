@@ -410,6 +410,12 @@ fn cli_is_loud_on_unknown_and_missing() {
         parse_cli(&["pr", "view", "core", "notanum"]),
         Err(CliParseError::BadArg { .. })
     ));
+    for number in ["0", "00", "01", "+1", "1.0"] {
+        assert!(matches!(
+            parse_cli(&["pr", "view", "core", number]),
+            Err(CliParseError::BadArg { .. })
+        ));
+    }
     assert!(matches!(
         parse_cli(&["pr", "view", "core"]),
         Err(CliParseError::MissingArg { .. })

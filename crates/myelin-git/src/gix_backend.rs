@@ -1,3 +1,4 @@
+use crate::coordinate::RepositorySlug;
 use crate::core::{BlameHunk, DiffLine, GitCoreError, Oid, ReadBackend, RepoLoc};
 use std::path::PathBuf;
 
@@ -19,17 +20,19 @@ impl RepoPathResolver for RootedResolver {
     fn repo_path(&self, repo: &RepoLoc) -> Result<PathBuf, GitCoreError> {
         validate_path_segment("tenant", &repo.tenant)?;
         validate_path_segment("region", &repo.region)?;
-        let repo_dir = validate_repo_slug(&repo.repo)?;
-        let (repo_name, namespaces) = repo_dir.split_last().ok_or_else(|| {
-            GitCoreError::Read("invalid repo slug: empty (fail-closed path resolution)".into())
-        })?;
+        let slug = RepositorySlug::parse(&repo.repo)
+            .map_err(|error| GitCoreError::Read(format!("invalid repo slug: {error}")))?;
         let mut path = self.root.clone();
         path.push(&repo.tenant);
         path.push(&repo.region);
-        for piece in namespaces {
-            path.push(piece);
+        let mut segments = slug.segments().peekable();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_some() {
+                path.push(segment);
+            } else {
+                path.push(format!("{segment}.git"));
+            }
         }
-        path.push(format!("{repo_name}.git"));
         Ok(path)
     }
 }
@@ -56,29 +59,6 @@ pub fn validate_path_segment(kind: &str, seg: &str) -> Result<(), GitCoreError> 
         }
     }
     Ok(())
-}
-
-pub fn validate_repo_slug(repo: &str) -> Result<Vec<String>, GitCoreError> {
-    if repo.contains('\\') || repo.contains('\0') {
-        return Err(GitCoreError::Read(format!(
-            "invalid repo slug {repo:?}: contains a backslash/NUL (path-traversal guard, fail-closed)"
-        )));
-    }
-    let pieces: Vec<String> = repo.split('/').map(|s| s.to_string()).collect();
-    for piece in &pieces {
-        validate_path_segment("repo", piece)?;
-    }
-    if pieces
-        .iter()
-        .take(pieces.len().saturating_sub(1))
-        .any(|piece| piece.to_ascii_lowercase().ends_with(".git"))
-    {
-        return Err(GitCoreError::Read(format!(
-            "invalid repo slug {repo:?}: a namespace segment cannot end in `.git` because it \
-             would resolve inside another bare repository (fail-closed)"
-        )));
-    }
-    Ok(pieces)
 }
 
 pub struct GixCore<P: RepoPathResolver> {

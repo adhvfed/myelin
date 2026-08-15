@@ -1,7 +1,7 @@
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
-use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
+use crate::git_edge::{map_method, param, pull_request_number_param, reroot, tenant_of};
 #[cfg(any(test, feature = "test-support"))]
 use crate::repo_authz::AllowAllRepos;
 use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};

@@ -76,6 +76,7 @@ fn classify(r: &ArtifactRef) -> Result<GitArtifactType, ProjectError> {
 pub fn git_pr_ref(tenant: &str, repo: &str, number: u64) -> Result<ArtifactRef, GitRefError> {
     validate_ref_components(&[("tenant", tenant)])?;
     validate_repo(repo, "repo")?;
+    validate_pr_number(number)?;
     parse_git(&format!("myelin://{tenant}/git/pr/{repo}:{number}"))
 }
 
@@ -96,6 +97,7 @@ pub fn git_review_ref(
         ("reviewer_pseudonym", reviewer_pseudonym),
     ])?;
     validate_repo(repo, "repo")?;
+    validate_pr_number(pr_number)?;
     parse_git(&format!(
         "myelin://{tenant}/git/review/{repo}:{pr_number}:{reviewer_pseudonym}"
     ))
@@ -117,16 +119,17 @@ fn validate_ref_components(components: &[(&'static str, &str)]) -> Result<(), Gi
 }
 
 fn validate_repo(value: &str, component: &'static str) -> Result<(), GitRefError> {
-    if value.split('/').any(|part| {
-        part.is_empty()
-            || part == "."
-            || part == ".."
-            || !part
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    }) || value.contains('#')
-    {
+    if crate::coordinate::RepositorySlug::parse(value).is_err() {
         return Err(GitRefError::InvalidComponent { component });
+    }
+    Ok(())
+}
+
+fn validate_pr_number(number: u64) -> Result<(), GitRefError> {
+    if number == 0 {
+        return Err(GitRefError::InvalidComponent {
+            component: "number",
+        });
     }
     Ok(())
 }
@@ -739,6 +742,18 @@ mod tests {
                 component: "reviewer_pseudonym"
             })
         ));
+        assert!(matches!(
+            git_pr_ref("acme", "repo7", 0),
+            Err(GitRefError::InvalidComponent {
+                component: "number"
+            })
+        ));
+        assert!(matches!(
+            git_review_ref("acme", "repo7", 0, "psn:bob"),
+            Err(GitRefError::InvalidComponent {
+                component: "number"
+            })
+        ));
     }
 
     #[test]
@@ -758,6 +773,7 @@ mod tests {
             })
         ));
         assert!(git_repo_ref("acme", "platform:api").is_err());
+        assert!(git_repo_ref("acme", "platform.git/api").is_err());
     }
 
     #[test]

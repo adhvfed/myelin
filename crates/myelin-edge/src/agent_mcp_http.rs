@@ -719,9 +719,9 @@ impl GateApproverPolicy for CreatorApproverPolicy {
                 let repo = args
                     .get("repo")
                     .and_then(serde_json::Value::as_str)
-                    .filter(|repo| !repo.is_empty() && repo.len() <= 255)
+                    .filter(|repo| myelin_git::coordinate::RepositorySlug::parse(repo).is_ok())
                     .ok_or_else(|| {
-                        "merge approval requires a bounded repository slug".to_string()
+                        "merge approval requires a canonical repository slug".to_string()
                     })?;
                 self.repos.authorize_repo_permission(
                     &approver,

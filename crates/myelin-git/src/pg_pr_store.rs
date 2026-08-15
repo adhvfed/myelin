@@ -264,7 +264,7 @@ fn validate_cross_visible_slugs(slugs: &[String]) -> Result<(), DurableError> {
     }
     let mut unique = std::collections::BTreeSet::new();
     for slug in slugs {
-        crate::gix_backend::validate_repo_slug(slug).map_err(|_| {
+        crate::coordinate::RepositorySlug::parse(slug).map_err(|_| {
             DurableError::Git("cross-repository PR visible set contains invalid slug".into())
         })?;
         if !unique.insert(slug) {

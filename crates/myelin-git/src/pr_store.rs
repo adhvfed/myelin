@@ -918,7 +918,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                 let file_number = path
                     .file_stem()
                     .and_then(|value| value.to_str())
-                    .and_then(|value| value.parse::<u64>().ok())
+                    .and_then(crate::coordinate::parse_pull_request_number)
                     .ok_or_else(|| {
                         DurableError::Io(format!("invalid PR record filename {}", path.display()))
                     })?;
@@ -1045,13 +1045,14 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(n) = path
+            let number = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                max = Some(max.map_or(n, |m| m.max(n)));
-            }
+                .and_then(crate::coordinate::parse_pull_request_number)
+                .ok_or_else(|| {
+                    DurableError::Io(format!("invalid PR record filename {}", path.display()))
+                })?;
+            max = Some(max.map_or(number, |current| current.max(number)));
         }
         Ok(max)
     }
@@ -1427,6 +1428,38 @@ mod tests {
             ),
             "a list must not expose the mismatched record"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn record_filenames_have_one_positive_decimal_identity() {
+        let root = temp_root("record-filename-canon");
+        let gitstore = DurableGitStore::rooted(&root);
+        gitstore.create_repo(&loc()).unwrap();
+        let store = DurablePrStore::rooted(&root);
+        let canonical = store.pr_path(&loc(), 1).unwrap();
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        let alias = canonical.with_file_name("01.json");
+        std::fs::write(
+            &alias,
+            serde_json::to_vec(&open_record(
+                1,
+                "refs/heads/main",
+                &"a".repeat(40),
+                "psn:author@acme",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.list_bounded(&loc(), 10, 10 * PR_RECORD_MAX_BYTES),
+            Err(DurableError::Io(message)) if message.contains("invalid PR record filename")
+        ));
+        assert!(matches!(
+            store.max_pr_number(&loc()),
+            Err(DurableError::Io(message)) if message.contains("invalid PR record filename")
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 

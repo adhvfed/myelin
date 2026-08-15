@@ -1,4 +1,5 @@
 mod edge;
+pub mod git_coordinate;
 mod object_key;
 mod parse;
 

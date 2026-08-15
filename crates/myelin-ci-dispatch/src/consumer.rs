@@ -428,7 +428,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| SkipReason::MalformedPayload("missing `repo`".into()))?
         .to_string();
-    myelin_git::gix_backend::validate_repo_slug(&repo).map_err(|error| {
+    myelin_git::coordinate::RepositorySlug::parse(&repo).map_err(|error| {
         SkipReason::InvalidProvenance(format!("invalid payload repository {repo:?}: {error}"))
     })?;
 

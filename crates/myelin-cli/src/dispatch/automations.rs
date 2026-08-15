@@ -426,7 +426,7 @@ fn validate_caveats(caveats: &[&str]) -> Result<(), CliError> {
         }
         let repository_scope = caveat
             .strip_prefix("repo:")
-            .is_some_and(|repo| myelin_git::gix_backend::validate_repo_slug(repo).is_ok());
+            .is_some_and(|repo| myelin_git::coordinate::RepositorySlug::parse(repo).is_ok());
         let capability = caveat.split('.').count() >= 2
             && caveat.split('.').all(|segment| {
                 !segment.is_empty()
@@ -465,7 +465,7 @@ fn validate_branch(branch: &str) -> Result<(), CliError> {
 }
 
 fn validate_repository_scope(event_type: &str, repository: &str) -> Result<(), CliError> {
-    if repository.len() > 255 || myelin_git::gix_backend::validate_repo_slug(repository).is_err() {
+    if myelin_git::coordinate::RepositorySlug::parse(repository).is_err() {
         return Err(CliError::Usage(
             "--repo must be a bounded canonical repository slug".into(),
         ));

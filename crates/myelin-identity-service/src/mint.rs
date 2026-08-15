@@ -926,14 +926,11 @@ pub fn attenuate_for_caveats(
         }
         if let Some(repository) = caveat.strip_prefix("repo:") {
             if !repository.contains('#') {
-                if repository.is_empty()
-                    || repository.len() > 255
-                    || repository.chars().any(char::is_control)
-                {
-                    return Err(MintError::InvalidDelegationCaveat(
-                        "repository scope must contain a bounded repository name".into(),
-                    ));
-                }
+                myelin_refs::git_coordinate::RepositorySlug::parse(repository).map_err(|_| {
+                    MintError::InvalidDelegationCaveat(
+                        "repository scope must contain a canonical repository slug".into(),
+                    )
+                })?;
                 repositories.insert(repository.to_string());
                 continue;
             }
@@ -1915,6 +1912,33 @@ mod tests {
         .expect_err("a caveat cannot rewrite the signed run binding");
 
         assert!(matches!(error, MintError::InvalidDelegationCaveat(_)));
+    }
+
+    #[test]
+    fn repository_caveats_use_the_public_git_coordinate() {
+        let actor = human("p:human", "acme");
+        let acme = scope("acme");
+        assert!(attenuate_for_caveats(
+            auth(&["repo.pull"]),
+            &caveats(&["repo:platform/api"]),
+            &acme,
+            &RunId("run-1".into()),
+            &actor,
+        )
+        .is_ok());
+
+        for caveat in ["repo:platform.git/api", "repo:platform//api", "repo:../api"] {
+            assert!(matches!(
+                attenuate_for_caveats(
+                    auth(&["repo.pull"]),
+                    &caveats(&[caveat]),
+                    &acme,
+                    &RunId("run-1".into()),
+                    &actor,
+                ),
+                Err(MintError::InvalidDelegationCaveat(_))
+            ));
+        }
     }
 
     #[test]

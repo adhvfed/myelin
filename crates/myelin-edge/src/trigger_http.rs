@@ -613,7 +613,7 @@ fn validate_delegation_caveats(
         }
         if let Some(repository) = caveat.strip_prefix("repo:") {
             if !repository.contains('#')
-                && myelin_git::gix_backend::validate_repo_slug(repository).is_ok()
+                && myelin_git::coordinate::RepositorySlug::parse(repository).is_ok()
             {
                 continue;
             }
@@ -653,7 +653,7 @@ fn bind_repository_caveat(body: &mut CreateTriggerBody) -> Result<(), EdgeError>
 }
 
 fn validate_repository_scope(repository: &str) -> Result<(), EdgeError> {
-    if repository.len() <= 255 && myelin_git::gix_backend::validate_repo_slug(repository).is_ok() {
+    if myelin_git::coordinate::RepositorySlug::parse(repository).is_ok() {
         Ok(())
     } else {
         Err(EdgeError::BadRequest(

@@ -64,16 +64,9 @@ pub fn validate_wire_segment(kind: &str, seg: &str) -> Result<(), WireError> {
 }
 
 pub fn validate_wire_repo_slug(repo: &str) -> Result<Vec<String>, WireError> {
-    if repo.contains('\\') || repo.contains('\0') {
-        return Err(WireError::Path(format!(
-            "invalid repo slug {repo:?}: contains a backslash/NUL (path-traversal guard, fail-closed)"
-        )));
-    }
-    let pieces: Vec<String> = repo.split('/').map(|s| s.to_string()).collect();
-    for piece in &pieces {
-        validate_wire_segment("repo", piece)?;
-    }
-    Ok(pieces)
+    let slug = myelin_refs::git_coordinate::RepositorySlug::parse(repo)
+        .map_err(|error| WireError::Path(format!("invalid repo slug: {error}")))?;
+    Ok(slug.segments().map(str::to_owned).collect())
 }
 
 pub fn resolve_bare_repo_path(

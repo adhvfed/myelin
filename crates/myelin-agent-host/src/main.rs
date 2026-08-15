@@ -457,21 +457,11 @@ fn triggering_merge_target(request: &ModelRequest) -> Result<(String, u64), Mode
             )
         })?;
     let (repo, number) = target;
-    if repo.is_empty()
-        || repo.len() > 255
-        || !repo
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
-    {
-        return Err(ModelError::Parse(
-            "development merge task has an invalid repository slug".into(),
-        ));
-    }
-    let number = number
-        .parse::<u64>()
-        .ok()
-        .filter(|number| *number > 0)
-        .ok_or_else(|| {
+    myelin_refs::git_coordinate::RepositorySlug::parse(repo).map_err(|_| {
+        ModelError::Parse("development merge task has an invalid repository slug".into())
+    })?;
+    let number =
+        myelin_refs::git_coordinate::parse_pull_request_number(number).ok_or_else(|| {
             ModelError::Parse("development merge task has an invalid PR number".into())
         })?;
     Ok((repo.to_string(), number))
@@ -603,6 +593,35 @@ mod tests {
                 })
                 .collect(),
             ..ModelRequest::default()
+        }
+    }
+
+    fn merge_request(target: &str) -> ModelRequest {
+        ModelRequest {
+            turns: vec![ModelTurn::User {
+                content: format!("Merge pull request {target}."),
+            }],
+            ..ModelRequest::default()
+        }
+    }
+
+    #[test]
+    fn development_merge_targets_share_the_public_git_coordinate() {
+        assert_eq!(
+            triggering_merge_target(&merge_request("platform/api#42")).unwrap(),
+            ("platform/api".into(), 42)
+        );
+
+        for alias in [
+            "platform/api#0",
+            "platform/api#01",
+            "platform.git/api#1",
+            "platform//api#1",
+        ] {
+            assert!(
+                triggering_merge_target(&merge_request(alias)).is_err(),
+                "noncanonical merge target was admitted: {alias}"
+            );
         }
     }
 

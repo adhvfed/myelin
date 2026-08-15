@@ -1,11 +1,11 @@
 use base64::Engine as _;
 
-use crate::gix_backend::validate_repo_slug;
+use crate::coordinate::{RepositorySlug, MAX_REPOSITORY_SLUG_BYTES};
 use crate::pr_store::{PrListBucket, PrListSort, PrListState, PR_LIST_PAGE_MAX};
 
 pub const PR_LIST_CURSOR_PREFIX: &str = "pl1_";
 pub const PR_LIST_CURSOR_MAX_BYTES: usize = 512;
-pub const PR_LIST_CURSOR_MAX_REPO_SLUG_BYTES: usize = 255;
+pub const PR_LIST_CURSOR_MAX_REPO_SLUG_BYTES: usize = MAX_REPOSITORY_SLUG_BYTES;
 
 const VERSION: u8 = 1;
 const FIXED_BYTES: usize = 94;
@@ -97,7 +97,7 @@ impl PrListCursor {
             PrListCursorEndpoint::CrossRepository(_) => {
                 let slug = key.repo_slug.as_deref().ok_or(PrListCursorError)?;
                 if slug.len() > PR_LIST_CURSOR_MAX_REPO_SLUG_BYTES
-                    || validate_repo_slug(slug).is_err()
+                    || RepositorySlug::parse(slug).is_err()
                 {
                     return Err(PrListCursorError);
                 }

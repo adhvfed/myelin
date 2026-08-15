@@ -226,7 +226,8 @@ pub fn valid_code_search_query(query: &str) -> bool {
 }
 
 pub fn valid_code_search_repo(repo: &str) -> bool {
-    repo.len() <= CODE_SEARCH_REPO_MAX_BYTES && crate::gix_backend::validate_repo_slug(repo).is_ok()
+    repo.len() <= CODE_SEARCH_REPO_MAX_BYTES
+        && crate::coordinate::RepositorySlug::parse(repo).is_ok()
 }
 
 pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
@@ -389,9 +390,10 @@ fn positional<'a>(args: &'a [&str], n: usize) -> Option<&'a str> {
 fn repo_and_number(args: &[&str]) -> Result<(String, u64), CliParseError> {
     let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
     let raw = positional(args, 1).ok_or(CliParseError::MissingArg { what: "number" })?;
-    let number = raw.parse::<u64>().map_err(|_| CliParseError::BadArg {
-        value: raw.to_string(),
-    })?;
+    let number =
+        crate::coordinate::parse_pull_request_number(raw).ok_or_else(|| CliParseError::BadArg {
+            value: raw.to_string(),
+        })?;
     Ok((repo.to_string(), number))
 }
 

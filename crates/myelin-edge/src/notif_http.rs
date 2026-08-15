@@ -417,9 +417,8 @@ fn git_pr_coordinate(subject: &ArtifactRef, expected_tenant: &str) -> Option<(St
 
 fn git_pr_parts(id: &str) -> Option<(&str, u64)> {
     let (repo, number) = id.rsplit_once(':')?;
-    myelin_git::gix_backend::validate_repo_slug(repo).ok()?;
-    let parsed = number.parse::<u64>().ok()?;
-    (parsed > 0 && parsed.to_string() == number).then_some((repo, parsed))
+    myelin_git::coordinate::RepositorySlug::parse(repo).ok()?;
+    myelin_git::coordinate::parse_pull_request_number(number).map(|parsed| (repo, parsed))
 }
 
 fn git_repo_subject(subject: &ArtifactRef, expected_tenant: &str) -> Option<ArtifactRef> {
@@ -435,7 +434,7 @@ fn git_repo_subject(subject: &ArtifactRef, expected_tenant: &str) -> Option<Arti
         "pr" => git_pr_parts(&parsed.id)?.0,
         _ => return None,
     };
-    myelin_git::gix_backend::validate_repo_slug(slug).ok()?;
+    myelin_git::coordinate::RepositorySlug::parse(slug).ok()?;
     Some(ArtifactRef(format!("repo:{slug}")))
 }
 
@@ -601,6 +600,8 @@ mod tests {
             "myelin://acme/git/blob/core:deadbeef",
             "myelin://acme/git/pr/team//core:42",
             "myelin://acme/git/pr/team/core:0",
+            "myelin://acme/git/pr/team/core:01",
+            "myelin://acme/git/pr/team.git/core:42",
         ] {
             assert_eq!(git_repo_subject(&ArtifactRef(subject.into()), "acme"), None);
             assert_eq!(
