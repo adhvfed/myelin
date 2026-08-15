@@ -60,39 +60,48 @@ describe("automation delegation", () => {
       tokenScheme: "agent",
       expectedStatus: 403,
     });
-    const response = await founder.json(`/v1/agent-runs/${encodeURIComponent(runId)}/mcp`, {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name: "git.list_repositories", arguments: { limit: 100 } },
-      },
-      token: runToken,
-      tokenScheme: "agent",
-      expectedStatus: 200,
-    });
-    expect(JSON.stringify(response.body)).not.toContain(runToken);
-    const result = record(response.body.result, "governed repository read");
-    expect(result, `governed repository read failed: ${JSON.stringify(result)}`).toMatchObject({
-      isError: false,
-      _meta: { tool: "git.list_repositories", runToken: expect.any(String) },
-    });
-    const content = array(result.content, "governed repository read content");
-    const repositoryPage = record(
-      JSON.parse(
-        string(
-          record(content[0], "repository read content item").text,
-          "repository read JSON",
+    const expectedSlug = `${systemTestConfig.tenant}/${repository.slug}`;
+    let cursor: string | undefined;
+    let found = false;
+    for (let pageNumber = 1; pageNumber <= 100 && !found; pageNumber += 1) {
+      const response = await founder.json(`/v1/agent-runs/${encodeURIComponent(runId)}/mcp`, {
+        method: "POST",
+        body: {
+          jsonrpc: "2.0",
+          id: pageNumber,
+          method: "tools/call",
+          params: {
+            name: "git.list_repositories",
+            arguments: { limit: 100, ...(cursor === undefined ? {} : { cursor }) },
+          },
+        },
+        token: runToken,
+        tokenScheme: "agent",
+        expectedStatus: 200,
+      });
+      expect(JSON.stringify(response.body)).not.toContain(runToken);
+      const result = record(response.body.result, "governed repository read");
+      expect(result, `governed repository read failed: ${JSON.stringify(result)}`).toMatchObject({
+        isError: false,
+        _meta: { tool: "git.list_repositories", runToken: expect.any(String) },
+      });
+      const content = array(result.content, "governed repository read content");
+      const repositoryPage = record(
+        JSON.parse(
+          string(
+            record(content[0], "repository read content item").text,
+            "repository read JSON",
+          ),
         ),
-      ),
-      "repository page visible to the founder",
-    );
-    expect(array(repositoryPage.items, "repositories visible through delegation")).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ slug: `${systemTestConfig.tenant}/${repository.slug}` }),
-      ]),
-    );
+        "repository page visible to the founder",
+      );
+      found = array(repositoryPage.items, "repositories visible through delegation")
+        .some((item) => record(item, "visible repository").slug === expectedSlug);
+      const nextCursor = record(repositoryPage.page, "repository page metadata").next_cursor;
+      if (nextCursor === null) break;
+      cursor = string(nextCursor, "next repository cursor");
+    }
+    expect(found, `the delegated catalogue did not contain ${expectedSlug}`).toBe(true);
 
     const closed = await founder.json(`/v1/agent-runs/${encodeURIComponent(runId)}/close`, {
       method: "POST",
