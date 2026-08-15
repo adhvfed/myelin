@@ -102,6 +102,16 @@ async fn write(
     actor: &Principal,
     deltas: Vec<TupleDelta>,
 ) -> Result<Zookie, myelin_identity_service::WriteError> {
+    write_until(tuples, scope, actor, deltas, None).await
+}
+
+async fn write_until(
+    tuples: &TupleStore,
+    scope: &TenantScope,
+    actor: &Principal,
+    deltas: Vec<TupleDelta>,
+    expires_at: Option<Timestamp>,
+) -> Result<Zookie, myelin_identity_service::WriteError> {
     let tuples = tuples.clone();
     let scope = scope.clone();
     let actor = actor.clone();
@@ -111,7 +121,7 @@ async fn write(
             &actor,
             &deltas,
             None,
-            None,
+            expires_at,
             Timestamp("2026-07-18T00:00:00Z".into()),
         )
     })
@@ -143,6 +153,21 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
     let alice = principal(&tenant, "fr-par", &format!("p:alice:{suffix}"));
     let bob = principal(&tenant, "fr-par", &format!("p:bob:{suffix}"));
     let outsider = principal(&tenant, "fr-par", &format!("p:outsider:{suffix}"));
+    let expired_project_reader = principal(
+        &tenant,
+        "fr-par",
+        &format!("p:expired-project-reader:{suffix}"),
+    );
+    let expired_inherited_reader = principal(
+        &tenant,
+        "fr-par",
+        &format!("p:expired-inherited-reader:{suffix}"),
+    );
+    let expired_issue_grantee = principal(
+        &tenant,
+        "fr-par",
+        &format!("p:expired-issue-grantee:{suffix}"),
+    );
     let worker = principal(&tenant, "fr-par", &format!("svc:worker:{suffix}"));
     let scope = TenantScope::from_verified_token(&alice, alice.region.clone());
     let tuples = TupleStore::with_pg(
@@ -189,6 +214,49 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
     )
     .await
     .expect("seed project viewers");
+    write(
+        &tuples,
+        &scope,
+        &alice,
+        vec![
+            tuple(
+                true,
+                "team:temporary-project-viewers",
+                "member",
+                &expired_inherited_reader.principal_id.0,
+            ),
+            tuple(
+                true,
+                "team:temporary-issue-grantees",
+                "member",
+                &expired_issue_grantee.principal_id.0,
+            ),
+        ],
+    )
+    .await
+    .expect("seed the durable side of temporary userset grants");
+    write_until(
+        &tuples,
+        &scope,
+        &alice,
+        vec![
+            tuple(
+                true,
+                format!("project:{project}"),
+                "reader",
+                &expired_project_reader.principal_id.0,
+            ),
+            tuple(
+                true,
+                format!("project:{project}"),
+                "parent_team",
+                "team:temporary-project-viewers#view",
+            ),
+        ],
+        Some(Timestamp("2026-07-18T00:01:00Z".into())),
+    )
+    .await
+    .expect("record temporary direct and inherited project grants");
 
     let staged = store
         .create(
@@ -206,6 +274,20 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .reconcile_authorization(&worker, &staged.id, &writer)
         .await
         .expect("activate normal production issue");
+    write_until(
+        &tuples,
+        &scope,
+        &alice,
+        vec![tuple(
+            true,
+            format!("issue:{}", staged.id),
+            "confidential_grant",
+            "team:temporary-issue-grantees#member",
+        )],
+        Some(Timestamp("2026-07-18T00:01:00Z".into())),
+    )
+    .await
+    .expect("record a temporary issue-specific userset grant");
 
     assert!(matches!(
         store
@@ -242,6 +324,21 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .unwrap()
         .items
         .is_empty());
+    for (principal, grant) in [
+        (&expired_project_reader, "direct project grant"),
+        (&expired_inherited_reader, "inherited project grant"),
+        (&expired_issue_grantee, "issue-specific userset grant"),
+    ] {
+        assert!(
+            store
+                .list(principal, IssuePageRequest::new(20, None).unwrap())
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "an expired {grant} cannot leave the issue visible"
+        );
+    }
 
     drop(store);
     let restarted_bootstrap = PgBootstrap::connect(config, 4)

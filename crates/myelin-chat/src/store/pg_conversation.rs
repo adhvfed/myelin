@@ -31,12 +31,14 @@ pub fn visible_public_conversations_cte() -> String {
               AND parent_acl.object_id = 'channel:' || conversation.conversation_id
               AND parent_acl.relation = 'parent_project'
               AND parent_acl.subject = project.object_id || '#view'
+              AND (parent_acl.expires_at IS NULL OR parent_acl.expires_at > CURRENT_TIMESTAMP)
              JOIN rebac_tuple member_acl
                ON member_acl.tenant_id = conversation.tenant_id
               AND member_acl.region = conversation.region
               AND member_acl.object_id = 'channel:' || conversation.conversation_id
               AND member_acl.relation = 'member'
               AND member_acl.subject = project.object_id || '#view'
+              AND (member_acl.expires_at IS NULL OR member_acl.expires_at > CURRENT_TIMESTAMP)
             WHERE conversation.tenant_id = $1 AND conversation.region = $2
               AND conversation.kind = 'channel_public' AND NOT conversation.archived
               AND conversation.acl_zookie IS NOT NULL
@@ -343,12 +345,14 @@ impl PgConversationStore {
                 AND parent_acl.object_id = 'channel:' || conversation.conversation_id
                 AND parent_acl.relation = 'parent_project'
                 AND parent_acl.subject = project.object_id || '#view'
+                AND (parent_acl.expires_at IS NULL OR parent_acl.expires_at > CURRENT_TIMESTAMP)
                JOIN rebac_tuple member_acl
                  ON member_acl.tenant_id = conversation.tenant_id
                 AND member_acl.region = conversation.region
                 AND member_acl.object_id = 'channel:' || conversation.conversation_id
                 AND member_acl.relation = 'member'
                 AND member_acl.subject = project.object_id || '#view'
+                AND (member_acl.expires_at IS NULL OR member_acl.expires_at > CURRENT_TIMESTAMP)
               WHERE conversation.tenant_id = $1 AND conversation.region = $2
                 AND conversation.kind = 'channel_public' AND NOT conversation.archived
                 AND conversation.acl_zookie IS NOT NULL

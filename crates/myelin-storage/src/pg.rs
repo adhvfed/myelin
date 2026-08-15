@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS rebac_tuple (
 CREATE INDEX IF NOT EXISTS rebac_tuple_rev
     ON rebac_tuple (tenant_id, region, subject, relation, object_id);";
 
+pub const REBAC_TUPLE_EXPIRY_MIGRATION: &str =
+    "ALTER TABLE rebac_tuple ADD COLUMN IF NOT EXISTS expires_at timestamptz;";
+
 #[derive(Debug)]
 pub enum PgError {
     Connect(String),
@@ -106,6 +109,10 @@ impl PgStore {
                    WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
                                AND region = current_setting('myelin.region', true));",
             ),
+            crate::migration::Migration::plain(
+                "0115_rebac_tuple_expiry",
+                REBAC_TUPLE_EXPIRY_MIGRATION,
+            ),
         ]);
         crate::pg_migrator::PgMigrator::apply(&self.pool, &migrations).await
     }
@@ -159,19 +166,16 @@ impl PgStore {
         );
         crate::tenant_tx::with_tenant_tx(&self.pool, tenant, &self.region, move |conn| {
             Box::pin(async move {
-                sqlx::query(
-                    "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
-                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                Self::upsert_tuple_on_conn(
+                    conn,
+                    &tenant_owned,
+                    &row_region,
+                    &object_id,
+                    &relation,
+                    &subject,
+                    None,
                 )
-                .bind(&tenant_owned)
-                .bind(&row_region)
-                .bind(&object_id)
-                .bind(&relation)
-                .bind(&subject)
-                .execute(&mut *conn)
                 .await
-                .map_err(|e| PgError::Query(e.to_string()))?;
-                Ok(())
             })
         })
         .await
@@ -195,7 +199,9 @@ impl PgStore {
             Box::pin(async move {
                 let rows = sqlx::query(
                     "SELECT object_id FROM rebac_tuple \
-                     WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
+                     WHERE tenant_id = $1 AND subject = $2 AND relation = $3 \
+                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) \
+                     ORDER BY object_id",
                 )
                 .bind(&tenant_owned)
                 .bind(&subject)
@@ -232,7 +238,8 @@ impl PgStore {
             Box::pin(async move {
                 let exists: bool = sqlx::query_scalar(
                     "SELECT EXISTS (SELECT 1 FROM rebac_tuple \
-                     WHERE tenant_id = $1 AND object_id = $2 AND relation = $3 AND subject = $4)",
+                     WHERE tenant_id = $1 AND object_id = $2 AND relation = $3 AND subject = $4 \
+                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP))",
                 )
                 .bind(&tenant_owned)
                 .bind(&object_id)
@@ -317,7 +324,9 @@ impl PgStore {
             Box::pin(async move {
                 let rows = sqlx::query(
                     "SELECT object_id FROM rebac_tuple \
-                     WHERE tenant_id = $1 AND subject = $2 AND relation = $3 ORDER BY object_id",
+                     WHERE tenant_id = $1 AND subject = $2 AND relation = $3 \
+                       AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) \
+                     ORDER BY object_id",
                 )
                 .bind(&tenant_owned)
                 .bind(&subject)
@@ -346,15 +355,32 @@ impl PgStore {
         relation: &str,
         subject: &str,
     ) -> Result<(), PgError> {
+        Self::upsert_tuple_on_conn(conn, tenant, region, object_id, relation, subject, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_tuple_on_conn(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        object_id: &str,
+        relation: &str,
+        subject: &str,
+        expires_at: Option<&str>,
+    ) -> Result<(), PgError> {
         sqlx::query(
-            "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+            "INSERT INTO rebac_tuple \
+               (tenant_id, region, object_id, relation, subject, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6::timestamptz) \
+             ON CONFLICT (tenant_id, region, object_id, relation, subject) DO UPDATE \
+             SET expires_at = EXCLUDED.expires_at",
         )
         .bind(tenant)
         .bind(region)
         .bind(object_id)
         .bind(relation)
         .bind(subject)
+        .bind(expires_at)
         .execute(&mut *conn)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
@@ -392,7 +418,9 @@ impl PgStore {
     ) -> Result<Vec<(String, String, String)>, PgError> {
         let rows = sqlx::query(
             "SELECT object_id, relation, subject FROM rebac_tuple \
-             WHERE tenant_id = $1 AND region = $2 ORDER BY object_id, relation, subject",
+             WHERE tenant_id = $1 AND region = $2 \
+               AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) \
+             ORDER BY object_id, relation, subject",
         )
         .bind(tenant)
         .bind(region)

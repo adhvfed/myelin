@@ -252,6 +252,10 @@ pub fn identity_tuple_revision_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0113_rebac_revision", REBAC_REVISION_MIGRATION),
         Migration::plain("0114_rebac_revision_rls", REBAC_REVISION_RLS_POLICY),
+        Migration::plain(
+            "0115_rebac_tuple_expiry",
+            crate::pg::REBAC_TUPLE_EXPIRY_MIGRATION,
+        ),
     ])
 }
 
@@ -276,7 +280,7 @@ pub fn auth_replay_durable_migrations() -> Migrations {
     ])
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TupleEdgeOp {
     Add,
     Remove,
@@ -288,6 +292,16 @@ pub struct DurableTupleEdge {
     pub relation: String,
     pub subject: String,
     pub revision: u64,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableTupleDelta {
+    pub op: TupleEdgeOp,
+    pub object: String,
+    pub relation: String,
+    pub subject: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,7 +330,7 @@ impl DurableTupleBacking {
         &self,
         tenant: &str,
         region: &str,
-        deltas: Vec<(TupleEdgeOp, String, String, String)>,
+        deltas: Vec<DurableTupleDelta>,
         expected_revision: Option<String>,
         event_for_revision: F,
     ) -> Result<DurableTupleWriteOutcome, ProviderError>
@@ -340,7 +354,7 @@ impl DurableTupleBacking {
 
                     let objects: Vec<String> = deltas
                         .iter()
-                        .map(|(_, object, _, _)| object.clone())
+                        .map(|delta| delta.object.clone())
                         .collect::<BTreeSet<_>>()
                         .into_iter()
                         .collect();
@@ -389,16 +403,17 @@ impl DurableTupleBacking {
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|error| PgError::Query(error.to_string()))?;
-                    for (op, object, relation, subject) in &deltas {
-                        match op {
+                    for delta in &deltas {
+                        match delta.op {
                             TupleEdgeOp::Add => {
-                                PgStore::insert_tuple_on_conn(
+                                PgStore::upsert_tuple_on_conn(
                                     conn,
                                     &tenant_owned,
                                     &region_owned,
-                                    object,
-                                    relation,
-                                    subject,
+                                    &delta.object,
+                                    &delta.relation,
+                                    &delta.subject,
+                                    delta.expires_at.as_deref(),
                                 )
                                 .await?
                             }
@@ -407,9 +422,9 @@ impl DurableTupleBacking {
                                     conn,
                                     &tenant_owned,
                                     &region_owned,
-                                    object,
-                                    relation,
-                                    subject,
+                                    &delta.object,
+                                    &delta.relation,
+                                    &delta.subject,
                                 )
                                 .await?
                             }
@@ -451,18 +466,21 @@ impl DurableTupleBacking {
                 Box::pin(async move {
                     let rows = sqlx::query(
                         "SELECT NULL::text AS object_id, NULL::text AS relation, \
-                                NULL::text AS subject, \
+                                NULL::text AS subject, NULL::text AS expires_at, \
                                 COALESCE((SELECT revision FROM rebac_revision \
                                           WHERE tenant_id = $1 AND region = $2), 0) AS revision, \
                                 true AS is_snapshot \
                          UNION ALL \
                          SELECT t.object_id, t.relation, t.subject, \
+                                to_char(t.expires_at AT TIME ZONE 'UTC', \
+                                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS expires_at, \
                                 COALESCE(r.revision, 0) AS revision, false AS is_snapshot \
                          FROM rebac_tuple t \
                          LEFT JOIN rebac_object_revision r \
                            ON r.tenant_id = t.tenant_id AND r.region = t.region \
                           AND r.object_id = t.object_id \
                          WHERE t.tenant_id = $1 AND t.region = $2 \
+                           AND (t.expires_at IS NULL OR t.expires_at > CURRENT_TIMESTAMP) \
                          ORDER BY is_snapshot DESC, object_id, relation, subject",
                     )
                     .bind(&tenant_owned)
@@ -491,6 +509,7 @@ impl DurableTupleBacking {
                                 subject: row.get::<Option<String>, _>("subject").ok_or_else(
                                     || PgError::Query("relationship edge has no subject".into()),
                                 )?,
+                                expires_at: row.get::<Option<String>, _>("expires_at"),
                                 revision: decode_revision(
                                     "relationship object revision",
                                     row.get::<i64, _>("revision"),

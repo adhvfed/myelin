@@ -803,7 +803,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0114_rebac_revision_rls");
+        assert_eq!(*ids.last().unwrap(), "0115_rebac_tuple_expiry");
     }
 
     #[test]

@@ -165,6 +165,10 @@ async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
         principal_id: PrincipalId("p:outsider".into()),
         ..actor(&tenant, &region)
     };
+    let temporary_team_member = Principal {
+        principal_id: PrincipalId("p:temporary-team-member".into()),
+        ..actor(&tenant, &region)
+    };
     let scope = TenantScope::from_verified_token(&founder, founder.region.clone());
     tuples
         .write_tuples(
@@ -206,6 +210,71 @@ async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
             .unwrap()
             .is_empty(),
         "an unrelated principal learns no project metadata"
+    );
+
+    tuples
+        .write_tuples(
+            &scope,
+            &founder,
+            &[add(
+                "team:temporary-project-access",
+                "member",
+                &temporary_team_member.principal_id.0,
+            )],
+            None,
+            None,
+            Timestamp("2020-01-01T00:00:00Z".into()),
+        )
+        .expect("seed the durable side of a temporary inherited grant");
+    tuples
+        .write_tuples(
+            &scope,
+            &founder,
+            &[
+                add(
+                    &format!("project:{}", first.project.id),
+                    "reader",
+                    &outsider.principal_id.0,
+                ),
+                add(
+                    &format!("project:{}", first.project.id),
+                    "parent_team",
+                    "team:temporary-project-access#view",
+                ),
+            ],
+            None,
+            Some(Timestamp("2020-01-01T00:01:00Z".into())),
+            Timestamp("2020-01-01T00:00:00Z".into()),
+        )
+        .expect("record temporary direct and inherited project grants");
+    assert!(
+        store
+            .list_visible(&outsider, None, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a direct project grant disappears from the user's project list at its deadline"
+    );
+    assert!(
+        store
+            .list_visible(&temporary_team_member, None, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an expired parent edge cannot keep inherited project visibility alive"
+    );
+    let expired_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rebac_tuple \
+          WHERE tenant_id = $1 AND region = $2 AND expires_at < CURRENT_TIMESTAMP",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .fetch_one(admin.db_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        expired_rows, 2,
+        "expiry revokes authority without erasing the durable relationship history"
     );
 
     let tuple: (String, String, String) = sqlx::query(

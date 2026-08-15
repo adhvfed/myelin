@@ -2166,7 +2166,7 @@ mod tests {
                 &caveats(&["g"]),
                 MachineKind::Agent,
                 &ttl(120),
-                &ts("2026-06-19T00:00:00Z"),
+                &ts("2099-06-19T00:00:00Z"),
             )
             .expect("mint");
         let stored = tuples
@@ -2180,7 +2180,7 @@ mod tests {
         assert_eq!(grant.tuple.subject.0, "p:agent");
         assert_eq!(
             grant.expires_at,
-            Some(ts("2026-06-19T00:02:00Z")),
+            Some(ts("2099-06-19T00:02:00Z")),
             "the per-run grant tuple's expires_at == run life (now + 120s)"
         );
     }

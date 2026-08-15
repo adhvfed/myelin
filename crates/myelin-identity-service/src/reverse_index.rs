@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, SubjectPattern};
 use myelin_identity::iam_events::{signals, IDENTITY_TUPLE_WRITTEN};
 use myelin_identity::{ObjectId, ObjectType, PrincipalId, RelName, Zookie};
@@ -38,7 +39,13 @@ struct PartKey {
 
 #[derive(Default)]
 struct Partition {
-    rows: BTreeMap<(String, String, String), ReverseRow>,
+    rows: BTreeMap<(String, String, String), IndexedRow>,
+    revisions: BTreeMap<(String, String, String), Zookie>,
+}
+
+struct IndexedRow {
+    row: ReverseRow,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Default)]
@@ -85,6 +92,18 @@ impl ReverseIndex {
         row: ReverseRow,
         zookie: &Zookie,
     ) {
+        self.apply_delta_until(scope, op, object_type, row, zookie, None);
+    }
+
+    fn apply_delta_until(
+        &self,
+        scope: &TenantScope,
+        op: &str,
+        object_type: &ObjectType,
+        row: ReverseRow,
+        zookie: &Zookie,
+        expires_at: Option<DateTime<Utc>>,
+    ) {
         if !matches!(op, "add" | "remove") {
             return;
         }
@@ -96,12 +115,21 @@ impl ReverseIndex {
         };
         let mut inner = self.lock();
         let partition = inner.partitions.entry(pk).or_default();
+        let key = row.key();
+        if partition
+            .revisions
+            .get(&key)
+            .is_some_and(|current| current.0 > zookie.0)
+        {
+            return;
+        }
+        partition.revisions.insert(key.clone(), zookie.clone());
         match op {
             "add" => {
-                partition.rows.insert(row.key(), row);
+                partition.rows.insert(key, IndexedRow { row, expires_at });
             }
             "remove" => {
-                partition.rows.remove(&row.key());
+                partition.rows.remove(&key);
             }
             _ => unreachable!("operation was validated before locking the projection"),
         }
@@ -130,14 +158,17 @@ impl ReverseIndex {
             object_type: object_type.0.clone(),
         };
         let inner = self.lock();
+        let now = Utc::now();
         inner
             .partitions
             .get(&pk)
             .map(|p| {
                 p.rows
                     .values()
-                    .filter(|r| &r.subject == subject && &r.relation == relation)
-                    .map(|r| r.object_id.clone())
+                    .filter(|indexed| indexed.is_live_at(now))
+                    .map(|indexed| &indexed.row)
+                    .filter(|row| &row.subject == subject && &row.relation == relation)
+                    .map(|row| row.object_id.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -157,14 +188,17 @@ impl ReverseIndex {
             object_type: object_type.0.clone(),
         };
         let inner = self.lock();
+        let now = Utc::now();
         inner
             .partitions
             .get(&pk)
             .map(|p| {
                 p.rows
                     .values()
-                    .filter(|r| r.object_id.0 == object_id && &r.relation == relation)
-                    .map(|r| r.subject.clone())
+                    .filter(|indexed| indexed.is_live_at(now))
+                    .map(|indexed| &indexed.row)
+                    .filter(|row| row.object_id.0 == object_id && &row.relation == relation)
+                    .map(|row| row.subject.clone())
                     .collect()
             })
             .unwrap_or_default()
@@ -190,12 +224,25 @@ impl ReverseIndex {
         self.lock()
             .partitions
             .get(&pk)
-            .map(|p| p.rows.len())
+            .map(|partition| {
+                let now = Utc::now();
+                partition
+                    .rows
+                    .values()
+                    .filter(|row| row.is_live_at(now))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl IndexedRow {
+    fn is_live_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_none_or(|expires_at| expires_at > now)
     }
 }
 
@@ -265,12 +312,19 @@ impl ReverseIndexConsumer {
             .get("deltas")
             .and_then(|d| d.as_array())
             .ok_or_else(|| "identity.tuple.written event carries no deltas array".to_string())?;
+        let occurred_at = DateTime::parse_from_rfc3339(&ev.occurred_at.0)
+            .map_err(|_| {
+                "identity.tuple.written event carries an invalid RFC 3339 occurrence time"
+                    .to_string()
+            })?
+            .with_timezone(&Utc);
 
         struct ValidatedDelta<'a> {
             op: &'a str,
             object: &'a str,
             relation: &'a str,
             subject: &'a str,
+            expires_at: Option<DateTime<Utc>>,
         }
 
         fn required_delta_field<'a>(
@@ -290,6 +344,43 @@ impl ReverseIndexConsumer {
                 })
         }
 
+        fn optional_expiry(
+            delta: &serde_json::Value,
+            index: usize,
+            op: &str,
+            occurred_at: DateTime<Utc>,
+        ) -> Result<Option<DateTime<Utc>>, String> {
+            let Some(value) = delta.as_object().and_then(|delta| delta.get("expires_at")) else {
+                return Ok(None);
+            };
+            if op == "remove" {
+                return Err(format!(
+                    "identity.tuple.written remove delta {index} unexpectedly carries `expires_at`"
+                ));
+            }
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "identity.tuple.written delta {index} has a non-string or empty `expires_at`"
+                    )
+                })?;
+            let expires_at = DateTime::parse_from_rfc3339(value)
+                .map_err(|_| {
+                    format!(
+                        "identity.tuple.written delta {index} has an invalid RFC 3339 `expires_at`"
+                    )
+                })?
+                .with_timezone(&Utc);
+            if expires_at <= occurred_at {
+                return Err(format!(
+                    "identity.tuple.written delta {index} does not expire after the event occurrence"
+                ));
+            }
+            Ok(Some(expires_at))
+        }
+
         let validated = deltas
             .iter()
             .enumerate()
@@ -305,6 +396,7 @@ impl ReverseIndexConsumer {
                     object: required_delta_field(delta, index, "object")?,
                     relation: required_delta_field(delta, index, "relation")?,
                     subject: required_delta_field(delta, index, "subject")?,
+                    expires_at: optional_expiry(delta, index, op, occurred_at)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -315,7 +407,7 @@ impl ReverseIndexConsumer {
                 continue;
             }
             let object_type = ObjectType(type_of_object_id(delta.object));
-            self.index.apply_delta(
+            self.index.apply_delta_until(
                 &scope,
                 delta.op,
                 &object_type,
@@ -325,6 +417,7 @@ impl ReverseIndexConsumer {
                     object_id: ObjectId(delta.object.to_string()),
                 },
                 &zookie,
+                delta.expires_at,
             );
             applied_any = true;
         }
@@ -423,14 +516,26 @@ mod tests {
         scope: &TenantScope,
         deltas: &[TupleDelta],
     ) -> Zookie {
+        feed_write_until(store, outbox, consumer, scope, deltas, None, now())
+    }
+
+    fn feed_write_until(
+        store: &TupleStore,
+        outbox: &OutboxStore,
+        consumer: &ReverseIndexConsumer,
+        scope: &TenantScope,
+        deltas: &[TupleDelta],
+        expires_at: Option<Timestamp>,
+        occurred_at: Timestamp,
+    ) -> Zookie {
         let z = store
             .write_tuples(
                 scope,
                 &actor_in(&scope.tenant().0),
                 deltas,
                 None,
-                None,
-                now(),
+                expires_at,
+                occurred_at,
             )
             .expect("write");
         let bus = InProcessBus::new();
@@ -440,6 +545,42 @@ mod tests {
             consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
         z
+    }
+
+    #[test]
+    fn expiring_grant_disappears_from_the_reverse_index_at_its_deadline() {
+        let outbox = OutboxStore::new();
+        let store = TupleStore::new(outbox.clone());
+        let index = ReverseIndex::new();
+        let consumer = ReverseIndexConsumer::new(index.clone());
+        let s = scope("acme");
+
+        feed_write_until(
+            &store,
+            &outbox,
+            &consumer,
+            &s,
+            &[TupleDelta::Add(tuple("run:finished", "runner", "p:agent"))],
+            Some(Timestamp("2020-01-01T00:01:00Z".into())),
+            Timestamp("2020-01-01T00:00:00Z".into()),
+        );
+
+        assert!(
+            index
+                .objects_for(
+                    &s,
+                    &ObjectType("run".into()),
+                    &PrincipalId("p:agent".into()),
+                    &RelName("runner".into()),
+                )
+                .is_empty(),
+            "an event-fed listing cannot preserve authority after the tuple deadline"
+        );
+        assert_eq!(
+            index.row_count(&s, &ObjectType("run".into())),
+            0,
+            "expired grants are absent from the projection's observable row count"
+        );
     }
 
     #[test]
@@ -600,6 +741,51 @@ mod tests {
             "a re-add is idempotent (one row)"
         );
         let _ = consumer;
+    }
+
+    #[test]
+    fn older_redelivery_cannot_resurrect_a_removed_reverse_row() {
+        let index = ReverseIndex::new();
+        let s = scope("acme");
+        let row = ReverseRow {
+            subject: PrincipalId("p:alice".into()),
+            relation: RelName("reader".into()),
+            object_id: ObjectId("repo:core".into()),
+        };
+        let repo = ObjectType("repo".into());
+
+        index.apply_delta(
+            &s,
+            "add",
+            &repo,
+            row.clone(),
+            &Zookie("zk-00000000000000000001".into()),
+        );
+        index.apply_delta(
+            &s,
+            "remove",
+            &repo,
+            row.clone(),
+            &Zookie("zk-00000000000000000002".into()),
+        );
+        index.apply_delta(
+            &s,
+            "add",
+            &repo,
+            row,
+            &Zookie("zk-00000000000000000001".into()),
+        );
+
+        assert_eq!(
+            index.row_count(&s, &repo),
+            0,
+            "a delayed older add cannot overwrite the newer tombstone"
+        );
+        assert_eq!(
+            index.watermark(&s),
+            Zookie("zk-00000000000000000002".into()),
+            "redelivery does not regress the projection watermark"
+        );
     }
 
     #[test]

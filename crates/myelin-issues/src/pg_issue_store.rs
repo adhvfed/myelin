@@ -2110,6 +2110,7 @@ walk(issue_id, arm, object_id, relation, depth, path, supported) AS (
     FROM rebac_tuple t
     WHERE t.tenant_id = $1 AND t.region = $2
       AND t.object_id = w.object_id AND t.relation = w.relation
+      AND (t.expires_at IS NULL OR t.expires_at > CURRENT_TIMESTAMP)
       AND position('#' IN t.subject) > 0
       AND NOT (w.relation = 'view'
                AND split_part(w.object_id, ':', 1) IN ('org', 'team', 'project'))
@@ -2139,6 +2140,7 @@ walk(issue_id, arm, object_id, relation, depth, path, supported) AS (
     JOIN rebac_tuple t
       ON t.tenant_id = $1 AND t.region = $2
      AND t.object_id = w.object_id AND t.relation = inherited.tupleset
+     AND (t.expires_at IS NULL OR t.expires_at > CURRENT_TIMESTAMP)
     WHERE w.relation = 'view'
       AND split_part(w.object_id, ':', 1) = inherited.object_type
       AND position('#' IN t.subject) > 0
@@ -2156,6 +2158,7 @@ const ISSUE_VIEW_MEMBERS_CTE: &str = r#"
   JOIN rebac_tuple t
     ON t.tenant_id = $1 AND t.region = $2
    AND t.object_id = w.object_id AND t.relation = w.relation
+   AND (t.expires_at IS NULL OR t.expires_at > CURRENT_TIMESTAMP)
   WHERE w.supported AND position('#' IN t.subject) = 0
     AND NOT (w.relation = 'view'
              AND split_part(w.object_id, ':', 1) IN ('org', 'team', 'project'))

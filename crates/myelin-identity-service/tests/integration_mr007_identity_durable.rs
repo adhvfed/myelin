@@ -296,6 +296,94 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relationship_expiry_survives_restart_without_lingering_authority() {
+    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
+        Ok(provider) => provider,
+        Err(_) => {
+            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
+            return;
+        }
+    };
+    admin
+        .migrate(&identity_durable_migrations(), &HotTables::none())
+        .await
+        .expect("identity durable migrations");
+    admin
+        .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
+        .await
+        .expect("relationship revision and expiry migrations");
+    admin
+        .migrate_foundation()
+        .await
+        .expect("foundation outbox migration");
+    let Some(app) = app_provider().await else {
+        return;
+    };
+    let region = app.config().region.clone();
+    let handle = tokio::runtime::Handle::current();
+    let tenant = format!("mr007-expiry-{}", uniq());
+    let tenant_scope = scope(&tenant, &region);
+    let writer = TupleStore::with_pg(DurableTupleBacking::new(app.clone()), handle.clone());
+
+    writer
+        .write_tuples(
+            &tenant_scope,
+            &actor(&tenant),
+            &[TupleDelta::Add(tuple(
+                "run:expired",
+                "run_bound",
+                "p:agent",
+            ))],
+            None,
+            Some(Timestamp("2001-01-01T00:00:00Z".into())),
+            Timestamp("2000-01-01T00:00:00Z".into()),
+        )
+        .expect("the historical relationship was live when committed");
+    writer
+        .write_tuples(
+            &tenant_scope,
+            &actor(&tenant),
+            &[TupleDelta::Add(tuple("run:live", "run_bound", "p:agent"))],
+            None,
+            Some(Timestamp("2099-01-01T00:02:00Z".into())),
+            Timestamp("2099-01-01T00:00:00Z".into()),
+        )
+        .expect("the future relationship commits with its expiry");
+    drop(writer);
+
+    let restarted = TupleStore::with_pg(DurableTupleBacking::new(app), handle);
+    let visible = restarted
+        .tuples_in(&tenant_scope)
+        .expect("a fresh process reads the live authorization snapshot");
+    assert_eq!(
+        visible.len(),
+        1,
+        "only the unexpired relationship remains authority"
+    );
+    assert_eq!(visible[0].tuple.object.0, "run:live");
+    assert_eq!(
+        visible[0].expires_at.as_ref().map(|value| value.0.as_str()),
+        Some("2099-01-01T00:02:00.000000Z"),
+        "PostgreSQL preserves the exact expiry contract across restart"
+    );
+
+    for sql in [
+        "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM rebac_object_revision WHERE tenant_id = $1",
+        "DELETE FROM rebac_revision WHERE tenant_id = $1",
+    ] {
+        let _ = sqlx::query(sql)
+            .bind(&tenant)
+            .execute(admin.db_pool())
+            .await;
+    }
+    let _ = sqlx::query("DELETE FROM outbox WHERE aggregate LIKE $1")
+        .bind(format!("identity:tuple:{tenant}:%"))
+        .execute(admin.db_pool())
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
     let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
         Ok(p) => p,

@@ -24,6 +24,7 @@ pub const S3_HOLDER: &str = "identity_rebac_tuples";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteError {
     EmptyWrite,
+    InvalidExpiry { detail: &'static str },
     PreconditionFailed { expected: Zookie, actual: Zookie },
     CrossTenant { detail: String },
     CommitFailed(String),
@@ -33,6 +34,9 @@ impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             WriteError::EmptyWrite => write!(f, "write_tuples requires at least one relationship delta"),
+            WriteError::InvalidExpiry { detail } => {
+                write!(f, "write_tuples rejected an invalid relationship expiry: {detail}")
+            }
             WriteError::PreconditionFailed { expected, actual } => write!(
                 f,
                 "write_tuples precondition failed: expected object zookie {expected:?} but the \
@@ -62,6 +66,11 @@ pub struct StoredTuple {
     pub tuple: RelationTuple,
     pub zookie: Zookie,
     pub expires_at: Option<Timestamp>,
+}
+
+struct RelationshipLifetime {
+    expires_at: Option<Timestamp>,
+    occurred_at: Timestamp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,10 +267,16 @@ impl TupleStore {
             #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
                 let inner = Self::mem_lock(inner_arc);
+                let now = chrono::Utc::now();
                 let tuples = inner
                     .partitions
                     .get(&Self::part_key(scope))
-                    .map(|p| p.values().cloned().collect())
+                    .map(|p| {
+                        p.values()
+                            .filter(|tuple| tuple_is_live_at(tuple, &now))
+                            .cloned()
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let zookie = self.current_zookie();
                 Ok(TupleSnapshot { tuples, zookie })
@@ -286,7 +301,7 @@ impl TupleStore {
                             caveat: None,
                         },
                         zookie: Self::zookie_of(edge.revision),
-                        expires_at: None,
+                        expires_at: edge.expires_at.map(Timestamp),
                     })
                     .collect();
                 Ok(TupleSnapshot {
@@ -312,20 +327,24 @@ impl TupleStore {
         occurred_at: Timestamp,
     ) -> Result<Zookie, WriteError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
-        self.validate_write_scope(scope, actor, deltas)?;
+        let lifetime = RelationshipLifetime {
+            expires_at,
+            occurred_at,
+        };
+        self.validate_write_scope(
+            scope,
+            actor,
+            deltas,
+            lifetime.expires_at.as_ref(),
+            &lifetime.occurred_at,
+        )?;
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            TupleBackend::Memory(inner_arc) => self.write_tuples_memory(
-                inner_arc,
-                scope,
-                actor,
-                deltas,
-                precondition,
-                expires_at,
-                &occurred_at,
-            ),
+            TupleBackend::Memory(inner_arc) => {
+                self.write_tuples_memory(inner_arc, scope, actor, deltas, precondition, &lifetime)
+            }
             TupleBackend::Pg(pg) => {
-                self.write_tuples_pg(pg, scope, actor, deltas, precondition, &occurred_at)
+                self.write_tuples_pg(pg, scope, actor, deltas, precondition, &lifetime)
             }
         }
     }
@@ -335,6 +354,8 @@ impl TupleStore {
         scope: &TenantScope,
         actor: &Principal,
         deltas: &[TupleDelta],
+        expires_at: Option<&Timestamp>,
+        occurred_at: &Timestamp,
     ) -> Result<(), WriteError> {
         if deltas.is_empty() {
             return Err(WriteError::EmptyWrite);
@@ -343,6 +364,24 @@ impl TupleStore {
             return Err(WriteError::CrossTenant {
                 detail: "the attributed actor is outside the verified tenant scope".into(),
             });
+        }
+        if let Some(expires_at) = expires_at {
+            let occurred_at =
+                chrono::DateTime::parse_from_rfc3339(&occurred_at.0).map_err(|_| {
+                    WriteError::InvalidExpiry {
+                        detail: "an expiring write requires a valid RFC 3339 occurrence time",
+                    }
+                })?;
+            let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at.0).map_err(|_| {
+                WriteError::InvalidExpiry {
+                    detail: "expires_at must be a valid RFC 3339 timestamp",
+                }
+            })?;
+            if expires_at <= occurred_at {
+                return Err(WriteError::InvalidExpiry {
+                    detail: "expires_at must be strictly after the write occurrence",
+                });
+            }
         }
         for delta in deltas {
             let tuple = match delta {
@@ -376,9 +415,10 @@ impl TupleStore {
         actor: &Principal,
         deltas: &[TupleDelta],
         zookie: &Zookie,
+        expires_at: Option<&Timestamp>,
         occurred_at: &Timestamp,
     ) -> (AggregateKey, EventEnvelope) {
-        let draft = self.tuple_written_draft(scope, deltas, zookie);
+        let draft = self.tuple_written_draft(scope, deltas, zookie, expires_at);
         let aggregate = draft.aggregate.clone();
         let event_id: EventId = self.minter.mint().into();
         let ctx = EmitContext {
@@ -402,6 +442,7 @@ impl TupleStore {
         actor: &Principal,
         deltas: &[TupleDelta],
         zookie: &Zookie,
+        expires_at: Option<&Timestamp>,
         occurred_at: &Timestamp,
     ) -> Result<OutboxTransaction, WriteError> {
         let ctx_base = EmitContextBase {
@@ -419,14 +460,13 @@ impl TupleStore {
             deltas.len(),
             zookie.0
         ));
-        let draft = self.tuple_written_draft(scope, deltas, zookie);
+        let draft = self.tuple_written_draft(scope, deltas, zookie, expires_at);
         tx.emit(draft, None)
             .map_err(|e| WriteError::CommitFailed(e.0))?;
         Ok(tx)
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    #[allow(clippy::too_many_arguments)]
     fn write_tuples_memory(
         &self,
         inner_arc: &Arc<Mutex<Inner>>,
@@ -434,8 +474,7 @@ impl TupleStore {
         actor: &Principal,
         deltas: &[TupleDelta],
         precondition: Option<&Precondition>,
-        expires_at: Option<Timestamp>,
-        occurred_at: &Timestamp,
+        lifetime: &RelationshipLifetime,
     ) -> Result<Zookie, WriteError> {
         let part_key = Self::part_key(scope);
         let mut inner = Self::mem_lock(inner_arc);
@@ -455,7 +494,14 @@ impl TupleStore {
 
         let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let zookie = Self::zookie_of(new_rev);
-        let tx = self.stage_event(scope, actor, deltas, &zookie, occurred_at)?;
+        let tx = self.stage_event(
+            scope,
+            actor,
+            deltas,
+            &zookie,
+            lifetime.expires_at.as_ref(),
+            &lifetime.occurred_at,
+        )?;
 
         let partition = inner.partitions.entry(part_key).or_default();
         for delta in deltas {
@@ -468,7 +514,7 @@ impl TupleStore {
                             region: scope.region().clone(),
                             tuple: t.clone(),
                             zookie: zookie.clone(),
-                            expires_at: expires_at.clone(),
+                            expires_at: lifetime.expires_at.clone(),
                         },
                     );
                 }
@@ -489,34 +535,37 @@ impl TupleStore {
         actor: &Principal,
         deltas: &[TupleDelta],
         precondition: Option<&Precondition>,
-        occurred_at: &Timestamp,
+        lifetime: &RelationshipLifetime,
     ) -> Result<Zookie, WriteError> {
         let tenant = scope.tenant().0.clone();
         let region = scope.region().0.clone();
         let expected = precondition.and_then(|value| value.expected_zookie.clone());
 
-        let edge_deltas: Vec<(myelin_storage::TupleEdgeOp, String, String, String)> = deltas
+        let edge_deltas: Vec<myelin_storage::DurableTupleDelta> = deltas
             .iter()
             .map(|d| match d {
-                TupleDelta::Add(t) => (
-                    myelin_storage::TupleEdgeOp::Add,
-                    t.object.0.clone(),
-                    t.relation.0.clone(),
-                    t.subject.0.clone(),
-                ),
-                TupleDelta::Remove(t) => (
-                    myelin_storage::TupleEdgeOp::Remove,
-                    t.object.0.clone(),
-                    t.relation.0.clone(),
-                    t.subject.0.clone(),
-                ),
+                TupleDelta::Add(t) => myelin_storage::DurableTupleDelta {
+                    op: myelin_storage::TupleEdgeOp::Add,
+                    object: t.object.0.clone(),
+                    relation: t.relation.0.clone(),
+                    subject: t.subject.0.clone(),
+                    expires_at: lifetime.expires_at.as_ref().map(|value| value.0.clone()),
+                },
+                TupleDelta::Remove(t) => myelin_storage::DurableTupleDelta {
+                    op: myelin_storage::TupleEdgeOp::Remove,
+                    object: t.object.0.clone(),
+                    relation: t.relation.0.clone(),
+                    subject: t.subject.0.clone(),
+                    expires_at: None,
+                },
             })
             .collect();
         let event_store = self.clone();
         let event_scope = scope.clone();
         let event_actor = actor.clone();
         let event_deltas = deltas.to_vec();
-        let event_time = occurred_at.clone();
+        let event_expires_at = lifetime.expires_at.clone();
+        let event_time = lifetime.occurred_at.clone();
         let outcome = pg
             .block(pg.backing.apply_deltas_co_commit(
                 &tenant,
@@ -529,6 +578,7 @@ impl TupleStore {
                         &event_actor,
                         &event_deltas,
                         &Self::zookie_of(revision),
+                        event_expires_at.as_ref(),
                         &event_time,
                     );
                     (aggregate.0, envelope)
@@ -556,6 +606,7 @@ impl TupleStore {
         scope: &TenantScope,
         deltas: &[TupleDelta],
         zookie: &Zookie,
+        expires_at: Option<&Timestamp>,
     ) -> EventDraft {
         let object = deltas
             .iter()
@@ -573,12 +624,18 @@ impl TupleStore {
         let ops: Vec<serde_json::Value> = deltas
             .iter()
             .map(|d| match d {
-                TupleDelta::Add(t) => serde_json::json!({
-                    "op": "add",
-                    "object": t.object.0,
-                    "relation": t.relation.0,
-                    "subject": t.subject.0,
-                }),
+                TupleDelta::Add(t) => {
+                    let mut delta = serde_json::json!({
+                        "op": "add",
+                        "object": t.object.0,
+                        "relation": t.relation.0,
+                        "subject": t.subject.0,
+                    });
+                    if let Some(expires_at) = expires_at {
+                        delta["expires_at"] = serde_json::json!(expires_at.0);
+                    }
+                    delta
+                }
                 TupleDelta::Remove(t) => serde_json::json!({
                     "op": "remove",
                     "object": t.object.0,
@@ -646,6 +703,14 @@ impl TupleDeltaObject for RelationTuple {
     fn tuple_object(&self) -> &str {
         &self.object.0
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn tuple_is_live_at(tuple: &StoredTuple, now: &chrono::DateTime<chrono::Utc>) -> bool {
+    tuple.expires_at.as_ref().is_none_or(|expires_at| {
+        chrono::DateTime::parse_from_rfc3339(&expires_at.0)
+            .is_ok_and(|expires_at| expires_at > *now)
+    })
 }
 
 pub fn run_grant_expiry(run_deadline: impl Into<String>) -> Timestamp {
@@ -926,7 +991,7 @@ mod tests {
     fn per_run_grant_is_an_auto_expiring_tuple() {
         let store = TupleStore::new(OutboxStore::new());
         let s = scope("acme");
-        let deadline = run_grant_expiry("2026-06-19T01:00:00Z");
+        let deadline = run_grant_expiry("2099-06-19T01:00:00Z");
         store
             .write_tuples(
                 &s,
@@ -934,7 +999,7 @@ mod tests {
                 &[TupleDelta::Add(tuple("run:R1", "runner", "agent:A1"))],
                 None,
                 Some(deadline.clone()),
-                now(),
+                Timestamp("2099-06-19T00:00:00Z".into()),
             )
             .expect("per-run grant write");
         let grant = store
@@ -968,6 +1033,60 @@ mod tests {
             durable.expires_at, None,
             "an ordinary grant is durable (no expiry)"
         );
+    }
+
+    #[test]
+    fn expired_relationships_disappear_from_every_snapshot() {
+        let store = TupleStore::new(OutboxStore::new());
+        let s = scope("acme");
+
+        store
+            .write_tuples(
+                &s,
+                &actor(),
+                &[TupleDelta::Add(tuple("run:old", "runner", "agent:A1"))],
+                None,
+                Some(Timestamp("2001-01-01T00:00:00Z".into())),
+                Timestamp("2000-01-01T00:00:00Z".into()),
+            )
+            .expect("the historical relationship was valid when written");
+
+        assert!(
+            store
+                .tuples_in(&s)
+                .expect("read the live snapshot")
+                .is_empty(),
+            "an expired grant is absent from the authorization snapshot, never lingering authority"
+        );
+    }
+
+    #[test]
+    fn malformed_or_non_future_expiry_aborts_before_revision_and_event() {
+        let outbox = OutboxStore::new();
+        let store = TupleStore::new(outbox.clone());
+        let s = scope("acme");
+        let delta = TupleDelta::Add(tuple("run:bad", "runner", "agent:A1"));
+
+        for expires_at in ["not-a-time", "2026-06-19T00:00:00Z"] {
+            assert!(matches!(
+                store.write_tuples(
+                    &s,
+                    &actor(),
+                    std::slice::from_ref(&delta),
+                    None,
+                    Some(Timestamp(expires_at.into())),
+                    Timestamp("2026-06-19T00:00:00Z".into()),
+                ),
+                Err(WriteError::InvalidExpiry { .. })
+            ));
+        }
+
+        assert_eq!(
+            store.current_zookie(),
+            Zookie("zk-00000000000000000000".into())
+        );
+        assert_eq!(outbox.outbox_depth(), 0, "a refused expiry emits no event");
+        assert!(store.tuples_in(&s).expect("inspect state").is_empty());
     }
 
     #[test]

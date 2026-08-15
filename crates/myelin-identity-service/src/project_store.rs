@@ -17,6 +17,7 @@ pub const VISIBLE_PROJECTS_CTE: &str = r#"
 WITH RECURSIVE visible_project(object_id) AS (
   SELECT object_id FROM rebac_tuple
    WHERE tenant_id = $1 AND region = $2 AND subject = $3
+     AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
      AND ((split_part(object_id, ':', 1) = 'org'
              AND relation IN ('member', 'admin'))
        OR (split_part(object_id, ':', 1) = 'team'
@@ -29,6 +30,7 @@ WITH RECURSIVE visible_project(object_id) AS (
     JOIN visible_project parent
       ON edge.subject = parent.object_id || '#view'
    WHERE edge.tenant_id = $1 AND edge.region = $2
+     AND (edge.expires_at IS NULL OR edge.expires_at > CURRENT_TIMESTAMP)
      AND ((split_part(edge.object_id, ':', 1) = 'team'
              AND edge.relation = 'parent_org'
              AND split_part(parent.object_id, ':', 1) = 'org')

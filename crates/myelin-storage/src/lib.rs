@@ -273,9 +273,9 @@ pub use identity_durable::{
     auth_replay_durable_migrations, identity_agent_durable_migrations, identity_durable_migrations,
     identity_project_durable_migrations, identity_tuple_revision_migrations,
     DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob, DurableReplayBacking,
-    DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, DurableTupleEdge,
-    DurableTupleSnapshot, DurableTupleWriteOutcome, TupleEdgeOp, ACTIVE_PRINCIPAL_STATUS_JSON,
-    HUMAN_PRINCIPAL_KIND_JSON,
+    DurableRevocationBacking, DurableRevocationRow, DurableTupleBacking, DurableTupleDelta,
+    DurableTupleEdge, DurableTupleSnapshot, DurableTupleWriteOutcome, TupleEdgeOp,
+    ACTIVE_PRINCIPAL_STATUS_JSON, HUMAN_PRINCIPAL_KIND_JSON,
 };
 pub use kms_durable::{
     kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,
