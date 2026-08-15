@@ -167,11 +167,21 @@ where
         inner: Box::pin(body()),
     }
     .await;
-    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+    let _cleanup_guard = SCHEMA_SETUP_LOCK.lock().await;
+    let cleanup = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(pool)
         .await;
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
+    match (result, cleanup) {
+        (Ok(()), Ok(_)) => {}
+        (Ok(()), Err(error)) => panic!("drop isolated CI HTTP schema `{schema}`: {error}"),
+        (Err(payload), cleanup) => {
+            if let Err(error) = cleanup {
+                eprintln!(
+                    "drop isolated CI HTTP schema `{schema}` while unwinding failed: {error}"
+                );
+            }
+            std::panic::resume_unwind(payload);
+        }
     }
 }
 
