@@ -19,6 +19,9 @@ use crate::job_accounting_store::{
 };
 
 const PR_RUN_SUPERSESSION_LOCK_DOMAIN: &str = "myelin.ci.pr-run-supersession.v1";
+const CI_RUN_IDEMPOTENCY_LOCK_DOMAIN: &str = "myelin.ci.run-idempotency.v1";
+
+const LOCK_CI_RUN_IDEMPOTENCY_QUERY: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunInsert {
@@ -983,6 +986,11 @@ async fn insert_on_conn(
             .await
             .map_err(|_| CiRunStoreError::Db("PR concurrency-group lock".into()))?;
     }
+    lock_ci_run_idempotency_on_conn(conn, &row.tenant_id, &row.run_id).await?;
+    if verify_existing_replay_on_conn(conn, row).await? {
+        return Ok(false);
+    }
+
     let inserted = sqlx::query(INSERT_CI_RUN_QUERY)
         .bind(&row.tenant_id)
         .bind(&row.region)
@@ -1011,6 +1019,37 @@ async fn insert_on_conn(
         return Ok(true);
     }
 
+    if verify_existing_replay_on_conn(conn, row).await? {
+        Ok(false)
+    } else {
+        Err(CiRunStoreError::ConflictNotVisible)
+    }
+}
+
+async fn lock_ci_run_idempotency_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: &str,
+    run_id: &str,
+) -> Result<(), CiRunStoreError> {
+    let identity = format!(
+        "{CI_RUN_IDEMPOTENCY_LOCK_DOMAIN}:{}:{tenant_id}:{}:{run_id}",
+        tenant_id.len(),
+        run_id.len()
+    );
+    sqlx::query(LOCK_CI_RUN_IDEMPOTENCY_QUERY)
+        .bind(identity)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| {
+            CiRunStoreError::Db(format!("acquire ci_run idempotency lock: {error}"))
+        })?;
+    Ok(())
+}
+
+async fn verify_existing_replay_on_conn(
+    conn: &mut sqlx::PgConnection,
+    row: &CiRunInsert,
+) -> Result<bool, CiRunStoreError> {
     let stored = sqlx::query(VERIFY_CI_RUN_REPLAY_QUERY)
         .bind(&row.tenant_id)
         .bind(&row.region)
@@ -1034,8 +1073,10 @@ async fn insert_on_conn(
         .bind(crate::ERASED_PSEUDONYM)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(|e| CiRunStoreError::Db(e.to_string()))?
-        .ok_or(CiRunStoreError::ConflictNotVisible)?;
+        .map_err(|e| CiRunStoreError::Db(e.to_string()))?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
 
     let mut differing_fields = Vec::new();
     for (field, matches) in [
@@ -1084,7 +1125,7 @@ async fn insert_on_conn(
     }
 
     if differing_fields.is_empty() {
-        Ok(false)
+        Ok(true)
     } else {
         Err(CiRunStoreError::ReplayCollision { differing_fields })
     }
@@ -1283,6 +1324,15 @@ mod tests {
                 "excludes mutable {mutable}"
             );
         }
+    }
+
+    #[test]
+    fn run_idempotency_lock_frames_the_whole_tenant_and_run_identity() {
+        assert_eq!(
+            LOCK_CI_RUN_IDEMPOTENCY_QUERY,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+        );
+        assert!(CI_RUN_IDEMPOTENCY_LOCK_DOMAIN.ends_with(".v1"));
     }
 
     #[test]

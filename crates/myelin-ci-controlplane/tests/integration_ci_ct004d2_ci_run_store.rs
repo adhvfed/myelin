@@ -497,10 +497,45 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     }
     assert_eq!((fresh, collisions), (1, 1));
 
+    let serialized_push = row("tenantA", &run_id(42));
+    let mut manual_replay = serialized_push.clone();
+    manual_replay.trigger_kind = "manual".into();
+    let runtime = tokio::runtime::Handle::current();
+    let mut winning_tx = app.begin().await.expect("begin serialized winner");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id',$1,true), set_config('myelin.region',$2,true)",
+    )
+    .bind(&serialized_push.tenant_id)
+    .bind(&serialized_push.region)
+    .execute(&mut *winning_tx)
+    .await
+    .unwrap();
+    {
+        let mut handler_tx = HandlerTx::with_connection(&mut *winning_tx);
+        assert!(store
+            .co_commit_insert(&mut handler_tx, &serialized_push, &runtime)
+            .expect("winning insert"));
+    }
+    let mut waiting_replay = Box::pin(store.insert_ci_run(&manual_replay));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut waiting_replay)
+            .await
+            .is_err(),
+        "the contender waits for the run identity transaction"
+    );
+    winning_tx.commit().await.expect("commit serialized winner");
+    assert_eq!(
+        waiting_replay.await,
+        Err(CiRunStoreError::ReplayCollision {
+            differing_fields: vec!["trigger_kind"]
+        }),
+        "a concurrent replay is compared with the winner before insert-only constraints"
+    );
+
     let co_run = run_id(50);
     let co_original = row("tenantA", &co_run);
     assert!(store.insert_ci_run(&co_original).await.unwrap());
-    let rt = tokio::runtime::Handle::current();
+    let rt = runtime;
 
     let mut exact_tx = app.begin().await.expect("begin exact co-commit");
     sqlx::query(
