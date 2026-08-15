@@ -330,6 +330,8 @@ fn pr_envelope(ev: &str, repo: &str, number: u64, head_oid: &str) -> EventEnvelo
     envelope.payload = serde_json::json!({
         "repo": repo,
         "number": number,
+        "base_ref": "refs/heads/main",
+        "head_ref": "refs/heads/feature/ci",
         "head_oid": head_oid,
         "head_generation": 1,
         "is_fork": false,

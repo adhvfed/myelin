@@ -110,7 +110,7 @@ fn trigger_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(event_id.into()),
         type_: EventType("git.pr.opened".into()),
-        schema_ver: 1,
+        schema_ver: myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2,
         tenant: tenant.clone(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
@@ -131,7 +131,13 @@ fn trigger_event(tenant: &str, commit: &str, event_id: &str) -> EventEnvelope {
         occurred_at: Timestamp("2026-07-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-07-19T00:00:00Z".into()),
         payload: serde_json::json!({
-            "repo": "web", "number": 42, "head_oid": commit, "is_fork": false
+            "repo": "web",
+            "number": 42,
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature/ci",
+            "head_oid": commit,
+            "head_generation": 1,
+            "is_fork": false
         }),
     }
 }
