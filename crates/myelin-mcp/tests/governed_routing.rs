@@ -900,7 +900,7 @@ fn requires_approval_tool_is_hitl_gated_before_apply() {
 }
 
 #[test]
-fn a_caller_supplied_granted_boolean_never_applies() {
+fn a_caller_supplied_granted_boolean_is_not_an_approval_shape() {
     let server = governed_server();
     let resps = drive(
         &server,
@@ -909,17 +909,14 @@ fn a_caller_supplied_granted_boolean_never_applies() {
         ],
     );
     let r = &resps[0];
-    assert!(
-        r["result"]["_meta"]["eventId"].is_null(),
-        "a caller-supplied `granted: true` must NOT apply a requires_approval tool (server-side \
-         verdict only): {r}"
+    assert_eq!(
+        r["error"]["code"],
+        serde_json::json!(myelin_mcp::protocol::INVALID_PARAMS),
+        "a caller-supplied verdict is rejected as malformed protocol input: {r}"
     );
     assert!(
-        matches!(
-            server.router().unwrap().audit()[0].outcome,
-            CallOutcome::Gated { .. } | CallOutcome::Denied { .. }
-        ),
-        "the call is withheld or refused - never Applied off a caller boolean"
+        server.router().unwrap().audit().is_empty(),
+        "invalid approval input reaches neither governance nor an effect adapter"
     );
 }
 

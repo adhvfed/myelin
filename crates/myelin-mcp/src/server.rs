@@ -224,6 +224,7 @@ impl McpServer {
 
         validate_tool_arguments(tool.definition(), &args)
             .map_err(|reason| RpcError::new(INVALID_PARAMS, reason))?;
+        let presented_gate_id = presented_gate_id(params, tool.requires_approval())?;
 
         let router = self.router.as_ref().ok_or_else(|| {
             RpcError::new(
@@ -273,11 +274,6 @@ impl McpServer {
             EffectKind::Mutate | EffectKind::External => {}
         }
 
-        let presented_gate_id = params
-            .get("approval")
-            .and_then(|a| a.get("gateId"))
-            .and_then(Value::as_str);
-
         let now = (self.clock)();
         let idempotency_key = params
             .get("_meta")
@@ -304,6 +300,52 @@ impl McpServer {
             router.teardown(&(self.clock)());
         }
     }
+}
+
+fn presented_gate_id(params: &Value, requires_approval: bool) -> Result<Option<&str>, RpcError> {
+    let Some(approval) = params.get("approval") else {
+        return Ok(None);
+    };
+    if !requires_approval {
+        return Err(RpcError::new(
+            INVALID_PARAMS,
+            "this tool does not accept an approval gate",
+        ));
+    }
+    let approval = approval.as_object().ok_or_else(|| {
+        RpcError::new(
+            INVALID_PARAMS,
+            "tools/call `approval` must contain exactly one `gateId`",
+        )
+    })?;
+    if approval.len() != 1 {
+        return Err(RpcError::new(
+            INVALID_PARAMS,
+            "tools/call `approval` must contain exactly one `gateId`",
+        ));
+    }
+    let gate_id = approval
+        .get("gateId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RpcError::new(
+                INVALID_PARAMS,
+                "tools/call approval `gateId` must be an opaque gate identifier",
+            )
+        })?;
+    let opaque = gate_id.strip_prefix("gate:").is_some_and(|opaque| {
+        opaque.len() == 32
+            && opaque
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if !opaque {
+        return Err(RpcError::new(
+            INVALID_PARAMS,
+            "tools/call approval `gateId` must be an opaque gate identifier",
+        ));
+    }
+    Ok(Some(gate_id))
 }
 
 enum Frame {
@@ -634,6 +676,28 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], json!(INVALID_PARAMS));
+    }
+
+    #[test]
+    fn approval_shape_has_one_exact_protocol_interpretation() {
+        let valid = json!({"approval": {"gateId": "gate:0123456789abcdef0123456789abcdef"}});
+        assert_eq!(
+            presented_gate_id(&valid, true).unwrap(),
+            Some("gate:0123456789abcdef0123456789abcdef")
+        );
+
+        for invalid in [
+            json!({"approval": {"granted": true}}),
+            json!({"approval": {"gateId": 7}}),
+            json!({"approval": {"gateId": "gate:short"}}),
+            json!({"approval": {"gateId": "gate:0123456789abcdef0123456789abcdef", "granted": true}}),
+        ] {
+            assert!(
+                presented_gate_id(&invalid, true).is_err(),
+                "malformed approval input is rejected, never reinterpreted as no approval"
+            );
+        }
+        assert!(presented_gate_id(&valid, false).is_err());
     }
 
     #[test]
