@@ -59,7 +59,7 @@ fn corpus_specs() -> Vec<IndexSpec> {
 
 fn git_line_range_spec() -> IndexSpec {
     IndexSpec::new("git", "blob", myelin_search::line_range_subdoc_facets())
-        .with_acl_object_type("repo")
+        .with_parent_acl_object_type("repo", "repo")
 }
 
 fn indexer() -> (Arc<IncrementalIndexer>, Arc<OwnerFetcher>) {
@@ -131,7 +131,7 @@ fn doc_block_sub_anchor_resolves_at_block_grain() {
 #[test]
 fn kn_db_row_sub_anchor_resolves_at_row_grain() {
     let (ix, fetcher) = indexer();
-    let row_ref = "myelin://acme/knowledge/db_row/tasks:r7#row-r7";
+    let row_ref = "myelin://acme/knowledge/row/tasks:r7#row-r7";
     let mut fields: BTreeMap<String, FieldValue> = BTreeMap::new();
     fields.insert("priority".into(), FieldValue::Select("P0".into()));
     let ok = OrderKey::parse("hmmmm").expect("a base-62 key");
@@ -140,7 +140,7 @@ fn kn_db_row_sub_anchor_resolves_at_row_grain() {
         db_row_subdoc_projection(&fields, "a row about the P0 incident", Some(ok)),
     );
 
-    ix.index(&created_event("knowledge.db_row.created", row_ref))
+    ix.index(&created_event("knowledge.row.created", row_ref))
         .expect("index row sub-doc");
     assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
@@ -172,7 +172,7 @@ fn kn_db_row_sub_anchor_resolves_at_row_grain() {
 #[test]
 fn kn_field_sub_anchor_resolves_at_field_grain() {
     let (ix, fetcher) = indexer();
-    let field_ref = "myelin://acme/knowledge/db_row/tasks:r7#field-priority";
+    let field_ref = "myelin://acme/knowledge/row/tasks:r7#field-priority";
     fetcher.put(
         field_ref,
         db_field_subdoc_projection(
@@ -182,7 +182,7 @@ fn kn_field_sub_anchor_resolves_at_field_grain() {
         ),
     );
 
-    ix.index(&created_event("knowledge.db_row.updated", field_ref))
+    ix.index(&created_event("knowledge.row.updated", field_ref))
         .expect("index field sub-doc");
     let hits = ix
         .search_structured(
@@ -415,7 +415,7 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
 #[test]
 fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
     let _ = REGION;
-    let block_agg = "page/42#b9";
+    let block_agg = "42#b9";
     let lr_agg = "repo:main:src/x.rs#L10-L12";
     let block_snap = format!("myelin://acme/knowledge/page/{block_agg}");
     let lr_snap = format!("myelin://acme/git/blob/{lr_agg}");

@@ -8,8 +8,8 @@ use myelin_search::{
 
 pub use myelin_search::block_subdoc_projection;
 pub use myelin_search::{
-    kn_db_row_index_spec, kn_index_specs, kn_page_index_spec, page_search_projection,
-    register_kn_index_specs, FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_DB_ROW_TYPE,
+    kn_index_specs, kn_page_index_spec, kn_row_index_spec, page_search_projection,
+    register_kn_index_specs, FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_ROW_TYPE,
     KN_SUBSYSTEM,
 };
 
@@ -256,8 +256,8 @@ mod tests {
             page.semantic,
             "the page doc is semantically indexed (vector-in-v1, §6)"
         );
-        let row = kn_db_row_index_spec();
-        assert_eq!(row.type_, KN_DB_ROW_TYPE);
+        let row = kn_row_index_spec();
+        assert_eq!(row.type_, KN_ROW_TYPE);
         assert!(
             !row.semantic,
             "a db row is a structured record, not vector-embedded prose"

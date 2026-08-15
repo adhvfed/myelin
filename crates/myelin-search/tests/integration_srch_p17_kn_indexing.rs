@@ -11,7 +11,7 @@ use myelin_events::{
     Visibility,
 };
 use myelin_search::{
-    compile, kn_db_row_index_spec, kn_page_index_spec, page_search_projection, AclFilter,
+    compile, kn_page_index_spec, kn_row_index_spec, page_search_projection, AclFilter,
     EmbeddingAdapter, FieldDecl, FieldKind, FieldSchema, IncrementalIndexer, IndexSpec,
     MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher, SearchProjection, FACET_ARTIFACT_REF,
     FACET_EMBED, FACET_MENTION, FT_BODY_FIELD,
@@ -86,7 +86,7 @@ fn event_in(id: &str, type_: &str, subject: &str, t: &str) -> EventEnvelope {
 
 fn kn_indexer(fetcher: Arc<KnFetcher>) -> IncrementalIndexer {
     IncrementalIndexer::new(
-        vec![kn_page_index_spec(), kn_db_row_index_spec()],
+        vec![kn_page_index_spec(), kn_row_index_spec()],
         fetcher,
         Arc::new(MockEmbeddingAdapter::new(16)),
     )
@@ -267,8 +267,8 @@ fn kn_structured_inline_node_facets_filter_correctly() {
 
 #[test]
 fn kn_db_row_custom_field_query_via_gin_scan() {
-    let row_a = "myelin://acme/knowledge/db_row/tasks:1";
-    let row_b = "myelin://acme/knowledge/db_row/tasks:2";
+    let row_a = "myelin://acme/knowledge/row/tasks:1";
+    let row_b = "myelin://acme/knowledge/row/tasks:2";
     let fetcher = Arc::new(KnFetcher::default());
     let mut fa = BTreeMap::new();
     fa.insert("priority".to_string(), FieldValue::Select("high".into()));
@@ -329,7 +329,7 @@ fn kn_db_row_custom_field_query_via_gin_scan() {
 
 #[test]
 fn kn_rollup_field_is_read_time_not_a_stored_indexed_value() {
-    let spec: IndexSpec = kn_db_row_index_spec();
+    let spec: IndexSpec = kn_row_index_spec();
     let mut schema = FieldSchema::new().with(FT_BODY_FIELD, FieldDecl::stored(FieldType::Text));
     for (name, ty) in &spec.struct_fields {
         schema = schema.with(name.clone(), FieldDecl::stored(*ty));

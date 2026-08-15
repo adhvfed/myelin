@@ -1,6 +1,6 @@
 use myelin_query::FieldType;
 use myelin_search::{
-    kn_db_row_index_spec, kn_index_specs, kn_page_index_spec, register_kn_index_specs,
+    kn_index_specs, kn_page_index_spec, kn_row_index_spec, register_kn_index_specs,
     IncrementalIndexer, IndexSpec, MockEmbeddingAdapter, ProjectFetcher, FACET_ARTIFACT_REF,
     FACET_EMBED, FACET_MENTION,
 };
@@ -45,10 +45,10 @@ fn producer_kn_page_spec_is_the_frozen_6_3_shape() {
 }
 
 #[test]
-fn producer_kn_db_row_spec_is_the_gin_scan_facet_shape() {
-    let s = kn_db_row_index_spec();
+fn producer_kn_row_spec_is_the_gin_scan_facet_shape() {
+    let s = kn_row_index_spec();
     assert_eq!(s.subsystem, "knowledge");
-    assert_eq!(s.type_, "db_row");
+    assert_eq!(s.type_, "row");
     assert!(
         !s.semantic,
         "a db row is a structured record, not vector-embedded prose"

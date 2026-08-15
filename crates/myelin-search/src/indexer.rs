@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
+use myelin_events::{
+    EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern, ARTIFACT_TYPE_TOKENS,
+    SUBSYSTEM_TOKENS,
+};
 use myelin_query::{FieldType, FieldValue};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
@@ -23,6 +26,17 @@ pub struct IndexSpec {
     pub struct_fields: BTreeMap<String, FieldType>,
     pub semantic: bool,
     pub acl_object_type: String,
+    #[serde(skip)]
+    acl_anchor: AclAnchor,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum AclAnchor {
+    #[default]
+    Subject,
+    ParentIdPrefix {
+        artifact_type: String,
+    },
 }
 
 impl IndexSpec {
@@ -31,13 +45,23 @@ impl IndexSpec {
         type_: impl Into<String>,
         struct_fields: BTreeMap<String, FieldType>,
     ) -> IndexSpec {
+        let subsystem = subsystem.into();
         let type_ = type_.into();
+        assert!(
+            SUBSYSTEM_TOKENS.contains(&subsystem.as_str()),
+            "IndexSpec subsystem `{subsystem}` is outside the canonical event/reference taxonomy"
+        );
+        assert!(
+            ARTIFACT_TYPE_TOKENS.contains(&type_.as_str()),
+            "IndexSpec artifact type `{type_}` is outside the canonical event/reference taxonomy"
+        );
         IndexSpec {
-            subsystem: subsystem.into(),
+            subsystem,
             acl_object_type: type_.clone(),
             type_,
             struct_fields,
             semantic: false,
+            acl_anchor: AclAnchor::Subject,
         }
     }
 
@@ -48,6 +72,23 @@ impl IndexSpec {
 
     pub fn with_acl_object_type(mut self, acl_object_type: impl Into<String>) -> IndexSpec {
         self.acl_object_type = acl_object_type.into();
+        self
+    }
+
+    pub fn with_parent_acl_object_type(
+        mut self,
+        acl_object_type: impl Into<String>,
+        parent_artifact_type: impl Into<String>,
+    ) -> IndexSpec {
+        let parent_artifact_type = parent_artifact_type.into();
+        assert!(
+            ARTIFACT_TYPE_TOKENS.contains(&parent_artifact_type.as_str()),
+            "IndexSpec parent artifact type `{parent_artifact_type}` is outside the canonical event/reference taxonomy"
+        );
+        self.acl_object_type = acl_object_type.into();
+        self.acl_anchor = AclAnchor::ParentIdPrefix {
+            artifact_type: parent_artifact_type,
+        };
         self
     }
 }
@@ -447,6 +488,7 @@ impl IncrementalIndexer {
             Some(s) => s.clone(),
             None => return Ok(()),
         };
+        let acl_object = Self::acl_object_reference(subject, &spec)?;
 
         let projection = match self.fetcher.project(&ev.tenant, &ev.region, ref_) {
             Ok(p) => p,
@@ -464,10 +506,9 @@ impl IncrementalIndexer {
             .unwrap_or_else(|| Self::detect_lang(&projection.text));
         let _analyzed_terms = crate::analysis::Analyzer::for_tag(&lang).analyze(&projection.text);
 
-        let acl_object = myelin_refs::strip_sub(&subject.artifact_ref).0;
         debug_assert_eq!(
             subject.sub.is_some(),
-            acl_object != ref_.0,
+            myelin_refs::strip_sub(&subject.artifact_ref).0 != ref_.0,
             "a sub-artifact doc pins its ACL on the #sub-stripped parent (5.7/§3.1)"
         );
         let mut doc =
@@ -497,6 +538,35 @@ impl IncrementalIndexer {
                 be.upsert_stamped(&doc, &zookie, version)
             })
             .map_err(|e| IndexEventError::Engine(e.to_string()))
+    }
+
+    fn acl_object_reference(
+        subject: &myelin_refs::ParsedArtifactRef,
+        spec: &IndexSpec,
+    ) -> Result<String, IndexEventError> {
+        match &spec.acl_anchor {
+            AclAnchor::Subject => Ok(myelin_refs::strip_sub(&subject.artifact_ref).0),
+            AclAnchor::ParentIdPrefix { artifact_type } => {
+                let (parent_id, _) = subject.id.split_once(':').ok_or_else(|| {
+                    IndexEventError::Malformed(format!(
+                        "{} `{}` does not carry its parent identity before `:`",
+                        subject.type_, subject.artifact_ref.0
+                    ))
+                })?;
+                let candidate = format!(
+                    "myelin://{}/{}/{artifact_type}/{parent_id}",
+                    subject.tenant.0, subject.subsystem
+                );
+                myelin_refs::parse(&candidate)
+                    .map(|reference| reference.0)
+                    .map_err(|error| {
+                        IndexEventError::Malformed(format!(
+                            "{} `{}` carries an invalid parent identity: {error}",
+                            subject.type_, subject.artifact_ref.0
+                        ))
+                    })
+            }
+        }
     }
 
     fn apply_removed(&self, ev: &EventEnvelope) -> Result<(), IndexEventError> {
@@ -697,6 +767,27 @@ mod tests {
         IncrementalIndexer::new(specs, fetcher, Arc::new(MockEmbeddingAdapter::new(8)))
     }
 
+    #[test]
+    #[should_panic(expected = "IndexSpec subsystem `wiki` is outside the canonical")]
+    fn index_specs_reject_noncanonical_subsystems_at_construction() {
+        let _ = IndexSpec::new("wiki", "page", BTreeMap::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "IndexSpec artifact type `db_row` is outside the canonical")]
+    fn index_specs_reject_storage_table_names_as_artifact_types() {
+        let _ = IndexSpec::new("knowledge", "db_row", BTreeMap::new());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "IndexSpec parent artifact type `repository` is outside the canonical"
+    )]
+    fn index_specs_reject_noncanonical_parent_artifact_types() {
+        let _ = IndexSpec::new("git", "blob", BTreeMap::new())
+            .with_parent_acl_object_type("repo", "repository");
+    }
+
     fn event(id: &str, type_: &str, subject: &str, payload: serde_json::Value) -> EventEnvelope {
         EventEnvelope {
             event_id: EventId(id.into()),
@@ -845,6 +936,29 @@ mod tests {
             }
             other => panic!("expected a non-retryable poison, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parent_owned_documents_require_a_parent_identity_before_projection_fetch() {
+        let r = "myelin://acme/git/blob/orphan";
+        let fetcher = Arc::new(FakeFetcher::with(r, proj("unreachable")));
+        let spec = IndexSpec::new("git", "blob", BTreeMap::new())
+            .with_parent_acl_object_type("repo", "repo");
+        let ix = indexer_with(vec![spec], fetcher.clone());
+        let ev = event("01J-orphan", "git.blob.indexed", r, serde_json::json!({}));
+
+        match ix.handle(&ev, &mut myelin_events::HandlerTx::none()) {
+            HandleOutcome::NonRetryable(Reason(message)) => assert!(
+                message.contains("does not carry its parent identity"),
+                "the poison names the missing parent identity: {message}"
+            ),
+            other => panic!("expected a non-retryable poison, got {other:?}"),
+        }
+        assert_eq!(
+            fetcher.call_count(r),
+            0,
+            "structurally invalid child references fail before contacting their owner"
+        );
     }
 
     #[test]

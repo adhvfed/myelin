@@ -188,13 +188,11 @@ mod tests {
             SubGrain::Heading("intro".into())
         );
         assert_eq!(
-            SubGrain::classify(&ref_("myelin://acme/knowledge/db_row/tasks:r7#row-r7")),
+            SubGrain::classify(&ref_("myelin://acme/knowledge/row/tasks:r7#row-r7")),
             SubGrain::Row("r7".into())
         );
         assert_eq!(
-            SubGrain::classify(&ref_(
-                "myelin://acme/knowledge/db_row/tasks:r7#field-priority"
-            )),
+            SubGrain::classify(&ref_("myelin://acme/knowledge/row/tasks:r7#field-priority")),
             SubGrain::Field("priority".into())
         );
         assert_eq!(
@@ -211,8 +209,8 @@ mod tests {
         for (r, kind) in [
             ("myelin://acme/knowledge/page/1#b2", SubKind::Block),
             ("myelin://acme/knowledge/page/1#hx", SubKind::Heading),
-            ("myelin://acme/knowledge/db_row/d:r#row-r", SubKind::Row),
-            ("myelin://acme/knowledge/db_row/d:r#field-f", SubKind::Field),
+            ("myelin://acme/knowledge/row/d:r#row-r", SubKind::Row),
+            ("myelin://acme/knowledge/row/d:r#field-f", SubKind::Field),
             (
                 "myelin://acme/git/blob/repo:main:x.rs#L1-L9",
                 SubKind::LineRange,

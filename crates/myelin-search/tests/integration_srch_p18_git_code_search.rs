@@ -111,6 +111,7 @@ fn parser_blob() -> GitBlobProjectionInput {
 fn git_code_search_v1_symbol_path_literal_commit_trigram() {
     let rust_ref = "myelin://acme/git/blob/repoA:main:src/scheduler/deadlock.rs";
     let py_ref = "myelin://acme/git/blob/repoA:main:lib/parser/tokenizer.py";
+    let repository = "myelin://acme/git/repo/repoA";
     let fetcher = Arc::new(GitFetcher::default());
     fetcher.put(rust_ref, git_blob_search_projection(&scheduler_blob()));
     fetcher.put(py_ref, git_blob_search_projection(&parser_blob()));
@@ -126,7 +127,7 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
         "both Git blobs are live"
     );
 
-    let acl = AclFilter::ids([rust_ref, py_ref]);
+    let acl = AclFilter::ids([repository]);
 
     let sym = ix
         .search_ft(&tenant(), &region(), &acl, "deadlock", 10)
@@ -222,6 +223,8 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
 fn srch_d1_private_git_blob_never_leaks() {
     let visible = "myelin://acme/git/blob/public-repo:main:src/lib.rs";
     let private = "myelin://acme/git/blob/secret-repo:main:src/secret.rs";
+    let visible_repository = "myelin://acme/git/repo/public-repo";
+    let private_repository = "myelin://acme/git/repo/secret-repo";
     let fetcher = Arc::new(GitFetcher::default());
 
     let public_blob = GitBlobProjectionInput {
@@ -248,7 +251,7 @@ fn srch_d1_private_git_blob_never_leaks() {
         "both blobs are indexed"
     );
 
-    let acl_unauth = AclFilter::ids([visible]);
+    let acl_unauth = AclFilter::ids([visible_repository]);
 
     let hits = ix
         .search_ft(&tenant(), &region(), &acl_unauth, "zarquonreactor", 10)
@@ -278,14 +281,14 @@ fn srch_d1_private_git_blob_never_leaks() {
         "0 leak: a substring unique to the private blob never surfaces it for an unauthorized viewer"
     );
 
-    let acl_granted = AclFilter::ids([visible, private]);
+    let acl_granted = AclFilter::ids([visible_repository, private_repository]);
     let granted = ix
         .search_ft(&tenant(), &region(), &acl_granted, "zarquonreactor", 10)
         .expect("ft granted");
     assert_eq!(
         granted.len(),
         2,
-        "after the grant BOTH blobs surface (the rejection was the ACL, not a deny)"
+        "after both repository grants, both blobs surface"
     );
     assert!(
         granted.iter().any(|h| h.doc_id == private),
@@ -297,6 +300,8 @@ fn srch_d1_private_git_blob_never_leaks() {
 fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
     let acme_blob = "myelin://acme/git/blob/shared:main:src/main.rs";
     let evil_blob = "myelin://evil/git/blob/shared:main:src/main.rs";
+    let acme_repository = "myelin://acme/git/repo/shared";
+    let evil_repository = "myelin://evil/git/repo/shared";
     let fetcher = Arc::new(GitFetcher::default());
     fetcher.put(acme_blob, git_blob_search_projection(&scheduler_blob()));
     fetcher.put(evil_blob, git_blob_search_projection(&scheduler_blob()));
@@ -313,7 +318,7 @@ fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
         .search_ft(
             &acme_t,
             &region(),
-            &AclFilter::ids([acme_blob]),
+            &AclFilter::ids([acme_repository]),
             "deadlock",
             10,
         )
@@ -327,7 +332,7 @@ fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
         .search_ft(
             &acme_t,
             &region(),
-            &AclFilter::ids([evil_blob]),
+            &AclFilter::ids([evil_repository]),
             "deadlock",
             10,
         )
@@ -341,7 +346,7 @@ fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
         .search_ft(
             &evil_t,
             &region(),
-            &AclFilter::ids([acme_blob]),
+            &AclFilter::ids([acme_repository]),
             "deadlock",
             10,
         )

@@ -115,10 +115,9 @@ pub use rollup::{
     MAX_FORMULA_DEPTH, MAX_FORMULA_NODES,
 };
 pub use search_feed::{
-    feed_project, kn_db_row_index_spec, kn_declared_index_specs, kn_index_specs,
-    kn_page_index_spec, kn_read_permission, kn_search_query, kn_search_semantic,
-    page_search_projection, register_kn_index_specs, FeedGrain, SearchAclFilter,
-    KN_READ_PERMISSION, KN_SEARCH_OBJECT_TYPE,
+    feed_project, kn_declared_index_specs, kn_index_specs, kn_page_index_spec, kn_read_permission,
+    kn_row_index_spec, kn_search_query, kn_search_semantic, page_search_projection,
+    register_kn_index_specs, FeedGrain, SearchAclFilter, KN_READ_PERMISSION, KN_SEARCH_OBJECT_TYPE,
 };
 pub use store::{knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable};
 pub use subs::{

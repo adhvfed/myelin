@@ -9,7 +9,7 @@ pub const KN_SUBSYSTEM: &str = "knowledge";
 
 pub const KN_PAGE_TYPE: &str = "page";
 
-pub const KN_DB_ROW_TYPE: &str = "db_row";
+pub const KN_ROW_TYPE: &str = "row";
 
 pub const FACET_MENTION: &str = "mention";
 pub const FACET_ARTIFACT_REF: &str = "artifact_ref";
@@ -23,7 +23,7 @@ pub fn kn_page_index_spec() -> IndexSpec {
     IndexSpec::new(KN_SUBSYSTEM, KN_PAGE_TYPE, struct_fields).semantic()
 }
 
-pub fn kn_db_row_index_spec() -> IndexSpec {
+pub fn kn_row_index_spec() -> IndexSpec {
     let mut struct_fields: BTreeMap<String, FieldType> = BTreeMap::new();
     struct_fields.insert("priority".to_string(), FieldType::Select);
     struct_fields.insert("owner".to_string(), FieldType::Principal);
@@ -32,11 +32,11 @@ pub fn kn_db_row_index_spec() -> IndexSpec {
         crate::engine::ORDER_KEY_FIELD.to_string(),
         FieldType::OrderKey,
     );
-    IndexSpec::new(KN_SUBSYSTEM, KN_DB_ROW_TYPE, struct_fields)
+    IndexSpec::new(KN_SUBSYSTEM, KN_ROW_TYPE, struct_fields)
 }
 
 pub fn kn_index_specs() -> Vec<IndexSpec> {
-    vec![kn_page_index_spec(), kn_db_row_index_spec()]
+    vec![kn_page_index_spec(), kn_row_index_spec()]
 }
 
 pub fn register_kn_index_specs() -> Vec<IndexSpec> {
@@ -230,10 +230,10 @@ mod tests {
     }
 
     #[test]
-    fn db_row_spec_is_the_gin_scan_facet_shape() {
-        let s = kn_db_row_index_spec();
+    fn row_spec_is_the_gin_scan_facet_shape() {
+        let s = kn_row_index_spec();
         assert_eq!(s.subsystem, "knowledge");
-        assert_eq!(s.type_, "db_row");
+        assert_eq!(s.type_, "row");
         assert!(
             !s.semantic,
             "a db row is a structured record, not vector-embedded prose"

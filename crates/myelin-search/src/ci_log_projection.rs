@@ -7,9 +7,10 @@ use crate::indexer::{IndexSpec, SearchProjection};
 
 pub const CI_SUBSYSTEM: &str = "ci";
 
-pub const CI_LOG_TYPE: &str = "ci_log";
+pub const CI_LOG_TYPE: &str = "log";
 
 pub const CI_LOG_ACL_OBJECT_TYPE: &str = "ci_run";
+pub const CI_LOG_ACL_ARTIFACT_TYPE: &str = "run";
 
 pub const FACET_RUN_ID: &str = "run_id";
 pub const FACET_JOB_ID: &str = "job_id";
@@ -22,7 +23,7 @@ pub fn ci_log_index_spec() -> IndexSpec {
     struct_fields.insert(FACET_STEP_NO.to_string(), FieldType::Int);
 
     IndexSpec::new(CI_SUBSYSTEM, CI_LOG_TYPE, struct_fields)
-        .with_acl_object_type(CI_LOG_ACL_OBJECT_TYPE)
+        .with_parent_acl_object_type(CI_LOG_ACL_OBJECT_TYPE, CI_LOG_ACL_ARTIFACT_TYPE)
 }
 
 pub fn ci_log_index_specs() -> Vec<IndexSpec> {
@@ -139,7 +140,7 @@ mod tests {
     fn ci_log_spec_is_the_consumed_11_8_shape() {
         let s = ci_log_index_spec();
         assert_eq!(s.subsystem, "ci");
-        assert_eq!(s.type_, "ci_log");
+        assert_eq!(s.type_, "log");
         assert_eq!(
             s.acl_object_type, "ci_run",
             "a CI log's reachability is its parent CI run's `view` (the blob→repo analog)"
@@ -273,7 +274,7 @@ mod tests {
     fn doc_ref_is_the_run_job_step_key() {
         assert_eq!(
             ci_log_doc_ref("acme", "run-7", "build", 3),
-            "myelin://acme/ci/ci_log/run-7:build:3"
+            "myelin://acme/ci/log/run-7:build:3"
         );
     }
 

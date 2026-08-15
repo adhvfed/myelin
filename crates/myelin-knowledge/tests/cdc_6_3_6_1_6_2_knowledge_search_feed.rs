@@ -98,7 +98,7 @@ fn provider_knowledge_declares_its_index_specs() {
         "the semantic page doc"
     );
     assert!(
-        specs.iter().any(|s| s.type_ == "db_row" && !s.semantic),
+        specs.iter().any(|s| s.type_ == "row" && !s.semantic),
         "the non-semantic db_row doc"
     );
     for s in &specs {

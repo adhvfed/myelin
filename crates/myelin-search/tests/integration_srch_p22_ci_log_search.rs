@@ -55,7 +55,7 @@ impl ProjectFetcher for CiLogFetcher {
 fn ci_event(id: &str, subject: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(id.into()),
-        type_: EventType("ci.ci_log.sealed".into()),
+        type_: EventType("ci.log.available".into()),
         schema_ver: 1,
         tenant: tenant(),
         region: region(),
@@ -104,6 +104,7 @@ fn ci_input(tenant: &str, run: &str, job: &str, step: u32, log: &str) -> CiLogPr
 fn ci_log_index_and_step_query_returns_the_right_segment() {
     let step1 = ci_log_doc_ref("acme", "run-1", "build", 1);
     let step3 = ci_log_doc_ref("acme", "run-1", "build", 3);
+    let run = "myelin://acme/ci/run/run-1";
     let fetcher = Arc::new(CiLogFetcher::default());
     fetcher.put(
         &step1,
@@ -124,7 +125,7 @@ fn ci_log_index_and_step_query_returns_the_right_segment() {
     ix.index(&ci_event("e-3", &step3)).expect("index step 3");
     assert_eq!(ix.live_count(&tenant(), &region()), 2, "both steps indexed");
 
-    let acl = AclFilter::ids([step1.as_str(), step3.as_str()]);
+    let acl = AclFilter::ids([run]);
 
     let ft = ix
         .search_ft(&tenant(), &region(), &acl, "assertion", 10)
@@ -156,6 +157,7 @@ fn ci_log_index_and_step_query_returns_the_right_segment() {
 fn details_ref_step_anchor_resolves_to_the_exact_failing_step_doc() {
     let step2 = ci_log_doc_ref("acme", "run-7", "test", 2);
     let step5 = ci_log_doc_ref("acme", "run-7", "test", 5);
+    let run = "myelin://acme/ci/run/run-7";
     let fetcher = Arc::new(CiLogFetcher::default());
     fetcher.put(
         &step2,
@@ -174,7 +176,7 @@ fn details_ref_step_anchor_resolves_to_the_exact_failing_step_doc() {
     assert_eq!(parsed.run_id, "run-7");
     assert_eq!(parsed.step_no, 5);
 
-    let acl = AclFilter::ids([step2.as_str(), step5.as_str()]);
+    let acl = AclFilter::ids([run]);
     let hits = ix
         .search_structured(
             &tenant(),
@@ -196,6 +198,7 @@ fn details_ref_step_anchor_resolves_to_the_exact_failing_step_doc() {
 fn ci_log_per_job_facet_query() {
     let build1 = ci_log_doc_ref("acme", "run-9", "build", 1);
     let test1 = ci_log_doc_ref("acme", "run-9", "test", 1);
+    let run = "myelin://acme/ci/run/run-9";
     let fetcher = Arc::new(CiLogFetcher::default());
     fetcher.put(
         &build1,
@@ -209,7 +212,7 @@ fn ci_log_per_job_facet_query() {
     ix.index(&ci_event("e-b", &build1)).expect("index build");
     ix.index(&ci_event("e-t", &test1)).expect("index test");
 
-    let acl = AclFilter::ids([build1.as_str(), test1.as_str()]);
+    let acl = AclFilter::ids([run]);
     let hits = ix
         .search_structured(
             &tenant(),
@@ -228,6 +231,8 @@ fn ci_log_per_job_facet_query() {
 fn srch_d1_fork_scoped_ci_log_never_leaks() {
     let visible = ci_log_doc_ref("acme", "run-main", "build", 1);
     let fork_scoped = ci_log_doc_ref("acme", "run-fork", "build", 1);
+    let visible_run = "myelin://acme/ci/run/run-main";
+    let fork_run = "myelin://acme/ci/run/run-fork";
     let fetcher = Arc::new(CiLogFetcher::default());
     fetcher.put(
         &visible,
@@ -255,7 +260,7 @@ fn srch_d1_fork_scoped_ci_log_never_leaks() {
         .expect("index fork-scoped");
     assert_eq!(ix.live_count(&tenant(), &region()), 2, "both logs indexed");
 
-    let acl_unauth = AclFilter::ids([visible.as_str()]);
+    let acl_unauth = AclFilter::ids([visible_run]);
 
     let ft = ix
         .search_ft(&tenant(), &region(), &acl_unauth, "zarquon", 10)
@@ -291,7 +296,7 @@ fn srch_d1_fork_scoped_ci_log_never_leaks() {
         "0 leak: the fork-scoped CI log never surfaces in a structured facet scan"
     );
 
-    let acl_granted = AclFilter::ids([visible.as_str(), fork_scoped.as_str()]);
+    let acl_granted = AclFilter::ids([visible_run, fork_run]);
     let granted = ix
         .search_ft(&tenant(), &region(), &acl_granted, "zarquon", 10)
         .expect("ft granted");
@@ -310,6 +315,8 @@ fn srch_d1_fork_scoped_ci_log_never_leaks() {
 fn srch_d3_cross_tenant_ci_logs_do_not_leak() {
     let acme_log = ci_log_doc_ref("acme", "run-1", "build", 1);
     let evil_log = ci_log_doc_ref("evil", "run-1", "build", 1);
+    let acme_run = "myelin://acme/ci/run/run-1";
+    let evil_run = "myelin://evil/ci/run/run-1";
     let fetcher = Arc::new(CiLogFetcher::default());
     fetcher.put(
         &acme_log,
@@ -329,13 +336,7 @@ fn srch_d3_cross_tenant_ci_logs_do_not_leak() {
     let evil_t = TenantId("evil".into());
 
     let acme_hits = ix
-        .search_ft(
-            &acme_t,
-            &region(),
-            &AclFilter::ids([acme_log.as_str()]),
-            "build",
-            10,
-        )
+        .search_ft(&acme_t, &region(), &AclFilter::ids([acme_run]), "build", 10)
         .expect("acme search");
     assert!(
         acme_hits.iter().any(|h| h.doc_id == acme_log),
@@ -343,13 +344,7 @@ fn srch_d3_cross_tenant_ci_logs_do_not_leak() {
     );
 
     let cross = ix
-        .search_ft(
-            &acme_t,
-            &region(),
-            &AclFilter::ids([evil_log.as_str()]),
-            "build",
-            10,
-        )
+        .search_ft(&acme_t, &region(), &AclFilter::ids([evil_run]), "build", 10)
         .expect("cross-tenant search");
     assert!(
         cross.is_empty(),
@@ -357,13 +352,7 @@ fn srch_d3_cross_tenant_ci_logs_do_not_leak() {
     );
 
     let evil_hits = ix
-        .search_ft(
-            &evil_t,
-            &region(),
-            &AclFilter::ids([acme_log.as_str()]),
-            "build",
-            10,
-        )
+        .search_ft(&evil_t, &region(), &AclFilter::ids([acme_run]), "build", 10)
         .expect("evil search");
     assert!(
         evil_hits.is_empty(),

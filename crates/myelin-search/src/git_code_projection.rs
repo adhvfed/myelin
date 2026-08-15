@@ -23,7 +23,7 @@ pub fn git_code_projection_spec() -> IndexSpec {
     struct_fields.insert(FACET_LANGUAGE.to_string(), FieldType::Text);
     struct_fields.insert(FACET_BLOB_OID.to_string(), FieldType::Text);
     IndexSpec::new(GIT_SUBSYSTEM, GIT_BLOB_TYPE, struct_fields)
-        .with_acl_object_type(GIT_BLOB_ACL_OBJECT_TYPE)
+        .with_parent_acl_object_type(GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_ACL_OBJECT_TYPE)
 }
 
 pub fn git_index_specs() -> Vec<IndexSpec> {
