@@ -18,6 +18,8 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
 
 mod common;
+#[path = "support/isolated_database.rs"]
+mod isolated_database;
 
 fn admin_url(cfg: &MyelinConfig) -> String {
     cfg.database_url
@@ -91,7 +93,8 @@ async fn rls_read_all_no_predicate(store: &PgStore, acting_tenant: &str) -> Vec<
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drill1_outbox_no_loss_under_crash() {
     let cfg = MyelinConfig::dev();
-    let isolated = common::IsolatedDatabase::create(&admin_url(&cfg), "drill1_outbox").await;
+    let isolated =
+        isolated_database::IsolatedDatabase::create(&admin_url(&cfg), "drill1_outbox").await;
     let store = PgStore::connect(isolated.url(), &cfg.region, 6)
         .await
         .expect("connect Postgres (is the stack up?)");

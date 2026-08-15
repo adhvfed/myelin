@@ -18,6 +18,8 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::Region;
 
 mod common;
+#[path = "support/isolated_database.rs"]
+mod isolated_database;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_blobstore_put_get_head_delete() {
@@ -182,7 +184,8 @@ fn envelope(id: &str, subject: &str, aggregate: &str) -> EventEnvelope {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_outbox_relay_drains_to_bus() {
     let cfg = MyelinConfig::dev();
-    let isolated = common::IsolatedDatabase::create(&admin_url(&cfg), "smoke_outbox_relay").await;
+    let isolated =
+        isolated_database::IsolatedDatabase::create(&admin_url(&cfg), "smoke_outbox_relay").await;
     let store = PgStore::connect(isolated.url(), &cfg.region, 4)
         .await
         .expect("connect Postgres");

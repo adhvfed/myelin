@@ -17,6 +17,8 @@ use myelin_tenancy::{Region, TenantId};
 use myelin_harness::load_generator::{LoadGenerator, Multiplier, PrincipalMix, Sink, StormProfile};
 
 mod common;
+#[path = "support/isolated_database.rs"]
+mod isolated_database;
 
 fn admin_url(cfg: &MyelinConfig) -> String {
     cfg.database_url
@@ -150,7 +152,8 @@ impl Sink for CollectingSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn load_10x_containerized_smoke() {
     let cfg = MyelinConfig::dev();
-    let isolated = common::IsolatedDatabase::create(&admin_url(&cfg), "load_10x_outbox").await;
+    let isolated =
+        isolated_database::IsolatedDatabase::create(&admin_url(&cfg), "load_10x_outbox").await;
     let store = PgStore::connect(isolated.url(), &cfg.region, 8)
         .await
         .expect("connect Postgres (is the stack up?)");
