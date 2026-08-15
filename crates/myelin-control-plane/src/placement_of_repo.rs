@@ -1,4 +1,5 @@
-use myelin_tenancy::{ArtifactRef, CellId, Region, TenantId};
+use myelin_refs::ArtifactRef;
+use myelin_tenancy::{CellId, Region, TenantId};
 
 use crate::placement_of::{CellGateway, GatewayReject, Misroute, MisrouteAuditRecord};
 use crate::registry::{PlacementError, Registry};
@@ -68,25 +69,12 @@ impl std::fmt::Display for RepoPlacementError {
 impl std::error::Error for RepoPlacementError {}
 
 fn repo_tenant(repo: &ArtifactRef) -> Option<TenantId> {
-    let rest = repo.0.strip_prefix("myelin://")?;
-    if rest.contains('#') {
+    let parsed = myelin_refs::parse_scoped(&repo.0).ok()?;
+    if parsed.subsystem != "git" || parsed.type_ != "repo" || parsed.sub.is_some() {
         return None;
     }
-    let mut segments = rest.splitn(4, '/');
-    let (tenant, subsystem, type_, id) = (
-        segments.next()?,
-        segments.next()?,
-        segments.next()?,
-        segments.next()?,
-    );
-    if tenant.is_empty()
-        || subsystem != "git"
-        || type_ != "repo"
-        || id.split('/').any(str::is_empty)
-    {
-        return None;
-    }
-    Some(TenantId::from_token(tenant))
+    myelin_refs::git_coordinate::RepositorySlug::parse(&parsed.id).ok()?;
+    Some(parsed.tenant)
 }
 
 impl Registry {
@@ -349,6 +337,22 @@ mod tests {
             "an empty repo-id segment is not a repo ref"
         );
         assert!(reg.placement_of_repo(&empty_id).is_none());
+    }
+
+    #[test]
+    fn placement_accepts_only_the_repository_slug_git_will_store() {
+        let mut reg = registry_with_repo();
+        for slug in ["platform.git/api", "platform//api", "../api", "api key"] {
+            let reference = repo("01J0ACME", slug);
+            assert!(
+                matches!(
+                    reg.register_repo(&reference, StorageGroup::from_token("g")),
+                    Err(RepoPlacementError::NotARepoRef { .. })
+                ),
+                "placement admitted a repository Git cannot store: {slug:?}"
+            );
+            assert!(reg.placement_of_repo(&reference).is_none());
+        }
     }
 
     #[test]
