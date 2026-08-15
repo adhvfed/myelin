@@ -47,6 +47,26 @@ test.describe("Knowledge workspace", () => {
     await expect(page.getByText("Team", { exact: true }).first()).toBeVisible();
   });
 
+  test("a response-lost page creation retries without cloning the page", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { emptyKnowledge: true, knowledgeCreateResponseLosses: 1 },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page); await page.goto("/knowledge");
+
+    await page.getByRole("button", { name: "Create the first page" }).click();
+    await page.getByRole("textbox", { name: "Page title" }).fill("Retry-safe runbook");
+    await page.getByText("Runbook", { exact: true }).click();
+    await page.getByRole("button", { name: "Create page" }).click();
+    await expect(page.getByRole("alert")).toContainText("page was not confirmed");
+
+    await page.getByRole("button", { name: "Create page" }).click();
+    await page.waitForURL(/\/knowledge\?page=[0-9A-HJKMNP-TV-Z]{26}$/);
+    await page.reload();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue("Retry-safe runbook");
+    await expect(page.getByRole("link", { name: /Retry-safe runbook/ })).toHaveCount(1);
+  });
+
   test("uses page navigation first on a narrow viewport", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 760 }); await devLogin(page); await page.goto("/knowledge");
     await expect(page.getByRole("heading", { name: "Knowledge", level: 1 })).toBeVisible();

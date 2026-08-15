@@ -111,6 +111,7 @@ const state = {
   emptyChat: false,
   chatPostResponseLosses: 0,
   emptyKnowledge: false,
+  knowledgeCreateResponseLosses: 0,
   // CT-005 CI read-surface controls. Cursors bind the canonicalized concrete visible-repository set,
   // just as production does; tests mutate membership rather than a synthetic generation counter.
   emptyCi: false,
@@ -411,11 +412,17 @@ const server = createServer((req, res) => {
         }
         if (body.resetKnowledge === true) {
           state.emptyKnowledge = false;
+          state.knowledgeCreateResponseLosses = 0;
           knowledge.reset();
         }
         if (typeof body.emptyKnowledge === "boolean") {
           state.emptyKnowledge = body.emptyKnowledge;
+          state.knowledgeCreateResponseLosses = 0;
           knowledge.reset({ empty: body.emptyKnowledge });
+        }
+        if (Number.isInteger(body.knowledgeCreateResponseLosses) &&
+            body.knowledgeCreateResponseLosses >= 0) {
+          state.knowledgeCreateResponseLosses = body.knowledgeCreateResponseLosses;
         }
         if (typeof body.bumpKnowledgePage === "string") knowledge.bump(body.bumpKnowledgePage);
         if (body.resetCi === true) resetCi();
@@ -585,7 +592,14 @@ const server = createServer((req, res) => {
     let raw = ""; req.on("data", (chunk) => (raw += chunk)); req.on("end", () => {
       let body; try { body = JSON.parse(raw); } catch { return send(res, 400, { error: { message: "invalid Knowledge page body", code: "bad_request" } }); }
       const output = knowledge.create(body); if (output.status === 400) return send(res, 400, { error: { message: "invalid Knowledge page body", code: "bad_request" } });
-      state.emptyKnowledge = false; return send(res, output.status, output.json, { "cache-control": "no-store" });
+      state.emptyKnowledge = false;
+      if (state.knowledgeCreateResponseLosses > 0) {
+        state.knowledgeCreateResponseLosses -= 1;
+        return send(res, 503, {
+          error: { message: "Knowledge committed but its response was lost", code: "unavailable" },
+        });
+      }
+      return send(res, output.status, output.json, { "cache-control": "no-store" });
     }); return;
   }
 
