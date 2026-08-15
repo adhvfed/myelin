@@ -157,15 +157,43 @@ fn malformed_updated_dead_letters() {
 
     let mut bad = lifecycle_event("01J-bad", "knowledge.page.updated", "");
     bad.subject = ArtifactRef(String::new());
-    bad.payload = serde_json::json!({ "title": "x" });
+    bad.payload = serde_json::json!({
+        "ref": "myelin://acme/knowledge/page/payload-cannot-redeem-the-envelope"
+    });
     match consumer.deliver(&msg("knowledge.page.updated", &bad)) {
         Delivered::DeadLettered(Reason(r)) => {
             assert!(
-                r.contains("ArtifactRef"),
-                "the poison names the missing ref: {r}"
+                r.contains("envelope ArtifactRef"),
+                "the poison names the authoritative missing subject: {r}"
             )
         }
         other => panic!("a malformed invalidation event must dead-letter, got {other:?}"),
     }
     assert_eq!(shim.call_count(), 0, "no bust on a malformed event");
+}
+
+#[test]
+fn a_foreign_subject_dead_letters_without_crossing_cache_partitions() {
+    let shim = NoOpCacheShim::new();
+    let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
+    let spec = ConsumerSpec::new(
+        ConsumerName("refs-projection-invalidator".into()),
+        INVALIDATOR_SUBJECT_PREFIXES,
+    );
+    let consumer = consume(spec, inv, DedupLedger::new()).expect("bind");
+    let event = lifecycle_event(
+        "01J-foreign",
+        "knowledge.page.updated",
+        "myelin://globex/knowledge/page/7c2",
+    );
+
+    assert!(matches!(
+        consumer.deliver(&msg("knowledge.page.updated", &event)),
+        Delivered::DeadLettered(_)
+    ));
+    assert_eq!(
+        shim.call_count(),
+        0,
+        "a tenant label may never redirect another tenant's cache invalidation"
+    );
 }

@@ -96,28 +96,40 @@ impl RefsProjectionInvalidator {
             return Ok(());
         }
 
-        let ref_ = self.artifact_ref(ev).ok_or_else(|| {
-            InvalidateError(format!(
-                "{} names no ArtifactRef to invalidate (no envelope subject, no payload ref)",
-                ev.type_.0
-            ))
-        })?;
+        let ref_ = self.artifact_ref(ev)?;
 
         self.cache.invalidate(&ev.tenant, &ev.region, &ref_);
         self.busted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    fn artifact_ref(&self, ev: &EventEnvelope) -> Option<ArtifactRef> {
-        if !ev.subject.0.is_empty() {
-            return Some(ev.subject.clone());
+    fn artifact_ref(&self, ev: &EventEnvelope) -> Result<ArtifactRef, InvalidateError> {
+        let parsed = myelin_refs::parse_scoped(&ev.subject.0).map_err(|error| {
+            InvalidateError(format!(
+                "{} has an invalid envelope ArtifactRef: {error}",
+                ev.type_.0
+            ))
+        })?;
+        if parsed.artifact_ref != ev.subject {
+            return Err(InvalidateError(format!(
+                "{} has a non-canonical envelope ArtifactRef",
+                ev.type_.0
+            )));
         }
-        let p = &ev.payload;
-        p.get("ref")
-            .or_else(|| p.get("subject"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| ArtifactRef(s.to_string()))
+        if parsed.tenant != ev.tenant {
+            return Err(InvalidateError(format!(
+                "{} envelope subject belongs to another tenant",
+                ev.type_.0
+            )));
+        }
+        let event_subsystem = ev.type_.0.split('.').next().unwrap_or_default();
+        if parsed.subsystem != event_subsystem {
+            return Err(InvalidateError(format!(
+                "{} envelope subject belongs to the `{}` subsystem",
+                ev.type_.0, parsed.subsystem
+            )));
+        }
+        Ok(parsed.artifact_ref)
     }
 }
 
@@ -311,24 +323,21 @@ mod tests {
     }
 
     #[test]
-    fn payload_ref_fallback_busts_when_subject_empty() {
+    fn payload_ref_cannot_replace_the_authoritative_envelope_subject() {
         let shim = NoOpCacheShim::new();
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
         let mut ev = lifecycle_event("01J-u3", "chat.message.updated", "");
         ev.subject = ArtifactRef(String::new());
         ev.payload = serde_json::json!({ "ref": "myelin://acme/chat/message/m1" });
-        assert_eq!(
+        assert!(matches!(
             inv.handle(&ev, &mut myelin_events::HandlerTx::none()),
-            HandleOutcome::Done
-        );
-        assert_eq!(
-            shim.invalidations()[0].ref_.0,
-            "myelin://acme/chat/message/m1"
-        );
+            HandleOutcome::NonRetryable(_)
+        ));
+        assert_eq!(shim.call_count(), 0);
     }
 
     #[test]
-    fn busts_are_tenant_first_no_cross_tenant_path() {
+    fn a_subject_cannot_bust_another_tenants_cache_partition() {
         let shim = NoOpCacheShim::new();
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
         let ref_ = "myelin://acme/knowledge/page/7c2";
@@ -336,15 +345,44 @@ mod tests {
         ev_a.tenant = TenantId("acme".into());
         let mut ev_b = lifecycle_event("01J-b", "knowledge.page.updated", ref_);
         ev_b.tenant = TenantId("other".into());
-        inv.handle(&ev_a, &mut myelin_events::HandlerTx::none());
-        inv.handle(&ev_b, &mut myelin_events::HandlerTx::none());
-        let calls = shim.invalidations();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].tenant.0, "acme");
         assert_eq!(
-            calls[1].tenant.0, "other",
-            "the second bust is the OTHER tenant - keys never cross"
+            inv.handle(&ev_a, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
         );
+        assert!(matches!(
+            inv.handle(&ev_b, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::NonRetryable(_)
+        ));
+        let calls = shim.invalidations();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tenant.0, "acme");
+    }
+
+    #[test]
+    fn event_type_and_canonical_subject_must_name_the_same_subsystem() {
+        let shim = NoOpCacheShim::new();
+        let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
+
+        let wrong_subsystem = lifecycle_event(
+            "01J-wrong-subsystem",
+            "knowledge.page.updated",
+            "myelin://acme/issue/issue/ENG-1",
+        );
+        assert!(matches!(
+            inv.handle(&wrong_subsystem, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::NonRetryable(_)
+        ));
+
+        let noncanonical = lifecycle_event(
+            "01J-noncanonical",
+            "knowledge.page.updated",
+            "myelin://acme/knowledge/page/7c2#L01-L02",
+        );
+        assert!(matches!(
+            inv.handle(&noncanonical, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::NonRetryable(_)
+        ));
+        assert_eq!(shim.call_count(), 0);
     }
 
     #[test]
