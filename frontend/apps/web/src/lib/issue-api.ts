@@ -123,7 +123,7 @@ export const issuesMutate = action(async (mutation: IssueMutation) => {
         const decoded = parseIssueCreateReceipt(await edgePost(
           "/v1/issues",
           { project_id: parsed.projectId, title: parsed.title },
-          { idempotencyKey: crypto.randomUUID() },
+          { idempotencyKey: parsed.clientNonce },
         ));
         if (!decoded) throw new IssueRouteError("error");
         return decoded;

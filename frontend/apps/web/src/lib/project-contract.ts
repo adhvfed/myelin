@@ -1,3 +1,5 @@
+import { isClientNonce } from "./client-nonce";
+
 export const MAX_PROJECT_NAME_BYTES = 100;
 export const MAX_PROJECT_PREFIX_BYTES = 10;
 export const MAX_PROJECT_PAGE_SIZE = 100;
@@ -24,6 +26,7 @@ export interface ProjectListInput {
 export interface NewProjectInput {
   name: string;
   issuePrefix: string;
+  clientNonce: string;
 }
 
 export interface ProjectCreationReceipt {
@@ -107,10 +110,11 @@ export function projectListSearchParams(input: ProjectListInput): URLSearchParam
 
 export function parseNewProjectInput(value: unknown): NewProjectInput | null {
   const input = record(value);
-  if (!input || !exact(input, ["name", "issuePrefix"]) ||
+  if (!input || !exact(input, ["name", "issuePrefix", "clientNonce"]) ||
       typeof input.name !== "string" || typeof input.issuePrefix !== "string" ||
-      projectNameError(input.name) || projectPrefixError(input.issuePrefix)) return null;
-  return { name: input.name, issuePrefix: input.issuePrefix };
+      projectNameError(input.name) || projectPrefixError(input.issuePrefix) ||
+      !isClientNonce(input.clientNonce)) return null;
+  return { name: input.name, issuePrefix: input.issuePrefix, clientNonce: input.clientNonce };
 }
 
 function parseProject(value: unknown): ProjectVM | null {

@@ -25,7 +25,7 @@ function issueActionError(kind: IssueErrorKind): string {
     case "not-found":
       return "That project is no longer available to you.";
     default:
-      return "We couldn't confirm whether the issue was created. Check the list before retrying.";
+      return "We couldn't confirm whether the issue was created. Retrying this unchanged draft is safe.";
   }
 }
 
@@ -38,7 +38,7 @@ function projectActionError(kind: ProjectErrorKind): string {
     case "not-found":
       return "Project creation isn't available to you.";
     default:
-      return "We couldn't confirm whether the project was created. Reload and check your projects before retrying.";
+      return "We couldn't confirm whether the project was created. Retrying this unchanged draft is safe.";
   }
 }
 
@@ -49,6 +49,8 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
   const [title, setTitle] = createSignal("");
   const [projectName, setProjectName] = createSignal("");
   const [projectPrefix, setProjectPrefix] = createSignal("");
+  const [issueClientNonce, setIssueClientNonce] = createSignal(crypto.randomUUID());
+  const [projectClientNonce, setProjectClientNonce] = createSignal(crypto.randomUUID());
   const [error, setError] = createSignal<string | null>(null);
   const [submitting, setSubmitting] = createSignal<"project" | "issue" | null>(null);
   const [creatingProject, setCreatingProject] = createSignal(false);
@@ -62,6 +64,8 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
     setTitle("");
     setProjectName("");
     setProjectPrefix("");
+    setIssueClientNonce(crypto.randomUUID());
+    setProjectClientNonce(crypto.randomUUID());
     setError(null);
     setSubmitting(null);
     setCreatingProject(false);
@@ -114,21 +118,26 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
     setSubmitting("issue");
     setError(null);
     try {
-      const result = await mutateIssue({ op: "create", projectId: project.id, title: title() });
+      const result = await mutateIssue({
+        op: "create",
+        projectId: project.id,
+        title: title(),
+        clientNonce: issueClientNonce(),
+      });
       if (!result.ok) {
         setError(issueActionError(result.error));
         titleInput?.focus();
         return;
       }
       if (result.op !== "create") {
-        setError("We couldn't confirm whether the issue was created. Check the list before retrying.");
+        setError(issueActionError("error"));
         titleInput?.focus();
         return;
       }
       props.onAccepted(result.receipt);
       props.onClose();
     } catch {
-      setError("We couldn't confirm whether the issue was created. Check the list before retrying.");
+      setError(issueActionError("error"));
       titleInput?.focus();
     } finally {
       setSubmitting(null);
@@ -147,17 +156,22 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
     setSubmitting("project");
     setError(null);
     try {
-      const result = await mutateProject({ name: projectName(), issuePrefix: projectPrefix() });
+      const result = await mutateProject({
+        name: projectName(),
+        issuePrefix: projectPrefix(),
+        clientNonce: projectClientNonce(),
+      });
       if (!result.ok) {
         setError(projectActionError(result.error));
         (result.error === "conflict" ? projectPrefixInput : projectNameInput)?.focus();
         return;
       }
       catalogue.add(result.receipt.project);
+      setIssueClientNonce(crypto.randomUUID());
       setCreatingProject(false);
       setError(null);
     } catch {
-      setError("We couldn't confirm whether the project was created. Reload and check your projects before retrying.");
+      setError(projectActionError("error"));
       projectNameInput?.focus();
     } finally {
       setSubmitting(null);
@@ -228,8 +242,8 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
             disabled={busy()}
             nameRef={(element) => { projectNameInput = element; }}
             prefixRef={(element) => { projectPrefixInput = element; }}
-            onName={(value) => { setProjectName(value); clearError(); }}
-            onPrefix={(value) => { setProjectPrefix(value); clearError(); }}
+            onName={(value) => { setProjectName(value); setProjectClientNonce(crypto.randomUUID()); clearError(); }}
+            onPrefix={(value) => { setProjectPrefix(value); setProjectClientNonce(crypto.randomUUID()); clearError(); }}
           />
         </form>
       </Show>
@@ -246,12 +260,13 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
             loadingMore={catalogue.loadingMore()}
             loadMoreError={catalogue.loadMoreError()}
             titleRef={(element) => { titleInput = element; }}
-            onProject={(value) => { catalogue.select(value); clearError(); }}
-            onTitle={(value) => { setTitle(value); clearError(); }}
+            onProject={(value) => { catalogue.select(value); setIssueClientNonce(crypto.randomUUID()); clearError(); }}
+            onTitle={(value) => { setTitle(value); setIssueClientNonce(crypto.randomUUID()); clearError(); }}
             onLoadMore={() => void catalogue.loadMore()}
             onCreateProject={() => {
               setProjectName("");
               setProjectPrefix("");
+              setProjectClientNonce(crypto.randomUUID());
               setError(null);
               setCreatingProject(true);
             }}

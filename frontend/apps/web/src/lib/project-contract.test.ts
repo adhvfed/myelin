@@ -44,10 +44,12 @@ describe("project browser contract", () => {
       .toEqual({ cursor: project.id, limit: 100 });
     expect(parseProjectListInput({ cursor: project.id, limit: 101 })).toBeNull();
     expect(parseProjectListInput({ limit: 50, tenant: "other" })).toBeNull();
-    expect(parseNewProjectInput({ name: "Developer experience", issuePrefix: "DX" }))
-      .toEqual({ name: "Developer experience", issuePrefix: "DX" });
-    expect(parseNewProjectInput({ name: "Developer experience", issuePrefix: "dx" })).toBeNull();
-    expect(parseNewProjectInput({ name: "Project", issuePrefix: "DX", tenant: "other" })).toBeNull();
+    expect(parseNewProjectInput({ name: "Developer experience", issuePrefix: "DX", clientNonce: "project_1" }))
+      .toEqual({ name: "Developer experience", issuePrefix: "DX", clientNonce: "project_1" });
+    expect(parseNewProjectInput({ name: "Developer experience", issuePrefix: "dx", clientNonce: "project_1" })).toBeNull();
+    expect(parseNewProjectInput({ name: "Project", issuePrefix: "DX" })).toBeNull();
+    expect(parseNewProjectInput({ name: "Project", issuePrefix: "DX", clientNonce: "has spaces" })).toBeNull();
+    expect(parseNewProjectInput({ name: "Project", issuePrefix: "DX", clientNonce: "project_1", tenant: "other" })).toBeNull();
   });
 
   it("gives field-level guidance without silently normalizing identity", () => {

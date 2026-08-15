@@ -52,7 +52,7 @@ export const createProject = action(async (value: NewProjectInput) => {
     const receipt = parseProjectCreation(await edgePost(
       "/v1/projects",
       { name: input.name, issue_prefix: input.issuePrefix },
-      { idempotencyKey: crypto.randomUUID() },
+      { idempotencyKey: input.clientNonce },
     ));
     return result(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
   } catch (error) {

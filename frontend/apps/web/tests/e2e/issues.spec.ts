@@ -12,10 +12,12 @@ async function setEdgeConfig(cfg: {
   issueActivationPolls?: number;
   issueActivationUnavailable?: boolean;
   issueCreateUnavailable?: boolean;
+  issueCreateResponseLosses?: number;
   issueCloseUnavailable?: boolean;
   emptyProjects?: boolean;
   projectsUnavailable?: boolean;
   projectCreateUnavailable?: boolean;
+  projectCreateResponseLosses?: number;
   issueListFirstPageHolds?: number;
   releaseIssueListFirstPages?: boolean;
   issueListFirstPageDelaysMs?: number[];
@@ -191,6 +193,61 @@ test.describe("issue workflows", () => {
     await expectNoAxeViolations(page, "first project and issue journey");
   });
 
+  test("a lost project response can be retried without creating or selecting a duplicate", async ({ page }) => {
+    await setEdgeConfig({
+      emptyProjects: true,
+      emptyIssues: true,
+      projectCreateResponseLosses: 1,
+      issueActivationPolls: 1,
+    });
+    await devLogin(page);
+    await gotoInteractive(page, "/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    const dialog = page.getByRole("dialog", { name: "Set up issue tracking" });
+    await dialog.getByLabel("Project name").fill("Reliability");
+    await dialog.getByLabel("Issue key").fill("REL");
+    await dialog.getByRole("button", { name: "Create project" }).click();
+
+    await expect(dialog.getByRole("alert")).toContainText("Retrying this unchanged draft is safe");
+    await expect(dialog.getByLabel("Project name")).toHaveValue("Reliability");
+    await dialog.getByRole("button", { name: "Create project" }).click();
+
+    const issueDialog = page.getByRole("dialog", { name: "New issue" });
+    await expect(issueDialog.getByLabel("Project").locator("option")).toHaveCount(1);
+    await expect(issueDialog.getByLabel("Project")).toContainText("Reliability — REL");
+    await issueDialog.getByLabel("Title").fill("Make uncertain delivery uneventful");
+    await issueDialog.getByRole("button", { name: "Create issue" }).click();
+    await expect(page.getByTestId("issue-row").filter({ hasText: "Make uncertain delivery uneventful" }))
+      .toHaveCount(1);
+
+    await page.reload();
+    await waitForInteractiveShell(page);
+    await page.getByRole("button", { name: "New issue" }).click();
+    await expect(page.getByRole("dialog", { name: "New issue" }).getByLabel("Project").locator("option"))
+      .toHaveCount(1);
+  });
+
+  test("a lost issue response can be retried without creating a duplicate issue", async ({ page }) => {
+    await setEdgeConfig({ emptyIssues: true, issueCreateResponseLosses: 1, issueActivationPolls: 1 });
+    await devLogin(page);
+    await gotoInteractive(page, "/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    const dialog = page.getByRole("dialog", { name: "New issue" });
+    await dialog.getByLabel("Title").fill("Retry one durable issue");
+    await dialog.getByRole("button", { name: "Create issue" }).click();
+
+    await expect(dialog.getByRole("alert")).toContainText("Retrying this unchanged draft is safe");
+    await expect(dialog.getByLabel("Title")).toHaveValue("Retry one durable issue");
+    await dialog.getByRole("button", { name: "Create issue" }).click();
+    await expect(page.getByTestId("issue-row").filter({ hasText: "Retry one durable issue" })).toHaveCount(1);
+
+    await page.reload();
+    await waitForInteractiveShell(page);
+    await expect(page.getByTestId("issue-row").filter({ hasText: "Retry one durable issue" })).toHaveCount(1);
+  });
+
   test("project discovery failure never guesses an issue destination", async ({ page }) => {
     await setEdgeConfig({ projectsUnavailable: true });
     await devLogin(page);
@@ -265,7 +322,7 @@ test.describe("issue workflows", () => {
     await expect(page.getByTestId("pending-issue")).not.toContainText("safely pending");
   });
 
-  test("ambiguous create and close failures tell the user to check before retrying", async ({ page }) => {
+  test("issue create retries stay safe while ambiguous closes require a state check", async ({ page }) => {
     await setEdgeConfig({ issueCreateUnavailable: true });
     await devLogin(page);
     await gotoInteractive(page, "/issues");
@@ -273,9 +330,8 @@ test.describe("issue workflows", () => {
     await page.getByLabel("Title").fill("Do not overclaim a failed create");
     await page.getByRole("button", { name: "Create issue" }).click();
     await expect(page.getByRole("alert")).toContainText(
-      "We couldn't confirm whether the issue was created. Check the list before retrying.",
+      "We couldn't confirm whether the issue was created. Retrying this unchanged draft is safe.",
     );
-    await expect(page.getByRole("alert")).not.toContainText("Nothing was submitted twice");
 
     await setEdgeConfig({ issueCreateUnavailable: false, issueCloseUnavailable: true });
     await gotoInteractive(page, `/issues/${OPEN_ID}`);

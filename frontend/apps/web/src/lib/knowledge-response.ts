@@ -1,5 +1,6 @@
 import { BLOCK_TYPES, type BlockType, type EditorBlock } from "@myelin/design-system";
 import { isArtifactRef, parseArtifactRef } from "./artifact-ref";
+import { isClientNonce } from "./client-nonce";
 
 type WireRecord = Record<string, unknown>;
 const utf8 = new TextEncoder();
@@ -160,8 +161,7 @@ export function parseKnowledgeCreateDraft(value: unknown): KnowledgeCreateDraft 
   const row = record(value);
   if (!row || !exact(row, ["title", "template", "visibility", "clientNonce"]) || !cleanText(row.title, 512) ||
       (row.title as string).trim() !== row.title || !["blank", "product-spec", "runbook"].includes(row.template as string) ||
-      !["private", "team"].includes(row.visibility as string) || typeof row.clientNonce !== "string" ||
-      !/^[A-Za-z0-9_-]{1,128}$/.test(row.clientNonce)) return null;
+      !["private", "team"].includes(row.visibility as string) || !isClientNonce(row.clientNonce)) return null;
   return row as unknown as KnowledgeCreateDraft;
 }
 

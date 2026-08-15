@@ -2,13 +2,15 @@
 // RPC boundary, so every mutation is reconstructed from an exact, bounded wire shape before a URL
 // is built or an Edge call can run.
 
+import { isClientNonce } from "./client-nonce";
+
 export const MAX_ISSUE_TITLE_BYTES = 512;
 export const MAX_PR_MARKDOWN_BYTES = 64 * 1024;
 export const MAX_REPO_SLUG_BYTES = 255;
 export const MAX_GIT_PATH_BYTES = 4 * 1024;
 
 export type IssueMutation =
-  | { op: "create"; projectId: string; title: string }
+  | { op: "create"; projectId: string; title: string; clientNonce: string }
   | { op: "close"; issueId: string }
   | { op: "activation"; requestEventId: string };
 
@@ -113,14 +115,15 @@ export function parseIssueMutation(value: unknown): IssueMutation | null {
   if (!input || typeof input.op !== "string") return null;
   switch (input.op) {
     case "create": {
-      if (!exactKeys(input, ["op", "projectId", "title"]) ||
-          !canonicalUuid(input.projectId) || !bounded(input.title, MAX_ISSUE_TITLE_BYTES)) {
+      if (!exactKeys(input, ["op", "projectId", "title", "clientNonce"]) ||
+          !canonicalUuid(input.projectId) || !bounded(input.title, MAX_ISSUE_TITLE_BYTES) ||
+          !isClientNonce(input.clientNonce)) {
         return null;
       }
       const title = input.title.trim();
       return !title || hasControl(title)
         ? null
-        : { op: "create", projectId: input.projectId, title };
+        : { op: "create", projectId: input.projectId, title, clientNonce: input.clientNonce };
     }
     case "close":
       return exactKeys(input, ["op", "issueId"]) && canonicalUuid(input.issueId)

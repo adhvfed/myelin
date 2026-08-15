@@ -1,4 +1,5 @@
 import { isStorableArtifactRef } from "./artifact-ref";
+import { isClientNonce } from "./client-nonce";
 import { isProjectId } from "./project-contract";
 
 const utf8 = new TextEncoder();
@@ -202,8 +203,7 @@ export function parseChatConversationDraft(value: unknown): ChatConversationDraf
       !isProjectId(draft.projectId) || !cleanText(draft.channel, 255) ||
       !cleanText(draft.topic, 255) ||
       draft.channel.trim() !== draft.channel || draft.topic.trim() !== draft.topic ||
-      typeof draft.clientNonce !== "string" ||
-      !/^[A-Za-z0-9_-]{1,128}$/.test(draft.clientNonce)) return null;
+      !isClientNonce(draft.clientNonce)) return null;
   return {
     projectId: draft.projectId,
     channel: draft.channel,
@@ -216,8 +216,7 @@ export function parseChatMessageDraft(value: unknown): ChatMessageDraft | null {
   const draft = record(value);
   if (!draft || !exact(draft, ["conversationId", "content", "clientNonce"]) ||
       !isChatUlid(draft.conversationId) || !cleanText(draft.content, 32 * 1024) ||
-      !draft.content.trim() || typeof draft.clientNonce !== "string" ||
-      !/^[A-Za-z0-9_-]{1,128}$/.test(draft.clientNonce)) return null;
+      !draft.content.trim() || !isClientNonce(draft.clientNonce)) return null;
   return {
     conversationId: draft.conversationId,
     content: draft.content,

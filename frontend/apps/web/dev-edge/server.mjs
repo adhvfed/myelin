@@ -93,10 +93,12 @@ const state = {
   issueActivationPolls: 2,
   issueActivationUnavailable: false,
   issueCreateUnavailable: false,
+  issueCreateResponseLosses: 0,
   issueCloseUnavailable: false,
   emptyProjects: false,
   projectsUnavailable: false,
   projectCreateUnavailable: false,
+  projectCreateResponseLosses: 0,
   issueListFirstPageHolds: 0,
   issueListFirstPageDelaysMs: [],
   issueListCursorDelaysMs: [],
@@ -137,6 +139,7 @@ const ciLiveClients = new Set();
 
 let issueRows = freshIssueFixtures();
 const issueReceipts = new Map();
+const issueCreations = new Map();
 const issueListDelayTimers = new Map();
 const heldIssueListResponses = new Set();
 let issueListDelayGeneration = 0;
@@ -151,6 +154,7 @@ const DEFAULT_PROJECT = {
   created_at: "2026-07-01T00:00:00.000Z",
 };
 let projectRows = [{ ...DEFAULT_PROJECT }];
+const projectCreations = new Map();
 let projectSequence = 300;
 
 function resetProjects() {
@@ -159,6 +163,8 @@ function resetProjects() {
   state.emptyProjects = false;
   state.projectsUnavailable = false;
   state.projectCreateUnavailable = false;
+  state.projectCreateResponseLosses = 0;
+  projectCreations.clear();
 }
 
 function cancelIssueListDelays() {
@@ -182,6 +188,7 @@ function resetIssues() {
   cancelIssueListDelays();
   issueRows = freshIssueFixtures();
   issueReceipts.clear();
+  issueCreations.clear();
   issueSequence = 200;
   state.emptyIssues = false;
   state.onlyClosedIssues = false;
@@ -189,6 +196,7 @@ function resetIssues() {
   state.issueActivationPolls = 2;
   state.issueActivationUnavailable = false;
   state.issueCreateUnavailable = false;
+  state.issueCreateResponseLosses = 0;
   state.issueCloseUnavailable = false;
   state.issueListFirstPageHolds = 0;
   state.issueListFirstPageDelaysMs = [];
@@ -447,6 +455,9 @@ const server = createServer((req, res) => {
         if (Number.isInteger(body.issueActivationPolls)) state.issueActivationPolls = body.issueActivationPolls;
         if (typeof body.issueActivationUnavailable === "boolean") state.issueActivationUnavailable = body.issueActivationUnavailable;
         if (typeof body.issueCreateUnavailable === "boolean") state.issueCreateUnavailable = body.issueCreateUnavailable;
+        if (Number.isInteger(body.issueCreateResponseLosses) && body.issueCreateResponseLosses >= 0) {
+          state.issueCreateResponseLosses = body.issueCreateResponseLosses;
+        }
         if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
         if (typeof body.emptyProjects === "boolean") {
           state.emptyProjects = body.emptyProjects;
@@ -454,6 +465,9 @@ const server = createServer((req, res) => {
         }
         if (typeof body.projectsUnavailable === "boolean") state.projectsUnavailable = body.projectsUnavailable;
         if (typeof body.projectCreateUnavailable === "boolean") state.projectCreateUnavailable = body.projectCreateUnavailable;
+        if (Number.isInteger(body.projectCreateResponseLosses) && body.projectCreateResponseLosses >= 0) {
+          state.projectCreateResponseLosses = body.projectCreateResponseLosses;
+        }
         if (Number.isInteger(body.prCommitContinuationFailures) && body.prCommitContinuationFailures >= 0) {
           state.prCommitContinuationFailures = body.prCommitContinuationFailures;
         }
@@ -814,7 +828,8 @@ const server = createServer((req, res) => {
 
   if (method === "POST" && path === "/v1/projects") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
-    if (!validPrOperationId(req.headers["idempotency-key"])) {
+    const clientNonce = req.headers["idempotency-key"];
+    if (!validPrOperationId(clientNonce)) {
       return send(res, 400, { error: { message: "project creation requires an idempotency key", code: "bad_request" } });
     }
     if (state.projectCreateUnavailable) {
@@ -841,6 +856,13 @@ const server = createServer((req, res) => {
           typeof body.issue_prefix !== "string" || !/^[A-Z0-9]{2,10}$/.test(body.issue_prefix)) {
         return send(res, 400, { error: { message: "invalid project create body", code: "bad_request" } });
       }
+      const replay = projectCreations.get(clientNonce);
+      if (replay) {
+        if (replay.name !== body.name || replay.issuePrefix !== body.issue_prefix) {
+          return send(res, 409, { error: { message: "idempotency key already used for another project", code: "conflict" } });
+        }
+        return send(res, 200, { project: replay.project, created: false, durable: true });
+      }
       if (projectRows.some((project) => project.issue_prefix === body.issue_prefix)) {
         return send(res, 409, { error: { message: "issue prefix already exists", code: "conflict" } });
       }
@@ -855,7 +877,12 @@ const server = createServer((req, res) => {
         created_at: new Date(ISSUE_BASE_TIME_FOR_CREATE + sequence * 1_000).toISOString(),
       };
       projectRows.push(project);
+      projectCreations.set(clientNonce, { name: body.name, issuePrefix: body.issue_prefix, project });
       state.emptyProjects = false;
+      if (state.projectCreateResponseLosses > 0) {
+        state.projectCreateResponseLosses -= 1;
+        return send(res, 503, { error: { message: "project was committed but its response was lost", code: "unavailable" } });
+      }
       return send(res, 201, { project, created: true, durable: true });
     });
     return;
@@ -866,7 +893,8 @@ const server = createServer((req, res) => {
   let im;
   if (method === "POST" && path === "/v1/issues") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
-    if (!validPrOperationId(req.headers["idempotency-key"])) {
+    const clientNonce = req.headers["idempotency-key"];
+    if (!validPrOperationId(clientNonce)) {
       return send(res, 400, { error: { message: "issue creation requires an idempotency key", code: "bad_request" } });
     }
     if (state.issueCreateUnavailable) {
@@ -881,6 +909,9 @@ const server = createServer((req, res) => {
       } catch {
         return send(res, 400, { error: { message: "invalid issue create body", code: "bad_request" } });
       }
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return send(res, 400, { error: { message: "invalid issue create body", code: "bad_request" } });
+      }
       const project = projectRows.find((row) => row.id === body.project_id);
       if (
         Object.keys(body).length !== 2 ||
@@ -889,6 +920,14 @@ const server = createServer((req, res) => {
         !body.title.trim()
       ) {
         return send(res, 400, { error: { message: "invalid issue create body", code: "bad_request" } });
+      }
+      const title = body.title.trim();
+      const replay = issueCreations.get(clientNonce);
+      if (replay) {
+        if (replay.projectId !== body.project_id || replay.title !== title) {
+          return send(res, 409, { error: { message: "idempotency key already used for another issue", code: "conflict" } });
+        }
+        return send(res, 200, { ...replay.response, created: false, durable: true });
       }
       const number = ++issueSequence;
       const id = `10000000-0000-4000-8000-${String(number).padStart(12, "0")}`;
@@ -901,17 +940,23 @@ const server = createServer((req, res) => {
         project_id: project.id,
         state: "Todo",
         state_category: "unstarted",
-        title: body.title.trim(),
+        title,
         version: 1,
         created_at: now,
         updated_at: now,
       };
       const requestEventId = `01J${String(number).padStart(23, "0")}`;
       issueReceipts.set(requestEventId, { row, polls: 0, active: false });
-      return send(res, 202, {
+      const response = {
         issue: { id, ref: row.ref, key, project_id: row.project_id },
         authorization: { status: "pending", request_event_id: requestEventId },
-      });
+      };
+      issueCreations.set(clientNonce, { projectId: body.project_id, title, response });
+      if (state.issueCreateResponseLosses > 0) {
+        state.issueCreateResponseLosses -= 1;
+        return send(res, 503, { error: { message: "issue was committed but its response was lost", code: "unavailable" } });
+      }
+      return send(res, 202, { ...response, created: true, durable: true });
     });
     return;
   }
