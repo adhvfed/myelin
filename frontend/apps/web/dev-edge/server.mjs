@@ -111,6 +111,7 @@ const state = {
   prCommitContinuationFailures: 0,
   prCommitContinuationMalformedPages: 0,
   prCommitContinuationRequests: 0,
+  prMutationResponseLosses: 0,
   emptyChat: false,
   chatPostResponseLosses: 0,
   emptyKnowledge: false,
@@ -141,6 +142,7 @@ const ciLiveClients = new Set();
 let issueRows = freshIssueFixtures();
 const issueReceipts = new Map();
 const issueCreations = new Map();
+const prMutationReceipts = new Map();
 const issueListDelayTimers = new Map();
 const heldIssueListResponses = new Set();
 let issueListDelayGeneration = 0;
@@ -408,6 +410,8 @@ const server = createServer((req, res) => {
         if (body.resetPrFixtures === true) {
           resetPrFixtures();
           resetPrCommitPagination();
+          prMutationReceipts.clear();
+          state.prMutationResponseLosses = 0;
         }
         if (body.resetIssues === true) resetIssues();
         if (body.resetChat === true) {
@@ -478,6 +482,9 @@ const server = createServer((req, res) => {
         }
         if (Number.isInteger(body.prCommitContinuationMalformedPages) && body.prCommitContinuationMalformedPages >= 0) {
           state.prCommitContinuationMalformedPages = body.prCommitContinuationMalformedPages;
+        }
+        if (Number.isInteger(body.prMutationResponseLosses) && body.prMutationResponseLosses >= 0) {
+          state.prMutationResponseLosses = body.prMutationResponseLosses;
         }
         if (Number.isInteger(body.issueListFirstPageHolds) && body.issueListFirstPageHolds >= 0) {
           state.issueListFirstPageHolds = body.issueListFirstPageHolds;
@@ -989,7 +996,8 @@ const server = createServer((req, res) => {
     (pm = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/(.+)$/))
   ) {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
-    if (pm[3] === "merge" && !validPrOperationId(req.headers["idempotency-key"])) {
+    const clientNonce = req.headers["idempotency-key"];
+    if (!validPrOperationId(clientNonce)) {
       return send(res, 400, {
         error: {
           message: "production PR writes require a valid `Idempotency-Key` header",
@@ -1006,8 +1014,32 @@ const server = createServer((req, res) => {
       } catch {
         body = {};
       }
+      const receiptKey = `${path}\u0000${clientNonce}`;
+      const fingerprint = JSON.stringify(body);
+      const replay = prMutationReceipts.get(receiptKey);
+      if (replay) {
+        if (replay.fingerprint !== fingerprint) {
+          return send(res, 409, {
+            error: { message: "idempotency key already used for another PR mutation", code: "conflict" },
+          });
+        }
+        return send(res, replay.status, replay.json);
+      }
       const out = devPost(decodeURIComponent(pm[1]), Number(pm[2]), pm[3], body);
       if (out.status === 404) return send(res, 404, notFoundEnvelope("pull request"));
+      if (out.status >= 200 && out.status < 300) {
+        prMutationReceipts.set(receiptKey, {
+          fingerprint,
+          status: out.status,
+          json: structuredClone(out.json ?? null),
+        });
+        if (state.prMutationResponseLosses > 0) {
+          state.prMutationResponseLosses -= 1;
+          return send(res, 503, {
+            error: { message: "PR mutation was committed but its response was lost", code: "unavailable" },
+          });
+        }
+      }
       return send(res, out.status, out.json ?? null);
     });
     return;

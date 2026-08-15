@@ -52,12 +52,14 @@ describe("parsePrMutation", () => {
       repo: "team/core",
       n: 42,
       body_md: "  review this  ",
+      clientNonce: "thread_1",
       anchor: { path: "src/lib.rs", line: 7, side: "new" },
     })).toEqual({
       op: "thread",
       repo: "team/core",
       n: 42,
       body_md: "review this",
+      clientNonce: "thread_1",
       anchor: { path: "src/lib.rs", line: 7, side: "new" },
     });
     expect(parsePrMutation({
@@ -83,15 +85,16 @@ describe("parsePrMutation", () => {
     { op: "merge", repo: "core", n: 0 },
     { op: "merge", repo: "core", n: Number.MAX_SAFE_INTEGER + 1 },
     { op: "merge", repo: "core", n: 1, surprise: true },
-    { op: "comment", repo: "core", n: 1, threadId: "r-1", body_md: "x" },
+    { op: "comment", repo: "core", n: 1, threadId: "r-1", body_md: "x", clientNonce: "comment_1" },
     { op: "resolve", repo: "core", n: 1, threadId: "t-1", resolved: "yes" },
     { op: "review-discard", repo: "core", n: 1, reviewId: "t-1" },
     { op: "review-submit", repo: "core", n: 1, reviewId: "r-1", verdict: "dismissed" },
-    { op: "thread", repo: "core", n: 1, body_md: "x", anchor: { path: "src/x", line: 1 } },
-    { op: "thread", repo: "core", n: 1, body_md: " ", anchor: { path: "src/x", line: 1 } },
-    { op: "thread", repo: "core", n: 1, body_md: "x", anchor: { path: "../secret", line: 1 } },
-    { op: "thread", repo: "core", n: 1, body_md: "x", anchor: { path: "src/x", line: -1 } },
-    { op: "thread", repo: "core", n: 1, body_md: "x".repeat(MAX_PR_MARKDOWN_BYTES + 1) },
+    { op: "thread", repo: "core", n: 1, body_md: "x", clientNonce: "thread_1", anchor: { path: "src/x", line: 1 } },
+    { op: "thread", repo: "core", n: 1, body_md: " ", clientNonce: "thread_1", anchor: { path: "src/x", line: 1 } },
+    { op: "thread", repo: "core", n: 1, body_md: "x", clientNonce: "thread_1", anchor: { path: "../secret", line: 1 } },
+    { op: "thread", repo: "core", n: 1, body_md: "x", clientNonce: "thread_1", anchor: { path: "src/x", line: -1 } },
+    { op: "thread", repo: "core", n: 1, body_md: "x", clientNonce: "has spaces" },
+    { op: "thread", repo: "core", n: 1, body_md: "x".repeat(MAX_PR_MARKDOWN_BYTES + 1), clientNonce: "thread_1" },
   ])("rejects malformed, unsafe, oversized, or non-exact input %#", (value) => {
     expect(parsePrMutation(value)).toBeNull();
   });

@@ -122,6 +122,7 @@ export default function PrDiffScreen() {
   // The line-comment composer (one open at a time). `c` / a gutter click opens it on the focused line.
   const [commentAt, setCommentAt] = createSignal<CommentAt | null>(null);
   const [draft, setDraft] = createSignal("");
+  const [draftClientNonce, setDraftClientNonce] = createSignal(crypto.randomUUID());
   const [live, setLive] = createSignal("");
   // Expanded context is namespaced by immutable diff identity rather than page-local file indexes.
   // That keeps a late response from one cursor page or pre-rebase head out of another file's rows.
@@ -187,11 +188,23 @@ export default function PrDiffScreen() {
     const at = commentAt();
     const body = draft().trim();
     if (!at || !body) return;
-    await mutate({ op: "thread", repo: repo(), n: n(), body_md: body, anchor: { path: at.path, line: at.line, side: at.side } });
-    setDraft("");
-    setCommentAt(null);
-    setLive("Comment posted");
-    await reload();
+    try {
+      await mutate({
+        op: "thread",
+        repo: repo(),
+        n: n(),
+        body_md: body,
+        clientNonce: draftClientNonce(),
+        anchor: { path: at.path, line: at.line, side: at.side },
+      });
+      setDraft("");
+      setDraftClientNonce(crypto.randomUUID());
+      setCommentAt(null);
+      setLive("Comment posted");
+      await reload();
+    } catch {
+      setLive("The comment could not be confirmed. Retrying this unchanged draft is safe.");
+    }
   };
 
   // If a deep-linked line no longer exists, report an older head instead of selecting a nearby line.
@@ -299,7 +312,11 @@ export default function PrDiffScreen() {
                       onExpandContext={(fileIdx, gapKey) => void expandContext(fileIdx, gapKey)}
                       expandedContext={expandedContext()}
                       hasThread={hasThread}
-                      onRequestComment={(path, side, line) => { setCommentAt({ path, side, line }); setDraft(""); }}
+                      onRequestComment={(path, side, line) => {
+                        setCommentAt({ path, side, line });
+                        setDraft("");
+                        setDraftClientNonce(crypto.randomUUID());
+                      }}
                       deepLink={deepLinkExists() ? deepLink() : null}
                       renderThread={(path, _side, line) => {
                         const ts = liveThreadsFor(path, line);
@@ -322,7 +339,10 @@ export default function PrDiffScreen() {
                               focusOnMount
                               label={`Comment on ${path} line ${line}`}
                               value={draft()}
-                              onValue={setDraft}
+                              onValue={(value) => {
+                                setDraft(value);
+                                setDraftClientNonce(crypto.randomUUID());
+                              }}
                               onSubmit={() => void submitComment()}
                               onEscape={() => setCommentAt(null)}
                               submitShortcut="mod-enter"

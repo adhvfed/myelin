@@ -1100,7 +1100,9 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
   if (!parsed) throw new RepoRouteError("error");
   const base = `/v1/git/repos/${seg(parsed.repo)}/prs/${parsed.n}`;
   return authed(async () => {
-    const mutationOptions = { idempotencyKey: crypto.randomUUID() };
+    const mutationOptions = {
+      idempotencyKey: "clientNonce" in parsed ? parsed.clientNonce : crypto.randomUUID(),
+    };
     switch (parsed.op) {
       case "thread": {
         const response = await edgePost(`${base}/threads`, {

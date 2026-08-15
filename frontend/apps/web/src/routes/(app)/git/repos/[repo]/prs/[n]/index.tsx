@@ -427,6 +427,7 @@ function ReviewsSection(props: {
   const [draft, setDraft] = createSignal<PrReviewVM | null>(null);
   const [verdictOpen, setVerdictOpen] = createSignal(false);
   const [pendingText, setPendingText] = createSignal("");
+  const [pendingClientNonce, setPendingClientNonce] = createSignal(crypto.randomUUID());
   const [summaryText, setSummaryText] = createSignal("");
   const submitted = createMemo(() => props.reviews.filter((r) => r.verdict !== "in_progress"));
 
@@ -452,11 +453,19 @@ function ReviewsSection(props: {
     const text = pendingText().trim();
     if (!d || !text) return;
     try {
-      await doMutate({ op: "review-comment", repo: props.repo, n: props.n, reviewId: d.id, body_md: text });
+      await doMutate({
+        op: "review-comment",
+        repo: props.repo,
+        n: props.n,
+        reviewId: d.id,
+        body_md: text,
+        clientNonce: pendingClientNonce(),
+      });
       setPendingText("");
+      setPendingClientNonce(crypto.randomUUID());
       props.toast.show({ title: "Pending comment added (only you can see it)", variant: "info" });
     } catch {
-      props.toast.show({ title: "Could not add the comment", variant: "danger" });
+      props.toast.show({ title: "Comment not confirmed — retrying this unchanged draft is safe", variant: "danger" });
     }
   };
   const submit = async (verdict: "approved" | "changes_requested" | "commented") => {
@@ -530,7 +539,7 @@ function ReviewsSection(props: {
             <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", "font-size": "var(--fs-caption)", color: "var(--text-muted)" }}>
               <Icon name="edit" /> Review in progress · Pending · only you
             </span>
-            <SharedComposer value={pendingText()} onValue={setPendingText} label="Pending review comment" placeholder="Add a comment to this review…" onSubmit={() => void addPending()} submitShortcut="mod-enter" />
+            <SharedComposer value={pendingText()} onValue={(value) => { setPendingText(value); setPendingClientNonce(crypto.randomUUID()); }} label="Pending review comment" placeholder="Add a comment to this review…" onSubmit={() => void addPending()} submitShortcut="mod-enter" />
             <div style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
               <button type="button" onClick={() => void addPending()} class="btn-secondary" style={barBtn}>Add comment</button>
               <button type="button" data-testid="open-verdict" onClick={() => setVerdictOpen(true)} class="btn-primary" style={barBtnPrimary}>
@@ -755,15 +764,23 @@ function DiscussionSection(props: {
   // also clears the DOM — an uncontrolled field kept the stale text and a second submit duplicate-posted.
   // The text is preserved on failure (the signal keeps it, never lost).
   const [composer, setComposer] = createSignal("");
+  const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const post = async () => {
     const text = composer().trim();
     if (!text) return;
     try {
-      await doMutate({ op: "thread", repo: props.repo, n: props.n, body_md: text });
+      await doMutate({
+        op: "thread",
+        repo: props.repo,
+        n: props.n,
+        body_md: text,
+        clientNonce: clientNonce(),
+      });
       setComposer("");
+      setClientNonce(crypto.randomUUID());
       await props.onChange();
     } catch {
-      props.toast.show({ title: "Could not start the discussion", variant: "danger" });
+      props.toast.show({ title: "Comment not confirmed — retrying this unchanged draft is safe", variant: "danger" });
     }
   };
   return (
@@ -788,7 +805,7 @@ function DiscussionSection(props: {
       </Show>
       {/* The composer (a read-only viewer's write is server-rejected → the toast; the field never lies). */}
       <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
-        <SharedComposer value={composer()} onValue={setComposer} label="New comment" placeholder="Start a discussion…" onSubmit={() => void post()} submitShortcut="mod-enter" />
+        <SharedComposer value={composer()} onValue={(value) => { setComposer(value); setClientNonce(crypto.randomUUID()); }} label="New comment" placeholder="Start a discussion…" onSubmit={() => void post()} submitShortcut="mod-enter" />
         <button type="button" data-testid="post-thread" disabled={!composer().trim()} onClick={() => void post()} class="btn-primary" style={{ ...barBtnPrimary, "align-self": "flex-start" }}>Comment</button>
       </div>
     </section>
@@ -804,16 +821,25 @@ function ThreadView(props: {
 }) {
   const doMutate = useAction(prMutate);
   const [reply, setReply] = createSignal("");
+  const [replyClientNonce, setReplyClientNonce] = createSignal(crypto.randomUUID());
   const [updatingResolution, setUpdatingResolution] = createSignal(false);
   const send = async () => {
     const text = reply().trim();
     if (!text) return;
     try {
-      await doMutate({ op: "comment", repo: props.repo, n: props.n, threadId: props.thread.id, body_md: text });
+      await doMutate({
+        op: "comment",
+        repo: props.repo,
+        n: props.n,
+        threadId: props.thread.id,
+        body_md: text,
+        clientNonce: replyClientNonce(),
+      });
       setReply("");
+      setReplyClientNonce(crypto.randomUUID());
       await props.onChange();
     } catch {
-      props.toast.show({ title: "Could not post the reply", variant: "danger" });
+      props.toast.show({ title: "Reply not confirmed — retrying this unchanged draft is safe", variant: "danger" });
     }
   };
   const toggleResolution = async () => {
@@ -876,7 +902,7 @@ function ThreadView(props: {
         )}
       </For>
       <div style={{ display: "flex", gap: "var(--space-1)", "align-items": "flex-start" }}>
-        <SharedComposer value={reply()} onValue={setReply} label="Reply" placeholder="Reply…" onSubmit={() => void send()} submitShortcut="mod-enter" />
+        <SharedComposer value={reply()} onValue={(value) => { setReply(value); setReplyClientNonce(crypto.randomUUID()); }} label="Reply" placeholder="Reply…" onSubmit={() => void send()} submitShortcut="mod-enter" />
         <button type="button" onClick={() => void send()} class="btn-secondary" style={barBtn}>Reply</button>
       </div>
     </li>

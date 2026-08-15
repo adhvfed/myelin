@@ -15,11 +15,11 @@ export type IssueMutation =
   | { op: "activation"; requestEventId: string };
 
 export type PrMutation =
-  | { op: "thread"; repo: string; n: number; body_md: string; anchor?: PrAnchor }
-  | { op: "comment"; repo: string; n: number; threadId: string; body_md: string }
+  | { op: "thread"; repo: string; n: number; body_md: string; clientNonce: string; anchor?: PrAnchor }
+  | { op: "comment"; repo: string; n: number; threadId: string; body_md: string; clientNonce: string }
   | { op: "resolve"; repo: string; n: number; threadId: string; resolved: boolean }
   | { op: "review-start"; repo: string; n: number }
-  | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string }
+  | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string; clientNonce: string }
   | { op: "review-submit"; repo: string; n: number; reviewId: string; verdict: ReviewVerdict; summary_md?: string }
   | { op: "review-discard"; repo: string; n: number; reviewId: string }
   | { op: "merge"; repo: string; n: number };
@@ -146,18 +146,23 @@ export function parsePrMutation(value: unknown): PrMutation | null {
   const base = { repo: input.repo, n: input.n };
   switch (input.op) {
     case "thread": {
-      if (!exactKeys(input, ["op", "repo", "n", "body_md", "anchor"])) return null;
+      if (!exactKeys(input, ["op", "repo", "n", "body_md", "clientNonce", "anchor"]) ||
+          !isClientNonce(input.clientNonce)) return null;
       const body_md = markdown(input.body_md, true);
       if (body_md === null) return null;
-      if (input.anchor === undefined) return { op: "thread", ...base, body_md };
+      if (input.anchor === undefined) {
+        return { op: "thread", ...base, body_md, clientNonce: input.clientNonce };
+      }
       const anchor = parseAnchor(input.anchor);
-      return anchor ? { op: "thread", ...base, body_md, anchor } : null;
+      return anchor ? { op: "thread", ...base, body_md, clientNonce: input.clientNonce, anchor } : null;
     }
     case "comment": {
-      if (!exactKeys(input, ["op", "repo", "n", "threadId", "body_md"]) ||
-          !threadId(input.threadId)) return null;
+      if (!exactKeys(input, ["op", "repo", "n", "threadId", "body_md", "clientNonce"]) ||
+          !threadId(input.threadId) || !isClientNonce(input.clientNonce)) return null;
       const body_md = markdown(input.body_md, true);
-      return body_md === null ? null : { op: "comment", ...base, threadId: input.threadId, body_md };
+      return body_md === null ? null : {
+        op: "comment", ...base, threadId: input.threadId, body_md, clientNonce: input.clientNonce,
+      };
     }
     case "resolve":
       return exactKeys(input, ["op", "repo", "n", "threadId", "resolved"]) &&
@@ -167,12 +172,12 @@ export function parsePrMutation(value: unknown): PrMutation | null {
     case "review-start":
       return exactKeys(input, ["op", "repo", "n"]) ? { op: "review-start", ...base } : null;
     case "review-comment": {
-      if (!exactKeys(input, ["op", "repo", "n", "reviewId", "body_md"]) ||
-          !reviewId(input.reviewId)) return null;
+      if (!exactKeys(input, ["op", "repo", "n", "reviewId", "body_md", "clientNonce"]) ||
+          !reviewId(input.reviewId) || !isClientNonce(input.clientNonce)) return null;
       const body_md = markdown(input.body_md, true);
       return body_md === null
         ? null
-        : { op: "review-comment", ...base, reviewId: input.reviewId, body_md };
+        : { op: "review-comment", ...base, reviewId: input.reviewId, body_md, clientNonce: input.clientNonce };
     }
     case "review-submit": {
       if (!exactKeys(input, ["op", "repo", "n", "reviewId", "verdict", "summary_md"]) ||

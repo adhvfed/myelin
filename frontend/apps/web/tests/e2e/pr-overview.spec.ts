@@ -13,13 +13,14 @@ async function resetPrFixtures() {
   await context.dispose();
 }
 
-async function configurePrContinuation(data: {
+async function configurePr(data: {
   prCommitContinuationFailures?: number;
   prCommitContinuationMalformedPages?: number;
+  prMutationResponseLosses?: number;
 }) {
   const context = await pwRequest.newContext();
   const response = await context.post(`${EDGE}/__test/config`, { data });
-  expect(response.ok(), "dev-edge PR continuation config must be accepted").toBeTruthy();
+  expect(response.ok(), "dev-edge PR config must be accepted").toBeTruthy();
   const body = await response.json() as {
     state: { prCommitContinuationRequests: number };
   };
@@ -28,7 +29,7 @@ async function configurePrContinuation(data: {
 }
 
 async function prContinuationRequestCount() {
-  return (await configurePrContinuation({})).prCommitContinuationRequests;
+  return (await configurePr({})).prCommitContinuationRequests;
 }
 
 async function commitOids(list: Locator) {
@@ -129,7 +130,7 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     const list = page.getByTestId("pr-commits-list");
     await expect(list.locator("li")).toHaveCount(20);
     const firstTwentyOids = await commitOids(list);
-    await configurePrContinuation({ prCommitContinuationFailures: 1 });
+    await configurePr({ prCommitContinuationFailures: 1 });
 
     await page.getByTestId("load-older-commits").click();
     await expect(page.getByText("Older commits could not be loaded.", { exact: false })).toBeVisible();
@@ -150,7 +151,7 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     const list = page.getByTestId("pr-commits-list");
     await expect(list.locator("li")).toHaveCount(20);
     const firstTwentyOids = await commitOids(list);
-    await configurePrContinuation({ prCommitContinuationMalformedPages: 1 });
+    await configurePr({ prCommitContinuationMalformedPages: 1 });
 
     await page.getByTestId("load-older-commits").click();
     await expect(page.getByText("Older commits could not be loaded.", { exact: false })).toBeVisible();
@@ -231,6 +232,30 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await page.getByLabel("New comment").pressSequentially("Kicking off the discussion.");
     await page.getByTestId("post-thread").click();
     await expect(page.getByTestId("discussion").getByText("Kicking off the discussion.")).toBeVisible();
+  });
+
+  test("a response-lost discussion retry keeps one durable comment", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/4");
+    await page.waitForLoadState("networkidle");
+    await configurePr({ prMutationResponseLosses: 1 });
+
+    const discussion = page.getByTestId("discussion");
+    const box = discussion.getByLabel("New comment");
+    const comment = discussion.getByText("One comment after uncertain delivery.");
+    await box.fill("One comment after uncertain delivery.");
+    await page.getByTestId("post-thread").click();
+
+    await expect(page.getByText("Comment not confirmed — retrying this unchanged draft is safe"))
+      .toBeVisible();
+    await expect(box).toHaveText("One comment after uncertain delivery.");
+    await page.getByTestId("post-thread").click();
+    await expect(comment).toHaveCount(1);
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(page.getByTestId("discussion").getByText("One comment after uncertain delivery."))
+      .toHaveCount(1);
   });
 
   test("an in-progress review batch RESUMES on reload — 'Start a review' does not double-create (finding #18)", async ({ page }) => {
