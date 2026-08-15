@@ -510,4 +510,4 @@ scripts:
       --config playwright.integration.config.ts "$@"' -- "$@"
 
   test:browser-contract:
-    script: pnpm --dir frontend test:e2e -- "$@"
+    script: pnpm --dir frontend --filter @myelin/web exec playwright test "$@"
