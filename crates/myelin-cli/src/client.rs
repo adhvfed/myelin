@@ -481,6 +481,7 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
         value,
         &[
             "run_id",
+            "ref",
             "pipeline_id",
             "repo_ref",
             "source_ref",
@@ -494,9 +495,18 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
         ],
         "run summary",
     )?;
-    canonical_uuid_field(run, "run_id", "run summary")?;
+    let run_id = canonical_uuid_field(run, "run_id", "run summary")?;
     canonical_uuid_field(run, "pipeline_id", "run summary")?;
-    bounded_string_field(run, "repo_ref", "run summary", 1_024)?;
+    let repo_ref = bounded_string_field(run, "repo_ref", "run summary", 1_024)?;
+    let tenant = repo_ref
+        .strip_prefix("myelin://")
+        .and_then(|rest| rest.split_once('/'))
+        .filter(|(tenant, suffix)| !tenant.is_empty() && suffix.starts_with("git/repo/"))
+        .map(|(tenant, _)| tenant)
+        .ok_or_else(|| malformed_ci_error("run summary repository ref is not canonical"))?;
+    if run["ref"].as_str() != Some(format!("myelin://{tenant}/ci/run/{run_id}").as_str()) {
+        return malformed_ci("run summary ref is not canonical");
+    }
     let trigger_kind = run["trigger_kind"]
         .as_str()
         .filter(|value| valid_trigger_kind(value))
@@ -1169,6 +1179,11 @@ mod tests {
         }
         response["items"][0]["source_ref"] = json!("refs/heads/main");
         response["items"][0]["trigger_kind"] = json!("pull_request");
+        assert!(validate_ci_success(&call, &response).is_err());
+
+        response["items"][0]["trigger_kind"] = json!("push");
+        response["items"][0]["ref"] =
+            json!("myelin://other/ci/run/91000000-0000-4000-8000-000000000001");
         assert!(validate_ci_success(&call, &response).is_err());
     }
 

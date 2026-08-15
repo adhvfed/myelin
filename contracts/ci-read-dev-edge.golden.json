@@ -49,6 +49,7 @@
         "items": [
           {
             "run_id": "91000000-0000-4000-8000-000000000001",
+            "ref": "myelin://acme/ci/run/91000000-0000-4000-8000-000000000001",
             "pipeline_id": "93000000-0000-4000-8000-000000000001",
             "repo_ref": "myelin://acme/git/repo/alpha",
             "source_ref": "refs/heads/main",
@@ -86,6 +87,7 @@
         "items": [
           {
             "run_id": "91000000-0000-4000-8000-000000000002",
+            "ref": "myelin://acme/ci/run/91000000-0000-4000-8000-000000000002",
             "pipeline_id": "93000000-0000-4000-8000-000000000001",
             "repo_ref": "myelin://acme/git/repo/alpha",
             "source_ref": null,
@@ -152,6 +154,7 @@
         "status": 200,
         "run": {
           "run_id": "91000000-0000-4000-8000-000000000001",
+          "ref": "myelin://acme/ci/run/91000000-0000-4000-8000-000000000001",
           "pipeline_id": "93000000-0000-4000-8000-000000000001",
           "repo_ref": "myelin://acme/git/repo/alpha",
           "source_ref": "refs/heads/main",

@@ -84,7 +84,7 @@ impl DurableCiReadApi {
             .map_err(map_surface_error)?
             .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
         Ok(json!({
-            "run": run_json(&detail.run),
+            "run": run_json(&detail.run, tenant),
             "jobs": detail.jobs.iter().map(job_json).collect::<Vec<_>>(),
             "steps": detail.steps.iter().map(step_json).collect::<Vec<_>>(),
         }))
@@ -487,9 +487,10 @@ fn repo_slug_from_ref<'a>(tenant: &str, repo_ref: &'a str) -> Option<&'a str> {
     Some(slug)
 }
 
-fn run_json(run: &CiRunSummary) -> Value {
+fn run_json(run: &CiRunSummary, tenant: &str) -> Value {
     json!({
         "run_id": run.run_id,
+        "ref": format!("myelin://{tenant}/ci/run/{}", run.run_id),
         "pipeline_id": run.pipeline_id,
         "repo_ref": run.repo_ref,
         "source_ref": run.source_ref,
@@ -672,7 +673,11 @@ impl Handler for CiRunListHandler {
                 request,
             ))
             .map_err(map_surface_error)?;
-        let items = page.items.iter().map(run_json).collect::<Vec<_>>();
+        let items = page
+            .items
+            .iter()
+            .map(|run| run_json(run, tenant))
+            .collect::<Vec<_>>();
         Ok(no_store(EdgeResponse::json(
             200,
             &page_envelope(json!(items), page.next_cursor, page.limit as usize),

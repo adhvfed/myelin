@@ -14,6 +14,7 @@ export type CiStepState = "running" | "passed" | "failed" | "skipped";
 
 export interface CiRunVM {
   run_id: string;
+  ref: string;
   pipeline_id: string;
   repo_ref: string;
   source_ref: string | null;
@@ -103,9 +104,11 @@ function safeNonNegative(value: unknown): value is number {
 function run(value: unknown): CiRunVM | null {
   const row = record(value);
   if (!row || !exact(row, [
-    "run_id", "pipeline_id", "repo_ref", "source_ref", "commit_oid", "trigger_kind", "trust_tier",
+    "run_id", "ref", "pipeline_id", "repo_ref", "source_ref", "commit_oid", "trigger_kind", "trust_tier",
     "state", "cost_settled", "created_at", "finished_at",
-  ]) || !isCiUuid(row.run_id) || !isCiUuid(row.pipeline_id) ||
+  ]) || !isCiUuid(row.run_id) ||
+      row.ref !== `myelin://${artifactTenant(row.repo_ref)}/ci/run/${row.run_id}` ||
+      !isCiUuid(row.pipeline_id) ||
       !bounded(row.repo_ref, 1_024) ||
       (row.source_ref !== null &&
         (row.trigger_kind !== "push" || !bounded(row.source_ref, 1_024) || !isBranchRef(row.source_ref))) ||
@@ -118,6 +121,11 @@ function run(value: unknown): CiRunVM | null {
       typeof row.cost_settled !== "boolean" || !canonicalTime(row.created_at) ||
       (row.finished_at !== null && !canonicalTime(row.finished_at))) return null;
   return row as unknown as CiRunVM;
+}
+
+function artifactTenant(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return /^myelin:\/\/([^/]+)\/git\/repo\/.+$/.exec(value)?.[1] ?? null;
 }
 
 function job(value: unknown): CiJobVM | null {

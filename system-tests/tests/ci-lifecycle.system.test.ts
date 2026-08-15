@@ -51,6 +51,7 @@ describe.sequential("CI delivery lifecycle", () => {
     );
 
     expect(run).toMatchObject({
+      ref: `myelin://${systemTestConfig.tenant}/ci/run/${run.run_id}`,
       repo_ref: repoRef,
       commit_oid: pipelineCommitOid,
       trigger_kind: "push",

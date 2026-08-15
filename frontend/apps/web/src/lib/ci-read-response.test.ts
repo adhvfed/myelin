@@ -20,6 +20,7 @@ function cursor(): string {
 function run() {
   return {
     run_id: RUN,
+    ref: `myelin://acme/ci/run/${RUN}`,
     pipeline_id: PIPELINE,
     repo_ref: "myelin://acme/git/repo/alpha",
     source_ref: "refs/heads/main",

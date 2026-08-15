@@ -39,6 +39,7 @@ export const CI_VISIBLE_REPO_REFS = Object.freeze([
 
 const NEWEST_RUN = Object.freeze({
     run_id: CI_NEWEST_RUN,
+    ref: `myelin://acme/ci/run/${CI_NEWEST_RUN}`,
     pipeline_id: PIPELINE,
     repo_ref: "myelin://acme/git/repo/alpha",
     source_ref: "refs/heads/main",
@@ -52,6 +53,7 @@ const NEWEST_RUN = Object.freeze({
   });
 const OLDER_RUN = Object.freeze({
     run_id: CI_OLDER_RUN,
+    ref: `myelin://acme/ci/run/${CI_OLDER_RUN}`,
     pipeline_id: PIPELINE,
     repo_ref: "myelin://acme/git/repo/alpha",
     source_ref: null,

@@ -8,6 +8,7 @@ import { ciRepoLabel, type CiJobVM, type CiStepVM } from "~/lib/ci-read-response
 import { CiErrorState, ciErrKind } from "~/components/CiErrorState";
 import { CiLiveLog } from "~/components/CiLiveLog";
 import { CiStatus, formatCiDate } from "~/components/CiStatus";
+import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 
 const ARCHIVE_CHUNK = 64 * 1024;
 
@@ -66,7 +67,10 @@ export default function CiRunDetail() {
                       <time datetime={view.run.created_at}>{formatCiDate(view.run.created_at)}</time>
                     </p>
                   </div>
-                  <CiStatus state={view.run.state} />
+                  <div class="ci-run-detail-actions">
+                    <CopyArtifactRef reference={view.run.ref} />
+                    <CiStatus state={view.run.state} />
+                  </div>
                 </header>
 
                 <dl class="ci-run-facts">
