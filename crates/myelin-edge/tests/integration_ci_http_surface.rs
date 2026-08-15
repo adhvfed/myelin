@@ -21,7 +21,8 @@ use myelin_identity_service::{
 };
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_storage::{
-    with_tenant_tx, BlobStore, ContentHash, FsBlobStore, KmsEngine, PgError, TenantScope,
+    with_tenant_tx, BlobStore, ContentHash, FsBlobStore, KmsEngine, PgError, PgMigrator,
+    TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
@@ -47,6 +48,7 @@ const GOLDEN_FAILED_JOB: &str = "92000000-0000-4000-8000-000000000001";
 const GOLDEN_LIVE_JOB: &str = "92000000-0000-4000-8000-000000000002";
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+static SCHEMA_SETUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct RevocableRepoAuthorizer {
     grants: GrantBackedRepos,
@@ -108,6 +110,7 @@ async fn pool(url: &str, schema: &str) -> PgPool {
 }
 
 async fn setup_schema(admin: &PgPool, schema: &str) {
+    let _setup_guard = SCHEMA_SETUP_LOCK.lock().await;
     admin
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
@@ -116,16 +119,12 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .execute(format!("CREATE SCHEMA {schema}").as_str())
         .await
         .expect("create isolated schema");
-    for migration in myelin_flow::migrations::migrations()
-        .0
-        .iter()
-        .chain(ci_controlplane_migrations().0.iter())
-    {
-        admin
-            .execute(migration.ddl)
-            .await
-            .unwrap_or_else(|error| panic!("apply {}: {error}", migration.id));
-    }
+    PgMigrator::apply(admin, &myelin_flow::migrations::migrations())
+        .await
+        .expect("apply flow migrations in the isolated schema");
+    PgMigrator::apply(admin, &ci_controlplane_migrations())
+        .await
+        .expect("apply CI migrations in the isolated schema");
     admin
         .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
         .await
@@ -310,20 +309,21 @@ async fn insert_golden_ci_surface(
         Box::pin(async move {
             sqlx::query(
                 "INSERT INTO ci_run (
-                   tenant_id, region, run_id, project_id, repo_ref, commit_oid, pipeline_id,
+                   tenant_id, region, run_id, project_id, repo_ref, source_ref, commit_oid, pipeline_id,
                    wf_run_id, definition_snapshot, trigger_kind, trust_tier, state,
                    cost_settled, correlation_id, created_at, finished_at
                  ) VALUES
                  (
                    $1, $2, $3::uuid, '94000000-0000-4000-8000-000000000001'::uuid, $5,
-                   '0123456789abcdef', '93000000-0000-4000-8000-000000000001'::uuid,
+                   'refs/heads/main', '0123456789abcdef',
+                   '93000000-0000-4000-8000-000000000001'::uuid,
                    '95000000-0000-4000-8000-000000000001'::uuid, 'cas:golden-newest', 'push',
                    'trusted', 'failed', TRUE, $3, '2026-07-24T12:00:00Z'::timestamptz,
                    '2026-07-24T12:05:00Z'::timestamptz
                  ),
                  (
                    $1, $2, $4::uuid, '94000000-0000-4000-8000-000000000001'::uuid, $5,
-                   'fedcba9876543210', '93000000-0000-4000-8000-000000000001'::uuid,
+                   NULL, 'fedcba9876543210', '93000000-0000-4000-8000-000000000001'::uuid,
                    '95000000-0000-4000-8000-000000000002'::uuid, 'cas:golden-older',
                    'pull_request', 'trusted', 'running', FALSE, $4,
                    '2026-07-24T11:00:00Z'::timestamptz, NULL
