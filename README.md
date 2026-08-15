@@ -31,7 +31,9 @@ also expects a systemd user manager, `runsc` on `PATH`, and a Git-capable root f
 `$XDG_DATA_HOME/gvisor-assets/git-rootfs` (or
 `~/.local/share/gvisor-assets/git-rootfs`). Set `MYELIN_RUNSC_BIN` or
 `MYELIN_GVISOR_GIT_ROOTFS` to override those locations. The self-hosting scripts
-stage these assets; `scripts/stage-git-rootfs.sh` can restage the Git image.
+stage these assets; `scripts/stage-git-rootfs.sh` can restage the Git image. Fed places both the
+Edge and the backend test process in delegated systemd scopes so their gVisor children receive the
+memory and CPU controllers needed to enforce job limits.
 
 ## Development
 

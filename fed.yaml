@@ -401,7 +401,9 @@ scripts:
       REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
       NATS_URL: "nats://localhost:{{NATS_PORT}}"
       MYELIN_REGION: fr-par
-    script: cargo test --features integration "$@"
+    script: >-
+      systemd-run --user --scope --quiet --property=Delegate=yes
+      cargo test --features integration "$@"
 
   test:frontend:
     script: pnpm --dir frontend check
