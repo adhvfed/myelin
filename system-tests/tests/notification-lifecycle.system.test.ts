@@ -63,6 +63,13 @@ function signalEnvelope(options: SignalOptions): ExternalEventEnvelope {
   };
 }
 
+function pullRequestSubject(repository: string, number: number): string {
+  if (!Number.isSafeInteger(number) || number < 1) {
+    throw new Error("a notification journey needs a canonical positive pull-request number");
+  }
+  return `myelin://${systemTestConfig.tenant}/git/pr/${repository}:${number}`;
+}
+
 async function findInboxItem(
   client: SystemTestClient,
   subject: string,
@@ -116,7 +123,7 @@ describe.sequential("notification delivery lifecycle", () => {
 
   test("routes, de-duplicates, collapses, scopes, and marks a durable mention read", async () => {
     const dedupKey = uniqueName("mention");
-    const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:1`;
+    const subject = pullRequestSubject(slug, 1);
     const envelope = signalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
@@ -196,7 +203,7 @@ describe.sequential("notification delivery lifecycle", () => {
   });
 
   test("suppresses self-notifications before processing a later delivery", async () => {
-    const selfSubject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:self`;
+    const selfSubject = pullRequestSubject(slug, 2);
     await bus.publish(signalEnvelope({
       actor: systemTestConfig.principal,
       recipient: systemTestConfig.principal,
@@ -204,7 +211,7 @@ describe.sequential("notification delivery lifecycle", () => {
       subject: selfSubject,
     }));
 
-    const markerSubject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:marker`;
+    const markerSubject = pullRequestSubject(slug, 3);
     await bus.publish(signalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
@@ -219,9 +226,7 @@ describe.sequential("notification delivery lifecycle", () => {
   });
 
   test("walks the whole inbox without losing or repeating a notification", async () => {
-    const subjects = ["first", "second"].map(
-      (suffix) => `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${uniqueName(suffix)}`,
-    );
+    const subjects = [4, 5].map((number) => pullRequestSubject(slug, number));
     for (const [index, subject] of subjects.entries()) {
       await bus.publish(signalEnvelope({
         actor: systemTestConfig.reviewerPrincipal,
