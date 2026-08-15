@@ -96,6 +96,52 @@ test.describe("Chat workspace", () => {
     await expect(page.getByText(message, { exact: true })).toHaveCount(1);
   });
 
+  test("a lost topic acknowledgement can be retried without creating a second topic", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { emptyChat: true, chatConversationResponseLosses: 1 },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await page.getByRole("button", { name: "Create the first topic" }).click();
+    await page.getByRole("textbox", { name: "Channel", exact: true }).fill("reliability");
+    await page.getByRole("textbox", { name: "Topic", exact: true }).fill("durable retries");
+    await page.getByRole("button", { name: "Create topic" }).click();
+    await expect(page.getByRole("alert")).toContainText("Retrying this unchanged topic is safe");
+
+    await page.getByRole("button", { name: "Create topic" }).click();
+    await expect(page.getByRole("heading", { name: "durable retries", level: 2 })).toBeVisible();
+    await page.reload();
+    await expect(page.getByTestId("chat-topic-link").filter({ hasText: "durable retries" }))
+      .toHaveCount(1);
+  });
+
+  test("editing an uncertain topic starts a distinct creation", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { emptyChat: true, chatConversationResponseLosses: 1 },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await page.getByRole("button", { name: "Create the first topic" }).click();
+    await page.getByRole("textbox", { name: "Channel", exact: true }).fill("reliability");
+    const topic = page.getByRole("textbox", { name: "Topic", exact: true });
+    await topic.fill("first attempt");
+    await page.getByRole("button", { name: "Create topic" }).click();
+    await expect(page.getByRole("alert")).toContainText("Retrying this unchanged topic is safe");
+
+    await topic.fill("revised attempt");
+    await page.getByRole("button", { name: "Create topic" }).click();
+    await expect(page.getByRole("heading", { name: "revised attempt", level: 2 })).toBeVisible();
+    await page.reload();
+    await expect(page.getByTestId("chat-topic-link").filter({ hasText: "first attempt" }))
+      .toHaveCount(1);
+    await expect(page.getByTestId("chat-topic-link").filter({ hasText: "revised attempt" }))
+      .toHaveCount(1);
+  });
+
   test("the narrow layout moves cleanly between topic navigation and the composer", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 760 });
     await devLogin(page);

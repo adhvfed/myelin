@@ -14,7 +14,7 @@ describe("development Chat contract", () => {
       project_id: FIRST_PROJECT,
       channel: "engineering",
       topic: "release readiness",
-    });
+    }, "create-1");
     if (!created.json) throw new Error("expected a created conversation");
 
     expect(created).toMatchObject({
@@ -36,7 +36,7 @@ describe("development Chat contract", () => {
     ]);
   });
 
-  it("allows a familiar room name in another project without weakening retries", () => {
+  it("scopes topic retry identities to one exact draft", () => {
     const chat = new ChatFixtures();
     chat.reset({ empty: true });
     const room = (project_id: string) => ({
@@ -45,10 +45,14 @@ describe("development Chat contract", () => {
       topic: "release readiness",
     });
 
-    expect(chat.createConversation(room(FIRST_PROJECT)).status).toBe(201);
-    expect(chat.createConversation(room(FIRST_PROJECT)).status).toBe(409);
-    expect(chat.createConversation(room(SECOND_PROJECT)).status).toBe(201);
-    expect(chat.createConversation({ channel: "engineering", topic: "release readiness" }).status)
-      .toBe(400);
+    expect(chat.createConversation(room(FIRST_PROJECT), "create-1").status).toBe(201);
+    expect(chat.createConversation(room(FIRST_PROJECT), "create-1").status).toBe(200);
+    expect(chat.createConversation(room(FIRST_PROJECT), "create-2").status).toBe(200);
+    expect(chat.createConversation(room(SECOND_PROJECT), "create-1").status).toBe(409);
+    expect(chat.createConversation(room(SECOND_PROJECT), "create-3").status).toBe(201);
+    expect(chat.createConversation(
+      { channel: "engineering", topic: "release readiness" },
+      "create-4",
+    ).status).toBe(400);
   });
 });

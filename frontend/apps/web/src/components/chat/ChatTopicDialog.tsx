@@ -25,9 +25,9 @@ function errorCopy(kind: ChatErrorKind): string {
     case "not-found":
       return "Topic creation isn’t available to you.";
     case "unavailable":
-      return "Chat is temporarily unavailable. Your topic was not confirmed.";
+      return "Chat is temporarily unavailable. Retrying this unchanged topic is safe.";
     default:
-      return "We couldn’t confirm the topic. Check the topic list before retrying.";
+      return "We couldn’t confirm the topic. Retrying this unchanged topic is safe.";
   }
 }
 
@@ -149,6 +149,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
               value={catalogue.selectedId()}
               onChange={(event) => {
                 catalogue.select(event.currentTarget.value);
+                setClientNonce(crypto.randomUUID());
                 setError(null);
               }}
               disabled={submitting()}
@@ -181,6 +182,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
             value={channel()}
             onInput={(event) => {
               setChannel(event.currentTarget.value);
+              setClientNonce(crypto.randomUUID());
               setError(null);
             }}
             maxlength={255}
@@ -198,6 +200,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
             value={topic()}
             onInput={(event) => {
               setTopic(event.currentTarget.value);
+              setClientNonce(crypto.randomUUID());
               setError(null);
             }}
             maxlength={255}

@@ -44,6 +44,14 @@ function cleanMessage(value) {
     });
 }
 
+function validIdempotencyKey(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 128 &&
+    [...value].every((character) => {
+      const point = character.codePointAt(0);
+      return point >= 0x21 && point <= 0x7e;
+    });
+}
+
 function conversationJson(row) {
   return {
     id: row.id,
@@ -127,19 +135,34 @@ export class ChatFixtures {
     };
   }
 
-  createConversation(body) {
+  createConversation(body, clientNonce) {
     if (!exactObject(body, ["project_id", "channel", "topic"]) ||
         !canonicalProjectId(body.project_id) ||
-        !cleanLabel(body.channel) || !cleanLabel(body.topic)) return { status: 400 };
-    if (this.conversations.some((row) => row.project_id === body.project_id &&
-        row.channel === body.channel && row.topic === body.topic)) {
-      return { status: 409 };
+        !cleanLabel(body.channel) || !cleanLabel(body.topic) ||
+        !validIdempotencyKey(clientNonce)) return { status: 400 };
+    const retry = this.conversations.find((row) => row.client_nonce === clientNonce);
+    if (retry) {
+      if (retry.project_id !== body.project_id || retry.channel !== body.channel ||
+          retry.topic !== body.topic) return { status: 409 };
+      return {
+        status: 200,
+        json: { conversation: conversationJson(retry), durable: true },
+      };
+    }
+    const existing = this.conversations.find((row) => row.project_id === body.project_id &&
+      row.channel === body.channel && row.topic === body.topic);
+    if (existing) {
+      return {
+        status: 200,
+        json: { conversation: conversationJson(existing), durable: true },
+      };
     }
     const row = {
       id: fixtureUlid(++this.sequence),
       project_id: body.project_id,
       channel: body.channel,
       topic: body.topic,
+      client_nonce: clientNonce,
     };
     this.conversations.push(row);
     this.messages.set(row.id, []);

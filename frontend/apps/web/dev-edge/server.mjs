@@ -113,6 +113,7 @@ const state = {
   prCommitContinuationRequests: 0,
   prMutationResponseLosses: 0,
   emptyChat: false,
+  chatConversationResponseLosses: 0,
   chatPostResponseLosses: 0,
   emptyKnowledge: false,
   knowledgeCreateResponseLosses: 0,
@@ -416,13 +417,19 @@ const server = createServer((req, res) => {
         if (body.resetIssues === true) resetIssues();
         if (body.resetChat === true) {
           state.emptyChat = false;
+          state.chatConversationResponseLosses = 0;
           state.chatPostResponseLosses = 0;
           chat.reset();
         }
         if (typeof body.emptyChat === "boolean") {
           state.emptyChat = body.emptyChat;
+          state.chatConversationResponseLosses = 0;
           state.chatPostResponseLosses = 0;
           chat.reset({ empty: body.emptyChat });
+        }
+        if (Number.isInteger(body.chatConversationResponseLosses) &&
+            body.chatConversationResponseLosses >= 0) {
+          state.chatConversationResponseLosses = body.chatConversationResponseLosses;
         }
         if (Number.isInteger(body.chatPostResponseLosses) && body.chatPostResponseLosses >= 0) {
           state.chatPostResponseLosses = body.chatPostResponseLosses;
@@ -542,7 +549,7 @@ const server = createServer((req, res) => {
       } catch {
         return send(res, 400, { error: { message: "invalid Chat topic body", code: "bad_request" } });
       }
-      const output = chat.createConversation(body);
+      const output = chat.createConversation(body, req.headers["idempotency-key"]);
       if (output.status === 400) {
         return send(res, 400, { error: { message: "invalid Chat topic body", code: "bad_request" } });
       }
@@ -550,6 +557,12 @@ const server = createServer((req, res) => {
         return send(res, 409, { error: { message: "Chat topic already exists", code: "conflict" } });
       }
       state.emptyChat = false;
+      if (state.chatConversationResponseLosses > 0) {
+        state.chatConversationResponseLosses -= 1;
+        return send(res, 503, {
+          error: { message: "Chat topic committed but its response was lost", code: "unavailable" },
+        });
+      }
       return send(res, output.status, output.json, { "cache-control": "no-store" });
     });
     return;
