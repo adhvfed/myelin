@@ -1,7 +1,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
-use myelin_events::{EventEnvelope, IdMinter, Timestamp, Ulid};
+use myelin_events::{EventEnvelope, IdMinter, Timestamp, Ulid, UlidMinter};
 use myelin_identity::{
     DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
     RelationTuple, TupleDelta, IDENTITY_PROJECT_CREATED,
@@ -70,11 +70,11 @@ fn add(object: &str, relation: &str, subject: &str) -> TupleDelta {
     })
 }
 
-struct FixedMinter(&'static str);
+struct FixedMinter(String);
 
 impl IdMinter for FixedMinter {
     fn mint(&self) -> Ulid {
-        Ulid(self.0.into())
+        Ulid(self.0.clone())
     }
 }
 
@@ -95,12 +95,12 @@ async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
     let region = app.config().region.clone();
     let tenant = format!("project-onboarding-{}", unique());
     let founder = actor(&tenant, &region);
-    let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let event_id = UlidMinter::new().mint().0;
     let tuples = TupleStore::with_pg(
         DurableTupleBacking::new(app.clone()),
         tokio::runtime::Handle::current(),
     );
-    let store = PgProjectStore::with_minter(app, Arc::new(FixedMinter(event_id)));
+    let store = PgProjectStore::with_minter(app, Arc::new(FixedMinter(event_id.clone())));
 
     let first = store
         .create(
@@ -210,11 +210,13 @@ async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
 
     let tuple: (String, String, String) = sqlx::query(
         "SELECT object_id, relation, subject FROM rebac_tuple \
-          WHERE tenant_id = $1 AND region = $2 AND object_id = $3",
+          WHERE tenant_id = $1 AND region = $2 AND object_id = $3 \
+            AND relation = 'writer' AND subject = $4",
     )
     .bind(&tenant)
     .bind(&region)
     .bind(format!("project:{}", first.project.id))
+    .bind(&founder.principal_id.0)
     .fetch_one(admin.db_pool())
     .await
     .map(|row| {
@@ -237,7 +239,7 @@ async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
     let envelope: EventEnvelope = sqlx::query_scalar::<_, serde_json::Value>(
         "SELECT envelope FROM outbox WHERE event_id = $1",
     )
-    .bind(event_id)
+    .bind(&event_id)
     .fetch_one(admin.db_pool())
     .await
     .and_then(|value| {
