@@ -1228,6 +1228,7 @@ const server = createServer((req, res) => {
           status: "pending",
           issue: {
             id: receipt.row.id,
+            ref: receipt.row.ref,
             key: receipt.row.key,
             project_id: receipt.row.project_id,
           },
