@@ -404,6 +404,7 @@ impl IncrementalIndexer {
     }
 
     fn index_inner(&self, ev: &EventEnvelope) -> Result<(), IndexEventError> {
+        let subject = Self::canonical_reference(&ev.subject, &ev.tenant)?;
         let type_ = ev.type_.0.as_str();
 
         if type_.ends_with(Self::PERMISSION_CHANGED_SUFFIX) {
@@ -415,40 +416,32 @@ impl IncrementalIndexer {
             return self.apply_removed(ev);
         }
 
-        self.apply_upsert(ev)
+        self.apply_upsert(ev, &subject)
     }
 
-    fn subsystem_type_of(ref_: &ArtifactRef) -> Option<(String, String)> {
-        let rest = ref_.0.strip_prefix("myelin://")?;
-        let mut segs = rest.split('/');
-        let _tenant = segs.next()?;
-        let subsystem = segs.next()?;
-        let type_ = segs.next()?;
-        if subsystem.is_empty() || type_.is_empty() {
-            return None;
-        }
-        Some((subsystem.to_string(), type_.to_string()))
-    }
-
-    fn sub_anchor_of(ref_: &ArtifactRef) -> Option<&str> {
-        ref_.0.split_once('#').map(|(_, sub)| sub)
-    }
-
-    fn acl_object_of(ref_: &ArtifactRef) -> String {
-        match ref_.0.split_once('#') {
-            Some((root, _sub)) => root.to_string(),
-            None => ref_.0.clone(),
-        }
-    }
-
-    fn apply_upsert(&self, ev: &EventEnvelope) -> Result<(), IndexEventError> {
-        let ref_ = &ev.subject;
-        let (subsystem, type_) = Self::subsystem_type_of(ref_).ok_or_else(|| {
-            IndexEventError::Malformed(format!(
-                "event subject `{}` is not a myelin:// artifact ref",
-                ref_.0
-            ))
+    fn canonical_reference(
+        reference: &ArtifactRef,
+        tenant: &TenantId,
+    ) -> Result<myelin_refs::ParsedArtifactRef, IndexEventError> {
+        let parsed = myelin_refs::parse_scoped(&reference.0).map_err(|error| {
+            IndexEventError::Malformed(format!("event carries an invalid ArtifactRef: {error}"))
         })?;
+        if parsed.artifact_ref != *reference || parsed.tenant != *tenant {
+            return Err(IndexEventError::Malformed(
+                "event ArtifactRef is non-canonical or belongs to another tenant".into(),
+            ));
+        }
+        Ok(parsed)
+    }
+
+    fn apply_upsert(
+        &self,
+        ev: &EventEnvelope,
+        subject: &myelin_refs::ParsedArtifactRef,
+    ) -> Result<(), IndexEventError> {
+        let ref_ = &ev.subject;
+        let subsystem = &subject.subsystem;
+        let type_ = &subject.type_;
 
         let spec = match self.specs.get(&(subsystem.clone(), type_.clone())) {
             Some(s) => s.clone(),
@@ -471,9 +464,9 @@ impl IncrementalIndexer {
             .unwrap_or_else(|| Self::detect_lang(&projection.text));
         let _analyzed_terms = crate::analysis::Analyzer::for_tag(&lang).analyze(&projection.text);
 
-        let acl_object = Self::acl_object_of(ref_);
+        let acl_object = myelin_refs::strip_sub(&subject.artifact_ref).0;
         debug_assert_eq!(
-            Self::sub_anchor_of(ref_).is_some(),
+            subject.sub.is_some(),
             acl_object != ref_.0,
             "a sub-artifact doc pins its ACL on the #sub-stripped parent (5.7/§3.1)"
         );
@@ -507,8 +500,14 @@ impl IncrementalIndexer {
     }
 
     fn apply_removed(&self, ev: &EventEnvelope) -> Result<(), IndexEventError> {
-        let doc_id = Self::str_field(&ev.payload, "ref").unwrap_or_else(|| ev.subject.0.clone());
-        self.remove_doc(&ev.tenant, &ev.region, &doc_id)
+        if let Some(payload_ref) = ev.payload.get("ref") {
+            if payload_ref.as_str() != Some(ev.subject.0.as_str()) {
+                return Err(IndexEventError::Malformed(
+                    "removal payload `ref` must equal the envelope subject".into(),
+                ));
+            }
+        }
+        self.remove_doc(&ev.tenant, &ev.region, &ev.subject.0)
     }
 
     fn remove_doc(
@@ -536,6 +535,9 @@ impl IncrementalIndexer {
             ))
         })?;
         for doc_id in &refs {
+            Self::canonical_reference(&ArtifactRef(doc_id.clone()), &ev.tenant)?;
+        }
+        for doc_id in &refs {
             self.registry
                 .with_backend(&ev.tenant, &ev.region, |be| {
                     be.restamp_zookie(doc_id, &new_zookie);
@@ -562,11 +564,12 @@ impl IncrementalIndexer {
     }
 
     fn str_array_field(payload: &serde_json::Value, key: &str) -> Option<Vec<String>> {
-        payload.get(key).and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                .collect()
-        })
+        payload
+            .get(key)?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect()
     }
 }
 
@@ -838,7 +841,7 @@ mod tests {
         );
         match ix.handle(&ev, &mut myelin_events::HandlerTx::none()) {
             HandleOutcome::NonRetryable(Reason(r)) => {
-                assert!(r.contains("not a myelin"), "names it: {r}")
+                assert!(r.contains("invalid ArtifactRef"), "names it: {r}")
             }
             other => panic!("expected a non-retryable poison, got {other:?}"),
         }
@@ -1003,6 +1006,55 @@ mod tests {
             ),
             "missing zookie/refs → poison"
         );
+
+        let mixed = event(
+            "01J-mixed",
+            "authz.tuple.permission.changed",
+            "myelin://acme/issue/issue/X",
+            serde_json::json!({
+                "zookie": "zk-2",
+                "refs": ["myelin://acme/issue/issue/X", 7]
+            }),
+        );
+        assert!(matches!(
+            ix.handle(&mixed, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::NonRetryable(_)
+        ));
+    }
+
+    #[test]
+    fn permission_batch_validates_every_reference_before_restamping_any() {
+        let r = "myelin://acme/issue/issue/ENG-1";
+        let fetcher = Arc::new(FakeFetcher::with(r, proj("body")));
+        let ix = indexer_with(vec![issue_spec()], fetcher);
+        assert_eq!(
+            ix.index(&event(
+                "01J-create",
+                "issue.issue.created",
+                r,
+                serde_json::json!({ "zookie": "zk-1" }),
+            )),
+            Ok(())
+        );
+
+        let forged = event(
+            "01J-forged",
+            "authz.tuple.permission.changed",
+            r,
+            serde_json::json!({
+                "zookie": "zk-forged",
+                "refs": [r, "myelin://other/issue/issue/ENG-2"]
+            }),
+        );
+        assert!(matches!(
+            ix.index(&forged),
+            Err(IndexEventError::Malformed(_))
+        ));
+        assert_eq!(
+            ix.indexed_zookie_of(&tenant(), &region(), r).as_deref(),
+            Some("zk-1"),
+            "a bad batch cannot partially restamp its valid prefix"
+        );
     }
 
     #[test]
@@ -1031,6 +1083,66 @@ mod tests {
             0,
             "the erased doc is removed from the index"
         );
+    }
+
+    #[test]
+    fn a_removal_cannot_redirect_its_effect_to_another_document() {
+        let first = "myelin://acme/issue/issue/ENG-1";
+        let second = "myelin://acme/issue/issue/ENG-2";
+        let fetcher = Arc::new(FakeFetcher::with(first, proj("first")));
+        fetcher.put(second, proj("second"));
+        let ix = indexer_with(vec![issue_spec()], fetcher);
+        for (event_id, reference) in [("01J-1", first), ("01J-2", second)] {
+            assert_eq!(
+                ix.index(&event(
+                    event_id,
+                    "issue.issue.created",
+                    reference,
+                    serde_json::json!({}),
+                )),
+                Ok(())
+            );
+        }
+
+        let redirected = event(
+            "01J-remove",
+            "issue.issue.erased",
+            first,
+            serde_json::json!({ "ref": second }),
+        );
+        assert!(matches!(
+            ix.index(&redirected),
+            Err(IndexEventError::Malformed(_))
+        ));
+        assert_eq!(
+            ix.live_count(&tenant(), &region()),
+            2,
+            "a contradictory removal must delete neither document"
+        );
+    }
+
+    #[test]
+    fn every_index_event_subject_is_canonical_and_tenant_bound() {
+        let fetcher = Arc::new(FakeFetcher::default());
+        let ix = indexer_with(vec![issue_spec()], fetcher);
+        for subject in [
+            "myelin://acme/issue/issue/",
+            "myelin://acme/issue/issue/ENG 1",
+            "myelin://other/issue/issue/ENG-1",
+        ] {
+            assert!(
+                matches!(
+                    ix.index(&event(
+                        "01J-malformed",
+                        "issue.issue.created",
+                        subject,
+                        serde_json::json!({}),
+                    )),
+                    Err(IndexEventError::Malformed(_))
+                ),
+                "Search admitted a malformed subject: {subject:?}"
+            );
+        }
     }
 
     #[test]
