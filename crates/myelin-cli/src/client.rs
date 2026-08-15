@@ -498,12 +498,16 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
     let run_id = canonical_uuid_field(run, "run_id", "run summary")?;
     canonical_uuid_field(run, "pipeline_id", "run summary")?;
     let repo_ref = bounded_string_field(run, "repo_ref", "run summary", 1_024)?;
-    let tenant = repo_ref
-        .strip_prefix("myelin://")
-        .and_then(|rest| rest.split_once('/'))
-        .filter(|(tenant, suffix)| !tenant.is_empty() && suffix.starts_with("git/repo/"))
-        .map(|(tenant, _)| tenant)
+    let repository = myelin_refs::parse_scoped(repo_ref)
+        .ok()
+        .filter(|reference| {
+            reference.subsystem == "git"
+                && reference.type_ == "repo"
+                && reference.sub.is_none()
+                && myelin_git::coordinate::RepositorySlug::parse(&reference.id).is_ok()
+        })
         .ok_or_else(|| malformed_ci_error("run summary repository ref is not canonical"))?;
+    let tenant = repository.tenant.as_str();
     if run["ref"].as_str() != Some(format!("myelin://{tenant}/ci/run/{run_id}").as_str()) {
         return malformed_ci("run summary ref is not canonical");
     }
@@ -1188,6 +1192,29 @@ mod tests {
         response["items"][0]["ref"] =
             json!("myelin://other/ci/run/91000000-0000-4000-8000-000000000001");
         assert!(validate_ci_success(&call, &response).is_err());
+    }
+
+    #[test]
+    fn ci_run_repository_refs_share_the_git_storage_coordinate() {
+        let call = get("/v1/ci/runs", Some("state=all&limit=1"));
+        let mut response = golden_expected("runs-first-page-keyset");
+        response["page"]["next_cursor"] = json!(canonical_cursor());
+
+        response["items"][0]["repo_ref"] = json!("myelin://acme/git/repo/platform/api");
+        validate_ci_success(&call, &response).unwrap();
+
+        for malformed in [
+            "myelin://acme/git/repo/platform.git/api",
+            "myelin://acme/git/repo/platform//api",
+            "myelin://acme/git/repo/platform#comment-1",
+            "myelin://acme/git/blob/platform",
+        ] {
+            response["items"][0]["repo_ref"] = json!(malformed);
+            assert!(
+                validate_ci_success(&call, &response).is_err(),
+                "CLI trusted a malformed repository reference: {malformed}"
+            );
+        }
     }
 
     #[test]
