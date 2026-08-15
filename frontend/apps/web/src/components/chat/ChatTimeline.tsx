@@ -2,7 +2,8 @@ import { Icon, Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { A } from "@solidjs/router";
 import { createEffect, For, Show } from "solid-js";
 
-import type { ChatConversation, ChatMessage } from "~/lib/api";
+import type { ChatConversation, ChatMessage, ChatMessageNode } from "~/lib/api";
+import { artifactRefHref, artifactRefLabel } from "~/lib/artifact-ref";
 import { chatAuthorLabel, chatTimestamp } from "~/lib/chat-view";
 import { ChatComposer } from "./ChatComposer";
 
@@ -14,6 +15,53 @@ export interface ChatTimelineProps {
   hasEarlier: boolean;
   onLoadEarlier: () => void;
   onPosted: () => Promise<void> | void;
+}
+
+type ChatReferenceNode = Extract<ChatMessageNode, { ref: string }>;
+
+function ChatReference(props: { node: ChatReferenceNode }) {
+  const label = () => props.node.kind === "embed"
+    ? `Embedded · ${artifactRefLabel(props.node.ref)}`
+    : artifactRefLabel(props.node.ref);
+  const href = () => artifactRefHref(props.node.ref);
+  return <Show
+    when={href()}
+    fallback={<span class="chat-message-node" data-kind={props.node.kind} title={props.node.ref}>
+      {label()}
+    </span>}
+  >
+    {(target) => <A
+      class="chat-message-node"
+      data-kind={props.node.kind}
+      href={target()}
+      title={props.node.ref}
+    >
+      {label()}
+    </A>}
+  </Show>;
+}
+
+function ChatInlineNode(props: { node: ChatMessageNode }) {
+  const mention = () => props.node.kind === "mention" ? props.node : undefined;
+  const reference = () => props.node.kind !== "mention" ? props.node : undefined;
+  return <Show
+    when={mention()}
+    fallback={<Show when={reference()}>{(node) => <ChatReference node={node()} />}</Show>}
+  >
+    {(node) => <span class="chat-message-node" data-kind="mention" title={node().principal_id}>
+      @{node().principal_id}
+    </span>}
+  </Show>;
+}
+
+function ChatMessageBody(props: { message: ChatMessage }) {
+  return <p dir="auto">
+    <For each={props.message.content.split("\uFFFC")}>
+      {(part, index) => <>{part}<Show when={index() < props.message.nodes.length}>
+        <ChatInlineNode node={props.message.nodes[index()]!} />
+      </Show></>}
+    </For>
+  </p>;
 }
 
 export function ChatTimeline(props: ChatTimelineProps) {
@@ -81,7 +129,7 @@ export function ChatTimeline(props: ChatTimelineProps) {
                       </time>
                       <Show when={message.edited}><span>edited</span></Show>
                     </header>
-                    <p>{message.content}</p>
+                    <ChatMessageBody message={message} />
                   </article>
                 </li>
               )}</For>

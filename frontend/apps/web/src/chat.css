@@ -305,6 +305,24 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+.chat-message-node {
+  display: inline-flex;
+  align-items: baseline;
+  margin-inline: 0.15em;
+  padding-inline: 0.35em;
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-1);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-size: 0.92em;
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+}
+a.chat-message-node:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.chat-message-node[data-kind="mention"] { color: var(--accent); }
 .chat-message-you .chat-avatar { background: var(--surface-selected); }
 
 .chat-empty-timeline {

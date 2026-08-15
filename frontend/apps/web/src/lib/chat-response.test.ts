@@ -28,6 +28,7 @@ const message = {
   author_kind: "human",
   is_you: true,
   content: "The rollout is green.",
+  nodes: [],
   edited: false,
   state: "active",
   created_at: 1_700_000_000,
@@ -71,6 +72,36 @@ describe("Chat wire projection", () => {
     })).toBeNull();
     expect(parseChatMessageReceipt({ message_id: "not-an-id", durable: true })).toBeNull();
   });
+
+  it("decodes every structured node without losing its position", () => {
+    const structured = {
+      ...message,
+      content: "Ask \uFFFC to compare \uFFFC with \uFFFC.",
+      nodes: [
+        { kind: "mention", principal_id: "p:alice" },
+        { kind: "artifact_ref", ref: "myelin://acme/issue/issue/MYL-7" },
+        { kind: "embed", ref: "myelin://acme/knowledge/page/runbook" },
+      ],
+    };
+    expect(parseChatMessages({
+      conversation,
+      items: [structured],
+      page: { next_cursor: null, limit: 50 },
+    })?.items).toEqual([structured]);
+
+    for (const invalid of [
+      { ...structured, content: "One marker \uFFFC", nodes: structured.nodes.slice(0, 2) },
+      { ...structured, nodes: [{ kind: "mention", principal_id: "alice smith" }] },
+      { ...structured, nodes: [{ kind: "artifact_ref", ref: "https://example.test/work" }] },
+      { ...structured, nodes: [{ kind: "embed", ref: structured.nodes[2]!.ref, secret: true }] },
+    ]) {
+      expect(parseChatMessages({
+        conversation,
+        items: [invalid],
+        page: { next_cursor: null, limit: 50 },
+      })).toBeNull();
+    }
+  });
 });
 
 describe("Chat mutation input", () => {
@@ -79,10 +110,12 @@ describe("Chat mutation input", () => {
       projectId: PROJECT,
       channel: "engineering",
       topic: "release",
+      clientNonce: "topic_01J-1",
     })).toEqual({
       projectId: PROJECT,
       channel: "engineering",
       topic: "release",
+      clientNonce: "topic_01J-1",
     });
     expect(parseChatMessageDraft({
       conversationId: ID,
@@ -96,6 +129,7 @@ describe("Chat mutation input", () => {
       projectId: PROJECT,
       channel: " engineering",
       topic: "release",
+      clientNonce: "nonce",
     })).toBeNull();
     expect(parseChatMessageDraft({
       conversationId: ID,
@@ -111,8 +145,15 @@ describe("Chat mutation input", () => {
       projectId: PROJECT,
       channel: "engineering",
       topic: "release",
+      clientNonce: "nonce",
       tenant: "x",
     }))
       .toBeNull();
+    expect(parseChatConversationDraft({
+      projectId: PROJECT,
+      channel: "engineering",
+      topic: "release",
+      clientNonce: "response lost retry",
+    })).toBeNull();
   });
 });

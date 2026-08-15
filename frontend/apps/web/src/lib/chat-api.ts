@@ -23,6 +23,7 @@ export type {
   ChatConversationPage,
   ChatConversationReceipt,
   ChatMessage,
+  ChatMessageNode,
   ChatMessagePage,
   ChatMessageReceipt,
   ChatMessageState,
@@ -140,9 +141,10 @@ export const chatMutate = action(async (mutation: ChatMutation) => {
         projectId: mutation.projectId,
         channel: mutation.channel,
         topic: mutation.topic,
+        clientNonce: mutation.clientNonce,
       });
       if (!parsed || Object.keys(mutation).some((key) =>
-        !["op", "projectId", "channel", "topic"].includes(key))) {
+        !["op", "projectId", "channel", "topic", "clientNonce"].includes(key))) {
         return result({ ok: false, error: "bad-input" });
       }
       const receipt = await chatAuthed(async () => {
@@ -151,7 +153,7 @@ export const chatMutate = action(async (mutation: ChatMutation) => {
             project_id: parsed.projectId,
             channel: parsed.channel,
             topic: parsed.topic,
-          }),
+          }, { idempotencyKey: parsed.clientNonce }),
         );
         if (!decoded) throw new ChatRouteError("error");
         return decoded;

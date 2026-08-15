@@ -25,6 +25,7 @@ const message = (id: string, isYou = false): ChatMessage => ({
   author_kind: "human",
   is_you: isYou,
   content: id,
+  nodes: [],
   edited: false,
   state: "active",
   created_at: 1,

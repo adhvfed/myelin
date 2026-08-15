@@ -19,7 +19,7 @@ export interface ChatTopicDialogProps {
 function errorCopy(kind: ChatErrorKind): string {
   switch (kind) {
     case "bad-input":
-      return "Use a channel and topic name without surrounding whitespace.";
+      return "Check the project, channel, and topic. Names must be 1–255 bytes without surrounding whitespace or control characters.";
     case "conflict":
       return "That topic already exists in this channel.";
     case "not-found":
@@ -36,6 +36,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
   const catalogue = createProjectCatalogue();
   const [channel, setChannel] = createSignal("");
   const [topic, setTopic] = createSignal("");
+  const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [error, setError] = createSignal<string | null>(null);
   const [submitting, setSubmitting] = createSignal(false);
   let channelInput: HTMLInputElement | undefined;
@@ -44,6 +45,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
     if (!props.open) return;
     setChannel("");
     setTopic("");
+    setClientNonce(crypto.randomUUID());
     setError(null);
     setSubmitting(false);
   });
@@ -80,6 +82,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
         projectId: catalogue.selectedId(),
         channel: channel(),
         topic: topic(),
+        clientNonce: clientNonce(),
       });
       if (!result.ok) {
         setError(errorCopy(result.error));

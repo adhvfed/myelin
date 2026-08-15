@@ -1,3 +1,4 @@
+import { isStorableArtifactRef } from "./artifact-ref";
 import { isProjectId } from "./project-contract";
 
 const utf8 = new TextEncoder();
@@ -20,6 +21,9 @@ export interface ChatConversationPage {
 
 export type ChatAuthorKind = "human" | "agent" | "service";
 export type ChatMessageState = "active" | "edited" | "deleted" | "tombstoned";
+export type ChatMessageNode =
+  | { kind: "mention"; principal_id: string }
+  | { kind: "artifact_ref" | "embed"; ref: string };
 
 export interface ChatMessage {
   id: string;
@@ -27,6 +31,7 @@ export interface ChatMessage {
   author_kind: ChatAuthorKind;
   is_you: boolean;
   content: string;
+  nodes: ChatMessageNode[];
   edited: boolean;
   state: ChatMessageState;
   created_at: number | null;
@@ -52,6 +57,7 @@ export interface ChatConversationDraft {
   projectId: string;
   channel: string;
   topic: string;
+  clientNonce: string;
 }
 
 export interface ChatMessageDraft {
@@ -89,6 +95,10 @@ function nullableText(value: unknown, maximum: number): value is string | null {
   return value === null || cleanText(value, maximum);
 }
 
+function identity(value: unknown): value is string {
+  return cleanText(value, 512) && ![...value].some((character) => /\s/u.test(character));
+}
+
 function conversation(value: unknown): ChatConversation | null {
   const row = record(value);
   if (!row || !exact(row, ["id", "ref", "project_id", "channel", "topic", "linked_ref", "pinned_canvas"]) ||
@@ -121,19 +131,41 @@ export function parseChatConversations(value: unknown): ChatConversationPage | n
     : null;
 }
 
+function messageNode(value: unknown): ChatMessageNode | null {
+  const node = record(value);
+  if (!node || typeof node.kind !== "string") return null;
+  if (node.kind === "mention") {
+    return exact(node, ["kind", "principal_id"]) && identity(node.principal_id)
+      ? { kind: "mention", principal_id: node.principal_id }
+      : null;
+  }
+  if (node.kind === "artifact_ref" || node.kind === "embed") {
+    return exact(node, ["kind", "ref"]) && isStorableArtifactRef(node.ref)
+      ? { kind: node.kind, ref: node.ref }
+      : null;
+  }
+  return null;
+}
+
 function message(value: unknown): ChatMessage | null {
   const row = record(value);
   if (!row || !exact(row, [
-    "id", "author", "author_kind", "is_you", "content", "edited", "state", "created_at",
+    "id", "author", "author_kind", "is_you", "content", "nodes", "edited", "state", "created_at",
   ]) || !isChatUlid(row.id) ||
       (typeof row.author !== "string" || !/^chat-author:[0-9a-f]{32}$/.test(row.author)) ||
       !["human", "agent", "service"].includes(row.author_kind as string) ||
       typeof row.is_you !== "boolean" || !cleanText(row.content, 32 * 1024, true) ||
+      !Array.isArray(row.nodes) || row.nodes.length > 32 ||
       typeof row.edited !== "boolean" ||
       !["active", "edited", "deleted", "tombstoned"].includes(row.state as string) ||
       (row.created_at !== null &&
         (!Number.isSafeInteger(row.created_at) || (row.created_at as number) < 0))) return null;
-  return row as unknown as ChatMessage;
+  const nodes = row.nodes.map(messageNode);
+  if (!nodes.every((node): node is ChatMessageNode => node !== null) ||
+      [...row.content].filter((character) => character === "\uFFFC").length !== nodes.length) {
+    return null;
+  }
+  return { ...row, nodes } as unknown as ChatMessage;
 }
 
 export function parseChatMessages(value: unknown): ChatMessagePage | null {
@@ -166,11 +198,18 @@ export function parseChatMessageReceipt(value: unknown): ChatMessageReceipt | nu
 
 export function parseChatConversationDraft(value: unknown): ChatConversationDraft | null {
   const draft = record(value);
-  if (!draft || !exact(draft, ["projectId", "channel", "topic"]) ||
+  if (!draft || !exact(draft, ["projectId", "channel", "topic", "clientNonce"]) ||
       !isProjectId(draft.projectId) || !cleanText(draft.channel, 255) ||
       !cleanText(draft.topic, 255) ||
-      draft.channel.trim() !== draft.channel || draft.topic.trim() !== draft.topic) return null;
-  return { projectId: draft.projectId, channel: draft.channel, topic: draft.topic };
+      draft.channel.trim() !== draft.channel || draft.topic.trim() !== draft.topic ||
+      typeof draft.clientNonce !== "string" ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(draft.clientNonce)) return null;
+  return {
+    projectId: draft.projectId,
+    channel: draft.channel,
+    topic: draft.topic,
+    clientNonce: draft.clientNonce,
+  };
 }
 
 export function parseChatMessageDraft(value: unknown): ChatMessageDraft | null {

@@ -37,6 +37,8 @@ test.describe("Chat workspace", () => {
     await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
     await expect(page.getByRole("heading", { name: "release readiness", level: 2 })).toBeVisible();
     await expect(page.getByText("The canary is healthy.", { exact: false })).toBeVisible();
+    await expect(page.getByRole("link", { name: "MYL-204", exact: true }))
+      .toHaveAttribute("href", "/issues?state=all&key=MYL-204");
     await expect(page.getByText("I’m watching error rate", { exact: false })).toBeVisible();
     await expect(page.getByText("Agent · 543210", { exact: true })).toBeVisible();
     await expectAccessible(page, "seeded Chat timeline");
