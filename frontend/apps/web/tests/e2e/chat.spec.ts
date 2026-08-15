@@ -44,6 +44,25 @@ test.describe("Chat workspace", () => {
     await expectAccessible(page, "seeded Chat timeline");
   });
 
+  test("keeps every unsent draft with the topic where it was written", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
+    const releaseDraft = "Hold this thought with the release.";
+    await page.getByLabel("Message release readiness").fill(releaseDraft);
+
+    await page.getByTestId("chat-topic-link").filter({ hasText: "agent operations" }).click();
+    await expect(page.getByLabel("Message agent operations")).toHaveText("");
+    const agentDraft = "Keep this one with agent operations.";
+    await page.getByLabel("Message agent operations").fill(agentDraft);
+
+    await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
+    await expect(page.getByLabel("Message release readiness")).toHaveText(releaseDraft);
+    await page.getByTestId("chat-topic-link").filter({ hasText: "agent operations" }).click();
+    await expect(page.getByLabel("Message agent operations")).toHaveText(agentDraft);
+  });
+
   test("a first user can create a topic, send with Enter, and reload without losing it", async ({ page, request }) => {
     const empty = await request.post(`${EDGE}/__test/config`, { data: { emptyChat: true } });
     expect(empty.ok()).toBe(true);

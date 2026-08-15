@@ -14,7 +14,7 @@ export interface ChatTimelineProps {
   loadingEarlier: boolean;
   hasEarlier: boolean;
   onLoadEarlier: () => void;
-  onPosted: () => Promise<void> | void;
+  onPosted: (conversationId: string) => Promise<void> | void;
 }
 
 type ChatReferenceNode = Extract<ChatMessageNode, { ref: string }>;

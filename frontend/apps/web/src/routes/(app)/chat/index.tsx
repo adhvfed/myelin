@@ -155,15 +155,17 @@ export default function ChatIndex() {
     }
   };
 
-  const refreshMessages = async () => {
-    const conversationId = validSelectedId();
-    if (!conversationId) return;
+  const refreshMessages = async (conversationId: string) => {
     await revalidate(getChatMessages.keyFor({ conversationId, limit: 100 }));
   };
 
-  const messagePosted = async () => {
-    await refreshMessages();
-    toast.show({ title: "Message sent", variant: "success" });
+  const messagePosted = async (conversationId: string) => {
+    try {
+      await refreshMessages(conversationId);
+      toast.show({ title: "Message sent", variant: "success" });
+    } catch {
+      toast.show({ title: "Message sent — reload the topic to see it", variant: "warning" });
+    }
   };
 
   return (
