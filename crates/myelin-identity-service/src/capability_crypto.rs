@@ -15,6 +15,7 @@ type HmacSha256 = Hmac<Sha256>;
 const V4_PUBLIC_HEADER: &str = "v4.public.";
 const DPOP_HEADER: &str = "dpop.v1.";
 const MACAROON_DOMAIN: &[u8] = b"myelin.cap.macaroon.v1";
+const SHA256_BYTES: usize = 32;
 
 fn b64url_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -158,6 +159,8 @@ impl CellTokenAuthority {
         let auth: Vec<serde_json::Value> = spec
             .authority
             .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .map(|g| serde_json::Value::String(g.clone()))
             .collect();
         claims.insert("auth".into(), auth.into());
@@ -292,17 +295,7 @@ impl ParsedMaterial {
             serde_json::Value::Array(arr) => {
                 let mut out = Vec::with_capacity(arr.len());
                 for c in arr {
-                    let set: BTreeSet<String> = match c {
-                        serde_json::Value::Array(grants) => grants
-                            .into_iter()
-                            .filter_map(|g| g.as_str().map(str::to_string))
-                            .collect(),
-                        _ => {
-                            return Err(AuthzError::BadRequest(
-                                "a caveat must be a JSON array of grant strings".into(),
-                            ))
-                        }
-                    };
+                    let set = parse_grant_set(&c, "caveat").map_err(AuthzError::BadRequest)?;
                     out.push(set);
                 }
                 out
@@ -314,6 +307,11 @@ impl ParsedMaterial {
             }
         };
         let tail = b64url_decode(parts[2])?;
+        if tail.len() != SHA256_BYTES {
+            return Err(AuthzError::BadRequest(format!(
+                "capability caveat-chain tag must be {SHA256_BYTES} bytes"
+            )));
+        }
         let dpop = match parts.get(3) {
             Some(d) => Some(
                 String::from_utf8(b64url_decode(d)?)
@@ -667,23 +665,11 @@ impl PasetoCapabilityVerifier {
                 "a non-run credential carries a delegation snapshot - ambiguous purpose refused",
             ));
         }
-        let root_grants: BTreeSet<String> = match claims.get("auth") {
-            Some(serde_json::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|g| g.as_str().map(str::to_string))
-                .collect(),
-            None => BTreeSet::new(),
-            _ => {
-                return Err(AuthzError::BadRequest(
-                    "`auth` claim must be an array".into(),
-                ))
-            }
-        };
-        let bound_jkt = claims
-            .get("cnf")
-            .and_then(|c| c.get("jkt"))
-            .and_then(|j| j.as_str())
-            .map(str::to_string);
+        let root_grants = claims
+            .get("auth")
+            .ok_or_else(|| refuse("verified token is missing its signed `auth` authority"))
+            .and_then(|auth| parse_grant_set(auth, "signed `auth`").map_err(refuse))?;
+        let bound_jkt = verified_confirmation_jkt(&claims)?;
 
         let now = (self.now)();
         if exp <= now {
@@ -812,6 +798,50 @@ fn str_claim(claims: &serde_json::Value, key: &str) -> Result<String, AuthzError
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| refuse(format!("verified token missing/empty `{key}` claim")))
+}
+
+fn parse_grant_set(value: &serde_json::Value, label: &str) -> Result<BTreeSet<String>, String> {
+    let grants = value
+        .as_array()
+        .ok_or_else(|| format!("{label} must be a JSON array of grant strings"))?;
+    let mut parsed = BTreeSet::new();
+    for (index, grant) in grants.iter().enumerate() {
+        let grant = grant
+            .as_str()
+            .ok_or_else(|| format!("{label} grant at index {index} must be a string"))?;
+        if !parsed.insert(grant.to_string()) {
+            return Err(format!("{label} contains duplicate grant `{grant}`"));
+        }
+    }
+    Ok(parsed)
+}
+
+fn verified_confirmation_jkt(claims: &serde_json::Value) -> Result<Option<String>, AuthzError> {
+    let Some(confirmation) = claims.get("cnf") else {
+        return Ok(None);
+    };
+    let object = confirmation
+        .as_object()
+        .ok_or_else(|| refuse("signed `cnf` claim must be an object containing only `jkt`"))?;
+    if object.len() != 1 {
+        return Err(refuse(
+            "signed `cnf` claim must contain exactly one `jkt` binding",
+        ));
+    }
+    let jkt = object
+        .get("jkt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|jkt| !jkt.is_empty())
+        .ok_or_else(|| refuse("signed `cnf.jkt` must be a non-empty string"))?;
+    let thumbprint = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(jkt.as_bytes())
+        .map_err(|_| refuse("signed `cnf.jkt` must be a base64url SHA-256 thumbprint"))?;
+    if thumbprint.len() != SHA256_BYTES {
+        return Err(refuse(format!(
+            "signed `cnf.jkt` must decode to {SHA256_BYTES} bytes"
+        )));
+    }
+    Ok(Some(jkt.to_string()))
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {

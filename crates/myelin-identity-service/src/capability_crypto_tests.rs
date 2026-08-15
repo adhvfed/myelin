@@ -94,6 +94,35 @@ fn mint_raw_claims(cell: &CellTokenAuthority, claims: serde_json::Value) -> Stri
     encode_material(&paseto, &[], &tail, None)
 }
 
+fn valid_raw_claims(purpose: &str, auth: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "tenant": "acme",
+        "region": "eu-west",
+        "sub": "subj-1",
+        "jti": "raw-jti",
+        "exp": NOW + 300,
+        "purpose": purpose,
+        "aud": "edge",
+        "auth": auth,
+    })
+}
+
+fn append_raw_caveat(
+    material: &str,
+    raw_caveat: serde_json::Value,
+    grants_used_by_legacy_decoder: &[&str],
+) -> String {
+    let parts: Vec<&str> = material.split('|').collect();
+    let previous_tail = b64url_decode(parts[2]).unwrap();
+    let parsed_grants = grants_used_by_legacy_decoder
+        .iter()
+        .map(|grant| (*grant).to_string())
+        .collect();
+    let tail = macaroon_fold(&previous_tail, &parsed_grants);
+    let caveats = b64url_encode(&serde_json::to_vec(&vec![raw_caveat]).unwrap());
+    format!("{}|{caveats}|{}", parts[0], b64url_encode(&tail))
+}
+
 #[test]
 fn positive_signed_token_verifies() {
     let c = cell();
@@ -324,6 +353,76 @@ fn negative_removed_or_forged_caveat_is_rejected() {
         matches!(&err, AuthzError::FailClosed(m) if m.contains("caveat-chain tag mismatch")),
         "stripping a caveat (resetting the chain) must be rejected, got {err:?}"
     );
+}
+
+#[test]
+fn mixed_type_caveat_is_rejected_instead_of_partially_applied() {
+    let c = cell();
+    let root = c.mint(&spec("acme", &["read", "write"], None));
+    let ambiguous = append_raw_caveat(
+        &root,
+        serde_json::json!(["read", { "unexpected": "grant" }]),
+        &["read"],
+    );
+
+    let error = verifier(c.trust_anchor())
+        .verify_material(&ambiguous, MachineKind::Agent)
+        .expect_err("every caveat element must participate in decoding or the token is refused");
+    assert!(
+        matches!(error, AuthzError::BadRequest(message) if message.contains("index 1")),
+        "the malformed grant should be identified precisely"
+    );
+}
+
+#[test]
+fn signed_authority_must_be_present_and_unambiguous() {
+    let c = cell();
+    let mut missing = valid_raw_claims("operator_bootstrap", serde_json::json!([]));
+    missing.as_object_mut().unwrap().remove("auth");
+    let malformed = [
+        missing,
+        valid_raw_claims("operator_bootstrap", serde_json::json!(["edge.whoami", 7])),
+        valid_raw_claims(
+            "operator_bootstrap",
+            serde_json::json!(["edge.whoami", "edge.whoami"]),
+        ),
+    ];
+
+    for claims in malformed {
+        let material = mint_raw_claims(&c, claims);
+        assert!(
+            matches!(
+                verifier(c.trust_anchor()).verify_material(&material, MachineKind::Agent),
+                Err(AuthzError::FailClosed(_))
+            ),
+            "a signed authority with no unique, exact interpretation must fail closed"
+        );
+    }
+}
+
+#[test]
+fn malformed_signed_sender_constraint_never_becomes_a_bearer_token() {
+    let c = cell();
+    let malformed_confirmations = [
+        serde_json::json!(null),
+        serde_json::json!({}),
+        serde_json::json!({ "jkt": 7 }),
+        serde_json::json!({ "jkt": "not-a-thumbprint" }),
+        serde_json::json!({ "jkt": b64url_encode(&[1; SHA256_BYTES]), "extra": true }),
+    ];
+
+    for confirmation in malformed_confirmations {
+        let mut claims = valid_raw_claims("pat", serde_json::json!(["edge.whoami"]));
+        claims["cnf"] = confirmation;
+        let material = mint_raw_claims(&c, claims);
+        assert!(
+            matches!(
+                verifier(c.trust_anchor()).verify_material(&material, MachineKind::Pat),
+                Err(AuthzError::FailClosed(_))
+            ),
+            "a present but malformed sender constraint must never be treated as absent"
+        );
+    }
 }
 
 #[test]
