@@ -131,7 +131,7 @@ pub(crate) fn pull_request_number_param(
     name: &str,
 ) -> Result<u64, EdgeError> {
     let raw = param(ctx, name)?;
-    myelin_git::coordinate::parse_pull_request_number(raw).ok_or_else(|| {
+    myelin_git::coordinate::parse_positive_decimal(raw).ok_or_else(|| {
         EdgeError::BadRequest(format!(
             "path param `{name}` must be a canonical positive pull-request number"
         ))

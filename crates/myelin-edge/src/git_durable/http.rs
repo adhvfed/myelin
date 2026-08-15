@@ -2100,14 +2100,15 @@ fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
                 if slot.is_some() {
                     return Err(duplicate(name));
                 }
-                let number = value.parse::<u64>().map_err(|_| {
-                    EdgeError::BadRequest(format!(
-                        "file-lines `{name}` must be a positive line number"
-                    ))
-                })?;
-                if number == 0 || number > u32::MAX as u64 {
+                let number =
+                    myelin_git::coordinate::parse_positive_decimal(value).ok_or_else(|| {
+                        EdgeError::BadRequest(format!(
+                            "file-lines `{name}` must be a canonical positive line number"
+                        ))
+                    })?;
+                if number > u32::MAX as u64 {
                     return Err(EdgeError::BadRequest(format!(
-                        "file-lines `{name}` must be a positive line number"
+                        "file-lines `{name}` must be a canonical positive line number"
                     )));
                 }
                 *slot = Some(number as usize);
@@ -4910,6 +4911,8 @@ mod file_lines_boundary_tests {
             "path=x&path=y&start=1&end=1",
             "path=..%2Fsecret&start=1&end=1",
             "path=x&start=0&end=1",
+            "path=x&start=01&end=1",
+            "path=x&start=1&end=+1",
             "path=x&start=2&end=1",
             &format!("path=x&start=1&end={}", FILE_LINES_MAX_RANGE + 1),
             "path=x%ZZ&start=1&end=1",

@@ -83,7 +83,7 @@ function canonicalSub(value: string | undefined): boolean {
   const line = /^L([^/]+)-L([^/]+)$/.exec(value);
   const start = line?.[1];
   const end = line?.[2];
-  if (start && end && isCanonicalU64(start) && isCanonicalU64(end)) {
+  if (start && end && start !== "0" && isCanonicalU64(start) && isCanonicalU64(end)) {
     return unsignedLessThanOrEqual(start, end);
   }
   if (/^[bh].+/.test(value)) return true;

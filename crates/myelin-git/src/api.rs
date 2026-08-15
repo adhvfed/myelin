@@ -391,7 +391,7 @@ fn repo_and_number(args: &[&str]) -> Result<(String, u64), CliParseError> {
     let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
     let raw = positional(args, 1).ok_or(CliParseError::MissingArg { what: "number" })?;
     let number =
-        crate::coordinate::parse_pull_request_number(raw).ok_or_else(|| CliParseError::BadArg {
+        crate::coordinate::parse_positive_decimal(raw).ok_or_else(|| CliParseError::BadArg {
             value: raw.to_string(),
         })?;
     Ok((repo.to_string(), number))

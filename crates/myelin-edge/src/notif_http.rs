@@ -418,7 +418,7 @@ fn git_pr_coordinate(subject: &ArtifactRef, expected_tenant: &str) -> Option<(St
 fn git_pr_parts(id: &str) -> Option<(&str, u64)> {
     let (repo, number) = id.rsplit_once(':')?;
     myelin_git::coordinate::RepositorySlug::parse(repo).ok()?;
-    myelin_git::coordinate::parse_pull_request_number(number).map(|parsed| (repo, parsed))
+    myelin_git::coordinate::parse_positive_decimal(number).map(|parsed| (repo, parsed))
 }
 
 fn git_repo_subject(subject: &ArtifactRef, expected_tenant: &str) -> Option<ArtifactRef> {

@@ -918,7 +918,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
                 let file_number = path
                     .file_stem()
                     .and_then(|value| value.to_str())
-                    .and_then(crate::coordinate::parse_pull_request_number)
+                    .and_then(crate::coordinate::parse_positive_decimal)
                     .ok_or_else(|| {
                         DurableError::Io(format!("invalid PR record filename {}", path.display()))
                     })?;
@@ -1048,7 +1048,7 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
             let number = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .and_then(crate::coordinate::parse_pull_request_number)
+                .and_then(crate::coordinate::parse_positive_decimal)
                 .ok_or_else(|| {
                     DurableError::Io(format!("invalid PR record filename {}", path.display()))
                 })?;

@@ -88,8 +88,8 @@ fn ends_with_git_case_insensitive(segment: &str) -> bool {
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".git"))
 }
 
-/// Parse the one canonical positive decimal spelling of a pull-request coordinate.
-pub fn parse_pull_request_number(value: &str) -> Option<u64> {
+/// Parse the one canonical positive decimal spelling of a numeric coordinate.
+pub fn parse_positive_decimal(value: &str) -> Option<u64> {
     let number = value.parse::<u64>().ok()?;
     (number > 0 && number.to_string() == value).then_some(number)
 }
@@ -123,10 +123,10 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_numbers_have_one_positive_decimal_spelling() {
-        assert_eq!(parse_pull_request_number("42"), Some(42));
+    fn positive_decimal_coordinates_have_one_spelling() {
+        assert_eq!(parse_positive_decimal("42"), Some(42));
         assert_eq!(
-            parse_pull_request_number(&u64::MAX.to_string()),
+            parse_positive_decimal(&u64::MAX.to_string()),
             Some(u64::MAX)
         );
         for invalid in [
@@ -139,7 +139,7 @@ mod tests {
             "1e2",
             "18446744073709551616",
         ] {
-            assert_eq!(parse_pull_request_number(invalid), None, "{invalid}");
+            assert_eq!(parse_positive_decimal(invalid), None, "{invalid}");
         }
     }
 }

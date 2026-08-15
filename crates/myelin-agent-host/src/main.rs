@@ -460,10 +460,9 @@ fn triggering_merge_target(request: &ModelRequest) -> Result<(String, u64), Mode
     myelin_refs::git_coordinate::RepositorySlug::parse(repo).map_err(|_| {
         ModelError::Parse("development merge task has an invalid repository slug".into())
     })?;
-    let number =
-        myelin_refs::git_coordinate::parse_pull_request_number(number).ok_or_else(|| {
-            ModelError::Parse("development merge task has an invalid PR number".into())
-        })?;
+    let number = myelin_refs::git_coordinate::parse_positive_decimal(number).ok_or_else(|| {
+        ModelError::Parse("development merge task has an invalid PR number".into())
+    })?;
     Ok((repo.to_string(), number))
 }
 

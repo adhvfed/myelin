@@ -184,15 +184,17 @@ fn parse_sub(sub: &str) -> Result<Sub, ParseError> {
     }
 
     if let Some(n) = sub.strip_prefix("step-") {
-        return n
-            .parse::<u64>()
+        return parse_canonical_u64(n)
             .map(Sub::Step)
-            .map_err(|_| ParseError::UnknownSubKind { sub: sub.into() });
+            .ok_or_else(|| ParseError::UnknownSubKind { sub: sub.into() });
     }
 
     if let Some(range) = sub.strip_prefix('L') {
         if let Some((start_s, end_s)) = range.split_once("-L") {
-            if let (Ok(start), Ok(end)) = (start_s.parse::<u64>(), end_s.parse::<u64>()) {
+            if let (Some(start), Some(end)) = (
+                crate::git_coordinate::parse_positive_decimal(start_s),
+                crate::git_coordinate::parse_positive_decimal(end_s),
+            ) {
                 if end >= start {
                     return Ok(Sub::LineRange { start, end });
                 }
@@ -213,6 +215,11 @@ fn parse_sub(sub: &str) -> Result<Sub, ParseError> {
     }
 
     Err(ParseError::UnknownSubKind { sub: sub.into() })
+}
+
+fn parse_canonical_u64(value: &str) -> Option<u64> {
+    let number = value.parse::<u64>().ok()?;
+    (number.to_string() == value).then_some(number)
 }
 
 fn format_sub(sub: &Sub) -> String {
@@ -544,6 +551,16 @@ mod tests {
             parse("myelin://acme/git/ref/main#L42"),
             Err(ParseError::UnknownSubKind { .. })
         ));
+        for reference in [
+            "myelin://acme/ci/run/1#step-01",
+            "myelin://acme/git/ref/main#L0-L1",
+            "myelin://acme/git/ref/main#L01-L2",
+        ] {
+            assert!(
+                matches!(parse(reference), Err(ParseError::UnknownSubKind { .. })),
+                "numeric anchor alias was admitted: {reference}"
+            );
+        }
         assert!(matches!(
             parse("myelin://acme/knowledge/page/7#b"),
             Err(ParseError::UnknownSubKind { .. })

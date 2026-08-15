@@ -1763,6 +1763,12 @@ describe("the CLI authentication journey", () => {
         { expectedStatus: 200 },
       );
       expect(rejectedObject.body).toEqual({ lines: [] });
+      const aliasedLine = await systemClient.json(
+        `${sourceRepository.path}/file-lines/${gitBlobOid(rejectedSecret)}`
+          + `?path=${encodeURIComponent(sourcePath)}&start=01&end=1`,
+        { expectedStatus: 400 },
+      );
+      expect(aliasedLine.body).toMatchObject({ error: { code: "bad_request" } });
 
       // The collaborator authors the proposed change through the governed Git surface. The
       // optimistic blob OID prevents lost updates, while start_ref creates a review branch without

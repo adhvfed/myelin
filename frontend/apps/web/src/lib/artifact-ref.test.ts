@@ -28,6 +28,8 @@ describe("artifact references", () => {
     "myelin://acme/issue/invented/MYL-7",
     "myelin://acme/issue/issue/MYL-7#step-01",
     "myelin://acme/issue/issue/MYL-7#step-18446744073709551616",
+    "myelin://acme/issue/issue/MYL-7#L0-L1",
+    "myelin://acme/issue/issue/MYL-7#L01-L2",
     "myelin://acme/issue/issue/MYL-7#L10-L9",
     "myelin://acme/issue/issue/MYL-7#L18446744073709551615-L18446744073709551616",
     "myelin://acme/issue/issue/MYL-7#unknown-anchor",
