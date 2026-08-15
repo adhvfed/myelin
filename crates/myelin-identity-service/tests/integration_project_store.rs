@@ -372,6 +372,108 @@ async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn project_listing_keeps_the_newest_work_in_reach_across_pages() {
+    let config = test_config();
+    let admin = SubstrateProvider::connect(admin_config(&config), 4)
+        .await
+        .expect("connect to the Postgres required by project discovery");
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    let app = SubstrateProvider::connect(config, 6)
+        .await
+        .expect("connect constrained runtime role");
+    let region = app.config().region.clone();
+    let tenant = format!("project-listing-{}", unique());
+    let founder = actor(&tenant, &region);
+    let store = PgProjectStore::new(app);
+
+    let oldest = store
+        .create(&founder, proposal("Oldest work", "OLD", "create-oldest"))
+        .await
+        .expect("create the oldest project")
+        .project;
+    let middle = store
+        .create(&founder, proposal("Middle work", "MID", "create-middle"))
+        .await
+        .expect("create the middle project")
+        .project;
+    let newest = store
+        .create(&founder, proposal("Newest work", "NEW", "create-newest"))
+        .await
+        .expect("create the newest project")
+        .project;
+
+    sqlx::query(
+        "UPDATE identity_project \
+            SET created_at = CASE issue_prefix \
+                WHEN 'OLD' THEN TIMESTAMPTZ '2026-01-01T00:00:00Z' \
+                WHEN 'MID' THEN TIMESTAMPTZ '2026-01-02T00:00:00Z' \
+                WHEN 'NEW' THEN TIMESTAMPTZ '2026-01-03T00:00:00Z' \
+                ELSE created_at \
+            END \
+          WHERE tenant_id = $1 AND region = $2",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .execute(admin.db_pool())
+    .await
+    .expect("make recency deterministic without coupling it to random project ids");
+
+    let first_page = store
+        .list_visible(&founder, None, 2)
+        .await
+        .expect("list the first page of visible projects");
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|project| &project.id)
+            .collect::<Vec<_>>(),
+        vec![&newest.id, &middle.id],
+        "new work belongs at the front of a developer's project list"
+    );
+
+    let second_page = store
+        .list_visible(&founder, Some(&middle.id), 2)
+        .await
+        .expect("continue from the last project on the first page");
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|project| &project.id)
+            .collect::<Vec<_>>(),
+        vec![&oldest.id],
+        "the cursor continues by stable creation order without gaps or repeats"
+    );
+    assert!(
+        store
+            .list_visible(&founder, Some("00000000-0000-0000-0000-000000000000"), 2,)
+            .await
+            .expect("an unknown cursor fails closed")
+            .is_empty(),
+        "a cursor must name a project visible to its caller"
+    );
+
+    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM identity_project WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant' = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn operator_bootstrap_registers_existing_project_metadata_once() {
     let config = test_config();
     let admin = SubstrateProvider::connect(admin_config(&config), 4)

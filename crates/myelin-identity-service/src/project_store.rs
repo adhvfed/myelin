@@ -365,7 +365,17 @@ impl PgProjectStore {
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
                     let query = format!(
-                        "{VISIBLE_PROJECTS_CTE} \
+                        "{VISIBLE_PROJECTS_CTE}, \
+                         cursor_position(created_at, project_id) AS ( \
+                           SELECT cursor_project.created_at, cursor_project.project_id \
+                             FROM identity_project cursor_project \
+                             JOIN visible_project cursor_visible \
+                               ON cursor_visible.object_id = \
+                                  'project:' || cursor_project.project_id::text \
+                            WHERE cursor_project.tenant_id = $1 \
+                              AND cursor_project.region = $2 \
+                              AND cursor_project.project_id = $4 \
+                         ) \
                          SELECT project.project_id, project.name, project.issue_prefix, \
                                 project.default_issue_type_id, project.created_by, \
                                 project.created_at \
@@ -373,8 +383,15 @@ impl PgProjectStore {
                            JOIN visible_project visible \
                              ON visible.object_id = 'project:' || project.project_id::text \
                           WHERE project.tenant_id = $1 AND project.region = $2 \
-                            AND ($4::uuid IS NULL OR project.project_id < $4) \
-                          ORDER BY project.project_id DESC LIMIT $5"
+                            AND ( \
+                              $4::uuid IS NULL OR EXISTS ( \
+                                SELECT 1 FROM cursor_position cursor \
+                                 WHERE (project.created_at, project.project_id) \
+                                     < (cursor.created_at, cursor.project_id) \
+                              ) \
+                            ) \
+                          ORDER BY project.created_at DESC, project.project_id DESC \
+                          LIMIT $5"
                     );
                     let rows = sqlx::query(&query)
                         .bind(&tenant)

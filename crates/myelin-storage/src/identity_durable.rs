@@ -4,7 +4,7 @@ use sqlx::Row;
 
 use myelin_events::EventEnvelope;
 
-use crate::migration::{Migration, Migrations};
+use crate::migration::{Migration, MigrationPhase, Migrations};
 use crate::pg::{PgError, PgStore};
 use crate::pgrelay::PgRelay;
 use crate::provider::{ProviderError, SubstrateProvider};
@@ -143,6 +143,10 @@ CREATE POLICY myelin_tenant_isolation ON identity_project \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
+pub const IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION: &str = "\
+CREATE INDEX CONCURRENTLY IF NOT EXISTS identity_project_recent_list_idx
+    ON identity_project (tenant_id, region, created_at DESC, project_id DESC);";
+
 pub const AUTH_REPLAY_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS auth_replay (
     tenant_id text   NOT NULL,
@@ -264,6 +268,15 @@ pub fn identity_project_durable_migrations() -> Migrations {
         Migration::plain("0082_identity_project", IDENTITY_PROJECT_MIGRATION),
         Migration::plain("0083_identity_project_rls", IDENTITY_PROJECT_RLS_POLICY),
     ])
+}
+
+pub fn identity_project_recent_list_migrations() -> Migrations {
+    Migrations::of([Migration::phased(
+        "0116_identity_project_recent_list_index",
+        IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
+        MigrationPhase::Expand,
+        "identity_project",
+    )])
 }
 
 pub fn identity_agent_durable_migrations() -> Migrations {
@@ -921,6 +934,27 @@ mod principal_decode_tests {
                 .contains("principal row has an incomplete encrypted profile"));
             assert!(!error.to_string().contains("secret-key-ref"));
         }
+    }
+}
+
+#[cfg(test)]
+mod project_migration_tests {
+    use super::{
+        identity_project_recent_list_migrations, IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
+    };
+    use crate::migration::MigrationPhase;
+
+    #[test]
+    fn project_recency_index_is_an_online_expansion() {
+        let migrations = identity_project_recent_list_migrations();
+        let migration = migrations.0.first().expect("the recency index migration");
+
+        assert_eq!(migration.phase, MigrationPhase::Expand);
+        assert_eq!(migration.table, Some("identity_project"));
+        assert!(IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION
+            .contains("CREATE INDEX CONCURRENTLY IF NOT EXISTS"));
+        assert!(IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION
+            .contains("tenant_id, region, created_at DESC, project_id DESC"));
     }
 }
 
