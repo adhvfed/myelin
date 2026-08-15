@@ -73,6 +73,21 @@ export function isStorableArtifactRef(value: unknown): value is string {
   return isArtifactRef(value) && utf8.encode(value).byteLength <= 1024;
 }
 
+export type RelatedArtifactRefError = "invalid" | "cross-tenant" | "self" | "duplicate";
+
+export function relatedArtifactRefError(
+  sourceReference: string,
+  candidateReference: string,
+  existingReferences: readonly string[],
+): RelatedArtifactRefError | null {
+  const source = parseArtifactRef(sourceReference);
+  const candidate = parseArtifactRef(candidateReference);
+  if (!source || !candidate || !isStorableArtifactRef(candidateReference)) return "invalid";
+  if (source.tenant !== candidate.tenant) return "cross-tenant";
+  if (source.root === candidate.root) return "self";
+  return existingReferences.includes(candidateReference) ? "duplicate" : null;
+}
+
 export function artifactRefLabel(reference: string): string {
   const parsed = parseArtifactRef(reference);
   if (!parsed) return "Linked work";

@@ -120,7 +120,14 @@ describe("Chat mutation input", () => {
     expect(parseChatMessageDraft({
       conversationId: ID,
       content: "Ship carefully\nthen observe.",
+      references: [],
       clientNonce: "browser_01J-1",
+    })).not.toBeNull();
+    expect(parseChatMessageDraft({
+      conversationId: ID,
+      content: "Track \uFFFC.",
+      references: ["myelin://acme/issue/issue/MYL-7"],
+      clientNonce: "browser_01J-2",
     })).not.toBeNull();
   });
 
@@ -134,11 +141,19 @@ describe("Chat mutation input", () => {
     expect(parseChatMessageDraft({
       conversationId: ID,
       content: "  ",
+      references: [],
       clientNonce: "nonce",
     })).toBeNull();
     expect(parseChatMessageDraft({
       conversationId: ID,
       content: "bad\0message",
+      references: [],
+      clientNonce: "nonce",
+    })).toBeNull();
+    expect(parseChatMessageDraft({
+      conversationId: ID,
+      content: "Missing marker",
+      references: ["myelin://acme/issue/issue/MYL-7"],
       clientNonce: "nonce",
     })).toBeNull();
     expect(parseChatConversationDraft({

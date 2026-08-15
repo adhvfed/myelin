@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { artifactRefHref, artifactRefLabel, parseArtifactRef } from "./artifact-ref";
+import {
+  artifactRefHref,
+  artifactRefLabel,
+  parseArtifactRef,
+  relatedArtifactRefError,
+} from "./artifact-ref";
 
 describe("artifact references", () => {
   it("keeps the canonical root while understanding a structured sub-reference", () => {
@@ -44,5 +49,16 @@ describe("artifact references", () => {
     expect(artifactRefHref("myelin://acme/issue/issue/MYL-7")).toBe("/issues?state=all&key=MYL-7");
     expect(artifactRefLabel("myelin://acme/git/pr/platform:42")).toBe("platform #42");
     expect(artifactRefHref("myelin://acme/git/pr/platform:42")).toBe("/git/repos/platform/prs/42");
+  });
+
+  it("validates a related-work edge against source, tenant, and existing edges", () => {
+    const source = "myelin://acme/chat/channel/01J00000000000000000000000";
+    const issue = "myelin://acme/issue/issue/MYL-7";
+    expect(relatedArtifactRefError(source, issue, [])).toBeNull();
+    expect(relatedArtifactRefError(source, "https://example.invalid/7", [])).toBe("invalid");
+    expect(relatedArtifactRefError(source, "myelin://other/issue/issue/MYL-7", []))
+      .toBe("cross-tenant");
+    expect(relatedArtifactRefError(source, `${source}#message-7`, [])).toBe("self");
+    expect(relatedArtifactRefError(source, issue, [issue])).toBe("duplicate");
   });
 });

@@ -3,29 +3,44 @@ import { useAction } from "@solidjs/router";
 import { createEffect, createSignal, onMount, Show } from "solid-js";
 
 import { chatMutate, type ChatErrorKind } from "~/lib/api";
+import {
+  artifactRefHref,
+  artifactRefLabel,
+  relatedArtifactRefError,
+  type RelatedArtifactRefError,
+} from "~/lib/artifact-ref";
 
 export interface ChatComposerProps {
   conversationId: string;
+  conversationRef: string;
   topic: string;
   onPosted: (conversationId: string) => Promise<void> | void;
 }
 
 interface ConversationDraft {
   content: string;
+  references: string[];
   clientNonce: string;
   error: string | null;
   sending: boolean;
+  linking: boolean;
+  referenceInput: string;
+  referenceError: string | null;
 }
 
 const EMPTY_DRAFT: ConversationDraft = {
   content: "",
+  references: [],
   clientNonce: "",
   error: null,
   sending: false,
+  linking: false,
+  referenceInput: "",
+  referenceError: null,
 };
 
 function newDraft(): ConversationDraft {
-  return { ...EMPTY_DRAFT, clientNonce: crypto.randomUUID() };
+  return { ...EMPTY_DRAFT, references: [], clientNonce: crypto.randomUUID() };
 }
 
 function errorCopy(kind: ChatErrorKind): string {
@@ -41,6 +56,13 @@ function errorCopy(kind: ChatErrorKind): string {
     default:
       return "We couldn’t confirm the send. This draft keeps its retry identity until you edit it.";
   }
+}
+
+function referenceErrorCopy(kind: RelatedArtifactRefError): string {
+  if (kind === "cross-tenant") return "Linked work must belong to this workspace.";
+  if (kind === "self") return "Choose work outside this conversation.";
+  if (kind === "duplicate") return "This work is already linked in the draft.";
+  return "Paste a complete canonical myelin:// reference.";
 }
 
 export function ChatComposer(props: ChatComposerProps) {
@@ -95,6 +117,7 @@ export function ChatComposer(props: ChatComposerProps) {
         op: "post-message",
         conversationId,
         content: outgoing.content,
+        references: outgoing.references,
         clientNonce: outgoing.clientNonce,
       });
     } catch {
@@ -128,7 +151,39 @@ export function ChatComposer(props: ChatComposerProps) {
     }
   };
 
-  const editorValue = (): EditorBlock[] => [{ type: "paragraph", markdown: draft().content }];
+  const addReference = () => {
+    const conversationId = props.conversationId;
+    const current = draft();
+    const reference = current.referenceInput.trim();
+    const validation = relatedArtifactRefError(
+      props.conversationRef,
+      reference,
+      current.references,
+    );
+    if (validation) {
+      updateDraft(conversationId, (value) => ({
+        ...value,
+        referenceError: referenceErrorCopy(validation),
+      }));
+      return;
+    }
+    updateDraft(conversationId, (value) => ({
+      ...value,
+      content: `${value.content}${value.content && !/\s$/u.test(value.content) ? " " : ""}\uFFFC`,
+      references: [...value.references, reference],
+      clientNonce: crypto.randomUUID(),
+      error: null,
+      linking: false,
+      referenceInput: "",
+      referenceError: null,
+    }));
+  };
+
+  const editorValue = (): EditorBlock[] => [{
+    type: "paragraph",
+    markdown: draft().content,
+    references: draft().references,
+  }];
 
   return (
     <div class="chat-composer">
@@ -137,25 +192,103 @@ export function ChatComposer(props: ChatComposerProps) {
           value={editorValue()}
           readOnly={!interactive() || draft().sending}
           inputLabel={`Message ${props.topic}`}
+          referenceLabel={artifactRefLabel}
+          referenceHref={artifactRefHref}
           onSubmit={() => void send()}
           onChange={(blocks) => {
             const conversationId = props.conversationId;
             updateDraft(conversationId, (current) => ({
               ...current,
               content: blocks.map((block) => block.markdown).join("\n"),
+              references: blocks.flatMap((block) => block.references ?? []),
               clientNonce: crypto.randomUUID(),
               error: null,
             }));
           }}
         />
       </div>
-      <div class="chat-composer-footer">
-        <Show
-          when={draft().error}
-          fallback={<span id="chat-composer-hint">Enter to send · Shift+Enter for a new line</span>}
+      <Show when={draft().linking}>
+        <form
+          class="chat-reference-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            addReference();
+          }}
         >
-          {(message) => <span id="chat-composer-error" role="alert" class="chat-field-error">{message()}</span>}
-        </Show>
+          <label>
+            Canonical Myelin reference
+            <input
+              value={draft().referenceInput}
+              maxlength={1024}
+              autocomplete="off"
+              autofocus
+              placeholder="myelin://workspace/issue/issue/ENG-41"
+              aria-invalid={Boolean(draft().referenceError)}
+              onInput={(event) => {
+                const conversationId = props.conversationId;
+                updateDraft(conversationId, (current) => ({
+                  ...current,
+                  referenceInput: event.currentTarget.value,
+                  referenceError: null,
+                }));
+              }}
+            />
+          </label>
+          <div>
+            <button
+              type="submit"
+              class="chat-button chat-button-primary"
+              disabled={!draft().referenceInput.trim()}
+            >
+              Add reference
+            </button>
+            <button
+              type="button"
+              class="chat-button chat-button-secondary"
+              onClick={() => {
+                const conversationId = props.conversationId;
+                updateDraft(conversationId, (current) => ({
+                  ...current,
+                  linking: false,
+                  referenceInput: "",
+                  referenceError: null,
+                }));
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+          <Show
+            when={draft().referenceError}
+            fallback={<p>Paste a reference copied from an issue, pull request, CI run, or Knowledge page.</p>}
+          >
+            {(message) => <p role="alert" class="chat-field-error">{message()}</p>}
+          </Show>
+        </form>
+      </Show>
+      <div class="chat-composer-footer">
+        <div class="chat-composer-guidance">
+          <button
+            type="button"
+            class="chat-link-work"
+            disabled={draft().sending || draft().references.length >= 32}
+            title={draft().references.length >= 32
+              ? "This message has reached its structured-reference limit"
+              : undefined}
+            onClick={() => {
+              const conversationId = props.conversationId;
+              updateDraft(conversationId, (current) => ({ ...current, linking: true }));
+            }}
+          >
+            <Icon name="link" /> Link work
+          </button>
+          <Show
+            when={draft().error}
+            fallback={<span id="chat-composer-hint">Enter to send · Shift+Enter for a new line</span>}
+          >
+            {(message) => <span id="chat-composer-error" role="alert" class="chat-field-error">{message()}</span>}
+          </Show>
+        </div>
         <button
           type="button"
           class="chat-button chat-button-primary"

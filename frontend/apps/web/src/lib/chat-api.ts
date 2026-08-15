@@ -164,16 +164,21 @@ export const chatMutate = action(async (mutation: ChatMutation) => {
       const parsed = parseChatMessageDraft({
         conversationId: mutation.conversationId,
         content: mutation.content,
+        references: mutation.references,
         clientNonce: mutation.clientNonce,
       });
       if (!parsed || Object.keys(mutation).some((key) =>
-        !["op", "conversationId", "content", "clientNonce"].includes(key))) {
+        !["op", "conversationId", "content", "references", "clientNonce"].includes(key))) {
         return result({ ok: false, error: "bad-input" });
       }
       const receipt = await chatAuthed(async () => {
         const decoded = parseChatMessageReceipt(await edgePost(
           `/v1/chat/conversations/${segment(parsed.conversationId)}/messages`,
-          { content: parsed.content, client_nonce: parsed.clientNonce },
+          {
+            content: parsed.content,
+            references: parsed.references,
+            client_nonce: parsed.clientNonce,
+          },
         ));
         if (!decoded) throw new ChatRouteError("error");
         return decoded;

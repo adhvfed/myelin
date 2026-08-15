@@ -64,6 +64,7 @@ export interface ChatConversationDraft {
 export interface ChatMessageDraft {
   conversationId: string;
   content: string;
+  references: string[];
   clientNonce: string;
 }
 
@@ -214,12 +215,16 @@ export function parseChatConversationDraft(value: unknown): ChatConversationDraf
 
 export function parseChatMessageDraft(value: unknown): ChatMessageDraft | null {
   const draft = record(value);
-  if (!draft || !exact(draft, ["conversationId", "content", "clientNonce"]) ||
+  if (!draft || !exact(draft, ["conversationId", "content", "references", "clientNonce"]) ||
       !isChatUlid(draft.conversationId) || !cleanText(draft.content, 32 * 1024) ||
-      !draft.content.trim() || !isClientNonce(draft.clientNonce)) return null;
+      !draft.content.trim() || !Array.isArray(draft.references) || draft.references.length > 32 ||
+      !draft.references.every(isStorableArtifactRef) ||
+      [...draft.content].filter((character) => character === "\uFFFC").length !== draft.references.length ||
+      !isClientNonce(draft.clientNonce)) return null;
   return {
     conversationId: draft.conversationId,
     content: draft.content,
+    references: draft.references,
     clientNonce: draft.clientNonce,
   };
 }

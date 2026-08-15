@@ -44,6 +44,11 @@ function cleanMessage(value) {
     });
 }
 
+function storableArtifactRef(value) {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= 1024 &&
+    /^myelin:\/\/[^/\s]+\/[^/\s]+\/[^/\s]+\/[^/#\s]+(?:#\S+)?$/.test(value);
+}
+
 function validIdempotencyKey(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 128 &&
     [...value].every((character) => {
@@ -191,7 +196,10 @@ export class ChatFixtures {
 
   postMessage(conversationId, body) {
     if (!this.conversations.some((row) => row.id === conversationId)) return { status: 404 };
-    if (!exactObject(body, ["content", "client_nonce"]) || !cleanMessage(body.content) ||
+    if (!exactObject(body, ["content", "references", "client_nonce"]) || !cleanMessage(body.content) ||
+        !Array.isArray(body.references) || body.references.length > 32 ||
+        !body.references.every(storableArtifactRef) ||
+        [...body.content].filter((character) => character === "\uFFFC").length !== body.references.length ||
         typeof body.client_nonce !== "string" ||
         !/^[A-Za-z0-9_-]{1,128}$/.test(body.client_nonce)) return { status: 400 };
     const rows = this.messages.get(conversationId) ?? [];
@@ -202,7 +210,7 @@ export class ChatFixtures {
       author: AUTHOR,
       author_kind: "human",
       content: body.content,
-      nodes: [],
+      nodes: body.references.map((ref) => ({ kind: "artifact_ref", ref })),
       created_at: 1_750_001_000 + this.sequence,
       client_nonce: body.client_nonce,
     };

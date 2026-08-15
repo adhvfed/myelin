@@ -365,6 +365,53 @@ a.chat-message-node:hover {
   color: var(--text-subtle);
   font-size: var(--fs-caption);
 }
+.chat-composer-footer > .chat-button { flex: none; }
+.chat-composer-guidance {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.chat-link-work {
+  min-height: var(--control-h);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding-inline: var(--space-1);
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.chat-link-work:hover:not(:disabled) { color: var(--text-primary); }
+.chat-link-work:disabled { opacity: .55; cursor: not-allowed; }
+.chat-reference-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--space-2);
+  margin-block-start: var(--space-2);
+  padding: var(--space-2);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-1);
+  background: var(--surface);
+}
+.chat-reference-form label { min-width: 0; color: var(--text-muted); font-weight: var(--weight-medium); }
+.chat-reference-form input {
+  width: 100%;
+  min-height: var(--control-h);
+  display: block;
+  margin-block-start: var(--space-1);
+  padding-inline: var(--space-2);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-1);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+.chat-reference-form input[aria-invalid="true"] { border-color: var(--danger); }
+.chat-reference-form > div { display: flex; gap: var(--space-1); }
+.chat-reference-form p { grid-column: 1 / -1; margin: 0; color: var(--text-subtle); }
 
 .chat-topic-form { display: flex; flex-direction: column; gap: var(--space-3); }
 .chat-field-label { color: var(--text-primary); font-size: var(--fs-caption); font-weight: var(--weight-medium); }
@@ -428,7 +475,10 @@ a.chat-message-node:hover {
   .chat-timeline,
   .chat-composer { padding-inline: var(--space-2); }
   .chat-composer-footer { align-items: flex-end; }
-  .chat-composer-footer > span { max-width: 18ch; }
+  .chat-composer-guidance > span { max-width: 18ch; }
+  .chat-composer-guidance { align-items: flex-start; flex-direction: column; }
+  .chat-reference-form { grid-template-columns: 1fr; align-items: stretch; }
+  .chat-reference-form > div { flex-wrap: wrap; }
   .chat-message { grid-template-columns: 1.75rem minmax(0, 1fr); }
   .chat-avatar { width: 1.75rem; height: 1.75rem; }
 }

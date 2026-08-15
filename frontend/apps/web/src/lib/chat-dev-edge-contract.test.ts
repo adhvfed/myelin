@@ -34,6 +34,18 @@ describe("development Chat contract", () => {
     expect(chat.listConversations({ cursor: undefined, limit: 50 }).items).toEqual([
       created.json.conversation,
     ]);
+
+    const reference = "myelin://acme/issue/issue/MYL-7";
+    expect(chat.postMessage(created.json.conversation.id, {
+      content: "Track \uFFFC.",
+      references: [reference],
+      client_nonce: "message-1",
+    }).status).toBe(201);
+    expect(chat.listMessages(created.json.conversation.id, { before: undefined, limit: 50 })
+      ?.items[0]).toMatchObject({
+      content: "Track \uFFFC.",
+      nodes: [{ kind: "artifact_ref", ref: reference }],
+    });
   });
 
   it("scopes topic retry identities to one exact draft", () => {

@@ -1,7 +1,7 @@
 import { Icon } from "@myelin/design-system";
 import { Show, createSignal, createUniqueId } from "solid-js";
 
-import { isStorableArtifactRef, parseArtifactRef } from "~/lib/artifact-ref";
+import { relatedArtifactRefError, type RelatedArtifactRefError } from "~/lib/artifact-ref";
 
 export interface KnowledgeReferenceComposerProps {
   pageRef: string;
@@ -9,6 +9,13 @@ export interface KnowledgeReferenceComposerProps {
   disabled: boolean;
   atCapacity: boolean;
   onAdd: (reference: string) => void;
+}
+
+function errorCopy(error: RelatedArtifactRefError): string {
+  if (error === "cross-tenant") return "Related work must belong to this workspace.";
+  if (error === "self") return "Choose work outside this page.";
+  if (error === "duplicate") return "This work is already linked from the page.";
+  return "Paste a complete canonical myelin:// reference.";
 }
 
 export function KnowledgeReferenceComposer(props: KnowledgeReferenceComposerProps) {
@@ -25,22 +32,9 @@ export function KnowledgeReferenceComposer(props: KnowledgeReferenceComposerProp
 
   const add = () => {
     const reference = draft().trim();
-    const target = parseArtifactRef(reference);
-    const source = parseArtifactRef(props.pageRef);
-    if (!isStorableArtifactRef(reference) || !target || !source) {
-      setError("Paste a complete canonical myelin:// reference.");
-      return;
-    }
-    if (target.tenant !== source.tenant) {
-      setError("Related work must belong to this workspace.");
-      return;
-    }
-    if (target.root === source.root) {
-      setError("Choose work outside this page.");
-      return;
-    }
-    if (props.references.includes(reference)) {
-      setError("This work is already linked from the page.");
+    const validation = relatedArtifactRefError(props.pageRef, reference, props.references);
+    if (validation) {
+      setError(errorCopy(validation));
       return;
     }
     props.onAdd(reference);

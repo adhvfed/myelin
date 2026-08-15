@@ -140,6 +140,7 @@ export function ChatTimeline(props: ChatTimelineProps) {
 
       <ChatComposer
         conversationId={props.conversation.id}
+        conversationRef={props.conversation.ref}
         topic={props.conversation.topic}
         onPosted={props.onPosted}
       />

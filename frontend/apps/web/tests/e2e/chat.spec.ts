@@ -63,6 +63,33 @@ test.describe("Chat workspace", () => {
     await expect(page.getByLabel("Message agent operations")).toHaveText(agentDraft);
   });
 
+  test("sends a structured work reference that remains navigable after reload", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/chat");
+    await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
+
+    const message = "Review the linked issue before continuing the rollout.";
+    await page.getByLabel("Message release readiness").fill(message);
+    await page.getByRole("button", { name: "Link work" }).click();
+    await page.getByRole("textbox", { name: "Canonical Myelin reference" })
+      .fill("myelin://acme/issue/issue/MYL-777");
+    await expectAccessible(page, "Chat reference composer");
+    await page.getByRole("button", { name: "Add reference" }).click();
+    await expect(page.getByRole("link", { name: "Reference: MYL-777" }))
+      .toHaveAttribute("href", "/issues?state=all&key=MYL-777");
+
+    await page.getByRole("button", { name: "Send" }).click();
+    const posted = page.locator(".chat-message-you").filter({ hasText: message });
+    await expect(posted).toHaveCount(1);
+    await expect(posted.getByRole("link", { name: "MYL-777" }))
+      .toHaveAttribute("href", "/issues?state=all&key=MYL-777");
+
+    await page.reload();
+    const durable = page.locator(".chat-message-you").filter({ hasText: message });
+    await expect(durable).toHaveCount(1);
+    await expect(durable.getByRole("link", { name: "MYL-777" })).toBeVisible();
+  });
+
   test("a first user can create a topic, send with Enter, and reload without losing it", async ({ page, request }) => {
     const empty = await request.post(`${EDGE}/__test/config`, { data: { emptyChat: true } });
     expect(empty.ok()).toBe(true);
