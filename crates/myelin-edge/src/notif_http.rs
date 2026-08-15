@@ -372,7 +372,7 @@ fn can_read_subject(
                     if git.authorize_pr_review(
                         &principal.tenant.0,
                         &principal.region.0,
-                        repo,
+                        &repo,
                         number,
                         principal,
                     ) {
@@ -402,36 +402,40 @@ fn can_read_subject(
     )
 }
 
-fn git_pr_coordinate<'a>(
-    subject: &'a ArtifactRef,
-    expected_tenant: &str,
-) -> Option<(&'a str, u64)> {
-    let rest = subject
-        .0
-        .strip_prefix(&format!("myelin://{expected_tenant}/git/pr/"))?;
-    let (repo, number) = rest.split_once(':')?;
-    if repo.is_empty() || repo.contains('/') || repo.chars().any(char::is_control) {
+fn git_pr_coordinate(subject: &ArtifactRef, expected_tenant: &str) -> Option<(String, u64)> {
+    let parsed = myelin_refs::parse_scoped(&subject.0).ok()?;
+    if parsed.tenant.as_str() != expected_tenant
+        || parsed.subsystem != "git"
+        || parsed.type_ != "pr"
+        || parsed.sub.is_some()
+    {
         return None;
     }
-    Some((repo, number.parse().ok()?))
+    let (repo, number) = git_pr_parts(&parsed.id)?;
+    Some((repo.to_string(), number))
+}
+
+fn git_pr_parts(id: &str) -> Option<(&str, u64)> {
+    let (repo, number) = id.rsplit_once(':')?;
+    myelin_git::gix_backend::validate_repo_slug(repo).ok()?;
+    let parsed = number.parse::<u64>().ok()?;
+    (parsed > 0 && parsed.to_string() == number).then_some((repo, parsed))
 }
 
 fn git_repo_subject(subject: &ArtifactRef, expected_tenant: &str) -> Option<ArtifactRef> {
-    let rest = subject
-        .0
-        .strip_prefix(&format!("myelin://{expected_tenant}/git/"))?;
-    let (kind, id) = rest.split_once('/')?;
-    if id.is_empty() || id.contains('/') || id.contains('#') {
+    let parsed = myelin_refs::parse_scoped(&subject.0).ok()?;
+    if parsed.tenant.as_str() != expected_tenant
+        || parsed.subsystem != "git"
+        || parsed.sub.is_some()
+    {
         return None;
     }
-    let slug = match kind {
-        "repo" => id.strip_prefix("repo:").unwrap_or(id),
-        "pr" => id.split_once(':')?.0,
+    let slug = match parsed.type_.as_str() {
+        "repo" => parsed.id.strip_prefix("repo:").unwrap_or(&parsed.id),
+        "pr" => git_pr_parts(&parsed.id)?.0,
         _ => return None,
     };
-    if slug.is_empty() || slug.chars().any(char::is_control) {
-        return None;
-    }
+    myelin_git::gix_backend::validate_repo_slug(slug).ok()?;
     Some(ArtifactRef(format!("repo:{slug}")))
 }
 
@@ -568,13 +572,35 @@ mod tests {
         );
         assert_eq!(
             git_pr_coordinate(&ArtifactRef("myelin://acme/git/pr/core:42".into()), "acme"),
-            Some(("core", 42))
+            Some(("core".into(), 42))
+        );
+        assert_eq!(
+            git_repo_subject(
+                &ArtifactRef("myelin://acme/git/pr/team/core:42".into()),
+                "acme"
+            ),
+            Some(ArtifactRef("repo:team/core".into()))
+        );
+        assert_eq!(
+            git_repo_subject(
+                &ArtifactRef("myelin://acme/git/repo/team/core".into()),
+                "acme"
+            ),
+            Some(ArtifactRef("repo:team/core".into()))
+        );
+        assert_eq!(
+            git_pr_coordinate(
+                &ArtifactRef("myelin://acme/git/pr/team/core:42".into()),
+                "acme"
+            ),
+            Some(("team/core".into(), 42))
         );
         for subject in [
             "myelin://other/git/pr/core:42",
             "myelin://acme/git/pr/no-repo-coordinate",
             "myelin://acme/git/blob/core:deadbeef",
-            "myelin://acme/git/pr/team/core:42",
+            "myelin://acme/git/pr/team//core:42",
+            "myelin://acme/git/pr/team/core:0",
         ] {
             assert_eq!(git_repo_subject(&ArtifactRef(subject.into()), "acme"), None);
             assert_eq!(

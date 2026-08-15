@@ -2,6 +2,7 @@ import { For, Match, Show, Switch, createSignal } from "solid-js";
 import { Dialog, Icon, useToast } from "@myelin/design-system";
 
 import type { AutomationApprovalDecision } from "../lib/api";
+import { artifactRefHref, artifactRefLabel } from "../lib/artifact-ref";
 import { inboxReasonLabel, type InboxItem } from "../lib/inbox-response";
 import type { InboxState } from "../lib/notifications";
 
@@ -122,7 +123,16 @@ export function InboxDialog(props: InboxDialogProps) {
                         {inboxReasonLabel(item.reason)}
                         <Show when={item.coalesce_count > 1}> · {item.coalesce_count} events</Show>
                       </strong>
-                      <code>{item.subject}</code>
+                      <Show
+                        when={artifactRefHref(item.subject)}
+                        fallback={<code>{item.subject}</code>}
+                      >
+                        {(href) => (
+                          <a href={href()} title={item.subject}>
+                            <code>{artifactRefLabel(item.subject)}</code>
+                          </a>
+                        )}
+                      </Show>
                       <Show when={item.state === "unread"}>
                         <button
                           type="button"

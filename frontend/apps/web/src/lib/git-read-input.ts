@@ -1,4 +1,5 @@
 import { isFullGitRef } from "./git-ref";
+import { isGitRepositorySlug } from "./artifact-ref";
 
 export { isFullGitRef } from "./git-ref";
 
@@ -60,12 +61,6 @@ function hasControl(value: string): boolean {
     const point = character.codePointAt(0)!;
     return point <= 0x1f || point === 0x7f;
   });
-}
-
-function repo(value: unknown): value is string {
-  return bounded(value, 255) && value.length > 0 && value.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  );
 }
 
 function refName(value: unknown): value is string {
@@ -139,9 +134,11 @@ function prNumber(value: unknown): value is number {
 }
 
 export function parseGitRepoInput(value: unknown): GitRepoInput | null {
-  if (typeof value === "string") return repo(value) ? { repo: value } : null;
+  if (typeof value === "string") return isGitRepositorySlug(value) ? { repo: value } : null;
   const input = record(value);
-  return input && exact(input, ["repo"]) && repo(input.repo) ? { repo: input.repo } : null;
+  return input && exact(input, ["repo"]) && isGitRepositorySlug(input.repo)
+    ? { repo: input.repo }
+    : null;
 }
 
 export function parseGitRepoListInput(value: unknown): GitRepoListInput | null {
@@ -166,7 +163,7 @@ export function gitRepoListSearchParams(input: GitRepoListInput): URLSearchParam
 export function parseGitRefsInput(value: unknown): GitRefsInput | null {
   const input = record(value);
   if (!input || !exact(input, ["repo", "limit", "cursor", "q", "current"]) ||
-      !repo(input.repo) || (input.limit !== undefined &&
+      !isGitRepositorySlug(input.repo) || (input.limit !== undefined &&
         (!Number.isSafeInteger(input.limit) || (input.limit as number) < 1 ||
           (input.limit as number) > 100)) ||
       (input.cursor !== undefined && !refsCursor(input.cursor)) ||
@@ -192,7 +189,7 @@ export function gitRefsSearchParams(input: GitRefsInput): URLSearchParams {
 
 export function parseGitBrowseInput(value: unknown, allowEmptyPath: boolean): GitBrowseInput | null {
   const input = record(value);
-  return input && exact(input, ["repo", "ref", "path"]) && repo(input.repo) &&
+  return input && exact(input, ["repo", "ref", "path"]) && isGitRepositorySlug(input.repo) &&
     refName(input.ref) && path(input.path, allowEmptyPath)
     ? { repo: input.repo, ref: input.ref, path: input.path }
     : null;
@@ -201,7 +198,7 @@ export function parseGitBrowseInput(value: unknown, allowEmptyPath: boolean): Gi
 export function parseGitTreeInput(value: unknown): GitTreeInput | null {
   const input = record(value);
   if (!input || !exact(input, ["repo", "ref", "path", "limit", "cursor", "q"]) ||
-      !repo(input.repo) || !refName(input.ref) || !path(input.path, true) ||
+      !isGitRepositorySlug(input.repo) || !refName(input.ref) || !path(input.path, true) ||
       (input.limit !== undefined && (!Number.isSafeInteger(input.limit) ||
         (input.limit as number) < 1 || (input.limit as number) > 100)) ||
       (input.cursor !== undefined && !treeCursor(input.cursor)) ||
@@ -226,7 +223,7 @@ export function gitTreeSearchParams(input: GitTreeInput): URLSearchParams {
 
 export function parseGitCommitsInput(value: unknown): GitCommitsInput | null {
   const input = record(value);
-  if (!input || !exact(input, ["repo", "ref", "cursor"]) || !repo(input.repo) ||
+  if (!input || !exact(input, ["repo", "ref", "cursor"]) || !isGitRepositorySlug(input.repo) ||
       !refName(input.ref) || (input.cursor !== undefined &&
         (!bounded(input.cursor, 4 * 1024) || hasControl(input.cursor)))) return null;
   return {
@@ -238,7 +235,7 @@ export function parseGitCommitsInput(value: unknown): GitCommitsInput | null {
 
 export function parseGitCommitInput(value: unknown): GitCommitInput | null {
   const input = record(value);
-  return input && exact(input, ["repo", "oid"]) && repo(input.repo) &&
+  return input && exact(input, ["repo", "oid"]) && isGitRepositorySlug(input.repo) &&
     typeof input.oid === "string" && /^[0-9a-f]{40}$/.test(input.oid)
     ? { repo: input.repo, oid: input.oid }
     : null;
@@ -246,14 +243,15 @@ export function parseGitCommitInput(value: unknown): GitCommitInput | null {
 
 export function parseGitPrInput(value: unknown): GitPrInput | null {
   const input = record(value);
-  return input && exact(input, ["repo", "n"]) && repo(input.repo) && prNumber(input.n)
+  return input && exact(input, ["repo", "n"]) && isGitRepositorySlug(input.repo) && prNumber(input.n)
     ? { repo: input.repo, n: input.n }
     : null;
 }
 
 export function parseGitRepoPrsInput(value: unknown): GitRepoPrsInput | null {
   const input = record(value);
-  if (!input || !exact(input, ["repo", "state", "sort", "cursor"]) || !repo(input.repo) ||
+  if (!input || !exact(input, ["repo", "state", "sort", "cursor"]) ||
+      !isGitRepositorySlug(input.repo) ||
       (input.state !== undefined && !["open", "merged", "closed", "all"].includes(input.state as string)) ||
       (input.sort !== undefined && input.sort !== "updated" && input.sort !== "created") ||
       (input.cursor !== undefined && !safeCursor(input.cursor))) return null;
@@ -278,7 +276,8 @@ export function parseGitMyPrsInput(value: unknown): GitMyPrsInput | null {
 
 export function parseGitPrCommitsInput(value: unknown): GitPrCommitsInput | null {
   const input = record(value);
-  if (!input || !exact(input, ["repo", "n", "limit", "cursor"]) || !repo(input.repo) ||
+  if (!input || !exact(input, ["repo", "n", "limit", "cursor"]) ||
+      !isGitRepositorySlug(input.repo) ||
       !prNumber(input.n) || (input.limit !== undefined && (!Number.isSafeInteger(input.limit) ||
         (input.limit as number) < 1 || (input.limit as number) > 100)) ||
       (input.cursor !== undefined && !isPrCommitCursor(input.cursor))) return null;
@@ -305,7 +304,8 @@ export function gitPrCommitsPath(input: GitPrCommitsInput): string {
 
 export function parseGitPrDiffInput(value: unknown): GitPrDiffInput | null {
   const input = record(value);
-  if (!input || !exact(input, ["repo", "n", "cursor", "view"]) || !repo(input.repo) ||
+  if (!input || !exact(input, ["repo", "n", "cursor", "view"]) ||
+      !isGitRepositorySlug(input.repo) ||
       !prNumber(input.n) || (input.cursor !== undefined && !safeCursor(input.cursor)) ||
       (input.view !== undefined && input.view !== "split" && input.view !== "unified")) return null;
   return {

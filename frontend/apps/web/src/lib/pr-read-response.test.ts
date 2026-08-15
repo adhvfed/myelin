@@ -43,7 +43,7 @@ describe("PR read response projection", () => {
   it("projects the durable PR record", () => {
     expect(parsePr({
       number: 42,
-      ref: "myelin://acme/git/pr/core:42",
+      ref: "myelin://acme/git/pr/platform/api:42",
       pr_state: "open",
       title: "Bound the PR read path",
       body_md: "No unchecked JSON.",
@@ -61,7 +61,7 @@ describe("PR read response projection", () => {
       storage_key: "drop",
     })).toEqual({
       number: 42,
-      ref: "myelin://acme/git/pr/core:42",
+      ref: "myelin://acme/git/pr/platform/api:42",
       pr_state: "open",
       title: "Bound the PR read path",
       body_md: "No unchecked JSON.",

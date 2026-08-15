@@ -11,7 +11,7 @@ import type {
   PrListRowVM,
   PrVM,
 } from "./api";
-import { parseArtifactRef } from "./artifact-ref";
+import { isGitRepositorySlug, parseGitPullRequestRef } from "./artifact-ref";
 import { isBranchRef } from "./git-ref";
 
 type WireRecord = Record<string, unknown>;
@@ -56,16 +56,9 @@ function safePath(value: unknown): value is string {
     }) && value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
 }
 
-function repo(value: unknown): value is string {
-  return bounded(value, 255) && value.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  );
-}
-
 function prRef(value: unknown, number: number): value is string {
-  const parsed = parseArtifactRef(value);
-  return parsed !== null && parsed.subsystem === "git" && parsed.type === "pr" &&
-    parsed.sub === null && parsed.id.endsWith(`:${number}`);
+  const parsed = parseGitPullRequestRef(value);
+  return parsed !== null && parsed.sub === null && parsed.number === String(number);
 }
 
 function checksSummary(value: unknown): ChecksSummaryVM | null {
@@ -92,7 +85,7 @@ function prListRow(value: unknown): PrListRowVM | null {
       !["requested", "approved", "changes", "none"].includes(input.review_state as string) ||
       typeof input.you_are_requested !== "boolean" || !summary ||
       !(input.updated_at === null || uint(input.updated_at)) ||
-      !(input.repo === null || repo(input.repo))) return null;
+      !(input.repo === null || isGitRepositorySlug(input.repo))) return null;
   return {
     number: input.number,
     title: input.title,

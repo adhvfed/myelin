@@ -18,6 +18,14 @@ export interface ArtifactRefParts {
   root: string;
 }
 
+export interface GitPullRequestRef {
+  tenant: string;
+  repo: string;
+  number: string;
+  sub: string | null;
+  root: string;
+}
+
 export function parseArtifactRef(value: unknown): ArtifactRefParts | null {
   if (typeof value !== "string" || utf8.encode(value).byteLength > MAX_ARTIFACT_REF_BYTES ||
       [...value].some((character) => character.charCodeAt(0) <= 0x20 || character.charCodeAt(0) === 0x7f)) {
@@ -44,6 +52,27 @@ function isCanonicalU64(value: string): boolean {
   if (!/^(?:0|[1-9][0-9]*)$/.test(value)) return false;
   return value.length < MAX_U64.length ||
     (value.length === MAX_U64.length && value <= MAX_U64);
+}
+
+export function isGitRepositorySlug(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || utf8.encode(value).byteLength > 255) {
+    return false;
+  }
+  const parts = value.split("/");
+  return parts.every((part) => part !== "" && part !== "." && part !== ".." &&
+    /^[A-Za-z0-9._-]+$/.test(part)) &&
+    !parts.slice(0, -1).some((part) => part.toLowerCase().endsWith(".git"));
+}
+
+export function parseGitPullRequestRef(value: unknown): GitPullRequestRef | null {
+  const parsed = parseArtifactRef(value);
+  if (!parsed || parsed.subsystem !== "git" || parsed.type !== "pr") return null;
+  const separator = parsed.id.lastIndexOf(":");
+  if (separator <= 0) return null;
+  const repo = parsed.id.slice(0, separator);
+  const number = parsed.id.slice(separator + 1);
+  if (!isGitRepositorySlug(repo) || number === "0" || !isCanonicalU64(number)) return null;
+  return { tenant: parsed.tenant, repo, number, sub: parsed.sub, root: parsed.root };
 }
 
 function unsignedLessThanOrEqual(left: string, right: string): boolean {
@@ -94,12 +123,8 @@ export function artifactRefLabel(reference: string): string {
   const parsed = parseArtifactRef(reference);
   if (!parsed) return "Linked work";
   if (parsed.subsystem === "issue" && parsed.type === "issue") return parsed.id;
-  if (parsed.subsystem === "git" && parsed.type === "pr") {
-    const separator = parsed.id.lastIndexOf(":");
-    if (separator > 0 && /^[1-9][0-9]*$/.test(parsed.id.slice(separator + 1))) {
-      return `${parsed.id.slice(0, separator)} #${parsed.id.slice(separator + 1)}`;
-    }
-  }
+  const pullRequest = parseGitPullRequestRef(reference);
+  if (pullRequest) return `${pullRequest.repo} #${pullRequest.number}`;
   if (parsed.subsystem === "knowledge" && parsed.type === "page") {
     return `Knowledge · ${parsed.id.slice(-6)}`;
   }
@@ -116,15 +141,12 @@ export function artifactRefHref(reference: string): string | undefined {
   if (parsed.subsystem === "knowledge" && parsed.type === "page") {
     return `/knowledge?page=${encodeURIComponent(parsed.id)}`;
   }
-  if (parsed.subsystem === "git" && parsed.type === "repo") {
+  if (parsed.subsystem === "git" && parsed.type === "repo" && isGitRepositorySlug(parsed.id)) {
     return `/git/repos/${encodeURIComponent(parsed.id)}`;
   }
-  if (parsed.subsystem === "git" && parsed.type === "pr") {
-    const separator = parsed.id.lastIndexOf(":");
-    const number = parsed.id.slice(separator + 1);
-    if (separator > 0 && /^[1-9][0-9]*$/.test(number)) {
-      return `/git/repos/${encodeURIComponent(parsed.id.slice(0, separator))}/prs/${number}`;
-    }
+  const pullRequest = parseGitPullRequestRef(reference);
+  if (pullRequest) {
+    return `/git/repos/${encodeURIComponent(pullRequest.repo)}/prs/${pullRequest.number}`;
   }
   if (parsed.subsystem === "ci" && parsed.type === "run") {
     return `/ci/runs/${encodeURIComponent(parsed.id)}`;

@@ -210,12 +210,18 @@ test.describe("R3.5 first-run — honest inbox", () => {
     await expect(inboxButton).toHaveAttribute("aria-label", /1 unread notification/i);
     await inboxButton.click();
     const dialog = page.getByRole("dialog", { name: "Inbox" });
-    await expect(dialog).toContainText("myelin://acme/git/pr/myelin:42");
-    await expect(dialog).not.toContainText("myelin://acme/git/pr/myelin:43");
+    const firstPullRequest = dialog.getByRole("link", { name: "platform/myelin #42" });
+    await expect(firstPullRequest).toHaveAttribute("href", "/git/repos/platform%2Fmyelin/prs/42");
+    await expect(firstPullRequest).toHaveAttribute(
+      "title",
+      "myelin://acme/git/pr/platform/myelin:42",
+    );
+    await expect(dialog.getByRole("link", { name: "platform/myelin #43" })).toHaveCount(0);
 
     await dialog.getByRole("button", { name: "Load more" }).click();
-    await expect(dialog).toContainText("myelin://acme/git/pr/myelin:42");
-    await expect(dialog).toContainText("myelin://acme/git/pr/myelin:43");
+    await expect(firstPullRequest).toBeVisible();
+    await expect(dialog.getByRole("link", { name: "platform/myelin #43" }))
+      .toHaveAttribute("href", "/git/repos/platform%2Fmyelin/prs/43");
     await expect(dialog.getByRole("button", { name: "Load more" })).toHaveCount(0);
     await expect(inboxButton).toHaveAttribute("aria-label", /2 unread notifications/i);
     await expectNoAxeViolations(page, "a paged inbox");

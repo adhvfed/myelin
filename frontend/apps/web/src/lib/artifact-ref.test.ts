@@ -4,6 +4,7 @@ import {
   artifactRefHref,
   artifactRefLabel,
   parseArtifactRef,
+  parseGitPullRequestRef,
   relatedArtifactRefError,
 } from "./artifact-ref";
 
@@ -56,6 +57,25 @@ describe("artifact references", () => {
       .toBe("/git/repos/platform%2Fapi/prs/42");
     expect(artifactRefHref("myelin://acme/git/repo/platform/api"))
       .toBe("/git/repos/platform%2Fapi");
+    expect(artifactRefHref("myelin://acme/git/repo/platform.git/api")).toBeUndefined();
+  });
+
+  it("parses a nested pull-request coordinate once without losing numeric precision", () => {
+    expect(parseGitPullRequestRef(
+      "myelin://acme/git/pr/platform/api:18446744073709551615#comment-7",
+    )).toEqual({
+      tenant: "acme",
+      repo: "platform/api",
+      number: "18446744073709551615",
+      sub: "comment-7",
+      root: "myelin://acme/git/pr/platform/api:18446744073709551615",
+    });
+    for (const value of [
+      "myelin://acme/git/pr/platform/api:0",
+      "myelin://acme/git/pr/platform/api:01",
+      "myelin://acme/git/pr/platform/api:18446744073709551616",
+      "myelin://acme/git/pr/platform.git/api:1",
+    ]) expect(parseGitPullRequestRef(value), value).toBeNull();
   });
 
   it("validates a related-work edge against source, tenant, and existing edges", () => {

@@ -11,7 +11,7 @@ import type {
   TreeVM,
 } from "./api";
 import { isFullGitRef } from "./git-read-input";
-import { parseArtifactRef } from "./artifact-ref";
+import { isGitRepositorySlug, parseArtifactRef } from "./artifact-ref";
 
 const MAX_TEXT_BYTES = 512 * 1024;
 const MAX_PATH_BYTES = 4 * 1024;
@@ -60,12 +60,6 @@ function treePage(value: unknown): { next_cursor: string | null; limit: number }
   return { next_cursor: page.next_cursor as string | null, limit: page.limit as number };
 }
 
-function repoSlug(value: unknown): value is string {
-  return bounded(value, 255) && value.length > 0 && value.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  );
-}
-
 function repoPath(value: unknown): value is string {
   return displayText(value, MAX_PATH_BYTES) && value.length > 0 && !value.startsWith("/") &&
     !value.includes("\\") && value.split("/").every((part) =>
@@ -111,7 +105,7 @@ export function parseRepoHome(value: unknown): RepoHomeVM | null {
   if (state !== "populated" && state !== "empty" && state !== "restricted") return null;
   if (state === "restricted") return { state: "restricted" };
   const reference = parseArtifactRef(home.ref);
-  if (!repoSlug(home.slug) || !displayText(home.default_branch, 1_024) ||
+  if (!isGitRepositorySlug(home.slug) || !displayText(home.default_branch, 1_024) ||
       (home.clone_url !== undefined && !displayText(home.clone_url, 4 * 1024)) ||
       !reference || reference.sub !== null || reference.subsystem !== "git" ||
       reference.type !== "repo") return null;

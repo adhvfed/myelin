@@ -141,6 +141,7 @@ describe("Git read RPC inputs", () => {
 
   it.each([
     () => parseGitRepoInput("../core"),
+    () => parseGitRepoInput("platform.git/core"),
     () => parseGitBrowseInput({ repo: "core", ref: "main", path: "../secret" }, false),
     () => parseGitBrowseInput({ repo: "core", ref: "main", path: "", surprise: true }, true),
     () => parseGitBrowseInput({ repo: "core", ref: "main\nnext", path: "x" }, false),

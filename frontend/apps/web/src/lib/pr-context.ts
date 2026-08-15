@@ -1,10 +1,10 @@
 import { query, redirect } from "@solidjs/router";
 
 import { edgeGet, isUnauthorized } from "../server/gateway";
+import { parseGitPullRequestRef } from "./artifact-ref";
 import { isKnowledgeUlid, parseKnowledgePage } from "./knowledge-response";
 import { parseIssuesPage } from "./mutation-response";
 import {
-  isArtifactRef,
   parseRelatedRefsPage,
   RELATED_REFS_PAGE_LIMIT,
   type RelatedRefsPage,
@@ -43,7 +43,7 @@ async function read<T>(path: string, parse: (value: unknown) => T | null): Promi
 }
 
 function prRef(value: unknown): value is string {
-  return isArtifactRef(value) && /^myelin:\/\/[^/]+\/git\/pr\/[^/#]+:[1-9][0-9]*$/.test(value);
+  return parseGitPullRequestRef(value)?.sub === null;
 }
 
 function issueKey(root: string): string | null {
