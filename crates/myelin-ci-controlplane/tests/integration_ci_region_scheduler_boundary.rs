@@ -162,6 +162,99 @@ async fn insert_active_job_owner(admin: &PgPool, tenant: &str, region: &str, ord
     .expect("insert active Flow owner for scheduler fixture");
 }
 
+#[tokio::test]
+async fn scheduler_validation_distinguishes_dormant_acl_from_reachable_authority() {
+    let admin_url = configured_url("DATABASE_MIGRATION_URL", ADMIN_DEFAULT);
+    common::with_privilege_fixture_lock(&admin_url, &["ci_scheduler_probe_"], || async {
+        let app_url = configured_url("DATABASE_URL", APP_DEFAULT);
+        let scheduler_url = configured_url("MYELIN_CI_SCHEDULER_DATABASE_URL", SCHEDULER_DEFAULT);
+        let admin = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&admin_url)
+            .await
+            .expect("connect migration role");
+        PgMigrator::apply_validated(
+            &admin,
+            &ci_controlplane_migrations(),
+            &ci_controlplane_hot_tables(),
+        )
+        .await
+        .expect("apply the real CI control-plane migrations in public");
+
+        let schema = format!(
+            "ci_scheduler_probe_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        admin
+            .execute(
+                format!(
+                    "CREATE SCHEMA {schema} AUTHORIZATION myelin_admin;
+                     CREATE TABLE {schema}.unrelated_secret (value text NOT NULL);
+                     GRANT SELECT ON {schema}.unrelated_secret TO myelin_ci_region_scheduler"
+                )
+                .as_str(),
+            )
+            .await
+            .expect("create an unreachable table ACL");
+
+        common::with_schema_cleanup(&admin, &schema, || async {
+            let app = connect_pool_with_reset(&app_url, FR_PAR, 2)
+                .await
+                .expect("connect constrained app pool");
+            let raw_scheduler = connect_pool_with_reset(&scheduler_url, FR_PAR, 1)
+                .await
+                .expect("connect raw scheduler pool");
+            assert_permission_denied(
+                sqlx::query(&format!("SELECT * FROM {schema}.unrelated_secret"))
+                    .execute(&raw_scheduler)
+                    .await,
+                "a table ACL without schema usage remains unreachable",
+            );
+
+            let dormant = CiSchedulerDbConfig::from_parts(
+                scheduler_url.clone(),
+                &app_url,
+                &admin_url,
+                FR_PAR.to_owned(),
+            )
+            .expect("three distinct database credentials");
+            CiSchedulerDbProvider::connect(dormant, &app)
+                .await
+                .expect("unreachable ACLs do not expand effective scheduler authority");
+
+            admin
+                .execute(
+                    format!("GRANT USAGE ON SCHEMA {schema} TO myelin_ci_region_scheduler")
+                        .as_str(),
+                )
+                .await
+                .expect("make the unrelated table grant reachable");
+            let reachable = CiSchedulerDbConfig::from_parts(
+                scheduler_url,
+                &app_url,
+                &admin_url,
+                FR_PAR.to_owned(),
+            )
+            .expect("three distinct database credentials");
+            let refusal = match CiSchedulerDbProvider::connect(reachable, &app).await {
+                Err(error) => error,
+                Ok(_) => panic!("reachable unrelated authority must fail startup"),
+            };
+            assert_eq!(refusal, CiSchedulerDbError::ExcessPrivileges);
+
+            raw_scheduler.close().await;
+            app.close().await;
+        })
+        .await;
+        admin.close().await;
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe() {
     let lock_admin_url = configured_url("DATABASE_MIGRATION_URL", ADMIN_DEFAULT);

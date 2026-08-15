@@ -582,6 +582,9 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                      WHERE unrelated.relkind IN ('r', 'p', 'f', 'v', 'm')
                        AND namespace.nspname NOT IN ('pg_catalog', 'information_schema')
                        AND namespace.nspname NOT LIKE 'pg_toast%'
+                       AND pg_catalog.has_schema_privilege(
+                         session_user, namespace.oid, 'USAGE'
+                       )
                        AND unrelated.oid NOT IN (
                          'public.job_queue'::regclass,
                          'public.fair_deficit'::regclass,

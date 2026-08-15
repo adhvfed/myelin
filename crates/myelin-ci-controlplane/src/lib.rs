@@ -630,9 +630,9 @@ mod tests {
     fn the_shell_carries_the_complete_data_model_and_no_consumers() {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
-            spec.migrations.0.len(),
-            76,
-            "the complete CI schema and every append-only provenance follow-on are present"
+            spec.migrations,
+            ci_controlplane_migrations(),
+            "the shell carries the authoritative CI migration set byte for byte"
         );
         assert!(
             spec.consumers.is_empty(),
