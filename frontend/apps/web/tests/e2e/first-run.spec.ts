@@ -109,6 +109,8 @@ test.describe("R3.5 first-run — empty tenant onboarding", () => {
     await create.getByLabel("Name or namespace/name").fill("first-repository");
     await create.getByRole("button", { name: "Create repository" }).click();
     await page.waitForURL("**/git/repos/first-repository");
+    await expect(page.getByRole("button", { name: "Copy reference" }))
+      .toHaveAttribute("title", "myelin://acme/git/repo/first-repository");
 
     const setup = page.getByTestId("git-setup");
     await setup.getByText("Set up Git").click();

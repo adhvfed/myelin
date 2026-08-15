@@ -68,6 +68,7 @@ export const SEED_REPO_HOMES = [
   {
     state: "populated",
     slug: "acme/myelin",
+    ref: "myelin://acme/git/repo/myelin",
     default_branch: "main",
     readme: MYELIN_TREE["README.md"].file,
     readme_excerpt: "# acme/myelin\n\nThe make-it-real spine.",
@@ -90,6 +91,7 @@ export const SEED_REPO_HOMES = [
   {
     state: "empty",
     slug: "acme/sandbox",
+    ref: "myelin://acme/git/repo/sandbox",
     default_branch: "main",
     clone_url: "/acme/eu-west/sandbox.git",
     counts: { branches: 0, tags: 0 },

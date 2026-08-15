@@ -92,6 +92,8 @@ test("durable product data is available and mutable after browser login", async 
   await createDialog.getByRole("button", { name: "Create repository" }).click();
   await page.waitForURL(`**/git/repos/${slug}`);
   await expect(page.getByRole("heading", { name: `${tenant}/${slug}` })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy reference" }))
+    .toHaveAttribute("title", `myelin://${tenant}/git/repo/${slug}`);
   const gitSetup = page.getByTestId("git-setup");
   await gitSetup.getByText("Set up Git").click();
   await expect(gitSetup).toContainText(`${principal}@${tenant}.noreply`);

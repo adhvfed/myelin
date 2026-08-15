@@ -3,12 +3,14 @@ import { describe, expect, it } from "vitest";
 import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
 
 const OID = "0123456789abcdef0123456789abcdef01234567";
+const REPO_REF = "myelin://acme/git/repo/core";
 
 describe("repository read response projection", () => {
   it("projects bounded known fields and drops surplus fields recursively", () => {
     expect(parseRepoHome({
       state: "populated",
       slug: "acme/core",
+      ref: REPO_REF,
       default_branch: "main",
       entries: [{
         name: "x", path: "src/x", is_dir: false, size: 1, secret: "drop",
@@ -20,6 +22,7 @@ describe("repository read response projection", () => {
     })).toEqual({
       state: "populated",
       slug: "acme/core",
+      ref: REPO_REF,
       default_branch: "main",
       entries: [{
         name: "x", path: "src/x", is_dir: false, size: 1,
@@ -32,6 +35,7 @@ describe("repository read response projection", () => {
     expect(parseRepoHome({
       state: "populated",
       slug: "acme/core",
+      ref: REPO_REF,
       default_branch: "main",
       snapshot_oid: OID,
       entries: [{ path: "src", is_dir: true }],
@@ -49,11 +53,11 @@ describe("repository read response projection", () => {
 
   it("projects the page envelope without totals or internal metadata", () => {
     expect(parseReposPage({
-      items: [{ state: "empty", slug: "acme/core", default_branch: "main" }],
+      items: [{ state: "empty", slug: "acme/core", ref: REPO_REF, default_branch: "main" }],
       page: { next_cursor: null, limit: 50, total: 99 },
       internal: "drop",
     })).toEqual({
-      items: [{ state: "empty", slug: "acme/core", default_branch: "main" }],
+      items: [{ state: "empty", slug: "acme/core", ref: REPO_REF, default_branch: "main" }],
       page: { next_cursor: null, limit: 50 },
     });
   });
@@ -104,6 +108,32 @@ describe("repository read response projection", () => {
     expect(parseRepoHome(value)).toBeNull();
   });
 
+  it.each([
+    undefined,
+    "myelin://other/git/repo/core",
+    "myelin://acme/git/repo/other",
+    "myelin://acme/git/pr/core",
+    "myelin://acme/git/repo/core#check-build",
+  ])("rejects a repository home without its exact canonical identity: %s", (ref) => {
+    expect(parseRepoHome({
+      state: "empty", slug: "acme/core", ref, default_branch: "main",
+    })).toBeNull();
+  });
+
+  it("keeps a hierarchical repository slug and reference byte-for-byte aligned", () => {
+    expect(parseRepoHome({
+      state: "empty",
+      slug: "acme/platform/api",
+      ref: "myelin://acme/git/repo/platform/api",
+      default_branch: "main",
+    })).toEqual({
+      state: "empty",
+      slug: "acme/platform/api",
+      ref: "myelin://acme/git/repo/platform/api",
+      default_branch: "main",
+    });
+  });
+
   it("rejects unsafe browse projections", () => {
     expect(parseRefs({ branches: [{ name: "main", oid: "short" }], tags: [], default_branch: "main" })).toBeNull();
     expect(parseTree({ path: "../secret", entries: [] })).toBeNull();
@@ -142,11 +172,11 @@ describe("repository read response projection", () => {
       page: { next_cursor: null, limit: 1 },
     },
     {
-      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
       entries_page: { ref: "main", next_cursor: null, limit: 100, snapshot_oid: OID },
     },
     {
-      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
       snapshot_oid: OID,
       entries_page: {
         ref: "refs/heads/main", next_cursor: null, limit: 100,
@@ -154,11 +184,11 @@ describe("repository read response projection", () => {
       },
     },
     {
-      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
       snapshot_oid: OID,
     },
     {
-      state: "populated", slug: "acme/core", default_branch: "main", entries: [],
+      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
       entries_page: {
         ref: "refs/heads/main", next_cursor: null, limit: 100, snapshot_oid: OID,
       },

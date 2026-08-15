@@ -1,4 +1,4 @@
-import type { RepoHomeVM, TreeVM } from "./api";
+import type { PopulatedRepoHomeVM, TreeVM } from "./api";
 import type { GitTreeInput } from "./git-read-input";
 
 export const TREE_PAGE_LIMIT = 100;
@@ -75,7 +75,7 @@ export function treeLimitValue(value: unknown): number {
 
 export function repoHomeContinuationHref(
   repo: string,
-  page: NonNullable<RepoHomeVM["entries_page"]>,
+  page: NonNullable<PopulatedRepoHomeVM["entries_page"]>,
 ): string | null {
   if (!page.next_cursor) return null;
   return treeHref({

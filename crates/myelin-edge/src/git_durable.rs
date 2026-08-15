@@ -880,6 +880,7 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         let repo = self.store.open_repo(&loc)?;
         let full_slug = format!("{tenant}/{slug}");
+        let repo_ref = format!("myelin://{tenant}/git/repo/{slug}");
         let clone_url = self.clone_url(tenant, region, slug);
         let refs = repo.refs_summary()?;
         let default_branch = refs.default_branch.clone();
@@ -888,6 +889,7 @@ impl DurableGitBackend {
             return Ok(json!({
                 "state": "empty",
                 "slug": full_slug,
+                "ref": repo_ref,
                 "clone_url": clone_url,
                 "default_branch": default_branch,
                 "counts": counts,
@@ -918,6 +920,7 @@ impl DurableGitBackend {
         Ok(json!({
             "state": "populated",
             "slug": full_slug,
+            "ref": repo_ref,
             "clone_url": clone_url,
             "default_branch": default_branch,
             "readme": readme,

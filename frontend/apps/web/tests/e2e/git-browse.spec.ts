@@ -46,6 +46,8 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await page.waitForURL("**/git/repos/myelin");
 
     await expect(page.getByRole("heading", { name: "acme/myelin", level: 1 })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Copy reference" }))
+      .toHaveAttribute("title", "myelin://acme/git/repo/myelin");
     // Clone URL plus the viewer-specific privacy setup and top-level tree from the ViewModel.
     await expect(page.getByTestId("clone-url")).toContainText("/acme/eu-west/myelin.git");
     const setup = page.getByTestId("git-setup");

@@ -11,6 +11,7 @@ import { Markdown } from "~/components/Markdown";
 import { CloneUrl, GitSetupGuide } from "~/components/GitCloneSetup";
 import { repoHomeContinuationHref } from "~/lib/tree-browse-state";
 import { useAppViewer } from "~/components/AppShell";
+import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -27,7 +28,10 @@ export default function RepoHomeScreen() {
   );
   const viewer = useAppViewer();
   const toast = useToast();
-  const defaultBranch = () => repo()?.default_branch ?? "main";
+  const defaultBranch = () => {
+    const home = repo();
+    return home && home.state !== "restricted" ? home.default_branch : "main";
+  };
 
   return (
     <section aria-labelledby="repo-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
@@ -60,29 +64,39 @@ export default function RepoHomeScreen() {
                     <RepoErrorState kind="no-access" repo={params.repo} />
                   </Match>
 
-                  <Match when={home.state === "empty"}>
-                    <h1 id="repo-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>{home.slug}</h1>
-                    <div data-testid="repo-empty" style={{ ...card, display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-                      <p style={{ margin: "0", color: "var(--text-muted)" }}>This repository has no commits yet.</p>
-                      <Show when={home.clone_url} keyed>
-                        {(cloneUrl) => <>
-                          <CloneUrl url={cloneUrl} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
-                          <GitSetupGuide
-                            url={cloneUrl}
-                            principalId={viewer.principalId}
-                            tenant={viewer.tenant}
-                            defaultBranch={defaultBranch()}
-                          />
-                        </>}
-                      </Show>
-                    </div>
+                  <Match when={home.state === "empty" ? home : undefined} keyed>
+                    {(empty) => (
+                      <>
+                        <div style={{ display: "flex", "align-items": "center", gap: "var(--space-3)", "flex-wrap": "wrap" }}>
+                          <h1 id="repo-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>{empty.slug}</h1>
+                          <CopyArtifactRef reference={empty.ref} />
+                        </div>
+                        <div data-testid="repo-empty" style={{ ...card, display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+                          <p style={{ margin: "0", color: "var(--text-muted)" }}>This repository has no commits yet.</p>
+                          <Show when={empty.clone_url} keyed>
+                            {(cloneUrl) => <>
+                              <CloneUrl url={cloneUrl} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
+                              <GitSetupGuide
+                                url={cloneUrl}
+                                principalId={viewer.principalId}
+                                tenant={viewer.tenant}
+                                defaultBranch={defaultBranch()}
+                              />
+                            </>}
+                          </Show>
+                        </div>
+                      </>
+                    )}
                   </Match>
 
-                  <Match when={home.state === "populated"}>
+                  <Match when={home.state === "populated" ? home : undefined} keyed>
+                    {(populated) => (
+                      <>
                     <header style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
                       <div style={{ display: "flex", "align-items": "center", gap: "var(--space-3)", "flex-wrap": "wrap" }}>
-                        <h1 id="repo-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>{home.slug}</h1>
-                        <Show when={home.counts}>
+                        <h1 id="repo-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>{populated.slug}</h1>
+                        <CopyArtifactRef reference={populated.ref} />
+                        <Show when={populated.counts}>
                           {(c) => (
                             <span data-testid="repo-counts" style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
                               {c().branches} {c().branches === 1 ? "branch" : "branches"} <span aria-hidden="true">·</span> {c().tags} {c().tags === 1 ? "tag" : "tags"}
@@ -97,7 +111,7 @@ export default function RepoHomeScreen() {
                           currentFullRef={`refs/heads/${defaultBranch()}`}
                           hrefFor={(ref) => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref)}`}
                         />
-                        <Show when={home.clone_url} keyed>
+                        <Show when={populated.clone_url} keyed>
                           {(cloneUrl) => <>
                             <CloneUrl url={cloneUrl} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
                             <GitSetupGuide
@@ -119,7 +133,7 @@ export default function RepoHomeScreen() {
                     </header>
 
                     {/* The latest-commit bar. */}
-                    <Show when={home.latest_commit}>
+                    <Show when={populated.latest_commit}>
                       {(lc) => (
                         <div data-testid="latest-commit" style={{ ...card, display: "flex", "align-items": "center", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
                           <Icon name="commit" />
@@ -132,23 +146,23 @@ export default function RepoHomeScreen() {
 
                     <TreeList
                       repo={params.repo!}
-                      refName={home.entries_page?.ref ?? defaultBranch()}
-                      entries={home.entries ?? []}
+                      refName={populated.entries_page?.ref ?? defaultBranch()}
+                      entries={populated.entries ?? []}
                       heading={`Files on ${defaultBranch()}`}
                     />
-                    <Show when={home.entries_page && repoHomeContinuationHref(params.repo!, home.entries_page)}>
+                    <Show when={populated.entries_page && repoHomeContinuationHref(params.repo!, populated.entries_page)}>
                       {(href) => (
                         <A
                           data-testid="repo-tree-next-page"
                           href={href()}
                           style={{ color: "var(--text-primary)", "align-self": "flex-start" }}
                         >
-                          Next {home.entries_page?.limit ?? 100}
+                          Next {populated.entries_page?.limit ?? 100}
                         </A>
                       )}
                     </Show>
 
-                    <Show when={home.readme}>
+                    <Show when={populated.readme}>
                       {(readme) => (
                         <section aria-labelledby="readme-heading">
                           <h2 id="readme-heading" style={{ "font-size": "var(--fs-h3)", margin: "0 0 var(--space-2)" }}>README</h2>
@@ -158,6 +172,8 @@ export default function RepoHomeScreen() {
                         </section>
                       )}
                     </Show>
+                      </>
+                    )}
                   </Match>
                 </Switch>
               )}

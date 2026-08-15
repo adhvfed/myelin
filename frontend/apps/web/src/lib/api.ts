@@ -117,22 +117,36 @@ export interface RepoEntry {
   latest_commit?: CommitBriefVM;
 }
 
-/** The Git RepoHome ViewModel as the edge projects it (populated / empty / restricted). Extended by
- *  R3.4 with default_branch, full README, latest_commit, branch/tag counts, name-carrying entries. */
-export interface RepoHomeVM {
-  state: "populated" | "empty" | "restricted";
-  slug?: string;
+interface VisibleRepoHomeVM {
+  slug: string;
+  ref: string;
+  clone_url?: string;
+  default_branch: string;
+  counts?: { branches: number; tags: number };
+}
+
+export interface EmptyRepoHomeVM extends VisibleRepoHomeVM {
+  state: "empty";
+}
+
+/** The populated Git repository home projected by the Edge. */
+export interface PopulatedRepoHomeVM extends VisibleRepoHomeVM {
+  state: "populated";
   /** Full README markdown (rendered via the read-path / sanitized markdown renderer). */
   readme?: string;
   readme_excerpt?: string;
-  clone_url?: string;
   entries?: RepoEntry[];
-  default_branch?: string;
   latest_commit?: CommitBriefVM;
-  counts?: { branches: number; tags: number };
   snapshot_oid?: string;
   entries_page?: TreePageVM & { ref: string; snapshot_oid: string };
 }
+
+/** The Git RepoHome ViewModel is deliberately discriminated: restricted responses carry no
+ * repository metadata, while every visible repository has one canonical ArtifactRef. */
+export type RepoHomeVM =
+  | PopulatedRepoHomeVM
+  | EmptyRepoHomeVM
+  | { state: "restricted" };
 
 /** One ref row for the switcher. */
 export interface RefRow {

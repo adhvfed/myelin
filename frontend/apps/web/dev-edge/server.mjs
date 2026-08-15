@@ -1211,6 +1211,7 @@ const server = createServer((req, res) => {
       state.createdRepos.set(slug, {
         state: "empty",
         slug: `acme/${slug}`,
+        ref: `myelin://acme/git/repo/${slug}`,
         default_branch: "main",
         clone_url: `/acme/eu-west/${encodeURIComponent(slug)}.git`,
         counts: { branches: 0, tags: 0 },

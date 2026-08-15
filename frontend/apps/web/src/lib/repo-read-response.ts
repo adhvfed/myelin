@@ -6,10 +6,12 @@ import type {
   RefsVM,
   RepoEntry,
   RepoHomeVM,
+  PopulatedRepoHomeVM,
   ReposPage,
   TreeVM,
 } from "./api";
 import { isFullGitRef } from "./git-read-input";
+import { parseArtifactRef } from "./artifact-ref";
 
 const MAX_TEXT_BYTES = 512 * 1024;
 const MAX_PATH_BYTES = 4 * 1024;
@@ -108,21 +110,33 @@ export function parseRepoHome(value: unknown): RepoHomeVM | null {
   const state = home.state;
   if (state !== "populated" && state !== "empty" && state !== "restricted") return null;
   if (state === "restricted") return { state: "restricted" };
+  const reference = parseArtifactRef(home.ref);
   if (!repoSlug(home.slug) || !displayText(home.default_branch, 1_024) ||
-      (home.clone_url !== undefined && !displayText(home.clone_url, 4 * 1024))) return null;
-  const result: RepoHomeVM = {
-    state,
+      (home.clone_url !== undefined && !displayText(home.clone_url, 4 * 1024)) ||
+      !reference || reference.sub !== null || reference.subsystem !== "git" ||
+      reference.type !== "repo") return null;
+  const separator = home.slug.indexOf("/");
+  if (separator < 1 || reference.tenant !== home.slug.slice(0, separator) ||
+      reference.id !== home.slug.slice(separator + 1)) return null;
+  let counts: { branches: number; tags: number } | undefined;
+  if (home.counts !== undefined) {
+    const wireCounts = record(home.counts);
+    if (!wireCounts || !uint(wireCounts.branches) || !uint(wireCounts.tags)) return null;
+    counts = { branches: wireCounts.branches, tags: wireCounts.tags };
+  }
+  const visible = {
     slug: home.slug,
+    ref: reference.root,
     default_branch: home.default_branch,
     ...(home.clone_url === undefined ? {} : { clone_url: home.clone_url }),
+    ...(counts === undefined ? {} : { counts }),
   };
+  if (state === "empty") return { state, ...visible };
+
+  const result: PopulatedRepoHomeVM = { state, ...visible };
   const modernPagination = home.snapshot_oid !== undefined || home.entries_page !== undefined;
-  if (state === "populated" && modernPagination &&
-      (home.snapshot_oid === undefined || home.entries_page === undefined)) return null;
-  if (home.counts !== undefined) {
-    const counts = record(home.counts);
-    if (!counts || !uint(counts.branches) || !uint(counts.tags)) return null;
-    result.counts = { branches: counts.branches, tags: counts.tags };
+  if (modernPagination && (home.snapshot_oid === undefined || home.entries_page === undefined)) {
+    return null;
   }
   for (const key of ["readme", "readme_excerpt"] as const) {
     if (home[key] !== undefined) {

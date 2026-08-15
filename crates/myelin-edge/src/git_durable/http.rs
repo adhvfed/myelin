@@ -1002,6 +1002,7 @@ mod tree_page_backend_tests {
             .repo_home_json(TENANT, REGION, fixture.label())
             .expect("repo home");
         assert_eq!(home["state"], "populated");
+        assert_eq!(home["ref"], format!("myelin://{TENANT}/git/repo/wide"));
         assert_eq!(home["entries"].as_array().unwrap().len(), 100);
         assert_eq!(home["entries_page"]["limit"], 100);
         assert_eq!(home["entries_page"]["ref"], "refs/heads/main");
@@ -1035,6 +1036,18 @@ mod tree_page_backend_tests {
         assert_eq!(names.len(), 1_001);
         assert_eq!(names.first().unwrap(), "file-0000.txt");
         assert_eq!(names.last().unwrap(), "file-1000.txt");
+    }
+
+    #[test]
+    fn unborn_repo_home_exposes_the_same_canonical_identity_it_will_keep_after_first_push() {
+        let fixture = Fixture::new("unborn");
+        let home = fixture
+            .be
+            .repo_home_json(TENANT, REGION, fixture.label())
+            .expect("empty repo home");
+
+        assert_eq!(home["state"], "empty");
+        assert_eq!(home["ref"], format!("myelin://{TENANT}/git/repo/unborn"));
     }
 
     #[test]

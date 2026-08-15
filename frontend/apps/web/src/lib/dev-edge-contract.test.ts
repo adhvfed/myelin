@@ -146,7 +146,11 @@ describe("the dev Edge repository summary contract", () => {
       items: [{ state: "empty", slug: "acme/sandbox" }],
       page: { next_cursor: null, limit: 1 },
     });
-    expect(repoHomeJson("myelin")).toMatchObject({ default_branch: "main", entries: expect.any(Array) });
+    expect(repoHomeJson("myelin")).toMatchObject({
+      ref: "myelin://acme/git/repo/myelin",
+      default_branch: "main",
+      entries: expect.any(Array),
+    });
   });
 
   it("rejects unknown, duplicate, noncanonical, and out-of-bounds summary queries", () => {
