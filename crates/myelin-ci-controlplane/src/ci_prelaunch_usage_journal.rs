@@ -841,10 +841,6 @@ async fn run_parent_admission_on_conn(
         .get_launch_template_on_conn(connection, &claim.tenant_id, &claim.job_id)
         .await
         .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-    let current_authority = authority_from_durable_claim(claim, &run, &manifest, &launch)
-        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
-    let authorities = runtime_authorities_from_durable_claim(claim, &run, &manifest)
-        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
     let manifest_job = manifest
         .jobs
         .iter()
@@ -856,6 +852,10 @@ async fn run_parent_admission_on_conn(
     if launch.spec.meter_to.reserve_id.as_str() != reserve_handle {
         return Err(CiPrelaunchUsageJournalError::DispatchedReserveHandleMismatch);
     }
+    let current_authority = authority_from_durable_claim(claim, &run, &manifest, &launch)
+        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
+    let authorities = runtime_authorities_from_durable_claim(claim, &run, &manifest)
+        .map_err(|_| CiPrelaunchUsageJournalError::DurableAuthorityUnavailable)?;
 
     let reservation = sqlx::query(
         "SELECT reserved, state FROM cost_reservation
