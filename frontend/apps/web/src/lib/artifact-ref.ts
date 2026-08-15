@@ -36,12 +36,16 @@ export function parseArtifactRef(value: unknown): ArtifactRefParts | null {
   };
 }
 
-const MAX_U64 = 18_446_744_073_709_551_615n;
+const MAX_U64 = "18446744073709551615";
 
-function canonicalUnsigned(value: string): bigint | null {
-  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) return null;
-  const parsed = BigInt(value);
-  return parsed <= MAX_U64 ? parsed : null;
+function isCanonicalU64(value: string): boolean {
+  if (!/^(?:0|[1-9][0-9]*)$/.test(value)) return false;
+  return value.length < MAX_U64.length ||
+    (value.length === MAX_U64.length && value <= MAX_U64);
+}
+
+function unsignedLessThanOrEqual(left: string, right: string): boolean {
+  return left.length < right.length || (left.length === right.length && left <= right);
 }
 
 function canonicalSub(value: string | undefined): boolean {
@@ -49,12 +53,12 @@ function canonicalSub(value: string | undefined): boolean {
   for (const prefix of ["comment-", "thread-", "message-", "row-", "field-", "check-"]) {
     if (value.startsWith(prefix)) return value.length > prefix.length;
   }
-  if (value.startsWith("step-")) return canonicalUnsigned(value.slice("step-".length)) !== null;
+  if (value.startsWith("step-")) return isCanonicalU64(value.slice("step-".length));
   const line = /^L([^/]+)-L([^/]+)$/.exec(value);
-  const start = line?.[1] ? canonicalUnsigned(line[1]) : null;
-  const end = line?.[2] ? canonicalUnsigned(line[2]) : null;
-  if (start !== null && end !== null) {
-    return end >= start;
+  const start = line?.[1];
+  const end = line?.[2];
+  if (start && end && isCanonicalU64(start) && isCanonicalU64(end)) {
+    return unsignedLessThanOrEqual(start, end);
   }
   if (/^[bh].+/.test(value)) return true;
   const commit = /^commit-([^/]+)\/(?:check-([^/]+)|ci-result)$/.exec(value);

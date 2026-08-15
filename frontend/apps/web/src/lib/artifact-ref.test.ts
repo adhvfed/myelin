@@ -21,11 +21,22 @@ describe("artifact references", () => {
     "myelin://acme/invented/issue/MYL-7",
     "myelin://acme/issue/invented/MYL-7",
     "myelin://acme/issue/issue/MYL-7#step-01",
+    "myelin://acme/issue/issue/MYL-7#step-18446744073709551616",
+    "myelin://acme/issue/issue/MYL-7#L10-L9",
+    "myelin://acme/issue/issue/MYL-7#L18446744073709551615-L18446744073709551616",
     "myelin://acme/issue/issue/MYL-7#unknown-anchor",
     "myelin://acme/issue/issue/MYL-7 extra",
     `myelin://acme/issue/issue/${"x".repeat(4 * 1024)}`,
   ])("refuses a non-canonical reference: %s", (value) => {
     expect(parseArtifactRef(value)).toBeNull();
+  });
+
+  it.each([
+    "myelin://acme/issue/issue/MYL-7#step-18446744073709551615",
+    "myelin://acme/git/blob/platform#L9-L10",
+    "myelin://acme/git/blob/platform#L18446744073709551615-L18446744073709551615",
+  ])("accepts a bounded numeric sub-reference: %s", (value) => {
+    expect(parseArtifactRef(value)).not.toBeNull();
   });
 
   it("gives known work concise labels and local destinations", () => {
