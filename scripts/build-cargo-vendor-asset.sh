@@ -51,12 +51,13 @@ canonical_tree_sha256() {
     -C "$1" -cf - . | sha256sum | awk '{print $1}'
 }
 
-committed_digest() {
-  awk -v row="${ROW_ID}" '
+committed_field() {
+  local field="$1"
+  awk -v row="${ROW_ID}" -v field="${field}" '
     /^\[\[asset\]\]/ { in_block = 0 }
     $0 == "id = \"" row "\"" { in_block = 1 }
-    in_block && /^canonical_tree_sha256 = / {
-      line = $0; sub(/^canonical_tree_sha256 = "/, "", line); sub(/"$/, "", line);
+    in_block && index($0, field " = ") == 1 {
+      line = $0; sub(/^[^"]*"/, "", line); sub(/"$/, "", line);
       print line; exit
     }
   ' "${MANIFEST}"
@@ -67,10 +68,17 @@ committed_digest() {
 LOCK_SHA256="$(sha256sum "${LOCK_SRC}" | awk '{print $1}')"
 
 if [[ "${FORCE:-0}" != "1" && -d "${STAGED}" ]]; then
-  PIN="$(committed_digest)"
+  PIN="$(committed_field canonical_tree_sha256)"
+  LOCK_PIN="$(committed_field lockfile_sha256)"
   CURRENT="$(canonical_tree_sha256 "${STAGED}")"
-  if [[ -n "${PIN}" && "${CURRENT}" == "${PIN}" ]]; then
-    echo "build-cargo-vendor-asset: already staged at ${STAGED}, matches sha256:${PIN}" >&2
+  STAGED_LOCK_SHA256=""
+  if [[ -f "${STAGED}/Cargo.lock" && ! -L "${STAGED}/Cargo.lock" ]]; then
+    STAGED_LOCK_SHA256="$(sha256sum "${STAGED}/Cargo.lock" | awk '{print $1}')"
+  fi
+  if [[ -n "${PIN}" && "${CURRENT}" == "${PIN}" &&
+        -n "${LOCK_PIN}" && "${LOCK_SHA256}" == "${LOCK_PIN}" &&
+        "${STAGED_LOCK_SHA256}" == "${LOCK_SHA256}" ]]; then
+    echo "build-cargo-vendor-asset: already staged at ${STAGED}, matches tree sha256:${PIN} and lock sha256:${LOCK_PIN}" >&2
     echo "${STAGED}"
     exit 0
   fi
@@ -106,7 +114,7 @@ printf '%s\n' \
 chmod -R a+rX "${TMP}"
 
 DIGEST="$(canonical_tree_sha256 "${TMP}")"
-PIN="$(committed_digest)"
+PIN="$(committed_field canonical_tree_sha256)"
 if [[ -n "${PIN}" && "${PIN}" != "${DIGEST}" && "${ALLOW_DIGEST_CHANGE:-0}" != "1" ]]; then
   die "built sha256:${DIGEST} differs from committed sha256:${PIN}; set ALLOW_DIGEST_CHANGE=1 only for an intentional repin"
 fi
