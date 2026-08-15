@@ -24,14 +24,14 @@ use myelin_ci_controlplane::{
     ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
-    ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
-    ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
-    BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX, CREATE_CHECK_ATTEMPT_DDL,
-    CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL, CREATE_CI_JOB_ACCOUNTING_DDL,
-    CREATE_CI_JOB_DDL, CREATE_CI_JOB_PARENT_ATTEMPT_DDL, CREATE_CI_JOB_PRELAUNCH_USAGE_DDL,
-    CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL, CREATE_CI_RUN_CHECK_ATTEMPT_DDL,
-    CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
+    ALTER_CI_RUN_ADD_SOURCE_REF_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL,
+    ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL,
+    ALTER_JOB_QUEUE_ADD_COMPLETION_DDL, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL,
+    ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL, BUMP_CHECK_ATTEMPT_SQL, CI_JOB_RUN_LEDGER_INDEX,
+    CREATE_CHECK_ATTEMPT_DDL, CREATE_CI_COST_EVENT_DDL, CREATE_CI_DRIVE_MANIFEST_DDL,
+    CREATE_CI_JOB_ACCOUNTING_DDL, CREATE_CI_JOB_DDL, CREATE_CI_JOB_PARENT_ATTEMPT_DDL,
+    CREATE_CI_JOB_PRELAUNCH_USAGE_DDL, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL, CREATE_CI_JOB_SPEC_DDL,
+    CREATE_CI_RUN_CHECK_ATTEMPT_DDL, CREATE_CI_RUN_DDL, CREATE_JOB_QUEUE_DDL,
 };
 use myelin_ci_sandbox::{
     CompletionClaim, EgressPolicy, EnvVar, IdemToken, ImageRef, JobKind, JobSpecTemplate,
@@ -693,7 +693,7 @@ async fn seed_claimed_manifest_job(
         let token_request = CiJobTokenRequest {
             tenant_id: claim.tenant_id.clone(),
             region: claim.region.clone(),
-            project_id: "55555555-5555-4555-8555-555555555555".into(),
+            project_id: manifest.project_id.clone(),
             wf_run_id: claim.wf_run_id.clone(),
             ci_run_id: ci_run_id.into(),
             job_id: claim.job_id.clone(),
@@ -1179,6 +1179,10 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
         .await
         .expect("ci_run PR ordering authority migration");
+    admin
+        .execute(ALTER_CI_RUN_ADD_SOURCE_REF_DDL)
+        .await
+        .expect("ci_run branch provenance migration");
     sqlx::raw_sql(CREATE_CI_DRIVE_MANIFEST_DDL)
         .execute(&admin)
         .await
@@ -3670,6 +3674,10 @@ async fn a_v2_reservation_prevents_stale_queued_cancellation() {
             .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
             .await
             .expect("ci_run PR ordering authority migration");
+        admin
+            .execute(ALTER_CI_RUN_ADD_SOURCE_REF_DDL)
+            .await
+            .expect("ci_run branch provenance migration");
         sqlx::raw_sql(CREATE_CI_DRIVE_MANIFEST_DDL)
             .execute(&admin)
             .await
