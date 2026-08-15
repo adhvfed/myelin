@@ -149,7 +149,6 @@ export const changeAutomationLifecycle = action(async (input: {
     const receipt = parseAutomationLifecycle(await edgePost(
       `/v1/triggers/${segment(input.automationId)}/${input.action}`,
       {},
-      { idempotencyKey: crypto.randomUUID() },
     ));
     return receipt
       ? respond({ ok: true, receipt })
@@ -182,7 +181,6 @@ export const eraseAutomationResult = action(async (input: {
     const receipt = parseAutomationErasure(await edgePost(
       `/v1/triggers/${segment(input.automationId)}/runs/${segment(input.runId)}/result/erase`,
       {},
-      { idempotencyKey: crypto.randomUUID() },
     ));
     return receipt
       ? respond({ ok: true, receipt })

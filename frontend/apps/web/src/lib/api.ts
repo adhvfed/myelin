@@ -687,11 +687,7 @@ export const markInboxRead = action(async (itemId: string) => {
       /[\p{Cc}]/u.test(itemId)) return result({ ok: false });
   try {
     return await inboxAuthed(async () => {
-      const response = await edgePost(
-        `/v1/notif/inbox/${seg(itemId)}/read`,
-        {},
-        { idempotencyKey: crypto.randomUUID() },
-      );
+      const response = await edgePost(`/v1/notif/inbox/${seg(itemId)}/read`, {});
       const receipt = parseInboxReadReceipt(response);
       return result(receipt ? { ok: true, receipt } : { ok: false });
     });
@@ -718,7 +714,6 @@ export const decideAutomationApproval = action(async (input: AutomationApprovalI
       const response = await edgePost(
         `/v1/triggers/${seg(input.automationId)}/firings/${input.decision}`,
         { event_id: input.eventId },
-        { idempotencyKey: crypto.randomUUID() },
       );
       const receipt = response !== null && typeof response === "object" &&
         !Array.isArray(response) ? response as Record<string, unknown> : null;
@@ -750,7 +745,6 @@ export const decideAgentEffectApproval = action(async (input: AgentEffectApprova
       const response = await edgePost(
         `/v1/agent-approvals/${seg(input.gateId)}/decision`,
         { decision: input.decision },
-        { idempotencyKey: crypto.randomUUID() },
       );
       const receipt = response !== null && typeof response === "object" &&
         !Array.isArray(response) ? response as Record<string, unknown> : null;
