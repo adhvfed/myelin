@@ -760,3 +760,73 @@ fn ci_service_producer_can_report_checks() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn malformed_check_facts_are_atomic_and_leave_the_projection_unchanged() {
+    let (be, root) = backend_with_open_pr("malformed-checks");
+    let ci_producer = principal_of_kind("ci:runner", PrincipalKind::Service);
+
+    let error = be
+        .report_checks(
+            TENANT,
+            REGION,
+            "widgets",
+            1,
+            &ci_producer,
+            &json!({ "green_contexts": ["ci/build", 7] }),
+        )
+        .expect_err("a mixed check array must be rejected whole");
+    assert!(matches!(
+        error,
+        myelin_git::durable::DurableError::InvalidInput(_)
+    ));
+    let record = be
+        .get_pr(TENANT, REGION, "widgets", 1, &ci_producer)
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.green_contexts.is_empty(),
+        "the valid prefix of malformed CI facts must not reach the merge gate"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn malformed_fork_endorsements_are_atomic() {
+    let (be, root) = backend_with_open_pr("malformed-endorsement");
+    let ci_producer = principal_of_kind("ci:runner", PrincipalKind::Service);
+    let approver = principal_of_kind("maintainer", PrincipalKind::Human);
+    be.report_checks(
+        TENANT,
+        REGION,
+        "widgets",
+        1,
+        &ci_producer,
+        &json!({ "fork_unendorsed_contexts": ["ci/fork-build"] }),
+    )
+    .unwrap();
+
+    let mixed = be
+        .endorse_fork_ci(
+            TENANT,
+            REGION,
+            "widgets",
+            1,
+            &json!({ "contexts": ["ci/fork-build", 7] }),
+            &approver,
+        )
+        .expect_err("a mixed endorsement array must be rejected whole");
+    assert!(matches!(
+        mixed,
+        myelin_git::durable::DurableError::InvalidInput(_)
+    ));
+    let record = be
+        .get_pr(TENANT, REGION, "widgets", 1, &approver)
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.endorsed_contexts.is_empty(),
+        "the malformed request may not leave a partial endorsement"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

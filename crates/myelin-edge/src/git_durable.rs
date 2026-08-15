@@ -58,6 +58,7 @@ use myelin_git::web::{
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{DurablePlacementBacking, KmsEngine, SubstrateProvider, TenantScope};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -106,6 +107,104 @@ impl core::fmt::Debug for RepoActorContext<'_> {
 pub struct PrActorContext<'a> {
     repo: RepoActorContext<'a>,
     number: u64,
+}
+
+const MAX_CHECK_CONTEXTS: usize = 256;
+const MAX_CHECK_CONTEXT_BYTES: usize = 255;
+const MAX_BRANCH_PROTECTION_RULESETS: usize = 256;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BranchProtectionRequest {
+    rulesets: Vec<BranchProtectionRuleRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BranchProtectionRuleRequest {
+    ref_pattern: String,
+    #[serde(default)]
+    required_contexts: Vec<String>,
+    #[serde(default)]
+    required_approvals: u32,
+    #[serde(default)]
+    require_codeowner_review: bool,
+    #[serde(default)]
+    require_conversation_resolution: bool,
+    #[serde(default)]
+    allow_force_push: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckReportRequest {
+    green_contexts: Option<Vec<String>>,
+    fork_unendorsed_contexts: Option<Vec<String>>,
+    codeowner_review_satisfied: Option<bool>,
+    outstanding_conversations: Option<u32>,
+}
+
+impl CheckReportRequest {
+    fn has_update(&self) -> bool {
+        self.green_contexts.is_some()
+            || self.fork_unendorsed_contexts.is_some()
+            || self.codeowner_review_satisfied.is_some()
+            || self.outstanding_conversations.is_some()
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndorseForkCiRequest {
+    contexts: Option<Vec<String>>,
+}
+
+fn invalid_request(label: &str, error: impl std::fmt::Display) -> DurableError {
+    DurableError::InvalidInput(format!("{label} body is malformed: {error}"))
+}
+
+fn validate_check_contexts(label: &str, contexts: &[String]) -> Result<(), DurableError> {
+    if contexts.len() > MAX_CHECK_CONTEXTS {
+        return Err(DurableError::InvalidInput(format!(
+            "{label} may contain at most {MAX_CHECK_CONTEXTS} contexts"
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for context in contexts {
+        let valid_provider = context.split_once('/').is_some_and(|(provider, name)| {
+            matches!(provider, "ci" | "external") && !name.is_empty()
+        });
+        if !valid_provider
+            || context.len() > MAX_CHECK_CONTEXT_BYTES
+            || context.trim() != context
+            || context.chars().any(char::is_control)
+        {
+            return Err(DurableError::InvalidInput(format!(
+                "{label} entries must be 1-{MAX_CHECK_CONTEXT_BYTES} byte `ci/<name>` or \
+                 `external/<name>` policy tokens without surrounding whitespace"
+            )));
+        }
+        if !seen.insert(context) {
+            return Err(DurableError::InvalidInput(format!(
+                "{label} contains duplicate context `{context}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ref_pattern(pattern: &str) -> Result<(), DurableError> {
+    if !pattern.starts_with("refs/heads/")
+        || pattern.len() <= "refs/heads/".len()
+        || pattern.len() > WIRE_MAX_REF_NAME_BYTES
+        || pattern.chars().any(char::is_whitespace)
+        || pattern.chars().any(char::is_control)
+    {
+        return Err(DurableError::InvalidInput(
+            "branch-protection `ref_pattern` must be a bounded `refs/heads/<pattern>` token".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl core::fmt::Debug for PrActorContext<'_> {
@@ -2080,46 +2179,42 @@ impl DurableGitBackend {
     ) -> Result<usize, DurableError> {
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?;
-        let rulesets: Vec<BranchProtectionRuleset> = body
-            .get("rulesets")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .map(|r| BranchProtectionRuleset {
-                        ref_pattern: r
-                            .get("ref_pattern")
-                            .and_then(Value::as_str)
-                            .unwrap_or("refs/heads/main")
-                            .to_string(),
-                        required_contexts: r
-                            .get("required_contexts")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        required_approvals: r
-                            .get("required_approvals")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as u32,
-                        require_codeowner_review: r
-                            .get("require_codeowner_review")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        require_conversation_resolution: r
-                            .get("require_conversation_resolution")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        allow_force_push: r
-                            .get("allow_force_push")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let request = if body.is_null() {
+            BranchProtectionRequest {
+                rulesets: Vec::new(),
+            }
+        } else {
+            serde_json::from_value::<BranchProtectionRequest>(body.clone())
+                .map_err(|error| invalid_request("branch-protection", error))?
+        };
+        if request.rulesets.len() > MAX_BRANCH_PROTECTION_RULESETS {
+            return Err(DurableError::InvalidInput(format!(
+                "branch-protection may contain at most {MAX_BRANCH_PROTECTION_RULESETS} rulesets"
+            )));
+        }
+        let mut patterns = std::collections::BTreeSet::new();
+        let mut rulesets = Vec::with_capacity(request.rulesets.len());
+        for rule in request.rulesets {
+            validate_ref_pattern(&rule.ref_pattern)?;
+            validate_check_contexts(
+                "branch-protection `required_contexts`",
+                &rule.required_contexts,
+            )?;
+            if !patterns.insert(rule.ref_pattern.clone()) {
+                return Err(DurableError::InvalidInput(format!(
+                    "branch-protection contains duplicate ref pattern `{}`",
+                    rule.ref_pattern
+                )));
+            }
+            rulesets.push(BranchProtectionRuleset {
+                ref_pattern: rule.ref_pattern,
+                required_contexts: rule.required_contexts,
+                required_approvals: rule.required_approvals,
+                require_codeowner_review: rule.require_codeowner_review,
+                require_conversation_resolution: rule.require_conversation_resolution,
+                allow_force_push: rule.allow_force_push,
+            });
+        }
         let n = rulesets.len();
         self.prs
             .put_protection(&loc, &BranchProtectionConfig { rulesets })?;
@@ -2164,38 +2259,37 @@ impl DurableGitBackend {
             )));
         }
         let loc = Self::loc(tenant, region, slug);
-        let green_contexts = body
-            .get("green_contexts")
-            .and_then(Value::as_array)
-            .map(|g| {
-                g.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            });
-        let fork_unendorsed_contexts = body
-            .get("fork_unendorsed_contexts")
-            .and_then(Value::as_array)
-            .map(|g| {
-                g.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            });
-        let outstanding_conversations = body
-            .get("outstanding_conversations")
-            .and_then(Value::as_u64)
-            .map(u32::try_from)
-            .transpose()
-            .map_err(|_| DurableError::Git("outstanding conversation count exceeds u32".into()))?;
+        let request = serde_json::from_value::<CheckReportRequest>(body.clone())
+            .map_err(|error| invalid_request("check report", error))?;
+        if !request.has_update() {
+            return Err(DurableError::InvalidInput(
+                "check report body must contain at least one check projection field".into(),
+            ));
+        }
+        if let Some(contexts) = request.green_contexts.as_deref() {
+            validate_check_contexts("check report `green_contexts`", contexts)?;
+        }
+        if let Some(contexts) = request.fork_unendorsed_contexts.as_deref() {
+            validate_check_contexts("check report `fork_unendorsed_contexts`", contexts)?;
+        }
+        if let (Some(green), Some(unendorsed)) = (
+            request.green_contexts.as_deref(),
+            request.fork_unendorsed_contexts.as_deref(),
+        ) {
+            if let Some(context) = green.iter().find(|context| unendorsed.contains(context)) {
+                return Err(DurableError::InvalidInput(format!(
+                    "check context `{context}` cannot be both green and unendorsed"
+                )));
+            }
+        }
         self.pr_mutate(
             &loc,
             number,
             PrMutation::ReportChecks {
-                green_contexts,
-                fork_unendorsed_contexts,
-                codeowner_review_satisfied: body
-                    .get("codeowner_review_satisfied")
-                    .and_then(Value::as_bool),
-                outstanding_conversations,
+                green_contexts: request.green_contexts,
+                fork_unendorsed_contexts: request.fork_unendorsed_contexts,
+                codeowner_review_satisfied: request.codeowner_review_satisfied,
+                outstanding_conversations: request.outstanding_conversations,
             },
             operation_id,
             principal,
@@ -2290,11 +2384,17 @@ impl DurableGitBackend {
         let rec = self
             .pr_get(&loc, number, principal)?
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
-        let to_endorse: Vec<String> = match body.get("contexts").and_then(Value::as_array) {
-            Some(a) => a
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
+        let request = if body.is_null() {
+            EndorseForkCiRequest::default()
+        } else {
+            serde_json::from_value::<EndorseForkCiRequest>(body.clone())
+                .map_err(|error| invalid_request("fork-CI endorsement", error))?
+        };
+        let to_endorse = match request.contexts {
+            Some(contexts) => {
+                validate_check_contexts("fork-CI endorsement `contexts`", &contexts)?;
+                contexts
+            }
             None => rec.fork_unendorsed_contexts.clone(),
         };
         self.pr_mutate(

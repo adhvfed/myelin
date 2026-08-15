@@ -397,6 +397,34 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     .await;
     assert_eq!(gb, 404, "no ref advance on the blocked bypass attempt");
 
+    for (bad_body, why) in [
+        (
+            br#"{"rulesets":[{"ref_pattern":"refs/heads/main","required_contexts":["ci/build",7]}]}"#.as_slice(),
+            "mixed context array",
+        ),
+        (
+            br#"{"rulesets":[{"ref_pattern":"refs/heads/main","required_approvals":4294967296}]}"#.as_slice(),
+            "overflowing approval count",
+        ),
+        (
+            br#"{"rulesets":[{"required_contexts":["ci/build"]}]}"#.as_slice(),
+            "missing ref pattern",
+        ),
+    ] {
+        let (status, response) = http(
+            addr,
+            "POST",
+            "/v1/git/repos/svc/branch-protection",
+            &hdr(&author),
+            bad_body.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "a policy with a {why} is rejected whole: {response}"
+        );
+    }
+
     let (sp, _sv) = http(
         addr,
         "POST",
@@ -428,6 +456,19 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     )
     .await;
     assert_eq!(m2a, 409, "repo-required ci/build not green → blocked");
+
+    let (bad_report, bad_report_body) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/svc/prs/2/checks",
+        &hdr(&ci),
+        br#"{"green_contexts":["ci/build",7]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        bad_report, 400,
+        "a malformed CI fact array cannot partially turn the gate green: {bad_report_body}"
+    );
 
     let (cr, _crv) = http(
         addr,
