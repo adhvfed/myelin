@@ -67,20 +67,12 @@ impl std::fmt::Display for RepoPlacementError {
 
 impl std::error::Error for RepoPlacementError {}
 
-fn parse_repo_ref(repo: &ArtifactRef) -> Option<(TenantId, &str)> {
-    let rest = repo.0.strip_prefix("myelin://")?;
-    if rest.contains('#') {
+fn parse_repo_ref(repo: &ArtifactRef) -> Option<(TenantId, String)> {
+    let parsed = myelin_refs::parse_scoped(&repo.0).ok()?;
+    if parsed.sub.is_some() || parsed.subsystem != "git" || parsed.type_ != "repo" {
         return None;
     }
-    let segments: Vec<&str> = rest.split('/').collect();
-    if segments.len() != 4 {
-        return None;
-    }
-    let (tenant, subsystem, type_, id) = (segments[0], segments[1], segments[2], segments[3]);
-    if tenant.is_empty() || id.is_empty() || subsystem != "git" || type_ != "repo" {
-        return None;
-    }
-    Some((TenantId::from_token(tenant), id))
+    Some((parsed.tenant, parsed.id))
 }
 
 impl Registry {
@@ -295,6 +287,19 @@ mod tests {
             "region is the TENANT's region (the pin)"
         );
         assert_eq!(answer.status, PlacementStatus::Active);
+    }
+
+    #[test]
+    fn hierarchical_repository_names_keep_one_placement_identity() {
+        let mut reg = registry_with_repo();
+        let repo = repo("01J0ACME", "platform/api");
+        reg.register_repo(&repo, StorageGroup::from_token("pack-nested"))
+            .expect("a hierarchical repository is a canonical repository reference");
+
+        let answer = reg
+            .placement_of_repo(&repo)
+            .expect("the same hierarchical identity resolves");
+        assert_eq!(answer.group.as_str(), "pack-nested");
     }
 
     #[test]

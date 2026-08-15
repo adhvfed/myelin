@@ -30,6 +30,8 @@ describe("artifact references", () => {
     "myelin://acme/issue/issue/MYL-7#L10-L9",
     "myelin://acme/issue/issue/MYL-7#L18446744073709551615-L18446744073709551616",
     "myelin://acme/issue/issue/MYL-7#unknown-anchor",
+    "myelin://acme/knowledge/page/platform/api",
+    "myelin://acme/git/repo/platform//api",
     "myelin://acme/issue/issue/MYL-7 extra",
     `myelin://acme/issue/issue/${"x".repeat(4 * 1024)}`,
   ])("refuses a non-canonical reference: %s", (value) => {
@@ -49,6 +51,11 @@ describe("artifact references", () => {
     expect(artifactRefHref("myelin://acme/issue/issue/MYL-7")).toBe("/issues?state=all&key=MYL-7");
     expect(artifactRefLabel("myelin://acme/git/pr/platform:42")).toBe("platform #42");
     expect(artifactRefHref("myelin://acme/git/pr/platform:42")).toBe("/git/repos/platform/prs/42");
+    expect(artifactRefLabel("myelin://acme/git/pr/platform/api:42")).toBe("platform/api #42");
+    expect(artifactRefHref("myelin://acme/git/pr/platform/api:42"))
+      .toBe("/git/repos/platform%2Fapi/prs/42");
+    expect(artifactRefHref("myelin://acme/git/repo/platform/api"))
+      .toBe("/git/repos/platform%2Fapi");
   });
 
   it("validates a related-work edge against source, tenant, and existing edges", () => {

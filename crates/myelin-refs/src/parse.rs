@@ -36,9 +36,9 @@ impl core::fmt::Display for ParseError {
             ),
             ParseError::IncompleteScope { got_segments } => write!(
                 f,
-                "ambiguous ArtifactRef: scope is not total - a `{SCHEME}` URN needs exactly four \
-                 segments `tenant/subsystem/type/id`, got {got_segments}. Scope is never guessed \
-                 (REF-3)."
+                "ambiguous ArtifactRef: scope is not total - a `{SCHEME}` URN needs four logical \
+                 segments `tenant/subsystem/type/id` (Git ids may contain `/`), got \
+                 {got_segments}. Scope is never guessed (REF-3)."
             ),
             ParseError::EmptySegment { segment } => write!(
                 f,
@@ -248,12 +248,14 @@ pub fn parse_scoped(s: &str) -> Result<ParsedArtifactRef, ParseError> {
     };
 
     let segments: Vec<&str> = scope.split('/').collect();
-    if segments.len() != 4 {
+    let path_shaped_git_id = segments.get(1) == Some(&"git");
+    if segments.len() < 4 || (segments.len() > 4 && !path_shaped_git_id) {
         return Err(ParseError::IncompleteScope {
             got_segments: segments.len(),
         });
     }
-    let (tenant, subsystem, type_, id) = (segments[0], segments[1], segments[2], segments[3]);
+    let (tenant, subsystem, type_) = (segments[0], segments[1], segments[2]);
+    let id = segments[3..].join("/");
 
     if tenant.is_empty() {
         return Err(ParseError::EmptySegment { segment: "tenant" });
@@ -266,7 +268,7 @@ pub fn parse_scoped(s: &str) -> Result<ParsedArtifactRef, ParseError> {
     if type_.is_empty() {
         return Err(ParseError::EmptySegment { segment: "type" });
     }
-    if id.is_empty() {
+    if id.is_empty() || segments[3..].contains(&"") {
         return Err(ParseError::EmptySegment { segment: "id" });
     }
 
@@ -299,7 +301,7 @@ pub fn parse_scoped(s: &str) -> Result<ParsedArtifactRef, ParseError> {
         tenant: TenantId(tenant.to_string()),
         subsystem: subsystem.to_string(),
         type_: type_.to_string(),
-        id: id.to_string(),
+        id,
         sub: parsed_sub,
     })
 }
@@ -352,6 +354,27 @@ mod tests {
             let r = parse(s).expect("well-formed URN must parse");
             assert_eq!(format(&r), s, "round-trip must be byte-identical for `{s}`");
         }
+    }
+
+    #[test]
+    fn git_ids_preserve_hierarchical_repository_names_without_weakening_other_scopes() {
+        for (reference, id) in [
+            ("myelin://acme/git/repo/platform/api", "platform/api"),
+            ("myelin://acme/git/pr/platform/api:42", "platform/api:42"),
+        ] {
+            let parsed = parse_scoped(reference).expect("path-shaped Git id");
+            assert_eq!(parsed.id, id);
+            assert_eq!(format(&parsed.artifact_ref), reference);
+        }
+
+        assert!(matches!(
+            parse("myelin://acme/knowledge/page/platform/api"),
+            Err(ParseError::IncompleteScope { got_segments: 5 })
+        ));
+        assert!(matches!(
+            parse("myelin://acme/git/repo/platform//api"),
+            Err(ParseError::EmptySegment { segment: "id" })
+        ));
     }
 
     #[test]

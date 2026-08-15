@@ -20,7 +20,8 @@ impl std::fmt::Display for GitRefError {
         match self {
             GitRefError::InvalidComponent { component } => write!(
                 f,
-                "git artifact reference component `{component}` is empty or contains a reserved `/` or `#` delimiter"
+                "git artifact reference component `{component}` is empty or contains characters \
+                 outside its canonical grammar"
             ),
             GitRefError::Parse(error) => write!(f, "invalid git artifact reference: {error}"),
         }
@@ -52,19 +53,15 @@ pub enum GitArtifactType {
 }
 
 fn classify(r: &ArtifactRef) -> Result<GitArtifactType, ProjectError> {
-    let rest =
-        r.0.strip_prefix("myelin://")
-            .ok_or_else(|| ProjectError::NotAGitArtifact {
-                reference: r.0.clone(),
-            })?;
-    let scope = rest.split('#').next().unwrap_or(rest);
-    let segments: Vec<&str> = scope.split('/').collect();
-    if segments.len() != 4 || segments[1] != "git" {
+    let parsed = myelin_refs::parse_scoped(&r.0).map_err(|_| ProjectError::NotAGitArtifact {
+        reference: r.0.clone(),
+    })?;
+    if parsed.subsystem != "git" {
         return Err(ProjectError::NotAGitArtifact {
             reference: r.0.clone(),
         });
     }
-    match segments[2] {
+    match parsed.type_.as_str() {
         "pr" => Ok(GitArtifactType::Pr),
         "commit" => Ok(GitArtifactType::Commit),
         "review" => Ok(GitArtifactType::Review),
@@ -77,12 +74,14 @@ fn classify(r: &ArtifactRef) -> Result<GitArtifactType, ProjectError> {
 }
 
 pub fn git_pr_ref(tenant: &str, repo: &str, number: u64) -> Result<ArtifactRef, GitRefError> {
-    validate_ref_components(&[("tenant", tenant), ("repo", repo)])?;
+    validate_ref_components(&[("tenant", tenant)])?;
+    validate_repo(repo, "repo")?;
     parse_git(&format!("myelin://{tenant}/git/pr/{repo}:{number}"))
 }
 
 pub fn git_commit_ref(tenant: &str, repo: &str, sha: &str) -> Result<ArtifactRef, GitRefError> {
-    validate_ref_components(&[("tenant", tenant), ("repo", repo), ("sha", sha)])?;
+    validate_ref_components(&[("tenant", tenant), ("sha", sha)])?;
+    validate_repo(repo, "repo")?;
     parse_git(&format!("myelin://{tenant}/git/commit/{repo}:{sha}"))
 }
 
@@ -94,16 +93,17 @@ pub fn git_review_ref(
 ) -> Result<ArtifactRef, GitRefError> {
     validate_ref_components(&[
         ("tenant", tenant),
-        ("repo", repo),
         ("reviewer_pseudonym", reviewer_pseudonym),
     ])?;
+    validate_repo(repo, "repo")?;
     parse_git(&format!(
         "myelin://{tenant}/git/review/{repo}:{pr_number}:{reviewer_pseudonym}"
     ))
 }
 
 pub fn git_repo_ref(tenant: &str, repo_id: &str) -> Result<ArtifactRef, GitRefError> {
-    validate_ref_components(&[("tenant", tenant), ("repo_id", repo_id)])?;
+    validate_ref_components(&[("tenant", tenant)])?;
+    validate_repo(repo_id, "repo_id")?;
     parse_git(&format!("myelin://{tenant}/git/repo/{repo_id}"))
 }
 
@@ -112,6 +112,21 @@ fn validate_ref_components(components: &[(&'static str, &str)]) -> Result<(), Gi
         if value.is_empty() || value.contains(['/', '#']) {
             return Err(GitRefError::InvalidComponent { component });
         }
+    }
+    Ok(())
+}
+
+fn validate_repo(value: &str, component: &'static str) -> Result<(), GitRefError> {
+    if value.split('/').any(|part| {
+        part.is_empty()
+            || part == "."
+            || part == ".."
+            || !part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }) || value.contains('#')
+    {
+        return Err(GitRefError::InvalidComponent { component });
     }
     Ok(())
 }
@@ -131,13 +146,8 @@ pub fn display_key(r: &ArtifactRef) -> Option<String> {
 }
 
 fn canonical_id(r: &ArtifactRef) -> Option<String> {
-    let rest = r.0.strip_prefix("myelin://")?;
-    let scope = rest.split('#').next().unwrap_or(rest);
-    let segments: Vec<&str> = scope.split('/').collect();
-    if segments.len() != 4 || segments[1] != "git" {
-        return None;
-    }
-    Some(segments[3].to_string())
+    let parsed = myelin_refs::parse_scoped(&r.0).ok()?;
+    (parsed.subsystem == "git").then_some(parsed.id)
 }
 
 fn short_sha(sha: &str) -> String {
@@ -729,6 +739,25 @@ mod tests {
                 component: "reviewer_pseudonym"
             })
         ));
+    }
+
+    #[test]
+    fn git_ref_builders_preserve_hierarchical_repository_names() {
+        assert_eq!(
+            git_repo_ref("acme", "platform/api").unwrap().0,
+            "myelin://acme/git/repo/platform/api"
+        );
+        assert_eq!(
+            git_pr_ref("acme", "platform/api", 42).unwrap().0,
+            "myelin://acme/git/pr/platform/api:42"
+        );
+        assert!(matches!(
+            git_repo_ref("acme", "platform//api"),
+            Err(GitRefError::InvalidComponent {
+                component: "repo_id"
+            })
+        ));
+        assert!(git_repo_ref("acme", "platform:api").is_err());
     }
 
     #[test]

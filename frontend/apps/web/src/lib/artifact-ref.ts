@@ -23,9 +23,11 @@ export function parseArtifactRef(value: unknown): ArtifactRefParts | null {
       [...value].some((character) => character.charCodeAt(0) <= 0x20 || character.charCodeAt(0) === 0x7f)) {
     return null;
   }
-  const match = /^myelin:\/\/([^/]+)\/([^/]+)\/([^/]+)\/([^/#]+)(?:#(.+))?$/.exec(value);
+  const match = /^myelin:\/\/([^/]+)\/([^/]+)\/([^/]+)\/([^#]+)(?:#(.+))?$/.exec(value);
   if (!match?.[1] || !match[2] || !match[3] || !match[4] ||
-      !SUBSYSTEMS.has(match[2]) || !TYPES.has(match[3]) || !canonicalSub(match[5])) return null;
+      !SUBSYSTEMS.has(match[2]) || !TYPES.has(match[3]) || !canonicalSub(match[5]) ||
+      (match[4].includes("/") && match[2] !== "git") ||
+      match[4].split("/").some((part) => part === "")) return null;
   return {
     tenant: match[1],
     subsystem: match[2],

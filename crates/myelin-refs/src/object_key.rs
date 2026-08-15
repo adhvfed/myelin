@@ -27,9 +27,28 @@ pub fn object_key(object: &ArtifactRef) -> Option<ObjectKey> {
         return None;
     }
 
-    if let Some(rest) = root.strip_prefix(crate::SCHEME) {
+    if root.starts_with(crate::SCHEME) {
+        if let Ok(parsed) = crate::parse_scoped(raw) {
+            let id = parsed
+                .id
+                .strip_prefix(&format!("{}:", parsed.type_))
+                .unwrap_or(&parsed.id);
+            if id.is_empty() {
+                return None;
+            }
+            return Some(ObjectKey {
+                tenant: Some(parsed.tenant.0),
+                subsystem: Some(parsed.subsystem),
+                object_type: Some(parsed.type_),
+                id: id.to_string(),
+            });
+        }
+
+        // Historical plural-subsystem references predate the canonical parser. Keep their one
+        // explicit compatibility path while refusing every other malformed URN.
+        let rest = root.strip_prefix(crate::SCHEME)?;
         let segs: Vec<&str> = rest.split('/').collect();
-        if segs.len() != 4 || segs.iter().any(|s| s.is_empty()) {
+        if segs.len() != 4 || segs[1] != "issues" || segs.iter().any(|s| s.is_empty()) {
             return None;
         }
         let (tenant, subsystem, ty, id_seg) = (segs[0], segs[1], segs[2], segs[3]);
@@ -93,6 +112,11 @@ mod tests {
         );
         assert_eq!(key("repo:core"), Some("repo:core".into()));
         assert_eq!(
+            key("myelin://acme/git/repo/team/app"),
+            key("repo:team/app"),
+            "a hierarchical repository keeps one authorization key"
+        );
+        assert_eq!(
             key("myelin://acme/issues/issue/issue:PROJ-1"),
             key("issue:PROJ-1"),
             "the historical plural-subsystem URN spelling still reaches the one key"
@@ -131,7 +155,7 @@ mod tests {
             "",
             "   ",
             "myelin://acme/git/repo",
-            "myelin://acme/git/repo/a/b",
+            "myelin://acme/git/repo/a//b",
             "myelin://acme//repo/core",
             "myelin://acme/git/repo/repo:",
             "https://acme/git/repo/core",
