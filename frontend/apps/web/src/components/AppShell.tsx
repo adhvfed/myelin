@@ -186,11 +186,9 @@ export function AppShell(props: AppShellProps) {
       id: `nav:${n.href}`,
       label: `Go to ${n.label}`,
       icon: n.icon,
-      run: () => {
-        window.location.assign(n.href);
-      },
+      run: () => navigate(n.href),
     })),
-    // R3.1 — PR palette entries (client-side navigation via useNavigate, never window.location).
+    // Repository-scoped PR commands join the same client-side navigation contract.
     ...(currentRepo()
       ? [
           {

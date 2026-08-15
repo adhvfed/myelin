@@ -234,4 +234,19 @@ test.describe("MR-019 app shell — real browser", () => {
     await page.keyboard.press("Enter");
     await expect(page.getByRole("dialog", { name: "Inbox" })).toBeVisible();
   });
+
+  test("palette navigation keeps the authenticated app shell alive", async ({ page }) => {
+    await devLogin(page);
+    const shell = page.locator(".app-shell");
+    await shell.evaluate((element) => element.setAttribute("data-navigation-sentinel", "alive"));
+
+    await page.keyboard.press("ControlOrMeta+k");
+    const search = page.getByRole("combobox", { name: /Search or run a command/ });
+    await search.fill("Go to Knowledge");
+    await search.press("Enter");
+
+    await page.waitForURL("**/knowledge");
+    await expect(page.getByRole("heading", { level: 1, name: "Knowledge" })).toBeVisible();
+    await expect(shell).toHaveAttribute("data-navigation-sentinel", "alive");
+  });
 });
