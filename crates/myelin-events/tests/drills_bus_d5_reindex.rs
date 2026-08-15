@@ -37,7 +37,7 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn ci_runs() -> ReferenceReindexSource {
-    let mut src = ReferenceReindexSource::new("ci", "run");
+    let mut src = ReferenceReindexSource::new(tenant(), "ci", "run");
     src.upsert(
         "ci.run:1",
         1,
@@ -67,7 +67,7 @@ fn live_projection(src: &ReferenceReindexSource, scope: &SnapshotScope) -> Deriv
 
 fn live_envelope(draft: &myelin_events::SnapshotDraft) -> myelin_events::EventEnvelope {
     use myelin_events::{AggregateKey, CorrelationId, EventId};
-    let id = draft.event_id();
+    let id = draft.event_id(&tenant());
     myelin_events::EventEnvelope {
         event_id: EventId(id.0.clone()),
         type_: draft.type_.clone(),

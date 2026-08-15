@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use crate::outbox::{EmitContextBase, IdMinter, OutboxStore, Ulid};
 use crate::{
     AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventId, EventType, OutboxTx,
-    Visibility,
+    TenantId, Visibility,
 };
 
 pub const SNAPSHOT_EVENT_NAME: &str = "snapshot";
 
-pub fn snapshot_event_id(aggregate: &AggregateKey, version: u64) -> EventId {
-    let keyed = format!("{}@{}", aggregate.0, version);
+pub fn snapshot_event_id(tenant: &TenantId, aggregate: &AggregateKey, version: u64) -> EventId {
+    let keyed = format!("{}:{}:{}@{version}", tenant.0.len(), tenant.0, aggregate.0);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in keyed.as_bytes() {
         hash ^= u64::from(*b);
@@ -52,8 +52,8 @@ pub struct SnapshotDraft {
 }
 
 impl SnapshotDraft {
-    pub fn event_id(&self) -> EventId {
-        snapshot_event_id(&self.aggregate, self.version)
+    pub fn event_id(&self, tenant: &TenantId) -> EventId {
+        snapshot_event_id(tenant, &self.aggregate, self.version)
     }
 
     fn to_event_draft(&self) -> EventDraft {
@@ -108,6 +108,10 @@ pub struct ReindexReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReindexError {
     NoSourceForOwner(String),
+    SubjectTenantMismatch {
+        subject: String,
+        expected_tenant: String,
+    },
     OutboxFailed(String),
 }
 
@@ -117,6 +121,13 @@ impl std::fmt::Display for ReindexError {
             ReindexError::NoSourceForOwner(o) => {
                 write!(f, "reindex: no registered owner for scope owner `{o}`")
             }
+            ReindexError::SubjectTenantMismatch {
+                subject,
+                expected_tenant,
+            } => write!(
+                f,
+                "reindex: snapshot subject `{subject}` does not belong to tenant `{expected_tenant}`"
+            ),
             ReindexError::OutboxFailed(e) => write!(f, "reindex: outbox emit failed: {e}"),
         }
     }
@@ -137,11 +148,16 @@ pub fn reindex(
         .ok_or_else(|| ReindexError::NoSourceForOwner(scope.owner.clone()))?;
 
     let drafts = source.replay(scope, since);
+    let tenant = &ctx_base.tenant;
+
+    for draft in &drafts {
+        validate_subject_tenant(&draft.subject, tenant)?;
+    }
 
     let mut to_emit: Vec<SnapshotDraft> = Vec::new();
     let mut skipped_duplicate = 0usize;
     for draft in drafts {
-        let id = draft.event_id();
+        let id = draft.event_id(tenant);
         if outbox.row(&id).is_some() {
             skipped_duplicate += 1;
         } else {
@@ -151,7 +167,10 @@ pub fn reindex(
 
     let snapshots_emitted = to_emit.len();
     if !to_emit.is_empty() {
-        let ids: Vec<Ulid> = to_emit.iter().map(|d| Ulid(d.event_id().0)).collect();
+        let ids: Vec<Ulid> = to_emit
+            .iter()
+            .map(|draft| Ulid(draft.event_id(tenant).0))
+            .collect();
         let minter: Arc<dyn IdMinter> = Arc::new(PresetMinter::new(ids));
         let mut tx = outbox.begin(minter, ctx_base);
         for draft in &to_emit {
@@ -171,6 +190,21 @@ pub fn reindex(
         snapshots_skipped_duplicate: skipped_duplicate,
         owners_replayed: vec![scope.owner.clone()],
     })
+}
+
+fn validate_subject_tenant(subject: &ArtifactRef, expected: &TenantId) -> Result<(), ReindexError> {
+    let Some(rest) = subject.0.strip_prefix("myelin://") else {
+        return Ok(());
+    };
+    let actual = rest.split('/').next().unwrap_or_default();
+    if actual == expected.0 {
+        Ok(())
+    } else {
+        Err(ReindexError::SubjectTenantMismatch {
+            subject: subject.0.clone(),
+            expected_tenant: expected.0.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -219,14 +253,20 @@ impl DerivedStore {
 }
 
 pub struct ReferenceReindexSource {
+    tenant: TenantId,
     owner: String,
     artifact: String,
     truth: BTreeMap<String, (u64, serde_json::Value)>,
 }
 
 impl ReferenceReindexSource {
-    pub fn new(owner: impl Into<String>, artifact: impl Into<String>) -> ReferenceReindexSource {
+    pub fn new(
+        tenant: TenantId,
+        owner: impl Into<String>,
+        artifact: impl Into<String>,
+    ) -> ReferenceReindexSource {
         ReferenceReindexSource {
+            tenant,
             owner: owner.into(),
             artifact: artifact.into(),
             truth: BTreeMap::new(),
@@ -262,7 +302,10 @@ impl ReindexSource for ReferenceReindexSource {
                 aggregate: AggregateKey(agg.clone()),
                 version: *v,
                 type_: self.snapshot_type(),
-                subject: ArtifactRef(format!("myelin://t/{}/{}/{agg}", self.owner, self.artifact)),
+                subject: ArtifactRef(format!(
+                    "myelin://{}/{}/{}/{agg}",
+                    self.tenant.0, self.owner, self.artifact
+                )),
                 payload: payload.clone(),
                 data_role: DataRole::Processor,
                 visibility: Visibility::Internal,
@@ -277,14 +320,22 @@ mod tests {
     use crate::{Actor, CorrelationId, Region, TenantId, Timestamp};
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
+    fn tenant() -> TenantId {
+        TenantId("acme".into())
+    }
+
     fn ctx_base() -> EmitContextBase {
+        ctx_base_for(tenant())
+    }
+
+    fn ctx_base_for(tenant: TenantId) -> EmitContextBase {
         EmitContextBase {
-            tenant: TenantId("acme".into()),
+            tenant: tenant.clone(),
             region: Region("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                TenantId("acme".into()),
+                tenant,
             )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-20T00:00:00Z".into()),
@@ -298,33 +349,38 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_event_id_is_deterministic_from_aggregate_and_version() {
+    fn snapshot_event_id_is_deterministic_from_tenant_aggregate_and_version() {
         let a = AggregateKey("ci.run:42".into());
         let b = AggregateKey("ci.run:43".into());
         assert_eq!(
-            snapshot_event_id(&a, 1),
-            snapshot_event_id(&a, 1),
+            snapshot_event_id(&tenant(), &a, 1),
+            snapshot_event_id(&tenant(), &a, 1),
             "same inputs → same id"
         );
         assert_ne!(
-            snapshot_event_id(&a, 1),
-            snapshot_event_id(&a, 2),
+            snapshot_event_id(&tenant(), &a, 1),
+            snapshot_event_id(&tenant(), &a, 2),
             "version bumps the id"
         );
         assert_ne!(
-            snapshot_event_id(&a, 1),
-            snapshot_event_id(&b, 1),
+            snapshot_event_id(&tenant(), &a, 1),
+            snapshot_event_id(&tenant(), &b, 1),
             "aggregate bumps the id"
         );
+        assert_ne!(
+            snapshot_event_id(&tenant(), &a, 1),
+            snapshot_event_id(&TenantId("other".into()), &a, 1),
+            "tenant bumps the id so shared outboxes cannot deduplicate across tenants"
+        );
         assert!(
-            snapshot_event_id(&a, 1).0.starts_with("snap-"),
+            snapshot_event_id(&tenant(), &a, 1).0.starts_with("snap-"),
             "snapshot ids are prefixed"
         );
     }
 
     #[test]
     fn reindex_is_idempotent_a_rerun_emits_zero_new_snapshots() {
-        let mut source = ReferenceReindexSource::new("ci", "run");
+        let mut source = ReferenceReindexSource::new(tenant(), "ci", "run");
         source.upsert("ci.run:1", 1, serde_json::json!({ "status": "success" }));
         source.upsert("ci.run:2", 1, serde_json::json!({ "status": "failure" }));
         let sources: &[&dyn ReindexSource] = &[&source];
@@ -347,8 +403,69 @@ mod tests {
     }
 
     #[test]
+    fn reindex_is_isolated_by_tenant_in_a_shared_outbox() {
+        let globex = TenantId("globex".into());
+        let mut acme_source = ReferenceReindexSource::new(tenant(), "ci", "run");
+        acme_source.upsert("ci.run:1", 1, serde_json::json!({ "status": "success" }));
+        let mut globex_source = ReferenceReindexSource::new(globex.clone(), "ci", "run");
+        globex_source.upsert("ci.run:1", 1, serde_json::json!({ "status": "failure" }));
+        let scope = SnapshotScope::new("ci", "run:all");
+        let mut outbox = OutboxStore::new();
+
+        let acme =
+            reindex(&scope, None, &[&acme_source], &mut outbox, ctx_base()).expect("acme rebuild");
+        let other = reindex(
+            &scope,
+            None,
+            &[&globex_source],
+            &mut outbox,
+            ctx_base_for(globex.clone()),
+        )
+        .expect("globex rebuild");
+
+        assert_eq!(acme.snapshots_emitted, 1);
+        assert_eq!(other.snapshots_emitted, 1);
+        assert_eq!(
+            outbox.committed_count(),
+            2,
+            "neither tenant masks the other"
+        );
+        assert_ne!(
+            snapshot_event_id(&tenant(), &AggregateKey("ci.run:1".into()), 1),
+            snapshot_event_id(&globex, &AggregateKey("ci.run:1".into()), 1),
+            "the same aggregate version has a distinct identity per tenant"
+        );
+    }
+
+    #[test]
+    fn reindex_rejects_a_cross_tenant_subject_before_staging_anything() {
+        let mut source =
+            ReferenceReindexSource::new(TenantId("globex".into()), "knowledge", "page");
+        source.upsert("home", 1, serde_json::json!({ "title": "private" }));
+        let mut outbox = OutboxStore::new();
+
+        let error = reindex(
+            &SnapshotScope::new("knowledge", "page:all"),
+            None,
+            &[&source],
+            &mut outbox,
+            ctx_base(),
+        )
+        .expect_err("a globex subject cannot enter acme's rebuild");
+
+        assert!(matches!(
+            error,
+            ReindexError::SubjectTenantMismatch {
+                expected_tenant,
+                ..
+            } if expected_tenant == "acme"
+        ));
+        assert_eq!(outbox.committed_count(), 0, "validation is atomic");
+    }
+
+    #[test]
     fn emitted_snapshots_carry_the_deterministic_event_id() {
-        let mut source = ReferenceReindexSource::new("knowledge", "page");
+        let mut source = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         source.upsert(
             "knowledge.page:home",
             3,
@@ -360,7 +477,7 @@ mod tests {
         let mut outbox = OutboxStore::new();
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
 
-        let expected = snapshot_event_id(&AggregateKey("knowledge.page:home".into()), 3);
+        let expected = snapshot_event_id(&tenant(), &AggregateKey("knowledge.page:home".into()), 3);
         let row = outbox
             .row(&expected)
             .expect("snapshot lands at its deterministic id");
@@ -373,7 +490,7 @@ mod tests {
 
     #[test]
     fn reference_consumer_rebuilds_byte_identically_cold_equals_live() {
-        let mut source = ReferenceReindexSource::new("ci", "run");
+        let mut source = ReferenceReindexSource::new(tenant(), "ci", "run");
         source.upsert("ci.run:1", 1, serde_json::json!({ "status": "success" }));
         source.upsert("ci.run:2", 2, serde_json::json!({ "status": "failure" }));
         source.upsert("ci.run:3", 1, serde_json::json!({ "status": "running" }));
@@ -390,7 +507,9 @@ mod tests {
         let mut outbox = OutboxStore::new();
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
         for draft in source.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row present");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row present");
             cold.ingest(&envelope_of(&row));
         }
 
@@ -405,7 +524,7 @@ mod tests {
 
     #[test]
     fn reindex_of_unknown_owner_is_a_loud_error() {
-        let source = ReferenceReindexSource::new("ci", "run");
+        let source = ReferenceReindexSource::new(tenant(), "ci", "run");
         let sources: &[&dyn ReindexSource] = &[&source];
         let scope = SnapshotScope::new("refs", "edge:all");
         let mut outbox = OutboxStore::new();
@@ -415,7 +534,7 @@ mod tests {
 
     #[test]
     fn reindex_since_cursor_replays_only_newer_versions() {
-        let mut source = ReferenceReindexSource::new("ci", "run");
+        let mut source = ReferenceReindexSource::new(tenant(), "ci", "run");
         source.upsert("ci.run:1", 1, serde_json::json!({ "status": "old" }));
         source.upsert("ci.run:2", 5, serde_json::json!({ "status": "new" }));
         let sources: &[&dyn ReindexSource] = &[&source];
@@ -436,7 +555,7 @@ mod tests {
             aggregate: AggregateKey("a:1".into()),
             version: 2,
             type_: EventType("x.a.snapshot".into()),
-            subject: ArtifactRef("myelin://t/x/a/1".into()),
+            subject: ArtifactRef("myelin://acme/x/a/1".into()),
             payload: serde_json::json!({ "version": 2, "v": "new" }),
             data_role: DataRole::Processor,
             visibility: Visibility::Internal,
@@ -466,21 +585,22 @@ mod tests {
     }
 
     fn snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
+        let event_id = draft.event_id(&tenant());
         EventEnvelope {
-            event_id: draft.event_id(),
+            event_id: event_id.clone(),
             type_: draft.type_.clone(),
             schema_ver: 1,
-            tenant: TenantId("acme".into()),
+            tenant: tenant(),
             region: Region("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                TenantId("acme".into()),
+                tenant(),
             )),
             subject: draft.subject.clone(),
             aggregate: draft.aggregate.clone(),
             causation_id: None,
-            correlation_id: CorrelationId(draft.event_id().0),
+            correlation_id: CorrelationId(event_id.0),
             caused_by: None,
             depth: 0,
             contains_personal_data: false,

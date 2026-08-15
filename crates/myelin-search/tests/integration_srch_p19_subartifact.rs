@@ -274,13 +274,13 @@ fn ctx_base() -> EmitContextBase {
 
 #[test]
 fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
-    let mut src = ReferenceReindexSource::new("git", "blob");
+    let mut src = ReferenceReindexSource::new(tenant(), "git", "blob");
     src.upsert(
         "repo:main:src/scheduler/deadlock.rs#L42-L45",
         1,
         serde_json::json!({ "kind": "blob" }),
     );
-    let snapshot_ref = "myelin://t/git/blob/repo:main:src/scheduler/deadlock.rs#L42-L45";
+    let snapshot_ref = "myelin://acme/git/blob/repo:main:src/scheduler/deadlock.rs#L42-L45";
 
     let (ix, fetcher) = indexer();
 
@@ -328,7 +328,7 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
     };
     fetcher.put(snapshot_ref, line_range_subdoc_projection(&after));
 
-    let mut src_after = ReferenceReindexSource::new("git", "blob");
+    let mut src_after = ReferenceReindexSource::new(tenant(), "git", "blob");
     src_after.upsert(
         "repo:main:src/scheduler/deadlock.rs#L42-L45",
         2,
@@ -417,12 +417,12 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
     let _ = REGION;
     let block_agg = "page/42#b9";
     let lr_agg = "repo:main:src/x.rs#L10-L12";
-    let block_snap = format!("myelin://t/knowledge/page/{block_agg}");
-    let lr_snap = format!("myelin://t/git/blob/{lr_agg}");
+    let block_snap = format!("myelin://acme/knowledge/page/{block_agg}");
+    let lr_snap = format!("myelin://acme/git/blob/{lr_agg}");
 
-    let mut kn_src = ReferenceReindexSource::new("knowledge", "page");
+    let mut kn_src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
     kn_src.upsert(block_agg, 1, serde_json::json!({ "kind": "page" }));
-    let mut git_src = ReferenceReindexSource::new("git", "blob");
+    let mut git_src = ReferenceReindexSource::new(tenant(), "git", "blob");
     git_src.upsert(lr_agg, 1, serde_json::json!({ "kind": "blob" }));
 
     let (ix, fetcher) = indexer();

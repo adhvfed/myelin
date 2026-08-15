@@ -193,13 +193,15 @@ pub fn run_e2e3_storage_half(
 }
 
 pub struct DerivedReindexSource {
+    tenant: myelin_events::TenantId,
     owner: String,
     truth: BTreeMap<String, (u64, serde_json::Value)>,
 }
 
 impl DerivedReindexSource {
-    pub fn new(owner: impl Into<String>) -> DerivedReindexSource {
+    pub fn new(tenant: myelin_events::TenantId, owner: impl Into<String>) -> DerivedReindexSource {
         DerivedReindexSource {
+            tenant,
             owner: owner.into(),
             truth: BTreeMap::new(),
         }
@@ -252,7 +254,10 @@ impl ReindexSource for DerivedReindexSource {
                     aggregate: myelin_events::AggregateKey(agg.clone()),
                     version: *v,
                     type_: self.snapshot_type(),
-                    subject: ArtifactRef(format!("myelin://t/{}/derived/{agg}", self.owner)),
+                    subject: ArtifactRef(format!(
+                        "myelin://{}/{}/derived/{agg}",
+                        self.tenant.0, self.owner
+                    )),
                     payload: body,
                     data_role: DataRole::Processor,
                     visibility: Visibility::Internal,
@@ -270,7 +275,7 @@ fn live_envelope(region: &Region, draft: &myelin_events::SnapshotDraft) -> Event
 
     let tenant = TenantId("01J0ACME".into());
     EventEnvelope {
-        event_id: EventId(draft.event_id().0),
+        event_id: EventId(draft.event_id(&tenant).0),
         type_: EventType(draft.type_.0.clone()),
         schema_ver: 1,
         tenant: tenant.clone(),
@@ -337,17 +342,17 @@ mod tests {
     }
 
     fn all_sources() -> BTreeMap<DerivedStoreClass, DerivedReindexSource> {
-        let mut olap = DerivedReindexSource::new("olap_src");
+        let mut olap = DerivedReindexSource::new(tenant(), "olap_src");
         olap.upsert("issue:PROJ-1", 1, serde_json::json!({ "cfd": 3 }))
             .upsert("issue:PROJ-2", 2, serde_json::json!({ "cfd": 5 }));
 
-        let mut search = DerivedReindexSource::new("search_src");
+        let mut search = DerivedReindexSource::new(tenant(), "search_src");
         search
             .upsert("page:home", 1, serde_json::json!({ "text": "raft" }))
             .upsert("page:guide", 2, serde_json::json!({ "text": "paxos" }))
             .upsert("page:faq", 1, serde_json::json!({ "text": "faq" }));
 
-        let mut refs = DerivedReindexSource::new("refs_src");
+        let mut refs = DerivedReindexSource::new(tenant(), "refs_src");
         refs.upsert(
             "edge:PR-1->ISSUE-1",
             1,

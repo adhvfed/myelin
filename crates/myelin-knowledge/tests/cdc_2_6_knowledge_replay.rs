@@ -6,14 +6,18 @@ use myelin_events::{
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 
+fn tenant() -> TenantId {
+    TenantId("acme".into())
+}
+
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
-        tenant: TenantId("acme".into()),
+        tenant: tenant(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
             PrincipalId("platform".into()),
             PrincipalKind::Service,
-            TenantId("acme".into()),
+            tenant(),
         )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-22T00:00:00Z".into()),
@@ -23,21 +27,22 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
+    let event_id = draft.event_id(&tenant());
     EventEnvelope {
-        event_id: draft.event_id(),
+        event_id: event_id.clone(),
         type_: draft.type_.clone(),
         schema_ver: 1,
-        tenant: TenantId("acme".into()),
+        tenant: tenant(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
             PrincipalId("platform".into()),
             PrincipalKind::Service,
-            TenantId("acme".into()),
+            tenant(),
         )),
         subject: draft.subject.clone(),
         aggregate: draft.aggregate.clone(),
         causation_id: None,
-        correlation_id: CorrelationId(draft.event_id().0),
+        correlation_id: CorrelationId(event_id.0),
         caused_by: None,
         depth: 0,
         contains_personal_data: false,
@@ -109,7 +114,7 @@ fn cdc_2_6_full_surface_rebuilds_cold_equals_live_via_the_live_consumer_only() {
     let mut cold = DerivedStore::new();
     for draft in s.replay(&scope, None) {
         let row = outbox
-            .row(&draft.event_id())
+            .row(&draft.event_id(&tenant()))
             .expect("snapshot row present in the outbox");
         cold.ingest(&row.envelope);
     }
@@ -172,14 +177,17 @@ fn cdc_2_6_refs_edge_snapshot_token_is_the_frozen_wire_string() {
 #[test]
 fn cdc_2_6_snapshot_id_is_deterministic_matching_the_bus_seam() {
     let a = AggregateKey("myelin://acme/knowledge/row/task-1".into());
-    assert_eq!(snapshot_event_id(&a, 2), snapshot_event_id(&a, 2));
+    assert_eq!(
+        snapshot_event_id(&tenant(), &a, 2),
+        snapshot_event_id(&tenant(), &a, 2)
+    );
     assert_ne!(
-        snapshot_event_id(&a, 2),
-        snapshot_event_id(&a, 3),
+        snapshot_event_id(&tenant(), &a, 2),
+        snapshot_event_id(&tenant(), &a, 3),
         "a row edit re-snapshots"
     );
     assert!(
-        snapshot_event_id(&a, 2).0.starts_with("snap-"),
+        snapshot_event_id(&tenant(), &a, 2).0.starts_with("snap-"),
         "the snapshot id is prefixed"
     );
 }

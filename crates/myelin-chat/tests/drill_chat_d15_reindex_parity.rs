@@ -153,7 +153,7 @@ fn chat_source(corpus: &[CorpusMessage]) -> ChatReindexSource {
 fn message_envelope(message_ref: &str, version: u64) -> EventEnvelope {
     let agg = AggregateKey(message_ref.to_string());
     EventEnvelope {
-        event_id: myelin_events::snapshot_event_id(&agg, version),
+        event_id: myelin_events::snapshot_event_id(&tenant(), &agg, version),
         type_: EventType(CHAT_MESSAGE_SNAPSHOT.into()),
         schema_ver: 1,
         tenant: tenant(),
@@ -208,7 +208,9 @@ fn rebuild_read_model(
         let sources: &[&dyn ReindexSource] = &[src];
         bus_reindex(scope, None, sources, &mut outbox, ctx_base()).expect("reindex emit");
         for draft in src.replay(scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row");
             rm.ingest(&row.envelope, fetcher);
         }
     } else {
@@ -238,7 +240,9 @@ fn search_message_index_cold_rebuild_byte_matches_live() {
         let sources: &[&dyn ReindexSource] = &[&src];
         bus_reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("emit");
         for draft in src.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row");
             live_ix.index(&row.envelope).expect("live index");
         }
     }

@@ -237,7 +237,7 @@ impl ReindexCtx {
                 Some(EventEnvelope {
                     event_id: EventId(format!(
                         "olap-reindex:{}",
-                        snapshot_event_id(&draft.aggregate, draft.version).0
+                        snapshot_event_id(&self.tenant, &draft.aggregate, draft.version).0
                     )),
                     type_: EventType(token),
                     schema_ver: 1,

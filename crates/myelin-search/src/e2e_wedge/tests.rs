@@ -71,10 +71,10 @@ fn e2e_3_parity_hash_diverges_on_a_dropped_doc() {
     let scope = SnapshotScope::new("knowledge", "page:all");
 
     let fetcher = Arc::new(LineageFetcher::default());
-    let mut owner = ReferenceReindexSource::new("knowledge", "page");
+    let mut owner = ReferenceReindexSource::new(tenant.clone(), "knowledge", "page");
     for (agg, body) in &lineage {
         owner.upsert(agg, 1, serde_json::json!({ "kind": "page" }));
-        fetcher.put(&lineage_snapshot_ref(agg), body);
+        fetcher.put(&lineage_snapshot_ref(&tenant, agg), body);
     }
     let ix = Arc::new(IncrementalIndexer::new(
         vec![lineage_page_spec()],
@@ -91,10 +91,10 @@ fn e2e_3_parity_hash_diverges_on_a_dropped_doc() {
 
     let short: Vec<(String, String)> = lineage[..lineage.len() - 1].to_vec();
     let fetcher2 = Arc::new(LineageFetcher::default());
-    let mut owner2 = ReferenceReindexSource::new("knowledge", "page");
+    let mut owner2 = ReferenceReindexSource::new(tenant.clone(), "knowledge", "page");
     for (agg, body) in &short {
         owner2.upsert(agg, 1, serde_json::json!({ "kind": "page" }));
-        fetcher2.put(&lineage_snapshot_ref(agg), body);
+        fetcher2.put(&lineage_snapshot_ref(&tenant, agg), body);
     }
     let ix2 = Arc::new(IncrementalIndexer::new(
         vec![lineage_page_spec()],

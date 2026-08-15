@@ -336,8 +336,9 @@ fn e2e3_lineage_source() -> KnowledgeReindexSource {
 }
 
 fn e2e3_snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
+    let event_id = draft.event_id(&e2e_tenant());
     EventEnvelope {
-        event_id: draft.event_id(),
+        event_id: event_id.clone(),
         type_: draft.type_.clone(),
         schema_ver: 1,
         tenant: e2e_tenant(),
@@ -346,7 +347,7 @@ fn e2e3_snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
         subject: draft.subject.clone(),
         aggregate: draft.aggregate.clone(),
         causation_id: None,
-        correlation_id: CorrelationId(draft.event_id().0),
+        correlation_id: CorrelationId(event_id.0),
         caused_by: None,
         depth: 0,
         contains_personal_data: false,
@@ -450,7 +451,9 @@ pub fn run_e2e3_spec_to_ship_lineage() -> E2eArtifact {
     let mut cold = DerivedStore::new();
     assert!(cold.is_empty(), "the derived store is wiped before rebuild");
     for draft in source.replay(&scope, None) {
-        let row = outbox.row(&draft.event_id()).expect("snapshot row present");
+        let row = outbox
+            .row(&draft.event_id(&e2e_tenant()))
+            .expect("snapshot row present");
         cold.ingest(&row.envelope);
     }
     let cold_equals_live = cold.len() == live.len() && cold.parity_bytes() == live.parity_bytes();

@@ -186,8 +186,9 @@ mod tests {
         let second = src.replay(&scope, None);
         assert_eq!(first, second, "the replay is deterministic (cold == live)");
 
-        let id_a = snapshot_event_id(&first[0].aggregate, first[0].version);
-        let id_b = snapshot_event_id(&second[0].aggregate, second[0].version);
+        let tenant = TenantId("acme".into());
+        let id_a = snapshot_event_id(&tenant, &first[0].aggregate, first[0].version);
+        let id_b = snapshot_event_id(&tenant, &second[0].aggregate, second[0].version);
         assert_eq!(id_a, id_b, "the snapshot event_id is deterministic");
     }
 

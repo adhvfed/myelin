@@ -270,14 +270,18 @@ mod tests {
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
+    fn tenant() -> TenantId {
+        TenantId("acme".into())
+    }
+
     fn ctx_base() -> EmitContextBase {
         EmitContextBase {
-            tenant: TenantId("acme".into()),
+            tenant: tenant(),
             region: Region("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                TenantId("acme".into()),
+                tenant(),
             )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-22T00:00:00Z".into()),
@@ -335,21 +339,22 @@ mod tests {
     }
 
     fn snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
+        let event_id = draft.event_id(&tenant());
         EventEnvelope {
-            event_id: draft.event_id(),
+            event_id: event_id.clone(),
             type_: draft.type_.clone(),
             schema_ver: 1,
-            tenant: TenantId("acme".into()),
+            tenant: tenant(),
             region: Region("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                TenantId("acme".into()),
+                tenant(),
             )),
             subject: draft.subject.clone(),
             aggregate: draft.aggregate.clone(),
             causation_id: None,
-            correlation_id: CorrelationId(draft.event_id().0),
+            correlation_id: CorrelationId(event_id.0),
             caused_by: None,
             depth: 0,
             contains_personal_data: false,
@@ -493,13 +498,13 @@ mod tests {
     fn snapshot_event_id_is_deterministic() {
         let a = AggregateKey("myelin://acme/knowledge/row/row-1".into());
         assert_eq!(
-            snapshot_event_id(&a, 3),
-            snapshot_event_id(&a, 3),
+            snapshot_event_id(&tenant(), &a, 3),
+            snapshot_event_id(&tenant(), &a, 3),
             "same inputs → same id"
         );
         assert_ne!(
-            snapshot_event_id(&a, 3),
-            snapshot_event_id(&a, 4),
+            snapshot_event_id(&tenant(), &a, 3),
+            snapshot_event_id(&tenant(), &a, 4),
             "version bumps the id"
         );
     }
@@ -520,7 +525,7 @@ mod tests {
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("full-surface reindex");
         for draft in s.replay(&scope, None) {
             let row = outbox
-                .row(&draft.event_id())
+                .row(&draft.event_id(&tenant()))
                 .expect("snapshot row present (live path only)");
             cold.ingest(&row.envelope);
         }
@@ -556,7 +561,7 @@ mod tests {
         assert_eq!(r1.snapshots_emitted, 2, "both typed edges re-emitted");
         for draft in s.drift_correct_edges(None) {
             let row = outbox
-                .row(&draft.event_id())
+                .row(&draft.event_id(&tenant()))
                 .expect("edge snapshot present");
             assert!(row.envelope.type_.0 == REFS_EDGE_SNAPSHOT);
             refs_projection.ingest(&row.envelope);

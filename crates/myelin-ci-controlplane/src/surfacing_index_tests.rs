@@ -5,6 +5,10 @@ use myelin_events::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
+fn tenant() -> TenantId {
+    TenantId("acme".into())
+}
+
 #[test]
 fn spec_is_cis_owned_6_3_run_shape() {
     let s = ci_run_index_spec();
@@ -118,12 +122,12 @@ fn declare_indexable_honours_restriction_zero_restricted_rows_indexed() {
 
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
-        tenant: TenantId("acme".into()),
+        tenant: tenant(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
             PrincipalId("ci".into()),
             PrincipalKind::Service,
-            TenantId("acme".into()),
+            tenant(),
         )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-23T00:00:00Z".into()),
@@ -133,21 +137,22 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
+    let event_id = draft.event_id(&tenant());
     EventEnvelope {
-        event_id: draft.event_id(),
+        event_id: event_id.clone(),
         type_: draft.type_.clone(),
         schema_ver: 1,
-        tenant: TenantId("acme".into()),
+        tenant: tenant(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
             PrincipalId("ci".into()),
             PrincipalKind::Service,
-            TenantId("acme".into()),
+            tenant(),
         )),
         subject: draft.subject.clone(),
         aggregate: draft.aggregate.clone(),
         causation_id: None,
-        correlation_id: CorrelationId(draft.event_id().0),
+        correlation_id: CorrelationId(event_id.0),
         caused_by: None,
         depth: 0,
         contains_personal_data: false,
@@ -199,7 +204,7 @@ fn rebuild_from_snapshots_without_ci_db() {
     );
     for draft in src.replay(&scope, None) {
         let row = outbox
-            .row(&draft.event_id())
+            .row(&draft.event_id(&tenant()))
             .expect("snapshot row present in the outbox");
         cold.ingest(&row.envelope);
     }
@@ -237,12 +242,12 @@ fn ci_snapshot_id_is_deterministic() {
     let drafts = ci_source_with_two_runs().replay(&SnapshotScope::new("ci", "run:all"), None);
     let a = &drafts[0];
     assert_eq!(
-        snapshot_event_id(&a.aggregate, a.version),
-        snapshot_event_id(&a.aggregate, a.version)
+        snapshot_event_id(&tenant(), &a.aggregate, a.version),
+        snapshot_event_id(&tenant(), &a.aggregate, a.version)
     );
     assert_ne!(
-        snapshot_event_id(&a.aggregate, a.version),
-        snapshot_event_id(&a.aggregate, a.version + 1)
+        snapshot_event_id(&tenant(), &a.aggregate, a.version),
+        snapshot_event_id(&tenant(), &a.aggregate, a.version + 1)
     );
 }
 

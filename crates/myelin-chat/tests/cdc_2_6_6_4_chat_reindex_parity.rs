@@ -86,7 +86,7 @@ fn source() -> ChatReindexSource {
 fn live_envelope(message_ref: &str, version: u64) -> EventEnvelope {
     let agg = AggregateKey(message_ref.to_string());
     EventEnvelope {
-        event_id: myelin_events::snapshot_event_id(&agg, version),
+        event_id: myelin_events::snapshot_event_id(&tenant(), &agg, version),
         type_: EventType(CHAT_MESSAGE_SNAPSHOT.into()),
         schema_ver: 1,
         tenant: tenant(),
@@ -134,7 +134,7 @@ fn cdc_2_6_6_4_chat_replay_parity_provider_reemits_consumer_rebuilds_one_path() 
     let mut cold = ChatReadModelConsumer::new();
     for draft in src.replay(&scope, None) {
         let row = outbox
-            .row(&draft.event_id())
+            .row(&draft.event_id(&tenant()))
             .expect("snapshot row at deterministic id");
         assert_eq!(
             row.envelope.type_.0, CHAT_MESSAGE_SNAPSHOT,
@@ -182,7 +182,9 @@ fn cdc_2_6_chat_replay_erased_subject_is_a_tombstone_on_rebuild() {
 
     let mut cold = ChatReadModelConsumer::new();
     for draft in src.replay(&scope, None) {
-        let row = outbox.row(&draft.event_id()).expect("snapshot row");
+        let row = outbox
+            .row(&draft.event_id(&tenant()))
+            .expect("snapshot row");
         cold.ingest(&row.envelope, &proj);
     }
     assert_eq!(

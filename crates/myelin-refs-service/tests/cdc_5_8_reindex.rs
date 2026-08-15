@@ -133,7 +133,11 @@ fn reindex_snapshots_ingest_through_the_real_consumer_runtime_deduped() {
         .reindex(&scope(), None, &truth, &mut outbox, ctx_base())
         .expect("reindex emits the snapshot");
 
-    let snap_id = snapshot_event_id(&myelin_events::AggregateKey("refs.edge:1".into()), 1);
+    let snap_id = snapshot_event_id(
+        &tenant(),
+        &myelin_events::AggregateKey("refs.edge:1".into()),
+        1,
+    );
     let row = outbox
         .row(&snap_id)
         .expect("snapshot row in the outbox at its deterministic id");

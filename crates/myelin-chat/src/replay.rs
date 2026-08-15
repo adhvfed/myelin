@@ -300,8 +300,8 @@ mod tests {
         let b = src.replay(&scope, None);
         assert_eq!(a, b);
         assert_eq!(
-            snapshot_event_id(&a[0].aggregate, a[0].version),
-            snapshot_event_id(&b[0].aggregate, b[0].version)
+            snapshot_event_id(&tenant(), &a[0].aggregate, a[0].version),
+            snapshot_event_id(&tenant(), &b[0].aggregate, b[0].version)
         );
     }
 
@@ -334,14 +334,18 @@ mod tests {
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
+    fn tenant() -> EvTenantId {
+        EvTenantId("acme".into())
+    }
+
     fn ctx_base() -> EmitContextBase {
         EmitContextBase {
-            tenant: EvTenantId("acme".into()),
+            tenant: tenant(),
             region: EvRegion("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                EvTenantId("acme".into()),
+                tenant(),
             )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
@@ -372,7 +376,7 @@ mod tests {
             "one chat.message.snapshot emitted through the outbox"
         );
         let row = outbox
-            .row(&drafts[0].event_id())
+            .row(&drafts[0].event_id(&tenant()))
             .expect("the chat.message.snapshot row is on the outbox (never off it)");
         assert_eq!(row.envelope.type_.0, "chat.message.snapshot");
 
@@ -445,21 +449,18 @@ mod tests {
     }
 
     fn message_snapshot_envelope(message_ref: &str, version: u64) -> EventEnvelope {
-        use myelin_events::{
-            Actor, AggregateKey, CorrelationId, Region as EvRegion, TenantId as EvTenantId,
-            Timestamp,
-        };
+        use myelin_events::{Actor, AggregateKey, CorrelationId, Region as EvRegion, Timestamp};
         let agg = AggregateKey(message_ref.to_string());
         EventEnvelope {
-            event_id: myelin_events::snapshot_event_id(&agg, version),
+            event_id: myelin_events::snapshot_event_id(&tenant(), &agg, version),
             type_: EventType(events::CHAT_MESSAGE_SNAPSHOT.into()),
             schema_ver: 1,
-            tenant: EvTenantId("acme".into()),
+            tenant: tenant(),
             region: EvRegion("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                EvTenantId("acme".into()),
+                tenant(),
             )),
             subject: ArtifactRef(message_ref.to_string()),
             aggregate: agg,
@@ -538,7 +539,9 @@ mod tests {
         let mut outbox = myelin_events::OutboxStore::new();
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
         for draft in src.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row present");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row present");
             cold.ingest(&row.envelope, &proj);
         }
 
@@ -598,7 +601,9 @@ mod tests {
         let mut outbox = myelin_events::OutboxStore::new();
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("post-erase reindex");
         for draft in src.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row");
             cold.ingest(&row.envelope, &proj);
         }
 
@@ -633,7 +638,9 @@ mod tests {
         let mut outbox = myelin_events::OutboxStore::new();
         reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
         for draft in src.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row");
             cold.ingest(&row.envelope, &proj);
         }
 

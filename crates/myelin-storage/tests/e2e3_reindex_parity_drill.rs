@@ -32,17 +32,17 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn all_sources() -> BTreeMap<DerivedStoreClass, DerivedReindexSource> {
-    let mut olap = DerivedReindexSource::new("olap_src");
+    let mut olap = DerivedReindexSource::new(tenant(), "olap_src");
     olap.upsert("issue:PROJ-1", 1, serde_json::json!({ "cfd": 3 }))
         .upsert("issue:PROJ-2", 2, serde_json::json!({ "cfd": 5 }));
 
-    let mut search = DerivedReindexSource::new("search_src");
+    let mut search = DerivedReindexSource::new(tenant(), "search_src");
     search
         .upsert("page:home", 1, serde_json::json!({ "text": "raft" }))
         .upsert("page:guide", 2, serde_json::json!({ "text": "paxos" }))
         .upsert("page:faq", 1, serde_json::json!({ "text": "faq" }));
 
-    let mut refs = DerivedReindexSource::new("refs_src");
+    let mut refs = DerivedReindexSource::new(tenant(), "refs_src");
     refs.upsert(
         "edge:PR-1->ISSUE-1",
         1,

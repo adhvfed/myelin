@@ -321,7 +321,7 @@ impl SearchReindexer {
                     hit_cap = true;
                     break;
                 }
-                let event_id = draft.event_id();
+                let event_id = draft.event_id(tenant);
                 if !self
                     .cursors
                     .record_applied(tenant, &region, scope, &event_id.0, draft.version)
@@ -459,11 +459,11 @@ mod tests {
     }
 
     fn snapshot_ref(agg: &str) -> String {
-        format!("myelin://t/knowledge/page/{agg}")
+        format!("myelin://acme/knowledge/page/{agg}")
     }
 
     fn owner_with_three_pages() -> ReferenceReindexSource {
-        let mut src = ReferenceReindexSource::new("knowledge", "page");
+        let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src.upsert("home", 1, serde_json::json!({ "kind": "page" }));
         src.upsert("guide", 2, serde_json::json!({ "kind": "page" }));
         src.upsert("faq", 1, serde_json::json!({ "kind": "page" }));
@@ -590,7 +590,7 @@ mod tests {
         );
         fetcher.put(&other_ref, "an unrelated page about paxos");
 
-        let mut src = ReferenceReindexSource::new("knowledge", "page");
+        let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src.upsert("owned", 1, serde_json::json!({ "kind": "page" }));
         src.upsert("other", 1, serde_json::json!({ "kind": "page" }));
 
@@ -618,7 +618,7 @@ mod tests {
             "only the unrelated page remains"
         );
 
-        let mut src_after = ReferenceReindexSource::new("knowledge", "page");
+        let mut src_after = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src_after.upsert("other", 1, serde_json::json!({ "kind": "page" }));
         fetcher.bodies.lock().unwrap().remove(&owned_ref);
 
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn reindex_is_throttled_and_resumable_via_the_cursor_store() {
-        let mut src = ReferenceReindexSource::new("knowledge", "page");
+        let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src.upsert("p1", 1, serde_json::json!({ "kind": "page" }));
         src.upsert("p2", 2, serde_json::json!({ "kind": "page" }));
         src.upsert("p3", 3, serde_json::json!({ "kind": "page" }));
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn incremental_backfill_appends_without_wiping() {
-        let mut src = ReferenceReindexSource::new("knowledge", "page");
+        let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src.upsert("old", 1, serde_json::json!({ "kind": "page" }));
         src.upsert("new", 5, serde_json::json!({ "kind": "page" }));
         let (ix, fetcher) = indexer_with(&[]);
@@ -740,7 +740,7 @@ mod tests {
         let reindexer = SearchReindexer::new(ix.clone(), region());
         let mut outbox = OutboxStore::new();
         let only_old = {
-            let mut s = ReferenceReindexSource::new("knowledge", "page");
+            let mut s = ReferenceReindexSource::new(tenant(), "knowledge", "page");
             s.upsert("old", 1, serde_json::json!({ "kind": "page" }));
             s
         };
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn reindex_of_unknown_owner_is_a_loud_error() {
-        let src = ReferenceReindexSource::new("knowledge", "page");
+        let src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         let (ix, _f) = indexer_with(&[]);
         let reindexer = SearchReindexer::new(ix, region());
         let unknown = SnapshotScope::new("refs", "edge:all");
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn srch_d5_cold_equals_live_ci_variant() {
-        let mut src = ReferenceReindexSource::new("knowledge", "page");
+        let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src.upsert("alpha", 1, serde_json::json!({ "kind": "page" }));
         src.upsert("beta", 1, serde_json::json!({ "kind": "page" }));
         let (ix, fetcher) = indexer_with(&[]);

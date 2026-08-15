@@ -10,17 +10,21 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 
+fn tenant() -> TenantId {
+    TenantId::from_token("01J0ACME")
+}
+
 fn envelope(event_id: &str, aggregate: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(event_id.into()),
         type_: EventType("issues.issue.created".into()),
         schema_ver: 1,
-        tenant: TenantId::from_token("01J0ACME"),
+        tenant: tenant(),
         region: region(),
         actor: Actor(Principal::stub(
             PrincipalId("p".into()),
             PrincipalKind::Human,
-            TenantId::from_token("01J0ACME"),
+            tenant(),
         )),
         subject: ArtifactRef("myelin://acme/issues/issue/PROJ-1".into()),
         aggregate: AggregateKey(aggregate.into()),
@@ -124,13 +128,13 @@ fn cdc_11_6_olap_store_is_fed_by_the_bus_and_reindexes_byte_matching_live() {
     };
     use myelin_storage::{reindex_olap_from_bus, OlapAnalyticsSource, OlapBusConsumer};
 
-    let mut src = OlapAnalyticsSource::new("olap_src");
+    let mut src = OlapAnalyticsSource::new(tenant(), "olap_src");
     src.upsert("issue:A", 1, Some("subj:alice"));
     src.upsert("issue:B", 2, None);
 
     let mut live = OlapBusConsumer::boot(region());
     for draft in src.replay(&SnapshotScope::new("olap_src", "all"), None) {
-        let env = envelope(&draft.event_id().0, &draft.aggregate.0);
+        let env = envelope(&draft.event_id(&tenant()).0, &draft.aggregate.0);
         let _ = live.ingest(&env);
     }
     assert_eq!(

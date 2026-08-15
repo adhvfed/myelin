@@ -294,7 +294,7 @@ fn e2e2_flagship_wake_once_and_nested_causality_root_carried() {
 
 #[test]
 fn e2e3_spec_to_ship_lineage_reindex_cold_equals_live() {
-    let mut source = ReferenceReindexSource::new("lineage", "node");
+    let mut source = ReferenceReindexSource::new(tenant(), "lineage", "node");
     let nodes = [
         ("lineage.node:spec-doc", 1, "r-spec"),
         ("lineage.node:issue", 1, "r-issue"),
@@ -353,7 +353,7 @@ fn e2e3_spec_to_ship_lineage_reindex_cold_equals_live() {
         "E2E-3: the cold rebuild materialised every lineage node"
     );
 
-    let home_id = snapshot_event_id(&AggregateKey("lineage.node:spec-doc".into()), 1);
+    let home_id = snapshot_event_id(&tenant(), &AggregateKey("lineage.node:spec-doc".into()), 1);
     let _ = home_id;
 
     let mut src = SignalSource::new();
@@ -591,7 +591,7 @@ fn bus_is_the_carriage_spine_of_all_four_e2e_scenarios() {
         "spine E2E-2: causal depth is one hop deeper"
     );
 
-    let mut source = ReferenceReindexSource::new("o", "a");
+    let mut source = ReferenceReindexSource::new(tenant(), "o", "a");
     source.upsert("o.a:1", 1, serde_json::json!({ "version": 1 }));
     let mut ob = OutboxStore::new();
     let sources: &[&dyn ReindexSource] = &[&source];

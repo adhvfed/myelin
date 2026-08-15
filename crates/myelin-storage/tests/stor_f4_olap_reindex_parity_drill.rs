@@ -35,7 +35,7 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn olap_source() -> OlapAnalyticsSource {
-    let mut src = OlapAnalyticsSource::new("olap_src");
+    let mut src = OlapAnalyticsSource::new(tenant(), "olap_src");
     src.upsert("issue:PROJ-1", 1, Some("subj:alice"));
     src.upsert("issue:PROJ-2", 2, Some("subj:bob"));
     src.upsert("issue:PROJ-3", 1, None);
@@ -58,7 +58,7 @@ fn live_envelope(agg: &str, event_id: &str, subject: Option<&str>) -> EventEnvel
         subject: ArtifactRef(
             subject
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("myelin://t/olap_src/analytics/{agg}")),
+                .unwrap_or_else(|| format!("myelin://01J0ACME/olap_src/analytics/{agg}")),
         ),
         aggregate: AggregateKey(agg.into()),
         causation_id: None,
@@ -79,7 +79,7 @@ fn live_projection(src: &OlapAnalyticsSource) -> OlapBusConsumer {
     let mut consumer = OlapBusConsumer::boot(region());
     for draft in src.replay(&SnapshotScope::new("olap_src", "all"), None) {
         let subject = draft.payload.get("subject").and_then(|s| s.as_str());
-        let env = live_envelope(&draft.aggregate.0, &draft.event_id().0, subject);
+        let env = live_envelope(&draft.aggregate.0, &draft.event_id(&tenant()).0, subject);
         consumer
             .ingest(&env)
             .expect("an in-region live event is admitted");

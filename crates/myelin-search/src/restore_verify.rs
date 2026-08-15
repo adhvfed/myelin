@@ -408,7 +408,7 @@ mod tests {
     }
 
     fn snapshot_ref(agg: &str) -> String {
-        format!("myelin://t/knowledge/page/{agg}")
+        format!("myelin://acme/knowledge/page/{agg}")
     }
     fn scope() -> SnapshotScope {
         SnapshotScope::new("knowledge", "page:all")
@@ -448,7 +448,7 @@ mod tests {
         let erased = subject("u-erased");
         let pn = pseudonym("u-erased");
 
-        let mut src_before = ReferenceReindexSource::new("knowledge", "page");
+        let mut src_before = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src_before.upsert("owned", 1, serde_json::json!({ "kind": "page" }));
         src_before.upsert("other", 1, serde_json::json!({ "kind": "page" }));
         fetcher.put(
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn run_or_fail_ci_returns_ok_on_green_empty_ledger() {
         let (_ix, fetcher, reindexer, holder) = cell();
-        let mut src = ReferenceReindexSource::new("knowledge", "page");
+        let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src.upsert("a", 1, serde_json::json!({ "kind": "page" }));
         fetcher.put(&snapshot_ref("a"), "a page about consensus");
         let ledger = SearchErasureLedger::new(tenant(), region());
@@ -544,7 +544,7 @@ mod tests {
         let (ix, fetcher, reindexer, holder) = cell();
         let erased = subject("u-x");
         let pn = pseudonym("u-x");
-        let mut src = ReferenceReindexSource::new("knowledge", "page");
+        let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src.upsert("owned", 1, serde_json::json!({ "kind": "page" }));
         fetcher.put(
             &snapshot_ref("owned"),
@@ -596,7 +596,7 @@ mod tests {
     fn re_erasure_is_idempotent_when_owner_tombstoned() {
         let (ix, fetcher, reindexer, holder) = cell();
         let erased = subject("u-gone");
-        let mut src_after = ReferenceReindexSource::new("knowledge", "page");
+        let mut src_after = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         src_after.upsert("other", 1, serde_json::json!({ "kind": "page" }));
         fetcher.put(&snapshot_ref("other"), "unrelated page about paxos");
         fetcher.remove(&snapshot_ref("owned"));
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn an_unknown_owner_fails_the_gate_loud() {
         let (_ix, _f, reindexer, holder) = cell();
-        let src = ReferenceReindexSource::new("knowledge", "page");
+        let src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
         let ledger = SearchErasureLedger::new(tenant(), region());
         let unknown = SnapshotScope::new("refs", "edge:all");
         let mut outbox = OutboxStore::new();

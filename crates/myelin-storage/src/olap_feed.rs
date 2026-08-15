@@ -48,13 +48,15 @@ impl OlapBusConsumer {
 }
 
 pub struct OlapAnalyticsSource {
+    tenant: myelin_events::TenantId,
     owner: String,
     truth: BTreeMap<String, (u64, Option<String>)>,
 }
 
 impl OlapAnalyticsSource {
-    pub fn new(owner: impl Into<String>) -> OlapAnalyticsSource {
+    pub fn new(tenant: myelin_events::TenantId, owner: impl Into<String>) -> OlapAnalyticsSource {
         OlapAnalyticsSource {
+            tenant,
             owner: owner.into(),
             truth: BTreeMap::new(),
         }
@@ -94,11 +96,9 @@ impl ReindexSource for OlapAnalyticsSource {
                     aggregate: myelin_events::AggregateKey(agg.clone()),
                     version: *v,
                     type_: self.snapshot_type(),
-                    subject: ArtifactRef(
-                        subject.clone().unwrap_or_else(|| {
-                            format!("myelin://t/{}/analytics/{agg}", self.owner)
-                        }),
-                    ),
+                    subject: ArtifactRef(subject.clone().unwrap_or_else(|| {
+                        format!("myelin://{}/{}/analytics/{agg}", self.tenant.0, self.owner)
+                    })),
                     payload,
                     data_role: DataRole::Processor,
                     visibility: Visibility::Internal,
@@ -208,7 +208,7 @@ mod tests {
             subject: ArtifactRef(
                 subject
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("myelin://t/olap_src/analytics/{agg}")),
+                    .unwrap_or_else(|| format!("myelin://01J0ACME/olap_src/analytics/{agg}")),
             ),
             aggregate: AggregateKey(agg.into()),
             causation_id: None,
@@ -226,7 +226,7 @@ mod tests {
     }
 
     fn olap_source() -> OlapAnalyticsSource {
-        let mut src = OlapAnalyticsSource::new("olap_src");
+        let mut src = OlapAnalyticsSource::new(tenant(), "olap_src");
         src.upsert("issue:PROJ-1", 1, Some("subj:alice"));
         src.upsert("issue:PROJ-2", 2, Some("subj:bob"));
         src.upsert("issue:PROJ-3", 1, None);
@@ -240,7 +240,7 @@ mod tests {
             let env = live_envelope(
                 &draft.aggregate.0,
                 draft.version,
-                &draft.event_id().0,
+                &draft.event_id(&tenant()).0,
                 subject,
             );
             consumer

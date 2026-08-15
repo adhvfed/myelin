@@ -580,8 +580,8 @@ fn signal_snapshot_draft_carries_the_signal_on_the_whitelisted_subject() {
     let back: Signal = serde_json::from_value(draft.payload.clone()).unwrap();
     assert_eq!(back.dedup_key.0, "run-42");
     assert_eq!(
-        draft.event_id(),
-        myelin_events::snapshot_event_id(&draft.aggregate, 3)
+        draft.event_id(&tenant()),
+        myelin_events::snapshot_event_id(&tenant(), &draft.aggregate, 3)
     );
 }
 

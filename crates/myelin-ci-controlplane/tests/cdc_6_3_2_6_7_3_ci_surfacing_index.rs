@@ -9,6 +9,10 @@ use myelin_events::{
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::FieldType;
 
+fn tenant() -> TenantId {
+    TenantId("acme".into())
+}
+
 #[test]
 fn cdc_6_3_provider_ci_run_spec_is_the_frozen_shape() {
     let s = ci_run_index_spec();
@@ -51,12 +55,12 @@ fn cdc_6_3_spec_serializes_to_the_wire_shape() {
 
 fn ctx_base() -> EmitContextBase {
     EmitContextBase {
-        tenant: TenantId("acme".into()),
+        tenant: tenant(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
             PrincipalId("ci".into()),
             PrincipalKind::Service,
-            TenantId("acme".into()),
+            tenant(),
         )),
         schema_ver: 1,
         occurred_at: Timestamp("2026-06-23T00:00:00Z".into()),
@@ -66,21 +70,22 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
+    let event_id = draft.event_id(&tenant());
     EventEnvelope {
-        event_id: draft.event_id(),
+        event_id: event_id.clone(),
         type_: draft.type_.clone(),
         schema_ver: 1,
-        tenant: TenantId("acme".into()),
+        tenant: tenant(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
             PrincipalId("ci".into()),
             PrincipalKind::Service,
-            TenantId("acme".into()),
+            tenant(),
         )),
         subject: draft.subject.clone(),
         aggregate: draft.aggregate.clone(),
         causation_id: None,
-        correlation_id: CorrelationId(draft.event_id().0),
+        correlation_id: CorrelationId(event_id.0),
         caused_by: None,
         depth: 0,
         contains_personal_data: false,
@@ -128,7 +133,7 @@ fn cdc_2_6_replay_rebuilds_without_ci_db_cold_equals_live() {
     let r1 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
     assert_eq!(r1.snapshots_emitted, 2);
     for d in src.replay(&scope, None) {
-        cold.ingest(&outbox.row(&d.event_id()).unwrap().envelope);
+        cold.ingest(&outbox.row(&d.event_id(&tenant())).unwrap().envelope);
     }
     assert_eq!(
         cold.parity_bytes(),

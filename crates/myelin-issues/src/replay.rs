@@ -166,8 +166,16 @@ mod tests {
         let b = src.replay(&scope, None);
         assert_eq!(a, b);
         assert_eq!(
-            snapshot_event_id(&a[0].aggregate, a[0].version),
-            snapshot_event_id(&b[0].aggregate, b[0].version)
+            snapshot_event_id(
+                &myelin_events::TenantId("acme".into()),
+                &a[0].aggregate,
+                a[0].version,
+            ),
+            snapshot_event_id(
+                &myelin_events::TenantId("acme".into()),
+                &b[0].aggregate,
+                b[0].version,
+            )
         );
     }
 

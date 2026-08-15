@@ -55,7 +55,7 @@ fn pseudonym(id: &str) -> String {
         .render()
 }
 fn snapshot_ref(agg: &str) -> String {
-    format!("myelin://t/knowledge/page/{agg}")
+    format!("myelin://acme/knowledge/page/{agg}")
 }
 fn scope() -> SnapshotScope {
     SnapshotScope::new("knowledge", "page:all")
@@ -124,7 +124,7 @@ fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
     let erased_ids = ["u-erased-1", "u-erased-2", "u-erased-3"];
     let ledger = SearchErasureLedger::new(tenant(), region());
 
-    let mut owner = ReferenceReindexSource::new("knowledge", "page");
+    let mut owner = ReferenceReindexSource::new(tenant(), "knowledge", "page");
     for (i, id) in erased_ids.iter().enumerate() {
         let agg = format!("owned-{i}");
         owner.upsert(&agg, 1, serde_json::json!({ "kind": "page" }));
@@ -217,7 +217,7 @@ fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
 #[test]
 fn srch_d9_restore_failure_is_loud() {
     let (_ix, _f, reindexer, holder) = cell();
-    let src = ReferenceReindexSource::new("knowledge", "page");
+    let src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
     let ledger = SearchErasureLedger::new(tenant(), region());
     let unknown = SnapshotScope::new("refs", "edge:all");
     let mut outbox = OutboxStore::new();

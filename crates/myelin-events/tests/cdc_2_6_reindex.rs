@@ -21,13 +21,17 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
+fn tenant() -> TenantId {
+    TenantId("acme".into())
+}
+
 fn provider_reindex() -> (
     ReindexReceipt,
     OutboxStore,
     ReferenceReindexSource,
     SnapshotScope,
 ) {
-    let mut source = ReferenceReindexSource::new("knowledge", "page");
+    let mut source = ReferenceReindexSource::new(tenant(), "knowledge", "page");
     source.upsert(
         "knowledge.page:home",
         2,
@@ -56,7 +60,7 @@ fn cdc_2_6_provider_reindex_consumer_rebuilds_cold_equals_live() {
     );
     assert_eq!(receipt.owners_replayed, vec!["knowledge".to_string()]);
 
-    let home_id = snapshot_event_id(&AggregateKey("knowledge.page:home".into()), 2);
+    let home_id = snapshot_event_id(&tenant(), &AggregateKey("knowledge.page:home".into()), 2);
     let row = outbox
         .row(&home_id)
         .expect("the home snapshot is at its deterministic id");
@@ -68,7 +72,9 @@ fn cdc_2_6_provider_reindex_consumer_rebuilds_cold_equals_live() {
     }
     let mut cold = DerivedStore::new();
     for draft in source.replay(&scope, None) {
-        let r = outbox.row(&draft.event_id()).expect("snapshot row present");
+        let r = outbox
+            .row(&draft.event_id(&tenant()))
+            .expect("snapshot row present");
         cold.ingest(&r.envelope);
     }
     assert_eq!(
@@ -79,7 +85,9 @@ fn cdc_2_6_provider_reindex_consumer_rebuilds_cold_equals_live() {
 
     let before = cold.parity_bytes();
     for draft in source.replay(&scope, None) {
-        let r = outbox.row(&draft.event_id()).expect("snapshot row present");
+        let r = outbox
+            .row(&draft.event_id(&tenant()))
+            .expect("snapshot row present");
         assert!(
             !cold.ingest(&r.envelope),
             "a re-ingested snapshot is a no-op (idempotent)"
@@ -94,7 +102,7 @@ fn cdc_2_6_provider_reindex_consumer_rebuilds_cold_equals_live() {
 
 fn live_envelope(draft: &myelin_events::SnapshotDraft) -> myelin_events::EventEnvelope {
     use myelin_events::{CorrelationId, EventId};
-    let id = draft.event_id();
+    let id = draft.event_id(&tenant());
     myelin_events::EventEnvelope {
         event_id: EventId(id.0.clone()),
         type_: draft.type_.clone(),

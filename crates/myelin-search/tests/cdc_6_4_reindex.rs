@@ -74,12 +74,12 @@ fn page_spec() -> IndexSpec {
 }
 
 fn snapshot_ref(agg: &str) -> String {
-    format!("myelin://t/knowledge/page/{agg}")
+    format!("myelin://acme/knowledge/page/{agg}")
 }
 
 #[test]
 fn reindex_provides_a_job_that_rebuilds_through_the_live_consumer() {
-    let mut src = ReferenceReindexSource::new("knowledge", "page");
+    let mut src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
     src.upsert("home", 1, serde_json::json!({ "kind": "page" }));
     src.upsert("guide", 1, serde_json::json!({ "kind": "page" }));
 
@@ -131,7 +131,7 @@ fn reindex_provides_a_job_that_rebuilds_through_the_live_consumer() {
 
 #[test]
 fn reindex_of_an_unknown_owner_is_loud() {
-    let src = ReferenceReindexSource::new("knowledge", "page");
+    let src = ReferenceReindexSource::new(tenant(), "knowledge", "page");
     let fetcher = Arc::new(OwnerProjection::default());
     let embedder: Arc<dyn EmbeddingAdapter> = Arc::new(MockEmbeddingAdapter::new(8));
     let ix = Arc::new(IncrementalIndexer::new(

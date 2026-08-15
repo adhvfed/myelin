@@ -197,7 +197,9 @@ fn search_code_index_cold_rebuild_byte_matches_live() {
         let sources: &[&dyn ReindexSource] = &[&src];
         bus_reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("emit");
         for draft in src.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row");
             live_ix.index(&row.envelope).expect("live index");
         }
     }
@@ -320,7 +322,7 @@ fn check_fact(
 
 #[test]
 fn check_status_projection_rebuilds_from_ci_reemit_byte_identical() {
-    let mut ci = myelin_events::reindex::ReferenceReindexSource::new("ci", "check");
+    let mut ci = myelin_events::reindex::ReferenceReindexSource::new(tenant(), "ci", "check");
 
     let live_consumer = CheckStatusConsumer::new();
     let live_proj = {
@@ -361,7 +363,9 @@ fn check_status_projection_rebuilds_from_ci_reemit_byte_identical() {
 
     let mut cold_proj = CheckStatusProjection::new();
     for draft in ci.replay(&scope, None) {
-        let row = outbox.row(&draft.event_id()).expect("snapshot row");
+        let row = outbox
+            .row(&draft.event_id(&tenant()))
+            .expect("snapshot row");
         let fact = CheckStatusConsumer::decode(&row.envelope.payload).expect("decode CI fact");
         cold_proj.apply(&fact);
     }

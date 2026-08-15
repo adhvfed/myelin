@@ -113,7 +113,7 @@ impl<'a> NotifReindexer<'a> {
                 continue;
             }
             for draft in source.replay(scope, since) {
-                let event_id = draft.event_id();
+                let event_id = draft.event_id(tenant);
                 if full_rebuild {
                     self.consumer
                         .dedup()

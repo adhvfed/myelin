@@ -180,7 +180,7 @@ impl RefsReindexer {
         let drafts = source.replay(scope, since);
         let mut ingested = 0usize;
         for draft in &drafts {
-            let id = snapshot_event_id(&draft.aggregate, draft.version);
+            let id = snapshot_event_id(tenant, &draft.aggregate, draft.version);
             let row = outbox.row(&id).ok_or_else(|| {
                 ReindexError::Bus(format!("snapshot row {} absent after emit", id.0))
             })?;

@@ -132,14 +132,18 @@ mod tests {
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
+    fn tenant() -> TenantId {
+        TenantId("acme".into())
+    }
+
     fn ctx_base() -> EmitContextBase {
         EmitContextBase {
-            tenant: TenantId("acme".into()),
+            tenant: tenant(),
             region: Region("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                TenantId("acme".into()),
+                tenant(),
             )),
             schema_ver: 1,
             occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
@@ -330,7 +334,9 @@ mod tests {
         let r1 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
         assert_eq!(r1.snapshots_emitted, 2);
         for draft in s.replay(&scope, None) {
-            let row = outbox.row(&draft.event_id()).expect("snapshot row present");
+            let row = outbox
+                .row(&draft.event_id(&tenant()))
+                .expect("snapshot row present");
             cold.ingest(&row.envelope);
         }
         assert_eq!(
@@ -346,21 +352,22 @@ mod tests {
 
     fn snapshot_envelope(draft: &SnapshotDraft) -> myelin_events::EventEnvelope {
         use myelin_events::CorrelationId;
+        let event_id = draft.event_id(&tenant());
         myelin_events::EventEnvelope {
-            event_id: draft.event_id(),
+            event_id: event_id.clone(),
             type_: draft.type_.clone(),
             schema_ver: 1,
-            tenant: TenantId("acme".into()),
+            tenant: tenant(),
             region: Region("fr-par".into()),
             actor: Actor(Principal::stub(
                 PrincipalId("platform".into()),
                 PrincipalKind::Service,
-                TenantId("acme".into()),
+                tenant(),
             )),
             subject: draft.subject.clone(),
             aggregate: draft.aggregate.clone(),
             causation_id: None,
-            correlation_id: CorrelationId(draft.event_id().0),
+            correlation_id: CorrelationId(event_id.0),
             caused_by: None,
             depth: 0,
             contains_personal_data: false,
@@ -376,7 +383,13 @@ mod tests {
     #[test]
     fn git_snapshot_id_is_deterministic() {
         let a = AggregateKey("myelin://acme/git/repo/core".into());
-        assert_eq!(snapshot_event_id(&a, 3), snapshot_event_id(&a, 3));
-        assert_ne!(snapshot_event_id(&a, 3), snapshot_event_id(&a, 4));
+        assert_eq!(
+            snapshot_event_id(&tenant(), &a, 3),
+            snapshot_event_id(&tenant(), &a, 3)
+        );
+        assert_ne!(
+            snapshot_event_id(&tenant(), &a, 3),
+            snapshot_event_id(&tenant(), &a, 4)
+        );
     }
 }

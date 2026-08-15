@@ -46,11 +46,11 @@ fn ctx_base() -> EmitContextBase {
 }
 
 fn storage_artifact() -> E2e3StorageArtifact {
-    let mut olap = DerivedReindexSource::new("olap_src");
+    let mut olap = DerivedReindexSource::new(tenant(), "olap_src");
     olap.upsert("issue:PROJ-1", 1, serde_json::json!({ "cfd": 3 }));
-    let mut search = DerivedReindexSource::new("search_src");
+    let mut search = DerivedReindexSource::new(tenant(), "search_src");
     search.upsert("page:home", 1, serde_json::json!({ "text": "raft" }));
-    let mut refs = DerivedReindexSource::new("refs_src");
+    let mut refs = DerivedReindexSource::new(tenant(), "refs_src");
     refs.upsert(
         "edge:PR-1->ISSUE-1",
         1,
@@ -190,7 +190,7 @@ impl ProjectFetcher for OwnerProjection {
 #[test]
 fn cdc_consumer_search_reindexer_cold_equals_live() {
     fn snapshot_ref(agg: &str) -> String {
-        format!("myelin://t/knowledge/page/{agg}")
+        format!("myelin://01J0ACME/knowledge/page/{agg}")
     }
     let fetcher = Arc::new(OwnerProjection::default());
     fetcher.put(&snapshot_ref("alpha"), "alpha discusses raft consensus");
@@ -202,7 +202,7 @@ fn cdc_consumer_search_reindexer_cold_equals_live() {
         Arc::new(MockEmbeddingAdapter::new(8)),
     ));
 
-    let mut src = SearchReferenceSource::new("knowledge", "page");
+    let mut src = SearchReferenceSource::new(tenant(), "knowledge", "page");
     src.upsert("alpha", 1, serde_json::json!({ "kind": "page" }));
     src.upsert("beta", 1, serde_json::json!({ "kind": "page" }));
     let scope = SnapshotScope::new("knowledge", "page:all");
