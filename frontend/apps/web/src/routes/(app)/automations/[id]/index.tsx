@@ -102,6 +102,26 @@ export default function AutomationDetail() {
                         <div><dt>Personal data</dt><dd>{item().require_no_personal_data ? "Refused" : "Allowed by policy"}</dd></div>
                         <div><dt>Causal depth</dt><dd>{item().max_causal_depth}</dd></div>
                       </dl>
+                      <Show when={item().last_evaluation_error}>
+                        {(diagnostic) => (
+                          <section
+                            class="automation-evaluation-error"
+                            role="alert"
+                            aria-labelledby="automation-evaluation-error-heading"
+                          >
+                            <Icon name="check-fail" title="Rule evaluation failed" />
+                            <div>
+                              <h2 id="automation-evaluation-error-heading">
+                                Latest event could not be evaluated
+                              </h2>
+                              <p>{diagnostic().detail}</p>
+                              <p class="automation-evaluation-error-meta">
+                                Event <code>{diagnostic().event_id}</code> · {formatAutomationTime(diagnostic().event_recorded_at)}
+                              </p>
+                            </div>
+                          </section>
+                        )}
+                      </Show>
                       <Show when={item().condition}>
                         {(condition) => (
                           <section class="automation-condition" aria-labelledby="automation-condition-heading">

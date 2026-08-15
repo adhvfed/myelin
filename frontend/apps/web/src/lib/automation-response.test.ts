@@ -31,6 +31,7 @@ const automation = {
   require_human_approval: true,
   state: "active",
   created_at: "2026-08-10T12:00:00Z",
+  last_evaluation_error: null,
 };
 
 const firing = {
@@ -104,6 +105,24 @@ describe("automation response decoding", () => {
     expect(parseAutomationFiringPage({
       items: [{ ...firing, run_id: null, run_ref: null, result_state: "available" }],
       page: { next_cursor: null, limit: 25 },
+    })).toBeNull();
+  });
+
+  it("carries the latest owner-visible rule evaluation failure without weakening the row", () => {
+    const diagnostic = {
+      code: "type_error",
+      detail: "comparison is not defined over the operand types",
+      event_id: "git-ref-updated-01JABC",
+      event_recorded_at: "2026-08-10T12:03:00Z",
+    } as const;
+    expect(parseAutomation({
+      trigger: { ...automation, last_evaluation_error: diagnostic },
+    })).toEqual({ ...automation, last_evaluation_error: diagnostic });
+    expect(parseAutomation({
+      trigger: {
+        ...automation,
+        last_evaluation_error: { ...diagnostic, secret_event_payload: "must-never-cross" },
+      },
     })).toBeNull();
   });
 

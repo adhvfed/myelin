@@ -35,6 +35,14 @@ export interface AutomationVM {
   require_human_approval: boolean;
   state: AutomationState;
   created_at: string;
+  last_evaluation_error: AutomationEvaluationErrorVM | null;
+}
+
+export interface AutomationEvaluationErrorVM {
+  code: "invalid_matcher" | "missing_context" | "type_error" | "cost_exceeded" | "not_compiled";
+  detail: string;
+  event_id: string;
+  event_recorded_at: string;
 }
 
 export interface AutomationApprovalVM {
@@ -126,6 +134,16 @@ function timestamp(value: unknown): value is string {
   return text(value, 64) && Number.isFinite(Date.parse(value));
 }
 
+function evaluationError(value: unknown): AutomationEvaluationErrorVM | null {
+  const row = record(value);
+  if (!row || !exact(row, ["code", "detail", "event_id", "event_recorded_at"]) ||
+      !["invalid_matcher", "missing_context", "type_error", "cost_exceeded", "not_compiled"]
+        .includes(row.code as string) ||
+      !text(row.detail, 1_024, true) || !text(row.event_id, 255) ||
+      !timestamp(row.event_recorded_at)) return null;
+  return row as unknown as AutomationEvaluationErrorVM;
+}
+
 function safeInteger(value: unknown, minimum: number, maximum: number): value is number {
   return Number.isSafeInteger(value) && (value as number) >= minimum && (value as number) <= maximum;
 }
@@ -139,7 +157,7 @@ function automation(value: unknown): AutomationVM | null {
     "id", "ref", "owner_principal_id", "run_as_agent_id", "event_type", "subject_type",
     "condition", "matcher", "task", "delegation_caveats", "budget_minor_units",
     "max_firings", "firings_used", "max_causal_depth", "require_no_personal_data",
-    "require_human_approval", "state", "created_at",
+    "require_human_approval", "state", "created_at", "last_evaluation_error",
   ]) || !isAutomationId(row.id) || !isAutomationId(row.run_as_agent_id) || !referenceTenant ||
       !text(row.owner_principal_id, 255) || !text(row.event_type, 255) ||
       (row.subject_type !== null && !text(row.subject_type, 64)) ||
@@ -153,7 +171,10 @@ function automation(value: unknown): AutomationVM | null {
       typeof row.require_no_personal_data !== "boolean" ||
       typeof row.require_human_approval !== "boolean" ||
       !["active", "paused", "disabled"].includes(row.state as string) ||
-      !timestamp(row.created_at)) return null;
+      !timestamp(row.created_at) ||
+      (row.last_evaluation_error !== null && evaluationError(row.last_evaluation_error) === null)) {
+    return null;
+  }
   return row as unknown as AutomationVM;
 }
 

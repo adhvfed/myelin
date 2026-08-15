@@ -98,7 +98,7 @@ test("an automation owner governs durable agent work without configuring an inte
     budget_minor_units: 125_000,
     max_firings: 8,
     max_causal_depth: 3,
-    delegation_caveats: ["issue:read"],
+    delegation_caveats: ["run.view"],
     require_human_approval: true,
   }, { ...owner, status: 201 });
   const automation = (createdAutomation.trigger as JsonObject);

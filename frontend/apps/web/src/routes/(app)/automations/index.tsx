@@ -102,6 +102,11 @@ function AutomationRow(props: { automation: AutomationVM }) {
         <span class="automation-row-main">
           <strong>{props.automation.event_type}</strong>
           <span>{props.automation.task}</span>
+          <Show when={props.automation.last_evaluation_error}>
+            <span class="automation-row-error">
+              <Icon name="check-fail" /> Latest event could not be evaluated
+            </span>
+          </Show>
         </span>
         <span class="automation-row-meta">
           <span>{props.automation.firings_used} / {props.automation.max_firings} firings</span>
