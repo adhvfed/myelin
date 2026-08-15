@@ -11,7 +11,8 @@ import type {
   TreeVM,
 } from "./api";
 import { isFullGitRef } from "./git-read-input";
-import { isGitRepositorySlug, parseArtifactRef } from "./artifact-ref";
+import { parseArtifactRef } from "./artifact-ref";
+import { isGitRepositorySlug } from "./git-coordinate";
 
 const MAX_TEXT_BYTES = 512 * 1024;
 const MAX_PATH_BYTES = 4 * 1024;

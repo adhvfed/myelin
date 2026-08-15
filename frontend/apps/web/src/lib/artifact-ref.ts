@@ -1,3 +1,8 @@
+import {
+  isGitRepositorySlug,
+  parseGitPullRequestNumberText,
+} from "./git-coordinate";
+
 const utf8 = new TextEncoder();
 const MAX_ARTIFACT_REF_BYTES = 4 * 1024;
 const SUBSYSTEMS = new Set([
@@ -52,16 +57,6 @@ function isCanonicalU64(value: string): boolean {
   if (!/^(?:0|[1-9][0-9]*)$/.test(value)) return false;
   return value.length < MAX_U64.length ||
     (value.length === MAX_U64.length && value <= MAX_U64);
-}
-
-export function isGitRepositorySlug(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0 || utf8.encode(value).byteLength > 255) {
-    return false;
-  }
-  const parts = value.split("/");
-  return parts.every((part) => part !== "" && part !== "." && part !== ".." &&
-    /^[A-Za-z0-9._-]+$/.test(part)) &&
-    !parts.slice(0, -1).some((part) => part.toLowerCase().endsWith(".git"));
 }
 
 export function parseGitPullRequestRef(value: unknown): GitPullRequestRef | null {
@@ -145,7 +140,7 @@ export function artifactRefHref(reference: string): string | undefined {
     return `/git/repos/${encodeURIComponent(parsed.id)}`;
   }
   const pullRequest = parseGitPullRequestRef(reference);
-  if (pullRequest) {
+  if (pullRequest && parseGitPullRequestNumberText(pullRequest.number) !== null) {
     return `/git/repos/${encodeURIComponent(pullRequest.repo)}/prs/${pullRequest.number}`;
   }
   if (parsed.subsystem === "ci" && parsed.type === "run") {

@@ -1,5 +1,6 @@
 import type { RepoListPage, RepoListRowVM } from "./api";
 import { isRepoListCursor } from "./git-read-input";
+import { isGitRepositorySlug } from "./git-coordinate";
 
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
@@ -23,21 +24,16 @@ function safeCloneUrl(value: string): boolean {
   return !/[\p{Cc}\s]/u.test(value);
 }
 
-function repoSlug(value: unknown): value is string {
-  return bounded(value, 255) && value.length > 0 && value.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  );
-}
-
 function row(value: unknown): RepoListRowVM | null {
   const item = record(value);
   if (!item) return null;
   if (item.state === "restricted") return { state: "restricted" };
-  if (item.state === "empty" && exact(item, ["state", "slug"]) && repoSlug(item.slug)) {
+  if (item.state === "empty" && exact(item, ["state", "slug"]) &&
+      isGitRepositorySlug(item.slug)) {
     return { state: "empty", slug: item.slug };
   }
   if (item.state === "populated" && exact(item, ["state", "slug", "clone_url"]) &&
-      repoSlug(item.slug) && bounded(item.clone_url, 4 * 1024) &&
+      isGitRepositorySlug(item.slug) && bounded(item.clone_url, 4 * 1024) &&
       item.clone_url.length > 0 && safeCloneUrl(item.clone_url)) {
     return { state: "populated", slug: item.slug, clone_url: item.clone_url };
   }

@@ -2,6 +2,8 @@
 // server-function boundary, so both the request and Edge response are reconstructed from bounded,
 // exact wire shapes before they can influence a URL or the diff UI.
 
+import { isGitRepositorySlug } from "./git-coordinate";
+
 export const MAX_FILE_LINES_RANGE = 1_000;
 export const MAX_FILE_LINES_BLOB_BYTES = 512 * 1024;
 export const MAX_FILE_LINES_PATH_BYTES = 4 * 1024;
@@ -40,12 +42,6 @@ function boundedString(value: unknown, maximum: number): value is string {
   return typeof value === "string" && utf8.encode(value).byteLength <= maximum;
 }
 
-function repoSlug(value: unknown): value is string {
-  return boundedString(value, 255) && value.length > 0 && value.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  );
-}
-
 function gitPath(value: unknown): value is string {
   if (!boundedString(value, MAX_FILE_LINES_PATH_BYTES) || !value || value.startsWith("/") ||
       value.includes("\\") || [...value].some((character) => {
@@ -62,7 +58,7 @@ function lineNumber(value: unknown): value is number {
 export function parseFileLinesInput(value: unknown): FileLinesInput | null {
   const input = record(value);
   if (!input || !exactKeys(input, ["repo", "oid", "path", "start", "end"]) ||
-      !repoSlug(input.repo) || typeof input.oid !== "string" ||
+      !isGitRepositorySlug(input.repo) || typeof input.oid !== "string" ||
       !/^[0-9a-f]{40}$/.test(input.oid) || !gitPath(input.path) ||
       !lineNumber(input.start) || !lineNumber(input.end) || input.end < input.start ||
       input.end - input.start + 1 > MAX_FILE_LINES_RANGE) return null;

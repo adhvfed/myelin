@@ -1,3 +1,8 @@
+import {
+  MAX_GIT_REPOSITORY_SLUG_BYTES,
+  normalizeGitRepositorySlug,
+} from "./git-coordinate";
+
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
@@ -13,17 +18,14 @@ function record(value: unknown): WireRecord | null {
 }
 
 export function parseRepositorySlug(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const slug = value.trim();
-  if (!slug || utf8.encode(slug).byteLength > 255) return null;
-  return slug.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  ) ? slug : null;
+  return normalizeGitRepositorySlug(value);
 }
 
 export function repositorySlugError(value: string): string | null {
   if (!value.trim()) return "Enter a repository name.";
-  if (utf8.encode(value.trim()).byteLength > 255) return "Use at most 255 UTF-8 bytes.";
+  if (utf8.encode(value.trim()).byteLength > MAX_GIT_REPOSITORY_SLUG_BYTES) {
+    return `Use at most ${MAX_GIT_REPOSITORY_SLUG_BYTES} UTF-8 bytes.`;
+  }
   return parseRepositorySlug(value)
     ? null
     : "Use letters, numbers, dots, dashes, underscores, and optional namespace slashes.";

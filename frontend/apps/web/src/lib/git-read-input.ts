@@ -1,5 +1,5 @@
 import { isFullGitRef } from "./git-ref";
-import { isGitRepositorySlug } from "./artifact-ref";
+import { isGitPullRequestNumber, isGitRepositorySlug } from "./git-coordinate";
 
 export { isFullGitRef } from "./git-ref";
 
@@ -129,10 +129,6 @@ export function isPrCommitCursor(value: unknown): value is string {
   }
 }
 
-function prNumber(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) > 0;
-}
-
 export function parseGitRepoInput(value: unknown): GitRepoInput | null {
   if (typeof value === "string") return isGitRepositorySlug(value) ? { repo: value } : null;
   const input = record(value);
@@ -243,7 +239,8 @@ export function parseGitCommitInput(value: unknown): GitCommitInput | null {
 
 export function parseGitPrInput(value: unknown): GitPrInput | null {
   const input = record(value);
-  return input && exact(input, ["repo", "n"]) && isGitRepositorySlug(input.repo) && prNumber(input.n)
+  return input && exact(input, ["repo", "n"]) && isGitRepositorySlug(input.repo) &&
+      isGitPullRequestNumber(input.n)
     ? { repo: input.repo, n: input.n }
     : null;
 }
@@ -278,7 +275,8 @@ export function parseGitPrCommitsInput(value: unknown): GitPrCommitsInput | null
   const input = record(value);
   if (!input || !exact(input, ["repo", "n", "limit", "cursor"]) ||
       !isGitRepositorySlug(input.repo) ||
-      !prNumber(input.n) || (input.limit !== undefined && (!Number.isSafeInteger(input.limit) ||
+      !isGitPullRequestNumber(input.n) || (input.limit !== undefined &&
+        (!Number.isSafeInteger(input.limit) ||
         (input.limit as number) < 1 || (input.limit as number) > 100)) ||
       (input.cursor !== undefined && !isPrCommitCursor(input.cursor))) return null;
   return {
@@ -306,7 +304,8 @@ export function parseGitPrDiffInput(value: unknown): GitPrDiffInput | null {
   const input = record(value);
   if (!input || !exact(input, ["repo", "n", "cursor", "view"]) ||
       !isGitRepositorySlug(input.repo) ||
-      !prNumber(input.n) || (input.cursor !== undefined && !safeCursor(input.cursor)) ||
+      !isGitPullRequestNumber(input.n) ||
+      (input.cursor !== undefined && !safeCursor(input.cursor)) ||
       (input.view !== undefined && input.view !== "split" && input.view !== "unified")) return null;
   return {
     repo: input.repo,

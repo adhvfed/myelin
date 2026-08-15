@@ -46,6 +46,7 @@ describe("file-lines boundary codec", () => {
     null,
     { repo: "core", oid: OID, path: "x", start: 1, end: 1, extra: true },
     { repo: "../core", oid: OID, path: "x", start: 1, end: 1 },
+    { repo: "platform.git/core", oid: OID, path: "x", start: 1, end: 1 },
     { repo: "core", oid: OID.toUpperCase(), path: "x", start: 1, end: 1 },
     { repo: "core", oid: OID, path: "../secret", start: 1, end: 1 },
     { repo: "core", oid: OID, path: "x", start: 0, end: 1 },

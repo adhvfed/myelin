@@ -1,4 +1,7 @@
-import { isGitRepositorySlug } from "./artifact-ref";
+import {
+  isGitRepositorySlug,
+  parseGitPullRequestNumberText,
+} from "./git-coordinate";
 
 /** Decode the router's single encoded repository segment exactly once. */
 export function parseGitRepositoryRouteParam(value: unknown): string | null {
@@ -18,7 +21,5 @@ export function gitRepositoryPath(repo: string): string {
 
 /** Parse the canonical positive integer coordinate supported by the browser client. */
 export function parseGitPullRequestRouteParam(value: unknown): number | null {
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) return null;
-  const number = Number(value);
-  return Number.isSafeInteger(number) ? number : null;
+  return parseGitPullRequestNumberText(value);
 }

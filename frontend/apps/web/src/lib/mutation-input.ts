@@ -3,10 +3,10 @@
 // is built or an Edge call can run.
 
 import { isClientNonce } from "./client-nonce";
+import { isGitPullRequestNumber, isGitRepositorySlug } from "./git-coordinate";
 
 export const MAX_ISSUE_TITLE_BYTES = 512;
 export const MAX_PR_MARKDOWN_BYTES = 64 * 1024;
-export const MAX_REPO_SLUG_BYTES = 255;
 export const MAX_GIT_PATH_BYTES = 4 * 1024;
 
 export type IssueMutation =
@@ -67,14 +67,7 @@ function canonicalUlid(value: unknown): value is string {
     /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(value);
 }
 
-function repoSlug(value: unknown): value is string {
-  if (!bounded(value, MAX_REPO_SLUG_BYTES) || !value) return false;
-  return value.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  );
-}
-
-function prNumber(value: unknown): value is number {
+function positiveSafeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
@@ -101,7 +94,7 @@ function gitPath(value: unknown): value is string {
 function parseAnchor(value: unknown): PrAnchor | null {
   const input = record(value);
   if (!input || !exactKeys(input, ["path", "line", "side"]) ||
-      !gitPath(input.path) || !prNumber(input.line) ||
+      !gitPath(input.path) || !positiveSafeInteger(input.line) ||
       (input.side !== "old" && input.side !== "new")) return null;
   return {
     path: input.path,
@@ -140,7 +133,8 @@ export function parseIssueMutation(value: unknown): IssueMutation | null {
 
 export function parsePrMutation(value: unknown): PrMutation | null {
   const input = record(value);
-  if (!input || typeof input.op !== "string" || !repoSlug(input.repo) || !prNumber(input.n)) {
+  if (!input || typeof input.op !== "string" || !isGitRepositorySlug(input.repo) ||
+      !isGitPullRequestNumber(input.n)) {
     return null;
   }
   const base = { repo: input.repo, n: input.n };

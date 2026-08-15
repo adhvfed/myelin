@@ -24,6 +24,7 @@ describe("code search boundary", () => {
   it("rejects invalid inputs and untrusted response coordinates", () => {
     expect(parseCodeSearchInput({ q: "  " })).toBeNull();
     expect(parseCodeSearchInput({ q: "needle", repo: "../private" })).toBeNull();
+    expect(parseCodeSearchInput({ q: "needle", repo: "platform.git/private" })).toBeNull();
     expect(parseCodeSearchPage({
       items: [{
         repo: "core",

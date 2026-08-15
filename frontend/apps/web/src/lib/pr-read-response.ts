@@ -11,7 +11,8 @@ import type {
   PrListRowVM,
   PrVM,
 } from "./api";
-import { isGitRepositorySlug, parseGitPullRequestRef } from "./artifact-ref";
+import { parseGitPullRequestRef } from "./artifact-ref";
+import { isGitRepositorySlug } from "./git-coordinate";
 import { isBranchRef } from "./git-ref";
 
 type WireRecord = Record<string, unknown>;

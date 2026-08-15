@@ -58,6 +58,7 @@ describe("artifact references", () => {
     expect(artifactRefHref("myelin://acme/git/repo/platform/api"))
       .toBe("/git/repos/platform%2Fapi");
     expect(artifactRefHref("myelin://acme/git/repo/platform.git/api")).toBeUndefined();
+    expect(artifactRefHref("myelin://acme/git/pr/platform:9007199254740992")).toBeUndefined();
   });
 
   it("parses a nested pull-request coordinate once without losing numeric precision", () => {

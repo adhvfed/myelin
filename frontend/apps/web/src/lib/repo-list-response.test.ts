@@ -36,6 +36,7 @@ describe("repository catalogue summary response", () => {
     { items: [{ state: "populated", slug: "acme/core", clone_url: "x smuggled" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "populated", slug: "acme/core", clone_url: "x\tsmuggled" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "empty", slug: "../core" }], page: { next_cursor: null, limit: 1 } },
+    { items: [{ state: "empty", slug: "acme.git/core" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "unknown", slug: "acme/core" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "empty", slug: "acme/core", default_branch: "main" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "populated", slug: "acme/core", clone_url: "/x", entries: [] }], page: { next_cursor: null, limit: 1 } },

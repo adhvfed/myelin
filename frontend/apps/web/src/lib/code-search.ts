@@ -1,3 +1,5 @@
+import { isGitRepositorySlug } from "./git-coordinate";
+
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
@@ -40,17 +42,11 @@ function clean(value: unknown, maximum: number): value is string {
   return bounded(value, maximum) && !/\p{Cc}/u.test(value);
 }
 
-function repoSlug(value: unknown): value is string {
-  return clean(value, 255) && value.length > 0 && value.split("/").every((part) =>
-    part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part)
-  );
-}
-
 export function parseCodeSearchInput(value: unknown): CodeSearchInput | null {
   const input = record(value);
   if (!input || !exact(input, ["q", "repo"]) || !clean(input.q, 4 * 1024) ||
       input.q.trim().length === 0 ||
-      (input.repo !== undefined && !repoSlug(input.repo))) return null;
+      (input.repo !== undefined && !isGitRepositorySlug(input.repo))) return null;
   return {
     q: input.q,
     ...(input.repo === undefined ? {} : { repo: input.repo }),
@@ -66,7 +62,7 @@ export function codeSearchParams(input: CodeSearchInput): URLSearchParams {
 function parseHit(value: unknown): CodeSearchHit | null {
   const hit = record(value);
   if (!hit || !exact(hit, ["repo", "ref", "snapshot_oid", "path", "line", "excerpt"]) ||
-      !repoSlug(hit.repo) || !clean(hit.ref, 4 * 1024) || hit.ref.length === 0 ||
+      !isGitRepositorySlug(hit.repo) || !clean(hit.ref, 4 * 1024) || hit.ref.length === 0 ||
       typeof hit.snapshot_oid !== "string" || !/^[0-9a-f]{40,64}$/.test(hit.snapshot_oid) ||
       !clean(hit.path, 4 * 1024) || hit.path.length === 0 || hit.path.startsWith("/") ||
       hit.path.includes("\\") || hit.path.split("/").some((part) => !part || part === "." || part === "..") ||

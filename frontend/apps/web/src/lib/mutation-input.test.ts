@@ -82,6 +82,7 @@ describe("parsePrMutation", () => {
     [],
     { op: "unknown", repo: "core", n: 1 },
     { op: "merge", repo: "../core", n: 1 },
+    { op: "merge", repo: "platform.git/core", n: 1 },
     { op: "merge", repo: "core", n: 0 },
     { op: "merge", repo: "core", n: Number.MAX_SAFE_INTEGER + 1 },
     { op: "merge", repo: "core", n: 1, surprise: true },
