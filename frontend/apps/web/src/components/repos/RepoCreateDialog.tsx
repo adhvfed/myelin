@@ -19,7 +19,7 @@ function createError(kind: RepoCreateError): string {
     case "forbidden":
       return "You do not have permission to create repositories.";
     default:
-      return "We couldn't confirm whether the repository was created. Check the list before retrying.";
+      return "We couldn't confirm whether the repository was created. Retrying this unchanged name is safe.";
   }
 }
 
@@ -61,7 +61,7 @@ export function RepoCreateDialog(props: RepoCreateDialogProps) {
       props.onCreated(result.receipt.slug);
       props.onClose();
     } catch {
-      setError("We couldn't confirm whether the repository was created. Check the list before retrying.");
+      setError(createError("error"));
       input?.focus();
     } finally {
       setSubmitting(false);

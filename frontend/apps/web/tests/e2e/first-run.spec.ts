@@ -8,6 +8,7 @@ const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
 async function setEdgeConfig(cfg: {
   emptyRepos?: boolean;
+  repoCreateResponseLosses?: number;
   devLoginEnabled?: boolean;
   whoamiUnavailable?: boolean;
   seedInboxAgentApproval?: boolean;
@@ -116,6 +117,29 @@ test.describe("R3.5 first-run — empty tenant onboarding", () => {
     await expect(setup.getByTestId("git-setup-commands")).toContainText("git clone");
     await expect(setup.getByTestId("git-setup-commands")).toContainText("git push -u origin 'main'");
     await expectNoAxeViolations(page, "the first repository setup");
+  });
+
+  test("a lost creation response retries to the one repository that was already committed", async ({ page }) => {
+    await setEdgeConfig({ emptyRepos: true, repoCreateResponseLosses: 1 });
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("dev-login").click();
+    await page.waitForURL("**/git/repos");
+
+    await page.getByTestId("repos-empty").getByRole("button", { name: "Create repository" }).click();
+    const dialog = page.getByRole("dialog", { name: "New repository" });
+    await dialog.getByLabel("Name or namespace/name").fill("retry-safe");
+    await dialog.getByRole("button", { name: "Create repository" }).click();
+
+    await expect(dialog.getByRole("alert")).toContainText("Retrying this unchanged name is safe");
+    await expect(dialog.getByLabel("Name or namespace/name")).toHaveValue("retry-safe");
+    await dialog.getByRole("button", { name: "Create repository" }).click();
+    await page.waitForURL("**/git/repos/retry-safe");
+
+    await page.goto("/git/repos");
+    await expect(page.getByRole("link", { name: /retry-safe/ })).toHaveCount(1);
+    await page.reload();
+    await expect(page.getByRole("link", { name: /retry-safe/ })).toHaveCount(1);
   });
 });
 

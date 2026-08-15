@@ -66,6 +66,7 @@ const PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
 const state = {
   // A fresh tenant has no repos yet — the first-run onboarding empty state.
   emptyRepos: process.env.DEV_EDGE_EMPTY_REPOS === "1",
+  repoCreateResponseLosses: 0,
   // Repositories created while exercising that fresh-tenant posture. Reset with `emptyRepos` so
   // every onboarding test starts from a genuinely empty catalogue.
   createdRepos: new Map(),
@@ -384,6 +385,10 @@ const server = createServer((req, res) => {
         if (typeof body.emptyRepos === "boolean") {
           state.emptyRepos = body.emptyRepos;
           state.createdRepos.clear();
+          state.repoCreateResponseLosses = 0;
+        }
+        if (Number.isInteger(body.repoCreateResponseLosses) && body.repoCreateResponseLosses >= 0) {
+          state.repoCreateResponseLosses = body.repoCreateResponseLosses;
         }
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
@@ -1108,10 +1113,6 @@ const server = createServer((req, res) => {
 
   if (method === "POST" && path === "/v1/git/repos") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
-    const retryKey = req.headers["idempotency-key"];
-    if (typeof retryKey !== "string" || retryKey.length < 1 || retryKey.length > 128 || /\s/.test(retryKey)) {
-      return send(res, 400, { error: { message: "invalid repository create retry key", code: "bad_request" } });
-    }
     let raw = "";
     let requestBytes = 0;
     let requestTooLarge = false;
@@ -1138,7 +1139,14 @@ const server = createServer((req, res) => {
       if (!valid) {
         return send(res, 400, { error: { message: "invalid repository name", code: "bad_request" } });
       }
-      if (state.createdRepos.has(slug) || repoHomeJson(slug)) {
+      if (state.createdRepos.has(slug)) {
+        return send(res, 200, {
+          applied: { action: "git.repo.create", slug },
+          created: false,
+          durable: true,
+        });
+      }
+      if (repoHomeJson(slug)) {
         return send(res, 409, { error: { message: "repository already exists", code: "conflict" } });
       }
       state.createdRepos.set(slug, {
@@ -1148,6 +1156,10 @@ const server = createServer((req, res) => {
         clone_url: `/acme/eu-west/${encodeURIComponent(slug)}.git`,
         counts: { branches: 0, tags: 0 },
       });
+      if (state.repoCreateResponseLosses > 0) {
+        state.repoCreateResponseLosses -= 1;
+        return send(res, 503, { error: { message: "repository was committed but its response was lost", code: "unavailable" } });
+      }
       return send(res, 201, {
         applied: { action: "git.repo.create", slug },
         created: true,

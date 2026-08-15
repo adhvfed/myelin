@@ -592,11 +592,7 @@ export const createRepo = action(async (value: string) => {
   const slug = parseRepositorySlug(value);
   if (!slug) return result({ ok: false, error: "bad-input" });
   try {
-    const response = await edgePost(
-      "/v1/git/repos",
-      { slug },
-      { idempotencyKey: crypto.randomUUID() },
-    );
+    const response = await edgePost("/v1/git/repos", { slug });
     const receipt = parseRepoCreateReceipt(response, slug);
     return result(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
   } catch (error) {
