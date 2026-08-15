@@ -219,55 +219,104 @@ fn parse_tool_result(response: &[u8], expected_call_id: &str) -> Result<ToolResu
             "governed MCP response is not bound to the requested tool call",
         ));
     }
-    if let Some(error) = envelope.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("governed MCP request was refused");
-        return Err(failed(message));
-    }
-    let result = envelope
-        .get("result")
-        .ok_or_else(|| failed("governed MCP response contains neither result nor error"))?;
-    if let Some(gate_id) = result
-        .get("_meta")
-        .and_then(|meta| meta.get("gateId"))
-        .and_then(Value::as_str)
-    {
-        if gate_id.is_empty()
-            || gate_id.len() > 256
-            || !gate_id.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(failed(
-                "governed MCP response contains an invalid approval gate ID",
-            ));
+    let result = match (envelope.get("result"), envelope.get("error")) {
+        (Some(result), None) => result,
+        (None, Some(error)) => {
+            let message = error
+                .as_object()
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .filter(|message| !message.is_empty())
+                .ok_or_else(|| failed("governed MCP response contains a malformed error"))?;
+            return Err(failed(message));
         }
-        return Err(ToolExecError::ApprovalRequired {
-            gate_id: gate_id.to_string(),
-        });
+        (Some(_), Some(_)) => {
+            return Err(failed(
+                "governed MCP response contains both result and error",
+            ))
+        }
+        (None, None) => {
+            return Err(failed(
+                "governed MCP response contains neither result nor error",
+            ))
+        }
+    };
+    let result = result
+        .as_object()
+        .ok_or_else(|| failed("governed MCP result must be a JSON object"))?;
+    if let Some(meta) = result.get("_meta") {
+        let meta = meta
+            .as_object()
+            .ok_or_else(|| failed("governed MCP result `_meta` must be a JSON object"))?;
+        if let Some(gate_id) = meta.get("gateId") {
+            let gate_id = gate_id.as_str().ok_or_else(|| {
+                failed("governed MCP response contains a non-string approval gate ID")
+            })?;
+            if gate_id.is_empty()
+                || gate_id.len() > 256
+                || !gate_id.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(failed(
+                    "governed MCP response contains an invalid approval gate ID",
+                ));
+            }
+            return Err(ToolExecError::ApprovalRequired {
+                gate_id: gate_id.to_string(),
+            });
+        }
     }
-    let mut text = result
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|content| content.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|content| content.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.is_empty() {
-        text = serde_json::to_string(result)
-            .map_err(|error| failed(format!("serialize governed MCP result: {error}")))?;
-    }
+    let is_error = match result.get("isError") {
+        None => false,
+        Some(Value::Bool(is_error)) => *is_error,
+        Some(_) => return Err(failed("governed MCP result `isError` must be a boolean")),
+    };
+    let text = render_tool_content(result)?;
     if text.len() > MAX_RESULT_TEXT_BYTES {
         return Err(failed(
             "governed MCP tool result exceeds its 256 KiB model bound",
         ));
     }
-    if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return Ok(ToolResult::Refused { refused: text });
+    if is_error {
+        Ok(ToolResult::Refused { refused: text })
+    } else {
+        Ok(ToolResult::Succeeded(text))
     }
-    Ok(ToolResult::Succeeded(text))
+}
+
+fn render_tool_content(result: &serde_json::Map<String, Value>) -> Result<String, ToolExecError> {
+    let content = result
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| failed("governed MCP result `content` must be an array"))?;
+    let mut text = Vec::with_capacity(content.len());
+    let mut text_only = true;
+    for (index, block) in content.iter().enumerate() {
+        let block = block.as_object().ok_or_else(|| {
+            failed(format!(
+                "governed MCP content block at index {index} must be an object"
+            ))
+        })?;
+        let kind = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+            failed(format!(
+                "governed MCP content block at index {index} has no string `type`"
+            ))
+        })?;
+        if kind == "text" {
+            text.push(block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                failed(format!(
+                    "governed MCP text block at index {index} has no string `text`"
+                ))
+            })?);
+        } else {
+            text_only = false;
+        }
+    }
+    if text_only && text.iter().any(|part| !part.is_empty()) {
+        return Ok(text.join("\n"));
+    }
+
+    serde_json::to_string(&Value::Object(result.clone()))
+        .map_err(|error| failed(format!("serialize governed MCP result: {error}")))
 }
 
 fn failed(reason: impl Into<String>) -> ToolExecError {
@@ -404,5 +453,57 @@ mod tests {
         let error = parse_tool_result(response.to_string().as_bytes(), "expected-call")
             .expect_err("a response for another call must fail closed");
         assert!(error.to_string().contains("not bound"));
+    }
+
+    #[test]
+    fn structured_content_is_preserved_instead_of_partially_dropped() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "result": {
+                "content": [
+                    {"type": "text", "text": "build graph"},
+                    {"type": "image", "data": "aW1hZ2U", "mimeType": "image/png"},
+                ],
+                "isError": false,
+            },
+        });
+
+        let result = parse_tool_result(response.to_string().as_bytes(), "call-1").unwrap();
+        assert!(!result.is_refused());
+        assert!(result.content().contains("build graph"));
+        assert!(result.content().contains("image/png"));
+    }
+
+    #[test]
+    fn malformed_governed_result_is_never_partially_interpreted() {
+        let malformed_results = [
+            json!({"content": [{"type": "text"}], "isError": false}),
+            json!({"content": [{"type": 7}], "isError": false}),
+            json!({"content": [], "isError": "false"}),
+            json!({"content": [], "_meta": {"gateId": 7}}),
+            json!({"content": "not-an-array", "isError": false}),
+        ];
+
+        for result in malformed_results {
+            let response = json!({"jsonrpc": "2.0", "id": "call-1", "result": result});
+            assert!(
+                parse_tool_result(response.to_string().as_bytes(), "call-1").is_err(),
+                "malformed MCP result fields must not degrade into a successful tool result"
+            );
+        }
+    }
+
+    #[test]
+    fn json_rpc_result_and_error_are_mutually_exclusive() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "result": {"content": []},
+            "error": {"code": -32603, "message": "internal error"},
+        });
+        let error = parse_tool_result(response.to_string().as_bytes(), "call-1")
+            .expect_err("an ambiguous JSON-RPC response is invalid");
+        assert!(error.to_string().contains("both result and error"));
     }
 }
