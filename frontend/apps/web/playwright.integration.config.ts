@@ -7,11 +7,9 @@ if (!baseURL) {
   );
 }
 
-const chromiumPath =
-  process.env.CHROMIUM_PATH ??
-  (process.env.CI
-    ? undefined
-    : `${process.env.HOME}/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome`);
+// The installed Playwright package is the browser revision authority. An explicit override is
+// useful for managed environments; inferring a cache path would become stale on every upgrade.
+const chromiumPath = process.env.CHROMIUM_PATH?.trim() || undefined;
 
 export default defineConfig({
   testDir: "./tests/integration-browser",

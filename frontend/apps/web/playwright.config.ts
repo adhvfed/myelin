@@ -3,13 +3,9 @@ import { defineConfig, devices } from "@playwright/test";
 // Run the web app and its contract backend together in a real browser.
 const PORT = Number(process.env.PORT ?? 3000);
 const EDGE_PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
-// CI installs the exact Playwright-pinned browser and should let Playwright resolve it. Local
-// development keeps using the already-cached full Chromium binary unless explicitly overridden.
-const CHROMIUM_PATH =
-  process.env.CHROMIUM_PATH ??
-  (process.env.CI
-    ? undefined
-    : `${process.env.HOME}/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome`);
+// Playwright owns the browser revision pin. Keep an override for environments that provide their
+// own Chromium, but never guess the package manager's cache layout or revision.
+const chromiumPath = process.env.CHROMIUM_PATH?.trim() || undefined;
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -28,10 +24,7 @@ export default defineConfig({
       name: "chromium",
       use: {
         ...devices["Desktop Chrome"],
-        // Use the CACHED chromium (no download): point at the full chrome binary so Playwright does
-        // not reach for the version-pinned chrome-headless-shell it would otherwise fetch. Override
-        // with CHROMIUM_PATH if the cache layout differs.
-        launchOptions: CHROMIUM_PATH ? { executablePath: CHROMIUM_PATH } : {},
+        launchOptions: chromiumPath ? { executablePath: chromiumPath } : {},
       },
     },
   ],
