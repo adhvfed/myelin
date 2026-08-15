@@ -182,7 +182,8 @@ fn envelope(id: &str, subject: &str, aggregate: &str) -> EventEnvelope {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_outbox_relay_drains_to_bus() {
     let cfg = MyelinConfig::dev();
-    let store = PgStore::connect(&admin_url(&cfg), &cfg.region, 4)
+    let isolated = common::IsolatedDatabase::create(&admin_url(&cfg), "smoke_outbox_relay").await;
+    let store = PgStore::connect(isolated.url(), &cfg.region, 4)
         .await
         .expect("connect Postgres");
     store.migrate().await.expect("run migrations");
@@ -190,8 +191,6 @@ async fn pg_outbox_relay_drains_to_bus() {
     let agg = format!("issue:SMOKE-{}", std::process::id());
     let id1 = format!("smoke-out-1-{}", std::process::id());
     let id2 = format!("smoke-out-2-{}", std::process::id());
-    let pool = admin_pool(&cfg).await;
-
     common::with_cleanup(
         || async {
             let relay = store.relay();
@@ -216,7 +215,7 @@ async fn pg_outbox_relay_drains_to_bus() {
             assert_eq!(n2, 0, "already-published rows are not re-claimed");
         },
         || async {
-            common::delete_outbox_for_aggregate(&pool, &agg).await;
+            isolated.drop_schema().await;
         },
     )
     .await;

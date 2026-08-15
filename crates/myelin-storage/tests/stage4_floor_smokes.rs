@@ -23,14 +23,6 @@ fn admin_url(cfg: &MyelinConfig) -> String {
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-async fn admin_pool(cfg: &MyelinConfig) -> sqlx::PgPool {
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&admin_url(cfg))
-        .await
-        .expect("connect admin pool (is the stack up?)")
-}
-
 fn principal() -> Principal {
     Principal::stub(
         PrincipalId("p".into()),
@@ -158,11 +150,16 @@ impl Sink for CollectingSink {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn load_10x_containerized_smoke() {
     let cfg = MyelinConfig::dev();
-    let store = PgStore::connect(&admin_url(&cfg), &cfg.region, 8)
+    let isolated = common::IsolatedDatabase::create(&admin_url(&cfg), "load_10x_outbox").await;
+    let store = PgStore::connect(isolated.url(), &cfg.region, 8)
         .await
         .expect("connect Postgres (is the stack up?)");
     store.migrate().await.expect("run migrations");
-    let pool = admin_pool(&cfg).await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(isolated.url())
+        .await
+        .expect("connect isolated load pool");
 
     let tag = format!("{}-{}", std::process::id(), 0);
     let state_table = format!("load10x_state_{}", tag.replace('-', "_"));
@@ -292,12 +289,8 @@ async fn load_10x_containerized_smoke() {
             );
         },
         || async {
-            common::delete_outbox_for_aggregate(&pool, &agg).await;
-            sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {state_table}"))
-                .execute(&pool)
-                .await
-                .ok();
             tokio::task::block_in_place(|| bus.purge());
+            isolated.drop_schema().await;
         },
     )
     .await;

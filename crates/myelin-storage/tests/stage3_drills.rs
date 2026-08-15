@@ -91,14 +91,19 @@ async fn rls_read_all_no_predicate(store: &PgStore, acting_tenant: &str) -> Vec<
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drill1_outbox_no_loss_under_crash() {
     let cfg = MyelinConfig::dev();
-    let store = PgStore::connect(&admin_url(&cfg), &cfg.region, 6)
+    let isolated = common::IsolatedDatabase::create(&admin_url(&cfg), "drill1_outbox").await;
+    let store = PgStore::connect(isolated.url(), &cfg.region, 6)
         .await
         .expect("connect Postgres (is the stack up?)");
     store
         .migrate()
         .await
         .expect("run migrations (outbox + rebac_tuple + RLS)");
-    let pool = admin_pool(&cfg).await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(isolated.url())
+        .await
+        .expect("connect isolated drill pool");
 
     let tag = uniq();
     let state_table = format!("drill1_state_{}", tag.replace('-', "_"));
@@ -230,12 +235,8 @@ async fn drill1_outbox_no_loss_under_crash() {
             );
         },
         || async {
-            common::delete_outbox_for_aggregate(&pool, &agg).await;
-            sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {state_table}"))
-                .execute(&pool)
-                .await
-                .ok();
             tokio::task::block_in_place(|| bus.purge());
+            isolated.drop_schema().await;
         },
     )
     .await;
