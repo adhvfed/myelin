@@ -132,7 +132,7 @@ impl std::fmt::Display for CiSupersededDefinitionGuardError {
                  concurrently-booting older binary could still register and admit under it. This is \
                  never 'nothing to fence'. REMEDIATION: apply the control-plane migrations \
                  (`{}` seeds this predecessor row on a fresh database), then reboot",
-                crate::migrations::CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID
+                crate::migrations::CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID
             ),
             Self::FenceUnavailable(detail) => write!(
                 f,
