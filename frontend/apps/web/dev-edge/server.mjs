@@ -117,6 +117,7 @@ const state = {
   chatPostResponseLosses: 0,
   emptyKnowledge: false,
   knowledgeCreateResponseLosses: 0,
+  knowledgeSaveResponseDelaysMs: [],
   // CT-005 CI read-surface controls. Cursors bind the canonicalized concrete visible-repository set,
   // just as production does; tests mutate membership rather than a synthetic generation counter.
   emptyCi: false,
@@ -437,16 +438,24 @@ const server = createServer((req, res) => {
         if (body.resetKnowledge === true) {
           state.emptyKnowledge = false;
           state.knowledgeCreateResponseLosses = 0;
+          state.knowledgeSaveResponseDelaysMs = [];
           knowledge.reset();
         }
         if (typeof body.emptyKnowledge === "boolean") {
           state.emptyKnowledge = body.emptyKnowledge;
           state.knowledgeCreateResponseLosses = 0;
+          state.knowledgeSaveResponseDelaysMs = [];
           knowledge.reset({ empty: body.emptyKnowledge });
         }
         if (Number.isInteger(body.knowledgeCreateResponseLosses) &&
             body.knowledgeCreateResponseLosses >= 0) {
           state.knowledgeCreateResponseLosses = body.knowledgeCreateResponseLosses;
+        }
+        if (Array.isArray(body.knowledgeSaveResponseDelaysMs) &&
+            body.knowledgeSaveResponseDelaysMs.length <= 10 &&
+            body.knowledgeSaveResponseDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 10_000)) {
+          state.knowledgeSaveResponseDelaysMs = [...body.knowledgeSaveResponseDelaysMs];
         }
         if (typeof body.bumpKnowledgePage === "string") knowledge.bump(body.bumpKnowledgePage);
         if (body.resetCi === true) resetCi();
@@ -659,6 +668,11 @@ const server = createServer((req, res) => {
       if (output.status === 400) return send(res, 400, { error: { message: "invalid Knowledge save body", code: "bad_request" } });
       if (output.status === 404) return send(res, 404, notFoundEnvelope("Knowledge page"));
       if (output.status === 409) return send(res, 409, { error: { message: "Knowledge page changed while editing", code: "conflict" } });
+      const responseDelay = state.knowledgeSaveResponseDelaysMs.shift() ?? 0;
+      if (responseDelay > 0) {
+        setTimeout(() => send(res, 200, output.json, { "cache-control": "no-store" }), responseDelay);
+        return;
+      }
       return send(res, 200, output.json, { "cache-control": "no-store" });
     }); return;
   }

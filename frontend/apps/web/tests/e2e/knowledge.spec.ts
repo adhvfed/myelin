@@ -67,6 +67,55 @@ test.describe("Knowledge workspace", () => {
     await expect(page.getByRole("link", { name: /Retry-safe runbook/ })).toHaveCount(1);
   });
 
+  test("keeps edits with their pages and autosaves them after navigation", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/knowledge");
+
+    await page.getByRole("link", { name: /Engineering principles/ }).click();
+    const principlesTitle = "Engineering principles, locally refined";
+    await page.getByRole("textbox", { name: "Page title" }).fill(principlesTitle);
+
+    await page.getByRole("link", { name: /EU release runbook/ }).click();
+    await expect(page.getByRole("textbox", { name: "Page title" }))
+      .toHaveValue("EU release runbook");
+    const runbookTitle = "EU release runbook, locally refined";
+    await page.getByRole("textbox", { name: "Page title" }).fill(runbookTitle);
+
+    await page.getByRole("link", { name: /Engineering principles/ }).click();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue(principlesTitle);
+    await expect(page.locator(".knowledge-save-state")).toHaveText("Saved", { timeout: 10_000 });
+
+    await page.getByRole("link", { name: /EU release runbook/ }).click();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue(runbookTitle);
+    await expect(page.locator(".knowledge-save-state")).toHaveText("Saved", { timeout: 10_000 });
+
+    await page.reload();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue(runbookTitle);
+    await page.getByRole("link", { name: /Engineering principles/ }).click();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue(principlesTitle);
+  });
+
+  test("saves edits made while the previous revision is still being confirmed", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { knowledgeSaveResponseDelaysMs: [1_800] },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/knowledge");
+
+    await page.getByRole("link", { name: /Engineering principles/ }).click();
+    const title = page.getByRole("textbox", { name: "Page title" });
+    await title.fill("Engineering principles, first revision");
+    await expect(page.locator(".knowledge-save-state")).toHaveText("Saving…", { timeout: 5_000 });
+
+    const finalTitle = "Engineering principles, refined while saving";
+    await title.fill(finalTitle);
+    await expect(page.locator(".knowledge-save-state")).toHaveText("Saved", { timeout: 10_000 });
+
+    await page.reload();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue(finalTitle);
+  });
+
   test("uses page navigation first on a narrow viewport", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 760 }); await devLogin(page); await page.goto("/knowledge");
     await expect(page.getByRole("heading", { name: "Knowledge", level: 1 })).toBeVisible();

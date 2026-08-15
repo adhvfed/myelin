@@ -44,15 +44,26 @@ export default function KnowledgeIndex() {
   };
   const openCreate = () => navigate(selected() ? `${knowledgeHref(selected())}&new=1` : "/knowledge?new=1");
   const closeCreate = () => navigate(knowledgeHref(selected()), { replace: true });
-  const reloadPage = async () => {
-    const id = selected();
-    if (!id) return undefined;
-    await revalidate(getKnowledgePage.keyFor(id));
-    return getKnowledgePage(id);
+  const reloadPage = async (pageId: string) => {
+    try {
+      await revalidate(getKnowledgePage.keyFor(pageId));
+      return await getKnowledgePage(pageId);
+    } catch {
+      return undefined;
+    }
   };
-  const pageSaved = async () => {
-    await Promise.all([revalidate("knowledge-pages"), reloadPage()]);
-    toast.show({ title: "Page saved", variant: "success" });
+  const pageSaved = async (page: { id: string }) => {
+    try {
+      await Promise.all([
+        revalidate("knowledge-pages"),
+        revalidate(getKnowledgePage.keyFor(page.id)),
+      ]);
+      if (selected() === page.id) toast.show({ title: "Page saved", variant: "success" });
+    } catch {
+      if (selected() === page.id) {
+        toast.show({ title: "Page saved — reload to refresh its details", variant: "warning" });
+      }
+    }
   };
 
   return <>
