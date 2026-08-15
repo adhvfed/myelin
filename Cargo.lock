@@ -2793,7 +2793,6 @@ dependencies = [
  "myelin-gdpr-service",
  "myelin-harness",
  "myelin-identity",
- "myelin-refs",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",

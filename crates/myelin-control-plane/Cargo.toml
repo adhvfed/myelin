@@ -20,7 +20,6 @@ myelin-substrate = { path = "../myelin-substrate" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
-myelin-refs = { path = "../myelin-refs" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-storage = { path = "../myelin-storage" }
 blake3 = { workspace = true }

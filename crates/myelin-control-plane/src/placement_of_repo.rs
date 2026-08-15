@@ -67,12 +67,26 @@ impl std::fmt::Display for RepoPlacementError {
 
 impl std::error::Error for RepoPlacementError {}
 
-fn parse_repo_ref(repo: &ArtifactRef) -> Option<(TenantId, String)> {
-    let parsed = myelin_refs::parse_scoped(&repo.0).ok()?;
-    if parsed.sub.is_some() || parsed.subsystem != "git" || parsed.type_ != "repo" {
+fn repo_tenant(repo: &ArtifactRef) -> Option<TenantId> {
+    let rest = repo.0.strip_prefix("myelin://")?;
+    if rest.contains('#') {
         return None;
     }
-    Some((parsed.tenant, parsed.id))
+    let mut segments = rest.splitn(4, '/');
+    let (tenant, subsystem, type_, id) = (
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+    );
+    if tenant.is_empty()
+        || subsystem != "git"
+        || type_ != "repo"
+        || id.split('/').any(str::is_empty)
+    {
+        return None;
+    }
+    Some(TenantId::from_token(tenant))
 }
 
 impl Registry {
@@ -81,7 +95,7 @@ impl Registry {
         repo: &ArtifactRef,
         group: StorageGroup,
     ) -> Result<(), RepoPlacementError> {
-        let (tenant, _id) = parse_repo_ref(repo)
+        let tenant = repo_tenant(repo)
             .ok_or_else(|| RepoPlacementError::NotARepoRef { repo: repo.clone() })?;
         let placement =
             self.placement(&tenant)
@@ -109,7 +123,7 @@ impl Registry {
         target_cell: CellId,
         target_group: StorageGroup,
     ) -> Result<(), RepoPlacementError> {
-        let (tenant, _id) = parse_repo_ref(repo)
+        let tenant = repo_tenant(repo)
             .ok_or_else(|| RepoPlacementError::NotARepoRef { repo: repo.clone() })?;
         let placement =
             self.placement(&tenant)
@@ -131,7 +145,7 @@ impl Registry {
     }
 
     pub fn placement_of_repo(&self, repo: &ArtifactRef) -> Option<RepoPlacement> {
-        let (tenant, _id) = parse_repo_ref(repo)?;
+        let tenant = repo_tenant(repo)?;
         let row = self.repo_placement_row(&repo.0)?;
         let tenant_placement = self.placement(&tenant)?;
         Some(RepoPlacement {
@@ -150,15 +164,12 @@ impl Registry {
     ) -> Result<(), RepoPlacementError> {
         match self.cell(cell_id) {
             None => Err(RepoPlacementError::Invariant(PlacementError::UnknownCell {
-                tenant: parse_repo_ref(repo)
-                    .map(|(t, _)| t)
-                    .unwrap_or_else(|| TenantId::from_token(repo.0.clone())),
+                tenant: repo_tenant(repo).unwrap_or_else(|| TenantId::from_token(repo.0.clone())),
                 cell: cell_id.clone(),
             })),
             Some(cell) if &cell.region != region => Err(RepoPlacementError::Invariant(
                 PlacementError::CrossRegionMemberCell {
-                    tenant: parse_repo_ref(repo)
-                        .map(|(t, _)| t)
+                    tenant: repo_tenant(repo)
                         .unwrap_or_else(|| TenantId::from_token(repo.0.clone())),
                     tenant_region: region.clone(),
                     cell: cell_id.clone(),
@@ -201,9 +212,7 @@ impl CellGateway {
     }
 
     fn repo_tenant_or_placeholder(&self, repo: &ArtifactRef) -> TenantId {
-        parse_repo_ref(repo)
-            .map(|(t, _)| t)
-            .unwrap_or_else(|| TenantId::from_token(repo.0.clone()))
+        repo_tenant(repo).unwrap_or_else(|| TenantId::from_token(repo.0.clone()))
     }
 
     fn record_repo_misroute(
