@@ -1166,6 +1166,17 @@ mod validation_config_tests {
         noncanonical_subject.subject = ArtifactRef("myelin://acme/issue/issue/one#step-01".into());
         assert_eq!(reason(&noncanonical_subject), "invalid_artifact_ref");
 
+        let mut invisible_subject = envelope();
+        invisible_subject.subject = ArtifactRef("myelin://acme/issue/issue/one two".into());
+        assert_eq!(reason(&invisible_subject), "invalid_artifact_ref");
+
+        let mut oversized_subject = envelope();
+        oversized_subject.subject = ArtifactRef(format!(
+            "myelin://acme/issue/issue/{}",
+            "x".repeat(myelin_refs::MAX_ARTIFACT_REF_BYTES)
+        ));
+        assert_eq!(reason(&oversized_subject), "invalid_artifact_ref");
+
         let mut cross_tenant_subject = envelope();
         cross_tenant_subject.subject = ArtifactRef("myelin://foreign/issue/issue/one".into());
         assert_eq!(reason(&cross_tenant_subject), "subject_tenant_mismatch");

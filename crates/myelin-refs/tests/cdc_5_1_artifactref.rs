@@ -70,6 +70,17 @@ fn cdc_5_1_consumer_rejects_display_projections_loudly() {
         consumer_parses("myelin://acme/git/pr/42#widget-9"),
         Err(ParseError::UnknownSubKind { .. })
     ));
+    assert_eq!(
+        consumer_parses("myelin://acme/issue/issue/ENG 1"),
+        Err(ParseError::ForbiddenCharacter)
+    );
+    assert_eq!(
+        consumer_parses(&format!(
+            "myelin://acme/issue/issue/{}",
+            "x".repeat(myelin_refs::MAX_ARTIFACT_REF_BYTES)
+        )),
+        Err(ParseError::TooLong)
+    );
 }
 
 #[test]

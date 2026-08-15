@@ -15,7 +15,7 @@ pub use edge::{
 
 pub use parse::{
     format, mint, parse, parse_scoped, strip_sub, sub_kind, ParseError, ParsedArtifactRef, Sub,
-    SubKind, SCHEME,
+    SubKind, MAX_ARTIFACT_REF_BYTES, SCHEME,
 };
 
 pub use object_key::{object_key, ObjectKey};

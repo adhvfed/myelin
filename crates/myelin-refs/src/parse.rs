@@ -3,9 +3,12 @@ use myelin_tenancy::TenantId;
 use serde::{Deserialize, Serialize};
 
 pub const SCHEME: &str = "myelin://";
+pub const MAX_ARTIFACT_REF_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    TooLong,
+    ForbiddenCharacter,
     MissingScheme { input: String },
     IncompleteScope { got_segments: usize },
     EmptySegment { segment: &'static str },
@@ -28,6 +31,13 @@ pub struct ParsedArtifactRef {
 impl core::fmt::Display for ParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            ParseError::TooLong => write!(
+                f,
+                "malformed ArtifactRef: the reference exceeds the {MAX_ARTIFACT_REF_BYTES}-byte parsing bound."
+            ),
+            ParseError::ForbiddenCharacter => f.write_str(
+                "malformed ArtifactRef: spaces and ASCII control characters are not part of the canonical grammar.",
+            ),
             ParseError::MissingScheme { input } => write!(
                 f,
                 "not an ArtifactRef: `{input}` does not start with the canonical scheme `{SCHEME}` \
@@ -243,6 +253,12 @@ fn format_sub(sub: &Sub) -> String {
 }
 
 pub fn parse_scoped(s: &str) -> Result<ParsedArtifactRef, ParseError> {
+    if s.len() > MAX_ARTIFACT_REF_BYTES {
+        return Err(ParseError::TooLong);
+    }
+    if s.bytes().any(|byte| byte <= b' ' || byte == 0x7f) {
+        return Err(ParseError::ForbiddenCharacter);
+    }
     let rest = s
         .strip_prefix(SCHEME)
         .ok_or_else(|| ParseError::MissingScheme {
@@ -360,6 +376,29 @@ mod tests {
         ] {
             let r = parse(s).expect("well-formed URN must parse");
             assert_eq!(format(&r), s, "round-trip must be byte-identical for `{s}`");
+        }
+    }
+
+    #[test]
+    fn references_are_bounded_and_have_no_invisible_syntax() {
+        let prefix = "myelin://acme/issue/issue/";
+        let exact = format!(
+            "{prefix}{}",
+            "x".repeat(MAX_ARTIFACT_REF_BYTES - prefix.len())
+        );
+        assert_eq!(format(&parse(&exact).unwrap()), exact);
+        assert_eq!(parse(&format!("{exact}x")), Err(ParseError::TooLong));
+
+        for reference in [
+            "myelin://acme/issue/issue/MYL 1",
+            "myelin://acme/issue/issue/MYL-1\n",
+            "myelin://acme/issue/issue/MYL-1\u{7f}",
+        ] {
+            assert_eq!(
+                parse(reference),
+                Err(ParseError::ForbiddenCharacter),
+                "forbidden syntax was admitted: {reference:?}"
+            );
         }
     }
 
@@ -570,6 +609,11 @@ mod tests {
     #[test]
     fn parse_error_display_is_loud_and_names_the_rule() {
         let cases: &[(ParseError, &str)] = &[
+            (ParseError::TooLong, "exceeds the 4096-byte parsing bound"),
+            (
+                ParseError::ForbiddenCharacter,
+                "ASCII control characters are not part of the canonical grammar",
+            ),
             (
                 ParseError::MissingScheme {
                     input: "#42".into(),
