@@ -4,7 +4,7 @@
   "private": true,
   "description": "Black-box tests for a running Myelin backend assembled by Service Federation.",
   "type": "module",
-  "packageManager": "pnpm@10.5.2",
+  "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": ">=22",
     "pnpm": ">=10"
