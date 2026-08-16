@@ -176,7 +176,7 @@ fn command_to_call(
         }
         CliCommand::View { issue_id } => EdgeCall::get(format!("/v1/issues/{issue_id}")),
         CliCommand::Close { issue_id } => {
-            EdgeCall::post_json(format!("/v1/issues/{issue_id}/close"), json!({}))
+            EdgeCall::post_retry_safe_json(format!("/v1/issues/{issue_id}/close"), json!({}))
         }
     })
 }
@@ -208,6 +208,7 @@ mod tests {
     const PROJECT: &str = "11111111-1111-1111-1111-111111111111";
     const TYPE: &str = "22222222-2222-2222-2222-222222222222";
     const JOB: &str = "33333333-3333-3333-3333-333333333333";
+    const ISSUE: &str = "44444444-4444-4444-4444-444444444444";
 
     fn document(_: &str) -> Result<String, CliError> {
         Ok(json!({
@@ -293,5 +294,17 @@ mod tests {
             .to_string())
         })
         .is_err());
+    }
+
+    #[test]
+    fn close_targets_one_idempotent_terminal_state_without_retry_ceremony() {
+        let close = issues_dispatch(&["close", ISSUE]).unwrap();
+        assert_eq!(close.method, HttpMethod::Post);
+        assert_eq!(close.path, format!("/v1/issues/{ISSUE}/close"));
+        assert_eq!(close.retry_policy, RetryPolicy::None);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(close.payload.as_deref().unwrap()).unwrap(),
+            json!({}),
+        );
     }
 }

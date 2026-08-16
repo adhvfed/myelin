@@ -2221,6 +2221,33 @@ describe("the CLI authentication journey", () => {
         ]),
       );
 
+      // Closing is a terminal-state target, not a create operation. Humans can express the intent
+      // directly, and a repeated command observes the same durable issue without extra ceremony.
+      const closedContextualIssue = await runCli(
+        configDirectory,
+        "--json",
+        "issue",
+        "close",
+        issueId,
+      );
+      expect(closedContextualIssue.exitCode, closedContextualIssue.stderr).toBe(0);
+      expect(JSON.parse(closedContextualIssue.stdout)).toMatchObject({
+        id: issueId,
+        key: issueKey,
+        state: "Done",
+        state_category: "completed",
+      });
+
+      const repeatedClose = await runCli(
+        configDirectory,
+        "--json",
+        "issue",
+        "close",
+        issueId,
+      );
+      expect(repeatedClose.exitCode, repeatedClose.stderr).toBe(0);
+      expect(JSON.parse(repeatedClose.stdout)).toEqual(JSON.parse(closedContextualIssue.stdout));
+
       const agentChatMessage = `${uniqueName("Agent verified the release context")} \u{FFFC} \u{FFFC}`;
       const agentPostKey = `agent-chat-${randomUUID()}`;
       const postedByAgent = await askAgentToAct(
