@@ -38,8 +38,6 @@ pub const CI_PIPELINE_CREATED: &str = "ci.pipeline.created";
 pub const CI_PIPELINE_UPDATED: &str = "ci.pipeline.updated";
 pub const CI_PIPELINE_VALIDATED: &str = "ci.pipeline.validated";
 
-pub const CI_SUPPLY_CHAIN_VERIFICATION_FAILED: &str = "ci.supply_chain.verification_failed";
-
 pub const CI_RUN_ERASED: &str = "ci.run.erased";
 pub const CI_DEPLOYMENT_ERASED: &str = "ci.deployment.erased";
 pub const CI_RUNNER_ERASED: &str = "ci.runner.erased";
@@ -81,7 +79,6 @@ pub const CI_DURABLE_TOKENS: &[&str] = &[
     CI_PIPELINE_CREATED,
     CI_PIPELINE_UPDATED,
     CI_PIPELINE_VALIDATED,
-    CI_SUPPLY_CHAIN_VERIFICATION_FAILED,
     CI_RUN_ERASED,
     CI_DEPLOYMENT_ERASED,
     CI_RUNNER_ERASED,

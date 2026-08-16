@@ -124,17 +124,19 @@ pub const DEFERRED_BY_REFERENCE_FLOORS: &[FloorFollowOn] = &[
     },
     FloorFollowOn {
         id: "slsa-l3-plus-hermetic",
-        what: "SLSA L3+ / hermetic (two-party) provenance",
-        built_seam: "SLSA L1-L2 provenance + SBOM ship v1 (supply_chain)",
-        preserved_contract: "the provenance/attestation seam (the supply-chain attestation shape) \
-                             - L3+ strengthens the isolation/non-falsifiability, not the shape",
+        what: "verifiable, hermetic build provenance and software bills of materials",
+        built_seam: "none - Myelin does not yet publish or verify production attestations",
+        preserved_contract: "CI's immutable run, definition, commit, and input-digest provenance; \
+                             a future attestation system must derive from those durable facts",
         trigger: "customer demand (demand-triggered)",
         status: TriggerStatus::NotFired {
             as_of: "2026-06-25: demand-triggered - named by reference; no demand signal recorded. \
                     Floor remains named (handled by reference, not this prompt).",
         },
-        follow_on: "hermetic / two-party (L3+) provenance over the existing attestation seam",
-        promotion_gate: "the build provenance meets SLSA L3+ (hermetic, non-falsifiable) - CI",
+        follow_on: "design and wire a real signing identity, transparency service, verifier, \
+                    attestation store, and user-visible failure path as one production feature",
+        promotion_gate: "a system journey proves that tampered or untrusted build inputs cannot \
+                         execute and that published provenance remains independently verifiable",
         built: false,
     },
 ];

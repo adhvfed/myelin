@@ -16,7 +16,6 @@ pub const CI_TYPE_TOKENS: &[&str] = &[
     "log",
     "artifact",
     "cost",
-    "supply_chain",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]

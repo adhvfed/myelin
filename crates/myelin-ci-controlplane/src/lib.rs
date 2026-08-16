@@ -143,7 +143,6 @@ pub mod scheduler;
 pub mod schema;
 pub mod secret_admin;
 pub mod secret_broker;
-pub mod supply_chain;
 pub mod surfacing;
 pub mod surfacing_index;
 pub mod surfacing_store;
@@ -159,11 +158,6 @@ pub use check_emitter::{
 };
 
 pub use ci_result_signal::{CiResultSignal, RollupDelivery};
-
-pub use supply_chain::{
-    BuildIdentity, KeylessSignature, RekorLog, Sbom, SbomFormat, SlsaProvenance,
-    SupplyChainVerifier, VerificationFailure,
-};
 
 pub use ci_secret_store::{
     durable_ci_job_secret_resolver, CiSecretStoreError, DurableCiSecretStore,
