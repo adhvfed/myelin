@@ -241,7 +241,7 @@ fn code_search_cli_rejects_ambiguous_unbounded_or_unsafe_input() {
 
 #[test]
 fn repo_list_cli_parses_strict_order_independent_pagination_flags() {
-    let cursor = crate::web::RepoListCursor::new([9; 32], "alpha")
+    let cursor = crate::web::RepoListCursor::legacy([9; 32], "alpha")
         .unwrap()
         .encode();
     assert_eq!(
@@ -276,11 +276,11 @@ fn repo_list_cli_parses_strict_order_independent_pagination_flags() {
 
 #[test]
 fn repo_list_cli_rejects_ambiguous_or_noncanonical_pagination_flags() {
-    let cursor = crate::web::RepoListCursor::new([3; 32], "alpha")
+    let cursor = crate::web::RepoListCursor::legacy([3; 32], "alpha")
         .unwrap()
         .encode();
     let padded_cursor = format!("{cursor}=");
-    let oversized_cursor = format!("rl1_{}", "a".repeat(crate::web::REPO_LIST_CURSOR_MAX_BYTES));
+    let oversized_cursor = format!("rl2_{}", "a".repeat(crate::web::REPO_LIST_CURSOR_MAX_BYTES));
     for args in [
         vec!["repo", "list", "--limit"],
         vec!["repo", "list", "--cursor"],
@@ -290,7 +290,7 @@ fn repo_list_cli_rejects_ambiguous_or_noncanonical_pagination_flags() {
         vec!["repo", "list", "--limit", "0"],
         vec!["repo", "list", "--limit", "01"],
         vec!["repo", "list", "--limit", "101"],
-        vec!["repo", "list", "--cursor", "rl1_not-base64!"],
+        vec!["repo", "list", "--cursor", "rl2_not-base64!"],
         vec!["repo", "list", "--cursor", &padded_cursor],
         vec!["repo", "list", "--cursor", &oversized_cursor],
     ] {

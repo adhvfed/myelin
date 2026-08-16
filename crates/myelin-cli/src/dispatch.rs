@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn git_repo_list_pagination_builds_exact_safe_summary_queries() {
-        let cursor = myelin_git::web::RepoListCursor::new([4; 32], "alpha")
+        let cursor = myelin_git::web::RepoListCursor::legacy([4; 32], "alpha")
             .unwrap()
             .encode();
         let limit = git_dispatch(&["repo", "list", "--limit", "25"]).unwrap();
@@ -493,8 +493,8 @@ mod tests {
         );
 
         let mut encoded = FormQuery::default();
-        encoded.push("cursor", "rl1_a&b%= ?");
-        assert_eq!(encoded.finish(), "cursor=rl1_a%26b%25%3D%20%3F");
+        encoded.push("cursor", "rl2_a&b%= ?");
+        assert_eq!(encoded.finish(), "cursor=rl2_a%26b%25%3D%20%3F");
     }
 
     #[test]

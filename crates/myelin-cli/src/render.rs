@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn repository_next_cursor_hint_round_trips_through_git_parser_and_dispatch() {
-        let cursor = RepoListCursor::new([8; 32], "alpha").unwrap().encode();
+        let cursor = RepoListCursor::legacy([8; 32], "alpha").unwrap().encode();
         let rendered = render(
             &json!({
                 "items": [{"slug": "acme/alpha", "state": "populated"}],

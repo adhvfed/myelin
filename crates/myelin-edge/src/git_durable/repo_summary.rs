@@ -150,7 +150,7 @@ pub(super) fn parse_repo_summary_query(query: &str) -> Result<RepoSummaryQuery, 
 
 pub(super) fn repo_summary_cursor_scope(tenant: &str, region: &str) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"myelin.edge.durable-repository-catalogue.v1\0");
+    hash.update(b"myelin.edge.durable-repository-catalogue.v2\0");
     for value in [tenant, region] {
         hash.update(&(value.len() as u64).to_be_bytes());
         hash.update(value.as_bytes());

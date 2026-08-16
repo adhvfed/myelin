@@ -492,14 +492,14 @@ fn pr_state_label(s: PrState) -> &'static str {
 
 pub const REPO_LIST_ROW_MAX_SLUG_BYTES: usize = crate::coordinate::MAX_REPOSITORY_SLUG_BYTES;
 pub const REPO_LIST_ROW_MAX_CLONE_URL_BYTES: usize = 4 * 1024;
-pub const REPO_LIST_CURSOR_PREFIX: &str = "rl1_";
+pub const REPO_LIST_CURSOR_PREFIX: &str = "rl2_";
 pub const REPO_LIST_CURSOR_MAX_BYTES: usize = 512;
 pub const PR_COMMIT_CURSOR_PREFIX: &str = "pc1_";
 pub const PR_COMMIT_CURSOR_MAX_BYTES: usize = 256;
 pub const PR_COMMIT_CURSOR_MAX_POSITION: usize = crate::durable::PR_COMMIT_MAX_POSITION;
 
-const REPO_LIST_CURSOR_VERSION: u8 = 1;
-const REPO_LIST_CURSOR_FIXED_BYTES: usize = 1 + 32 + 2;
+const REPO_LIST_CURSOR_VERSION: u8 = 2;
+const REPO_LIST_CURSOR_FIXED_BYTES: usize = 1 + 32 + 1 + 2;
 const PR_COMMIT_CURSOR_VERSION: u8 = 1;
 const PR_COMMIT_CURSOR_FRAME_BYTES: usize = 1 + 32 + 1 + 20 + 20 + 4;
 
@@ -517,16 +517,43 @@ impl std::error::Error for RepoListCursorError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoListCursor {
     scope: [u8; 32],
+    last_catalogue_key: Option<String>,
     last_slug: String,
 }
 
 impl RepoListCursor {
-    pub fn new(scope: [u8; 32], last_slug: impl Into<String>) -> Result<Self, RepoListCursorError> {
-        let last_slug = last_slug.into();
-        if !valid_repo_list_cursor_slug(&last_slug) {
+    pub fn catalogued(
+        scope: [u8; 32],
+        last_catalogue_key: impl Into<String>,
+        last_slug: impl Into<String>,
+    ) -> Result<Self, RepoListCursorError> {
+        Self::from_parts(scope, Some(last_catalogue_key.into()), last_slug.into())
+    }
+
+    pub fn legacy(
+        scope: [u8; 32],
+        last_slug: impl Into<String>,
+    ) -> Result<Self, RepoListCursorError> {
+        Self::from_parts(scope, None, last_slug.into())
+    }
+
+    fn from_parts(
+        scope: [u8; 32],
+        last_catalogue_key: Option<String>,
+        last_slug: String,
+    ) -> Result<Self, RepoListCursorError> {
+        if !valid_repo_list_cursor_slug(&last_slug)
+            || last_catalogue_key
+                .as_deref()
+                .is_some_and(|key| !valid_repo_list_catalogue_key(key))
+        {
             return Err(RepoListCursorError);
         }
-        Ok(Self { scope, last_slug })
+        Ok(Self {
+            scope,
+            last_catalogue_key,
+            last_slug,
+        })
     }
 
     pub fn parse(value: &str) -> Result<Self, RepoListCursorError> {
@@ -547,22 +574,43 @@ impl RepoListCursor {
         }
         let mut scope = [0_u8; 32];
         scope.copy_from_slice(&frame[1..33]);
-        let slug_len = usize::from(u16::from_be_bytes([frame[33], frame[34]]));
-        if slug_len == 0 || frame.len() != REPO_LIST_CURSOR_FIXED_BYTES + slug_len {
+        let catalogue_key_len = usize::from(frame[33]);
+        let slug_len = usize::from(u16::from_be_bytes([frame[34], frame[35]]));
+        if slug_len == 0
+            || frame.len() != REPO_LIST_CURSOR_FIXED_BYTES + catalogue_key_len + slug_len
+        {
             return Err(RepoListCursorError);
         }
-        let last_slug = std::str::from_utf8(&frame[35..])
+        let catalogue_key_end = REPO_LIST_CURSOR_FIXED_BYTES + catalogue_key_len;
+        let last_catalogue_key = if catalogue_key_len == 0 {
+            None
+        } else {
+            Some(
+                std::str::from_utf8(&frame[REPO_LIST_CURSOR_FIXED_BYTES..catalogue_key_end])
+                    .map_err(|_| RepoListCursorError)?
+                    .to_string(),
+            )
+        };
+        let last_slug = std::str::from_utf8(&frame[catalogue_key_end..])
             .map_err(|_| RepoListCursorError)?
             .to_string();
-        Self::new(scope, last_slug)
+        Self::from_parts(scope, last_catalogue_key, last_slug)
     }
 
     pub fn encode(&self) -> String {
+        let catalogue_key = self
+            .last_catalogue_key
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes();
         let slug = self.last_slug.as_bytes();
-        let mut frame = Vec::with_capacity(REPO_LIST_CURSOR_FIXED_BYTES + slug.len());
+        let mut frame =
+            Vec::with_capacity(REPO_LIST_CURSOR_FIXED_BYTES + catalogue_key.len() + slug.len());
         frame.push(REPO_LIST_CURSOR_VERSION);
         frame.extend_from_slice(&self.scope);
+        frame.push(catalogue_key.len() as u8);
         frame.extend_from_slice(&(slug.len() as u16).to_be_bytes());
+        frame.extend_from_slice(catalogue_key);
         frame.extend_from_slice(slug);
         format!(
             "{REPO_LIST_CURSOR_PREFIX}{}",
@@ -574,6 +622,10 @@ impl RepoListCursor {
         self.scope
     }
 
+    pub fn last_catalogue_key(&self) -> Option<&str> {
+        self.last_catalogue_key.as_deref()
+    }
+
     pub fn last_slug(&self) -> &str {
         &self.last_slug
     }
@@ -581,6 +633,12 @@ impl RepoListCursor {
 
 fn valid_repo_list_cursor_slug(slug: &str) -> bool {
     crate::coordinate::RepositorySlug::parse(slug).is_ok()
+}
+
+fn valid_repo_list_catalogue_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= crate::durable::REPOSITORY_CATALOGUE_KEY_MAX_BYTES
+        && key.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -24,7 +24,7 @@ pub fn git_read_tool_defs() -> Vec<ToolDef> {
     vec![
         read_tool(
             LIST_REPOSITORIES_TOOL,
-            r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string","maxLength":512}},"additionalProperties":false}"#,
+            r#"{"type":"object","description":"Lists visible repositories from newest to oldest.","properties":{"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string","description":"Opaque next_cursor from the previous page.","maxLength":512}},"additionalProperties":false}"#,
         ),
         read_tool(
             READ_FILE_TOOL,
@@ -50,6 +50,10 @@ mod tests {
                 .map(ToolDef::canonical_name)
                 .collect::<Vec<_>>(),
             ["git.list_repositories", "git.read_file", "git.search_code"]
+        );
+        assert!(
+            definitions[0].input_schema.contains("newest to oldest"),
+            "the agent-facing contract explains repository ordering"
         );
         for definition in definitions {
             definition.validate().unwrap();

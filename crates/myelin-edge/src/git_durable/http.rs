@@ -3688,12 +3688,12 @@ mod repo_summary_tests {
             body,
             json!({
                 "items": [
-                    { "state": "empty", "slug": "acme/empty" },
                     {
                         "state": "populated",
                         "slug": "acme/populated",
                         "clone_url": "/acme/eu-west/populated.git",
                     },
+                    { "state": "empty", "slug": "acme/empty" },
                 ],
                 "page": { "next_cursor": null, "limit": DEFAULT_PAGE_LIMIT },
             })
@@ -3706,7 +3706,7 @@ mod repo_summary_tests {
     }
 
     #[test]
-    fn authorization_precedes_keyset_paging_and_continuation_has_no_gaps_or_duplicates() {
+    fn newest_first_paging_authorizes_before_slicing_without_gaps_or_duplicates() {
         let root = temp_root("auth-before-page");
         let viewer = human("u:viewer");
         let authz = GrantBackedRepos::new()
@@ -3736,7 +3736,7 @@ mod repo_summary_tests {
             assert!(cursor.starts_with(REPO_LIST_CURSOR_PREFIX));
             query = format!("view=summary&limit=1&cursor={cursor}");
         }
-        assert_eq!(seen, ["acme/alpha", "acme/gamma", "acme/omega"]);
+        assert_eq!(seen, ["acme/omega", "acme/gamma", "acme/alpha"]);
         assert!(!seen.iter().any(|slug| slug == "acme/beta"));
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3772,7 +3772,7 @@ mod repo_summary_tests {
         }
         assert!(matches!(
             parse_repo_summary_query(&format!(
-                "view=summary&cursor=rl1_{}",
+                "view=summary&cursor=rl2_{}",
                 "a".repeat(REPO_LIST_CURSOR_MAX_BYTES)
             )),
             Err(EdgeError::BadRequest(_))
@@ -3781,14 +3781,14 @@ mod repo_summary_tests {
 
     #[test]
     fn cursor_is_canonical_bounded_and_scoped_to_verified_tenant_region() {
-        let cursor = RepoListCursor::new(repo_summary_cursor_scope(TENANT, REGION), "alpha")
+        let cursor = RepoListCursor::legacy(repo_summary_cursor_scope(TENANT, REGION), "alpha")
             .unwrap()
             .encode();
         let parsed = parse_repo_summary_cursor(&cursor, TENANT, REGION).expect("canonical cursor");
         assert_eq!(parsed.last_slug(), "alpha");
         for malformed in [
-            "rl1_".to_string(),
-            "rl1_not-base64!".to_string(),
+            "rl2_".to_string(),
+            "rl2_not-base64!".to_string(),
             format!("{cursor}="),
         ] {
             assert!(matches!(
@@ -3813,7 +3813,7 @@ mod repo_summary_tests {
         let empty = json(serve(&handler, &viewer, "view=summary").expect("empty tenant summary"));
         assert_eq!(empty["items"], json!([]));
         let wrong_scope =
-            RepoListCursor::new(repo_summary_cursor_scope("other-tenant", REGION), "alpha")
+            RepoListCursor::legacy(repo_summary_cursor_scope("other-tenant", REGION), "alpha")
                 .unwrap()
                 .encode();
         assert!(matches!(

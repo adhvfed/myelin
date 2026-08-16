@@ -420,23 +420,36 @@ fn repository_list_rows_reject_unsafe_or_oversized_fields() {
 
 #[test]
 fn repository_list_cursor_codec_is_canonical_bounded_and_round_trips() {
-    let cursor = RepoListCursor::new([7; 32], "platform/alpha").unwrap();
+    let cursor =
+        RepoListCursor::catalogued([7; 32], "01J00000000000000000000000", "platform/alpha")
+            .unwrap();
     let encoded = cursor.encode();
     assert!(encoded.starts_with(REPO_LIST_CURSOR_PREFIX));
     assert!(!encoded.contains('='), "the base64url token is unpadded");
     assert_eq!(RepoListCursor::parse(&encoded).unwrap(), cursor);
+    let legacy = RepoListCursor::legacy([7; 32], "platform/legacy").unwrap();
+    assert_eq!(RepoListCursor::parse(&legacy.encode()).unwrap(), legacy);
 
     for malformed in [
-        "rl1_".to_string(),
-        "rl1_not-base64!".to_string(),
+        "rl2_".to_string(),
+        "rl2_not-base64!".to_string(),
         format!("{encoded}="),
-        RepoListCursor::new([7; 32], "alpha").unwrap().encode() + "%",
-        format!("rl1_{}", "a".repeat(REPO_LIST_CURSOR_MAX_BYTES)),
+        RepoListCursor::legacy([7; 32], "alpha").unwrap().encode() + "%",
+        format!("rl2_{}", "a".repeat(REPO_LIST_CURSOR_MAX_BYTES)),
     ] {
         assert_eq!(RepoListCursor::parse(&malformed), Err(RepoListCursorError));
     }
     for slug in ["", ".", "..", "platform.git/api", "white space"] {
-        assert_eq!(RepoListCursor::new([0; 32], slug), Err(RepoListCursorError));
+        assert_eq!(
+            RepoListCursor::legacy([0; 32], slug),
+            Err(RepoListCursorError)
+        );
+    }
+    for key in ["", "white space", "punctuation!"] {
+        assert_eq!(
+            RepoListCursor::catalogued([0; 32], key, "alpha"),
+            Err(RepoListCursorError)
+        );
     }
 }
 

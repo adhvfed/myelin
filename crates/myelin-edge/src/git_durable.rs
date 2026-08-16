@@ -25,7 +25,7 @@ use myelin_git::durable::{
 };
 use myelin_git::durable::{
     CatalogueRepoState, DurableError, DurableGitRepo, DurableGitStore, RefKind, RefsPageError,
-    RefsPageRequest, RepoCreationClaim,
+    RefsPageRequest, RepoCreationClaim, RepositoryCatalogueKey,
 };
 use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
@@ -116,6 +116,63 @@ pub struct PrActorContext<'a> {
 const MAX_CHECK_CONTEXTS: usize = 256;
 const MAX_CHECK_CONTEXT_BYTES: usize = 255;
 const MAX_BRANCH_PROTECTION_RULESETS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RepositoryCatalogueEntry {
+    slug: String,
+    creation_key: Option<RepositoryCatalogueKey>,
+}
+
+fn compare_repository_catalogue_positions(
+    left_key: Option<&str>,
+    left_slug: &str,
+    right_key: Option<&str>,
+    right_slug: &str,
+) -> std::cmp::Ordering {
+    match (left_key, right_key) {
+        (Some(left), Some(right)) => right.cmp(left).then_with(|| left_slug.cmp(right_slug)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left_slug.cmp(right_slug),
+    }
+}
+
+impl RepositoryCatalogueEntry {
+    fn compare_for_listing(&self, other: &Self) -> std::cmp::Ordering {
+        compare_repository_catalogue_positions(
+            self.creation_key
+                .as_ref()
+                .map(RepositoryCatalogueKey::as_str),
+            &self.slug,
+            other
+                .creation_key
+                .as_ref()
+                .map(RepositoryCatalogueKey::as_str),
+            &other.slug,
+        )
+    }
+
+    fn follows(&self, cursor: &RepoListCursor) -> bool {
+        compare_repository_catalogue_positions(
+            self.creation_key
+                .as_ref()
+                .map(RepositoryCatalogueKey::as_str),
+            &self.slug,
+            cursor.last_catalogue_key(),
+            cursor.last_slug(),
+        ) == std::cmp::Ordering::Greater
+    }
+
+    fn cursor(
+        &self,
+        scope: [u8; 32],
+    ) -> Result<RepoListCursor, myelin_git::web::RepoListCursorError> {
+        match &self.creation_key {
+            Some(key) => RepoListCursor::catalogued(scope, key.as_str(), &self.slug),
+            None => RepoListCursor::legacy(scope, &self.slug),
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -277,7 +334,7 @@ impl DurableGitBackend {
         let root = root.into();
         let (provider, checks) = providers.into_projection(runtime.clone());
         Ok(DurableGitBackend {
-            store: DurableGitStore::rooted(root.clone()),
+            store: DurableGitStore::rooted_with_minter(root.clone(), minter.clone()),
             prs: DurablePrStore::rooted(root.clone()),
             pg_prs: Some(PgPrStore::new(provider, kms, runtime)?),
             checks: Some(checks),
@@ -297,14 +354,15 @@ impl DurableGitBackend {
     #[cfg(any(test, feature = "test-support"))]
     pub fn rooted_inmem_for_test(root: impl Into<PathBuf>) -> DurableGitBackend {
         let root = root.into();
+        let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
         DurableGitBackend {
-            store: DurableGitStore::rooted(root.clone()),
+            store: DurableGitStore::rooted_with_minter(root.clone(), minter.clone()),
             prs: DurablePrStore::rooted(root.clone()),
             pg_prs: None,
             checks: None,
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox: OutboxStore::new(),
-            minter: Arc::new(MonotonicMinter::new()),
+            minter,
             clone_base: String::new(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
@@ -679,6 +737,29 @@ impl DurableGitBackend {
         Ok(slugs)
     }
 
+    fn visible_repository_catalogue(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+    ) -> Result<Vec<RepositoryCatalogueEntry>, DurableError> {
+        let candidates = self.scan_repo_slugs(tenant, region)?;
+        let visible = self
+            .repo_authz
+            .visible_repos(principal, tenant, region, &candidates);
+        let mut entries = visible
+            .into_iter()
+            .map(|slug| {
+                let creation_key = self
+                    .store
+                    .repository_catalogue_key(&Self::loc(tenant, region, &slug))?;
+                Ok(RepositoryCatalogueEntry { slug, creation_key })
+            })
+            .collect::<Result<Vec<_>, DurableError>>()?;
+        entries.sort_by(RepositoryCatalogueEntry::compare_for_listing);
+        Ok(entries)
+    }
+
     fn list_repos_visible(
         &self,
         tenant: &str,
@@ -687,22 +768,19 @@ impl DurableGitBackend {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<RepoHome>, bool), DurableError> {
-        let candidates = self.scan_repo_slugs(tenant, region)?;
-        let visible = self
-            .repo_authz
-            .visible_repos(principal, tenant, region, &candidates);
-        let mut page: Vec<String> = visible
+        let mut page = self
+            .visible_repository_catalogue(tenant, region, principal)?
             .into_iter()
             .skip(offset)
             .take(limit.saturating_add(1))
-            .collect();
+            .collect::<Vec<_>>();
         let has_more = page.len() > limit;
         page.truncate(limit);
         let mut out = Vec::new();
-        for slug in page {
-            let loc = Self::loc(tenant, region, &slug);
+        for entry in page {
+            let loc = Self::loc(tenant, region, &entry.slug);
             let repo = self.store.open_repo(&loc)?;
-            out.push(self.repo_home(tenant, region, &slug, &repo)?);
+            out.push(self.repo_home(tenant, region, &entry.slug, &repo)?);
         }
         Ok((out, has_more))
     }
@@ -712,30 +790,27 @@ impl DurableGitBackend {
         tenant: &str,
         region: &str,
         principal: &Principal,
-        after: Option<&str>,
+        after: Option<&RepoListCursor>,
         limit: usize,
-    ) -> Result<(Vec<RepoListRow>, Option<String>), DurableError> {
-        let candidates = self.scan_repo_slugs(tenant, region)?;
-        let visible = self
-            .repo_authz
-            .visible_repos(principal, tenant, region, &candidates);
-        let mut page: Vec<String> = visible
+    ) -> Result<(Vec<RepoListRow>, Option<RepositoryCatalogueEntry>), DurableError> {
+        let mut page = self
+            .visible_repository_catalogue(tenant, region, principal)?
             .into_iter()
-            .filter(|slug| after.is_none_or(|last| slug.as_str() > last))
+            .filter(|entry| after.is_none_or(|cursor| entry.follows(cursor)))
             .take(limit.saturating_add(1))
-            .collect();
+            .collect::<Vec<_>>();
         let has_more = page.len() > limit;
         page.truncate(limit);
-        let next_slug = if has_more { page.last().cloned() } else { None };
+        let next_position = if has_more { page.last().cloned() } else { None };
 
         let mut rows = Vec::with_capacity(page.len());
-        for slug in page {
-            let loc = Self::loc(tenant, region, &slug);
+        for entry in page {
+            let loc = Self::loc(tenant, region, &entry.slug);
             let repo = self.store.open_repo(&loc)?;
-            let full_slug = format!("{tenant}/{slug}");
+            let full_slug = format!("{tenant}/{}", entry.slug);
             let row = match repo.catalogue_repo_state()? {
                 CatalogueRepoState::Populated => {
-                    RepoListRow::populated(full_slug, self.clone_url(tenant, region, &slug))
+                    RepoListRow::populated(full_slug, self.clone_url(tenant, region, &entry.slug))
                 }
                 CatalogueRepoState::Empty => RepoListRow::empty(full_slug),
             }
@@ -746,7 +821,7 @@ impl DurableGitBackend {
             })?;
             rows.push(row);
         }
-        Ok((rows, next_slug))
+        Ok((rows, next_position))
     }
 
     pub fn list_repositories(
@@ -769,19 +844,14 @@ impl DurableGitBackend {
             .as_deref()
             .map(|value| parse_repo_summary_cursor(value, tenant, region))
             .transpose()?;
-        let (rows, next_slug) = self
-            .list_repo_summaries_visible(
-                tenant,
-                region,
-                principal,
-                cursor.as_ref().map(RepoListCursor::last_slug),
-                limit,
-            )
+        let (rows, next_position) = self
+            .list_repo_summaries_visible(tenant, region, principal, cursor.as_ref(), limit)
             .map_err(map_repo_summary_durable_err)?;
         let items = rows.iter().map(RepoListRow::to_json).collect::<Vec<_>>();
-        let next_cursor = next_slug
-            .map(|last_slug| {
-                RepoListCursor::new(repo_summary_cursor_scope(tenant, region), last_slug)
+        let next_cursor = next_position
+            .map(|position| {
+                position
+                    .cursor(repo_summary_cursor_scope(tenant, region))
                     .map(|cursor| cursor.encode())
                     .map_err(|error| {
                         EdgeError::Internal(format!(

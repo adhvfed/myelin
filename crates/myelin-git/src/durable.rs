@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::core::{Oid, RepoLoc};
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
@@ -13,6 +14,7 @@ pub use crate::tree_pagination::{
     TREE_PAGE_LATEST_COMMIT_WALK_MAX, TREE_PAGE_MAX_LIMIT, TREE_PAGE_MAX_QUERY_BYTES,
     TREE_PAGE_SCAN_MAX_ENTRIES, TREE_PAGE_SCAN_MAX_NAME_BYTES, TREE_PAGE_SCAN_MAX_TOTAL_NAME_BYTES,
 };
+use myelin_events::{IdMinter, UlidMinter};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableError {
@@ -2212,8 +2214,79 @@ impl DurableGitRepo {
     }
 }
 
+const REPOSITORY_CATALOGUE_KEY_FILE: &str = "myelin-catalogue-key";
+pub const REPOSITORY_CATALOGUE_KEY_MAX_BYTES: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RepositoryCatalogueKey(String);
+
+impl RepositoryCatalogueKey {
+    fn parse(value: impl Into<String>) -> Result<Self, DurableError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > REPOSITORY_CATALOGUE_KEY_MAX_BYTES
+            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(DurableError::Git(
+                "repository catalogue key is malformed".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn read_repository_catalogue_key(
+    repo_path: &Path,
+) -> Result<Option<RepositoryCatalogueKey>, DurableError> {
+    let path = repo_path.join(REPOSITORY_CATALOGUE_KEY_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(DurableError::Io(format!(
+                "inspect repository catalogue key {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > REPOSITORY_CATALOGUE_KEY_MAX_BYTES as u64
+    {
+        return Err(DurableError::Git(
+            "repository catalogue key is malformed".into(),
+        ));
+    }
+    let value = std::fs::read_to_string(&path).map_err(|error| {
+        DurableError::Io(format!(
+            "read repository catalogue key {}: {error}",
+            path.display()
+        ))
+    })?;
+    RepositoryCatalogueKey::parse(value).map(Some)
+}
+
+fn persist_repository_catalogue_key(
+    repo_path: &Path,
+    key: &RepositoryCatalogueKey,
+) -> Result<(), DurableError> {
+    if read_repository_catalogue_key(repo_path)?.is_some() {
+        return Ok(());
+    }
+    write_file_atomic(
+        repo_path,
+        &repo_path.join(REPOSITORY_CATALOGUE_KEY_FILE),
+        key.0.as_bytes(),
+    )
+}
+
 pub struct DurableGitStore<P: RepoPathResolver = RootedResolver> {
     resolver: P,
+    minter: Arc<dyn IdMinter>,
 }
 
 pub enum RepoCreationClaim {
@@ -2224,12 +2297,15 @@ pub enum RepoCreationClaim {
 pub struct RepoCreationGuard {
     repo_path: PathBuf,
     owner_path: PathBuf,
+    catalogue_key: RepositoryCatalogueKey,
     _lock: std::fs::File,
 }
 
 impl RepoCreationGuard {
     pub fn initialize(&self) -> Result<DurableGitRepo, DurableError> {
-        init_bare_repo(&self.repo_path)
+        let repo = init_bare_repo(&self.repo_path)?;
+        persist_repository_catalogue_key(&self.repo_path, &self.catalogue_key)?;
+        Ok(repo)
     }
 
     pub fn complete(self) -> Result<(), DurableError> {
@@ -2278,15 +2354,24 @@ fn init_bare_repo(path: &Path) -> Result<DurableGitRepo, DurableError> {
 
 impl DurableGitStore<RootedResolver> {
     pub fn rooted(root: impl Into<PathBuf>) -> Self {
+        Self::rooted_with_minter(root, Arc::new(UlidMinter::new()))
+    }
+
+    pub fn rooted_with_minter(root: impl Into<PathBuf>, minter: Arc<dyn IdMinter>) -> Self {
         Self {
             resolver: RootedResolver::new(root),
+            minter,
         }
     }
 }
 
 impl<P: RepoPathResolver> DurableGitStore<P> {
     pub fn new(resolver: P) -> Self {
-        Self { resolver }
+        Self::with_minter(resolver, Arc::new(UlidMinter::new()))
+    }
+
+    pub fn with_minter(resolver: P, minter: Arc<dyn IdMinter>) -> Self {
+        Self { resolver, minter }
     }
 
     pub fn repo_path(&self, repo: &RepoLoc) -> Result<PathBuf, DurableError> {
@@ -2300,6 +2385,13 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
             RepoCreationClaim::Existing(repo) => Ok(repo),
             RepoCreationClaim::Acquired(claim) => claim.create(),
         }
+    }
+
+    pub fn repository_catalogue_key(
+        &self,
+        repo: &RepoLoc,
+    ) -> Result<Option<RepositoryCatalogueKey>, DurableError> {
+        read_repository_catalogue_key(&self.repo_path(repo)?)
     }
 
     pub fn claim_repo_creation(
@@ -2351,7 +2443,7 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
             ))
         })?;
 
-        match std::fs::metadata(&owner_path) {
+        let catalogue_key = match std::fs::metadata(&owner_path) {
             Ok(metadata) => {
                 if metadata.len() != OWNER_FINGERPRINT_BYTES {
                     return Err(DurableError::Git(
@@ -2370,6 +2462,7 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
                         repo.repo
                     )));
                 }
+                RepositoryCatalogueKey::parse(self.minter.mint().0)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if let Ok(repository) = git2::Repository::open(&repo_path) {
@@ -2378,7 +2471,9 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
                         path: repo_path,
                     }));
                 }
+                let catalogue_key = RepositoryCatalogueKey::parse(self.minter.mint().0)?;
                 write_file_atomic(parent, &owner_path, owner.as_bytes())?;
+                catalogue_key
             }
             Err(error) => {
                 return Err(DurableError::Io(format!(
@@ -2386,11 +2481,12 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
                     owner_path.display()
                 )))
             }
-        }
+        };
 
         Ok(RepoCreationClaim::Acquired(RepoCreationGuard {
             repo_path,
             owner_path,
+            catalogue_key,
             _lock: lock,
         }))
     }
@@ -2603,8 +2699,38 @@ mod tests {
             repo.path().is_dir(),
             "the bare repo is a real on-disk directory"
         );
+        let catalogue_key = store
+            .repository_catalogue_key(&loc())
+            .expect("read catalogue key")
+            .expect("new repositories carry durable catalogue order");
         assert!(store.repo_exists(&loc()), "present after create");
         assert!(store.create_repo(&loc()).is_ok());
+        assert_eq!(
+            store.repository_catalogue_key(&loc()).unwrap(),
+            Some(catalogue_key),
+            "idempotent create preserves the repository's original position"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repositories_from_before_catalogue_order_remain_a_stable_legacy_tier() {
+        let root = temp_root("legacy-catalogue");
+        let store = DurableGitStore::rooted(&root);
+        let repo_path = store.repo_path(&loc()).unwrap();
+        std::fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
+        init_bare_repo(&repo_path).expect("simulate a repository created by the prior format");
+
+        assert_eq!(store.repository_catalogue_key(&loc()).unwrap(), None);
+        store
+            .create_repo(&loc())
+            .expect("legacy repository remains usable");
+        assert_eq!(
+            store.repository_catalogue_key(&loc()).unwrap(),
+            None,
+            "opening an existing repository must not pretend it was just created"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2630,6 +2756,10 @@ mod tests {
         interrupted
             .initialize()
             .expect("Git initialization reached disk");
+        let initial_catalogue_key = store
+            .repository_catalogue_key(&loc())
+            .unwrap()
+            .expect("initialization durably records catalogue order");
         drop(interrupted);
 
         assert!(matches!(
@@ -2646,6 +2776,11 @@ mod tests {
         resumed
             .create()
             .expect("the original creator finishes the repository");
+        assert_eq!(
+            store.repository_catalogue_key(&loc()).unwrap(),
+            Some(initial_catalogue_key),
+            "recovery cannot make an interrupted repository look newly created"
+        );
         assert!(matches!(
             store
                 .claim_repo_creation(&loc(), "principal:bob")
