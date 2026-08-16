@@ -85,14 +85,16 @@ function commitBrief(value: unknown): CommitBriefVM | null {
 function repoEntry(value: unknown): RepoEntry | null {
   const entry = record(value);
   if (!entry || !repoPath(entry.path) || typeof entry.is_dir !== "boolean" ||
-      (entry.name !== undefined && !displayText(entry.name, 1_024)) ||
+      !displayText(entry.name, 1_024) || entry.name.length === 0 ||
+      entry.name.includes("/") || entry.name.includes("\\") ||
+      entry.path.split("/").at(-1) !== entry.name ||
       (entry.size !== undefined && !uint(entry.size))) return null;
   const latest = entry.latest_commit === undefined ? undefined : commitBrief(entry.latest_commit);
   if (entry.latest_commit !== undefined && !latest) return null;
   return {
     path: entry.path,
+    name: entry.name,
     is_dir: entry.is_dir,
-    ...(entry.name === undefined ? {} : { name: entry.name }),
     ...(entry.size === undefined ? {} : { size: entry.size }),
     ...(latest ? { latest_commit: latest } : {}),
   };
@@ -102,68 +104,54 @@ export function parseRepoHome(value: unknown): RepoHomeVM | null {
   const home = record(value);
   if (!home) return null;
   const state = home.state;
-  if (state !== "populated" && state !== "empty" && state !== "restricted") return null;
-  if (state === "restricted") return { state: "restricted" };
+  if (state !== "populated" && state !== "empty") return null;
   const reference = parseArtifactRef(home.ref);
   if (!isGitRepositorySlug(home.slug) || !displayText(home.default_branch, 1_024) ||
-      (home.clone_url !== undefined && !displayText(home.clone_url, 4 * 1024)) ||
+      !isFullGitRef(`refs/heads/${home.default_branch}`) ||
+      !displayText(home.clone_url, 4 * 1024) || home.clone_url.length === 0 ||
+      /[\p{Cc}\s]/u.test(home.clone_url) ||
       !reference || reference.sub !== null || reference.subsystem !== "git" ||
       reference.type !== "repo") return null;
   const separator = home.slug.indexOf("/");
   if (separator < 1 || reference.tenant !== home.slug.slice(0, separator) ||
       reference.id !== home.slug.slice(separator + 1)) return null;
-  let counts: { branches: number; tags: number } | undefined;
-  if (home.counts !== undefined) {
-    const wireCounts = record(home.counts);
-    if (!wireCounts || !uint(wireCounts.branches) || !uint(wireCounts.tags)) return null;
-    counts = { branches: wireCounts.branches, tags: wireCounts.tags };
-  }
+  const wireCounts = record(home.counts);
+  if (!wireCounts || !uint(wireCounts.branches) || !uint(wireCounts.tags)) return null;
+  const counts = { branches: wireCounts.branches, tags: wireCounts.tags };
   const visible = {
     slug: home.slug,
     ref: reference.root,
+    clone_url: home.clone_url,
     default_branch: home.default_branch,
-    ...(home.clone_url === undefined ? {} : { clone_url: home.clone_url }),
-    ...(counts === undefined ? {} : { counts }),
+    counts,
   };
   if (state === "empty") return { state, ...visible };
 
-  const result: PopulatedRepoHomeVM = { state, ...visible };
-  const modernPagination = home.snapshot_oid !== undefined || home.entries_page !== undefined;
-  if (modernPagination && (home.snapshot_oid === undefined || home.entries_page === undefined)) {
-    return null;
-  }
-  for (const key of ["readme", "readme_excerpt"] as const) {
-    if (home[key] !== undefined) {
-      if (!bounded(home[key], MAX_TEXT_BYTES)) return null;
-      result[key] = home[key];
-    }
-  }
-  if (home.entries !== undefined) {
-    if (!Array.isArray(home.entries) || home.entries.length > MAX_REPO_ENTRIES) return null;
-    const entries = home.entries.map(repoEntry);
-    if (!entries.every((entry): entry is RepoEntry => entry !== null)) return null;
-    result.entries = entries;
-  }
-  if (home.snapshot_oid !== undefined) {
-    if (!gitOid(home.snapshot_oid)) return null;
-    result.snapshot_oid = home.snapshot_oid;
-  }
-  if (home.entries_page !== undefined) {
-    const entriesPage = record(home.entries_page);
-    const page = treePage(entriesPage);
-    if (!entriesPage || !page || !isFullGitRef(entriesPage.ref) ||
-        !gitOid(entriesPage.snapshot_oid) ||
-        (result.entries !== undefined && result.entries.length > page.limit) ||
-        (result.snapshot_oid !== undefined && result.snapshot_oid !== entriesPage.snapshot_oid)) {
-      return null;
-    }
-    result.entries_page = {
+  if (!gitOid(home.snapshot_oid) || !Array.isArray(home.entries) ||
+      home.entries.length > MAX_REPO_ENTRIES) return null;
+  const entries = home.entries.map(repoEntry);
+  if (!entries.every((entry): entry is RepoEntry => entry !== null)) return null;
+  const entriesPage = record(home.entries_page);
+  const page = treePage(entriesPage);
+  if (!entriesPage || !page || entries.length > page.limit ||
+      entriesPage.ref !== `refs/heads/${home.default_branch}` ||
+      entriesPage.snapshot_oid !== home.snapshot_oid) return null;
+  const result: PopulatedRepoHomeVM = {
+    state,
+    ...visible,
+    entries,
+    snapshot_oid: home.snapshot_oid,
+    entries_page: {
       ref: entriesPage.ref,
-      snapshot_oid: entriesPage.snapshot_oid,
+      snapshot_oid: home.snapshot_oid,
       ...page,
-    };
+    },
+  };
+  for (const key of ["readme", "readme_excerpt"] as const) {
+    if (home[key] !== null && !bounded(home[key], MAX_TEXT_BYTES)) return null;
+    if (typeof home[key] === "string") result[key] = home[key];
   }
-  if (home.latest_commit !== undefined) {
+  if (home.latest_commit !== null) {
     const latest = commitBrief(home.latest_commit);
     if (!latest) return null;
     result.latest_commit = latest;

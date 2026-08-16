@@ -27,7 +27,6 @@ function safeCloneUrl(value: string): boolean {
 function row(value: unknown): RepoListRowVM | null {
   const item = record(value);
   if (!item) return null;
-  if (item.state === "restricted") return { state: "restricted" };
   if (item.state === "empty" && exact(item, ["state", "slug"]) &&
       isGitRepositorySlug(item.slug)) {
     return { state: "empty", slug: item.slug };

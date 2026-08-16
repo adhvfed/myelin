@@ -75,7 +75,7 @@ export function treeLimitValue(value: unknown): number {
 
 export function repoHomeContinuationHref(
   repo: string,
-  page: NonNullable<PopulatedRepoHomeVM["entries_page"]>,
+  page: PopulatedRepoHomeVM["entries_page"],
 ): string | null {
   if (!page.next_cursor) return null;
   return treeHref({

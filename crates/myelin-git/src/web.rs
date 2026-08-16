@@ -847,7 +847,6 @@ impl std::error::Error for RepoListRowError {}
 pub enum RepoListRow {
     Populated { slug: String, clone_url: String },
     Empty { slug: String },
-    Restricted,
 }
 
 impl RepoListRow {
@@ -866,10 +865,6 @@ impl RepoListRow {
         })
     }
 
-    pub fn restricted() -> Self {
-        Self::Restricted
-    }
-
     pub fn to_json(&self) -> Value {
         match self {
             Self::Populated { slug, clone_url } => json!({
@@ -881,7 +876,6 @@ impl RepoListRow {
                 "state": "empty",
                 "slug": slug,
             }),
-            Self::Restricted => json!({ "state": "restricted" }),
         }
     }
 }
@@ -899,76 +893,6 @@ fn validated_repo_list_clone_url(clone_url: String) -> Result<String, RepoListRo
     valid
         .then_some(clone_url)
         .ok_or(RepoListRowError::InvalidCloneUrl)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RepoHome {
-    Populated {
-        slug: String,
-        readme_excerpt: String,
-        entries: Vec<(String, bool)>,
-        clone_url: String,
-    },
-    Empty {
-        slug: String,
-        clone_url: String,
-    },
-    Restricted,
-}
-
-impl RepoHome {
-    pub fn render(&self) -> String {
-        let mut h = String::new();
-        h.push_str("<main class=\"repo-home\">");
-        match self {
-            RepoHome::Populated {
-                slug,
-                readme_excerpt,
-                entries,
-                clone_url,
-            } => {
-                h.push_str(&format!("<h2 class=\"repo-title\">{}</h2>", escape(slug)));
-                h.push_str(&format!(
-                    "<div class=\"clone-url\"><code>{}</code>\
-                     <button class=\"btn\" data-action=\"copy-clone-url\">Copy</button></div>",
-                    escape(clone_url)
-                ));
-                h.push_str("<ul class=\"file-tree\">");
-                for (path, is_dir) in entries {
-                    let glyph = if *is_dir { "\u{1F4C1}" } else { "\u{1F4C4}" };
-                    h.push_str(&format!(
-                        "<li class=\"tree-entry\"><span class=\"glyph\" aria-hidden=\"true\">{}</span>\
-                         <a href=\"blob/{}\"><code>{}</code></a></li>",
-                        glyph,
-                        escape(path),
-                        escape(path),
-                    ));
-                }
-                h.push_str("</ul>");
-                h.push_str(&format!(
-                    "<section class=\"readme\"><pre>{}</pre></section>",
-                    escape(readme_excerpt)
-                ));
-            }
-            RepoHome::Empty { slug, clone_url } => {
-                h.push_str(&format!("<h2 class=\"repo-title\">{}</h2>", escape(slug)));
-                h.push_str(&format!(
-                    "<div class=\"state-empty\"><p>This repository has no commits yet.</p>\
-                     <pre class=\"onboard\">git clone {}\ngit push -u origin main</pre></div>",
-                    escape(clone_url),
-                ));
-            }
-            RepoHome::Restricted => {
-                h.push_str(
-                    "<div class=\"state-restricted\" role=\"note\">\
-                     <span class=\"glyph\" aria-hidden=\"true\">\u{1F512}</span>\
-                     <p>This repository is not available to you.</p></div>",
-                );
-            }
-        }
-        h.push_str("</main>");
-        h
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1199,32 +1123,6 @@ fn render_hint_json(h: &RenderHint) -> Value {
         "approvals": { "current": h.approvals.0, "required": h.approvals.1 },
         "is_draft": h.is_draft,
     })
-}
-
-impl RepoHome {
-    pub fn to_json(&self) -> Value {
-        match self {
-            RepoHome::Populated {
-                slug,
-                readme_excerpt,
-                entries,
-                clone_url,
-            } => json!({
-                "state": "populated",
-                "slug": slug,
-                "readme_excerpt": readme_excerpt,
-                "clone_url": clone_url,
-                "entries": entries
-                    .iter()
-                    .map(|(path, is_dir)| json!({ "path": path, "is_dir": is_dir }))
-                    .collect::<Vec<_>>(),
-            }),
-            RepoHome::Empty { slug, clone_url } => {
-                json!({ "state": "empty", "slug": slug, "clone_url": clone_url })
-            }
-            RepoHome::Restricted => json!({ "state": "restricted" }),
-        }
-    }
 }
 
 impl WebEditForm {

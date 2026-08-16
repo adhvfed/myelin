@@ -99,7 +99,7 @@ function RepoRow(props: { repo: RepoListRowVM }) {
         gap: "var(--space-1)",
       }}
     >
-      <Switch fallback={<span style={{ color: "var(--text-subtle)" }}>Restricted repository</span>}>
+      <Switch>
         <Match when={empty()} keyed>
           {(repo) => (
             <A

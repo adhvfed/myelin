@@ -378,10 +378,6 @@ fn repository_list_rows_have_exact_lightweight_json_shapes() {
         RepoListRow::empty("acme/empty").unwrap().to_json(),
         serde_json::json!({ "state": "empty", "slug": "acme/empty" })
     );
-    assert_eq!(
-        RepoListRow::restricted().to_json(),
-        serde_json::json!({ "state": "restricted" })
-    );
 }
 
 #[test]

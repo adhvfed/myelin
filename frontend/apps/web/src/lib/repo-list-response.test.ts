@@ -11,16 +11,14 @@ describe("repository catalogue response", () => {
       items: [
         { state: "populated", slug: "acme/core", clone_url: "/acme/eu/core.git" },
         { state: "empty", slug: "acme/sandbox" },
-        { state: "restricted", slug: "must-not-project", secret: "drop" },
       ],
-      page: { next_cursor: CURSOR, limit: 3 },
+      page: { next_cursor: CURSOR, limit: 2 },
     })).toEqual({
       items: [
         { state: "populated", slug: "acme/core", clone_url: "/acme/eu/core.git" },
         { state: "empty", slug: "acme/sandbox" },
-        { state: "restricted" },
       ],
-      page: { next_cursor: CURSOR, limit: 3 },
+      page: { next_cursor: CURSOR, limit: 2 },
     });
 
     expect(parseRepoHome({ state: "populated", slug: "acme/core", clone_url: "/x" }))
@@ -38,6 +36,7 @@ describe("repository catalogue response", () => {
     { items: [{ state: "empty", slug: "../core" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "empty", slug: "acme.git/core" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "unknown", slug: "acme/core" }], page: { next_cursor: null, limit: 1 } },
+    { items: [{ state: "restricted" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "empty", slug: "acme/core", default_branch: "main" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "populated", slug: "acme/core", clone_url: "/x", entries: [] }], page: { next_cursor: null, limit: 1 } },
     { items: [{ state: "empty", slug: "acme/a" }, { state: "empty", slug: "acme/b" }], page: { next_cursor: null, limit: 1 } },

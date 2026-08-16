@@ -109,8 +109,7 @@ export interface CommitBriefVM {
  *  the full repo-relative path (the link target). `latest_commit` is present when the bounded walk
  *  resolved it (absent rows render name-only — the graceful degrade). */
 export interface RepoEntry {
-  name?: string;
-  /** Retained for back-compat; equals `name` at the root. The link uses `path`. */
+  name: string;
   path: string;
   is_dir: boolean;
   size?: number;
@@ -120,9 +119,9 @@ export interface RepoEntry {
 interface VisibleRepoHomeVM {
   slug: string;
   ref: string;
-  clone_url?: string;
+  clone_url: string;
   default_branch: string;
-  counts?: { branches: number; tags: number };
+  counts: { branches: number; tags: number };
 }
 
 export interface EmptyRepoHomeVM extends VisibleRepoHomeVM {
@@ -135,18 +134,14 @@ export interface PopulatedRepoHomeVM extends VisibleRepoHomeVM {
   /** Full README markdown (rendered via the read-path / sanitized markdown renderer). */
   readme?: string;
   readme_excerpt?: string;
-  entries?: RepoEntry[];
+  entries: RepoEntry[];
   latest_commit?: CommitBriefVM;
-  snapshot_oid?: string;
-  entries_page?: TreePageVM & { ref: string; snapshot_oid: string };
+  snapshot_oid: string;
+  entries_page: TreePageVM & { ref: string; snapshot_oid: string };
 }
 
-/** The Git RepoHome ViewModel is deliberately discriminated: restricted responses carry no
- * repository metadata, while every visible repository has one canonical ArtifactRef. */
-export type RepoHomeVM =
-  | PopulatedRepoHomeVM
-  | EmptyRepoHomeVM
-  | { state: "restricted" };
+/** The Git RepoHome ViewModel contains only visible repositories; denied reads are zero-leak 404s. */
+export type RepoHomeVM = PopulatedRepoHomeVM | EmptyRepoHomeVM;
 
 /** One ref row for the switcher. */
 export interface RefRow {
@@ -206,8 +201,7 @@ export type TreeVM = TreeDirectoryVM | TreeBlobRedirectVM;
 /** One summary-only repository catalogue row. Heavy RepoHome data belongs to `GET /repos/{repo}`. */
 export type RepoListRowVM =
   | { state: "populated"; slug: string; clone_url: string }
-  | { state: "empty"; slug: string }
-  | { state: "restricted" };
+  | { state: "empty"; slug: string };
 
 /** The bounded repository catalogue envelope. */
 export interface RepoListPage {

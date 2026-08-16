@@ -4,14 +4,42 @@ import { parseBlob, parseRefs, parseRepoHome, parseTree } from "./repo-read-resp
 
 const OID = "0123456789abcdef0123456789abcdef01234567";
 const REPO_REF = "myelin://acme/git/repo/core";
+const COUNTS = { branches: 1, tags: 0 };
+
+function emptyHome(overrides: Record<string, unknown> = {}) {
+  return {
+    state: "empty",
+    slug: "acme/core",
+    ref: REPO_REF,
+    clone_url: "/acme/eu-west/core.git",
+    default_branch: "main",
+    counts: COUNTS,
+    ...overrides,
+  };
+}
+
+function populatedHome(overrides: Record<string, unknown> = {}) {
+  return {
+    ...emptyHome(),
+    state: "populated",
+    readme: null,
+    readme_excerpt: null,
+    latest_commit: null,
+    entries: [],
+    snapshot_oid: OID,
+    entries_page: {
+      ref: "refs/heads/main",
+      next_cursor: null,
+      limit: 100,
+      snapshot_oid: OID,
+    },
+    ...overrides,
+  };
+}
 
 describe("repository read response projection", () => {
   it("projects bounded known fields and drops surplus fields recursively", () => {
-    expect(parseRepoHome({
-      state: "populated",
-      slug: "acme/core",
-      ref: REPO_REF,
-      default_branch: "main",
+    expect(parseRepoHome(populatedHome({
       entries: [{
         name: "x", path: "src/x", is_dir: false, size: 1, secret: "drop",
         latest_commit: {
@@ -19,36 +47,49 @@ describe("repository read response projection", () => {
         },
       }],
       secret: "drop",
-    })).toEqual({
+    }))).toEqual({
       state: "populated",
       slug: "acme/core",
       ref: REPO_REF,
+      clone_url: "/acme/eu-west/core.git",
       default_branch: "main",
+      counts: COUNTS,
       entries: [{
         name: "x", path: "src/x", is_dir: false, size: 1,
         latest_commit: { short_oid: OID.slice(0, 12), oid: OID, summary: "ship", committed_at: 1 },
       }],
+      snapshot_oid: OID,
+      entries_page: {
+        ref: "refs/heads/main", next_cursor: null, limit: 100, snapshot_oid: OID,
+      },
     });
   });
 
   it("decodes the repo-home tree continuation with its exact qualified snapshot", () => {
-    expect(parseRepoHome({
-      state: "populated",
-      slug: "acme/core",
-      ref: REPO_REF,
-      default_branch: "main",
-      snapshot_oid: OID,
-      entries: [{ path: "src", is_dir: true }],
+    expect(parseRepoHome(populatedHome({
+      entries: [{ name: "src", path: "src", is_dir: true }],
       entries_page: {
         ref: "refs/heads/main", next_cursor: "gt1_a-b_c", limit: 1,
         snapshot_oid: OID, internal: "drop",
       },
-    })).toMatchObject({
+    }))).toMatchObject({
       snapshot_oid: OID,
       entries_page: {
         ref: "refs/heads/main", next_cursor: "gt1_a-b_c", limit: 1, snapshot_oid: OID,
       },
     });
+  });
+
+  it("keeps a committed repository usable when it has no README", () => {
+    const latest = {
+      short_oid: OID.slice(0, 12), oid: OID, summary: "initial commit",
+      author: "u", committed_at: 1,
+    };
+    const home = parseRepoHome(populatedHome({ latest_commit: latest }));
+    expect(home?.state).toBe("populated");
+    expect(home).not.toHaveProperty("readme");
+    expect(home).not.toHaveProperty("readme_excerpt");
+    expect(home).toMatchObject({ entries: [], snapshot_oid: OID, latest_commit: latest });
   });
 
   it("projects refs, trees, blobs, and kind-mismatch redirects", () => {
@@ -62,11 +103,11 @@ describe("repository read response projection", () => {
     });
     expect(parseTree({
       ref: "refs/heads/main", path: "", snapshot_oid: OID,
-      entries: [{ path: "x", is_dir: false }], readme: "# readme",
+      entries: [{ name: "x", path: "x", is_dir: false }], readme: "# readme",
       page: { next_cursor: "gt1_a-b_c", limit: 1, secret: "drop" }, secret: "drop",
     })).toEqual({
       ref: "refs/heads/main", path: "", snapshot_oid: OID,
-      entries: [{ path: "x", is_dir: false }], readme: "# readme",
+      entries: [{ name: "x", path: "x", is_dir: false }], readme: "# readme",
       page: { next_cursor: "gt1_a-b_c", limit: 1 },
     });
     expect(parseTree({
@@ -93,10 +134,13 @@ describe("repository read response projection", () => {
   });
 
   it.each([
-    { state: "populated", slug: "../core", default_branch: "main" },
-    { state: "populated", slug: "core", default_branch: "main", entries: [{ path: "../x", is_dir: false }] },
-    { state: "populated", slug: "core", default_branch: "main", entries: Array(1001).fill({ path: "x", is_dir: false }) },
-    { state: "populated", slug: "core", default_branch: "main", latest_commit: { short_oid: "short", summary: "x", committed_at: 1 } },
+    { state: "restricted" },
+    populatedHome({ slug: "../core" }),
+    populatedHome({ entries: [{ name: "x", path: "../x", is_dir: false }] }),
+    populatedHome({ entries: Array(101).fill({ name: "x", path: "x", is_dir: false }) }),
+    populatedHome({ latest_commit: { short_oid: "short", summary: "x", committed_at: 1 } }),
+    populatedHome({ readme: undefined }),
+    populatedHome({ clone_url: "bad url" }),
   ])("rejects malformed or unbounded home payload %#", (value) => {
     expect(parseRepoHome(value)).toBeNull();
   });
@@ -108,22 +152,21 @@ describe("repository read response projection", () => {
     "myelin://acme/git/pr/core",
     "myelin://acme/git/repo/core#check-build",
   ])("rejects a repository home without its exact canonical identity: %s", (ref) => {
-    expect(parseRepoHome({
-      state: "empty", slug: "acme/core", ref, default_branch: "main",
-    })).toBeNull();
+    expect(parseRepoHome(emptyHome({ ref }))).toBeNull();
   });
 
   it("keeps a hierarchical repository slug and reference byte-for-byte aligned", () => {
-    expect(parseRepoHome({
+    expect(parseRepoHome(emptyHome({
+      slug: "acme/platform/api",
+      ref: "myelin://acme/git/repo/platform/api",
+      clone_url: "/acme/eu-west/platform%2Fapi.git",
+    }))).toEqual({
       state: "empty",
       slug: "acme/platform/api",
       ref: "myelin://acme/git/repo/platform/api",
+      clone_url: "/acme/eu-west/platform%2Fapi.git",
       default_branch: "main",
-    })).toEqual({
-      state: "empty",
-      slug: "acme/platform/api",
-      ref: "myelin://acme/git/repo/platform/api",
-      default_branch: "main",
+      counts: COUNTS,
     });
   });
 
@@ -160,28 +203,17 @@ describe("repository read response projection", () => {
       entries: [{ path: "a", is_dir: false }, { path: "b", is_dir: false }],
       page: { next_cursor: null, limit: 1 },
     },
-    {
-      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
+    populatedHome({
       entries_page: { ref: "main", next_cursor: null, limit: 100, snapshot_oid: OID },
-    },
-    {
-      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
-      snapshot_oid: OID,
+    }),
+    populatedHome({
       entries_page: {
         ref: "refs/heads/main", next_cursor: null, limit: 100,
         snapshot_oid: "1".repeat(40),
       },
-    },
-    {
-      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
-      snapshot_oid: OID,
-    },
-    {
-      state: "populated", slug: "acme/core", ref: REPO_REF, default_branch: "main", entries: [],
-      entries_page: {
-        ref: "refs/heads/main", next_cursor: null, limit: 100, snapshot_oid: OID,
-      },
-    },
+    }),
+    populatedHome({ entries_page: undefined }),
+    populatedHome({ snapshot_oid: undefined }),
   ])("rejects malformed modern tree pagination %#", (value) => {
     const parsed = "state" in value ? parseRepoHome(value) : parseTree(value);
     expect(parsed).toBeNull();
