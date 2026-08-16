@@ -147,6 +147,10 @@ pub const IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION: &str = "\
 CREATE INDEX CONCURRENTLY IF NOT EXISTS identity_project_recent_list_idx
     ON identity_project (tenant_id, region, created_at DESC, project_id DESC);";
 
+pub const IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION: &str = "\
+CREATE INDEX CONCURRENTLY IF NOT EXISTS identity_agent_recent_list_idx
+    ON identity_agent (tenant_id, region, created_at DESC, agent_id DESC);";
+
 pub const AUTH_REPLAY_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS auth_replay (
     tenant_id text   NOT NULL,
@@ -284,6 +288,15 @@ pub fn identity_agent_durable_migrations() -> Migrations {
         Migration::plain("0084_identity_agent", IDENTITY_AGENT_MIGRATION),
         Migration::plain("0085_identity_agent_rls", IDENTITY_AGENT_RLS_POLICY),
     ])
+}
+
+pub fn identity_agent_recent_list_migrations() -> Migrations {
+    Migrations::of([Migration::phased(
+        "0117_identity_agent_recent_list_index",
+        IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION,
+        MigrationPhase::Expand,
+        "identity_agent",
+    )])
 }
 
 pub fn auth_replay_durable_migrations() -> Migrations {
@@ -938,23 +951,45 @@ mod principal_decode_tests {
 }
 
 #[cfg(test)]
-mod project_migration_tests {
+mod recent_list_migration_tests {
     use super::{
-        identity_project_recent_list_migrations, IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
+        identity_agent_recent_list_migrations, identity_project_recent_list_migrations,
+        IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION, IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
     };
-    use crate::migration::MigrationPhase;
+    use crate::migration::{MigrationPhase, Migrations};
 
-    #[test]
-    fn project_recency_index_is_an_online_expansion() {
-        let migrations = identity_project_recent_list_migrations();
+    fn assert_online_recency_index(
+        migrations: Migrations,
+        table: &'static str,
+        ddl: &str,
+        ordered_columns: &str,
+    ) {
         let migration = migrations.0.first().expect("the recency index migration");
 
         assert_eq!(migration.phase, MigrationPhase::Expand);
-        assert_eq!(migration.table, Some("identity_project"));
-        assert!(IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION
-            .contains("CREATE INDEX CONCURRENTLY IF NOT EXISTS"));
-        assert!(IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION
-            .contains("tenant_id, region, created_at DESC, project_id DESC"));
+        assert_eq!(migration.table, Some(table));
+        assert!(ddl.contains("CREATE INDEX CONCURRENTLY IF NOT EXISTS"));
+        assert!(ddl.contains(ordered_columns));
+    }
+
+    #[test]
+    fn project_recency_index_is_an_online_expansion() {
+        assert_online_recency_index(
+            identity_project_recent_list_migrations(),
+            "identity_project",
+            IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
+            "tenant_id, region, created_at DESC, project_id DESC",
+        );
+    }
+
+    #[test]
+    fn agent_recency_index_is_an_online_expansion() {
+        assert_online_recency_index(
+            identity_agent_recent_list_migrations(),
+            "identity_agent",
+            IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION,
+            "tenant_id, region, created_at DESC, agent_id DESC",
+        );
     }
 }
 

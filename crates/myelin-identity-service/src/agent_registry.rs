@@ -323,14 +323,32 @@ impl PgAgentRegistry {
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
                     let rows = sqlx::query(
-                        "SELECT a.agent_id, a.name, a.runtime_ref, a.created_by, a.tools, \
+                        "WITH cursor_position(created_at, agent_id) AS ( \
+                           SELECT cursor_agent.created_at, cursor_agent.agent_id \
+                             FROM identity_agent cursor_agent \
+                             JOIN principal cursor_principal \
+                               ON cursor_principal.tenant_id = cursor_agent.tenant_id \
+                              AND cursor_principal.region = cursor_agent.region \
+                              AND cursor_principal.principal_id = \
+                                  'agent:' || cursor_agent.agent_id::text \
+                            WHERE cursor_agent.tenant_id = $1 \
+                              AND cursor_agent.region = $2 \
+                              AND cursor_agent.agent_id = $3 \
+                         ) \
+                         SELECT a.agent_id, a.name, a.runtime_ref, a.created_by, a.tools, \
                                 a.grants, a.created_at, p.kind, p.status \
                            FROM identity_agent a \
                            JOIN principal p ON p.tenant_id = a.tenant_id AND p.region = a.region \
                             AND p.principal_id = 'agent:' || a.agent_id::text \
                           WHERE a.tenant_id = $1 AND a.region = $2 \
-                            AND ($3::uuid IS NULL OR a.agent_id < $3) \
-                          ORDER BY a.agent_id DESC LIMIT $4",
+                            AND ( \
+                              $3::uuid IS NULL OR EXISTS ( \
+                                SELECT 1 FROM cursor_position cursor \
+                                 WHERE (a.created_at, a.agent_id) \
+                                     < (cursor.created_at, cursor.agent_id) \
+                              ) \
+                            ) \
+                          ORDER BY a.created_at DESC, a.agent_id DESC LIMIT $4",
                     )
                     .bind(&tenant)
                     .bind(&region)

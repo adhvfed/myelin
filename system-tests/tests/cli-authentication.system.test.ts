@@ -643,6 +643,11 @@ describe("the CLI authentication journey", () => {
         agent: { id: activated.agent.id, ref: activated.agent.ref },
       });
 
+      const newestAgent = await runCli(configDirectory, "agent", "list", "--limit", "1");
+      expect(newestAgent.exitCode, newestAgent.stderr).toBe(0);
+      expect(newestAgent.stdout).toContain(agentName);
+      expect(newestAgent.stdout).toContain(activated.agent.ref);
+
       expect(await findThroughEveryCliPage(configDirectory, "agent", activated.agent.id))
         .toMatchObject({
           id: activated.agent.id,

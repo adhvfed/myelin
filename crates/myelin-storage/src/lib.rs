@@ -270,13 +270,14 @@ pub use external_agent_run_durable::{
     EXTERNAL_AGENT_RUN_RLS_POLICY,
 };
 pub use identity_durable::{
-    auth_replay_durable_migrations, identity_agent_durable_migrations, identity_durable_migrations,
+    auth_replay_durable_migrations, identity_agent_durable_migrations,
+    identity_agent_recent_list_migrations, identity_durable_migrations,
     identity_project_durable_migrations, identity_project_recent_list_migrations,
     identity_tuple_revision_migrations, DurablePrincipalBacking, DurablePrincipalRow,
     DurableProfileBlob, DurableReplayBacking, DurableRevocationBacking, DurableRevocationRow,
     DurableTupleBacking, DurableTupleDelta, DurableTupleEdge, DurableTupleSnapshot,
     DurableTupleWriteOutcome, TupleEdgeOp, ACTIVE_PRINCIPAL_STATUS_JSON, HUMAN_PRINCIPAL_KIND_JSON,
-    IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
+    IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION, IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
 };
 pub use kms_durable::{
     kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,

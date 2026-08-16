@@ -217,6 +217,88 @@ async fn one_human_activation_is_retry_safe_durable_and_ready_for_a_governed_run
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_rosters_keep_the_newest_collaborator_in_reach_across_pages() {
+    let (admin, app) = providers().await;
+    let tenant = unique("listing");
+    let region = app.config().region.clone();
+    let actor = human(&tenant, &region);
+    let registry = PgAgentRegistry::new(app);
+
+    let mut oldest_proposal = proposal("activate-oldest");
+    oldest_proposal.name = "Oldest companion".into();
+    let oldest = registry
+        .create(&actor, oldest_proposal)
+        .await
+        .expect("activate the oldest collaborator")
+        .agent;
+
+    let mut middle_proposal = proposal("activate-middle");
+    middle_proposal.name = "Middle companion".into();
+    let middle = registry
+        .create(&actor, middle_proposal)
+        .await
+        .expect("activate the middle collaborator")
+        .agent;
+
+    let mut newest_proposal = proposal("activate-newest");
+    newest_proposal.name = "Newest companion".into();
+    let newest = registry
+        .create(&actor, newest_proposal)
+        .await
+        .expect("activate the newest collaborator")
+        .agent;
+
+    sqlx::query(
+        "UPDATE identity_agent \
+            SET created_at = CASE name \
+                WHEN 'Oldest companion' THEN TIMESTAMPTZ '2026-01-01T00:00:00Z' \
+                WHEN 'Middle companion' THEN TIMESTAMPTZ '2026-01-02T00:00:00Z' \
+                WHEN 'Newest companion' THEN TIMESTAMPTZ '2026-01-03T00:00:00Z' \
+                ELSE created_at \
+            END \
+          WHERE tenant_id = $1 AND region = $2",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .execute(admin.db_pool())
+    .await
+    .expect("make recency deterministic without coupling it to random agent ids");
+
+    let first_page = registry
+        .list(&actor, None, 2)
+        .await
+        .expect("list the first page of collaborators");
+    assert_eq!(
+        first_page.iter().map(|agent| &agent.id).collect::<Vec<_>>(),
+        vec![&newest.id, &middle.id],
+        "newly activated collaborators belong at the front of the roster"
+    );
+
+    let second_page = registry
+        .list(&actor, Some(&middle.id), 2)
+        .await
+        .expect("continue from the last collaborator on the first page");
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|agent| &agent.id)
+            .collect::<Vec<_>>(),
+        vec![&oldest.id],
+        "the cursor continues by stable activation order without gaps or repeats"
+    );
+    assert!(
+        registry
+            .list(&actor, Some("00000000-0000-0000-0000-000000000000"), 2,)
+            .await
+            .expect("an unknown cursor fails closed")
+            .is_empty(),
+        "a cursor must name an agent in the caller's roster"
+    );
+
+    cleanup(&admin, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_platform_managed_tenant_ceiling_learns_new_catalogue_grants_additively() {
     let (admin, app) = providers().await;
     let tenant = unique("platform-policy-upgrade");

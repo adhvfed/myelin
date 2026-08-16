@@ -215,6 +215,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::reserve_settle_durable::cost_ledger_value_invariant_migrations(),
         crate::identity_durable::identity_tuple_revision_migrations(),
         crate::identity_durable::identity_project_recent_list_migrations(),
+        crate::identity_durable::identity_agent_recent_list_migrations(),
     ]
 }
 
@@ -806,7 +807,7 @@ mod boot_migrations_tests {
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
         assert_eq!(
             *ids.last().unwrap(),
-            "0116_identity_project_recent_list_index"
+            "0117_identity_agent_recent_list_index"
         );
     }
 
