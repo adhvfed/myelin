@@ -955,11 +955,14 @@ const server = createServer((req, res) => {
         Object.keys(body).length !== 2 ||
         !project ||
         typeof body.title !== "string" ||
-        !body.title.trim()
+        !body.title ||
+        Buffer.byteLength(body.title, "utf8") > 512 ||
+        body.title.trim() !== body.title ||
+        /\p{Cc}/u.test(body.title)
       ) {
         return send(res, 400, { error: { message: "invalid issue create body", code: "bad_request" } });
       }
-      const title = body.title.trim();
+      const title = body.title;
       const replay = issueCreations.get(clientNonce);
       if (replay) {
         if (replay.projectId !== body.project_id || replay.title !== title) {

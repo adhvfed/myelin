@@ -39,6 +39,7 @@ describe("parseIssueMutation", () => {
     { op: "create", projectId: "123e4567-e89b-12d3-a456-426614174000", title: "ok" },
     { op: "create", projectId: "123e4567-e89b-12d3-a456-426614174000", title: "ok", clientNonce: "has spaces" },
     { op: "create", projectId: "123e4567-e89b-12d3-a456-426614174000", title: "line\nbreak", clientNonce: "create_1" },
+    { op: "create", projectId: "123e4567-e89b-12d3-a456-426614174000", title: "hidden\u0085control", clientNonce: "create_1" },
     { op: "create", projectId: "123e4567-e89b-12d3-a456-426614174000", title: "x".repeat(MAX_ISSUE_TITLE_BYTES + 1), clientNonce: "create_1" },
   ])("rejects malformed or non-exact input %#", (value) => {
     expect(parseIssueMutation(value)).toBeNull();

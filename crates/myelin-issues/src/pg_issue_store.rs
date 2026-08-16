@@ -36,6 +36,13 @@ pub const MAX_AUTHORIZED_ISSUE_IDS: usize = 10_000;
 pub const MAX_RELATIONS_PER_ISSUE: i64 = 100;
 const REFS_EDGE_REMOVED: &str = "refs.edge.removed";
 
+pub(crate) fn is_valid_issue_title(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TITLE_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssuePermission {
     View,
@@ -2561,9 +2568,9 @@ fn decode_row(
 fn validate_create(proposal: &CreateIssue) -> Result<(), IssueStoreError> {
     parse_uuid("project_id", &proposal.project_id)?;
     parse_uuid("type_id", &proposal.type_id)?;
-    if proposal.title.is_empty() || proposal.title.len() > MAX_TITLE_BYTES {
+    if !is_valid_issue_title(&proposal.title) {
         return Err(IssueStoreError::BadInput(format!(
-            "title must contain 1..={MAX_TITLE_BYTES} bytes"
+            "title must contain 1..={MAX_TITLE_BYTES} bytes without surrounding whitespace or control characters"
         )));
     }
     if proposal.prefix.len() < 2
@@ -2744,10 +2751,17 @@ mod tests {
             title: "bounded title".into(),
         };
         assert!(validate_create(&valid).is_ok());
+        for title in [
+            "x".repeat(MAX_TITLE_BYTES + 1),
+            " padded title ".into(),
+            "line\nbreak".into(),
+            "hidden\u{85}control".into(),
+        ] {
+            let mut bad = valid.clone();
+            bad.title = title;
+            assert!(validate_create(&bad).is_err());
+        }
         let mut bad = valid.clone();
-        bad.title = "x".repeat(MAX_TITLE_BYTES + 1);
-        assert!(validate_create(&bad).is_err());
-        bad = valid.clone();
         bad.prefix = "eng".into();
         assert!(validate_create(&bad).is_err());
         bad = valid;

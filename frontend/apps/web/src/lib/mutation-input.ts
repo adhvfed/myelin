@@ -51,10 +51,7 @@ function bounded(value: unknown, maxBytes: number): value is string {
 }
 
 function hasControl(value: string): boolean {
-  return [...value].some((character) => {
-    const point = character.codePointAt(0)!;
-    return point <= 0x1f || point === 0x7f;
-  });
+  return /\p{Cc}/u.test(value);
 }
 
 function canonicalUuid(value: unknown): value is string {

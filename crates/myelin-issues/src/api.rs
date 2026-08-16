@@ -1,4 +1,5 @@
 use crate::import::SourceSystem;
+use crate::pg_issue_store::{is_valid_issue_title, MAX_TITLE_BYTES};
 
 pub const DEFAULT_CLI_PAGE_LIMIT: u32 = 50;
 pub const MAX_CLI_PAGE_LIMIT: u32 = 100;
@@ -6,7 +7,6 @@ pub const MAX_ISSUE_KEY_PREFIX_BYTES: usize = 32;
 pub const MAX_ISSUE_CURSOR_BYTES: usize = 192;
 pub const MAX_ISSUE_IMPORT_JSON_BYTES: usize = 512 * 1024;
 pub const MAX_ISSUE_IMPORT_RECORDS: usize = 256;
-const MAX_TITLE_BYTES: usize = 512;
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_PREFIX: &str = "ic_";
 
@@ -230,7 +230,10 @@ impl core::fmt::Display for CliParseError {
             Self::BadValue { field, value } => {
                 write!(f, "malformed {field}: `{value}`")
             }
-            Self::BadTitle => write!(f, "malformed title (expected 1..=512 bytes)"),
+            Self::BadTitle => write!(
+                f,
+                "malformed title (expected 1..={MAX_TITLE_BYTES} bytes without surrounding whitespace or control characters)"
+            ),
             Self::InvalidCombination(message) => write!(f, "{message}"),
         }
     }
@@ -457,7 +460,7 @@ fn parse_create(args: &[&str]) -> Result<CliCommand, CliParseError> {
             });
         }
     }
-    if title.is_empty() || title.len() > MAX_TITLE_BYTES {
+    if !is_valid_issue_title(&title) {
         return Err(CliParseError::BadTitle);
     }
     Ok(CliCommand::Create {
@@ -694,6 +697,22 @@ mod tests {
                 "x"
             ])
             .is_err());
+        }
+        for title in [" padded ", "line\nbreak", "hidden\u{85}control"] {
+            assert_eq!(
+                parse_cli(&[
+                    "create",
+                    "--project",
+                    PROJECT,
+                    "--type",
+                    TYPE,
+                    "--prefix",
+                    "ENG",
+                    "--title",
+                    title,
+                ]),
+                Err(CliParseError::BadTitle),
+            );
         }
     }
 

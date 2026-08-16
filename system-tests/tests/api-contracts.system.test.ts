@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 
+import { systemTestConfig } from "../src/config.js";
 import { systemClient } from "../src/context.js";
 import { array, record } from "../src/json.js";
 
@@ -124,6 +125,19 @@ describe("external API contracts", () => {
       expectedStatus: 413,
     });
     expectError(knowledge.body, "payload_too_large");
+  });
+
+  test.each([
+    ["surrounding whitespace", " padded title "],
+    ["line breaks", "line\nbreak"],
+    ["control characters", "hidden\u0085control"],
+  ])("rejects issue titles with %s", async (_case, title) => {
+    const response = await systemClient.json("/v1/issues", {
+      method: "POST",
+      body: { project_id: systemTestConfig.issues.projectId, title },
+      expectedStatus: 400,
+    });
+    expectError(response.body, "bad_request");
   });
 
   test("exposes a recipient-scoped, bounded notification inbox", async () => {

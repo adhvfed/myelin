@@ -1,5 +1,6 @@
 import { expect, request as pwRequest, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
+import { DEV_ACCESS_TOKEN, DEV_ISSUE_TARGET } from "../../dev-edge/dev-contract.mjs";
 
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 const OPEN_ID = "00000000-0000-4000-8000-000000000102";
@@ -74,6 +75,23 @@ test.beforeEach(async () => setEdgeConfig({ resetIssues: true }));
 test.afterEach(async () => setEdgeConfig({ resetIssues: true }));
 
 test.describe("issue workflows", () => {
+  test("the direct API refuses issue titles people cannot reliably read", async ({ request }) => {
+    for (const [name, title] of [
+      ["surrounding whitespace", " padded title "],
+      ["line breaks", "line\nbreak"],
+      ["control characters", "hidden\u0085control"],
+    ] as const) {
+      const response = await request.post(`${EDGE}/v1/issues`, {
+        headers: {
+          authorization: `Bearer ${DEV_ACCESS_TOKEN}`,
+          "idempotency-key": `invalid-title-${name.replaceAll(" ", "-")}`,
+        },
+        data: { project_id: DEV_ISSUE_TARGET.project_id, title },
+      });
+      expect(response.status(), name).toBe(400);
+    }
+  });
+
   test("unauthenticated issue detail redirects to login", async ({ page }) => {
     await page.goto(`/issues/${OPEN_ID}`);
     await page.waitForURL("**/login");
