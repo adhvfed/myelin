@@ -54,7 +54,7 @@ use myelin_git::receive_pack::{
 use myelin_git::refs_pagination::WIRE_MAX_REF_NAME_BYTES;
 use myelin_git::web::{
     CommitDiff, CommitRow, DiffFile, DiffLineView, PrCommitCursor, PrDiffFile, PrDiffHunk,
-    PrDiffLine, PrDiffVM, RepoHome, RepoListCursor, RepoListRow, WebEditOutcome,
+    PrDiffLine, PrDiffVM, RepoListCursor, RepoListRow, WebEditOutcome,
     PR_COMMIT_CURSOR_MAX_POSITION,
 };
 #[cfg(test)]
@@ -760,32 +760,7 @@ impl DurableGitBackend {
         Ok(entries)
     }
 
-    fn list_repos_visible(
-        &self,
-        tenant: &str,
-        region: &str,
-        principal: &Principal,
-        offset: usize,
-        limit: usize,
-    ) -> Result<(Vec<RepoHome>, bool), DurableError> {
-        let mut page = self
-            .visible_repository_catalogue(tenant, region, principal)?
-            .into_iter()
-            .skip(offset)
-            .take(limit.saturating_add(1))
-            .collect::<Vec<_>>();
-        let has_more = page.len() > limit;
-        page.truncate(limit);
-        let mut out = Vec::new();
-        for entry in page {
-            let loc = Self::loc(tenant, region, &entry.slug);
-            let repo = self.store.open_repo(&loc)?;
-            out.push(self.repo_home(tenant, region, &entry.slug, &repo)?);
-        }
-        Ok((out, has_more))
-    }
-
-    fn list_repo_summaries_visible(
+    fn list_repository_rows_visible(
         &self,
         tenant: &str,
         region: &str,
@@ -835,28 +810,26 @@ impl DurableGitBackend {
             .filter(|limit| (1..=MAX_PAGE_LIMIT).contains(limit))
             .ok_or_else(|| {
                 EdgeError::BadRequest(format!(
-                    "repository summary limit must be within 1..={MAX_PAGE_LIMIT}"
+                    "repository list limit must be within 1..={MAX_PAGE_LIMIT}"
                 ))
             })?;
         let tenant = &principal.tenant.0;
         let region = &principal.region.0;
         let cursor = cursor
             .as_deref()
-            .map(|value| parse_repo_summary_cursor(value, tenant, region))
+            .map(|value| parse_repo_list_cursor(value, tenant, region))
             .transpose()?;
         let (rows, next_position) = self
-            .list_repo_summaries_visible(tenant, region, principal, cursor.as_ref(), limit)
-            .map_err(map_repo_summary_durable_err)?;
+            .list_repository_rows_visible(tenant, region, principal, cursor.as_ref(), limit)
+            .map_err(map_repo_list_durable_err)?;
         let items = rows.iter().map(RepoListRow::to_json).collect::<Vec<_>>();
         let next_cursor = next_position
             .map(|position| {
                 position
-                    .cursor(repo_summary_cursor_scope(tenant, region))
+                    .cursor(repo_list_cursor_scope(tenant, region))
                     .map(|cursor| cursor.encode())
                     .map_err(|error| {
-                        EdgeError::Internal(format!(
-                            "mint repository summary cursor failed: {error}"
-                        ))
+                        EdgeError::Internal(format!("mint repository list cursor failed: {error}"))
                     })
             })
             .transpose()?;
@@ -866,48 +839,6 @@ impl DurableGitBackend {
     fn clone_url(&self, tenant: &str, region: &str, slug: &str) -> String {
         let wire_slug = slug.replace('/', "%2F");
         format!("{}/{tenant}/{region}/{wire_slug}.git", self.clone_base)
-    }
-
-    fn repo_home(
-        &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        repo: &DurableGitRepo,
-    ) -> Result<RepoHome, DurableError> {
-        let full_slug = format!("{tenant}/{slug}");
-        let clone_url = self.clone_url(tenant, region, slug);
-        let refs = repo.refs_summary()?;
-        if refs.default_tip.is_none() {
-            Ok(RepoHome::Empty {
-                slug: full_slug,
-                clone_url,
-            })
-        } else {
-            let branch_ref = format!("refs/heads/{}", refs.default_branch);
-            let page = first_root_tree_page(repo, &branch_ref)?;
-            let entries = page
-                .entries
-                .iter()
-                .map(|entry| (entry.name.clone(), entry.is_dir))
-                .collect();
-            let readme = read_text_blob_at_snapshot_bounded(
-                repo,
-                &page.snapshot_oid,
-                "README.md",
-                64 * 1024,
-            )?
-            .unwrap_or_default()
-            .chars()
-            .take(400)
-            .collect();
-            Ok(RepoHome::Populated {
-                slug: full_slug,
-                readme_excerpt: readme,
-                entries,
-                clone_url,
-            })
-        }
     }
 
     fn commit_log(

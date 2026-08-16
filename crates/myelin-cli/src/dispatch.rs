@@ -204,17 +204,17 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     match command {
         CliCommand::RepoList { limit, cursor } => {
             let mut query = FormQuery::default();
-            query.push("view", "summary");
             if let Some(limit) = limit {
                 query.push("limit", &limit.to_string());
             }
             if let Some(cursor) = cursor {
                 query.push("cursor", cursor);
             }
+            let query = query.finish();
             Ok(EdgeCall {
                 method: HttpMethod::Get,
                 path: "/v1/git/repos".into(),
-                query: Some(query.finish()),
+                query: (!query.is_empty()).then_some(query),
                 payload: None,
                 idempotency_key: None,
                 retry_policy: RetryPolicy::None,
@@ -468,28 +468,28 @@ mod tests {
         let call = git_dispatch(&["repo", "list"]).unwrap();
         assert_eq!(call.method, HttpMethod::Get);
         assert_eq!(call.path, "/v1/git/repos");
-        assert_eq!(call.query.as_deref(), Some("view=summary"));
+        assert_eq!(call.query, None);
         assert!(call.payload.is_none());
     }
 
     #[test]
-    fn git_repo_list_pagination_builds_exact_safe_summary_queries() {
+    fn git_repo_list_pagination_builds_exact_safe_queries() {
         let cursor = myelin_git::web::RepoListCursor::legacy([4; 32], "alpha")
             .unwrap()
             .encode();
         let limit = git_dispatch(&["repo", "list", "--limit", "25"]).unwrap();
-        assert_eq!(limit.query.as_deref(), Some("view=summary&limit=25"));
+        assert_eq!(limit.query.as_deref(), Some("limit=25"));
 
         let cursor_only = git_dispatch(&["repo", "list", "--cursor", &cursor]).unwrap();
         assert_eq!(
             cursor_only.query.as_deref(),
-            Some(format!("view=summary&cursor={cursor}").as_str())
+            Some(format!("cursor={cursor}").as_str())
         );
 
         let both = git_dispatch(&["repo", "list", "--cursor", &cursor, "--limit", "2"]).unwrap();
         assert_eq!(
             both.query.as_deref(),
-            Some(format!("view=summary&limit=2&cursor={cursor}").as_str())
+            Some(format!("limit=2&cursor={cursor}").as_str())
         );
 
         let mut encoded = FormQuery::default();

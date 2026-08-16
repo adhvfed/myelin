@@ -275,7 +275,7 @@ async fn durable_create_open_view_round_trip() {
         .unwrap()
         .iter()
         .find(|item| item["slug"] == "acme/alpha")
-        .expect("created repository summary row");
+        .expect("created repository list row");
     assert_eq!(
         alpha
             .as_object()

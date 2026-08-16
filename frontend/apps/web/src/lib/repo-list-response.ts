@@ -40,7 +40,7 @@ function row(value: unknown): RepoListRowVM | null {
   return null;
 }
 
-/** Decode only the summary catalogue contract; RepoHome fields are deliberately not accepted here. */
+/** Decode only the repository catalogue contract; RepoHome fields are deliberately rejected. */
 export function parseRepoListPage(value: unknown): RepoListPage | null {
   const envelope = record(value);
   const page = record(envelope?.page);

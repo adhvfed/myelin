@@ -576,7 +576,9 @@ export const getRepos = query(async (request: GitRepoListInput = {}): Promise<Re
   if (!input) throw new RepoRouteError("error");
   return authed(async () => {
     const search = gitRepoListSearchParams(input).toString();
-    const page = parseRepoListPage(await edgeGet(`/v1/git/repos?${search}`));
+    const page = parseRepoListPage(
+      await edgeGet(`/v1/git/repos${search.length === 0 ? "" : `?${search}`}`),
+    );
     if (!page) throw new RepoRouteError("error");
     return page;
   });

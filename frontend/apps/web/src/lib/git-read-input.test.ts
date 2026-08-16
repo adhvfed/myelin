@@ -74,12 +74,12 @@ describe("Git read RPC inputs", () => {
     );
   });
 
-  it("accepts only the exact bounded repository-list input and always selects the summary view", () => {
+  it("accepts only the exact bounded repository-list input", () => {
     const cursor = "rl2_AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGgAGMDFKMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDJteWVsaW4";
     expect(parseGitRepoListInput({})).toEqual({});
     expect(parseGitRepoListInput({ limit: 1, cursor })).toEqual({ limit: 1, cursor });
     expect(gitRepoListSearchParams({ limit: 1, cursor }).toString())
-      .toBe(`view=summary&limit=1&cursor=${cursor}`);
+      .toBe(`limit=1&cursor=${cursor}`);
 
     for (const value of [
       "not-an-object",

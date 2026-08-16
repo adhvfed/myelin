@@ -7,15 +7,15 @@ use serde_json::Value;
 
 use super::map_durable_err;
 
-pub(super) const REPO_SUMMARY_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
-const REPO_SUMMARY_QUERY_MAX_BYTES: usize = 16 * 1024;
+pub(super) const REPO_LIST_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+const REPO_LIST_QUERY_MAX_BYTES: usize = 16 * 1024;
 
-pub(super) struct RepoSummaryQuery {
+pub(super) struct RepoListQuery {
     pub(super) limit: usize,
     pub(super) cursor: Option<String>,
 }
 
-pub(super) fn map_repo_summary_durable_err(error: DurableError) -> EdgeError {
+pub(super) fn map_repo_list_durable_err(error: DurableError) -> EdgeError {
     match error {
         DurableError::Git(message) if message.starts_with("wire ref limit exceeded:") => {
             EdgeError::PayloadTooLarge(
@@ -24,16 +24,6 @@ pub(super) fn map_repo_summary_durable_err(error: DurableError) -> EdgeError {
         }
         other => map_durable_err(other),
     }
-}
-
-pub(super) fn repo_summary_requested(query: &str) -> bool {
-    query.split('&').any(|pair| {
-        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
-        let form_name = raw_name.replace('+', " ");
-        percent_encoding::percent_decode_str(&form_name)
-            .decode_utf8()
-            .is_ok_and(|name| name == "view")
-    })
 }
 
 fn decode_query_component(raw: &str) -> Result<String, EdgeError> {
@@ -46,7 +36,7 @@ fn decode_query_component(raw: &str) -> Result<String, EdgeError> {
                 || !bytes[index + 2].is_ascii_hexdigit()
             {
                 return Err(EdgeError::BadRequest(
-                    "repository summary query contains malformed percent encoding".into(),
+                    "repository list query contains malformed percent encoding".into(),
                 ));
             }
             index += 3;
@@ -57,48 +47,42 @@ fn decode_query_component(raw: &str) -> Result<String, EdgeError> {
     let form_value = raw.replace('+', " ");
     let decoded = percent_encoding::percent_decode_str(&form_value)
         .decode_utf8()
-        .map_err(|_| EdgeError::BadRequest("repository summary query is not valid UTF-8".into()))?
+        .map_err(|_| EdgeError::BadRequest("repository list query is not valid UTF-8".into()))?
         .into_owned();
     if decoded.chars().any(char::is_control) {
         return Err(EdgeError::BadRequest(
-            "repository summary query contains a control character".into(),
+            "repository list query contains a control character".into(),
         ));
     }
     Ok(decoded)
 }
 
-pub(super) fn parse_repo_summary_query(query: &str) -> Result<RepoSummaryQuery, EdgeError> {
-    if query.len() > REPO_SUMMARY_QUERY_MAX_BYTES {
+pub(super) fn parse_repo_list_query(query: &str) -> Result<RepoListQuery, EdgeError> {
+    if query.len() > REPO_LIST_QUERY_MAX_BYTES {
         return Err(EdgeError::BadRequest(
-            "repository summary query is too large".into(),
+            "repository list query is too large".into(),
         ));
     }
-    let mut view = None;
     let mut limit = None;
     let mut cursor = None;
+    if query.is_empty() {
+        return Ok(RepoListQuery {
+            limit: DEFAULT_PAGE_LIMIT,
+            cursor: None,
+        });
+    }
     for pair in query.split('&') {
         let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
-            EdgeError::BadRequest("malformed repository summary query parameter".into())
+            EdgeError::BadRequest("malformed repository list query parameter".into())
         })?;
         let name = decode_query_component(raw_name)?;
         let value = decode_query_component(raw_value)?;
         let duplicate = |field: &str| {
             EdgeError::BadRequest(format!(
-                "duplicate repository summary query parameter `{field}`"
+                "duplicate repository list query parameter `{field}`"
             ))
         };
         match name.as_str() {
-            "view" => {
-                if view.is_some() {
-                    return Err(duplicate("view"));
-                }
-                if value != "summary" {
-                    return Err(EdgeError::BadRequest(
-                        "repository list view must be `summary`".into(),
-                    ));
-                }
-                view = Some(());
-            }
             "limit" => {
                 if limit.is_some() {
                     return Err(duplicate("limit"));
@@ -108,7 +92,7 @@ pub(super) fn parse_repo_summary_query(query: &str) -> Result<RepoSummaryQuery, 
                 });
                 limit = Some(parsed.ok_or_else(|| {
                     EdgeError::BadRequest(format!(
-                        "repository summary limit must be canonical and within 1..={MAX_PAGE_LIMIT}"
+                        "repository list limit must be canonical and within 1..={MAX_PAGE_LIMIT}"
                     ))
                 })?);
             }
@@ -120,35 +104,30 @@ pub(super) fn parse_repo_summary_query(query: &str) -> Result<RepoSummaryQuery, 
                     || value.len() > REPO_LIST_CURSOR_MAX_BYTES
                 {
                     return Err(EdgeError::BadRequest(
-                        "repository summary cursor is malformed".into(),
+                        "repository list cursor is malformed".into(),
                     ));
                 }
                 cursor = Some(value);
             }
             "" => {
                 return Err(EdgeError::BadRequest(
-                    "empty repository summary query parameter name".into(),
+                    "empty repository list query parameter name".into(),
                 ));
             }
             _ => {
                 return Err(EdgeError::BadRequest(format!(
-                    "unknown repository summary query parameter `{name}`"
+                    "unknown repository list query parameter `{name}`"
                 )));
             }
         }
     }
-    if view.is_none() {
-        return Err(EdgeError::BadRequest(
-            "repository summary query requires `view=summary`".into(),
-        ));
-    }
-    Ok(RepoSummaryQuery {
+    Ok(RepoListQuery {
         limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
         cursor,
     })
 }
 
-pub(super) fn repo_summary_cursor_scope(tenant: &str, region: &str) -> [u8; 32] {
+pub(super) fn repo_list_cursor_scope(tenant: &str, region: &str) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"myelin.edge.durable-repository-catalogue.v2\0");
     for value in [tenant, region] {
@@ -158,27 +137,27 @@ pub(super) fn repo_summary_cursor_scope(tenant: &str, region: &str) -> [u8; 32] 
     *hash.finalize().as_bytes()
 }
 
-pub(super) fn parse_repo_summary_cursor(
+pub(super) fn parse_repo_list_cursor(
     value: &str,
     tenant: &str,
     region: &str,
 ) -> Result<RepoListCursor, EdgeError> {
     let cursor = RepoListCursor::parse(value)
-        .map_err(|_| EdgeError::BadRequest("repository summary cursor is malformed".into()))?;
-    if cursor.scope() != repo_summary_cursor_scope(tenant, region) {
+        .map_err(|_| EdgeError::BadRequest("repository list cursor is malformed".into()))?;
+    if cursor.scope() != repo_list_cursor_scope(tenant, region) {
         return Err(EdgeError::BadRequest(
-            "repository summary cursor scope mismatch".into(),
+            "repository list cursor scope mismatch".into(),
         ));
     }
     Ok(cursor)
 }
 
-pub(super) fn repo_summary_response(value: &Value) -> Result<EdgeResponse, EdgeError> {
+pub(super) fn repo_list_response(value: &Value) -> Result<EdgeResponse, EdgeError> {
     let body = serde_json::to_vec(value)
-        .map_err(|error| EdgeError::Internal(format!("serialize repository summary: {error}")))?;
-    if body.len() > REPO_SUMMARY_RESPONSE_MAX_BYTES {
+        .map_err(|error| EdgeError::Internal(format!("serialize repository list: {error}")))?;
+    if body.len() > REPO_LIST_RESPONSE_MAX_BYTES {
         return Err(EdgeError::PayloadTooLarge(
-            "repository summary exceeds the response byte limit".into(),
+            "repository list exceeds the response byte limit".into(),
         ));
     }
     Ok(EdgeResponse::Bytes {

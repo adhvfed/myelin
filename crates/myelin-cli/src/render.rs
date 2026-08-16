@@ -683,7 +683,7 @@ mod tests {
         assert_eq!(call.path, "/v1/git/repos");
         assert_eq!(
             call.query.as_deref(),
-            Some(format!("view=summary&cursor={cursor}").as_str())
+            Some(format!("cursor={cursor}").as_str())
         );
     }
 

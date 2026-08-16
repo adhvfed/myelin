@@ -5,7 +5,7 @@ import { parseRepoListPage } from "./repo-list-response";
 
 const CURSOR = "rl2_AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGgAGMDFKMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDJteWVsaW4";
 
-describe("repository catalogue summary response", () => {
+describe("repository catalogue response", () => {
   it("decodes summary rows without weakening the full RepoHome contract", () => {
     expect(parseRepoListPage({
       items: [

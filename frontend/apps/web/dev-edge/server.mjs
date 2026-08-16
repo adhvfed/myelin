@@ -1,5 +1,5 @@
 // Local edge test double. It implements the subset of HTTP routes exercised by the web app:
-//   GET/POST /v1/git/repos  → summary catalogue / durable-shape repository creation (Bearer-auth)
+//   GET/POST /v1/git/repos  → repository catalogue / durable-shape creation (Bearer-auth)
 //   GET/POST /v1/projects   → authorized project catalogue / first-project creation
 //   GET  /v1/whoami         → the verified principal + scope (Bearer-auth)
 //   POST /v1/auth/refresh   → the single-refresh round-trip (returns a fresh access token, or 401)
@@ -11,9 +11,8 @@ import {
   DEV_ACCESS_TOKEN,
   DEV_REFRESH_TOKEN,
   whoamiJson,
-  reposEnvelope,
-  repoSummaryEnvelope,
-  parseRepoSummaryQuery,
+  repoListEnvelope,
+  parseRepoListQuery,
   repoHomeJson,
   blobJson,
   blameJson,
@@ -1231,28 +1230,21 @@ const server = createServer((req, res) => {
 
   if (method === "GET" && path === "/v1/git/repos") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
-    if (url.searchParams.has("view")) {
-      const input = parseRepoSummaryQuery(url.search.slice(1));
-      if (!input) {
-        return send(res, 400, { error: { message: "invalid repository list request", code: "bad_request" } });
-      }
-      if (state.emptyRepos) {
-        const items = [...state.createdRepos.values()]
-          .slice(0, input.limit)
-          .map((repo) => ({ state: "empty", slug: repo.slug }));
-        return send(res, 200, { items, page: { next_cursor: null, limit: input.limit } });
-      }
-      return send(res, 200, repoSummaryEnvelope(input));
+    const input = parseRepoListQuery(url.search.slice(1));
+    if (!input) {
+      return send(res, 400, { error: { message: "invalid repository list request", code: "bad_request" } });
     }
-    const limit = Number(url.searchParams.get("limit") ?? 50);
     // A fresh tenant (test-controlled) serves the empty envelope → the onboarding empty state.
     if (state.emptyRepos) {
+      const items = [...state.createdRepos.values()]
+        .slice(0, input.limit)
+        .map((repo) => ({ state: "empty", slug: repo.slug }));
       return send(res, 200, {
-        items: [...state.createdRepos.values()].slice(0, limit),
-        page: { next_cursor: null, limit },
+        items,
+        page: { next_cursor: null, limit: input.limit },
       });
     }
-    return send(res, 200, reposEnvelope(limit));
+    return send(res, 200, repoListEnvelope(input));
   }
 
   if (method === "GET" && path === "/v1/issues") {

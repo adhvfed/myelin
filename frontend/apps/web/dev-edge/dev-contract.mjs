@@ -103,7 +103,7 @@ export const SEED_REPO_HOMES = [
   },
 ];
 
-export const SEED_REPO_SUMMARIES = [
+export const SEED_REPO_LIST_ROWS = [
   {
     state: "populated",
     slug: "acme/myelin",
@@ -119,11 +119,6 @@ const SEED_REPO_CATALOGUE_KEYS = new Map([
   ["myelin", "01J00000000000000000000002"],
   ["sandbox", "01J00000000000000000000001"],
 ]);
-
-// Legacy no-view catalogue fixture retained while old clients migrate to the summary projection.
-export function reposEnvelope(limit = 50) {
-  return { items: SEED_REPO_HOMES, page: { next_cursor: null, limit } };
-}
 
 const REPO_LIST_QUERY_MAX_BYTES = 16 * 1024;
 const REPO_LIST_CURSOR_MAX_BYTES = 512;
@@ -179,21 +174,20 @@ function decodeRepoListCursor(cursor) {
   }
 }
 
-/** Strict summary-list query grammar: exact view, canonical decimal limit, canonical rl2 cursor. */
-export function parseRepoSummaryQuery(rawQuery) {
+/** Strict repository-list query grammar: canonical decimal limit and canonical rl2 cursor. */
+export function parseRepoListQuery(rawQuery) {
   if (typeof rawQuery !== "string" ||
       textEncoder.encode(rawQuery).byteLength > REPO_LIST_QUERY_MAX_BYTES) return null;
   const parsed = {};
-  for (const pair of rawQuery.split("&")) {
+  for (const pair of rawQuery === "" ? [] : rawQuery.split("&")) {
     const equals = pair.indexOf("=");
     if (equals <= 0) return null;
     const name = decodeQueryComponent(pair.slice(0, equals));
     const value = decodeQueryComponent(pair.slice(equals + 1));
-    if (name === null || value === null || !["view", "limit", "cursor"].includes(name) ||
+    if (name === null || value === null || !["limit", "cursor"].includes(name) ||
         Object.hasOwn(parsed, name)) return null;
     parsed[name] = value;
   }
-  if (parsed.view !== "summary") return null;
   const limit = parsed.limit === undefined ? 50 : Number(parsed.limit);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
       (parsed.limit !== undefined && String(limit) !== parsed.limit)) return null;
@@ -201,7 +195,7 @@ export function parseRepoSummaryQuery(rawQuery) {
   return { limit, ...(parsed.cursor === undefined ? {} : { cursor: parsed.cursor }) };
 }
 
-export function repoSummaryEnvelope(options = {}) {
+export function repoListEnvelope(options = {}) {
   const limit = options.limit ?? 50;
   const after = options.cursor === undefined ? null : decodeRepoListCursor(options.cursor);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
@@ -220,7 +214,7 @@ export function repoSummaryEnvelope(options = {}) {
     if (right.catalogueKey !== null) return 1;
     return left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0;
   };
-  const sorted = [...SEED_REPO_SUMMARIES].sort((left, right) =>
+  const sorted = [...SEED_REPO_LIST_ROWS].sort((left, right) =>
     compare(position(left), position(right)));
   const remaining = after === null
     ? sorted

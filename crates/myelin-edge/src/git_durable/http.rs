@@ -5,36 +5,13 @@ struct DRepoList {
 }
 impl Handler for DRepoList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        if repo_summary_requested(&ctx.request.query) {
-            let query = parse_repo_summary_query(&ctx.request.query)?;
-            let envelope = self.be.list_repositories(
-                ctx.principal,
-                u32::try_from(query.limit).expect("bounded repository summary limit"),
-                query.cursor,
-            )?;
-            return repo_summary_response(&envelope);
-        }
-        let offset = ctx
-            .page
-            .cursor
-            .as_deref()
-            .and_then(|c| c.parse::<usize>().ok())
-            .unwrap_or(0);
-        let limit = ctx.page.limit;
-        let (page, has_more) = self
-            .be
-            .list_repos_visible(tenant_of(ctx), region_of(ctx), ctx.principal, offset, limit)
-            .map_err(map_durable_err)?;
-        let items: Vec<Value> = page.iter().map(|repo| repo.to_json()).collect();
-        let next = if has_more {
-            Some(offset.saturating_add(limit).to_string())
-        } else {
-            None
-        };
-        Ok(EdgeResponse::json(
-            200,
-            &page_envelope(json!(items), next, limit),
-        ))
+        let query = parse_repo_list_query(&ctx.request.query)?;
+        let envelope = self.be.list_repositories(
+            ctx.principal,
+            u32::try_from(query.limit).expect("bounded repository list limit"),
+            query.cursor,
+        )?;
+        repo_list_response(&envelope)
     }
 }
 
@@ -1165,13 +1142,6 @@ mod tree_page_backend_tests {
         assert_eq!(home["state"], "populated");
         assert_eq!(home["entries"], json!([]));
         assert!(home["entries_page"]["next_cursor"].is_null());
-        assert!(matches!(
-            fixture
-                .be
-                .repo_home(TENANT, REGION, fixture.label(), &fixture.repo)
-                .expect("catalogue home"),
-            RepoHome::Populated { entries, .. } if entries.is_empty()
-        ));
     }
 
     #[test]
@@ -3591,7 +3561,7 @@ mod create_claim_tests {
 }
 
 #[cfg(test)]
-mod repo_summary_tests {
+mod repository_list_tests {
     use super::*;
     use crate::catalogue::Page;
     use crate::repo_authz::GrantBackedRepos;
@@ -3670,7 +3640,7 @@ mod repo_summary_tests {
     }
 
     #[test]
-    fn summary_rows_have_exact_shapes_and_skip_legacy_home_reads() {
+    fn list_rows_have_exact_shapes_without_materializing_repository_homes() {
         let root = temp_root("exact-rows");
         let viewer = human("u:viewer");
         let authz = GrantBackedRepos::new()
@@ -3683,7 +3653,7 @@ mod repo_summary_tests {
         add_non_commit_main_target(&be, "populated");
         let handler = DRepoList { be: Arc::new(be) };
 
-        let body = json(serve(&handler, &viewer, "view=summary").expect("summary response"));
+        let body = json(serve(&handler, &viewer, "").expect("repository list response"));
         assert_eq!(
             body,
             json!({
@@ -3697,10 +3667,6 @@ mod repo_summary_tests {
                 ],
                 "page": { "next_cursor": null, "limit": DEFAULT_PAGE_LIMIT },
             })
-        );
-        assert!(
-            serve(&handler, &viewer, "").is_err(),
-            "the deliberately non-commit branch breaks legacy RepoHome, proving summary did not use it"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -3720,10 +3686,10 @@ mod repo_summary_tests {
         }
         let handler = DRepoList { be: Arc::new(be) };
 
-        let mut query = "view=summary&limit=1".to_string();
+        let mut query = "limit=1".to_string();
         let mut seen = Vec::new();
         loop {
-            let body = json(serve(&handler, &viewer, &query).expect("summary page"));
+            let body = json(serve(&handler, &viewer, &query).expect("repository list page"));
             let items = body["items"].as_array().expect("items");
             seen.extend(
                 items
@@ -3734,7 +3700,7 @@ mod repo_summary_tests {
                 break;
             };
             assert!(cursor.starts_with(REPO_LIST_CURSOR_PREFIX));
-            query = format!("view=summary&limit=1&cursor={cursor}");
+            query = format!("limit=1&cursor={cursor}");
         }
         assert_eq!(seen, ["acme/omega", "acme/gamma", "acme/alpha"]);
         assert!(!seen.iter().any(|slug| slug == "acme/beta"));
@@ -3742,37 +3708,29 @@ mod repo_summary_tests {
     }
 
     #[test]
-    fn summary_query_is_strict_and_limits_are_canonical_and_bounded() {
-        assert!(repo_summary_requested("limit=2&%76iew=summary"));
-        assert_eq!(
-            parse_repo_summary_query("%76iew=summary&limit=100")
-                .unwrap()
-                .limit,
-            100
-        );
+    fn repository_list_query_is_strict_and_limits_are_canonical_and_bounded() {
+        assert_eq!(parse_repo_list_query("").unwrap().limit, DEFAULT_PAGE_LIMIT);
+        assert_eq!(parse_repo_list_query("%6cimit=100").unwrap().limit, 100);
         for query in [
-            "view",
-            "view=other",
-            "view=summary&view=summary",
-            "view=summary&unknown=x",
-            "view=summary&unknown=%GG",
-            "view=summary%0A",
-            "view=summary&limit=0",
-            "view=summary&limit=01",
-            "view=summary&limit=101",
-            "view=summary&cursor=x",
+            "limit",
+            "view=summary",
+            "limit=1&limit=1",
+            "unknown=x",
+            "unknown=%GG",
+            "limit=100%0A",
+            "limit=0",
+            "limit=01",
+            "limit=101",
+            "cursor=x",
         ] {
             assert!(
-                matches!(
-                    parse_repo_summary_query(query),
-                    Err(EdgeError::BadRequest(_))
-                ),
+                matches!(parse_repo_list_query(query), Err(EdgeError::BadRequest(_))),
                 "query should be rejected: {query}"
             );
         }
         assert!(matches!(
-            parse_repo_summary_query(&format!(
-                "view=summary&cursor=rl2_{}",
+            parse_repo_list_query(&format!(
+                "cursor=rl2_{}",
                 "a".repeat(REPO_LIST_CURSOR_MAX_BYTES)
             )),
             Err(EdgeError::BadRequest(_))
@@ -3781,10 +3739,10 @@ mod repo_summary_tests {
 
     #[test]
     fn cursor_is_canonical_bounded_and_scoped_to_verified_tenant_region() {
-        let cursor = RepoListCursor::legacy(repo_summary_cursor_scope(TENANT, REGION), "alpha")
+        let cursor = RepoListCursor::legacy(repo_list_cursor_scope(TENANT, REGION), "alpha")
             .unwrap()
             .encode();
-        let parsed = parse_repo_summary_cursor(&cursor, TENANT, REGION).expect("canonical cursor");
+        let parsed = parse_repo_list_cursor(&cursor, TENANT, REGION).expect("canonical cursor");
         assert_eq!(parsed.last_slug(), "alpha");
         for malformed in [
             "rl2_".to_string(),
@@ -3792,16 +3750,16 @@ mod repo_summary_tests {
             format!("{cursor}="),
         ] {
             assert!(matches!(
-                parse_repo_summary_cursor(&malformed, TENANT, REGION),
+                parse_repo_list_cursor(&malformed, TENANT, REGION),
                 Err(EdgeError::BadRequest(_))
             ));
         }
         assert!(matches!(
-            parse_repo_summary_cursor(&cursor, "other-tenant", REGION),
+            parse_repo_list_cursor(&cursor, "other-tenant", REGION),
             Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
         ));
         assert!(matches!(
-            parse_repo_summary_cursor(&cursor, TENANT, "other-region"),
+            parse_repo_list_cursor(&cursor, TENANT, "other-region"),
             Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
         ));
 
@@ -3810,17 +3768,17 @@ mod repo_summary_tests {
         let handler = DRepoList {
             be: Arc::new(DurableGitBackend::rooted_inmem_for_test(&root)),
         };
-        let empty = json(serve(&handler, &viewer, "view=summary").expect("empty tenant summary"));
+        let empty = json(serve(&handler, &viewer, "").expect("empty repository list"));
         assert_eq!(empty["items"], json!([]));
         let wrong_scope =
-            RepoListCursor::legacy(repo_summary_cursor_scope("other-tenant", REGION), "alpha")
+            RepoListCursor::legacy(repo_list_cursor_scope("other-tenant", REGION), "alpha")
                 .unwrap()
                 .encode();
         assert!(matches!(
             serve(
                 &handler,
                 &viewer,
-                &format!("view=summary&cursor={wrong_scope}")
+                &format!("cursor={wrong_scope}")
             ),
             Err(EdgeError::BadRequest(message)) if message.contains("scope mismatch")
         ));
@@ -3828,12 +3786,12 @@ mod repo_summary_tests {
     }
 
     #[test]
-    fn summary_response_and_candidate_cardinality_are_bounded() {
+    fn repository_list_response_and_candidate_cardinality_are_bounded() {
         let small = page_envelope(json!([]), None, DEFAULT_PAGE_LIMIT);
-        assert_eq!(repo_summary_response(&small).unwrap().status(), 200);
+        assert_eq!(repo_list_response(&small).unwrap().status(), 200);
         assert!(matches!(
-            repo_summary_response(&json!({
-                "items": ["x".repeat(REPO_SUMMARY_RESPONSE_MAX_BYTES)],
+            repo_list_response(&json!({
+                "items": ["x".repeat(REPO_LIST_RESPONSE_MAX_BYTES)],
                 "page": { "next_cursor": null, "limit": 1 },
             })),
             Err(EdgeError::PayloadTooLarge(_))
@@ -3854,8 +3812,8 @@ mod repo_summary_tests {
     }
 
     #[test]
-    fn summary_capacity_errors_use_catalogue_specific_sanitized_text() {
-        let mapped = map_repo_summary_durable_err(DurableError::Git(
+    fn repository_list_capacity_errors_use_catalogue_specific_sanitized_text() {
+        let mapped = map_repo_list_durable_err(DurableError::Git(
             "wire ref limit exceeded: private branch detail".into(),
         ));
         assert_eq!(mapped.status(), 413);
@@ -3864,7 +3822,7 @@ mod repo_summary_tests {
             "413 (payload_too_large): repository catalogue exceeds the interactive list limit"
         );
 
-        let delegated = map_repo_summary_durable_err(DurableError::NotFound("missing".into()));
+        let delegated = map_repo_list_durable_err(DurableError::NotFound("missing".into()));
         assert_eq!(
             delegated,
             map_durable_err(DurableError::NotFound("missing".into())),
@@ -3878,31 +3836,6 @@ mod repo_summary_tests {
             "413 (payload_too_large): repository exceeds the smart-HTTP ref limit",
             "actual wire callers retain the established sanitized message"
         );
-    }
-
-    #[test]
-    fn no_view_keeps_the_legacy_repo_home_projection_and_offset_cursor() {
-        let root = temp_root("legacy-compat");
-        let viewer = human("u:viewer");
-        let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "legacy");
-        let be =
-            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
-        create_repo(&be, "legacy", &viewer);
-        let handler = DRepoList { be: Arc::new(be) };
-
-        let body = json(serve(&handler, &viewer, "limit=1").expect("legacy response"));
-        assert_eq!(
-            body,
-            json!({
-                "items": [{
-                    "state": "empty",
-                    "slug": "acme/legacy",
-                    "clone_url": "/acme/eu-west/legacy.git",
-                }],
-                "page": { "next_cursor": null, "limit": 1 },
-            })
-        );
-        std::fs::remove_dir_all(&root).ok();
     }
 }
 
@@ -4073,28 +4006,6 @@ mod pr_list_tests {
             capped["page"]["next_cursor"].is_null(),
             "the transitional ceiling never emits a cursor its strict parser will reject"
         );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn repository_list_pages_visible_slugs_before_building_view_models() {
-        let root = temp_root("repo-page");
-        let authz = GrantBackedRepos::new()
-            .grant_read("u:viewer", TENANT, "alpha")
-            .grant_read("u:viewer", TENANT, "beta")
-            .grant_read("u:viewer", TENANT, "gamma");
-        let be =
-            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
-        let viewer = human("u:viewer");
-        for slug in ["alpha", "beta", "gamma"] {
-            be.create_repo_as(TENANT, REGION, slug, &viewer).unwrap();
-        }
-
-        let handler = DRepoList { be: Arc::new(be) };
-        let body = serve(&handler, &viewer, None, "limit=1&cursor=1");
-        assert_eq!(body["items"].as_array().unwrap().len(), 1);
-        assert_eq!(body["items"][0]["slug"], "acme/beta");
-        assert_eq!(body["page"]["next_cursor"], "2");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -4661,15 +4572,10 @@ mod pr_list_tests {
         let author = human("u:author");
         be.create_repo_as(TENANT, REGION, "widgets", &author)
             .unwrap();
-        let loc = DurableGitBackend::loc(TENANT, REGION, "widgets");
-        let repo = be.store.open_repo(&loc).expect("open repo");
-        let advertised = match be
-            .repo_home(TENANT, REGION, "widgets", &repo)
-            .expect("repo home reads")
-        {
-            RepoHome::Empty { clone_url, .. } | RepoHome::Populated { clone_url, .. } => clone_url,
-            other => panic!("a fresh repo projects an Empty/Populated home, got {other:?}"),
-        };
+        let home = be
+            .repo_home_json(TENANT, REGION, "widgets")
+            .expect("repository home");
+        let advertised = home["clone_url"].as_str().expect("clone URL");
         assert!(
             advertised.ends_with("/acme/eu-west/widgets.git"),
             "got {advertised}"

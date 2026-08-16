@@ -114,7 +114,7 @@ test.describe("MR-019 app shell — real browser", () => {
     await expectNoAxeViolations(page, "the authenticated shell + repos screen");
   });
 
-  test("repository summary pages replace rows and browser Back restores the prior page", async ({ page }) => {
+  test("repository pages replace rows and browser Back restores the prior page", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos?limit=1");
 
@@ -129,7 +129,7 @@ test.describe("MR-019 app shell — real browser", () => {
     await expect(page).toHaveURL(/\/git\/repos\?limit=1$/);
     await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
     await expect(page.getByText("acme/sandbox", { exact: true })).toHaveCount(0);
-    await expectNoAxeViolations(page, "repository summary page restored by browser back");
+    await expectNoAxeViolations(page, "repository list page restored by browser back");
   });
 
   test("the session cookie is opaque and re-authentication revokes the prior id", async ({ page }) => {

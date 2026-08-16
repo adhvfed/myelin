@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
-  parseRepoSummaryQuery,
+  parseRepoListQuery,
   parsePrCommitsQuery,
   prChecksJson,
   prDiffCapacityEnvelope,
@@ -14,7 +14,7 @@ import {
   fileLinesJson,
   refsJson,
   repoHomeJson,
-  repoSummaryEnvelope,
+  repoListEnvelope,
   SEED_REFS,
   treeJson,
   validPrOperationId,
@@ -140,12 +140,12 @@ describe("the dev Edge expand-context object contract", () => {
   });
 });
 
-describe("the dev Edge repository summary contract", () => {
-  it("strictly parses summary coordinates and keyset-pages shape-separated fixtures", () => {
-    expect(parseRepoSummaryQuery("view=summary&limit=1"))
+describe("the dev Edge repository list contract", () => {
+  it("strictly parses coordinates and keyset-pages shape-separated fixtures", () => {
+    expect(parseRepoListQuery("limit=1"))
       .toEqual({ limit: 1 });
-    const first = repoSummaryEnvelope({ limit: 1 });
-    if (!first) throw new Error("expected the first repository summary page");
+    const first = repoListEnvelope({ limit: 1 });
+    if (!first) throw new Error("expected the first repository list page");
     expect(first).toEqual({
       items: [{
         state: "populated",
@@ -161,7 +161,7 @@ describe("the dev Edge repository summary contract", () => {
     expect(first.items[0]).not.toHaveProperty("default_branch");
     expect(first.items[0]).not.toHaveProperty("entries");
 
-    const second = repoSummaryEnvelope({ limit: 1, cursor: first.page.next_cursor });
+    const second = repoListEnvelope({ limit: 1, cursor: first.page.next_cursor });
     expect(second).toEqual({
       items: [{ state: "empty", slug: "acme/sandbox" }],
       page: { next_cursor: null, limit: 1 },
@@ -173,14 +173,15 @@ describe("the dev Edge repository summary contract", () => {
     });
   });
 
-  it("rejects unknown, duplicate, noncanonical, and out-of-bounds summary queries", () => {
+  it("accepts defaults and rejects unknown, duplicate, noncanonical, and out-of-bounds queries", () => {
+    expect(parseRepoListQuery("")).toEqual({ limit: 50 });
     for (const query of [
-      "", "view=home", "view=summary&view=summary", "view=summary&other=1",
-      "view=summary&limit=01", "view=summary&limit=0", "view=summary&limit=101",
-      "view=summary&cursor=", "view=summary&cursor=opaque",
-      "view=summary&cursor=rl2_YR", `view=summary&cursor=rl2_${"a".repeat(512)}`,
+      "view=summary", "other=1", "limit=1&limit=1",
+      "limit=01", "limit=0", "limit=101",
+      "cursor=", "cursor=opaque",
+      "cursor=rl2_YR", `cursor=rl2_${"a".repeat(512)}`,
       "x".repeat(16 * 1024 + 1),
-    ]) expect(parseRepoSummaryQuery(query), query).toBeNull();
+    ]) expect(parseRepoListQuery(query), query).toBeNull();
   });
 });
 

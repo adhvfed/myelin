@@ -148,7 +148,7 @@ export function parseGitRepoListInput(value: unknown): GitRepoListInput | null {
 }
 
 export function gitRepoListSearchParams(input: GitRepoListInput): URLSearchParams {
-  const params = new URLSearchParams({ view: "summary" });
+  const params = new URLSearchParams();
   if (input.limit !== undefined) params.set("limit", String(input.limit));
   if (input.cursor !== undefined) params.set("cursor", input.cursor);
   return params;
