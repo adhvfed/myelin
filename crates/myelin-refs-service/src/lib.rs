@@ -11,7 +11,6 @@ use myelin_substrate::{
 pub mod backlinks;
 pub mod cache;
 pub mod chat_producer;
-pub mod ci_producer;
 pub mod cross_cell;
 pub mod dek;
 #[cfg(any(test, feature = "test-support"))]
@@ -51,7 +50,6 @@ pub use cache::{CacheFillError, R2ProjectionCache, R2_DEFAULT_TTL, R2_KEY_PREFIX
 pub use chat_producer::{
     ChatAnchorState, ChatEdgeProducer, ChatOwner, CHAT_CHANNEL_TYPE, CHAT_OWNER_TOKEN,
 };
-pub use ci_producer::{CiOwner, StepAnchorResolver, StepResolution, CI_OWNER_TOKEN};
 pub use cross_cell::{
     cross_cell_backlink_pointer, cross_cell_erase_receipt, fanout_carried_fields,
     migrate_home_cell, CellLocalBacklinkResolver, CrossCellEraseReceipt, CrossCellFanOut,
