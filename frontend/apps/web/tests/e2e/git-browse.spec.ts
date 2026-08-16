@@ -62,6 +62,27 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "repo home");
   });
 
+  test("the ref switcher keeps the current branch pinned while searching the server", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin");
+    await page.getByTestId("ref-switcher-trigger").click();
+
+    const switcher = page.getByRole("dialog", { name: "Switch branch or tag" });
+    const search = switcher.getByRole("textbox", { name: "Search branches and tags" });
+    await expect(switcher.getByRole("group", { name: "Pinned" }))
+      .toContainText("main");
+
+    await search.fill("feature");
+    const feature = switcher.getByRole("link", { name: "feature", exact: true });
+    await expect(feature).toHaveAttribute(
+      "href",
+      "/git/repos/myelin/tree/refs%2Fheads%2Ffeature",
+    );
+    await expect(switcher.getByRole("group", { name: "Pinned" }))
+      .toContainText("main");
+    await expectNoAxeViolations(page, "searched ref switcher");
+  });
+
   test("blob view renders the file contents from the WebEditForm ViewModel", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin");

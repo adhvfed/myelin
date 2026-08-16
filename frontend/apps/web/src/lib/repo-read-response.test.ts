@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseBlob, parseRefs, parseRepoHome, parseReposPage, parseTree } from "./repo-read-response";
+import { parseBlob, parseRefs, parseRepoHome, parseTree } from "./repo-read-response";
 
 const OID = "0123456789abcdef0123456789abcdef01234567";
 const REPO_REF = "myelin://acme/git/repo/core";
@@ -51,21 +51,11 @@ describe("repository read response projection", () => {
     });
   });
 
-  it("projects the page envelope without totals or internal metadata", () => {
-    expect(parseReposPage({
-      items: [{ state: "empty", slug: "acme/core", ref: REPO_REF, default_branch: "main" }],
-      page: { next_cursor: null, limit: 50, total: 99 },
-      internal: "drop",
-    })).toEqual({
-      items: [{ state: "empty", slug: "acme/core", ref: REPO_REF, default_branch: "main" }],
-      page: { next_cursor: null, limit: 50 },
-    });
-  });
-
   it("projects refs, trees, blobs, and kind-mismatch redirects", () => {
     expect(parseRefs({
       branches: [{ name: "main", oid: OID, is_default: true, secret: "drop" }],
-      tags: [], default_branch: "main", secret: "drop",
+      tags: [], default_branch: "main", pinned: [],
+      page: { next_cursor: null, limit: 1 }, secret: "drop",
     })).toEqual({
       branches: [{ name: "main", oid: OID, is_default: true }],
       tags: [], default_branch: "main", pinned: [], page: { next_cursor: null, limit: 1 },
@@ -221,20 +211,6 @@ describe("repository read response projection", () => {
     });
   });
 
-  it.each([101, 1_000])("accepts a terminal legacy refs response with %i rows", (count) => {
-    const parsed = parseRefs({
-      branches: Array.from({ length: count }, (_, index) => ({
-        name: `branch-${index}`, oid: OID,
-      })),
-      tags: [],
-      default_branch: "main",
-    });
-
-    expect(parsed?.branches).toHaveLength(count);
-    expect(parsed?.page).toEqual({ next_cursor: null, limit: count });
-    expect(parsed?.pinned).toEqual([]);
-  });
-
   it.each([
     {
       branches: [{ name: "a", oid: OID, is_default: false }],
@@ -288,10 +264,6 @@ describe("repository read response projection", () => {
     {
       branches: [], tags: [], default_branch: "main", pinned: [],
       page: { next_cursor: `gr1_${"x".repeat(8 * 1024)}`, limit: 1 },
-    },
-    {
-      branches: Array(1_001).fill({ name: "main", oid: OID }),
-      tags: [], default_branch: "main",
     },
   ])("rejects an invalid refs response %#", (value) => {
     expect(parseRefs(value)).toBeNull();

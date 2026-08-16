@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import type { GitRefsInput } from "./git-read-input";
 import type { RefsVM } from "./api";
-import { parseRefs } from "./repo-read-response";
 import {
   REF_SWITCHER_ROW_CAP,
   RefSwitcherController,
@@ -130,23 +129,6 @@ describe("RefSwitcher pagination state", () => {
     expect(controller.snapshot().rows).toHaveLength(REF_SWITCHER_ROW_CAP);
     await controller.loadMore();
     expect(pageNumber).toBe(3);
-  });
-
-  it("retains only 300 rows from a terminal legacy response", async () => {
-    const legacy = parseRefs({
-      branches: Array.from({ length: 1_000 }, (_, index) => ({
-        name: `legacy-${index}`, oid: OID,
-      })),
-      tags: [],
-      default_branch: "main",
-    });
-    if (!legacy) throw new Error("expected the bounded legacy fixture to parse");
-    const controller = new RefSwitcherController(async () => legacy, () => {});
-
-    await controller.search({ repo: "core", query: "" });
-
-    expect(controller.snapshot()).toMatchObject({ nextCursor: null, capped: true });
-    expect(controller.snapshot().rows).toHaveLength(REF_SWITCHER_ROW_CAP);
   });
 
   it("keeps current/default pins visible when a server page has no matching rows", async () => {

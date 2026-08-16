@@ -1,5 +1,6 @@
 import type {
   BlobVM,
+  BranchRefRow,
   CommitBriefVM,
   PinnedRefRow,
   RefRow,
@@ -7,7 +8,6 @@ import type {
   RepoEntry,
   RepoHomeVM,
   PopulatedRepoHomeVM,
-  ReposPage,
   TreeVM,
 } from "./api";
 import { isFullGitRef } from "./git-read-input";
@@ -20,7 +20,6 @@ const MAX_REPO_ENTRIES = 1_000;
 const MAX_REF_BYTES = 4 * 1024;
 const MAX_REF_CURSOR_BYTES = 8 * 1024;
 const MAX_TREE_CURSOR_BYTES = 8 * 1024;
-const MAX_LEGACY_REFS = 1_000;
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
@@ -172,20 +171,6 @@ export function parseRepoHome(value: unknown): RepoHomeVM | null {
   return result;
 }
 
-export function parseReposPage(value: unknown): ReposPage | null {
-  const envelope = record(value);
-  const page = record(envelope?.page);
-  if (!envelope || !Array.isArray(envelope.items) || envelope.items.length > 100 || !page ||
-      (page.next_cursor !== null && !displayText(page.next_cursor, 4 * 1024)) ||
-      !Number.isSafeInteger(page.limit) || (page.limit as number) < 1 || (page.limit as number) > 100) {
-    return null;
-  }
-  const items = envelope.items.map(parseRepoHome);
-  return items.every((item): item is RepoHomeVM => item !== null)
-    ? { items, page: { next_cursor: page.next_cursor, limit: page.limit as number } }
-    : null;
-}
-
 function refText(value: unknown, maximum = MAX_REF_BYTES): value is string {
   return bounded(value, maximum) && value.length > 0 && ![...value].some((character) => {
     const point = character.codePointAt(0)!;
@@ -193,17 +178,22 @@ function refText(value: unknown, maximum = MAX_REF_BYTES): value is string {
   });
 }
 
-function refRow(value: unknown, branch: boolean, requireDefault: boolean): RefRow | null {
+function branchRefRow(value: unknown): BranchRefRow | null {
   const row = record(value);
   if (!row || !refText(row.name) || !gitOid(row.oid) ||
-      (branch && requireDefault && typeof row.is_default !== "boolean") ||
-      (branch && !requireDefault && row.is_default !== undefined &&
-        typeof row.is_default !== "boolean")) return null;
+      typeof row.is_default !== "boolean") return null;
   return {
     name: row.name,
     oid: row.oid,
-    ...(branch && row.is_default !== undefined ? { is_default: row.is_default as boolean } : {}),
+    is_default: row.is_default,
   };
+}
+
+function tagRefRow(value: unknown): RefRow | null {
+  const row = record(value);
+  return row && refText(row.name) && gitOid(row.oid)
+    ? { name: row.name, oid: row.oid }
+    : null;
 }
 
 function pinnedRef(value: unknown, defaultBranch: string): PinnedRefRow | null {
@@ -229,31 +219,24 @@ function refCursor(value: unknown): value is string {
 export function parseRefs(value: unknown): RefsVM | null {
   const refs = record(value);
   if (!refs || !Array.isArray(refs.branches) || !Array.isArray(refs.tags) ||
-      !refText(refs.default_branch)) return null;
-  const legacy = refs.pinned === undefined && refs.page === undefined;
-  if (!legacy && (refs.pinned === undefined || refs.page === undefined)) return null;
-  const page = legacy ? null : record(refs.page);
+      !refText(refs.default_branch) || !Array.isArray(refs.pinned)) return null;
+  const page = record(refs.page);
   const rowCount = refs.branches.length + refs.tags.length;
-  const limit = legacy ? Math.max(1, rowCount) : page?.limit;
-  if ((legacy && rowCount > MAX_LEGACY_REFS) ||
-      (!legacy && (!Number.isSafeInteger(limit) || (limit as number) < 1 ||
-        (limit as number) > 100 || rowCount > (limit as number) || !page ||
-        (page.next_cursor !== null && !refCursor(page.next_cursor))))) {
+  const limit = page?.limit;
+  if (!page || !Number.isSafeInteger(limit) || (limit as number) < 1 ||
+      (limit as number) > 100 || rowCount > (limit as number) ||
+      (page.next_cursor !== null && !refCursor(page.next_cursor))) {
     return null;
   }
-  const branches = refs.branches.map((row) => refRow(row, true, !legacy));
-  const tags = refs.tags.map((row) => refRow(row, false, false));
-  if (!branches.every((row): row is RefRow => row !== null) ||
+  const branches = refs.branches.map(branchRefRow);
+  const tags = refs.tags.map(tagRefRow);
+  if (!branches.every((row): row is BranchRefRow => row !== null) ||
       !tags.every((row): row is RefRow => row !== null) ||
       branches.some((row) => row.is_default && row.name !== refs.default_branch) ||
-      (!legacy && branches.some((row) =>
-        row.is_default !== (row.name === refs.default_branch))) ||
+      branches.some((row) => row.is_default !== (row.name === refs.default_branch)) ||
       branches.filter((row) => row.is_default).length > 1) return null;
-  let pins: Array<PinnedRefRow | null> = [];
-  if (!legacy) {
-    if (!Array.isArray(refs.pinned) || refs.pinned.length > 2) return null;
-    pins = refs.pinned.map((row) => pinnedRef(row, refs.default_branch as string));
-  }
+  if (refs.pinned.length > 2) return null;
+  const pins = refs.pinned.map((row) => pinnedRef(row, refs.default_branch as string));
   if (!pins.every((row): row is PinnedRefRow => row !== null) ||
       new Set(pins.map((row) => row.full_name)).size !== pins.length) return null;
   return {
@@ -262,7 +245,7 @@ export function parseRefs(value: unknown): RefsVM | null {
     default_branch: refs.default_branch,
     pinned: pins,
     page: {
-      next_cursor: legacy ? null : page!.next_cursor as string | null,
+      next_cursor: page.next_cursor as string | null,
       limit: limit as number,
     },
   };

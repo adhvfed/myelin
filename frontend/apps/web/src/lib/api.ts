@@ -155,6 +155,10 @@ export interface RefRow {
   is_default?: boolean;
 }
 
+export interface BranchRefRow extends RefRow {
+  is_default: boolean;
+}
+
 export interface PinnedRefRow extends RefRow {
   kind: "branch" | "tag";
   full_name: string;
@@ -163,7 +167,7 @@ export interface PinnedRefRow extends RefRow {
 
 /** The ref switcher source (GET /v1/git/repos/{repo}/refs). */
 export interface RefsVM {
-  branches: RefRow[];
+  branches: BranchRefRow[];
   tags: RefRow[];
   default_branch: string;
   pinned: PinnedRefRow[];
@@ -196,12 +200,6 @@ export type RepoListRowVM =
 /** The bounded repository catalogue envelope. */
 export interface RepoListPage {
   items: RepoListRowVM[];
-  page: { next_cursor: string | null; limit: number };
-}
-
-/** Legacy list-of-RepoHome envelope retained for the strict v1 home decoder compatibility tests. */
-export interface ReposPage {
-  items: RepoHomeVM[];
   page: { next_cursor: string | null; limit: number };
 }
 
