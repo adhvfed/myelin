@@ -611,7 +611,7 @@ const server = createServer((req, res) => {
       } catch {
         return send(res, 400, { error: { message: "invalid Chat message body", code: "bad_request" } });
       }
-      const output = chat.postMessage(conversationId, body);
+      const output = chat.postMessage(conversationId, body, req.headers["idempotency-key"]);
       if (output.status === 404) return send(res, 404, notFoundEnvelope("conversation"));
       if (output.status === 400) {
         return send(res, 400, { error: { message: "invalid Chat message body", code: "bad_request" } });

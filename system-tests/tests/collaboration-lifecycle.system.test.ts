@@ -1323,10 +1323,8 @@ command = ["true"]
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
       {
         method: "POST",
-        body: {
-          content: "Confirmed from a second principal.",
-          client_nonce: `reviewer-${randomUUID()}`,
-        },
+        body: { content: "Confirmed from a second principal." },
+        idempotencyKey: `reviewer-${randomUUID()}`,
         expectedStatus: 201,
       },
     );
@@ -1336,10 +1334,8 @@ command = ["true"]
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
       {
         method: "POST",
-        body: {
-          content: "The paged history is consistent.",
-          client_nonce: `author-final-${randomUUID()}`,
-        },
+        body: { content: "The paged history is consistent." },
+        idempotencyKey: `author-final-${randomUUID()}`,
         expectedStatus: 201,
       },
     );

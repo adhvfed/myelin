@@ -65,7 +65,7 @@ describe("external API contracts", () => {
     expectError(issues.body, "bad_request");
   });
 
-  test("keeps Knowledge retry identity in the standard operation header", async () => {
+  test("keeps retry identity in the standard operation header", async () => {
     const body = {
       title: "Header-scoped retry contract",
       template: "blank",
@@ -85,6 +85,25 @@ describe("external API contracts", () => {
       expectedStatus: 400,
     });
     expectError(legacy.body, "bad_request");
+
+    const messagePath = "/v1/chat/conversations/01J00000000000000000000000/messages";
+    const missingMessageKey = await systemClient.json(messagePath, {
+      method: "POST",
+      body: { content: "Header-scoped retry contract" },
+      idempotencyKey: false,
+      expectedStatus: 400,
+    });
+    expectError(missingMessageKey.body, "bad_request");
+
+    const legacyMessageKey = await systemClient.json(messagePath, {
+      method: "POST",
+      body: {
+        content: "Header-scoped retry contract",
+        client_nonce: "legacy-body-token",
+      },
+      expectedStatus: 400,
+    });
+    expectError(legacyMessageKey.body, "bad_request");
   });
 
   test("enforces interactive payload limits before durable work", async () => {

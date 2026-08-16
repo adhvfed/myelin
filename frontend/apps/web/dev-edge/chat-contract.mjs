@@ -194,25 +194,25 @@ export class ChatFixtures {
     };
   }
 
-  postMessage(conversationId, body) {
+  postMessage(conversationId, body, idempotencyKey) {
+    const bodyShape = exactObject(body, ["content"]) || exactObject(body, ["content", "references"]);
+    const references = body?.references ?? [];
+    if (!bodyShape || !cleanMessage(body.content) || !Array.isArray(references) ||
+        references.length > 32 || !references.every(storableArtifactRef) ||
+        [...body.content].filter((character) => character === "\uFFFC").length !== references.length ||
+        !validIdempotencyKey(idempotencyKey)) return { status: 400 };
     if (!this.conversations.some((row) => row.id === conversationId)) return { status: 404 };
-    if (!exactObject(body, ["content", "references", "client_nonce"]) || !cleanMessage(body.content) ||
-        !Array.isArray(body.references) || body.references.length > 32 ||
-        !body.references.every(storableArtifactRef) ||
-        [...body.content].filter((character) => character === "\uFFFC").length !== body.references.length ||
-        typeof body.client_nonce !== "string" ||
-        !/^[A-Za-z0-9_-]{1,128}$/.test(body.client_nonce)) return { status: 400 };
     const rows = this.messages.get(conversationId) ?? [];
-    const existing = rows.find((row) => row.client_nonce === body.client_nonce);
+    const existing = rows.find((row) => row.client_nonce === idempotencyKey);
     if (existing) return { status: 201, json: { message_id: existing.id, durable: true } };
     const row = {
       id: fixtureUlid(++this.sequence),
       author: AUTHOR,
       author_kind: "human",
       content: body.content,
-      nodes: body.references.map((ref) => ({ kind: "artifact_ref", ref })),
+      nodes: references.map((ref) => ({ kind: "artifact_ref", ref })),
       created_at: 1_750_001_000 + this.sequence,
-      client_nonce: body.client_nonce,
+      client_nonce: idempotencyKey,
     };
     rows.push(row);
     this.messages.set(conversationId, rows);

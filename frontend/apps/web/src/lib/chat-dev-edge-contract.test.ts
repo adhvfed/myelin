@@ -39,13 +39,36 @@ describe("development Chat contract", () => {
     expect(chat.postMessage(created.json.conversation.id, {
       content: "Track \uFFFC.",
       references: [reference],
-      client_nonce: "message-1",
-    }).status).toBe(201);
+    }, "message-1").status).toBe(201);
     expect(chat.listMessages(created.json.conversation.id, { before: undefined, limit: 50 })
       ?.items[0]).toMatchObject({
       content: "Track \uFFFC.",
       nodes: [{ kind: "artifact_ref", ref: reference }],
     });
+  });
+
+  it("keeps message retry identity in the standard operation header", () => {
+    const chat = new ChatFixtures();
+    chat.reset({ empty: true });
+    const created = chat.createConversation({
+      project_id: FIRST_PROJECT,
+      channel: "reliability",
+      topic: "lost acknowledgements",
+    }, "create-1");
+    if (!created.json) throw new Error("expected a created conversation");
+    const conversationId = created.json.conversation.id;
+    const message = { content: "Commit this once." };
+
+    const first = chat.postMessage(conversationId, message, "message-1");
+    expect(chat.postMessage(conversationId, message, "message-1")).toEqual(first);
+    expect(chat.listMessages(conversationId, { before: undefined, limit: 50 })?.items)
+      .toHaveLength(1);
+    expect(chat.postMessage(conversationId, message, undefined).status).toBe(400);
+    expect(chat.postMessage(
+      conversationId,
+      { ...message, client_nonce: "legacy-body-token" },
+      "message-2",
+    ).status).toBe(400);
   });
 
   it("scopes topic retry identities to one exact draft", () => {

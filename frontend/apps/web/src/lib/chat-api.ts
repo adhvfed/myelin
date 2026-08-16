@@ -177,8 +177,8 @@ export const chatMutate = action(async (mutation: ChatMutation) => {
           {
             content: parsed.content,
             references: parsed.references,
-            client_nonce: parsed.clientNonce,
           },
+          { idempotencyKey: parsed.clientNonce },
         ));
         if (!decoded) throw new ChatRouteError("error");
         return decoded;

@@ -405,7 +405,6 @@ struct CreateConversationBody {
 #[serde(deny_unknown_fields)]
 struct PostMessageBody {
     content: String,
-    client_nonce: Option<String>,
     #[serde(default)]
     references: Vec<String>,
 }
@@ -499,11 +498,9 @@ impl Handler for MessagePostHandler {
         require_empty_query(ctx)?;
         let conversation_id = conversation_param(ctx)?.to_string();
         let body: PostMessageBody = parse_body(&ctx.request.body)?;
-        let client_nonce = client_nonce(
-            ctx.request,
-            &ctx.principal.principal_id.0,
-            body.client_nonce.as_deref(),
-        )?;
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
         let message_id = self.api.post_message(
             ctx.principal,
             ctx.principal,
@@ -743,20 +740,6 @@ fn validate_nonce(value: &str) -> Result<(), EdgeError> {
     Ok(())
 }
 
-fn client_nonce(
-    request: &crate::request::EdgeRequest,
-    principal_id: &str,
-    explicit: Option<&str>,
-) -> Result<String, EdgeError> {
-    match explicit {
-        Some(value) => {
-            validate_nonce(value)?;
-            Ok(value.to_string())
-        }
-        None => request.stable_idempotency_nonce(principal_id),
-    }
-}
-
 fn require_empty_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
     if ctx.request.query.is_empty() {
         Ok(())
@@ -963,7 +946,16 @@ mod tests {
     }
 
     #[test]
-    fn message_nonce_accepts_the_legacy_body_field_or_one_public_retry_key() {
+    fn message_body_contains_domain_input_not_retry_transport_metadata() {
+        let body: PostMessageBody =
+            serde_json::from_slice(br#"{"content":"Ship it"}"#).expect("content-only message body");
+        assert_eq!(body.content, "Ship it");
+        assert!(body.references.is_empty());
+        assert!(serde_json::from_slice::<PostMessageBody>(
+            br#"{"content":"Ship it","client_nonce":"legacy-42"}"#
+        )
+        .is_err());
+
         let request = crate::request::EdgeRequest::new(
             "POST",
             "/v1/chat/conversations/01J00000000000000000000000/messages",
@@ -971,14 +963,25 @@ mod tests {
             vec![("idempotency-key".into(), "send-42".into())],
             Vec::new(),
         );
-        assert_eq!(
-            client_nonce(&request, "svc:agent", Some("legacy-42")).unwrap(),
-            "legacy-42"
+        let nonce = request
+            .stable_idempotency_nonce("svc:agent")
+            .expect("standard retry header");
+        assert!(validate_nonce(&nonce).is_ok());
+        assert_ne!(
+            nonce,
+            request
+                .stable_idempotency_nonce("svc:other")
+                .expect("principal-scoped retry header")
         );
-        assert_eq!(
-            client_nonce(&request, "svc:agent", None).unwrap(),
-            request.stable_idempotency_nonce("svc:agent").unwrap()
+
+        let missing = crate::request::EdgeRequest::new(
+            "POST",
+            "/v1/chat/conversations/01J00000000000000000000000/messages",
+            "",
+            Vec::new(),
+            Vec::new(),
         );
+        assert!(missing.stable_idempotency_nonce("svc:agent").is_err());
     }
 
     #[test]
