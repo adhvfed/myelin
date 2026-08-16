@@ -174,22 +174,34 @@ export interface RefsVM {
   page: { next_cursor: string | null; limit: number };
 }
 
-/** The tree-at-path ViewModel (GET /v1/git/repos/{repo}/tree/{ref}/{...path}). `redirect_to_blob`
- *  signals a file requested under tree/ (the client redirects to the blob route — kind mismatch). */
-export interface TreeVM {
-  ref?: string;
-  path?: string;
-  entries?: RepoEntry[];
+/** A snapshot-pinned directory page from GET /v1/git/repos/{repo}/tree/{ref}/{...path}. */
+export interface TreeDirectoryVM {
+  ref: string;
+  path: string;
+  entries: RepoEntry[];
   readme?: string;
-  redirect_to_blob?: boolean;
-  snapshot_oid?: string;
-  page?: TreePageVM;
+  redirect_to_blob?: false;
+  snapshot_oid: string;
+  page: TreePageVM;
 }
 
 export interface TreePageVM {
   next_cursor: string | null;
   limit: number;
 }
+
+/** A file requested through the tree route. The browser follows it to the blob surface. */
+export interface TreeBlobRedirectVM {
+  ref: string;
+  path: string;
+  redirect_to_blob: true;
+  entries?: never;
+  readme?: never;
+  snapshot_oid?: never;
+  page?: never;
+}
+
+export type TreeVM = TreeDirectoryVM | TreeBlobRedirectVM;
 
 /** One summary-only repository catalogue row. Heavy RepoHome data belongs to `GET /repos/{repo}`. */
 export type RepoListRowVM =

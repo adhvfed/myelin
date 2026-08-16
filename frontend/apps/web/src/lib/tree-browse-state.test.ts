@@ -17,7 +17,14 @@ describe("tree browse URL state", () => {
     const requests: Array<{ repo: string; ref: string; path: string; limit?: number }> = [];
     const reader = new InitialTreeReader(async (input) => {
       requests.push(input);
-      return { ref: input.ref, path: input.path, entries: [], readme: "# README" };
+      return {
+        ref: input.ref,
+        path: input.path,
+        entries: [],
+        readme: "# README",
+        snapshot_oid: OID,
+        page: { next_cursor: null, limit: 100 },
+      };
     });
     const coordinates = { repo: "core", ref: "refs/heads/main", path: "src" };
 

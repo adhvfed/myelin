@@ -253,40 +253,34 @@ export function parseRefs(value: unknown): RefsVM | null {
 
 export function parseTree(value: unknown): TreeVM | null {
   const tree = record(value);
-  if (!tree || (tree.ref !== undefined && (!displayText(tree.ref, 1_024) || !tree.ref)) ||
-      (tree.path !== undefined && tree.path !== "" && !repoPath(tree.path)) ||
-      (tree.redirect_to_blob !== undefined && typeof tree.redirect_to_blob !== "boolean") ||
+  if (!tree || !displayText(tree.ref, 1_024) || !tree.ref ||
+      (tree.path !== "" && !repoPath(tree.path)) ||
       (tree.readme !== undefined && tree.readme !== null && !bounded(tree.readme, MAX_TEXT_BYTES))) {
     return null;
   }
   if (tree.redirect_to_blob === true) {
+    if (tree.path === "" || tree.entries !== undefined || tree.readme !== undefined ||
+        tree.snapshot_oid !== undefined || tree.page !== undefined) return null;
     return {
-      ...(tree.ref === undefined ? {} : { ref: tree.ref as string }),
-      ...(tree.path === undefined ? {} : { path: tree.path as string }),
+      ref: tree.ref,
+      path: tree.path as string,
       redirect_to_blob: true,
     };
   }
-  const modern = tree.page !== undefined || tree.snapshot_oid !== undefined;
-  const page = modern ? treePage(tree.page) : null;
-  if (modern && (!page || !gitOid(tree.snapshot_oid) || !displayText(tree.ref, 1_024) ||
-      !tree.ref || (tree.path !== "" && !repoPath(tree.path)) || !Array.isArray(tree.entries))) {
+  const page = treePage(tree.page);
+  if (tree.redirect_to_blob !== undefined || !page || !gitOid(tree.snapshot_oid) ||
+      !Array.isArray(tree.entries) || tree.entries.length > page.limit) {
     return null;
   }
-  let parsedEntries: RepoEntry[] | undefined;
-  if (tree.entries !== undefined) {
-    const maximum = modern ? page!.limit : MAX_REPO_ENTRIES;
-    if (!Array.isArray(tree.entries) || tree.entries.length > maximum) return null;
-    const candidate = tree.entries.map(repoEntry);
-    if (!candidate.every((entry): entry is RepoEntry => entry !== null)) return null;
-    parsedEntries = candidate;
-  }
+  const entries = tree.entries.map(repoEntry);
+  if (!entries.every((entry): entry is RepoEntry => entry !== null)) return null;
   return {
-    ...(tree.ref === undefined ? {} : { ref: tree.ref }),
-    ...(tree.path === undefined ? {} : { path: tree.path }),
-    ...(parsedEntries === undefined ? {} : { entries: parsedEntries }),
+    ref: tree.ref,
+    path: tree.path as string,
+    entries,
     ...(typeof tree.readme === "string" ? { readme: tree.readme } : {}),
-    ...(tree.redirect_to_blob === undefined ? {} : { redirect_to_blob: tree.redirect_to_blob }),
-    ...(modern ? { snapshot_oid: tree.snapshot_oid as string, page: page! } : {}),
+    snapshot_oid: tree.snapshot_oid,
+    page,
   };
 }
 

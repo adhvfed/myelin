@@ -60,8 +60,6 @@ describe("repository read response projection", () => {
       branches: [{ name: "main", oid: OID, is_default: true }],
       tags: [], default_branch: "main", pinned: [], page: { next_cursor: null, limit: 1 },
     });
-    expect(parseTree({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }], readme: null, secret: "drop" }))
-      .toEqual({ ref: "main", path: "", entries: [{ path: "x", is_dir: false }] });
     expect(parseTree({
       ref: "refs/heads/main", path: "", snapshot_oid: OID,
       entries: [{ path: "x", is_dir: false }], readme: "# readme",
@@ -70,6 +68,11 @@ describe("repository read response projection", () => {
       ref: "refs/heads/main", path: "", snapshot_oid: OID,
       entries: [{ path: "x", is_dir: false }], readme: "# readme",
       page: { next_cursor: "gt1_a-b_c", limit: 1 },
+    });
+    expect(parseTree({
+      ref: "refs/heads/main", path: "README.md", redirect_to_blob: true, secret: "drop",
+    })).toEqual({
+      ref: "refs/heads/main", path: "README.md", redirect_to_blob: true,
     });
     expect(parseBlob({
       path: "x", contents: "hello", base_oid: "blake3:value", viewer_may_edit: false,
@@ -131,17 +134,13 @@ describe("repository read response projection", () => {
     expect(parseBlob({ path: "x", contents: "not empty", base_oid: OID, viewer_may_edit: false, preview_unavailable: true })).toBeNull();
   });
 
-  it("keeps bounded page-less tree compatibility", () => {
-    expect(parseTree({
-      ref: "main", path: "",
-      entries: Array.from({ length: 1_000 }, (_, index) => ({ path: `file-${index}`, is_dir: false })),
-    })?.entries).toHaveLength(1_000);
-    expect(parseTree({
-      ref: "main", path: "", entries: Array(1_001).fill({ path: "x", is_dir: false }),
-    })).toBeNull();
-  });
-
   it.each([
+    {},
+    { ref: "main", path: "", redirect_to_blob: true },
+    {
+      ref: "main", path: "README.md", redirect_to_blob: true,
+      snapshot_oid: OID, entries: [], page: { next_cursor: null, limit: 1 },
+    },
     {
       ref: "main", path: "", snapshot_oid: OID, entries: [],
     },
