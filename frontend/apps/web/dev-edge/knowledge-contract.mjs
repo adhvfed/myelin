@@ -8,7 +8,7 @@ function clean(value, max, empty = false) { return typeof value === "string" && 
 const TYPES = ["paragraph", "heading", "bullet_list", "ordered_list", "task_list", "blockquote", "code_block", "callout", "divider"];
 function operationId(value) { return typeof value === "string" && /^[!-~]{1,128}$/.test(value); }
 
-function blocksFor(template) {
+export function knowledgeTemplateBlocks(template) {
   if (template === "blank") return [["paragraph", ""]];
   if (template === "product-spec") return [["heading", "Problem"], ["paragraph", "What user or organisational problem are we solving?"], ["heading", "Outcomes"], ["bullet_list", "Describe the measurable change this work should create."], ["heading", "Approach"], ["paragraph", "Explain the smallest coherent approach and the alternatives considered."], ["heading", "Risks"], ["bullet_list", "Name failure modes, privacy implications, and how we will observe them."]];
   if (template === "runbook") return [["heading", "When to use this runbook"], ["paragraph", "Describe the signals and impact that should trigger this response."], ["heading", "Response"], ["ordered_list", "Confirm the alert and establish an incident lead."], ["ordered_list", "Stabilise the service before changing multiple variables."], ["heading", "Recovery checks"], ["task_list", "User-visible health has recovered and remains stable."], ["task_list", "Follow-up work has an owner and is linked to the incident."]];
@@ -42,7 +42,7 @@ export class KnowledgeFixtures {
   bump(id) { const row = this.pages.find((page) => page.id === id); if (!row) return false; row.version += 1; row.updated_at += 1; return true; }
   create(body, idempotencyKey) {
     if (!exact(body, ["title", "template", "visibility"]) || !clean(body.title, 512) || body.title.trim() !== body.title || !["private", "team"].includes(body.visibility) || !operationId(idempotencyKey)) return { status: 400 };
-    const template = blocksFor(body.template); if (!template) return { status: 400 };
+    const template = knowledgeTemplateBlocks(body.template); if (!template) return { status: 400 };
     const existingId = this.nonces.get(idempotencyKey); if (existingId) return { status: 200, json: { page: this.get(existingId), created: false, durable: true } };
     const id = ulid(++this.sequence); const timestamp = 1_760_010_000 + this.sequence;
     const row = { id, title: body.title, visibility: body.visibility, version: 1, created_at: timestamp, updated_at: timestamp, blocks: template.map(([type, markdown]) => ({ id: ulid(++this.sequence), type, markdown })) };

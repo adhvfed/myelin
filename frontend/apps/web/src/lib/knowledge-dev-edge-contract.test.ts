@@ -1,6 +1,22 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-import { KnowledgeFixtures } from "../../dev-edge/knowledge-contract.mjs";
+import {
+  KnowledgeFixtures,
+  knowledgeTemplateBlocks,
+} from "../../dev-edge/knowledge-contract.mjs";
+
+const goldenPath = new URL(
+  "../../../../../contracts/knowledge-page-templates.golden.json",
+  import.meta.url,
+);
+const golden = JSON.parse(readFileSync(goldenPath, "utf8")) as {
+  contract_id: string;
+  templates: Array<{
+    id: string;
+    blocks: Array<{ type: string; markdown: string }>;
+  }>;
+};
 
 const page = {
   title: "Retry-safe runbook",
@@ -9,6 +25,14 @@ const page = {
 };
 
 describe("the development Knowledge mutation contract", () => {
+  it("serves the same useful starting documents as the durable Edge", () => {
+    expect(golden.contract_id).toBe("knowledge-page-template-parity");
+    for (const template of golden.templates) {
+      expect(knowledgeTemplateBlocks(template.id), template.id)
+        .toEqual(template.blocks.map(({ type, markdown }) => [type, markdown]));
+    }
+  });
+
   it("replays one header-scoped operation without cloning its page", () => {
     const knowledge = new KnowledgeFixtures();
     knowledge.reset({ empty: true });

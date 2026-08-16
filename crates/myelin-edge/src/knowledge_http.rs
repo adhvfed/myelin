@@ -745,27 +745,40 @@ fn template_blocks(template: &str) -> Result<Vec<(&'static str, &'static str)>, 
                 "bullet_list",
                 "Describe the measurable change this work should create.",
             ),
-            ("heading", "Delivery links"),
+            ("heading", "Approach"),
             (
                 "paragraph",
-                "Link the issues, pull requests, and decisions that carry this forward.",
+                "Explain the smallest coherent approach and the alternatives considered.",
+            ),
+            ("heading", "Risks"),
+            (
+                "bullet_list",
+                "Name failure modes, privacy implications, and how we will observe them.",
             ),
         ]),
         "runbook" => Ok(vec![
             ("heading", "When to use this runbook"),
             (
                 "paragraph",
-                "Describe the symptoms and the service boundary.",
+                "Describe the signals and impact that should trigger this response.",
             ),
-            ("heading", "Diagnosis"),
+            ("heading", "Response"),
             (
                 "ordered_list",
-                "Record safe, reversible checks in the order they should run.",
+                "Confirm the alert and establish an incident lead.",
             ),
-            ("heading", "Recovery"),
+            (
+                "ordered_list",
+                "Stabilise the service before changing multiple variables.",
+            ),
+            ("heading", "Recovery checks"),
             (
                 "task_list",
-                "Describe the recovery steps and how to verify the result.",
+                "User-visible health has recovered and remains stable.",
+            ),
+            (
+                "task_list",
+                "Follow-up work has an owner and is linked to the incident.",
             ),
         ]),
         _ => Err(EdgeError::BadRequest(
@@ -1023,10 +1036,21 @@ mod tests {
     }
 
     #[test]
-    fn templates_teach_real_work_without_fake_activity() {
-        assert_eq!(template_blocks("blank").expect("blank").len(), 1);
-        let spec = template_blocks("product-spec").expect("spec");
-        assert!(spec.iter().any(|(_, text)| text.contains("pull requests")));
+    fn templates_match_the_shared_product_contract() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../contracts/knowledge-page-templates.golden.json"
+        ))
+        .expect("knowledge template golden contract");
+        assert_eq!(golden["contract_id"], "knowledge-page-template-parity");
+        for template in golden["templates"].as_array().expect("template vectors") {
+            let id = template["id"].as_str().expect("template id");
+            let blocks = template_blocks(id)
+                .expect("golden template is supported")
+                .into_iter()
+                .map(|(block_type, markdown)| json!({ "type": block_type, "markdown": markdown }))
+                .collect::<Vec<_>>();
+            assert_eq!(json!(blocks), template["blocks"], "template `{id}` drifted");
+        }
         assert!(template_blocks("not-a-template").is_err());
     }
 }

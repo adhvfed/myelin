@@ -1,0 +1,37 @@
+{
+  "contract_id": "knowledge-page-template-parity",
+  "templates": [
+    {
+      "id": "blank",
+      "blocks": [
+        { "type": "paragraph", "markdown": "" }
+      ]
+    },
+    {
+      "id": "product-spec",
+      "blocks": [
+        { "type": "heading", "markdown": "Problem" },
+        { "type": "paragraph", "markdown": "What user or organisational problem are we solving?" },
+        { "type": "heading", "markdown": "Outcomes" },
+        { "type": "bullet_list", "markdown": "Describe the measurable change this work should create." },
+        { "type": "heading", "markdown": "Approach" },
+        { "type": "paragraph", "markdown": "Explain the smallest coherent approach and the alternatives considered." },
+        { "type": "heading", "markdown": "Risks" },
+        { "type": "bullet_list", "markdown": "Name failure modes, privacy implications, and how we will observe them." }
+      ]
+    },
+    {
+      "id": "runbook",
+      "blocks": [
+        { "type": "heading", "markdown": "When to use this runbook" },
+        { "type": "paragraph", "markdown": "Describe the signals and impact that should trigger this response." },
+        { "type": "heading", "markdown": "Response" },
+        { "type": "ordered_list", "markdown": "Confirm the alert and establish an incident lead." },
+        { "type": "ordered_list", "markdown": "Stabilise the service before changing multiple variables." },
+        { "type": "heading", "markdown": "Recovery checks" },
+        { "type": "task_list", "markdown": "User-visible health has recovered and remains stable." },
+        { "type": "task_list", "markdown": "Follow-up work has an owner and is linked to the incident." }
+      ]
+    }
+  ]
+}

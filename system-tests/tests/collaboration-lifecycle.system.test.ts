@@ -1407,7 +1407,20 @@ command = ["true"]
     const initialVersion = integer(page.version, "knowledge page version");
     expect(created.body).toMatchObject({ created: true, durable: true });
     expect(page).toMatchObject({ title, visibility: "team", can_edit: true });
-    expect(array(page.blocks, "template blocks").length).toBeGreaterThan(1);
+    const startingBlocks = array(page.blocks, "product-spec starting blocks").map((value) => {
+      const block = record(value, "product-spec starting block");
+      return [block.type, block.markdown];
+    });
+    expect(startingBlocks).toEqual([
+      ["heading", "Problem"],
+      ["paragraph", "What user or organisational problem are we solving?"],
+      ["heading", "Outcomes"],
+      ["bullet_list", "Describe the measurable change this work should create."],
+      ["heading", "Approach"],
+      ["paragraph", "Explain the smallest coherent approach and the alternatives considered."],
+      ["heading", "Risks"],
+      ["bullet_list", "Name failure modes, privacy implications, and how we will observe them."],
+    ]);
 
     const replay = await systemClient.json("/v1/knowledge/pages", {
       method: "POST",

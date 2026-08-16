@@ -33,6 +33,9 @@ test("a signed-in engineer creates, edits, and resumes an encrypted durable Know
   await page.getByRole("button", { name: "Create page" }).click();
   await page.waitForURL(/\/knowledge\?page=[0-9A-HJKMNP-TV-Z]{26}$/);
 
+  await expect(page.getByRole("textbox", { name: "Heading block 3" })).toContainText("Response");
+  await expect(page.getByRole("textbox", { name: "Task block 8" }))
+    .toContainText("Follow-up work has an owner and is linked to the incident.");
   const response = page.getByRole("textbox", { name: "Numbered list block 4" });
   await response.fill(edited);
   await page.getByRole("button", { name: "Link related work" }).click();
