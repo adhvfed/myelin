@@ -75,7 +75,7 @@ describe("Git read RPC inputs", () => {
   });
 
   it("accepts only the exact bounded repository-list input and always selects the summary view", () => {
-    const cursor = "rl1_YWNtZS9teWVsaW4";
+    const cursor = "rl2_AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGgAGMDFKMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDJteWVsaW4";
     expect(parseGitRepoListInput({})).toEqual({});
     expect(parseGitRepoListInput({ limit: 1, cursor })).toEqual({ limit: 1, cursor });
     expect(gitRepoListSearchParams({ limit: 1, cursor }).toString())
@@ -87,8 +87,8 @@ describe("Git read RPC inputs", () => {
       { limit: 101 },
       { limit: 1.5 },
       { cursor: "opaque" },
-      { cursor: "rl1_YR" }, // decodes like `YQ`, but has non-canonical trailing bits
-      { cursor: `rl1_${"a".repeat(512)}` },
+      { cursor: "rl2_YR" }, // decodes like `YQ`, but has non-canonical trailing bits
+      { cursor: `rl2_${"a".repeat(512)}` },
       { surprise: true },
     ]) expect(parseGitRepoListInput(value), JSON.stringify(value)).toBeNull();
   });

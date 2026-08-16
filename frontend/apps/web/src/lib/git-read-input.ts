@@ -87,42 +87,40 @@ function treeCursor(value: unknown): value is string {
   return bounded(value, 8 * 1024) && /^gt1_[A-Za-z0-9_-]+$/.test(value) && !hasControl(value);
 }
 
-/** A canonical repository-list cursor (`rl1_` + unpadded canonical base64url, Edge max 512 B). */
-export function isRepoListCursor(value: unknown): value is string {
-  if (!bounded(value, 512) || !/^rl1_[A-Za-z0-9_-]+$/.test(value)) return false;
-  const encoded = value.slice("rl1_".length);
-  if (encoded.length % 4 === 1) return false;
+function cursorFrame(value: unknown, prefix: string, maximum: number): Uint8Array | null {
+  if (!bounded(value, maximum) || !value.startsWith(prefix)) return null;
+  const encoded = value.slice(prefix.length);
+  if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded) || encoded.length % 4 === 1) return null;
   try {
     const padded = encoded.replace(/-/g, "+").replace(/_/g, "/") +
       "=".repeat((4 - (encoded.length % 4)) % 4);
     const decoded = atob(padded);
     const canonical = btoa(decoded).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    return canonical === encoded;
+    return canonical === encoded
+      ? Uint8Array.from(decoded, (byte) => byte.charCodeAt(0))
+      : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** An opaque canonical repository-list cursor (`rl2_`, unpadded base64url, at most 512 bytes). */
+export function isRepoListCursor(value: unknown): value is string {
+  return cursorFrame(value, "rl2_", 512) !== null;
 }
 
 /** A canonical PR-commit cursor (`pc1_` + the Edge's exact 78-byte v1 frame). */
 export function isPrCommitCursor(value: unknown): value is string {
-  if (!bounded(value, 256) || !/^pc1_[A-Za-z0-9_-]+$/.test(value)) return false;
-  const encoded = value.slice("pc1_".length);
-  if (encoded.length % 4 === 1) return false;
+  const frame = cursorFrame(value, "pc1_", 256);
+  if (!frame || frame.length !== 78 || frame[0] !== 1) return false;
   try {
-    const padded = encoded.replace(/-/g, "+").replace(/_/g, "/") +
-      "=".repeat((4 - (encoded.length % 4)) % 4);
-    const decoded = atob(padded);
-    const canonical = btoa(decoded).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    if (canonical !== encoded || decoded.length !== 78 || decoded.charCodeAt(0) !== 1) return false;
-
-    const baseKind = decoded.charCodeAt(33);
+    const baseKind = frame[33]!;
     if (baseKind !== 0 && baseKind !== 1) return false;
-    if (baseKind === 0 && [...decoded.slice(34, 54)].some((byte) => byte.charCodeAt(0) !== 0)) {
+    if (baseKind === 0 && frame.slice(34, 54).some((byte) => byte !== 0)) {
       return false;
     }
-    const position = new DataView(
-      Uint8Array.from(decoded, (byte) => byte.charCodeAt(0)).buffer,
-    ).getUint32(74, false);
+    const position = new DataView(frame.buffer, frame.byteOffset, frame.byteLength)
+      .getUint32(74, false);
     return position >= 1 && position <= 100_000;
   } catch {
     return false;

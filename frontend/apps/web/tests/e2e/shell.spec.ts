@@ -121,7 +121,7 @@ test.describe("MR-019 app shell — real browser", () => {
     await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
     await expect(page.getByText("acme/sandbox", { exact: true })).toHaveCount(0);
     await page.getByTestId("repos-next").click();
-    await expect(page).toHaveURL(/\/git\/repos\?limit=1&cursor=rl1_/);
+    await expect(page).toHaveURL(/\/git\/repos\?limit=1&cursor=rl2_/);
     await expect(page.getByText("acme/sandbox", { exact: true })).toBeVisible();
     await expect(page.getByText("acme/myelin", { exact: true })).toHaveCount(0);
 

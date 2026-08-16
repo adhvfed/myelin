@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { parseRepoHome } from "./repo-read-response";
 import { parseRepoListPage } from "./repo-list-response";
 
-const CURSOR = "rl1_YWNtZS9teWVsaW4";
+const CURSOR = "rl2_AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGgAGMDFKMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDJteWVsaW4";
 
 describe("repository catalogue summary response", () => {
   it("decodes summary rows without weakening the full RepoHome contract", () => {
@@ -44,7 +44,7 @@ describe("repository catalogue summary response", () => {
     { items: [], page: { next_cursor: null, limit: 0 } },
     { items: [], page: { next_cursor: null, limit: 101 } },
     { items: [], page: { next_cursor: "opaque", limit: 1 } },
-    { items: [], page: { next_cursor: "rl1_YR", limit: 1 } },
+    { items: [], page: { next_cursor: "rl2_YR", limit: 1 } },
     { items: [], page: { next_cursor: null, limit: 1, total: 0 } },
     { items: [], page: { next_cursor: null, limit: 1 }, internal: true },
   ])("rejects malformed or out-of-bounds summary payload %#", (value) => {

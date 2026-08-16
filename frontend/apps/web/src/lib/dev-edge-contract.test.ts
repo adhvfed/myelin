@@ -152,7 +152,11 @@ describe("the dev Edge repository summary contract", () => {
         slug: "acme/myelin",
         clone_url: "/acme/eu-west/myelin.git",
       }],
-      page: { next_cursor: "rl1_YWNtZS9teWVsaW4", limit: 1 },
+      page: {
+        next_cursor:
+          "rl2_AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGgAGMDFKMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDJteWVsaW4",
+        limit: 1,
+      },
     });
     expect(first.items[0]).not.toHaveProperty("default_branch");
     expect(first.items[0]).not.toHaveProperty("entries");
@@ -174,7 +178,7 @@ describe("the dev Edge repository summary contract", () => {
       "", "view=home", "view=summary&view=summary", "view=summary&other=1",
       "view=summary&limit=01", "view=summary&limit=0", "view=summary&limit=101",
       "view=summary&cursor=", "view=summary&cursor=opaque",
-      "view=summary&cursor=rl1_YR", `view=summary&cursor=rl1_${"a".repeat(512)}`,
+      "view=summary&cursor=rl2_YR", `view=summary&cursor=rl2_${"a".repeat(512)}`,
       "x".repeat(16 * 1024 + 1),
     ]) expect(parseRepoSummaryQuery(query), query).toBeNull();
   });

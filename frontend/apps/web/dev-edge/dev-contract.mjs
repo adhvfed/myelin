@@ -115,6 +115,11 @@ export const SEED_REPO_SUMMARIES = [
   },
 ];
 
+const SEED_REPO_CATALOGUE_KEYS = new Map([
+  ["myelin", "01J00000000000000000000002"],
+  ["sandbox", "01J00000000000000000000001"],
+]);
+
 // Legacy no-view catalogue fixture retained while old clients migrate to the summary projection.
 export function reposEnvelope(limit = 50) {
   return { items: SEED_REPO_HOMES, page: { next_cursor: null, limit } };
@@ -122,29 +127,59 @@ export function reposEnvelope(limit = 50) {
 
 const REPO_LIST_QUERY_MAX_BYTES = 16 * 1024;
 const REPO_LIST_CURSOR_MAX_BYTES = 512;
+const REPO_LIST_CURSOR_FIXED_BYTES = 36;
+const REPO_LIST_CURSOR_MAX_CATALOGUE_KEY_BYTES = 64;
 
-function repoListCursor(slug) {
-  return `rl1_${Buffer.from(slug, "utf8").toString("base64url")}`;
+function repoListCursor(position) {
+  const catalogueKeyBytes = position.catalogueKey === null
+    ? Buffer.alloc(0)
+    : Buffer.from(position.catalogueKey, "ascii");
+  if (catalogueKeyBytes.length > REPO_LIST_CURSOR_MAX_CATALOGUE_KEY_BYTES) return null;
+  const { slug } = position;
+  const slugBytes = Buffer.from(slug, "utf8");
+  const frame = Buffer.alloc(
+    REPO_LIST_CURSOR_FIXED_BYTES + catalogueKeyBytes.length + slugBytes.length,
+  );
+  frame[0] = 2;
+  frame[33] = catalogueKeyBytes.length;
+  frame.writeUInt16BE(slugBytes.length, 34);
+  catalogueKeyBytes.copy(frame, REPO_LIST_CURSOR_FIXED_BYTES);
+  slugBytes.copy(frame, REPO_LIST_CURSOR_FIXED_BYTES + catalogueKeyBytes.length);
+  return `rl2_${frame.toString("base64url")}`;
 }
 
 function decodeRepoListCursor(cursor) {
   if (typeof cursor !== "string" || textEncoder.encode(cursor).byteLength > REPO_LIST_CURSOR_MAX_BYTES ||
-      !/^rl1_[A-Za-z0-9_-]+$/.test(cursor)) return null;
+      !/^rl2_[A-Za-z0-9_-]+$/.test(cursor)) return null;
   try {
-    const encoded = cursor.slice("rl1_".length);
+    const encoded = cursor.slice("rl2_".length);
     const bytes = Buffer.from(encoded, "base64url");
-    if (bytes.toString("base64url") !== encoded) return null;
-    const slug = bytes.toString("utf8");
-    if (!slug || Buffer.from(slug, "utf8").compare(bytes) !== 0 ||
+    if (bytes.toString("base64url") !== encoded ||
+        bytes.length < REPO_LIST_CURSOR_FIXED_BYTES || bytes[0] !== 2) return null;
+    const catalogueKeyLength = bytes[33];
+    const slugLength = bytes.readUInt16BE(34);
+    if (catalogueKeyLength > REPO_LIST_CURSOR_MAX_CATALOGUE_KEY_BYTES || slugLength === 0 ||
+        bytes.length !== REPO_LIST_CURSOR_FIXED_BYTES + catalogueKeyLength + slugLength) return null;
+    const catalogueKey = bytes.subarray(
+      REPO_LIST_CURSOR_FIXED_BYTES,
+      REPO_LIST_CURSOR_FIXED_BYTES + catalogueKeyLength,
+    );
+    if ([...catalogueKey].some((byte) =>
+      !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+        (byte >= 97 && byte <= 122)))) return null;
+    const catalogueKeyValue = catalogueKey.toString("ascii");
+    const slugBytes = bytes.subarray(REPO_LIST_CURSOR_FIXED_BYTES + catalogueKeyLength);
+    const slug = slugBytes.toString("utf8");
+    if (!slug || Buffer.from(slug, "utf8").compare(slugBytes) !== 0 ||
         !slug.split("/").every((part) => part && part !== "." && part !== ".." &&
           /^[A-Za-z0-9._-]+$/.test(part))) return null;
-    return slug;
+    return { catalogueKey: catalogueKeyLength === 0 ? null : catalogueKeyValue, slug };
   } catch {
     return null;
   }
 }
 
-/** Strict summary-list query grammar: exact view, canonical decimal limit, canonical rl1 cursor. */
+/** Strict summary-list query grammar: exact view, canonical decimal limit, canonical rl2 cursor. */
 export function parseRepoSummaryQuery(rawQuery) {
   if (typeof rawQuery !== "string" ||
       textEncoder.encode(rawQuery).byteLength > REPO_LIST_QUERY_MAX_BYTES) return null;
@@ -171,12 +206,28 @@ export function repoSummaryEnvelope(options = {}) {
   const after = options.cursor === undefined ? null : decodeRepoListCursor(options.cursor);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
       (options.cursor !== undefined && after === null)) return null;
+  const position = (row) => {
+    const slug = bareName(row.slug);
+    return { catalogueKey: SEED_REPO_CATALOGUE_KEYS.get(slug) ?? null, slug };
+  };
+  const compare = (left, right) => {
+    if (left.catalogueKey !== null && right.catalogueKey !== null) {
+      return left.catalogueKey > right.catalogueKey ? -1
+        : left.catalogueKey < right.catalogueKey ? 1
+        : left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0;
+    }
+    if (left.catalogueKey !== null) return -1;
+    if (right.catalogueKey !== null) return 1;
+    return left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0;
+  };
   const sorted = [...SEED_REPO_SUMMARIES].sort((left, right) =>
-    left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0);
-  const remaining = after === null ? sorted : sorted.filter((row) => row.slug > after);
+    compare(position(left), position(right)));
+  const remaining = after === null
+    ? sorted
+    : sorted.filter((row) => compare(position(row), after) > 0);
   const items = remaining.slice(0, limit);
   const next = remaining.length > items.length && items.length > 0
-    ? repoListCursor(items.at(-1).slug)
+    ? repoListCursor(position(items.at(-1)))
     : null;
   return { items, page: { next_cursor: next, limit } };
 }
