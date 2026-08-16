@@ -638,7 +638,7 @@ const server = createServer((req, res) => {
     if (url.search) return send(res, 400, { error: { message: "Knowledge mutations accept no query", code: "bad_request" } });
     let raw = ""; req.on("data", (chunk) => (raw += chunk)); req.on("end", () => {
       let body; try { body = JSON.parse(raw); } catch { return send(res, 400, { error: { message: "invalid Knowledge page body", code: "bad_request" } }); }
-      const output = knowledge.create(body); if (output.status === 400) return send(res, 400, { error: { message: "invalid Knowledge page body", code: "bad_request" } });
+      const output = knowledge.create(body, req.headers["idempotency-key"]); if (output.status === 400) return send(res, 400, { error: { message: "invalid Knowledge page body or Idempotency-Key", code: "bad_request" } });
       state.emptyKnowledge = false;
       if (state.knowledgeCreateResponseLosses > 0) {
         state.knowledgeCreateResponseLosses -= 1;

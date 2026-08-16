@@ -72,8 +72,8 @@ export const knowledgeMutate = action(async (mutation: KnowledgeMutation) => {
       if (!draft || Object.keys(mutation).some((key) => !["op", "title", "template", "visibility", "clientNonce"].includes(key))) return respond({ ok: false, error: "bad-input" });
       const receipt = await authed(async () => {
         const parsed = parseKnowledgeCreateReceipt(await edgePost("/v1/knowledge/pages", {
-          title: draft.title, template: draft.template, visibility: draft.visibility, client_nonce: draft.clientNonce,
-        }));
+          title: draft.title, template: draft.template, visibility: draft.visibility,
+        }, { idempotencyKey: draft.clientNonce }));
         if (!parsed) throw new KnowledgeRouteError("error");
         return parsed;
       });

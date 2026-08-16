@@ -6,6 +6,7 @@ function ulid(sequence) { return encode(1_760_000_000_000n + BigInt(sequence), 1
 function exact(value, keys) { return value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === keys.length && Object.keys(value).every((key) => keys.includes(key)); }
 function clean(value, max, empty = false) { return typeof value === "string" && (empty || value.length > 0) && Buffer.byteLength(value, "utf8") <= max && !value.includes("\0"); }
 const TYPES = ["paragraph", "heading", "bullet_list", "ordered_list", "task_list", "blockquote", "code_block", "callout", "divider"];
+function operationId(value) { return typeof value === "string" && /^[!-~]{1,128}$/.test(value); }
 
 function blocksFor(template) {
   if (template === "blank") return [["paragraph", ""]];
@@ -39,13 +40,13 @@ export class KnowledgeFixtures {
   list({ cursor, limit }) { const ordered = [...this.pages].sort((a, b) => b.id.localeCompare(a.id)); const eligible = cursor ? ordered.filter((row) => row.id < cursor) : ordered; const items = eligible.slice(0, limit); return { items: items.map(summary), page: { next_cursor: eligible.length > items.length ? items.at(-1)?.id ?? null : null, limit } }; }
   get(id) { const row = this.pages.find((page) => page.id === id); return row ? document(row) : null; }
   bump(id) { const row = this.pages.find((page) => page.id === id); if (!row) return false; row.version += 1; row.updated_at += 1; return true; }
-  create(body) {
-    if (!exact(body, ["title", "template", "visibility", "client_nonce"]) || !clean(body.title, 512) || body.title.trim() !== body.title || !["private", "team"].includes(body.visibility) || !/^[A-Za-z0-9_-]{1,128}$/.test(body.client_nonce)) return { status: 400 };
+  create(body, idempotencyKey) {
+    if (!exact(body, ["title", "template", "visibility"]) || !clean(body.title, 512) || body.title.trim() !== body.title || !["private", "team"].includes(body.visibility) || !operationId(idempotencyKey)) return { status: 400 };
     const template = blocksFor(body.template); if (!template) return { status: 400 };
-    const existingId = this.nonces.get(body.client_nonce); if (existingId) return { status: 200, json: { page: this.get(existingId), created: false, durable: true } };
+    const existingId = this.nonces.get(idempotencyKey); if (existingId) return { status: 200, json: { page: this.get(existingId), created: false, durable: true } };
     const id = ulid(++this.sequence); const timestamp = 1_760_010_000 + this.sequence;
     const row = { id, title: body.title, visibility: body.visibility, version: 1, created_at: timestamp, updated_at: timestamp, blocks: template.map(([type, markdown]) => ({ id: ulid(++this.sequence), type, markdown })) };
-    this.pages.push(row); this.nonces.set(body.client_nonce, id);
+    this.pages.push(row); this.nonces.set(idempotencyKey, id);
     return { status: 201, json: { page: document(row), created: true, durable: true } };
   }
   save(id, body) {

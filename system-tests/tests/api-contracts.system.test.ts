@@ -51,7 +51,6 @@ describe("external API contracts", () => {
         title: "Strict page",
         template: "blank",
         visibility: "team",
-        client_nonce: "strict-page",
         ignored: true,
       },
       expectedStatus: 400,
@@ -64,6 +63,28 @@ describe("external API contracts", () => {
       expectedStatus: 400,
     });
     expectError(issues.body, "bad_request");
+  });
+
+  test("keeps Knowledge retry identity in the standard operation header", async () => {
+    const body = {
+      title: "Header-scoped retry contract",
+      template: "blank",
+      visibility: "private",
+    };
+    const missing = await systemClient.json("/v1/knowledge/pages", {
+      method: "POST",
+      body,
+      idempotencyKey: false,
+      expectedStatus: 400,
+    });
+    expectError(missing.body, "bad_request");
+
+    const legacy = await systemClient.json("/v1/knowledge/pages", {
+      method: "POST",
+      body: { ...body, client_nonce: "legacy-body-token" },
+      expectedStatus: 400,
+    });
+    expectError(legacy.body, "bad_request");
   });
 
   test("enforces interactive payload limits before durable work", async () => {
@@ -80,7 +101,6 @@ describe("external API contracts", () => {
         title: "x".repeat(321 * 1_024),
         template: "blank",
         visibility: "team",
-        client_nonce: "oversized-page",
       },
       expectedStatus: 413,
     });

@@ -1,0 +1,37 @@
+import { describe, expect, it } from "vitest";
+
+import { KnowledgeFixtures } from "../../dev-edge/knowledge-contract.mjs";
+
+const page = {
+  title: "Retry-safe runbook",
+  template: "runbook",
+  visibility: "team",
+};
+
+describe("the development Knowledge mutation contract", () => {
+  it("replays one header-scoped operation without cloning its page", () => {
+    const knowledge = new KnowledgeFixtures();
+    knowledge.reset({ empty: true });
+
+    const created = knowledge.create(page, "create-runbook-1");
+    const replayed = knowledge.create(page, "create-runbook-1");
+    const createdId = created.json?.page?.id;
+
+    expect(created).toMatchObject({ status: 201, json: { created: true } });
+    expect(createdId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    expect(replayed).toMatchObject({
+      status: 200,
+      json: { created: false, page: { id: createdId } },
+    });
+    expect(knowledge.list({ cursor: undefined, limit: 100 }).items).toHaveLength(1);
+  });
+
+  it("rejects missing operation identity and the retired body-carried token", () => {
+    const knowledge = new KnowledgeFixtures();
+    knowledge.reset({ empty: true });
+
+    expect(knowledge.create(page, undefined)).toEqual({ status: 400 });
+    expect(knowledge.create({ ...page, client_nonce: "legacy" }, "create-runbook-2"))
+      .toEqual({ status: 400 });
+  });
+});

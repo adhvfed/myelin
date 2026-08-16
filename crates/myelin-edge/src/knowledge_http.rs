@@ -166,7 +166,6 @@ struct CreatePageBody {
     title: String,
     template: String,
     visibility: String,
-    client_nonce: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -218,11 +217,9 @@ impl Handler for PageCreateHandler {
         require_empty_query(ctx)?;
         let body: CreatePageBody = parse_body(&ctx.request.body)?;
         validate_title(&body.title)?;
-        let client_nonce = client_nonce(
-            ctx.request,
-            &ctx.principal.principal_id.0,
-            body.client_nonce.as_deref(),
-        )?;
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
         let visibility = parse_visibility(&body.visibility)?;
         let template = template_blocks(&body.template)?;
         let page_id = self.api.mint_id();
@@ -617,35 +614,6 @@ fn validate_title(value: &str) -> Result<(), EdgeError> {
     }
 }
 
-fn validate_nonce(value: &str) -> Result<(), EdgeError> {
-    if !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        Ok(())
-    } else {
-        Err(EdgeError::BadRequest(
-            "Knowledge client_nonce must be 1-128 URL-safe characters".into(),
-        ))
-    }
-}
-
-fn client_nonce(
-    request: &crate::request::EdgeRequest,
-    principal_id: &str,
-    explicit: Option<&str>,
-) -> Result<String, EdgeError> {
-    match explicit {
-        Some(value) => {
-            validate_nonce(value)?;
-            Ok(value.to_string())
-        }
-        None => request.stable_idempotency_nonce(principal_id),
-    }
-}
-
 fn validate_document(
     principal: &Principal,
     blocks: &[BlockBody],
@@ -982,6 +950,18 @@ mod tests {
         )
         .is_ok());
         assert!(validate_document(&principal(), &[]).is_err());
+    }
+
+    #[test]
+    fn creation_body_contains_domain_input_not_retry_transport_metadata() {
+        assert!(parse_body::<CreatePageBody>(
+            br#"{"title":"Runbook","template":"blank","visibility":"team"}"#
+        )
+        .is_ok());
+        assert!(parse_body::<CreatePageBody>(
+            br#"{"title":"Runbook","template":"blank","visibility":"team","client_nonce":"legacy"}"#
+        )
+        .is_err());
     }
 
     #[test]
