@@ -12,6 +12,7 @@ use myelin_events::MonotonicMinter;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 use myelin_git::api::{
     http_catalogue, valid_code_search_query, valid_code_search_repo, Method as GitMethod,
+    Operation as GitOperation,
 };
 use myelin_git::check_status::GitOid;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};

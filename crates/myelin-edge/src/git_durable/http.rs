@@ -3104,54 +3104,47 @@ fn pr_review_guarded(be: &Arc<DurableGitBackend>, inner: Arc<dyn Handler>) -> Ar
 pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> GatewayBuilder {
     use RepoPermission::{ApproveUntrustedCi, ProtectedPush, Pull, Push};
     for ep in http_catalogue() {
-        let pattern = match (ep.method, ep.path) {
-            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
+        let pattern = match ep.operation {
+            GitOperation::ReadBlob | GitOperation::WriteBlob => {
                 reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
             }
-            (GitMethod::Get, "/api/git/repos/{repo}/blame/{ref}/{path}") => {
-                reroot("/api/git/repos/{repo}/blame/{ref}/{...path}")
-            }
-            (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
-                reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
-            }
-            _ => reroot(ep.path),
+            GitOperation::BlameBlob => reroot("/api/git/repos/{repo}/blame/{ref}/{...path}"),
+            _ => reroot(ep.path()),
         };
-        let method = map_method(ep.method);
-        let (handler, action): (Arc<dyn Handler>, &'static str) = match (ep.method, ep.path) {
-            (GitMethod::Get, "/api/git/repos") => {
+        let method = map_method(ep.method());
+        let (handler, action): (Arc<dyn Handler>, &'static str) = match ep.operation {
+            GitOperation::ListRepositories => {
                 (Arc::new(DRepoList { be: be.clone() }), "git.repos.list")
             }
-            (GitMethod::Post, "/api/git/repos") => {
+            GitOperation::CreateRepository => {
                 (Arc::new(DRepoCreate { be: be.clone() }), "git.repo.create")
             }
-            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}") => (
+            GitOperation::ViewPullRequest => (
                 pr_read_guarded(&be, Arc::new(DPrOverview { be: be.clone() })),
                 "git.pr.view",
             ),
-            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}/checks") => (
+            GitOperation::ViewPullRequestChecks => (
                 pr_read_guarded(&be, Arc::new(DPrChecks { be: be.clone() })),
                 "git.pr.checks",
             ),
-            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
-                (Arc::new(DBlobView { be: be.clone() }), "git.blob.view")
-            }
-            (GitMethod::Get, "/api/git/repos/{repo}/blame/{ref}/{path}") => (
+            GitOperation::ReadBlob => (Arc::new(DBlobView { be: be.clone() }), "git.blob.view"),
+            GitOperation::BlameBlob => (
                 guarded(&be, Pull, Arc::new(DBlameView { be: be.clone() })),
                 "git.blame.view",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
+            GitOperation::WriteBlob => (
                 guarded(&be, Push, Arc::new(DWebEditCommit { be: be.clone() })),
                 "git.blob.commit",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs") => (
+            GitOperation::OpenPullRequest => (
                 guarded(&be, Push, Arc::new(DOpenPr { be: be.clone() })),
                 "git.pr.open",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/reviews") => (
+            GitOperation::ReviewPullRequest => (
                 pr_review_guarded(&be, Arc::new(DPrReview { be: be.clone() })),
                 "git.pr.review",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => (
+            GitOperation::EndorseForkCi => (
                 guarded(
                     &be,
                     ApproveUntrustedCi,
@@ -3159,11 +3152,11 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 ),
                 "git.pr.endorse_fork_ci",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/merge") => (
+            GitOperation::MergePullRequest => (
                 guarded(&be, ProtectedPush, Arc::new(DMerge { be: be.clone() })),
                 "git.pr.merge",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/branch-protection") => (
+            GitOperation::SetBranchProtection => (
                 guarded(
                     &be,
                     ProtectedPush,
@@ -3171,17 +3164,13 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 ),
                 "git.repo.branch_protection.set",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/checks") => (
+            GitOperation::ReportPullRequestChecks => (
                 guarded(&be, Push, Arc::new(DReportChecks { be: be.clone() })),
                 "git.checks.report",
             ),
-            (GitMethod::Get, "/api/git/search/code") => {
+            GitOperation::SearchCode => {
                 (Arc::new(DCodeSearch { be: be.clone() }), "git.search.code")
             }
-            (_, other) => (
-                Arc::new(DCodeSearch { be: be.clone() }),
-                Box::leak(format!("git.unmapped:{other}").into_boxed_str()),
-            ),
         };
         b = b.route(method, &pattern, action, handler);
     }

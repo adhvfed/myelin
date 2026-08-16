@@ -2,7 +2,7 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx, Method, API_VERSION};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
-use myelin_git::api::{http_catalogue, Method as GitMethod};
+use myelin_git::api::{http_catalogue, Method as GitMethod, Operation as GitOperation};
 use myelin_git::web::{
     representative_pr_page, PrOverviewPage, RepoHome, WebEditForm, WebEditOutcome,
 };
@@ -267,6 +267,19 @@ impl Handler for CodeSearchHandler {
 struct DeferredWriteHandler {
     action: &'static str,
 }
+
+struct DurableOnlyHandler {
+    operation: &'static str,
+}
+
+impl Handler for DurableOnlyHandler {
+    fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        Err(EdgeError::Unavailable(format!(
+            "{} requires the durable Git backend",
+            self.operation
+        )))
+    }
+}
 impl Handler for DeferredWriteHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let body = if ctx.request.body.is_empty() {
@@ -355,85 +368,98 @@ pub(crate) fn map_method(m: GitMethod) -> Method {
 
 pub fn register_git(mut b: GatewayBuilder, state: Arc<GitEdgeState>) -> GatewayBuilder {
     for ep in http_catalogue() {
-        let pattern = match (ep.method, ep.path) {
-            (GitMethod::Get | GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
+        let pattern = match ep.operation {
+            GitOperation::ReadBlob | GitOperation::WriteBlob => {
                 reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
             }
-            _ => reroot(ep.path),
+            GitOperation::BlameBlob => reroot("/api/git/repos/{repo}/blame/{ref}/{...path}"),
+            _ => reroot(ep.path()),
         };
-        let method = map_method(ep.method);
-        let (handler, action): (Arc<dyn Handler>, &'static str) = match (ep.method, ep.path) {
-            (GitMethod::Get, "/api/git/repos") => (
+        let method = map_method(ep.method());
+        let (handler, action): (Arc<dyn Handler>, &'static str) = match ep.operation {
+            GitOperation::ListRepositories => (
                 Arc::new(RepoListHandler {
                     state: state.clone(),
                 }),
                 "git.repos.list",
             ),
-            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}") => (
+            GitOperation::ViewPullRequest => (
                 Arc::new(PrOverviewHandler {
                     state: state.clone(),
                 }),
                 "git.pr.view",
             ),
-            (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}/checks") => (
+            GitOperation::ViewPullRequestChecks => (
                 Arc::new(PrChecksHandler {
                     state: state.clone(),
                 }),
                 "git.pr.checks",
             ),
-            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
+            GitOperation::ReadBlob => (
                 Arc::new(BlobViewHandler {
                     state: state.clone(),
                 }),
                 "git.blob.view",
             ),
-            (GitMethod::Get, "/api/git/search/code") => (
+            GitOperation::BlameBlob => (
+                Arc::new(DurableOnlyHandler {
+                    operation: "git blame",
+                }),
+                "git.blame.view",
+            ),
+            GitOperation::SearchCode => (
                 Arc::new(CodeSearchHandler {
                     state: state.clone(),
                 }),
                 "git.search.code",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
+            GitOperation::WriteBlob => (
                 Arc::new(WebEditCommitHandler {
                     state: state.clone(),
                 }),
                 "git.blob.commit",
             ),
-            (GitMethod::Post, "/api/git/repos") => (
+            GitOperation::CreateRepository => (
                 Arc::new(DeferredWriteHandler {
                     action: "git.repo.create",
                 }),
                 "git.repo.create",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs") => (
+            GitOperation::OpenPullRequest => (
                 Arc::new(DeferredWriteHandler {
                     action: "git.pr.open",
                 }),
                 "git.pr.open",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/reviews") => (
+            GitOperation::ReviewPullRequest => (
                 Arc::new(DeferredWriteHandler {
                     action: "git.pr.review",
                 }),
                 "git.pr.review",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => (
+            GitOperation::EndorseForkCi => (
                 Arc::new(DeferredWriteHandler {
                     action: "git.pr.endorse_fork_ci",
                 }),
                 "git.pr.endorse_fork_ci",
             ),
-            (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/merge") => (
+            GitOperation::MergePullRequest => (
                 Arc::new(DeferredWriteHandler {
                     action: "git.pr.merge",
                 }),
                 "git.pr.merge",
             ),
-            (_, other) => (
+            GitOperation::SetBranchProtection => (
                 Arc::new(DeferredWriteHandler {
-                    action: "git.unmapped",
+                    action: "git.repo.branch_protection.set",
                 }),
-                Box::leak(format!("git.unmapped:{other}").into_boxed_str()),
+                "git.repo.branch_protection.set",
+            ),
+            GitOperation::ReportPullRequestChecks => (
+                Arc::new(DeferredWriteHandler {
+                    action: "git.checks.report",
+                }),
+                "git.checks.report",
             ),
         };
         b = b.route(method, &pattern, action, handler);
@@ -509,12 +535,17 @@ mod tests {
             crate::gateway::Gateway::builder(test_authn(), test_human(), Arc::new(crate::AllowAll)),
             state,
         );
-        let gw = b.build();
-        let _ = gw;
+        let actions = b.registered_actions().collect::<Vec<_>>();
         assert_eq!(
+            actions.len(),
             http_catalogue().len(),
-            14,
-            "the git catalogue surface is stable"
+            "each Git catalogue operation mounts exactly one route"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| !action.starts_with("git.unmapped")),
+            "every Git catalogue operation has a named handler and policy action"
         );
     }
 

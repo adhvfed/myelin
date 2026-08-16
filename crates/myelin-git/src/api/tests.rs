@@ -4,11 +4,11 @@ use serde_json::json;
 #[test]
 fn every_write_endpoint_is_id_checked_bus2() {
     for ep in http_catalogue() {
-        if ep.method.is_write() {
+        if ep.method().is_write() {
             assert!(
                 ep.is_id_checked(),
                 "write endpoint {} is not Id.check-gated (BUS-2 violation)",
-                ep.path
+                ep.path()
             );
         }
     }
@@ -17,23 +17,24 @@ fn every_write_endpoint_is_id_checked_bus2() {
 #[test]
 fn endpoint_constructor_refuses_an_ungated_write() {
     assert!(
-        Endpoint::new(
-            Method::Post,
-            "/api/git/repos/{repo}/prs/{n}/merge",
-            Handler::MergeGate,
-            false
-        )
-        .is_none(),
+        Endpoint::new(Operation::MergePullRequest, false).is_none(),
         "an un-gated write endpoint must be refused"
     );
-    assert!(Endpoint::new(Method::Post, "/x", Handler::Lifecycle, true).is_some());
-    assert!(Endpoint::new(Method::Get, "/x", Handler::Project, false).is_some());
+    assert!(Endpoint::new(Operation::CreateRepository, true).is_some());
+    assert!(Endpoint::new(Operation::ViewPullRequest, false).is_some());
 }
 
 #[test]
 fn the_catalogue_covers_the_arch_section_4_endpoints() {
     let cat = http_catalogue();
-    let paths: Vec<&str> = cat.iter().map(|e| e.path).collect();
+    assert_eq!(
+        cat.iter()
+            .map(|endpoint| endpoint.operation)
+            .collect::<Vec<_>>(),
+        Operation::ALL,
+        "each operation has exactly one catalogue row in canonical order"
+    );
+    let paths: Vec<&str> = cat.iter().map(Endpoint::path).collect();
     for expected in [
         "/api/git/repos",
         "/api/git/repos/{repo}/prs/{n}",
@@ -49,15 +50,15 @@ fn the_catalogue_covers_the_arch_section_4_endpoints() {
             "the catalogue is missing arch §4 endpoint {expected}"
         );
     }
-    let merge = cat.iter().find(|e| e.path.ends_with("/merge")).unwrap();
-    assert_eq!(merge.handler, Handler::MergeGate);
-    let checks = cat.iter().find(|e| e.path.ends_with("/checks")).unwrap();
-    assert_eq!(checks.handler, Handler::CheckStatus);
+    let merge = cat.iter().find(|e| e.path().ends_with("/merge")).unwrap();
+    assert_eq!(merge.handler(), Handler::MergeGate);
+    let checks = cat.iter().find(|e| e.path().ends_with("/checks")).unwrap();
+    assert_eq!(checks.handler(), Handler::CheckStatus);
     let endorse = cat
         .iter()
-        .find(|e| e.path.ends_with("/endorse-fork-ci"))
+        .find(|e| e.path().ends_with("/endorse-fork-ci"))
         .unwrap();
-    assert_eq!(endorse.handler, Handler::ForkEndorse);
+    assert_eq!(endorse.handler(), Handler::ForkEndorse);
 }
 
 #[test]

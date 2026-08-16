@@ -23,39 +23,134 @@ pub enum Handler {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    ListRepositories,
+    CreateRepository,
+    ViewPullRequest,
+    ViewPullRequestChecks,
+    OpenPullRequest,
+    ReviewPullRequest,
+    EndorseForkCi,
+    MergePullRequest,
+    SetBranchProtection,
+    ReportPullRequestChecks,
+    ReadBlob,
+    BlameBlob,
+    WriteBlob,
+    SearchCode,
+}
+
+impl Operation {
+    pub const ALL: [Operation; 14] = [
+        Operation::ListRepositories,
+        Operation::CreateRepository,
+        Operation::ViewPullRequest,
+        Operation::ViewPullRequestChecks,
+        Operation::OpenPullRequest,
+        Operation::ReviewPullRequest,
+        Operation::EndorseForkCi,
+        Operation::MergePullRequest,
+        Operation::SetBranchProtection,
+        Operation::ReportPullRequestChecks,
+        Operation::ReadBlob,
+        Operation::BlameBlob,
+        Operation::WriteBlob,
+        Operation::SearchCode,
+    ];
+
+    pub const fn method(self) -> Method {
+        match self {
+            Operation::ListRepositories
+            | Operation::ViewPullRequest
+            | Operation::ViewPullRequestChecks
+            | Operation::ReadBlob
+            | Operation::BlameBlob
+            | Operation::SearchCode => Method::Get,
+            Operation::CreateRepository
+            | Operation::OpenPullRequest
+            | Operation::ReviewPullRequest
+            | Operation::EndorseForkCi
+            | Operation::MergePullRequest
+            | Operation::SetBranchProtection
+            | Operation::ReportPullRequestChecks
+            | Operation::WriteBlob => Method::Post,
+        }
+    }
+
+    pub const fn path(self) -> &'static str {
+        match self {
+            Operation::ListRepositories | Operation::CreateRepository => "/api/git/repos",
+            Operation::ViewPullRequest => "/api/git/repos/{repo}/prs/{n}",
+            Operation::ViewPullRequestChecks | Operation::ReportPullRequestChecks => {
+                "/api/git/repos/{repo}/prs/{n}/checks"
+            }
+            Operation::OpenPullRequest => "/api/git/repos/{repo}/prs",
+            Operation::ReviewPullRequest => "/api/git/repos/{repo}/prs/{n}/reviews",
+            Operation::EndorseForkCi => "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci",
+            Operation::MergePullRequest => "/api/git/repos/{repo}/prs/{n}/merge",
+            Operation::SetBranchProtection => "/api/git/repos/{repo}/branch-protection",
+            Operation::ReadBlob | Operation::WriteBlob => "/api/git/repos/{repo}/blob/{ref}/{path}",
+            Operation::BlameBlob => "/api/git/repos/{repo}/blame/{ref}/{path}",
+            Operation::SearchCode => "/api/git/search/code",
+        }
+    }
+
+    pub const fn handler(self) -> Handler {
+        match self {
+            Operation::ListRepositories => Handler::ListFilter,
+            Operation::CreateRepository
+            | Operation::OpenPullRequest
+            | Operation::ReviewPullRequest => Handler::Lifecycle,
+            Operation::ViewPullRequest | Operation::ReadBlob | Operation::BlameBlob => {
+                Handler::Project
+            }
+            Operation::ViewPullRequestChecks | Operation::ReportPullRequestChecks => {
+                Handler::CheckStatus
+            }
+            Operation::EndorseForkCi => Handler::ForkEndorse,
+            Operation::MergePullRequest => Handler::MergeGate,
+            Operation::SetBranchProtection => Handler::Settings,
+            Operation::WriteBlob => Handler::ReceivePack,
+            Operation::SearchCode => Handler::CodeSearch,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
-    pub method: Method,
-    pub path: &'static str,
-    pub handler: Handler,
+    pub operation: Operation,
     id_checked: bool,
 }
 
 impl Endpoint {
-    pub const fn checked(method: Method, path: &'static str, handler: Handler) -> Endpoint {
+    pub const fn checked(operation: Operation) -> Endpoint {
         Endpoint {
-            method,
-            path,
-            handler,
+            operation,
             id_checked: true,
         }
     }
 
-    pub fn new(
-        method: Method,
-        path: &'static str,
-        handler: Handler,
-        id_checked: bool,
-    ) -> Option<Endpoint> {
-        if method.is_write() && !id_checked {
+    pub fn new(operation: Operation, id_checked: bool) -> Option<Endpoint> {
+        if operation.method().is_write() && !id_checked {
             return None;
         }
         Some(Endpoint {
-            method,
-            path,
-            handler,
+            operation,
             id_checked,
         })
+    }
+
+    pub const fn method(&self) -> Method {
+        self.operation.method()
+    }
+
+    pub const fn path(&self) -> &'static str {
+        self.operation.path()
+    }
+
+    pub const fn handler(&self) -> Handler {
+        self.operation.handler()
     }
 
     pub const fn is_id_checked(&self) -> bool {
@@ -64,66 +159,7 @@ impl Endpoint {
 }
 
 pub fn http_catalogue() -> Vec<Endpoint> {
-    vec![
-        Endpoint::checked(Method::Get, "/api/git/repos", Handler::ListFilter),
-        Endpoint::checked(Method::Post, "/api/git/repos", Handler::Lifecycle),
-        Endpoint::checked(
-            Method::Get,
-            "/api/git/repos/{repo}/prs/{n}",
-            Handler::Project,
-        ),
-        Endpoint::checked(
-            Method::Get,
-            "/api/git/repos/{repo}/prs/{n}/checks",
-            Handler::CheckStatus,
-        ),
-        Endpoint::checked(
-            Method::Post,
-            "/api/git/repos/{repo}/prs",
-            Handler::Lifecycle,
-        ),
-        Endpoint::checked(
-            Method::Post,
-            "/api/git/repos/{repo}/prs/{n}/reviews",
-            Handler::Lifecycle,
-        ),
-        Endpoint::checked(
-            Method::Post,
-            "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci",
-            Handler::ForkEndorse,
-        ),
-        Endpoint::checked(
-            Method::Post,
-            "/api/git/repos/{repo}/prs/{n}/merge",
-            Handler::MergeGate,
-        ),
-        Endpoint::checked(
-            Method::Post,
-            "/api/git/repos/{repo}/branch-protection",
-            Handler::Settings,
-        ),
-        Endpoint::checked(
-            Method::Post,
-            "/api/git/repos/{repo}/prs/{n}/checks",
-            Handler::CheckStatus,
-        ),
-        Endpoint::checked(
-            Method::Get,
-            "/api/git/repos/{repo}/blob/{ref}/{path}",
-            Handler::Project,
-        ),
-        Endpoint::checked(
-            Method::Get,
-            "/api/git/repos/{repo}/blame/{ref}/{path}",
-            Handler::Project,
-        ),
-        Endpoint::checked(
-            Method::Post,
-            "/api/git/repos/{repo}/blob/{ref}/{path}",
-            Handler::ReceivePack,
-        ),
-        Endpoint::checked(Method::Get, "/api/git/search/code", Handler::CodeSearch),
-    ]
+    Operation::ALL.into_iter().map(Endpoint::checked).collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

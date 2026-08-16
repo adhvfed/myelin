@@ -242,8 +242,8 @@ async fn the_mounted_policy_admits_every_production_route() {
     );
 
     for ep in http_catalogue() {
-        let path = concretize(&ep.path.replacen("/api/git", "/v1/git", 1));
-        let (method, body) = match ep.method {
+        let path = concretize(&ep.path().replacen("/api/git", "/v1/git", 1));
+        let (method, body) = match ep.method() {
             GitMethod::Get => ("GET", Vec::new()),
             GitMethod::Post => ("POST", b"{}".to_vec()),
         };
