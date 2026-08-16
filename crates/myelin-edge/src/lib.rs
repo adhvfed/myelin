@@ -16,9 +16,9 @@ pub mod gateway;
 #[path = "git_durable/ci_surface.rs"]
 mod git_ci_surface;
 pub mod git_durable;
-pub mod git_edge;
 pub mod git_effect;
 pub mod git_receive_pack;
+mod git_route;
 pub mod git_wire_exec;
 pub mod git_wire_http;
 pub mod issue_authz;
@@ -75,7 +75,6 @@ pub use git_durable::{
     recover_placed_git_at_boot, register_git_durable, DurableGitBackend, GitBootRecoveryReport,
     GitCellBootRecoveryReport, GitDatabaseProviders,
 };
-pub use git_edge::{register_git, GitEdgeState};
 pub use git_effect::GitEffectApi;
 pub use git_wire_exec::{
     production_git_core, production_git_core_default, production_git_core_default_with_shutdown,

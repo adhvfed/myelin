@@ -50,3 +50,4 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-tenancy = { path = "../myelin-tenancy" }
+tempfile.workspace = true

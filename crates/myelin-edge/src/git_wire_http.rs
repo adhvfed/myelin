@@ -2,7 +2,7 @@ use crate::catalogue::{Handler, HandlerCtx, Method};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::DurableGitBackend;
-use crate::git_edge::{param, tenant_of};
+use crate::git_route::{param, tenant_of};
 use crate::repo_authz::RepoAccess;
 use crate::request::EdgeResponse;
 use myelin_git::core::{GitCore, GitCoreError, RepoLoc, Service};

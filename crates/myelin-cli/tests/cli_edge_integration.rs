@@ -1,5 +1,5 @@
 use myelin_edge::{
-    register_git, serve_edge, AllowAll, Gateway, GitEdgeState, Method, WhoamiHandler,
+    register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
 use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 const REGION: &str = "eu-west";
@@ -52,7 +53,7 @@ fn seed_tenant(store: &PrincipalStore, tenant: &str) {
         .expect("link credential");
 }
 
-fn build() -> (Arc<Gateway>, CellTokenAuthority) {
+fn build() -> (Arc<Gateway>, CellTokenAuthority, TempDir) {
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
     seed_tenant(&store, "acme");
@@ -66,15 +67,16 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
         Arc::new(KmsEngine::new()),
     )));
 
-    let git_state = Arc::new(GitEdgeState::new().seed_demo("acme"));
+    let root = tempfile::tempdir().expect("temporary Git root");
+    let git = Arc::new(DurableGitBackend::rooted_inmem_for_test(root.path()));
     let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
         Method::Get,
         "/v1/whoami",
         "edge.whoami",
         Arc::new(WhoamiHandler),
     );
-    builder = register_git(builder, git_state);
-    (Arc::new(builder.build()), cell)
+    builder = register_git_durable(builder, git);
+    (Arc::new(builder.build()), cell, root)
 }
 
 fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str) -> String {
@@ -127,30 +129,8 @@ fn run_cli(edge: &str, token: Option<&str>, args: &[&str]) -> (i32, String, Stri
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn git_repo_list_end_to_end_renders_the_viewmodel() {
-    let (gw, cell) = build();
-    let addr = spawn(gw).await;
-    let edge = format!("http://{addr}");
-    let token = mint(&cell, "acme", "jti-e2e");
-
-    let (code, stdout, stderr) = run_cli(&edge, Some(&token), &["git", "repo", "list"]);
-    assert_eq!(code, 0, "exit 0 on success; stderr={stderr}");
-    assert!(
-        stdout.contains("acme/myelin") && stdout.contains("[populated]"),
-        "renders the repo ViewModel; got: {stdout}"
-    );
-
-    let (jc, jout, _) = run_cli(&edge, Some(&token), &["--json", "git", "repo", "list"]);
-    assert_eq!(jc, 0);
-    let v: serde_json::Value = serde_json::from_str(&jout).expect("--json emits valid JSON");
-    assert_eq!(v["items"][0]["state"], "populated");
-    assert!(v["items"][0]["slug"].as_str().unwrap().starts_with("acme/"));
-    assert_eq!(v["page"]["limit"], 50);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forged_token_is_a_clean_unauthenticated_error_not_a_panic() {
-    let (gw, _cell) = build();
+    let (gw, _cell, _root) = build();
     let addr = spawn(gw).await;
     let edge = format!("http://{addr}");
     let forged = "acme|eu-west|subj-1|jti|0|agent:run";
@@ -168,7 +148,7 @@ async fn forged_token_is_a_clean_unauthenticated_error_not_a_panic() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_token_is_a_clean_unauthenticated_error() {
-    let (gw, _cell) = build();
+    let (gw, _cell, _root) = build();
     let addr = spawn(gw).await;
     let edge = format!("http://{addr}");
 
@@ -186,7 +166,7 @@ async fn missing_token_is_a_clean_unauthenticated_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whoami_renders_the_verified_principal() {
-    let (gw, cell) = build();
+    let (gw, cell, _root) = build();
     let addr = spawn(gw).await;
     let edge = format!("http://{addr}");
     let token = mint(&cell, "acme", "jti-whoami");
@@ -205,7 +185,7 @@ async fn whoami_renders_the_verified_principal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_token_is_never_echoed_to_stdout_or_stderr() {
-    let (gw, cell) = build();
+    let (gw, cell, _root) = build();
     let addr = spawn(gw).await;
     let edge = format!("http://{addr}");
     let token = mint(&cell, "acme", "jti-secret");
