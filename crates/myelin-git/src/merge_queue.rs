@@ -176,19 +176,19 @@ mod tests {
             .merge(&request())
             .expect_err("an un-endorsed fork success must refuse the merge");
         assert!(
-            err.0.contains("the merge gate did not admit"),
+            err.detail().contains("the merge gate did not admit"),
             "humanised: {}",
-            err.0
+            err
         );
         assert!(
-            err.0.contains("ci/test"),
+            err.detail().contains("ci/test"),
             "names the unmet context: {}",
-            err.0
+            err
         );
         assert!(
-            !err.0.contains("Blocked"),
+            !err.detail().contains("Blocked"),
             "no raw gate struct in the reason: {}",
-            err.0
+            err
         );
         assert_eq!(merges.get(), 0, "0 forks self-green their gate at merge");
     }
@@ -237,9 +237,9 @@ mod tests {
             .merge(&request())
             .expect_err("a missing required context must refuse the merge");
         assert!(
-            err.0.contains("ci/test"),
+            err.detail().contains("ci/test"),
             "names the missing context: {}",
-            err.0
+            err
         );
     }
 
@@ -253,7 +253,7 @@ mod tests {
             Err(ActivityError::retryable("merge conflict"))
         });
         let err = perf.merge(&request()).expect_err("the conflict propagates");
-        assert_eq!(err.0, "merge conflict");
+        assert_eq!(err.detail(), "merge conflict");
     }
 
     #[test]
