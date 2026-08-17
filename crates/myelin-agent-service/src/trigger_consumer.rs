@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use myelin_events::{Backoff, EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
-use myelin_identity::SetExpr;
+use myelin_identity::{PrincipalId, SetExpr};
 use myelin_query::{EvalError, EventMatcher, RelMembership};
 use myelin_storage::{
     AgentTriggerEvaluationErrorCode, DurableAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
     MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT,
 };
+
+use crate::loop_guards::SelfGuard;
 
 pub const TRIGGER_CONSUMER_NAME: &str = "agent-governed-trigger";
 pub const MAX_EVENT_BINDINGS: u32 = MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT;
@@ -112,6 +114,10 @@ impl GovernedTriggerConsumer {
             .with_timezone(&Utc);
 
         for binding in bindings {
+            let run_as = PrincipalId(format!("agent:{}", binding.run_as_agent_id));
+            if SelfGuard::new(run_as).admit_envelope(event).is_refused() {
+                continue;
+            }
             if !self
                 .visibility
                 .can_view(&binding, event)

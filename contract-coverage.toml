@@ -234,7 +234,10 @@ cdc = [
 row = "3.6"
 title = "reactive/dispatch tier"
 status = "covered"
-cdc = ["crates/myelin-query/tests/cdc_3_6_dispatch_tier.rs"]
+cdc = [
+    "crates/myelin-agent-service/src/trigger_consumer/tests.rs",
+    "crates/myelin-agent-service/tests/cdc_3_6_13_1_loop_guards.rs",
+]
 
 [[contract]]
 row = "4.1"

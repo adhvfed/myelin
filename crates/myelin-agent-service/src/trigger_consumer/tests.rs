@@ -5,7 +5,7 @@ use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler,
     EventId, EventType, HandleOutcome, Timestamp, Visibility,
 };
-use myelin_identity::{Literal, ObjectType, Principal, PrincipalId, PrincipalKind};
+use myelin_identity::{Literal, ObjectType, Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate};
 use myelin_storage::{
     AgentTriggerEvaluationErrorCode, AgentTriggerFiringState, DurableAgentTriggerBinding,
@@ -260,6 +260,49 @@ fn green_feature_and_revoked_visibility_are_quiet() {
             "non-matching or no-longer-visible work spends no trigger budget"
         );
     }
+}
+
+#[test]
+fn an_agent_cannot_fire_its_own_automation_but_neighbouring_agents_still_can() {
+    let self_binding = binding("refs/heads/main");
+    let mut neighbour_binding = self_binding.clone();
+    neighbour_binding.binding_id = "4bf441cb-33e1-49e1-91bc-bbb8b5a5217d".into();
+    neighbour_binding.run_as_agent_id = "20000000-0000-4000-8000-000000000002".into();
+    let store = Arc::new(RecordingStore {
+        bindings: vec![self_binding.clone(), neighbour_binding.clone()],
+        reservations: Mutex::new(Vec::new()),
+        diagnostics: Mutex::new(Vec::new()),
+    });
+    let consumer = GovernedTriggerConsumer::new(
+        "acme",
+        "fr-par",
+        store.clone(),
+        Arc::new(Visible(true)),
+        ignoring_approvals(),
+    );
+    let mut own_event = event("ci.run.failed", "refs/heads/main", "agent-authored-1");
+    own_event.actor = Actor(Principal::stub(
+        PrincipalId(format!("agent:{}", self_binding.run_as_agent_id)),
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("hosted:luna".into()),
+            on_behalf_of: Some(PrincipalId("founder".into())),
+        },
+        TenantId("acme".into()),
+    ));
+
+    assert_eq!(
+        consumer.handle(&own_event, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done,
+    );
+    assert_eq!(
+        *store.reservations.lock().unwrap(),
+        vec![(neighbour_binding.binding_id, "agent-authored-1".into())],
+        "the authoring agent spends nothing on its own event while an unrelated explicit automation remains live",
+    );
+    assert!(
+        store.diagnostics.lock().unwrap().is_empty(),
+        "a structural self-guard is a quiet non-match, not a broken automation",
+    );
 }
 
 #[test]

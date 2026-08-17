@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, onTestFinished, test } from "vitest";
 
 import { findAutomation } from "../src/automations.js";
 import { systemTestConfig } from "../src/config.js";
 import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/context.js";
+import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
-import { array, record, string } from "../src/json.js";
+import { array, record, string, type JsonRecord } from "../src/json.js";
 
 async function mapInBatches<Input, Output>(
   inputs: readonly Input[],
@@ -110,6 +111,150 @@ describe("automation delegation", () => {
       tokenScheme: "agent",
     });
     expect(closed.body).toMatchObject({ run: { id: runId, state: "closed" }, closed: true });
+  });
+
+  test("lets another actor wake an automation without feeding an agent its own work", async () => {
+    const founder = await browserApprovedCliClient();
+    const activated = await founder.json("/v1/agents", {
+      method: "POST",
+      body: {
+        name: uniqueName("self-quiet-agent"),
+        runtime: "hosted",
+        tools: ["chat.read_messages"],
+      },
+      idempotencyKey: `self-quiet-agent-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const agentId = string(record(activated.body.agent, "self-quiet agent").id, "agent id");
+    const conversation = await founder.json("/v1/chat/conversations", {
+      method: "POST",
+      body: {
+        project_id: systemTestConfig.issues.projectId,
+        channel: uniqueName("self-quiet-room"),
+        topic: "Agents should not assign their own echoes back to themselves",
+      },
+      idempotencyKey: `self-quiet-room-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const conversationId = string(
+      record(conversation.body.conversation, "self-quiet conversation").id,
+      "conversation id",
+    );
+    const message = await founder.json(
+      `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
+      {
+        method: "POST",
+        body: { content: "A stable visible message for the automation boundary." },
+        idempotencyKey: `self-quiet-message-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const messageId = string(message.body.message_id, "message id");
+    const eventType = `chat.message.self_guard_${randomUUID().replaceAll("-", "")}_tested`;
+
+    const created = await founder.json("/v1/triggers", {
+      method: "POST",
+      body: {
+        event_type: eventType,
+        run_as_agent_id: agentId,
+        task: "Read the message and prepare one concise response.",
+        budget_minor_units: 10_000,
+        max_firings: 2,
+        require_human_approval: true,
+      },
+      idempotencyKey: `self-quiet-trigger-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const triggerId = string(
+      record(created.body.trigger, "self-quiet automation").id,
+      "automation id",
+    );
+    onTestFinished(async () => {
+      await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}/disable`, {
+        method: "POST",
+        body: {},
+        expectedStatus: 200,
+      });
+    });
+
+    const now = new Date().toISOString();
+    const selfEventId = `self-authored-chat-${randomUUID()}`;
+    const humanEventId = `human-authored-chat-${randomUUID()}`;
+    const base: ExternalEventEnvelope = {
+      event_id: selfEventId,
+      type_: eventType,
+      schema_ver: 1,
+      tenant: systemTestConfig.tenant,
+      region: systemTestConfig.region,
+      actor: {
+        tenant: systemTestConfig.tenant,
+        region: systemTestConfig.region,
+        principal_id: `agent:${agentId}`,
+        kind: {
+          Agent: {
+            runtime_ref: "hosted:luna",
+            on_behalf_of: systemTestConfig.principal,
+          },
+        },
+        data_role: "Processor",
+        status: "Active",
+      },
+      subject: `myelin://${systemTestConfig.tenant}/chat/message/${messageId}`,
+      aggregate: `channel:${conversationId}`,
+      causation_id: null,
+      correlation_id: selfEventId,
+      caused_by: null,
+      depth: 1,
+      contains_personal_data: false,
+      data_role: "Processor",
+      visibility: "Internal",
+      pii_key_ref: null,
+      occurred_at: now,
+      recorded_at: now,
+      payload: { conversation_id: conversationId, message_id: messageId },
+    };
+    const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
+    try {
+      expect((await bus.publish(base)).duplicate).toBe(false);
+      expect((await bus.publish({
+        ...base,
+        event_id: humanEventId,
+        correlation_id: humanEventId,
+        actor: {
+          tenant: systemTestConfig.tenant,
+          region: systemTestConfig.region,
+          principal_id: systemTestConfig.principal,
+          kind: "Human",
+          data_role: "Controller",
+          status: "Active",
+        },
+        data_role: "Controller",
+      })).duplicate).toBe(false);
+    } finally {
+      await bus.close();
+    }
+
+    const firings = await eventually<JsonRecord[]>(async () => {
+      const response = await founder.json(
+        `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+      );
+      const items = array(response.body.items, "self-quiet automation history")
+        .map((item) => record(item, "self-quiet automation firing"));
+      return items.some((item) => item.event_id === humanEventId) ? items : undefined;
+    }, { description: "the other actor's event to reach the automation" });
+    expect(firings).toEqual([
+      expect.objectContaining({
+        event_id: humanEventId,
+        state: "awaiting_approval",
+      }),
+    ]);
+    expect(firings).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ event_id: selfEventId }),
+    ]));
+    expect(await findAutomation(founder, triggerId)).toMatchObject({
+      id: triggerId,
+      firings_used: 1,
+    });
   });
 
   test("narrows real authority and never stores a decorative promise", async () => {
