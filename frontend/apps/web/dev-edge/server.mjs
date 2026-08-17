@@ -105,6 +105,9 @@ const state = {
   projectsUnavailable: false,
   projectCreateUnavailable: false,
   projectCreateResponseLosses: 0,
+  projectListCursorDelaysMs: [],
+  projectListCursorRequests: 0,
+  projectListCursorResponses: 0,
   issueListFirstPageHolds: 0,
   issueListFirstPageDelaysMs: [],
   issueListCursorDelaysMs: [],
@@ -184,7 +187,27 @@ function resetProjects() {
   state.projectsUnavailable = false;
   state.projectCreateUnavailable = false;
   state.projectCreateResponseLosses = 0;
+  state.projectListCursorDelaysMs = [];
+  state.projectListCursorRequests = 0;
+  state.projectListCursorResponses = 0;
   projectCreations.clear();
+}
+
+function seedProjectCount(count) {
+  resetProjects();
+  for (let index = 1; index < count; index += 1) {
+    const suffix = String(index).padStart(12, "0");
+    projectRows.push({
+      id: `30000000-0000-4000-8000-${suffix}`,
+      ref: `myelin://acme/identity/project/30000000-0000-4000-8000-${suffix}`,
+      name: `Project ${String(index).padStart(3, "0")}`,
+      issue_prefix: `P${index}`,
+      default_issue_type_id: `40000000-0000-4000-8000-${suffix}`,
+      created_at: new Date(ISSUE_BASE_TIME_FOR_CREATE + index * 1_000).toISOString(),
+    });
+  }
+  projectRows = projectRows.slice(0, count);
+  state.emptyProjects = count === 0;
 }
 
 function cancelIssueListDelays() {
@@ -574,8 +597,15 @@ const server = createServer((req, res) => {
         }
         if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
         if (typeof body.emptyProjects === "boolean") {
-          state.emptyProjects = body.emptyProjects;
-          projectRows = body.emptyProjects ? [] : [{ ...DEFAULT_PROJECT }];
+          seedProjectCount(body.emptyProjects ? 0 : 1);
+        }
+        if (Number.isInteger(body.projectCount) && body.projectCount >= 0 &&
+            body.projectCount <= 100) seedProjectCount(body.projectCount);
+        if (Array.isArray(body.projectListCursorDelaysMs) &&
+            body.projectListCursorDelaysMs.length <= 10 &&
+            body.projectListCursorDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.projectListCursorDelaysMs = [...body.projectListCursorDelaysMs];
         }
         if (typeof body.projectsUnavailable === "boolean") state.projectsUnavailable = body.projectsUnavailable;
         if (typeof body.projectCreateUnavailable === "boolean") state.projectCreateUnavailable = body.projectCreateUnavailable;
@@ -989,7 +1019,20 @@ const server = createServer((req, res) => {
     }
     const items = sorted.slice(start, start + limit);
     const nextCursor = start + items.length < sorted.length ? items.at(-1)?.id ?? null : null;
-    return send(res, 200, { items, page: { next_cursor: nextCursor, limit } });
+    const output = { items, page: { next_cursor: nextCursor, limit } };
+    if (cursor !== null) {
+      state.projectListCursorRequests += 1;
+      const delay = state.projectListCursorDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(() => {
+          state.projectListCursorResponses += 1;
+          send(res, 200, output);
+        }, delay);
+        return;
+      }
+      state.projectListCursorResponses += 1;
+    }
+    return send(res, 200, output);
   }
 
   if (method === "POST" && path === "/v1/projects") {

@@ -17,6 +17,8 @@ export function createProjectCatalogue() {
   const [loadingMore, setLoadingMore] = createSignal(false);
   const [loadMoreError, setLoadMoreError] = createSignal(false);
   const [retrying, setRetrying] = createSignal(false);
+  let generation = 0;
+  let continuationRequest = 0;
 
   const firstPage = () => {
     const result = initial();
@@ -41,7 +43,16 @@ export function createProjectCatalogue() {
     }
   });
 
+  const restartContinuations = () => {
+    generation += 1;
+    continuationRequest += 1;
+    setExtraPages([]);
+    setLoadingMore(false);
+    setLoadMoreError(false);
+  };
+
   const add = (project: ProjectVM) => {
+    restartContinuations();
     setCreated((rows) => [project, ...rows]);
     setSelectedId(project.id);
     void revalidate("projects-list");
@@ -50,22 +61,28 @@ export function createProjectCatalogue() {
   const loadMore = async () => {
     const cursor = nextCursor();
     if (!cursor || loadingMore()) return;
+    const startedInGeneration = generation;
+    const request = ++continuationRequest;
     setLoadingMore(true);
     setLoadMoreError(false);
     try {
       const result = await getProjects({ cursor, limit: 50 });
+      if (startedInGeneration !== generation || request !== continuationRequest) return;
       if (result.ok) setExtraPages((pages) => [...pages, result.page]);
       else setLoadMoreError(true);
     } catch {
-      setLoadMoreError(true);
+      if (startedInGeneration === generation && request === continuationRequest) {
+        setLoadMoreError(true);
+      }
     } finally {
-      setLoadingMore(false);
+      if (startedInGeneration === generation && request === continuationRequest) {
+        setLoadingMore(false);
+      }
     }
   };
 
   const retry = async () => {
-    setExtraPages([]);
-    setLoadMoreError(false);
+    restartContinuations();
     setRetrying(true);
     try {
       await revalidate("projects-list");

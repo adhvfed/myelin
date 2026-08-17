@@ -19,6 +19,8 @@ async function setEdgeConfig(cfg: {
   projectsUnavailable?: boolean;
   projectCreateUnavailable?: boolean;
   projectCreateResponseLosses?: number;
+  projectCount?: number;
+  projectListCursorDelaysMs?: number[];
   issueListFirstPageHolds?: number;
   releaseIssueListFirstPages?: boolean;
   issueListFirstPageDelaysMs?: number[];
@@ -244,6 +246,42 @@ test.describe("issue workflows", () => {
     await page.getByRole("button", { name: "New issue" }).click();
     await expect(page.getByRole("dialog", { name: "New issue" }).getByLabel("Project").locator("option"))
       .toHaveCount(1);
+  });
+
+  test("a project created while pagination is loading restarts the shared catalogue", async ({ page, request }) => {
+    await setEdgeConfig({ projectCount: 51, projectListCursorDelaysMs: [1_500] });
+    await devLogin(page);
+    await gotoInteractive(page, "/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toHaveAccessibleName("New issue");
+    const projects = dialog.getByLabel("Project");
+    await expect(projects.locator("option")).toHaveCount(50);
+    await dialog.getByRole("button", { name: "Load more projects" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.projectListCursorRequests;
+    }).toBe(1);
+
+    await dialog.getByRole("button", { name: "New project" }).click();
+    await expect(dialog).toHaveAccessibleName("New project");
+    await dialog.getByLabel("Project name").fill("Catalogue integrity");
+    await dialog.getByLabel("Issue key").fill("CAT");
+    await dialog.getByRole("button", { name: "Create project" }).click();
+    await expect(dialog).toHaveAccessibleName("New issue");
+    await expect(projects).toContainText("Catalogue integrity — CAT");
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.projectListCursorResponses;
+    }).toBe(1);
+    await expect(dialog.getByRole("button", { name: "Load more projects" })).toBeVisible();
+    await expect(projects.locator("option").filter({ hasText: "Project 001" })).toHaveCount(0);
+
+    await dialog.getByRole("button", { name: "Load more projects" }).click();
+    await expect(projects.locator("option").filter({ hasText: "Project 001" })).toHaveCount(1);
+    await expect(projects.locator("option").filter({ hasText: "Myelin — MYL" })).toHaveCount(1);
   });
 
   test("a lost issue response can be retried without creating a duplicate issue", async ({ page }) => {
