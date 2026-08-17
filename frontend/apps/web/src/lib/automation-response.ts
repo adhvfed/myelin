@@ -2,6 +2,7 @@ const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
 export const AUTOMATION_PAGE_LIMIT = 25;
+export const MAX_AUTOMATION_TASK_BYTES = 4 * 1024;
 
 export type AutomationState = "active" | "paused" | "disabled";
 export type AutomationFiringState =
@@ -162,7 +163,8 @@ function automation(value: unknown): AutomationVM | null {
       !text(row.owner_principal_id, 255) || !text(row.event_type, 255) ||
       (row.subject_type !== null && !text(row.subject_type, 64)) ||
       (row.condition !== null && !text(row.condition, 4_096, true)) || !matcher ||
-      !text(row.task, 16_384, true) || !Array.isArray(caveats) || caveats.length > 64 ||
+      !text(row.task, MAX_AUTOMATION_TASK_BYTES, true) ||
+      row.task.trim() !== row.task || !Array.isArray(caveats) || caveats.length > 64 ||
       !caveats.every((item) => text(item, 1_024)) ||
       !safeInteger(row.budget_minor_units, 1, 1_000_000_000_000) ||
       !safeInteger(row.max_firings, 1, 1_000_000) ||

@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 pub mod approval;
+pub mod automation;
 pub mod events;
 
 pub use approval::McpApprovalContract;
+pub use automation::{validate_automation_task, AutomationTaskError, MAX_AUTOMATION_TASK_BYTES};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Conversation {

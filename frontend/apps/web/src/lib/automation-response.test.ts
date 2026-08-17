@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_AUTOMATION_TASK_BYTES,
   parseAutomation,
   parseAutomationErasure,
   parseAutomationFiringPage,
@@ -106,6 +107,16 @@ describe("automation response decoding", () => {
       items: [{ ...firing, run_id: null, run_ref: null, result_state: "available" }],
       page: { next_cursor: null, limit: 25 },
     })).toBeNull();
+    expect(parseAutomation({ trigger: { ...automation, task: "Inspect\0the failure" } }))
+      .toBeNull();
+    expect(parseAutomation({
+      trigger: { ...automation, task: "x".repeat(MAX_AUTOMATION_TASK_BYTES + 1) },
+    })).toBeNull();
+    expect(parseAutomation({ trigger: { ...automation, task: " Inspect the failure" } }))
+      .toBeNull();
+    expect(parseAutomation({
+      trigger: { ...automation, task: "Inspect the failure.\nOpen one focused issue." },
+    })).not.toBeNull();
   });
 
   it("carries the latest owner-visible rule evaluation failure without weakening the row", () => {

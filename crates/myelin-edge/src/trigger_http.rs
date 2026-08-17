@@ -710,11 +710,7 @@ fn create_proposal(
     client_nonce: String,
 ) -> Result<NewAgentTriggerBinding, EdgeError> {
     let agent_id = parse_uuid(&body.run_as_agent_id)?;
-    if body.task.is_empty() || body.task.len() > 4096 || body.task.trim() != body.task {
-        return Err(EdgeError::BadRequest(
-            "task must contain 1..=4096 bytes without surrounding whitespace".into(),
-        ));
-    }
+    validate_task(&body.task)?;
     validate_budget_minor_units(body.budget_minor_units)?;
     if !(1..=1_000_000).contains(&body.max_firings) || body.max_causal_depth > 64 {
         return Err(EdgeError::BadRequest(
@@ -757,6 +753,11 @@ fn create_proposal(
         require_human_approval: body.require_human_approval,
         created_at: chrono::Utc::now(),
     })
+}
+
+fn validate_task(task: &str) -> Result<(), EdgeError> {
+    myelin_agent::validate_automation_task(task)
+        .map_err(|error| EdgeError::BadRequest(error.to_string()))
 }
 
 fn validate_budget_minor_units(value: u64) -> Result<(), EdgeError> {
@@ -1315,6 +1316,14 @@ mod tests {
             "max_firings":1
         }"#;
         assert!(parse_create_body(missing_budget).is_err());
+    }
+
+    #[test]
+    fn automation_tasks_match_the_shared_agent_prompt_contract() {
+        assert!(validate_task("Inspect the failure.\nOpen one focused issue.").is_ok());
+        for task in ["Inspect\0the failure.", "Inspect\u{1b}[31mthe failure."] {
+            assert!(validate_task(task).is_err(), "accepted {task:?}");
+        }
     }
 
     #[test]

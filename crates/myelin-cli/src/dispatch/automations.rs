@@ -6,7 +6,6 @@ use super::{is_canonical_uuid, CliError, EdgeCall, FormQuery, HttpMethod, RetryP
 
 const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
-const MAX_TASK_BYTES: usize = 4096;
 const MAX_CAVEATS: usize = 128;
 const MAX_CAVEAT_BYTES: usize = 255;
 const MAX_BUDGET_MINOR_UNITS: u64 = 1_000_000_000_000;
@@ -124,11 +123,8 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     let run_as_agent_id = required(options.run_as_agent_id, "--run-as")?;
     require_automation_id("--run-as", run_as_agent_id)?;
     let task = required(options.task, "--task")?;
-    if task.is_empty() || task.len() > MAX_TASK_BYTES || task.trim() != task {
-        return Err(CliError::Usage(format!(
-            "--task must contain 1..={MAX_TASK_BYTES} bytes without surrounding whitespace"
-        )));
-    }
+    myelin_agent::validate_automation_task(task)
+        .map_err(|error| CliError::Usage(format!("invalid --task: {error}")))?;
     let budget_minor_units = bounded_u64(
         required(options.budget_minor_units, "--budget-minor-units")?,
         "--budget-minor-units",
@@ -733,6 +729,30 @@ mod tests {
             vec!["reject", AUTOMATION, " bad"],
         ] {
             assert!(automation_dispatch(&args).is_err(), "accepted {args:?}");
+        }
+    }
+
+    #[test]
+    fn automation_tasks_match_the_shared_agent_prompt_contract() {
+        let base = [
+            "create",
+            "--event",
+            "ci.run.failed",
+            "--run-as",
+            AGENT,
+            "--task",
+            "Inspect the failure.\nOpen one focused issue.",
+            "--budget-minor-units",
+            "1",
+            "--max-firings",
+            "1",
+        ];
+        assert!(automation_dispatch(&base).is_ok());
+
+        for task in ["Inspect\0the failure.", "Inspect\u{1b}[31mthe failure."] {
+            let mut args = base;
+            args[6] = task;
+            assert!(automation_dispatch(&args).is_err(), "accepted {task:?}");
         }
     }
 }
