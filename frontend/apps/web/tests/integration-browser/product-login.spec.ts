@@ -21,6 +21,8 @@ const edgeUrl = requiredEnvironment("MYELIN_INTEGRATION_EDGE_URL").replace(/\/$/
 const token = requiredEnvironment("MYELIN_BROWSER_EDGE_TOKEN");
 const tenant = requiredEnvironment("MYELIN_BROWSER_TENANT");
 const principal = requiredEnvironment("MYELIN_BROWSER_PRINCIPAL");
+const runnerImage =
+  "myelin.local/linux-small-v1-rootfs@sha256:65f0f6f242cd4412b4ad56250eadb0a459a59a71b49d21485e68da6a3d5cb975";
 
 async function edgeRequest(
   request: APIRequestContext,
@@ -52,7 +54,7 @@ async function edgeRequest(
   return object(JSON.parse(text));
 }
 
-async function waitForCiRun(
+async function waitForSucceededCiRun(
   request: APIRequestContext,
   repoRef: string,
   commitOid: unknown,
@@ -66,10 +68,18 @@ async function waitForCiRun(
       const row = value as JsonObject;
       return row.repo_ref === repoRef && row.commit_oid === commitOid;
     });
-    if (match !== undefined) return object(match);
+    if (match !== undefined) {
+      const run = object(match);
+      if (run.state === "succeeded") return run;
+      if (["failed", "timed_out", "cancelled"].includes(String(run.state))) {
+        throw new Error(
+          `CI run for ${repoRef} at ${String(commitOid)} became ${String(run.state)}`,
+        );
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`CI run for ${repoRef} at ${String(commitOid)} did not appear within 15 seconds`);
+  throw new Error(`CI run for ${repoRef} at ${String(commitOid)} did not succeed within 15 seconds`);
 }
 
 test("durable product data is available and mutable after browser login", async ({
@@ -113,24 +123,28 @@ test("durable product data is available and mutable after browser login", async 
     200,
     {
       base_oid: "",
-      contents: `on = "push"
+      contents: `schema_version = 2
+on = "push"
+
+[execution]
+profile = "linux-small-v1"
 
 [[jobs]]
 name = "test"
-image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
+image = "${runnerImage}"
 command = ["true"]
 `,
     },
   );
   const pipelineOid = object(pipelineCommit.applied).new_oid;
   expect(pipelineOid).toMatch(/^[0-9a-f]{40}$/);
-  const ciRun = await waitForCiRun(
+  const ciRun = await waitForSucceededCiRun(
     request,
     `myelin://${tenant}/git/repo/${slug}`,
     pipelineOid,
   );
   const ciRunId = String(ciRun.run_id);
-  expect(ciRun).toMatchObject({ trigger_kind: "push", state: "queued" });
+  expect(ciRun).toMatchObject({ trigger_kind: "push", state: "succeeded" });
   expect(ciRunId).toMatch(/^[0-9a-f-]{36}$/);
 
   const featureCommit = await edgeRequest(
@@ -180,13 +194,14 @@ command = ["true"]
 
   await navigateToApp(page, "/ci");
   const ciRow = page.getByTestId("ci-run-row").filter({ hasText: slug });
-  await expect(ciRow).toContainText("Queued");
+  await expect(ciRow).toContainText("Succeeded");
   await expect(ciRow).toContainText("push");
   await ciRow.click();
   await expect(page).toHaveURL(new RegExp(`/ci/runs/${ciRunId}$`));
   await expect(page.getByRole("heading", { name: `Run ${ciRunId.slice(0, 8)}` })).toBeVisible();
   await expect(page.getByText(String(pipelineOid), { exact: true })).toBeVisible();
-  await expect(page.getByTestId("ci-jobs-empty")).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "test" })).toBeVisible();
+  await expect(page.getByTestId("ci-job-result")).toContainText("Workload passed");
 
   await navigateToApp(page, "/issues");
   const issuePrefix = `B${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;
