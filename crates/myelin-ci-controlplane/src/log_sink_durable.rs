@@ -1,7 +1,7 @@
 use myelin_events::{derive_envelope, Actor, EmitContext, EventEnvelope, EventId, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::pgrelay::PgRelay;
-use myelin_storage::{with_tenant_tx, PgError};
+use myelin_storage::{with_tenant_tx, ContentHash, PgError, PiiKeyRef};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
@@ -15,6 +15,101 @@ use crate::log_sink::{FlushedJobLogs, LogPersist, LogResume, SINGLE_STEP_NO};
 pub struct DurableLogPersist {
     pool: PgPool,
     rt: tokio::runtime::Handle,
+}
+
+#[derive(Debug)]
+struct CheckpointScope {
+    region: String,
+    run: Uuid,
+    job: Uuid,
+}
+
+fn validate_checkpoint(
+    tenant: &TenantId,
+    flushed: &FlushedJobLogs,
+) -> Result<Option<CheckpointScope>, PgError> {
+    if flushed.segments.is_empty() && flushed.anchors.is_empty() && flushed.pointers.is_empty() {
+        return Ok(None);
+    }
+    let region = flushed
+        .anchors
+        .first()
+        .map(|anchor| anchor.region.clone())
+        .or_else(|| {
+            flushed
+                .segments
+                .first()
+                .map(|segment| segment.region.clone())
+        })
+        .ok_or_else(|| {
+            PgError::Query(
+                "log checkpoint contains availability pointers without a regional index row".into(),
+            )
+        })?;
+    let run = parse_uuid("run_id", &flushed.run_id)?;
+    let job = parse_uuid("job_id", &flushed.job_id)?;
+
+    for segment in &flushed.segments {
+        let segment_run = parse_uuid("segment run_id", &segment.run_id)?;
+        let segment_job = parse_uuid("segment job_id", &segment.job_id)?;
+        let blob_is_canonical = segment
+            .blob_ref
+            .as_deref()
+            .is_some_and(|blob_ref| ContentHash::parse(blob_ref).is_ok());
+        let key_belongs_to_tenant =
+            PiiKeyRef::parse(&segment.pii_key_ref).is_some_and(|key| key.tenant == *tenant);
+        if segment.tenant_id != tenant.as_str()
+            || segment.region != region
+            || segment_run != run
+            || segment_job != job
+            || segment.segment_seq < 0
+            || segment.byte_start < 0
+            || segment.byte_end <= segment.byte_start
+            || !blob_is_canonical
+            || !key_belongs_to_tenant
+        {
+            return Err(PgError::Query(
+                "log checkpoint contains a foreign or invalid segment".into(),
+            ));
+        }
+    }
+
+    let expected_step_id = SINGLE_STEP_NO.to_string();
+    for anchor in &flushed.anchors {
+        let anchor_run = parse_uuid("anchor run_id", &anchor.run_id)?;
+        let anchor_job = parse_uuid("anchor job_id", &anchor.job_id)?;
+        let status_and_end_agree = if anchor.status.is_terminal() {
+            anchor
+                .byte_end
+                .is_some_and(|byte_end| byte_end >= anchor.byte_start)
+        } else {
+            anchor.byte_end.is_none()
+        };
+        if anchor.tenant_id != tenant.as_str()
+            || anchor.region != region
+            || anchor_run != run
+            || anchor_job != job
+            || anchor.step_id != expected_step_id
+            || anchor.byte_start < 0
+            || !status_and_end_agree
+        {
+            return Err(PgError::Query(
+                "log checkpoint contains a foreign or invalid anchor".into(),
+            ));
+        }
+    }
+
+    for pointer in &flushed.pointers {
+        let pointer_run = parse_uuid("pointer run_id", &pointer.coord().run_id)?;
+        let pointer_job = parse_uuid("pointer job_id", &pointer.coord().job_id)?;
+        if pointer_run != run || pointer_job != job || pointer.coord().step_no != SINGLE_STEP_NO {
+            return Err(PgError::Query(
+                "log checkpoint contains a foreign availability pointer".into(),
+            ));
+        }
+    }
+
+    Ok(Some(CheckpointScope { region, run, job }))
 }
 
 impl DurableLogPersist {
@@ -173,16 +268,10 @@ impl DurableLogPersist {
         tenant: &TenantId,
         flushed: FlushedJobLogs,
     ) -> Result<(), PgError> {
-        let region = flushed
-            .anchors
-            .first()
-            .map(|a| a.region.clone())
-            .or_else(|| flushed.segments.first().map(|s| s.region.clone()));
-        let Some(region) = region else {
+        let Some(scope) = validate_checkpoint(tenant, &flushed)? else {
             return Ok(());
         };
-        let run = parse_uuid("run_id", &flushed.run_id)?;
-        let job = parse_uuid("job_id", &flushed.job_id)?;
+        let CheckpointScope { region, run, job } = scope;
         let tenant_str = tenant.as_str().to_string();
         let append_lock = format!(
             "{}:{}|{}:{}|{}|{}",
@@ -246,20 +335,6 @@ impl DurableLogPersist {
                 };
 
                 for seg in &flushed.segments {
-                    let seg_run = parse_uuid("run_id", &seg.run_id)?;
-                    let seg_job = parse_uuid("job_id", &seg.job_id)?;
-                    if seg.tenant_id != tenant_bind
-                        || seg.region != region_bind
-                        || seg_run != run
-                        || seg_job != job
-                        || seg.segment_seq < 0
-                        || seg.byte_start < 0
-                        || seg.byte_end < seg.byte_start
-                    {
-                        return Err(PgError::Query(
-                            "log checkpoint contains a foreign or invalid segment".into(),
-                        ));
-                    }
                     if seg.segment_seq > next_segment_seq {
                         return Err(PgError::Query(format!(
                             "log append sequence gap: committed next={next_segment_seq}, incoming={}",
@@ -321,8 +396,8 @@ impl DurableLogPersist {
                     let inserted = sqlx::query(INSERT_LOG_SEGMENT_QUERY)
                         .bind(&seg.tenant_id)
                         .bind(&seg.region)
-                        .bind(seg_run)
-                        .bind(seg_job)
+                        .bind(run)
+                        .bind(job)
                         .bind(seg.segment_seq)
                         .bind(seg.blob_ref.as_deref())
                         .bind(seg.byte_start)
@@ -342,24 +417,11 @@ impl DurableLogPersist {
                     next_byte_offset = seg.byte_end;
                 }
                 for anc in &flushed.anchors {
-                    let anc_run = parse_uuid("run_id", &anc.run_id)?;
-                    let anc_job = parse_uuid("job_id", &anc.job_id)?;
-                    if anc.tenant_id != tenant_bind
-                        || anc.region != region_bind
-                        || anc_run != run
-                        || anc_job != job
-                        || anc.byte_start < 0
-                        || anc.byte_end.is_some_and(|end| end < anc.byte_start)
-                    {
-                        return Err(PgError::Query(
-                            "log checkpoint contains a foreign or invalid anchor".into(),
-                        ));
-                    }
                     let upserted = sqlx::query(UPSERT_LOG_ANCHOR_QUERY)
                         .bind(&anc.tenant_id)
                         .bind(&anc.region)
-                        .bind(anc_run)
-                        .bind(anc_job)
+                        .bind(run)
+                        .bind(job)
                         .bind(&anc.step_id)
                         .bind(anc.byte_start)
                         .bind(anc.byte_end)
@@ -421,11 +483,11 @@ fn ci_log_event_id(tenant: &TenantId, ptr: &LogAvailablePointer) -> EventId {
     let keyed = format!(
         "{}\u{0}{}\u{0}{}\u{0}{}@{}:{}",
         tenant.as_str(),
-        canon(&ptr.coord.run_id),
-        canon(&ptr.coord.job_id),
-        ptr.coord.step_no,
-        ptr.byte_start,
-        ptr.byte_end,
+        canon(&ptr.coord().run_id),
+        canon(&ptr.coord().job_id),
+        ptr.coord().step_no,
+        ptr.byte_start(),
+        ptr.byte_end(),
     );
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in keyed.as_bytes() {
@@ -468,4 +530,133 @@ impl LogPersist for DurableLogPersist {
 fn parse_uuid(field: &'static str, value: &str) -> Result<Uuid, PgError> {
     Uuid::parse_str(value)
         .map_err(|e| PgError::Query(format!("log index {field} is not a uuid ({value:?}): {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_pipeline::{LogAnchorRow, LogCoord, LogSegmentRow};
+
+    const RUN_ID: &str = "00000000-0000-0000-0000-000000000001";
+    const JOB_ID: &str = "00000000-0000-0000-0000-000000000002";
+    const OTHER_JOB_ID: &str = "00000000-0000-0000-0000-000000000003";
+
+    fn tenant() -> TenantId {
+        TenantId::from_token("tenant-a")
+    }
+
+    fn running_anchor() -> LogAnchorRow {
+        LogAnchorRow {
+            tenant_id: tenant().as_str().to_string(),
+            region: "eu-west".into(),
+            run_id: RUN_ID.into(),
+            job_id: JOB_ID.into(),
+            step_id: SINGLE_STEP_NO.to_string(),
+            byte_start: 0,
+            byte_end: None,
+            status: AnchorStatus::Running,
+        }
+    }
+
+    fn sealed_segment() -> LogSegmentRow {
+        LogSegmentRow {
+            tenant_id: tenant().as_str().to_string(),
+            region: "eu-west".into(),
+            run_id: RUN_ID.into(),
+            job_id: JOB_ID.into(),
+            segment_seq: 0,
+            blob_ref: Some(ContentHash::blake3(b"one log frame").to_multihash_string()),
+            byte_start: 0,
+            byte_end: 13,
+            pii_key_ref: format!("kms://{}/0/tenant", tenant().as_str()),
+        }
+    }
+
+    fn checkpoint() -> FlushedJobLogs {
+        FlushedJobLogs {
+            run_id: RUN_ID.into(),
+            job_id: JOB_ID.into(),
+            segments: vec![sealed_segment()],
+            anchors: vec![running_anchor()],
+            pointers: vec![],
+        }
+    }
+
+    #[test]
+    fn checkpoint_validation_accepts_one_canonical_tenant_bound_batch() {
+        let mut checkpoint = checkpoint();
+        checkpoint.pointers.push(
+            LogAvailablePointer::new(
+                LogCoord::new(RUN_ID, JOB_ID, SINGLE_STEP_NO),
+                0,
+                13,
+                Some(ContentHash::blake3(b"one log frame")),
+            )
+            .expect("canonical pointer"),
+        );
+
+        let scope = validate_checkpoint(&tenant(), &checkpoint)
+            .expect("the complete checkpoint is valid")
+            .expect("the batch is not empty");
+        assert_eq!(scope.region, "eu-west");
+        assert_eq!(scope.run.to_string(), RUN_ID);
+        assert_eq!(scope.job.to_string(), JOB_ID);
+    }
+
+    #[test]
+    fn pointer_only_and_foreign_pointer_batches_are_refused_before_io() {
+        let pointer =
+            LogAvailablePointer::new(LogCoord::new(RUN_ID, JOB_ID, SINGLE_STEP_NO), 0, 1, None)
+                .expect("canonical pointer");
+        let pointer_only = FlushedJobLogs {
+            run_id: RUN_ID.into(),
+            job_id: JOB_ID.into(),
+            segments: vec![],
+            anchors: vec![],
+            pointers: vec![pointer],
+        };
+        assert!(validate_checkpoint(&tenant(), &pointer_only)
+            .unwrap_err()
+            .to_string()
+            .contains("without a regional index row"));
+
+        let mut foreign = checkpoint();
+        foreign.pointers.push(
+            LogAvailablePointer::new(
+                LogCoord::new(RUN_ID, OTHER_JOB_ID, SINGLE_STEP_NO),
+                0,
+                1,
+                None,
+            )
+            .expect("well-formed but foreign pointer"),
+        );
+        assert!(validate_checkpoint(&tenant(), &foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign availability pointer"));
+    }
+
+    #[test]
+    fn malformed_segment_and_anchor_rows_are_refused_before_io() {
+        let mut malformed_segment = checkpoint();
+        malformed_segment.segments[0].blob_ref = Some("blake3:not-canonical".into());
+        assert!(validate_checkpoint(&tenant(), &malformed_segment)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign or invalid segment"));
+
+        let mut foreign_key = checkpoint();
+        foreign_key.segments[0].pii_key_ref = "kms://tenant-b/0/tenant".into();
+        assert!(validate_checkpoint(&tenant(), &foreign_key)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign or invalid segment"));
+
+        let mut malformed_anchor = checkpoint();
+        malformed_anchor.anchors[0].byte_end = Some(13);
+        assert!(validate_checkpoint(&tenant(), &malformed_anchor)
+            .unwrap_err()
+            .to_string()
+            .contains("foreign or invalid anchor"));
+    }
 }

@@ -212,12 +212,13 @@ fn cdc_producer_end_to_end_rides_all_three_consumed_surfaces() {
 
 #[test]
 fn ci_log_available_from_the_real_producer_is_searchable_under_its_parent_run_grant() {
-    let pointer = LogAvailablePointer {
-        coord: LogCoord::new("01J0RUN", "01J0JOB", 7),
-        byte_start: 0,
-        byte_end: 21,
-        segment_ref: Some("blake3:segment".into()),
-    };
+    let pointer = LogAvailablePointer::new(
+        LogCoord::new("01J0RUN", "01J0JOB", 7),
+        0,
+        21,
+        Some(ContentHash::blake3(b"sealed searchable segment")),
+    )
+    .expect("the pointer has one canonical non-empty byte range");
     let draft = pointer
         .to_draft(&tenant())
         .expect("the producer mints one canonical tenant-bound event");

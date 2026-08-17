@@ -120,12 +120,16 @@ fn crossing_the_coalesce_budget_emits_one_pointer_per_window() {
     let pointers = p.drain_pointers();
     let mut prev_end = 0i64;
     for ptr in &pointers {
-        assert_eq!(ptr.byte_start, prev_end, "pointers cover contiguous ranges");
+        assert_eq!(
+            ptr.byte_start(),
+            prev_end,
+            "pointers cover contiguous ranges"
+        );
         assert!(
-            ptr.byte_end > ptr.byte_start,
+            ptr.byte_end() > ptr.byte_start(),
             "each pointer covers new bytes"
         );
-        prev_end = ptr.byte_end;
+        prev_end = ptr.byte_end();
     }
 }
 
@@ -427,12 +431,10 @@ fn an_empty_redactor_is_the_identity() {
 
 #[test]
 fn the_log_available_pointer_is_references_not_payloads() {
-    let ptr = LogAvailablePointer {
-        coord: coord(),
-        byte_start: 0,
-        byte_end: 4096,
-        segment_ref: Some("blake3:abc".into()),
-    };
+    let segment_ref = ContentHash::blake3(b"sealed log segment");
+    let segment_address = segment_ref.to_multihash_string();
+    let ptr = LogAvailablePointer::new(coord(), 0, 4096, Some(segment_ref))
+        .expect("a canonical non-empty range");
     let draft = ptr.to_draft(&tenant()).expect("canonical log pointer");
     assert_eq!(
         draft.type_.0, CI_LOG_AVAILABLE,
@@ -457,7 +459,7 @@ fn the_log_available_pointer_is_references_not_payloads() {
     let payload = draft.payload.as_object().expect("object payload");
     assert_eq!(payload["byte_start"], 0);
     assert_eq!(payload["byte_end"], 4096);
-    assert_eq!(payload["segment_ref"], "blake3:abc");
+    assert_eq!(payload["segment_ref"], segment_address);
     assert_eq!(
         payload["details_ref"], "myelin://01J0ACME/ci/run/run-1#step-1",
         "the separate human deep link is canonical and tenant-bound"
@@ -640,15 +642,19 @@ fn ambiguous_log_coordinates_never_become_durable_subjects() {
         LogCoord::new("run:1", "job-1", 1),
         LogCoord::new("run-1", "job/1", 1),
     ] {
-        let pointer = LogAvailablePointer {
-            coord,
-            byte_start: 0,
-            byte_end: 1,
-            segment_ref: None,
-        };
         assert!(matches!(
-            pointer.to_draft(&tenant()),
+            LogAvailablePointer::new(coord, 0, 1, None),
             Err(LogReferenceError::InvalidCoordinate { .. })
+        ));
+    }
+}
+
+#[test]
+fn empty_reversed_and_negative_pointer_ranges_are_unrepresentable() {
+    for (byte_start, byte_end) in [(0, 0), (2, 1), (-1, 1)] {
+        assert!(matches!(
+            LogAvailablePointer::new(coord(), byte_start, byte_end, None),
+            Err(LogReferenceError::InvalidRange { .. })
         ));
     }
 }

@@ -8,9 +8,10 @@ use std::sync::{Arc, Barrier};
 use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_controlplane_migrations, log_pipeline::AnchorStatus, log_pipeline::CoalesceBudget,
-    log_pipeline::LogAnchorRow, log_pipeline::LogCoord, log_pipeline::LogPipeline,
-    log_pipeline::SealThreshold, log_pipeline::SecretRedactor, DurableLogPersist, FlushedJobLogs,
-    LogPersist, LogPipelineSink, CREATE_CI_JOB_SPEC_DDL, CREATE_JOB_QUEUE_DDL, SINGLE_STEP_NO,
+    log_pipeline::LogAnchorRow, log_pipeline::LogAvailablePointer, log_pipeline::LogCoord,
+    log_pipeline::LogPipeline, log_pipeline::SealThreshold, log_pipeline::SecretRedactor,
+    DurableLogPersist, FlushedJobLogs, LogPersist, LogPipelineSink, CREATE_CI_JOB_SPEC_DDL,
+    CREATE_JOB_QUEUE_DDL, SINGLE_STEP_NO,
 };
 use myelin_ci_sandbox::FirehoseSink;
 use myelin_events::OUTBOX_MIGRATION;
@@ -702,6 +703,37 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
         .join()
         .expect("the persist thread joins");
 
+        let foreign_job = uid("ct004f-idem-foreign-job");
+        let original_pointer = flushed.pointers.first().expect("one availability pointer");
+        let foreign_checkpoint = FlushedJobLogs {
+            run_id: flushed.run_id.clone(),
+            job_id: flushed.job_id.clone(),
+            segments: flushed.segments.clone(),
+            anchors: flushed.anchors.clone(),
+            pointers: vec![LogAvailablePointer::new(
+                LogCoord::new(&run, &foreign_job, SINGLE_STEP_NO),
+                original_pointer.byte_start(),
+                original_pointer.byte_end(),
+                original_pointer.segment_ref().cloned(),
+            )
+            .expect("well-formed but foreign pointer")],
+        };
+        let app_for_foreign = app.clone();
+        let tenant_for_foreign = tenant.clone();
+        let rt_for_foreign = tokio::runtime::Handle::current();
+        let foreign_error = std::thread::spawn(move || {
+            DurableLogPersist::with_pg(app_for_foreign, rt_for_foreign)
+                .persist(&tenant_for_foreign, foreign_checkpoint)
+                .expect_err("a checkpoint cannot publish another job's availability event")
+                .to_string()
+        })
+        .join()
+        .expect("the foreign-pointer writer joins");
+        assert!(
+            foreign_error.contains("foreign availability pointer"),
+            "the identity refusal is explicit: {foreign_error}"
+        );
+
         let (seg_count, status, _byte_end, dangling) =
             read_back(&app, tenant.as_str(), region.as_str(), &run, &job).await;
         assert_eq!(
@@ -715,6 +747,11 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
             outbox_count(&app, &run, &job).await as usize,
             flushed.pointers.len(),
             "re-delivery did NOT duplicate ci.log.available outbox rows"
+        );
+        assert_eq!(
+            outbox_count(&app, &run, &foreign_job).await,
+            0,
+            "the refused pointer emitted no cross-job outbox fact"
         );
         assert!(
             !flushed.pointers.is_empty(),
@@ -763,7 +800,9 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
             p.close_step(&coord, AnchorStatus::Passed).expect("close");
             let pointers = p.drain_pointers();
             assert!(
-                pointers.iter().any(|pt| pt.segment_ref.is_none()),
+                pointers
+                    .iter()
+                    .any(|pointer| pointer.segment_ref().is_none()),
                 "a coalesce pointer with NO sealed-segment ref was produced"
             );
             FlushedJobLogs {

@@ -2,7 +2,7 @@ use myelin_events::firehose::{
     Firehose, FirehoseError, FirehoseScope, FrameDraft, FIREHOSE_MAX_SCOPE_ID_BYTES,
 };
 use myelin_events::{ArtifactRef, DataRole, EventDraft, EventType, Visibility};
-use myelin_storage::{BlobError, BlobStore};
+use myelin_storage::{BlobError, BlobStore, ContentHash};
 use myelin_tenancy::{Region, TenantId};
 
 use myelin_ci_sandbox::events::CI_LOG_AVAILABLE;
@@ -217,6 +217,10 @@ pub enum LogReferenceError {
         component: &'static str,
         reason: &'static str,
     },
+    InvalidRange {
+        byte_start: i64,
+        byte_end: i64,
+    },
     InvalidReference(ParseError),
 }
 
@@ -226,6 +230,13 @@ impl std::fmt::Display for LogReferenceError {
             LogReferenceError::InvalidCoordinate { component, reason } => {
                 write!(f, "invalid CI log {component}: {reason}")
             }
+            LogReferenceError::InvalidRange {
+                byte_start,
+                byte_end,
+            } => write!(
+                f,
+                "invalid CI log byte range: expected 0 <= start < end, got {byte_start}:{byte_end}"
+            ),
             LogReferenceError::InvalidReference(error) => error.fmt(f),
         }
     }
@@ -234,7 +245,8 @@ impl std::fmt::Display for LogReferenceError {
 impl std::error::Error for LogReferenceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            LogReferenceError::InvalidCoordinate { .. } => None,
+            LogReferenceError::InvalidCoordinate { .. }
+            | LogReferenceError::InvalidRange { .. } => None,
             LogReferenceError::InvalidReference(error) => Some(error),
         }
     }
@@ -433,25 +445,66 @@ impl SealThreshold {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogAvailablePointer {
-    pub coord: LogCoord,
-    pub byte_start: i64,
-    pub byte_end: i64,
-    pub segment_ref: Option<String>,
+    coord: LogCoord,
+    byte_start: i64,
+    byte_end: i64,
+    segment_ref: Option<ContentHash>,
 }
 
 impl LogAvailablePointer {
+    pub fn new(
+        coord: LogCoord,
+        byte_start: i64,
+        byte_end: i64,
+        segment_ref: Option<ContentHash>,
+    ) -> Result<LogAvailablePointer, LogReferenceError> {
+        coord.validate_identity()?;
+        if byte_start < 0 || byte_end <= byte_start {
+            return Err(LogReferenceError::InvalidRange {
+                byte_start,
+                byte_end,
+            });
+        }
+        Ok(LogAvailablePointer {
+            coord,
+            byte_start,
+            byte_end,
+            segment_ref,
+        })
+    }
+
+    pub fn coord(&self) -> &LogCoord {
+        &self.coord
+    }
+
+    pub fn byte_start(&self) -> i64 {
+        self.byte_start
+    }
+
+    pub fn byte_end(&self) -> i64 {
+        self.byte_end
+    }
+
+    pub fn segment_ref(&self) -> Option<&ContentHash> {
+        self.segment_ref.as_ref()
+    }
+
     pub fn subject(&self, tenant: &TenantId) -> Result<ArtifactRef, LogReferenceError> {
         self.coord.log_ref(tenant)
     }
 
     pub fn to_draft(&self, tenant: &TenantId) -> Result<EventDraft, LogReferenceError> {
+        let segment_ref = self
+            .segment_ref
+            .as_ref()
+            .map(ContentHash::to_multihash_string);
         let payload = serde_json::json!({
             "run": format!("ci/run/{}", self.coord.run_id),
             "job": self.coord.job_id,
             "step": self.coord.step_no,
             "byte_start": self.byte_start,
             "byte_end": self.byte_end,
-            "segment_ref": self.segment_ref,
+            "segment_ref": segment_ref,
             "details_ref": self.coord.details_ref(tenant)?.0,
         });
         Ok(EventDraft {
@@ -721,14 +774,21 @@ impl<B: BlobStore> LogPipeline<B> {
                 prospective.extend_from_slice(&stream.open_segment);
             }
             prospective.extend_from_slice(bytes);
-            Some(
-                self.blobs
-                    .put(&self.tenant, &prospective)?
-                    .to_multihash_string(),
-            )
+            Some(self.blobs.put(&self.tenant, &prospective)?)
         } else {
             None
         };
+        let pointer = plan
+            .emit_pointer
+            .then(|| {
+                LogAvailablePointer::new(
+                    coord.clone(),
+                    plan.pointer_start,
+                    plan.next_offset,
+                    segment_ref.clone(),
+                )
+            })
+            .transpose()?;
 
         let frame_payload = format!(
             "ci/run/{}/job/{}/step/{}@{}:{}",
@@ -778,19 +838,14 @@ impl<B: BlobStore> LogPipeline<B> {
                 run_id: coord.run_id.clone(),
                 job_id: coord.job_id.clone(),
                 segment_seq: plan.segment_seq,
-                blob_ref: Some(segment_ref.clone()),
+                blob_ref: Some(segment_ref.to_multihash_string()),
                 byte_start: plan.open_segment_start,
                 byte_end: plan.next_offset,
                 pii_key_ref: self.tenant_dek_ref(),
             });
         }
-        if plan.emit_pointer {
-            self.pointers.push(LogAvailablePointer {
-                coord: coord.clone(),
-                byte_start: plan.pointer_start,
-                byte_end: plan.next_offset,
-                segment_ref,
-            });
+        if let Some(pointer) = pointer {
+            self.pointers.push(pointer);
         }
 
         Ok(frame.seq)
@@ -868,7 +923,14 @@ impl<B: BlobStore> LogPipeline<B> {
 
         self.write_pin.admit_log_write(&self.region)?;
         self.write_pin.admit_log_write(&self.region)?;
-        let blob_ref = self.blobs.put(&self.tenant, &bytes)?.to_multihash_string();
+        let content_hash = self.blobs.put(&self.tenant, &bytes)?;
+        let blob_ref = content_hash.to_multihash_string();
+        let pointer = LogAvailablePointer::new(
+            coord.clone(),
+            pointer_start,
+            segment_end,
+            Some(content_hash),
+        )?;
 
         let stream = self
             .streams
@@ -890,12 +952,7 @@ impl<B: BlobStore> LogPipeline<B> {
             byte_end: segment_end,
             pii_key_ref: self.tenant_dek_ref(),
         });
-        self.pointers.push(LogAvailablePointer {
-            coord: coord.clone(),
-            byte_start: pointer_start,
-            byte_end: segment_end,
-            segment_ref: Some(blob_ref.clone()),
-        });
+        self.pointers.push(pointer);
 
         Ok(Some(blob_ref))
     }
