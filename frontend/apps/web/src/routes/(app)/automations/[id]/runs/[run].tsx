@@ -1,4 +1,4 @@
-import { ErrorBoundary, Show, Suspense, createSignal, onMount } from "solid-js";
+import { ErrorBoundary, Show, Suspense, createEffect, createSignal, onMount } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, useAction, useParams } from "@solidjs/router";
 import { ConfirmDialog, Icon, Skeleton, useToast } from "@myelin/design-system";
@@ -19,14 +19,29 @@ export default function AutomationResult() {
   const [erasing, setErasing] = createSignal(false);
   const [eraseError, setEraseError] = createSignal(false);
   const [interactive, setInteractive] = createSignal(false);
+  let routeGeneration = 0;
   onMount(() => setInteractive(true));
+
+  createEffect(() => {
+    automationId();
+    runId();
+    routeGeneration += 1;
+    setErasure(null);
+    setConfirming(false);
+    setErasing(false);
+    setEraseError(false);
+  });
 
   const eraseResult = async () => {
     if (erasing()) return;
+    const automation = automationId();
+    const run = runId();
+    const generation = routeGeneration;
     setErasing(true);
     setEraseError(false);
     try {
-      const response = await erase({ automationId: automationId(), runId: runId() });
+      const response = await erase({ automationId: automation, runId: run });
+      if (generation !== routeGeneration || automationId() !== automation || runId() !== run) return;
       if (!response.ok) {
         setEraseError(true);
         setConfirming(false);
@@ -36,10 +51,14 @@ export default function AutomationResult() {
       setConfirming(false);
       toast.show({ title: "Erased agent result", variant: "success" });
     } catch {
-      setEraseError(true);
-      setConfirming(false);
+      if (generation === routeGeneration && automationId() === automation && runId() === run) {
+        setEraseError(true);
+        setConfirming(false);
+      }
     } finally {
-      setErasing(false);
+      if (generation === routeGeneration && automationId() === automation && runId() === run) {
+        setErasing(false);
+      }
     }
   };
 

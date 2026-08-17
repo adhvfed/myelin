@@ -1,4 +1,4 @@
-import { ErrorBoundary, For, Show, Suspense, createSignal, onMount } from "solid-js";
+import { ErrorBoundary, For, Show, Suspense, createEffect, createSignal, onMount } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, revalidate, useAction, useParams, useSearchParams } from "@solidjs/router";
 import { ConfirmDialog, Icon, Skeleton, useToast } from "@myelin/design-system";
@@ -27,6 +27,7 @@ export default function AutomationDetail() {
   const [confirmingDisable, setConfirmingDisable] = createSignal(false);
   const [mutationError, setMutationError] = createSignal(false);
   const [interactive, setInteractive] = createSignal(false);
+  let routeGeneration = 0;
   onMount(() => setInteractive(true));
   const automationId = () => params.id ?? "";
   const cursor = () => search.cursor as string | undefined;
@@ -42,12 +43,24 @@ export default function AutomationDetail() {
   }, { deferStream: true });
   const current = () => replacement() ?? detail()?.automation;
 
+  createEffect(() => {
+    automationId();
+    routeGeneration += 1;
+    setReplacement(null);
+    setPendingAction(null);
+    setConfirmingDisable(false);
+    setMutationError(false);
+  });
+
   const applyLifecycle = async (action: AutomationLifecycleAction) => {
     if (pendingAction()) return;
+    const id = automationId();
+    const generation = routeGeneration;
     setPendingAction(action);
     setMutationError(false);
     try {
-      const result = await mutate({ automationId: automationId(), action });
+      const result = await mutate({ automationId: id, action });
+      if (generation !== routeGeneration || automationId() !== id) return;
       if (!result.ok) {
         setMutationError(true);
         return;
@@ -60,10 +73,12 @@ export default function AutomationDetail() {
         variant: "success",
       });
     } catch {
-      setMutationError(true);
+      if (generation === routeGeneration && automationId() === id) setMutationError(true);
     } finally {
-      setConfirmingDisable(false);
-      setPendingAction(null);
+      if (generation === routeGeneration && automationId() === id) {
+        setConfirmingDisable(false);
+        setPendingAction(null);
+      }
     }
   };
 

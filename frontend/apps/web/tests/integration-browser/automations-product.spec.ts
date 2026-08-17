@@ -104,6 +104,21 @@ test("an automation owner governs durable agent work without configuring an inte
   const automation = (createdAutomation.trigger as JsonObject);
   const automationId = String(automation.id);
   expect(automationId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  const secondTask = `Summarise a separate ownership change for ${suffix}.`;
+  const createdSecondAutomation = await post(request, "/v1/triggers", {
+    event_type: "issue.issue.updated",
+    filter: `payload.change_kind == 'second-${suffix}'`,
+    run_as_agent_id: agentId,
+    task: secondTask,
+    budget_minor_units: 125_000,
+    max_firings: 8,
+    max_causal_depth: 3,
+    delegation_caveats: ["run.view"],
+    require_human_approval: true,
+  }, { ...owner, status: 201 });
+  const secondAutomation = createdSecondAutomation.trigger as JsonObject;
+  const secondAutomationId = String(secondAutomation.id);
+  expect(secondAutomationId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
 
   await signIn(page);
   await page.getByRole("link", { name: "Automations" }).click();
@@ -137,6 +152,22 @@ test("an automation owner governs durable agent work without configuring an inte
   await dialog.getByRole("button", { name: "Disable automation" }).click();
   await expect(page.getByTitle("State: Disabled")).toBeVisible();
   await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
+
+  await page.evaluate((id) => {
+    window.history.pushState({}, "", `/automations/${id}`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, secondAutomationId);
+  await page.waitForURL(`**/automations/${secondAutomationId}`);
+  await expect(page.getByRole("heading", { level: 1, name: secondTask })).toBeVisible();
+  await expect(page.getByTitle("State: Active")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy reference" }))
+    .toHaveAttribute("title", String(secondAutomation.ref));
+
+  await page.goBack();
+  await page.waitForURL(`**/automations/${automationId}`);
+  await expect(page.getByRole("heading", { level: 1, name: task })).toBeVisible();
+  await expect(page.getByTitle("State: Disabled")).toBeVisible();
 
   await page.reload();
   await waitForAppHydration(page);
