@@ -132,21 +132,10 @@ impl HnswVectorIndex {
     }
 
     pub fn upsert(&mut self, record: VectorRecord) -> Result<(), IndexError> {
+        self.validate_embedding(&record.embedding)?;
         let dim = record.embedding.dim();
-        if dim == 0 {
-            return Err(IndexError::Engine(
-                "a vector embedding must be non-empty".into(),
-            ));
-        }
-        match self.dim {
-            Some(d) if d != dim => {
-                return Err(IndexError::Engine(format!(
-                    "vector dimensionality {dim} does not match the index dimensionality {d} \
-                     (a model swap must reindex, never mix dimensions - §3.3)"
-                )));
-            }
-            None => self.dim = Some(dim),
-            _ => {}
+        if self.dim.is_none() {
+            self.dim = Some(dim);
         }
 
         self.soft_delete(&record.doc_id);
@@ -196,6 +185,24 @@ impl HnswVectorIndex {
 
         if layer > top_layer {
             self.entry = Some(new_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_embedding(&self, embedding: &Embedding) -> Result<(), IndexError> {
+        let dim = embedding.dim();
+        if dim == 0 {
+            return Err(IndexError::Engine(
+                "a vector embedding must be non-empty".into(),
+            ));
+        }
+        if let Some(expected) = self.dim {
+            if expected != dim {
+                return Err(IndexError::Engine(format!(
+                    "vector dimensionality {dim} does not match the index dimensionality {expected} \
+                     (a model swap must reindex, never mix dimensions - §3.3)"
+                )));
+            }
         }
         Ok(())
     }

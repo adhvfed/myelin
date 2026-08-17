@@ -610,8 +610,7 @@ impl IncrementalIndexer {
         for doc_id in &refs {
             self.registry
                 .with_backend(&ev.tenant, &ev.region, |be| {
-                    be.restamp_zookie(doc_id, &new_zookie);
-                    Ok(())
+                    be.restamp_zookie(doc_id, &new_zookie)
                 })
                 .map_err(|e| IndexEventError::Engine(e.to_string()))?;
         }

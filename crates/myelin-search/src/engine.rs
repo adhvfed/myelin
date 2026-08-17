@@ -379,9 +379,6 @@ impl TantivyBackend {
         indexed_zookie: &str,
         version: u64,
     ) -> Result<(), IndexError> {
-        let key = Term::from_field_text(self.schema.doc_id, &doc.doc_id);
-        self.writer.delete_term(key);
-
         let mut td = TantivyDocument::default();
         td.add_text(self.schema.doc_id, &doc.doc_id);
         td.add_text(self.schema.acl_object, &doc.acl_object);
@@ -408,26 +405,37 @@ impl TantivyBackend {
             self.add_facet(&mut td, field, declared, value)?;
         }
 
-        self.writer.add_document(td)?;
-        self.writer.commit()?;
-
         match (&doc.embedding, &doc.model_ref) {
-            (Some(embedding), Some(model_ref)) => {
-                self.vectors.upsert(crate::vector::VectorRecord {
-                    doc_id: doc.doc_id.clone(),
-                    acl_object: doc.acl_object.clone(),
-                    embedding: embedding.clone(),
-                    model_ref: model_ref.clone(),
-                })?;
-            }
+            (Some(embedding), Some(_)) => self.vectors.validate_embedding(embedding)?,
             (Some(_), None) => {
                 return Err(IndexError::Engine(
                     "an embedding requires a model_ref (a vector must pin its model - §3.3)".into(),
                 ));
             }
-            (None, _) => {
-                self.vectors.soft_delete(&doc.doc_id);
+            (None, Some(_)) => {
+                return Err(IndexError::Engine(
+                    "a model_ref requires an embedding (model provenance must describe a vector)"
+                        .into(),
+                ));
             }
+            (None, None) => {}
+        }
+
+        let key = Term::from_field_text(self.schema.doc_id, &doc.doc_id);
+        self.writer.delete_term(key);
+
+        self.writer.add_document(td)?;
+        self.writer.commit()?;
+
+        if let (Some(embedding), Some(model_ref)) = (&doc.embedding, &doc.model_ref) {
+            self.vectors.upsert(crate::vector::VectorRecord {
+                doc_id: doc.doc_id.clone(),
+                acl_object: doc.acl_object.clone(),
+                embedding: embedding.clone(),
+                model_ref: model_ref.clone(),
+            })?;
+        } else {
+            self.vectors.soft_delete(&doc.doc_id);
         }
 
         self.doc_meta.insert(
@@ -445,11 +453,11 @@ impl TantivyBackend {
         self.doc_meta.get(doc_id).map(|m| m.indexed_zookie.clone())
     }
 
-    pub fn restamp_zookie(&mut self, doc_id: &str, new_zookie: &str) {
+    pub fn restamp_zookie(&mut self, doc_id: &str, new_zookie: &str) -> Result<(), IndexError> {
         let Some(meta) = self.doc_meta.get(doc_id).cloned() else {
-            return;
+            return Ok(());
         };
-        let _ = self.upsert_stamped(&meta.doc, new_zookie, meta.version + 1);
+        self.upsert_stamped(&meta.doc, new_zookie, meta.version + 1)
     }
 
     pub fn locate_subject(&self, matcher: &SubjectMatcher) -> Vec<String> {
@@ -1152,6 +1160,60 @@ mod tests {
             matches!(err, IndexError::Engine(_)),
             "loud rejection: a vector needs a model_ref"
         );
+        assert!(
+            be.search(&AclFilter::All, "body", 10).unwrap().is_empty(),
+            "a rejected vector document must not leak into full-text search"
+        );
+        assert_eq!(
+            be.indexed_zookie_of("d"),
+            None,
+            "a rejected document leaves no metadata behind"
+        );
+
+        let mut model_without_embedding = IndexDocument::new("d", "body");
+        model_without_embedding.model_ref = Some("text-embed@1".into());
+        assert!(
+            be.upsert(&model_without_embedding).is_err(),
+            "model provenance without a vector is rejected as meaningless state"
+        );
+    }
+
+    #[test]
+    fn rejected_replacement_preserves_the_last_good_document() {
+        use crate::vector::Embedding;
+        let mut be = TantivyBackend::open(&facet_decl()).expect("open");
+        let key = OrderKey::bisect(None, None);
+        be.upsert_stamped(&doc("d", "last good body", "open", 1, &key), "zk-1", 1)
+            .expect("initial document");
+
+        let mut invalid_vector = doc("d", "invalid vector replacement", "open", 1, &key);
+        invalid_vector.embedding = Some(Embedding::new(vec![1.0, 0.0]));
+        assert!(be.upsert_stamped(&invalid_vector, "zk-2", 2).is_err());
+        assert_eq!(
+            be.search(&AclFilter::All, "last", 10).unwrap()[0].doc_id,
+            "d",
+            "vector validation happens before the text-index mutation"
+        );
+
+        let mut invalid_facet = doc("d", "invalid facet replacement", "open", 1, &key);
+        invalid_facet.fields.insert(
+            "undeclared".into(),
+            FieldValue::Text("not in the schema".into()),
+        );
+        assert!(be.upsert_stamped(&invalid_facet, "zk-3", 3).is_err());
+
+        be.upsert(&doc("other", "commit pending work", "open", 1, &key))
+            .expect("a later commit");
+        assert_eq!(
+            be.search(&AclFilter::All, "last", 10).unwrap()[0].doc_id,
+            "d",
+            "validation failure never queues deletion of the prior document"
+        );
+        assert!(be
+            .search(&AclFilter::All, "replacement", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(be.indexed_zookie_of("d").as_deref(), Some("zk-1"));
     }
 
     #[test]
