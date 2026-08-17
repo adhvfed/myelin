@@ -1,6 +1,6 @@
 import { Dialog, Icon } from "@myelin/design-system";
 import { useAction } from "@solidjs/router";
-import { Show, createEffect, createSignal } from "solid-js";
+import { Show, createEffect, createSignal, onCleanup } from "solid-js";
 import { createRepo, type RepoCreateError } from "~/lib/api";
 import { repositorySlugError } from "~/lib/repo-create";
 
@@ -29,13 +29,16 @@ export function RepoCreateDialog(props: RepoCreateDialogProps) {
   const [error, setError] = createSignal<string | null>(null);
   const [submitting, setSubmitting] = createSignal(false);
   let input: HTMLInputElement | undefined;
+  let openingGeneration = 0;
 
   createEffect(() => {
+    openingGeneration += 1;
     if (!props.open) return;
     setSlug("");
     setError(null);
     setSubmitting(false);
   });
+  onCleanup(() => { openingGeneration += 1; });
 
   const close = () => {
     if (!submitting()) props.onClose();
@@ -49,10 +52,12 @@ export function RepoCreateDialog(props: RepoCreateDialogProps) {
       input?.focus();
       return;
     }
+    const generation = openingGeneration;
     setSubmitting(true);
     setError(null);
     try {
       const result = await create(slug());
+      if (generation !== openingGeneration) return;
       if (!result.ok) {
         setError(createError(result.error));
         input?.focus();
@@ -61,10 +66,12 @@ export function RepoCreateDialog(props: RepoCreateDialogProps) {
       props.onCreated(result.receipt.slug);
       props.onClose();
     } catch {
-      setError(createError("error"));
-      input?.focus();
+      if (generation === openingGeneration) {
+        setError(createError("error"));
+        input?.focus();
+      }
     } finally {
-      setSubmitting(false);
+      if (generation === openingGeneration) setSubmitting(false);
     }
   };
 

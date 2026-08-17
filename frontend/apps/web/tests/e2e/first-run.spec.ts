@@ -9,6 +9,7 @@ const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 async function setEdgeConfig(cfg: {
   emptyRepos?: boolean;
   repoCreateResponseLosses?: number;
+  repoCreateResponseDelaysMs?: number[];
   devLoginEnabled?: boolean;
   whoamiUnavailable?: boolean;
   seedInboxAgentApproval?: boolean;
@@ -144,6 +145,36 @@ test.describe("R3.5 first-run — empty tenant onboarding", () => {
     await expect(page.getByRole("link", { name: /retry-safe/ })).toHaveCount(1);
     await page.reload();
     await expect(page.getByRole("link", { name: /retry-safe/ })).toHaveCount(1);
+  });
+
+  test("a late repository creation cannot navigate away from the screen that replaced its dialog", async ({ page, request }) => {
+    await setEdgeConfig({ emptyRepos: true, repoCreateResponseDelaysMs: [1_500] });
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("dev-login").click();
+    await page.waitForURL("**/git/repos");
+
+    await page.getByTestId("repos-empty").getByRole("button", { name: "Create repository" }).click();
+    const dialog = page.getByRole("dialog", { name: "New repository" });
+    await dialog.getByLabel("Name or namespace/name").fill("created-after-leaving");
+    await dialog.getByRole("button", { name: "Create repository" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.repoCreateRequests;
+    }).toBe(1);
+
+    await page.evaluate(() => {
+      window.history.pushState({}, "", "/issues");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await expect(page.getByRole("heading", { name: "Issues", level: 1 })).toBeVisible();
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.repoCreateResponses;
+    }).toBe(1);
+    await page.waitForTimeout(500);
+    expect(new URL(page.url()).pathname).toBe("/issues");
   });
 });
 

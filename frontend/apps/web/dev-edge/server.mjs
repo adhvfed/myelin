@@ -66,6 +66,9 @@ const state = {
   // A fresh tenant has no repos yet — the first-run onboarding empty state.
   emptyRepos: process.env.DEV_EDGE_EMPTY_REPOS === "1",
   repoCreateResponseLosses: 0,
+  repoCreateResponseDelaysMs: [],
+  repoCreateRequests: 0,
+  repoCreateResponses: 0,
   // Repositories created while exercising that fresh-tenant posture. Reset with `emptyRepos` so
   // every onboarding test starts from a genuinely empty catalogue.
   createdRepos: new Map(),
@@ -440,9 +443,18 @@ const server = createServer((req, res) => {
           state.emptyRepos = body.emptyRepos;
           state.createdRepos.clear();
           state.repoCreateResponseLosses = 0;
+          state.repoCreateResponseDelaysMs = [];
+          state.repoCreateRequests = 0;
+          state.repoCreateResponses = 0;
         }
         if (Number.isInteger(body.repoCreateResponseLosses) && body.repoCreateResponseLosses >= 0) {
           state.repoCreateResponseLosses = body.repoCreateResponseLosses;
+        }
+        if (Array.isArray(body.repoCreateResponseDelaysMs) &&
+            body.repoCreateResponseDelaysMs.length <= 10 &&
+            body.repoCreateResponseDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.repoCreateResponseDelaysMs = [...body.repoCreateResponseDelaysMs];
         }
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
@@ -1497,15 +1509,25 @@ const server = createServer((req, res) => {
         clone_url: `/acme/eu-west/${encodeURIComponent(slug)}.git`,
         counts: { branches: 0, tags: 0 },
       });
-      if (state.repoCreateResponseLosses > 0) {
-        state.repoCreateResponseLosses -= 1;
-        return send(res, 503, { error: { message: "repository was committed but its response was lost", code: "unavailable" } });
+      state.repoCreateRequests += 1;
+      const respond = () => {
+        state.repoCreateResponses += 1;
+        if (state.repoCreateResponseLosses > 0) {
+          state.repoCreateResponseLosses -= 1;
+          return send(res, 503, { error: { message: "repository was committed but its response was lost", code: "unavailable" } });
+        }
+        return send(res, 201, {
+          applied: { action: "git.repo.create", slug },
+          created: true,
+          durable: true,
+        });
+      };
+      const delay = state.repoCreateResponseDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(respond, delay);
+        return;
       }
-      return send(res, 201, {
-        applied: { action: "git.repo.create", slug },
-        created: true,
-        durable: true,
-      });
+      return respond();
     });
     return;
   }
