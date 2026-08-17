@@ -6,6 +6,12 @@ use myelin_events::{
     derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
     EventId, EventType, IdMinter, Timestamp, Visibility,
 };
+use myelin_identity::{ObjectId, PrincipalId, RelName, RelationTuple, TupleDelta};
+use myelin_identity_service::tuple_written_event;
+use myelin_storage::{
+    DurableTupleBacking, DurableTupleDelta, DurableTupleWriteOutcome, TenantScope, TupleEdgeOp,
+};
+use myelin_tenancy::Region;
 
 use super::{
     AuthorKind, ConversationId, Message, MessageId, MessageState, NewMessage, RangeCursor,
@@ -83,6 +89,12 @@ impl PgMessageStore {
         tenant: &str,
         region: &str,
     ) -> Result<(), StoreError> {
+        if region != self.region {
+            return Err(StoreError::Cold(format!(
+                "message store is pinned to region {}, not {region}",
+                self.region
+            )));
+        }
         sqlx::query("SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)")
             .bind(tenant)
             .bind(region)
@@ -122,11 +134,13 @@ impl PgMessageStore {
         }
 
         let message_id = minter.mint();
-        sqlx::query(&format!(
+        let stored_message_id = sqlx::query_scalar::<_, String>(&format!(
             "INSERT INTO {} (tenant_id, region, conversation_id, message_id, thread_root_id, \
              author, author_kind, body_inline, body_nodes, client_nonce, edited_seq, state) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0) \
-             ON CONFLICT DO NOTHING",
+             ON CONFLICT (tenant_id, region, conversation_id, client_nonce) DO UPDATE \
+             SET client_nonce = EXCLUDED.client_nonce \
+             RETURNING message_id",
             self.table
         ))
         .bind(&msg.conv.tenant)
@@ -139,10 +153,10 @@ impl PgMessageStore {
         .bind(&msg.body_inline)
         .bind(&msg.body_nodes)
         .bind(&msg.client_nonce)
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| StoreError::Cold(format!("insert: {e}")))?;
-        Ok(message_id)
+        Ok(MessageId(stored_message_id))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -199,6 +213,11 @@ impl PgMessageStore {
         occurred: Timestamp,
         recorded: Timestamp,
     ) -> Result<MessageId, StoreError> {
+        if actor.0.tenant.0 != msg.conv.tenant {
+            return Err(StoreError::Cold(
+                "message actor is outside the conversation tenant".into(),
+            ));
+        }
         let mut conn = self
             .pool
             .acquire()
@@ -224,6 +243,7 @@ impl PgMessageStore {
         }
 
         let message_id = minter.mint();
+        let visibility_event_id = message_visibility_event_id(&event_id);
         let envelope = self.message_created_envelope(
             &msg,
             &message_id,
@@ -266,11 +286,12 @@ impl PgMessageStore {
             .await
             .map_err(|e| StoreError::Cold(format!("begin co-commit tx: {e}")))?;
 
-        sqlx::query(&format!(
+        let inserted = sqlx::query_scalar::<_, String>(&format!(
             "INSERT INTO {} (tenant_id, region, conversation_id, message_id, thread_root_id, \
              author, author_kind, body_inline, body_nodes, client_nonce, edited_seq, state) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0) \
-             ON CONFLICT DO NOTHING",
+             ON CONFLICT (tenant_id, region, conversation_id, client_nonce) DO NOTHING \
+             RETURNING message_id",
             self.table
         ))
         .bind(&msg.conv.tenant)
@@ -283,9 +304,72 @@ impl PgMessageStore {
         .bind(&msg.body_inline)
         .bind(&msg.body_nodes)
         .bind(&msg.client_nonce)
-        .execute(&mut *dbtx)
+        .fetch_optional(&mut *dbtx)
         .await
         .map_err(|e| StoreError::Cold(format!("co-commit message insert: {e}")))?;
+
+        if inserted.is_none() {
+            let existing = sqlx::query_scalar::<_, String>(&format!(
+                "SELECT message_id FROM {} WHERE tenant_id = $1 AND region = $2 \
+                 AND conversation_id = $3 AND client_nonce = $4",
+                self.table
+            ))
+            .bind(&msg.conv.tenant)
+            .bind(&msg.conv.region)
+            .bind(&msg.conv.conversation_id)
+            .bind(&msg.client_nonce)
+            .fetch_optional(&mut *dbtx)
+            .await
+            .map_err(|e| StoreError::Cold(format!("co-commit nonce resolution: {e}")))?
+            .ok_or_else(|| {
+                StoreError::Cold(
+                    "message nonce conflicted without an authoritative existing row".into(),
+                )
+            })?;
+            dbtx.rollback()
+                .await
+                .map_err(|e| StoreError::Cold(format!("rollback duplicate append: {e}")))?;
+            return Ok(MessageId(existing));
+        }
+
+        let visibility_tuple = message_visibility_tuple(&msg, &message_id);
+        let identity_delta = TupleDelta::Add(visibility_tuple.clone());
+        let durable_delta = DurableTupleDelta {
+            op: TupleEdgeOp::Add,
+            object: visibility_tuple.object.0,
+            relation: visibility_tuple.relation.0,
+            subject: visibility_tuple.subject.0,
+            expires_at: None,
+        };
+        let scope = TenantScope::from_verified_token(&actor.0, Region(msg.conv.region.clone()));
+        let (tenant, region) = (&msg.conv.tenant, &msg.conv.region);
+        let visibility_outcome = DurableTupleBacking::apply_deltas_in_tx(
+            &mut dbtx,
+            tenant,
+            region,
+            &[durable_delta],
+            None,
+            |revision| {
+                let (aggregate, envelope) = tuple_written_event(
+                    visibility_event_id,
+                    &scope,
+                    &actor.0,
+                    &[identity_delta],
+                    revision,
+                    None,
+                    &occurred,
+                    &recorded,
+                );
+                (aggregate.0, envelope)
+            },
+        )
+        .await
+        .map_err(|error| StoreError::Cold(format!("co-commit message visibility: {error}")))?;
+        let DurableTupleWriteOutcome::Committed { .. } = visibility_outcome else {
+            return Err(StoreError::Cold(
+                "message visibility write unexpectedly rejected without a precondition".into(),
+            ));
+        };
 
         myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
             &mut dbtx,
@@ -510,6 +594,25 @@ impl PgMessageStore {
         }
         Ok(())
     }
+}
+
+fn message_visibility_tuple(msg: &NewMessage, message_id: &MessageId) -> RelationTuple {
+    RelationTuple {
+        object: ObjectId(format!("message:{}", message_id.as_str())),
+        relation: RelName("parent_channel".into()),
+        subject: PrincipalId(format!("channel:{}#read", msg.conv.conversation_id)),
+        caveat: None,
+    }
+}
+
+fn message_visibility_event_id(message_event_id: &EventId) -> EventId {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"myelin.chat.message-visibility-event.v1\0");
+    digest.update(message_event_id.0.as_bytes());
+    EventId(format!(
+        "chat-visibility-{}",
+        &digest.finalize().to_hex()[..32]
+    ))
 }
 
 fn row_to_message(r: &sqlx::postgres::PgRow) -> Message {

@@ -21,6 +21,43 @@ pub const S3_TABLE: &str = "rebac_tuple";
 
 pub const S3_HOLDER: &str = "identity_rebac_tuples";
 
+/// Derives the canonical event for a relationship write performed inside another aggregate's
+/// transaction. Callers own the transaction and event id; Identity owns the event contract.
+#[allow(clippy::too_many_arguments)]
+pub fn tuple_written_event(
+    event_id: EventId,
+    scope: &TenantScope,
+    actor: &Principal,
+    deltas: &[TupleDelta],
+    revision: u64,
+    expires_at: Option<&Timestamp>,
+    occurred_at: &Timestamp,
+    recorded_at: &Timestamp,
+) -> (AggregateKey, EventEnvelope) {
+    let draft = tuple_written_draft(
+        scope,
+        deltas,
+        &Zookie(format!("zk-{revision:020}")),
+        expires_at,
+    );
+    let aggregate = draft.aggregate.clone();
+    let envelope = derive_envelope(
+        draft,
+        EmitContext {
+            event_id,
+            tenant: scope.tenant().clone(),
+            region: scope.region().clone(),
+            actor: Actor(actor.clone()),
+            schema_ver: 1,
+            occurred_at: occurred_at.clone(),
+            recorded_at: recorded_at.clone(),
+            caused_by: None,
+        },
+        None,
+    );
+    (aggregate, envelope)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WriteError {
     EmptyWrite,
@@ -409,32 +446,6 @@ impl TupleStore {
         Ok(())
     }
 
-    fn derive_tuple_event(
-        &self,
-        scope: &TenantScope,
-        actor: &Principal,
-        deltas: &[TupleDelta],
-        zookie: &Zookie,
-        expires_at: Option<&Timestamp>,
-        occurred_at: &Timestamp,
-    ) -> (AggregateKey, EventEnvelope) {
-        let draft = self.tuple_written_draft(scope, deltas, zookie, expires_at);
-        let aggregate = draft.aggregate.clone();
-        let event_id: EventId = self.minter.mint().into();
-        let ctx = EmitContext {
-            event_id,
-            tenant: scope.tenant().clone(),
-            region: scope.region().clone(),
-            actor: Actor(actor.clone()),
-            schema_ver: 1,
-            occurred_at: occurred_at.clone(),
-            recorded_at: occurred_at.clone(),
-            caused_by: None,
-        };
-        let envelope = derive_envelope(draft, ctx, None);
-        (aggregate, envelope)
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     fn stage_event(
         &self,
@@ -460,7 +471,7 @@ impl TupleStore {
             deltas.len(),
             zookie.0
         ));
-        let draft = self.tuple_written_draft(scope, deltas, zookie, expires_at);
+        let draft = tuple_written_draft(scope, deltas, zookie, expires_at);
         tx.emit(draft, None)
             .map_err(|e| WriteError::CommitFailed(e.0))?;
         Ok(tx)
@@ -560,7 +571,7 @@ impl TupleStore {
                 },
             })
             .collect();
-        let event_store = self.clone();
+        let event_minter = Arc::clone(&self.minter);
         let event_scope = scope.clone();
         let event_actor = actor.clone();
         let event_deltas = deltas.to_vec();
@@ -573,12 +584,14 @@ impl TupleStore {
                 edge_deltas,
                 expected.as_ref().map(|zookie| zookie.0.clone()),
                 move |revision| {
-                    let (aggregate, envelope) = event_store.derive_tuple_event(
+                    let (aggregate, envelope) = tuple_written_event(
+                        event_minter.mint().into(),
                         &event_scope,
                         &event_actor,
                         &event_deltas,
-                        &Self::zookie_of(revision),
+                        revision,
                         event_expires_at.as_ref(),
+                        &event_time,
                         &event_time,
                     );
                     (aggregate.0, envelope)
@@ -598,64 +611,6 @@ impl TupleStore {
                     actual: Self::zookie_of(actual_revision),
                 })
             }
-        }
-    }
-
-    fn tuple_written_draft(
-        &self,
-        scope: &TenantScope,
-        deltas: &[TupleDelta],
-        zookie: &Zookie,
-        expires_at: Option<&Timestamp>,
-    ) -> EventDraft {
-        let object = deltas
-            .iter()
-            .map(|d| match d {
-                TupleDelta::Add(t) | TupleDelta::Remove(t) => t.tuple_object(),
-            })
-            .next()
-            .unwrap_or("unknown");
-        let subject = EvArtifactRef(format!(
-            "myelin://{}/identity/tuple/{}",
-            scope.tenant().0,
-            object
-        ));
-        let aggregate = AggregateKey(format!("identity:tuple:{}:{}", scope.tenant().0, object));
-        let ops: Vec<serde_json::Value> = deltas
-            .iter()
-            .map(|d| match d {
-                TupleDelta::Add(t) => {
-                    let mut delta = serde_json::json!({
-                        "op": "add",
-                        "object": t.object.0,
-                        "relation": t.relation.0,
-                        "subject": t.subject.0,
-                    });
-                    if let Some(expires_at) = expires_at {
-                        delta["expires_at"] = serde_json::json!(expires_at.0);
-                    }
-                    delta
-                }
-                TupleDelta::Remove(t) => serde_json::json!({
-                    "op": "remove",
-                    "object": t.object.0,
-                    "relation": t.relation.0,
-                    "subject": t.subject.0,
-                }),
-            })
-            .collect();
-        EventDraft {
-            type_: EventType(IDENTITY_TUPLE_WRITTEN.to_string()),
-            subject,
-            aggregate,
-            payload: serde_json::json!({
-                "zookie": zookie.0,
-                "deltas": ops,
-            }),
-            data_role: EvDataRole::Controller,
-            visibility: Visibility::Internal,
-            contains_personal_data: false,
-            pii_key_ref: None,
         }
     }
 
@@ -686,6 +641,63 @@ impl TupleStore {
     #[cfg(any(test, feature = "test-support"))]
     fn mem_lock(arc: &Arc<Mutex<Inner>>) -> std::sync::MutexGuard<'_, Inner> {
         arc.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn tuple_written_draft(
+    scope: &TenantScope,
+    deltas: &[TupleDelta],
+    zookie: &Zookie,
+    expires_at: Option<&Timestamp>,
+) -> EventDraft {
+    let object = deltas
+        .iter()
+        .map(|d| match d {
+            TupleDelta::Add(t) | TupleDelta::Remove(t) => t.tuple_object(),
+        })
+        .next()
+        .unwrap_or("unknown");
+    let subject = EvArtifactRef(format!(
+        "myelin://{}/identity/tuple/{}",
+        scope.tenant().0,
+        object
+    ));
+    let aggregate = AggregateKey(format!("identity:tuple:{}:{}", scope.tenant().0, object));
+    let ops: Vec<serde_json::Value> = deltas
+        .iter()
+        .map(|d| match d {
+            TupleDelta::Add(t) => {
+                let mut delta = serde_json::json!({
+                    "op": "add",
+                    "object": t.object.0,
+                    "relation": t.relation.0,
+                    "subject": t.subject.0,
+                });
+                if let Some(expires_at) = expires_at {
+                    delta["expires_at"] = serde_json::json!(expires_at.0);
+                }
+                delta
+            }
+            TupleDelta::Remove(t) => serde_json::json!({
+                "op": "remove",
+                "object": t.object.0,
+                "relation": t.relation.0,
+                "subject": t.subject.0,
+            }),
+        })
+        .collect();
+    EventDraft {
+        type_: EventType(IDENTITY_TUPLE_WRITTEN.to_string()),
+        subject,
+        aggregate,
+        payload: serde_json::json!({
+            "zookie": zookie.0,
+            "deltas": ops,
+        }),
+        data_role: EvDataRole::Controller,
+        visibility: Visibility::Internal,
+        contains_personal_data: false,
+        pii_key_ref: None,
     }
 }
 

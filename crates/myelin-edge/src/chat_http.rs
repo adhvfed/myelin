@@ -48,13 +48,14 @@ pub struct DurableChatReadApi {
 impl DurableChatReadApi {
     pub fn new(
         pool: PgPool,
+        region: impl Into<String>,
         runtime: Handle,
         kms: Arc<KmsEngine>,
         identity: StoreBackedCheck,
     ) -> Self {
         Self {
             conversations: PgConversationStore::new(pool.clone()),
-            messages: PgMessageStore::new(pool, "edge", MESSAGE_TABLE),
+            messages: PgMessageStore::new(pool, region, MESSAGE_TABLE),
             runtime,
             kms,
             authorization: ChatAuthorization::new(identity),
@@ -519,11 +520,12 @@ impl Handler for MessagePostHandler {
 pub fn register_chat(
     builder: GatewayBuilder,
     pool: PgPool,
+    region: impl Into<String>,
     runtime: Handle,
     kms: Arc<KmsEngine>,
     identity: StoreBackedCheck,
 ) -> GatewayBuilder {
-    let reads = DurableChatReadApi::new(pool, runtime, kms, identity);
+    let reads = DurableChatReadApi::new(pool, region, runtime, kms, identity);
     let api = DurableChatMutationApi::new(reads.clone());
     builder
         .route(

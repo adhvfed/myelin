@@ -1,7 +1,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_chat::store::pg::PgMessageStore;
-use myelin_chat::store::{AuthorKind, ConversationId, MonotonicUlidSource, NewMessage};
+use myelin_chat::store::{AuthorKind, ConversationId, NewMessage, SystemUlidSource};
 use myelin_content::InlineNode;
 use myelin_events::{Actor, ArtifactRef, IdMinter, Timestamp, Ulid, UlidMinter};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -16,6 +16,11 @@ fn admin_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
+}
+
+fn app_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
 }
 
 fn region() -> &'static str {
@@ -69,12 +74,20 @@ async fn fresh_store() -> (sqlx::PgPool, String, PgMessageStore, String) {
         NEXT_STORE.fetch_add(1, Ordering::Relaxed)
     );
     let table = format!("message_p399_{suffix}");
-    let store = PgMessageStore::new(admin.clone(), region(), table.clone());
-    store.migrate().await.expect("apply the message DDL + RLS");
+    PgMessageStore::new(admin.clone(), region(), table.clone())
+        .migrate()
+        .await
+        .expect("apply the message DDL + RLS");
     sqlx::raw_sql(myelin_events::OUTBOX_MIGRATION)
         .execute(&admin)
         .await
         .expect("apply the frozen outbox migration");
+    let app = PgPoolOptions::new()
+        .max_connections(6)
+        .connect(&app_url())
+        .await
+        .expect("connect to dev Postgres as the production application role");
+    let store = PgMessageStore::new(app, region(), table.clone());
     (admin, table, store, suffix)
 }
 
@@ -105,27 +118,64 @@ async fn delete_outbox_aggregate(admin: &sqlx::PgPool, aggregate: &str) {
     transaction.commit().await.expect("commit outbox cleanup");
 }
 
+async fn delete_message_visibility(admin: &sqlx::PgPool, message_id: &str) {
+    let object = format!("message:{message_id}");
+    delete_outbox_aggregate(admin, &format!("identity:tuple:acmeP399:{object}")).await;
+    sqlx::query(
+        "DELETE FROM rebac_tuple \
+         WHERE tenant_id = 'acmeP399' AND region = $1 AND object_id = $2",
+    )
+    .bind(region())
+    .bind(&object)
+    .execute(admin)
+    .await
+    .expect("delete this test's message visibility relationship");
+    sqlx::query(
+        "DELETE FROM rebac_object_revision \
+         WHERE tenant_id = 'acmeP399' AND region = $1 AND object_id = $2",
+    )
+    .bind(region())
+    .bind(object)
+    .execute(admin)
+    .await
+    .expect("delete this test's message visibility revision");
+}
+
 #[tokio::test]
 async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     let (admin, table, store, suffix) = fresh_store().await;
 
     let conv = ConversationId::new("acmeP399", region(), format!("01J0CONVP399{suffix}"));
-    let src = MonotonicUlidSource::new();
+    let src = SystemUlidSource::new();
     let event_ids = UlidMinter::new();
 
     delete_outbox_aggregate(&admin, &conv.conversation_id).await;
 
-    let id0 = store
-        .append_co_commit(
+    let first_message = new_msg(&conv, "n0", "alice", "hello world");
+    let (left, right) = tokio::join!(
+        store.append_co_commit(
             &src,
-            new_msg(&conv, "n0", "alice", "hello world"),
+            first_message.clone(),
             event_ids.mint().into(),
             actor(),
             now(),
             now(),
-        )
-        .await
-        .expect("co-commit append");
+        ),
+        store.append_co_commit(
+            &src,
+            first_message,
+            event_ids.mint().into(),
+            actor(),
+            now(),
+            now(),
+        ),
+    );
+    let id0 = left.expect("first concurrent co-commit append");
+    assert_eq!(
+        right.expect("second concurrent co-commit append"),
+        id0,
+        "concurrent sends with one client nonce agree on the authoritative message id",
+    );
 
     let msg_count: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {table} WHERE conversation_id = $1"
@@ -137,6 +187,46 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     assert_eq!(
         msg_count, 1,
         "CHAT-D13: the message row is present after co-commit"
+    );
+
+    let visibility = sqlx::query(
+        "SELECT relation, subject FROM rebac_tuple \
+         WHERE tenant_id = $1 AND region = $2 AND object_id = $3",
+    )
+    .bind(&conv.tenant)
+    .bind(&conv.region)
+    .bind(format!("message:{}", id0.as_str()))
+    .fetch_one(&admin)
+    .await
+    .expect("the message visibility relationship co-committed");
+    assert_eq!(
+        (
+            visibility.get::<String, _>("relation"),
+            visibility.get::<String, _>("subject"),
+        ),
+        (
+            "parent_channel".into(),
+            format!("channel:{}#read", conv.conversation_id),
+        ),
+        "message.view follows the exact channel.read relationship used by authorization",
+    );
+    let identity_aggregate = format!("identity:tuple:{}:message:{}", conv.tenant, id0.as_str());
+    let identity_envelope: serde_json::Value =
+        sqlx::query_scalar("SELECT envelope FROM outbox WHERE aggregate = $1")
+            .bind(&identity_aggregate)
+            .fetch_one(&admin)
+            .await
+            .expect("the relationship projection event co-committed");
+    assert_eq!(identity_envelope["type_"], "identity.tuple.written");
+    assert_eq!(
+        identity_envelope["payload"]["deltas"],
+        serde_json::json!([{
+            "op": "add",
+            "object": format!("message:{}", id0.as_str()),
+            "relation": "parent_channel",
+            "subject": format!("channel:{}#read", conv.conversation_id),
+        }]),
+        "the projection event describes the same authoritative relationship as the row",
     );
 
     let ob_rows = sqlx::query(
@@ -209,20 +299,33 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         ob_count, 1,
         "CHAT-D14: exactly one event (the retry emitted none)"
     );
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
+            .bind(&identity_aggregate)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        identity_count, 1,
+        "an idempotent retry emits no second relationship event",
+    );
 
     const N: usize = 24;
+    let mut message_ids = vec![id0];
     for i in 1..=N {
-        store
-            .append_co_commit(
-                &src,
-                new_msg(&conv, &format!("n{i}"), "alice", &format!("m{i}")),
-                event_ids.mint().into(),
-                actor(),
-                now(),
-                now(),
-            )
-            .await
-            .expect("burst co-commit");
+        message_ids.push(
+            store
+                .append_co_commit(
+                    &src,
+                    new_msg(&conv, &format!("n{i}"), "alice", &format!("m{i}")),
+                    event_ids.mint().into(),
+                    actor(),
+                    now(),
+                    now(),
+                )
+                .await
+                .expect("burst co-commit"),
+        );
     }
     let mut seqs: Vec<i64> = sqlx::query_scalar("SELECT seq FROM outbox WHERE aggregate = $1")
         .bind(&conv.conversation_id)
@@ -237,13 +340,16 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     );
 
     delete_outbox_aggregate(&admin, &conv.conversation_id).await;
+    for message_id in message_ids {
+        delete_message_visibility(&admin, message_id.as_str()).await;
+    }
     drop_store(&admin, &table).await;
 }
 
 #[tokio::test]
 async fn a_structured_reference_is_one_atomic_durable_action() {
     let (admin, table, store, suffix) = fresh_store().await;
-    let src = MonotonicUlidSource::new();
+    let src = SystemUlidSource::new();
     let event_ids = UlidMinter::new();
 
     let referenced_conv =
@@ -367,8 +473,34 @@ async fn a_structured_reference_is_one_atomic_durable_action() {
         (0, 0),
         "a failed reference edge leaves neither a visible message nor an orphan event"
     );
+    let rolled_back_visibility: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rebac_tuple \
+         WHERE tenant_id = $1 AND region = $2 AND relation = 'parent_channel' AND subject = $3",
+    )
+    .bind(&rollback_conv.tenant)
+    .bind(&rollback_conv.region)
+    .bind(format!("channel:{}#read", rollback_conv.conversation_id))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    let rolled_back_identity_events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox \
+         WHERE envelope -> 'payload' -> 'deltas' @> $1::jsonb",
+    )
+    .bind(serde_json::json!([{
+        "subject": format!("channel:{}#read", rollback_conv.conversation_id),
+    }]))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        (rolled_back_visibility, rolled_back_identity_events),
+        (0, 0),
+        "the failed append also leaves no authorization relationship or projection event",
+    );
 
     delete_outbox_aggregate(&admin, &referenced_conv.conversation_id).await;
     delete_outbox_aggregate(&admin, &edge_aggregate.0).await;
+    delete_message_visibility(&admin, source_message_id.as_str()).await;
     drop_store(&admin, &table).await;
 }

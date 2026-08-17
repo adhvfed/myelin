@@ -1218,6 +1218,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     builder = register_privacy(builder, agent_traces, handle.clone());
     let mcp_chat = DurableChatReadApi::new(
         provider.db_pool().clone(),
+        provider.config().region.clone(),
         handle.clone(),
         kms.clone(),
         check.clone(),
@@ -1254,6 +1255,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     builder = register_chat(
         builder,
         provider.db_pool().clone(),
+        provider.config().region.clone(),
         handle.clone(),
         kms.clone(),
         check.clone(),

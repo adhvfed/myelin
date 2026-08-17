@@ -141,7 +141,9 @@ pub use ssh_auth::{
     encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,
     KeyBindingIndex, KeyBindingResolver, PrincipalStoreKeyBindings, RegisteredKey, SshVerifier,
 };
-pub use tuple_store::{run_grant_expiry, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE};
+pub use tuple_store::{
+    run_grant_expiry, tuple_written_event, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,
+};
 pub use webauthn::{
     encode_assertion_material, encode_registration_material,
     ChallengeGuard as WebauthnChallengeGuard, CoseKey, CredentialBindingIndex, WebauthnConfig,

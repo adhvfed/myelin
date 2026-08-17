@@ -368,116 +368,146 @@ impl DurableTupleBacking {
         self.provider
             .with_tenant_tx(tenant, move |conn| {
                 Box::pin(async move {
-                    sqlx::query(
-                        "INSERT INTO rebac_revision (tenant_id, region, revision) \
-                         VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
+                    Self::apply_deltas_in_tx(
+                        conn,
+                        &tenant_owned,
+                        &region_owned,
+                        &deltas,
+                        expected_revision.as_deref(),
+                        event_for_revision,
                     )
-                    .bind(&tenant_owned)
-                    .bind(&region_owned)
-                    .execute(&mut *conn)
                     .await
-                    .map_err(|error| PgError::Query(error.to_string()))?;
-
-                    let objects: Vec<String> = deltas
-                        .iter()
-                        .map(|delta| delta.object.clone())
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect();
-                    let tenant_revision: i64 = sqlx::query_scalar(
-                        "SELECT revision FROM rebac_revision \
-                         WHERE tenant_id = $1 AND region = $2 FOR UPDATE",
-                    )
-                    .bind(&tenant_owned)
-                    .bind(&region_owned)
-                    .fetch_one(&mut *conn)
-                    .await
-                    .map_err(|error| PgError::Query(error.to_string()))?;
-                    let object_revision: Option<i64> = if objects.is_empty() {
-                        None
-                    } else {
-                        sqlx::query_scalar(
-                            "SELECT MAX(revision) FROM rebac_object_revision \
-                             WHERE tenant_id = $1 AND region = $2 AND object_id = ANY($3)",
-                        )
-                        .bind(&tenant_owned)
-                        .bind(&region_owned)
-                        .bind(&objects)
-                        .fetch_one(&mut *conn)
-                        .await
-                        .map_err(|error| PgError::Query(error.to_string()))?
-                    };
-                    let actual_revision = decode_revision(
-                        "relationship precondition revision",
-                        object_revision.unwrap_or(tenant_revision),
-                    )?;
-                    if expected_revision
-                        .as_deref()
-                        .is_some_and(|expected| expected != format_revision(actual_revision))
-                    {
-                        return Ok(DurableTupleWriteOutcome::PreconditionFailed {
-                            actual_revision,
-                        });
-                    }
-
-                    let revision: i64 = sqlx::query_scalar(
-                        "UPDATE rebac_revision SET revision = revision + 1 \
-                         WHERE tenant_id = $1 AND region = $2 RETURNING revision",
-                    )
-                    .bind(&tenant_owned)
-                    .bind(&region_owned)
-                    .fetch_one(&mut *conn)
-                    .await
-                    .map_err(|error| PgError::Query(error.to_string()))?;
-                    for delta in &deltas {
-                        match delta.op {
-                            TupleEdgeOp::Add => {
-                                PgStore::upsert_tuple_on_conn(
-                                    conn,
-                                    &tenant_owned,
-                                    &region_owned,
-                                    &delta.object,
-                                    &delta.relation,
-                                    &delta.subject,
-                                    delta.expires_at.as_deref(),
-                                )
-                                .await?
-                            }
-                            TupleEdgeOp::Remove => {
-                                PgStore::delete_tuple_on_conn(
-                                    conn,
-                                    &tenant_owned,
-                                    &region_owned,
-                                    &delta.object,
-                                    &delta.relation,
-                                    &delta.subject,
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    for object in &objects {
-                        sqlx::query(
-                            "INSERT INTO rebac_object_revision \
-                             (tenant_id, region, object_id, revision) VALUES ($1, $2, $3, $4) \
-                             ON CONFLICT (tenant_id, region, object_id) DO UPDATE \
-                             SET revision = EXCLUDED.revision",
-                        )
-                        .bind(&tenant_owned)
-                        .bind(&region_owned)
-                        .bind(object)
-                        .bind(revision)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(|error| PgError::Query(error.to_string()))?;
-                    }
-                    let revision = decode_revision("committed relationship revision", revision)?;
-                    let (aggregate, envelope) = event_for_revision(revision);
-                    PgRelay::co_commit_in_tx(conn, &aggregate, &envelope).await?;
-                    Ok(DurableTupleWriteOutcome::Committed { revision })
                 })
             })
             .await
+    }
+
+    /// Applies relationship deltas and their projection event inside a caller-owned transaction.
+    /// This is the narrow co-commit seam for aggregates whose visibility relationship must become
+    /// authoritative in the same commit as the aggregate itself.
+    pub async fn apply_deltas_in_tx<F>(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        deltas: &[DurableTupleDelta],
+        expected_revision: Option<&str>,
+        event_for_revision: F,
+    ) -> Result<DurableTupleWriteOutcome, PgError>
+    where
+        F: FnOnce(u64) -> (String, EventEnvelope),
+    {
+        if deltas.is_empty() {
+            return Err(PgError::Query(
+                "relationship write requires at least one delta".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO rebac_revision (tenant_id, region, revision) \
+             VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(region)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+
+        let objects: Vec<String> = deltas
+            .iter()
+            .map(|delta| delta.object.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let tenant_revision: i64 = sqlx::query_scalar(
+            "SELECT revision FROM rebac_revision \
+             WHERE tenant_id = $1 AND region = $2 FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(region)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        let object_revision: Option<i64> = if objects.is_empty() {
+            None
+        } else {
+            sqlx::query_scalar(
+                "SELECT MAX(revision) FROM rebac_object_revision \
+                 WHERE tenant_id = $1 AND region = $2 AND object_id = ANY($3)",
+            )
+            .bind(tenant)
+            .bind(region)
+            .bind(&objects)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?
+        };
+        let actual_revision = decode_revision(
+            "relationship precondition revision",
+            object_revision.unwrap_or(tenant_revision),
+        )?;
+        if expected_revision.is_some_and(|expected| expected != format_revision(actual_revision)) {
+            return Ok(DurableTupleWriteOutcome::PreconditionFailed { actual_revision });
+        }
+
+        let revision: i64 = sqlx::query_scalar(
+            "UPDATE rebac_revision SET revision = revision + 1 \
+             WHERE tenant_id = $1 AND region = $2 RETURNING revision",
+        )
+        .bind(tenant)
+        .bind(region)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        for delta in deltas {
+            match delta.op {
+                TupleEdgeOp::Add => {
+                    PgStore::upsert_tuple_on_conn(
+                        conn,
+                        tenant,
+                        region,
+                        &delta.object,
+                        &delta.relation,
+                        &delta.subject,
+                        delta.expires_at.as_deref(),
+                    )
+                    .await?
+                }
+                TupleEdgeOp::Remove => {
+                    PgStore::delete_tuple_on_conn(
+                        conn,
+                        tenant,
+                        region,
+                        &delta.object,
+                        &delta.relation,
+                        &delta.subject,
+                    )
+                    .await?
+                }
+            }
+        }
+        for object in &objects {
+            sqlx::query(
+                "INSERT INTO rebac_object_revision \
+                 (tenant_id, region, object_id, revision) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (tenant_id, region, object_id) DO UPDATE \
+                 SET revision = EXCLUDED.revision",
+            )
+            .bind(tenant)
+            .bind(region)
+            .bind(object)
+            .bind(revision)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        }
+        let revision = decode_revision("committed relationship revision", revision)?;
+        let (aggregate, envelope) = event_for_revision(revision);
+        if envelope.tenant.0 != tenant || envelope.region.0 != region {
+            return Err(PgError::Query(
+                "relationship event is outside the write's tenant and region".into(),
+            ));
+        }
+        PgRelay::co_commit_in_tx(conn, &aggregate, &envelope).await?;
+        Ok(DurableTupleWriteOutcome::Committed { revision })
     }
 
     pub async fn snapshot_in(
