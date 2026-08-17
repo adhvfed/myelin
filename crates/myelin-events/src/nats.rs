@@ -15,6 +15,15 @@ use crate::relay::{
 };
 use crate::{ArtifactRef, EventEnvelope, EventId};
 
+const SERVER_SHUTDOWN_PULL_ERROR: &str =
+    "error while processing messages from the stream: 409, Some(\"Server Shutdown\")";
+
+fn is_server_shutdown(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    // async-nats 0.47 erases unexpected pull status messages into an I/O error.
+    // Match its complete rendering so unrelated 409 responses remain observable.
+    error.to_string() == SERVER_SHUTDOWN_PULL_ERROR
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct JetStreamPublisherConfig {
     pub nats_url: String,
@@ -849,7 +858,13 @@ impl NatsJetStreamBus {
                 .map_err(|e| TransportError(format!("pull batch: {e}")))?;
             let mut out = Vec::new();
             while let Some(next) = batch.next().await {
-                out.push(next.map_err(|e| TransportError(format!("pull message: {e}")))?);
+                match next {
+                    Ok(message) => out.push(message),
+                    Err(error) if is_server_shutdown(error.as_ref()) => break,
+                    Err(error) => {
+                        return Err(TransportError(format!("pull message: {error}")));
+                    }
+                }
             }
             Ok::<_, TransportError>(out)
         })?;
@@ -983,6 +998,10 @@ mod publisher_tests {
 
     use super::*;
 
+    fn nats_error(message: &str) -> async_nats::Error {
+        std::io::Error::other(message).into()
+    }
+
     fn config() -> JetStreamPublisherConfig {
         JetStreamPublisherConfig {
             nats_url: "nats://127.0.0.1:4222".into(),
@@ -994,6 +1013,24 @@ mod publisher_tests {
             replicas: 3,
             duplicate_window: std::time::Duration::from_secs(120),
             publish_ack_timeout: std::time::Duration::from_secs(2),
+        }
+    }
+
+    #[test]
+    fn only_server_shutdown_is_a_graceful_pull_ending() {
+        let shutdown = nats_error(SERVER_SHUTDOWN_PULL_ERROR);
+        assert!(is_server_shutdown(shutdown.as_ref()));
+
+        for error in [
+            "error while processing messages from the stream: 409, Some(\"Consumer Deleted\")",
+            "error while processing messages from the stream: 503, Some(\"Server Shutdown\")",
+            "connection reset by peer",
+        ] {
+            let error = nats_error(error);
+            assert!(
+                !is_server_shutdown(error.as_ref()),
+                "unrelated broker failure was hidden: {error}"
+            );
         }
     }
 

@@ -37,6 +37,10 @@ fn payload_free_hook_omits_secret_panic_material_from_stderr() {
         "the payload-free diagnostic must remain observable: {stderr:?}"
     );
     assert!(
+        stderr.contains("location="),
+        "the payload-free diagnostic must identify the faulting source location: {stderr:?}"
+    );
+    assert!(
         !stderr.contains(SENTINEL),
         "panic payload leaked to process stderr: {stderr:?}"
     );

@@ -7,8 +7,17 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub fn install_payload_free_panic_hook(service: &'static str) {
-    std::panic::set_hook(Box::new(move |_| {
-        eprintln!("{service}: an internal task panicked; payload suppressed");
+    std::panic::set_hook(Box::new(move |panic| {
+        if let Some(location) = panic.location() {
+            eprintln!(
+                "{service}: an internal task panicked; payload suppressed; location={}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
+        } else {
+            eprintln!("{service}: an internal task panicked; payload suppressed; location=unknown");
+        }
     }));
 }
 
