@@ -1,6 +1,6 @@
 import { Dialog, Icon } from "@myelin/design-system";
 import { useAction } from "@solidjs/router";
-import { createEffect, createSignal, Show } from "solid-js";
+import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 import { createProjectCatalogue } from "~/components/projects/project-catalogue";
 import {
   issuesMutate,
@@ -58,8 +58,10 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
   let projectNameInput: HTMLInputElement | undefined;
   let projectPrefixInput: HTMLInputElement | undefined;
   let focusStep = "";
+  let openingGeneration = 0;
 
   createEffect(() => {
+    openingGeneration += 1;
     if (!props.open) return;
     setTitle("");
     setProjectName("");
@@ -70,6 +72,7 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
     setSubmitting(null);
     setCreatingProject(false);
   });
+  onCleanup(() => { openingGeneration += 1; });
 
   const showProjectSetup = () => catalogue.empty() || creatingProject();
 
@@ -115,6 +118,7 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
       (validation ? titleInput : undefined)?.focus();
       return;
     }
+    const generation = openingGeneration;
     setSubmitting("issue");
     setError(null);
     try {
@@ -124,6 +128,7 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
         title: title(),
         clientNonce: issueClientNonce(),
       });
+      if (generation !== openingGeneration) return;
       if (!result.ok) {
         setError(issueActionError(result.error));
         titleInput?.focus();
@@ -137,10 +142,12 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
       props.onAccepted(result.receipt);
       props.onClose();
     } catch {
-      setError(issueActionError("error"));
-      titleInput?.focus();
+      if (generation === openingGeneration) {
+        setError(issueActionError("error"));
+        titleInput?.focus();
+      }
     } finally {
-      setSubmitting(null);
+      if (generation === openingGeneration) setSubmitting(null);
     }
   };
 
@@ -153,6 +160,7 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
       (nameError ? projectNameInput : projectPrefixInput)?.focus();
       return;
     }
+    const generation = openingGeneration;
     setSubmitting("project");
     setError(null);
     try {
@@ -161,6 +169,7 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
         issuePrefix: projectPrefix(),
         clientNonce: projectClientNonce(),
       });
+      if (generation !== openingGeneration) return;
       if (!result.ok) {
         setError(projectActionError(result.error));
         (result.error === "conflict" ? projectPrefixInput : projectNameInput)?.focus();
@@ -171,10 +180,12 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
       setCreatingProject(false);
       setError(null);
     } catch {
-      setError(projectActionError("error"));
-      projectNameInput?.focus();
+      if (generation === openingGeneration) {
+        setError(projectActionError("error"));
+        projectNameInput?.focus();
+      }
     } finally {
-      setSubmitting(null);
+      if (generation === openingGeneration) setSubmitting(null);
     }
   };
 

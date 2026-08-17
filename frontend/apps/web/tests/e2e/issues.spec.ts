@@ -15,12 +15,14 @@ async function setEdgeConfig(cfg: {
   issueActivationUnavailable?: boolean;
   issueCreateUnavailable?: boolean;
   issueCreateResponseLosses?: number;
+  issueCreateResponseDelaysMs?: number[];
   issueCloseUnavailable?: boolean;
   issueCloseResponseDelaysMs?: number[];
   emptyProjects?: boolean;
   projectsUnavailable?: boolean;
   projectCreateUnavailable?: boolean;
   projectCreateResponseLosses?: number;
+  projectCreateResponseDelaysMs?: number[];
   projectCount?: number;
   projectListCursorDelaysMs?: number[];
   issueListFirstPageHolds?: number;
@@ -40,6 +42,10 @@ async function edgeIssueState(): Promise<{
   issueListFirstPageDelayedRequests: number;
   issueListFirstPageDelayedResponses: number;
   issueListCursorRequestsByState: { open: number; closed: number; all: number };
+  issueCreateRequests: number;
+  issueCreateResponses: number;
+  projectCreateRequests: number;
+  projectCreateResponses: number;
 }> {
   const context = await pwRequest.newContext();
   const response = await context.post(`${EDGE}/__test/config`, { data: {} });
@@ -250,6 +256,40 @@ test.describe("issue workflows", () => {
       .toHaveCount(1);
   });
 
+  test("a late project response leaves a newly opened project draft untouched", async ({ page }) => {
+    await setEdgeConfig({
+      emptyProjects: true,
+      emptyIssues: true,
+      projectCreateResponseDelaysMs: [1_500],
+    });
+    await devLogin(page);
+    await gotoInteractive(page, "/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    let dialog = page.getByRole("dialog", { name: "Set up issue tracking" });
+    await dialog.getByLabel("Project name").fill("Abandoned project");
+    await dialog.getByLabel("Issue key").fill("OLD");
+    await dialog.getByRole("button", { name: "Create project" }).click();
+    await expect.poll(async () => (await edgeIssueState()).projectCreateRequests).toBe(1);
+
+    await page.evaluate(() => {
+      window.history.pushState({}, "", "/issues");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await expect(dialog).toBeHidden();
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    dialog = page.getByRole("dialog", { name: "Set up issue tracking" });
+    await dialog.getByLabel("Project name").fill("Fresh project draft");
+    await dialog.getByLabel("Issue key").fill("NEW");
+    await expect.poll(async () => (await edgeIssueState()).projectCreateResponses).toBe(1);
+    await page.waitForTimeout(500);
+
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByLabel("Project name")).toHaveValue("Fresh project draft");
+    await expect(dialog.getByLabel("Issue key")).toHaveValue("NEW");
+  });
+
   test("a project created while pagination is loading restarts the shared catalogue", async ({ page, request }) => {
     await setEdgeConfig({ projectCount: 51, projectListCursorDelaysMs: [1_500] });
     await devLogin(page);
@@ -304,6 +344,34 @@ test.describe("issue workflows", () => {
     await page.reload();
     await waitForInteractiveShell(page);
     await expect(page.getByTestId("issue-row").filter({ hasText: "Retry one durable issue" })).toHaveCount(1);
+  });
+
+  test("a late issue response cannot close the fresh draft that replaced it", async ({ page }) => {
+    await setEdgeConfig({ emptyIssues: true, issueCreateResponseDelaysMs: [1_500] });
+    await devLogin(page);
+    await gotoInteractive(page, "/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    let dialog = page.getByRole("dialog", { name: "New issue" });
+    await dialog.getByLabel("Title").fill("Abandoned issue");
+    await dialog.getByRole("button", { name: "Create issue" }).click();
+    await expect.poll(async () => (await edgeIssueState()).issueCreateRequests).toBe(1);
+
+    await page.evaluate(() => {
+      window.history.pushState({}, "", "/issues");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await expect(dialog).toBeHidden();
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    dialog = page.getByRole("dialog", { name: "New issue" });
+    await dialog.getByLabel("Title").fill("Fresh issue draft");
+    await expect.poll(async () => (await edgeIssueState()).issueCreateResponses).toBe(1);
+    await page.waitForTimeout(500);
+
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByLabel("Title")).toHaveValue("Fresh issue draft");
+    await expect(page.getByTestId("pending-issue")).toHaveCount(0);
   });
 
   test("project discovery failure never guesses an issue destination", async ({ page }) => {

@@ -103,6 +103,9 @@ const state = {
   issueActivationUnavailable: false,
   issueCreateUnavailable: false,
   issueCreateResponseLosses: 0,
+  issueCreateResponseDelaysMs: [],
+  issueCreateRequests: 0,
+  issueCreateResponses: 0,
   issueCloseUnavailable: false,
   issueCloseResponseDelaysMs: [],
   issueCloseRequests: 0,
@@ -111,6 +114,9 @@ const state = {
   projectsUnavailable: false,
   projectCreateUnavailable: false,
   projectCreateResponseLosses: 0,
+  projectCreateResponseDelaysMs: [],
+  projectCreateRequests: 0,
+  projectCreateResponses: 0,
   projectListCursorDelaysMs: [],
   projectListCursorRequests: 0,
   projectListCursorResponses: 0,
@@ -199,6 +205,9 @@ function resetProjects() {
   state.projectsUnavailable = false;
   state.projectCreateUnavailable = false;
   state.projectCreateResponseLosses = 0;
+  state.projectCreateResponseDelaysMs = [];
+  state.projectCreateRequests = 0;
+  state.projectCreateResponses = 0;
   state.projectListCursorDelaysMs = [];
   state.projectListCursorRequests = 0;
   state.projectListCursorResponses = 0;
@@ -252,6 +261,9 @@ function resetIssues() {
   state.issueActivationUnavailable = false;
   state.issueCreateUnavailable = false;
   state.issueCreateResponseLosses = 0;
+  state.issueCreateResponseDelaysMs = [];
+  state.issueCreateRequests = 0;
+  state.issueCreateResponses = 0;
   state.issueCloseUnavailable = false;
   state.issueCloseResponseDelaysMs = [];
   state.issueCloseRequests = 0;
@@ -643,6 +655,12 @@ const server = createServer((req, res) => {
         if (Number.isInteger(body.issueCreateResponseLosses) && body.issueCreateResponseLosses >= 0) {
           state.issueCreateResponseLosses = body.issueCreateResponseLosses;
         }
+        if (Array.isArray(body.issueCreateResponseDelaysMs) &&
+            body.issueCreateResponseDelaysMs.length <= 10 &&
+            body.issueCreateResponseDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.issueCreateResponseDelaysMs = [...body.issueCreateResponseDelaysMs];
+        }
         if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
         if (Array.isArray(body.issueCloseResponseDelaysMs) &&
             body.issueCloseResponseDelaysMs.length <= 10 &&
@@ -665,6 +683,12 @@ const server = createServer((req, res) => {
         if (typeof body.projectCreateUnavailable === "boolean") state.projectCreateUnavailable = body.projectCreateUnavailable;
         if (Number.isInteger(body.projectCreateResponseLosses) && body.projectCreateResponseLosses >= 0) {
           state.projectCreateResponseLosses = body.projectCreateResponseLosses;
+        }
+        if (Array.isArray(body.projectCreateResponseDelaysMs) &&
+            body.projectCreateResponseDelaysMs.length <= 10 &&
+            body.projectCreateResponseDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.projectCreateResponseDelaysMs = [...body.projectCreateResponseDelaysMs];
         }
         if (Number.isInteger(body.prCommitContinuationFailures) && body.prCommitContinuationFailures >= 0) {
           state.prCommitContinuationFailures = body.prCommitContinuationFailures;
@@ -1162,11 +1186,21 @@ const server = createServer((req, res) => {
       projectRows.push(project);
       projectCreations.set(clientNonce, { name: body.name, issuePrefix: body.issue_prefix, project });
       state.emptyProjects = false;
-      if (state.projectCreateResponseLosses > 0) {
-        state.projectCreateResponseLosses -= 1;
-        return send(res, 503, { error: { message: "project was committed but its response was lost", code: "unavailable" } });
+      state.projectCreateRequests += 1;
+      const respond = () => {
+        state.projectCreateResponses += 1;
+        if (state.projectCreateResponseLosses > 0) {
+          state.projectCreateResponseLosses -= 1;
+          return send(res, 503, { error: { message: "project was committed but its response was lost", code: "unavailable" } });
+        }
+        return send(res, 201, { project, created: true, durable: true });
+      };
+      const delay = state.projectCreateResponseDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(respond, delay);
+        return;
       }
-      return send(res, 201, { project, created: true, durable: true });
+      return respond();
     });
     return;
   }
@@ -1238,11 +1272,21 @@ const server = createServer((req, res) => {
         authorization: { status: "pending", request_event_id: requestEventId },
       };
       issueCreations.set(clientNonce, { projectId: body.project_id, title, response });
-      if (state.issueCreateResponseLosses > 0) {
-        state.issueCreateResponseLosses -= 1;
-        return send(res, 503, { error: { message: "issue was committed but its response was lost", code: "unavailable" } });
+      state.issueCreateRequests += 1;
+      const respond = () => {
+        state.issueCreateResponses += 1;
+        if (state.issueCreateResponseLosses > 0) {
+          state.issueCreateResponseLosses -= 1;
+          return send(res, 503, { error: { message: "issue was committed but its response was lost", code: "unavailable" } });
+        }
+        return send(res, 202, { ...response, created: true, durable: true });
+      };
+      const delay = state.issueCreateResponseDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(respond, delay);
+        return;
       }
-      return send(res, 202, { ...response, created: true, durable: true });
+      return respond();
     });
     return;
   }
