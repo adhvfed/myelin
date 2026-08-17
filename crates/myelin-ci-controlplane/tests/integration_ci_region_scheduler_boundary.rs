@@ -61,39 +61,69 @@ fn assert_permission_denied(result: Result<PgQueryResult, sqlx::Error>, operatio
 }
 
 async fn cleanup(admin: &PgPool, tenants: &[&str]) {
+    let mut transaction = admin
+        .begin()
+        .await
+        .expect("begin scheduler-boundary cleanup");
+    sqlx::query("SELECT run_id FROM ci_run WHERE tenant_id = ANY($1) FOR UPDATE")
+        .bind(tenants)
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("lock scheduler-boundary runs against the live starter");
     sqlx::query("DELETE FROM workflow_run WHERE tenant_id = ANY($1)")
         .bind(tenants)
-        .execute(admin)
+        .execute(&mut *transaction)
         .await
         .expect("clean scheduler-boundary workflow fixtures");
     sqlx::query("DELETE FROM job_queue WHERE tenant_id = ANY($1)")
         .bind(tenants)
-        .execute(admin)
+        .execute(&mut *transaction)
         .await
         .expect("clean scheduler-boundary queue fixtures");
     sqlx::query("DELETE FROM fair_deficit WHERE tenant_id = ANY($1)")
         .bind(tenants)
-        .execute(admin)
+        .execute(&mut *transaction)
         .await
         .expect("clean scheduler-boundary fairness fixtures");
+    sqlx::query("DELETE FROM ci_job WHERE tenant_id = ANY($1)")
+        .bind(tenants)
+        .execute(&mut *transaction)
+        .await
+        .expect("clean configuration jobs retired by the live starter");
     sqlx::query("DELETE FROM ci_run WHERE tenant_id = ANY($1)")
         .bind(tenants)
-        .execute(admin)
+        .execute(&mut *transaction)
         .await
         .expect("clean scheduler-boundary run fixtures");
+    transaction
+        .commit()
+        .await
+        .expect("commit scheduler-boundary cleanup");
 }
 
 async fn cleanup_stale_fixtures(admin: &PgPool) {
-    for table in ["workflow_run", "job_queue", "fair_deficit", "ci_run"] {
-        sqlx::query(&format!(
-            "DELETE FROM {table}
-              WHERE tenant_id LIKE 'scheduler-a-%'
-                 OR tenant_id LIKE 'scheduler-b-%'
-                 OR tenant_id LIKE 'scheduler-de-%'"
-        ))
-        .execute(admin)
-        .await
-        .unwrap_or_else(|error| panic!("clean stale scheduler fixtures from {table}: {error}"));
+    let tenants: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT tenant_id
+           FROM (
+             SELECT tenant_id FROM ci_run
+             UNION SELECT tenant_id FROM ci_job
+             UNION SELECT tenant_id FROM workflow_run
+             UNION SELECT tenant_id FROM job_queue
+             UNION SELECT tenant_id FROM fair_deficit
+           ) fixtures
+          WHERE tenant_id LIKE 'scheduler-a-%'
+             OR tenant_id LIKE 'scheduler-b-%'
+             OR tenant_id LIKE 'scheduler-de-%'",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("discover stale scheduler-boundary tenants");
+    if !tenants.is_empty() {
+        cleanup(
+            admin,
+            &tenants.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await;
     }
 }
 
