@@ -217,6 +217,42 @@ test.describe("Chat workspace", () => {
     await expect(page.getByRole("heading", { name: "Chat", level: 1 })).toBeVisible();
   });
 
+  test("a topic created while pagination is loading restarts the catalogue snapshot", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { chatConversationCount: 101, chatConversationCursorDelaysMs: [1_500] },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await page.getByRole("button", { name: "More topics" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.chatConversationCursorRequests;
+    }).toBe(1);
+
+    await page.getByRole("button", { name: "Create a topic" }).click();
+    await page.getByRole("textbox", { name: "Channel", exact: true }).fill("reliability");
+    await page.getByRole("textbox", { name: "Topic", exact: true }).fill("one coherent catalogue");
+    await page.getByRole("button", { name: "Create topic" }).click();
+    await expect(page.getByTestId("chat-topic-link").filter({ hasText: "one coherent catalogue" }))
+      .toBeVisible();
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.chatConversationCursorResponses;
+    }).toBe(1);
+    await expect(page.getByRole("button", { name: "More topics" })).toBeVisible();
+    await expect(page.getByTestId("chat-topic-link").filter({ hasText: "agent operations" }))
+      .toHaveCount(0);
+
+    await page.getByRole("button", { name: "More topics" }).click();
+    await expect(page.getByTestId("chat-topic-link").filter({ hasText: "agent operations" }))
+      .toBeVisible();
+    await expect(page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }))
+      .toBeVisible();
+  });
+
   test("an earlier page can never arrive in the topic opened while it was loading", async ({ page, request }) => {
     const configured = await request.post(`${EDGE}/__test/config`, {
       data: { chatPaginatedMessages: true, chatMessageCursorDelaysMs: [1_500] },

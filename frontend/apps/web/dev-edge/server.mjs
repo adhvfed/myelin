@@ -119,6 +119,9 @@ const state = {
   prMutationResponseLosses: 0,
   emptyChat: false,
   chatConversationResponseLosses: 0,
+  chatConversationCursorDelaysMs: [],
+  chatConversationCursorRequests: 0,
+  chatConversationCursorResponses: 0,
   chatPostResponseLosses: 0,
   chatPaginatedMessages: false,
   chatMessageCursorDelaysMs: [],
@@ -447,6 +450,9 @@ const server = createServer((req, res) => {
         if (body.resetChat === true) {
           state.emptyChat = false;
           state.chatConversationResponseLosses = 0;
+          state.chatConversationCursorDelaysMs = [];
+          state.chatConversationCursorRequests = 0;
+          state.chatConversationCursorResponses = 0;
           state.chatPostResponseLosses = 0;
           state.chatPaginatedMessages = false;
           state.chatMessageCursorDelaysMs = [];
@@ -457,12 +463,28 @@ const server = createServer((req, res) => {
         if (typeof body.emptyChat === "boolean") {
           state.emptyChat = body.emptyChat;
           state.chatConversationResponseLosses = 0;
+          state.chatConversationCursorDelaysMs = [];
+          state.chatConversationCursorRequests = 0;
+          state.chatConversationCursorResponses = 0;
           state.chatPostResponseLosses = 0;
           state.chatPaginatedMessages = false;
           state.chatMessageCursorDelaysMs = [];
           state.chatMessageCursorRequests = 0;
           state.chatMessageCursorResponses = 0;
           chat.reset({ empty: body.emptyChat });
+        }
+        if (Number.isInteger(body.chatConversationCount) &&
+            body.chatConversationCount >= 0 && body.chatConversationCount <= 200) {
+          state.emptyChat = body.chatConversationCount === 0;
+          state.chatConversationCursorRequests = 0;
+          state.chatConversationCursorResponses = 0;
+          chat.reset({ conversationCount: body.chatConversationCount });
+        }
+        if (Array.isArray(body.chatConversationCursorDelaysMs) &&
+            body.chatConversationCursorDelaysMs.length <= 10 &&
+            body.chatConversationCursorDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.chatConversationCursorDelaysMs = [...body.chatConversationCursorDelaysMs];
         }
         if (typeof body.chatPaginatedMessages === "boolean") {
           state.chatPaginatedMessages = body.chatPaginatedMessages;
@@ -608,7 +630,20 @@ const server = createServer((req, res) => {
     if (!input) {
       return send(res, 400, { error: { message: "invalid Chat topic query", code: "bad_request" } });
     }
-    return send(res, 200, chat.listConversations(input), { "cache-control": "no-store" });
+    const output = chat.listConversations(input);
+    if (input.cursor) {
+      state.chatConversationCursorRequests += 1;
+      const delay = state.chatConversationCursorDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(() => {
+          state.chatConversationCursorResponses += 1;
+          send(res, 200, output, { "cache-control": "no-store" });
+        }, delay);
+        return;
+      }
+      state.chatConversationCursorResponses += 1;
+    }
+    return send(res, 200, output, { "cache-control": "no-store" });
   }
 
   if (method === "POST" && path === "/v1/chat/conversations") {

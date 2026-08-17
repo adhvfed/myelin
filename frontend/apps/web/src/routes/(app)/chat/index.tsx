@@ -54,6 +54,8 @@ export default function ChatIndex() {
   const [earlierMessagePages, setEarlierMessagePages] = createSignal<ChatMessagePage[]>([]);
   const [loadingEarlier, setLoadingEarlier] = createSignal(false);
   const [earlierError, setEarlierError] = createSignal(false);
+  let conversationGeneration = 0;
+  let conversationRequest = 0;
   let messageGeneration = 0;
   let earlierMessageRequest = 0;
 
@@ -131,16 +133,32 @@ export default function ChatIndex() {
   const loadMoreConversations = async () => {
     const cursor = nextConversationCursor();
     if (!cursor || loadingConversations()) return;
+    const generation = conversationGeneration;
+    const request = ++conversationRequest;
     setLoadingConversations(true);
     setConversationContinuationError(false);
     try {
       const page = await getChatConversations({ cursor, limit: 100 });
-      setConversationPages((pages) => [...pages, page]);
+      if (generation === conversationGeneration && request === conversationRequest) {
+        setConversationPages((pages) => [...pages, page]);
+      }
     } catch {
-      setConversationContinuationError(true);
+      if (generation === conversationGeneration && request === conversationRequest) {
+        setConversationContinuationError(true);
+      }
     } finally {
-      setLoadingConversations(false);
+      if (generation === conversationGeneration && request === conversationRequest) {
+        setLoadingConversations(false);
+      }
     }
+  };
+  const restartConversations = () => {
+    conversationGeneration += 1;
+    conversationRequest += 1;
+    setConversationPages([]);
+    setConversationContinuationError(false);
+    setLoadingConversations(false);
+    void revalidate("chat-conversations");
   };
 
   const loadEarlier = async () => {
@@ -242,8 +260,7 @@ export default function ChatIndex() {
         preferredProjectId={selectedConversation()?.project_id}
         onClose={closeCreate}
         onCreated={(receipt) => {
-          void revalidate("chat-conversations");
-          setConversationPages([]);
+          restartConversations();
           navigate(chatHref(receipt.conversation.id));
           toast.show({ title: `Topic created in ${receipt.conversation.channel}`, variant: "success" });
         }}

@@ -88,13 +88,18 @@ export class ChatFixtures {
     this.reset();
   }
 
-  reset({ empty = false, paginated = false } = {}) {
-    this.sequence = 20;
-    this.conversations = empty ? [] : [
+  reset({ empty = false, paginated = false, conversationCount = 3 } = {}) {
+    const count = empty ? 0 : conversationCount;
+    this.sequence = Math.max(20, count);
+    const conversations = [
       { id: fixtureUlid(1), project_id: PROJECT_ID, channel: "engineering", topic: "release readiness" },
       { id: fixtureUlid(2), project_id: PROJECT_ID, channel: "engineering", topic: "agent operations" },
       { id: fixtureUlid(3), project_id: PROJECT_ID, channel: "product", topic: "customer feedback" },
     ];
+    for (let index = 4; index <= count; index += 1) {
+      conversations.push({ id: fixtureUlid(index), project_id: PROJECT_ID, channel: "archive", topic: `Archived topic ${String(index).padStart(3, "0")}` });
+    }
+    this.conversations = conversations.slice(0, count);
     this.messages = new Map();
     if (!empty) {
       const releaseMessages = [
