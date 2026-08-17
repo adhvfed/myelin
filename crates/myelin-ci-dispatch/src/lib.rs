@@ -31,8 +31,8 @@ pub use resolve::{
 };
 
 use myelin_substrate::{
-    boot, serve, AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec,
-    PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
+    ServeError, StoreManifest,
 };
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -237,7 +237,7 @@ fn dispatch_critical() -> CriticalDependencies {
     CriticalDependencies::new(["broker", "authz", "blob"])
 }
 
-pub fn dispatch_app_spec(
+fn dispatch_app_spec(
     config: Config,
     outbox: myelin_events::OutboxStore,
     consumers: Vec<ConsumerReg>,
@@ -269,20 +269,22 @@ pub fn dispatch_app_spec_with_intake(
     spec
 }
 
-pub fn boot_dispatch(
+#[cfg(test)]
+fn boot_dispatch(
     config: Config,
     outbox: myelin_events::OutboxStore,
     consumers: Vec<ConsumerReg>,
-) -> Result<ServeHandle, ServeError> {
-    boot(dispatch_app_spec(config, outbox, consumers))
+) -> Result<myelin_substrate::ServeHandle, ServeError> {
+    myelin_substrate::boot(dispatch_app_spec(config, outbox, consumers))
 }
 
-pub fn run_dispatch(
+#[cfg(test)]
+fn run_dispatch(
     config: Config,
     outbox: myelin_events::OutboxStore,
     consumers: Vec<ConsumerReg>,
 ) -> Result<(), ServeError> {
-    serve(dispatch_app_spec(config, outbox, consumers))
+    myelin_substrate::serve(dispatch_app_spec(config, outbox, consumers))
 }
 
 pub async fn run_dispatch_until_shutdown<F>(
@@ -306,16 +308,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_substrate::{Liveness, Surface};
+    use myelin_substrate::{boot, Liveness, Surface};
 
     #[test]
-    fn dispatch_boots_from_serve_appspec_with_three_ports() {
+    fn bare_test_spec_boots_with_three_ports() {
         let handle = boot_dispatch(
             Config::default(),
             myelin_events::OutboxStore::new(),
             Vec::new(),
         )
-        .expect("the Trigger & Dispatch shell boots from serve(AppSpec)");
+        .expect("the CI dispatch test shell boots from serve(AppSpec)");
         assert_eq!(handle.name(), SERVICE_NAME, "the deployable service name");
 
         assert_eq!(
@@ -391,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shell_carries_the_dedup_ledger_and_the_injected_trigger_consumer() {
+    fn bare_spec_carries_the_dedup_ledger_and_explicit_consumer() {
         use std::sync::Arc;
         let handler = consumer::CiTriggerHandler::new(
             Arc::new(consumer::MapGitConfigReader::new()),
@@ -445,10 +447,7 @@ mod tests {
             myelin_events::OutboxStore::new(),
             Vec::new(),
         );
-        assert!(
-            empty.consumers.is_empty(),
-            "the shell boots with no consumers too"
-        );
+        assert!(empty.consumers.is_empty(), "the bare test spec stays empty");
     }
 
     #[test]
