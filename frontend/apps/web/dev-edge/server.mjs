@@ -120,6 +120,9 @@ const state = {
   chatMessageCursorResponses: 0,
   emptyKnowledge: false,
   knowledgeCreateResponseLosses: 0,
+  knowledgeListCursorDelaysMs: [],
+  knowledgeListCursorRequests: 0,
+  knowledgeListCursorResponses: 0,
   knowledgeSaveResponseDelaysMs: [],
   // CT-005 CI read-surface controls. Cursors bind the canonicalized concrete visible-repository set,
   // just as production does; tests mutate membership rather than a synthetic generation counter.
@@ -461,14 +464,33 @@ const server = createServer((req, res) => {
         if (body.resetKnowledge === true) {
           state.emptyKnowledge = false;
           state.knowledgeCreateResponseLosses = 0;
+          state.knowledgeListCursorDelaysMs = [];
+          state.knowledgeListCursorRequests = 0;
+          state.knowledgeListCursorResponses = 0;
           state.knowledgeSaveResponseDelaysMs = [];
           knowledge.reset();
         }
         if (typeof body.emptyKnowledge === "boolean") {
           state.emptyKnowledge = body.emptyKnowledge;
           state.knowledgeCreateResponseLosses = 0;
+          state.knowledgeListCursorDelaysMs = [];
+          state.knowledgeListCursorRequests = 0;
+          state.knowledgeListCursorResponses = 0;
           state.knowledgeSaveResponseDelaysMs = [];
           knowledge.reset({ empty: body.emptyKnowledge });
+        }
+        if (Number.isInteger(body.knowledgePageCount) &&
+            body.knowledgePageCount >= 0 && body.knowledgePageCount <= 200) {
+          state.emptyKnowledge = body.knowledgePageCount === 0;
+          state.knowledgeListCursorRequests = 0;
+          state.knowledgeListCursorResponses = 0;
+          knowledge.reset({ pageCount: body.knowledgePageCount });
+        }
+        if (Array.isArray(body.knowledgeListCursorDelaysMs) &&
+            body.knowledgeListCursorDelaysMs.length <= 10 &&
+            body.knowledgeListCursorDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.knowledgeListCursorDelaysMs = [...body.knowledgeListCursorDelaysMs];
         }
         if (Number.isInteger(body.knowledgeCreateResponseLosses) &&
             body.knowledgeCreateResponseLosses >= 0) {
@@ -665,7 +687,21 @@ const server = createServer((req, res) => {
   if (method === "GET" && path === "/v1/knowledge/pages") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     const input = parseKnowledgeQuery(url.search.slice(1));
-    return input ? send(res, 200, knowledge.list(input), { "cache-control": "no-store" }) : send(res, 400, { error: { message: "invalid Knowledge page query", code: "bad_request" } });
+    if (!input) return send(res, 400, { error: { message: "invalid Knowledge page query", code: "bad_request" } });
+    const output = knowledge.list(input);
+    if (input.cursor) {
+      state.knowledgeListCursorRequests += 1;
+      const delay = state.knowledgeListCursorDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(() => {
+          state.knowledgeListCursorResponses += 1;
+          send(res, 200, output, { "cache-control": "no-store" });
+        }, delay);
+        return;
+      }
+      state.knowledgeListCursorResponses += 1;
+    }
+    return send(res, 200, output, { "cache-control": "no-store" });
   }
 
   if (method === "POST" && path === "/v1/knowledge/pages") {

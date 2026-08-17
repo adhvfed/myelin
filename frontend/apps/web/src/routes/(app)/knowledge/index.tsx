@@ -9,6 +9,10 @@ import { getKnowledgePage, getKnowledgePages, isKnowledgeUlid, KnowledgeRouteErr
 
 interface PageResult<T> { value: T | null; error: KnowledgeErrorKind | null }
 function kind(error: unknown): KnowledgeErrorKind { return error instanceof KnowledgeRouteError ? error.kind : "error"; }
+function mergePages(first: KnowledgePageList | undefined, continuations: KnowledgePageList[]) {
+  const pages = [first?.items ?? [], ...continuations.map((page) => page.items)].flat();
+  return [...new Map(pages.map((page) => [page.id, page])).values()];
+}
 
 export default function KnowledgeIndex() {
   const [search] = useSearchParams();
@@ -23,6 +27,7 @@ export default function KnowledgeIndex() {
   const [interactive, setInteractive] = createSignal(false);
   const [more, setMore] = createSignal<KnowledgePageList[]>([]);
   const [loadingMore, setLoadingMore] = createSignal(false);
+  let pageListGeneration = 0;
 
   const first = createAsync(async (): Promise<PageResult<KnowledgePageList>> => {
     try { return { value: await getKnowledgePages({ limit: 100 }), error: null }; }
@@ -38,16 +43,30 @@ export default function KnowledgeIndex() {
     catch (error) { if (error instanceof Response) throw error; return { value: null, error: kind(error) }; }
   }, { deferStream: true });
 
-  const pages = createMemo(() => [...(first()?.value?.items ?? []), ...more().flatMap((page) => page.items)]);
+  const pages = createMemo(() => mergePages(first()?.value ?? undefined, more()));
   const nextCursor = () => more().at(-1)?.page.next_cursor ?? first()?.value?.page.next_cursor ?? null;
   onMount(() => setInteractive(true));
 
   const loadMore = async () => {
     const cursor = nextCursor(); if (!cursor || loadingMore()) return;
+    const generation = pageListGeneration;
     setLoadingMore(true);
-    try { const page = await getKnowledgePages({ cursor, limit: 100 }); setMore((current) => [...current, page]); }
-    catch { toast.show({ title: "More pages couldn’t be loaded", variant: "danger" }); }
-    finally { setLoadingMore(false); }
+    try {
+      const page = await getKnowledgePages({ cursor, limit: 100 });
+      if (generation === pageListGeneration) setMore((current) => [...current, page]);
+    } catch {
+      if (generation === pageListGeneration) {
+        toast.show({ title: "More pages couldn’t be loaded", variant: "danger" });
+      }
+    } finally {
+      if (generation === pageListGeneration) setLoadingMore(false);
+    }
+  };
+  const restartPageList = () => {
+    pageListGeneration += 1;
+    setMore([]);
+    setLoadingMore(false);
+    void revalidate("knowledge-pages");
   };
   const openCreate = () => navigate(selected() ? `${knowledgeHref(selected())}&new=1` : "/knowledge?new=1");
   const closeCreate = () => navigate(knowledgeHref(selected()), { replace: true });
@@ -87,7 +106,7 @@ export default function KnowledgeIndex() {
         </Show>
       </section>
     </div>
-    <KnowledgeCreateDialog open={createOpen()} onClose={closeCreate} onCreated={(receipt) => { void revalidate("knowledge-pages"); setMore([]); navigate(knowledgeHref(receipt.page.id)); toast.show({ title: receipt.created ? "Page created" : "Page already existed", variant: "success" }); }} />
+    <KnowledgeCreateDialog open={createOpen()} onClose={closeCreate} onCreated={(receipt) => { restartPageList(); navigate(knowledgeHref(receipt.page.id)); toast.show({ title: receipt.created ? "Page created" : "Page already existed", variant: "success" }); }} />
   </>;
 }
 

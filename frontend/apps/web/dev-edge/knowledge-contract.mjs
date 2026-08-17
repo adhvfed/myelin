@@ -30,12 +30,17 @@ export function parseKnowledgeQuery(raw) {
 
 export class KnowledgeFixtures {
   constructor() { this.reset(); }
-  reset({ empty = false } = {}) {
-    this.sequence = 40; this.nonces = new Map();
-    this.pages = empty ? [] : [
+  reset({ empty = false, pageCount = 2 } = {}) {
+    const count = empty ? 0 : pageCount;
+    this.sequence = Math.max(40, count); this.nonces = new Map();
+    const pages = [
       { id: ulid(1), title: "Engineering principles", visibility: "team", version: 3, created_at: 1_760_000_000, updated_at: 1_760_003_000, blocks: [{ id: ulid(11), type: "heading", markdown: "Build for understanding" }, { id: ulid(12), type: "paragraph", markdown: "The product and its code should make the important relationships visible. Prefer cohesive systems, explicit ownership, and evidence over ceremony." }, { id: ulid(13), type: "callout", markdown: "Quality is a product feature. Slow down when a seam deserves a proper design." }] },
       { id: ulid(2), title: "EU release runbook", visibility: "team", version: 2, created_at: 1_760_000_100, updated_at: 1_760_002_000, blocks: [{ id: ulid(21), type: "heading", markdown: "Release gate" }, { id: ulid(22), type: "task_list", markdown: "CI, privacy checks, and rollback evidence are green." }] },
     ];
+    for (let index = 3; index <= count; index += 1) {
+      pages.push({ id: ulid(index), title: `Knowledge page ${String(index).padStart(3, "0")}`, visibility: "team", version: 1, created_at: 1_760_000_000 + index, updated_at: 1_760_000_000 + index, blocks: [{ id: ulid(1_000 + index), type: "paragraph", markdown: `Context page ${index}.` }] });
+    }
+    this.pages = pages.slice(0, count);
   }
   list({ cursor, limit }) { const ordered = [...this.pages].sort((a, b) => b.id.localeCompare(a.id)); const eligible = cursor ? ordered.filter((row) => row.id < cursor) : ordered; const items = eligible.slice(0, limit); return { items: items.map(summary), page: { next_cursor: eligible.length > items.length ? items.at(-1)?.id ?? null : null, limit } }; }
   get(id) { const row = this.pages.find((page) => page.id === id); return row ? document(row) : null; }

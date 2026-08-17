@@ -142,6 +142,37 @@ test.describe("Knowledge workspace", () => {
     await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue("Engineering principles, refined");
   });
 
+  test("a page created while pagination is loading restarts from one coherent snapshot", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { knowledgePageCount: 101, knowledgeListCursorDelaysMs: [1_500] },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/knowledge");
+
+    await page.getByRole("button", { name: "More pages" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.knowledgeListCursorRequests;
+    }).toBe(1);
+
+    await page.getByRole("button", { name: "Create a page" }).click();
+    await page.getByRole("textbox", { name: "Page title" }).fill("One coherent catalogue");
+    await page.getByRole("button", { name: "Create page" }).click();
+    await expect(page.getByRole("link", { name: /One coherent catalogue/ })).toBeVisible();
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.knowledgeListCursorResponses;
+    }).toBe(1);
+    await expect(page.getByRole("button", { name: "More pages" })).toBeVisible();
+    await expect(page.getByRole("link", { name: /EU release runbook/ })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "More pages" }).click();
+    await expect(page.getByRole("link", { name: /EU release runbook/ })).toBeVisible();
+    await expect(page.getByRole("link", { name: /Engineering principles/ })).toBeVisible();
+  });
+
   test("an invalid page link explains itself and leads back to the knowledge base", async ({ page }) => {
     await devLogin(page);
     await page.setViewportSize({ width: 375, height: 760 });
