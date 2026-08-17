@@ -155,13 +155,8 @@ impl S3BlobStore {
     }
 
     fn key_path(tenant: &TenantId, hash: &ContentHash) -> String {
-        let digest = &hash.digest_hex;
-        let (fan, rest) = if digest.len() >= 2 {
-            digest.split_at(2)
-        } else {
-            (digest.as_str(), "")
-        };
-        format!("{}/{}/{}/{}", tenant.0, hash.algo.tag(), fan, rest)
+        let (fan, rest) = hash.digest_hex().split_at(2);
+        format!("{}/{}/{}/{}", tenant.0, hash.algorithm().tag(), fan, rest)
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -219,7 +214,7 @@ impl BlobStore for S3BlobStore {
             .into_bytes()
             .to_vec();
 
-        let actual = match hash.algo {
+        let actual = match hash.algorithm() {
             HashAlgo::Blake3 => ContentHash::blake3(&bytes),
             HashAlgo::Sha256 => return Err(BlobError::AlgoNotVerifiable(HashAlgo::Sha256)),
         };

@@ -428,7 +428,7 @@ mod tests {
             .put_object(&repo, GitObjectKind::Blob, content)
             .expect("put");
 
-        assert_eq!(address.algo, crate::blob::HashAlgo::Sha256);
+        assert_eq!(address.algorithm(), crate::blob::HashAlgo::Sha256);
         assert_eq!(address, git_object_address(GitObjectKind::Blob, content));
         assert!(address.to_multihash_string().starts_with("sha256:"));
 

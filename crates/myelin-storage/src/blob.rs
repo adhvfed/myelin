@@ -6,15 +6,15 @@ use std::sync::Mutex;
 
 use myelin_tenancy::TenantId;
 
-#[derive(
-    Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub struct ContentHash {
-    pub algo: HashAlgo,
-    pub digest_hex: String,
+    algo: HashAlgo,
+    digest_hex: String,
 }
 
 impl ContentHash {
+    const DIGEST_HEX_LEN: usize = 64;
+
     pub fn blake3(bytes: &[u8]) -> ContentHash {
         let digest = blake3::hash(bytes);
         ContentHash {
@@ -36,17 +36,51 @@ impl ContentHash {
         format!("{}:{}", self.algo.tag(), self.digest_hex)
     }
 
+    pub fn algorithm(&self) -> HashAlgo {
+        self.algo
+    }
+
+    pub fn digest_hex(&self) -> &str {
+        &self.digest_hex
+    }
+
     pub fn parse(s: &str) -> std::result::Result<ContentHash, BlobError> {
         let (tag, hex_part) = s
             .split_once(':')
             .ok_or_else(|| BlobError::MalformedAddress(s.to_string()))?;
         let algo =
             HashAlgo::from_tag(tag).ok_or_else(|| BlobError::UnknownAlgo(tag.to_string()))?;
-        hex::decode(hex_part).map_err(|_| BlobError::MalformedAddress(s.to_string()))?;
-        Ok(ContentHash {
-            algo,
-            digest_hex: hex_part.to_string(),
-        })
+        ContentHash::from_parts(algo, hex_part.to_string())
+    }
+
+    fn from_parts(algo: HashAlgo, digest_hex: String) -> Result<ContentHash> {
+        let is_canonical = digest_hex.len() == Self::DIGEST_HEX_LEN
+            && digest_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !is_canonical {
+            return Err(BlobError::MalformedAddress(format!(
+                "{}:{digest_hex}",
+                algo.tag()
+            )));
+        }
+        Ok(ContentHash { algo, digest_hex })
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ContentHashWire {
+    algo: HashAlgo,
+    digest_hex: String,
+}
+
+impl<'de> serde::Deserialize<'de> for ContentHash {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <ContentHashWire as serde::Deserialize>::deserialize(deserializer)?;
+        ContentHash::from_parts(wire.algo, wire.digest_hex).map_err(serde::de::Error::custom)
     }
 }
 
@@ -268,13 +302,8 @@ impl FsBlobStore {
     }
 
     fn key_path(tenant: &TenantId, hash: &ContentHash) -> String {
-        let digest = &hash.digest_hex;
-        let (fan, rest) = if digest.len() >= 2 {
-            digest.split_at(2)
-        } else {
-            (digest.as_str(), "")
-        };
-        format!("{}/{}/{}/{}", tenant.0, hash.algo.tag(), fan, rest)
+        let (fan, rest) = hash.digest_hex().split_at(2);
+        format!("{}/{}/{}/{}", tenant.0, hash.algorithm().tag(), fan, rest)
     }
 
     #[doc(hidden)]
@@ -314,7 +343,7 @@ impl BlobStore for FsBlobStore {
                 })?
         };
         let plaintext = self.wrap.unwrap(tenant, &stored);
-        let actual = match hash.algo.rehash(&plaintext) {
+        let actual = match hash.algorithm().rehash(&plaintext) {
             Ok(actual) => actual,
             Err(e) => {
                 self.telemetry.record_integrity_fail();
@@ -387,7 +416,7 @@ mod tests {
         let bytes = b"the quick brown fox";
 
         let h = store.put(&acme, bytes).expect("put");
-        assert_eq!(h.algo, HashAlgo::Blake3);
+        assert_eq!(h.algorithm(), HashAlgo::Blake3);
         assert_eq!(h, ContentHash::blake3(bytes));
         assert!(h.to_multihash_string().starts_with("blake3:"));
 
@@ -423,16 +452,57 @@ mod tests {
         let s = h.to_multihash_string();
         let parsed = ContentHash::parse(&s).expect("round-trip parse");
         assert_eq!(parsed, h);
+        assert_eq!(parsed.algorithm(), HashAlgo::Blake3);
+        assert_eq!(parsed.digest_hex().len(), ContentHash::DIGEST_HEX_LEN);
 
         assert_eq!(HashAlgo::from_tag("sha256"), Some(HashAlgo::Sha256));
         assert!(matches!(
             ContentHash::parse("md5:abcd"),
             Err(BlobError::UnknownAlgo(_))
         ));
-        assert!(matches!(
-            ContentHash::parse("blake3:nothex!!"),
-            Err(BlobError::MalformedAddress(_))
-        ));
+    }
+
+    #[test]
+    fn parsing_rejects_every_noncanonical_digest_shape() {
+        let noncanonical = [
+            "blake3:",
+            "blake3:a",
+            "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blake3:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "blake3:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            "sha256:00000000000000000000000000000000000000000000000000000000000000000",
+        ];
+
+        for address in noncanonical {
+            assert!(
+                matches!(
+                    ContentHash::parse(address),
+                    Err(BlobError::MalformedAddress(_))
+                ),
+                "accepted noncanonical address {address:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialization_preserves_the_wire_shape_without_bypassing_validation() {
+        let hash = ContentHash::sha256(b"wire format");
+        let encoded = serde_json::to_value(&hash).expect("serialize content hash");
+        assert_eq!(encoded["algo"], "Sha256");
+        assert_eq!(encoded["digest_hex"], hash.digest_hex());
+        assert_eq!(
+            serde_json::from_value::<ContentHash>(encoded).expect("valid hash round-trips"),
+            hash
+        );
+
+        let invalid = serde_json::json!({
+            "algo": "Blake3",
+            "digest_hex": "a",
+        });
+        assert!(
+            serde_json::from_value::<ContentHash>(invalid).is_err(),
+            "deserialization must not construct an invalid content address"
+        );
     }
 
     #[test]
@@ -512,21 +582,14 @@ mod tests {
     }
 
     #[test]
-    fn key_path_is_per_tenant_fanout_and_handles_short_digests() {
+    fn key_path_is_per_tenant_with_canonical_fanout() {
         let h = ContentHash::blake3(b"x");
         let path = FsBlobStore::key_path(&tenant("acme"), &h);
         let parts: Vec<&str> = path.split('/').collect();
         assert_eq!(parts[0], "acme");
         assert_eq!(parts[1], "blake3");
         assert_eq!(parts[2].len(), 2, "two-char Git-style fan-out dir");
-        assert_eq!(format!("{}{}", parts[2], parts[3]), h.digest_hex);
-
-        let short = ContentHash {
-            algo: HashAlgo::Blake3,
-            digest_hex: "a".to_string(),
-        };
-        let short_path = FsBlobStore::key_path(&tenant("acme"), &short);
-        assert_eq!(short_path, "acme/blake3/a/");
+        assert_eq!(format!("{}{}", parts[2], parts[3]), h.digest_hex());
     }
 
     #[test]
@@ -540,7 +603,7 @@ mod tests {
         .to_string();
         assert!(integrity.contains("integrity fail"), "{integrity}");
         assert!(integrity.contains("serve refused"), "{integrity}");
-        assert!(integrity.contains(&req.digest_hex) && integrity.contains(&act.digest_hex));
+        assert!(integrity.contains(req.digest_hex()) && integrity.contains(act.digest_hex()));
 
         assert!(BlobError::NotFound {
             tenant: tenant("acme"),
@@ -565,7 +628,7 @@ mod tests {
         let acme = tenant("acme");
         let object = b"blob 11\0hello world";
         let h = ContentHash::sha256(object);
-        assert_eq!(h.algo, HashAlgo::Sha256);
+        assert_eq!(h.algorithm(), HashAlgo::Sha256);
         let path = FsBlobStore::key_path(&acme, &h);
         store.objects.lock().unwrap().insert(path, object.to_vec());
 
@@ -580,7 +643,7 @@ mod tests {
             Err(BlobError::IntegrityFail { requested, actual }) => {
                 assert_eq!(requested, h);
                 assert_eq!(
-                    actual.algo,
+                    actual.algorithm(),
                     HashAlgo::Sha256,
                     "verified under the blob's own tag"
                 );

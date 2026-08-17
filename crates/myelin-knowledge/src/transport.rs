@@ -335,10 +335,9 @@ impl core::fmt::Display for TransportError {
                 f,
                 "snapshot cursor does not continue the live stream on page `{page_id}`"
             ),
-            TransportError::InvalidSnapshot { page_id } => write!(
-                f,
-                "snapshot is empty, regressive, or conflicts on page `{page_id}`"
-            ),
+            TransportError::InvalidSnapshot { page_id } => {
+                write!(f, "snapshot is regressive or conflicts on page `{page_id}`")
+            }
             TransportError::OpLog(error) => write!(f, "collab op rejected: {error}"),
             TransportError::Firehose(error) => write!(f, "collab transport failed: {error}"),
         }
@@ -447,7 +446,7 @@ impl<A: OpAuthority> CollabTransport<A> {
                 || (snapshot.snap_seq == installed.snap_seq
                     && snapshot.blob_hash != installed.blob_hash)
         });
-        if snapshot.blob_hash.digest_hex.is_empty() || conflicts {
+        if conflicts {
             return Err(TransportError::InvalidSnapshot {
                 page_id: self.page_id.clone(),
             });
@@ -762,13 +761,6 @@ mod tests {
             PageSnapshot {
                 snap_seq: 7,
                 blob_hash: ContentHash::blake3(b"different"),
-            },
-            PageSnapshot {
-                snap_seq: 8,
-                blob_hash: ContentHash {
-                    algo: myelin_storage::blob::HashAlgo::Blake3,
-                    digest_hex: String::new(),
-                },
             },
         ] {
             assert!(matches!(

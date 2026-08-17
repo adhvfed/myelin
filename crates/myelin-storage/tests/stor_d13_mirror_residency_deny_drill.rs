@@ -88,6 +88,6 @@ fn stor_d13_outbound_mirror_residency_deny_zero_pii_egress() {
          same_region_target=fr-par flagged=false attestation=PASS  \
          pii_to_ungated_extra_eu_mirror=0 (deny at 10.5/control-plane; Storage FLAGS the crossing)",
         tenant.as_str(),
-        addr.digest_hex
+        addr.digest_hex()
     );
 }

@@ -248,9 +248,9 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
                 .native_addr_for_test(&repo, &address)
                 .expect("object index state")
                 .expect("native addr");
-            let dh = &native.digest_hex;
+            let dh = native.digest_hex();
             let (fan, rest) = dh.split_at(2);
-            let native_key = format!("{}/{}/{}/{}", tenant.0, native.algo.tag(), fan, rest);
+            let native_key = format!("{}/{}/{}/{}", tenant.0, native.algorithm().tag(), fan, rest);
 
             handle.block_on(async {
                 raw.put_object()
@@ -338,9 +338,9 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
             let h = store.put(&tenant, &content).expect("replicated put");
             assert_eq!(store.get(&tenant, &h).expect("clean get"), content);
 
-            let dh = &h.digest_hex;
+            let dh = h.digest_hex();
             let (fan, rest) = dh.split_at(2);
-            let native_key = format!("{}/{}/{}/{}", tenant.0, h.algo.tag(), fan, rest);
+            let native_key = format!("{}/{}/{}/{}", tenant.0, h.algorithm().tag(), fan, rest);
 
             handle.block_on(async {
                 raw.put_object()
@@ -472,9 +472,9 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
                 .native_addr_for_test(&repo, &address)
                 .expect("object index state")
                 .expect("native addr");
-            let dh = &native.digest_hex;
+            let dh = native.digest_hex();
             let (fan, rest) = dh.split_at(2);
-            let native_key = format!("{}/{}/{}/{}", tenant.0, native.algo.tag(), fan, rest);
+            let native_key = format!("{}/{}/{}/{}", tenant.0, native.algorithm().tag(), fan, rest);
 
             handle.block_on(async {
                 raw.put_object()

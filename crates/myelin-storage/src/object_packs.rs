@@ -192,7 +192,7 @@ mod tests {
         );
 
         let address = crate::gitpack::git_object_address(GitObjectKind::Blob, content);
-        assert_eq!(address.algo, HashAlgo::Sha256);
+        assert_eq!(address.algorithm(), HashAlgo::Sha256);
         assert_eq!(tier.get_object(&repo, &address).unwrap(), content);
     }
 

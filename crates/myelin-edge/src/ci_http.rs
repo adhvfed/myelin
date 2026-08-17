@@ -599,11 +599,6 @@ fn materialize_log_archive(
 
         let hash = ContentHash::parse(&segment.blob_ref)
             .map_err(|_| EdgeError::Unavailable("CI log data is temporarily unavailable".into()))?;
-        if hash.to_multihash_string() != segment.blob_ref || hash.digest_hex.len() != 64 {
-            return Err(EdgeError::Unavailable(
-                "CI log data is temporarily unavailable".into(),
-            ));
-        }
         let bytes = blobs
             .get_bounded(
                 tenant,

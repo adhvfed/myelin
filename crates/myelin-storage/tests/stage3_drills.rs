@@ -297,7 +297,7 @@ async fn drill2_restore_verify_cross_seam() {
                     "INSERT INTO {docs} (seq, blob_hash, bus_event_id) VALUES ($1, $2, $3)"
                 ))
                 .bind(seq)
-                .bind(&hash.digest_hex)
+                .bind(hash.digest_hex())
                 .bind(&bus_event_id)
                 .execute(&pool)
                 .await
@@ -325,7 +325,7 @@ async fn drill2_restore_verify_cross_seam() {
                 "INSERT INTO {docs} (seq, blob_hash, bus_event_id) VALUES ($1, $2, $3)"
             ))
             .bind(T + 1)
-            .bind(&post_hash.digest_hex)
+            .bind(post_hash.digest_hex())
             .bind(format!("d2-evt-{tag}-{}", T + 1))
             .execute(&pool)
             .await
@@ -367,7 +367,8 @@ async fn drill2_restore_verify_cross_seam() {
             for (seq, blob_hex) in &restored_rows {
                 let expected = blob_at.get(seq).expect("known blob for restored seq");
                 assert_eq!(
-                    *blob_hex, expected.digest_hex,
+                    blob_hex.as_str(),
+                    expected.digest_hex(),
                     "row's stored address matches what we wrote"
                 );
                 let got = tokio::task::block_in_place(|| blobs.get(&tenant, expected)).expect(

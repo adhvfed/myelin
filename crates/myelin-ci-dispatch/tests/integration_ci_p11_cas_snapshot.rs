@@ -101,9 +101,15 @@ async fn cas_snapshot_round_trips_through_real_object_store_and_floating_tag_is_
         .credentials_provider(creds)
         .build();
     let raw = aws_sdk_s3::Client::from_conf(conf);
-    let digest = &address.digest_hex;
+    let digest = address.digest_hex();
     let (fan, rest) = digest.split_at(2);
-    let key = format!("{}/{}/{}/{}", tenant.0, address.algo.tag(), fan, rest);
+    let key = format!(
+        "{}/{}/{}/{}",
+        tenant.0,
+        address.algorithm().tag(),
+        fan,
+        rest
+    );
     let _ = raw
         .delete_object()
         .bucket(&cfg.s3.bucket)
