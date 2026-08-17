@@ -58,7 +58,9 @@ pub use e2e_wedge::{
     run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, run_knowledge_e2e_legs, E2eArtifact,
     E2E_SCENARIOS as KNOWLEDGE_E2E_SCENARIOS,
 };
-pub use editor::{Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE};
+pub use editor::{
+    Document, EditOp, Editor, EditorBlock, EditorError, SecondViewer, BROWSER_DRIVE_EVIDENCE,
+};
 pub use emit::{
     block_ref, database_ref, emit_change, event_actor_pseudonym, page_ref,
     pseudonymized_event_principal, row_ref, KnowledgeChange, KnowledgeLivingDocHandler,
@@ -133,9 +135,9 @@ pub use sync_block::{
     SyncBlockProjection, SyncBlockRender, SyncSource, Tombstone, TombstoneReason, Viewer,
 };
 pub use transport::{
-    doc_scope, knowledge_stream, AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp,
-    DocOpLog, FailClosedAuthority, OpAuthority, OpId, OpKind, PageSnapshot, PersistedOp, Presence,
-    SendOutcome, TransportError,
+    doc_scope, knowledge_stream, AllowAllAuthority, AuthAction, CollabTransport, DocOp, DocOpLog,
+    FailClosedAuthority, OpAuthority, OpId, OpKind, OpLogError, PageSnapshot, PersistedOp,
+    Presence, Recovery, SendOutcome, TransportError,
 };
 
 use myelin_events::OutboxStore;

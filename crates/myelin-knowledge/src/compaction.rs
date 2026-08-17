@@ -15,7 +15,7 @@ impl DocSnapshot {
     pub fn as_page_snapshot(&self) -> PageSnapshot {
         PageSnapshot {
             snap_seq: self.snap_seq,
-            blob_hash: self.blob_hash.to_multihash_string(),
+            blob_hash: self.blob_hash.clone(),
         }
     }
 }
@@ -198,7 +198,8 @@ mod tests {
     fn log_with(n: u64) -> DocOpLog {
         let mut log = DocOpLog::new();
         for i in 1..=n {
-            log.persist(op("c1", i, OpKind::Insert, &format!("edit-{i}")));
+            log.persist(op("c1", i, OpKind::Insert, &format!("edit-{i}")))
+                .expect("the op id is fresh");
         }
         log
     }
@@ -233,9 +234,11 @@ mod tests {
     #[test]
     fn materialize_carries_op_content_not_just_seq() {
         let mut a = DocOpLog::new();
-        a.persist(op("c1", 1, OpKind::Insert, "alpha"));
+        a.persist(op("c1", 1, OpKind::Insert, "alpha"))
+            .expect("the op id is fresh");
         let mut b = DocOpLog::new();
-        b.persist(op("c1", 1, OpKind::Insert, "omega"));
+        b.persist(op("c1", 1, OpKind::Insert, "omega"))
+            .expect("the op id is fresh");
         let ma = materialize(&a.ops_up_to(1));
         let mb = materialize(&b.ops_up_to(1));
         assert_ne!(
@@ -244,10 +247,13 @@ mod tests {
         );
 
         let mut c = DocOpLog::new();
-        c.persist(op("ab", 1, OpKind::Insert, "cd"));
+        c.persist(op("ab", 1, OpKind::Insert, "cd"))
+            .expect("the op id is fresh");
         let mut d = DocOpLog::new();
-        d.persist(op("ab", 1, OpKind::Insert, "cd"));
-        d.persist(op("e", 1, OpKind::Insert, ""));
+        d.persist(op("ab", 1, OpKind::Insert, "cd"))
+            .expect("the op id is fresh");
+        d.persist(op("e", 1, OpKind::Insert, ""))
+            .expect("the op id is fresh");
         assert_ne!(
             materialize(&c.ops_up_to(2)),
             materialize(&d.ops_up_to(2)),
@@ -514,9 +520,8 @@ mod tests {
             "the resync seed carries the snapshot's snap_seq"
         );
         assert_eq!(
-            seed.blob_hash,
-            snapshot.blob_hash.to_multihash_string(),
-            "the resync seed points at the SAME content-addressed blob (one format)"
+            seed.blob_hash, snapshot.blob_hash,
+            "the resync seed points at the same typed content address"
         );
     }
 

@@ -1,6 +1,6 @@
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::transport::{
-    AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp, OpId, OpKind, SendOutcome,
+    AllowAllAuthority, AuthAction, CollabTransport, DocOp, OpId, OpKind, Recovery, SendOutcome,
 };
 use myelin_tenancy::TenantId;
 
@@ -17,7 +17,7 @@ fn principal() -> Principal {
 }
 
 fn transport() -> CollabTransport<AllowAllAuthority> {
-    CollabTransport::open_with_authority(tenant(), "doc-design", AllowAllAuthority).expect("opens")
+    CollabTransport::open(tenant(), "doc-design", AllowAllAuthority).expect("opens")
 }
 
 fn op(client: &str, lamport: u64) -> DocOp {
@@ -30,7 +30,13 @@ fn op(client: &str, lamport: u64) -> DocOp {
 }
 
 fn provider_send_op(t: &mut CollabTransport<AllowAllAuthority>, op: DocOp) -> SendOutcome {
-    t.send_op(op)
+    let actor = Principal::stub(
+        PrincipalId(op.actor.clone()),
+        PrincipalKind::Human,
+        tenant(),
+    );
+    t.send_op(&actor, op)
+        .expect("the provider is authorized to edit")
 }
 
 fn consumer_connect_backfill(
@@ -38,11 +44,13 @@ fn consumer_connect_backfill(
     last_seq: u64,
 ) -> Vec<u64> {
     match t
-        .connect(&principal(), AuthAction::Edit, Some(last_seq))
+        .recover(&principal(), AuthAction::Edit, Some(last_seq))
         .expect("an authorized in-window connect resumes")
     {
-        Connected::Resumed { backfill } => backfill.iter().map(|p| p.op_seq).collect(),
-        Connected::ResyncFromSnapshot { tail, .. } => tail.iter().map(|p| p.op_seq).collect(),
+        Recovery::Resumed { backfill, .. } | Recovery::RebuiltFromLog { backfill, .. } => {
+            backfill.iter().map(|p| p.op_seq).collect()
+        }
+        Recovery::ResyncFromSnapshot { tail, .. } => tail.iter().map(|p| p.op_seq).collect(),
     }
 }
 

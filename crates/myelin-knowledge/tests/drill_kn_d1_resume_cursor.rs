@@ -1,8 +1,9 @@
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::transport::{
-    AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp, OpId, OpKind, PageSnapshot,
+    AllowAllAuthority, AuthAction, CollabTransport, DocOp, OpId, OpKind, PageSnapshot, Recovery,
     SendOutcome,
 };
+use myelin_storage::blob::ContentHash;
 use myelin_tenancy::TenantId;
 use std::collections::BTreeMap;
 
@@ -19,8 +20,7 @@ fn principal() -> Principal {
 }
 
 fn transport() -> CollabTransport<AllowAllAuthority> {
-    CollabTransport::open_with_authority(tenant(), "doc-allhands", AllowAllAuthority)
-        .expect("opens")
+    CollabTransport::open(tenant(), "doc-allhands", AllowAllAuthority).expect("opens")
 }
 
 fn op(client: &str, lamport: u64) -> DocOp {
@@ -30,6 +30,16 @@ fn op(client: &str, lamport: u64) -> DocOp {
         OpKind::Insert,
         format!("{client}#{lamport}").into_bytes(),
     )
+}
+
+fn send(t: &mut CollabTransport<AllowAllAuthority>, op: DocOp) -> SendOutcome {
+    let actor = Principal::stub(
+        PrincipalId(op.actor.clone()),
+        PrincipalKind::Human,
+        tenant(),
+    );
+    t.send_op(&actor, op)
+        .expect("the actor is authorized to edit")
 }
 
 fn label(payload: &[u8]) -> String {
@@ -42,7 +52,7 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
 
     let mut applied: BTreeMap<u64, String> = BTreeMap::new();
     for (client, lamport) in [("c1", 1u64), ("c1", 2), ("c2", 1), ("c1", 3)] {
-        let out = t.send_op(op(client, lamport));
+        let out = send(&mut t, op(client, lamport));
         assert!(out.applied(), "each fresh op applies");
         let p = out.persisted();
         applied.insert(p.op_seq, label(&p.op.payload));
@@ -50,7 +60,7 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
     assert_eq!(t.head_seq(), 4, "four ops applied, op_seq 1..4");
 
     let inflight = op("c2", 2);
-    let inflight_first = t.send_op(inflight.clone());
+    let inflight_first = send(&mut t, inflight.clone());
     assert!(
         inflight_first.applied(),
         "the in-flight op did reach the server before the sever"
@@ -61,7 +71,7 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
     let c2_cursor = 4u64;
 
     for lamport in [4u64, 5, 6] {
-        let out = t.send_op(op("c1", lamport));
+        let out = send(&mut t, op("c1", lamport));
         assert!(out.applied());
         let p = out.persisted();
         applied.insert(p.op_seq, label(&p.op.payload));
@@ -73,11 +83,11 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
     );
 
     let connected = t
-        .reconnect(&principal(), AuthAction::Edit, c2_cursor)
+        .recover(&principal(), AuthAction::Edit, Some(c2_cursor))
         .expect("c2 reconnects (authorized warm resume)");
     let backfill = match connected {
-        Connected::Resumed { backfill } => backfill,
-        Connected::ResyncFromSnapshot { .. } => {
+        Recovery::Resumed { backfill, .. } => backfill,
+        Recovery::RebuiltFromLog { .. } | Recovery::ResyncFromSnapshot { .. } => {
             panic!("the cursor was in-window - warm resume, not cold")
         }
     };
@@ -88,7 +98,7 @@ fn kn_d1_kill_and_sever_mid_multi_author_edit_resume_loses_zero_ops_zero_dup() {
         "resume replays (last_seq, now] EXACTLY - 0 ops lost"
     );
 
-    let resend = t.send_op(inflight);
+    let resend = send(&mut t, inflight);
     assert!(
         matches!(resend, SendOutcome::Duplicate(_)),
         "c2's in-flight re-send is an idempotent NO-OP (the UNIQUE(op_id) guard)"
@@ -137,8 +147,9 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
         .expect("opens");
     t.install_snapshot(PageSnapshot {
         snap_seq: 3,
-        blob_hash: "blake3:snap".into(),
-    });
+        blob_hash: ContentHash::blake3(b"snapshot at 3"),
+    })
+    .expect("the snapshot seeds an empty live stream");
 
     for (client, lamport) in [
         ("c1", 1u64),
@@ -150,7 +161,7 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
         ("c1", 5),
         ("c1", 6),
     ] {
-        t.send_op(op(client, lamport));
+        send(&mut t, op(client, lamport));
     }
     assert_eq!(
         t.head_seq(),
@@ -159,10 +170,10 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
     );
 
     let connected = t
-        .reconnect(&principal(), AuthAction::Edit, 2)
+        .recover(&principal(), AuthAction::Edit, Some(2))
         .expect("the long-severed client reconnects via the cold path");
     match connected {
-        Connected::ResyncFromSnapshot { snapshot, tail } => {
+        Recovery::ResyncFromSnapshot { snapshot, tail, .. } => {
             assert_eq!(
                 snapshot.snap_seq, 3,
                 "the cold path loads the block-granular snapshot (NAMED)"
@@ -173,7 +184,7 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
                 "the live tail after the snapshot is replayed - 0 ops lost across the cold rebuild"
             );
         }
-        Connected::Resumed { .. } => {
+        Recovery::Resumed { .. } | Recovery::RebuiltFromLog { .. } => {
             panic!("the cursor was below the window floor - the cold path, not warm")
         }
     }
@@ -182,15 +193,15 @@ fn kn_d1_cold_leg_long_sever_resyncs_from_snapshot_zero_lost() {
 #[test]
 fn kn_d1_resume_straddles_an_engine_promote_cutover_unchanged() {
     let mut t = transport();
-    t.send_op(op("c1", 1));
-    t.send_op(op("c1", 2));
+    send(&mut t, op("c1", 1));
+    send(&mut t, op("c1", 2));
     let cutover = DocOp::cas(
         OpId::new("server", 1),
         "actor-server",
         OpKind::EnginePromote,
         b"seed".to_vec(),
     );
-    let promoted = t.send_op(cutover);
+    let promoted = send(&mut t, cutover);
     assert!(
         promoted.applied(),
         "the engine_promote op is an ordinary op on the log"
@@ -200,15 +211,15 @@ fn kn_d1_resume_straddles_an_engine_promote_cutover_unchanged() {
         3,
         "it gets the next monotone op_seq"
     );
-    t.send_op(op("c1", 3));
-    t.send_op(op("c1", 4));
+    send(&mut t, op("c1", 3));
+    send(&mut t, op("c1", 4));
 
     let connected = t
-        .reconnect(&principal(), AuthAction::Edit, 1)
+        .recover(&principal(), AuthAction::Edit, Some(1))
         .expect("resume across the cutover");
     let backfill = match connected {
-        Connected::Resumed { backfill } => backfill,
-        Connected::ResyncFromSnapshot { tail, .. } => tail,
+        Recovery::Resumed { backfill, .. } | Recovery::RebuiltFromLog { backfill, .. } => backfill,
+        Recovery::ResyncFromSnapshot { tail, .. } => tail,
     };
     assert_eq!(
         backfill.iter().map(|p| p.op_seq).collect::<Vec<_>>(),

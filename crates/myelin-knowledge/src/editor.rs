@@ -1,6 +1,6 @@
 use crate::transport::{
-    AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp, OpAuthority, OpId, OpKind,
-    PersistedOp, SendOutcome, TransportError,
+    AuthAction, CollabTransport, DocOp, OpAuthority, OpId, OpKind, PersistedOp, Recovery,
+    SendOutcome, TransportError,
 };
 use myelin_content::editor::surgery::{insert_text, split_at};
 use myelin_content::editor::{canonicalize, caret_count};
@@ -173,7 +173,39 @@ impl Document {
     }
 }
 
-pub struct Editor<A: OpAuthority = AllowAllAuthority> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditorError {
+    InvalidEdit,
+    ClockExhausted,
+    Transport(TransportError),
+}
+
+impl core::fmt::Display for EditorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EditorError::InvalidEdit => f.write_str("edit points outside the current document"),
+            EditorError::ClockExhausted => f.write_str("editor operation clock is exhausted"),
+            EditorError::Transport(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for EditorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EditorError::InvalidEdit | EditorError::ClockExhausted => None,
+            EditorError::Transport(error) => Some(error),
+        }
+    }
+}
+
+impl From<TransportError> for EditorError {
+    fn from(error: TransportError) -> Self {
+        EditorError::Transport(error)
+    }
+}
+
+pub struct Editor<A: OpAuthority> {
     doc: Document,
     transport: CollabTransport<A>,
     client_id: String,
@@ -181,26 +213,15 @@ pub struct Editor<A: OpAuthority = AllowAllAuthority> {
     actor: Principal,
 }
 
-impl Editor<AllowAllAuthority> {
-    pub fn open_page(
-        tenant: TenantId,
-        page_id: &str,
-        client_id: &str,
-        actor: Principal,
-    ) -> Result<Editor<AllowAllAuthority>, TransportError> {
-        Editor::open_page_with_authority(tenant, page_id, client_id, actor, AllowAllAuthority)
-    }
-}
-
 impl<A: OpAuthority> Editor<A> {
-    pub fn open_page_with_authority(
+    pub fn open_page(
         tenant: TenantId,
         page_id: &str,
         client_id: &str,
         actor: Principal,
         authority: A,
     ) -> Result<Editor<A>, TransportError> {
-        let transport = CollabTransport::open_with_authority(tenant, page_id, authority)?;
+        let transport = CollabTransport::open(tenant, page_id, authority)?;
         Ok(Editor {
             doc: Document::new_page(),
             transport,
@@ -222,24 +243,37 @@ impl<A: OpAuthority> Editor<A> {
         self.transport.head_seq()
     }
 
-    fn next_op_id(&mut self) -> OpId {
-        self.lamport += 1;
-        OpId::new(self.client_id.clone(), self.lamport)
+    fn next_op_id(&self) -> Result<OpId, EditorError> {
+        let lamport = self
+            .lamport
+            .checked_add(1)
+            .ok_or(EditorError::ClockExhausted)?;
+        Ok(OpId::new(self.client_id.clone(), lamport))
     }
 
-    pub fn apply_local(&mut self, op: EditOp) -> SendOutcome {
-        self.doc.apply(&op);
-        let op_id = self.next_op_id();
+    pub fn apply_local(&mut self, op: EditOp) -> Result<SendOutcome, EditorError> {
+        let mut edited = self.doc.clone();
+        edited.apply(&op).ok_or(EditorError::InvalidEdit)?;
+        let op_id = self.next_op_id()?;
+        let lamport = op_id.lamport;
         let doc_op = DocOp::cas(
             op_id,
             self.actor.principal_id.0.clone(),
             op.kind(),
             op.encode(),
         );
-        self.transport.send_op(doc_op)
+        let outcome = self.transport.send_op(&self.actor, doc_op)?;
+        self.lamport = lamport;
+        self.doc = edited;
+        Ok(outcome)
     }
 
-    pub fn type_text(&mut self, block: usize, offset: usize, text: &str) -> SendOutcome {
+    pub fn type_text(
+        &mut self,
+        block: usize,
+        offset: usize,
+        text: &str,
+    ) -> Result<SendOutcome, EditorError> {
         self.apply_local(EditOp::InsertText {
             block,
             offset,
@@ -247,25 +281,27 @@ impl<A: OpAuthority> Editor<A> {
         })
     }
 
-    pub fn split_block(&mut self, block: usize, offset: usize) -> SendOutcome {
+    pub fn split_block(&mut self, block: usize, offset: usize) -> Result<SendOutcome, EditorError> {
         self.apply_local(EditOp::SplitBlock { block, offset })
     }
 
-    pub fn append_block(&mut self, md: &str) -> SendOutcome {
+    pub fn append_block(&mut self, md: &str) -> Result<SendOutcome, EditorError> {
         self.apply_local(EditOp::AppendBlock { md: md.to_string() })
     }
 
-    pub fn connect_viewer(
+    pub fn load_viewer(
         &mut self,
         principal: &Principal,
         cursor: Option<u64>,
     ) -> Result<SecondViewer, TransportError> {
-        let connected = self
+        let recovery = self
             .transport
-            .connect(principal, AuthAction::Edit, cursor)?;
-        let backfill = match connected {
-            Connected::Resumed { backfill } => backfill,
-            Connected::ResyncFromSnapshot { tail, .. } => tail,
+            .recover(principal, AuthAction::Edit, cursor)?;
+        let backfill = match recovery {
+            Recovery::Resumed { backfill, .. } | Recovery::RebuiltFromLog { backfill, .. } => {
+                backfill
+            }
+            Recovery::ResyncFromSnapshot { tail, .. } => tail,
         };
         let mut viewer = SecondViewer::new();
         for persisted in &backfill {
@@ -277,8 +313,9 @@ impl<A: OpAuthority> Editor<A> {
     pub fn subscribe(
         &mut self,
         cursor: Option<u64>,
-    ) -> Result<myelin_events::FirehoseSubscription, myelin_events::FirehoseError> {
-        self.transport.subscribe(cursor)
+    ) -> Result<myelin_events::FirehoseSubscription, TransportError> {
+        self.transport
+            .subscribe(&self.actor, AuthAction::Edit, cursor)
     }
 }
 
@@ -335,6 +372,7 @@ impl SecondViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{AllowAllAuthority, FailClosedAuthority};
     use myelin_content::inline::OBJ;
     use myelin_events::ArtifactRef;
     use myelin_identity::{PrincipalId, PrincipalKind};
@@ -348,7 +386,18 @@ mod tests {
     }
 
     fn editor(client: &str) -> Editor<AllowAllAuthority> {
-        Editor::open_page(tenant(), "page-1", client, actor("alice")).expect("page opens")
+        Editor::open_page(
+            tenant(),
+            "page-1",
+            client,
+            actor("alice"),
+            AllowAllAuthority,
+        )
+        .expect("page opens")
+    }
+
+    fn edit(result: Result<SendOutcome, EditorError>) -> SendOutcome {
+        result.expect("the edit is valid and authorized")
     }
 
     #[test]
@@ -363,9 +412,43 @@ mod tests {
     }
 
     #[test]
+    fn the_default_editor_denies_edits_and_subscriptions_without_mutating_local_state() {
+        let mut e = Editor::open_page(
+            tenant(),
+            "page-1",
+            "c1",
+            actor("alice"),
+            FailClosedAuthority,
+        )
+        .expect("the page opens fail-closed");
+        let before = e.document().clone();
+
+        assert!(matches!(
+            e.type_text(0, 0, "must not appear"),
+            Err(EditorError::Transport(TransportError::Unauthorized { .. }))
+        ));
+        assert!(matches!(
+            e.subscribe(None),
+            Err(TransportError::Unauthorized { .. })
+        ));
+        assert_eq!(e.document(), &before, "the denied edit stays local nowhere");
+        assert_eq!(e.head_seq(), 0, "the denied edit stays remote nowhere");
+    }
+
+    #[test]
+    fn an_invalid_local_edit_is_not_persisted() {
+        let mut e = editor("c1");
+        let before = e.document().clone();
+
+        assert_eq!(e.type_text(99, 0, "outside"), Err(EditorError::InvalidEdit));
+        assert_eq!(e.document(), &before, "the document remains unchanged");
+        assert_eq!(e.head_seq(), 0, "the invalid edit emits no operation");
+    }
+
+    #[test]
     fn typing_updates_the_document_and_sends_an_op() {
         let mut e = editor("c1");
-        let out = e.type_text(0, 0, "Severity high");
+        let out = edit(e.type_text(0, 0, "Severity high"));
         assert!(
             out.applied(),
             "a fresh edit is applied (assigned an op_seq)"
@@ -378,8 +461,8 @@ mod tests {
     #[test]
     fn enter_splits_a_block_caret_at_start_of_new() {
         let mut e = editor("c1");
-        e.type_text(0, 0, "hello world");
-        e.split_block(0, 6);
+        edit(e.type_text(0, 0, "hello world"));
+        edit(e.split_block(0, 6));
         assert_eq!(e.document().block_count(), 2, "Enter added a block");
         assert_eq!(e.document().blocks[0].md, "hello ");
         assert_eq!(e.document().blocks[1].md, "world");
@@ -389,8 +472,8 @@ mod tests {
     #[test]
     fn ime_commit_is_char_faithful_end_to_end() {
         let mut e = editor("c1");
-        e.type_text(0, 0, "ab cd");
-        let out = e.type_text(0, 3, "日本");
+        edit(e.type_text(0, 0, "ab cd"));
+        let out = edit(e.type_text(0, 3, "日本"));
         assert!(out.applied());
         assert_eq!(e.document().blocks[0].md, "ab 日本cd");
         assert!(e.document().corpus_roundtrips());
@@ -399,8 +482,8 @@ mod tests {
     #[test]
     fn typed_reserved_char_escapes_through_the_one_render_path() {
         let mut e = editor("c1");
-        e.type_text(0, 0, "ax");
-        e.type_text(0, 1, "*");
+        edit(e.type_text(0, 0, "ax"));
+        edit(e.type_text(0, 1, "*"));
         assert_eq!(e.document().blocks[0].md, r"a\*x");
         assert!(
             e.document().corpus_roundtrips(),
@@ -411,11 +494,11 @@ mod tests {
     #[test]
     fn kn_d2_integrated_path_roundtrips_100_percent() {
         let mut e = editor("c1");
-        e.type_text(0, 0, "# Incident: API 5xx spike");
-        e.append_block("Severity **high**. Owner @alice");
-        e.append_block("- [ ] page the on-call");
-        e.append_block(r"escaped \* and `code` and ~~strike~~");
-        e.split_block(1, 9);
+        edit(e.type_text(0, 0, "# Incident: API 5xx spike"));
+        edit(e.append_block("Severity **high**. Owner @alice"));
+        edit(e.append_block("- [ ] page the on-call"));
+        edit(e.append_block(r"escaped \* and `code` and ~~strike~~"));
+        edit(e.split_block(1, 9));
         for (i, b) in e.document().blocks.iter().enumerate() {
             let (re, _) = canonicalize(&b.md, &b.nodes);
             assert_eq!(re, b.md, "block {i} ({:?}) is NOT a fixed point", b.md);
@@ -444,10 +527,10 @@ mod tests {
     fn a_second_viewer_converges_on_the_editor_document() {
         let mut e = editor("c1");
         let stream: Vec<PersistedOp> = vec![
-            e.type_text(0, 0, "Severity ").persisted().clone(),
-            e.split_block(0, 9).persisted().clone(),
-            e.type_text(1, 0, "high").persisted().clone(),
-            e.append_block("Owner @alice").persisted().clone(),
+            edit(e.type_text(0, 0, "Severity ")).persisted().clone(),
+            edit(e.split_block(0, 9)).persisted().clone(),
+            edit(e.type_text(1, 0, "high")).persisted().clone(),
+            edit(e.append_block("Owner @alice")).persisted().clone(),
         ];
 
         let mut viewer = SecondViewer::new();
@@ -465,7 +548,7 @@ mod tests {
     #[test]
     fn a_redelivered_frame_is_an_idempotent_no_op_on_the_viewer() {
         let mut e = editor("c1");
-        let p = e.type_text(0, 0, "x").persisted().clone();
+        let p = edit(e.type_text(0, 0, "x")).persisted().clone();
         let mut viewer = SecondViewer::new();
         assert!(viewer.observe(&p), "first observe applies");
         let before = viewer.document().clone();
@@ -483,17 +566,17 @@ mod tests {
     #[test]
     fn a_late_joiner_is_caught_up_by_the_backfill() {
         let mut e = editor("c1");
-        e.type_text(0, 0, "before join");
-        e.append_block("second block");
+        edit(e.type_text(0, 0, "before join"));
+        edit(e.append_block("second block"));
         let mut viewer = e
-            .connect_viewer(&actor("bob"), None)
+            .load_viewer(&actor("bob"), None)
             .expect("the viewer connects + is backfilled");
         assert_eq!(
             viewer.document().to_markdown(),
             e.document().to_markdown(),
             "the late joiner caught up via the backfill"
         );
-        let p = e.append_block("after join").persisted().clone();
+        let p = edit(e.append_block("after join")).persisted().clone();
         assert!(viewer.observe(&p));
         assert_eq!(viewer.document().to_markdown(), e.document().to_markdown());
     }
@@ -502,7 +585,7 @@ mod tests {
     fn a_live_subscription_receives_the_edit_frame() {
         let mut e = editor("c1");
         let sub = e.subscribe(None).expect("a live subscription opens");
-        let out = e.type_text(0, 0, "live edit");
+        let out = edit(e.type_text(0, 0, "live edit"));
         let frames = sub.drain_ready();
         assert_eq!(
             frames.len(),
@@ -595,7 +678,7 @@ mod tests {
 
     #[test]
     fn an_over_broad_page_scope_is_rejected_at_open() {
-        let r = Editor::open_page(tenant(), "*", "c1", actor("alice"));
+        let r = Editor::open_page(tenant(), "*", "c1", actor("alice"), FailClosedAuthority);
         assert!(matches!(r, Err(TransportError::OverBroadScope(_))));
     }
 

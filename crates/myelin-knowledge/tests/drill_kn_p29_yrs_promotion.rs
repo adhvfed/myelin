@@ -1,7 +1,7 @@
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::block_tree::BlockId;
 use myelin_knowledge::transport::{
-    AllowAllAuthority, AuthAction, CollabTransport, Connected, DocOp, OpId, OpKind, SendOutcome,
+    AllowAllAuthority, AuthAction, CollabTransport, DocOp, OpId, OpKind, Recovery, SendOutcome,
 };
 use myelin_knowledge::yrs_engine::{DocSnapshot, EnginePromotion, YrsDoc};
 use myelin_tenancy::TenantId;
@@ -19,8 +19,7 @@ fn principal() -> Principal {
 }
 
 fn transport() -> CollabTransport<AllowAllAuthority> {
-    CollabTransport::open_with_authority(tenant(), "doc-allhands", AllowAllAuthority)
-        .expect("opens")
+    CollabTransport::open(tenant(), "doc-allhands", AllowAllAuthority).expect("opens")
 }
 
 fn bid(s: &str) -> BlockId {
@@ -45,13 +44,23 @@ fn yrs_op(client: &str, lamport: u64, update_bytes: Vec<u8>) -> DocOp {
     )
 }
 
+fn send(t: &mut CollabTransport<AllowAllAuthority>, op: DocOp) -> SendOutcome {
+    let actor = Principal::stub(
+        PrincipalId(op.actor.clone()),
+        PrincipalKind::Human,
+        tenant(),
+    );
+    t.send_op(&actor, op)
+        .expect("the actor is authorized to edit")
+}
+
 #[test]
 fn kn_d1_re_greens_across_a_real_engine_promote_cutover_zero_lost_zero_dup() {
     let mut t = transport();
 
     let mut applied: Vec<(u64, OpKind)> = Vec::new();
     for (client, lamport) in [("c1", 1u64), ("c2", 1), ("c1", 2)] {
-        let out = t.send_op(cas_op(client, lamport));
+        let out = send(&mut t, cas_op(client, lamport));
         assert!(out.applied(), "each CAS-era op applies");
         let p = out.persisted();
         applied.push((p.op_seq, p.op.kind));
@@ -63,7 +72,7 @@ fn kn_d1_re_greens_across_a_real_engine_promote_cutover_zero_lost_zero_dup() {
     snapshot.push_block(bid("b2"), "body");
     let promo = EnginePromotion::new(snapshot, t.head_seq());
     assert_eq!(promo.cutover_seq(), 4, "the cutover op_seq is head + 1");
-    let cutover_out = t.send_op(promo.cutover_op());
+    let cutover_out = send(&mut t, promo.cutover_op());
     assert!(
         cutover_out.applied(),
         "the cutover op is an ordinary op on the log"
@@ -78,14 +87,14 @@ fn kn_d1_re_greens_across_a_real_engine_promote_cutover_zero_lost_zero_dup() {
 
     let live = promo.seeded_doc();
     let u1 = live.edit_block_text(&bid("b1"), 5, "!").unwrap();
-    let out = t.send_op(yrs_op("c1", 3, u1));
+    let out = send(&mut t, yrs_op("c1", 3, u1));
     assert!(out.applied());
     assert_eq!(out.persisted().op_seq, 5, "Yrs-era op gets op_seq 5");
     applied.push((5, OpKind::Insert));
 
     let u_inflight = live.edit_block_text(&bid("b2"), 4, "?").unwrap();
     let inflight_op = yrs_op("c2", 2, u_inflight);
-    let inflight_first = t.send_op(inflight_op.clone());
+    let inflight_first = send(&mut t, inflight_op.clone());
     assert!(
         inflight_first.applied(),
         "the in-flight Yrs op reached the server before the sever"
@@ -95,7 +104,7 @@ fn kn_d1_re_greens_across_a_real_engine_promote_cutover_zero_lost_zero_dup() {
     let c2_cursor = 5u64;
 
     let u_more = live.edit_block_text(&bid("b1"), 6, " (rev)").unwrap();
-    let out = t.send_op(yrs_op("c1", 4, u_more));
+    let out = send(&mut t, yrs_op("c1", 4, u_more));
     assert!(out.applied());
     assert_eq!(
         out.persisted().op_seq,
@@ -105,11 +114,11 @@ fn kn_d1_re_greens_across_a_real_engine_promote_cutover_zero_lost_zero_dup() {
     applied.push((7, OpKind::Insert));
 
     let connected = t
-        .reconnect(&principal(), AuthAction::Edit, c2_cursor)
+        .recover(&principal(), AuthAction::Edit, Some(c2_cursor))
         .expect("c2 reconnects (warm resume across the cutover)");
     let backfill = match connected {
-        Connected::Resumed { backfill } => backfill,
-        Connected::ResyncFromSnapshot { tail, .. } => tail,
+        Recovery::Resumed { backfill, .. } | Recovery::RebuiltFromLog { backfill, .. } => backfill,
+        Recovery::ResyncFromSnapshot { tail, .. } => tail,
     };
     let backfill_seqs: Vec<u64> = backfill.iter().map(|p| p.op_seq).collect();
     assert_eq!(
@@ -118,7 +127,7 @@ fn kn_d1_re_greens_across_a_real_engine_promote_cutover_zero_lost_zero_dup() {
         "resume replays (last_seq, now] EXACTLY across the cutover - 0 lost"
     );
 
-    let resend = t.send_op(inflight_op);
+    let resend = send(&mut t, inflight_op);
     assert!(
         matches!(resend, SendOutcome::Duplicate(_)),
         "the in-flight re-send is an idempotent NO-OP"
@@ -143,10 +152,12 @@ fn kn_d1_re_greens_across_a_real_engine_promote_cutover_zero_lost_zero_dup() {
 
     let reconstructed = YrsDoc::from_state(promo.seed_bytes()).unwrap();
     for p in t
-        .reconnect(&principal(), AuthAction::Edit, promo.cutover_seq())
+        .recover(&principal(), AuthAction::Edit, Some(promo.cutover_seq()))
         .map(|c| match c {
-            Connected::Resumed { backfill } => backfill,
-            Connected::ResyncFromSnapshot { tail, .. } => tail,
+            Recovery::Resumed { backfill, .. } | Recovery::RebuiltFromLog { backfill, .. } => {
+                backfill
+            }
+            Recovery::ResyncFromSnapshot { tail, .. } => tail,
         })
         .unwrap()
     {

@@ -1,7 +1,7 @@
 use myelin_content::editor::{dom_to_offset, offset_to_dom};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::editor::{Document, EditorBlock, SecondViewer};
-use myelin_knowledge::{Editor, PersistedOp};
+use myelin_knowledge::{AllowAllAuthority, Editor, EditorError, PersistedOp, SendOutcome};
 use myelin_tenancy::TenantId;
 
 fn tenant() -> TenantId {
@@ -12,11 +12,24 @@ fn principal(name: &str) -> Principal {
     Principal::stub(PrincipalId(name.into()), PrincipalKind::Human, tenant())
 }
 
+fn editor(page_id: &str) -> Editor<AllowAllAuthority> {
+    Editor::open_page(
+        tenant(),
+        page_id,
+        "client-A",
+        principal("alice"),
+        AllowAllAuthority,
+    )
+    .expect("the page opens")
+}
+
+fn edit(result: Result<SendOutcome, EditorError>) -> SendOutcome {
+    result.expect("the edit is valid and authorized")
+}
+
 #[test]
 fn create_page_type_blocks_second_connection_sees_edits_live() {
-    let mut editor =
-        Editor::open_page(tenant(), "incident-api-5xx", "client-A", principal("alice"))
-            .expect("the page opens");
+    let mut editor = editor("incident-api-5xx");
     assert_eq!(
         editor.document().block_count(),
         1,
@@ -31,18 +44,21 @@ fn create_page_type_blocks_second_connection_sees_edits_live() {
     let op_log: Vec<PersistedOp> = vec![
         editor
             .type_text(0, 0, "# Incident: API 5xx spike")
+            .expect("the edit is valid and authorized")
             .persisted()
             .clone(),
         editor
             .append_block("Severity **high**. Owner @alice")
+            .expect("the edit is valid and authorized")
             .persisted()
             .clone(),
         editor
             .append_block("- [ ] page the on-call")
+            .expect("the edit is valid and authorized")
             .persisted()
             .clone(),
-        editor.split_block(1, 9).persisted().clone(),
-        editor.type_text(0, 0, "緊急 ").persisted().clone(),
+        edit(editor.split_block(1, 9)).persisted().clone(),
+        edit(editor.type_text(0, 0, "緊急 ")).persisted().clone(),
     ];
 
     let frames = sub.drain_ready();
@@ -86,9 +102,8 @@ fn create_page_type_blocks_second_connection_sees_edits_live() {
 
 #[test]
 fn a_redelivered_live_frame_does_not_double_apply() {
-    let mut editor = Editor::open_page(tenant(), "page-dup", "client-A", principal("alice"))
-        .expect("the page opens");
-    let p = editor.type_text(0, 0, "once").persisted().clone();
+    let mut editor = editor("page-dup");
+    let p = edit(editor.type_text(0, 0, "once")).persisted().clone();
 
     let mut viewer = SecondViewer::new();
     assert!(viewer.observe(&p), "the first delivery applies");
@@ -106,21 +121,22 @@ fn a_redelivered_live_frame_does_not_double_apply() {
 
 #[test]
 fn a_late_joiner_is_caught_up_then_sees_live() {
-    let mut editor = Editor::open_page(tenant(), "page-late", "client-A", principal("alice"))
-        .expect("the page opens");
-    editor.type_text(0, 0, "typed before the viewer joined");
-    editor.append_block("a second pre-join block");
+    let mut editor = editor("page-late");
+    edit(editor.type_text(0, 0, "typed before the viewer joined"));
+    edit(editor.append_block("a second pre-join block"));
 
     let mut viewer = editor
-        .connect_viewer(&principal("bob"), None)
-        .expect("the late joiner connects + is caught up by the backfill");
+        .load_viewer(&principal("bob"), None)
+        .expect("the late joiner is caught up by the backfill");
     assert_eq!(
         viewer.document().to_markdown(),
         editor.document().to_markdown(),
         "the late joiner caught up via the backfill"
     );
 
-    let p = editor.append_block("after the join").persisted().clone();
+    let p = edit(editor.append_block("after the join"))
+        .persisted()
+        .clone();
     assert!(viewer.observe(&p));
     assert_eq!(
         viewer.document().to_markdown(),
@@ -131,11 +147,10 @@ fn a_late_joiner_is_caught_up_then_sees_live() {
 
 #[test]
 fn the_dom_bridge_round_trips_on_the_live_document() {
-    let mut editor = Editor::open_page(tenant(), "page-bridge", "client-A", principal("alice"))
-        .expect("the page opens");
-    editor.type_text(0, 0, "Severity **high**. café 日本");
-    editor.append_block("- [ ] task with `code` and ~~strike~~");
-    editor.split_block(0, 9);
+    let mut editor = editor("page-bridge");
+    edit(editor.type_text(0, 0, "Severity **high**. café 日本"));
+    edit(editor.append_block("- [ ] task with `code` and ~~strike~~"));
+    edit(editor.split_block(0, 9));
 
     for (i, block) in editor.document().blocks.iter().enumerate() {
         let len = block.md.chars().count();
