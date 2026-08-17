@@ -282,6 +282,28 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
       .toHaveCount(1);
   });
 
+  test("a response-lost review start retries the same durable batch", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/4");
+    await page.waitForLoadState("networkidle");
+    await configurePr({ prMutationResponseLosses: 1 });
+
+    const start = page.getByTestId("start-review");
+    await start.click();
+    await expect(page.getByText("Could not start a review")).toBeVisible();
+    await expect(start).toBeEnabled();
+
+    await start.click();
+    await expect(page.getByTestId("review-batch")).toBeVisible();
+    await page.getByRole("button", { name: "Discard" }).click();
+    await expect(start).toBeVisible();
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(start).toBeVisible();
+    await expect(page.getByTestId("review-batch")).toHaveCount(0);
+  });
+
   test("an in-progress review batch RESUMES on reload — 'Start a review' does not double-create (finding #18)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/4"); // isolated fixture — no other test drives PR #4's reviews.

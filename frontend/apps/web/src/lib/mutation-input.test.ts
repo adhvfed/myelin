@@ -76,6 +76,17 @@ describe("parsePrMutation", () => {
       threadId: "t-7",
       resolved: true,
     });
+    expect(parsePrMutation({
+      op: "review-start",
+      repo: "team/core",
+      n: 42,
+      clientNonce: "review-start_1",
+    })).toEqual({
+      op: "review-start",
+      repo: "team/core",
+      n: 42,
+      clientNonce: "review-start_1",
+    });
   });
 
   it.each([
@@ -89,6 +100,8 @@ describe("parsePrMutation", () => {
     { op: "merge", repo: "core", n: 1, surprise: true },
     { op: "comment", repo: "core", n: 1, threadId: "r-1", body_md: "x", clientNonce: "comment_1" },
     { op: "resolve", repo: "core", n: 1, threadId: "t-1", resolved: "yes" },
+    { op: "review-start", repo: "core", n: 1 },
+    { op: "review-start", repo: "core", n: 1, clientNonce: "has spaces" },
     { op: "review-discard", repo: "core", n: 1, reviewId: "t-1" },
     { op: "review-submit", repo: "core", n: 1, reviewId: "r-1", verdict: "dismissed" },
     { op: "thread", repo: "core", n: 1, body_md: "x", clientNonce: "thread_1", anchor: { path: "src/x", line: 1 } },

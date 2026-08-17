@@ -435,6 +435,8 @@ function ReviewsSection(props: {
 }) {
   const doMutate = useAction(prMutate);
   const [draft, setDraft] = createSignal<PrReviewVM | null>(null);
+  const [startingReview, setStartingReview] = createSignal(false);
+  const [startClientNonce, setStartClientNonce] = createSignal(crypto.randomUUID());
   const [verdictOpen, setVerdictOpen] = createSignal(false);
   const [pendingText, setPendingText] = createSignal("");
   const [pendingClientNonce, setPendingClientNonce] = createSignal(crypto.randomUUID());
@@ -451,11 +453,24 @@ function ReviewsSection(props: {
   });
 
   const start = async () => {
+    if (startingReview()) return;
+    const clientNonce = startClientNonce();
+    setStartingReview(true);
     try {
-      const r = await doMutate({ op: "review-start", repo: props.repo, n: props.n });
-      if ("review" in r) setDraft(r.review);
+      const r = await doMutate({
+        op: "review-start",
+        repo: props.repo,
+        n: props.n,
+        clientNonce,
+      });
+      if ("review" in r) {
+        setDraft(r.review);
+        setStartClientNonce(crypto.randomUUID());
+      }
     } catch {
       props.toast.show({ title: "Could not start a review", variant: "danger" });
+    } finally {
+      setStartingReview(false);
     }
   };
   const addPending = async () => {
@@ -540,8 +555,9 @@ function ReviewsSection(props: {
       <Show
         when={draft()}
         fallback={
-          <button type="button" data-testid="start-review" onClick={() => void start()} class="btn-secondary" style={barBtn}>
-            <Icon name="message" /> Start a review
+          <button type="button" data-testid="start-review" disabled={startingReview()} onClick={() => void start()} class="btn-secondary" style={barBtn}>
+            <Icon name={startingReview() ? "cycle" : "message"} />
+            {startingReview() ? "Starting review…" : "Start a review"}
           </button>
         }
       >

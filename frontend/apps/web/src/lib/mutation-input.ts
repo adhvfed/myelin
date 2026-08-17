@@ -18,7 +18,7 @@ export type PrMutation =
   | { op: "thread"; repo: string; n: number; body_md: string; clientNonce: string; anchor?: PrAnchor }
   | { op: "comment"; repo: string; n: number; threadId: string; body_md: string; clientNonce: string }
   | { op: "resolve"; repo: string; n: number; threadId: string; resolved: boolean }
-  | { op: "review-start"; repo: string; n: number }
+  | { op: "review-start"; repo: string; n: number; clientNonce: string }
   | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string; clientNonce: string }
   | { op: "review-submit"; repo: string; n: number; reviewId: string; verdict: ReviewVerdict; summary_md?: string }
   | { op: "review-discard"; repo: string; n: number; reviewId: string }
@@ -161,7 +161,10 @@ export function parsePrMutation(value: unknown): PrMutation | null {
         ? { op: "resolve", ...base, threadId: input.threadId, resolved: input.resolved }
         : null;
     case "review-start":
-      return exactKeys(input, ["op", "repo", "n"]) ? { op: "review-start", ...base } : null;
+      return exactKeys(input, ["op", "repo", "n", "clientNonce"]) &&
+          isClientNonce(input.clientNonce)
+        ? { op: "review-start", ...base, clientNonce: input.clientNonce }
+        : null;
     case "review-comment": {
       if (!exactKeys(input, ["op", "repo", "n", "reviewId", "body_md", "clientNonce"]) ||
           !reviewId(input.reviewId) || !isClientNonce(input.clientNonce)) return null;
