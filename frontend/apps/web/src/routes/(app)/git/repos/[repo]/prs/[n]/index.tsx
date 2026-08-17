@@ -92,6 +92,7 @@ export default function PrOverviewScreen() {
   const repo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
   const n = () => parseGitPullRequestRouteParam(params.n) ?? 0;
   const ready = () => repo() !== "" && n() > 0;
+  const identity = createMemo(() => ready() ? { repo: repo(), n: n() } : undefined);
   const repoPath = () => gitRepositoryPath(repo());
 
   const pr = createAsync(
@@ -197,80 +198,83 @@ export default function PrOverviewScreen() {
           }
         >
           <Show when={ready()} fallback={<NotAvailable kind="pull request" status="missing" />}>
-            {/* NOT keyed — a mutation action auto-revalidates `pr()`; a keyed Show would re-create the
-                children (losing the reviews section's in-progress draft). Non-keyed keeps them mounted
-                and reactive, so a submitted review re-renders in place without dropping the batch. */}
+            {/* Keep child state mounted while this PR's queries refresh, but remount it when route
+                identity changes. Drafts and confirmation dialogs belong to exactly one PR. */}
             <Show when={pr()}>
               {(p) => (
-                <>
-                  <PrHeader pr={p()} repo={repo()} active="overview" commitsCount={p().commits_count} />
+                <Show when={identity()} keyed>
+                  {(current) => (
+                    <>
+                      <PrHeader pr={p()} repo={current.repo} active="overview" commitsCount={p().commits_count} />
 
-                  <Show when={p().body_md}>
-                    <section aria-label="Description" style={{ ...card }}>
-                      <Markdown source={p().body_md ?? ""} />
-                    </section>
-                  </Show>
+                      <Show when={p().body_md}>
+                        <section aria-label="Description" style={{ ...card }}>
+                          <Markdown source={p().body_md ?? ""} />
+                        </section>
+                      </Show>
 
-                  {/* G-9 CHECKS — degrades LOCALLY: an `unavailable` sentinel renders "Checks
-                      unavailable" HERE, the PR stays live (never "PR not available", finding 5). The
-                      ErrorBoundary is the belt-and-braces for an unexpected render throw. */}
-                  <ErrorBoundary fallback={() => <ChecksUnavailable onRetry={() => void revalidate("git-pr-checks")} />}>
-                    <Show
-                      when={checks() !== undefined}
-                      fallback={<Skeleton label="Loading checks…" rows={3} rowHeight="2rem" data-testid="checks-loading" />}
-                    >
+                      {/* G-9 CHECKS — degrades LOCALLY: an `unavailable` sentinel renders "Checks
+                          unavailable" HERE, the PR stays live (never "PR not available", finding 5). The
+                          ErrorBoundary is the belt-and-braces for an unexpected render throw. */}
+                      <ErrorBoundary fallback={() => <ChecksUnavailable onRetry={() => void revalidate("git-pr-checks")} />}>
+                        <Show
+                          when={checks() !== undefined}
+                          fallback={<Skeleton label="Loading checks…" rows={3} rowHeight="2rem" data-testid="checks-loading" />}
+                        >
+                          <Show
+                            when={checksOrNull(checks())}
+                            keyed
+                            fallback={<ChecksUnavailable onRetry={() => void revalidate("git-pr-checks")} />}
+                          >
+                            {(ck) => <ChecksPanel checks={ck} />}
+                          </Show>
+                        </Show>
+                      </ErrorBoundary>
+
+                      {/* G-8 REVIEWS + the batched review bar. */}
+                      <ReviewsSection
+                        repo={current.repo}
+                        n={current.n}
+                        reviews={threads()?.reviews ?? []}
+                        onChange={reload}
+                        toast={toast}
+                      />
+
+                      {/* Commits IN this PR. */}
+                      <CommitsSection repo={current.repo} n={current.n} initial={commits()} />
+
+                      {/* Discussion (threads with anchor null) inline. */}
+                      <DiscussionSection
+                        repo={current.repo}
+                        n={current.n}
+                        threads={(threads()?.discussion ?? []) as PrThreadVM[]}
+                        loading={threads() === undefined}
+                        onChange={reload}
+                        toast={toast}
+                      />
+
+                      {/* MERGE card — reflects the authoritative gate; ConfirmDialog re-verifies on 409.
+                          When checks are unavailable it degrades to "Gate state unavailable" (never
+                          fabricates a gate). */}
                       <Show
                         when={checksOrNull(checks())}
                         keyed
-                        fallback={<ChecksUnavailable onRetry={() => void revalidate("git-pr-checks")} />}
+                        fallback={
+                          <Show when={isUnavailable(checks())}>
+                            <section aria-labelledby="merge-heading" style={{ ...card, color: "var(--text-muted)" }} data-testid="merge-degraded">
+                              <h2 id="merge-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>Merge readiness</h2>
+                              <p role="note" style={{ margin: "0" }}>Gate state unavailable — the checks service didn't respond, so merge readiness can't be shown. The gate is never assumed.</p>
+                            </section>
+                          </Show>
+                        }
                       >
-                        {(ck) => <ChecksPanel checks={ck} />}
+                        {(ck) => (
+                          <MergeCard repo={current.repo} n={current.n} pr={p()} checks={ck} onChange={reload} toast={toast} />
+                        )}
                       </Show>
-                    </Show>
-                  </ErrorBoundary>
-
-                  {/* G-8 REVIEWS + the batched review bar. */}
-                  <ReviewsSection
-                    repo={repo()}
-                    n={n()}
-                    reviews={threads()?.reviews ?? []}
-                    onChange={reload}
-                    toast={toast}
-                  />
-
-                  {/* Commits IN this PR. */}
-                  <CommitsSection repo={repo()} n={n()} initial={commits()} />
-
-                  {/* Discussion (threads with anchor null) inline. */}
-                  <DiscussionSection
-                    repo={repo()}
-                    n={n()}
-                    threads={(threads()?.discussion ?? []) as PrThreadVM[]}
-                    loading={threads() === undefined}
-                    onChange={reload}
-                    toast={toast}
-                  />
-
-                  {/* MERGE card — reflects the authoritative gate; ConfirmDialog re-verifies on 409.
-                      When checks are unavailable it degrades to "Gate state unavailable" (never
-                      fabricates a gate). */}
-                  <Show
-                    when={checksOrNull(checks())}
-                    keyed
-                    fallback={
-                      <Show when={isUnavailable(checks())}>
-                        <section aria-labelledby="merge-heading" style={{ ...card, color: "var(--text-muted)" }} data-testid="merge-degraded">
-                          <h2 id="merge-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>Merge readiness</h2>
-                          <p role="note" style={{ margin: "0" }}>Gate state unavailable — the checks service didn't respond, so merge readiness can't be shown. The gate is never assumed.</p>
-                        </section>
-                      </Show>
-                    }
-                  >
-                    {(ck) => (
-                      <MergeCard repo={repo()} n={n()} pr={p()} checks={ck} onChange={reload} toast={toast} />
-                    )}
-                  </Show>
-                </>
+                    </>
+                  )}
+                </Show>
               )}
             </Show>
           </Show>

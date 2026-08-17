@@ -224,6 +224,30 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(page.getByTestId("reviews").getByText("Commented")).toBeVisible();
   });
 
+  test("draft review and discussion state belong to one pull request", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1");
+    await page.waitForLoadState("networkidle");
+
+    await page.getByTestId("start-review").click();
+    await page.getByLabel("Pending review comment").fill("This draft belongs to PR one.");
+    await page.getByLabel("New comment").fill("This discussion also belongs to PR one.");
+
+    await page.evaluate(() => {
+      window.history.pushState({}, "", "/git/repos/myelin/prs/2");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await page.waitForURL("**/git/repos/myelin/prs/2");
+    await expect(page.getByRole("heading", { level: 1, name: "Hotfix: saturating cursor arithmetic" }))
+      .toBeVisible();
+
+    await expect(page.getByTestId("start-review")).toBeVisible();
+    await expect(page.getByTestId("review-batch")).toHaveCount(0);
+    await expect(page.getByLabel("New comment")).toHaveText("");
+    await expect(page.getByText("This draft belongs to PR one.")).toHaveCount(0);
+    await expect(page.getByText("This discussion also belongs to PR one.")).toHaveCount(0);
+  });
+
   test("posting to the discussion appends the comment", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1");
