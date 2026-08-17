@@ -513,7 +513,7 @@ fn job_json(job: &CiJobSurface) -> Value {
         "matrix_key": job.matrix_key,
         "state": job.state,
         "attempt": job.attempt,
-        "result_summary": job.result_summary,
+        "result_summary": job.result_summary.as_ref().map(|summary| summary.to_value()),
     })
 }
 

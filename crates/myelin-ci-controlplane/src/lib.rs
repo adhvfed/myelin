@@ -6,6 +6,7 @@ pub mod ci_claim_window;
 pub mod ci_credential_generation;
 pub mod ci_drive_manifest;
 pub mod ci_identity_adapter;
+pub mod ci_job_result;
 pub mod ci_launch_authority;
 pub mod ci_manifest_job_runner;
 pub mod ci_manifest_pipeline;

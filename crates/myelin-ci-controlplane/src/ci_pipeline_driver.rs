@@ -42,6 +42,7 @@ use myelin_flow::{
 };
 
 use crate::ci_drive_manifest::CiDriveManifestStore;
+use crate::ci_job_result::{CiJobDisposition, CiJobResultSummary};
 use crate::ci_manifest_job_runner::CiJobTokenRequest;
 use crate::ci_pipeline::PipelineStage;
 #[cfg(any(test, feature = "test-support"))]
@@ -72,24 +73,6 @@ use crate::job_spec_store::{
 use crate::metering::{CostEventRow, CostKind, Meter};
 #[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::Lane;
-
-pub(crate) const MAX_CI_DIAGNOSTIC_BYTES: usize = 2_048;
-
-pub(crate) fn bounded_ci_diagnostic(value: &str) -> String {
-    let mut output = String::with_capacity(value.len().min(MAX_CI_DIAGNOSTIC_BYTES));
-    for character in value.chars() {
-        let character = if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
-            '�'
-        } else {
-            character
-        };
-        if output.len() + character.len_utf8() > MAX_CI_DIAGNOSTIC_BYTES {
-            break;
-        }
-        output.push(character);
-    }
-    output
-}
 
 fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
@@ -1348,7 +1331,7 @@ async fn settle_ci_job_surface_on_conn(
     } else {
         "failed"
     };
-    let summary = terminal_result_summary(surface.report, surface.disposition, surface.diagnostic);
+    let summary = terminal_result_summary(surface.report, surface.disposition, surface.diagnostic)?;
     let state_predicate = if preparation {
         "state IN ('queued','leased') OR (state=$5 AND result_summary=$6)"
     } else {
@@ -1384,27 +1367,20 @@ fn terminal_result_summary(
     report: &TerminalReport,
     disposition: Option<CiJobTerminalDisposition>,
     diagnostic: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, CompletionTxError> {
     match disposition {
         Some(disposition) => {
-            let mut summary = serde_json::json!({
-                "passed": report.passed,
-                "timed_out": report.timed_out,
-                "disposition": disposition.as_storage_token(),
-                "workload_started": disposition.workload_started(),
-            });
-            if let Some(diagnostic) = diagnostic {
-                let diagnostic = bounded_ci_diagnostic(diagnostic);
-                if !diagnostic.is_empty() {
-                    summary["diagnostic"] = serde_json::Value::String(diagnostic);
-                }
+            let disposition = CiJobDisposition::from_token(disposition.as_storage_token())
+                .ok_or(CompletionTxError::Refused)?;
+            let summary = CiJobResultSummary::current(disposition, diagnostic);
+            if summary.passed() != report.passed || summary.timed_out() != report.timed_out {
+                return Err(CompletionTxError::Refused);
             }
-            summary
+            Ok(summary.to_value())
         }
-        None => serde_json::json!({
-            "passed": report.passed,
-            "timed_out": report.timed_out,
-        }),
+        None => CiJobResultSummary::legacy(report.passed, report.timed_out)
+            .map(|summary| summary.to_value())
+            .map_err(|_| CompletionTxError::Refused),
     }
 }
 

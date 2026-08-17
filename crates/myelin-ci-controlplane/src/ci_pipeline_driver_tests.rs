@@ -403,7 +403,8 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
             &report,
             Some(CiJobTerminalDisposition::WorkloadFailed),
             None,
-        ),
+        )
+        .unwrap(),
         serde_json::json!({
             "passed": false,
             "timed_out": false,
@@ -412,7 +413,7 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
         })
     );
     assert_eq!(
-        terminal_result_summary(&report, None, None),
+        terminal_result_summary(&report, None, None).unwrap(),
         serde_json::json!({"passed": false, "timed_out": false}),
         "a historical v3 replay retains the exact legacy summary shape"
     );
@@ -430,7 +431,8 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
                 },
             )),
             None,
-        ),
+        )
+        .unwrap(),
         serde_json::json!({
             "passed": false,
             "timed_out": true,
@@ -449,7 +451,8 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
                 },
             )),
             Some(diagnostic),
-        ),
+        )
+        .unwrap(),
         serde_json::json!({
             "passed": false,
             "timed_out": false,
@@ -458,46 +461,6 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
             "diagnostic": diagnostic,
         }),
         "a preparation-terminal result_summary must retain its underlying diagnostic"
-    );
-}
-
-#[test]
-fn surfaced_diagnostics_are_single_line_utf8_bounded_text() {
-    let input = format!(
-        "checkout\n\u{85}\u{2028}\u{2029}{}\u{7f}",
-        "é".repeat(MAX_CI_DIAGNOSTIC_BYTES)
-    );
-    let bounded = bounded_ci_diagnostic(&input);
-
-    assert!(bounded.len() <= MAX_CI_DIAGNOSTIC_BYTES);
-    assert!(!bounded.chars().any(char::is_control));
-    assert!(!bounded.contains('\u{2028}'));
-    assert!(!bounded.contains('\u{2029}'));
-    assert!(bounded.starts_with("checkout�"));
-    assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
-
-    let report = TerminalReport {
-        passed: false,
-        timed_out: false,
-        usage: ResourceUsage {
-            cpu_seconds: 0,
-            mem_byte_seconds: 0,
-        },
-        result_refs: Vec::new(),
-    };
-    assert_eq!(
-        terminal_result_summary(
-            &report,
-            Some(CiJobTerminalDisposition::WorkloadFailed),
-            Some(""),
-        ),
-        serde_json::json!({
-            "passed": false,
-            "timed_out": false,
-            "disposition": "workload_failed",
-            "workload_started": true,
-        }),
-        "an absent diagnostic has one canonical wire representation"
     );
 }
 
@@ -891,7 +854,8 @@ fn secret_withhold_result_summary_persists_the_machine_reason() {
             },
         )),
         Some("secret_withheld:DEPLOY_KEY=capability_unavailable"),
-    );
+    )
+    .unwrap();
     assert_eq!(summary["passed"], false);
     assert_eq!(summary["workload_started"], false);
     assert_eq!(summary["disposition"], "secret_resolution_failed");

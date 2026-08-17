@@ -1,6 +1,6 @@
-use crate::ci_result_summary::parse_ci_job_result_summary;
 use crate::dispatch::EdgeCall;
 use base64::Engine as _;
+use myelin_ci_controlplane::ci_job_result::CiJobResultSummary;
 use myelin_ci_controlplane::surfacing_store::CI_RUN_CURSOR_PREFIX;
 use myelin_git::web::RepoListCursor;
 use serde_json::Value;
@@ -333,10 +333,10 @@ fn render_ci_run_detail(value: &Value) -> String {
         output.push_str(&format!(
             "  {marker} {state}  {stage}/{name}  attempt={attempt}  {job_id}\n"
         ));
-        let result = parse_ci_job_result_summary(&job["result_summary"])
+        let result = CiJobResultSummary::parse(&job["result_summary"])
             .ok()
             .flatten();
-        if let Some(result) = result {
+        if let Some(result) = result.as_ref() {
             output.push_str(&format!("    result: {}\n", result.label()));
             if let Some(diagnostic) = result.diagnostic() {
                 output.push_str(&format!(
@@ -345,7 +345,9 @@ fn render_ci_run_detail(value: &Value) -> String {
                 ));
             }
         }
-        if result.is_none_or(|result| result.workload_started() != Some(false))
+        if result
+            .as_ref()
+            .is_none_or(|result| result.workload_started() != Some(false))
             && safe_cli_uuid(run_id)
             && job
                 .get("job_id")

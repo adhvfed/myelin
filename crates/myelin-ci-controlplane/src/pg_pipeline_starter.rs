@@ -717,7 +717,12 @@ impl PgCiPipelineStarter {
         candidate: &StarterCandidate,
         error: &RunPlanError,
     ) -> Result<StartQueuedOutcome, PgCiStarterError> {
-        let diagnostic = crate::ci_pipeline_driver::bounded_ci_diagnostic(&error.to_string());
+        let diagnostic = crate::ci_job_result::canonical_ci_diagnostic(&error.to_string());
+        let result_summary = crate::ci_job_result::CiJobResultSummary::current(
+            crate::ci_job_result::CiJobDisposition::ConfigurationRefused,
+            Some(&diagnostic),
+        )
+        .to_value();
         let mut transaction = self
             .pool
             .begin()
@@ -798,13 +803,7 @@ impl PgCiPipelineStarter {
         .bind(REJECTED_JOB_STAGE)
         .bind(REJECTED_JOB_NAME)
         .bind(&candidate.record.definition_snapshot)
-        .bind(serde_json::json!({
-            "passed": false,
-            "timed_out": false,
-            "disposition": "configuration_refused",
-            "workload_started": false,
-            "diagnostic": diagnostic,
-        }))
+        .bind(result_summary)
         .execute(&mut *transaction)
         .await
         .map_err(|error| {

@@ -1,4 +1,3 @@
-use crate::ci_result_summary::parse_ci_job_result_summary;
 use crate::config::EdgeConfig;
 use crate::dispatch::{EdgeCall, RetryPolicy};
 use crate::error::CliError;
@@ -9,6 +8,7 @@ use hyper::{Request, Response, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
+use myelin_ci_controlplane::ci_job_result::CiJobResultSummary;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -418,7 +418,8 @@ fn validate_ci_run_detail(requested_run: &str, body: &Value) -> Result<(), CliEr
         {
             return malformed_ci("run job attempt must be positive");
         }
-        parse_ci_job_result_summary(&job["result_summary"]).map_err(malformed_ci_error)?;
+        CiJobResultSummary::parse(&job["result_summary"])
+            .map_err(|error| malformed_ci_error(error.to_string()))?;
     }
     if dependencies
         .values()

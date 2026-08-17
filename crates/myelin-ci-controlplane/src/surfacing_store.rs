@@ -1,3 +1,4 @@
+use crate::ci_job_result::CiJobResultSummary;
 use crate::ci_run_store::{CiRunStore, CiRunStoreError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -314,7 +315,7 @@ pub struct CiJobSurface {
     pub matrix_key: Option<Value>,
     pub state: String,
     pub attempt: i32,
-    pub result_summary: Option<Value>,
+    pub result_summary: Option<CiJobResultSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -568,7 +569,10 @@ impl CiRunStore {
         };
         Ok(Some(CiRunSurface {
             run: run_from_row(run),
-            jobs: jobs.into_iter().map(job_from_row).collect(),
+            jobs: jobs
+                .into_iter()
+                .map(job_from_row)
+                .collect::<Result<Vec<_>, _>>()?,
             steps: steps.into_iter().map(step_from_row).collect(),
         }))
     }
@@ -1043,8 +1047,17 @@ fn run_from_row(row: sqlx::postgres::PgRow) -> CiRunSummary {
     }
 }
 
-fn job_from_row(row: sqlx::postgres::PgRow) -> CiJobSurface {
-    CiJobSurface {
+fn job_from_row(row: sqlx::postgres::PgRow) -> Result<CiJobSurface, CiRunSurfaceError> {
+    let stored: Option<Value> = row.get("result_summary");
+    let result_summary = match stored {
+        Some(value) => CiJobResultSummary::parse(&value).map_err(|error| {
+            CiRunSurfaceError::Storage(format!(
+                "CI job contains an invalid result summary: {error}"
+            ))
+        })?,
+        None => None,
+    };
+    Ok(CiJobSurface {
         job_id: row.get("job_id"),
         stage: row.get("stage"),
         name: row.get("name"),
@@ -1052,8 +1065,8 @@ fn job_from_row(row: sqlx::postgres::PgRow) -> CiJobSurface {
         matrix_key: row.get("matrix_key"),
         state: row.get("state"),
         attempt: row.get("attempt"),
-        result_summary: row.get("result_summary"),
-    }
+        result_summary,
+    })
 }
 
 fn step_from_row(row: sqlx::postgres::PgRow) -> CiStepSurface {

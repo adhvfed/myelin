@@ -26,6 +26,7 @@ const RUN_3: &str = "71000000-0000-4000-8000-000000000003";
 const RUN_HIDDEN: &str = "71000000-0000-4000-8000-000000000004";
 const RUN_NEWER: &str = "71000000-0000-4000-8000-000000000005";
 const JOB: &str = "72000000-0000-4000-8000-000000000001";
+const CORRUPT_JOB: &str = "72000000-0000-4000-8000-000000000002";
 
 static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -156,7 +157,8 @@ async fn insert_detail(app: &PgPool) {
                    spec_ref, state, attempt, result_summary
                  ) VALUES (
                    $1, $2, $3::uuid, $4::uuid, 'build', 'test', '{}', '{\"os\":\"linux\"}',
-                   'cas:spec', 'failed', 2, '{\"exit_code\":1}'
+                   'cas:spec', 'failed', 2,
+                   '{\"passed\":false,\"timed_out\":false,\"disposition\":\"workload_failed\",\"workload_started\":true,\"diagnostic\":\"Process exited with status 1.\"}'
                  )",
             )
             .bind(TENANT)
@@ -335,6 +337,14 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
         assert_eq!(detail.jobs.len(), 1);
         assert_eq!(detail.jobs[0].name, "test");
         assert_eq!(detail.jobs[0].needs, Vec::<String>::new());
+        assert_eq!(
+            detail.jobs[0]
+                .result_summary
+                .as_ref()
+                .expect("typed terminal result")
+                .label(),
+            "Workload failed"
+        );
         assert_eq!(detail.steps.len(), 1);
         assert_eq!(detail.steps[0].step_id, "compile");
         assert_eq!(detail.steps[0].byte_end, Some(48));
@@ -492,6 +502,35 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
             ),
             "the serving index is ready and has the exact table/key/predicate identity"
         );
+
+        with_tenant_tx(&app, TENANT, REGION, move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO ci_job (
+                       tenant_id, region, job_id, run_id, stage, name, needs, matrix_key,
+                       spec_ref, state, attempt, result_summary
+                     ) VALUES (
+                       $1, $2, $3::uuid, $4::uuid, 'pipeline', 'Corrupt', '{}', NULL,
+                       'cas:spec', 'failed', 1, '{\"message\":\"not a result contract\"}'
+                     )",
+                )
+                .bind(TENANT)
+                .bind(REGION)
+                .bind(CORRUPT_JOB)
+                .bind(RUN_HIDDEN)
+                .execute(&mut *conn)
+                .await
+                .map(|_| ())
+                .map_err(|error| PgError::Query(error.to_string()))
+            })
+        })
+        .await
+        .expect("insert corrupt durable result fixture");
+        assert!(matches!(
+            store.get_surface_run(TENANT, REGION, RUN_HIDDEN, HIDDEN).await,
+            Err(CiRunSurfaceError::Storage(message))
+                if message == "CI job contains an invalid result summary: run job result summary has missing or unknown fields"
+        ));
 
         app.close().await;
         admin.close().await;
