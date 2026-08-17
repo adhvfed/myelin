@@ -203,7 +203,6 @@ pub use tool_scope::{
 };
 
 pub use app::{
-    agent_app_spec, agent_app_spec_with_ingestion, boot_agent, governed_trigger_consumer_reg,
-    run_agent, run_agent_ingestion_until_shutdown, trigger_intake_filter, EVENT_DURABLE_CONSUMER,
-    EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT, SERVICE_NAME,
+    governed_trigger_consumer_reg, run_agent_ingestion_until_shutdown, trigger_intake_filter,
+    EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT, SERVICE_NAME,
 };

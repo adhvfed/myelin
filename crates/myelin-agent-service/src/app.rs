@@ -1,6 +1,8 @@
+#[cfg(test)]
+use myelin_substrate::{boot, serve, ServeHandle};
 use myelin_substrate::{
-    boot, serve, AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations,
-    OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations, OutboxSpec,
+    PublicRoutes, ServeError, StoreManifest,
 };
 
 pub const SERVICE_NAME: &str = "myelin-agent";
@@ -45,7 +47,7 @@ fn agent_service_migrations() -> Migrations {
     }))
 }
 
-pub fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec {
+fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -93,7 +95,7 @@ pub fn governed_trigger_consumer_reg(
     ))
 }
 
-pub fn agent_app_spec_with_ingestion(
+fn agent_app_spec_with_ingestion(
     config: Config,
     outbox: myelin_events::OutboxStore,
     consumers: Vec<myelin_substrate::ConsumerReg>,
@@ -124,14 +126,16 @@ where
     .await
 }
 
-pub fn boot_agent(
+#[cfg(test)]
+fn boot_agent(
     config: Config,
     outbox: myelin_events::OutboxStore,
 ) -> Result<ServeHandle, ServeError> {
     boot(agent_app_spec(config, outbox))
 }
 
-pub fn run_agent(config: Config, outbox: myelin_events::OutboxStore) -> Result<(), ServeError> {
+#[cfg(test)]
+fn run_agent(config: Config, outbox: myelin_events::OutboxStore) -> Result<(), ServeError> {
     serve(agent_app_spec(config, outbox))
 }
 
@@ -196,12 +200,12 @@ mod tests {
     }
 
     #[test]
-    fn shell_wires_the_five_table_migration_set_and_empty_consumer_seam() {
+    fn bare_spec_owns_migrations_but_no_implicit_consumers() {
         let spec = agent_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(spec.name, SERVICE_NAME);
         assert!(
             spec.consumers.is_empty(),
-            "the dispatch consumer is wired per-tenant (empty bare seam)"
+            "production must inject the governed per-tenant consumers explicitly"
         );
         assert_eq!(
             spec.migrations.0.len(),
