@@ -95,7 +95,6 @@ status = "covered"
 cdc = [
     "crates/myelin-storage/tests/cdc_st_02_coloc.rs",
     "crates/myelin-knowledge/tests/cdc_2_2_2_3_2_4_2_9_kn_d7_outbox.rs",
-    "crates/myelin-ci-controlplane/tests/cdc_supply_chain_2_2_10_6_4_7.rs",
     "crates/myelin-issues/tests/drill_iss_p06_emit_iff_committed.rs",
     "crates/myelin-issues/tests/integration_iss_p06_outbox.rs",
     "crates/myelin-issues/tests/drill_iss_d5_reorder_zero_clobber.rs",
@@ -441,7 +440,6 @@ status = "covered"
 cdc = [
     "crates/myelin-events/tests/cdc_5_9_check_seam_carriage.rs",
     "crates/myelin-git/tests/cdc_5_9_check_status_consumer.rs",
-    "crates/myelin-refs-service/tests/cdc_5_9_ci_sub_anchors.rs",
     "crates/myelin-ci-sandbox/tests/cdc_7_6_5_9_ci_notif_summary.rs",
     "crates/myelin-flow/tests/cdc_5_9_merge_queue.rs",
     "crates/myelin-ci-controlplane/tests/cdc_5_9_ci_check_producer.rs",
@@ -770,7 +768,6 @@ status = "covered"
 cdc = [
     "crates/myelin-gdpr-service/tests/cdc_10_6_audit_log.rs",
     "crates/myelin-gdpr-service/tests/cdc_10_6_audit_proofs.rs",
-    "crates/myelin-ci-controlplane/tests/cdc_supply_chain_2_2_10_6_4_7.rs",
 ]
 
 [[contract]]
