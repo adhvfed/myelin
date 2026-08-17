@@ -163,6 +163,38 @@ test.describe("Chat workspace", () => {
       .toHaveCount(1);
   });
 
+  test("a late topic creation cannot reclaim navigation after its dialog was left", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { emptyChat: true, chatConversationResponseDelaysMs: [1_500] },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await page.getByRole("button", { name: "Create the first topic" }).click();
+    await page.getByRole("textbox", { name: "Channel", exact: true }).fill("reliability");
+    await page.getByRole("textbox", { name: "Topic", exact: true }).fill("created after leaving");
+    await page.getByRole("button", { name: "Create topic" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.chatConversationCreateRequests;
+    }).toBe(1);
+
+    await page.evaluate(() => {
+      window.history.pushState({}, "", "/chat");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await expect(page.getByRole("dialog", { name: "New topic" })).toHaveCount(0);
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.chatConversationCreateResponses;
+    }).toBe(1);
+    await page.waitForTimeout(500);
+    expect(new URL(page.url()).searchParams.has("conversation")).toBe(false);
+    await expect(page.getByText("Topic created in reliability", { exact: true })).toHaveCount(0);
+  });
+
   test("editing an uncertain topic starts a distinct creation", async ({ page, request }) => {
     const configured = await request.post(`${EDGE}/__test/config`, {
       data: { emptyChat: true, chatConversationResponseLosses: 1 },

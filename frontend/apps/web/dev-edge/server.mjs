@@ -125,6 +125,9 @@ const state = {
   prMutationResponseLosses: 0,
   emptyChat: false,
   chatConversationResponseLosses: 0,
+  chatConversationResponseDelaysMs: [],
+  chatConversationCreateRequests: 0,
+  chatConversationCreateResponses: 0,
   chatConversationCursorDelaysMs: [],
   chatConversationCursorRequests: 0,
   chatConversationCursorResponses: 0,
@@ -482,6 +485,9 @@ const server = createServer((req, res) => {
         if (body.resetChat === true) {
           state.emptyChat = false;
           state.chatConversationResponseLosses = 0;
+          state.chatConversationResponseDelaysMs = [];
+          state.chatConversationCreateRequests = 0;
+          state.chatConversationCreateResponses = 0;
           state.chatConversationCursorDelaysMs = [];
           state.chatConversationCursorRequests = 0;
           state.chatConversationCursorResponses = 0;
@@ -495,6 +501,9 @@ const server = createServer((req, res) => {
         if (typeof body.emptyChat === "boolean") {
           state.emptyChat = body.emptyChat;
           state.chatConversationResponseLosses = 0;
+          state.chatConversationResponseDelaysMs = [];
+          state.chatConversationCreateRequests = 0;
+          state.chatConversationCreateResponses = 0;
           state.chatConversationCursorDelaysMs = [];
           state.chatConversationCursorRequests = 0;
           state.chatConversationCursorResponses = 0;
@@ -533,6 +542,12 @@ const server = createServer((req, res) => {
         if (Number.isInteger(body.chatConversationResponseLosses) &&
             body.chatConversationResponseLosses >= 0) {
           state.chatConversationResponseLosses = body.chatConversationResponseLosses;
+        }
+        if (Array.isArray(body.chatConversationResponseDelaysMs) &&
+            body.chatConversationResponseDelaysMs.length <= 10 &&
+            body.chatConversationResponseDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.chatConversationResponseDelaysMs = [...body.chatConversationResponseDelaysMs];
         }
         if (Number.isInteger(body.chatPostResponseLosses) && body.chatPostResponseLosses >= 0) {
           state.chatPostResponseLosses = body.chatPostResponseLosses;
@@ -725,13 +740,23 @@ const server = createServer((req, res) => {
         return send(res, 409, { error: { message: "Chat topic already exists", code: "conflict" } });
       }
       state.emptyChat = false;
-      if (state.chatConversationResponseLosses > 0) {
-        state.chatConversationResponseLosses -= 1;
-        return send(res, 503, {
-          error: { message: "Chat topic committed but its response was lost", code: "unavailable" },
-        });
+      state.chatConversationCreateRequests += 1;
+      const respond = () => {
+        state.chatConversationCreateResponses += 1;
+        if (state.chatConversationResponseLosses > 0) {
+          state.chatConversationResponseLosses -= 1;
+          return send(res, 503, {
+            error: { message: "Chat topic committed but its response was lost", code: "unavailable" },
+          });
+        }
+        return send(res, output.status, output.json, { "cache-control": "no-store" });
+      };
+      const delay = state.chatConversationResponseDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(respond, delay);
+        return;
       }
-      return send(res, output.status, output.json, { "cache-control": "no-store" });
+      return respond();
     });
     return;
   }

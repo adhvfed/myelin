@@ -1,6 +1,6 @@
 import { Dialog, Icon } from "@myelin/design-system";
 import { A, useAction } from "@solidjs/router";
-import { createEffect, createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 
 import { createProjectCatalogue } from "~/components/projects/project-catalogue";
 import {
@@ -40,8 +40,10 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
   const [error, setError] = createSignal<string | null>(null);
   const [submitting, setSubmitting] = createSignal(false);
   let channelInput: HTMLInputElement | undefined;
+  let openingGeneration = 0;
 
   createEffect(() => {
+    openingGeneration += 1;
     if (!props.open) return;
     setChannel("");
     setTopic("");
@@ -49,6 +51,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
     setError(null);
     setSubmitting(false);
   });
+  onCleanup(() => { openingGeneration += 1; });
 
   createEffect(() => {
     const preferred = props.preferredProjectId;
@@ -74,6 +77,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
       channelInput?.focus();
       return;
     }
+    const generation = openingGeneration;
     setSubmitting(true);
     setError(null);
     try {
@@ -84,6 +88,7 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
         topic: topic(),
         clientNonce: clientNonce(),
       });
+      if (generation !== openingGeneration) return;
       if (!result.ok) {
         setError(errorCopy(result.error));
         return;
@@ -95,9 +100,9 @@ export function ChatTopicDialog(props: ChatTopicDialogProps) {
       props.onClose();
       props.onCreated(result.receipt);
     } catch {
-      setError(errorCopy("error"));
+      if (generation === openingGeneration) setError(errorCopy("error"));
     } finally {
-      setSubmitting(false);
+      if (generation === openingGeneration) setSubmitting(false);
     }
   };
 
