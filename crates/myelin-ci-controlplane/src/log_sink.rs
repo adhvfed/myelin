@@ -131,39 +131,58 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
             .canonical_run_id
             .clone()
             .unwrap_or_else(|| run_id.to_string());
-        let flushed = {
+        let prepared = {
             let mut map = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-            let open = map.entry(key.clone()).or_insert_with(|| {
-                let mut pipeline = LogPipeline::new(
-                    tenant.clone(),
-                    self.region.clone(),
-                    self.blobs.clone(),
-                    SecretRedactor::for_job(std::iter::empty::<String>()),
-                );
-                pipeline.resume_stream(
-                    &LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_NO),
-                    resume.step_byte_start,
-                    resume.next_byte_offset,
-                    resume.next_segment_seq,
-                );
-                OpenLogPipeline {
-                    canonical_run_id: canonical_run_id.clone(),
-                    pipeline,
+            let open = match map.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let mut pipeline = LogPipeline::new(
+                        tenant.clone(),
+                        self.region.clone(),
+                        self.blobs.clone(),
+                        SecretRedactor::for_job(std::iter::empty::<String>()),
+                    );
+                    pipeline
+                        .resume_stream(
+                            &LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_NO),
+                            resume.step_byte_start,
+                            resume.next_byte_offset,
+                            resume.next_segment_seq,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "resume incremental log pipeline for run={run_id} job={job_id}: {error}"
+                            )
+                        })?;
+                    entry.insert(OpenLogPipeline {
+                        canonical_run_id: canonical_run_id.clone(),
+                        pipeline,
+                    })
                 }
-            });
+            };
             let coord = LogCoord::new(&open.canonical_run_id, job_id, SINGLE_STEP_NO);
             open.pipeline
                 .ship_frame(&coord, frame)
-                .map_err(|error| error.to_string())?;
-            open.pipeline
-                .seal_open_segment(&coord)
-                .map_err(|error| error.to_string())?;
-            FlushedJobLogs {
-                run_id: open.canonical_run_id.clone(),
-                job_id: job_id.to_string(),
-                segments: open.pipeline.drain_segment_rows(),
-                anchors: open.pipeline.anchor_rows().into_iter().cloned().collect(),
-                pointers: open.pipeline.drain_pointers(),
+                .and_then(|_| open.pipeline.seal_open_segment(&coord))
+                .map(|_| FlushedJobLogs {
+                    run_id: open.canonical_run_id.clone(),
+                    job_id: job_id.to_string(),
+                    segments: open.pipeline.drain_segment_rows(),
+                    anchors: open.pipeline.anchor_rows().into_iter().cloned().collect(),
+                    pointers: open.pipeline.drain_pointers(),
+                })
+                .map_err(|error| error.to_string())
+        };
+        let flushed = match prepared {
+            Ok(flushed) => flushed,
+            Err(error) => {
+                self.pipelines
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&key);
+                return Err(format!(
+                    "prepare incremental log checkpoint for run={run_id} job={job_id}: {error}"
+                ));
             }
         };
         if let Err(error) = self.persist.persist(tenant, flushed) {
@@ -207,16 +226,22 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
                     self.blobs.clone(),
                     SecretRedactor::for_job(std::iter::empty::<String>()),
                 );
-                pipeline.resume_stream(
-                    &LogCoord::new(
-                        resume.canonical_run_id.as_deref().unwrap_or(run_id),
-                        job_id,
-                        SINGLE_STEP_NO,
-                    ),
-                    resume.step_byte_start,
-                    resume.next_byte_offset,
-                    resume.next_segment_seq,
-                );
+                pipeline
+                    .resume_stream(
+                        &LogCoord::new(
+                            resume.canonical_run_id.as_deref().unwrap_or(run_id),
+                            job_id,
+                            SINGLE_STEP_NO,
+                        ),
+                        resume.step_byte_start,
+                        resume.next_byte_offset,
+                        resume.next_segment_seq,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "resume terminal log pipeline for run={run_id} job={job_id}: {error}"
+                        )
+                    })?;
                 OpenLogPipeline {
                     canonical_run_id: resume
                         .canonical_run_id
@@ -254,7 +279,9 @@ impl<S: BlobStore + Clone, P: LogPersist> FirehoseSink for LogPipelineSink<S, P>
 mod tests {
     use super::*;
     use myelin_ci_sandbox::FirehoseSink;
-    use myelin_storage::{ContentHash, FsBlobStore};
+    use myelin_storage::blob::BlobDependencyError;
+    use myelin_storage::{BlobError, BlobMeta, ContentHash, FsBlobStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[derive(Default)]
@@ -283,6 +310,33 @@ mod tests {
             _flushed: FlushedJobLogs,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err(std::io::Error::other("injected durable log failure").into())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailOnceBlobStore {
+        attempts: Arc<AtomicUsize>,
+        inner: Arc<FsBlobStore>,
+    }
+
+    impl BlobStore for FailOnceBlobStore {
+        fn put(&self, tenant: &TenantId, bytes: &[u8]) -> Result<ContentHash, BlobError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(BlobError::Backend(BlobDependencyError::Transient));
+            }
+            self.inner.put(tenant, bytes)
+        }
+
+        fn get(&self, tenant: &TenantId, hash: &ContentHash) -> Result<Vec<u8>, BlobError> {
+            self.inner.get(tenant, hash)
+        }
+
+        fn head(&self, tenant: &TenantId, hash: &ContentHash) -> Result<BlobMeta, BlobError> {
+            self.inner.head(tenant, hash)
+        }
+
+        fn delete(&self, tenant: &TenantId, hash: &ContentHash) -> Result<(), BlobError> {
+            self.inner.delete(tenant, hash)
         }
     }
 
@@ -394,6 +448,36 @@ mod tests {
             sink.pipelines.lock().unwrap().is_empty(),
             "failed jobs do not leak a stale open pipeline into a retry"
         );
+    }
+
+    #[test]
+    fn archive_failure_drops_the_partial_pipeline_and_retry_persists_one_copy() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let blobs = FailOnceBlobStore {
+            attempts: attempts.clone(),
+            inner: Arc::new(FsBlobStore::new()),
+        };
+        let persist = Arc::new(RecordingPersist::default());
+        let sink = LogPipelineSink::new(Region::new("eu-west"), blobs, persist.clone());
+        let tenant = TenantId::from_token("tnt-archive-retry");
+        let frame = b"persist me exactly once\n";
+
+        let error = sink
+            .ship_frame("run-retry", "job-retry", &tenant, frame)
+            .expect_err("object storage refusal is returned to the runner");
+        assert!(error.contains("prepare incremental log checkpoint"));
+        assert!(error.contains("object-store dependency is temporarily unavailable"));
+        assert!(sink.pipelines.lock().unwrap().is_empty());
+        assert!(persist.flushed.lock().unwrap().is_empty());
+
+        sink.ship_frame("run-retry", "job-retry", &tenant, frame)
+            .expect("the runner can retry the same frame");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let flushed = persist.flushed.lock().unwrap();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].1.segments.len(), 1);
+        assert_eq!(flushed[0].1.segments[0].byte_start, 0);
+        assert_eq!(flushed[0].1.segments[0].byte_end, frame.len() as i64);
     }
 
     #[test]

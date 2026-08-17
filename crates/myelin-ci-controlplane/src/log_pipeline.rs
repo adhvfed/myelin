@@ -1,6 +1,8 @@
-use myelin_events::firehose::{Firehose, FirehoseError, FirehoseScope, FrameDraft};
+use myelin_events::firehose::{
+    Firehose, FirehoseError, FirehoseScope, FrameDraft, FIREHOSE_MAX_SCOPE_ID_BYTES,
+};
 use myelin_events::{ArtifactRef, DataRole, EventDraft, EventType, Visibility};
-use myelin_storage::{BlobStore, ContentHash};
+use myelin_storage::{BlobError, BlobStore};
 use myelin_tenancy::{Region, TenantId};
 
 use myelin_ci_sandbox::events::CI_LOG_AVAILABLE;
@@ -36,7 +38,26 @@ impl std::error::Error for CrossRegionLogWrite {}
 pub enum LogPipelineError {
     CrossRegion(CrossRegionLogWrite),
     InvalidScope(FirehoseError),
-    MissingStream { run_id: String, job_id: String },
+    InvalidCoordinate(LogReferenceError),
+    InvalidResume {
+        run_id: String,
+        job_id: String,
+        reason: &'static str,
+    },
+    StreamAlreadyOpen {
+        run_id: String,
+        job_id: String,
+    },
+    NonTerminalClose {
+        run_id: String,
+        job_id: String,
+    },
+    Blob(BlobError),
+    CapacityExceeded {
+        run_id: String,
+        job_id: String,
+        resource: &'static str,
+    },
 }
 
 impl std::fmt::Display for LogPipelineError {
@@ -44,9 +65,31 @@ impl std::fmt::Display for LogPipelineError {
         match self {
             LogPipelineError::CrossRegion(error) => error.fmt(f),
             LogPipelineError::InvalidScope(error) => error.fmt(f),
-            LogPipelineError::MissingStream { run_id, job_id } => write!(
+            LogPipelineError::InvalidCoordinate(error) => error.fmt(f),
+            LogPipelineError::InvalidResume {
+                run_id,
+                job_id,
+                reason,
+            } => write!(
                 f,
-                "CI log stream state is missing for run `{run_id}` and job `{job_id}`"
+                "cannot resume CI log run `{run_id}` job `{job_id}`: {reason}"
+            ),
+            LogPipelineError::StreamAlreadyOpen { run_id, job_id } => write!(
+                f,
+                "cannot resume CI log run `{run_id}` job `{job_id}` over an open stream"
+            ),
+            LogPipelineError::NonTerminalClose { run_id, job_id } => write!(
+                f,
+                "cannot close CI log run `{run_id}` job `{job_id}` with a running status"
+            ),
+            LogPipelineError::Blob(error) => write!(f, "archive CI log bytes: {error}"),
+            LogPipelineError::CapacityExceeded {
+                run_id,
+                job_id,
+                resource,
+            } => write!(
+                f,
+                "CI log {resource} capacity exhausted for run `{run_id}` and job `{job_id}`"
             ),
         }
     }
@@ -57,7 +100,12 @@ impl std::error::Error for LogPipelineError {
         match self {
             LogPipelineError::CrossRegion(error) => Some(error),
             LogPipelineError::InvalidScope(error) => Some(error),
-            LogPipelineError::MissingStream { .. } => None,
+            LogPipelineError::InvalidCoordinate(error) => Some(error),
+            LogPipelineError::InvalidResume { .. } => None,
+            LogPipelineError::StreamAlreadyOpen { .. } => None,
+            LogPipelineError::NonTerminalClose { .. } => None,
+            LogPipelineError::Blob(error) => Some(error),
+            LogPipelineError::CapacityExceeded { .. } => None,
         }
     }
 }
@@ -71,6 +119,18 @@ impl From<CrossRegionLogWrite> for LogPipelineError {
 impl From<FirehoseError> for LogPipelineError {
     fn from(error: FirehoseError) -> Self {
         LogPipelineError::InvalidScope(error)
+    }
+}
+
+impl From<BlobError> for LogPipelineError {
+    fn from(error: BlobError) -> Self {
+        LogPipelineError::Blob(error)
+    }
+}
+
+impl From<LogReferenceError> for LogPipelineError {
+    fn from(error: LogReferenceError) -> Self {
+        LogPipelineError::InvalidCoordinate(error)
     }
 }
 
@@ -228,10 +288,17 @@ impl LogCoord {
                     reason: "the id is empty",
                 });
             }
-            if value
-                .chars()
-                .any(|character| matches!(character, ':' | '/' | '#') || character.is_whitespace())
-            {
+            if value.len() > FIREHOSE_MAX_SCOPE_ID_BYTES {
+                return Err(LogReferenceError::InvalidCoordinate {
+                    component,
+                    reason: "the id exceeds the bounded coordinate length",
+                });
+            }
+            if value.chars().any(|character| {
+                matches!(character, ':' | '/' | '#')
+                    || character.is_whitespace()
+                    || character.is_control()
+            }) {
                 return Err(LogReferenceError::InvalidCoordinate {
                     component,
                     reason: "the id contains whitespace or a reserved `:`, `/`, or `#` delimiter",
@@ -403,6 +470,91 @@ struct StreamState {
     last_pointer_offset: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AppendPlan {
+    frame_offset: i64,
+    next_offset: i64,
+    open_segment_start: i64,
+    next_open_len: usize,
+    next_pointer_bytes: u64,
+    pointer_start: i64,
+    segment_seq: i32,
+    next_segment_seq: Option<i32>,
+    next_lines_shipped: u64,
+    emit_pointer: bool,
+}
+
+impl AppendPlan {
+    fn build(
+        coord: &LogCoord,
+        state: Option<&StreamState>,
+        bytes_len: usize,
+        lines_shipped: u64,
+        coalesce_at_bytes: u64,
+        seal_at_bytes: u64,
+    ) -> Result<AppendPlan, LogPipelineError> {
+        let exhausted = |resource| LogPipelineError::CapacityExceeded {
+            run_id: coord.run_id.clone(),
+            job_id: coord.job_id.clone(),
+            resource,
+        };
+        let byte_len = i64::try_from(bytes_len).map_err(|_| exhausted("byte offset"))?;
+        let pointer_bytes = u64::try_from(bytes_len).map_err(|_| exhausted("pointer"))?;
+        let frame_offset = state.map_or(0, |stream| stream.next_offset);
+        let next_offset = frame_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| exhausted("byte offset"))?;
+        let open_segment_start = state.map_or(frame_offset, |stream| {
+            if stream.open_segment.is_empty() {
+                frame_offset
+            } else {
+                stream.open_segment_start
+            }
+        });
+        let next_open_len = state
+            .map_or(0, |stream| stream.open_segment.len())
+            .checked_add(bytes_len)
+            .ok_or_else(|| exhausted("segment"))?;
+        let next_pointer_bytes = state
+            .map_or(0, |stream| stream.bytes_since_pointer)
+            .checked_add(pointer_bytes)
+            .ok_or_else(|| exhausted("pointer"))?;
+        let pointer_start = state.map_or(0, |stream| stream.last_pointer_offset);
+        let segment_seq = state.map_or(0, |stream| stream.next_segment_seq);
+        let should_seal = next_open_len > 0
+            && u64::try_from(next_open_len).map_err(|_| exhausted("segment"))? >= seal_at_bytes;
+        let next_segment_seq = should_seal
+            .then(|| {
+                segment_seq
+                    .checked_add(1)
+                    .ok_or_else(|| exhausted("segment sequence"))
+            })
+            .transpose()?;
+        let next_lines_shipped = lines_shipped
+            .checked_add(1)
+            .ok_or_else(|| exhausted("line count"))?;
+        let emit_pointer =
+            should_seal || (next_pointer_bytes >= coalesce_at_bytes && next_offset > pointer_start);
+
+        Ok(AppendPlan {
+            frame_offset,
+            next_offset,
+            open_segment_start,
+            next_open_len,
+            next_pointer_bytes,
+            pointer_start,
+            segment_seq,
+            next_segment_seq,
+            next_lines_shipped,
+            emit_pointer,
+        })
+    }
+
+    fn seals_segment(self) -> bool {
+        self.next_segment_seq.is_some()
+    }
+}
+
 pub struct LogPipeline<B: BlobStore> {
     tenant: TenantId,
     region: Region,
@@ -460,9 +612,31 @@ impl<B: BlobStore> LogPipeline<B> {
         step_byte_start: i64,
         next_byte_offset: i64,
         next_segment_seq: i32,
-    ) {
+    ) -> Result<(), LogPipelineError> {
+        coord.validate_identity()?;
+        let invalid = |reason| LogPipelineError::InvalidResume {
+            run_id: coord.run_id.clone(),
+            job_id: coord.job_id.clone(),
+            reason,
+        };
+        if step_byte_start < 0 {
+            return Err(invalid("the step byte start is negative"));
+        }
+        if next_byte_offset < step_byte_start {
+            return Err(invalid("the next byte offset precedes the step start"));
+        }
+        if next_segment_seq < 0 {
+            return Err(invalid("the next segment sequence is negative"));
+        }
+        let key = (coord.run_id.clone(), coord.job_id.clone());
+        if self.streams.contains_key(&key) {
+            return Err(LogPipelineError::StreamAlreadyOpen {
+                run_id: coord.run_id.clone(),
+                job_id: coord.job_id.clone(),
+            });
+        }
         self.streams.insert(
-            (coord.run_id.clone(), coord.job_id.clone()),
+            key,
             StreamState {
                 next_offset: next_byte_offset,
                 open_segment: Vec::new(),
@@ -489,6 +663,7 @@ impl<B: BlobStore> LogPipeline<B> {
                 status: AnchorStatus::Running,
             },
         );
+        Ok(())
     }
 
     pub fn ship_line(&mut self, coord: &LogCoord, line: &str) -> Result<u64, LogPipelineError> {
@@ -509,88 +684,106 @@ impl<B: BlobStore> LogPipeline<B> {
         coord: &LogCoord,
         bytes: &[u8],
     ) -> Result<u64, LogPipelineError> {
-        let len = bytes.len() as i64;
-
+        coord.validate_identity()?;
         let scope = coord.firehose_scope()?;
         let key = (coord.run_id.clone(), coord.job_id.clone());
-
-        let (frame_offset, frame_payload) = {
-            let st = self.streams.entry(key.clone()).or_default();
-            let offset = st.next_offset;
-            let payload = format!(
-                "ci/run/{}/job/{}/step/{}@{}:{}",
-                coord.run_id,
-                coord.job_id,
-                coord.step_no,
-                offset,
-                offset + len
-            );
-            (offset, payload)
-        };
-        let seq = self
-            .firehose
-            .publish(CI_LOG_STREAM, &scope, FrameDraft::new(frame_payload))
-            .seq;
+        let state = self.streams.get(&key);
+        let plan = AppendPlan::build(
+            coord,
+            state,
+            bytes.len(),
+            self.lines_shipped,
+            self.coalesce.bytes_per_pointer,
+            self.seal.seal_at_bytes,
+        )?;
 
         self.write_pin.admit_log_write(&self.region)?;
-        self.open_or_extend_anchor(coord, frame_offset, frame_offset + len);
+        if plan.seals_segment() {
+            self.write_pin.admit_log_write(&self.region)?;
+        }
+        if plan.emit_pointer {
+            self.write_pin.admit_log_write(&self.region)?;
+        }
 
-        let should_seal = {
-            let st = self
-                .streams
-                .get_mut(&key)
-                .ok_or_else(|| LogPipelineError::MissingStream {
-                    run_id: coord.run_id.clone(),
-                    job_id: coord.job_id.clone(),
-                })?;
-            if st.open_segment.is_empty() {
-                st.open_segment_start = st.next_offset;
+        let segment_ref = if plan.seals_segment() {
+            let mut prospective = Vec::with_capacity(plan.next_open_len);
+            if let Some(stream) = state {
+                prospective.extend_from_slice(&stream.open_segment);
             }
-            st.open_segment.extend_from_slice(bytes);
-            st.next_offset += len;
-            st.bytes_since_pointer += len as u64;
-            self.lines_shipped += 1;
-            st.open_segment.len() as u64 >= self.seal.seal_at_bytes
+            prospective.extend_from_slice(bytes);
+            Some(
+                self.blobs
+                    .put(&self.tenant, &prospective)?
+                    .to_multihash_string(),
+            )
+        } else {
+            None
         };
 
-        if should_seal {
-            self.seal_open_segment(coord)?;
-        }
-
-        let crossed = self
-            .streams
-            .get(&key)
-            .is_some_and(|state| state.bytes_since_pointer >= self.coalesce.bytes_per_pointer);
-        if crossed {
-            self.emit_coalesced_pointer(coord, None)?;
-        }
-
-        Ok(seq)
-    }
-
-    fn open_or_extend_anchor(&mut self, coord: &LogCoord, _start: i64, _end: i64) {
-        let akey = (
-            coord.run_id.clone(),
-            coord.job_id.clone(),
-            coord.step_no.to_string(),
+        let frame_payload = format!(
+            "ci/run/{}/job/{}/step/{}@{}:{}",
+            coord.run_id, coord.job_id, coord.step_no, plan.frame_offset, plan.next_offset
         );
-        let st_start = self
-            .streams
-            .get(&(coord.run_id.clone(), coord.job_id.clone()))
-            .map(|s| s.next_offset)
-            .unwrap_or(0);
+        let frame = self
+            .firehose
+            .publish(CI_LOG_STREAM, &scope, FrameDraft::new(frame_payload));
+
+        let stream = self.streams.entry(key).or_default();
+        if stream.open_segment.is_empty() {
+            stream.open_segment_start = plan.frame_offset;
+        }
+        stream.open_segment.extend_from_slice(bytes);
+        stream.next_offset = plan.next_offset;
+        stream.bytes_since_pointer = plan.next_pointer_bytes;
+        if let Some(next_segment_seq) = plan.next_segment_seq {
+            stream.open_segment.clear();
+            stream.next_segment_seq = next_segment_seq;
+        }
+        if plan.emit_pointer {
+            stream.last_pointer_offset = plan.next_offset;
+            stream.bytes_since_pointer = 0;
+        }
+        self.lines_shipped = plan.next_lines_shipped;
+
         self.anchor_rows
-            .entry(akey)
+            .entry((
+                coord.run_id.clone(),
+                coord.job_id.clone(),
+                coord.step_no.to_string(),
+            ))
             .or_insert_with(|| LogAnchorRow {
                 tenant_id: self.tenant.as_str().to_string(),
                 region: self.region.as_str().to_string(),
                 run_id: coord.run_id.clone(),
                 job_id: coord.job_id.clone(),
                 step_id: coord.step_no.to_string(),
-                byte_start: st_start,
+                byte_start: plan.frame_offset,
                 byte_end: None,
                 status: AnchorStatus::Running,
             });
+        if let Some(segment_ref) = &segment_ref {
+            self.segment_rows.push(LogSegmentRow {
+                tenant_id: self.tenant.as_str().to_string(),
+                region: self.region.as_str().to_string(),
+                run_id: coord.run_id.clone(),
+                job_id: coord.job_id.clone(),
+                segment_seq: plan.segment_seq,
+                blob_ref: Some(segment_ref.clone()),
+                byte_start: plan.open_segment_start,
+                byte_end: plan.next_offset,
+                pii_key_ref: self.tenant_dek_ref(),
+            });
+        }
+        if plan.emit_pointer {
+            self.pointers.push(LogAvailablePointer {
+                coord: coord.clone(),
+                byte_start: plan.pointer_start,
+                byte_end: plan.next_offset,
+                segment_ref,
+            });
+        }
+
+        Ok(frame.seq)
     }
 
     pub fn close_step(
@@ -598,6 +791,13 @@ impl<B: BlobStore> LogPipeline<B> {
         coord: &LogCoord,
         status: AnchorStatus,
     ) -> Result<(), LogPipelineError> {
+        coord.validate_identity()?;
+        if !status.is_terminal() {
+            return Err(LogPipelineError::NonTerminalClose {
+                run_id: coord.run_id.clone(),
+                job_id: coord.job_id.clone(),
+            });
+        }
         self.write_pin.admit_log_write(&self.region)?;
         let end = self
             .streams
@@ -634,77 +834,60 @@ impl<B: BlobStore> LogPipeline<B> {
         &mut self,
         coord: &LogCoord,
     ) -> Result<Option<String>, LogPipelineError> {
+        coord.validate_identity()?;
         let key = (coord.run_id.clone(), coord.job_id.clone());
-        let (bytes, seg_start, seg_end, seg_seq) = {
-            let Some(st) = self.streams.get_mut(&key) else {
-                return Ok(None);
-            };
-            if st.open_segment.is_empty() {
-                return Ok(None);
-            }
-            let bytes = std::mem::take(&mut st.open_segment);
-            let seg_start = st.open_segment_start;
-            let seg_end = st.next_offset;
-            let seq = st.next_segment_seq;
-            st.next_segment_seq += 1;
-            (bytes, seg_start, seg_end, seq)
+        let Some(stream) = self.streams.get(&key) else {
+            return Ok(None);
         };
+        if stream.open_segment.is_empty() {
+            return Ok(None);
+        }
+        let bytes = stream.open_segment.clone();
+        let segment_start = stream.open_segment_start;
+        let segment_end = stream.next_offset;
+        let segment_seq = stream.next_segment_seq;
+        let next_segment_seq =
+            segment_seq
+                .checked_add(1)
+                .ok_or_else(|| LogPipelineError::CapacityExceeded {
+                    run_id: coord.run_id.clone(),
+                    job_id: coord.job_id.clone(),
+                    resource: "segment sequence",
+                })?;
+        let pointer_start = stream.last_pointer_offset;
 
         self.write_pin.admit_log_write(&self.region)?;
+        self.write_pin.admit_log_write(&self.region)?;
+        let blob_ref = self.blobs.put(&self.tenant, &bytes)?.to_multihash_string();
 
-        let blob_ref = match self.blobs.put(&self.tenant, &bytes) {
-            Ok(hash) => hash.to_multihash_string(),
-            Err(_) => ContentHash::blake3(&bytes).to_multihash_string(),
-        };
+        let stream = self
+            .streams
+            .get_mut(&key)
+            .expect("the exclusively borrowed log stream remains present");
+        stream.open_segment.clear();
+        stream.next_segment_seq = next_segment_seq;
+        stream.last_pointer_offset = segment_end;
+        stream.bytes_since_pointer = 0;
 
         self.segment_rows.push(LogSegmentRow {
             tenant_id: self.tenant.as_str().to_string(),
             region: self.region.as_str().to_string(),
             run_id: coord.run_id.clone(),
             job_id: coord.job_id.clone(),
-            segment_seq: seg_seq,
+            segment_seq,
             blob_ref: Some(blob_ref.clone()),
-            byte_start: seg_start,
-            byte_end: seg_end,
+            byte_start: segment_start,
+            byte_end: segment_end,
             pii_key_ref: self.tenant_dek_ref(),
         });
-
-        self.emit_coalesced_pointer(coord, Some(blob_ref.clone()))?;
-
-        Ok(Some(blob_ref))
-    }
-
-    fn emit_coalesced_pointer(
-        &mut self,
-        coord: &LogCoord,
-        segment_ref: Option<String>,
-    ) -> Result<(), LogPipelineError> {
-        self.write_pin.admit_log_write(&self.region)?;
-        let key = (coord.run_id.clone(), coord.job_id.clone());
-        let (range_start, range_end) = {
-            let st = self
-                .streams
-                .get_mut(&key)
-                .ok_or_else(|| LogPipelineError::MissingStream {
-                    run_id: coord.run_id.clone(),
-                    job_id: coord.job_id.clone(),
-                })?;
-            let start = st.last_pointer_offset;
-            let end = st.next_offset;
-            st.last_pointer_offset = end;
-            st.bytes_since_pointer = 0;
-            (start, end)
-        };
-        if range_end <= range_start && segment_ref.is_none() {
-            return Ok(());
-        }
         self.pointers.push(LogAvailablePointer {
             coord: coord.clone(),
-            byte_start: range_start,
-            byte_end: range_end,
-            segment_ref,
+            byte_start: pointer_start,
+            byte_end: segment_end,
+            segment_ref: Some(blob_ref.clone()),
         });
-        Ok(())
+
+        Ok(Some(blob_ref))
     }
 
     pub fn flush_job(

@@ -1,6 +1,9 @@
 use super::*;
-use myelin_storage::FsBlobStore;
+use myelin_storage::blob::BlobDependencyError;
+use myelin_storage::{BlobError, BlobMeta, BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 fn tenant() -> TenantId {
     TenantId::from_token("01J0ACME")
@@ -29,6 +32,32 @@ fn pipeline(coalesce_bytes: u64, seal_bytes: u64) -> LogPipeline<FsBlobStore> {
 
 fn coord() -> LogCoord {
     LogCoord::new("run-1", "job-1", 1)
+}
+
+struct FailOnceBlobStore {
+    attempts: Arc<AtomicUsize>,
+    inner: FsBlobStore,
+}
+
+impl BlobStore for FailOnceBlobStore {
+    fn put(&self, tenant: &TenantId, bytes: &[u8]) -> Result<ContentHash, BlobError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(BlobError::Backend(BlobDependencyError::Transient));
+        }
+        self.inner.put(tenant, bytes)
+    }
+
+    fn get(&self, tenant: &TenantId, hash: &ContentHash) -> Result<Vec<u8>, BlobError> {
+        self.inner.get(tenant, hash)
+    }
+
+    fn head(&self, tenant: &TenantId, hash: &ContentHash) -> Result<BlobMeta, BlobError> {
+        self.inner.head(tenant, hash)
+    }
+
+    fn delete(&self, tenant: &TenantId, hash: &ContentHash) -> Result<(), BlobError> {
+        self.inner.delete(tenant, hash)
+    }
 }
 
 #[test]
@@ -158,6 +187,98 @@ fn the_sealed_segment_blob_round_trips_the_exact_bytes() {
         addr, &expected,
         "the blob_ref is the content address of the sealed bytes"
     );
+}
+
+#[test]
+fn an_archive_failure_is_retryable_without_a_ghost_frame_or_duplicate_bytes() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let blobs = FailOnceBlobStore {
+        attempts: attempts.clone(),
+        inner: FsBlobStore::new(),
+    };
+    let mut pipeline = LogPipeline::new(tenant(), region(), blobs, SecretRedactor::default())
+        .with_thresholds(
+            CoalesceBudget::default(),
+            SealThreshold { seal_at_bytes: 1 },
+        );
+    let coord = coord();
+
+    assert!(matches!(
+        pipeline.ship_line(&coord, "one durable line"),
+        Err(LogPipelineError::Blob(BlobError::Backend(
+            BlobDependencyError::Transient
+        )))
+    ));
+    assert_eq!(
+        pipeline.lines_shipped(),
+        0,
+        "the failed line was not accepted"
+    );
+    assert_eq!(
+        pipeline.firehose_window_len(&coord),
+        0,
+        "subscribers never observe bytes that the archive refused"
+    );
+    assert!(pipeline.segment_rows().is_empty());
+    assert!(pipeline.anchor_rows().is_empty());
+    assert!(pipeline.drain_pointers().is_empty());
+
+    assert_eq!(
+        pipeline
+            .ship_line(&coord, "one durable line")
+            .expect("the exact retry succeeds"),
+        1,
+        "the failed attempt consumed no live cursor"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(pipeline.lines_shipped(), 1);
+    assert_eq!(pipeline.firehose_window_len(&coord), 1);
+    assert_eq!(pipeline.segment_rows().len(), 1);
+    assert_eq!(pipeline.segment_rows()[0].byte_start, 0);
+    assert_eq!(
+        pipeline.segment_rows()[0].byte_end,
+        "one durable line".len() as i64,
+        "the retry archives one copy of the line"
+    );
+}
+
+#[test]
+fn a_failed_flush_keeps_the_unsealed_bytes_for_an_exact_retry() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let blobs = FailOnceBlobStore {
+        attempts: attempts.clone(),
+        inner: FsBlobStore::new(),
+    };
+    let mut pipeline = LogPipeline::new(tenant(), region(), blobs, SecretRedactor::default());
+    let coord = coord();
+    pipeline
+        .ship_line(&coord, "buffered until flush")
+        .expect("buffering does not require object storage");
+
+    assert!(matches!(
+        pipeline.seal_open_segment(&coord),
+        Err(LogPipelineError::Blob(BlobError::Backend(
+            BlobDependencyError::Transient
+        )))
+    ));
+    assert!(
+        pipeline.segment_rows().is_empty(),
+        "a failed object write never creates an index row with a fabricated address"
+    );
+    assert!(pipeline.drain_pointers().is_empty());
+
+    pipeline
+        .seal_open_segment(&coord)
+        .expect("the buffered bytes remain retryable")
+        .expect("the retry seals a segment");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(pipeline.segment_rows().len(), 1);
+    assert_eq!(pipeline.segment_rows()[0].byte_start, 0);
+    assert_eq!(
+        pipeline.segment_rows()[0].byte_end,
+        "buffered until flush".len() as i64
+    );
+    assert_eq!(pipeline.durable_pointer_count(), 1);
 }
 
 #[test]
@@ -428,17 +549,74 @@ fn the_buffered_index_rows_carry_the_cell_region_and_no_bytes() {
 }
 
 #[test]
-fn malformed_run_coordinates_are_refused_without_mutating_log_state() {
+fn malformed_coordinates_are_refused_without_mutating_log_state() {
     let mut p = pipeline(1 << 20, 1);
-    let invalid = LogCoord::new("", "job-1", 1);
-
-    assert!(matches!(
-        p.ship_line(&invalid, "untrusted output"),
-        Err(LogPipelineError::InvalidScope(_))
-    ));
+    for invalid in [
+        LogCoord::new("", "job-1", 1),
+        LogCoord::new("run-1", "", 1),
+        LogCoord::new("run-1", "job/1", 1),
+        LogCoord::new("run-1", "job\0one", 1),
+        LogCoord::new("run-1", "j".repeat(FIREHOSE_MAX_SCOPE_ID_BYTES + 1), 1),
+    ] {
+        assert!(matches!(
+            p.ship_line(&invalid, "untrusted output"),
+            Err(LogPipelineError::InvalidCoordinate(_))
+        ));
+    }
     assert!(p.segment_rows().is_empty());
     assert!(p.anchor_rows().is_empty());
     assert!(p.drain_pointers().is_empty());
+    assert_eq!(p.lines_shipped(), 0);
+}
+
+#[test]
+fn resume_rejects_impossible_durable_heads_without_installing_them() {
+    let mut pipeline = pipeline(1 << 20, 1 << 20);
+    let coord = coord();
+
+    for (step_start, next_offset, next_segment) in [(-1, 0, 0), (2, 1, 0), (0, 0, -1)] {
+        assert!(matches!(
+            pipeline.resume_stream(&coord, step_start, next_offset, next_segment),
+            Err(LogPipelineError::InvalidResume { .. })
+        ));
+    }
+    assert!(pipeline.anchor_rows().is_empty());
+    assert_eq!(pipeline.lines_shipped(), 0);
+}
+
+#[test]
+fn resume_never_overwrites_an_open_stream() {
+    let mut pipeline = pipeline(1 << 20, 1 << 20);
+    let coord = coord();
+    pipeline
+        .resume_stream(&coord, 4, 8, 2)
+        .expect("the recovered head installs once");
+
+    assert!(matches!(
+        pipeline.resume_stream(&coord, 0, 0, 0),
+        Err(LogPipelineError::StreamAlreadyOpen { .. })
+    ));
+    let anchor = pipeline.anchor_rows()[0];
+    assert_eq!(anchor.byte_start, 4, "the installed head was not replaced");
+    pipeline
+        .ship_line(&coord, "x")
+        .expect("the original recovered cursor remains usable");
+    assert_eq!(pipeline.drain_pointers().len(), 0);
+}
+
+#[test]
+fn close_step_requires_a_terminal_status_and_leaves_the_anchor_open_on_refusal() {
+    let mut pipeline = pipeline(1 << 20, 1 << 20);
+    let coord = coord();
+    pipeline.ship_line(&coord, "still running").expect("ship");
+
+    assert!(matches!(
+        pipeline.close_step(&coord, AnchorStatus::Running),
+        Err(LogPipelineError::NonTerminalClose { .. })
+    ));
+    let anchor = pipeline.anchor_rows()[0];
+    assert_eq!(anchor.status, AnchorStatus::Running);
+    assert_eq!(anchor.byte_end, None);
 }
 
 #[test]
