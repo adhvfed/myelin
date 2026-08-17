@@ -119,12 +119,28 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .execute(format!("CREATE SCHEMA {schema}").as_str())
         .await
         .expect("create isolated schema");
+    PgMigrator::apply(admin, &myelin_storage::foundation_migrations())
+        .await
+        .expect("apply outbox foundation migrations in the isolated schema");
     PgMigrator::apply(admin, &myelin_flow::migrations::migrations())
         .await
         .expect("apply flow migrations in the isolated schema");
     PgMigrator::apply(admin, &ci_controlplane_migrations())
         .await
         .expect("apply CI migrations in the isolated schema");
+    let resolved_outbox_schema: String = sqlx::query_scalar(
+        "SELECT namespace.nspname \
+         FROM pg_class AS relation \
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+         WHERE relation.oid = to_regclass('outbox')",
+    )
+    .fetch_one(admin)
+    .await
+    .expect("resolve the transactional outbox used by the isolated test");
+    assert_eq!(
+        resolved_outbox_schema, schema,
+        "CI HTTP tests must never fall through to the shared public outbox"
+    );
     admin
         .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
         .await
