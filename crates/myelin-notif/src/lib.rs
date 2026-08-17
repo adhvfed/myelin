@@ -1,9 +1,12 @@
-use myelin_events::{DedupLedger, InProcessBus, OutboxStore};
+use myelin_events::OutboxStore;
+#[cfg(test)]
+use myelin_events::{DedupLedger, InProcessBus};
 use myelin_refs::ArtifactRef;
 use myelin_substrate::{
-    boot, serve, AppSpec, Config, ConsumerReg, CriticalDependencies, HotTables, InternalRpc,
-    Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    AppSpec, Config, ConsumerReg, CriticalDependencies, HotTables, InternalRpc, Migrations,
+    OutboxSpec, PublicRoutes, ServeError, StoreManifest,
 };
+#[cfg(test)]
 use myelin_tenancy::TenantId;
 use serde::{Deserialize, Serialize};
 
@@ -218,7 +221,7 @@ fn notif_migrations() -> Migrations {
     migrations::migrations()
 }
 
-pub fn notif_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
+fn notif_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
         config,
@@ -234,28 +237,26 @@ pub fn notif_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
     }
 }
 
-pub fn notif_app_spec_with_router(
+#[cfg(test)]
+fn notif_app_spec_with_router(
     config: Config,
     outbox: OutboxStore,
     tenants: &[TenantId],
     dedup: DedupLedger,
-) -> (AppSpec, router::InboxProjection) {
+) -> Result<(AppSpec, router::InboxProjection), myelin_events::SubscribeError> {
     let inbox = router::InboxProjection::new();
     let mut consumers: Vec<ConsumerReg> = Vec::with_capacity(tenants.len());
     for tenant in tenants {
-        if let Ok(router) =
-            router::build_router(tenant, inbox.clone(), outbox.clone(), dedup.clone())
-        {
-            consumers.push(ConsumerReg::new(router));
-        }
+        let router = router::build_router(tenant, inbox.clone(), outbox.clone(), dedup.clone())?;
+        consumers.push(ConsumerReg::new(router));
     }
     let mut spec = notif_app_spec(config, outbox.clone());
     spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
     spec.consumers = consumers;
-    (spec, inbox)
+    Ok((spec, inbox))
 }
 
-pub fn notif_app_spec_with_ingestion(
+fn notif_app_spec_with_ingestion(
     config: Config,
     outbox: OutboxStore,
     consumers: Vec<ConsumerReg>,
@@ -268,15 +269,8 @@ pub fn notif_app_spec_with_ingestion(
     spec
 }
 
-pub fn boot_notif(config: Config, outbox: OutboxStore) -> Result<ServeHandle, ServeError> {
-    boot(notif_app_spec(config, outbox))
-}
-
-pub fn run_notif(config: Config, outbox: OutboxStore) -> Result<(), ServeError> {
-    serve(notif_app_spec(config, outbox))
-}
-
-pub async fn run_notif_until_shutdown<F>(
+#[cfg(test)]
+async fn run_notif_until_shutdown<F>(
     config: Config,
     outbox: OutboxStore,
     shutdown: F,
@@ -308,12 +302,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_substrate::{Readiness, Startup, Surface};
+    use myelin_substrate::{boot, Readiness, Startup, Surface};
 
     #[test]
     fn notif_shell_boots_and_three_ports_bind() {
-        let handle =
-            boot_notif(Config::default(), OutboxStore::new()).expect("the notif shell boots");
+        let handle = boot(notif_app_spec(Config::default(), OutboxStore::new()))
+            .expect("the notification test shell boots");
         assert_eq!(handle.name(), "notif");
         assert_eq!(
             handle.surfaces(),
@@ -355,7 +349,7 @@ mod tests {
 
     #[test]
     fn booted_instance_is_ready_after_migrate_complete() {
-        let handle = boot_notif(Config::default(), OutboxStore::new()).expect("boot");
+        let handle = boot(notif_app_spec(Config::default(), OutboxStore::new())).expect("boot");
         assert_eq!(
             handle.metrics_health().startup(),
             Startup::Complete,
@@ -377,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_carries_empty_consumer_seam_and_durable_inbox_schema() {
+    fn bare_spec_owns_migrations_but_no_implicit_consumers() {
         let spec = notif_app_spec(Config::default(), OutboxStore::new());
         assert!(
             spec.consumers.is_empty(),
@@ -399,7 +393,8 @@ mod tests {
             OutboxStore::new(),
             &tenants,
             DedupLedger::new(),
-        );
+        )
+        .expect("both tenant-bound routers are valid");
         assert_eq!(
             spec.consumers.len(),
             2,
@@ -420,20 +415,22 @@ mod tests {
     }
 
     #[test]
-    fn notif_app_spec_with_router_skips_overbroad_tenant_but_boots() {
+    fn notif_app_spec_with_router_rejects_an_overbroad_tenant() {
         let tenants = [TenantId("acme".into()), TenantId("".into())];
-        let (spec, _inbox) = notif_app_spec_with_router(
+        let error = match notif_app_spec_with_router(
             Config::default(),
             OutboxStore::new(),
             &tenants,
             DedupLedger::new(),
-        );
+        ) {
+            Ok(_) => panic!("one invalid tenant must reject the complete routing topology"),
+            Err(error) => error,
+        };
         assert_eq!(
-            spec.consumers.len(),
-            1,
-            "only the valid tenant's router is wired (the empty one is skipped)"
+            error,
+            myelin_events::SubscribeError::WildcardSubject("sig..".into()),
+            "the configuration error identifies the rejected tenant-bound subject"
         );
-        boot(spec).expect("the shell still boots with the valid router");
     }
 }
 
