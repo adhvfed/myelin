@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 pub const FIREHOSE_MAX_SCOPE_ID_BYTES: usize = 1024;
 
@@ -395,38 +396,44 @@ pub struct Firehose {
 }
 
 #[derive(Clone)]
-struct SubHandle(std::rc::Weak<std::cell::RefCell<SubStream>>);
+struct SubHandle(Weak<Mutex<SubStream>>);
 
 #[derive(Clone, Debug)]
-pub struct Subscription(std::rc::Rc<std::cell::RefCell<SubStream>>);
+pub struct Subscription(Arc<Mutex<SubStream>>);
 
 impl Subscription {
     pub fn pull(&self) -> Option<Frame> {
-        self.0.borrow_mut().pull()
+        self.lock_stream().pull()
     }
 
     pub fn drain_ready(&self) -> Vec<Frame> {
-        self.0.borrow_mut().drain_ready()
+        self.lock_stream().drain_ready()
     }
 
     pub fn last_seq(&self) -> u64 {
-        self.0.borrow().last_seq()
+        self.lock_stream().last_seq()
     }
 
     pub fn resync_required(&self) -> bool {
-        self.0.borrow().resync_required()
+        self.lock_stream().resync_required()
     }
 
     pub fn ready_len(&self) -> usize {
-        self.0.borrow().ready_len()
+        self.lock_stream().ready_len()
     }
 
     pub fn stream(&self) -> String {
-        self.0.borrow().stream().to_string()
+        self.lock_stream().stream().to_string()
     }
 
     pub fn scope(&self) -> FirehoseScope {
-        self.0.borrow().scope().clone()
+        self.lock_stream().scope().clone()
+    }
+
+    fn lock_stream(&self) -> MutexGuard<'_, SubStream> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -460,9 +467,11 @@ impl Firehose {
                 let Some(subscriber) = handle.0.upgrade() else {
                     return false;
                 };
-                subscriber.borrow_mut().enqueue_live(frame.clone());
-                let remains_live = !subscriber.borrow().resync_required();
-                remains_live
+                let mut subscriber = subscriber
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                subscriber.enqueue_live(frame.clone());
+                !subscriber.resync_required()
             });
         }
         frame
@@ -560,12 +569,12 @@ impl Firehose {
             self.inflight_cap,
             start_seq,
         );
-        let rc = std::rc::Rc::new(std::cell::RefCell::new(sub));
+        let shared = Arc::new(Mutex::new(sub));
         self.subscribers
             .entry(key)
             .or_default()
-            .push(SubHandle(std::rc::Rc::downgrade(&rc)));
-        Subscription(rc)
+            .push(SubHandle(Arc::downgrade(&shared)));
+        Subscription(shared)
     }
 
     pub fn head_seq(&self, stream: &str, scope: &FirehoseScope) -> u64 {
@@ -701,6 +710,14 @@ mod tests {
     }
 
     #[test]
+    fn firehose_handles_can_cross_worker_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<Firehose>();
+        assert_send_sync::<Subscription>();
+    }
+
+    #[test]
     fn the_caller_owns_a_live_subscription_lifetime() {
         let mut fh = Firehose::new();
         let s = scope("doc:design");
@@ -710,7 +727,7 @@ mod tests {
             .expect("the live subscription opens");
 
         assert_eq!(
-            std::rc::Rc::strong_count(&subscription.0),
+            Arc::strong_count(&subscription.0),
             1,
             "the firehose does not retain a dropped caller's stream"
         );

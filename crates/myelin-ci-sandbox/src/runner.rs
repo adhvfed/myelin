@@ -219,7 +219,7 @@ pub trait PreparationLeaseCheckpoint: Send + Sync {
     fn renew(&self) -> Result<(), PreparationLeaseLost>;
 }
 
-pub trait FirehoseSink {
+pub trait FirehoseSink: Send + Sync {
     fn ship_frame(
         &self,
         run_id: &str,
