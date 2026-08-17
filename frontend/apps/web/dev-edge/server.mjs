@@ -135,6 +135,9 @@ const state = {
   chatMessageCursorResponses: 0,
   emptyKnowledge: false,
   knowledgeCreateResponseLosses: 0,
+  knowledgeCreateResponseDelaysMs: [],
+  knowledgeCreateRequests: 0,
+  knowledgeCreateResponses: 0,
   knowledgeListCursorDelaysMs: [],
   knowledgeListCursorRequests: 0,
   knowledgeListCursorResponses: 0,
@@ -537,6 +540,9 @@ const server = createServer((req, res) => {
         if (body.resetKnowledge === true) {
           state.emptyKnowledge = false;
           state.knowledgeCreateResponseLosses = 0;
+          state.knowledgeCreateResponseDelaysMs = [];
+          state.knowledgeCreateRequests = 0;
+          state.knowledgeCreateResponses = 0;
           state.knowledgeListCursorDelaysMs = [];
           state.knowledgeListCursorRequests = 0;
           state.knowledgeListCursorResponses = 0;
@@ -546,6 +552,9 @@ const server = createServer((req, res) => {
         if (typeof body.emptyKnowledge === "boolean") {
           state.emptyKnowledge = body.emptyKnowledge;
           state.knowledgeCreateResponseLosses = 0;
+          state.knowledgeCreateResponseDelaysMs = [];
+          state.knowledgeCreateRequests = 0;
+          state.knowledgeCreateResponses = 0;
           state.knowledgeListCursorDelaysMs = [];
           state.knowledgeListCursorRequests = 0;
           state.knowledgeListCursorResponses = 0;
@@ -568,6 +577,12 @@ const server = createServer((req, res) => {
         if (Number.isInteger(body.knowledgeCreateResponseLosses) &&
             body.knowledgeCreateResponseLosses >= 0) {
           state.knowledgeCreateResponseLosses = body.knowledgeCreateResponseLosses;
+        }
+        if (Array.isArray(body.knowledgeCreateResponseDelaysMs) &&
+            body.knowledgeCreateResponseDelaysMs.length <= 10 &&
+            body.knowledgeCreateResponseDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.knowledgeCreateResponseDelaysMs = [...body.knowledgeCreateResponseDelaysMs];
         }
         if (Array.isArray(body.knowledgeSaveResponseDelaysMs) &&
             body.knowledgeSaveResponseDelaysMs.length <= 10 &&
@@ -810,13 +825,23 @@ const server = createServer((req, res) => {
       let body; try { body = JSON.parse(raw); } catch { return send(res, 400, { error: { message: "invalid Knowledge page body", code: "bad_request" } }); }
       const output = knowledge.create(body, req.headers["idempotency-key"]); if (output.status === 400) return send(res, 400, { error: { message: "invalid Knowledge page body or Idempotency-Key", code: "bad_request" } });
       state.emptyKnowledge = false;
-      if (state.knowledgeCreateResponseLosses > 0) {
-        state.knowledgeCreateResponseLosses -= 1;
-        return send(res, 503, {
-          error: { message: "Knowledge committed but its response was lost", code: "unavailable" },
-        });
+      state.knowledgeCreateRequests += 1;
+      const respond = () => {
+        state.knowledgeCreateResponses += 1;
+        if (state.knowledgeCreateResponseLosses > 0) {
+          state.knowledgeCreateResponseLosses -= 1;
+          return send(res, 503, {
+            error: { message: "Knowledge committed but its response was lost", code: "unavailable" },
+          });
+        }
+        return send(res, output.status, output.json, { "cache-control": "no-store" });
+      };
+      const delay = state.knowledgeCreateResponseDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(respond, delay);
+        return;
       }
-      return send(res, output.status, output.json, { "cache-control": "no-store" });
+      return respond();
     }); return;
   }
 

@@ -67,6 +67,37 @@ test.describe("Knowledge workspace", () => {
     await expect(page.getByRole("link", { name: /Retry-safe runbook/ })).toHaveCount(1);
   });
 
+  test("a late page creation cannot reclaim navigation after its dialog was left", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { emptyKnowledge: true, knowledgeCreateResponseDelaysMs: [1_500] },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/knowledge");
+
+    await page.getByRole("button", { name: "Create the first page" }).click();
+    await page.getByRole("textbox", { name: "Page title" }).fill("Created after leaving");
+    await page.getByRole("button", { name: "Create page" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.knowledgeCreateRequests;
+    }).toBe(1);
+
+    await page.evaluate(() => {
+      window.history.pushState({}, "", "/knowledge");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await expect(page.getByRole("dialog", { name: "Create a Knowledge page" })).toHaveCount(0);
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.knowledgeCreateResponses;
+    }).toBe(1);
+    await page.waitForTimeout(500);
+    expect(new URL(page.url()).searchParams.has("page")).toBe(false);
+    await expect(page.getByText("Page created", { exact: true })).toHaveCount(0);
+  });
+
   test("keeps edits with their pages and autosaves them after navigation", async ({ page }) => {
     await devLogin(page);
     await page.goto("/knowledge");

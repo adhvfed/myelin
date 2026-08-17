@@ -1,6 +1,6 @@
 import { Dialog, Icon } from "@myelin/design-system";
 import { useAction } from "@solidjs/router";
-import { createEffect, createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { knowledgeMutate, type KnowledgeCreateReceipt, type KnowledgeErrorKind, type KnowledgeVisibility } from "~/lib/knowledge-api";
 
 export interface KnowledgeCreateDialogProps {
@@ -30,23 +30,28 @@ export function KnowledgeCreateDialog(props: KnowledgeCreateDialogProps) {
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   let titleInput: HTMLInputElement | undefined;
+  let openingGeneration = 0;
 
   createEffect(() => {
+    openingGeneration += 1;
     if (!props.open) return;
     setTitle(""); setTemplate("blank"); setVisibility("private"); setClientNonce(crypto.randomUUID()); setSubmitting(false); setError(null);
   });
+  onCleanup(() => { openingGeneration += 1; });
 
   const close = () => { if (!submitting()) props.onClose(); };
   const submit = async (event: SubmitEvent) => {
     event.preventDefault();
     if (!title().trim() || title().trim() !== title()) { setError("A clean page title is required."); titleInput?.focus(); return; }
+    const generation = openingGeneration;
     setSubmitting(true); setError(null);
     try {
       const result = await mutate({ op: "create", title: title(), template: template(), visibility: visibility(), clientNonce: clientNonce() });
+      if (generation !== openingGeneration) return;
       if (!result.ok || result.op !== "create") { setError(errorCopy(result.ok ? "error" : result.error)); return; }
       props.onClose(); props.onCreated(result.receipt);
-    } catch { setError(errorCopy("error")); }
-    finally { setSubmitting(false); }
+    } catch { if (generation === openingGeneration) setError(errorCopy("error")); }
+    finally { if (generation === openingGeneration) setSubmitting(false); }
   };
 
   return (
