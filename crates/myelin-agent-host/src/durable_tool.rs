@@ -141,10 +141,9 @@ impl ToolExecutor for DurableToolExecutor<'_> {
 }
 
 fn decode_result(stored: &str) -> Result<ToolResult, ToolExecError> {
-    match serde_json::from_str(stored) {
-        Ok(result) => Ok(result),
-        Err(_) => Ok(ToolResult::Succeeded(stored.to_string())),
-    }
+    serde_json::from_str(stored).map_err(|_| {
+        ToolExecError::Failed("durable tool replay result has invalid encoding".into())
+    })
 }
 
 pub(crate) fn tool_request_hash(
@@ -332,6 +331,21 @@ mod tests {
         assert_ne!(
             tool_request_hash(&definition(), &changed).unwrap(),
             tool_request_hash(&definition(), &renamed).unwrap(),
+        );
+    }
+
+    #[test]
+    fn malformed_replay_fails_closed_without_echoing_stored_content() {
+        let secret = "malformed-secret-result";
+        let error = decode_result(secret).expect_err("corrupt durable output is never a success");
+
+        assert_eq!(
+            error,
+            ToolExecError::Failed("durable tool replay result has invalid encoding".into())
+        );
+        assert!(
+            !error.to_string().contains(secret),
+            "the diagnostic must not disclose the corrupt stored payload"
         );
     }
 
