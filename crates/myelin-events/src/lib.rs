@@ -46,6 +46,7 @@ pub use dedup::{CoCommitError, CoCommitTx, DedupLedger, DurableDedup, CONSUMER_D
 pub use firehose::{
     Firehose, FirehoseError, FirehoseScope, Frame, FrameDraft, FramePayload, RetentionWindow,
     ScopeKind, SubStream, Subscription as FirehoseSubscription, DEFAULT_INFLIGHT_CAP,
+    FIREHOSE_MAX_FRAME_PAYLOAD_BYTES, FIREHOSE_MAX_SCOPE_ID_BYTES, FIREHOSE_MAX_STREAM_BYTES,
 };
 pub use harness::{
     HarnessError, PayloadShape, RegisteredToken, SubsystemTokenList, TokenListHarness,

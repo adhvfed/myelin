@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 pub const FIREHOSE_MAX_SCOPE_ID_BYTES: usize = 1024;
+pub const FIREHOSE_MAX_STREAM_BYTES: usize = 256;
+pub const FIREHOSE_MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FirehoseScope {
@@ -128,6 +130,20 @@ impl FrameDraft {
             payload: FramePayload(payload.into()),
         }
     }
+
+    fn validate(&self) -> Result<(), FirehoseError> {
+        if self.payload.0.is_empty() {
+            return Err(FirehoseError::InvalidFrame {
+                why: "frame payload must not be empty",
+            });
+        }
+        if self.payload.0.len() > FIREHOSE_MAX_FRAME_PAYLOAD_BYTES {
+            return Err(FirehoseError::FrameLimitExceeded {
+                maximum: FIREHOSE_MAX_FRAME_PAYLOAD_BYTES,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +152,10 @@ pub enum FirehoseError {
     ResyncRequired { last_seq: u64, window_floor: u64 },
     TailLimitExceeded,
     ScopeLimitExceeded { maximum: usize },
+    InvalidStream { why: &'static str },
+    StreamLimitExceeded { maximum: usize },
+    InvalidFrame { why: &'static str },
+    FrameLimitExceeded { maximum: usize },
     SequenceExhausted { last_seq: u64 },
     InvalidHeadSeed { current: u64, attempted: u64 },
 }
@@ -149,6 +169,13 @@ impl FirehoseError {
         matches!(
             self,
             FirehoseError::OverBroadScope { .. } | FirehoseError::ScopeLimitExceeded { .. }
+        )
+    }
+
+    pub fn is_invalid_stream(&self) -> bool {
+        matches!(
+            self,
+            FirehoseError::InvalidStream { .. } | FirehoseError::StreamLimitExceeded { .. }
         )
     }
 }
@@ -171,6 +198,20 @@ impl core::fmt::Display for FirehoseError {
                 f,
                 "firehose rejects scope resource id longer than {maximum} bytes"
             ),
+            FirehoseError::InvalidStream { why } => {
+                write!(f, "firehose rejects invalid stream name: {why}")
+            }
+            FirehoseError::StreamLimitExceeded { maximum } => write!(
+                f,
+                "firehose rejects stream name longer than {maximum} bytes"
+            ),
+            FirehoseError::InvalidFrame { why } => {
+                write!(f, "firehose rejects invalid frame: {why}")
+            }
+            FirehoseError::FrameLimitExceeded { maximum } => write!(
+                f,
+                "firehose rejects frame payload larger than {maximum} bytes"
+            ),
             FirehoseError::SequenceExhausted { last_seq } => write!(
                 f,
                 "firehose sequence is exhausted at {last_seq}; a new stream generation is required"
@@ -184,6 +225,41 @@ impl core::fmt::Display for FirehoseError {
 }
 
 impl std::error::Error for FirehoseError {}
+
+fn validate_stream(stream: &str) -> Result<(), FirehoseError> {
+    if stream.is_empty() {
+        return Err(FirehoseError::InvalidStream {
+            why: "stream name must not be empty",
+        });
+    }
+    if stream.len() > FIREHOSE_MAX_STREAM_BYTES {
+        return Err(FirehoseError::StreamLimitExceeded {
+            maximum: FIREHOSE_MAX_STREAM_BYTES,
+        });
+    }
+    if !stream
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(FirehoseError::InvalidStream {
+            why: "stream name accepts only ASCII letters, digits, `.`, `-`, and `_`",
+        });
+    }
+    if !stream
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        || !stream
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return Err(FirehoseError::InvalidStream {
+            why: "stream name must begin and end with an ASCII letter or digit",
+        });
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct RetentionWindow {
@@ -480,6 +556,8 @@ impl Firehose {
         scope: &FirehoseScope,
         draft: FrameDraft,
     ) -> Result<Frame, FirehoseError> {
+        validate_stream(stream)?;
+        draft.validate()?;
         let key = (stream.to_string(), scope.clone());
         let window = self
             .windows
@@ -518,6 +596,7 @@ impl Firehose {
         maximum_frames: usize,
         maximum_payload_bytes: usize,
     ) -> Result<Vec<Frame>, FirehoseError> {
+        validate_stream(stream)?;
         let key = (stream.to_string(), scope.clone());
         self.windows
             .get(&key)
@@ -531,6 +610,7 @@ impl Firehose {
         scope: &FirehoseScope,
         cursor: Option<u64>,
     ) -> Result<Subscription, FirehoseError> {
+        validate_stream(stream)?;
         match cursor {
             None => Ok(self.open_live(stream, scope, Vec::new())),
             Some(last_seq) => self.resume(stream, scope, last_seq),
@@ -543,6 +623,7 @@ impl Firehose {
         raw_scope: &str,
         cursor: Option<u64>,
     ) -> Result<Subscription, FirehoseError> {
+        validate_stream(stream)?;
         let scope = FirehoseScope::parse(raw_scope)?;
         self.subscribe(stream, &scope, cursor)
     }
@@ -563,6 +644,7 @@ impl Firehose {
         scope: &FirehoseScope,
         last_seq: u64,
     ) -> Result<Vec<Frame>, FirehoseError> {
+        validate_stream(stream)?;
         let key = (stream.to_string(), scope.clone());
         Ok(match self.windows.get(&key) {
             None => Vec::new(),
@@ -576,6 +658,7 @@ impl Firehose {
         scope: &FirehoseScope,
         last_seq: u64,
     ) -> Result<(), FirehoseError> {
+        validate_stream(stream)?;
         if last_seq == u64::MAX {
             return Err(FirehoseError::SequenceExhausted { last_seq });
         }
@@ -800,6 +883,94 @@ mod tests {
         assert_eq!(fh.head_seq("kn-ops", &s), u64::MAX);
         assert_eq!(fh.window_len("kn-ops", &s), 1);
         assert_eq!(sub.pull(), None, "no rejected frame reaches a subscriber");
+    }
+
+    #[test]
+    fn invalid_stream_names_are_refused_before_allocating_transport_state() {
+        let mut fh = Firehose::new();
+        let s = scope("channel:bounded");
+
+        for stream in [
+            "",
+            " chat",
+            "chat ",
+            ".chat",
+            "chat.",
+            "chat/live",
+            "chat:*",
+            "chät",
+        ] {
+            assert!(
+                fh.publish(stream, &s, draft("pointer"))
+                    .expect_err("an invalid producer stream is refused")
+                    .is_invalid_stream(),
+                "producer stream `{stream}` must be invalid"
+            );
+            assert!(
+                fh.subscribe(stream, &s, None)
+                    .expect_err("an invalid subscriber stream is refused")
+                    .is_invalid_stream(),
+                "subscriber stream `{stream}` must be invalid"
+            );
+            assert!(
+                fh.seed_head(stream, &s, 7)
+                    .expect_err("an invalid recovery stream is refused")
+                    .is_invalid_stream(),
+                "recovery stream `{stream}` must be invalid"
+            );
+        }
+
+        let overlong = "s".repeat(FIREHOSE_MAX_STREAM_BYTES + 1);
+        assert_eq!(
+            fh.publish(&overlong, &s, draft("pointer"))
+                .expect_err("an overlong stream is refused"),
+            FirehoseError::StreamLimitExceeded {
+                maximum: FIREHOSE_MAX_STREAM_BYTES
+            }
+        );
+        assert!(fh.windows.is_empty());
+        assert!(fh.subscribers.is_empty());
+
+        let exact = "s".repeat(FIREHOSE_MAX_STREAM_BYTES);
+        assert_eq!(
+            fh.publish(&exact, &s, draft("pointer"))
+                .expect("the exact stream-name bound is admitted")
+                .seq,
+            1
+        );
+    }
+
+    #[test]
+    fn frame_payload_bounds_refuse_empty_and_oversized_frames_without_a_ghost() {
+        let mut fh = Firehose::new();
+        let s = scope("doc:bounded");
+        let sub = fh
+            .subscribe("kn-ops", &s, None)
+            .expect("the bounded stream subscribes");
+
+        assert!(matches!(
+            fh.publish("kn-ops", &s, draft("")),
+            Err(FirehoseError::InvalidFrame { .. })
+        ));
+        let oversized = "p".repeat(FIREHOSE_MAX_FRAME_PAYLOAD_BYTES + 1);
+        assert_eq!(
+            fh.publish("kn-ops", &s, FrameDraft::new(oversized))
+                .expect_err("an oversized pointer frame is refused"),
+            FirehoseError::FrameLimitExceeded {
+                maximum: FIREHOSE_MAX_FRAME_PAYLOAD_BYTES
+            }
+        );
+        assert_eq!(fh.head_seq("kn-ops", &s), 0);
+        assert_eq!(fh.window_len("kn-ops", &s), 0);
+        assert_eq!(sub.pull(), None, "a refused frame is never delivered");
+
+        let exact = "p".repeat(FIREHOSE_MAX_FRAME_PAYLOAD_BYTES);
+        let frame = fh
+            .publish("kn-ops", &s, FrameDraft::new(&exact))
+            .expect("the exact payload bound is admitted");
+        assert_eq!(frame.seq, 1);
+        assert_eq!(frame.payload.0, exact);
+        assert_eq!(sub.pull(), Some(frame));
     }
 
     #[test]
