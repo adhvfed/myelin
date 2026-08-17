@@ -201,4 +201,19 @@ test.describe("Chat workspace", () => {
     await expect(page.getByRole("heading", { name: "Chat", level: 1 })).toBeVisible();
     await expectAccessible(page, "narrow Chat navigation");
   });
+
+  test("an invalid conversation link explains itself and leads back to the topic list", async ({ page }) => {
+    await devLogin(page);
+    await page.setViewportSize({ width: 375, height: 760 });
+    await page.goto("/chat?conversation=not-a-conversation");
+
+    await expect(page.getByRole("heading", { name: "Conversation unavailable" })).toBeVisible();
+    await expect(page.getByText("That conversation address is invalid.")).toBeVisible();
+    const back = page.getByRole("link", { name: "Back to topics" });
+    await expect(back).toHaveAttribute("href", "/chat");
+    await expectAccessible(page, "invalid Chat deep link");
+
+    await back.click();
+    await expect(page.getByRole("heading", { name: "Chat", level: 1 })).toBeVisible();
+  });
 });

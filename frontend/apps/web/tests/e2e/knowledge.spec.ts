@@ -141,4 +141,19 @@ test.describe("Knowledge workspace", () => {
     await page.reload();
     await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue("Engineering principles, refined");
   });
+
+  test("an invalid page link explains itself and leads back to the knowledge base", async ({ page }) => {
+    await devLogin(page);
+    await page.setViewportSize({ width: 375, height: 760 });
+    await page.goto("/knowledge?page=not-a-page");
+
+    await expect(page.getByRole("heading", { name: "Page address invalid" })).toBeVisible();
+    await expect(page.getByText("This link doesn’t contain a valid Myelin page address.")).toBeVisible();
+    const back = page.getByRole("link", { name: "Back to pages" });
+    await expect(back).toHaveAttribute("href", "/knowledge");
+    await expectAccessible(page, "invalid Knowledge deep link");
+
+    await back.click();
+    await expect(page.getByRole("heading", { name: "Knowledge", level: 1 })).toBeVisible();
+  });
 });

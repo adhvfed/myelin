@@ -14,7 +14,11 @@ export default function KnowledgeIndex() {
   const [search] = useSearchParams();
   const navigate = useNavigate();
   const toast = useToast();
-  const selected = () => typeof search.page === "string" && isKnowledgeUlid(search.page) ? search.page : undefined;
+  const requestedPage = () => typeof search.page === "string" ? search.page : undefined;
+  const selected = () => {
+    const page = requestedPage();
+    return page && isKnowledgeUlid(page) ? page : undefined;
+  };
   const createOpen = () => search.new === "1";
   const [interactive, setInteractive] = createSignal(false);
   const [more, setMore] = createSignal<KnowledgePageList[]>([]);
@@ -25,8 +29,11 @@ export default function KnowledgeIndex() {
     catch (error) { if (error instanceof Response) throw error; return { value: null, error: kind(error) }; }
   }, { deferStream: true });
   const document = createAsync(async () => {
-    const id = selected();
+    const id = requestedPage();
     if (!id) return null;
+    if (!isKnowledgeUlid(id)) {
+      return { value: null, error: "bad-input" as KnowledgeErrorKind };
+    }
     try { return { value: await getKnowledgePage(id), error: null as KnowledgeErrorKind | null }; }
     catch (error) { if (error instanceof Response) throw error; return { value: null, error: kind(error) }; }
   }, { deferStream: true });
@@ -68,10 +75,10 @@ export default function KnowledgeIndex() {
 
   return <>
     <Title>Knowledge · Myelin</Title>
-    <div class="knowledge-screen" classList={{ "knowledge-has-selection": Boolean(selected()) }} data-testid="knowledge-screen">
+    <div class="knowledge-screen" classList={{ "knowledge-has-selection": Boolean(requestedPage()) }} data-testid="knowledge-screen">
       <KnowledgeSidebar pages={pages()} selectedId={selected()} loading={first() === undefined} error={first()?.error} interactive={interactive()} hasMore={Boolean(nextCursor())} loadingMore={loadingMore()} onLoadMore={() => void loadMore()} onNew={openCreate} />
       <section class="knowledge-workspace-shell" aria-label="Knowledge page">
-        <Show when={selected()} fallback={<KnowledgeWelcome hasPages={pages().length > 0} interactive={interactive()} onNew={openCreate} />}>
+        <Show when={requestedPage()} fallback={<KnowledgeWelcome hasPages={pages().length > 0} interactive={interactive()} onNew={openCreate} />}>
           <Show when={document() !== undefined} fallback={<KnowledgeLoading />}>
             <Show when={document()?.value} fallback={<KnowledgeError kind={document()?.error ?? "error"} />}>
               {(page) => <KnowledgeWorkspace page={page()} onReload={reloadPage} onSaved={pageSaved} />}
@@ -89,4 +96,14 @@ function KnowledgeWelcome(props: { hasPages: boolean; interactive: boolean; onNe
 }
 
 function KnowledgeLoading() { return <div class="knowledge-loading"><Skeleton label="Loading page…" rows={4}><SkeletonBlock height="3rem" /><SkeletonBlock height="2rem" /><SkeletonBlock height="5rem" /><SkeletonBlock height="5rem" /></Skeleton></div>; }
-function KnowledgeError(props: { kind: KnowledgeErrorKind }) { return <div class="knowledge-welcome" role="alert"><Icon name="gate" size={28} /><h2>{props.kind === "not-found" ? "Page not found" : "Page unavailable"}</h2><p>{props.kind === "not-found" ? "It may have been removed, made private, or the link may be wrong." : "Knowledge couldn’t load this page. Refresh to try again."}</p><a class="knowledge-button secondary" href="/knowledge">Back to pages</a></div>; }
+function KnowledgeError(props: { kind: KnowledgeErrorKind }) {
+  const heading = () => props.kind === "bad-input"
+    ? "Page address invalid"
+    : props.kind === "not-found" ? "Page not found" : "Page unavailable";
+  const copy = () => props.kind === "bad-input"
+    ? "This link doesn’t contain a valid Myelin page address."
+    : props.kind === "not-found"
+      ? "It may have been removed, made private, or the link may be wrong."
+      : "Knowledge couldn’t load this page. Refresh to try again.";
+  return <div class="knowledge-welcome" role="alert"><Icon name="gate" size={28} /><h2>{heading()}</h2><p>{copy()}</p><a class="knowledge-button secondary" href="/knowledge">Back to pages</a></div>;
+}

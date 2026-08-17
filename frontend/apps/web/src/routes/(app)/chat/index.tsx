@@ -173,7 +173,7 @@ export default function ChatIndex() {
       <Title>Chat · Myelin</Title>
       <div
         class="chat-screen"
-        classList={{ "chat-has-selection": Boolean(validSelectedId()) }}
+        classList={{ "chat-has-selection": Boolean(selectedId()) }}
         data-testid="chat-screen"
       >
         <ChatSidebar
@@ -196,7 +196,7 @@ export default function ChatIndex() {
             <p role="alert" class="chat-inline-error">Earlier messages couldn’t be loaded. Try again.</p>
           </Show>
           <Show
-            when={validSelectedId()}
+            when={selectedId()}
             fallback={<ChatWelcome onNew={openCreate} hasTopics={conversations().length > 0} interactive={interactive()} />}
           >
             <Show
@@ -204,8 +204,12 @@ export default function ChatIndex() {
               fallback={<ChatLoading />}
             >
               <Show
-                when={selectedConversation() && recentMessages()?.page}
-                fallback={<ChatConversationError kind={recentMessages()?.error ?? "error"} />}
+                when={validSelectedId() && selectedConversation() && recentMessages()?.page}
+                fallback={
+                  <ChatConversationError
+                    kind={recentMessages()?.error ?? (validSelectedId() ? "error" : "bad-input")}
+                  />
+                }
               >
                 <ChatTimeline
                   conversation={selectedConversation()!}
