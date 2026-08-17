@@ -74,6 +74,12 @@ pub const CI_RUN_START_REJECTED_EVENT_V1_DOMAIN: &str = "myelin.ci.run-start-rej
 const REJECTED_JOB_STAGE: &str = "pipeline";
 const REJECTED_JOB_NAME: &str = "Configuration";
 
+#[derive(Clone, Copy)]
+enum RejectedFactPolicy {
+    Publish,
+    Withhold,
+}
+
 pub fn ci_job_id_v1(
     tenant: &TenantId,
     run_id: sqlx::types::Uuid,
@@ -496,7 +502,13 @@ impl PgCiPipelineStarter {
         let Some(candidate) = self.preflight_candidate().await? else {
             return Ok(StartQueuedOutcome::Idle);
         };
-        validate_candidate(&self.tenant, &self.region, &candidate)?;
+        match validate_candidate(&self.tenant, &self.region, &candidate) {
+            Ok(()) => {}
+            Err(PgCiStarterError::CorruptRun(message)) => {
+                return self.reject_corrupt_unlaunched(&candidate, &message).await;
+            }
+            Err(error) => return Err(error),
+        }
         if let Some(outcome) = self.cancel_if_already_superseded(&candidate).await? {
             return Ok(outcome);
         }
@@ -717,7 +729,43 @@ impl PgCiPipelineStarter {
         candidate: &StarterCandidate,
         error: &RunPlanError,
     ) -> Result<StartQueuedOutcome, PgCiStarterError> {
-        let diagnostic = crate::ci_job_result::canonical_ci_diagnostic(&error.to_string());
+        self.reject_unlaunchable_with_diagnostic(
+            candidate,
+            &error.to_string(),
+            RejectedFactPolicy::Publish,
+        )
+        .await
+    }
+
+    async fn reject_corrupt_unlaunched(
+        &self,
+        candidate: &StarterCandidate,
+        message: &str,
+    ) -> Result<StartQueuedOutcome, PgCiStarterError> {
+        let diagnostic = format!("queued CI run refused: {message}");
+        let outcome = self
+            .reject_unlaunchable_with_diagnostic(
+                candidate,
+                &diagnostic,
+                RejectedFactPolicy::Withhold,
+            )
+            .await?;
+        if matches!(outcome, StartQueuedOutcome::Rejected { .. }) {
+            eprintln!(
+                "ci-controlplane: retired corrupt unlaunched CI run {}: {message}",
+                candidate.record.run_id
+            );
+        }
+        Ok(outcome)
+    }
+
+    async fn reject_unlaunchable_with_diagnostic(
+        &self,
+        candidate: &StarterCandidate,
+        detail: &str,
+        fact_policy: RejectedFactPolicy,
+    ) -> Result<StartQueuedOutcome, PgCiStarterError> {
+        let diagnostic = crate::ci_job_result::canonical_ci_diagnostic(detail);
         let result_summary = crate::ci_job_result::CiJobResultSummary::current(
             crate::ci_job_result::CiJobDisposition::ConfigurationRefused,
             Some(&diagnostic),
@@ -832,14 +880,16 @@ impl PgCiPipelineStarter {
                 "rejected queued run lifecycle changed under its lock".into(),
             )
         })?;
-        emit_rejected_facts(
-            &mut transaction,
-            &candidate.record,
-            &candidate.created_at,
-            &finished_at,
-            &diagnostic,
-        )
-        .await?;
+        if matches!(fact_policy, RejectedFactPolicy::Publish) {
+            emit_rejected_facts(
+                &mut transaction,
+                &candidate.record,
+                &candidate.created_at,
+                &finished_at,
+                &diagnostic,
+            )
+            .await?;
+        }
         transaction.commit().await.map_err(|error| {
             PgCiStarterError::Database(format!("commit queued run rejection: {error}"))
         })?;
@@ -1429,6 +1479,7 @@ fn validate_candidate(
             ))
         }
     }
+    persisted_event_cause(&candidate.record)?;
     Ok(())
 }
 

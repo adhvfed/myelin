@@ -1607,6 +1607,105 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await;
     assert_atomic_started(&admin, poison_tenant, healthy_run, true, true).await;
 
+    let corrupt_tenant = "tenant_corrupt_lane";
+    let corrupt_run = "10000000-0000-0000-0000-0000000000f3";
+    let corrupt_wf = "20000000-0000-0000-0000-0000000000f3";
+    let causeless_run = "10000000-0000-0000-0000-0000000000f4";
+    let causeless_wf = "20000000-0000-0000-0000-0000000000f4";
+    let run_after_corruption = "10000000-0000-0000-0000-0000000000f5";
+    let wf_after_corruption = "20000000-0000-0000-0000-0000000000f5";
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        corrupt_tenant,
+        corrupt_run,
+        corrupt_wf,
+    )
+    .await;
+    sqlx::query("UPDATE ci_run SET repo_ref = NULL WHERE run_id = $1::uuid")
+        .bind(corrupt_run)
+        .execute(&admin)
+        .await
+        .expect("remove the poison fixture's launch provenance");
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        corrupt_tenant,
+        causeless_run,
+        causeless_wf,
+    )
+    .await;
+    sqlx::query("UPDATE ci_run SET cause_event_id = NULL WHERE run_id = $1::uuid")
+        .bind(causeless_run)
+        .execute(&admin)
+        .await
+        .expect("remove the poison fixture's triggering-event provenance");
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        corrupt_tenant,
+        run_after_corruption,
+        wf_after_corruption,
+    )
+    .await;
+    let corrupt_lane = PgCiRunStarterPoller::new(
+        ci_region_run_discovery_test_support(admin.clone()),
+        factory(&app, blobs.clone()),
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    );
+    let batch = corrupt_lane
+        .run_until_idle(6)
+        .await
+        .expect("malformed unlaunched rows cannot stop the starter lane");
+    assert_eq!((batch.started, batch.saturated), (1, false));
+    for (run_id, expected_diagnostic) in [
+        (
+            corrupt_run,
+            "repository, commit, and definition snapshot provenance",
+        ),
+        (causeless_run, "triggering-event provenance"),
+    ] {
+        let corrupt_lifecycle: (String, bool, bool) = sqlx::query_as(
+            "SELECT state, cost_settled, finished_at IS NOT NULL \
+             FROM ci_run WHERE run_id = $1::uuid",
+        )
+        .bind(run_id)
+        .fetch_one(&admin)
+        .await
+        .expect("read the retired poison run");
+        assert_eq!(corrupt_lifecycle, ("failed".into(), true, true));
+        let corrupt_summary: serde_json::Value = sqlx::query_scalar(
+            "SELECT result_summary FROM ci_job WHERE run_id = $1::uuid",
+        )
+        .bind(run_id)
+        .fetch_one(&admin)
+        .await
+        .expect("the retired run explains its configuration refusal");
+        assert_eq!(corrupt_summary["disposition"], "configuration_refused");
+        assert!(corrupt_summary["diagnostic"]
+            .as_str()
+            .is_some_and(|diagnostic| diagnostic.contains(expected_diagnostic)));
+        let published_facts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox \
+             WHERE envelope->>'tenant' = $1 \
+               AND envelope->'payload'->>'run' = $2",
+        )
+        .bind(corrupt_tenant)
+        .bind(ci_run_ref(corrupt_tenant, run_id).unwrap().0)
+        .fetch_one(&admin)
+        .await
+        .expect("count facts derived from corrupt provenance");
+        assert_eq!(published_facts, 0, "corrupt provenance is never republished");
+    }
+    assert_atomic_started(
+        &admin,
+        corrupt_tenant,
+        run_after_corruption,
+        true,
+        true,
+    )
+    .await;
+
     let poller_run = "10000000-0000-0000-0000-0000000000e0";
     let poller_wf = "20000000-0000-0000-0000-0000000000e0";
     insert_run(
