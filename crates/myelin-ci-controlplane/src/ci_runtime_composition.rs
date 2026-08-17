@@ -20,9 +20,9 @@ use crate::{
     MAX_SUPERSEDED_CI_PIPELINE_RUN_REPORT,
 };
 
-pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 5;
+pub const CI_MANIFEST_PIPELINE_VERSION: i32 = 6;
 
-pub const CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION: i32 = 4;
+pub const CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION: i32 = 5;
 
 pub const CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS: u64 = 10_000;
 
@@ -132,7 +132,7 @@ impl std::fmt::Display for CiSupersededDefinitionGuardError {
                  concurrently-booting older binary could still register and admit under it. This is \
                  never 'nothing to fence'. REMEDIATION: apply the control-plane migrations \
                  (`{}` seeds this predecessor row on a fresh database), then reboot",
-                crate::migrations::CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID
+                crate::migrations::CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID
             ),
             Self::FenceUnavailable(detail) => write!(
                 f,

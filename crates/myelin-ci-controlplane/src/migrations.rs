@@ -127,6 +127,8 @@ pub const CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0022d_ci_pipeline_v3_cutover_fence_row";
 pub const CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0026_ci_pipeline_v4_cutover_fence_row";
+pub const CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
+    "ci_0027_ci_pipeline_v5_cutover_fence_row";
 
 pub const CREATE_CI_RUN_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -1238,6 +1240,16 @@ VALUES (
 )
 ON CONFLICT (wf_type, version) DO NOTHING";
 
+pub const SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL: &str = "\
+INSERT INTO wf_definition (wf_type, version, code_hash, status)
+VALUES (
+  'ci.pipeline',
+  5,
+  'sentinel:ci-pipeline-v5-never-deployed-on-this-database',
+  'retired'
+)
+ON CONFLICT (wf_type, version) DO NOTHING";
+
 pub const ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL: &str = "\
 ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS reservation_write_version smallint;
 DO $myelin$
@@ -2009,6 +2021,10 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID,
         SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL,
     ));
+    migrations.push(Migration::plain(
+        CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID,
+        SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL,
+    ));
     Migrations::of(migrations)
 }
 
@@ -2662,6 +2678,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             (2, SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL),
             (3, SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL),
             (4, SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL),
+            (5, SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL),
         ] {
             assert!(ddl.contains("ON CONFLICT (wf_type, version) DO NOTHING"));
             assert!(ddl.contains(&format!(" {version},")));
@@ -2679,7 +2696,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             );
         }
         assert!(
-            SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL.contains(&format!(
+            SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL.contains(&format!(
                 "\n  {},\n",
                 crate::ci_runtime_composition::CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION
             )),
@@ -2779,6 +2796,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_RUN_BRANCH_SCOPE_VALIDATE_MIGRATION_ID,
                 CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
                 CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID,
+                CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID,
             ],
             "the append-only tail retains every expand → validate → contract dependency"
         );
@@ -2845,7 +2863,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            77,
+            78,
             "the complete append-only schema includes the current predecessor fence seed"
         );
         fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
@@ -2982,6 +3000,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL);
             } else if m.id == CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID {
                 assert_eq!(m.ddl, SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL);
+            } else if m.id == CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID {
+                assert_eq!(m.ddl, SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL);
             } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL);
             } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID {
@@ -3039,7 +3059,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            77,
+            78,
             "the runner applied the complete schema plus every additive follow-on"
         );
         assert_eq!(
