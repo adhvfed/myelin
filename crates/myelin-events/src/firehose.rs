@@ -482,19 +482,49 @@ impl SubStream {
     }
 }
 
-#[derive(Default)]
 pub struct Firehose {
     windows: HashMap<(String, FirehoseScope), RetentionWindow>,
-    subscribers: HashMap<(String, FirehoseScope), Vec<SubHandle>>,
+    subscribers: Arc<Mutex<SubscriberRegistry>>,
     window_capacity: usize,
     inflight_cap: usize,
 }
 
-#[derive(Clone)]
+type SubscriberKey = (String, FirehoseScope);
+type SubscriberRegistry = HashMap<SubscriberKey, Vec<SubHandle>>;
+
+#[derive(Clone, Debug)]
 struct SubHandle(Weak<Mutex<SubStream>>);
 
 #[derive(Clone, Debug)]
-pub struct Subscription(Arc<Mutex<SubStream>>);
+pub struct Subscription {
+    stream: Arc<Mutex<SubStream>>,
+    _registration: Arc<SubscriptionRegistration>,
+}
+
+#[derive(Debug)]
+struct SubscriptionRegistration {
+    registry: Weak<Mutex<SubscriberRegistry>>,
+    key: SubscriberKey,
+    stream: Weak<Mutex<SubStream>>,
+}
+
+impl Drop for SubscriptionRegistration {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove_key = registry.get_mut(&self.key).is_some_and(|subscribers| {
+            subscribers.retain(|handle| !Weak::ptr_eq(&handle.0, &self.stream));
+            subscribers.is_empty()
+        });
+        if remove_key {
+            registry.remove(&self.key);
+        }
+    }
+}
 
 impl Subscription {
     pub fn pull(&self) -> Option<Frame> {
@@ -526,9 +556,15 @@ impl Subscription {
     }
 
     fn lock_stream(&self) -> MutexGuard<'_, SubStream> {
-        self.0
+        self.stream
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for Firehose {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -544,7 +580,7 @@ impl Firehose {
     pub fn with_limits(window_capacity: usize, inflight_cap: usize) -> Firehose {
         Firehose {
             windows: HashMap::new(),
-            subscribers: HashMap::new(),
+            subscribers: Arc::new(Mutex::new(HashMap::new())),
             window_capacity: window_capacity.max(1),
             inflight_cap: inflight_cap.max(1),
         }
@@ -564,8 +600,12 @@ impl Firehose {
             .entry(key.clone())
             .or_insert_with(|| RetentionWindow::new(self.window_capacity));
         let frame = window.publish(draft)?;
-        if let Some(subs) = self.subscribers.get_mut(&key) {
-            subs.retain(|handle| {
+        let mut registry = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove_key = registry.get_mut(&key).is_some_and(|subscribers| {
+            subscribers.retain(|handle| {
                 let Some(subscriber) = handle.0.upgrade() else {
                     return false;
                 };
@@ -575,6 +615,10 @@ impl Firehose {
                 subscriber.enqueue_live(frame.clone());
                 !subscriber.resync_required()
             });
+            subscribers.is_empty()
+        });
+        if remove_key {
+            registry.remove(&key);
         }
         Ok(frame)
     }
@@ -686,10 +730,20 @@ impl Firehose {
         );
         let shared = Arc::new(Mutex::new(sub));
         self.subscribers
-            .entry(key)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key.clone())
             .or_default()
             .push(SubHandle(Arc::downgrade(&shared)));
-        Subscription(shared)
+        let registration = SubscriptionRegistration {
+            registry: Arc::downgrade(&self.subscribers),
+            key,
+            stream: Arc::downgrade(&shared),
+        };
+        Subscription {
+            stream: shared,
+            _registration: Arc::new(registration),
+        }
     }
 
     pub fn head_seq(&self, stream: &str, scope: &FirehoseScope) -> u64 {
@@ -713,6 +767,16 @@ mod tests {
 
     fn scope(s: &str) -> FirehoseScope {
         FirehoseScope::parse(s).expect("a bounded scope")
+    }
+
+    fn registered_subscriber_count(firehose: &Firehose) -> usize {
+        firehose
+            .subscribers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(Vec::len)
+            .sum()
     }
 
     fn draft(p: &str) -> FrameDraft {
@@ -813,8 +877,9 @@ mod tests {
             .expect("the cursor is in the retention window");
 
         assert_eq!(frames.len(), 2);
-        assert!(
-            fh.subscribers.is_empty(),
+        assert_eq!(
+            registered_subscriber_count(&fh),
+            0,
             "a recovery read owns no live subscriber state"
         );
     }
@@ -929,7 +994,7 @@ mod tests {
             }
         );
         assert!(fh.windows.is_empty());
-        assert!(fh.subscribers.is_empty());
+        assert_eq!(registered_subscriber_count(&fh), 0);
 
         let exact = "s".repeat(FIREHOSE_MAX_STREAM_BYTES);
         assert_eq!(
@@ -982,26 +1047,42 @@ mod tests {
     }
 
     #[test]
-    fn the_caller_owns_a_live_subscription_lifetime() {
+    fn the_last_subscription_handle_unregisters_immediately() {
         let mut fh = Firehose::new();
         let s = scope("doc:design");
-        let key = ("kn-ops".to_string(), s.clone());
         let subscription = fh
             .subscribe("kn-ops", &s, None)
             .expect("the live subscription opens");
 
         assert_eq!(
-            Arc::strong_count(&subscription.0),
+            Arc::strong_count(&subscription.stream),
             1,
             "the firehose does not retain a dropped caller's stream"
         );
+        assert_eq!(registered_subscriber_count(&fh), 1);
+
+        let surviving_handle = subscription.clone();
         drop(subscription);
+        assert_eq!(
+            registered_subscriber_count(&fh),
+            1,
+            "a cloned caller handle keeps exactly one registration alive"
+        );
+
         fh.publish("kn-ops", &s, draft("op-1"))
             .expect("the fixture publishes a valid frame");
+        assert_eq!(
+            surviving_handle.pull().map(|frame| frame.seq),
+            Some(1),
+            "the surviving handle remains live"
+        );
 
-        assert!(
-            fh.subscribers.get(&key).is_none_or(Vec::is_empty),
-            "publishing reaps the expired subscription handle"
+        drop(surviving_handle);
+
+        assert_eq!(
+            registered_subscriber_count(&fh),
+            0,
+            "the last handle unregisters without waiting for another publish"
         );
     }
 
@@ -1291,6 +1372,11 @@ mod tests {
         assert!(
             sub.pull().is_none(),
             "a dropped subscription delivers nothing until it resumes"
+        );
+        assert_eq!(
+            registered_subscriber_count(&fh),
+            0,
+            "an overrun immediately releases its live registry entry"
         );
     }
 
