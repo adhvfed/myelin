@@ -1,6 +1,7 @@
 import { Show, createSignal, onCleanup, onMount } from "solid-js";
 import { Icon } from "@myelin/design-system";
 import { getCiLog } from "~/lib/api";
+import { boundedCiLogWindow, decodeCiLogWindow } from "~/lib/ci-log-text";
 import { consumeCiLiveStream, type CiLiveEvent } from "~/lib/ci-live-stream";
 
 const LIVE_WINDOW_BYTES = 256 * 1024;
@@ -37,9 +38,7 @@ export function CiLiveLog(props: { run: string; job: string }) {
   const [resyncs, setResyncs] = createSignal(0);
 
   const replaceWindow = (start: number, end: number, next: Uint8Array) => {
-    const bounded = next.byteLength > LIVE_WINDOW_BYTES
-      ? next.slice(next.byteLength - LIVE_WINDOW_BYTES)
-      : next;
+    const bounded = boundedCiLogWindow(next, LIVE_WINDOW_BYTES, start > 0);
     setBytes(bounded);
     setWindowEnd(end);
     setWindowStart(end - bounded.byteLength);
@@ -202,7 +201,7 @@ export function CiLiveLog(props: { run: string; job: string }) {
     const value = bytes();
     return value.byteLength === 0
       ? "No durable output yet."
-      : new TextDecoder("utf-8", { fatal: false }).decode(value);
+      : decodeCiLogWindow(value, status() === "complete");
   };
 
   return (

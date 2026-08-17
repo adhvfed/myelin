@@ -83,7 +83,6 @@ export interface CiLogRangeVM {
   next_offset: number | null;
   encoding: "base64";
   data: string;
-  text: string;
 }
 
 function record(value: unknown): WireRecord | null {
@@ -351,7 +350,6 @@ export function parseCiLogRange(
     next_offset: range.next_offset as number | null,
     encoding: "base64",
     data: range.data as string,
-    text: new TextDecoder("utf-8", { fatal: false }).decode(bytes),
   };
 }
 

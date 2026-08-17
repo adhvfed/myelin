@@ -138,7 +138,7 @@ describe("CI read responses", () => {
     })).toBeNull();
   });
 
-  it("preserves byte-exact ranges even when a range begins inside UTF-8", () => {
+  it("preserves byte-exact ranges without pretending arbitrary boundaries are text", () => {
     const parsed = parseCiLogRange({
       run_id: RUN,
       job_id: JOB,
@@ -153,7 +153,6 @@ describe("CI read responses", () => {
       byte_start: 9,
       byte_end: 16,
       next_offset: 16,
-      text: "�\nfaile",
     });
     expect(parsed?.data).toBe("qQpmYWlsZQ==");
   });
@@ -168,7 +167,7 @@ describe("CI read responses", () => {
       next_offset: null,
       encoding: "base64",
       data: "",
-    })?.text).toBe("");
+    })?.data).toBe("");
   });
 
   it.each([

@@ -4,6 +4,7 @@ import { A, createAsync, useParams, useSearchParams } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
 import { CiRouteError, getCiLog, getCiRun } from "~/lib/api";
 import { isCiUuid } from "~/lib/ci-read-input";
+import { ciLogTextPage, ciLogTextRequest } from "~/lib/ci-log-text";
 import {
   ciJobResultLabel,
   ciRepoLabel,
@@ -36,7 +37,15 @@ export default function CiRunDetail() {
     if (job === undefined) return undefined;
     const offset = selectedOffset();
     if (!isCiUuid(job) || offset === null) throw new CiRouteError("bad-input");
-    return getCiLog({ run: runId(), job, start: offset, limit: ARCHIVE_CHUNK });
+    const transport = ciLogTextRequest(offset, ARCHIVE_CHUNK);
+    if (!transport) throw new CiRouteError("bad-input");
+    const page = ciLogTextPage(
+      await getCiLog({ run: runId(), job, ...transport }),
+      offset,
+      ARCHIVE_CHUNK,
+    );
+    if (!page) throw new CiRouteError("error");
+    return page;
   }, { deferStream: true });
 
   return (

@@ -105,6 +105,10 @@ test.describe("CT-005 CI web read surface", () => {
     await page.reload();
     await expect(page.getByTestId("ci-archived-log")).toHaveValue("prep\ncafé\nfailed\n");
     await expectNoAxeViolations(page, "CI archived log");
+
+    await page.goto(`/ci/runs/${FAILED_RUN}?job=92000000-0000-4000-8000-000000000001&offset=9`);
+    await expect(page.getByTestId("ci-archived-log")).toHaveValue("é\nfailed\n");
+    await expect(page.getByText("Archived bytes 8–18 of 18")).toBeVisible();
   });
 
   test("live bytes append durably and a stale resume cursor reloads the archive", async ({ page }) => {
