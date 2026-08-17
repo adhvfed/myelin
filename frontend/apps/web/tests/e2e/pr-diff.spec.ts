@@ -101,6 +101,27 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
     await expect(page.getByText("Does this clamp handle limit == 0?")).toBeVisible();
   });
 
+  test("a line-comment draft belongs to one repository and pull request", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1/diff");
+    await page.waitForSelector("[data-rowkey]");
+    await page.waitForTimeout(1_200);
+
+    await page.getByText(/let cap = self.limit.min\(100\)/).click();
+    await page.getByRole("textbox", { name: /Comment on src\/list_filter.rs line 2/ })
+      .fill("This draft belongs to the first repository.");
+
+    await page.evaluate(() => {
+      window.history.pushState({}, "", "/git/repos/platform%2Fmyelin/prs/1/diff");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await page.waitForURL("**/git/repos/platform%2Fmyelin/prs/1/diff");
+    await expect(page.getByRole("link", { name: "platform/myelin", exact: true })).toBeVisible();
+    await expect(page.getByText("This draft belongs to the first repository.")).toHaveCount(0);
+    await expect(page.getByRole("textbox", { name: /Comment on src\/list_filter.rs line 2/ }))
+      .toHaveCount(0);
+  });
+
   test("commenting on a DELETED (old-side) line in split view opens the composer + posts (finding #16)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1/diff");

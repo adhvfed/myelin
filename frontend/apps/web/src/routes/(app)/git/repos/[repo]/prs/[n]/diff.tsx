@@ -1,6 +1,6 @@
 // PR files view. It supplies diff data, threads, viewed state, deep links, and pagination to the
 // shared diff viewer.
-import { ErrorBoundary, For, Show, Suspense, createMemo, createSignal } from "solid-js";
+import { ErrorBoundary, For, Show, Suspense, createEffect, createMemo, createSignal } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, revalidate, useAction, useParams, useSearchParams } from "@solidjs/router";
 import {
@@ -134,8 +134,26 @@ export default function PrDiffScreen() {
   // That keeps a late response from one cursor page or pre-rebase head out of another file's rows.
   const [expandedByIdentity, setExpandedByIdentity] = createSignal<Record<string, DiffLineVM[]>>({});
   const pendingContext = new Set<string>();
-  const contextIdentity = (headOid: string, path: string, blobOid: string, gapKey: string) =>
-    JSON.stringify([headOid, path, blobOid, gapKey]);
+  let routeIdentity = "";
+  let routeGeneration = 0;
+
+  createEffect(() => {
+    const current = diff();
+    const nextIdentity = JSON.stringify([repo(), n(), current?.head_oid ?? null]);
+    if (nextIdentity === routeIdentity) return;
+    routeIdentity = nextIdentity;
+    routeGeneration += 1;
+    setViewOverride(viewParam());
+    setCommentAt(null);
+    setDraft("");
+    setDraftClientNonce(crypto.randomUUID());
+    setLive("");
+    setExpandedByIdentity({});
+    pendingContext.clear();
+  });
+
+  const contextIdentity = (repository: string, number: number, headOid: string, path: string, blobOid: string, gapKey: string) =>
+    JSON.stringify([repository, number, headOid, path, blobOid, gapKey]);
   const expandedContext = createMemo<ExpandedContext>(() => {
     const d = diff();
     if (!d) return {};
@@ -145,7 +163,7 @@ export default function PrDiffScreen() {
       const blobOid = file.new_blob_oid;
       if (!blobOid) return;
       file.hunks.forEach((_hunk, hunkIdx) => {
-        const lines = stored[contextIdentity(d.head_oid, file.path, blobOid, `${hunkIdx}`)];
+        const lines = stored[contextIdentity(repo(), n(), d.head_oid, file.path, blobOid, `${hunkIdx}`)];
         if (lines) visible[`${fileIdx}:${hunkIdx}`] = lines;
       });
     });
@@ -160,14 +178,16 @@ export default function PrDiffScreen() {
       setLive(`Unchanged context for ${file.path} is outside the bounded expansion range.`);
       return;
     }
-    const identity = contextIdentity(d.head_oid, file.path, file.new_blob_oid, gapKey);
+    const identity = contextIdentity(repo(), n(), d.head_oid, file.path, file.new_blob_oid, gapKey);
     if (pendingContext.has(identity) || expandedByIdentity()[identity]) return;
+    const requestGeneration = routeGeneration;
     pendingContext.add(identity);
     const { head_oid: headOid } = d;
     const { path, new_blob_oid: blobOid } = file;
+    const requestRepo = repo();
     try {
       const response = await getFileLines({
-        repo: repo(),
+        repo: requestRepo,
         oid: blobOid,
         path,
         start: range.start,
@@ -175,6 +195,7 @@ export default function PrDiffScreen() {
       });
       const lines = mapPrDiffContextLines(response.lines, range);
       if (!lines) throw new Error("invalid context response");
+      if (requestGeneration !== routeGeneration) return;
       const current = diff();
       const currentFile = current?.files[fileIdx];
       if (current?.head_oid !== headOid || currentFile?.path !== path ||
@@ -182,34 +203,45 @@ export default function PrDiffScreen() {
       setExpandedByIdentity((value) => ({ ...value, [identity]: lines }));
       setLive(`Expanded ${lines.length} unchanged ${lines.length === 1 ? "line" : "lines"} in ${path}.`);
     } catch {
-      setLive(`Couldn't expand unchanged lines in ${path}.`);
+      if (requestGeneration === routeGeneration) {
+        setLive(`Couldn't expand unchanged lines in ${path}.`);
+      }
     } finally {
       pendingContext.delete(identity);
     }
   };
   const mutate = useAction(prMutate);
-  const reload = () => revalidate("git-pr-threads");
+  const reload = (input: { repo: string; n: number }) =>
+    revalidate(getPrThreads.keyFor(input));
 
   const submitComment = async () => {
     const at = commentAt();
     const body = draft().trim();
     if (!at || !body) return;
+    const requestGeneration = routeGeneration;
+    const input = { repo: repo(), n: n() };
     try {
       await mutate({
         op: "thread",
-        repo: repo(),
-        n: n(),
+        repo: input.repo,
+        n: input.n,
         body_md: body,
         clientNonce: draftClientNonce(),
         anchor: { path: at.path, line: at.line, side: at.side },
       });
+      if (requestGeneration !== routeGeneration) {
+        void reload(input);
+        return;
+      }
       setDraft("");
       setDraftClientNonce(crypto.randomUUID());
       setCommentAt(null);
       setLive("Comment posted");
-      await reload();
+      await reload(input);
     } catch {
-      setLive("The comment could not be confirmed. Retrying this unchanged draft is safe.");
+      if (requestGeneration === routeGeneration) {
+        setLive("The comment could not be confirmed. Retrying this unchanged draft is safe.");
+      }
     }
   };
 
