@@ -33,7 +33,8 @@ fn d10_reconnect_backfills_then_live_loses_zero_ops() {
         .subscribe(stream, &s, None)
         .expect("bounded scope subscribes");
     for _ in 0..3 {
-        fh.publish(stream, &s, FrameDraft::new("op"));
+        fh.publish(stream, &s, FrameDraft::new("op"))
+            .expect("the fixture publishes a valid frame");
     }
     let seen: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(seen, vec![1, 2, 3], "the client saw 1,2,3 while connected");
@@ -46,7 +47,8 @@ fn d10_reconnect_backfills_then_live_loses_zero_ops() {
         "the connection is down"
     );
     for _ in 0..4 {
-        fh.publish(stream, &s, FrameDraft::new("op"));
+        fh.publish(stream, &s, FrameDraft::new("op"))
+            .expect("the fixture publishes a valid frame");
     }
 
     breaker.restore_dependency(Dependency::Firehose, Scope::Global);
@@ -60,7 +62,8 @@ fn d10_reconnect_backfills_then_live_loses_zero_ops() {
         "the gap (last_seq, now] is replayed - 0 ops lost"
     );
 
-    fh.publish(stream, &s, FrameDraft::new("op"));
+    fh.publish(stream, &s, FrameDraft::new("op"))
+        .expect("the fixture publishes a valid frame");
     let live: Vec<u64> = resumed.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(
         live,
@@ -101,7 +104,8 @@ fn d10_out_of_window_resume_raises_resync_required() {
 
     let last_seq = 2u64;
     for _ in 0..8 {
-        fh.publish(stream, &s, FrameDraft::new("msg"));
+        fh.publish(stream, &s, FrameDraft::new("msg"))
+            .expect("the fixture publishes a valid frame");
     }
     assert_eq!(
         fh.window_len(stream, &s),
@@ -158,13 +162,15 @@ fn d10_board_scope_reconnect_loses_zero_ops() {
         .subscribe(stream, &s, None)
         .expect("a board scope subscribes");
     for _ in 0..10 {
-        fh.publish(stream, &s, FrameDraft::new("row-edit"));
+        fh.publish(stream, &s, FrameDraft::new("row-edit"))
+            .expect("the fixture publishes a valid frame");
     }
     let seen: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(seen, (1..=10).collect::<Vec<u64>>());
 
     for _ in 0..10 {
-        fh.publish(stream, &s, FrameDraft::new("row-edit"));
+        fh.publish(stream, &s, FrameDraft::new("row-edit"))
+            .expect("the fixture publishes a valid frame");
     }
     let resumed = fh
         .resume(stream, &s, sub.last_seq())

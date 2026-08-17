@@ -39,7 +39,8 @@ fn d10_reconnect_across_engine_promote_loses_zero_ops() {
         .expect("bounded scope subscribes");
 
     for i in 1..=3u64 {
-        fh.publish(stream, &s, op_frame(ApplyEngine::Cas, i));
+        fh.publish(stream, &s, op_frame(ApplyEngine::Cas, i))
+            .expect("the fixture publishes a valid frame");
     }
     let seen: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(
@@ -55,11 +56,16 @@ fn d10_reconnect_across_engine_promote_loses_zero_ops() {
         breaker.is_broken(&Dependency::Firehose, &Scope::Global),
         "the connection is down across the boundary"
     );
-    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 4));
-    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 5));
-    fh.publish(stream, &s, engine_promote_frame());
-    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 7));
-    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 8));
+    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 4))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 5))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, engine_promote_frame())
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 7))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 8))
+        .expect("the fixture publishes a valid frame");
 
     breaker.restore_dependency(Dependency::Firehose, Scope::Global);
     let resumed = fh
@@ -86,7 +92,8 @@ fn d10_reconnect_across_engine_promote_loses_zero_ops() {
         "the same transport carried CAS bytes, the cutover, and CRDT bytes - byte-opaque, unchanged"
     );
 
-    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 9));
+    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 9))
+        .expect("the fixture publishes a valid frame");
     let live: Vec<u64> = resumed.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(
         live,
@@ -133,18 +140,21 @@ fn d10_post_promotion_reconnect_loses_zero_ops_unchanged() {
     let stream = "kn-ops";
     let s = scope("doc:post-promote");
 
-    fh.publish(stream, &s, engine_promote_frame());
+    fh.publish(stream, &s, engine_promote_frame())
+        .expect("the fixture publishes a valid frame");
     let sub = fh
         .subscribe(stream, &s, None)
         .expect("subscribe post-promotion");
     for i in 2..=5u64 {
-        fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, i));
+        fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, i))
+            .expect("the fixture publishes a valid frame");
     }
     let seen: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(seen, vec![2, 3, 4, 5], "the client saw the CRDT ops live");
 
     for i in 6..=9u64 {
-        fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, i));
+        fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, i))
+            .expect("the fixture publishes a valid frame");
     }
     let resumed = fh
         .resume(stream, &s, sub.last_seq())
@@ -181,7 +191,8 @@ fn measured_retention_window_exceeds_p99_reconnect_gap_per_stream_class() {
         if t.window_frames <= StreamClass::ChatLive.window_frames() {
             let mut fh = fh;
             for _ in 0..(t.window_frames + 1) {
-                fh.publish("kn-ops", &s, FrameDraft::new("f"));
+                fh.publish("kn-ops", &s, FrameDraft::new("f"))
+                    .expect("the fixture publishes a valid frame");
             }
             assert_eq!(
                 fh.window_len("kn-ops", &s),
@@ -200,11 +211,16 @@ fn out_of_window_reconnect_across_boundary_still_raises_resync_required() {
     let s = scope("doc:tiny-window");
 
     let last_seq = 1u64;
-    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 1));
-    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 2));
-    fh.publish(stream, &s, engine_promote_frame());
-    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 4));
-    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 5));
+    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 1))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, op_frame(ApplyEngine::Cas, 2))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, engine_promote_frame())
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 4))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(stream, &s, op_frame(ApplyEngine::Crdt, 5))
+        .expect("the fixture publishes a valid frame");
 
     let err = fh
         .resume(stream, &s, last_seq)

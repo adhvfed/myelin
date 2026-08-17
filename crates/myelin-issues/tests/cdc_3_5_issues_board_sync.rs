@@ -38,11 +38,13 @@ fn consumer_reconnect_consumes_provider_resume_backfill_losing_zero_ops() {
         .expect("subscribe with no cursor starts live");
 
     for i in 1..=3u64 {
-        let frame = fh.publish(
-            bs.stream(),
-            bs.scope(),
-            BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m")).to_draft(),
-        );
+        let frame = fh
+            .publish(
+                bs.stream(),
+                bs.scope(),
+                BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m")).to_draft(),
+            )
+            .expect("the fixture publishes a valid frame");
         assert_eq!(
             frame.seq, i,
             "the PROVIDER assigns the per-(stream, scope) monotone seq"
@@ -60,7 +62,8 @@ fn consumer_reconnect_consumes_provider_resume_backfill_losing_zero_ops() {
             bs.stream(),
             bs.scope(),
             BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m")).to_draft(),
-        );
+        )
+        .expect("the fixture publishes a valid frame");
     }
     let gap = bs.reconnect(&mut fh).expect("in-window resume backfills");
     assert_eq!(
@@ -82,7 +85,8 @@ fn consumer_surfaces_provider_resync_required_and_rebuilds_from_snapshot() {
             bs.stream(),
             bs.scope(),
             BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m")).to_draft(),
-        );
+        )
+        .expect("the fixture publishes a valid frame");
         if i == 2 {
             bs.pump();
         }
@@ -116,7 +120,8 @@ fn consumer_apply_is_idempotent_zero_dup() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-1", "todo", "a")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
@@ -125,7 +130,8 @@ fn consumer_apply_is_idempotent_zero_dup() {
             state_category: "done".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
 
     let mut a = bs.cache().clone();
     let ops = [

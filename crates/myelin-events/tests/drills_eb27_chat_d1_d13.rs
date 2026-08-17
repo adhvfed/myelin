@@ -58,7 +58,8 @@ fn chat_d1_resume_recovers_the_gap_zero_lost_zero_dup() {
         .subscribe(STREAM, &scope, None)
         .expect("a bounded channel: scope subscribes (never `*`)");
     for _ in 0..3 {
-        fh.publish(STREAM, &scope, FrameDraft::new("chat.presence.frame"));
+        fh.publish(STREAM, &scope, FrameDraft::new("chat.presence.frame"))
+            .expect("the fixture publishes a valid frame");
     }
     let seen: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(
@@ -70,7 +71,8 @@ fn chat_d1_resume_recovers_the_gap_zero_lost_zero_dup() {
 
     drop(sub);
     for _ in 0..4 {
-        fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"));
+        fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"))
+            .expect("the fixture publishes a valid frame");
     }
 
     let resumed = fh
@@ -83,7 +85,8 @@ fn chat_d1_resume_recovers_the_gap_zero_lost_zero_dup() {
         "the gap (last_seq, now] is replayed - 0 ops lost"
     );
 
-    fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"));
+    fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"))
+        .expect("the fixture publishes a valid frame");
     let live: Vec<u64> = resumed.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(live, vec![8], "0 dup across the backfill→live boundary");
 
@@ -119,7 +122,8 @@ fn chat_d1_over_window_raises_resync_required() {
         .subscribe(STREAM, &scope, None)
         .expect("bounded channel: scope");
     for _ in 0..10 {
-        fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"));
+        fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"))
+            .expect("the fixture publishes a valid frame");
     }
     drop(sub);
 

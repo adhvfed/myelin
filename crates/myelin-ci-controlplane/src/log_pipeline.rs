@@ -796,7 +796,7 @@ impl<B: BlobStore> LogPipeline<B> {
         );
         let frame = self
             .firehose
-            .publish(CI_LOG_STREAM, &scope, FrameDraft::new(frame_payload));
+            .publish(CI_LOG_STREAM, &scope, FrameDraft::new(frame_payload))?;
 
         let stream = self.streams.entry(key).or_default();
         if stream.open_segment.is_empty() {

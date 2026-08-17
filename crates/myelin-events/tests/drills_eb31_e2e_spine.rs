@@ -71,7 +71,9 @@ fn e2e1_pr_pane_live_check_update_zero_ops_lost_on_reconnect() {
 
     let first_tranche = ["build:running", "test:running", "build:success"];
     for f in first_tranche {
-        firehose.publish(stream, &scope, FrameDraft::new(f));
+        firehose
+            .publish(stream, &scope, FrameDraft::new(f))
+            .expect("the fixture publishes a valid frame");
     }
     let mut pane_saw: Vec<String> = pane
         .drain_ready()
@@ -87,7 +89,9 @@ fn e2e1_pr_pane_live_check_update_zero_ops_lost_on_reconnect() {
 
     let gap_tranche = ["test:failure", "lint:success"];
     for f in gap_tranche {
-        firehose.publish(stream, &scope, FrameDraft::new(f));
+        firehose
+            .publish(stream, &scope, FrameDraft::new(f))
+            .expect("the fixture publishes a valid frame");
     }
 
     let resumed = firehose
@@ -97,7 +101,9 @@ fn e2e1_pr_pane_live_check_update_zero_ops_lost_on_reconnect() {
         pane_saw.push(fr.payload.0);
     }
 
-    firehose.publish(stream, &scope, FrameDraft::new("deploy:success"));
+    firehose
+        .publish(stream, &scope, FrameDraft::new("deploy:success"))
+        .expect("the fixture publishes a valid frame");
     for fr in resumed.drain_ready() {
         pane_saw.push(fr.payload.0);
     }
@@ -541,7 +547,8 @@ fn bus_is_the_carriage_spine_of_all_four_e2e_scenarios() {
     let sub = fh
         .subscribe("ci.check.updated", &scope, None)
         .expect("subscribe");
-    fh.publish("ci.check.updated", &scope, FrameDraft::new("build:success"));
+    fh.publish("ci.check.updated", &scope, FrameDraft::new("build:success"))
+        .expect("the fixture publishes a valid frame");
     assert_eq!(
         sub.drain_ready().len(),
         1,
@@ -639,11 +646,13 @@ fn e2e_spine_gates_are_not_vacuous() {
     let sub = fh
         .subscribe("ci.check.updated", &scope, None)
         .expect("subscribe");
-    fh.publish("ci.check.updated", &scope, FrameDraft::new("f1"));
+    fh.publish("ci.check.updated", &scope, FrameDraft::new("f1"))
+        .expect("the fixture publishes a valid frame");
     let _ = sub.drain_ready();
     let last = sub.last_seq();
     for f in ["f2", "f3", "f4"] {
-        fh.publish("ci.check.updated", &scope, FrameDraft::new(f));
+        fh.publish("ci.check.updated", &scope, FrameDraft::new(f))
+            .expect("the fixture publishes a valid frame");
     }
     let resumed = fh.resume("ci.check.updated", &scope, last);
     let resync_required = resumed.is_err();

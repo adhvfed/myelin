@@ -16,7 +16,8 @@ fn live_frame_patches_the_cache() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-1", "todo", "m")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     bs.pump();
 
     fh.publish(
@@ -27,7 +28,8 @@ fn live_frame_patches_the_cache() {
             state_category: "in_review".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     let applied = bs.pump();
     assert_eq!(applied, 1, "one live op applied");
     assert_eq!(
@@ -46,7 +48,8 @@ fn presence_frame_advances_cursor_without_patching_cache() {
         bs.stream(),
         bs.scope(),
         FrameDraft::new("presence|user-7|typing"),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     bs.pump();
     assert!(bs.cache().is_empty(), "a presence frame patches no card");
     assert_eq!(
@@ -66,12 +69,14 @@ fn reconnect_backfills_the_edit_storm_gap_losing_zero_ops() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-1", "todo", "a")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-2", "todo", "b")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     bs.pump();
     assert_eq!(bs.last_seq(), 2);
     assert_eq!(bs.cache().len(), 2);
@@ -84,12 +89,14 @@ fn reconnect_backfills_the_edit_storm_gap_losing_zero_ops() {
             state_category: "in_progress".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-3", "todo", "c")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
@@ -98,12 +105,14 @@ fn reconnect_backfills_the_edit_storm_gap_losing_zero_ops() {
             state_category: "done".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-4", "todo", "d")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
@@ -112,12 +121,14 @@ fn reconnect_backfills_the_edit_storm_gap_losing_zero_ops() {
             order_key: "z".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-5", "todo", "e")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
@@ -125,7 +136,8 @@ fn reconnect_backfills_the_edit_storm_gap_losing_zero_ops() {
             issue_id: "I-3".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
@@ -134,7 +146,8 @@ fn reconnect_backfills_the_edit_storm_gap_losing_zero_ops() {
             state_category: "done".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     assert_eq!(
         fh.head_seq(bs.stream(), bs.scope()),
         10,
@@ -168,7 +181,8 @@ fn reconnect_backfills_the_edit_storm_gap_losing_zero_ops() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-6", "todo", "f")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     assert_eq!(bs.pump(), 1, "live continues gap-free");
     assert_eq!(bs.last_seq(), 11);
     assert!(bs.cache().card("I-6").is_some());
@@ -183,7 +197,8 @@ fn reconnect_is_idempotent_no_double_apply() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-1", "todo", "a")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
@@ -192,7 +207,8 @@ fn reconnect_is_idempotent_no_double_apply() {
             state_category: "done".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     bs.pump();
     let lane_before = bs.cache().card("I-1").unwrap().state_category.clone();
 
@@ -216,7 +232,8 @@ fn past_window_cursor_resyncs_to_snapshot_named_not_silent() {
             bs.stream(),
             bs.scope(),
             BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m")).to_draft(),
-        );
+        )
+        .expect("the fixture publishes a valid frame");
         if i == 2 {
             bs.pump();
         }
@@ -265,7 +282,8 @@ fn past_window_cursor_resyncs_to_snapshot_named_not_silent() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-7", "todo", "m")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     assert_eq!(bs.pump(), 1, "live continues after the resync");
     assert!(bs.cache().card("I-7").is_some());
     assert_eq!(bs.last_seq(), 7);

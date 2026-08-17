@@ -29,6 +29,7 @@ impl OpStreamArchiver {
     fn publish(&mut self, payload: &str) -> u64 {
         self.firehose
             .publish(&self.stream, &self.scope, FrameDraft::new(payload))
+            .expect("the fixture publishes a valid frame")
             .seq
     }
 

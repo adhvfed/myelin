@@ -308,7 +308,7 @@ fn subscribe_scope_limit_fails_closed_as_over_broad_scope() {
 
     assert!(matches!(
         gw.subscribe(&alice, &oversized, None, None),
-        Err(GatewayError::OverBroadScope(
+        Err(GatewayError::Firehose(
             myelin_events::FirehoseError::ScopeLimitExceeded { .. }
         ))
     ));
@@ -324,14 +324,17 @@ fn subscribe_none_cursor_starts_live_from_now() {
     let scope = chat_channel_scope(CHANNEL).unwrap();
 
     gw.firehose_mut()
-        .publish(&stream, &scope, FrameDraft::new("old"));
+        .publish(&stream, &scope, FrameDraft::new("old"))
+        .expect("the fixture publishes a valid frame");
     let sub = gw.subscribe(&alice, &conv(), None, None).unwrap();
     assert!(sub.drain_ready().is_empty(), "no backfill on a None cursor");
 
     gw.firehose_mut()
-        .publish(&stream, &scope, FrameDraft::new("new-1"));
+        .publish(&stream, &scope, FrameDraft::new("new-1"))
+        .expect("the fixture publishes a valid frame");
     gw.firehose_mut()
-        .publish(&stream, &scope, FrameDraft::new("new-2"));
+        .publish(&stream, &scope, FrameDraft::new("new-2"))
+        .expect("the fixture publishes a valid frame");
     let live: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(live, vec![2, 3], "only post-open live frames are delivered");
 }
@@ -347,7 +350,8 @@ fn resume_in_window_recovers_the_gap_zero_lost() {
 
     for p in ["m1", "m2", "m3", "m4", "m5"] {
         gw.firehose_mut()
-            .publish(&stream, &scope, FrameDraft::new(p));
+            .publish(&stream, &scope, FrameDraft::new(p))
+            .expect("the fixture publishes a valid frame");
     }
     let cursor = myelin_chat::MessageId("00000000000000000000000000".into());
 
@@ -366,7 +370,8 @@ fn resume_in_window_recovers_the_gap_zero_lost() {
     );
 
     gw.firehose_mut()
-        .publish(&stream, &scope, FrameDraft::new("m6"));
+        .publish(&stream, &scope, FrameDraft::new("m6"))
+        .expect("the fixture publishes a valid frame");
     let live: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(live, vec![6], "live continues gap-free, 0 dup");
 
@@ -395,7 +400,8 @@ fn resume_out_of_window_falls_back_to_snapshot_resync_zero_lost() {
     let scope = chat_channel_scope(CHANNEL).unwrap();
     for n in 0..6 {
         gw.firehose_mut()
-            .publish(&stream, &scope, FrameDraft::new(format!("f{n}")));
+            .publish(&stream, &scope, FrameDraft::new(format!("f{n}")))
+            .expect("the fixture publishes a valid frame");
     }
 
     let outcome = gw
@@ -417,7 +423,8 @@ fn resume_out_of_window_falls_back_to_snapshot_resync_zero_lost() {
         "the snapshot recovers everything after the cursor - 0 lost"
     );
     gw.firehose_mut()
-        .publish(&stream, &scope, FrameDraft::new("f6"));
+        .publish(&stream, &scope, FrameDraft::new("f6"))
+        .expect("the fixture publishes a valid frame");
     assert_eq!(
         sub.drain_ready().len(),
         1,
@@ -434,7 +441,8 @@ fn resume_re_gates_membership_new_enemy_guard() {
     let stream = alice.stream.clone();
     let scope = chat_channel_scope(CHANNEL).unwrap();
     gw.firehose_mut()
-        .publish(&stream, &scope, FrameDraft::new("m1"));
+        .publish(&stream, &scope, FrameDraft::new("m1"))
+        .expect("the fixture publishes a valid frame");
 
     id.remove_member("alice");
     let cursor = myelin_chat::MessageId("00000000000000000000000000".into());

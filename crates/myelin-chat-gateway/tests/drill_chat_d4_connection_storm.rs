@@ -212,7 +212,8 @@ fn chat_d4_fleet_reconnect_completes_for_all_zero_loss() {
 
     for body in ["m1", "m2", "m3"] {
         gw.firehose_mut()
-            .publish(&stream, &scope, myelin_events::FrameDraft::new(body));
+            .publish(&stream, &scope, myelin_events::FrameDraft::new(body))
+            .expect("the fixture publishes a valid frame");
     }
     let mut last_seqs = Vec::new();
     for sub in &subs {
@@ -226,7 +227,8 @@ fn chat_d4_fleet_reconnect_completes_for_all_zero_loss() {
 
     for body in ["m4", "m5", "m6", "m7"] {
         gw.firehose_mut()
-            .publish(&stream, &scope, myelin_events::FrameDraft::new(body));
+            .publish(&stream, &scope, myelin_events::FrameDraft::new(body))
+            .expect("the fixture publishes a valid frame");
     }
 
     let cursor = myelin_chat::MessageId("00000000000000000000000000".into());
@@ -334,7 +336,9 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
                 principal: format!("u{i}"),
                 class: "online".into(),
             },
-        ) == DeliveryOutcome::Shed
+        )
+        .expect("the bounded frame publishes")
+            == DeliveryOutcome::Shed
         {
             presence_shed += 1;
         }
@@ -345,18 +349,23 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
             &LiveFrame::AgentPartial {
                 correlation_id: format!("run-{i}"),
             },
-        ) == DeliveryOutcome::Shed
+        )
+        .expect("the bounded frame publishes")
+            == DeliveryOutcome::Shed
         {
             agent_shed += 1;
         }
-        match d.deliver(
-            &tenant,
-            &stream,
-            &scope,
-            &LiveFrame::HumanMessage {
-                message_id: format!("01J0MSG{i}"),
-            },
-        ) {
+        match d
+            .deliver(
+                &tenant,
+                &stream,
+                &scope,
+                &LiveFrame::HumanMessage {
+                    message_id: format!("01J0MSG{i}"),
+                },
+            )
+            .expect("the bounded frame publishes")
+        {
             DeliveryOutcome::Delivered(_) => human_delivered += 1,
             DeliveryOutcome::Shed => human_shed += 1,
         }
@@ -406,7 +415,8 @@ fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
 
     for body in ["m1", "m2"] {
         gw.firehose_mut()
-            .publish(&stream, &scope, myelin_events::FrameDraft::new(body));
+            .publish(&stream, &scope, myelin_events::FrameDraft::new(body))
+            .expect("the fixture publishes a valid frame");
     }
     for sub in &subs {
         let seen: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
@@ -429,11 +439,13 @@ fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
 
         let gap_lo = next_seq;
         for k in 0..3 {
-            gw.firehose_mut().publish(
-                &stream,
-                &scope,
-                myelin_events::FrameDraft::new(format!("w{wave}f{k}")),
-            );
+            gw.firehose_mut()
+                .publish(
+                    &stream,
+                    &scope,
+                    myelin_events::FrameDraft::new(format!("w{wave}f{k}")),
+                )
+                .expect("the fixture publishes a valid frame");
             next_seq += 1;
         }
         let gap_hi = next_seq - 1;

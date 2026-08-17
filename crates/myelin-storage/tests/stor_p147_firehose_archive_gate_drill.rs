@@ -23,7 +23,9 @@ fn p147_gate_firehose_segment_seals_content_addressed_under_tenant_dek() {
     let mut firehose = Firehose::new();
     let scope = FirehoseScope::parse("board:logs").expect("a bounded 3.5 scope");
     for i in 1..=8u64 {
-        firehose.publish("oplog", &scope, FrameDraft::new(format!("op-{i}")));
+        firehose
+            .publish("oplog", &scope, FrameDraft::new(format!("op-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
 
     let eng = engine();
@@ -96,7 +98,9 @@ fn p147_gate_destroyed_tenant_dek_crypto_shreds_the_segment_live_and_in_backups(
 
     let mut firehose = Firehose::new();
     let scope = FirehoseScope::parse("channel:eng").expect("scope");
-    firehose.publish("oplog", &scope, FrameDraft::new("inline-PII-op"));
+    firehose
+        .publish("oplog", &scope, FrameDraft::new("inline-PII-op"))
+        .expect("the fixture publishes a valid frame");
     let segment = arch
         .seal_from_firehose(&firehose, "oplog", &scope, 1, 1)
         .expect("seal")

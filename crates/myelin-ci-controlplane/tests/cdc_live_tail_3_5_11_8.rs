@@ -22,7 +22,9 @@ fn cdc_3_5_viewer_resume_backfills_the_gap_through_the_real_firehose() {
         .expect("the bounded run:<id> the transport admits");
 
     for i in 1..=6u64 {
-        let f = fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")));
+        let f = fh
+            .publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")))
+            .expect("the fixture publishes a valid frame");
         assert_eq!(f.seq, i, "the per-(stream, scope) monotone resume cursor");
     }
 
@@ -44,7 +46,8 @@ fn cdc_3_5_viewer_decodes_resync_required_over_window() {
     let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..6u64 {
-        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
+        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
     let archive = SegmentIndex::from_rows(
         "01J0RUN",

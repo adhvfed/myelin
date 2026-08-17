@@ -41,11 +41,16 @@ fn resume_backfills_the_gap_then_goes_live_losing_zero_lines() {
     let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded run:<id>");
 
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-1"));
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-2"));
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-3"));
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-4"));
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-5"));
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-1"))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-2"))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-3"))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-4"))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-5"))
+        .expect("the fixture publishes a valid frame");
 
     let mut tail = LiveTail::new(&mut fh, SegmentIndex::default());
     let outcome = tail.resume(&coord, 2, 0).expect("in-window resume");
@@ -64,7 +69,9 @@ fn resume_backfills_the_gap_then_goes_live_losing_zero_lines() {
     );
     assert_eq!(sub.last_seq(), 5, "the resume cursor advanced to the head");
 
-    let f6 = fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-6"));
+    let f6 = fh
+        .publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-6"))
+        .expect("the fixture publishes a valid frame");
     assert_eq!(f6.seq, 6);
     let live: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(
@@ -79,14 +86,17 @@ fn subscribe_with_no_cursor_starts_live_from_now() {
     let mut fh = Firehose::new();
     let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("old-1"));
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("old-2"));
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("old-1"))
+        .expect("the fixture publishes a valid frame");
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("old-2"))
+        .expect("the fixture publishes a valid frame");
 
     let mut tail = LiveTail::new(&mut fh, SegmentIndex::default());
     let sub = tail.subscribe(&coord, None).expect("bounded subscribe");
     assert!(sub.drain_ready().is_empty(), "no backfill on a None cursor");
 
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("new-3"));
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("new-3"))
+        .expect("the fixture publishes a valid frame");
     let live: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(
         live,
@@ -101,7 +111,8 @@ fn resume_at_head_is_a_no_op_backfill() {
     let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..5 {
-        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
+        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
     let mut tail = LiveTail::new(&mut fh, SegmentIndex::default());
     let outcome = tail.resume(&coord, 5, 0).expect("caught-up resume");
@@ -120,7 +131,8 @@ fn out_of_window_last_seq_yields_resync_required_then_range_reads_the_archive() 
     let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..6 {
-        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
+        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
 
     let archive = SegmentIndex::from_rows(
@@ -184,7 +196,8 @@ fn the_window_floor_boundary_backfills_not_resyncs() {
     let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 0..6 {
-        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")));
+        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("l-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
     let mut tail = LiveTail::new(&mut fh, SegmentIndex::default());
     let outcome = tail.resume(&coord, 3, 60).expect("boundary resume");

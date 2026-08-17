@@ -142,7 +142,9 @@ fn cdc_3_5_live_tail_rides_the_firehose_on_a_bounded_run_scope() {
         .subscribe(CI_LOG_STREAM, &scope, None)
         .expect("a bounded scope subscribes (never *)");
     for i in 1..=5u64 {
-        let f = fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")));
+        let f = fh
+            .publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")))
+            .expect("the fixture publishes a valid frame");
         assert_eq!(
             f.seq, i,
             "the per-(stream, scope) monotone seq (the resume cursor)"

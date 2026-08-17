@@ -9,6 +9,7 @@ fn provider_publishes(
     payload: &str,
 ) -> Frame {
     fh.publish(stream, scope, FrameDraft::new(payload))
+        .expect("the fixture publishes a valid frame")
 }
 
 fn consumer_resume_drains(

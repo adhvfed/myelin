@@ -88,7 +88,7 @@ pub fn publish_inbox_frame(
 ) -> Result<InboxFrame, FirehoseError> {
     let stream = inbox_stream(recipient);
     let scope = inbox_scope(recipient)?;
-    let frame = Firehose::publish(firehose, &stream, &scope, FrameDraft::new(item_id));
+    let frame = Firehose::publish(firehose, &stream, &scope, FrameDraft::new(item_id))?;
     Ok(decode_frame(frame))
 }
 

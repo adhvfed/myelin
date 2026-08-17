@@ -452,10 +452,13 @@ impl<A: OpAuthority> CollabTransport<A> {
             });
         }
         let head = self.log.head_seq().max(snapshot.snap_seq);
-        if !self.firehose.seed_head(&self.stream, &self.scope, head) {
-            return Err(TransportError::CursorMismatch {
-                page_id: self.page_id.clone(),
-            });
+        if let Err(error) = self.firehose.seed_head(&self.stream, &self.scope, head) {
+            return match error {
+                FirehoseError::InvalidHeadSeed { .. } => Err(TransportError::CursorMismatch {
+                    page_id: self.page_id.clone(),
+                }),
+                error => Err(TransportError::Firehose(error)),
+            };
         }
         self.log.seed_from_snapshot(&snapshot);
         self.snapshot = Some(snapshot);
@@ -540,15 +543,17 @@ impl<A: OpAuthority> CollabTransport<A> {
         }
         let outcome = self.log.persist(op).map_err(TransportError::OpLog)?;
         if let SendOutcome::Applied(persisted) = &outcome {
-            let _frame = self.firehose.publish(
-                &self.stream,
-                &self.scope,
-                FrameDraft::new(format!(
-                    "{}@{}",
-                    persisted.op.op_id.wire(),
-                    persisted.op_seq
-                )),
-            );
+            self.firehose
+                .publish(
+                    &self.stream,
+                    &self.scope,
+                    FrameDraft::new(format!(
+                        "{}@{}",
+                        persisted.op.op_id.wire(),
+                        persisted.op_seq
+                    )),
+                )
+                .map_err(TransportError::Firehose)?;
         }
         Ok(outcome)
     }
@@ -572,11 +577,13 @@ impl<A: OpAuthority> CollabTransport<A> {
     ) -> Result<(), TransportError> {
         self.authorize(principal, AuthAction::Edit)?;
         let presence_stream = format!("{}.presence", self.stream);
-        self.firehose.publish(
-            &presence_stream,
-            &self.scope,
-            FrameDraft::new(format!("{}|{}", presence.client_id, presence.awareness)),
-        );
+        self.firehose
+            .publish(
+                &presence_stream,
+                &self.scope,
+                FrameDraft::new(format!("{}|{}", presence.client_id, presence.awareness)),
+            )
+            .map_err(TransportError::Firehose)?;
         Ok(())
     }
 

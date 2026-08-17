@@ -36,7 +36,8 @@ fn iss_d13_board_reconnect_loses_zero_ops() {
             bs.stream(),
             bs.scope(),
             BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m")).to_draft(),
-        );
+        )
+        .expect("the fixture publishes a valid frame");
     }
     let applied = bs.pump();
     assert_eq!(applied, 10, "the viewer saw 10 ops while connected");
@@ -61,7 +62,8 @@ fn iss_d13_board_reconnect_loses_zero_ops() {
         } else {
             BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m"))
         };
-        fh.publish(bs.stream(), bs.scope(), op.to_draft());
+        fh.publish(bs.stream(), bs.scope(), op.to_draft())
+            .expect("the fixture publishes a valid frame");
     }
     assert_eq!(
         fh.head_seq(bs.stream(), bs.scope()),
@@ -104,7 +106,8 @@ fn iss_d13_board_reconnect_loses_zero_ops() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-final", "todo", "m")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     assert_eq!(bs.pump(), 1, "live continues gap-free");
     assert!(bs.cache().card("I-final").is_some());
 }
@@ -120,7 +123,8 @@ fn iss_d13_past_window_cursor_resyncs_to_snapshot() {
             bs.stream(),
             bs.scope(),
             BoardOp::Upsert(BoardCard::new(format!("I-{i}"), "todo", "m")).to_draft(),
-        );
+        )
+        .expect("the fixture publishes a valid frame");
         if i == 2 {
             bs.pump();
         }
@@ -169,7 +173,8 @@ fn iss_d13_past_window_cursor_resyncs_to_snapshot() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-9", "todo", "m")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     assert_eq!(bs.pump(), 1, "live continues after the resync");
     assert!(bs.cache().card("I-9").is_some());
     assert_eq!(bs.last_seq(), 9);

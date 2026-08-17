@@ -168,7 +168,8 @@ fn deliver(
     tx.commit().expect("commit");
     let scope = chat_channel_scope(CHANNEL).unwrap();
     gw.firehose_mut()
-        .publish(stream, &scope, FrameDraft::new(body));
+        .publish(stream, &scope, FrameDraft::new(body))
+        .expect("the fixture publishes a valid frame");
 }
 
 fn gateway(store: MemHotTier, window: usize) -> ChatGateway<DrillId, MemHotTier, HealthTable> {

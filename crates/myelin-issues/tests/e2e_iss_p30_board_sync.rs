@@ -18,12 +18,14 @@ fn board_sync_chained_mutation_loses_zero_ops() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-1", "todo", "a")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     fh.publish(
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-2", "todo", "b")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     bs.pump();
     assert_eq!(bs.cache().len(), 2);
 
@@ -48,7 +50,8 @@ fn board_sync_chained_mutation_loses_zero_ops() {
             state_category: "in_progress".into(),
         }
         .to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     assert!(bs.confirm_local("mut-move-1"));
     bs.pump();
     assert_eq!(
@@ -77,7 +80,8 @@ fn board_sync_chained_mutation_loses_zero_ops() {
         BoardOp::Upsert(BoardCard::new("I-5", "todo", "e")),
     ];
     for op in &storm {
-        fh.publish(bs.stream(), bs.scope(), op.to_draft());
+        fh.publish(bs.stream(), bs.scope(), op.to_draft())
+            .expect("the fixture publishes a valid frame");
     }
 
     let gap = bs
@@ -127,7 +131,8 @@ fn board_sync_chained_mutation_loses_zero_ops() {
         bs.stream(),
         bs.scope(),
         BoardOp::Upsert(BoardCard::new("I-6", "todo", "f")).to_draft(),
-    );
+    )
+    .expect("the fixture publishes a valid frame");
     assert_eq!(bs.pump(), 1, "live continues gap-free");
     assert!(bs.cache().card("I-6").is_some());
 }

@@ -79,7 +79,8 @@ fn gateway_resume_backfills_the_gap_over_the_real_transport() {
     let stream = format!("fan.{TENANT}");
     let scope = chat_channel_scope(CHANNEL).unwrap();
     for p in ["m1", "m2", "m3", "m4", "m5"] {
-        fh.publish(&stream, &scope, FrameDraft::new(p));
+        fh.publish(&stream, &scope, FrameDraft::new(p))
+            .expect("the fixture publishes a valid frame");
     }
     let sub = fh.resume(&stream, &scope, 2).expect("in-window resume");
     let seqs: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
@@ -96,7 +97,8 @@ fn gateway_over_window_cursor_yields_resync_required() {
     let stream = format!("fan.{TENANT}");
     let scope = chat_channel_scope(CHANNEL).unwrap();
     for _ in 0..6 {
-        fh.publish(&stream, &scope, FrameDraft::new("f"));
+        fh.publish(&stream, &scope, FrameDraft::new("f"))
+            .expect("the fixture publishes a valid frame");
     }
     let err = fh
         .resume(&stream, &scope, 2)

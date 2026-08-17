@@ -1,5 +1,5 @@
 use myelin_chat::{AuthorKind, ConversationId, Message};
-use myelin_events::{Firehose, FirehoseScope, Frame, FrameDraft};
+use myelin_events::{Firehose, FirehoseError, FirehoseScope, Frame, FrameDraft};
 use myelin_identity::PrincipalId;
 use myelin_tenancy::TenantId;
 
@@ -116,15 +116,22 @@ impl<'a> LiveDelivery<'a> {
         stream: &str,
         scope: &FirehoseScope,
         frame: &LiveFrame,
-    ) -> DeliveryOutcome {
+    ) -> Result<DeliveryOutcome, FirehoseError> {
         let surface = frame.surface();
         match self.governor.admit(tenant, surface) {
-            ShedVerdict::Shed { .. } => DeliveryOutcome::Shed,
+            ShedVerdict::Shed { .. } => Ok(DeliveryOutcome::Shed),
             ShedVerdict::Deliver => {
                 let published =
                     self.firehose
                         .publish(stream, scope, FrameDraft::new(frame.payload_pointer()));
-                DeliveryOutcome::Delivered(published)
+                let published = match published {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        self.governor.on_drained(tenant, surface);
+                        return Err(error);
+                    }
+                };
+                Ok(DeliveryOutcome::Delivered(published))
             }
         }
     }
@@ -136,7 +143,7 @@ impl<'a> LiveDelivery<'a> {
         scope: &FirehoseScope,
         _conv: &ConversationId,
         msg: &Message,
-    ) -> DeliveryOutcome {
+    ) -> Result<DeliveryOutcome, FirehoseError> {
         let frame = LiveFrame::from_message(msg);
         self.deliver(tenant, stream, scope, &frame)
     }
@@ -148,7 +155,7 @@ impl<'a> LiveDelivery<'a> {
         scope: &FirehoseScope,
         principal: &PrincipalId,
         class: &str,
-    ) -> DeliveryOutcome {
+    ) -> Result<DeliveryOutcome, FirehoseError> {
         let frame = LiveFrame::Presence {
             principal: principal.0.clone(),
             class: class.to_string(),
@@ -225,7 +232,9 @@ mod tests {
 
         let t = tenant();
         let mut delivery = LiveDelivery::new(&mut firehose, &mut gov);
-        let outcome = delivery.deliver_message(&t, "fan.acme", &scope, &conv, &msg);
+        let outcome = delivery
+            .deliver_message(&t, "fan.acme", &scope, &conv, &msg)
+            .expect("the bounded frame publishes");
         assert!(outcome.is_delivered(), "the human message delivers");
         let frame = outcome.frame().unwrap();
         assert!(frame.payload.0.contains("01J0MSG"));
@@ -260,15 +269,17 @@ mod tests {
             let mut d = LiveDelivery::new(&mut firehose, &mut gov);
             let mut presence_shed = false;
             for _ in 0..16 {
-                let o = d.deliver(
-                    &t,
-                    "fan.acme",
-                    &scope,
-                    &LiveFrame::Presence {
-                        principal: "alice".into(),
-                        class: "online".into(),
-                    },
-                );
+                let o = d
+                    .deliver(
+                        &t,
+                        "fan.acme",
+                        &scope,
+                        &LiveFrame::Presence {
+                            principal: "alice".into(),
+                            class: "online".into(),
+                        },
+                    )
+                    .expect("the bounded frame publishes");
                 if o == DeliveryOutcome::Shed {
                     presence_shed = true;
                     break;
@@ -276,14 +287,16 @@ mod tests {
             }
             assert!(presence_shed, "presence sheds first under pressure");
 
-            let human = d.deliver(
-                &t,
-                "fan.acme",
-                &scope,
-                &LiveFrame::HumanMessage {
-                    message_id: "01J0MSG".into(),
-                },
-            );
+            let human = d
+                .deliver(
+                    &t,
+                    "fan.acme",
+                    &scope,
+                    &LiveFrame::HumanMessage {
+                        message_id: "01J0MSG".into(),
+                    },
+                )
+                .expect("the bounded frame publishes");
             assert!(
                 human.is_delivered(),
                 "the human lane holds while presence sheds"
@@ -298,18 +311,60 @@ mod tests {
         let scope = scope();
         let t = tenant();
         let mut d = LiveDelivery::new(&mut firehose, &mut gov);
-        let outcome = d.deliver(
-            &t,
-            "fan.acme",
-            &scope,
-            &LiveFrame::HumanMessage {
-                message_id: "01J0MSG".into(),
-            },
-        );
+        let outcome = d
+            .deliver(
+                &t,
+                "fan.acme",
+                &scope,
+                &LiveFrame::HumanMessage {
+                    message_id: "01J0MSG".into(),
+                },
+            )
+            .expect("the bounded frame publishes");
         let frame = outcome.frame().expect("delivered");
         assert!(
             frame.seq >= 1,
             "a firehose frame carries the resume-cursor seq"
+        );
+    }
+
+    #[test]
+    fn a_refused_frame_releases_its_admission_slot() {
+        let mut firehose = Firehose::new();
+        let scope = scope();
+        firehose
+            .seed_head("fan.acme", &scope, u64::MAX - 1)
+            .expect("the fixture leaves room for one live frame");
+        let mut governor = ShedGovernor::new();
+        let tenant = tenant();
+        let frame = LiveFrame::HumanMessage {
+            message_id: "01J0MSG".into(),
+        };
+
+        let mut delivery = LiveDelivery::new(&mut firehose, &mut governor);
+        delivery
+            .deliver(&tenant, "fan.acme", &scope, &frame)
+            .expect("the final sequence publishes");
+        assert_eq!(
+            delivery
+                .governor_mut()
+                .in_flight(&tenant, LiveSurface::HumanMessage),
+            1
+        );
+
+        let error = delivery
+            .deliver(&tenant, "fan.acme", &scope, &frame)
+            .expect_err("the cursor cannot wrap");
+        assert_eq!(
+            error,
+            FirehoseError::SequenceExhausted { last_seq: u64::MAX }
+        );
+        assert_eq!(
+            delivery
+                .governor_mut()
+                .in_flight(&tenant, LiveSurface::HumanMessage),
+            1,
+            "a frame that never entered the transport owns no admission slot"
         );
     }
 }

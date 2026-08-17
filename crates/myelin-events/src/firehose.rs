@@ -136,6 +136,8 @@ pub enum FirehoseError {
     ResyncRequired { last_seq: u64, window_floor: u64 },
     TailLimitExceeded,
     ScopeLimitExceeded { maximum: usize },
+    SequenceExhausted { last_seq: u64 },
+    InvalidHeadSeed { current: u64, attempted: u64 },
 }
 
 impl FirehoseError {
@@ -169,6 +171,14 @@ impl core::fmt::Display for FirehoseError {
                 f,
                 "firehose rejects scope resource id longer than {maximum} bytes"
             ),
+            FirehoseError::SequenceExhausted { last_seq } => write!(
+                f,
+                "firehose sequence is exhausted at {last_seq}; a new stream generation is required"
+            ),
+            FirehoseError::InvalidHeadSeed { current, attempted } => write!(
+                f,
+                "firehose cannot seed head {attempted} over current head {current}"
+            ),
         }
     }
 }
@@ -193,31 +203,40 @@ impl RetentionWindow {
         }
     }
 
-    fn publish(&mut self, draft: FrameDraft) -> Frame {
-        self.last_seq += 1;
+    fn publish(&mut self, draft: FrameDraft) -> Result<Frame, FirehoseError> {
+        let next_seq = self
+            .last_seq
+            .checked_add(1)
+            .ok_or(FirehoseError::SequenceExhausted {
+                last_seq: self.last_seq,
+            })?;
         let frame = Frame {
-            seq: self.last_seq,
+            seq: next_seq,
             payload: draft.payload,
         };
         if self.frames.len() == self.capacity {
             self.frames.pop_front();
         }
         self.frames.push_back(frame.clone());
-        frame
+        self.last_seq = next_seq;
+        Ok(frame)
     }
 
-    fn seed_head(&mut self, last_seq: u64) -> bool {
+    fn seed_head(&mut self, last_seq: u64) -> Result<(), FirehoseError> {
         if last_seq == u64::MAX {
-            return false;
+            return Err(FirehoseError::SequenceExhausted { last_seq });
         }
         if self.last_seq == last_seq {
-            return true;
+            return Ok(());
         }
         if self.frames.is_empty() && last_seq > self.last_seq {
             self.last_seq = last_seq;
-            return true;
+            return Ok(());
         }
-        false
+        Err(FirehoseError::InvalidHeadSeed {
+            current: self.last_seq,
+            attempted: last_seq,
+        })
     }
 
     fn window_floor(&self) -> u64 {
@@ -455,13 +474,18 @@ impl Firehose {
         }
     }
 
-    pub fn publish(&mut self, stream: &str, scope: &FirehoseScope, draft: FrameDraft) -> Frame {
+    pub fn publish(
+        &mut self,
+        stream: &str,
+        scope: &FirehoseScope,
+        draft: FrameDraft,
+    ) -> Result<Frame, FirehoseError> {
         let key = (stream.to_string(), scope.clone());
         let window = self
             .windows
             .entry(key.clone())
             .or_insert_with(|| RetentionWindow::new(self.window_capacity));
-        let frame = window.publish(draft);
+        let frame = window.publish(draft)?;
         if let Some(subs) = self.subscribers.get_mut(&key) {
             subs.retain(|handle| {
                 let Some(subscriber) = handle.0.upgrade() else {
@@ -474,7 +498,7 @@ impl Firehose {
                 !subscriber.resync_required()
             });
         }
-        frame
+        Ok(frame)
     }
 
     pub fn tail(&self, stream: &str, scope: &FirehoseScope, lo: u64, hi: u64) -> Vec<Frame> {
@@ -546,7 +570,15 @@ impl Firehose {
         })
     }
 
-    pub fn seed_head(&mut self, stream: &str, scope: &FirehoseScope, last_seq: u64) -> bool {
+    pub fn seed_head(
+        &mut self,
+        stream: &str,
+        scope: &FirehoseScope,
+        last_seq: u64,
+    ) -> Result<(), FirehoseError> {
+        if last_seq == u64::MAX {
+            return Err(FirehoseError::SequenceExhausted { last_seq });
+        }
         self.windows
             .entry((stream.to_string(), scope.clone()))
             .or_insert_with(|| RetentionWindow::new(self.window_capacity))
@@ -610,21 +642,31 @@ mod tests {
         let board_a = scope("board:a");
         let board_b = scope("board:b");
 
-        let f1 = fh.publish("chat-live", &board_a, draft("op-1"));
-        let f2 = fh.publish("chat-live", &board_a, draft("op-2"));
-        let f3 = fh.publish("chat-live", &board_a, draft("op-3"));
+        let f1 = fh
+            .publish("chat-live", &board_a, draft("op-1"))
+            .expect("valid frame");
+        let f2 = fh
+            .publish("chat-live", &board_a, draft("op-2"))
+            .expect("valid frame");
+        let f3 = fh
+            .publish("chat-live", &board_a, draft("op-3"))
+            .expect("valid frame");
         assert_eq!(
             (f1.seq, f2.seq, f3.seq),
             (1, 2, 3),
             "monotone per (stream,scope)"
         );
 
-        let g1 = fh.publish("chat-live", &board_b, draft("op-x"));
+        let g1 = fh
+            .publish("chat-live", &board_b, draft("op-x"))
+            .expect("valid frame");
         assert_eq!(
             g1.seq, 1,
             "a different scope has an independent monotonic seq"
         );
-        let f4 = fh.publish("chat-live", &board_a, draft("op-4"));
+        let f4 = fh
+            .publish("chat-live", &board_a, draft("op-4"))
+            .expect("valid frame");
         assert_eq!(f4.seq, 4, "the original scope's sequence is independent");
     }
 
@@ -633,11 +675,16 @@ mod tests {
         let mut fh = Firehose::new();
         let s = scope("doc:design");
 
-        fh.publish("kn-ops", &s, draft("op-1"));
-        fh.publish("kn-ops", &s, draft("op-2"));
-        fh.publish("kn-ops", &s, draft("op-3"));
-        fh.publish("kn-ops", &s, draft("op-4"));
-        fh.publish("kn-ops", &s, draft("op-5"));
+        fh.publish("kn-ops", &s, draft("op-1"))
+            .expect("the fixture publishes a valid frame");
+        fh.publish("kn-ops", &s, draft("op-2"))
+            .expect("the fixture publishes a valid frame");
+        fh.publish("kn-ops", &s, draft("op-3"))
+            .expect("the fixture publishes a valid frame");
+        fh.publish("kn-ops", &s, draft("op-4"))
+            .expect("the fixture publishes a valid frame");
+        fh.publish("kn-ops", &s, draft("op-5"))
+            .expect("the fixture publishes a valid frame");
 
         let sub = fh
             .resume("kn-ops", &s, 2)
@@ -651,7 +698,8 @@ mod tests {
         );
         assert_eq!(sub.last_seq(), 5, "the resume cursor advanced to the head");
 
-        fh.publish("kn-ops", &s, draft("op-6"));
+        fh.publish("kn-ops", &s, draft("op-6"))
+            .expect("the fixture publishes a valid frame");
         let live = sub.drain_ready();
         assert_eq!(
             live.iter().map(|f| f.seq).collect::<Vec<_>>(),
@@ -672,8 +720,10 @@ mod tests {
     fn reading_a_backfill_does_not_open_a_live_subscription() {
         let mut fh = Firehose::new();
         let s = scope("doc:design");
-        fh.publish("kn-ops", &s, draft("op-1"));
-        fh.publish("kn-ops", &s, draft("op-2"));
+        fh.publish("kn-ops", &s, draft("op-1"))
+            .expect("the fixture publishes a valid frame");
+        fh.publish("kn-ops", &s, draft("op-2"))
+            .expect("the fixture publishes a valid frame");
 
         let frames = fh
             .backfill("kn-ops", &s, 0)
@@ -691,22 +741,65 @@ mod tests {
         let mut fh = Firehose::new();
         let s = scope("doc:design");
 
-        assert!(fh.seed_head("kn-ops", &s, 7));
+        fh.seed_head("kn-ops", &s, 7)
+            .expect("an empty stream accepts a recovered head");
         assert_eq!(fh.head_seq("kn-ops", &s), 7);
-        assert_eq!(fh.publish("kn-ops", &s, draft("op-8")).seq, 8);
+        assert_eq!(
+            fh.publish("kn-ops", &s, draft("op-8"))
+                .expect("the next live frame fits")
+                .seq,
+            8
+        );
         assert!(
-            fh.seed_head("kn-ops", &s, 8),
+            fh.seed_head("kn-ops", &s, 8).is_ok(),
             "the current head is idempotent"
         );
         assert!(
-            !fh.seed_head("kn-ops", &s, 9),
+            matches!(
+                fh.seed_head("kn-ops", &s, 9),
+                Err(FirehoseError::InvalidHeadSeed {
+                    current: 8,
+                    attempted: 9
+                })
+            ),
             "a seed cannot jump over retained live frames"
         );
         let fresh = scope("doc:fresh");
         assert!(
-            !fh.seed_head("kn-ops", &fresh, u64::MAX),
+            matches!(
+                fh.seed_head("kn-ops", &fresh, u64::MAX),
+                Err(FirehoseError::SequenceExhausted { last_seq: u64::MAX })
+            ),
             "a seed must leave room for the next live frame"
         );
+    }
+
+    #[test]
+    fn an_exhausted_sequence_refuses_the_frame_without_mutating_live_state() {
+        let mut fh = Firehose::new();
+        let s = scope("doc:long-lived");
+        fh.seed_head("kn-ops", &s, u64::MAX - 1)
+            .expect("the recovered head leaves room for one frame");
+        let sub = fh
+            .subscribe("kn-ops", &s, None)
+            .expect("the bounded stream subscribes");
+
+        let final_frame = fh
+            .publish("kn-ops", &s, draft("final"))
+            .expect("the final representable sequence publishes");
+        assert_eq!(final_frame.seq, u64::MAX);
+        assert_eq!(sub.pull(), Some(final_frame));
+
+        let error = fh
+            .publish("kn-ops", &s, draft("must-not-appear"))
+            .expect_err("a monotonic cursor can never wrap");
+        assert_eq!(
+            error,
+            FirehoseError::SequenceExhausted { last_seq: u64::MAX }
+        );
+        assert_eq!(fh.head_seq("kn-ops", &s), u64::MAX);
+        assert_eq!(fh.window_len("kn-ops", &s), 1);
+        assert_eq!(sub.pull(), None, "no rejected frame reaches a subscriber");
     }
 
     #[test]
@@ -732,7 +825,8 @@ mod tests {
             "the firehose does not retain a dropped caller's stream"
         );
         drop(subscription);
-        fh.publish("kn-ops", &s, draft("op-1"));
+        fh.publish("kn-ops", &s, draft("op-1"))
+            .expect("the fixture publishes a valid frame");
 
         assert!(
             fh.subscribers.get(&key).is_none_or(Vec::is_empty),
@@ -744,8 +838,10 @@ mod tests {
     fn subscribe_with_no_cursor_starts_live_from_now() {
         let mut fh = Firehose::new();
         let s = scope("channel:eng");
-        fh.publish("chat-live", &s, draft("old-1"));
-        fh.publish("chat-live", &s, draft("old-2"));
+        fh.publish("chat-live", &s, draft("old-1"))
+            .expect("the fixture publishes a valid frame");
+        fh.publish("chat-live", &s, draft("old-2"))
+            .expect("the fixture publishes a valid frame");
 
         let sub = fh
             .subscribe("chat-live", &s, None)
@@ -755,8 +851,10 @@ mod tests {
             "no backfill on a None cursor (live from now)"
         );
 
-        fh.publish("chat-live", &s, draft("new-3"));
-        fh.publish("chat-live", &s, draft("new-4"));
+        fh.publish("chat-live", &s, draft("new-3"))
+            .expect("the fixture publishes a valid frame");
+        fh.publish("chat-live", &s, draft("new-4"))
+            .expect("the fixture publishes a valid frame");
         let live: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
         assert_eq!(
             live,
@@ -770,7 +868,8 @@ mod tests {
         let mut fh = Firehose::new();
         let s = scope("board:7");
         for _ in 0..5 {
-            fh.publish("issues", &s, draft("row"));
+            fh.publish("issues", &s, draft("row"))
+                .expect("the fixture publishes a valid frame");
         }
         let sub = fh
             .resume("issues", &s, 5)
@@ -787,7 +886,8 @@ mod tests {
         let mut fh = Firehose::with_limits(3, DEFAULT_INFLIGHT_CAP);
         let s = scope("doc:hot");
         for _ in 0..6 {
-            fh.publish("kn-ops", &s, draft("op"));
+            fh.publish("kn-ops", &s, draft("op"))
+                .expect("the fixture publishes a valid frame");
         }
         assert_eq!(
             fh.window_len("kn-ops", &s),
@@ -830,7 +930,8 @@ mod tests {
         let mut fh = Firehose::with_limits(3, DEFAULT_INFLIGHT_CAP);
         let s = scope("board:big");
         for _ in 0..6 {
-            fh.publish("issues", &s, draft("row"));
+            fh.publish("issues", &s, draft("row"))
+                .expect("the fixture publishes a valid frame");
         }
         let sub = fh
             .resume("issues", &s, 3)
@@ -996,7 +1097,8 @@ mod tests {
 
         let sub = fh.subscribe("chat-live", &s, None).expect("subscribe");
         for _ in 0..3 {
-            fh.publish("chat-live", &s, draft("frame"));
+            fh.publish("chat-live", &s, draft("frame"))
+                .expect("the fixture publishes a valid frame");
         }
         assert_eq!(sub.ready_len(), 3, "the in-flight queue filled to the cap");
         assert!(
@@ -1004,7 +1106,8 @@ mod tests {
             "not dropped yet (at the cap, not over it)"
         );
 
-        fh.publish("chat-live", &s, draft("over-cap"));
+        fh.publish("chat-live", &s, draft("over-cap"))
+            .expect("the fixture publishes a valid frame");
         assert!(
             sub.resync_required(),
             "a slow consumer is dropped to resync_required (NAMED)"
@@ -1026,7 +1129,8 @@ mod tests {
         let s = scope("channel:eng");
         let sub = fh.subscribe("chat-live", &s, None).expect("subscribe");
         for i in 1..=100u64 {
-            fh.publish("chat-live", &s, draft("f"));
+            fh.publish("chat-live", &s, draft("f"))
+                .expect("the fixture publishes a valid frame");
             let pulled = sub
                 .pull()
                 .expect("a keeping-up consumer always has its frame");
@@ -1047,7 +1151,8 @@ mod tests {
         let mut fh = Firehose::new();
         let s = scope("board:logs");
         for _ in 0..10 {
-            fh.publish("ci-logs", &s, draft("line"));
+            fh.publish("ci-logs", &s, draft("line"))
+                .expect("the fixture publishes a valid frame");
         }
         let mid: Vec<u64> = fh.tail("ci-logs", &s, 3, 6).iter().map(|f| f.seq).collect();
         assert_eq!(
@@ -1068,7 +1173,8 @@ mod tests {
         let mut fh = Firehose::new();
         let s = scope("board:bounded-tail");
         for _ in 0..3 {
-            fh.publish("ci-logs", &s, draft("line"));
+            fh.publish("ci-logs", &s, draft("line"))
+                .expect("the fixture publishes a valid frame");
         }
 
         assert_eq!(
@@ -1093,7 +1199,8 @@ mod tests {
         let s = scope("channel:town-hall");
         let a = fh.subscribe("chat-live", &s, None).expect("a subscribes");
         let b = fh.subscribe("chat-live", &s, None).expect("b subscribes");
-        fh.publish("chat-live", &s, draft("hello"));
+        fh.publish("chat-live", &s, draft("hello"))
+            .expect("the fixture publishes a valid frame");
         assert_eq!(
             a.drain_ready().iter().map(|f| f.seq).collect::<Vec<_>>(),
             vec![1]
@@ -1110,7 +1217,8 @@ mod tests {
         let mut fh = Firehose::new();
         let s = scope("doc:x");
         for _ in 0..5 {
-            fh.publish("kn-ops", &s, draft("op"));
+            fh.publish("kn-ops", &s, draft("op"))
+                .expect("the fixture publishes a valid frame");
         }
         let sub = fh
             .resume("kn-ops", &s, 0)

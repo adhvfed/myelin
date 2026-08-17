@@ -33,8 +33,7 @@ pub enum GatewayError {
     NotReady,
     Unauthenticated(String),
     NotAMember(String),
-    OverBroadScope(FirehoseError),
-    ResyncRequired { last_seq: u64, window_floor: u64 },
+    Firehose(FirehoseError),
     SnapshotFailed(String),
 }
 
@@ -45,16 +44,18 @@ impl core::fmt::Display for GatewayError {
                 f,
                 "gateway not ready - shedding the new connection (liveness != readiness, 1.3)"
             ),
-            GatewayError::Unauthenticated(e) => write!(f, "authenticate refused the credential: {e}"),
-            GatewayError::NotAMember(ch) => {
-                write!(f, "principal is not a member of channel `{ch}` (read gate, fail-closed)")
+            GatewayError::Unauthenticated(e) => {
+                write!(f, "authenticate refused the credential: {e}")
             }
-            GatewayError::OverBroadScope(e) => write!(f, "over-broad subscription scope: {e}"),
-            GatewayError::ResyncRequired { last_seq, window_floor } => write!(
-                f,
-                "resync_required: last_seq={last_seq} older than the retention window (floor={window_floor}) \
-                 → *.snapshot resync (resync_from)"
-            ),
+            GatewayError::NotAMember(ch) => {
+                write!(
+                    f,
+                    "principal is not a member of channel `{ch}` (read gate, fail-closed)"
+                )
+            }
+            GatewayError::Firehose(error) => {
+                write!(f, "live transport refused the request: {error}")
+            }
             GatewayError::SnapshotFailed(e) => write!(f, "resync_from snapshot read failed: {e}"),
         }
     }
@@ -173,7 +174,7 @@ where
         let scope = self.bounded_scope(channel)?;
         self.firehose
             .subscribe(&conn.stream, &scope, cursor)
-            .map_err(GatewayError::OverBroadScope)
+            .map_err(GatewayError::Firehose)
     }
 
     pub fn resume(
@@ -196,10 +197,7 @@ where
             Err(FirehoseError::ResyncRequired { .. } | FirehoseError::TailLimitExceeded) => {
                 self.snapshot_resync(conn, channel, snapshot_cursor, &scope)
             }
-            Err(
-                e @ (FirehoseError::OverBroadScope { .. }
-                | FirehoseError::ScopeLimitExceeded { .. }),
-            ) => Err(GatewayError::OverBroadScope(e)),
+            Err(error) => Err(GatewayError::Firehose(error)),
         }
     }
 
@@ -217,12 +215,12 @@ where
         let sub = self
             .firehose
             .subscribe(&conn.stream, scope, None)
-            .map_err(GatewayError::OverBroadScope)?;
+            .map_err(GatewayError::Firehose)?;
         Ok(ResumeOutcome::Resync { snapshot, sub })
     }
 
     fn bounded_scope(&self, channel: &ConversationId) -> Result<FirehoseScope, GatewayError> {
-        chat_channel_scope(&channel.conversation_id).map_err(GatewayError::OverBroadScope)
+        chat_channel_scope(&channel.conversation_id).map_err(GatewayError::Firehose)
     }
 }
 

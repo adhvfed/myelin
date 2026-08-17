@@ -23,7 +23,8 @@ fn ci_d11_reconnect_mid_run_loses_zero_lines() {
     let mut tail = LiveTail::new(&mut fh, SegmentIndex::default());
     let sub = tail.subscribe(&coord, None).expect("bounded subscribe");
     for i in 1..=4u64 {
-        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")));
+        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
     let seen_before: Vec<u64> = sub.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(
@@ -35,7 +36,8 @@ fn ci_d11_reconnect_mid_run_loses_zero_lines() {
     assert_eq!(last_seq, 4, "the resume cursor at drop time is 4");
 
     for i in 5..=12u64 {
-        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")));
+        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
 
     let mut tail = LiveTail::new(&mut fh, SegmentIndex::default());
@@ -54,7 +56,8 @@ fn ci_d11_reconnect_mid_run_loses_zero_lines() {
         "CI-D11: the gap (4, now] is replayed - ZERO lines lost"
     );
 
-    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-13"));
+    fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new("line-13"))
+        .expect("the fixture publishes a valid frame");
     let live: Vec<u64> = sub2.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(live, vec![13], "live continues gap-free; 0 duplicate");
 
@@ -74,7 +77,8 @@ fn ci_d11_out_of_window_last_seq_falls_back_to_a_range_read() {
     let coord = LogCoord::new("01J0RUN", "01J0JOB", 1);
     let scope = coord.firehose_scope().expect("bounded");
     for i in 1..=12u64 {
-        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")));
+        fh.publish(CI_LOG_STREAM, &scope, FrameDraft::new(format!("line-{i}")))
+            .expect("the fixture publishes a valid frame");
     }
 
     let archive = SegmentIndex::from_rows("01J0RUN", "01J0JOB", &build_archive_rows());
