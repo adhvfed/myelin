@@ -4,6 +4,7 @@ import { DEV_ACCESS_TOKEN, DEV_ISSUE_TARGET } from "../../dev-edge/dev-contract.
 
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 const OPEN_ID = "00000000-0000-4000-8000-000000000102";
+const SECOND_OPEN_ID = "00000000-0000-4000-8000-000000000101";
 
 async function setEdgeConfig(cfg: {
   resetIssues?: boolean;
@@ -15,6 +16,7 @@ async function setEdgeConfig(cfg: {
   issueCreateUnavailable?: boolean;
   issueCreateResponseLosses?: number;
   issueCloseUnavailable?: boolean;
+  issueCloseResponseDelaysMs?: number[];
   emptyProjects?: boolean;
   projectsUnavailable?: boolean;
   projectCreateUnavailable?: boolean;
@@ -411,6 +413,33 @@ test.describe("issue workflows", () => {
     await expect(page.getByTitle("State: Done")).toBeVisible();
     await expect(page.getByRole("button", { name: "Close issue" })).toHaveCount(0);
     await expect(page.getByText("MYL-102 closed")).toBeVisible();
+  });
+
+  test("a late close response stays with the issue that was closed", async ({ page, request }) => {
+    await setEdgeConfig({ issueCloseResponseDelaysMs: [1_500] });
+    await devLogin(page);
+    await gotoInteractive(page, `/issues/${OPEN_ID}`);
+    await page.getByRole("button", { name: "Close issue" }).click();
+    await page.getByRole("alertdialog").getByRole("button", { name: "Close issue" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.issueCloseRequests;
+    }).toBe(1);
+
+    await page.evaluate((id) => {
+      window.history.pushState({}, "", `/issues/${id}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    }, SECOND_OPEN_ID);
+    await page.waitForURL(`**/issues/${SECOND_OPEN_ID}`);
+    await expect(page.getByRole("heading", { name: "Verify encrypted issue titles" })).toBeVisible();
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.issueCloseResponses;
+    }).toBe(1);
+    await expect(page.getByTitle("State: In progress")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Close issue" })).toBeVisible();
+    await expect(page.getByText("MYL-102 closed")).toHaveCount(0);
   });
 
   test("empty, projection-unavailable, and leak-free not-available states stay distinct", async ({ page }) => {

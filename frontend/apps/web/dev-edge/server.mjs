@@ -101,6 +101,9 @@ const state = {
   issueCreateUnavailable: false,
   issueCreateResponseLosses: 0,
   issueCloseUnavailable: false,
+  issueCloseResponseDelaysMs: [],
+  issueCloseRequests: 0,
+  issueCloseResponses: 0,
   emptyProjects: false,
   projectsUnavailable: false,
   projectCreateUnavailable: false,
@@ -241,6 +244,9 @@ function resetIssues() {
   state.issueCreateUnavailable = false;
   state.issueCreateResponseLosses = 0;
   state.issueCloseUnavailable = false;
+  state.issueCloseResponseDelaysMs = [];
+  state.issueCloseRequests = 0;
+  state.issueCloseResponses = 0;
   state.issueListFirstPageHolds = 0;
   state.issueListFirstPageDelaysMs = [];
   state.issueListCursorDelaysMs = [];
@@ -596,6 +602,12 @@ const server = createServer((req, res) => {
           state.issueCreateResponseLosses = body.issueCreateResponseLosses;
         }
         if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
+        if (Array.isArray(body.issueCloseResponseDelaysMs) &&
+            body.issueCloseResponseDelaysMs.length <= 10 &&
+            body.issueCloseResponseDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.issueCloseResponseDelaysMs = [...body.issueCloseResponseDelaysMs];
+        }
         if (typeof body.emptyProjects === "boolean") {
           seedProjectCount(body.emptyProjects ? 0 : 1);
         }
@@ -1186,7 +1198,18 @@ const server = createServer((req, res) => {
       row.version += 1;
       row.updated_at = new Date(Date.parse(row.updated_at) + 1_000).toISOString();
     }
-    return send(res, 200, row);
+    state.issueCloseRequests += 1;
+    const output = structuredClone(row);
+    const delay = state.issueCloseResponseDelaysMs.shift() ?? 0;
+    if (delay > 0) {
+      setTimeout(() => {
+        state.issueCloseResponses += 1;
+        send(res, 200, output);
+      }, delay);
+      return;
+    }
+    state.issueCloseResponses += 1;
+    return send(res, 200, output);
   }
 
   // R3.3 — PR write paths (threads / reviews / merge). Stateful in-memory; the e2e drives these.

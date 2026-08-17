@@ -8,7 +8,7 @@ import {
   StatusPill,
   useToast,
 } from "@myelin/design-system";
-import { ErrorBoundary, Show, Suspense, createMemo, createSignal, onMount } from "solid-js";
+import { ErrorBoundary, Show, Suspense, createEffect, createMemo, createSignal, onMount } from "solid-js";
 import { getIssue, issuesMutate, type IssueErrorKind, type IssueVM } from "~/lib/issue-api";
 import { isClosedCategory, issueErrorKind, issueTimestamp } from "~/lib/issue-view";
 import { CopyArtifactRef } from "~/components/CopyArtifactRef";
@@ -24,14 +24,17 @@ export default function IssueDetail() {
   // SSR can paint before the lazily loaded route chunk hydrates. Keep the destructive control
   // disabled until its click handler exists so an early user click is never silently discarded.
   const [interactive, setInteractive] = createSignal(false);
+  let routeGeneration = 0;
   onMount(() => setInteractive(true));
+  const issueId = () => params.id ?? "";
   const issue = createAsync(async (): Promise<{
     issue: IssueVM | null;
     error: IssueErrorKind | null;
   }> => {
-    if (!params.id) return { issue: null, error: "not-found" };
+    const id = issueId();
+    if (!id) return { issue: null, error: "not-found" };
     try {
-      return { issue: await getIssue(params.id), error: null };
+      return { issue: await getIssue(id), error: null };
     } catch (error) {
       if (error instanceof Response) throw error;
       return { issue: null, error: issueErrorKind(error) };
@@ -39,13 +42,30 @@ export default function IssueDetail() {
   }, { deferStream: true });
   const current = createMemo(() => replacement() ?? issue()?.issue);
 
+  createEffect(() => {
+    issueId();
+    routeGeneration += 1;
+    setReplacement(null);
+    setConfirming(false);
+    setClosing(false);
+    setCloseError(null);
+  });
+
   const close = async () => {
     const row = current();
     if (!row || closing()) return;
+    const generation = routeGeneration;
     setClosing(true);
     setCloseError(null);
     try {
       const result = await mutate({ op: "close", issueId: row.id });
+      if (generation !== routeGeneration || issueId() !== row.id) {
+        if (result.ok && result.op === "close") {
+          void revalidate(getIssue.keyFor(row.id));
+          void revalidate("issues-list");
+        }
+        return;
+      }
       if (!result.ok) {
         setCloseError(result.error);
         setConfirming(false);
@@ -62,10 +82,12 @@ export default function IssueDetail() {
       void revalidate("issues-list");
       toast.show({ title: `${result.issue.key} closed`, variant: "success" });
     } catch {
-      setCloseError("error");
-      setConfirming(false);
+      if (generation === routeGeneration && issueId() === row.id) {
+        setCloseError("error");
+        setConfirming(false);
+      }
     } finally {
-      setClosing(false);
+      if (generation === routeGeneration && issueId() === row.id) setClosing(false);
     }
   };
 
