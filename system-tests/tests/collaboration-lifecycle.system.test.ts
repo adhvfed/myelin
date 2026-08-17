@@ -12,6 +12,7 @@ import {
 import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
+import { awaitAuthorizedIssue } from "../src/issues.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 import type { SystemTestClient } from "../src/client.js";
@@ -53,18 +54,10 @@ async function awaitActiveIssue(title: string): Promise<JsonRecord> {
   const authorization = record(proposed.body.authorization, "issue authorization");
   const requestEventId = string(authorization.request_event_id, "authorization request id");
 
-  return eventually<JsonRecord>(
-    async () => {
-      const response = await systemClient.json(
-        `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
-        { expectedStatus: [200, 202] },
-      );
-      return response.status === 200 ? record(response.body.issue, "active issue") : undefined;
-    },
-    {
-      description: `issue authorization ${requestEventId}`,
-      timeoutMs: 4_000,
-    },
+  return awaitAuthorizedIssue(
+    systemClient,
+    requestEventId,
+    `issue authorization ${requestEventId}`,
   );
 }
 
@@ -1146,13 +1139,11 @@ command = ["true"]
       issue: { id: issue.id, key: issue.key, project_id: projectId },
       authorization: { status: "pending", request_event_id: requestEventId },
     });
-    const activeIssue = await eventually<JsonRecord>(async () => {
-      const response = await systemClient.json(
-        `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
-        { expectedStatus: [200, 202] },
-      );
-      return response.status === 200 ? record(response.body.issue, "active first project issue") : undefined;
-    }, { description: "the first project issue to become ordinary visible work" });
+    const activeIssue = await awaitAuthorizedIssue(
+      systemClient,
+      requestEventId,
+      "the first project issue to become ordinary visible work",
+    );
     expect(activeIssue).toMatchObject({
       id: issue.id,
       project_id: projectId,
@@ -1754,20 +1745,10 @@ command = ["true"]
     expect(summary.key).toMatch(/^MYL-\d+$/);
     expect(authorization.status).toBe("pending");
 
-    const active = await eventually<JsonRecord>(
-      async () => {
-        const response = await systemClient.json(
-          `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
-          { expectedStatus: [200, 202] },
-        );
-        if (response.status === 202) {
-          expect(response.body.status).toBe("pending");
-          return undefined;
-        }
-        expect(response.body.status).toBe("active");
-        return record(response.body.issue, "active issue");
-      },
-      { description: `issue authorization ${requestEventId}` },
+    const active = await awaitAuthorizedIssue(
+      systemClient,
+      requestEventId,
+      `issue authorization ${requestEventId}`,
     );
     expect(active).toMatchObject({ id: issueId, title, state_category: "unstarted" });
 

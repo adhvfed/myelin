@@ -10,6 +10,7 @@ import { describe, expect, test } from "vitest";
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { gitRepositoryUrl, systemTestConfig } from "../src/config.js";
 import { eventually } from "../src/eventually.js";
+import { awaitAuthorizedIssue } from "../src/issues.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
@@ -1375,17 +1376,10 @@ describe("the CLI authentication journey", () => {
         project: createdProject.project.id,
       });
 
-      const activeIssue = await eventually<JsonRecord>(
-        async () => {
-          const response = await systemClient.json(
-            `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
-            { expectedStatus: [200, 202] },
-          );
-          return response.status === 200
-            ? record(response.body.issue, "authorized CLI issue")
-            : undefined;
-        },
-        { description: `authorization for CLI issue ${issueKey}` },
+      const activeIssue = await awaitAuthorizedIssue(
+        systemClient,
+        requestEventId,
+        `authorization for CLI issue ${issueKey}`,
       );
       expect(activeIssue).toMatchObject({ id: issueId, key: issueKey, title: contextualIssueTitle });
 

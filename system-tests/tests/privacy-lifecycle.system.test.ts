@@ -6,6 +6,7 @@ import { systemTestConfig } from "../src/config.js";
 import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/context.js";
 import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
+import { awaitAuthorizedIssue } from "../src/issues.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import type { SystemTestClient } from "../src/client.js";
 
@@ -29,13 +30,11 @@ async function createVisibleIssue(
   const authorization = record(proposed.body.authorization, "issue authorization");
   const requestEventId = string(authorization.request_event_id, "authorization request id");
 
-  return eventually<JsonRecord>(async () => {
-    const response = await person.json(
-      `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
-      { expectedStatus: [200, 202] },
-    );
-    return response.status === 200 ? record(response.body.issue, "visible issue") : undefined;
-  }, { description: `the privacy test issue ${requestEventId} to become visible` });
+  return awaitAuthorizedIssue(
+    person,
+    requestEventId,
+    `the privacy test issue ${requestEventId} to become visible`,
+  );
 }
 
 function issueChange(
