@@ -185,7 +185,7 @@ pub struct CiRunFinalizationJob {
     pub job_id: String,
     pub reserve_handle: String,
     pub flow_timed_out: bool,
-    pub dispatched: bool,
+    pub flow_dispatched: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,7 +406,7 @@ impl CiRunFinalizer for DurableCiRunFinalizer {
                 {
                     return Err(CiRunStoreError::FinalizationManifestDivergence);
                 }
-                for job in finalization.jobs.iter().filter(|job| !job.dispatched) {
+                for job in finalization.jobs.iter().filter(|job| !job.flow_dispatched) {
                     let refunded = ledger
                         .cancel_unstarted_in_tx(
                             conn,
@@ -729,7 +729,10 @@ async fn finalize_on_conn(
         if job.reserve_handle != reserve_handle {
             return Err(CiRunStoreError::TerminalAccountingDivergence);
         }
-        if row.get::<bool, _>("skipped") == job.dispatched {
+        let skipped = row.get::<bool, _>("skipped");
+        if (!job.flow_dispatched && !skipped)
+            || (job.flow_dispatched && !job.flow_timed_out && skipped)
+        {
             return Err(CiRunStoreError::TerminalAccountingDivergence);
         }
         all_passed &= row.get::<bool, _>("passed");
@@ -868,7 +871,7 @@ fn validate_finalization(finalization: &CiRunFinalization) -> Result<(), CiRunSt
                 "duplicate reserve handle",
             ));
         }
-        if job.flow_timed_out && !job.dispatched {
+        if job.flow_timed_out && !job.flow_dispatched {
             return Err(CiRunStoreError::InvalidFinalization(
                 "timed-out undispatched job",
             ));
@@ -1260,7 +1263,7 @@ mod tests {
                 job_id: "55555555-5555-5555-5555-555555555555".into(),
                 reserve_handle: "reserve:job-1".into(),
                 flow_timed_out: false,
-                dispatched: true,
+                flow_dispatched: true,
             }],
         }
     }
@@ -1480,7 +1483,7 @@ mod tests {
             job_id: "66666666-6666-6666-6666-666666666666".into(),
             reserve_handle: duplicate_reserve.jobs[0].reserve_handle.clone(),
             flow_timed_out: false,
-            dispatched: true,
+            flow_dispatched: true,
         });
         assert_eq!(
             validate_finalization(&duplicate_reserve),

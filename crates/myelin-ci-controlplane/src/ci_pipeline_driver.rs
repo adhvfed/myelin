@@ -1326,10 +1326,14 @@ async fn settle_ci_job_surface_on_conn(
         surface.disposition,
         Some(CiJobTerminalDisposition::Preparation(_))
     );
-    let state = if !preparation && surface.report.passed && !surface.report.timed_out {
-        "succeeded"
-    } else {
-        "failed"
+    let state = match surface.disposition {
+        Some(
+            CiJobTerminalDisposition::SkippedBeforeStart
+            | CiJobTerminalDisposition::CancelledDuringPreparation
+            | CiJobTerminalDisposition::CancelledAfterWorkloadLaunch,
+        ) => "cancelled",
+        _ if !preparation && surface.report.passed && !surface.report.timed_out => "succeeded",
+        _ => "failed",
     };
     let summary = terminal_result_summary(surface.report, surface.disposition, surface.diagnostic)?;
     let state_predicate = if preparation {
@@ -1361,6 +1365,45 @@ async fn settle_ci_job_surface_on_conn(
     } else {
         Err(CompletionTxError::Refused)
     }
+}
+
+pub(crate) async fn settle_cancelled_ci_job_surface_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant: &TenantId,
+    region: &Region,
+    ci_run_id: &str,
+    job_id: &str,
+    disposition: CiJobTerminalDisposition,
+) -> Result<(), CompletionTxError> {
+    if !matches!(
+        disposition,
+        CiJobTerminalDisposition::SkippedBeforeStart
+            | CiJobTerminalDisposition::CancelledDuringPreparation
+            | CiJobTerminalDisposition::CancelledAfterWorkloadLaunch
+    ) {
+        return Err(CompletionTxError::Refused);
+    }
+    settle_ci_job_surface_on_conn(
+        conn,
+        tenant,
+        region,
+        ci_run_id,
+        job_id,
+        TerminalSurfaceInput {
+            report: &TerminalReport {
+                passed: false,
+                timed_out: false,
+                usage: ResourceUsage {
+                    cpu_seconds: 0,
+                    mem_byte_seconds: 0,
+                },
+                result_refs: Vec::new(),
+            },
+            disposition: Some(disposition),
+            diagnostic: None,
+        },
+    )
+    .await
 }
 
 fn terminal_result_summary(

@@ -36,7 +36,7 @@ use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{
     migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, MicroUsd,
-    PgFlowExecutor, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
+    PgFlowDriveStore, PgFlowExecutor, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{
@@ -100,6 +100,38 @@ async fn isolated_pool(schema: &str) -> PgPool {
         .connect(&admin_url())
         .await
         .expect("connect to live development PostgreSQL")
+}
+
+async fn apply_accounting_migrations(pool: &PgPool, schema: &str) {
+    PgMigrator::apply(pool, &foundation_migrations())
+        .await
+        .unwrap();
+    PgMigrator::apply(pool, &identity_durable_migrations())
+        .await
+        .unwrap();
+    PgMigrator::apply(pool, &cell_root_durable_migrations())
+        .await
+        .unwrap();
+    PgMigrator::apply_validated(
+        pool,
+        &flow_migrations(),
+        &HotTables::declare(["workflow_run"]),
+    )
+    .await
+    .unwrap();
+    PgMigrator::apply(pool, &reserve_settle_durable_migrations())
+        .await
+        .unwrap();
+    common::with_fixture_migration_lock(&admin_url(), pool, schema, || async {
+        PgMigrator::apply_validated(
+            pool,
+            &ci_controlplane_migrations(),
+            &ci_controlplane_hot_tables(),
+        )
+        .await
+        .unwrap();
+    })
+    .await;
 }
 
 async fn tagged_isolated_pool(schema: &str, application_name: &str) -> PgPool {
@@ -548,35 +580,7 @@ async fn run_reporter_scenario(
         &schema_for_cleanup,
         move || async move {
     let pool = isolated_pool(&schema).await;
-    PgMigrator::apply(&pool, &foundation_migrations())
-        .await
-        .unwrap();
-    PgMigrator::apply(&pool, &identity_durable_migrations())
-        .await
-        .unwrap();
-    PgMigrator::apply(&pool, &cell_root_durable_migrations())
-        .await
-        .unwrap();
-    PgMigrator::apply_validated(
-        &pool,
-        &flow_migrations(),
-        &HotTables::declare(["workflow_run"]),
-    )
-    .await
-    .unwrap();
-    PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
-        .await
-        .unwrap();
-    common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
-        PgMigrator::apply_validated(
-            &pool,
-            &ci_controlplane_migrations(),
-            &ci_controlplane_hot_tables(),
-        )
-        .await
-        .unwrap();
-    })
-    .await;
+    apply_accounting_migrations(&pool, &schema).await;
 
     let tenant = TenantId::from_token("accounting-tenant");
     let region = Region::new("fr-par");
@@ -3414,13 +3418,13 @@ async fn run_reporter_scenario(
                 job_id: job.into(),
                 reserve_handle: reserve_handle.clone(),
                 flow_timed_out: false,
-                dispatched: true,
+                flow_dispatched: true,
             },
             CiRunFinalizationJob {
                 job_id: skipped_job.into(),
                 reserve_handle: "reserve:skipped-live".into(),
                 flow_timed_out: false,
-                dispatched: false,
+                flow_dispatched: false,
             },
         ],
     };
@@ -3798,6 +3802,336 @@ async fn retry_and_supersession_are_safe_in_both_commit_orders() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unstarted_job_timeout_retires_its_reservation_and_wakes_its_pipeline() {
+    let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
+    let schema = format!("ci_accounting_{}_queued_timeout", std::process::id());
+    let bootstrap = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url())
+        .await
+        .expect("connect to create the isolated queued-timeout schema");
+    bootstrap
+        .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+        .await
+        .unwrap();
+    bootstrap
+        .execute(format!("CREATE SCHEMA {schema}").as_str())
+        .await
+        .unwrap();
+    let cleanup_bootstrap = bootstrap.clone();
+    let schema_for_cleanup = schema.clone();
+    with_schema_cleanup(
+        &cleanup_bootstrap,
+        &schema_for_cleanup,
+        move || async move {
+            let pool = isolated_pool(&schema).await;
+            apply_accounting_migrations(&pool, &schema).await;
+
+            let tenant = TenantId::from_token("queued-timeout-tenant");
+            let region = Region::new("fr-par");
+            let wf_run = "11111111-1111-8111-8111-111111111111";
+            let ci_run = "22222222-2222-8222-8222-222222222222";
+            let job = "33333333-3333-8333-8333-333333333333";
+            let omitted_job = "77777777-7777-8777-8777-777777777777";
+            let reservation = OPERATIONAL_RESERVE_HANDLE;
+            let ci_runs = ci_run_store_factory(pool.clone());
+            ci_runs
+                .insert_ci_run(&CiRunInsert {
+                    tenant_id: tenant.0.clone(),
+                    region: region.0.clone(),
+                    run_id: ci_run.into(),
+                    project_id: "55555555-5555-8555-8555-555555555555".into(),
+                    pipeline_id: "66666666-6666-8666-8666-666666666666".into(),
+                    wf_run_id: wf_run.into(),
+                    definition_snapshot: format!("blake3:{}", "a".repeat(64)),
+                    trigger_kind: "push".into(),
+                    concurrency_group: None,
+                    pr_head_generation: None,
+                    trust_tier: "trusted".into(),
+                    state: "queued".into(),
+                    correlation_id: "queued-timeout".into(),
+                    cause_event_id: Some("trigger-queued-timeout".into()),
+                    cause_depth: 0,
+                    caused_by: None,
+                    repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
+                    source_ref: Some("refs/heads/main".into()),
+                    commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
+                    triggered_by: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid",
+            )
+            .bind(&tenant.0)
+            .bind(ci_run)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let production_definition = ci_manifest_pipeline_definition().unwrap();
+            let mut drive_manifest = manifest(
+                &tenant.0,
+                &region.0,
+                wf_run,
+                ci_run,
+                job,
+                omitted_job,
+                production_definition.code_hash(),
+            );
+            drive_manifest.jobs.truncate(1);
+            drive_manifest.check_attempts.remove("package");
+            let manifest_store =
+                CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
+            let manifest_digest = manifest_store.insert(&drive_manifest).await.unwrap();
+            sqlx::query(
+                "INSERT INTO ci_job
+             (tenant_id,region,job_id,run_id,stage,name,needs,spec_ref,state,attempt)
+             VALUES ($1,$2,$3::uuid,$4::uuid,'build','build','{}'::uuid[],$5,'queued',1)",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(job)
+            .bind(ci_run)
+            .bind(format!("myelin://{}/ci/job-spec/{job}", tenant.0))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
+             VALUES ($1, $2, $3, $4, 'inflight')",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(reservation)
+            .bind(i64::try_from(TEST_RESERVATION_MICRO_USD).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let mut config = MyelinConfig::dev();
+            config.database_url = scoped_url(&admin_url(), &schema);
+            config.region = region.0.clone();
+            let provider = SubstrateProvider::connect(config, 4).await.unwrap();
+            let ledger = DurableCostLedger::new(provider.clone());
+            let runtime = ci_production_runtime_factory_test_support(
+                pool.clone(),
+                region.clone(),
+                ledger.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            let partition = partition_for_run_id(wf_run);
+            let _definition_registration = runtime
+                .worker_for(tenant.clone(), partition, "queued-timeout-definition")
+                .unwrap();
+            let mut poller = runtime
+                .workflow_poller(
+                    ci_region_run_discovery_test_support(pool.clone()),
+                    "queued-timeout-poller",
+                )
+                .unwrap();
+            let executor = PgFlowExecutor::new(
+                pool.clone(),
+                tokio::runtime::Handle::current(),
+                Arc::new(MonotonicMinter::new()),
+                tenant.clone(),
+                region.clone(),
+            );
+            tokio::task::block_in_place(|| {
+                executor
+                    .start_with_id(
+                        StartSpec {
+                            wf_type: CI_PIPELINE_WF_TYPE.into(),
+                            input: vec![
+                                ci_artifact_ref(
+                                    &tenant.0,
+                                    &format!("drive-manifest-{manifest_digest}"),
+                                )
+                                .unwrap(),
+                                ci_run_ref(&tenant.0, ci_run).unwrap(),
+                            ],
+                            budget: None,
+                            idem_key: "queued-timeout".into(),
+                        },
+                        Some(RunId(wf_run.into())),
+                    )
+                    .unwrap();
+            });
+
+            let (started_at, started_stamp) = drive_clock(&pool).await;
+            assert_eq!(
+                poller
+                    .run_once(8, 8, started_at, &started_stamp)
+                    .await
+                    .unwrap()
+                    .driven,
+                1
+            );
+            let (idem_token, queue_state): (String, String) = sqlx::query_as(
+                "SELECT idem_token, state FROM job_queue
+             WHERE tenant_id = $1 AND job_id = $2::uuid",
+            )
+            .bind(&tenant.0)
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(queue_state, "queued", "no runner ever claims this job");
+
+            let deadline: i64 = sqlx::query_scalar(
+                "SELECT EXTRACT(EPOCH FROM fire_at)::bigint FROM wf_timer
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(wf_run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let drive_store = PgFlowDriveStore::new(pool.clone(), tenant.clone(), region.clone());
+            drive_store
+                .fire_due_timer(partition, deadline)
+                .await
+                .unwrap()
+                .expect("the unclaimed job deadline wakes its parked pipeline");
+            assert_eq!(
+                poller
+                    .run_once(8, 8, deadline + 1, "2026-07-21T13:01:01.000000Z")
+                    .await
+                    .unwrap()
+                    .driven,
+                1
+            );
+            let late_wait: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM wf_history
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3
+               AND kind = 'signal_waited'
+               AND result @> jsonb_build_array($4::text)",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(wf_run)
+            .bind(format!("myelin://flow/wait-idem/{idem_token}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                late_wait, 1,
+                "money truth is durably waiting for one receipt"
+            );
+
+            let labels: Vec<String> = LINUX_SMALL_V1_RUNNER_LABELS
+                .iter()
+                .map(|label| (*label).to_owned())
+                .collect();
+            let region_store = ci_region_queue_store_test_support(pool.clone());
+            let lease = region_store
+                .claim(
+                    &region.0,
+                    &labels,
+                    &[TrustTier::Trusted],
+                    "runner-that-arrived-after-the-deadline",
+                    CI_RUNNER_EXECUTION_LEASE_TTL_SECS as u64,
+                )
+                .await
+                .unwrap()
+                .expect("a restart can lease stale work before the reaper's first sweep");
+            assert_eq!(lease.job_id.to_string(), job);
+
+            let reaper = JobQueueReaper::new(
+                region_store,
+                region.0.clone(),
+                std::time::Duration::from_secs(15),
+            )
+            .with_cancelled_accounting(pool.clone(), ledger);
+            assert_eq!(
+                reaper.reap_once().await.unwrap(),
+                1,
+                "the exact late-accounting wait retires its unstarted leased row"
+            );
+            assert_eq!(
+                poller
+                    .run_once(8, 8, deadline + 2, "2026-07-21T13:01:02.000000Z")
+                    .await
+                    .unwrap()
+                    .driven,
+                1,
+                "the synthetic typed receipt wakes and completes the same pipeline"
+            );
+
+            let lifecycle: (String, bool, String, String, String) = sqlx::query_as(
+                "SELECT c.state, c.cost_settled, w.state, q.state, j.state
+             FROM ci_run c
+             JOIN workflow_run w
+               ON w.tenant_id = c.tenant_id AND w.region = c.region
+              AND w.run_id = c.wf_run_id::text
+             JOIN job_queue q
+               ON q.tenant_id = c.tenant_id AND q.region = c.region
+              AND q.run_id = c.wf_run_id
+             JOIN ci_job j
+               ON j.tenant_id = c.tenant_id AND j.region = c.region
+              AND j.run_id = c.run_id
+             WHERE c.tenant_id = $1 AND c.run_id = $2::uuid",
+            )
+            .bind(&tenant.0)
+            .bind(ci_run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                lifecycle,
+                (
+                    "timed_out".into(),
+                    true,
+                    "completed".into(),
+                    "terminal".into(),
+                    "cancelled".into(),
+                )
+            );
+            let accounting: (bool, bool, bool, i64, i64) = sqlx::query_as(
+                "SELECT passed, timed_out, skipped, billed_minor_units, refunded_minor_units
+             FROM ci_job_accounting WHERE tenant_id = $1 AND job_id = $2::uuid",
+            )
+            .bind(&tenant.0)
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                accounting,
+                (
+                    false,
+                    false,
+                    true,
+                    0,
+                    i64::try_from(TEST_RESERVATION_MICRO_USD).unwrap(),
+                ),
+                "an unstarted job costs nothing and returns its entire reservation"
+            );
+            let signal: (i64, i64) = sqlx::query_as(
+                "SELECT count(*), count(*) FILTER (WHERE consumed_seq IS NOT NULL)
+             FROM wf_signal WHERE tenant_id = $1 AND run_id = $2 AND idem_key = $3",
+            )
+            .bind(&tenant.0)
+            .bind(wf_run)
+            .bind(&idem_token)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(signal, (1, 1), "one receipt is buffered and consumed once");
+            assert_eq!(
+                reaper.reap_once().await.unwrap(),
+                0,
+                "recovery replay has no second settlement, signal, or state change"
+            );
+            drop(pool);
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn normal_completion_and_existing_accounting_replay_include_prelaunch_usage_once() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
     run_reporter_scenario(false, false, false, true, false, None).await;
@@ -4101,35 +4435,7 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
         &schema_for_cleanup,
         move || async move {
             let pool = isolated_pool(&schema).await;
-            PgMigrator::apply(&pool, &foundation_migrations())
-                .await
-                .unwrap();
-            PgMigrator::apply(&pool, &identity_durable_migrations())
-                .await
-                .unwrap();
-            PgMigrator::apply(&pool, &cell_root_durable_migrations())
-                .await
-                .unwrap();
-            PgMigrator::apply_validated(
-                &pool,
-                &flow_migrations(),
-                &HotTables::declare(["workflow_run"]),
-            )
-            .await
-            .unwrap();
-            PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
-                .await
-                .unwrap();
-            common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
-                PgMigrator::apply_validated(
-                    &pool,
-                    &ci_controlplane_migrations(),
-                    &ci_controlplane_hot_tables(),
-                )
-                .await
-                .unwrap();
-            })
-            .await;
+            apply_accounting_migrations(&pool, &schema).await;
 
             let tenant = TenantId::from_token("accounting-v2-tenant");
             let region = Region::new("fr-par");
@@ -4203,6 +4509,19 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
             drive_manifest.check_attempts.remove("package");
             drive_manifest.jobs[0].reserve_handle = v2_reserve_handle.clone();
             manifest_store.insert(&drive_manifest).await.unwrap();
+            sqlx::query(
+                "INSERT INTO ci_job
+             (tenant_id,region,job_id,run_id,stage,name,needs,spec_ref,state,attempt)
+             VALUES ($1,$2,$3::uuid,$4::uuid,'build','build','{}'::uuid[],$5,'queued',1)",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(job)
+            .bind(ci_run)
+            .bind(format!("myelin://{}/ci/job-spec/{job}", tenant.0))
+            .execute(&pool)
+            .await
+            .unwrap();
 
             sqlx::query(
                 "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
@@ -4238,8 +4557,9 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
                  settlement, not the pre-slice Settlement refusal",
                 );
 
-            let accounting: (bool, i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT skipped, cpu_seconds, mem_byte_seconds, billed_minor_units, refunded_minor_units
+            let accounting: (bool, i64, i64, i64, i64, String) = sqlx::query_as(
+            "SELECT skipped, cpu_seconds, mem_byte_seconds, billed_minor_units, refunded_minor_units,
+                    (SELECT state FROM ci_job WHERE job_id = $1::uuid)
              FROM ci_job_accounting WHERE job_id = $1::uuid",
         )
         .bind(job)
@@ -4253,9 +4573,10 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
                     0,
                     0,
                     0,
-                    i64::try_from(TEST_RESERVATION_MICRO_USD).unwrap()
+                    i64::try_from(TEST_RESERVATION_MICRO_USD).unwrap(),
+                    "cancelled".into(),
                 ),
-                "the never-launched v2-reserved job settles a full refund, same as the v1 shape"
+                "the never-launched v2-reserved job is cancelled with a full refund"
             );
             let reservation_state: String =
                 sqlx::query_scalar("SELECT state FROM cost_reservation WHERE run_id = $1")

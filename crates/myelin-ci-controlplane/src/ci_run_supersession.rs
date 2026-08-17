@@ -8,7 +8,9 @@ use myelin_events::{
     CorrelationId, DataRole, EmitContext, EventDraft, EventId, EventType, MonotonicMinter,
     PersistedEventCause, Timestamp, Visibility,
 };
-use myelin_flow::{CancelOnConnOutcome, PgFlowExecutor, RunId};
+use myelin_flow::{
+    CancelOnConnOutcome, PgFlowExecutor, RunId, SignalPayload, TypedSignalSpec, JOB_DONE_SIGNAL,
+};
 use myelin_identity::{
     DataRole as IdentityDataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
 };
@@ -19,9 +21,10 @@ use sqlx::Row;
 
 use crate::ci_pipeline_driver::{
     checked_accounting_usage, checked_add_accounting_usage, close_cancelled_run_if_accounted,
-    decode_retry_attempt_usage, priced_cost_rows, validate_reservation_pricing_policy,
-    CiUsageAggregationError, DurableCiJobAccounting, TIER_P_OPERATIONAL_PRICING_REVISION,
-    TIER_P_OPERATIONAL_RESERVATION_PREFIX, TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
+    decode_retry_attempt_usage, priced_cost_rows, settle_cancelled_ci_job_surface_on_conn,
+    validate_reservation_pricing_policy, CiUsageAggregationError, DurableCiJobAccounting,
+    TIER_P_OPERATIONAL_PRICING_REVISION, TIER_P_OPERATIONAL_RESERVATION_PREFIX,
+    TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX,
 };
 use crate::ci_prelaunch_usage_journal::{
     resolve_prelaunch_usage_on_conn, CiPrelaunchParentExpectation, CiPrelaunchSettlementIdentity,
@@ -899,6 +902,16 @@ impl PgCiRunSupersession {
             )
             .await
             .map_err(|_| CiRunSupersessionError::Accounting)?;
+        settle_cancelled_ci_job_surface_on_conn(
+            conn,
+            &self.tenant,
+            &self.region,
+            &manifest.ci_run_id,
+            &job.job_id,
+            disposition,
+        )
+        .await
+        .map_err(|_| CiRunSupersessionError::Accounting)?;
         Ok(())
     }
 
@@ -940,6 +953,191 @@ impl PgCiRunSupersession {
             },
         )
         .await
+    }
+
+    pub async fn reconcile_timed_out_prelaunch_job(
+        &self,
+        wf_run_id: &str,
+        job_id: &str,
+    ) -> Result<bool, CiRunSupersessionError> {
+        let wf_run_id = wf_run_id.to_owned();
+        let job_id = job_id.to_owned();
+        let authority = self.clone();
+        myelin_storage::with_tenant_tx_error(
+            &self.pool,
+            &self.tenant.0,
+            &self.region.0,
+            move |conn| {
+                Box::pin(async move {
+                    authority
+                        .reconcile_timed_out_prelaunch_job_on_conn(conn, &wf_run_id, &job_id)
+                        .await
+                })
+            },
+        )
+        .await
+    }
+
+    async fn reconcile_timed_out_prelaunch_job_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        wf_run_id: &str,
+        job_id: &str,
+    ) -> Result<bool, CiRunSupersessionError> {
+        let job_uuid = sqlx::types::Uuid::parse_str(job_id)
+            .map_err(|_| CiRunSupersessionError::CorruptState("prelaunch job id is invalid"))?;
+        let lifecycle = sqlx::query(
+            "SELECT w.state AS workflow_state, c.state AS ci_state
+             FROM workflow_run w
+             JOIN ci_run c
+               ON c.tenant_id = w.tenant_id AND c.region = w.region
+              AND c.wf_run_id = w.run_id::uuid
+             WHERE w.tenant_id = $1 AND w.region = $2 AND w.run_id = $3
+             FOR UPDATE OF w, c",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(wf_run_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("lock timed-out prelaunch workflow"))?;
+        let Some(lifecycle) = lifecycle else {
+            return Ok(false);
+        };
+        if lifecycle.get::<String, _>("workflow_state") != "waiting"
+            || lifecycle.get::<String, _>("ci_state") != "running"
+        {
+            return Ok(false);
+        }
+
+        let queue = sqlx::query(
+            "SELECT idem_token, stage, retry_attempts
+             FROM job_queue
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3
+               AND run_id = $4::uuid AND state IN ('queued', 'leased')
+             FOR UPDATE",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(job_uuid)
+        .bind(wf_run_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("lock timed-out prelaunch job"))?;
+        let Some(queue) = queue else {
+            return Ok(false);
+        };
+        let idem_token: String = queue.get("idem_token");
+        let stage: String =
+            queue
+                .get::<Option<String>, _>("stage")
+                .ok_or(CiRunSupersessionError::CorruptState(
+                    "prelaunch job has no concrete stage",
+                ))?;
+        let wait_idem = format!("myelin://flow/wait-idem/{idem_token}");
+        let late_accounting_wait: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+               SELECT 1
+               FROM wf_history h
+               WHERE h.tenant_id = $1 AND h.region = $2 AND h.run_id = $3
+                 AND h.kind = 'signal_waited'
+                 AND h.result @> jsonb_build_array($4::text)
+                 AND h.result @> '[\"myelin://flow/wait-name/job.done\"]'::jsonb
+                 AND NOT EXISTS (
+                   SELECT 1 FROM jsonb_array_elements_text(h.result) marker(value)
+                   WHERE marker.value LIKE 'myelin://flow/wait-deadline/%'
+                 )
+             ) AND EXISTS (
+               SELECT 1
+               FROM wf_history timeout
+               WHERE timeout.tenant_id = $1 AND timeout.region = $2 AND timeout.run_id = $3
+                 AND timeout.kind = 'signal_received'
+                 AND timeout.result @> jsonb_build_array(
+                       'myelin://flow/signal-idem/wait:timeout'::text,
+                       'myelin://flow/signal-name/job.done'::text
+                     )
+             )",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(wf_run_id)
+        .bind(wait_idem)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("verify late accounting wait"))?;
+        if !late_accounting_wait {
+            return Ok(false);
+        }
+
+        let retry_usage =
+            decode_retry_attempt_usage(queue.get("retry_attempts")).map_err(|_| {
+                CiRunSupersessionError::CorruptState("prelaunch job retry accrual is malformed")
+            })?;
+        let (manifest, _) = self
+            .manifest
+            .load_by_wf_run_on_conn(conn, wf_run_id)
+            .await
+            .map_err(|_| CiRunSupersessionError::Manifest)?
+            .ok_or(CiRunSupersessionError::Manifest)?;
+        let job = manifest
+            .jobs
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .ok_or(CiRunSupersessionError::CorruptState(
+                "prelaunch job is absent from its immutable manifest",
+            ))?;
+        if job.name != stage {
+            return Err(CiRunSupersessionError::CorruptState(
+                "prelaunch stage disagrees with its immutable manifest",
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE job_queue
+             SET state = 'terminal', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
+             WHERE tenant_id = $1 AND region = $2 AND job_id = $3
+               AND run_id = $4::uuid AND state IN ('queued', 'leased')",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(job_uuid)
+        .bind(wf_run_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|_| CiRunSupersessionError::Database("terminalize timed-out prelaunch job"))?;
+        if updated.rows_affected() != 1 {
+            return Err(CiRunSupersessionError::CorruptState(
+                "timed-out prelaunch job lost its locked generation",
+            ));
+        }
+        self.settle_cancelled_job(
+            conn,
+            &manifest,
+            job,
+            retry_usage.unwrap_or(ResourceUsage {
+                cpu_seconds: 0,
+                mem_byte_seconds: 0,
+            }),
+            retry_usage.is_none(),
+        )
+        .await?;
+        self.executor
+            .signal_typed_on_conn(
+                conn,
+                TypedSignalSpec {
+                    run: RunId(wf_run_id.to_owned()),
+                    signal_name: JOB_DONE_SIGNAL.into(),
+                    idem_key: idem_token,
+                    payload: SignalPayload::CiJobDone {
+                        stage,
+                        passed: false,
+                        result_refs: Vec::new(),
+                    },
+                    payload_key_ref: None,
+                },
+            )
+            .await
+            .map_err(|_| CiRunSupersessionError::Workflow)?;
+        Ok(true)
     }
 
     async fn reconcile_abandoned_job_on_conn(

@@ -938,7 +938,8 @@ pub struct JobQueueReaper {
     region: String,
     interval: Duration,
     cancelled_accounting: Option<(sqlx::PgPool, myelin_storage::DurableCostLedger)>,
-    cancelled_cursor: std::sync::Mutex<Option<crate::job_queue_region::AbandonedCancelledCursor>>,
+    cancelled_cursor: std::sync::Mutex<Option<crate::job_queue_region::RecoveryCursor>>,
+    timed_out_cursor: std::sync::Mutex<Option<crate::job_queue_region::RecoveryCursor>>,
 }
 
 impl JobQueueReaper {
@@ -953,6 +954,7 @@ impl JobQueueReaper {
             interval,
             cancelled_accounting: None,
             cancelled_cursor: std::sync::Mutex::new(None),
+            timed_out_cursor: std::sync::Mutex::new(None),
         }
     }
 
@@ -1016,12 +1018,12 @@ impl JobQueueReaper {
             candidates = self.store.abandoned_cancelled(&self.region, None).await?;
         }
         let next_cursor =
-            candidates.last().map(
-                |candidate| crate::job_queue_region::AbandonedCancelledCursor {
+            candidates
+                .last()
+                .map(|candidate| crate::job_queue_region::RecoveryCursor {
                     tenant_id: candidate.tenant_id.clone(),
                     job_id: candidate.job_id.clone(),
-                },
-            );
+                });
         *self.cancelled_cursor.lock().map_err(|_| {
             JobQueueStoreError::Db("cancelled-recovery cursor lock poisoned".into())
         })? = next_cursor;
@@ -1056,12 +1058,69 @@ impl JobQueueReaper {
                 }
             }
         }
+        let after = self
+            .timed_out_cursor
+            .lock()
+            .map_err(|_| JobQueueStoreError::Db("timed-out recovery cursor lock poisoned".into()))?
+            .clone();
+        let mut prelaunch = self
+            .store
+            .active_prelaunch(&self.region, after.as_ref())
+            .await?;
+        if prelaunch.is_empty() && after.is_some() {
+            prelaunch = self.store.active_prelaunch(&self.region, None).await?;
+        }
+        let next_cursor =
+            prelaunch
+                .last()
+                .map(|candidate| crate::job_queue_region::RecoveryCursor {
+                    tenant_id: candidate.tenant_id.clone(),
+                    job_id: candidate.job_id.clone(),
+                });
+        *self.timed_out_cursor.lock().map_err(|_| {
+            JobQueueStoreError::Db("timed-out recovery cursor lock poisoned".into())
+        })? = next_cursor;
+        let mut timed_out_failures = 0_u64;
+        for candidate in prelaunch {
+            let authority = match crate::PgCiRunSupersession::new(
+                pool.clone(),
+                ledger.clone(),
+                myelin_tenancy::TenantId(candidate.tenant_id),
+                myelin_tenancy::Region(self.region.clone()),
+                tokio::runtime::Handle::current(),
+            ) {
+                Ok(authority) => authority,
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    timed_out_failures = timed_out_failures.saturating_add(1);
+                    first_failure.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+            };
+            match authority
+                .reconcile_timed_out_prelaunch_job(&candidate.wf_run_id, &candidate.job_id)
+                .await
+            {
+                Ok(true) => changed = changed.saturating_add(1),
+                Ok(false) => {}
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    timed_out_failures = timed_out_failures.saturating_add(1);
+                    first_failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
         if failures > 0 {
             let first = first_failure.unwrap_or_else(|| "unknown reconciliation failure".into());
-            return if failures == cancelled_failures {
+            return if failures == cancelled_failures && timed_out_failures == 0 {
                 Err(JobQueueStoreError::Db(format!(
                     "{cancelled_failures} cancelled recovery candidate(s) failed after {changed} \
                      row(s) were recovered; first failure: {first}"
+                )))
+            } else if failures == timed_out_failures && cancelled_failures == 0 {
+                Err(JobQueueStoreError::Db(format!(
+                    "{timed_out_failures} timed-out prelaunch recovery candidate(s) failed after \
+                     {changed} row(s) were recovered; first failure: {first}"
                 )))
             } else {
                 Err(JobQueueStoreError::Db(format!(
@@ -1080,8 +1139,9 @@ impl JobQueueReaper {
                 Ok(0) => {}
                 Ok(n) => {
                     eprintln!(
-                        "ci-controlplane reaper: recovered {n} expired lease(s) in region \
-                         `{}` (prelaunch sealing, active requeue, or cancelled settlement)",
+                        "ci-controlplane reaper: reconciled {n} CI lifecycle row(s) in region \
+                         `{}` (prelaunch sealing, active requeue, timeout retirement, or \
+                         cancelled settlement)",
                         self.region
                     );
                 }
@@ -1113,8 +1173,9 @@ impl JobQueueReaper {
                         Ok(0) => {}
                         Ok(n) => {
                             eprintln!(
-                                "ci-controlplane reaper: recovered {n} expired lease(s) in region \
-                                 `{}` (prelaunch sealing, active requeue, or cancelled settlement)",
+                                "ci-controlplane reaper: reconciled {n} CI lifecycle row(s) in \
+                                 region `{}` (prelaunch sealing, active requeue, timeout \
+                                 retirement, or cancelled settlement)",
                                 self.region
                             );
                         }

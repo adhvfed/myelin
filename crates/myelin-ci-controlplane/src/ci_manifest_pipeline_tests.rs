@@ -378,7 +378,7 @@ fn failed_frontier_drains_dispatched_sibling_and_never_dispatches_descendant() {
         finalizer.finalizations()[0]
             .jobs
             .iter()
-            .map(|job| (job.job_id.as_str(), job.dispatched))
+            .map(|job| (job.job_id.as_str(), job.flow_dispatched))
             .collect::<BTreeMap<_, _>>(),
         BTreeMap::from([(JOB_A, true), (JOB_B, true), (JOB_C, false)])
     );

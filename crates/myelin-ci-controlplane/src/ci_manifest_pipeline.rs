@@ -351,7 +351,7 @@ fn finalize_and_emit_terminal_facts(
                 job_id: job.job_id.clone(),
                 reserve_handle: job.reserve_handle.clone(),
                 flow_timed_out: decision.flow_timed_out_jobs.contains(&job.job_id),
-                dispatched: decision.dispatched_job_ids.contains(&job.job_id),
+                flow_dispatched: decision.dispatched_job_ids.contains(&job.job_id),
             })
             .collect(),
     };

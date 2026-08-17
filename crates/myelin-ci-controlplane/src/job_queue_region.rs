@@ -23,12 +23,20 @@ pub(crate) struct AbandonedCancelledJob {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AbandonedCancelledCursor {
+pub(crate) struct RecoveryCursor {
     pub tenant_id: String,
     pub job_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActivePrelaunchJob {
+    pub tenant_id: String,
+    pub wf_run_id: String,
+    pub job_id: String,
+}
+
 pub(crate) const MAX_ABANDONED_CANCELLED_RECOVERY_BATCH: i64 = 64;
+pub(crate) const MAX_ACTIVE_PRELAUNCH_RECOVERY_BATCH: i64 = 64;
 pub(crate) const MAX_PRELAUNCH_USAGE_SEAL_BATCH: i64 = 64;
 
 impl CiRegionQueueStore {
@@ -69,9 +77,17 @@ impl CiRegionQueueStore {
     pub(crate) async fn abandoned_cancelled(
         &self,
         region: &str,
-        after: Option<&AbandonedCancelledCursor>,
+        after: Option<&RecoveryCursor>,
     ) -> Result<Vec<AbandonedCancelledJob>, JobQueueStoreError> {
         abandoned_cancelled_region_scoped(&self.pool, region, after).await
+    }
+
+    pub(crate) async fn active_prelaunch(
+        &self,
+        region: &str,
+        after: Option<&RecoveryCursor>,
+    ) -> Result<Vec<ActivePrelaunchJob>, JobQueueStoreError> {
+        active_prelaunch_region_scoped(&self.pool, region, after).await
     }
 
     pub async fn count_non_terminal_null_stage_jobs(
@@ -87,6 +103,58 @@ impl CiRegionQueueStore {
     ) -> Result<i64, JobQueueStoreError> {
         count_non_terminal_null_claim_window_jobs_region_scoped(&self.pool, region).await
     }
+}
+
+async fn active_prelaunch_region_scoped(
+    pool: &PgPool,
+    region: &str,
+    after: Option<&RecoveryCursor>,
+) -> Result<Vec<ActivePrelaunchJob>, JobQueueStoreError> {
+    let region_owned = region.to_owned();
+    let after_tenant = after.map(|cursor| cursor.tenant_id.clone());
+    let after_job = after
+        .map(|cursor| Uuid::parse_str(&cursor.job_id))
+        .transpose()
+        .map_err(|_| JobQueueStoreError::CorruptRow("invalid queued-recovery cursor".into()))?;
+    let rows = with_region_tx(pool, region, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "SELECT q.tenant_id, q.run_id::text AS wf_run_id, q.job_id::text AS job_id
+                 FROM job_queue q
+                 JOIN workflow_run w
+                   ON w.tenant_id = q.tenant_id AND w.region = q.region
+                  AND w.run_id = q.run_id::text
+                 JOIN ci_run c
+                   ON c.tenant_id = q.tenant_id AND c.region = q.region
+                  AND c.wf_run_id = q.run_id
+                 WHERE q.region = $1 AND q.state IN ('queued', 'leased')
+                   AND w.state = 'waiting' AND c.state = 'running'
+                   AND (
+                     $2::text IS NULL
+                     OR q.tenant_id > $2
+                     OR (q.tenant_id = $2 AND q.job_id > $3::uuid)
+                   )
+                 ORDER BY q.tenant_id, q.job_id
+                 LIMIT $4",
+            )
+            .bind(&region_owned)
+            .bind(after_tenant)
+            .bind(after_job)
+            .bind(MAX_ACTIVE_PRELAUNCH_RECOVERY_BATCH)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))
+        })
+    })
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ActivePrelaunchJob {
+            tenant_id: row.get("tenant_id"),
+            wf_run_id: row.get("wf_run_id"),
+            job_id: row.get("job_id"),
+        })
+        .collect())
 }
 
 async fn seal_expired_prelaunch_usage_region_scoped(
@@ -131,7 +199,7 @@ async fn seal_expired_prelaunch_usage_region_scoped(
 async fn abandoned_cancelled_region_scoped(
     pool: &PgPool,
     region: &str,
-    after: Option<&AbandonedCancelledCursor>,
+    after: Option<&RecoveryCursor>,
 ) -> Result<Vec<AbandonedCancelledJob>, JobQueueStoreError> {
     let region_owned = region.to_owned();
     let after_tenant = after.map(|cursor| cursor.tenant_id.clone());
