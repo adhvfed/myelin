@@ -114,6 +114,10 @@ const state = {
   emptyChat: false,
   chatConversationResponseLosses: 0,
   chatPostResponseLosses: 0,
+  chatPaginatedMessages: false,
+  chatMessageCursorDelaysMs: [],
+  chatMessageCursorRequests: 0,
+  chatMessageCursorResponses: 0,
   emptyKnowledge: false,
   knowledgeCreateResponseLosses: 0,
   knowledgeSaveResponseDelaysMs: [],
@@ -419,13 +423,33 @@ const server = createServer((req, res) => {
           state.emptyChat = false;
           state.chatConversationResponseLosses = 0;
           state.chatPostResponseLosses = 0;
+          state.chatPaginatedMessages = false;
+          state.chatMessageCursorDelaysMs = [];
+          state.chatMessageCursorRequests = 0;
+          state.chatMessageCursorResponses = 0;
           chat.reset();
         }
         if (typeof body.emptyChat === "boolean") {
           state.emptyChat = body.emptyChat;
           state.chatConversationResponseLosses = 0;
           state.chatPostResponseLosses = 0;
+          state.chatPaginatedMessages = false;
+          state.chatMessageCursorDelaysMs = [];
+          state.chatMessageCursorRequests = 0;
+          state.chatMessageCursorResponses = 0;
           chat.reset({ empty: body.emptyChat });
+        }
+        if (typeof body.chatPaginatedMessages === "boolean") {
+          state.chatPaginatedMessages = body.chatPaginatedMessages;
+          state.chatMessageCursorRequests = 0;
+          state.chatMessageCursorResponses = 0;
+          chat.reset({ empty: state.emptyChat, paginated: body.chatPaginatedMessages });
+        }
+        if (Array.isArray(body.chatMessageCursorDelaysMs) &&
+            body.chatMessageCursorDelaysMs.length <= 10 &&
+            body.chatMessageCursorDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.chatMessageCursorDelaysMs = [...body.chatMessageCursorDelaysMs];
         }
         if (Number.isInteger(body.chatConversationResponseLosses) &&
             body.chatConversationResponseLosses >= 0) {
@@ -588,9 +612,20 @@ const server = createServer((req, res) => {
       return send(res, 400, { error: { message: "invalid Chat message query", code: "bad_request" } });
     }
     const output = chat.listMessages(conversationId, input);
-    return output
-      ? send(res, 200, output, { "cache-control": "no-store" })
-      : send(res, 404, notFoundEnvelope("conversation"));
+    if (!output) return send(res, 404, notFoundEnvelope("conversation"));
+    if (input.before) {
+      state.chatMessageCursorRequests += 1;
+      const delay = state.chatMessageCursorDelaysMs.shift() ?? 0;
+      if (delay > 0) {
+        setTimeout(() => {
+          state.chatMessageCursorResponses += 1;
+          send(res, 200, output, { "cache-control": "no-store" });
+        }, delay);
+        return;
+      }
+      state.chatMessageCursorResponses += 1;
+    }
+    return send(res, 200, output, { "cache-control": "no-store" });
   }
 
   if (

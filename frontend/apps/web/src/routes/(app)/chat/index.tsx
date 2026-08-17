@@ -54,6 +54,8 @@ export default function ChatIndex() {
   const [earlierMessagePages, setEarlierMessagePages] = createSignal<ChatMessagePage[]>([]);
   const [loadingEarlier, setLoadingEarlier] = createSignal(false);
   const [earlierError, setEarlierError] = createSignal(false);
+  let messageGeneration = 0;
+  let earlierMessageRequest = 0;
 
   const firstConversations = createAsync(async (): Promise<PageResult<ChatConversationPage>> => {
     try {
@@ -103,6 +105,8 @@ export default function ChatIndex() {
 
   createEffect(() => {
     validSelectedId();
+    messageGeneration += 1;
+    earlierMessageRequest += 1;
     setEarlierMessagePages([]);
     setEarlierError(false);
     setLoadingEarlier(false);
@@ -143,15 +147,22 @@ export default function ChatIndex() {
     const conversationId = validSelectedId();
     const before = nextMessageCursor();
     if (!conversationId || !before || loadingEarlier()) return;
+    const generation = messageGeneration;
+    const request = ++earlierMessageRequest;
     setLoadingEarlier(true);
     setEarlierError(false);
     try {
       const page = await getChatMessages({ conversationId, before, limit: 100 });
+      if (generation !== messageGeneration || request !== earlierMessageRequest) return;
       setEarlierMessagePages((pages) => [...pages, page]);
     } catch {
-      setEarlierError(true);
+      if (generation === messageGeneration && request === earlierMessageRequest) {
+        setEarlierError(true);
+      }
     } finally {
-      setLoadingEarlier(false);
+      if (generation === messageGeneration && request === earlierMessageRequest) {
+        setLoadingEarlier(false);
+      }
     }
   };
 

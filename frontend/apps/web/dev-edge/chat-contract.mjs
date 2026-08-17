@@ -88,7 +88,7 @@ export class ChatFixtures {
     this.reset();
   }
 
-  reset({ empty = false } = {}) {
+  reset({ empty = false, paginated = false } = {}) {
     this.sequence = 20;
     this.conversations = empty ? [] : [
       { id: fixtureUlid(1), project_id: PROJECT_ID, channel: "engineering", topic: "release readiness" },
@@ -97,7 +97,7 @@ export class ChatFixtures {
     ];
     this.messages = new Map();
     if (!empty) {
-      this.messages.set(fixtureUlid(1), [
+      const releaseMessages = [
         {
           id: fixtureUlid(10),
           author: OTHER_AUTHOR,
@@ -123,7 +123,20 @@ export class ChatFixtures {
           created_at: 1_750_000_120,
           client_nonce: "seed-3",
         },
-      ]);
+      ];
+      if (paginated) {
+        for (let index = 0; index < 101; index += 1) {
+          releaseMessages.push({
+            id: fixtureUlid(100 + index),
+            author: OTHER_AUTHOR,
+            author_kind: "human",
+            content: `Archived release note ${index + 1}.`,
+            created_at: 1_749_990_000 + index,
+            client_nonce: `archive-${index}`,
+          });
+        }
+      }
+      this.messages.set(fixtureUlid(1), releaseMessages);
     }
   }
 

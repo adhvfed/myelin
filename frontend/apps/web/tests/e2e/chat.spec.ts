@@ -216,4 +216,25 @@ test.describe("Chat workspace", () => {
     await back.click();
     await expect(page.getByRole("heading", { name: "Chat", level: 1 })).toBeVisible();
   });
+
+  test("an earlier page can never arrive in the topic opened while it was loading", async ({ page, request }) => {
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { chatPaginatedMessages: true, chatMessageCursorDelaysMs: [1_500] },
+    });
+    expect(configured.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
+    await page.getByRole("button", { name: "Load earlier messages" }).click();
+    await page.getByTestId("chat-topic-link").filter({ hasText: "agent operations" }).click();
+    await expect(page.getByRole("heading", { name: "agent operations", level: 2 })).toBeVisible();
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.chatMessageCursorResponses;
+    }).toBe(1);
+    await expect(page.getByText("The canary is healthy.", { exact: false })).toHaveCount(0);
+    await expect(page.getByText("Start the conversation")).toBeVisible();
+  });
 });
