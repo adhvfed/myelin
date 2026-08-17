@@ -240,8 +240,8 @@ impl CiManifestDurableJobRunner {
 
     fn manifest_job<'a>(&'a self, flow: &FlowJobSpec) -> Result<&'a GrantedCiJobV1, ActivityError> {
         if flow.kind != JobKind::Ci {
-            return Err(ActivityError(
-                "manifest CI runner refused a non-CI job".into(),
+            return Err(ActivityError::retryable(
+                "manifest CI runner refused a non-CI job",
             ));
         }
         if !flow
@@ -249,8 +249,8 @@ impl CiManifestDurableJobRunner {
             .strip_prefix(&self.manifest.wf_run_id)
             .is_some_and(|suffix| suffix.starts_with('/'))
         {
-            return Err(ActivityError(
-                "manifest CI runner refused an idempotency token from another workflow run".into(),
+            return Err(ActivityError::retryable(
+                "manifest CI runner refused an idempotency token from another workflow run",
             ));
         }
         self.manifest
@@ -258,9 +258,8 @@ impl CiManifestDurableJobRunner {
             .iter()
             .find(|job| job.job_id == flow.target)
             .ok_or_else(|| {
-                ActivityError(
-                    "manifest CI runner refused a dispatch target absent from the immutable manifest"
-                        .into(),
+                ActivityError::retryable(
+                    "manifest CI runner refused a dispatch target absent from the immutable manifest",
                 )
             })
     }
@@ -275,7 +274,9 @@ impl JobRunner for CiManifestDurableJobRunner {
             self.store
                 .co_persist_active_flow_dispatch(&enqueue, &spec, &job.name),
         )
-        .map_err(|error| ActivityError(format!("durable manifest dispatch refused: {error}")))?;
+        .map_err(|error| {
+            ActivityError::retryable(format!("durable manifest dispatch refused: {error}"))
+        })?;
         Ok(())
     }
 }
@@ -323,7 +324,8 @@ fn manifest_dispatch_parts(
     let trust_tier = sandbox_trust(manifest.trust_tier);
     let spec = SandboxJobSpecTemplate::new(
         SandboxJobKind::Ci,
-        ImageRef::pinned(job.image.clone()).map_err(|error| ActivityError(error.to_string()))?,
+        ImageRef::pinned(job.image.clone())
+            .map_err(|error| ActivityError::retryable(error.to_string()))?,
         job.command.clone(),
         job.env
             .iter()
@@ -360,9 +362,9 @@ fn manifest_dispatch_parts(
         },
         IdemToken(flow.idem_token.clone()),
     )
-    .map_err(|error| ActivityError(error.to_string()))?;
+    .map_err(|error| ActivityError::retryable(error.to_string()))?;
     let claim_window_secs = crate::ci_claim_window::claim_window_secs_for_template(&spec)
-        .map_err(|error| ActivityError(error.to_string()))?;
+        .map_err(|error| ActivityError::retryable(error.to_string()))?;
     let enqueue = DurableEnqueue {
         tenant_id: manifest.tenant_id.clone(),
         region: manifest.region.clone(),
@@ -412,9 +414,8 @@ pub(crate) fn validate_run_token(
     token_authority_handle: &str,
 ) -> Result<(), ActivityError> {
     if token.jti == token_authority_handle || token.ttl_secs() > MAX_CI_JOB_TOKEN_TTL_SECS {
-        return Err(ActivityError(
-            "CI token issuer returned an overlong-lived credential or copied the authority handle"
-                .into(),
+        return Err(ActivityError::retryable(
+            "CI token issuer returned an overlong-lived credential or copied the authority handle",
         ));
     }
     Ok(())

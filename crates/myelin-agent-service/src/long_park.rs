@@ -72,9 +72,9 @@ impl<B: SandboxBackend> JobRunner for AgentJobDispatcher<'_, B> {
             .job
             .clone()
             .with_dispatch_idem_token(IdemToken(spec.idem_token.clone()));
-        self.backend
-            .accept_async(dispatched.spec())
-            .map_err(|e| myelin_flow::ActivityError(format!("async dispatch refused: {e}")))
+        self.backend.accept_async(dispatched.spec()).map_err(|e| {
+            myelin_flow::ActivityError::retryable(format!("async dispatch refused: {e}"))
+        })
     }
 }
 

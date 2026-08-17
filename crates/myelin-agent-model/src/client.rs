@@ -71,6 +71,7 @@ pub enum ModelError {
     Transport(String),
     Http { status: u16, body: String },
     Parse(String),
+    ProcessingBlocked(String),
     UnsafeReplay(String),
 }
 
@@ -83,6 +84,7 @@ impl ModelError {
                 status: Some(*status),
             },
             Self::Parse(_) => RuntimeStepError::InvalidResponse,
+            Self::ProcessingBlocked(_) => RuntimeStepError::ProcessingBlocked,
             Self::UnsafeReplay(_) => RuntimeStepError::UnsafeReplay,
         }
     }
@@ -99,6 +101,12 @@ impl core::fmt::Display for ModelError {
                 write!(f, "model provider returned HTTP {status}: {body}")
             }
             ModelError::Parse(m) => write!(f, "model response parse error: {m}"),
+            ModelError::ProcessingBlocked(_) => {
+                write!(
+                    f,
+                    "agent processing is blocked by the subject's privacy settings"
+                )
+            }
             ModelError::UnsafeReplay(m) => write!(f, "model replay refused: {m}"),
         }
     }

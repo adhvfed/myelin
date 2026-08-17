@@ -401,8 +401,8 @@ mod tests {
         fn dispatch(&self, spec: &JobSpec) -> Result<(), crate::ActivityError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_first && n == 0 {
-                return Err(crate::ActivityError(
-                    "runner transiently unreachable".into(),
+                return Err(crate::ActivityError::retryable(
+                    "runner transiently unreachable",
                 ));
             }
             self.dispatched.lock().unwrap().push(spec.clone());

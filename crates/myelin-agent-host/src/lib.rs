@@ -155,6 +155,29 @@ impl AgentHostError {
             Self::Identity(_) => "identity_unavailable",
         }
     }
+
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Identity(_) => true,
+            Self::Run(
+                SkeletonError::DispatchRefused(_)
+                | SkeletonError::MintFailed(_)
+                | SkeletonError::CoCommit(_)
+                | SkeletonError::WalletSpendCapReached { .. }
+                | SkeletonError::CostSettlementFailed { .. }
+                | SkeletonError::TokenRevocationFailed { .. },
+            ) => true,
+            Self::Run(
+                SkeletonError::ToolValidationRejected(_)
+                | SkeletonError::ToolExecFailed(_)
+                | SkeletonError::ApprovalRequired { .. }
+                | SkeletonError::MaxTurnsExhausted { .. }
+                | SkeletonError::RuntimeStepFailed { .. }
+                | SkeletonError::MeteringUsageNotReported { .. }
+                | SkeletonError::MeteringOverflow { .. },
+            ) => false,
+        }
+    }
 }
 
 impl core::fmt::Display for AgentHostError {

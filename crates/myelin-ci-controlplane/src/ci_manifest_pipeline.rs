@@ -364,7 +364,7 @@ fn finalize_and_emit_terminal_facts(
     let result = ctx.activity(RetryPolicy::default_policy(), move |_idem, _attempt| {
         let outcome = finalizer
             .finalize(&finalization)
-            .map_err(|error| ActivityError(error.to_string()))?;
+            .map_err(|error| ActivityError::retryable(error.to_string()))?;
         Ok(vec![ArtifactRef(format!(
             "{closure_prefix}{}",
             outcome.completed_at

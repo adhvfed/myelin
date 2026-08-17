@@ -243,7 +243,7 @@ fn drill_flow_d5_failed_activity_no_ghost_emit() {
     );
     let err = ctx
         .activity(RetryPolicy { max_attempts: 2 }, |_i, attempt| {
-            Err(ActivityError(format!("hard failure {attempt}")))
+            Err(ActivityError::retryable(format!("hard failure {attempt}")))
         })
         .expect_err("the activity exhausts its retries");
     assert!(matches!(err, myelin_flow::WfError::ActivityExhausted(_)));

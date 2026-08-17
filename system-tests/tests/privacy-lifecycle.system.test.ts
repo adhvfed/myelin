@@ -246,7 +246,11 @@ describe("a person's agent-data privacy lifecycle", () => {
       description: "post-erasure agent processing to be refused",
       timeoutMs: 30_000,
     });
-    expect(refused).toMatchObject({ outcome: "failed", result_state: null });
+    expect(refused).toMatchObject({
+      outcome: "failed",
+      result_state: null,
+      terminal_reason: "agent processing is blocked by the owner's privacy settings",
+    });
     expect((await person.json("/v1/privacy/me/agent-data")).body).toMatchObject({
       agent_data: { state: "erased", recoverable_records: 0 },
     });

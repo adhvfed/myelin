@@ -859,7 +859,11 @@ mod tests {
                 RetryPolicy { max_attempts: 2 },
                 MicroUsd(100),
                 vec![unit("llm.tokens", 40, 20)],
-                |_idem, attempt| Err(crate::ActivityError(format!("hard failure {attempt}"))),
+                |_idem, attempt| {
+                    Err(crate::ActivityError::retryable(format!(
+                        "hard failure {attempt}"
+                    )))
+                },
             )
             .expect_err("the activity exhausts its retries");
         assert!(
@@ -898,7 +902,7 @@ mod tests {
                 RetryPolicy { max_attempts: 1 },
                 MicroUsd(100),
                 vec![unit("u", 40, 20)],
-                |_i, _a| Err(crate::ActivityError("boom".into())),
+                |_i, _a| Err(crate::ActivityError::retryable("boom")),
             )
             .expect_err("drive 1 exhausts");
         assert!(matches!(err1, crate::WfError::ActivityExhausted(_)));

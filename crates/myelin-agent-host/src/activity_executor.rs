@@ -9,7 +9,7 @@ use myelin_agent_service::{
     ToolExecutionContext, ToolExecutor,
 };
 use myelin_events::{OutboxStore, Timestamp, UlidMinter};
-use myelin_flow::WfJournal;
+use myelin_flow::{ActivityError, WfJournal};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId};
 use myelin_mcp::{
     approval_contract_from_effect_key, AuditPhase, GateAuditMinter, GovernanceAudit,
@@ -93,23 +93,57 @@ pub struct AgentHostActivityExecutor {
 struct HostedActivityAttemptFailure {
     code: &'static str,
     detail: String,
+    retryable: bool,
 }
 
 impl HostedActivityAttemptFailure {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    fn permanent(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: detail.into(),
+            retryable: false,
+        }
+    }
+
+    fn retryable(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+            retryable: true,
         }
     }
 
     fn from_model(error: ModelError) -> Self {
         let error = error.runtime_step_error();
-        Self::new(error.code(), error.to_string())
+        match error {
+            myelin_agent::RuntimeStepError::Unavailable
+            | myelin_agent::RuntimeStepError::Rejected { .. } => {
+                Self::retryable(error.code(), error.to_string())
+            }
+            myelin_agent::RuntimeStepError::Misconfigured
+            | myelin_agent::RuntimeStepError::InvalidResponse
+            | myelin_agent::RuntimeStepError::ProcessingBlocked
+            | myelin_agent::RuntimeStepError::UnsafeReplay => {
+                Self::permanent(error.code(), error.to_string())
+            }
+        }
     }
 
     fn from_host(error: AgentHostError) -> Self {
-        Self::new(error.code(), error.to_string())
+        let retryable = error.is_retryable();
+        Self {
+            code: error.code(),
+            detail: error.to_string(),
+            retryable,
+        }
+    }
+
+    fn into_activity_error(self) -> ActivityError {
+        if self.retryable {
+            ActivityError::retryable(self.detail)
+        } else {
+            ActivityError::permanent(self.detail)
+        }
     }
 }
 
@@ -394,7 +428,7 @@ impl AgentHostActivityExecutor {
         attempt: u32,
     ) -> Result<HostedAgentActivityOutcome, HostedActivityAttemptFailure> {
         if !activity_key.starts_with(&format!("{}/", input.run_id)) {
-            return Err(HostedActivityAttemptFailure::new(
+            return Err(HostedActivityAttemptFailure::permanent(
                 "activity_contract_invalid",
                 "hosted activity key belongs to a different run",
             ));
@@ -403,7 +437,7 @@ impl AgentHostActivityExecutor {
         if let Some(existing) = ledger
             .reservation_of(&input.tenant, &CostRunId::new(input.run_id.clone()))
             .map_err(|error| {
-                HostedActivityAttemptFailure::new(
+                HostedActivityAttemptFailure::retryable(
                     "cost_storage_unavailable",
                     format!("load hosted run cost reservation: {error}"),
                 )
@@ -415,7 +449,7 @@ impl AgentHostActivityExecutor {
                 return Ok(HostedAgentActivityOutcome::Completed(Self::run_ref(input)));
             }
             if existing.state == ReservationState::Settled {
-                return Err(HostedActivityAttemptFailure::new(
+                return Err(HostedActivityAttemptFailure::permanent(
                     "governed_budget_mismatch",
                     "settled hosted run has a different governed budget; replay refused",
                 ));
@@ -423,14 +457,14 @@ impl AgentHostActivityExecutor {
         }
         let (catalogue, advertised) =
             Self::selected_tools(&input.selected_tools, &input.delegation_caveats).map_err(
-                |error| HostedActivityAttemptFailure::new("tool_contract_unavailable", error),
+                |error| HostedActivityAttemptFailure::permanent("tool_contract_unavailable", error),
             )?;
         let model = self
             .models
             .client()
             .map_err(HostedActivityAttemptFailure::from_model)?;
         let deadline_now_secs = self.deadline_clock.now_unix_secs().map_err(|error| {
-            HostedActivityAttemptFailure::new("deadline_clock_unavailable", error)
+            HostedActivityAttemptFailure::retryable("deadline_clock_unavailable", error)
         })?;
         let mut wiring = RunSubstrateWiring {
             ledger: &mut ledger,
@@ -454,13 +488,13 @@ impl AgentHostActivityExecutor {
             Err(AgentHostError::Run(SkeletonError::ApprovalRequired { gate_id })) => {
                 let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
                 let gate = self.load_gate(&scope, &gate_id).map_err(|error| {
-                    HostedActivityAttemptFailure::new("approval_state_unavailable", error)
+                    HostedActivityAttemptFailure::retryable("approval_state_unavailable", error)
                 })?;
                 Self::ensure_gate_belongs_to_run(input, &gate).map_err(|error| {
-                    HostedActivityAttemptFailure::new("approval_state_invalid", error)
+                    HostedActivityAttemptFailure::permanent("approval_state_invalid", error)
                 })?;
                 if gate.state != GateState::Waiting {
-                    return Err(HostedActivityAttemptFailure::new(
+                    return Err(HostedActivityAttemptFailure::permanent(
                         "approval_state_invalid",
                         "hosted approval gate is not bound to this waiting run",
                     ));
@@ -482,7 +516,7 @@ impl AgentHostActivityExecutor {
         reason: HostedAgentStopReason,
     ) -> Result<ArtifactRef, HostedActivityAttemptFailure> {
         if !activity_key.starts_with(&format!("{}/", input.run_id)) {
-            return Err(HostedActivityAttemptFailure::new(
+            return Err(HostedActivityAttemptFailure::permanent(
                 "activity_contract_invalid",
                 "hosted stop activity key belongs to a different run",
             ));
@@ -490,13 +524,13 @@ impl AgentHostActivityExecutor {
         let reason = self
             .reconcile_stopped_gate(input, gate_id, reason)
             .map_err(|error| {
-                HostedActivityAttemptFailure::new("approval_reconciliation_failed", error)
+                HostedActivityAttemptFailure::retryable("approval_reconciliation_failed", error)
             })?;
         let mut ledger = CostLedger::with_pg(self.provider.clone());
         ledger
             .settle(&input.tenant, &CostRunId::new(input.run_id.clone()), &[])
             .map_err(|error| {
-                HostedActivityAttemptFailure::new(
+                HostedActivityAttemptFailure::retryable(
                     "cost_storage_unavailable",
                     format!("settle stopped hosted run: {error}"),
                 )
@@ -512,12 +546,12 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         activity_key: &str,
         attempt: u32,
         _workflow_time_secs: i64,
-    ) -> Result<HostedAgentActivityOutcome, String> {
+    ) -> Result<HostedAgentActivityOutcome, ActivityError> {
         match self.execute_attempt(input, activity_key, attempt) {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
                 report_activity_failure(input, "activity attempt", Some(attempt), &error);
-                Err(error.detail)
+                Err(error.into_activity_error())
             }
         }
     }
@@ -529,12 +563,12 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         _workflow_time_secs: i64,
         gate_id: &str,
         reason: HostedAgentStopReason,
-    ) -> Result<ArtifactRef, String> {
+    ) -> Result<ArtifactRef, ActivityError> {
         match self.stop_attempt(input, activity_key, gate_id, reason) {
             Ok(run_ref) => Ok(run_ref),
             Err(error) => {
                 report_activity_failure(input, "stop activity", None, &error);
-                Err(error.detail)
+                Err(error.into_activity_error())
             }
         }
     }
@@ -618,7 +652,39 @@ mod tests {
             failure.detail,
             "the agent runtime rejected the step (HTTP 503)",
         );
+        assert!(failure.retryable);
         assert!(!failure.detail.contains("provider response"));
         assert!(!failure.detail.contains("secret"));
+    }
+
+    #[test]
+    fn privacy_blocks_are_named_and_never_retried() {
+        let failure = HostedActivityAttemptFailure::from_host(AgentHostError::Run(
+            SkeletonError::RuntimeStepFailed {
+                run_id: "run-1".into(),
+                error: myelin_agent::RuntimeStepError::ProcessingBlocked,
+            },
+        ));
+
+        assert_eq!(failure.code, "runtime_processing_blocked");
+        assert!(!failure.retryable);
+        assert!(matches!(
+            failure.into_activity_error(),
+            ActivityError::Permanent(_)
+        ));
+    }
+
+    #[test]
+    fn preflight_dispatch_refusals_remain_retryable() {
+        let failure = HostedActivityAttemptFailure::from_host(AgentHostError::Run(
+            SkeletonError::DispatchRefused("cost ledger unavailable".into()),
+        ));
+
+        assert_eq!(failure.code, "dispatch_refused");
+        assert!(failure.retryable);
+        assert!(matches!(
+            failure.into_activity_error(),
+            ActivityError::Retryable(_)
+        ));
     }
 }

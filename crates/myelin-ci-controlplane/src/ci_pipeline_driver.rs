@@ -140,7 +140,7 @@ fn build_dispatch_parts(
     build_spec: &StageSpecBuilder,
     flow_spec: &FlowJobSpec,
 ) -> Result<(DurableEnqueue, SandboxJobSpec), ActivityError> {
-    let mut spec = (build_spec)(flow_spec).map_err(ActivityError)?;
+    let mut spec = (build_spec)(flow_spec).map_err(ActivityError::retryable)?;
 
     spec.trust_tier = terms.trust_tier;
     spec.idem_token = IdemToken(flow_spec.idem_token.clone());
@@ -153,7 +153,7 @@ fn build_dispatch_parts(
         &spec.workspace,
         spec.limits.timeout_secs,
     )
-    .map_err(|error| ActivityError(error.to_string()))?;
+    .map_err(|error| ActivityError::retryable(error.to_string()))?;
 
     let enq = DurableEnqueue {
         tenant_id: terms.tenant_id.clone(),
@@ -185,7 +185,7 @@ impl JobRunner for DurableJobRunner {
             .find(|(t, _)| t == &flow_spec.target)
             .map(|(_, name)| name.clone())
             .ok_or_else(|| {
-                ActivityError(format!(
+                ActivityError::retryable(format!(
                     "ci.pipeline dispatch refused: target `{}` is not a known pipeline stage - the \
                      verdict could not be durably attributed (fail-closed)",
                     flow_spec.target
@@ -205,7 +205,9 @@ impl JobRunner for DurableJobRunner {
             &self.rt,
             self.store.co_persist_dispatch(&enq, &launch, &stage),
         )
-        .map_err(|e| ActivityError(format!("durable co_persist_dispatch refused: {e}")))?;
+        .map_err(|e| {
+            ActivityError::retryable(format!("durable co_persist_dispatch refused: {e}"))
+        })?;
         Ok(())
     }
 }

@@ -520,8 +520,8 @@ mod tests {
         fn dispatch(&self, ci: &CiDispatch) -> Result<(), crate::ActivityError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail_first && n == 0 {
-                return Err(crate::ActivityError(
-                    "CI runner transiently unreachable".into(),
+                return Err(crate::ActivityError::retryable(
+                    "CI runner transiently unreachable",
                 ));
             }
             self.dispatched.lock().unwrap().push(ci.clone());
@@ -538,7 +538,7 @@ mod tests {
         fn merge(&self, request: &MergeRequest) -> Result<String, crate::ActivityError> {
             self.merges.fetch_add(1, Ordering::SeqCst);
             if self.conflict {
-                return Err(crate::ActivityError("merge conflict".into()));
+                return Err(crate::ActivityError::retryable("merge conflict"));
             }
             Ok(format!("merged-{}", request.speculative_commit_oid))
         }

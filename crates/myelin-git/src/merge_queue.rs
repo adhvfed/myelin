@@ -68,7 +68,7 @@ where
                     .iter()
                     .map(|u| format!("{}/{}", provider_label(&u.context), u.context.name))
                     .collect();
-                Err(ActivityError(format!(
+                Err(ActivityError::retryable(format!(
                     "the merge gate did not admit: the required check(s) {} are not green-and-current \
                      with an acceptable trust posture (an un-endorsed fork success is neutral for \
                      gating). The pull request was not merged.",
@@ -250,7 +250,7 @@ mod tests {
         proj.apply(&fact("test", 1, CheckState::Success, TrustTier::Trusted));
 
         let perf = GitMergePerformer::new(&proj, GitOid(HEAD.into()), policy(), vec![], |_r| {
-            Err(ActivityError("merge conflict".into()))
+            Err(ActivityError::retryable("merge conflict"))
         });
         let err = perf.merge(&request()).expect_err("the conflict propagates");
         assert_eq!(err.0, "merge conflict");

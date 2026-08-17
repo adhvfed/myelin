@@ -350,6 +350,7 @@ pub enum RuntimeStepError {
     Unavailable,
     Rejected { status: Option<u16> },
     InvalidResponse,
+    ProcessingBlocked,
     UnsafeReplay,
 }
 
@@ -360,6 +361,7 @@ impl RuntimeStepError {
             Self::Unavailable => "runtime_unavailable",
             Self::Rejected { .. } => "runtime_rejected",
             Self::InvalidResponse => "runtime_invalid_response",
+            Self::ProcessingBlocked => "runtime_processing_blocked",
             Self::UnsafeReplay => "runtime_unsafe_replay",
         }
     }
@@ -378,6 +380,12 @@ impl core::fmt::Display for RuntimeStepError {
             }
             Self::InvalidResponse => {
                 write!(f, "the agent runtime returned an invalid response")
+            }
+            Self::ProcessingBlocked => {
+                write!(
+                    f,
+                    "agent processing is blocked by the subject's privacy settings"
+                )
             }
             Self::UnsafeReplay => write!(f, "the agent runtime refused an unsafe replay"),
         }

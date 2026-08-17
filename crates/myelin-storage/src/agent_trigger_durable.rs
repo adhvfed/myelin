@@ -34,6 +34,8 @@ use crate::{ACTIVE_PRINCIPAL_STATUS_JSON, HUMAN_PRINCIPAL_KIND_JSON};
 
 const FAILED_RUN_TERMINAL_REASON: &str =
     "agent run failed; retry it or inspect the hosted-agent service diagnostics";
+const PRIVACY_BLOCKED_RUN_TERMINAL_REASON: &str =
+    "agent processing is blocked by the owner's privacy settings";
 const TERMINATED_RUN_TERMINAL_REASON: &str = "agent run was terminated";
 const NONDETERMINISTIC_RUN_TERMINAL_REASON: &str =
     "agent run stopped because durable replay diverged";
@@ -882,7 +884,16 @@ impl DurableAgentTriggerBacking {
                     let terminal_run_ids = sqlx::query_scalar::<_, String>(
                         "WITH terminal AS (\
                             SELECT firing.binding_id, firing.event_id, firing.run_id, \
-                                   run.state AS workflow_state \
+                                   run.state AS workflow_state, \
+                                   EXISTS (\
+                                     SELECT 1 FROM wf_activity_attempt attempt \
+                                      WHERE attempt.tenant_id = run.tenant_id \
+                                        AND attempt.region = run.region \
+                                        AND attempt.run_id = run.run_id \
+                                        AND attempt.state = 'failed' \
+                                        AND attempt.error LIKE \
+                                            '%code=runtime_processing_blocked:%'\
+                                   ) AS privacy_blocked \
                               FROM agent_trigger_firing firing \
                               JOIN workflow_run run ON run.tenant_id = firing.tenant_id \
                                AND run.region = firing.region \
@@ -896,7 +907,8 @@ impl DurableAgentTriggerBacking {
                          UPDATE agent_trigger_firing firing SET state = 'terminal', \
                            terminal_reason = CASE terminal.workflow_state \
                                WHEN 'completed' THEN NULL \
-                               WHEN 'failed' THEN $4 \
+                               WHEN 'failed' THEN CASE WHEN terminal.privacy_blocked \
+                                                  THEN $7 ELSE $4 END \
                                WHEN 'terminated' THEN $5 \
                                WHEN 'nondeterministic' THEN $6 \
                            END \
@@ -913,6 +925,7 @@ impl DurableAgentTriggerBacking {
                     .bind(FAILED_RUN_TERMINAL_REASON)
                     .bind(TERMINATED_RUN_TERMINAL_REASON)
                     .bind(NONDETERMINISTIC_RUN_TERMINAL_REASON)
+                    .bind(PRIVACY_BLOCKED_RUN_TERMINAL_REASON)
                     .fetch_all(&mut *conn)
                     .await
                     .map_err(query_error("reconcile terminal governed agent firings"))?;

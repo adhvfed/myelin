@@ -214,7 +214,7 @@ mod tests {
                 let mut failed = self.failed.lock().unwrap();
                 if !failed.contains(&step_index) {
                     failed.push(step_index);
-                    return Err(ActivityError("transient maintenance failure".into()));
+                    return Err(ActivityError::retryable("transient maintenance failure"));
                 }
             }
             self.steps.lock().unwrap().push(step_index);

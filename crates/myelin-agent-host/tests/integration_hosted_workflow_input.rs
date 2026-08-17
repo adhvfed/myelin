@@ -14,8 +14,8 @@ use myelin_events::{
     EventType, IdMinter, MonotonicMinter, Timestamp, Visibility,
 };
 use myelin_flow::{
-    partition_for_run_id, DriveOutcome, PgClaimedDriveInput, PgFlowWorker, PgInputResolveError,
-    PgRunOnceOutcome, PgWorkerScope, PgWorkflowInputResolver,
+    partition_for_run_id, ActivityError, DriveOutcome, PgClaimedDriveInput, PgFlowWorker,
+    PgInputResolveError, PgRunOnceOutcome, PgWorkerScope, PgWorkflowInputResolver,
 };
 use myelin_identity::{
     DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef,
@@ -364,7 +364,7 @@ impl HostedAgentRunExecutor for RecordingHostedAgent {
         activity_key: &str,
         _attempt: u32,
         now_secs: i64,
-    ) -> Result<HostedAgentActivityOutcome, String> {
+    ) -> Result<HostedAgentActivityOutcome, ActivityError> {
         self.executions
             .lock()
             .unwrap()
@@ -382,7 +382,7 @@ impl HostedAgentRunExecutor for RecordingHostedAgent {
         _now_secs: i64,
         gate_id: &str,
         reason: HostedAgentStopReason,
-    ) -> Result<ArtifactRef, String> {
+    ) -> Result<ArtifactRef, ActivityError> {
         Ok(ArtifactRef(format!(
             "myelin://{}/agent/run/{}:stopped:{}:gate:{}",
             input.tenant.0,
@@ -405,9 +405,11 @@ impl HostedAgentRunExecutor for UnavailableHostedAgent {
         _activity_key: &str,
         _attempt: u32,
         _now_secs: i64,
-    ) -> Result<HostedAgentActivityOutcome, String> {
+    ) -> Result<HostedAgentActivityOutcome, ActivityError> {
         *self.attempts.lock().unwrap() += 1;
-        Err("the model provider is unavailable".into())
+        Err(ActivityError::retryable(
+            "the model provider is unavailable",
+        ))
     }
 
     fn stop(
@@ -417,8 +419,44 @@ impl HostedAgentRunExecutor for UnavailableHostedAgent {
         _now_secs: i64,
         _gate_id: &str,
         _reason: HostedAgentStopReason,
-    ) -> Result<ArtifactRef, String> {
-        Err("an unavailable model never opens an approval gate".into())
+    ) -> Result<ArtifactRef, ActivityError> {
+        Err(ActivityError::permanent(
+            "an unavailable model never opens an approval gate",
+        ))
+    }
+}
+
+#[derive(Default)]
+struct PrivacyBlockedHostedAgent {
+    attempts: Mutex<u32>,
+}
+
+impl HostedAgentRunExecutor for PrivacyBlockedHostedAgent {
+    fn execute(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        _activity_key: &str,
+        _attempt: u32,
+        _now_secs: i64,
+    ) -> Result<HostedAgentActivityOutcome, ActivityError> {
+        *self.attempts.lock().unwrap() += 1;
+        Err(ActivityError::permanent(format!(
+            "hosted-agent run failed: SKELETON runtime step failed: run={} \
+             code=runtime_processing_blocked: agent processing is blocked by the subject's \
+             privacy settings",
+            input.run_id
+        )))
+    }
+
+    fn stop(
+        &self,
+        _input: &HostedAgentWorkflowInput,
+        _activity_key: &str,
+        _now_secs: i64,
+        _gate_id: &str,
+        _reason: HostedAgentStopReason,
+    ) -> Result<ArtifactRef, ActivityError> {
+        unreachable!("privacy-blocked work cannot open an approval gate")
     }
 }
 
@@ -595,6 +633,65 @@ async fn failed_hosted_work_releases_its_organization_budget_when_history_catche
     assert_eq!(
         ledger.state_of(&run.tenant, &cost_run),
         Ok(Some(ReservationState::Settled)),
+    );
+    clean_hosted_run(&app, &run.tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_blocked_work_fails_once_and_tells_its_owner_why() {
+    let app = test_provider().await;
+    let run = start_one_governed_hosted_run(&app).await;
+    let cost_run = CostRunId::new(run.run_id.clone());
+    let mut ledger = CostLedger::with_pg(app.clone());
+    ledger
+        .reserve(
+            run.tenant.clone(),
+            cost_run.clone(),
+            MicroUsd(250_000),
+            MicroUsd(250_000),
+        )
+        .expect("the organization lends this run its bounded budget");
+    ledger
+        .begin(&run.tenant, &cost_run)
+        .expect("the privacy check happens inside an admitted hosted activity");
+
+    let agent = Arc::new(PrivacyBlockedHostedAgent::default());
+    let driven = worker_for(&app, &run, agent.clone())
+        .run_once(1_786_352_400, "2026-08-10T09:00:00Z")
+        .await
+        .expect("the worker records the permanent privacy refusal");
+    assert!(matches!(
+        driven,
+        PgRunOnceOutcome::Driven {
+            outcome: DriveOutcome::Failed(ref reason),
+            ..
+        } if reason.contains("runtime_processing_blocked")
+    ));
+    assert_eq!(
+        *agent.attempts.lock().unwrap(),
+        1,
+        "an irreversible privacy decision is never retried"
+    );
+
+    assert_eq!(
+        run.triggers
+            .reconcile_terminal_firings(&run.tenant.0, 100)
+            .await
+            .expect("terminal history and budget converge together"),
+        1,
+    );
+    assert_eq!(
+        ledger.state_of(&run.tenant, &cost_run),
+        Ok(Some(ReservationState::Settled))
+    );
+    let history = run
+        .triggers
+        .list_firings_for_owner(&run.tenant.0, "founder", run.binding_id, None, 100)
+        .await
+        .expect("the founder can inspect why no agent work ran");
+    assert_eq!(
+        history[0].terminal_reason.as_deref(),
+        Some("agent processing is blocked by the owner's privacy settings")
     );
     clean_hosted_run(&app, &run.tenant).await;
 }

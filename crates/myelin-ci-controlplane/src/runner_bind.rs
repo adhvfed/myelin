@@ -653,7 +653,8 @@ fn durable_spec_resolver_with_issuer(
         );
         let run_token =
             bridge(&rt, token_issuer.mint(request.clone())).map_err(|e| e.to_string())?;
-        validate_run_token(&run_token, &launch.token_authority_handle).map_err(|e| e.0)?;
+        validate_run_token(&run_token, &launch.token_authority_handle)
+            .map_err(|error| error.detail().to_owned())?;
         let resolution = resolve_claim_launch_secrets(
             &TenantId(leased.tenant_id.clone()),
             launch.spec,
@@ -719,7 +720,8 @@ pub fn durable_v2_spec_resolver(
                 checkout_scope.as_ref(),
             )
             .map_err(|e| e.to_string())?;
-        validate_run_token(&minted.credential, &launch.token_authority_handle).map_err(|e| e.0)?;
+        validate_run_token(&minted.credential, &launch.token_authority_handle)
+            .map_err(|error| error.detail().to_owned())?;
         let resolution = resolve_claim_launch_secrets(
             &TenantId(leased.tenant_id.clone()),
             launch.spec,

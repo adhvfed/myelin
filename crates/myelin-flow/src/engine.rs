@@ -1270,7 +1270,7 @@ mod tests {
 
         let body: Box<WorkflowBody> = Box::new(|ctx: &mut WfCtx| {
             ctx.activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
-                Err(ActivityError("hard failure".into()))
+                Err(ActivityError::retryable("hard failure"))
             })
             .map_err(|e| format!("{e:?}"))?;
             Ok(vec![])

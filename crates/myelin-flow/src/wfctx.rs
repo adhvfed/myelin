@@ -22,7 +22,38 @@ pub mod attempt_state {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActivityError(pub String);
+pub enum ActivityError {
+    Retryable(String),
+    Permanent(String),
+}
+
+impl ActivityError {
+    pub fn retryable(detail: impl Into<String>) -> Self {
+        Self::Retryable(detail.into())
+    }
+
+    pub fn permanent(detail: impl Into<String>) -> Self {
+        Self::Permanent(detail.into())
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Retryable(detail) | Self::Permanent(detail) => detail,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl core::fmt::Display for ActivityError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.detail())
+    }
+}
+
+impl std::error::Error for ActivityError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WfError {
@@ -595,8 +626,8 @@ impl WfCtx {
                     return Ok(replayed.result.clone().unwrap_or_default());
                 }
                 history_kind::ACTIVITY_FAILED => {
-                    return Err(WfError::ActivityExhausted(ActivityError(
-                        "replayed activity_failed".into(),
+                    return Err(WfError::ActivityExhausted(ActivityError::permanent(
+                        "replayed activity_failed",
                     )));
                 }
                 other => {
@@ -610,8 +641,6 @@ impl WfCtx {
         self.side_effects_executed += 1;
         let idem_token = format!("{}/{}/{}", self.run_id, command_id, "act");
         let max = policy.max_attempts.max(1);
-        let mut last_err: Option<ActivityError> = None;
-
         for attempt in 1..=max {
             match run(&idem_token, attempt) {
                 Ok(result) => {
@@ -630,7 +659,7 @@ impl WfCtx {
                     return Ok(result);
                 }
                 Err(e) => {
-                    let final_attempt = attempt == max;
+                    let final_attempt = attempt == max || !e.is_retryable();
                     self.staged_attempts.push(self.attempt_row(
                         &command_id,
                         attempt,
@@ -640,16 +669,16 @@ impl WfCtx {
                         } else {
                             attempt_state::RETRYING
                         },
-                        Some(e.0.clone()),
+                        Some(e.detail().to_owned()),
                     ));
-                    last_err = Some(e);
+                    if final_attempt {
+                        self.stage_history(history_kind::ACTIVITY_FAILED, command_id, None);
+                        return Err(WfError::ActivityExhausted(e));
+                    }
                 }
             }
         }
-
-        let err = last_err.expect("a failing loop produced at least one error");
-        self.stage_history(history_kind::ACTIVITY_FAILED, command_id, None);
-        Err(WfError::ActivityExhausted(err))
+        unreachable!("an activity attempt either succeeds or returns its final error")
     }
 
     fn attempt_row(
@@ -1436,7 +1465,7 @@ mod tests {
             .activity(RetryPolicy { max_attempts: 3 }, move |idem, attempt| {
                 seen2.lock().unwrap().push(idem.to_string());
                 if attempt < 3 {
-                    Err(ActivityError(format!(
+                    Err(ActivityError::retryable(format!(
                         "transient failure on attempt {attempt}"
                     )))
                 } else {
@@ -1484,12 +1513,16 @@ mod tests {
         let mut ctx = begin(&outbox, journal.clone());
         let err = ctx
             .activity(RetryPolicy { max_attempts: 2 }, |_idem, attempt| {
-                Err(ActivityError(format!("hard failure {attempt}")))
+                Err(ActivityError::retryable(format!("hard failure {attempt}")))
             })
             .expect_err("the activity exhausts its retries");
         match err {
-            WfError::ActivityExhausted(ActivityError(msg)) => {
-                assert_eq!(msg, "hard failure 2", "the LAST attempt's error surfaces")
+            WfError::ActivityExhausted(error) => {
+                assert_eq!(
+                    error.detail(),
+                    "hard failure 2",
+                    "the LAST attempt's error surfaces"
+                )
             }
             other => panic!("expected ActivityExhausted, got {other:?}"),
         }
@@ -1512,6 +1545,38 @@ mod tests {
             attempts[1].state,
             attempt_state::FAILED,
             "the last attempt is FAILED"
+        );
+    }
+
+    #[test]
+    fn permanent_activity_failure_is_not_retried() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let mut ctx = begin(&outbox, journal.clone());
+        let attempts_run = Arc::new(Mutex::new(0_u32));
+        let observed = attempts_run.clone();
+
+        let error = ctx
+            .activity(RetryPolicy { max_attempts: 9 }, move |_idem, _attempt| {
+                *observed.lock().unwrap() += 1;
+                Err(ActivityError::permanent(
+                    "privacy erasure cannot become retryable",
+                ))
+            })
+            .expect_err("a permanent failure ends the activity immediately");
+
+        assert_eq!(*attempts_run.lock().unwrap(), 1);
+        assert!(matches!(
+            error,
+            WfError::ActivityExhausted(ActivityError::Permanent(_))
+        ));
+        ctx.commit().expect("co-commit the permanent failure");
+        let attempts = journal.attempts_for(&tenant(), "R1");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].state, attempt_state::FAILED);
+        assert_eq!(
+            attempts[0].error.as_deref(),
+            Some("privacy erasure cannot become retryable")
         );
     }
 
@@ -1728,7 +1793,7 @@ mod tests {
         let journal = WfJournal::new();
         let mut c1 = begin(&outbox, journal.clone());
         c1.activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
-            Err(ActivityError("hard failure".into()))
+            Err(ActivityError::retryable("hard failure"))
         })
         .expect_err("the activity exhausts");
         c1.commit().expect("co-commit the failure");
@@ -1849,8 +1914,8 @@ mod tests {
             "the divergence verdict reads true"
         );
         assert!(
-            !WfError::ActivityExhausted(ActivityError("x".into())).is_nondeterministic(),
-            "an activity exhaustion is NOT a divergence (it is a retryable failure, not a dead-letter)"
+            !WfError::ActivityExhausted(ActivityError::retryable("x")).is_nondeterministic(),
+            "an activity failure is not a replay divergence"
         );
         assert!(
             !WfError::CoCommit("y".into()).is_nondeterministic(),

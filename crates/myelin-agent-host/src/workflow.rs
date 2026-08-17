@@ -60,7 +60,7 @@ pub trait HostedAgentRunExecutor: Send + Sync {
         activity_key: &str,
         attempt: u32,
         workflow_time_secs: i64,
-    ) -> Result<HostedAgentActivityOutcome, String>;
+    ) -> Result<HostedAgentActivityOutcome, ActivityError>;
 
     /// Stops an activity without treating deterministic workflow time as wall time.
     fn stop(
@@ -70,7 +70,7 @@ pub trait HostedAgentRunExecutor: Send + Sync {
         workflow_time_secs: i64,
         gate_id: &str,
         reason: HostedAgentStopReason,
-    ) -> Result<myelin_refs::ArtifactRef, String>;
+    ) -> Result<myelin_refs::ArtifactRef, ActivityError>;
 }
 
 pub fn register_hosted_agent_workflow(
@@ -90,10 +90,12 @@ pub fn register_hosted_agent_workflow(
             ctx.activity(RetryPolicy { max_attempts: 1 }, |activity_key, attempt| {
                 match legacy_executor.execute(&input, activity_key, attempt, now_secs) {
                     Ok(HostedAgentActivityOutcome::Completed(run_ref)) => Ok(vec![run_ref]),
-                    Ok(HostedAgentActivityOutcome::ApprovalRequired { gate_id, .. }) => Err(
-                        ActivityError(format!("hosted agent requires approval at `{gate_id}`")),
-                    ),
-                    Err(error) => Err(ActivityError(error)),
+                    Ok(HostedAgentActivityOutcome::ApprovalRequired { gate_id, .. }) => {
+                        Err(ActivityError::permanent(format!(
+                            "hosted agent requires approval at `{gate_id}`"
+                        )))
+                    }
+                    Err(error) => Err(error),
                 }
             })
             .map_err(|error| format!("legacy hosted agent activity failed: {error:?}"))
@@ -113,7 +115,6 @@ pub fn register_hosted_agent_workflow(
                         executor
                             .execute(&input, activity_key, attempt, now_secs)
                             .map(|outcome| vec![encode_activity_outcome(&input, outcome)])
-                            .map_err(ActivityError)
                     })
                     .map_err(|error| format!("hosted agent activity failed: {error:?}"))?;
                 match decode_activity_outcome(&input, &activity_output)? {
@@ -150,7 +151,6 @@ pub fn register_hosted_agent_workflow(
                                                     reason,
                                                 )
                                                 .map(|run_ref| vec![run_ref])
-                                                .map_err(ActivityError)
                                         },
                                     )
                                     .map_err(|error| {
@@ -170,7 +170,6 @@ pub fn register_hosted_agent_workflow(
                                                 HostedAgentStopReason::Expired,
                                             )
                                             .map(|run_ref| vec![run_ref])
-                                            .map_err(ActivityError)
                                     },
                                 )
                                 .map_err(|error| {

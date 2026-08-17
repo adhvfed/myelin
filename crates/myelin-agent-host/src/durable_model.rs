@@ -101,6 +101,15 @@ impl DurableModelClient {
             "durable model turn refused to risk a second provider call: {detail}"
         ))
     }
+
+    fn journal_error(error: ModelStepError) -> ModelError {
+        match error {
+            ModelStepError::Erased | ModelStepError::Restricted => {
+                ModelError::ProcessingBlocked(error.to_string())
+            }
+            error => Self::replay_refused(error),
+        }
+    }
 }
 
 impl ModelClient for DurableModelClient {
@@ -120,7 +129,7 @@ impl ModelClient for DurableModelClient {
                 &request_hash,
                 &self.requested_by,
             )
-            .map_err(Self::replay_refused)?
+            .map_err(Self::journal_error)?
         {
             ModelStepBegin::Completed(response) => {
                 serde_json::from_value(response).map_err(|error| {
@@ -147,7 +156,7 @@ impl ModelClient for DurableModelClient {
                         &self.requested_by,
                         &encoded,
                     )
-                    .map_err(Self::replay_refused)?;
+                    .map_err(Self::journal_error)?;
                 Ok(response)
             }
         }
@@ -214,6 +223,33 @@ mod tests {
                 Some(_) => Err(ModelStepError::Conflict),
                 None => Err(ModelStepError::Missing),
             }
+        }
+    }
+
+    struct RefusingJournal(ModelStepError);
+
+    impl ModelStepJournal for RefusingJournal {
+        fn begin(
+            &self,
+            _tenant: &TenantId,
+            _run_id: &str,
+            _step_key: &str,
+            _request_hash: &str,
+            _requested_by: &str,
+        ) -> Result<ModelStepBegin, ModelStepError> {
+            Err(self.0.clone())
+        }
+
+        fn complete(
+            &self,
+            _tenant: &TenantId,
+            _run_id: &str,
+            _step_key: &str,
+            _request_hash: &str,
+            _requested_by: &str,
+            _response: &serde_json::Value,
+        ) -> Result<ModelStepCompletion, ModelStepError> {
+            unreachable!("a refused begin cannot complete")
         }
     }
 
@@ -300,5 +336,27 @@ mod tests {
             0,
             "no second provider call escaped"
         );
+    }
+
+    #[test]
+    fn privacy_refusal_is_not_misreported_as_an_unsafe_replay() {
+        for refusal in [ModelStepError::Erased, ModelStepError::Restricted] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let client = DurableModelClient::with_journal(
+                TenantId("acme".into()),
+                "run-1".into(),
+                "founder".into(),
+                Arc::new(RefusingJournal(refusal)),
+                Box::new(CountingClient {
+                    calls: calls.clone(),
+                }),
+            );
+
+            assert!(matches!(
+                client.complete(&ModelRequest::default()),
+                Err(ModelError::ProcessingBlocked(_))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
     }
 }
