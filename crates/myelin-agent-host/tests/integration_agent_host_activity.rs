@@ -445,6 +445,7 @@ async fn a_settled_agent_activity_replays_without_touching_the_model() {
             1_786_352_400,
         )
         .expect_err("a replay cannot change its governed reservation")
+        .detail()
         .contains("different governed budget"));
 
     let cleanup_tenant = tenant.0.clone();
