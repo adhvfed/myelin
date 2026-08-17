@@ -1,4 +1,3 @@
-use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, SubjectPattern};
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations,
     OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
@@ -6,7 +5,6 @@ use myelin_substrate::{
 
 pub const SERVICE_NAME: &str = "myelin-agent";
 
-pub const AGENT_DISPATCH_SUBJECT_PREFIX: &str = "agent.dispatch.";
 pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
 pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
 pub const EVENT_DURABLE_CONSUMER: &str = "agent-governed-trigger-intake";
@@ -47,28 +45,6 @@ fn agent_service_migrations() -> Migrations {
     }))
 }
 
-pub struct SkeletonDispatchConsumer {
-    subjects: Vec<SubjectPattern>,
-}
-
-impl SkeletonDispatchConsumer {
-    pub fn new(subjects: impl AsRef<[SubjectPattern]>) -> SkeletonDispatchConsumer {
-        SkeletonDispatchConsumer {
-            subjects: subjects.as_ref().to_vec(),
-        }
-    }
-}
-
-impl EventHandler for SkeletonDispatchConsumer {
-    fn subjects(&self) -> &[SubjectPattern] {
-        &self.subjects
-    }
-
-    fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
-        HandleOutcome::Done
-    }
-}
-
 pub fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec {
     AppSpec {
         name: SERVICE_NAME,
@@ -83,25 +59,6 @@ pub fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> App
         outbox: OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
     }
-}
-
-pub fn agent_dispatch_consumer_reg(
-    tenant: &myelin_tenancy::TenantId,
-    dedup: myelin_events::DedupLedger,
-) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
-    use myelin_events::{consume, ConsumerName, ConsumerSpec};
-    let prefix = format!("{AGENT_DISPATCH_SUBJECT_PREFIX}{}.", tenant.0);
-    let subjects = vec![SubjectPattern(prefix.clone())];
-    let consumer = SkeletonDispatchConsumer::new(subjects);
-    let runtime = consume(
-        ConsumerSpec::new(
-            ConsumerName(format!("agent-dispatch-{}", tenant.0)),
-            &[prefix.as_str()],
-        ),
-        consumer,
-        dedup,
-    )?;
-    Ok(myelin_substrate::ConsumerReg::new(runtime))
 }
 
 pub fn governed_trigger_consumer_reg(
@@ -266,23 +223,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_consumer_fills_the_consumer_slot() {
-        use myelin_events::DedupLedger;
-        use myelin_tenancy::TenantId;
-        let tenant = TenantId("acme".into());
-        let reg = agent_dispatch_consumer_reg(&tenant, DedupLedger::new()).expect(
-            "the agent.dispatch.acme. whitelist binds through the sanctioned consume (never `*`)",
-        );
-        let mut spec = agent_app_spec(Config::default(), myelin_events::OutboxStore::new());
-        spec.consumers = vec![reg];
-        assert_eq!(
-            spec.consumers.len(),
-            1,
-            "the dispatch consumer occupies the consumer slot (3.6)"
-        );
-    }
-
-    #[test]
     fn agent_stores_auto_register_as_holders_at_boot() {
         use myelin_substrate::StoreKind;
         let handle =
@@ -312,49 +252,5 @@ mod tests {
     fn failed_boot_returns_non_zero() {
         let r = run_agent(Config("BAD_POOL".into()), myelin_events::OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
-    }
-
-    #[test]
-    fn dispatch_consumer_is_explicit_first_notify_only() {
-        use myelin_events::{
-            Actor, AggregateKey, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
-            Timestamp, Visibility,
-        };
-        use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-        use myelin_refs::ArtifactRef;
-        use myelin_tenancy::{Region, TenantId};
-        let subjects = [SubjectPattern("agent.dispatch.acme.".into())];
-        let consumer = SkeletonDispatchConsumer::new(subjects);
-        let tenant = TenantId("acme".into());
-        let ev = EventEnvelope {
-            event_id: EventId("ev-1".into()),
-            type_: EventType("agent.dispatch.acme.mention".into()),
-            schema_ver: 1,
-            tenant: tenant.clone(),
-            region: Region("fr-par".into()),
-            actor: Actor(Principal::stub(
-                PrincipalId("p".into()),
-                PrincipalKind::Human,
-                tenant,
-            )),
-            subject: ArtifactRef("myelin://acme/chat/msg/1".into()),
-            aggregate: AggregateKey("conv:1".into()),
-            causation_id: None,
-            correlation_id: CorrelationId("c1".into()),
-            caused_by: None,
-            depth: 0,
-            contains_personal_data: false,
-            data_role: DataRole::Controller,
-            visibility: Visibility::Internal,
-            pii_key_ref: None,
-            occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
-            recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
-            payload: serde_json::json!({}),
-        };
-        assert_eq!(
-            consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
-            HandleOutcome::Done,
-            "explicit-first: a delivered match NOTIFIES (Done); it does not auto-spawn a costed run"
-        );
     }
 }
