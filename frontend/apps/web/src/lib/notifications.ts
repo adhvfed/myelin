@@ -43,6 +43,7 @@ export function createInbox(): InboxState {
   const [generation, setGeneration] = createSignal(0);
   const [loadingMore, setLoadingMore] = createSignal(false);
   const [loadMoreError, setLoadMoreError] = createSignal(false);
+  let continuationRequest = 0;
   const [page, { refetch }] = createResource(async () => {
     try {
       const next = await getInbox(null);
@@ -77,7 +78,9 @@ export function createInbox(): InboxState {
   const hasMore = () => nextCursor() !== null;
   const reload = async (): Promise<void> => {
     setGeneration((current) => current + 1);
+    continuationRequest += 1;
     setMorePages([]);
+    setLoadingMore(false);
     setLoadMoreError(false);
     await revalidate(getInbox.key);
     await refetch();
@@ -86,21 +89,27 @@ export function createInbox(): InboxState {
     const cursor = nextCursor();
     if (cursor === null || loadingMore()) return cursor === null;
     const startedInGeneration = generation();
+    const request = ++continuationRequest;
     setLoadingMore(true);
     setLoadMoreError(false);
     try {
       const next = await getInbox(cursor);
       setMorePages((current) => (
-        generation() === startedInGeneration && nextCursor() === cursor
+        generation() === startedInGeneration && request === continuationRequest &&
+          nextCursor() === cursor
           ? [...current, next]
           : current
       ));
       return true;
     } catch {
-      setLoadMoreError(true);
+      if (generation() === startedInGeneration && request === continuationRequest) {
+        setLoadMoreError(true);
+      }
       return false;
     } finally {
-      setLoadingMore(false);
+      if (generation() === startedInGeneration && request === continuationRequest) {
+        setLoadingMore(false);
+      }
     }
   };
   const markRead = async (itemId: string): Promise<boolean> => {

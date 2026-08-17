@@ -86,6 +86,12 @@ const state = {
   inboxAgentApprovalState: null,
   inboxMutationUnavailable: false,
   inboxPagination: false,
+  inboxPageOneState: "unread",
+  inboxPageTwoState: "unread",
+  inboxListCursorDelaysMs: [],
+  inboxListCursorFailures: 0,
+  inboxListCursorRequests: 0,
+  inboxListCursorResponses: 0,
   // Issues test controls, including the number of status reads before activation.
   emptyIssues: false,
   onlyClosedIssues: false,
@@ -414,6 +420,22 @@ const server = createServer((req, res) => {
         }
         if (typeof body.inboxPagination === "boolean") {
           state.inboxPagination = body.inboxPagination;
+          state.inboxPageOneState = "unread";
+          state.inboxPageTwoState = "unread";
+          state.inboxListCursorDelaysMs = [];
+          state.inboxListCursorFailures = 0;
+          state.inboxListCursorRequests = 0;
+          state.inboxListCursorResponses = 0;
+        }
+        if (Array.isArray(body.inboxListCursorDelaysMs) &&
+            body.inboxListCursorDelaysMs.length <= 10 &&
+            body.inboxListCursorDelaysMs.every((delay) =>
+              Number.isInteger(delay) && delay >= 0 && delay <= 5_000)) {
+          state.inboxListCursorDelaysMs = [...body.inboxListCursorDelaysMs];
+        }
+        if (Number.isInteger(body.inboxListCursorFailures) &&
+            body.inboxListCursorFailures >= 0 && body.inboxListCursorFailures <= 10) {
+          state.inboxListCursorFailures = body.inboxListCursorFailures;
         }
         if (body.resetPrFixtures === true) {
           resetPrFixtures();
@@ -1189,7 +1211,7 @@ const server = createServer((req, res) => {
       subject: "myelin://acme/git/pr/platform/myelin:2",
       subject_root: "myelin://acme/git/pr/platform/myelin:2",
       coalesce_count: 1,
-      state: "unread",
+      state: state.inboxPageTwoState,
       snooze_until: null,
       occurred_at: "2026-08-10T17:59:00.000Z",
       priority: 55,
@@ -1202,7 +1224,7 @@ const server = createServer((req, res) => {
       subject: "myelin://acme/git/pr/platform/myelin:1",
       subject_root: "myelin://acme/git/pr/platform/myelin:1",
       coalesce_count: 1,
-      state: "unread",
+      state: state.inboxPageOneState,
       snooze_until: null,
       occurred_at: "2026-08-10T18:00:00.000Z",
       priority: 55,
@@ -1210,7 +1232,42 @@ const server = createServer((req, res) => {
     }];
     const items = state.inboxPagination ? pagedItems : approvalItems;
     const nextCursor = state.inboxPagination && cursor === null ? "ni1_inbox-page-2" : null;
-    return send(res, 200, { items, page: { next_cursor: nextCursor, limit: 50 } });
+    const output = { items, page: { next_cursor: nextCursor, limit: 50 } };
+    if (cursor !== null) {
+      state.inboxListCursorRequests += 1;
+      const delay = state.inboxListCursorDelaysMs.shift() ?? 0;
+      const fail = state.inboxListCursorFailures > 0;
+      if (fail) state.inboxListCursorFailures -= 1;
+      const respond = () => {
+        state.inboxListCursorResponses += 1;
+        return fail
+          ? send(res, 503, { error: { message: "inbox continuation unavailable", code: "unavailable" } })
+          : send(res, 200, output);
+      };
+      if (delay > 0) {
+        setTimeout(respond, delay);
+        return;
+      }
+      return respond();
+    }
+    return send(res, 200, output);
+  }
+
+  let inboxReadMatch;
+  if (method === "POST" &&
+      (inboxReadMatch = path.match(/^\/v1\/notif\/inbox\/([^/]+)\/read$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (url.search) return send(res, 400, { error: { message: "invalid inbox read request", code: "bad_request" } });
+    const itemId = decodeCiPathSegment(inboxReadMatch[1]);
+    if (!state.inboxPagination || !["notice-page-1", "notice-page-2"].includes(itemId)) {
+      return send(res, 404, notFoundEnvelope("notification"));
+    }
+    if (state.inboxMutationUnavailable) {
+      return send(res, 503, { error: { message: "inbox mutation unavailable", code: "unavailable" } });
+    }
+    if (itemId === "notice-page-1") state.inboxPageOneState = "read";
+    else state.inboxPageTwoState = "read";
+    return send(res, 200, { id: itemId, state: "read" });
   }
 
   if (

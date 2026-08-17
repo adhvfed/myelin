@@ -14,6 +14,8 @@ async function setEdgeConfig(cfg: {
   seedInboxAgentApproval?: boolean;
   inboxMutationUnavailable?: boolean;
   inboxPagination?: boolean;
+  inboxListCursorDelaysMs?: number[];
+  inboxListCursorFailures?: number;
 }): Promise<void> {
   const ctx = await pwRequest.newContext();
   const res = await ctx.post(`${EDGE}/__test/config`, { data: cfg });
@@ -241,6 +243,46 @@ test.describe("R3.5 first-run — honest inbox", () => {
     await page.getByRole("link", { name: "README.md" }).click();
     await page.waitForURL("**/git/repos/platform%2Fmyelin/blob/**/README.md");
     await expect(page.getByRole("heading", { name: /README\.md/ })).toBeVisible();
+  });
+
+  test("a mutation supersedes an older inbox page without inheriting its failure", async ({ page, request }) => {
+    await setEdgeConfig({
+      inboxPagination: true,
+      inboxListCursorDelaysMs: [3_000, 4_500],
+      inboxListCursorFailures: 1,
+    });
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("dev-login").click();
+    await page.waitForURL("**/git/repos");
+
+    await page.getByRole("button", { name: /Inbox/ }).click();
+    const dialog = page.getByRole("dialog", { name: "Inbox" });
+    await dialog.getByRole("button", { name: "Load more" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.inboxListCursorRequests;
+    }).toBe(1);
+
+    await dialog.getByRole("button", { name: "Mark read" }).click();
+    await expect(dialog.getByRole("button", { name: "Mark read" })).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: "Load more" })).toBeEnabled();
+    await dialog.getByRole("button", { name: "Load more" }).click();
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.inboxListCursorRequests;
+    }).toBe(2);
+
+    await expect.poll(async () => {
+      const response = await request.post(`${EDGE}/__test/config`, { data: {} });
+      return (await response.json()).state.inboxListCursorResponses;
+    }).toBe(1);
+    await expect(dialog.getByTestId("inbox-more-error")).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: "Loading more…" })).toBeDisabled();
+
+    await expect(dialog.getByRole("link", { name: "platform/myelin #2" }))
+      .toBeVisible({ timeout: 7_000 });
+    await expect(dialog.getByRole("button", { name: "Load more" })).toHaveCount(0);
   });
 });
 
