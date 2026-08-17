@@ -7,7 +7,9 @@ use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 use sqlx::Row;
 
-use crate::log_pipeline::{LogAvailablePointer, INSERT_LOG_SEGMENT_QUERY, UPSERT_LOG_ANCHOR_QUERY};
+use crate::log_pipeline::{
+    AnchorStatus, LogAvailablePointer, INSERT_LOG_SEGMENT_QUERY, UPSERT_LOG_ANCHOR_QUERY,
+};
 use crate::log_sink::{FlushedJobLogs, LogPersist, LogResume, SINGLE_STEP_NO};
 
 pub struct DurableLogPersist {
@@ -97,7 +99,7 @@ impl DurableLogPersist {
                     }
                 };
                 let anchor = sqlx::query(
-                    "SELECT byte_start FROM log_anchor \
+                    "SELECT byte_start, byte_end, status FROM log_anchor \
                      WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND job_id = $4 \
                        AND step_id = $5",
                 )
@@ -109,11 +111,40 @@ impl DurableLogPersist {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|error| PgError::Query(error.to_string()))?;
-                let step_byte_start = match anchor {
-                    Some(row) => row
-                        .try_get::<i64, _>("byte_start")
-                        .map_err(|error| PgError::Query(error.to_string()))?,
-                    None if next_segment_seq == 0 => 0,
+                let (step_byte_start, terminal_status) = match anchor {
+                    Some(row) => {
+                        let byte_start = row
+                            .try_get::<i64, _>("byte_start")
+                            .map_err(|error| PgError::Query(error.to_string()))?;
+                        let byte_end = row
+                            .try_get::<Option<i64>, _>("byte_end")
+                            .map_err(|error| PgError::Query(error.to_string()))?;
+                        let status = row
+                            .try_get::<String, _>("status")
+                            .map_err(|error| PgError::Query(error.to_string()))?;
+                        let status = AnchorStatus::from_token(&status).ok_or_else(|| {
+                            PgError::Query("durable log anchor has an unknown status".into())
+                        })?;
+                        let terminal_status = if status.is_terminal() {
+                            if byte_end != Some(next_byte_offset) {
+                                return Err(PgError::Query(
+                                    "terminal log anchor does not end at the committed byte head"
+                                        .into(),
+                                ));
+                            }
+                            Some(status)
+                        } else {
+                            if byte_end.is_some() {
+                                return Err(PgError::Query(
+                                    "running log anchor unexpectedly has a terminal byte end"
+                                        .into(),
+                                ));
+                            }
+                            None
+                        };
+                        (byte_start, terminal_status)
+                    }
+                    None if next_segment_seq == 0 => (0, None),
                     None => {
                         return Err(PgError::Query(
                             "durable log segments exist without their step anchor".into(),
@@ -130,6 +161,7 @@ impl DurableLogPersist {
                     next_segment_seq,
                     next_byte_offset,
                     step_byte_start,
+                    terminal_status,
                 })
             })
         })

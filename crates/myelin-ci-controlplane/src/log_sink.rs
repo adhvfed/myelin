@@ -30,18 +30,17 @@ pub struct LogResume {
     pub next_segment_seq: i32,
     pub next_byte_offset: i64,
     pub step_byte_start: i64,
+    pub terminal_status: Option<AnchorStatus>,
 }
 
 pub trait LogPersist: Send + Sync {
     fn resume(
         &self,
-        _tenant: &TenantId,
-        _region: &Region,
-        _run_id: &str,
-        _job_id: &str,
-    ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(LogResume::default())
-    }
+        tenant: &TenantId,
+        region: &Region,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>>;
 
     fn persist(
         &self,
@@ -74,15 +73,22 @@ pub struct LogPipelineSink<S: BlobStore + Clone, P: LogPersist> {
     region: Region,
     blobs: S,
     persist: P,
-    pipelines: Mutex<HashMap<PipelineKey, Arc<Mutex<OpenLogPipeline<S>>>>>,
+    pipelines: Mutex<HashMap<PipelineKey, PipelineHandle<S>>>,
 }
 
 type PipelineKey = (String, String, String);
+type PipelineHandle<S> = Arc<Mutex<PipelineState<S>>>;
 
 struct OpenLogPipeline<S: BlobStore + Clone> {
     canonical_run_id: String,
     pipeline: LogPipeline<S>,
-    accepting_frames: bool,
+}
+
+enum PipelineState<S: BlobStore + Clone> {
+    Uninitialized,
+    Open(Box<OpenLogPipeline<S>>),
+    Finished(AnchorStatus),
+    Failed(String),
 }
 
 impl<S: BlobStore + Clone, P: LogPersist> LogPipelineSink<S, P> {
@@ -109,17 +115,43 @@ impl<S: BlobStore + Clone, P: LogPersist> LogPipelineSink<S, P> {
         tenant: &TenantId,
         run_id: &str,
         job_id: &str,
-    ) -> Result<Arc<Mutex<OpenLogPipeline<S>>>, String> {
-        if let Some(open) = self
+    ) -> Result<PipelineHandle<S>, String> {
+        let handle = self
             .pipelines
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(key)
-            .cloned()
-        {
-            return Ok(open);
-        }
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(PipelineState::Uninitialized)))
+            .clone();
 
+        let initialization_error = {
+            let mut state = handle.lock().unwrap_or_else(|error| error.into_inner());
+            if matches!(*state, PipelineState::Uninitialized) {
+                *state = self
+                    .recover_pipeline(tenant, run_id, job_id)
+                    .unwrap_or_else(PipelineState::Failed);
+            }
+            match &*state {
+                PipelineState::Failed(error) => Some(error.clone()),
+                PipelineState::Uninitialized => {
+                    unreachable!("the per-job lock serializes pipeline initialization")
+                }
+                PipelineState::Open(_) | PipelineState::Finished(_) => None,
+            }
+        };
+        if let Some(error) = initialization_error {
+            self.retire(key, &handle);
+            return Err(error);
+        }
+        Ok(handle)
+    }
+
+    fn recover_pipeline(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<PipelineState<S>, String> {
         let resume = self
             .persist
             .resume(tenant, &self.region, run_id, job_id)
@@ -129,6 +161,14 @@ impl<S: BlobStore + Clone, P: LogPersist> LogPipelineSink<S, P> {
         let canonical_run_id = resume
             .canonical_run_id
             .unwrap_or_else(|| run_id.to_string());
+        if let Some(status) = resume.terminal_status {
+            if !status.is_terminal() {
+                return Err(format!(
+                    "recover durable log head for run={run_id} job={job_id}: terminal status cannot be running"
+                ));
+            }
+            return Ok(PipelineState::Finished(status));
+        }
         let mut pipeline = LogPipeline::new(
             tenant.clone(),
             self.region.clone(),
@@ -145,20 +185,13 @@ impl<S: BlobStore + Clone, P: LogPersist> LogPipelineSink<S, P> {
             .map_err(|error| {
                 format!("resume log pipeline for run={run_id} job={job_id}: {error}")
             })?;
-        let candidate = Arc::new(Mutex::new(OpenLogPipeline {
+        Ok(PipelineState::Open(Box::new(OpenLogPipeline {
             canonical_run_id,
             pipeline,
-            accepting_frames: true,
-        }));
-
-        let mut pipelines = self
-            .pipelines
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        Ok(pipelines.entry(key.clone()).or_insert(candidate).clone())
+        })))
     }
 
-    fn retire(&self, key: &PipelineKey, expected: &Arc<Mutex<OpenLogPipeline<S>>>) {
+    fn retire(&self, key: &PipelineKey, expected: &PipelineHandle<S>) {
         let mut pipelines = self
             .pipelines
             .lock()
@@ -185,12 +218,20 @@ impl<S: BlobStore + Clone + Send + Sync, P: LogPersist> FirehoseSink for LogPipe
         }
         let key = Self::key(tenant, run_id, job_id);
         let handle = self.pipeline_for(&key, tenant, run_id, job_id)?;
-        let mut open = handle.lock().unwrap_or_else(|error| error.into_inner());
-        if !open.accepting_frames {
-            return Err(format!(
-                "log checkpoint for run={run_id} job={job_id} is no longer accepting frames; retry against its durable head"
-            ));
-        }
+        let mut state = handle.lock().unwrap_or_else(|error| error.into_inner());
+        let open = match &mut *state {
+            PipelineState::Open(open) => open,
+            PipelineState::Finished(status) => {
+                return Err(format!(
+                    "log stream for run={run_id} job={job_id} already finished as {}; late frames are refused",
+                    status.token()
+                ));
+            }
+            PipelineState::Failed(error) => return Err(error.clone()),
+            PipelineState::Uninitialized => {
+                unreachable!("pipeline_for initializes the per-job state")
+            }
+        };
         let canonical_run_id = open.canonical_run_id.clone();
         let coord = LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_NO);
         if let Err(error) = open
@@ -198,12 +239,13 @@ impl<S: BlobStore + Clone + Send + Sync, P: LogPersist> FirehoseSink for LogPipe
             .ship_frame(&coord, frame)
             .and_then(|_| open.pipeline.seal_open_segment(&coord))
         {
-            open.accepting_frames = false;
-            drop(open);
-            self.retire(&key, &handle);
-            return Err(format!(
+            let error = format!(
                 "prepare incremental log checkpoint for run={run_id} job={job_id}: {error}"
-            ));
+            );
+            *state = PipelineState::Failed(error.clone());
+            drop(state);
+            self.retire(&key, &handle);
+            return Err(error);
         }
         let flushed = FlushedJobLogs {
             run_id: open.canonical_run_id.clone(),
@@ -213,12 +255,13 @@ impl<S: BlobStore + Clone + Send + Sync, P: LogPersist> FirehoseSink for LogPipe
             pointers: open.pipeline.drain_pointers(),
         };
         if let Err(error) = self.persist.persist(tenant, flushed) {
-            open.accepting_frames = false;
-            drop(open);
-            self.retire(&key, &handle);
-            return Err(format!(
+            let error = format!(
                 "persist incremental log checkpoint for run={run_id} job={job_id}: {error}"
-            ));
+            );
+            *state = PipelineState::Failed(error.clone());
+            drop(state);
+            self.retire(&key, &handle);
+            return Err(error);
         }
         Ok(())
     }
@@ -231,31 +274,44 @@ impl<S: BlobStore + Clone + Send + Sync, P: LogPersist> FirehoseSink for LogPipe
         passed: bool,
     ) -> Result<(), String> {
         let key = Self::key(tenant, run_id, job_id);
-        let handle = self.pipeline_for(&key, tenant, run_id, job_id)?;
-        let mut open = handle.lock().unwrap_or_else(|error| error.into_inner());
-        if !open.accepting_frames {
-            return Err(format!(
-                "log checkpoint for run={run_id} job={job_id} is already finishing"
-            ));
-        }
-        let canonical_run_id = open.canonical_run_id.clone();
-        let coord = LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_NO);
-        let status = if passed {
+        let requested_status = if passed {
             AnchorStatus::Passed
         } else {
             AnchorStatus::Failed
         };
-        let prepared = open.pipeline.close_step(&coord, status).and_then(|_| {
-            open.pipeline
-                .flush_job(&canonical_run_id, job_id, SINGLE_STEP_NO)
-        });
+        let handle = self.pipeline_for(&key, tenant, run_id, job_id)?;
+        let mut state = handle.lock().unwrap_or_else(|error| error.into_inner());
+        let open = match &mut *state {
+            PipelineState::Open(open) => open,
+            PipelineState::Finished(status) if *status == requested_status => return Ok(()),
+            PipelineState::Finished(status) => {
+                return Err(format!(
+                    "log stream for run={run_id} job={job_id} already finished as {}; cannot finish it as {}",
+                    status.token(),
+                    requested_status.token()
+                ));
+            }
+            PipelineState::Failed(error) => return Err(error.clone()),
+            PipelineState::Uninitialized => {
+                unreachable!("pipeline_for initializes the per-job state")
+            }
+        };
+        let canonical_run_id = open.canonical_run_id.clone();
+        let coord = LogCoord::new(&canonical_run_id, job_id, SINGLE_STEP_NO);
+        let prepared = open
+            .pipeline
+            .close_step(&coord, requested_status)
+            .and_then(|_| {
+                open.pipeline
+                    .flush_job(&canonical_run_id, job_id, SINGLE_STEP_NO)
+            });
         if let Err(error) = prepared {
-            open.accepting_frames = false;
-            drop(open);
+            let error =
+                format!("prepare terminal log checkpoint for run={run_id} job={job_id}: {error}");
+            *state = PipelineState::Failed(error.clone());
+            drop(state);
             self.retire(&key, &handle);
-            return Err(format!(
-                "prepare terminal log checkpoint for run={run_id} job={job_id}: {error}"
-            ));
+            return Err(error);
         }
         let flushed = FlushedJobLogs {
             run_id: open.canonical_run_id.clone(),
@@ -264,11 +320,22 @@ impl<S: BlobStore + Clone + Send + Sync, P: LogPersist> FirehoseSink for LogPipe
             anchors: open.pipeline.anchor_rows().into_iter().cloned().collect(),
             pointers: open.pipeline.drain_pointers(),
         };
-        let persisted = self.persist.persist(tenant, flushed);
-        open.accepting_frames = false;
-        drop(open);
+        let result = match self.persist.persist(tenant, flushed) {
+            Ok(()) => {
+                *state = PipelineState::Finished(requested_status);
+                Ok(())
+            }
+            Err(error) => {
+                let error = format!(
+                    "persist terminal log checkpoint for run={run_id} job={job_id}: {error}"
+                );
+                *state = PipelineState::Failed(error.clone());
+                Err(error)
+            }
+        };
+        drop(state);
         self.retire(&key, &handle);
-        persisted.map_err(|error| format!("persist terminal log checkpoint: {error}"))
+        result
     }
 }
 
@@ -287,6 +354,56 @@ mod tests {
         flushed: Mutex<Vec<(String, FlushedJobLogs)>>,
     }
     impl LogPersist for RecordingPersist {
+        fn resume(
+            &self,
+            tenant: &TenantId,
+            region: &Region,
+            _run_id: &str,
+            job_id: &str,
+        ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>> {
+            let flushed = self.flushed.lock().unwrap();
+            let checkpoints: Vec<_> = flushed
+                .iter()
+                .filter(|(checkpoint_tenant, checkpoint)| {
+                    checkpoint_tenant == tenant.as_str()
+                        && checkpoint.job_id == job_id
+                        && checkpoint
+                            .anchors
+                            .first()
+                            .map(|anchor| anchor.region.as_str())
+                            .or_else(|| {
+                                checkpoint
+                                    .segments
+                                    .first()
+                                    .map(|segment| segment.region.as_str())
+                            })
+                            == Some(region.as_str())
+                })
+                .map(|(_, checkpoint)| checkpoint)
+                .collect();
+            let Some(latest) = checkpoints.last() else {
+                return Ok(LogResume::default());
+            };
+            let head = checkpoints
+                .iter()
+                .flat_map(|checkpoint| &checkpoint.segments)
+                .max_by_key(|segment| segment.segment_seq);
+            let anchor = checkpoints
+                .iter()
+                .rev()
+                .flat_map(|checkpoint| &checkpoint.anchors)
+                .find(|anchor| anchor.step_id == SINGLE_STEP_NO.to_string());
+            Ok(LogResume {
+                canonical_run_id: Some(latest.run_id.clone()),
+                next_segment_seq: head.map_or(0, |segment| segment.segment_seq + 1),
+                next_byte_offset: head.map_or(0, |segment| segment.byte_end),
+                step_byte_start: anchor.map_or(0, |anchor| anchor.byte_start),
+                terminal_status: anchor
+                    .map(|anchor| anchor.status)
+                    .filter(|status| status.is_terminal()),
+            })
+        }
+
         fn persist(
             &self,
             tenant: &TenantId,
@@ -302,6 +419,16 @@ mod tests {
 
     struct FailingPersist;
     impl LogPersist for FailingPersist {
+        fn resume(
+            &self,
+            _tenant: &TenantId,
+            _region: &Region,
+            _run_id: &str,
+            _job_id: &str,
+        ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(LogResume::default())
+        }
+
         fn persist(
             &self,
             _tenant: &TenantId,
@@ -321,6 +448,19 @@ mod tests {
     struct BlockingFirstPersist {
         state: Mutex<BlockingPersistState>,
         changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct BlockingResumePersist {
+        inner: RecordingPersist,
+        state: Mutex<BlockingResumeState>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct BlockingResumeState {
+        calls: usize,
+        released: bool,
     }
 
     #[derive(Default)]
@@ -349,7 +489,37 @@ mod tests {
         }
     }
 
+    impl BlockingResumePersist {
+        fn wait_for_calls(&self, count: usize, timeout: Duration) -> bool {
+            let state = self.state.lock().unwrap();
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(state, timeout, |state| state.calls < count)
+                .unwrap();
+            state.calls >= count
+        }
+
+        fn release(&self) {
+            self.state.lock().unwrap().released = true;
+            self.changed.notify_all();
+        }
+
+        fn calls(&self) -> usize {
+            self.state.lock().unwrap().calls
+        }
+    }
+
     impl LogPersist for BlockingFirstPersist {
+        fn resume(
+            &self,
+            _tenant: &TenantId,
+            _region: &Region,
+            _run_id: &str,
+            _job_id: &str,
+        ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(LogResume::default())
+        }
+
         fn persist(
             &self,
             _tenant: &TenantId,
@@ -366,6 +536,34 @@ mod tests {
                 state = self.changed.wait(state).unwrap();
             }
             Ok(())
+        }
+    }
+
+    impl LogPersist for BlockingResumePersist {
+        fn resume(
+            &self,
+            tenant: &TenantId,
+            region: &Region,
+            run_id: &str,
+            job_id: &str,
+        ) -> Result<LogResume, Box<dyn std::error::Error + Send + Sync>> {
+            let resume = self.inner.resume(tenant, region, run_id, job_id)?;
+            let mut state = self.state.lock().unwrap();
+            state.calls += 1;
+            let is_first = state.calls == 1;
+            self.changed.notify_all();
+            while is_first && !state.released {
+                state = self.changed.wait(state).unwrap();
+            }
+            Ok(resume)
+        }
+
+        fn persist(
+            &self,
+            tenant: &TenantId,
+            flushed: FlushedJobLogs,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.persist(tenant, flushed)
         }
     }
 
@@ -388,14 +586,6 @@ mod tests {
         fn delete(&self, tenant: &TenantId, hash: &ContentHash) -> Result<(), BlobError> {
             self.inner.delete(tenant, hash)
         }
-    }
-
-    fn sink() -> LogPipelineSink<Arc<FsBlobStore>, Arc<RecordingPersist>> {
-        LogPipelineSink::new(
-            Region::new("eu-west"),
-            Arc::new(FsBlobStore::new()),
-            Arc::new(RecordingPersist::default()),
-        )
     }
 
     #[test]
@@ -586,18 +776,92 @@ mod tests {
     }
 
     #[test]
-    fn finish_is_idempotent_no_double_seal() {
-        let s = sink();
-        let tenant = TenantId::from_token("tnt-1");
-        s.ship_frame("run-1", "job-1", &tenant, b"hello\n")
-            .expect("live checkpoint");
-        s.finish("run-1", "job-1", &tenant, true)
-            .expect("terminal checkpoint");
-        s.finish("run-1", "job-1", &tenant, true)
-            .expect("idempotent terminal retry");
+    fn concurrent_first_frames_share_one_durable_recovery() {
+        let persist = Arc::new(BlockingResumePersist::default());
+        let sink = Arc::new(LogPipelineSink::new(
+            Region::new("eu-west"),
+            Arc::new(FsBlobStore::new()),
+            persist.clone(),
+        ));
+        let tenant = TenantId::from_token("tnt-single-flight-resume");
+
+        let first = {
+            let sink = sink.clone();
+            let tenant = tenant.clone();
+            std::thread::spawn(move || sink.ship_frame("run-1", "job-1", &tenant, b"A"))
+        };
         assert!(
-            s.pipelines.lock().unwrap().is_empty(),
-            "no lingering pipeline after finish"
+            persist.wait_for_calls(1, Duration::from_secs(2)),
+            "the first caller starts durable recovery"
+        );
+
+        let second = {
+            let sink = sink.clone();
+            let tenant = tenant.clone();
+            std::thread::spawn(move || sink.ship_frame("run-1", "job-1", &tenant, b"B"))
+        };
+        assert!(
+            !persist.wait_for_calls(2, Duration::from_millis(100)),
+            "the next caller waits on the same recovery instead of creating a stale candidate"
+        );
+
+        persist.release();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(persist.calls(), 1, "recovery is single-flight per job");
+
+        let checkpoints = persist.inner.flushed.lock().unwrap();
+        let ranges: Vec<_> = checkpoints
+            .iter()
+            .map(|(_, checkpoint)| {
+                let segment = checkpoint.segments.first().expect("one sealed frame");
+                (segment.byte_start, segment.byte_end)
+            })
+            .collect();
+        assert_eq!(ranges, [(0, 1), (1, 2)]);
+    }
+
+    #[test]
+    fn terminal_checkpoint_survives_restart_and_is_monotone() {
+        let persist = Arc::new(RecordingPersist::default());
+        let blobs = Arc::new(FsBlobStore::new());
+        let tenant = TenantId::from_token("tnt-1");
+        let first = LogPipelineSink::new(Region::new("eu-west"), blobs.clone(), persist.clone());
+        first
+            .ship_frame("run-1", "job-1", &tenant, b"hello\n")
+            .expect("live checkpoint");
+        first
+            .finish("run-1", "job-1", &tenant, true)
+            .expect("terminal checkpoint");
+        let writes_after_finish = persist.flushed.lock().unwrap().len();
+        drop(first);
+
+        let restarted = LogPipelineSink::new(Region::new("eu-west"), blobs, persist.clone());
+        restarted
+            .finish("run-1", "job-1", &tenant, true)
+            .expect("matching terminal retry is a no-op");
+        assert_eq!(
+            persist.flushed.lock().unwrap().len(),
+            writes_after_finish,
+            "an idempotent retry performs no durable write"
+        );
+
+        let late_frame = restarted
+            .ship_frame("run-1", "job-1", &tenant, b"too late\n")
+            .expect_err("a terminal stream cannot reopen");
+        assert!(
+            late_frame.contains("already finished as passed")
+                && late_frame.contains("late frames are refused"),
+            "the refusal is actionable: {late_frame}"
+        );
+
+        let conflicting_finish = restarted
+            .finish("run-1", "job-1", &tenant, false)
+            .expect_err("terminal state is monotone");
+        assert!(
+            conflicting_finish.contains("already finished as passed")
+                && conflicting_finish.contains("cannot finish it as failed"),
+            "the conflict names both states: {conflicting_finish}"
         );
     }
 

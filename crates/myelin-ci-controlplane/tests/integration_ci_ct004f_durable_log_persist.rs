@@ -318,6 +318,48 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
             outbox_count(&app, &run, &job).await >= 1,
             "a ci.log.available pointer landed in the outbox (co-committed with the index)"
         );
+        let outbox_after_finish = outbox_count(&app, &run, &job).await;
+
+        let retry_error = {
+            let app = app.clone();
+            let tenant = tenant.clone();
+            let region = region.clone();
+            let workflow_run = workflow_run.clone();
+            let job = job.clone();
+            let rt = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                let restarted = LogPipelineSink::new(
+                    region,
+                    Arc::new(FsBlobStore::new()),
+                    DurableLogPersist::with_pg(app, rt),
+                );
+                restarted
+                    .finish(&workflow_run, &job, &tenant, true)
+                    .expect("a repeated terminal delivery is a durable no-op");
+                restarted
+                    .ship_frame(&workflow_run, &job, &tenant, b"late output\n")
+                    .expect_err("a restarted sink cannot reopen a terminal log stream")
+            })
+            .join()
+            .expect("the retry runner thread joins")
+        };
+        assert!(
+            retry_error.contains("already finished as passed")
+                && retry_error.contains("late frames are refused"),
+            "the terminal refusal is actionable: {retry_error}"
+        );
+        assert_eq!(
+            read_back(&app, tenant.as_str(), region.as_str(), &run, &job)
+                .await
+                .0,
+            seg_count,
+            "terminal redelivery creates no segment"
+        );
+        assert_eq!(
+            outbox_count(&app, &run, &job).await,
+            outbox_after_finish,
+            "terminal redelivery emits no availability event"
+        );
         app.close().await;
         admin.close().await;
     })

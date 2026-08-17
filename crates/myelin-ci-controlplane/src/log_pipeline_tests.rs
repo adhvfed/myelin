@@ -620,6 +620,19 @@ fn close_step_requires_a_terminal_status_and_leaves_the_anchor_open_on_refusal()
 }
 
 #[test]
+fn anchor_status_storage_tokens_round_trip_without_a_fallback() {
+    for status in [
+        AnchorStatus::Running,
+        AnchorStatus::Passed,
+        AnchorStatus::Failed,
+        AnchorStatus::Skipped,
+    ] {
+        assert_eq!(AnchorStatus::from_token(status.token()), Some(status));
+    }
+    assert_eq!(AnchorStatus::from_token("unknown"), None);
+}
+
+#[test]
 fn ambiguous_log_coordinates_never_become_durable_subjects() {
     for coord in [
         LogCoord::new("", "job-1", 1),

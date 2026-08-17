@@ -354,6 +354,16 @@ impl AnchorStatus {
         }
     }
 
+    pub fn from_token(token: &str) -> Option<AnchorStatus> {
+        match token {
+            "running" => Some(AnchorStatus::Running),
+            "passed" => Some(AnchorStatus::Passed),
+            "failed" => Some(AnchorStatus::Failed),
+            "skipped" => Some(AnchorStatus::Skipped),
+            _ => None,
+        }
+    }
+
     pub fn is_terminal(self) -> bool {
         !matches!(self, AnchorStatus::Running)
     }
