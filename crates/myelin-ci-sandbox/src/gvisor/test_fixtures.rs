@@ -225,15 +225,16 @@ pub(super) fn wired_cargo_config(fixture: &CargoBoundaryFixture) -> OciConfig {
         .unwrap()
         .expect("structured Cargo selector resolves the registered asset");
     let mut cfg = OciConfig::from_spec(&job, &profile)
-        .with_explicit_user_namespace_and_workspace(
+        .with_explicit_user_namespace_and_workspace_as(
             UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005),
+            WorkspaceProcessIdentity::Isolated,
             OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
             fixture.rootfs.clone(),
         )
         .unwrap()
         .with_cargo_vendor(vendor)
         .unwrap();
-    cfg.bind_materialized_cargo_lock(&fixture.lock_sha256)
+    cfg.bind_materialized_cargo_lock(Some(&fixture.lock_sha256))
         .unwrap();
     cfg
 }
@@ -605,6 +606,7 @@ pub(super) fn acquire_real_checkout_capsule(
         PathBuf::from("/abs/staged-rootfs"),
         &workspace_manager,
         &userns_allocator,
+        WorkspaceProcessIdentity::Isolated,
         None,
     )
     .expect("acquisition must succeed against a healthy real manager/allocator");

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use myelin_storage::blob::BlobDependencyError;
 use myelin_storage::{BlobError, BlobMeta, BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 
@@ -81,6 +82,30 @@ impl BlobStore for CountingBlobStore {
     fn delete(&self, tenant: &TenantId, hash: &ContentHash) -> Result<(), BlobError> {
         self.record("delete", tenant, hash);
         Ok(())
+    }
+}
+
+#[test]
+fn only_blob_backend_failures_are_retryable_dependencies() {
+    assert!(
+        RunPlanError::Blob(BlobError::Backend(BlobDependencyError::Transient))
+            .is_dependency_failure()
+    );
+
+    for refused in [
+        RunPlanError::Blob(BlobError::NotFound {
+            tenant: TenantId("tenant-a".into()),
+            hash: ContentHash::blake3(b"missing"),
+        }),
+        RunPlanError::RedispatchRequired(RedispatchReason::UnsupportedVersion(1)),
+        RunPlanError::WireMalformed {
+            detail: "not a run plan".into(),
+        },
+    ] {
+        assert!(
+            !refused.is_dependency_failure(),
+            "durable input failure must not wedge the starter queue: {refused}"
+        );
     }
 }
 

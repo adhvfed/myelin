@@ -61,8 +61,9 @@ The suite is intentionally organized around externally visible contracts:
 - `automation-delegation` proves automation caveats are enforceable authority and that a
   short-lived agent can use its founder's repository visibility only through an audited MCP read,
   never by impersonating the founder at an ordinary product endpoint.
-- `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as
-  one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
+- `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary exactly once,
+  executes the pushed commit in the pinned gVisor sandbox, settles successfully, and preserves the
+  exact archived output while repository visibility still governs both list and detail reads.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,
   recipient-scoped delivery, addressable inbox items, broker de-duplication, collapse, read state,
   self-suppression, and complete duplicate-free traversal through opaque inbox cursors.

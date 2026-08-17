@@ -18,8 +18,8 @@ use myelin_ci_controlplane::{
     CiManifestSchedulingV1, CiPrelaunchJournalOutcome, CiPrelaunchUsageJournal,
     CiRunSupersessionError, CiWorkflowDefinitionPin, DurableCiJobLaunchTemplate, DurableEnqueue,
     GrantedCiJobV1, Lane, PgCiPipelineStarter, PgCiRunStarterFactory, PgCiRunStarterPoller,
-    PgCiStarterError, PreparedRunPlanV2, ResolvedJobV2, ResolvedRunPlanV2, StartQueuedOutcome,
-    ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
+    PgCiStarterError, PreparedRunPlanV2, ResolvedJobV1, ResolvedJobV2, ResolvedRunPlanV1,
+    ResolvedRunPlanV2, StartQueuedOutcome, ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_DDL,
     ALTER_CI_JOB_ACCOUNTING_ADD_DISPOSITION_V4_VERDICT_DDL,
     ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
@@ -168,6 +168,20 @@ fn plan() -> ResolvedRunPlanV2 {
                 matrix_key: matrix,
             },
         ],
+    }
+}
+
+fn legacy_plan() -> ResolvedRunPlanV1 {
+    ResolvedRunPlanV1 {
+        schema_version: 1,
+        jobs: vec![ResolvedJobV1 {
+            name: "legacy".into(),
+            image: format!("registry.example/legacy@sha256:{}", "d".repeat(64)),
+            command: vec!["true".into()],
+            needs: Vec::new(),
+            is_generator: false,
+            matrix_key: BTreeMap::new(),
+        }],
     }
 }
 
@@ -390,6 +404,44 @@ async fn insert_run(
     .execute(admin)
     .await
     .expect("insert queued ci_run");
+    reserve_test_attempts(admin, tenant, run_id).await;
+}
+
+async fn insert_legacy_run(
+    admin: &PgPool,
+    blobs: &FsBlobStore,
+    tenant: &str,
+    run_id: &str,
+    wf_run_id: &str,
+) {
+    let bytes = legacy_plan()
+        .canonical_bytes()
+        .expect("canonical legacy plan");
+    let hash = blobs
+        .put(&TenantId(tenant.into()), &bytes)
+        .expect("put immutable legacy plan");
+    let snapshot = format!(
+        "myelin://{tenant}/ci/snapshot/{}",
+        hash.to_multihash_string()
+    );
+    sqlx::query(
+        "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
+         repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot, \
+         trigger_kind, trust_tier, state, correlation_id) \
+         VALUES ($1, 'fr-par', $2::uuid, '22222222-2222-2222-2222-222222222222'::uuid, \
+         '33333333-3333-3333-3333-333333333333'::uuid, $3::uuid, \
+         'myelin://' || $1 || '/git/repo/core', $5, \
+         'trigger-' || $2, 1, 'session:test', $4, \
+         'push', 'trusted', 'queued', 'corr-' || $2)",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .bind(wf_run_id)
+    .bind(snapshot)
+    .bind(TEST_COMMIT_OID)
+    .execute(admin)
+    .await
+    .expect("insert queued legacy ci_run");
     reserve_test_attempts(admin, tenant, run_id).await;
 }
 
@@ -1031,6 +1083,115 @@ async fn assert_exact_jobs(admin: &PgPool, tenant: &str, run_id: &str) {
     }
 }
 
+async fn assert_unlaunchable_run_is_a_complete_user_visible_failure(
+    admin: &PgPool,
+    tenant: &str,
+    run_id: &str,
+    wf_run_id: &str,
+    expected_diagnostic: &[&str],
+) {
+    let lifecycle: (String, bool, bool) = sqlx::query_as(
+        "SELECT state, cost_settled, finished_at IS NOT NULL \
+         FROM ci_run WHERE tenant_id=$1 AND run_id=$2::uuid",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .fetch_one(admin)
+    .await
+    .expect("read rejected run lifecycle");
+    assert_eq!(lifecycle, ("failed".into(), true, true));
+
+    let (stage, name, state, attempt, summary): (String, String, String, i32, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT stage, name, state, attempt, result_summary \
+         FROM ci_job WHERE tenant_id=$1 AND run_id=$2::uuid",
+        )
+        .bind(tenant)
+        .bind(run_id)
+        .fetch_one(admin)
+        .await
+        .expect("read rejected run's synthetic configuration job");
+    assert_eq!(
+        (stage.as_str(), name.as_str()),
+        ("pipeline", "Configuration")
+    );
+    assert_eq!((state.as_str(), attempt), ("failed", 1));
+    assert_eq!(summary["passed"], false);
+    assert_eq!(summary["timed_out"], false);
+    assert_eq!(summary["disposition"], "configuration_refused");
+    assert_eq!(summary["workload_started"], false);
+    let diagnostic = summary["diagnostic"]
+        .as_str()
+        .expect("configuration failure carries a diagnostic");
+    for fragment in expected_diagnostic {
+        assert!(
+            diagnostic.contains(fragment),
+            "configuration diagnostic `{diagnostic}` lacks `{fragment}`"
+        );
+    }
+
+    let run_ref = ci_run_ref(tenant, run_id).unwrap().0;
+    let facts: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+         WHERE envelope->>'tenant'=$1 AND envelope->'payload'->>'run'=$2 \
+           AND envelope->>'type_' IN ('ci.check.updated', 'ci.run.failed') \
+         ORDER BY envelope->>'type_', envelope->'payload'->'context'->>'name'",
+    )
+    .bind(tenant)
+    .bind(&run_ref)
+    .fetch_all(admin)
+    .await
+    .expect("read rejected run facts");
+    assert_eq!(
+        facts.len(),
+        4,
+        "three checks and one run failure are durable"
+    );
+    let (checks, failures): (Vec<_>, Vec<_>) = facts
+        .iter()
+        .partition(|envelope| envelope["type_"] == "ci.check.updated");
+    assert_eq!(checks.len(), 3);
+    assert_eq!(failures.len(), 1);
+    for (check, context) in checks.iter().zip(["build", "package", "test"]) {
+        assert_eq!(check["payload"]["context"]["name"], context);
+        assert_eq!(check["payload"]["state"], "error");
+        assert_eq!(check["payload"]["cost_settled"], true);
+        assert_eq!(check["causation_id"], format!("trigger-{run_id}"));
+        assert_eq!(check["correlation_id"], format!("corr-{run_id}"));
+        assert_eq!(check["depth"], 2);
+    }
+    let failure = failures[0];
+    assert_eq!(
+        failure["payload"]["structured_failure"]["failed_stage"],
+        "pipeline"
+    );
+    assert_eq!(
+        failure["payload"]["structured_failure"]["diagnostic"],
+        diagnostic
+    );
+    assert_eq!(failure["causation_id"], format!("trigger-{run_id}"));
+    assert_eq!(failure["correlation_id"], format!("corr-{run_id}"));
+    assert_eq!(failure["depth"], 2);
+
+    let forbidden_side_effects: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM workflow_run WHERE tenant_id=$1 AND run_id=$3), \
+           (SELECT count(*) FROM ci_drive_manifest WHERE tenant_id=$1 AND ci_run_id=$2::uuid), \
+           (SELECT count(*) FROM job_queue WHERE tenant_id=$1 AND run_id=$3::uuid), \
+           (SELECT count(*) FROM ci_job_accounting WHERE tenant_id=$1 AND ci_run_id=$2::uuid), \
+           (SELECT count(*) FROM cost_reservation WHERE tenant_id=$1 \
+              AND (run_id LIKE ('ci-reserve:v1:' || $2 || ':%') \
+                   OR run_id LIKE ('ci-reserve:v2:' || $2 || ':%')))",
+    )
+    .bind(tenant)
+    .bind(run_id)
+    .bind(wf_run_id)
+    .fetch_one(admin)
+    .await
+    .expect("prove rejection created no execution or accounting state");
+    assert_eq!(forbidden_side_effects, (0, 0, 0, 0, 0));
+}
+
 async fn visible_job_count(app: &PgPool, tenant: &str, region: &str) -> i64 {
     let mut transaction = app.begin().await.expect("begin RLS probe");
     sqlx::query(
@@ -1397,6 +1558,54 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .execute(&admin)
         .await
         .expect("remove only the deliberately unstarted shutdown fixture");
+
+    let poison_tenant = "tenant_poison_lane";
+    let poison_run = "10000000-0000-0000-0000-0000000000f1";
+    let poison_wf = "20000000-0000-0000-0000-0000000000f1";
+    let healthy_run = "10000000-0000-0000-0000-0000000000f2";
+    let healthy_wf = "20000000-0000-0000-0000-0000000000f2";
+    insert_legacy_run(
+        &admin,
+        blobs.as_ref(),
+        poison_tenant,
+        poison_run,
+        poison_wf,
+    )
+    .await;
+    insert_run(
+        &admin,
+        blobs.as_ref(),
+        poison_tenant,
+        healthy_run,
+        healthy_wf,
+    )
+    .await;
+    AUTHORITY_CALLS.store(0, Ordering::SeqCst);
+    let poison_lane = PgCiRunStarterPoller::new(
+        ci_region_run_discovery_test_support(admin.clone()),
+        factory(&app, blobs.clone()),
+        CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap(),
+    );
+    let batch = poison_lane
+        .run_until_idle(4)
+        .await
+        .expect("a durable refusal cannot block the healthy run behind it");
+    assert_eq!(batch.started, 1);
+    assert!(!batch.saturated);
+    assert_eq!(
+        AUTHORITY_CALLS.load(Ordering::SeqCst),
+        1,
+        "launch authority is consulted only for the executable V2 run"
+    );
+    assert_unlaunchable_run_is_a_complete_user_visible_failure(
+        &admin,
+        poison_tenant,
+        poison_run,
+        poison_wf,
+        &["schema V2", "received V1"],
+    )
+    .await;
+    assert_atomic_started(&admin, poison_tenant, healthy_run, true, true).await;
 
     let poller_run = "10000000-0000-0000-0000-0000000000e0";
     let poller_wf = "20000000-0000-0000-0000-0000000000e0";
@@ -3556,11 +3765,21 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .execute(&admin)
     .await
     .unwrap();
-    assert!(starter(&app, "tenant_cas", blobs.clone())
-        .run_once()
-        .await
-        .is_err());
-    assert_atomic_started(&admin, "tenant_cas", run6, false, false).await;
+    assert!(matches!(
+        starter(&app, "tenant_cas", blobs.clone())
+            .run_once()
+            .await
+            .expect("a permanently missing snapshot is terminalized"),
+        StartQueuedOutcome::Rejected { run_id } if run_id == run6
+    ));
+    assert_unlaunchable_run_is_a_complete_user_visible_failure(
+        &admin,
+        "tenant_cas",
+        run6,
+        wf6,
+        &["blob access failed", "not found"],
+    )
+    .await;
 
     let run_b = "10000000-0000-0000-0000-0000000000bb";
     let wf_b = "20000000-0000-0000-0000-0000000000bb";

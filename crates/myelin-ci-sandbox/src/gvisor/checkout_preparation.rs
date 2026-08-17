@@ -48,13 +48,13 @@ impl CheckoutPreparationSpec {
 
 #[derive(Debug)]
 pub(crate) struct PreparedCheckoutEvidence {
-    cargo_lock_sha256_hex: String,
+    cargo_lock_sha256_hex: Option<String>,
     preparation_usage: ResourceUsage,
 }
 
 impl PreparedCheckoutEvidence {
-    pub(crate) fn cargo_lock_sha256_hex(&self) -> &str {
-        &self.cargo_lock_sha256_hex
+    pub(crate) fn cargo_lock_sha256_hex(&self) -> Option<&str> {
+        self.cargo_lock_sha256_hex.as_deref()
     }
 
     pub(crate) fn preparation_usage(&self) -> ResourceUsage {
@@ -64,7 +64,7 @@ impl PreparedCheckoutEvidence {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn for_tests(preparation_usage: ResourceUsage) -> Self {
         PreparedCheckoutEvidence {
-            cargo_lock_sha256_hex: "c".repeat(64),
+            cargo_lock_sha256_hex: Some("c".repeat(64)),
             preparation_usage,
         }
     }
@@ -482,10 +482,20 @@ impl Drop for ScopedDacReadSearch {
     }
 }
 
+#[cfg(test)]
 fn verify_materialized_checkout_no_follow(
     workspace_host_path: &Path,
     expected: &ExpectedGitCommitId,
 ) -> Result<String, String> {
+    verify_materialized_checkout_no_follow_given(workspace_host_path, expected, true)?
+        .ok_or_else(|| "required Cargo.lock verification returned no digest".to_string())
+}
+
+fn verify_materialized_checkout_no_follow_given(
+    workspace_host_path: &Path,
+    expected: &ExpectedGitCommitId,
+    require_cargo_lock: bool,
+) -> Result<Option<String>, String> {
     let capabilities = current_thread_capabilities()
         .map_err(|error| format!("read host-verifier capability state: {error}"))?;
     let guard = if capability_is_permitted(&capabilities, CAP_DAC_READ_SEARCH_NUMBER) {
@@ -497,8 +507,15 @@ fn verify_materialized_checkout_no_follow(
     let result = verify_workspace_head_no_follow(workspace_host_path, expected)
         .map_err(|reason| format!("host-side HEAD re-verification disagreed: {reason}"))
         .and_then(|()| {
-            hash_workspace_cargo_lock_no_follow(workspace_host_path)
-                .map_err(|reason| format!("could not hash the materialized Cargo.lock: {reason}"))
+            if require_cargo_lock {
+                hash_workspace_cargo_lock_no_follow(workspace_host_path)
+                    .map(Some)
+                    .map_err(|reason| {
+                        format!("could not hash the materialized Cargo.lock: {reason}")
+                    })
+            } else {
+                Ok(None)
+            }
         });
 
     if let Some(guard) = guard {
@@ -688,6 +705,8 @@ pub(super) fn run_checkout_preparation_inner(
     lease: &mut UserNamespaceLease,
     session: &mut CheckoutPreparationSession,
     workspace: &ManagedWorkspace,
+    process_identity: WorkspaceProcessIdentity,
+    require_cargo_lock: bool,
     spec: CheckoutPreparationSpec,
     launch_permit: LaunchPermit,
     cancellation: &AtomicBool,
@@ -713,7 +732,12 @@ pub(super) fn run_checkout_preparation_inner(
         if spec.pack.shallow { "1" } else { "0" }.to_string(),
     ];
     let cfg = OciConfig::for_fixed_command(command, spec.limits.mem_bytes, &profile)
-        .with_explicit_user_namespace_and_workspace(userns, workspace_mount, root_abs)
+        .with_explicit_user_namespace_and_workspace_as(
+            userns,
+            process_identity,
+            workspace_mount,
+            root_abs,
+        )
         .map_err(CheckoutPreparationError::Refused)?;
 
     let expected_root_identity = revalidated_explicit_userns_root_identity().map_err(|reason| {
@@ -811,18 +835,20 @@ pub(super) fn run_checkout_preparation_inner(
         RUNTIME_QUIESCE_TIMEOUT,
         child_retirement,
     );
-    let outcome = evaluate_checkout_finalization(
+    let outcome = evaluate_checkout_finalization_given(
         finalization,
         lease,
         session,
         spec.limits.mem_bytes,
         &spec.expected_commit,
         &workspace_host_path,
+        require_cargo_lock,
     );
     let _ = std::fs::remove_dir_all(&bundle_dir);
     outcome
 }
 
+#[cfg(test)]
 fn evaluate_checkout_finalization(
     finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>>,
     lease: &mut UserNamespaceLease,
@@ -830,6 +856,26 @@ fn evaluate_checkout_finalization(
     mem_bytes: u64,
     expected_commit: &ExpectedGitCommitId,
     workspace_host_path: &Path,
+) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
+    evaluate_checkout_finalization_given(
+        finalization,
+        lease,
+        session,
+        mem_bytes,
+        expected_commit,
+        workspace_host_path,
+        true,
+    )
+}
+
+fn evaluate_checkout_finalization_given(
+    finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>>,
+    lease: &mut UserNamespaceLease,
+    session: &mut CheckoutPreparationSession,
+    mem_bytes: u64,
+    expected_commit: &ExpectedGitCommitId,
+    workspace_host_path: &Path,
+    require_cargo_lock: bool,
 ) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
     fn usage_of(primary: &Result<RunscOutcome, RunFailure>, mem_bytes: u64) -> ResourceUsage {
         match primary {
@@ -911,11 +957,14 @@ fn evaluate_checkout_finalization(
     }
     parse_checkout_confirmation_line(&outcome.stdout, expected_commit)
         .map_err(|reason| checkout_materialization_terminal_failed(reason, usage))?;
-    let cargo_lock_sha256_hex =
-        match verify_materialized_checkout_no_follow(workspace_host_path, expected_commit) {
-            Ok(hex) => hex,
-            Err(reason) => return Err(checkout_materialization_terminal_failed(reason, usage)),
-        };
+    let cargo_lock_sha256_hex = match verify_materialized_checkout_no_follow_given(
+        workspace_host_path,
+        expected_commit,
+        require_cargo_lock,
+    ) {
+        Ok(hex) => hex,
+        Err(reason) => return Err(checkout_materialization_terminal_failed(reason, usage)),
+    };
 
     Ok(PreparedCheckoutEvidence {
         cargo_lock_sha256_hex,
@@ -1466,6 +1515,24 @@ mod tests {
             let ws = temp_dir_for("cargo-lock-absent");
             let err = hash_workspace_cargo_lock_no_follow(&ws).unwrap_err();
             assert!(err.contains("Cargo.lock is not present"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[test]
+        fn generic_checkout_verifies_head_without_inventing_a_cargo_lock_requirement() {
+            let ws = temp_dir_for("generic-without-cargo-lock");
+            let expected = ExpectedGitCommitId::new(sha1_oid(0xbe), GitObjectFormat::Sha1).unwrap();
+            std::fs::create_dir_all(ws.join(".git")).unwrap();
+            std::fs::write(ws.join(".git/HEAD"), format!("{}\n", expected.as_str())).unwrap();
+
+            assert_eq!(
+                verify_materialized_checkout_no_follow_given(&ws, &expected, false).unwrap(),
+                None,
+                "a shell job has no Cargo-specific materialization contract"
+            );
+            let structured_error =
+                verify_materialized_checkout_no_follow_given(&ws, &expected, true).unwrap_err();
+            assert!(structured_error.contains("Cargo.lock is not present"));
             let _ = std::fs::remove_dir_all(&ws);
         }
 
@@ -2049,7 +2116,10 @@ mod tests {
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>();
-            assert_eq!(prepared_evidence.cargo_lock_sha256_hex(), expected_hex);
+            assert_eq!(
+                prepared_evidence.cargo_lock_sha256_hex(),
+                Some(expected_hex.as_str())
+            );
             session
                 .release_prepared(lease)
                 .expect("session must have reached Prepared on the happy path");

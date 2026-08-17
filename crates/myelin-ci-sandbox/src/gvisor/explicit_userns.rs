@@ -333,6 +333,13 @@ pub(super) fn harden_explicit_userns_runsc_root(dir: &Path) -> Result<(u64, u64)
     verify_explicit_userns_runsc_root_leaf(dir)
 }
 
+fn harden_local_development_runsc_root(dir: &Path) -> Result<(u64, u64), String> {
+    if !dir.is_absolute() {
+        return Err(format!("{dir:?} must be an absolute path"));
+    }
+    verify_explicit_userns_runsc_root_leaf(dir)
+}
+
 pub(super) fn verify_explicit_userns_runsc_root_leaf(dir: &Path) -> Result<(u64, u64), String> {
     let meta = std::fs::symlink_metadata(dir).map_err(|e| {
         format!(
@@ -373,11 +380,39 @@ pub fn preflight_explicit_userns_policy(
     helper_dir: &Path,
     runsc_root: &Path,
 ) -> Result<(), String> {
+    preflight_explicit_userns_policy_given(
+        helper_dir,
+        runsc_root,
+        harden_explicit_userns_runsc_root,
+    )
+}
+
+/// Validates explicit-userns execution for a single-user local-development runner.
+///
+/// The runsc binary, helper binaries, and subordinate-ID sources keep their production checks.
+/// The state root may live below a developer-owned private directory because that same developer
+/// already controls the runner process and its environment.
+pub fn preflight_local_development_explicit_userns_policy(
+    helper_dir: &Path,
+    runsc_root: &Path,
+) -> Result<(), String> {
+    preflight_explicit_userns_policy_given(
+        helper_dir,
+        runsc_root,
+        harden_local_development_runsc_root,
+    )
+}
+
+fn preflight_explicit_userns_policy_given(
+    helper_dir: &Path,
+    runsc_root: &Path,
+    validate_runsc_root: impl FnOnce(&Path) -> Result<(u64, u64), String>,
+) -> Result<(), String> {
     let bin = super::runsc_bin();
     harden_explicit_userns_runsc_binary(bin)?;
     verify_pinned_explicit_userns_runsc(bin)?;
     preflight_explicit_userns_helpers(helper_dir)?;
-    let runsc_root_identity = harden_explicit_userns_runsc_root(runsc_root)?;
+    let runsc_root_identity = validate_runsc_root(runsc_root)?;
     let policy = ResolvedExplicitUsernsPolicy {
         helper_dir: helper_dir.to_path_buf(),
         runsc_root: runsc_root.to_path_buf(),

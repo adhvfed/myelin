@@ -185,11 +185,10 @@ enum WorkspaceIdentity {
     Btrfs {
         subvol_id: u64,
     },
-    #[cfg(any(test, feature = "test-support"))]
     Directory {
         device: u64,
         inode: u64,
-        quota_bytes: u64,
+        _quota_bytes: u64,
     },
 }
 
@@ -208,9 +207,8 @@ impl PreparedWorkspace {
     pub fn subvol_id(&self) -> u64 {
         match self.identity.as_ref() {
             WorkspaceIdentity::Btrfs { subvol_id } => *subvol_id,
-            #[cfg(any(test, feature = "test-support"))]
             WorkspaceIdentity::Directory { .. } => {
-                panic!("subvol_id() is meaningless for a deterministic-directory test workspace")
+                panic!("subvol_id() is meaningless for a local-development directory workspace")
             }
         }
     }
@@ -240,9 +238,8 @@ impl OrphanCandidate {
     pub fn subvol_id(&self) -> u64 {
         match self.identity.as_ref() {
             WorkspaceIdentity::Btrfs { subvol_id } => *subvol_id,
-            #[cfg(any(test, feature = "test-support"))]
             WorkspaceIdentity::Directory { .. } => {
-                panic!("subvol_id() is meaningless for a deterministic-directory test orphan")
+                panic!("subvol_id() is meaningless for a local-development directory orphan")
             }
         }
     }
@@ -580,6 +577,26 @@ fn assert_base_dir_exclusively_owned(canonical_base: &Path) -> Result<(), Worksp
     Ok(())
 }
 
+fn assert_private_directory_base(canonical_base: &Path) -> Result<(), WorkspaceStorageError> {
+    use std::os::unix::fs::MetadataExt;
+    assert_base_dir_exclusively_owned(canonical_base)?;
+    let meta = std::fs::metadata(canonical_base).map_err(|e| WorkspaceStorageError::Io {
+        path: canonical_base.to_path_buf(),
+        reason: format!("stat private directory workspace base: {e}"),
+    })?;
+    if meta.mode() & 0o077 != 0 {
+        return Err(WorkspaceStorageError::Io {
+            path: canonical_base.to_path_buf(),
+            reason: format!(
+                "local-development workspace base must deny every group/world permission because \
+                 its leaves are writable across user-namespace mappings; found mode {:o}",
+                meta.mode() & 0o7777
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn assert_same_storage(
     self_base: &Path,
     capability_base: &Path,
@@ -599,9 +616,9 @@ fn btrfs_identity_or_backend_mismatch(
 ) -> Result<u64, WorkspaceStorageError> {
     match identity {
         WorkspaceIdentity::Btrfs { subvol_id } => Ok(*subvol_id),
-        #[cfg(any(test, feature = "test-support"))]
         WorkspaceIdentity::Directory { .. } => Err(WorkspaceStorageError::BackendMismatch {
-            detail: "a deterministic-directory workspace capability was presented to the Btrfs \
+            detail: "a local-development directory workspace capability was presented to the \
+                     Btrfs \
                      backend - the two backends' identities are not interchangeable"
                 .to_string(),
         }),
@@ -773,24 +790,21 @@ pub(crate) fn probe_qgroup_privilege(base_dir: &Path) -> Result<bool, WorkspaceS
 #[derive(Debug)]
 pub(crate) enum WorkspaceStorageBackend {
     Btrfs(WorkspaceStorage),
-    #[cfg(any(test, feature = "test-support"))]
-    DeterministicDirectoryForTests(DirectoryWorkspaceStorage),
+    LocalDevelopmentDirectory(DirectoryWorkspaceStorage),
 }
 
 impl WorkspaceStorageBackend {
     pub(crate) fn base_dir(&self) -> &Path {
         match self {
             Self::Btrfs(storage) => storage.base_dir(),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::DeterministicDirectoryForTests(storage) => storage.base_dir(),
+            Self::LocalDevelopmentDirectory(storage) => storage.base_dir(),
         }
     }
 
     pub(crate) fn check_health(&self) -> Result<(), WorkspaceStorageError> {
         match self {
             Self::Btrfs(storage) => storage.check_health(),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::DeterministicDirectoryForTests(storage) => storage.check_health(),
+            Self::LocalDevelopmentDirectory(storage) => storage.check_health(),
         }
     }
 
@@ -805,8 +819,7 @@ impl WorkspaceStorageBackend {
             Self::Btrfs(storage) => {
                 storage.create_workspace(job_id, quota_bytes, owner_uid, owner_gid)
             }
-            #[cfg(any(test, feature = "test-support"))]
-            Self::DeterministicDirectoryForTests(storage) => {
+            Self::LocalDevelopmentDirectory(storage) => {
                 storage.create_workspace(job_id, quota_bytes, owner_uid, owner_gid)
             }
         }
@@ -818,8 +831,7 @@ impl WorkspaceStorageBackend {
     ) -> Result<(), WorkspaceStorageError> {
         match self {
             Self::Btrfs(storage) => storage.delete_workspace(prepared),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::DeterministicDirectoryForTests(storage) => storage.delete_workspace(prepared),
+            Self::LocalDevelopmentDirectory(storage) => storage.delete_workspace(prepared),
         }
     }
 
@@ -829,8 +841,7 @@ impl WorkspaceStorageBackend {
     ) -> Result<(), WorkspaceStorageError> {
         match self {
             Self::Btrfs(storage) => storage.delete_orphan(candidate),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::DeterministicDirectoryForTests(storage) => storage.delete_orphan(candidate),
+            Self::LocalDevelopmentDirectory(storage) => storage.delete_orphan(candidate),
         }
     }
 
@@ -840,8 +851,7 @@ impl WorkspaceStorageBackend {
     ) -> Result<(), WorkspaceStorageError> {
         match self {
             Self::Btrfs(storage) => storage.retry_pending_sync(subvol_id),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::DeterministicDirectoryForTests(_) => Ok(()),
+            Self::LocalDevelopmentDirectory(_) => Ok(()),
         }
     }
 
@@ -851,22 +861,21 @@ impl WorkspaceStorageBackend {
     ) -> Result<Vec<OrphanCandidate>, WorkspaceStorageError> {
         match self {
             Self::Btrfs(storage) => storage.list_orphaned_workspaces(active_job_ids),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::DeterministicDirectoryForTests(storage) => {
+            Self::LocalDevelopmentDirectory(storage) => {
                 storage.list_orphaned_workspaces(active_job_ids)
             }
         }
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn directory_identity_or_backend_mismatch(
     identity: &WorkspaceIdentity,
 ) -> Result<(u64, u64), WorkspaceStorageError> {
     match identity {
         WorkspaceIdentity::Directory { device, inode, .. } => Ok((*device, *inode)),
         WorkspaceIdentity::Btrfs { .. } => Err(WorkspaceStorageError::BackendMismatch {
-            detail: "a Btrfs workspace capability was presented to the deterministic-directory \
+            detail: "a Btrfs workspace capability was presented to the local-development \
+                     directory \
                      backend - the two backends' identities are not interchangeable"
                 .to_string(),
         }),
@@ -910,13 +919,11 @@ fn scan_regular_file_bytes(dir: &Path) -> Result<u64, WorkspaceStorageError> {
     Ok(total)
 }
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub(crate) struct DirectoryWorkspaceStorage {
     canonical_base: PathBuf,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl DirectoryWorkspaceStorage {
     pub(crate) fn open(base_dir: &Path) -> Result<Self, WorkspaceStorageError> {
         if !exists_or_error(base_dir)? {
@@ -931,6 +938,13 @@ impl DirectoryWorkspaceStorage {
                 reason: format!("canonicalize: {e}"),
             })?;
         assert_base_dir_exclusively_owned(&canonical_base)?;
+        std::fs::set_permissions(&canonical_base, std::fs::Permissions::from_mode(0o700)).map_err(
+            |e| WorkspaceStorageError::Io {
+                path: canonical_base.clone(),
+                reason: format!("chmod local-development workspace base to 0700: {e}"),
+            },
+        )?;
+        assert_private_directory_base(&canonical_base)?;
         Ok(Self { canonical_base })
     }
 
@@ -939,7 +953,7 @@ impl DirectoryWorkspaceStorage {
     }
 
     pub(crate) fn check_health(&self) -> Result<(), WorkspaceStorageError> {
-        assert_base_dir_exclusively_owned(&self.canonical_base)
+        assert_private_directory_base(&self.canonical_base)
     }
 
     pub(crate) fn create_workspace(
@@ -972,9 +986,14 @@ impl DirectoryWorkspaceStorage {
                 reason: format!("create workspace leaf: {e}"),
             });
         }
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)) {
+        // The local-development process enters a user namespace before runsc resolves the bind
+        // mount. Its container-root mapping is the developer, but kernels and gVisor versions may
+        // initially present the mount through the subordinate identity. Keep the leaf writable to
+        // either mapping. The parent base is mode 0700 and exclusively owned by the developer, so
+        // no other host user can traverse to this leaf.
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)) {
             return Err(
-                self.rollback_fresh_leaf(&path, format!("chmod 0755 on the fresh leaf: {e}"))
+                self.rollback_fresh_leaf(&path, format!("chmod 0777 on the fresh leaf: {e}"))
             );
         }
         let meta = match std::fs::symlink_metadata(&path) {
@@ -991,7 +1010,7 @@ impl DirectoryWorkspaceStorage {
             identity: Box::new(WorkspaceIdentity::Directory {
                 device: meta.dev(),
                 inode: meta.ino(),
-                quota_bytes,
+                _quota_bytes: quota_bytes,
             }),
             minted_from: self.canonical_base.clone(),
         })
@@ -1155,7 +1174,7 @@ impl DirectoryWorkspaceStorage {
                 identity: Box::new(WorkspaceIdentity::Directory {
                     device: meta.dev(),
                     inode: meta.ino(),
-                    quota_bytes: 0,
+                    _quota_bytes: 0,
                 }),
                 minted_from: self.canonical_base.clone(),
             });
@@ -1164,7 +1183,6 @@ impl DirectoryWorkspaceStorage {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     let file = std::fs::File::open(dir)?;
     file.sync_all()
@@ -1174,7 +1192,7 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 impl PreparedWorkspace {
     pub(crate) fn directory_quota_bytes(&self) -> Option<u64> {
         match self.identity.as_ref() {
-            WorkspaceIdentity::Directory { quota_bytes, .. } => Some(*quota_bytes),
+            WorkspaceIdentity::Directory { _quota_bytes, .. } => Some(*_quota_bytes),
             WorkspaceIdentity::Btrfs { .. } => None,
         }
     }
@@ -1533,6 +1551,36 @@ mod tests {
             "the un-removable residual survives - surfaced via retain+poison, never a clean release"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn local_directory_backend_hardens_its_base_and_detects_permission_drift() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!(
+            "myelin-private-directory-base-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let storage = DirectoryWorkspaceStorage::open(&base)
+            .expect("opening the development backend hardens its enclosing base");
+        assert_eq!(std::fs::metadata(&base).unwrap().mode() & 0o777, 0o700);
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o705)).unwrap();
+        let error = storage
+            .check_health()
+            .expect_err("permission drift must close workspace admission");
+        assert!(error
+            .to_string()
+            .contains("deny every group/world permission"));
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(&base).unwrap();
     }
 
     fn libc_enospc() -> i32 {

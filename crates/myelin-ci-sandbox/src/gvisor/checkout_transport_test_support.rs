@@ -186,6 +186,7 @@ pub fn deterministic_enabled_backend_for_tests(root: &Path) -> (GvisorBackend, I
         workspace_integration: WorkspaceIntegration::Enabled {
             workspace_manager,
             userns_allocator,
+            process_identity: WorkspaceProcessIdentity::Isolated,
         },
         checkout: GvisorCheckoutConfig::disabled(),
         rootfs_overlay: None,

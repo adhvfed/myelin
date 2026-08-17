@@ -1738,6 +1738,28 @@ impl UserNamespaceAllocator {
             Path::new("/etc/subgid"),
             min_pool_size,
             true,
+            true,
+            incident_sink,
+        )
+    }
+
+    /// Builds the allocator for an explicitly selected single-user development runner.
+    ///
+    /// The system-owned subordinate-ID files remain strictly validated. Only the lease
+    /// directory's ancestor rule is relaxed, allowing ephemeral state below the developer's own
+    /// private data directory. Production callers must use [`Self::try_new`].
+    pub fn try_new_local_development(
+        leases_dir: PathBuf,
+        min_pool_size: u32,
+        incident_sink: IncidentSink,
+    ) -> Result<Self, UserNamespaceAllocatorError> {
+        Self::try_new_impl(
+            leases_dir,
+            Path::new("/etc/subuid"),
+            Path::new("/etc/subgid"),
+            min_pool_size,
+            true,
+            false,
             incident_sink,
         )
     }
@@ -1758,6 +1780,7 @@ impl UserNamespaceAllocator {
                 subgid_path,
                 min_pool_size,
                 false,
+                false,
                 incident_sink.clone(),
             ) {
                 Err(UserNamespaceAllocatorError::AlreadyLocked { .. })
@@ -1777,7 +1800,8 @@ impl UserNamespaceAllocator {
         subuid_path: &Path,
         subgid_path: &Path,
         min_pool_size: u32,
-        strict: bool,
+        strict_subordinate_config: bool,
+        strict_leases_dir: bool,
         incident_sink: IncidentSink,
     ) -> Result<Self, UserNamespaceAllocatorError> {
         let runner_uid = unsafe { libc::geteuid() };
@@ -1789,10 +1813,18 @@ impl UserNamespaceAllocator {
             });
         }
         let username = effective_username();
-        let uid_range =
-            parse_subordinate_range(subuid_path, runner_uid, username.as_deref(), strict)?;
-        let gid_range =
-            parse_subordinate_range(subgid_path, runner_uid, username.as_deref(), strict)?;
+        let uid_range = parse_subordinate_range(
+            subuid_path,
+            runner_uid,
+            username.as_deref(),
+            strict_subordinate_config,
+        )?;
+        let gid_range = parse_subordinate_range(
+            subgid_path,
+            runner_uid,
+            username.as_deref(),
+            strict_subordinate_config,
+        )?;
         if range_contains(uid_range, 0) || range_contains(uid_range, runner_uid) {
             return Err(UserNamespaceAllocatorError::SubordinateConfig {
                 path: subuid_path.to_path_buf(),
@@ -1823,7 +1855,7 @@ impl UserNamespaceAllocator {
             });
         }
 
-        harden_and_verify_leases_dir(&leases_dir, strict)?;
+        harden_and_verify_leases_dir(&leases_dir, strict_leases_dir)?;
         let lock =
             crate::dirlock::acquire_directory_lock(&leases_dir).map_err(|error| match error {
                 crate::dirlock::DirLockError::AlreadyLocked => {

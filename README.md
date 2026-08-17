@@ -26,14 +26,16 @@ and agents in one platform, built in Rust.
 Runtime dependencies: Postgres 16, NATS 2.10 (JetStream), Valkey 8, and an
 S3-compatible object store.
 
-The Git smart-HTTP service executes Git inside gVisor. Local development therefore
-also expects a systemd user manager, `runsc` on `PATH`, and a Git-capable root filesystem at
-`$XDG_DATA_HOME/gvisor-assets/git-rootfs` (or
-`~/.local/share/gvisor-assets/git-rootfs`). Set `MYELIN_RUNSC_BIN` or
-`MYELIN_GVISOR_GIT_ROOTFS` to override those locations. The self-hosting scripts
-stage these assets; `scripts/stage-git-rootfs.sh` can restage the Git image. Fed places both the
-Edge and the backend test process in delegated systemd scopes so their gVisor children receive the
-memory and CPU controllers needed to enforce job limits.
+Git smart HTTP and CI jobs execute inside gVisor. Local development therefore expects a systemd
+user manager, the root-owned pinned `runsc` installed at `/opt/myelin/bin/runsc`, and the root
+filesystems and Cargo vendor trees described by `runner-assets.toml` under
+`$XDG_DATA_HOME/gvisor-assets` (or `~/.local/share/gvisor-assets`). Set the corresponding
+`MYELIN_GVISOR_*` variables or `MYELIN_RUNSC_BIN` to override those locations. The self-hosting
+scripts stage these assets; `scripts/stage-git-rootfs.sh` can restage the Git image. Fed places
+Edge, CI, and backend tests in delegated systemd scopes so their gVisor children receive the memory
+and CPU controllers needed to enforce job limits. Its explicit `development` workspace mode uses
+private user-owned directories with bounded admission; production runners use the Btrfs-quota
+`enabled` mode and the capabilities in `deploy/systemd/myelin-ci-controlplane.service`.
 
 ## Development
 

@@ -114,7 +114,9 @@ impl PgCiRunStarterPoller {
                     started += 1;
                     processed += 1;
                 }
-                StartQueuedOutcome::Superseded { .. } => processed += 1,
+                StartQueuedOutcome::Superseded { .. } | StartQueuedOutcome::Rejected { .. } => {
+                    processed += 1
+                }
             }
         }
         Ok(CiRunStarterBatch {

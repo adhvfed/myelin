@@ -273,7 +273,27 @@ services:
 
   ci-controlplane:
     depends_on: [ci-dispatch]
-    process: cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane
+    process: >-
+      sh -c 'git_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/git";
+      assets="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets";
+      runner_state="$PWD/.fed/data/{{FED_PROJECT_ID}}/ci-runner";
+      if [ -n "${MYELIN_RUNSC_BIN:-}" ]; then runsc_bin="$MYELIN_RUNSC_BIN";
+      elif [ -x /opt/myelin/bin/runsc ]; then runsc_bin=/opt/myelin/bin/runsc;
+      else runsc_bin="$(command -v runsc)"; fi;
+      rootfs="${MYELIN_GVISOR_ROOTFS:-$assets/rootfs}";
+      rust_rootfs="${MYELIN_GVISOR_RUST_ROOTFS:-$assets/rust-rootfs}";
+      git_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-$assets/git-rootfs}";
+      umask 077; mkdir -p "$runner_state/runsc" "$runner_state/userns-leases"
+      "$runner_state/workspaces";
+      export MYELIN_CI_CHECKOUT_REPO_ROOT="$git_root" MYELIN_RUNSC_BIN="$runsc_bin"
+      MYELIN_GVISOR_ROOTFS="$rootfs" MYELIN_GVISOR_RUST_ROOTFS="$rust_rootfs"
+      MYELIN_GVISOR_GIT_ROOTFS="$git_rootfs" MYELIN_CI_WORKSPACE_MODE=development
+      MYELIN_EXPLICIT_USERNS_RUNSC_ROOT="$runner_state/runsc"
+      MYELIN_USERNS_LEASES_DIR="$runner_state/userns-leases"
+      MYELIN_CI_WORKSPACES_DIR="$runner_state/workspaces"
+      MYELIN_CI_WORKSPACE_CAPACITY_BYTES=10737418240;
+      exec systemd-run --user --scope --quiet --property=Delegate=yes
+      cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane'
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
@@ -287,8 +307,10 @@ services:
       REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
       NATS_URL: "nats://localhost:{{NATS_PORT}}"
       MYELIN_REGION: fr-par
-      MYELIN_CI_RUNNER: "0"
-    startup_message: "Myelin CI control plane is running (local runner disabled)"
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_CI_RUNNER: "1"
+    startup_message: "Myelin CI control plane and sandbox runner are running"
 
   git-checks:
     depends_on: [event-stream-ready]

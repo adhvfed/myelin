@@ -348,6 +348,10 @@ impl RunPlanError {
     pub fn requires_redispatch(&self) -> bool {
         matches!(self, RunPlanError::RedispatchRequired(_))
     }
+
+    pub fn is_dependency_failure(&self) -> bool {
+        matches!(self, RunPlanError::Blob(BlobError::Backend(_)))
+    }
 }
 
 impl std::fmt::Display for RunPlanError {

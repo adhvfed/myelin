@@ -503,10 +503,13 @@ impl GvisorBackend {
             })?;
         let cargo_vendor = selected_cargo_vendor(spec, registry)
             .map_err(|e| CheckoutOrchestrationError::Hook(HookError(e)))?;
-        let (workspace_manager, userns_allocator) = match &self.workspace_integration {
+        let (workspace_manager, userns_allocator, process_identity) = match &self
+            .workspace_integration
+        {
             WorkspaceIntegration::Enabled {
                 workspace_manager,
                 userns_allocator,
+                process_identity,
             } => {
                 workspace_manager.check_health().map_err(|e| {
                     CheckoutOrchestrationError::Hook(HookError(format!(
@@ -518,7 +521,7 @@ impl GvisorBackend {
                         "userns allocator identity check failed: {e}"
                     )))
                 })?;
-                (workspace_manager, userns_allocator)
+                (workspace_manager, userns_allocator, *process_identity)
             }
             WorkspaceIntegration::Disabled => {
                 return Err(CheckoutOrchestrationError::Hook(HookError(
@@ -656,6 +659,7 @@ impl GvisorBackend {
             checkout_guest_root.path().to_path_buf(),
             workspace_manager,
             userns_allocator,
+            process_identity,
             cargo_vendor,
         ) {
             Ok(runtime) => runtime,

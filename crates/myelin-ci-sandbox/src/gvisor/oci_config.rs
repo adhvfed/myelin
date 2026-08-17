@@ -235,10 +235,30 @@ pub(super) enum OciExecutionLayout {
     },
     ExplicitUserNamespaceWithWorkspace {
         config: UserNamespaceConfig,
+        process_identity: WorkspaceProcessIdentity,
         workspace: OciWorkspaceMount,
         absolute_rootfs: AbsoluteRootfs,
         cargo_vendor: Option<CargoVendorBoundary>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceProcessIdentity {
+    /// The workload runs as a distinct subordinate host identity.
+    Isolated,
+    /// The workload's container root maps to the invoking developer.
+    ///
+    /// This exists only for the explicitly selected single-user development workspace mode.
+    LocalDeveloper,
+}
+
+impl WorkspaceProcessIdentity {
+    fn container_id(self) -> u32 {
+        match self {
+            Self::Isolated => UNTRUSTED_UID,
+            Self::LocalDeveloper => 0,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -377,15 +397,17 @@ impl OciConfig {
         Ok(self)
     }
 
-    pub(crate) fn with_explicit_user_namespace_and_workspace(
+    pub(crate) fn with_explicit_user_namespace_and_workspace_as(
         mut self,
         config: UserNamespaceConfig,
+        process_identity: WorkspaceProcessIdentity,
         workspace: OciWorkspaceMount,
         absolute_rootfs: PathBuf,
     ) -> Result<OciConfig, String> {
         self.require_still_rootless()?;
         self.layout = OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
             config,
+            process_identity,
             workspace,
             absolute_rootfs: AbsoluteRootfs::new(absolute_rootfs)?,
             cargo_vendor: None,
@@ -446,7 +468,10 @@ impl OciConfig {
         Ok(self)
     }
 
-    pub(super) fn bind_materialized_cargo_lock(&mut self, digest: &str) -> Result<(), String> {
+    pub(super) fn bind_materialized_cargo_lock(
+        &mut self,
+        digest: Option<&str>,
+    ) -> Result<(), String> {
         match &mut self.layout {
             OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
                 cargo_vendor: Some(boundary),
@@ -458,6 +483,9 @@ impl OciConfig {
                             .to_string(),
                     );
                 }
+                let digest = digest.ok_or_else(|| {
+                    "structured Cargo launch requires a real materialized Cargo.lock".to_string()
+                })?;
                 if digest != boundary.asset.cargo_lock_sha256() {
                     return Err(format!(
                         "cargo vendor asset lock mismatch: checked-out Cargo.lock is sha256:{digest}, but the selected asset is keyed to sha256:{}",
@@ -639,6 +667,13 @@ impl OciConfig {
                 .map_err(|_| "format an OCI environment entry".to_string())?;
         }
         let has_cargo_vendor = self.has_cargo_vendor();
+        let process_identity = match &self.layout {
+            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
+                process_identity, ..
+            } => *process_identity,
+            _ => WorkspaceProcessIdentity::Isolated,
+        };
+        let process_id = process_identity.container_id();
         let cargo_home_tmpfs_bytes = if has_cargo_vendor {
             if self.tmpfs_bytes < 2 {
                 return Err(
@@ -681,8 +716,8 @@ impl OciConfig {
                          \"nodev\", \"mode=0700\", \"uid={uid}\", \"gid={gid}\", \
                          \"size={size}\"] }}",
                         destination = STRUCTURED_CARGO_HOME,
-                        uid = UNTRUSTED_UID,
-                        gid = UNTRUSTED_GID,
+                        uid = process_id,
+                        gid = process_id,
                         size = cargo_home_tmpfs_bytes,
                     ));
                     let vendor_source = cargo_vendor_host_source.ok_or_else(|| {
@@ -752,8 +787,8 @@ impl OciConfig {
              \"pids\": {{ \"limit\": {pids} }} }},\n    \
              \"seccomp\": {{ \"defaultAction\": \"SCMP_ACT_ERRNO\" }},\n    \
              \"namespaces\": [ {namespaces_json} ]{id_mappings_json}\n  }}\n}}",
-            uid = UNTRUSTED_UID,
-            gid = UNTRUSTED_GID,
+            uid = process_id,
+            gid = process_id,
             args = args,
             process_cwd = process_cwd,
             env_json = &*env_json,
@@ -866,8 +901,9 @@ mod tests {
             .is_none());
         let profile = HardeningProfile::derive(&free_form);
         let json = OciConfig::from_spec(&free_form, &profile)
-            .with_explicit_user_namespace_and_workspace(
+            .with_explicit_user_namespace_and_workspace_as(
                 UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005),
+                WorkspaceProcessIdentity::Isolated,
                 OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
                 PathBuf::from("/abs/staged-rootfs"),
             )
@@ -1165,8 +1201,9 @@ mod tests {
         let workspace = OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace-subvol"));
         let cfg = GvisorBackend::oci_config(&spec(vec![]))
             .unwrap()
-            .with_explicit_user_namespace_and_workspace(
+            .with_explicit_user_namespace_and_workspace_as(
                 config,
+                WorkspaceProcessIdentity::Isolated,
                 workspace,
                 PathBuf::from("/abs/staged-rootfs"),
             )
@@ -1206,13 +1243,40 @@ mod tests {
     }
 
     #[test]
+    fn local_development_workspace_maps_container_root_to_the_invoking_developer() {
+        let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
+        let json = GvisorBackend::oci_config(&spec(vec![]))
+            .unwrap()
+            .with_explicit_user_namespace_and_workspace_as(
+                config,
+                WorkspaceProcessIdentity::LocalDeveloper,
+                OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace")),
+                PathBuf::from("/abs/staged-rootfs"),
+            )
+            .unwrap()
+            .to_json()
+            .unwrap();
+
+        assert!(
+            json.contains("\"user\": { \"uid\": 0, \"gid\": 0 }"),
+            "development workspaces must run as container root, which maps to the invoking host \
+             user and owns the ordinary directory: {json}"
+        );
+        assert!(
+            json.contains("\"containerID\": 0, \"hostID\": 1000, \"size\": 1"),
+            "container root must map only to the invoking developer: {json}"
+        );
+    }
+
+    #[test]
     fn oci_config_with_explicit_user_namespace_and_workspace_refuses_a_relative_rootfs() {
         let config = UserNamespaceConfig::for_tests(1000, 1000, 100_005, 200_005);
         let workspace = OciWorkspaceMount::for_tests(PathBuf::from("/host/workspace-subvol"));
         let result = GvisorBackend::oci_config(&spec(vec![]))
             .unwrap()
-            .with_explicit_user_namespace_and_workspace(
+            .with_explicit_user_namespace_and_workspace_as(
                 config,
+                WorkspaceProcessIdentity::Isolated,
                 workspace,
                 PathBuf::from("relative/staged-rootfs"),
             );

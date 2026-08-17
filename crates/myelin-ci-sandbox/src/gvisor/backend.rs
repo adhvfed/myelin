@@ -60,7 +60,18 @@ pub struct GvisorBackend {
 #[derive(Debug)]
 pub enum GvisorWorkspaceConfig {
     Disabled,
+    /// Production Btrfs workspaces with hard per-job quotas and subordinate host ownership.
     Enabled {
+        base_dir: PathBuf,
+        host_capacity_bytes: u64,
+        leases_dir: PathBuf,
+        min_pool_size: u32,
+    },
+    /// Single-user development workspaces backed by ordinary directories.
+    ///
+    /// Capacity is bounded at admission but is not a filesystem-enforced quota. Workloads still
+    /// execute inside gVisor with cgroup limits and no network unless explicitly allowed.
+    LocalDevelopment {
         base_dir: PathBuf,
         host_capacity_bytes: u64,
         leases_dir: PathBuf,
@@ -245,7 +256,17 @@ impl GvisorBackend {
             registry,
             workspace_config,
             incident_sink,
-            UserNamespaceAllocator::try_new,
+            |local_development, leases_dir, min_pool_size, incident_sink| {
+                if local_development {
+                    UserNamespaceAllocator::try_new_local_development(
+                        leases_dir,
+                        min_pool_size,
+                        incident_sink,
+                    )
+                } else {
+                    UserNamespaceAllocator::try_new(leases_dir, min_pool_size, incident_sink)
+                }
+            },
             WorkspaceManager::try_new,
         )
     }
@@ -259,6 +280,7 @@ impl GvisorBackend {
     ) -> Result<GvisorBackend, GvisorBackendInitError>
     where
         U: FnOnce(
+            bool,
             PathBuf,
             u32,
             crate::workspace_manager::IncidentSink,
@@ -270,19 +292,43 @@ impl GvisorBackend {
     {
         let workspace_integration = match workspace_config {
             GvisorWorkspaceConfig::Disabled => WorkspaceIntegration::Disabled,
-            GvisorWorkspaceConfig::Enabled {
-                base_dir,
-                host_capacity_bytes,
-                leases_dir,
-                min_pool_size,
-            } => {
-                let userns_allocator =
-                    build_userns(leases_dir, min_pool_size, incident_sink.clone())
-                        .map_err(GvisorBackendInitError::UserNamespace)?;
-                let workspace_manager = build_workspace(
-                    WorkspaceStorageMode::EphemeralDisk {
+            config @ (GvisorWorkspaceConfig::Enabled { .. }
+            | GvisorWorkspaceConfig::LocalDevelopment { .. }) => {
+                let local_development =
+                    matches!(&config, GvisorWorkspaceConfig::LocalDevelopment { .. });
+                let (base_dir, host_capacity_bytes, leases_dir, min_pool_size) = match config {
+                    GvisorWorkspaceConfig::Enabled {
                         base_dir,
                         host_capacity_bytes,
+                        leases_dir,
+                        min_pool_size,
+                    }
+                    | GvisorWorkspaceConfig::LocalDevelopment {
+                        base_dir,
+                        host_capacity_bytes,
+                        leases_dir,
+                        min_pool_size,
+                    } => (base_dir, host_capacity_bytes, leases_dir, min_pool_size),
+                    GvisorWorkspaceConfig::Disabled => unreachable!(),
+                };
+                let userns_allocator = build_userns(
+                    local_development,
+                    leases_dir,
+                    min_pool_size,
+                    incident_sink.clone(),
+                )
+                .map_err(GvisorBackendInitError::UserNamespace)?;
+                let workspace_manager = build_workspace(
+                    if local_development {
+                        WorkspaceStorageMode::LocalDevelopmentDirectory {
+                            base_dir,
+                            host_capacity_bytes,
+                        }
+                    } else {
+                        WorkspaceStorageMode::EphemeralDisk {
+                            base_dir,
+                            host_capacity_bytes,
+                        }
                     },
                     incident_sink,
                 )
@@ -290,6 +336,11 @@ impl GvisorBackend {
                 WorkspaceIntegration::Enabled {
                     workspace_manager,
                     userns_allocator,
+                    process_identity: if local_development {
+                        WorkspaceProcessIdentity::LocalDeveloper
+                    } else {
+                        WorkspaceProcessIdentity::Isolated
+                    },
                 }
             }
         };
@@ -462,6 +513,7 @@ impl GvisorBackend {
         if let WorkspaceIntegration::Enabled {
             workspace_manager,
             userns_allocator,
+            ..
         } = &self.workspace_integration
         {
             workspace_manager.check_health().map_err(|e| {
@@ -520,14 +572,18 @@ impl GvisorBackend {
             WorkspaceIntegration::Enabled {
                 workspace_manager,
                 userns_allocator,
+                process_identity,
             } => match acquire_enabled_workspace(
-                spec,
-                &profile,
-                &container_id,
-                job_guest_root.path().to_path_buf(),
+                EnabledWorkspaceRequest::new(
+                    spec,
+                    &profile,
+                    &container_id,
+                    job_guest_root.path().to_path_buf(),
+                    *process_identity,
+                )
+                .with_optional_cargo_vendor(cargo_vendor),
                 workspace_manager,
                 userns_allocator,
-                cargo_vendor,
             ) {
                 Ok((cfg, context)) => {
                     enabled_context = Some(context);
@@ -1135,7 +1191,7 @@ mod tests {
                 min_pool_size: 1,
             },
             Arc::new(|_: &str| {}),
-            |_leases_dir, _min_pool_size, _sink| {
+            |_local_development, _leases_dir, _min_pool_size, _sink| {
                 Err(UserNamespaceAllocatorError::NoSubordinateEntry {
                     path: PathBuf::from("/etc/subuid"),
                     uid: 0,
@@ -1181,7 +1237,8 @@ mod tests {
                 min_pool_size: 1,
             },
             Arc::new(|_: &str| {}),
-            |leases_dir, min_pool_size, sink| {
+            |local_development, leases_dir, min_pool_size, sink| {
+                assert!(!local_development);
                 crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
                     leases_dir,
                     &subuid,
@@ -1230,7 +1287,8 @@ mod tests {
                 min_pool_size: 1,
             },
             Arc::new(|_: &str| {}),
-            |leases_dir, min_pool_size, sink| {
+            |local_development, leases_dir, min_pool_size, sink| {
+                assert!(!local_development);
                 crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
                     leases_dir,
                     &subuid,
@@ -1250,6 +1308,59 @@ mod tests {
     }
 
     #[test]
+    fn local_development_selects_directory_storage_and_the_developer_identity_together() {
+        let base = std::env::temp_dir().join(format!(
+            "myelin-gvisor-local-development-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let leases_dir = base.join("leases");
+        let subuid = base.join("subuid");
+        let subgid = base.join("subgid");
+        write_subordinate_file(&subuid, 100_000, 8);
+        write_subordinate_file(&subgid, 200_000, 8);
+
+        let backend = GvisorBackend::try_new_with_builders(
+            test_registry(),
+            GvisorWorkspaceConfig::LocalDevelopment {
+                base_dir: base.join("workspaces"),
+                host_capacity_bytes: 1 << 30,
+                leases_dir: leases_dir.clone(),
+                min_pool_size: 1,
+            },
+            Arc::new(|_: &str| {}),
+            |local_development, leases_dir, min_pool_size, sink| {
+                assert!(local_development);
+                crate::user_namespace::UserNamespaceAllocator::try_new_for_tests(
+                    leases_dir,
+                    &subuid,
+                    &subgid,
+                    min_pool_size,
+                    sink,
+                )
+            },
+            |mode, sink| {
+                assert!(matches!(
+                    mode,
+                    WorkspaceStorageMode::LocalDevelopmentDirectory { .. }
+                ));
+                WorkspaceManager::try_new(WorkspaceStorageMode::Disabled, sink)
+            },
+        )
+        .expect("the injected local-development components must construct");
+
+        assert!(matches!(
+            backend.workspace_integration,
+            WorkspaceIntegration::Enabled {
+                process_identity: WorkspaceProcessIdentity::LocalDeveloper,
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn try_new_with_builders_invokes_neither_builder_when_disabled() {
         let userns_called = Arc::new(AtomicBool::new(false));
         let workspace_called = Arc::new(AtomicBool::new(false));
@@ -1259,7 +1370,7 @@ mod tests {
             test_registry(),
             GvisorWorkspaceConfig::Disabled,
             Arc::new(|_: &str| {}),
-            move |leases_dir, min_pool_size, sink| {
+            move |_local_development, leases_dir, min_pool_size, sink| {
                 u.store(true, Ordering::SeqCst);
                 UserNamespaceAllocator::try_new(leases_dir, min_pool_size, sink)
             },
@@ -1433,6 +1544,7 @@ mod tests {
             workspace_integration: WorkspaceIntegration::Enabled {
                 workspace_manager,
                 userns_allocator,
+                process_identity: WorkspaceProcessIdentity::Isolated,
             },
             checkout: GvisorCheckoutConfig::disabled(),
             rootfs_overlay: None,

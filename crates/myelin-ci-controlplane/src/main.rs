@@ -38,12 +38,12 @@ impl fmt::Display for StartupRefusal {
             Self::InvalidWorkspaceMode(value) => write!(
                 f,
                 "invalid MYELIN_CI_WORKSPACE_MODE value {value:?}; allowed values are `enabled`, \
-                 `disabled`, or unset"
+                 `development`, `disabled`, or unset"
             ),
             Self::NonUnicodeWorkspaceMode(value) => write!(
                 f,
                 "invalid MYELIN_CI_WORKSPACE_MODE value {value:?} contains non-UTF-8 bytes; allowed \
-                 values are `enabled`, `disabled`, or unset"
+                 values are `enabled`, `development`, `disabled`, or unset"
             ),
             Self::NonTerminalNullStageBacklog { count } => write!(
                 f,
@@ -137,6 +137,7 @@ fn checkout_workspace_capability_requested(
 struct ExplicitUsernsPolicyPaths {
     helper_dir: std::path::PathBuf,
     runsc_root: std::path::PathBuf,
+    local_development: bool,
 }
 
 #[derive(Debug)]
@@ -154,21 +155,22 @@ fn parse_workspace_activation_given(
     capacity_bytes: impl FnOnce() -> Result<String, std::env::VarError>,
     explicit_userns_helper_dir: impl FnOnce() -> Result<String, std::env::VarError>,
 ) -> Result<ParsedWorkspaceActivation, StartupRefusal> {
-    let enabled = match mode {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) if value == "disabled" => false,
-        Ok(value) if value == "enabled" => true,
+    let local_development = match mode {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(value) if value == "disabled" => None,
+        Ok(value) if value == "enabled" => Some(false),
+        Ok(value) if value == "development" => Some(true),
         Ok(value) => return Err(StartupRefusal::InvalidWorkspaceMode(value)),
         Err(std::env::VarError::NotUnicode(value)) => {
             return Err(StartupRefusal::NonUnicodeWorkspaceMode(value));
         }
     };
-    if !enabled {
+    let Some(local_development) = local_development else {
         return Ok(ParsedWorkspaceActivation {
             workspace_config: myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig::Disabled,
             explicit_policy: None,
         });
-    }
+    };
     let required_absolute_path =
         |name: &'static str, value: Result<String, std::env::VarError>| match value {
             Ok(v) if !v.is_empty() => {
@@ -183,7 +185,7 @@ fn parse_workspace_activation_given(
             }
             Ok(_) | Err(std::env::VarError::NotPresent) => {
                 Err(StartupRefusal::RunnerHostPreflight(format!(
-                    "{name} is required when MYELIN_CI_WORKSPACE_MODE=enabled"
+                    "{name} is required when MYELIN_CI_WORKSPACE_MODE is `enabled` or `development`"
                 )))
             }
             Err(std::env::VarError::NotUnicode(_)) => Err(StartupRefusal::RunnerHostPreflight(
@@ -205,7 +207,7 @@ fn parse_workspace_activation_given(
         Err(std::env::VarError::NotPresent) => {
             return Err(StartupRefusal::RunnerHostPreflight(
                 "MYELIN_CI_WORKSPACE_CAPACITY_BYTES is required when \
-                 MYELIN_CI_WORKSPACE_MODE=enabled -- there is no default; the aggregate disk \
+                 MYELIN_CI_WORKSPACE_MODE is `enabled` or `development` -- there is no default; the aggregate disk \
                  admission ceiling is an operator/storage-layout decision"
                     .to_string(),
             ));
@@ -224,15 +226,25 @@ fn parse_workspace_activation_given(
         )?,
     };
     Ok(ParsedWorkspaceActivation {
-        workspace_config: myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig::Enabled {
-            base_dir,
-            host_capacity_bytes,
-            leases_dir,
-            min_pool_size: 1,
+        workspace_config: if local_development {
+            myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig::LocalDevelopment {
+                base_dir,
+                host_capacity_bytes,
+                leases_dir,
+                min_pool_size: 1,
+            }
+        } else {
+            myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig::Enabled {
+                base_dir,
+                host_capacity_bytes,
+                leases_dir,
+                min_pool_size: 1,
+            }
         },
         explicit_policy: Some(ExplicitUsernsPolicyPaths {
             helper_dir,
             runsc_root,
+            local_development,
         }),
     })
 }
@@ -266,10 +278,17 @@ fn prepare_runner_host() -> Result<myelin_ci_sandbox::gvisor::GvisorWorkspaceCon
     prepare_runner_host_given(
         parse_workspace_activation(),
         |policy| {
-            myelin_ci_sandbox::gvisor::preflight_explicit_userns_policy(
-                &policy.helper_dir,
-                &policy.runsc_root,
-            )
+            if policy.local_development {
+                myelin_ci_sandbox::gvisor::preflight_local_development_explicit_userns_policy(
+                    &policy.helper_dir,
+                    &policy.runsc_root,
+                )
+            } else {
+                myelin_ci_sandbox::gvisor::preflight_explicit_userns_policy(
+                    &policy.helper_dir,
+                    &policy.runsc_root,
+                )
+            }
         },
         || {
             let required_path = |name: &'static str| match std::env::var(name) {
@@ -886,6 +905,7 @@ mod tests {
         for (runner, workspace) in [
             (Ok("0".to_owned()), Ok("enabled".to_owned())),
             (absent, Ok("enabled".to_owned())),
+            (Ok("1".to_owned()), Ok("development".to_owned())),
             (Ok("1".to_owned()), Ok("disabled".to_owned())),
             (Ok("1".to_owned()), Ok("invalid".to_owned())),
             (Ok("1".to_owned()), Err(VarError::NotPresent)),
@@ -1013,7 +1033,7 @@ mod tests {
         );
         assert!(refusal
             .to_string()
-            .contains("allowed values are `enabled`, `disabled`, or unset"));
+            .contains("allowed values are `enabled`, `development`, `disabled`, or unset"));
     }
 
     #[cfg(unix)]
@@ -1125,6 +1145,9 @@ mod tests {
                 ..
             } => assert_eq!(host_capacity_bytes, 42),
             GvisorWorkspaceConfig::Disabled => panic!("enabled mode must produce Enabled"),
+            GvisorWorkspaceConfig::LocalDevelopment { .. } => {
+                panic!("enabled mode must not produce LocalDevelopment")
+            }
         }
     }
 
@@ -1152,6 +1175,9 @@ mod tests {
                 assert_eq!(min_pool_size, 1, "the userns pool must be fixed at 1");
             }
             GvisorWorkspaceConfig::Disabled => panic!("enabled mode must produce Enabled"),
+            GvisorWorkspaceConfig::LocalDevelopment { .. } => {
+                panic!("enabled mode must not produce LocalDevelopment")
+            }
         }
         let policy = parsed
             .explicit_policy
@@ -1164,6 +1190,34 @@ mod tests {
             policy.helper_dir,
             PathBuf::from("/usr/bin"),
             "unset helper dir must default"
+        );
+        assert!(!policy.local_development);
+    }
+
+    #[test]
+    fn development_mode_is_explicit_and_keeps_the_same_bounded_inputs() {
+        let parsed = parse_workspace_activation_given(
+            Ok("development".to_owned()),
+            || Ok("/home/developer/.local/state/myelin/runsc".to_owned()),
+            || Ok("/home/developer/.local/state/myelin/userns-leases".to_owned()),
+            || Ok("/home/developer/.local/state/myelin/ci-workspaces".to_owned()),
+            || Ok("1073741824".to_owned()),
+            || Ok("/usr/bin".to_owned()),
+        )
+        .expect("a fully bounded development configuration must parse");
+        assert!(matches!(
+            parsed.workspace_config,
+            GvisorWorkspaceConfig::LocalDevelopment {
+                host_capacity_bytes: 1_073_741_824,
+                min_pool_size: 1,
+                ..
+            }
+        ));
+        assert!(
+            parsed
+                .explicit_policy
+                .expect("development mode still requires explicit user namespaces")
+                .local_development
         );
     }
 
@@ -1268,6 +1322,7 @@ mod tests {
                 explicit_policy: Some(ExplicitUsernsPolicyPaths {
                     helper_dir: PathBuf::from("/usr/bin"),
                     runsc_root: PathBuf::from("/opt/myelin/gvisor-runsc-root"),
+                    local_development: false,
                 }),
             }),
             |_policy| {
@@ -1298,6 +1353,7 @@ mod tests {
                 explicit_policy: Some(ExplicitUsernsPolicyPaths {
                     helper_dir: PathBuf::from("/usr/bin"),
                     runsc_root: PathBuf::from("/opt/myelin/gvisor-runsc-root"),
+                    local_development: false,
                 }),
             }),
             |_policy| Err("synthetic explicit-userns preflight failure".to_owned()),

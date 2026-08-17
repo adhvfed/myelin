@@ -8,8 +8,9 @@ use myelin_ci_sandbox::gvisor::{
     OCI_CARGO_VENDOR_MOUNT,
 };
 use myelin_events::{
-    derive_envelope_from_persisted_cause, Actor, CausedBy, CorrelationId, EmitContext, EventId,
-    HandlerTx, IdMinter, PersistedEventCause, Timestamp,
+    derive_envelope_from_persisted_cause, Actor, AggregateKey, CausedBy, CorrelationId, DataRole,
+    EmitContext, EventDraft, EventId, EventType, HandlerTx, IdMinter, PersistedEventCause,
+    Timestamp, Visibility,
 };
 use myelin_flow::{partition_for_run_id, PgFlowExecutor, RunId, StartSpec, CI_PIPELINE_WF_TYPE};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -69,6 +70,10 @@ FOR UPDATE";
 pub const CI_JOB_ID_V1_DOMAIN: &str = "myelin.ci.job-id.v1";
 pub const CI_JOB_ID_V2_DOMAIN: &str = "myelin.ci.job-id.v2";
 pub const CI_INITIAL_CHECK_EVENT_V1_DOMAIN: &str = "myelin.ci.initial-check-event.v1";
+pub const CI_RUN_START_REJECTED_EVENT_V1_DOMAIN: &str = "myelin.ci.run-start-rejected.v1";
+const REJECTED_JOB_STAGE: &str = "pipeline";
+const REJECTED_JOB_NAME: &str = "Configuration";
+const MAX_REJECTION_DIAGNOSTIC_BYTES: usize = 2_048;
 
 pub fn ci_job_id_v1(
     tenant: &TenantId,
@@ -335,6 +340,7 @@ struct StarterCandidate {
 pub enum StartQueuedOutcome {
     Idle,
     Superseded { run_id: String },
+    Rejected { run_id: String },
     Started { run_id: String, wf_run_id: String },
 }
 
@@ -505,10 +511,13 @@ impl PgCiPipelineStarter {
         let prepared = if manifest_preflight.is_some() {
             None
         } else {
-            Some(
-                load_launch_run_plan_v2(self.blobs.as_ref(), &candidate.record)
-                    .map_err(PgCiStarterError::Plan)?,
-            )
+            match load_launch_run_plan_v2(self.blobs.as_ref(), &candidate.record) {
+                Ok(plan) => Some(plan),
+                Err(error) if !error.is_dependency_failure() => {
+                    return self.reject_unlaunchable(&candidate, &error).await;
+                }
+                Err(error) => return Err(PgCiStarterError::Plan(error)),
+            }
         };
 
         let mut transaction = self
@@ -704,6 +713,143 @@ impl PgCiPipelineStarter {
         })
     }
 
+    async fn reject_unlaunchable(
+        &self,
+        candidate: &StarterCandidate,
+        error: &RunPlanError,
+    ) -> Result<StartQueuedOutcome, PgCiStarterError> {
+        let diagnostic = bounded_rejection_diagnostic(error);
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| PgCiStarterError::Database(format!("begin rejection: {error}")))?;
+        scope_transaction(&mut transaction, &self.tenant, &self.region).await?;
+        let row = sqlx::query(LOCK_EXACT_QUEUED_RUN)
+            .bind(&self.tenant.0)
+            .bind(&self.region.0)
+            .bind(&candidate.record.run_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| {
+                PgCiStarterError::Database(format!("lock rejected queued run: {error}"))
+            })?;
+        let Some(row) = row else {
+            transaction.rollback().await.map_err(|error| {
+                PgCiStarterError::Database(format!("rollback lost rejection race: {error}"))
+            })?;
+            return Ok(StartQueuedOutcome::Idle);
+        };
+        let locked = decode_candidate(&row)?;
+        if &locked != candidate {
+            return Err(PgCiStarterError::CorruptRun(
+                "authoritative ci_run changed before launch rejection".into(),
+            ));
+        }
+        let attached: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM ci_drive_manifest \
+                              WHERE tenant_id = $1 AND region = $2 \
+                                AND ci_run_id = $3::uuid) \
+                 OR EXISTS (SELECT 1 FROM workflow_run \
+                             WHERE tenant_id = $1 AND region = $2 AND run_id = $4) \
+                 OR EXISTS (SELECT 1 FROM ci_job \
+                             WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid) \
+                 OR EXISTS (SELECT 1 FROM job_queue \
+                             WHERE tenant_id = $1 AND region = $2 AND run_id = $4::uuid) \
+                 OR EXISTS (SELECT 1 FROM ci_job_accounting \
+                             WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid) \
+                 OR EXISTS (SELECT 1 FROM cost_reservation \
+                             WHERE tenant_id = $1 AND region = $2 \
+                               AND (run_id LIKE ('ci-reserve:v1:' || $3::text || ':%') \
+                                    OR run_id LIKE ('ci-reserve:v2:' || $3::text || ':%')))",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(&candidate.record.run_id)
+        .bind(&candidate.record.wf_run_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| {
+            PgCiStarterError::Database(format!("verify rejected queued run: {error}"))
+        })?;
+        if attached {
+            return Err(PgCiStarterError::CorruptRun(
+                "unlaunchable queued run already owns launch, workflow, or accounting state".into(),
+            ));
+        }
+
+        let run_uuid = sqlx::types::Uuid::parse_str(&candidate.record.run_id)
+            .map_err(|_| PgCiStarterError::CorruptRun("rejected run id is not a UUID".into()))?;
+        let job_id = ci_job_id_v2(
+            &self.tenant,
+            run_uuid,
+            REJECTED_JOB_STAGE,
+            REJECTED_JOB_NAME,
+            &[],
+        );
+        sqlx::query(
+            "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, \
+                                 matrix_key, spec_ref, state, attempt, result_summary) \
+             VALUES ($1, $2, $3, $4::uuid, $5, $6, '{}', NULL, $7, 'failed', 1, $8)",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(job_id)
+        .bind(&candidate.record.run_id)
+        .bind(REJECTED_JOB_STAGE)
+        .bind(REJECTED_JOB_NAME)
+        .bind(&candidate.record.definition_snapshot)
+        .bind(serde_json::json!({
+            "passed": false,
+            "timed_out": false,
+            "disposition": "configuration_refused",
+            "workload_started": false,
+            "diagnostic": diagnostic,
+        }))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            PgCiStarterError::Database(format!("insert rejected configuration job: {error}"))
+        })?;
+        let finished_at: String = sqlx::query_scalar(
+            "UPDATE ci_run \
+             SET state = 'failed', cost_settled = true, finished_at = clock_timestamp() \
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid \
+               AND wf_run_id = $4::uuid AND state = 'queued' \
+               AND cost_settled = false AND finished_at IS NULL \
+             RETURNING to_char(finished_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .bind(&candidate.record.run_id)
+        .bind(&candidate.record.wf_run_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| {
+            PgCiStarterError::Database(format!("terminalize rejected queued run: {error}"))
+        })?
+        .ok_or_else(|| {
+            PgCiStarterError::CorruptRun(
+                "rejected queued run lifecycle changed under its lock".into(),
+            )
+        })?;
+        emit_rejected_facts(
+            &mut transaction,
+            &candidate.record,
+            &candidate.created_at,
+            &finished_at,
+            &diagnostic,
+        )
+        .await?;
+        transaction.commit().await.map_err(|error| {
+            PgCiStarterError::Database(format!("commit queued run rejection: {error}"))
+        })?;
+        Ok(StartQueuedOutcome::Rejected {
+            run_id: candidate.record.run_id.clone(),
+        })
+    }
+
     async fn preflight_candidate(&self) -> Result<Option<StarterCandidate>, PgCiStarterError> {
         let mut transaction = self
             .pool
@@ -822,20 +968,7 @@ async fn emit_initial_checks(
     manifest_digest: &str,
 ) -> Result<(), PgCiStarterError> {
     let tenant = TenantId(manifest.tenant_id.clone());
-    let cause_event_id = record.cause_event_id.clone().ok_or_else(|| {
-        PgCiStarterError::CorruptRun("queued run lacks durable triggering-event provenance".into())
-    })?;
-    let cause_depth = u32::try_from(record.cause_depth).map_err(|_| {
-        PgCiStarterError::CorruptRun(
-            "queued run carries causal depth outside the canonical u32 range".into(),
-        )
-    })?;
-    let cause = PersistedEventCause {
-        event_id: EventId(cause_event_id),
-        correlation_id: CorrelationId(record.correlation_id.clone()),
-        caused_by: record.caused_by.clone().map(CausedBy),
-        depth: cause_depth,
-    };
+    let cause = persisted_event_cause(record)?;
     // @tenant-cross-scope: PostgreSQL's clock is cell infrastructure with no tenant-owned rows;
     let emitted_at: String = sqlx::query_scalar(
         "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', \
@@ -891,6 +1024,182 @@ async fn emit_initial_checks(
             })?;
     }
     Ok(())
+}
+
+fn bounded_rejection_diagnostic(error: &RunPlanError) -> String {
+    let mut output = String::with_capacity(MAX_REJECTION_DIAGNOSTIC_BYTES.min(256));
+    for character in error.to_string().chars() {
+        let character = if character.is_control() {
+            '�'
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > MAX_REJECTION_DIAGNOSTIC_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn persisted_event_cause(record: &CiRunRecord) -> Result<PersistedEventCause, PgCiStarterError> {
+    let cause_event_id = record.cause_event_id.clone().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("queued run lacks durable triggering-event provenance".into())
+    })?;
+    let cause_depth = u32::try_from(record.cause_depth).map_err(|_| {
+        PgCiStarterError::CorruptRun(
+            "queued run carries causal depth outside the canonical u32 range".into(),
+        )
+    })?;
+    Ok(PersistedEventCause {
+        event_id: EventId(cause_event_id),
+        correlation_id: CorrelationId(record.correlation_id.clone()),
+        caused_by: record.caused_by.clone().map(CausedBy),
+        depth: cause_depth,
+    })
+}
+
+async fn emit_rejected_facts(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    record: &CiRunRecord,
+    started_at: &str,
+    finished_at: &str,
+    diagnostic: &str,
+) -> Result<(), PgCiStarterError> {
+    let tenant = TenantId(record.tenant_id.clone());
+    let region = Region(record.region.clone());
+    let repo_ref = record.repo_ref.as_deref().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("rejected run lacks a repository reference".into())
+    })?;
+    let commit_oid = record.commit_oid.as_deref().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("rejected run lacks a commit identity".into())
+    })?;
+    let run_ref = ci_run_ref(&record.tenant_id, &record.run_id)
+        .map_err(|error| PgCiStarterError::CorruptRun(error.to_string()))?;
+    let cause = persisted_event_cause(record)?;
+    let timestamp = Timestamp(finished_at.to_owned());
+    let actor = Actor(Principal::stub(
+        PrincipalId("ci-controlplane".into()),
+        PrincipalKind::Service,
+        tenant.clone(),
+    ));
+    let attempts = sqlx::query_as::<_, (String, i32)>(
+        "SELECT context, run_attempt \
+         FROM ci_run_check_attempt \
+         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid \
+         ORDER BY context",
+    )
+    .bind(&record.tenant_id)
+    .bind(&record.region)
+    .bind(&record.run_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|error| {
+        PgCiStarterError::Database(format!("load rejected check attempts: {error}"))
+    })?;
+    for (context, attempt) in attempts {
+        let attempt = u32::try_from(attempt).map_err(|_| {
+            PgCiStarterError::CorruptRun("rejected check attempt is not a positive u32".into())
+        })?;
+        if attempt == 0 {
+            return Err(PgCiStarterError::CorruptRun(
+                "rejected check attempt is not a positive u32".into(),
+            ));
+        }
+        let emit_context = crate::check_emitter::CheckEmitContext {
+            tenant: record.tenant_id.clone(),
+            repo: repo_ref.to_owned(),
+            commit_oid: commit_oid.to_owned(),
+            run_ref: run_ref.0.clone(),
+            run_attempt: attempt,
+            trust_tier: crate::check_emitter::TrustTier::from_stamp(&record.trust_tier),
+            started_at: started_at.to_owned(),
+            completed_at: Some(finished_at.to_owned()),
+        };
+        let status = crate::check_emitter::CheckStatusUpdate::required(
+            crate::check_emitter::CheckProvider::Ci,
+            &context,
+            crate::check_emitter::CheckState::Error,
+        )
+        .settled();
+        let draft = crate::check_emitter::assemble_check_status(&emit_context, &status);
+        let envelope = derive_envelope_from_persisted_cause(
+            draft,
+            EmitContext {
+                event_id: rejected_event_id(record, "check", Some(&context)),
+                tenant: tenant.clone(),
+                region: region.clone(),
+                actor: actor.clone(),
+                schema_ver: 1,
+                occurred_at: timestamp.clone(),
+                recorded_at: timestamp.clone(),
+                caused_by: None,
+            },
+            Some(&cause),
+        );
+        let aggregate = envelope.aggregate.0.clone();
+        PgRelay::co_commit_in_tx(transaction, &aggregate, &envelope)
+            .await
+            .map_err(|error| {
+                PgCiStarterError::Database(format!("emit rejected check fact: {error}"))
+            })?;
+    }
+
+    let draft = EventDraft {
+        type_: EventType(myelin_ci_sandbox::events::CI_RUN_FAILED.into()),
+        subject: run_ref.clone(),
+        aggregate: AggregateKey(format!("ci/run/{}", run_ref.0)),
+        payload: serde_json::json!({
+            "run": run_ref.0,
+            "repo_ref": repo_ref,
+            "commit_oid": commit_oid,
+            "structured_failure": {
+                "failed_stage": REJECTED_JOB_STAGE,
+                "diagnostic": diagnostic,
+            },
+        }),
+        data_role: DataRole::Controller,
+        visibility: Visibility::Internal,
+        contains_personal_data: false,
+        pii_key_ref: None,
+    };
+    let envelope = derive_envelope_from_persisted_cause(
+        draft,
+        EmitContext {
+            event_id: rejected_event_id(record, "run", None),
+            tenant,
+            region,
+            actor,
+            schema_ver: 1,
+            occurred_at: timestamp.clone(),
+            recorded_at: timestamp,
+            caused_by: None,
+        },
+        Some(&cause),
+    );
+    let aggregate = envelope.aggregate.0.clone();
+    PgRelay::co_commit_in_tx(transaction, &aggregate, &envelope)
+        .await
+        .map_err(|error| PgCiStarterError::Database(format!("emit rejected run fact: {error}")))?;
+    Ok(())
+}
+
+fn rejected_event_id(record: &CiRunRecord, kind: &str, context: Option<&str>) -> EventId {
+    let mut hasher = blake3::Hasher::new_derive_key(CI_RUN_START_REJECTED_EVENT_V1_DOMAIN);
+    for frame in [
+        record.tenant_id.as_bytes(),
+        record.region.as_bytes(),
+        record.run_id.as_bytes(),
+        kind.as_bytes(),
+        context.unwrap_or_default().as_bytes(),
+    ] {
+        hasher.update(&(frame.len() as u64).to_be_bytes());
+        hasher.update(frame);
+    }
+    EventId(format!(
+        "ci-run-start-rejected-{}",
+        hasher.finalize().to_hex()
+    ))
 }
 
 fn manifest_check_trust_tier(tier: CiManifestTrustTierV1) -> crate::check_emitter::TrustTier {

@@ -8,8 +8,9 @@ use super::{
     resolve_checkout_preparation_permit, run_checkout_preparation_inner,
     settle_enabled_finalization, unique_suffix, AcquisitionFailure, BoundWorkloadRefusal,
     CheckoutPreparationError, CheckoutPreparationSpec, ContainerRun, EnabledLaunchContext,
-    LeaseBindState, OciConfig, PreparedCheckoutEvidence, RealCheckoutCleanupExecutor,
-    RetainedWorkloadOutcome, RunFailure, RuntimeFinalization, WorkloadRotatedSpec,
+    EnabledWorkspaceRequest, LeaseBindState, OciConfig, PreparedCheckoutEvidence,
+    RealCheckoutCleanupExecutor, RetainedWorkloadOutcome, RunFailure, RuntimeFinalization,
+    WorkloadRotatedSpec, WorkspaceProcessIdentity,
 };
 #[cfg(any(test, feature = "test-support"))]
 use super::{
@@ -33,6 +34,7 @@ use crate::{
 pub(super) struct AcquiredCheckoutRuntime {
     workload_container_id: String,
     checkout_scope: CheckoutAuthorizationScope,
+    process_identity: WorkspaceProcessIdentity,
     enabled_context: EnabledLaunchContext,
     session: CheckoutPreparationSession,
     workload_cfg: OciConfig,
@@ -50,6 +52,7 @@ impl AcquiredCheckoutRuntime {
         absolute_rootfs: PathBuf,
         workspace_manager: &WorkspaceManager,
         userns_allocator: &UserNamespaceAllocator,
+        process_identity: WorkspaceProcessIdentity,
         cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
     ) -> Result<AcquiredCheckoutRuntime, AcquisitionFailure> {
         let checkout_scope =
@@ -71,17 +74,21 @@ impl AcquiredCheckoutRuntime {
         let workload_container_id =
             format!("myelin-prod-{}-{}", std::process::id(), unique_suffix());
         let (workload_cfg, enabled_context) = acquire_enabled_workspace(
-            spec,
-            profile,
-            &workload_container_id,
-            absolute_rootfs,
+            EnabledWorkspaceRequest::new(
+                spec,
+                profile,
+                &workload_container_id,
+                absolute_rootfs,
+                process_identity,
+            )
+            .with_optional_cargo_vendor(cargo_vendor),
             workspace_manager,
             userns_allocator,
-            cargo_vendor,
         )?;
         let runtime = AcquiredCheckoutRuntime {
             workload_container_id,
             checkout_scope,
+            process_identity,
             enabled_context,
             session: CheckoutPreparationSession::new(),
             workload_cfg,
@@ -291,6 +298,8 @@ pub(super) fn run_checkout_preparation_v2(
         &mut runtime.enabled_context.lease,
         &mut runtime.session,
         &runtime.enabled_context.workspace,
+        runtime.process_identity,
+        runtime.workload_cfg.has_cargo_vendor(),
         spec,
         permit,
         cancellation,

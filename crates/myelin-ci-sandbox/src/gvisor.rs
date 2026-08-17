@@ -12,8 +12,9 @@ use explicit_userns::{
 };
 pub use explicit_userns::{
     preflight_explicit_userns_helpers, preflight_explicit_userns_policy,
-    resolved_explicit_userns_helper_dir, resolved_explicit_userns_runsc_root,
-    ENV_EXPLICIT_USERNS_HELPER_DIR, ENV_EXPLICIT_USERNS_RUNSC_ROOT,
+    preflight_local_development_explicit_userns_policy, resolved_explicit_userns_helper_dir,
+    resolved_explicit_userns_runsc_root, ENV_EXPLICIT_USERNS_HELPER_DIR,
+    ENV_EXPLICIT_USERNS_RUNSC_ROOT,
 };
 
 mod cgroup;
@@ -30,7 +31,8 @@ pub(crate) use oci_config::OciWorkspaceMount;
 #[cfg(test)]
 use oci_config::CARGO_VENDOR_SOURCE_NAME;
 use oci_config::{
-    selected_cargo_vendor, validated_cargo_vendor_reference, FdBoundCargoVendor, OciExecutionLayout,
+    selected_cargo_vendor, validated_cargo_vendor_reference, FdBoundCargoVendor,
+    OciExecutionLayout, WorkspaceProcessIdentity,
 };
 pub use oci_config::{
     OciConfig, CARGO_SOURCE_REPLACE_CONFIG, CARGO_SOURCE_REPLACE_ENV,
@@ -79,8 +81,8 @@ pub(crate) use workspace_lease::AcquisitionFailure;
 use workspace_lease::{
     acquire_enabled_workspace, bind_prepared_lease_given, bind_then_continue,
     classify_workspace_deletion, cleanup_pre_bind_failure, join_diagnostics,
-    settle_enabled_finalization, EnabledLaunchContext, LeaseBindState, RuntimeBinding,
-    RuntimePreparation, WorkspaceDeletionOutcome, WorkspaceIntegration,
+    settle_enabled_finalization, EnabledLaunchContext, EnabledWorkspaceRequest, LeaseBindState,
+    RuntimeBinding, RuntimePreparation, WorkspaceDeletionOutcome, WorkspaceIntegration,
 };
 
 mod backend;

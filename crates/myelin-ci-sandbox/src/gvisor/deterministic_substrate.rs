@@ -87,7 +87,7 @@ pub(crate) fn deterministic_workspace_manager_for_tests(
     let sink: crate::workspace_manager::IncidentSink =
         std::sync::Arc::new(|msg: &str| eprintln!("[6e.1b workspace incident] {msg}"));
     crate::workspace_manager::WorkspaceManager::try_new(
-        crate::workspace_manager::WorkspaceStorageMode::DeterministicDirectoryForTests {
+        crate::workspace_manager::WorkspaceStorageMode::LocalDevelopmentDirectory {
             base_dir,
             host_capacity_bytes,
         },
@@ -144,6 +144,7 @@ fn acquire_deterministic_checkout_capsule(
         std::path::PathBuf::from("/abs/staged-rootfs"),
         &workspace_manager,
         &userns_allocator,
+        WorkspaceProcessIdentity::Isolated,
         None,
     )
     .expect("acquisition must succeed against a healthy deterministic manager/allocator");
@@ -439,8 +440,8 @@ mod tests {
             deterministic_userns_allocator_for_tests, deterministic_workspace_manager_for_tests,
             run_substituted_checkout_mismatched_evidence, run_substituted_checkout_success,
             settle_enabled_workspace_and_lease, substitute_checkout_spec, unique_suffix,
-            CgroupQuiescenceEvidence, LeaseBindState, RuntimeNamespaceQuiescence,
-            RuntimeQuiescenceEvidence, WorkspaceDeletionOutcome,
+            CgroupQuiescenceEvidence, EnabledWorkspaceRequest, LeaseBindState,
+            RuntimeNamespaceQuiescence, RuntimeQuiescenceEvidence, WorkspaceDeletionOutcome,
         };
         use crate::user_namespace::{
             CheckoutPreparationSession, PreparationQuiescenceProof, UserNamespaceQuiescenceProof,
@@ -839,13 +840,15 @@ mod tests {
             let profile = crate::hardening::HardeningProfile::derive(&spec);
             let container_id = "job-t10-workload";
             let (_cfg, mut ctx) = acquire_enabled_workspace(
-                &spec,
-                &profile,
-                container_id,
-                PathBuf::from("/abs/staged-rootfs"),
+                EnabledWorkspaceRequest::new(
+                    &spec,
+                    &profile,
+                    container_id,
+                    PathBuf::from("/abs/staged-rootfs"),
+                    crate::gvisor::WorkspaceProcessIdentity::Isolated,
+                ),
                 &wm,
                 &alloc,
-                None,
             )
             .expect("acquire a real paired workspace + userns lease");
             let (root_id, cgroup_id) = ((5_u64, 6_u64), (7_u64, 8_u64));

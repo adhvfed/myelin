@@ -6,19 +6,31 @@ import { GitProject } from "../src/git-project.js";
 import { array, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
-const pipeline = `on = "push"
+const runnerImage =
+  "myelin.local/linux-small-v1-rootfs@sha256:65f0f6f242cd4412b4ad56250eadb0a459a59a71b49d21485e68da6a3d5cb975";
+const logMessage = "The sandbox ran this exact commit — café";
+
+const pipeline = `schema_version = 2
+on = "push"
+
+[execution]
+profile = "linux-small-v1"
 
 [[jobs]]
 name = "contract"
-image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
-command = ["true"]
+image = "${runnerImage}"
+command = ["sh", "-c", "printf '${logMessage}\\n'"]
 `;
 
-const pullRequestPipeline = `on = "pull_request"
+const pullRequestPipeline = `schema_version = 2
+on = "pull_request"
+
+[execution]
+profile = "linux-small-v1"
 
 [[jobs]]
 name = "contract"
-image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
+image = "${runnerImage}"
 command = ["true"]
 `;
 
@@ -34,7 +46,7 @@ describe.sequential("CI delivery lifecycle", () => {
     await project.writeFile("main", "README.md", `# ${slug}\n`);
   });
 
-  test("turns a pushed pipeline into exactly one queued run", async () => {
+  test("dispatches exactly one run for a pushed pipeline", async () => {
     pipelineCommitOid = (await project.writeFile("main", ".myelin/ci.toml", pipeline)).commitOid;
 
     run = await eventually<JsonRecord>(
@@ -55,9 +67,8 @@ describe.sequential("CI delivery lifecycle", () => {
       repo_ref: repoRef,
       commit_oid: pipelineCommitOid,
       trigger_kind: "push",
-      state: "queued",
-      cost_settled: false,
     });
+    expect(["queued", "running", "succeeded"]).toContain(run.state);
     expect(run.run_id).toMatch(/^[0-9a-f-]{36}$/);
   });
 
@@ -95,30 +106,66 @@ describe.sequential("CI delivery lifecycle", () => {
       source_ref: "refs/heads/main",
       commit_oid: pullRequestCommit,
       trigger_kind: "pull_request",
-      state: "queued",
     });
+    expect(["queued", "running", "succeeded"]).toContain(pullRequestRun.state);
   });
 
-  test("surfaces the queued run while local execution is intentionally disabled", async () => {
+  test("executes the exact pushed commit and preserves its sandbox output", async () => {
     const runId = string(run.run_id, "CI run id");
-    const detail = await systemClient.json(`/v1/ci/runs/${encodeURIComponent(runId)}`);
-    expect(detail.body).toMatchObject({
+    const detail = await eventually<JsonRecord>(
+      async () => {
+        const response = await systemClient.json(`/v1/ci/runs/${encodeURIComponent(runId)}`);
+        const body = record(response.body, "CI run detail");
+        const current = record(body.run, "CI run");
+        if (current.state !== "succeeded") return undefined;
+        return body;
+      },
+      { description: `CI run ${runId} to finish in the sandbox`, timeoutMs: 60_000 },
+    );
+    expect(detail).toMatchObject({
       run: {
         run_id: runId,
         repo_ref: repoRef,
         commit_oid: pipelineCommitOid,
-        state: "queued",
+        state: "succeeded",
+        cost_settled: true,
       },
     });
-    expect(array(detail.body.jobs, "CI jobs")).toEqual([]);
-    expect(array(detail.body.steps, "CI steps")).toEqual([]);
+
+    const jobs = array(detail.jobs, "CI jobs");
+    expect(jobs).toHaveLength(1);
+    const job = record(jobs[0], "CI job");
+    expect(job).toMatchObject({ name: "contract", state: "succeeded", attempt: 1 });
+    const jobId = string(job.job_id, "CI job id");
+
+    const steps = array(detail.steps, "CI steps");
+    expect(steps).toHaveLength(1);
+    const step = record(steps[0], "CI step");
+    expect(step).toMatchObject({ job_id: jobId, status: "passed", byte_start: 0 });
+    expect(step.byte_end).toBeGreaterThan(0);
+
+    const archived = await systemClient.json(
+      `/v1/ci/runs/${encodeURIComponent(runId)}/jobs/${encodeURIComponent(jobId)}/log?start=0&limit=65536`,
+    );
+    const archive = record(archived.body, "CI log archive");
+    expect(archive).toMatchObject({
+      run_id: runId,
+      job_id: jobId,
+      byte_start: 0,
+      byte_end: archive.total_end,
+      next_offset: null,
+      encoding: "base64",
+    });
+    expect(
+      Buffer.from(string(archive.data, "CI log bytes"), "base64").toString("utf8"),
+    ).toContain(`${logMessage}\n`);
 
     const missing = await systemClient.json(
       "/v1/ci/runs/00000000-0000-0000-0000-000000000000",
       { expectedStatus: 404 },
     );
     expect(missing.body).toHaveProperty("error");
-  });
+  }, 65_000);
 
   test("inherits repository visibility instead of exposing runs platform-wide", async () => {
     const runId = string(run.run_id, "CI run id");

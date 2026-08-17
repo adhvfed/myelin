@@ -1,5 +1,4 @@
 use crate::dirlock::{fd_identity, path_identity};
-#[cfg(any(test, feature = "test-support"))]
 use crate::workspace_storage::DirectoryWorkspaceStorage;
 use crate::workspace_storage::{
     PreparedWorkspace, WorkspaceStorage, WorkspaceStorageBackend, WorkspaceStorageError,
@@ -17,8 +16,11 @@ pub enum WorkspaceStorageMode {
         base_dir: PathBuf,
         host_capacity_bytes: u64,
     },
-    #[cfg(any(test, feature = "test-support"))]
-    DeterministicDirectoryForTests {
+    /// User-owned directories for an explicitly selected local-development runner.
+    ///
+    /// Capacity is admission-accounted but not a filesystem-enforced quota. Never use this
+    /// mode for a shared or production runner.
+    LocalDevelopmentDirectory {
         base_dir: PathBuf,
         host_capacity_bytes: u64,
     },
@@ -477,8 +479,7 @@ impl WorkspaceManager {
                 base_dir,
                 host_capacity_bytes,
             } => (base_dir.clone(), *host_capacity_bytes),
-            #[cfg(any(test, feature = "test-support"))]
-            WorkspaceStorageMode::DeterministicDirectoryForTests {
+            WorkspaceStorageMode::LocalDevelopmentDirectory {
                 base_dir,
                 host_capacity_bytes,
             } => (base_dir.clone(), *host_capacity_bytes),
@@ -908,8 +909,7 @@ fn enabled_base_dir(mode: &WorkspaceStorageMode) -> Option<&Path> {
     match mode {
         WorkspaceStorageMode::Disabled => None,
         WorkspaceStorageMode::EphemeralDisk { base_dir, .. } => Some(base_dir),
-        #[cfg(any(test, feature = "test-support"))]
-        WorkspaceStorageMode::DeterministicDirectoryForTests { base_dir, .. } => Some(base_dir),
+        WorkspaceStorageMode::LocalDevelopmentDirectory { base_dir, .. } => Some(base_dir),
     }
 }
 
@@ -921,9 +921,8 @@ fn open_enabled_backend(
         WorkspaceStorageMode::EphemeralDisk { .. } => Ok(WorkspaceStorageBackend::Btrfs(
             WorkspaceStorage::open(base_dir).map_err(WorkspaceManagerError::Storage)?,
         )),
-        #[cfg(any(test, feature = "test-support"))]
-        WorkspaceStorageMode::DeterministicDirectoryForTests { .. } => {
-            Ok(WorkspaceStorageBackend::DeterministicDirectoryForTests(
+        WorkspaceStorageMode::LocalDevelopmentDirectory { .. } => {
+            Ok(WorkspaceStorageBackend::LocalDevelopmentDirectory(
                 DirectoryWorkspaceStorage::open(base_dir)
                     .map_err(WorkspaceManagerError::Storage)?,
             ))

@@ -17,6 +17,7 @@ pub(super) enum WorkspaceIntegration {
     Enabled {
         workspace_manager: WorkspaceManager,
         userns_allocator: UserNamespaceAllocator,
+        process_identity: WorkspaceProcessIdentity,
     },
 }
 
@@ -177,20 +178,61 @@ impl AcquisitionFailure {
     }
 }
 
-pub(super) fn acquire_enabled_workspace(
-    spec: &JobSpec,
-    profile: &HardeningProfile,
-    container_id: &str,
+pub(super) struct EnabledWorkspaceRequest<'a> {
+    spec: &'a JobSpec,
+    profile: &'a HardeningProfile,
+    container_id: &'a str,
     absolute_rootfs: PathBuf,
+    process_identity: WorkspaceProcessIdentity,
+    cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
+}
+
+impl<'a> EnabledWorkspaceRequest<'a> {
+    pub(super) fn new(
+        spec: &'a JobSpec,
+        profile: &'a HardeningProfile,
+        container_id: &'a str,
+        absolute_rootfs: PathBuf,
+        process_identity: WorkspaceProcessIdentity,
+    ) -> Self {
+        Self {
+            spec,
+            profile,
+            container_id,
+            absolute_rootfs,
+            process_identity,
+            cargo_vendor: None,
+        }
+    }
+
+    pub(super) fn with_optional_cargo_vendor(
+        mut self,
+        cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
+    ) -> Self {
+        self.cargo_vendor = cargo_vendor;
+        self
+    }
+}
+
+pub(super) fn acquire_enabled_workspace(
+    request: EnabledWorkspaceRequest<'_>,
     workspace_manager: &WorkspaceManager,
     userns_allocator: &UserNamespaceAllocator,
-    cargo_vendor: Option<crate::asset_registry::VerifiedCargoVendor>,
 ) -> Result<(OciConfig, EnabledLaunchContext), AcquisitionFailure> {
+    let EnabledWorkspaceRequest {
+        spec,
+        profile,
+        container_id,
+        absolute_rootfs,
+        process_identity,
+        cargo_vendor,
+    } = request;
     let (cfg, context) = acquire_enabled_workspace_given(
         spec,
         profile,
         container_id,
         absolute_rootfs,
+        process_identity,
         |bytes| workspace_manager.acquire_capacity(bytes),
         || userns_allocator.lease(),
         |job_key, quota, uid, gid, capacity| {
@@ -219,6 +261,7 @@ fn acquire_enabled_workspace_given(
     profile: &HardeningProfile,
     container_id: &str,
     absolute_rootfs: PathBuf,
+    process_identity: WorkspaceProcessIdentity,
     acquire_capacity: impl FnOnce(u64) -> Result<CapacityLease, CapacityRefusal>,
     lease_fn: impl FnOnce() -> Result<UserNamespaceLease, UserNamespaceRefusal>,
     create_workspace: impl FnOnce(
@@ -290,8 +333,9 @@ fn acquire_enabled_workspace_given(
     };
     let cfg =
         match OciWorkspaceMount::from_managed_workspace(&workspace).and_then(|workspace_mount| {
-            OciConfig::from_spec(spec, profile).with_explicit_user_namespace_and_workspace(
+            OciConfig::from_spec(spec, profile).with_explicit_user_namespace_and_workspace_as(
                 lease.config(),
+                process_identity,
                 workspace_mount,
                 absolute_rootfs,
             )
@@ -1064,13 +1108,15 @@ mod tests {
         let profile = HardeningProfile::derive(&command_spec);
         let container_id = "acquire-settle-ok-container";
         let (cfg, mut context) = acquire_enabled_workspace(
-            &command_spec,
-            &profile,
-            container_id,
-            PathBuf::from("/abs/staged-rootfs"),
+            EnabledWorkspaceRequest::new(
+                &command_spec,
+                &profile,
+                container_id,
+                PathBuf::from("/abs/staged-rootfs"),
+                WorkspaceProcessIdentity::Isolated,
+            ),
             &workspace_manager,
             &userns_allocator,
-            None,
         )
         .expect("acquisition must succeed against a healthy real manager/allocator");
         assert_eq!(
@@ -1127,13 +1173,15 @@ mod tests {
         let profile = HardeningProfile::derive(&command_spec);
         let container_id = "settle-mismatch-container";
         let (_cfg, mut context) = acquire_enabled_workspace(
-            &command_spec,
-            &profile,
-            container_id,
-            PathBuf::from("/abs/staged-rootfs"),
+            EnabledWorkspaceRequest::new(
+                &command_spec,
+                &profile,
+                container_id,
+                PathBuf::from("/abs/staged-rootfs"),
+                WorkspaceProcessIdentity::Isolated,
+            ),
             &workspace_manager,
             &userns_allocator,
-            None,
         )
         .expect("acquisition must succeed");
         let runsc_root_identity = (11, 22);
@@ -1207,13 +1255,15 @@ mod tests {
         let profile = HardeningProfile::derive(&command_spec);
         let container_id = "bound-abandons-both-container";
         let (_cfg, mut context) = acquire_enabled_workspace(
-            &command_spec,
-            &profile,
-            container_id,
-            PathBuf::from("/abs/staged-rootfs"),
+            EnabledWorkspaceRequest::new(
+                &command_spec,
+                &profile,
+                container_id,
+                PathBuf::from("/abs/staged-rootfs"),
+                WorkspaceProcessIdentity::Isolated,
+            ),
             &workspace_manager,
             &userns_allocator,
-            None,
         )
         .expect("acquisition must succeed");
         let runsc_root_identity = (11, 22);
@@ -1293,13 +1343,15 @@ mod tests {
         command_spec.limits.disk_bytes = 1;
         let profile = HardeningProfile::derive(&command_spec);
         let result = acquire_enabled_workspace(
-            &command_spec,
-            &profile,
-            "capacity-exhausted-container",
-            PathBuf::from("/abs/staged-rootfs"),
+            EnabledWorkspaceRequest::new(
+                &command_spec,
+                &profile,
+                "capacity-exhausted-container",
+                PathBuf::from("/abs/staged-rootfs"),
+                WorkspaceProcessIdentity::Isolated,
+            ),
             &workspace_manager,
             &userns_allocator,
-            None,
         );
         assert!(
             result.is_err(),
@@ -1331,6 +1383,7 @@ mod tests {
             &profile,
             "container-userns-refused",
             PathBuf::from("/abs/staged-rootfs"),
+            WorkspaceProcessIdentity::Isolated,
             |bytes| workspace_manager.acquire_capacity(bytes),
             || Err(UserNamespaceRefusal::PoolExhausted { pool_size: 0 }),
             |_, _, _, _, _| {
@@ -1370,6 +1423,7 @@ mod tests {
             &profile,
             "container-recoverable-failure",
             PathBuf::from("/abs/staged-rootfs"),
+            WorkspaceProcessIdentity::Isolated,
             |bytes| workspace_manager.acquire_capacity(bytes),
             || userns_allocator.lease(),
             |_, _, _, _, capacity: CapacityLease| {
@@ -1419,6 +1473,7 @@ mod tests {
             &profile,
             "container-unrecoverable-leak",
             PathBuf::from("/abs/staged-rootfs"),
+            WorkspaceProcessIdentity::Isolated,
             |bytes| workspace_manager.acquire_capacity(bytes),
             || userns_allocator.lease(),
             |_, _, _, _, _capacity| {
