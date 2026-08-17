@@ -205,6 +205,20 @@ impl RetentionWindow {
         frame
     }
 
+    fn seed_head(&mut self, last_seq: u64) -> bool {
+        if last_seq == u64::MAX {
+            return false;
+        }
+        if self.last_seq == last_seq {
+            return true;
+        }
+        if self.frames.is_empty() && last_seq > self.last_seq {
+            self.last_seq = last_seq;
+            return true;
+        }
+        false
+    }
+
     fn window_floor(&self) -> u64 {
         self.frames.front().map(|f| f.seq).unwrap_or(0)
     }
@@ -381,7 +395,7 @@ pub struct Firehose {
 }
 
 #[derive(Clone)]
-struct SubHandle(std::rc::Rc<std::cell::RefCell<SubStream>>);
+struct SubHandle(std::rc::Weak<std::cell::RefCell<SubStream>>);
 
 #[derive(Clone, Debug)]
 pub struct Subscription(std::rc::Rc<std::cell::RefCell<SubStream>>);
@@ -442,10 +456,14 @@ impl Firehose {
             .or_insert_with(|| RetentionWindow::new(self.window_capacity));
         let frame = window.publish(draft);
         if let Some(subs) = self.subscribers.get_mut(&key) {
-            for h in subs.iter() {
-                h.0.borrow_mut().enqueue_live(frame.clone());
-            }
-            subs.retain(|h| !h.0.borrow().resync_required());
+            subs.retain(|handle| {
+                let Some(subscriber) = handle.0.upgrade() else {
+                    return false;
+                };
+                subscriber.borrow_mut().enqueue_live(frame.clone());
+                let remains_live = !subscriber.borrow().resync_required();
+                remains_live
+            });
         }
         frame
     }
@@ -502,12 +520,28 @@ impl Firehose {
         scope: &FirehoseScope,
         last_seq: u64,
     ) -> Result<Subscription, FirehoseError> {
+        let backfill = self.backfill(stream, scope, last_seq)?;
+        Ok(self.open_live(stream, scope, backfill))
+    }
+
+    pub fn backfill(
+        &self,
+        stream: &str,
+        scope: &FirehoseScope,
+        last_seq: u64,
+    ) -> Result<Vec<Frame>, FirehoseError> {
         let key = (stream.to_string(), scope.clone());
-        let backfill = match self.windows.get(&key) {
+        Ok(match self.windows.get(&key) {
             None => Vec::new(),
             Some(window) => window.backfill(last_seq)?,
-        };
-        Ok(self.open_live(stream, scope, backfill))
+        })
+    }
+
+    pub fn seed_head(&mut self, stream: &str, scope: &FirehoseScope, last_seq: u64) -> bool {
+        self.windows
+            .entry((stream.to_string(), scope.clone()))
+            .or_insert_with(|| RetentionWindow::new(self.window_capacity))
+            .seed_head(last_seq)
     }
 
     fn open_live(
@@ -530,7 +564,7 @@ impl Firehose {
         self.subscribers
             .entry(key)
             .or_default()
-            .push(SubHandle(rc.clone()));
+            .push(SubHandle(std::rc::Rc::downgrade(&rc)));
         Subscription(rc)
     }
 
@@ -622,6 +656,70 @@ mod tests {
             all,
             vec![3, 4, 5, 6],
             "across the reconnect: 0 lost, 0 duplicate"
+        );
+    }
+
+    #[test]
+    fn reading_a_backfill_does_not_open_a_live_subscription() {
+        let mut fh = Firehose::new();
+        let s = scope("doc:design");
+        fh.publish("kn-ops", &s, draft("op-1"));
+        fh.publish("kn-ops", &s, draft("op-2"));
+
+        let frames = fh
+            .backfill("kn-ops", &s, 0)
+            .expect("the cursor is in the retention window");
+
+        assert_eq!(frames.len(), 2);
+        assert!(
+            fh.subscribers.is_empty(),
+            "a recovery read owns no live subscriber state"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_can_seed_an_empty_stream_cursor_once() {
+        let mut fh = Firehose::new();
+        let s = scope("doc:design");
+
+        assert!(fh.seed_head("kn-ops", &s, 7));
+        assert_eq!(fh.head_seq("kn-ops", &s), 7);
+        assert_eq!(fh.publish("kn-ops", &s, draft("op-8")).seq, 8);
+        assert!(
+            fh.seed_head("kn-ops", &s, 8),
+            "the current head is idempotent"
+        );
+        assert!(
+            !fh.seed_head("kn-ops", &s, 9),
+            "a seed cannot jump over retained live frames"
+        );
+        let fresh = scope("doc:fresh");
+        assert!(
+            !fh.seed_head("kn-ops", &fresh, u64::MAX),
+            "a seed must leave room for the next live frame"
+        );
+    }
+
+    #[test]
+    fn the_caller_owns_a_live_subscription_lifetime() {
+        let mut fh = Firehose::new();
+        let s = scope("doc:design");
+        let key = ("kn-ops".to_string(), s.clone());
+        let subscription = fh
+            .subscribe("kn-ops", &s, None)
+            .expect("the live subscription opens");
+
+        assert_eq!(
+            std::rc::Rc::strong_count(&subscription.0),
+            1,
+            "the firehose does not retain a dropped caller's stream"
+        );
+        drop(subscription);
+        fh.publish("kn-ops", &s, draft("op-1"));
+
+        assert!(
+            fh.subscribers.get(&key).is_none_or(Vec::is_empty),
+            "publishing reaps the expired subscription handle"
         );
     }
 
