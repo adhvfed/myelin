@@ -1,3 +1,4 @@
+use crate::ci_result_summary::parse_ci_job_result_summary;
 use crate::dispatch::EdgeCall;
 use base64::Engine as _;
 use myelin_ci_controlplane::surfacing_store::CI_RUN_CURSOR_PREFIX;
@@ -332,7 +333,20 @@ fn render_ci_run_detail(value: &Value) -> String {
         output.push_str(&format!(
             "  {marker} {state}  {stage}/{name}  attempt={attempt}  {job_id}\n"
         ));
-        if safe_cli_uuid(run_id)
+        let result = parse_ci_job_result_summary(&job["result_summary"])
+            .ok()
+            .flatten();
+        if let Some(result) = result {
+            output.push_str(&format!("    result: {}\n", result.label()));
+            if let Some(diagnostic) = result.diagnostic() {
+                output.push_str(&format!(
+                    "    diagnostic: {}\n",
+                    terminal_safe_single_line(diagnostic)
+                ));
+            }
+        }
+        if result.is_none_or(|result| result.workload_started() != Some(false))
+            && safe_cli_uuid(run_id)
             && job
                 .get("job_id")
                 .and_then(Value::as_str)
@@ -969,6 +983,8 @@ mod tests {
         let detail = render(&vector("failed-run-detail"), false);
         assert!(detail.contains("✗ failed"));
         assert!(detail.contains("test/contract"));
+        assert!(detail.contains("result: Workload failed"));
+        assert!(detail.contains("diagnostic: Process exited with status 1."));
         assert!(detail.contains(
             "myelin ci logs 91000000-0000-4000-8000-000000000001 --job \
              92000000-0000-4000-8000-000000000001"
@@ -1005,6 +1021,41 @@ mod tests {
         });
         let output = render(&detail, false);
         assert!(output.contains(&format!("live output: myelin ci watch {run} --job {job}")));
+    }
+
+    #[test]
+    fn configuration_refusal_explains_the_failure_without_offering_nonexistent_output() {
+        let run = "91000000-0000-4000-8000-000000000003";
+        let job = "92000000-0000-4000-8000-000000000003";
+        let detail = json!({
+            "run": {
+                "run_id": run,
+                "repo_ref": "myelin://acme/git/repo/alpha",
+                "state": "failed",
+                "created_at": "now",
+            },
+            "jobs": [{
+                "job_id": job,
+                "stage": "pipeline",
+                "name": "Configuration",
+                "state": "failed",
+                "attempt": 1,
+                "result_summary": {
+                    "passed": false,
+                    "timed_out": false,
+                    "disposition": "configuration_refused",
+                    "workload_started": false,
+                    "diagnostic": "run-plan schema V2 is required",
+                },
+            }],
+            "steps": [],
+        });
+
+        let output = render(&detail, false);
+        assert!(output.contains("result: Pipeline configuration refused"));
+        assert!(output.contains("diagnostic: run-plan schema V2 is required"));
+        assert!(!output.contains("archived output"));
+        assert!(!output.contains("live output"));
     }
 
     #[test]

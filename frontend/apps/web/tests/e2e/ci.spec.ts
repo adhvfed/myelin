@@ -88,6 +88,9 @@ test.describe("CT-005 CI web read surface", () => {
     await expect(page.getByRole("button", { name: "Copy reference" }))
       .toHaveAttribute("title", `myelin://acme/ci/run/${FAILED_RUN}`);
     await expect(page.getByRole("heading", { level: 3, name: "contract" })).toBeVisible();
+    await expect(page.getByTestId("ci-job-result")).toContainText("Workload failed");
+    await expect(page.getByTestId("ci-job-diagnostic"))
+      .toHaveText("Process exited with status 1.");
     await expect(page.getByText("byte 0")).toBeVisible();
     await expect(page.getByText("Archived", { exact: true })).toBeVisible();
     await expectNoAxeViolations(page, "CI run detail");

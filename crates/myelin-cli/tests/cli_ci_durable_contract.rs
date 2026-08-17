@@ -214,6 +214,8 @@ async fn compiled_cli_lists_views_and_reads_archived_ci_output_from_the_shared_c
     .await;
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("test/contract"));
+    assert!(stdout.contains("result: Workload failed"));
+    assert!(stdout.contains("diagnostic: Process exited with status 1."));
     assert!(stdout.contains(&format!("myelin ci logs {run} --job {job}")));
 
     let (code, stdout, stderr) = run_cli_against_response(

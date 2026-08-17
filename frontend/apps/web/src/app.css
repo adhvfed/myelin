@@ -547,6 +547,32 @@ button {
   box-shadow: inset var(--space-1) 0 0 var(--focus-ring);
 }
 
+.ci-job-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-inline-start: var(--space-1) solid var(--danger);
+  background: var(--surface);
+}
+
+.ci-job-result[data-outcome="passed"] {
+  border-inline-start-color: var(--success);
+}
+
+.ci-job-result[data-outcome="timed-out"] {
+  border-inline-start-color: var(--warning);
+}
+
+.ci-job-diagnostic {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ci-job-output-note {
+  color: var(--text-muted);
+}
+
 .ci-step-list {
   display: flex;
   flex-direction: column;

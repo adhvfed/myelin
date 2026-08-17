@@ -462,6 +462,46 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
 }
 
 #[test]
+fn surfaced_diagnostics_are_single_line_utf8_bounded_text() {
+    let input = format!(
+        "checkout\n\u{85}\u{2028}\u{2029}{}\u{7f}",
+        "é".repeat(MAX_CI_DIAGNOSTIC_BYTES)
+    );
+    let bounded = bounded_ci_diagnostic(&input);
+
+    assert!(bounded.len() <= MAX_CI_DIAGNOSTIC_BYTES);
+    assert!(!bounded.chars().any(char::is_control));
+    assert!(!bounded.contains('\u{2028}'));
+    assert!(!bounded.contains('\u{2029}'));
+    assert!(bounded.starts_with("checkout�"));
+    assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+
+    let report = TerminalReport {
+        passed: false,
+        timed_out: false,
+        usage: ResourceUsage {
+            cpu_seconds: 0,
+            mem_byte_seconds: 0,
+        },
+        result_refs: Vec::new(),
+    };
+    assert_eq!(
+        terminal_result_summary(
+            &report,
+            Some(CiJobTerminalDisposition::WorkloadFailed),
+            Some(""),
+        ),
+        serde_json::json!({
+            "passed": false,
+            "timed_out": false,
+            "disposition": "workload_failed",
+            "workload_started": true,
+        }),
+        "an absent diagnostic has one canonical wire representation"
+    );
+}
+
+#[test]
 fn immutable_pricing_projects_exact_raw_cpu_and_split_memory_costs() {
     let tenant = TenantId::from_token("acme");
     let usage = ResourceUsage {

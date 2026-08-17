@@ -353,7 +353,8 @@ async fn insert_golden_ci_surface(
                    spec_ref, state, attempt, result_summary
                 ) VALUES (
                    $1, $2, $3::uuid, $4::uuid, 'test', 'contract', '{}', NULL,
-                   'cas:golden-job', 'failed', 1, '{\"message\":\"contract failed\"}'::jsonb
+                   'cas:golden-job', 'failed', 1,
+                   '{\"passed\":false,\"timed_out\":false,\"disposition\":\"workload_failed\",\"workload_started\":true,\"diagnostic\":\"Process exited with status 1.\"}'::jsonb
                  ), (
                    $1, $2, $5::uuid, $6::uuid, 'test', 'live-contract', '{}', NULL,
                    'cas:golden-live-job', 'running', 1, NULL

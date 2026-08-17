@@ -1,3 +1,4 @@
+mod ci_result_summary;
 pub mod ci_watch;
 pub mod client;
 pub mod config;

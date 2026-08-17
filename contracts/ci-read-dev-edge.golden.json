@@ -176,7 +176,11 @@
             "state": "failed",
             "attempt": 1,
             "result_summary": {
-              "message": "contract failed"
+              "passed": false,
+              "timed_out": false,
+              "disposition": "workload_failed",
+              "workload_started": true,
+              "diagnostic": "Process exited with status 1."
             }
           }
         ],

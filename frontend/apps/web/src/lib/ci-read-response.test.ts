@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ciJobResultLabel,
   parseCiLogRange,
   parseCiRunDetail,
   parseCiRunsPage,
@@ -45,7 +46,7 @@ describe("CI read responses", () => {
       page: { next_cursor: null, limit: 1 },
     })?.items).toHaveLength(1);
 
-    expect(parseCiRunDetail({
+    const detail = parseCiRunDetail({
       run: run(),
       jobs: [{
         job_id: JOB,
@@ -55,7 +56,13 @@ describe("CI read responses", () => {
         matrix_key: null,
         state: "failed",
         attempt: 1,
-        result_summary: { message: "contract failed" },
+        result_summary: {
+          passed: false,
+          timed_out: false,
+          disposition: "workload_failed",
+          workload_started: true,
+          diagnostic: "Process exited with status 1.",
+        },
       }],
       steps: [{
         job_id: JOB,
@@ -65,7 +72,70 @@ describe("CI read responses", () => {
         status: "failed",
         details_ref: "#step-contract",
       }],
-    })?.steps[0]?.details_ref).toBe("#step-contract");
+    });
+    expect(detail?.steps[0]?.details_ref).toBe("#step-contract");
+    expect(detail?.jobs[0]?.result_summary).toEqual({
+      passed: false,
+      timed_out: false,
+      disposition: "workload_failed",
+      workload_started: true,
+      diagnostic: "Process exited with status 1.",
+    });
+    expect(ciJobResultLabel(detail!.jobs[0]!.result_summary!)).toBe("Workload failed");
+  });
+
+  it("normalizes legacy summaries and refuses unknown or contradictory modern results", () => {
+    const detailWith = (result_summary: unknown) => parseCiRunDetail({
+      run: run(),
+      jobs: [{
+        job_id: JOB,
+        stage: "test",
+        name: "contract",
+        needs: [],
+        matrix_key: null,
+        state: "failed",
+        attempt: 1,
+        result_summary,
+      }],
+      steps: [],
+    });
+
+    expect(detailWith({ passed: false, timed_out: false })?.jobs[0]?.result_summary).toEqual({
+      passed: false,
+      timed_out: false,
+      disposition: null,
+      workload_started: null,
+      diagnostic: null,
+    });
+    expect(detailWith({ passed: true, timed_out: true })).toBeNull();
+    expect(detailWith({ message: "contract failed" })).toBeNull();
+    expect(detailWith({
+      passed: false,
+      timed_out: false,
+      disposition: "workload_failed",
+      workload_started: false,
+    })).toBeNull();
+    expect(detailWith({
+      passed: false,
+      timed_out: false,
+      disposition: "configuration_refused",
+      workload_started: false,
+      diagnostic: "x".repeat(2_049),
+    })).toBeNull();
+    expect(detailWith({
+      passed: false,
+      timed_out: false,
+      disposition: "configuration_refused",
+      workload_started: false,
+      diagnostic: "first\u{0085}second",
+    })).toBeNull();
+    expect(detailWith({
+      passed: false,
+      timed_out: false,
+      disposition: "configuration_refused",
+      workload_started: false,
+      diagnostic: "first\u{2028}second",
+    })).toBeNull();
   });
 
   it("preserves byte-exact ranges even when a range begins inside UTF-8", () => {

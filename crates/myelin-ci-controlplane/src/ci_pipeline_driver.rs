@@ -73,6 +73,24 @@ use crate::metering::{CostEventRow, CostKind, Meter};
 #[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::Lane;
 
+pub(crate) const MAX_CI_DIAGNOSTIC_BYTES: usize = 2_048;
+
+pub(crate) fn bounded_ci_diagnostic(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().min(MAX_CI_DIAGNOSTIC_BYTES));
+    for character in value.chars() {
+        let character = if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+            '�'
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > MAX_CI_DIAGNOSTIC_BYTES {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
 fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
@@ -1376,7 +1394,10 @@ fn terminal_result_summary(
                 "workload_started": disposition.workload_started(),
             });
             if let Some(diagnostic) = diagnostic {
-                summary["diagnostic"] = serde_json::Value::String(diagnostic.to_owned());
+                let diagnostic = bounded_ci_diagnostic(diagnostic);
+                if !diagnostic.is_empty() {
+                    summary["diagnostic"] = serde_json::Value::String(diagnostic);
+                }
             }
             summary
         }

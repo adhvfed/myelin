@@ -73,7 +73,6 @@ pub const CI_INITIAL_CHECK_EVENT_V1_DOMAIN: &str = "myelin.ci.initial-check-even
 pub const CI_RUN_START_REJECTED_EVENT_V1_DOMAIN: &str = "myelin.ci.run-start-rejected.v1";
 const REJECTED_JOB_STAGE: &str = "pipeline";
 const REJECTED_JOB_NAME: &str = "Configuration";
-const MAX_REJECTION_DIAGNOSTIC_BYTES: usize = 2_048;
 
 pub fn ci_job_id_v1(
     tenant: &TenantId,
@@ -718,7 +717,7 @@ impl PgCiPipelineStarter {
         candidate: &StarterCandidate,
         error: &RunPlanError,
     ) -> Result<StartQueuedOutcome, PgCiStarterError> {
-        let diagnostic = bounded_rejection_diagnostic(error);
+        let diagnostic = crate::ci_pipeline_driver::bounded_ci_diagnostic(&error.to_string());
         let mut transaction = self
             .pool
             .begin()
@@ -1024,22 +1023,6 @@ async fn emit_initial_checks(
             })?;
     }
     Ok(())
-}
-
-fn bounded_rejection_diagnostic(error: &RunPlanError) -> String {
-    let mut output = String::with_capacity(MAX_REJECTION_DIAGNOSTIC_BYTES.min(256));
-    for character in error.to_string().chars() {
-        let character = if character.is_control() {
-            '�'
-        } else {
-            character
-        };
-        if output.len() + character.len_utf8() > MAX_REJECTION_DIAGNOSTIC_BYTES {
-            break;
-        }
-        output.push(character);
-    }
-    output
 }
 
 fn persisted_event_cause(record: &CiRunRecord) -> Result<PersistedEventCause, PgCiStarterError> {

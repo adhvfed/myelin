@@ -88,7 +88,13 @@ const FAILED_DETAIL = Object.freeze({
       matrix_key: null,
       state: "failed",
       attempt: 1,
-      result_summary: Object.freeze({ message: "contract failed" }),
+      result_summary: Object.freeze({
+        passed: false,
+        timed_out: false,
+        disposition: "workload_failed",
+        workload_started: true,
+        diagnostic: "Process exited with status 1.",
+      }),
     }),
   ]),
   steps: Object.freeze([

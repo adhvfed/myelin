@@ -4,7 +4,12 @@ import { A, createAsync, useParams, useSearchParams } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
 import { CiRouteError, getCiLog, getCiRun } from "~/lib/api";
 import { isCiUuid } from "~/lib/ci-read-input";
-import { ciRepoLabel, type CiJobVM, type CiStepVM } from "~/lib/ci-read-response";
+import {
+  ciJobResultLabel,
+  ciRepoLabel,
+  type CiJobVM,
+  type CiStepVM,
+} from "~/lib/ci-read-response";
 import { CiErrorState, ciErrKind } from "~/components/CiErrorState";
 import { CiLiveLog } from "~/components/CiLiveLog";
 import { CiStatus, formatCiDate } from "~/components/CiStatus";
@@ -193,22 +198,47 @@ function JobRow(props: {
         <CiStatus state={props.job.state} />
       </div>
       <p>Attempt {props.job.attempt}</p>
-      <Show when={props.steps.length > 0}>
-        <ol class="ci-step-list">
-          <For each={props.steps}>
-            {(step) => (
-              <li id={`step-${step.step_id}`}>
-                <CiStatus state={step.status} />
-                <span>{step.step_id}</span>
-                <span>byte {step.byte_start}</span>
-              </li>
-            )}
-          </For>
-        </ol>
+      <Show when={props.job.result_summary} keyed>
+        {(summary) => (
+          <div
+            class="ci-job-result"
+            data-outcome={summary.passed ? "passed" : summary.timed_out ? "timed-out" : "failed"}
+            data-testid="ci-job-result"
+          >
+            <strong>{ciJobResultLabel(summary)}</strong>
+            <Show when={summary.diagnostic} keyed>
+              {(diagnostic) => (
+                <p class="ci-job-diagnostic" data-testid="ci-job-diagnostic">{diagnostic}</p>
+              )}
+            </Show>
+          </div>
+        )}
       </Show>
-      <A href={logHref(props.run, props.job.job_id, 0)} class="ci-secondary-action">
-        <Icon name="database" /> Read archived output
-      </A>
+      <Show
+        when={props.job.result_summary?.workload_started !== false}
+        fallback={
+          <p class="ci-job-output-note" data-testid="ci-job-no-output">
+            No workload was started, so there is no job output.
+          </p>
+        }
+      >
+        <Show when={props.steps.length > 0}>
+          <ol class="ci-step-list">
+            <For each={props.steps}>
+              {(step) => (
+                <li id={`step-${step.step_id}`}>
+                  <CiStatus state={step.status} />
+                  <span>{step.step_id}</span>
+                  <span>byte {step.byte_start}</span>
+                </li>
+              )}
+            </For>
+          </ol>
+        </Show>
+        <A href={logHref(props.run, props.job.job_id, 0)} class="ci-secondary-action">
+          <Icon name="database" /> Read archived output
+        </A>
+      </Show>
     </li>
   );
 }

@@ -11,6 +11,22 @@ export type CiJobState =
   | "queued" | "leased" | "running" | "succeeded"
   | "failed" | "cancelled" | "reaped";
 export type CiStepState = "running" | "passed" | "failed" | "skipped";
+export type CiJobDisposition =
+  | "workload_passed" | "workload_failed" | "workload_timed_out"
+  | "secret_resolution_failed" | "secret_resolution_timed_out"
+  | "checkout_transport_failed" | "checkout_transport_timed_out"
+  | "checkout_materialization_failed" | "checkout_materialization_timed_out"
+  | "preparation_attempts_exhausted" | "skipped_before_start"
+  | "cancelled_during_preparation" | "cancelled_after_workload_launch"
+  | "configuration_refused";
+
+export interface CiJobResultSummary {
+  passed: boolean;
+  timed_out: boolean;
+  disposition: CiJobDisposition | null;
+  workload_started: boolean | null;
+  diagnostic: string | null;
+}
 
 export interface CiRunVM {
   run_id: string;
@@ -40,7 +56,7 @@ export interface CiJobVM {
   matrix_key: unknown;
   state: CiJobState;
   attempt: number;
-  result_summary: unknown;
+  result_summary: CiJobResultSummary | null;
 }
 
 export interface CiStepVM {
@@ -87,7 +103,8 @@ function bounded(value: unknown, maximum: number, allowEmpty = false): value is 
     utf8.encode(value).byteLength <= maximum &&
     ![...value].some((character) => {
       const point = character.codePointAt(0)!;
-      return point <= 0x1f || point === 0x7f;
+      return point <= 0x1f || (point >= 0x7f && point <= 0x9f) ||
+        point === 0x2028 || point === 0x2029;
     });
 }
 
@@ -128,6 +145,74 @@ function artifactTenant(value: unknown): string | null {
   return /^myelin:\/\/([^/]+)\/git\/repo\/.+$/.exec(value)?.[1] ?? null;
 }
 
+const dispositionFacts: Record<CiJobDisposition, {
+  passed: boolean;
+  timed_out: boolean;
+  workload_started: boolean;
+  label: string;
+}> = {
+  workload_passed: { passed: true, timed_out: false, workload_started: true, label: "Workload passed" },
+  workload_failed: { passed: false, timed_out: false, workload_started: true, label: "Workload failed" },
+  workload_timed_out: { passed: false, timed_out: true, workload_started: true, label: "Workload timed out" },
+  secret_resolution_failed: { passed: false, timed_out: false, workload_started: false, label: "Secret resolution failed" },
+  secret_resolution_timed_out: { passed: false, timed_out: true, workload_started: false, label: "Secret resolution timed out" },
+  checkout_transport_failed: { passed: false, timed_out: false, workload_started: false, label: "Repository checkout failed" },
+  checkout_transport_timed_out: { passed: false, timed_out: true, workload_started: false, label: "Repository checkout timed out" },
+  checkout_materialization_failed: { passed: false, timed_out: false, workload_started: false, label: "Checkout verification failed" },
+  checkout_materialization_timed_out: { passed: false, timed_out: true, workload_started: false, label: "Checkout verification timed out" },
+  preparation_attempts_exhausted: { passed: false, timed_out: false, workload_started: false, label: "Checkout attempts exhausted" },
+  skipped_before_start: { passed: false, timed_out: false, workload_started: false, label: "Skipped before start" },
+  cancelled_during_preparation: { passed: false, timed_out: false, workload_started: false, label: "Cancelled during preparation" },
+  cancelled_after_workload_launch: { passed: false, timed_out: false, workload_started: true, label: "Cancelled while running" },
+  configuration_refused: { passed: false, timed_out: false, workload_started: false, label: "Pipeline configuration refused" },
+};
+
+function resultSummary(value: unknown): { value: CiJobResultSummary | null } | null {
+  if (value === null) return { value: null };
+  const summary = record(value);
+  if (!summary) return null;
+  if (exact(summary, ["passed", "timed_out"])) {
+    if (typeof summary.passed !== "boolean" || typeof summary.timed_out !== "boolean" ||
+        (summary.passed && summary.timed_out)) return null;
+    return {
+      value: {
+        passed: summary.passed,
+        timed_out: summary.timed_out,
+        disposition: null,
+        workload_started: null,
+        diagnostic: null,
+      },
+    };
+  }
+  const fields = Object.hasOwn(summary, "diagnostic")
+    ? ["passed", "timed_out", "disposition", "workload_started", "diagnostic"]
+    : ["passed", "timed_out", "disposition", "workload_started"];
+  if (!exact(summary, fields) || typeof summary.passed !== "boolean" ||
+      typeof summary.timed_out !== "boolean" || typeof summary.disposition !== "string" ||
+      typeof summary.workload_started !== "boolean" ||
+      (Object.hasOwn(summary, "diagnostic") && !bounded(summary.diagnostic, 2_048))) return null;
+  const disposition = summary.disposition as CiJobDisposition;
+  const expected = dispositionFacts[disposition];
+  if (!expected || summary.passed !== expected.passed ||
+      summary.timed_out !== expected.timed_out ||
+      summary.workload_started !== expected.workload_started) return null;
+  return {
+    value: {
+      passed: summary.passed,
+      timed_out: summary.timed_out,
+      disposition,
+      workload_started: summary.workload_started,
+      diagnostic: Object.hasOwn(summary, "diagnostic") ? summary.diagnostic as string : null,
+    },
+  };
+}
+
+export function ciJobResultLabel(summary: CiJobResultSummary): string {
+  if (summary.disposition !== null) return dispositionFacts[summary.disposition].label;
+  if (summary.timed_out) return "Timed out";
+  return summary.passed ? "Passed" : "Failed";
+}
+
 function job(value: unknown): CiJobVM | null {
   const row = record(value);
   if (!row || !exact(row, [
@@ -138,7 +223,18 @@ function job(value: unknown): CiJobVM | null {
       !["queued", "leased", "running", "succeeded", "failed", "cancelled", "reaped"]
         .includes(row.state as string) ||
       !Number.isSafeInteger(row.attempt) || (row.attempt as number) < 1) return null;
-  return row as unknown as CiJobVM;
+  const summary = resultSummary(row.result_summary);
+  if (!summary) return null;
+  return {
+    job_id: row.job_id as string,
+    stage: row.stage as string,
+    name: row.name as string,
+    needs: row.needs as string[],
+    matrix_key: row.matrix_key,
+    state: row.state as CiJobState,
+    attempt: row.attempt as number,
+    result_summary: summary.value,
+  };
 }
 
 function step(value: unknown): CiStepVM | null {

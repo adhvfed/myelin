@@ -1,3 +1,4 @@
+use crate::ci_result_summary::parse_ci_job_result_summary;
 use crate::config::EdgeConfig;
 use crate::dispatch::{EdgeCall, RetryPolicy};
 use crate::error::CliError;
@@ -417,6 +418,7 @@ fn validate_ci_run_detail(requested_run: &str, body: &Value) -> Result<(), CliEr
         {
             return malformed_ci("run job attempt must be positive");
         }
+        parse_ci_job_result_summary(&job["result_summary"]).map_err(malformed_ci_error)?;
     }
     if dependencies
         .values()
@@ -1257,6 +1259,25 @@ mod tests {
         let mut extreme_attempt = response.clone();
         extreme_attempt["jobs"][0]["attempt"] = json!(i64::MAX);
         assert!(validate_ci_success(&call, &extreme_attempt).is_err());
+
+        let mut legacy_result = response.clone();
+        legacy_result["jobs"][0]["result_summary"] = json!({
+            "passed": false,
+            "timed_out": false,
+        });
+        validate_ci_success(&call, &legacy_result).unwrap();
+
+        let mut arbitrary_result = response.clone();
+        arbitrary_result["jobs"][0]["result_summary"] = json!({"message": "contract failed"});
+        assert!(validate_ci_success(&call, &arbitrary_result).is_err());
+
+        let mut contradictory_result = response.clone();
+        contradictory_result["jobs"][0]["result_summary"]["workload_started"] = json!(false);
+        assert!(validate_ci_success(&call, &contradictory_result).is_err());
+
+        let mut oversized_diagnostic = response.clone();
+        oversized_diagnostic["jobs"][0]["result_summary"]["diagnostic"] = json!("x".repeat(2_049));
+        assert!(validate_ci_success(&call, &oversized_diagnostic).is_err());
 
         let mut duplicate_step = response.clone();
         let repeated_step = duplicate_step["steps"][0].clone();
