@@ -10,7 +10,7 @@ use myelin_ci_controlplane::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_job_queue_store,
     CiSchedulerDbConfig, CiSchedulerDbError, CiSchedulerDbProvider, DurableEnqueue, EnqueueOutcome,
-    JobQueueReaper, Lane,
+    JobQueueReaper, Lane, DISCOVER_QUEUED_CI_RUN_TENANT_QUERY,
 };
 use myelin_ci_sandbox::TrustTier;
 use myelin_storage::{connect_pool_with_reset, PgMigrator};
@@ -127,13 +127,16 @@ async fn cleanup_stale_fixtures(admin: &PgPool) {
     }
 }
 
-async fn insert_queued_run(
-    admin: &PgPool,
+async fn insert_ci_run_fixture<'e, E>(
+    executor: E,
     tenant: &str,
     region: &str,
     ordinal: u16,
     created_at: &str,
-) {
+    state: &str,
+) where
+    E: Executor<'e, Database = sqlx::Postgres>,
+{
     let run_id = format!("20000000-0000-0000-0000-{ordinal:012}");
     let wf_run_id = format!("30000000-0000-0000-0000-{ordinal:012}");
     sqlx::query(
@@ -143,7 +146,7 @@ async fn insert_queued_run(
          ) VALUES (
            $1, $2, $3::uuid, '22222222-2222-2222-2222-222222222222'::uuid,
            '33333333-3333-3333-3333-333333333333'::uuid, $4::uuid,
-           'myelin://ci/scheduler-boundary', 'push', 'trusted', 'queued', $3, $5::timestamptz
+           'myelin://ci/scheduler-boundary', 'push', 'trusted', $6, $3, $5::timestamptz
          )",
     )
     .bind(tenant)
@@ -151,9 +154,93 @@ async fn insert_queued_run(
     .bind(&run_id)
     .bind(&wf_run_id)
     .bind(created_at)
-    .execute(admin)
+    .bind(state)
+    .execute(executor)
     .await
-    .expect("insert queued run discovery fixture");
+    .expect("insert CI run boundary fixture");
+}
+
+async fn assert_queued_run_discovery_is_oldest_first_and_region_bound(
+    admin: &PgPool,
+    tenant_a: &str,
+    tenant_b: &str,
+    tenant_other_region: &str,
+) {
+    let mut transaction = admin
+        .begin()
+        .await
+        .expect("begin private queued-discovery proof");
+    insert_ci_run_fixture(
+        &mut *transaction,
+        tenant_a,
+        FR_PAR,
+        201,
+        "2001-01-01T00:00:00Z",
+        "queued",
+    )
+    .await;
+    insert_ci_run_fixture(
+        &mut *transaction,
+        tenant_b,
+        FR_PAR,
+        202,
+        "2000-01-01T00:00:00Z",
+        "queued",
+    )
+    .await;
+    insert_ci_run_fixture(
+        &mut *transaction,
+        tenant_other_region,
+        DE_FRA,
+        203,
+        "1999-01-01T00:00:00Z",
+        "queued",
+    )
+    .await;
+
+    sqlx::query("SET LOCAL SESSION AUTHORIZATION myelin_ci_scheduler_fr_par")
+        .execute(&mut *transaction)
+        .await
+        .expect("assume the real mapped scheduler login inside the private transaction");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', '', true),
+                set_config('myelin.region', $1, true)",
+    )
+    .bind(FR_PAR)
+    .execute(&mut *transaction)
+    .await
+    .expect("scope private scheduler discovery");
+
+    let oldest: Option<String> = sqlx::query_scalar(DISCOVER_QUEUED_CI_RUN_TENANT_QUERY)
+        .bind(FR_PAR)
+        .fetch_optional(&mut *transaction)
+        .await
+        .expect("discover the oldest same-region queued run");
+    assert_eq!(
+        oldest,
+        Some(tenant_b.to_owned()),
+        "the mapped scheduler sees only the authoritative tenant owning the oldest queued run",
+    );
+
+    sqlx::query("SELECT set_config('myelin.region', $1, true)")
+        .bind(DE_FRA)
+        .execute(&mut *transaction)
+        .await
+        .expect("attempt to forge another scheduler region");
+    let wrong_region: Option<String> = sqlx::query_scalar(DISCOVER_QUEUED_CI_RUN_TENANT_QUERY)
+        .bind(DE_FRA)
+        .fetch_optional(&mut *transaction)
+        .await
+        .expect("wrong-region discovery is safely empty");
+    assert!(
+        wrong_region.is_none(),
+        "changing the client region GUC cannot escape the server-owned mapping",
+    );
+
+    transaction
+        .rollback()
+        .await
+        .expect("discard private queued-discovery fixtures");
 }
 
 async fn insert_active_job_owner(admin: &PgPool, tenant: &str, region: &str, ordinal: u16) {
@@ -346,37 +433,33 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
                     insert_active_job_owner(&admin, &fixture.tenant_id, &fixture.region, ordinal)
                         .await;
                 }
-                insert_queued_run(&admin, &tenant_a, FR_PAR, 201, "2001-01-01T00:00:00Z").await;
-                insert_queued_run(&admin, &tenant_b, FR_PAR, 202, "2000-01-01T00:00:00Z").await;
-                insert_queued_run(
+                insert_ci_run_fixture(
                     &admin,
-                    &tenant_other_region,
-                    DE_FRA,
-                    203,
-                    "1999-01-01T00:00:00Z",
+                    &tenant_a,
+                    FR_PAR,
+                    204,
+                    "1900-01-01T00:00:00Z",
+                    "running",
                 )
                 .await;
-                insert_queued_run(&admin, &tenant_a, FR_PAR, 204, "1900-01-01T00:00:00Z").await;
-                insert_queued_run(&admin, &tenant_b, FR_PAR, 206, "1900-01-01T00:00:01Z").await;
-                insert_queued_run(
+                insert_ci_run_fixture(
+                    &admin,
+                    &tenant_b,
+                    FR_PAR,
+                    206,
+                    "1900-01-01T00:00:01Z",
+                    "running",
+                )
+                .await;
+                insert_ci_run_fixture(
                     &admin,
                     &tenant_other_region,
                     DE_FRA,
                     205,
                     "1899-01-01T00:00:00Z",
+                    "running",
                 )
                 .await;
-                sqlx::query(
-                    "UPDATE ci_run SET state = 'running'
-          WHERE run_id IN (
-            '20000000-0000-0000-0000-000000000204'::uuid,
-            '20000000-0000-0000-0000-000000000205'::uuid,
-            '20000000-0000-0000-0000-000000000206'::uuid
-          )",
-                )
-                .execute(&admin)
-                .await
-                .expect("mark active workflow discovery fixtures running");
                 for (tenant, region, run_id, partition, created_at) in [
                     (
                         tenant_a.as_str(),
@@ -433,22 +516,13 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
                 let run_discovery = scheduler.region_run_discovery();
                 let labels = vec![proof_label.clone()];
 
-                assert_eq!(
-        run_discovery
-            .next_queued_tenant(FR_PAR)
-            .await
-            .expect("discover oldest same-region queued run"),
-        Some(myelin_tenancy::TenantId(tenant_b.clone())),
-        "discovery returns only the authoritative tenant owning the oldest visible queued run"
-    );
-                assert!(
-        run_discovery
-            .next_queued_tenant(DE_FRA)
-            .await
-            .expect("wrong-region discovery is safely empty")
-            .is_none(),
-        "changing the client region GUC cannot expose a run outside the server-owned mapping"
-    );
+                assert_queued_run_discovery_is_oldest_first_and_region_bound(
+                    &admin,
+                    &tenant_a,
+                    &tenant_b,
+                    &tenant_other_region,
+                )
+                .await;
                 let active_routes = run_discovery
                     .active_run_page(FR_PAR, None, 64)
                     .await
