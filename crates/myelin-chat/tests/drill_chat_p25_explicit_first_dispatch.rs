@@ -4,7 +4,7 @@ use myelin_agent::{
 };
 use myelin_chat::dispatch::{
     agent_provenance, dispatch_disposition_class, dispatch_explicit, no_auto_spawn_path_is_wired,
-    DispatchOutcome, Disposition, L3_AUTO_SPAWN_ABSENCE,
+    DispatchOutcome, Disposition, ExplicitDispatchError, L3_AUTO_SPAWN_ABSENCE,
 };
 use myelin_chat::events::{CHAT_MESSAGE_CREATED, CHAT_MESSAGE_MENTIONED, CHAT_REACTION_ADDED};
 use myelin_chat::presence::{ag_d4_attestation_is_green, AgD4Attestation};
@@ -20,7 +20,7 @@ use myelin_identity::{
     PrincipalStatus, Result as IdResult, RevokeTarget, RunId as IdRunId, RunToken, RuntimeRef,
     TupleDelta, Zookie,
 };
-use myelin_storage::reserve_settle::{CostLedger, MicroUsd};
+use myelin_storage::reserve_settle::{CostLedger, MicroUsd, ReserveError};
 use myelin_tenancy::{Region, TenantId};
 
 fn tenant() -> TenantId {
@@ -283,7 +283,8 @@ fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_m
         MicroUsd(5),
         MicroUsd(10),
         ProposedEffect("chat.post".into()),
-    );
+    )
+    .expect("a funded explicit dispatch succeeds");
 
     assert_eq!(
         disp,
@@ -294,7 +295,7 @@ fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_m
     );
     assert_eq!(
         applied,
-        Some(EffectResult::Applied(FxEventId("applied:chat.post".into()))),
+        EffectResult::Applied(FxEventId("applied:chat.post".into())),
         "the run's chat output routed through EffectApi (8.2)"
     );
 }
@@ -305,7 +306,7 @@ fn the_reserve_gate_refuses_an_explicit_run_with_no_balance() {
     let fx = MockEffectApi;
     let mut ledger = CostLedger::new();
 
-    let (disp, applied) = dispatch_explicit(
+    let error = dispatch_explicit(
         &id,
         &fx,
         &mut ledger,
@@ -315,19 +316,18 @@ fn the_reserve_gate_refuses_an_explicit_run_with_no_balance() {
         MicroUsd(50),
         MicroUsd(0),
         ProposedEffect("chat.post".into()),
-    );
+    )
+    .expect_err("an unfunded explicit dispatch is refused");
 
-    assert_eq!(
-        disp,
-        Disposition::NoBalanceRefused {
-            requested: MicroUsd(50),
-            available: MicroUsd(0)
-        },
+    assert!(
+        matches!(
+            error,
+            ExplicitDispatchError::Reservation(ReserveError::InsufficientBalance {
+                requested: MicroUsd(50),
+                available: MicroUsd(0),
+            })
+        ),
         "no balance → no run: reserve/settle gates even the explicit run (CHAT-D17)"
-    );
-    assert_eq!(
-        applied, None,
-        "a refused dispatch mints nothing + applies nothing"
     );
 }
 

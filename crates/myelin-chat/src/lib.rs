@@ -58,7 +58,7 @@ pub use dek::{
 pub use dispatch::{
     agent_provenance, dispatch_disposition_class, dispatch_explicit, mention_is_always_notify_only,
     no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,
-    L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
+    ExplicitDispatchError, L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};

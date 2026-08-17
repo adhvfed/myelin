@@ -189,7 +189,7 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
     let triage_would_dispatch = triage_class == DispatchOutcome::WouldDispatch;
 
     let mut ledger = CostLedger::new();
-    let (disp, applied) = dispatch_explicit(
+    let dispatch = dispatch_explicit(
         &id,
         &fx,
         &mut ledger,
@@ -200,8 +200,9 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
         MicroUsd(10),
         ProposedEffect("chat.post:triage-discussion".into()),
     );
-    let dispatched_through_one_wallet = matches!(disp, Disposition::Dispatched { .. });
-    let chat_output_applied = matches!(applied, Some(EffectResult::Applied(_)));
+    let dispatched_through_one_wallet =
+        matches!(&dispatch, Ok((Disposition::Dispatched { .. }, _)));
+    let chat_output_applied = matches!(&dispatch, Ok((_, EffectResult::Applied(_))));
     let re_reserve = ledger.reserve(
         e2e_tenant(),
         LedgerRunId("run:triage:1".into()),
@@ -211,7 +212,7 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
     let reserve_settle_balanced = re_reserve.is_err();
 
     let mut empty_ledger = CostLedger::new();
-    let (refused, refused_applied) = dispatch_explicit(
+    let refused = dispatch_explicit(
         &id,
         &fx,
         &mut empty_ledger,
@@ -222,8 +223,12 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
         MicroUsd(0),
         ProposedEffect("chat.post:triage-discussion".into()),
     );
-    let unfunded_run_refused =
-        matches!(refused, Disposition::NoBalanceRefused { .. }) && refused_applied.is_none();
+    let unfunded_run_refused = matches!(
+        refused,
+        Err(crate::dispatch::ExplicitDispatchError::Reservation(
+            myelin_storage::reserve_settle::ReserveError::InsufficientBalance { .. }
+        ))
+    );
 
     let card = merge_card();
     let gate = ClickGate::new(FlagshipId);

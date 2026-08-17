@@ -1,11 +1,11 @@
 use myelin_agent::{EffectApi, EffectResult, ProposedEffect, RunCtx};
 use myelin_events::{Actor, CausedBy, CorrelationId, EventEnvelope, EventId};
 use myelin_identity::{
-    DelegationCaveats, FailStaticBound, IdentityService, PrincipalId, PrincipalKind,
+    AuthzError, DelegationCaveats, FailStaticBound, IdentityService, PrincipalId, PrincipalKind,
     RunId as IdRunId, RunToken,
 };
 use myelin_storage::reserve_settle::{
-    CostLedger, MicroUsd, Reservation, ReserveError, RunId as LedgerRunId,
+    CostLedger, MicroUsd, Reservation, ReserveError, RunId as LedgerRunId, SettleError,
 };
 use myelin_tenancy::TenantId;
 
@@ -18,13 +18,52 @@ pub const L3_AUTO_SPAWN_ABSENCE: &str =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disposition {
     NotifiedInbox,
-    Dispatched {
-        run_token_jti: String,
+    Dispatched { run_token_jti: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExplicitDispatchError {
+    Reservation(ReserveError),
+    RunTokenUnavailable {
+        cause: AuthzError,
+        reservation_release: Result<MicroUsd, SettleError>,
     },
-    NoBalanceRefused {
-        requested: MicroUsd,
-        available: MicroUsd,
-    },
+}
+
+impl core::fmt::Display for ExplicitDispatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Reservation(error) => write!(f, "explicit chat dispatch refused: {error}"),
+            Self::RunTokenUnavailable {
+                reservation_release: Ok(_),
+                ..
+            } => f.write_str(
+                "explicit chat dispatch refused: the run token was unavailable; the reservation was released",
+            ),
+            Self::RunTokenUnavailable {
+                reservation_release: Err(_),
+                ..
+            } => f.write_str(
+                "explicit chat dispatch refused: the run token was unavailable and reservation release requires reconciliation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExplicitDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Reservation(error) => Some(error),
+            Self::RunTokenUnavailable {
+                reservation_release: Err(error),
+                ..
+            } => Some(error),
+            Self::RunTokenUnavailable {
+                reservation_release: Ok(_),
+                ..
+            } => None,
+        }
+    }
 }
 
 pub fn dispatch_disposition_class(token: &str, is_explicit_action: bool) -> DispatchOutcome {
@@ -61,32 +100,10 @@ pub fn dispatch_explicit<Id: IdentityService, Fx: EffectApi>(
     estimate: MicroUsd,
     available: MicroUsd,
     output: ProposedEffect,
-) -> (Disposition, Option<EffectResult>) {
+) -> Result<(Disposition, EffectResult), ExplicitDispatchError> {
     let ledger_run = LedgerRunId(run_id.to_string());
-    match reserve_gate(ledger, tenant, ledger_run, estimate, available) {
-        Err(ReserveError::InsufficientBalance {
-            requested,
-            available,
-        }) => {
-            return (
-                Disposition::NoBalanceRefused {
-                    requested,
-                    available,
-                },
-                None,
-            );
-        }
-        Err(_) => {
-            return (
-                Disposition::NoBalanceRefused {
-                    requested: estimate,
-                    available,
-                },
-                None,
-            );
-        }
-        Ok(_reservation) => {}
-    }
+    let reservation = reserve_gate(ledger, tenant, ledger_run, estimate, available)
+        .map_err(ExplicitDispatchError::Reservation)?;
 
     let id_run = IdRunId(run_id.to_string());
     let token: RunToken = match identity.mint_run_token(
@@ -96,26 +113,25 @@ pub fn dispatch_explicit<Id: IdentityService, Fx: EffectApi>(
         &FailStaticBound::DEFAULT_W,
     ) {
         Ok(t) => t,
-        Err(_) => {
-            return (
-                Disposition::NoBalanceRefused {
-                    requested: estimate,
-                    available,
-                },
-                None,
-            );
+        Err(cause) => {
+            let reservation_release =
+                ledger.cancel_unstarted(&reservation.tenant, &reservation.run);
+            return Err(ExplicitDispatchError::RunTokenUnavailable {
+                cause,
+                reservation_release,
+            });
         }
     };
 
     let run_ctx = RunCtx(token.jti.clone());
     let applied = effect_api.apply(&run_ctx, output);
 
-    (
+    Ok((
         Disposition::Dispatched {
             run_token_jti: token.jti.clone(),
         },
-        Some(applied),
-    )
+        applied,
+    ))
 }
 
 pub fn no_auto_spawn_path_is_wired(chat_tokens: &[&str]) -> bool {
@@ -256,7 +272,9 @@ mod tests {
         );
     }
 
-    struct MockIdentity;
+    struct MockIdentity {
+        fail_mint: bool,
+    }
     impl IdentityService for MockIdentity {
         fn authenticate(
             &self,
@@ -321,6 +339,11 @@ mod tests {
             _caveats: &DelegationCaveats,
             _ttl: &FailStaticBound,
         ) -> myelin_identity::Result<RunToken> {
+            if self.fail_mint {
+                return Err(AuthzError::Unavailable(
+                    "run-token signer unavailable".into(),
+                ));
+            }
             Ok(RunToken {
                 token: format!("tok:{}", run_id.0),
                 jti: format!("jti:{}", run_id.0),
@@ -360,7 +383,7 @@ mod tests {
 
     #[test]
     fn an_explicit_dispatch_reserves_mints_a_token_and_routes_the_output_through_effect_api() {
-        let id = MockIdentity;
+        let id = MockIdentity { fail_mint: false };
         let fx = MockEffectApi;
         let mut ledger = CostLedger::new();
         let (disp, applied) = dispatch_explicit(
@@ -373,7 +396,8 @@ mod tests {
             MicroUsd(5),
             MicroUsd(10),
             ProposedEffect("chat.post".into()),
-        );
+        )
+        .expect("a funded dispatch with an available token signer succeeds");
         assert_eq!(
             disp,
             Disposition::Dispatched {
@@ -383,19 +407,17 @@ mod tests {
         );
         assert_eq!(
             applied,
-            Some(EffectResult::Applied(myelin_agent::EventId(
-                "applied:chat.post".into()
-            ))),
+            EffectResult::Applied(myelin_agent::EventId("applied:chat.post".into())),
             "the run's chat output routed through EffectApi (8.2)"
         );
     }
 
     #[test]
     fn an_explicit_dispatch_with_no_balance_is_refused_before_any_mint_or_apply() {
-        let id = MockIdentity;
+        let id = MockIdentity { fail_mint: false };
         let fx = MockEffectApi;
         let mut ledger = CostLedger::new();
-        let (disp, applied) = dispatch_explicit(
+        let error = dispatch_explicit(
             &id,
             &fx,
             &mut ledger,
@@ -405,16 +427,55 @@ mod tests {
             MicroUsd(50),
             MicroUsd(10),
             ProposedEffect("chat.post".into()),
-        );
-        assert_eq!(
-            disp,
-            Disposition::NoBalanceRefused {
-                requested: MicroUsd(50),
-                available: MicroUsd(10)
-            },
+        )
+        .expect_err("an unfunded dispatch is refused before applying an effect");
+        assert!(
+            matches!(
+                error,
+                ExplicitDispatchError::Reservation(ReserveError::InsufficientBalance {
+                    requested: MicroUsd(50),
+                    available: MicroUsd(10),
+                })
+            ),
             "no balance → no run: reserve/settle gates even the explicit run (CHAT-D17)"
         );
-        assert_eq!(applied, None, "a refused dispatch applies nothing");
+    }
+
+    #[test]
+    fn a_token_mint_failure_releases_the_reservation_and_preserves_the_real_cause() {
+        let id = MockIdentity { fail_mint: true };
+        let fx = MockEffectApi;
+        let mut ledger = CostLedger::new();
+        let tenant = tenant();
+        let run = LedgerRunId("run:explicit:token-unavailable".into());
+
+        let error = dispatch_explicit(
+            &id,
+            &fx,
+            &mut ledger,
+            tenant.clone(),
+            &agent_id(),
+            &run.0,
+            MicroUsd(5),
+            MicroUsd(10),
+            ProposedEffect("chat.post".into()),
+        )
+        .expect_err("an unavailable token signer refuses the dispatch");
+
+        assert_eq!(
+            error,
+            ExplicitDispatchError::RunTokenUnavailable {
+                cause: AuthzError::Unavailable("run-token signer unavailable".into()),
+                reservation_release: Ok(MicroUsd(5)),
+            },
+        );
+        assert_eq!(
+            ledger
+                .state_of(&tenant, &run)
+                .expect("the ledger remains readable"),
+            Some(myelin_storage::reserve_settle::ReservationState::Cancelled),
+            "a dispatch that never received a run token cannot retain spend",
+        );
     }
 
     fn agent_message(

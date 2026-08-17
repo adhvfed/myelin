@@ -1,6 +1,7 @@
 use myelin_agent::{EffectApi, EffectResult, EventId as FxEventId, ProposedEffect, RunCtx};
 use myelin_chat::dispatch::{
     dispatch_disposition_class, dispatch_explicit, DispatchOutcome, Disposition,
+    ExplicitDispatchError,
 };
 use myelin_chat::events::{CHAT_MESSAGE_MENTIONED, CHAT_REACTION_ADDED};
 use myelin_identity::{
@@ -8,7 +9,7 @@ use myelin_identity::{
     ObjectId, ObjectType, Permission, Precondition, Principal, PrincipalId, Result as IdResult,
     RevokeTarget, RunId as IdRunId, RunToken, TupleDelta, Zookie,
 };
-use myelin_storage::reserve_settle::{CostLedger, MicroUsd, RunId as LedgerRunId};
+use myelin_storage::reserve_settle::{CostLedger, MicroUsd, ReserveError, RunId as LedgerRunId};
 use myelin_tenancy::{ArtifactRef, TenantId};
 
 fn tenant() -> TenantId {
@@ -152,7 +153,8 @@ fn cdc_an_explicit_run_consumes_reserve_mint_and_effect_api() {
         MicroUsd(5),
         MicroUsd(10),
         ProposedEffect("chat.post".into()),
-    );
+    )
+    .expect("a funded explicit dispatch succeeds");
 
     assert_eq!(
         disp,
@@ -163,7 +165,7 @@ fn cdc_an_explicit_run_consumes_reserve_mint_and_effect_api() {
     );
     assert_eq!(
         applied,
-        Some(EffectResult::Applied(FxEventId("applied:chat.post".into()))),
+        EffectResult::Applied(FxEventId("applied:chat.post".into())),
         "8.2 CONSUMER: the run's chat output applied through EffectApi"
     );
     let dup = ledger.reserve(
@@ -183,7 +185,7 @@ fn cdc_the_reserve_gate_refuses_an_unfunded_explicit_run() {
     let id = MintingIdentity;
     let fx = ApplyingEffectApi;
     let mut ledger = CostLedger::new();
-    let (disp, applied) = dispatch_explicit(
+    let error = dispatch_explicit(
         &id,
         &fx,
         &mut ledger,
@@ -193,17 +195,16 @@ fn cdc_the_reserve_gate_refuses_an_unfunded_explicit_run() {
         MicroUsd(50),
         MicroUsd(0),
         ProposedEffect("chat.post".into()),
-    );
-    assert_eq!(
-        disp,
-        Disposition::NoBalanceRefused {
-            requested: MicroUsd(50),
-            available: MicroUsd(0)
-        },
+    )
+    .expect_err("an unfunded explicit dispatch is refused");
+    assert!(
+        matches!(
+            error,
+            ExplicitDispatchError::Reservation(ReserveError::InsufficientBalance {
+                requested: MicroUsd(50),
+                available: MicroUsd(0),
+            })
+        ),
         "11.7 CONSUMER: no balance → no run (reserve gates even the explicit run)"
-    );
-    assert_eq!(
-        applied, None,
-        "nothing minted, nothing applied - the run never started"
     );
 }
