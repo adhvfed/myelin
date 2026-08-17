@@ -138,14 +138,18 @@ pub use transport::{
     SendOutcome, TransportError,
 };
 
-use myelin_events::{consume, ConsumerName, ConsumerSpec, DedupLedger, InProcessBus, OutboxStore};
+use myelin_events::OutboxStore;
+#[cfg(test)]
+use myelin_events::{consume, ConsumerName, ConsumerSpec, DedupLedger, InProcessBus};
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Decision, IdentityService, ListObjectsResult,
     ObjectType, Permission, Principal,
 };
+#[cfg(test)]
+use myelin_substrate::ConsumerReg;
 use myelin_substrate::{
-    boot, AppSpec, Authorizer, Config, ConsumerReg, CriticalDependencies, HotTables, InternalRpc,
-    Migration, Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    boot, AppSpec, Authorizer, Config, CriticalDependencies, HotTables, InternalRpc, Migration,
+    Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
 };
 use myelin_tenancy::ArtifactRef;
 
@@ -338,23 +342,23 @@ pub fn knowledge_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
 
 pub const LIVING_DOC_CONSUMER: &str = "knowledge-living-doc";
 
-pub fn knowledge_app_spec_with_consumers(
+#[cfg(test)]
+fn knowledge_app_spec_with_consumers(
     config: Config,
     outbox: OutboxStore,
     subjects: &[&str],
     dedup: DedupLedger,
-) -> AppSpec {
+) -> Result<AppSpec, myelin_events::SubscribeError> {
     let mut spec = knowledge_app_spec(config, outbox.clone());
     spec.outbox = OutboxSpec::new(outbox, InProcessBus::new());
 
-    if let Ok(consumer) = consume(
+    let consumer = consume(
         ConsumerSpec::new(ConsumerName(LIVING_DOC_CONSUMER.into()), subjects),
         KnowledgeLivingDocHandler::new(),
         dedup,
-    ) {
-        spec.consumers = vec![ConsumerReg::new(consumer)];
-    }
-    spec
+    )?;
+    spec.consumers = vec![ConsumerReg::new(consumer)];
+    Ok(spec)
 }
 
 pub fn entrypoint_authorizer() -> KnowledgeEntrypointAuthorizer<FailClosedEntrypoint> {
@@ -573,7 +577,8 @@ mod tests {
             OutboxStore::new(),
             &["myelin://acme/issues/", "myelin://acme/ci/"],
             DedupLedger::new(),
-        );
+        )
+        .expect("the concrete living-document subjects are valid");
         assert_eq!(
             spec.consumers.len(),
             1,
@@ -591,20 +596,19 @@ mod tests {
 
     #[test]
     fn wired_appspec_rejects_a_wildcard_consumer_subject() {
-        let spec = knowledge_app_spec_with_consumers(
+        let error = match knowledge_app_spec_with_consumers(
             Config::default(),
             OutboxStore::new(),
             &["*"],
             DedupLedger::new(),
-        );
-        assert!(
-            spec.consumers.is_empty(),
-            "a `*` subject is rejected at registration → no consumer wired (never silently widened)"
-        );
+        ) {
+            Ok(_) => panic!("a wildcard must reject the complete consumer topology"),
+            Err(error) => error,
+        };
         assert_eq!(
-            serve(spec),
-            Ok(()),
-            "the shell still boots + drains without the bad consumer"
+            error,
+            myelin_events::SubscribeError::WildcardSubject("*".into()),
+            "the invalid subscription is surfaced to the composition root"
         );
     }
 
