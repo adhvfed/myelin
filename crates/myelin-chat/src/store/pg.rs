@@ -13,9 +13,11 @@ use myelin_storage::{
 };
 use myelin_tenancy::Region;
 
+#[cfg(any(test, feature = "test-support"))]
+use super::TombstoneReason;
 use super::{
     AuthorKind, ConversationId, Message, MessageId, MessageState, NewMessage, RangeCursor,
-    StoreError, TombstoneReason,
+    StoreError,
 };
 
 pub const MESSAGE_TABLE_DDL: &str = "\
@@ -104,7 +106,9 @@ impl PgMessageStore {
         Ok(())
     }
 
-    pub async fn append(
+    #[cfg(any(test, feature = "test-support"))]
+    /// Mutates only the message table for storage-parity tests; emits no event.
+    pub async fn append_storage_only(
         &self,
         minter: &dyn super::UlidSource,
         msg: NewMessage,
@@ -506,7 +510,9 @@ impl PgMessageStore {
         Ok(rows.iter().map(row_to_message).collect())
     }
 
-    pub async fn revise(
+    #[cfg(any(test, feature = "test-support"))]
+    /// Mutates only the message table for storage-parity tests; emits no event.
+    pub async fn revise_storage_only(
         &self,
         conv: &ConversationId,
         msg_id: &MessageId,
@@ -563,7 +569,9 @@ impl PgMessageStore {
         Ok(())
     }
 
-    pub async fn tombstone(
+    #[cfg(any(test, feature = "test-support"))]
+    /// Mutates only the message table for storage-parity tests; emits no event.
+    pub async fn tombstone_storage_only(
         &self,
         conv: &ConversationId,
         msg_id: &MessageId,

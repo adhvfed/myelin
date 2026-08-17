@@ -64,7 +64,7 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     let mut pg_ids = Vec::new();
     for i in 0..40 {
         let id = store
-            .append(
+            .append_storage_only(
                 &pg_src,
                 new_msg(&conv, &format!("n{i}"), "alice", &format!("m{i}")),
             )
@@ -116,7 +116,17 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     let mem_gap = mem.resync_from(&conv, &mem_ids[9]).unwrap();
     assert_eq!(pg_gap.len(), 30, "PG resync is gap-free after the cursor");
     assert_eq!(mem_gap.len(), 30, "mem resync is gap-free after the cursor");
-    assert_eq!(ids(&pg_gap), ids(&pg_gap));
+    assert_eq!(
+        pg_gap
+            .iter()
+            .map(|message| &message.body_inline)
+            .collect::<Vec<_>>(),
+        mem_gap
+            .iter()
+            .map(|message| &message.body_inline)
+            .collect::<Vec<_>>(),
+        "Postgres and memory resync return the same messages in the same order",
+    );
     let pg_before = store
         .range(&conv, RangeCursor::Before(pg_ids[20].clone()), 5)
         .await
@@ -126,7 +136,7 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     assert_eq!(ids(&pg_before), want);
 
     let again = store
-        .append(&pg_src, new_msg(&conv, "n0", "alice", "m0 retry"))
+        .append_storage_only(&pg_src, new_msg(&conv, "n0", "alice", "m0 retry"))
         .await
         .expect("pg append retry");
     assert_eq!(again, pg_ids[0], "a retried send dedups to the existing id");
@@ -141,11 +151,11 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     );
 
     store
-        .revise(&conv, &pg_ids[0], b"edited".to_vec(), Vec::new(), 0)
+        .revise_storage_only(&conv, &pg_ids[0], b"edited".to_vec(), Vec::new(), 0)
         .await
         .expect("pg revise CAS");
     let cas_err = store
-        .revise(&conv, &pg_ids[0], b"clobber".to_vec(), Vec::new(), 0)
+        .revise_storage_only(&conv, &pg_ids[0], b"clobber".to_vec(), Vec::new(), 0)
         .await
         .expect_err("a stale CAS is refused");
     assert!(matches!(
@@ -154,7 +164,7 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     ));
 
     store
-        .tombstone(&conv, &pg_ids[1], TombstoneReason::SubjectErased)
+        .tombstone_storage_only(&conv, &pg_ids[1], TombstoneReason::SubjectErased)
         .await
         .expect("pg tombstone");
     let after = store.range(&conv, RangeCursor::Recent, 1000).await.unwrap();
