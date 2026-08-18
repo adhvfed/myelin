@@ -1420,11 +1420,12 @@ mod tests {
 
     #[test]
     fn an_admitted_machine_request_releases_its_slot_for_the_next_one() {
-        // machine budget of one in-flight slot: if the permit leaked, the
-        // second sequential request would shed.
+        // cap 3 / human 1 leaves the batch-ci class (a Service principal)
+        // exactly one in-flight slot: if the permit leaked, the second
+        // sequential request would shed.
         let gateway = machine_gateway(crate::shed_governor::EdgeShed::with_budgets(
-            shed_budget(2, 1),
-            shed_budget(2, 1),
+            shed_budget(3, 1),
+            shed_budget(3, 1),
         ));
         for _ in 0..3 {
             let response = gateway.handle(machine_request());
