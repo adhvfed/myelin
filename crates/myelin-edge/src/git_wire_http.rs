@@ -212,7 +212,6 @@ pub fn register_git_wire(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> G
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::Page;
     use crate::repo_authz::{DenyAllRepos, GrantBackedRepos};
     use crate::request::EdgeRequest;
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -256,14 +255,12 @@ mod tests {
             vec![],
             vec![],
         );
-        let page = Page::from_request(&req);
         let identity = crate::catalogue::test_request_identity(be_principal, scope);
         let ctx = HandlerCtx {
             identity: &identity,
             principal: be_principal,
             scope,
             params: &params,
-            page: &page,
             request: &req,
         };
         handler.handle(&ctx)

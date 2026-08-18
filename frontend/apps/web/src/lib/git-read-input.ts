@@ -39,7 +39,7 @@ export interface GitPrCommitsInput extends GitPrInput {
   limit?: number;
   cursor?: string;
 }
-export interface GitPrDiffInput extends GitPrInput { cursor?: string; view?: "split" | "unified" }
+export interface GitPrDiffInput extends GitPrInput { cursor?: string }
 
 function record(value: unknown): WireRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -300,15 +300,13 @@ export function gitPrCommitsPath(input: GitPrCommitsInput): string {
 
 export function parseGitPrDiffInput(value: unknown): GitPrDiffInput | null {
   const input = record(value);
-  if (!input || !exact(input, ["repo", "n", "cursor", "view"]) ||
+  if (!input || !exact(input, ["repo", "n", "cursor"]) ||
       !isGitRepositorySlug(input.repo) ||
       !isGitPullRequestNumber(input.n) ||
-      (input.cursor !== undefined && !safeCursor(input.cursor)) ||
-      (input.view !== undefined && input.view !== "split" && input.view !== "unified")) return null;
+      (input.cursor !== undefined && !safeCursor(input.cursor))) return null;
   return {
     repo: input.repo,
     n: input.n,
     ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
-    ...(input.view === undefined ? {} : { view: input.view }),
   };
 }

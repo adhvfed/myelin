@@ -721,10 +721,6 @@ mod tests {
         };
         let request = crate::EdgeRequest::new("POST", "/v1/agents", "", vec![], vec![]);
         let params = BTreeMap::new();
-        let page = crate::Page {
-            limit: 50,
-            cursor: None,
-        };
         activation_proposal(
             &HandlerCtx {
                 identity: &identity,
@@ -732,7 +728,6 @@ mod tests {
                 scope: &scope,
                 request: &request,
                 params: &params,
-                page: &page,
             },
             &PlatformToolCatalogue::platform().unwrap(),
             CreateAgentBody {

@@ -54,8 +54,8 @@ describe("Git read RPC inputs", () => {
     const cursor = prCommitCursor(20);
     expect(parseGitPrCommitsInput({ repo: "core", n: 42, limit: 20, cursor }))
       .toEqual({ repo: "core", n: 42, limit: 20, cursor });
-    expect(parseGitPrDiffInput({ repo: "core", n: 42, view: "split" }))
-      .toEqual({ repo: "core", n: 42, view: "split" });
+    expect(parseGitPrDiffInput({ repo: "core", n: 42, cursor: "50" }))
+      .toEqual({ repo: "core", n: 42, cursor: "50" });
     expect(parseGitRefsInput({
       repo: "core", limit: 25, cursor: "gr1_a-b_c", q: "feature & fixes",
       current: "refs/heads/feature/x",
@@ -161,7 +161,7 @@ describe("Git read RPC inputs", () => {
     () => parseGitRepoPrsInput({ repo: "core", sort: "oldest" }),
     () => parseGitMyPrsInput({ bucket: "all" }),
     () => parseGitPrCommitsInput({ repo: "core", n: 1, cursor: "x\nsmuggled" }),
-    () => parseGitPrDiffInput({ repo: "core", n: 1, view: "side-by-side" }),
+    () => parseGitPrDiffInput({ repo: "core", n: 1, view: "split" }),
     () => parseGitRefsInput({ repo: "core", limit: 0 }),
     () => parseGitRefsInput({ repo: "core", limit: 101 }),
     () => parseGitRefsInput({ repo: "core", cursor: "x\nsmuggled" }),

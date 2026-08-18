@@ -1025,21 +1025,19 @@ export const getPrCommits = query(
   "git-pr-commits",
 );
 
-/** The PR three-dot diff (GET /v1/git/repos/{repo}/prs/{n}/diff?cursor=&view=). `Pull`-guarded, 0-leak
+/** The PR three-dot diff (GET /v1/git/repos/{repo}/prs/{n}/diff?cursor=). `Pull`-guarded, 0-leak
  *  (a denial is the same 404 as an absent PR — surfaced as the no-access state, never a leaked path). */
 export const getPrDiff = query(
   async (input: {
     repo: string;
     n: number;
     cursor?: string;
-    view?: string;
   }): Promise<PrDiffReadVM> => {
     "use server";
     const parsed = parseGitPrDiffInput(input);
     if (!parsed) throw new RepoRouteError("error");
     const p = new URLSearchParams();
     if (parsed.cursor) p.set("cursor", parsed.cursor);
-    if (parsed.view) p.set("view", parsed.view);
     const q = p.toString();
     return prDiffAuthed(async () => {
       const diff = parsePrDiff(await edgeGet(

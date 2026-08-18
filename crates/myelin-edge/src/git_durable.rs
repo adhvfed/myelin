@@ -1,4 +1,6 @@
-use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
+use crate::catalogue::{
+    page_envelope, Handler, HandlerCtx, Page, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT,
+};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_route::{map_method, param, pull_request_number_param, reroot, tenant_of};
@@ -6,7 +8,7 @@ use crate::git_route::{map_method, param, pull_request_number_param, reroot, ten
 use crate::repo_authz::AllowAllRepos;
 use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
-use crate::request::{EdgeRequest, EdgeResponse};
+use crate::request::{decode_form_query_component, EdgeRequest, EdgeResponse};
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::MonotonicMinter;
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};

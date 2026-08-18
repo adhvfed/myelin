@@ -25,6 +25,16 @@ async function mapInBatches<Input, Output>(
 }
 
 describe("automation delegation", () => {
+  test("refuses an ambiguous page instead of quietly showing the wrong automation history", async () => {
+    const founder = await browserApprovedCliClient();
+
+    for (const query of ["limt=1", "limit=01", "cursor="]) {
+      const response = await founder.json(`/v1/triggers?${query}`, { expectedStatus: 400 });
+      expect(response.body).toMatchObject({ error: { code: "bad_request" } });
+      expect(JSON.stringify(response.body).length).toBeLessThan(2_048);
+    }
+  });
+
   test("shares a founder's view only through one short-lived, auditable agent run", async () => {
     const founder = await browserApprovedCliClient();
     const repository = new GitProject(uniqueName("audited-agent-read"), founder);

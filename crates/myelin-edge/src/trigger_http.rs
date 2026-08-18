@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use sqlx::types::Uuid;
 use tokio::runtime::Handle;
 
-use crate::catalogue::{page_envelope, Handler, HandlerCtx, MAX_PAGE_LIMIT};
+use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
@@ -183,8 +183,9 @@ impl Handler for TriggerListHandler {
                 "trigger listing accepts no request body".into(),
             ));
         }
-        let cursor = ctx.page.cursor.as_deref().map(parse_uuid).transpose()?;
-        let limit = ctx.page.limit.min(MAX_PAGE_LIMIT);
+        let page = crate::catalogue::Page::parse(&ctx.request.query, "trigger list")?;
+        let cursor = page.cursor.as_deref().map(parse_uuid).transpose()?;
+        let limit = page.limit;
         let mut bindings = self
             .api
             .drive(self.api.backing.list_for_owner(
@@ -244,14 +245,15 @@ impl Handler for TriggerFiringListHandler {
             ));
         }
         let binding_id = parse_uuid(trigger_param(ctx)?)?;
-        let limit = ctx.page.limit.min(MAX_PAGE_LIMIT);
+        let page = crate::catalogue::Page::parse(&ctx.request.query, "trigger firing list")?;
+        let limit = page.limit;
         let mut firings = self
             .api
             .drive(self.api.backing.list_firings_for_owner(
                 &ctx.principal.tenant.0,
                 &ctx.principal.principal_id.0,
                 binding_id,
-                ctx.page.cursor.as_deref(),
+                page.cursor.as_deref(),
                 limit as u32 + 1,
             ))?
             .map_err(|error| EdgeError::Internal(error.to_string()))?;

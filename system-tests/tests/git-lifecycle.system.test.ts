@@ -320,7 +320,7 @@ describe.sequential("Git engineering lifecycle", () => {
       title: "Ship the system-tested lifecycle",
       head_oid: featureCommitOid,
     });
-    const reviewerDiff = await reviewerClient.json(`${base}/diff?view=split&limit=100`);
+    const reviewerDiff = await reviewerClient.json(`${base}/diff?limit=100`);
     expect(array(reviewerDiff.body.files, "reviewer pull request diff files")).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "src/shipped.ts", kind: "text" })]),
     );
@@ -344,7 +344,7 @@ describe.sequential("Git engineering lifecycle", () => {
     const commits = await systemClient.json(`${base}/commits?limit=20`);
     expect(array(commits.body.items, "pull request commits").length).toBeGreaterThan(0);
 
-    const diff = await systemClient.json(`${base}/diff?view=split&limit=100`);
+    const diff = await systemClient.json(`${base}/diff?limit=100`);
     expect(diff.body).toMatchObject({
       number: pullRequestNumber,
       head_oid: featureCommitOid,
@@ -353,6 +353,11 @@ describe.sequential("Git engineering lifecycle", () => {
     expect(array(diff.body.files, "pull request diff files")).toEqual(
       expect.arrayContaining([expect.objectContaining({ path: "src/shipped.ts", kind: "text" })]),
     );
+
+    const decorativeLayout = await systemClient.json(`${base}/diff?view=split`, {
+      expectedStatus: 400,
+    });
+    expect(decorativeLayout.body).toMatchObject({ error: { code: "bad_request" } });
 
     const checks = await systemClient.json(`${base}/checks`);
     expect(checks.body).toHaveProperty("gate_admitted");
@@ -385,7 +390,7 @@ describe.sequential("Git engineering lifecycle", () => {
 
     const unrelatedBase = `${project.path}/prs/${unrelatedNumber}`;
     await reviewerClient.json(unrelatedBase, { expectedStatus: 404 });
-    await reviewerClient.json(`${unrelatedBase}/diff?view=split&limit=100`, { expectedStatus: 404 });
+    await reviewerClient.json(`${unrelatedBase}/diff?limit=100`, { expectedStatus: 404 });
   });
 
   test("keeps discussion and a batched review retry-safe for another principal", async () => {

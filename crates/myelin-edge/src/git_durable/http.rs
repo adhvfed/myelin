@@ -80,32 +80,30 @@ struct DCommitLog {
     be: Arc<DurableGitBackend>,
 }
 
-fn commit_log_offset(cursor: Option<&str>) -> Result<usize, EdgeError> {
-    match cursor {
-        None => Ok(0),
-        Some(cursor) => cursor
-            .parse::<usize>()
-            .ok()
-            .filter(|offset| *offset <= COMMIT_LOG_MAX_OFFSET)
-            .ok_or_else(|| EdgeError::BadRequest("invalid commit-log cursor".into())),
-    }
-}
-
 #[cfg(test)]
 mod commit_log_cursor_tests {
     use super::*;
 
     #[test]
     fn commit_log_cursor_is_strict_and_bounded() {
-        assert_eq!(commit_log_offset(None).unwrap(), 0);
+        let initial = Page::parse("", "commit log").unwrap();
         assert_eq!(
-            commit_log_offset(Some(&COMMIT_LOG_MAX_OFFSET.to_string())).unwrap(),
+            initial.offset(COMMIT_LOG_MAX_OFFSET, "commit-log").unwrap(),
+            0
+        );
+        let boundary =
+            Page::parse(&format!("cursor={COMMIT_LOG_MAX_OFFSET}"), "commit log").unwrap();
+        assert_eq!(
+            boundary
+                .offset(COMMIT_LOG_MAX_OFFSET, "commit-log")
+                .unwrap(),
             COMMIT_LOG_MAX_OFFSET
         );
         let maximum = usize::MAX.to_string();
-        for cursor in ["", "-1", "1.5", "not-a-cursor", maximum.as_str()] {
+        for cursor in ["01", "-1", "1.5", "not-a-cursor", maximum.as_str()] {
+            let page = Page::parse(&format!("cursor={cursor}"), "commit log").unwrap();
             assert!(matches!(
-                commit_log_offset(Some(cursor)),
+                page.offset(COMMIT_LOG_MAX_OFFSET, "commit-log"),
                 Err(EdgeError::BadRequest(message)) if message == "invalid commit-log cursor"
             ));
         }
@@ -114,8 +112,9 @@ mod commit_log_cursor_tests {
 
 impl Handler for DCommitLog {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let offset = commit_log_offset(ctx.page.cursor.as_deref())?;
-        let limit = ctx.page.limit;
+        let page = Page::parse(&ctx.request.query, "commit log")?;
+        let offset = page.offset(COMMIT_LOG_MAX_OFFSET, "commit-log")?;
+        let limit = page.limit;
         let (rows, has_more) = self
             .be
             .commit_log(
@@ -727,7 +726,7 @@ mod tree_page_backend_tests {
     use myelin_tenancy::{Region as IdRegion, TenantId};
 
     use super::*;
-    use crate::catalogue::{test_request_identity, Page};
+    use crate::catalogue::test_request_identity;
     use crate::repo_authz::GrantBackedRepos;
     use crate::request::EdgeRequest;
 
@@ -906,14 +905,12 @@ mod tree_page_backend_tests {
             vec![],
             vec![],
         );
-        let page = Page::from_request(&request);
         let identity = test_request_identity(viewer, &scope);
         handler.handle(&HandlerCtx {
             identity: &identity,
             principal: viewer,
             scope: &scope,
             params: &params,
-            page: &page,
             request: &request,
         })
     }
@@ -1501,7 +1498,6 @@ impl Handler for DPrCommits {
 #[cfg(test)]
 mod pr_commit_pagination_tests {
     use super::*;
-    use crate::catalogue::Page;
     use crate::request::EdgeRequest;
     use base64::Engine as _;
     use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -1634,14 +1630,12 @@ mod pr_commit_pagination_tests {
             vec![],
             vec![],
         );
-        let page = Page::from_request(&request);
         let identity = crate::catalogue::test_request_identity(viewer, &scope);
         handler.handle(&HandlerCtx {
             identity: &identity,
             principal: viewer,
             scope: &scope,
             params: &params,
-            page: &page,
             request: &request,
         })
     }
@@ -1971,13 +1965,9 @@ struct DPrDiff {
 }
 impl Handler for DPrDiff {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let offset = ctx
-            .page
-            .cursor
-            .as_deref()
-            .and_then(|c| c.parse::<usize>().ok())
-            .unwrap_or(0);
-        let limit = ctx.page.limit;
+        let page = Page::parse(&ctx.request.query, "pull request diff")?;
+        let offset = page.offset(myelin_git::durable::PR_DIFF_MAX_FILES, "pull request diff")?;
+        let limit = page.limit;
         let vm = self
             .be
             .pr_diff(
@@ -2008,31 +1998,6 @@ struct FileLinesQuery {
 }
 
 const FILE_LINES_MAX_QUERY_BYTES: usize = 16 * 1024;
-
-fn decode_form_query_component(raw: &str, subject: &str) -> Result<String, EdgeError> {
-    let bytes = raw.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return Err(EdgeError::BadRequest(format!(
-                    "{subject} query contains malformed percent encoding"
-                )));
-            }
-            index += 3;
-        } else {
-            index += 1;
-        }
-    }
-    let form_value = raw.replace('+', " ");
-    percent_encoding::percent_decode_str(&form_value)
-        .decode_utf8()
-        .map(|value| value.into_owned())
-        .map_err(|_| EdgeError::BadRequest(format!("{subject} query is not valid UTF-8")))
-}
 
 fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
     if query.len() > FILE_LINES_MAX_QUERY_BYTES {
@@ -2806,7 +2771,6 @@ impl Handler for DCodeSearch {
 #[cfg(test)]
 mod code_search_boundary_tests {
     use super::*;
-    use crate::catalogue::Page;
     use myelin_storage::TenantScope;
     use myelin_tenancy::{Region as IdentityRegion, TenantId as IdentityTenantId};
     use std::collections::BTreeMap;
@@ -2838,14 +2802,12 @@ mod code_search_boundary_tests {
         let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
         let params = BTreeMap::new();
         let request = EdgeRequest::new("GET", "/v1/git/search/code", query, vec![], vec![]);
-        let page = Page::from_request(&request);
         let identity = crate::catalogue::test_request_identity(&principal, &scope);
         DCodeSearch { be }.handle(&HandlerCtx {
             identity: &identity,
             principal: &principal,
             scope: &scope,
             params: &params,
-            page: &page,
             request: &request,
         })
     }
@@ -3563,7 +3525,6 @@ mod create_claim_tests {
 #[cfg(test)]
 mod repository_list_tests {
     use super::*;
-    use crate::catalogue::Page;
     use crate::repo_authz::GrantBackedRepos;
     use crate::request::EdgeRequest;
     use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -3604,14 +3565,12 @@ mod repository_list_tests {
         let scope = TenantScope::from_verified_token(viewer, viewer.region.clone());
         let params = BTreeMap::new();
         let request = EdgeRequest::new("GET", "/v1/git/repos", query, vec![], vec![]);
-        let page = Page::from_request(&request);
         let identity = crate::catalogue::test_request_identity(viewer, &scope);
         handler.handle(&HandlerCtx {
             identity: &identity,
             principal: viewer,
             scope: &scope,
             params: &params,
-            page: &page,
             request: &request,
         })
     }
@@ -3843,7 +3802,6 @@ mod repository_list_tests {
 mod pr_list_tests {
 
     use super::*;
-    use crate::catalogue::Page;
     use crate::repo_authz::GrantBackedRepos;
     use crate::request::EdgeRequest;
     use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -3912,14 +3870,12 @@ mod pr_list_tests {
             params.insert("repo".to_string(), r.to_string());
         }
         let req = EdgeRequest::new("GET", "/v1/git/prs", query, vec![], vec![]);
-        let page = Page::from_request(&req);
         let identity = crate::catalogue::test_request_identity(viewer, &scope);
         let ctx = HandlerCtx {
             identity: &identity,
             principal: viewer,
             scope: &scope,
             params: &params,
-            page: &page,
             request: &req,
         };
         handler
@@ -4842,7 +4798,6 @@ mod file_lines_boundary_tests {
 mod pr_thread_tests {
 
     use super::*;
-    use crate::catalogue::Page;
     use crate::repo_authz::GrantBackedRepos;
     use crate::request::EdgeRequest;
     use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -4909,14 +4864,12 @@ mod pr_thread_tests {
             )]
         };
         let req = EdgeRequest::new(method, "/v1/git/x", "", headers, bytes);
-        let page = Page::from_request(&req);
         let identity = crate::catalogue::test_request_identity(viewer, &scope);
         let ctx = HandlerCtx {
             identity: &identity,
             principal: viewer,
             scope: &scope,
             params: &pmap,
-            page: &page,
             request: &req,
         };
         handler.handle(&ctx).map(|r| r.json_body().expect("json"))

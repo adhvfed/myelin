@@ -150,6 +150,31 @@ impl EdgeRequest {
     }
 }
 
+pub(crate) fn decode_form_query_component(raw: &str, subject: &str) -> Result<String, EdgeError> {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(EdgeError::BadRequest(format!(
+                    "{subject} query contains malformed percent encoding"
+                )));
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let form_value = raw.replace('+', " ");
+    percent_encoding::percent_decode_str(&form_value)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| EdgeError::BadRequest(format!("{subject} query is not valid UTF-8")))
+}
+
 pub enum EdgeResponse {
     Bytes {
         status: u16,

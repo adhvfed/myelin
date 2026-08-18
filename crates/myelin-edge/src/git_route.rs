@@ -63,14 +63,12 @@ mod tests {
             vec![],
             vec![],
         );
-        let page = crate::catalogue::Page::from_request(&request);
         pull_request_number_param(
             &HandlerCtx {
                 identity: &identity,
                 principal: &principal,
                 scope: &scope,
                 params: &params,
-                page: &page,
                 request: &request,
             },
             "n",

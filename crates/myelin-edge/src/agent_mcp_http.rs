@@ -886,10 +886,6 @@ mod tests {
             ),
         };
         let params = BTreeMap::from([("run".into(), "run".into())]);
-        let page = crate::Page {
-            limit: 50,
-            cursor: None,
-        };
         let request = EdgeRequest::new(
             "POST",
             "/v1/agent-runs/run/mcp",
@@ -905,7 +901,6 @@ mod tests {
             principal: &principal,
             scope: &scope,
             params: &params,
-            page: &page,
             request: &request,
         };
         assert!(require_mcp_request(&ctx).is_ok());

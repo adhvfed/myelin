@@ -1,5 +1,5 @@
 use crate::authz::{authorize_edge_action, human_session_authority};
-use crate::catalogue::{Handler, HandlerCtx, Method, Page};
+use crate::catalogue::{Handler, HandlerCtx, Method};
 use crate::device_auth::{
     ApprovalOutcome, ClaimOutcome, DeviceApproval, DeviceAuthorizationBroker,
     DeviceAuthorizationError, DEVICE_AUTHORIZATION_TTL_SECS,
@@ -588,13 +588,11 @@ impl Gateway {
         };
         match &route.kind {
             RouteKind::Normal(handler) => {
-                let page = Page::from_request(req);
                 let ctx = HandlerCtx {
                     identity: &identity,
                     principal: &identity.principal,
                     scope: &scope,
                     params: &params,
-                    page: &page,
                     request: req,
                 };
                 let resp = handler.handle(&ctx)?;

@@ -1,5 +1,5 @@
 use crate::error::EdgeError;
-use crate::request::{EdgeRequest, EdgeResponse};
+use crate::request::{decode_form_query_component, EdgeRequest, EdgeResponse};
 use myelin_identity::Principal;
 use myelin_identity_service::RequestIdentity;
 use myelin_storage::TenantScope;
@@ -10,6 +10,8 @@ pub const API_VERSION: &str = "v1";
 
 pub const DEFAULT_PAGE_LIMIT: usize = 50;
 pub const MAX_PAGE_LIMIT: usize = 100;
+const MAX_PAGE_QUERY_BYTES: usize = 16 * 1024;
+const MAX_PAGE_CURSOR_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -54,15 +56,77 @@ pub struct Page {
 }
 
 impl Page {
-    pub fn from_request(req: &EdgeRequest) -> Page {
-        let limit = req
-            .query_param("limit")
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_PAGE_LIMIT)
-            .clamp(1, MAX_PAGE_LIMIT);
-        Page {
-            limit,
-            cursor: req.query_param("cursor"),
+    pub fn parse(query: &str, subject: &str) -> Result<Page, EdgeError> {
+        if query.len() > MAX_PAGE_QUERY_BYTES {
+            return Err(EdgeError::BadRequest(format!(
+                "{subject} query exceeds {MAX_PAGE_QUERY_BYTES} bytes"
+            )));
+        }
+        let mut limit = None;
+        let mut cursor = None;
+        if !query.is_empty() {
+            for pair in query.split('&') {
+                let (raw_name, raw_value) = pair.split_once('=').ok_or_else(|| {
+                    EdgeError::BadRequest(format!("malformed {subject} query parameter"))
+                })?;
+                let name = decode_form_query_component(raw_name, subject)?;
+                let value = decode_form_query_component(raw_value, subject)?;
+                match name.as_str() {
+                    "limit" if limit.is_none() => {
+                        let parsed = value.parse::<usize>().ok().filter(|parsed| {
+                            value == parsed.to_string() && (1..=MAX_PAGE_LIMIT).contains(parsed)
+                        });
+                        limit = Some(parsed.ok_or_else(|| {
+                            EdgeError::BadRequest(format!(
+                                "{subject} limit must be a canonical integer between 1 and \
+                                 {MAX_PAGE_LIMIT}"
+                            ))
+                        })?);
+                    }
+                    "cursor" if cursor.is_none() => {
+                        if value.is_empty()
+                            || value.len() > MAX_PAGE_CURSOR_BYTES
+                            || value.chars().any(char::is_control)
+                        {
+                            return Err(EdgeError::BadRequest(format!(
+                                "{subject} cursor must be nonempty printable text of at most \
+                                 {MAX_PAGE_CURSOR_BYTES} bytes"
+                            )));
+                        }
+                        cursor = Some(value);
+                    }
+                    "limit" | "cursor" => {
+                        return Err(EdgeError::BadRequest(format!(
+                            "duplicate {subject} query parameter `{name}`"
+                        )))
+                    }
+                    "" => {
+                        return Err(EdgeError::BadRequest(format!(
+                            "empty {subject} query parameter name"
+                        )))
+                    }
+                    _ => {
+                        return Err(EdgeError::BadRequest(format!(
+                            "unknown {subject} query parameter `{name}`"
+                        )))
+                    }
+                }
+            }
+        }
+        Ok(Page {
+            limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+            cursor,
+        })
+    }
+
+    pub fn offset(&self, maximum: usize, subject: &str) -> Result<usize, EdgeError> {
+        match self.cursor.as_deref() {
+            None => Ok(0),
+            Some(cursor) => cursor
+                .parse::<usize>()
+                .ok()
+                .filter(|offset| cursor == offset.to_string() && *offset <= maximum)
+                .ok_or_else(|| EdgeError::BadRequest(format!("invalid {subject} cursor"))),
         }
     }
 }
@@ -79,7 +143,6 @@ pub struct HandlerCtx<'a> {
     pub principal: &'a Principal,
     pub scope: &'a TenantScope,
     pub params: &'a BTreeMap<String, String>,
-    pub page: &'a Page,
     pub request: &'a EdgeRequest,
 }
 
@@ -120,13 +183,43 @@ mod tests {
     }
 
     #[test]
-    fn page_clamps_limit_to_the_cap_and_is_total() {
-        let req = EdgeRequest::new("GET", "/", "limit=10000&cursor=abc", vec![], vec![]);
-        let p = Page::from_request(&req);
-        assert_eq!(p.limit, MAX_PAGE_LIMIT, "limit is clamped to the cap");
-        assert_eq!(p.cursor, Some("abc".to_string()));
-        let req2 = EdgeRequest::new("GET", "/", "limit=banana", vec![], vec![]);
-        assert_eq!(Page::from_request(&req2).limit, DEFAULT_PAGE_LIMIT);
+    fn pagination_is_explicit_canonical_and_bounded() {
+        assert_eq!(
+            Page::parse("", "activity").unwrap(),
+            Page {
+                limit: DEFAULT_PAGE_LIMIT,
+                cursor: None
+            }
+        );
+        assert_eq!(
+            Page::parse("limit=100&cursor=next%3Apage", "activity").unwrap(),
+            Page {
+                limit: MAX_PAGE_LIMIT,
+                cursor: Some("next:page".into())
+            }
+        );
+
+        for query in [
+            "limit=0",
+            "limit=01",
+            "limit=101",
+            "limit=banana",
+            "limit=1&limit=2",
+            "cursor=",
+            "cursor=%00",
+            "cursor=a&cursor=b",
+            "limt=1",
+            "limit",
+            "limit=%GG",
+        ] {
+            assert!(
+                matches!(
+                    Page::parse(query, "activity"),
+                    Err(EdgeError::BadRequest(_))
+                ),
+                "ambiguous page query was admitted: {query}"
+            );
+        }
     }
 
     #[test]
