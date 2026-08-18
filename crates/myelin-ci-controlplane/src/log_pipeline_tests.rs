@@ -498,7 +498,7 @@ fn every_shipped_line_is_a_firehose_frame_on_a_bounded_scope() {
     let scope = c.firehose_scope().expect("a bounded run scope");
     assert_eq!(
         scope.selector(),
-        "log:run-1-job-1",
+        "run:run-1",
         "the live tail scope is bounded run:<id>"
     );
 }
