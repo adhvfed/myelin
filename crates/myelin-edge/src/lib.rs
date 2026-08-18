@@ -29,6 +29,7 @@ pub mod knowledge_http;
 pub mod mcp_read;
 pub mod notif_http;
 pub mod privacy_http;
+pub mod shed_governor;
 pub mod project_http;
 pub mod refs_http;
 pub mod repo_authz;

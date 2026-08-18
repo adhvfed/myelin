@@ -104,9 +104,9 @@ human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lan
 retry_after_secs = 10
 
 [[shed_budgets]]
-surface = "GitFrontDoor"      # the Git clone/push front door (GIT-P15, OQ-K): a CI/agent clone storm
-per_tenant_in_flight_cap = 128 # MEASURED: GIT-P15 clone-storm sheds the machine lanes before a human fetch at this cap.
-human_lane_reservation = 32    # 25% of cap — above the 20% measured human-lane floor.
+surface = "GitFrontDoor"      # the Git clone/push front door; ENFORCED at the edge gateway.
+per_tenant_in_flight_cap = 4  # sized to the edge's 4 global git-wire slots (server.rs): machines
+human_lane_reservation = 1    # hold at most 3 per tenant, so a human fetch always has a slot.
 retry_after_secs = 5
 
 [[shed_budgets]]
@@ -134,9 +134,9 @@ human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lan
 retry_after_secs = 10          # generous — a workflow start is not latency-critical; an agent fan-out backs off and re-initiates.
 
 [[shed_budgets]]
-surface = "HttpIntake"        # the generic public surface (§7.1): every surface reserves a human fraction.
-per_tenant_in_flight_cap = 200 # MEASURED: SUB-D3 (P-S32) + ID-D9 (P-424) held the human lane at this generic-intake cap.
-human_lane_reservation = 50    # 25% of cap — above the 20% measured human-lane floor.
+surface = "HttpIntake"        # the generic /v1 API surface; ENFORCED at the edge gateway.
+per_tenant_in_flight_cap = 48 # sized under the edge's 64 global dispatch slots (server.rs): one
+human_lane_reservation = 12   # tenant's machine lanes hold at most 36, humans keep 12 reserved.
 retry_after_secs = 5
 
 [[resilient_client]]

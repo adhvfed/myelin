@@ -16,6 +16,8 @@ use myelin_identity_service::{
     VerifiedAssertion,
 };
 use myelin_storage::TenantScope;
+use crate::shed_governor::{run_class_header, EdgeShed, RUN_CLASS_HEADER};
+use myelin_substrate::shed::{RunClass, Surface};
 use myelin_substrate::{Authorizer, InjectedIdentity, PublicSurface};
 use myelin_tenancy::{Region, TenantId};
 use serde_json::json;
@@ -234,9 +236,15 @@ pub struct GatewayBuilder {
     public_base_url: Option<String>,
     human_session_issuer: Option<HumanSessionIssuer>,
     device_authorization: Option<DeviceAuthorizationBroker>,
+    shed: EdgeShed,
 }
 
 impl GatewayBuilder {
+    pub fn with_shed(mut self, shed: EdgeShed) -> GatewayBuilder {
+        self.shed = shed;
+        self
+    }
+
     pub fn registered_actions(&self) -> impl Iterator<Item = &str> {
         self.routes.iter().map(|route| route.action.as_str())
     }
@@ -372,6 +380,7 @@ impl GatewayBuilder {
             public_base_url: self.public_base_url,
             human_session_issuer: self.human_session_issuer,
             device_authorization: self.device_authorization,
+            shed: self.shed,
         }
     }
 }
@@ -448,6 +457,7 @@ pub struct Gateway {
     public_base_url: Option<String>,
     human_session_issuer: Option<HumanSessionIssuer>,
     device_authorization: Option<DeviceAuthorizationBroker>,
+    shed: EdgeShed,
 }
 
 impl Gateway {
@@ -469,6 +479,7 @@ impl Gateway {
             public_base_url: None,
             human_session_issuer: None,
             device_authorization: None,
+            shed: EdgeShed::v1_floor(),
         }
     }
 
@@ -556,6 +567,25 @@ impl Gateway {
                 authorization_action
             )));
         }
+        let run_class = RunClass::derive(
+            &identity.principal.kind,
+            run_class_header(req.header(RUN_CLASS_HEADER)),
+        );
+        let surface = if route.action.starts_with("git.wire.") {
+            Surface::GitFrontDoor
+        } else {
+            Surface::HttpIntake
+        };
+        let _shed_permit = match self.shed.admit(surface, scope.tenant(), run_class) {
+            Ok(permit) => permit,
+            Err(retry_after_secs) => {
+                return Ok(EdgeResponse::error(&EdgeError::TooManyRequests(format!(
+                    "the {} lane for this tenant is at capacity; retry in {retry_after_secs}s",
+                    run_class.lane()
+                )))
+                .with_header("Retry-After", retry_after_secs.to_string()));
+            }
+        };
         match &route.kind {
             RouteKind::Normal(handler) => {
                 let page = Page::from_request(req);
@@ -1267,6 +1297,143 @@ mod tests {
             vec![],
         ));
         assert_eq!(response.status(), 200);
+    }
+
+    #[derive(Clone, Copy)]
+    struct AnyBindingMachineVerifier;
+
+    impl myelin_identity_service::TokenVerifier for AnyBindingMachineVerifier {
+        fn verify(
+            &self,
+            _credential: &Credential,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            self.token()
+        }
+
+        fn verify_for_request(
+            &self,
+            _credential: &Credential,
+            _binding: &DpopBinding,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            self.token()
+        }
+    }
+
+    impl AnyBindingMachineVerifier {
+        fn token(&self) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            Ok(myelin_identity_service::CapabilityToken {
+                tenant: TenantId("acme".into()),
+                region: Region("eu-west".into()),
+                kind: myelin_identity_service::MachineKind::Pat,
+                subject_key: "pat-subject".into(),
+                authority: myelin_identity_service::Authority::of(["edge.identity.read"]),
+                jti: "pat-jti".into(),
+                dpop_bound: true,
+                purpose: myelin_identity_service::CredentialPurpose::Pat,
+                audience: myelin_identity_service::CredentialAudience::Edge,
+                exp_unix: i64::MAX,
+            })
+        }
+    }
+
+    fn machine_gateway(shed: crate::shed_governor::EdgeShed) -> Gateway {
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let principal = Principal::stub(
+            myelin_identity::PrincipalId("pat-principal".into()),
+            PrincipalKind::Service,
+            TenantId("acme".into()),
+        );
+        let scope = TenantScope::from_verified_token(&principal, Region("eu-west".into()));
+        store
+            .put_principal(
+                &scope,
+                principal.principal_id.clone(),
+                PrincipalKind::Service,
+                myelin_identity::DataRole::Controller,
+                myelin_identity::PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .link_credential(&scope, "pat", "pat-subject", &principal.principal_id)
+            .unwrap();
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(AnyBindingMachineVerifier),
+            RevocationStore::new(),
+        ));
+        Gateway::builder(authn, human_login(), Arc::new(AllowAll))
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .with_shed(shed)
+            .build()
+    }
+
+    fn machine_request() -> EdgeRequest {
+        EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![("Authorization".into(), "Bearer opaque-proof".into())],
+            vec![],
+        )
+    }
+
+    fn shed_budget(cap: u32, human: u32) -> myelin_substrate::shed::SurfaceBudget {
+        myelin_substrate::shed::SurfaceBudget {
+            per_tenant_in_flight_cap: cap,
+            human_lane_reservation: human,
+            retry_after_secs: 5,
+        }
+    }
+
+    #[test]
+    fn a_machine_request_sheds_with_429_and_retry_after_when_its_lane_is_exhausted() {
+        // cap 1 with 1 reserved human slot leaves the machine lanes zero budget,
+        // so the very first machine request must shed through the full path.
+        let gateway = machine_gateway(crate::shed_governor::EdgeShed::with_budgets(
+            shed_budget(1, 1),
+            shed_budget(1, 1),
+        ));
+        let response = gateway.handle(machine_request());
+        assert_eq!(response.status(), 429);
+        assert_eq!(
+            response.json_body().unwrap()["error"]["code"],
+            "too_many_requests"
+        );
+        match &response {
+            EdgeResponse::Bytes { headers, .. } => {
+                assert!(
+                    headers
+                        .iter()
+                        .any(|(name, value)| name == "Retry-After" && value == "5"),
+                    "a shed carries the tuned Retry-After: {headers:?}"
+                );
+            }
+            EdgeResponse::Sse { .. } => panic!("a shed is a plain response"),
+        }
+    }
+
+    #[test]
+    fn an_admitted_machine_request_releases_its_slot_for_the_next_one() {
+        // machine budget of one in-flight slot: if the permit leaked, the
+        // second sequential request would shed.
+        let gateway = machine_gateway(crate::shed_governor::EdgeShed::with_budgets(
+            shed_budget(2, 1),
+            shed_budget(2, 1),
+        ));
+        for _ in 0..3 {
+            let response = gateway.handle(machine_request());
+            assert_eq!(
+                response.status(),
+                200,
+                "sequential machine requests within budget all admit (the permit releases)"
+            );
+        }
     }
 
     #[test]

@@ -249,8 +249,10 @@ impl ShedBudgetTable {
         rows.insert(
             Surface::GitFrontDoor,
             SurfaceBudget {
-                per_tenant_in_flight_cap: 128,
-                human_lane_reservation: 32,
+                // sized to the edge's 4 global git-wire slots: machines hold at
+                // most 3 per tenant, so a human fetch always has a slot.
+                per_tenant_in_flight_cap: 4,
+                human_lane_reservation: 1,
                 retry_after_secs: 5,
             },
         );
@@ -289,8 +291,11 @@ impl ShedBudgetTable {
         rows.insert(
             Surface::HttpIntake,
             SurfaceBudget {
-                per_tenant_in_flight_cap: 200,
-                human_lane_reservation: 50,
+                // sized under the edge's 64 global dispatch slots: one tenant's
+                // machine lanes hold at most 36, leaving headroom for humans
+                // and other tenants before the flat backstop trips.
+                per_tenant_in_flight_cap: 48,
+                human_lane_reservation: 12,
                 retry_after_secs: 5,
             },
         );

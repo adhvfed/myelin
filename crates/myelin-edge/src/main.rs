@@ -1110,13 +1110,21 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         recovery.merges_recovered
     );
 
+    let edge_shed = match myelin_edge::shed_governor::EdgeShed::from_thresholds(&thresholds) {
+        Ok(shed) => shed,
+        Err(e) => {
+            eprintln!("edge: the per-tenant shed budgets refused to load: {e}");
+            std::process::exit(1);
+        }
+    };
     let builder = Gateway::builder(
         authn,
         human_login,
         Arc::new(AuthenticatedActionPolicy::mounted()),
     )
     .default_token_scheme(EDGE_DEFAULT_TOKEN_SCHEME)
-    .with_human_session_issuer(cell.clone());
+    .with_human_session_issuer(cell.clone())
+    .with_shed(edge_shed);
     let builder = match device_authorization {
         Some(broker) => builder.with_device_authorization(broker),
         None => {

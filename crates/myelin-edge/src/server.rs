@@ -30,6 +30,12 @@ const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
 const MAX_CONCURRENT_REQUEST_BODIES: usize = 64;
 const MAX_CONCURRENT_GIT_PUSH_BODIES: usize = 2;
 const MAX_CONCURRENT_GATEWAY_DISPATCHES: usize = 64;
+// machine-classified requests (CI, agents, deploy keys, or anything carrying
+// x-myelin-run-class) draw from this smaller pool FIRST, so the remaining
+// dispatch slots stay available to interactive humans during a machine storm.
+// a caller that lies about its class gets past this pool but is then held to
+// its verified principal class by the per-tenant shed lane in the gateway.
+const MAX_CONCURRENT_MACHINE_DISPATCHES: usize = 48;
 const MAX_CONCURRENT_LARGE_RESPONSES: usize = 2;
 const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_HEADERS: usize = 64;
@@ -48,6 +54,7 @@ struct AdmissionSlots {
     request_body: Arc<Semaphore>,
     git_push_body: Arc<Semaphore>,
     gateway_dispatch: Arc<Semaphore>,
+    machine_dispatch: Arc<Semaphore>,
     large_response: Arc<Semaphore>,
 }
 
@@ -147,6 +154,7 @@ where
         request_body: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_BODIES)),
         git_push_body: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSH_BODIES)),
         gateway_dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT_GATEWAY_DISPATCHES)),
+        machine_dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT_MACHINE_DISPATCHES)),
         large_response: Arc::new(Semaphore::new(MAX_CONCURRENT_LARGE_RESPONSES)),
     };
     let mut accept_error = None;
@@ -363,12 +371,21 @@ async fn handle_connection_inner(
     } else {
         None
     };
+    let machine_permit = if is_machine_classified(&edge_req) {
+        match admission.machine_dispatch.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return machine_dispatch_shed(),
+        }
+    } else {
+        None
+    };
     let gateway_permit = match admission.gateway_dispatch.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return overloaded("the edge request service is at capacity; retry later"),
     };
 
     let (edge_response, large_response_permit) = match tokio::task::spawn_blocking(move || {
+        let _machine_permit = machine_permit;
         let _gateway_permit = gateway_permit;
         let _git_wire_permit = git_wire_permit;
         let _request_body_permit = request_body_permit;
@@ -515,6 +532,31 @@ fn request_body_deadline(path: &str) -> Duration {
 
 fn overloaded(message: &str) -> Response<EdgeBody> {
     let err = EdgeError::Unavailable(message.into());
+    let mut response = to_hyper(EdgeResponse::error(&err));
+    response.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static(GIT_WIRE_RETRY_AFTER_SECONDS),
+    );
+    response
+}
+
+// pre-auth classification for the machine dispatch pool: an explicit
+// x-myelin-run-class header, or one of the machine-only credential schemes.
+// "session" and "pat" stay in the general pool - they are human-operated.
+fn is_machine_classified(req: &EdgeRequest) -> bool {
+    if req.header(crate::shed_governor::RUN_CLASS_HEADER).is_some() {
+        return true;
+    }
+    matches!(
+        req.header("x-myelin-token-scheme").map(str::trim),
+        Some("ci" | "agent" | "deploy_key" | "per_job")
+    )
+}
+
+fn machine_dispatch_shed() -> Response<EdgeBody> {
+    let err = EdgeError::TooManyRequests(
+        "the machine dispatch pool is at capacity; retry later".into(),
+    );
     let mut response = to_hyper(EdgeResponse::error(&err));
     response.headers_mut().insert(
         hyper::header::RETRY_AFTER,
