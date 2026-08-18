@@ -647,8 +647,7 @@ mod tests {
         // aggregate_mismatch when the row and envelope disagreed; the
         // canonical `page:<id>` partition must clear the publisher's check.
         let t = tenant();
-        let minter = Arc::new(myelin_events::MonotonicMinter::new());
-        let store = OutboxStore::new();
+        let (store, minter) = store_and_minter();
         let mut tx = store.begin(Arc::clone(&minter), ctx_base());
         tx.stage_state_change("admission check emits");
         for change in [

@@ -3,7 +3,7 @@ use sqlx::{Acquire, Row};
 
 use myelin_content::InlineNode;
 use myelin_events::{
-    derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
+    derive_envelope, Actor, DataRole, EmitContext, EventDraft, EventEnvelope,
     EventId, EventType, IdMinter, Timestamp, Visibility,
 };
 use myelin_identity::{ObjectId, PrincipalId, RelName, RelationTuple, TupleDelta};

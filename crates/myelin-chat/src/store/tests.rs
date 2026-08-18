@@ -205,8 +205,8 @@ fn append_co_commits_a_real_chat_message_created_event() {
         "the co-committed event is chat.message.created"
     );
     assert_eq!(
-        row.aggregate.0, "01J0CONV",
-        "aggregate = conversation_id (contract 2.3 - the CHAT-D2 ordering key)"
+        row.aggregate.0, "channel:01J0CONV",
+        "aggregate = the canonical channel partition (contract 2.3 - the CHAT-D2 ordering key)"
     );
     assert!(
         row.subject.0.contains("#message-") && row.subject.0.contains(id.as_str()),
@@ -313,7 +313,7 @@ fn chat_d2_burst_from_many_gateways_preserves_per_conversation_total_order() {
     let mut seqs: Vec<u64> = ob
         .committed_rows()
         .into_iter()
-        .filter(|r| r.aggregate.0 == "01J0CONV")
+        .filter(|r| r.aggregate.0 == "channel:01J0CONV")
         .map(|r| r.seq)
         .collect();
     seqs.sort_unstable();
@@ -357,7 +357,7 @@ fn chat_d2_out_of_order_edit_reconciles_to_stable_id_order() {
     let types: Vec<String> = ob
         .committed_rows()
         .into_iter()
-        .filter(|r| r.aggregate.0 == "01J0CONV")
+        .filter(|r| r.aggregate.0 == "channel:01J0CONV")
         .map(|r| r.envelope.type_.0.clone())
         .collect();
     assert!(types.contains(&"chat.message.created".to_string()));

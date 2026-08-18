@@ -449,8 +449,8 @@ fn the_log_available_pointer_is_references_not_payloads() {
         "no inline-PII key (the bytes are behind the ref)"
     );
     assert_eq!(
-        draft.aggregate.0, "ci/run/run-1/job/job-1",
-        "per-(run, job)-aggregate ordering"
+        draft.aggregate.0, "run:run-1",
+        "per-run-aggregate ordering (canonical run:<id> partition)"
     );
     assert_eq!(
         draft.subject.0, "myelin://01J0ACME/ci/log/run-1:job-1:1",

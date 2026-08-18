@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use myelin_events::{
-    AggregateKey, DataRole, EventDraft, EventType, OutboxTransaction, OutboxTx as OutboxTxTrait,
+    DataRole, EventDraft, EventType, OutboxTransaction, OutboxTx as OutboxTxTrait,
     Visibility,
 };
 #[cfg(any(test, feature = "test-support"))]

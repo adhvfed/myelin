@@ -8,7 +8,7 @@ use myelin_ci_sandbox::gvisor::{
     OCI_CARGO_VENDOR_MOUNT,
 };
 use myelin_events::{
-    derive_envelope_from_persisted_cause, Actor, AggregateKey, CausedBy, CorrelationId, DataRole,
+    derive_envelope_from_persisted_cause, Actor, CausedBy, CorrelationId, DataRole,
     EmitContext, EventDraft, EventId, EventType, HandlerTx, IdMinter, PersistedEventCause,
     Timestamp, Visibility,
 };

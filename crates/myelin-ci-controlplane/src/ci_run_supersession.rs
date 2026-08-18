@@ -4,7 +4,7 @@ use std::sync::Arc;
 use myelin_ci_sandbox::ResourceUsage;
 use myelin_events::check_seam::{ci_result_draft, rollup_ci_result};
 use myelin_events::{
-    derive_envelope_from_persisted_cause, Actor, AggregateKey, ArtifactRef, CausedBy,
+    derive_envelope_from_persisted_cause, Actor, ArtifactRef, CausedBy,
     CorrelationId, DataRole, EmitContext, EventDraft, EventId, EventType, MonotonicMinter,
     PersistedEventCause, Timestamp, Visibility,
 };

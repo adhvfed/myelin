@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use myelin_events::check_seam::{check_updated_draft, ci_result_draft, rollup_ci_result};
-use myelin_events::{AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, Visibility};
+use myelin_events::{ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_flow::{
     read_stage_verdict, ActivityError, DispatchedJob, JobKind, JobOutcome, JobRunner, JobSpec,
     PgClaimedDriveInput, PgFlowWorker, PgInputResolveError, PgResolvedDriveInput, PgWorkerError,

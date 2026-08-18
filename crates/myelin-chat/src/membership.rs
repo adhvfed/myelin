@@ -1,4 +1,4 @@
-use myelin_events::{AggregateKey, DataRole, EventDraft, EventType, OutboxTx as _, Visibility};
+use myelin_events::{DataRole, EventDraft, EventType, OutboxTx as _, Visibility};
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Precondition, Principal,
     RelName, RelationTuple, TupleDelta, Zookie,

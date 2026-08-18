@@ -3,7 +3,7 @@ use sqlx::Acquire;
 use sqlx::Row;
 
 use myelin_events::{
-    derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventId, EventType,
+    derive_envelope, Actor, DataRole, EmitContext, EventDraft, EventId, EventType,
     Timestamp, Visibility,
 };
 
