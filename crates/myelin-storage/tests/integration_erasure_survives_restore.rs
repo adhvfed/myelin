@@ -190,7 +190,7 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
     store
         .write(&tenant, trace("55555555-5555-4555-8555-555555555555"))
         .expect("one subject-owned trace exists before the backup");
-    let key_ref = PiiKeyRef::new(tenant.clone(), 0, KeyClass::Subject("founder".into()));
+    let key_ref = PiiKeyRef::new(tenant.clone(), 0, KeyClass::Subject("founder".to_string()));
     kms.resolve_dek(&key_ref, &region)
         .expect("the subject DEK resolves before the backup (the data is live)");
 
@@ -286,7 +286,7 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
     .expect("the re-erase pass completes against the restored database");
 
     assert!(
-        re_erase.re_erased_subject(&myelin_storage::SubjectId::new("founder".into()), &tenant),
+        re_erase.re_erased_subject(&myelin_storage::SubjectId::new("founder"), &tenant),
         "the ledger replay re-erased the drill subject: {re_erase:?}"
     );
     assert!(
