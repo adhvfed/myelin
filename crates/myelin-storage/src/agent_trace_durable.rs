@@ -716,6 +716,24 @@ impl DurableAgentTraceStore {
         let tenant = TenantId(tenant_id.clone());
         let class = KeyClass::Subject(subject.clone());
         let dek_id = DekId::new(tenant.clone(), class.clone());
+        // record the erasure in the post-PIT ledger BEFORE destroying the key:
+        // a destroyed-but-unrecorded erasure would be silently resurrected by
+        // restoring any backup taken before this point (the re-erase pass
+        // replays this ledger against a restored database). offsets are unix
+        // seconds so a restore point can be compared against wall time.
+        let erased_at_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        crate::reerase_durable::DurablePostPitLedger::new(self.provider.clone())
+            .record(&tenant, &SubjectId::new(subject.clone()), erased_at_secs)
+            .await
+            .map_err(|error| {
+                AgentTraceError::Storage(format!(
+                    "refusing to destroy the subject key before its erasure is durably \
+                     recorded in the post-PIT ledger: {error}"
+                ))
+            })?;
         let key_destroyed = self
             .kms
             .try_destroy_dek(&dek_id)
