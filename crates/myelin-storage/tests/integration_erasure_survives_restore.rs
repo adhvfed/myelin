@@ -22,9 +22,9 @@ use myelin_storage::reerase::ReErasePass;
 use myelin_storage::reerase_durable::DurablePostPitLedger;
 use myelin_storage::restore::{ReindexFromSource, RestoreReport, SourceLog};
 use myelin_storage::{
-    all_durable_migrations, AgentTraceWrite, DurableAgentTraceStore, DurableKmsBacking,
-    EraseError, EraseHolders, HotTables, KeyClass, KmsError, PiiKeyRef, SealKey,
-    SubstrateProvider,
+    all_durable_migrations, AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore,
+    DurableKmsBacking, EraseError, EraseHolders, HotTables, KeyClass, KmsError, PiiKeyRef,
+    SealKey, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 
