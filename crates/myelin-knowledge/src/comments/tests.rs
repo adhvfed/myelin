@@ -65,7 +65,7 @@ fn comment_and_thread_mints_are_grammatical_and_classify() {
 
     for r in [&c, &th] {
         let root = strip_sub(r);
-        assert_eq!(format(&root), "myelin://acme/knowledge/page/7c2");
+        assert_eq!(format(&root), "page:7c2");
     }
 }
 
@@ -306,7 +306,7 @@ fn create_comment_emits_comment_created_through_the_outbox() {
         "subject = the #comment- sub-URN (the KN-P22 notif rules fire on this)"
     );
     assert_eq!(
-        row.aggregate.0, "myelin://acme/knowledge/page/7c2",
+        row.aggregate.0, "page:7c2",
         "aggregate = the page (per-doc order)"
     );
 }

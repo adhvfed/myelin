@@ -213,7 +213,21 @@ impl KnowledgeChange {
             | KnowledgeChange::RowUpdated { db_id, row_id }
             | KnowledgeChange::RowDeleted { db_id, row_id }
             | KnowledgeChange::RowMoved { db_id, row_id } => row_ref(tenant, db_id, row_id),
-            _ => ArtifactRef(self.aggregate(tenant).0),
+            KnowledgeChange::PageCreated { page_id }
+            | KnowledgeChange::PageUpdated { page_id }
+            | KnowledgeChange::PageMoved { page_id }
+            | KnowledgeChange::PageArchived { page_id }
+            | KnowledgeChange::PageRestored { page_id }
+            | KnowledgeChange::PageDeleted { page_id }
+            | KnowledgeChange::PagePublished { page_id }
+            | KnowledgeChange::PageUnpublished { page_id }
+            | KnowledgeChange::DocUpdated { page_id }
+            | KnowledgeChange::AccessGranted { page_id }
+            | KnowledgeChange::AccessRevoked { page_id }
+            | KnowledgeChange::SubjectExportRequested { page_id }
+            | KnowledgeChange::SubjectErasureRequested { page_id } => page_ref(tenant, page_id),
+            KnowledgeChange::DatabaseCreated { db_id }
+            | KnowledgeChange::DatabaseSchemaChanged { db_id } => database_ref(tenant, db_id),
         }
     }
 
@@ -354,10 +368,7 @@ mod tests {
             db_id: "tasks".into(),
             row_id: "r1".into(),
         };
-        assert_eq!(
-            row.aggregate(&t).0,
-            "myelin://acme/knowledge/database/tasks"
-        );
+        assert_eq!(row.aggregate(&t).0, "database:tasks");
         assert_eq!(
             row.subject(&t).0,
             "myelin://acme/knowledge/database/tasks#row-r1"

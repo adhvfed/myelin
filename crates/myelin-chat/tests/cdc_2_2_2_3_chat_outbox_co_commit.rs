@@ -62,7 +62,7 @@ fn chat_send_co_commits_via_the_frozen_outbox_emit_surface() {
     let rows = ob.committed_rows();
     assert_eq!(rows.len(), 1, "exactly one co-committed event");
     assert_eq!(rows[0].envelope.type_.0, "chat.message.created");
-    assert_eq!(rows[0].aggregate.0, "01J0CONVCDC");
+    assert_eq!(rows[0].aggregate.0, "channel:01J0CONVCDC");
     assert!(rows[0].subject.0.contains(id.as_str()));
 }
 
@@ -90,7 +90,7 @@ fn per_conversation_events_are_per_aggregate_ordered() {
     let rows: Vec<_> = ob
         .committed_rows()
         .into_iter()
-        .filter(|r| r.aggregate.0 == "01J0CONVCDC")
+        .filter(|r| r.aggregate.0 == "channel:01J0CONVCDC")
         .collect();
     let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
     assert_eq!(
