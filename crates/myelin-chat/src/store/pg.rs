@@ -375,11 +375,7 @@ impl PgMessageStore {
             ));
         };
 
-        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
-            &mut dbtx,
-            &msg.conv.conversation_id,
-            &envelope,
-        )
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut dbtx, &envelope.aggregate.0, &envelope)
         .await
         .map_err(|e| StoreError::Cold(format!("co-commit outbox insert: {e}")))?;
         for edge in edge_envelopes {

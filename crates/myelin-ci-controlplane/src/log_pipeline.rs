@@ -510,7 +510,13 @@ impl LogAvailablePointer {
         Ok(EventDraft {
             type_: EventType(CI_LOG_AVAILABLE.to_string()),
             subject: self.subject(tenant)?,
-            aggregate: myelin_ci_sandbox::events::run_aggregate(&self.coord.run_id),
+            // logs get their own per-(run, job) partition: canonical type:id
+            // form, ordered within the job, and never contending with the run
+            // lifecycle events for the run partition's outbox seq lock.
+            aggregate: myelin_events::AggregateKey(format!(
+                "log:{}-{}",
+                self.coord.run_id, self.coord.job_id
+            )),
             payload,
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,

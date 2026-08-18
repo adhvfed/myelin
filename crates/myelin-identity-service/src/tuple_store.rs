@@ -657,10 +657,13 @@ fn tuple_written_draft(
         })
         .next()
         .unwrap_or("unknown");
+    // a tuple object may carry '/' (nested repo names); only git refs may be
+    // path-shaped, so the subject encodes '/' as %2F to stay one id segment.
+    let subject_object = object.replace('/', "%2F");
     let subject = EvArtifactRef(format!(
         "myelin://{}/identity/tuple/{}",
         scope.tenant().0,
-        object
+        subject_object
     ));
     let aggregate = AggregateKey(format!("identity:tuple:{}:{}", scope.tenant().0, object));
     let ops: Vec<serde_json::Value> = deltas
@@ -1330,7 +1333,11 @@ mod tests {
         let outbox = OutboxStore::new();
         let store = TupleStore::new(outbox.clone());
         let s = scope("acme");
-        for object in ["repo:core", "project:461fc0c9-2383-49b2-bc0f-d7c7e632346e"] {
+        for object in [
+            "repo:core",
+            "project:461fc0c9-2383-49b2-bc0f-d7c7e632346e",
+            "repo:team/system-wire-nested",
+        ] {
             store
                 .write_tuples(
                     &s,

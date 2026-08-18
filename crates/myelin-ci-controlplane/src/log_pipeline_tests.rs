@@ -449,7 +449,7 @@ fn the_log_available_pointer_is_references_not_payloads() {
         "no inline-PII key (the bytes are behind the ref)"
     );
     assert_eq!(
-        draft.aggregate.0, "run:run-1",
+        draft.aggregate.0, "log:run-1-job-1",
         "per-run-aggregate ordering (canonical run:<id> partition)"
     );
     assert_eq!(
@@ -498,7 +498,7 @@ fn every_shipped_line_is_a_firehose_frame_on_a_bounded_scope() {
     let scope = c.firehose_scope().expect("a bounded run scope");
     assert_eq!(
         scope.selector(),
-        "run:run-1",
+        "log:run-1-job-1",
         "the live tail scope is bounded run:<id>"
     );
 }

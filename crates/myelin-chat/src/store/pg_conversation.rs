@@ -183,11 +183,7 @@ impl PgConversationStore {
                 conversation.id.conversation_id.clone(),
             ));
         }
-        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
-            &mut tx,
-            &conversation.id.conversation_id,
-            &envelope,
-        )
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &envelope.aggregate.0, &envelope)
         .await
         .map_err(|error| {
             ConversationError::Storage(format!("co-commit conversation event: {error}"))
