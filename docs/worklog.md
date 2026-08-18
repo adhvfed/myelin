@@ -14,11 +14,14 @@ in the gVisor sandbox — the self-CI loop is live.
 
 Two real product findings from trying the FULL history first:
 
-- **onboarding a large repo trips the per-op sandbox budget.** the
-  whole 108 MiB-pack history in one receive op exceeded the wire op's
-  512 MiB disk scratch budget (the error mislabels it as the wire cap
-  and as an upload-pack failure — both worth fixing). a repo importer
-  should chunk ingestion; range-pushes are the manual workaround.
+- **onboarding the full history trips a 512 MiB bound in the receive
+  op.** pushing the whole 108 MiB-pack history was rejected with
+  "upload-pack response exceeded the 536870912-byte wire cap", while a
+  snapshot push of the same tree succeeded — so the overflow scales
+  with history, not pack size, and the error's labels (upload-pack, on
+  a receive; "wire cap", fed from the job's disk_bytes) are misleading.
+  needs a repro with instrumentation before fixing; a repo importer
+  should chunk ingestion regardless.
 - **the pseudonymous-commit gate (contract 10.9) is live and enforced:**
   every historical commit was refused because its author email is a
   real identity, not `<pseudonym>@<tenant>.noreply`. correct behavior —
