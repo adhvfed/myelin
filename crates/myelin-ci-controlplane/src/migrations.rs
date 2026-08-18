@@ -129,6 +129,8 @@ pub const CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0026_ci_pipeline_v4_cutover_fence_row";
 pub const CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0027_ci_pipeline_v5_cutover_fence_row";
+pub const CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
+    "ci_0028_ci_pipeline_v6_cutover_fence_row";
 
 pub const CREATE_CI_RUN_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -1250,6 +1252,16 @@ VALUES (
 )
 ON CONFLICT (wf_type, version) DO NOTHING";
 
+pub const SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL: &str = "\
+INSERT INTO wf_definition (wf_type, version, code_hash, status)
+VALUES (
+  'ci.pipeline',
+  6,
+  'sentinel:ci-pipeline-v6-never-deployed-on-this-database',
+  'retired'
+)
+ON CONFLICT (wf_type, version) DO NOTHING";
+
 pub const ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL: &str = "\
 ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS reservation_write_version smallint;
 DO $myelin$
@@ -2024,6 +2036,10 @@ pub fn ci_controlplane_migrations() -> Migrations {
     migrations.push(Migration::plain(
         CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID,
         SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL,
+    ));
+    migrations.push(Migration::plain(
+        CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID,
+        SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL,
     ));
     Migrations::of(migrations)
 }
