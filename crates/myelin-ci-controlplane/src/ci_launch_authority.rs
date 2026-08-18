@@ -24,7 +24,7 @@ use sqlx::{PgPool, Row};
 
 pub const LINUX_SMALL_V1_POLICY_REVISION: &str = "linux-small-v1:1";
 pub const LINUX_SMALL_V1_RUNNER_LABELS: [&str; 2] = ["linux", "linux-small-v1"];
-pub const LINUX_BUILD_V1_POLICY_REVISION: &str = "linux-build-v1:1";
+pub const LINUX_BUILD_V1_POLICY_REVISION: &str = "linux-build-v1:2";
 pub const LINUX_BUILD_V1_RUNNER_LABELS: [&str; 2] = ["linux", "linux-build-v1"];
 pub const TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING: u32 = 1_024;
 const CI_OPERATIONAL_RESERVATION_V1_DOMAIN: &[u8] = b"myelin.ci.operational-reservation.v1\0";
@@ -1189,12 +1189,16 @@ fn linux_small_limits() -> CiManifestLimitsV1 {
 }
 
 fn linux_build_limits() -> CiManifestLimitsV1 {
+    // sized for a real-world compiled-language workspace: a cold cargo build
+    // of this repo needs tens of GiB of target/ scratch and well over 30
+    // minutes at 8 vCPUs (the myelin self-build timed out under the v1
+    // numbers with healthy compile output in its logs).
     CiManifestLimitsV1 {
         cpu_millis: 8_000,
-        mem_bytes: 8 * 1024 * 1024 * 1024,
-        disk_bytes: 8 * 1024 * 1024 * 1024,
-        pids_max: 1024,
-        timeout_secs: 1800,
+        mem_bytes: 16 * 1024 * 1024 * 1024,
+        disk_bytes: 32 * 1024 * 1024 * 1024,
+        pids_max: 2048,
+        timeout_secs: 7_200,
     }
 }
 
@@ -2507,11 +2511,11 @@ mod tests {
         let authority = policy.materialize(&record, &prepared, &pin).await.unwrap();
 
         assert_eq!(authority.policy_revision, LINUX_BUILD_V1_POLICY_REVISION);
-        assert_eq!(authority.policy_revision, "linux-build-v1:1");
+        assert_eq!(authority.policy_revision, "linux-build-v1:2");
         assert_eq!(authority.jobs.len(), 2);
         for grant in &authority.jobs {
             assert_eq!(grant.limits, linux_build_limits());
-            assert_eq!(grant.limits.mem_bytes, 8 * 1024 * 1024 * 1024);
+            assert_eq!(grant.limits.mem_bytes, 16 * 1024 * 1024 * 1024);
             assert_eq!(
                 grant.scheduling.labels,
                 LINUX_BUILD_V1_RUNNER_LABELS

@@ -291,7 +291,7 @@ services:
       MYELIN_EXPLICIT_USERNS_RUNSC_ROOT="$runner_state/runsc"
       MYELIN_USERNS_LEASES_DIR="$runner_state/userns-leases"
       MYELIN_CI_WORKSPACES_DIR="$runner_state/workspaces"
-      MYELIN_CI_WORKSPACE_CAPACITY_BYTES=10737418240;
+      MYELIN_CI_WORKSPACE_CAPACITY_BYTES=68719476736;
       exec systemd-run --user --scope --quiet --property=Delegate=yes
       cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane'
     environment:
