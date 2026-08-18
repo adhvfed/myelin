@@ -1,6 +1,11 @@
 
 version = 1
-as_of = "2026-07-22"
+as_of = "2026-08-18"
+
+# honesty note: values historically labelled "MEASURED" came from in-repo
+# simulations of the mechanisms, not from production measurement. every value
+# here is a tuning seed unless its comment names the production enforcement
+# point (today: the edge gateway rows marked ENFORCED).
 
 [revocation]
 sla_mins = 5
@@ -10,12 +15,12 @@ multiplier = 30
 human_lane_p99_budget_us = 10000  # SUB-D3: the substrate's protected-human-lane p99 ceiling under 30× (P-S33 re-confirms).
 
 [ci_surge]
-per_tenant_in_flight_cap = 64               # MEASURED: == shed_budgets.CiDispatch cap; the 30× CI surge shed the batch lane here, cross-tenant 0.
+per_tenant_in_flight_cap = 64               # seed (in-repo simulation): == shed_budgets.CiDispatch cap; the 30× CI surge shed the batch lane here, cross-tenant 0.
 drr_base_quantum = 1                        # the DRR deficit decrement on one claim (fairness::BASE_QUANTUM).
 drr_deficit_ceiling = 64                    # the DRR burst-credit cap — a long-idle fair_key cannot hoard priority (fairness::DEFICIT_CEILING).
-starvation_wait_p99_max_ticks = 32          # MEASUREMENT-GATE (07#1): wait p99 over this owes the hierarchical scheduler (CI-P29). MEASURED within budget at 30×.
+starvation_wait_p99_max_ticks = 32          # promotion gate (07#1): wait p99 over this owes the hierarchical scheduler (CI-P29). simulated within budget at 30×.
 hierarchical_scheduler_promotion_owed = false # CI-D2 measured the wait p99 within budget → flat DRR holds; the hierarchy stays a named floor.
-prewarm_buffer_per_arrival_rate_bps = 1000  # MEASURED (07#2 / §5.4): 10% of the recent arrival rate kept warm (replaces CI-P4's fixed floor).
+prewarm_buffer_per_arrival_rate_bps = 1000  # seed (07#2 / §5.4, simulated): 10% of the recent arrival rate kept warm (replaces CI-P4's fixed floor).
 prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-packing under the per-VM memory floor (never past the zone's headroom).
 
 [authz_surge]
@@ -62,8 +67,8 @@ facet_promotion_ratio = 0.05  # contract 6.3: the FROZEN >5% facet-promotion tri
 rollup_read_p99_max_ms = 250  # KN-D10 (KN-P18 / P-308, architecture §4.2 / KQ-4): the read-time rollup/formula
 
 [authz_index]
-ids_cardinality_cap = 1000      # P-ID-32: the Ids↔Filter switch point, MEASURED + FINALISED at scale (crossover sits AT the cap).
-reverse_index_lag_slo_ms = 1000 # P-ID-32: the freshness SLO, MEASURED + FINALISED under surge (achievable; bounded < revocation SLA).
+ids_cardinality_cap = 1000      # P-ID-32: the Ids↔Filter switch point (drilled in-repo at the cap boundary).
+reverse_index_lag_slo_ms = 1000 # P-ID-32: the freshness SLO seed (bounded < revocation SLA).
 list_subjects_density_members = 50000 # the pinned density (a 50k-member channel, C8).
 list_subjects_density_budget_ms = 250 # the 50k-density expand budget seed (P-ID-23/M4 re-measure at real density).
 
@@ -73,34 +78,34 @@ warning_margin_secs = 604800     # the nearing-deadline warning fires 7 days (1 
 extension_total_secs = 7776000   # Art. 12(3) extension-for-complex: 3 months = 90 days (re-arm w/ recorded reason).
 
 [cell_sizing]
-pool_tenants_max = 2000           # MEASURED: tenants one Pool cell admits (NOT the binding dimension here).
-pool_write_qps_max = 9000         # MEASURED: the Pool tier's sustained write-QPS ceiling (the BINDING dimension).
-pool_storage_bytes_max = 2199023255552  # MEASURED: ~2 TiB stored-bytes ceiling (storage binds last).
-pool_binding_dimension = "write_qps"    # MEASURED (ADR-10): write QPS binds FIRST at the Pool tier.
+pool_tenants_max = 2000           # seed (in-repo simulation): tenants one Pool cell admits (NOT the binding dimension here).
+pool_write_qps_max = 9000         # seed (in-repo simulation): the Pool tier's sustained write-QPS ceiling (the BINDING dimension).
+pool_storage_bytes_max = 2199023255552  # seed (in-repo simulation): ~2 TiB stored-bytes ceiling (storage binds last).
+pool_binding_dimension = "write_qps"    # seed (ADR-10, simulated): write QPS binds FIRST at the Pool tier.
 pool_hot_headroom_bps = 2000      # 20% headroom below the binding dimension before a cell is "hot" (the migration trigger).
 
 [[shed_budgets]]
-surface = "CiDispatch"        # CI is the batch lane (§7.6: n/a human reservation) — CI + agent share the wallet.
-per_tenant_in_flight_cap = 64 # MEASURED: SUB-D3 30× CI/agent surge shed the machine lanes here; cross-tenant 0.
-human_lane_reservation = 0    # the batch lane reserves no human slots (exempt from the human-lane floor).
+surface = "CiDispatch"        # TARGET (not yet enforced - no admission point in the dispatcher).
+per_tenant_in_flight_cap = 64 # the batch lane: CI + agent share the wallet; no human reservation.
+human_lane_reservation = 0
 retry_after_secs = 5
 
 [[shed_budgets]]
-surface = "CollabOpStream"    # a fraction reserved for active editors (the human lane).
-per_tenant_in_flight_cap = 128 # MEASURED: connection-storm (P-S31) held the active-editor lane at this cap.
-human_lane_reservation = 32    # 25% of cap — above the 20% measured human-lane floor.
+surface = "CollabOpStream"    # TARGET (not yet enforced - no admission point in this service).
+per_tenant_in_flight_cap = 128 # numbers come from in-repo simulations of ShedLane, not production
+human_lane_reservation = 32    # measurement; treat as the tuning seed when this surface is wired.
 retry_after_secs = 2
 
 [[shed_budgets]]
-surface = "ConnectionTier"    # reserved connection slots for interactive humans.
-per_tenant_in_flight_cap = 256 # MEASURED: connection-storm (P-S31) + CHAT-D3/D4 (P-500) held interactive humans at this cap.
-human_lane_reservation = 64    # 25% of cap — above the 20% measured human-lane floor.
+surface = "ConnectionTier"    # TARGET (not yet enforced - no admission point in this service).
+per_tenant_in_flight_cap = 256
+human_lane_reservation = 64
 retry_after_secs = 3
 
 [[shed_budgets]]
-surface = "AgentMention"      # humans never queue behind agent runs (a reserved human fraction).
-per_tenant_in_flight_cap = 96  # MEASURED: BUS-D7 (P-420) + SUB-D3 + AG-D6 (P-478) held the human lane under the 30× agent-dispatch storm.
-human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
+surface = "AgentMention"      # TARGET (not yet enforced - no admission point in this service).
+per_tenant_in_flight_cap = 96
+human_lane_reservation = 24
 retry_after_secs = 10
 
 [[shed_budgets]]
@@ -110,28 +115,28 @@ human_lane_reservation = 1    # hold at most 3 per tenant, so a human fetch alwa
 retry_after_secs = 5
 
 [[shed_budgets]]
-surface = "RefsBacklinkRead"  # the Refs backlink/traverse READ surface (REF-P22, REF-D10): a CI/agent
-per_tenant_in_flight_cap = 192 # MEASURED: REF-D10 30× agent backlink-read surge shed the machine lane at this cap; human read held.
-human_lane_reservation = 48    # 25% of cap — above the 20% measured human-lane floor.
+surface = "RefsBacklinkRead"  # TARGET (not yet enforced - no admission point in this service).
+per_tenant_in_flight_cap = 192
+human_lane_reservation = 48
 retry_after_secs = 3
 
 [[shed_budgets]]
-surface = "RefsRefCreate"     # the Refs ref-CREATION surface (REF-P22, REF-D10): an agent ref-creation
-per_tenant_in_flight_cap = 96  # MEASURED: REF-D10 30× agent ref-creation surge shed the machine lane at this cap; human create held.
-human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
+surface = "RefsRefCreate"     # TARGET (not yet enforced - no admission point in this service).
+per_tenant_in_flight_cap = 96
+human_lane_reservation = 24
 retry_after_secs = 5
 
 [[shed_budgets]]
-surface = "SearchQuery"       # the Search QUERY surface (SRCH-P25, SRCH-D6): a CI/agent search-query storm
-per_tenant_in_flight_cap = 160 # MEASURED: SRCH-D6 30× agent/CI search-query surge shed the machine lanes at this cap; the human search lane held within its interactive latency budget.
-human_lane_reservation = 40    # 25% of cap — above the 20% measured human-lane floor.
+surface = "SearchQuery"       # TARGET (not yet enforced - no admission point in this service).
+per_tenant_in_flight_cap = 160
+human_lane_reservation = 40
 retry_after_secs = 3
 
 [[shed_budgets]]
-surface = "WorkflowAgentLane" # the durable-workflow START surface (P-FLOW-27, FLOW-D8): an agent-initiated-workflow
-per_tenant_in_flight_cap = 96  # MEASURED: FLOW-D8 30× agent-initiated-workflow surge shed the agent lane at this cap; the human-initiated workflow lane held within its reserved slots.
-human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
-retry_after_secs = 10          # generous — a workflow start is not latency-critical; an agent fan-out backs off and re-initiates.
+surface = "WorkflowAgentLane" # TARGET (not yet enforced - no admission point in this service).
+per_tenant_in_flight_cap = 96
+human_lane_reservation = 24
+retry_after_secs = 10
 
 [[shed_budgets]]
 surface = "HttpIntake"        # the generic /v1 API surface; ENFORCED at the edge gateway.
@@ -142,7 +147,7 @@ retry_after_secs = 5
 [[resilient_client]]
 target = "identity-authz"        # the auth HOT PATH: `check`/`list_objects` (the authz spine, the
 hot_path = true
-latency_budget_ms = 150          # MEASURED: the authz client-deadline budget under the 30× surge
+latency_budget_ms = 150          # the authz client-deadline budget seed (simulated 30× surge)
 timeout_ms = 120                 # TUNED tighter than the budget — an authz call past 120 ms is a
 backoff_base_ms = 20             # tight backoff — a hot-path retry must resolve fast or shed.
 max_attempts = 3
@@ -155,7 +160,7 @@ bulkhead_max_concurrency = 256   # high concurrency: the authz spine fans wide.
 [[resilient_client]]
 target = "event-bus"             # interactive publish/consume (the outbox relay's downstream): hot.
 hot_path = true
-latency_budget_ms = 250          # MEASURED publish-ack budget under surge.
+latency_budget_ms = 250          # publish-ack budget seed (simulated surge).
 timeout_ms = 200                 # tuned within budget; looser than authz, still a hot path.
 backoff_base_ms = 25
 max_attempts = 3
@@ -168,7 +173,7 @@ bulkhead_max_concurrency = 128
 [[resilient_client]]
 target = "storage-blob"          # the object store (RustFS/S3): bulk blob I/O — a BATCH target.
 hot_path = false
-latency_budget_ms = 5000         # MEASURED blob round-trip budget (a multi-MB object is not a hot path).
+latency_budget_ms = 5000         # blob round-trip budget seed (a multi-MB object is not a hot path).
 timeout_ms = 4000                # LOOSER than the hot path by design — a blob read is allowed seconds.
 backoff_base_ms = 100
 max_attempts = 4
@@ -181,7 +186,7 @@ bulkhead_max_concurrency = 32    # bounded lower: a blob hop is heavy.
 [[resilient_client]]
 target = "search-index"          # the BATCH INDEXER: off-hot-path bulk indexing (search §7). The
 hot_path = false
-latency_budget_ms = 30000        # MEASURED: a bulk index batch p99 is whole seconds.
+latency_budget_ms = 30000        # a bulk index batch p99 is whole seconds.
 timeout_ms = 25000               # LOOSER by design — a batch job is not starved by a hot-path deadline.
 backoff_base_ms = 250
 max_attempts = 4
@@ -193,30 +198,30 @@ bulkhead_max_concurrency = 16    # bounded low: a batch index hop is the heavies
 
 [[firehose_retention]]
 class = "ci_log"                  # ci.log.appended — the HEAVIEST producer (§4.3) → the LARGEST window.
-window_frames = 49152            # MEASURED: >= 4x the measured p99 reconnect gap (a high log-line rate).
-p99_reconnect_gap_frames = 12288 # MEASURED: the p99 frames a CI-log reconnect must backfill (D-10).
+window_frames = 49152            # seed (in-repo simulation): >= 4x the measured p99 reconnect gap (a high log-line rate).
+p99_reconnect_gap_frames = 12288 # seed (in-repo simulation): the p99 frames a CI-log reconnect must backfill (D-10).
 
 [[firehose_retention]]
 class = "collab_op"              # the KN doc op-stream + presence — a moderate interactive rate.
-window_frames = 8192             # MEASURED: >= 4x the measured p99 gap. UNCHANGED across the KN
-p99_reconnect_gap_frames = 2048  # MEASURED: the p99 frames a collab-op reconnect must backfill (D-10).
+window_frames = 8192             # seed (in-repo simulation): >= 4x the measured p99 gap. UNCHANGED across the KN
+p99_reconnect_gap_frames = 2048  # seed (in-repo simulation): the p99 frames a collab-op reconnect must backfill (D-10).
 
 [[firehose_retention]]
 class = "chat_live"              # Chat live delivery + presence + agent partials — a human-paced rate.
-window_frames = 2048             # MEASURED: >= 4x the measured p99 gap (the smallest of the three).
-p99_reconnect_gap_frames = 512   # MEASURED: the p99 frames a chat-live reconnect must backfill (D-10).
+window_frames = 2048             # seed (in-repo simulation): >= 4x the measured p99 gap (the smallest of the three).
+p99_reconnect_gap_frames = 512   # seed (in-repo simulation): the p99 frames a chat-live reconnect must backfill (D-10).
 
 [column_store_seam]
-promote_events_per_sec_per_stream = 50000  # MEASURED criterion: a single-stream sustained rate above
-degraded_publish_latency_p99_ms = 100      # MEASURED criterion: the per-aggregate publish-latency p99
+promote_events_per_sec_per_stream = 50000  # promotion criterion: a single-stream sustained rate above
+degraded_publish_latency_p99_ms = 100      # promotion criterion: the per-aggregate publish-latency p99
 promotion_owed = false                     # NO measured volume outgrows JetStream → seam stays NAMED.
 
 [search_freshness]
-freshness_p99_ms = 2000          # MEASURED-under-load + held: the §4.10 seconds-grade event→searchable
+freshness_p99_ms = 2000          # simulated under load: the §4.10 seconds-grade event→searchable
 index_lag_alarm_margin_ms = 500  # the index-lag alarm fires at 2000−500 = 1500 ms — BELOW the budget,
 
 [filtered_ann]
-recall_at_k_bps = 10000               # MEASURED + held: exact recall@k (100.00 %) under a selective
+recall_at_k_bps = 10000               # simulated + held: exact recall@k (100.00 %) under a selective
 brute_force_fallback_visible_bps = 2000 # the TUNED very-selective trigger: ≤ 20 % visible ⇒ fall back to
 ivf_pq_promotion_live_vectors = 1000000 # the §3.3 HNSW→IVF-PQ promotion point (per-cell live vectors);
 
