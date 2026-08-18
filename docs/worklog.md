@@ -4,6 +4,41 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-18 — the event spine stopped silently losing user actions
+
+The dev instance had 4,386 quarantined outbox events plus 2,656 stuck
+behind them (a quarantined head permanently blocks its aggregate). Every
+one traced to producers minting envelopes the publisher's own admission
+check refuses — meaning real user actions (channel creation, chat
+messages, CI runs, page creation, every ReBAC grant) emitted events that
+never reached a single consumer, ever:
+
+- identity: `tuple`/`agent` missing from the type-token table — 100% of
+  identity.tuple.written died; the S8 reverse index consumed nothing.
+- chat: bare-ulid aggregates plus a row/envelope divergence in the pg
+  co-commit; channel events died and message events hung behind them.
+- ci: path-form `ci/run/...` aggregates (one nested a full ref) and a
+  schemeless run subject.
+- knowledge: full-ref envelope aggregates vs bare-id row aggregates;
+  `database` missing from the token table; `view-` missing from the sub
+  grammar; row subjects five segments long.
+
+Fixes: canonical `type:id` partitions everywhere (`channel:<id>`,
+`run:<id>`, `log:<run>-<job>`, `page:<id>`, `database:<id>`), canonical
+scoped run subjects, %2F-encoded slashes in tuple objects, and the
+missing taxonomy/grammar tokens. The changed pipeline code was cut over
+to ci.pipeline@7 through the definition fence's own upgrade path.
+
+Regression net: `pgrelay::publisher_admission` exposes the relay's real
+admission check and the chat/identity/knowledge producers drive their
+actual emit paths through it in unit tests — that net caught two more
+live bugs (a subject falling through to the new aggregate form, and the
+five-segment row subjects) before they shipped.
+
+Proof: full workspace tests + clippy -D warnings green on linux; full
+system suite green; **zero** freshly quarantined events across an entire
+85-test system run, down from ~600/day.
+
 ## 2026-08-18 — erasure now survives a restore (drilled for real)
 
 The production erase path (`/v1/privacy/me/agent-data/erase` →
