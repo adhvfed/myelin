@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_ci_sandbox::ImageRef;
-use myelin_events::{AggregateKey, EventId};
+use myelin_events::EventId;
 use myelin_events::{ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
