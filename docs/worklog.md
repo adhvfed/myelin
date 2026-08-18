@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-18 — dogfood: myelin's own CI builds myelin
+
+The self-host tenant `myelin` was bootstrapped on the dev stack, the
+`myelin` repo created through the product API, and the source pushed
+through myelin's own git wire with a stock git client. The push of a
+current-tree snapshot triggered `.myelin/ci.toml` and the pipeline ran
+in the gVisor sandbox — the self-CI loop is live.
+
+Two real product findings from trying the FULL history first:
+
+- **onboarding a large repo trips the per-op sandbox budget.** the
+  whole 108 MiB-pack history in one receive op exceeded the wire op's
+  512 MiB disk scratch budget (the error mislabels it as the wire cap
+  and as an upload-pack failure — both worth fixing). a repo importer
+  should chunk ingestion; range-pushes are the manual workaround.
+- **the pseudonymous-commit gate (contract 10.9) is live and enforced:**
+  every historical commit was refused because its author email is a
+  real identity, not `<pseudonym>@<tenant>.noreply`. correct behavior —
+  and it means real-world onboarding needs an import flow that
+  pseudonymizes committer/author identities while preserving a mapping
+  (the pseudonym map exists; the importer does not).
+
 ## 2026-08-18 — checkpoint: every test surface green on main
 
 Validation state of main (3f060e74 + this entry), all on the linux box:
