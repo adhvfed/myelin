@@ -236,11 +236,20 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
         .arg(&dump_path)
         .output()
         .expect("pg_restore runs");
-    assert!(
-        restore.status.success(),
-        "pg_restore rebuilt the scratch database: {}",
-        String::from_utf8_lossy(&restore.stderr)
-    );
+    // a newer client dumping an older server emits session SETs the server
+    // does not know (e.g. transaction_timeout). those are the ONLY errors a
+    // green drill may ignore; any data-level restore error still fails.
+    if !restore.status.success() {
+        let stderr = String::from_utf8_lossy(&restore.stderr);
+        let benign_version_skew = stderr
+            .lines()
+            .filter(|line| line.contains("error:"))
+            .all(|line| line.contains("unrecognized configuration parameter"));
+        assert!(
+            benign_version_skew,
+            "pg_restore failed beyond session-setting version skew: {stderr}"
+        );
+    }
 
     let mut scratch_config = admin_config();
     scratch_config.database_url = scratch_url.clone();
