@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-18 — checkpoint: every test surface green on main
+
+Validation state of main (3f060e74 + this entry), all on the linux box:
+full workspace tests, clippy `-D warnings`, the contract-coverage gate,
+the complete system suite (85/85 with **zero** freshly quarantined
+events), and the browser integration suite (5/5). Two mid-session
+system-suite flakes were traced to overlapping `fed` invocations racing
+service restarts under different project ids — a tooling footgun to
+remember, not a product bug (each suite passes untouched).
+
+Next up, in order: a user-facing DSR surface beyond agent-data (gap 2),
+an ops entrypoint for post-restore re-erasure, the CT-007 sandbox
+branch mining, and the self-CI dogfood push (myelin building myelin in
+its own sandbox - the mechanism is already system-tested; the self-host
+tenant bootstrap is the missing plumbing).
+
 ## 2026-08-18 — the event spine stopped silently losing user actions
 
 The dev instance had 4,386 quarantined outbox events plus 2,656 stuck
