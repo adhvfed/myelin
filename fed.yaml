@@ -310,6 +310,9 @@ services:
       MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
       MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
       MYELIN_CI_RUNNER: "1"
+      # the dev runner claims both profiles so a repo pinning the
+      # linux-build-v1 image (e.g. myelin's own .myelin/ci.toml) executes.
+      MYELIN_CI_RUNNER_EXECUTION_PROFILES: "linux-small-v1,linux-build-v1"
     startup_message: "Myelin CI control plane and sandbox runner are running"
 
   git-checks:
