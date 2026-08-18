@@ -184,8 +184,4 @@ mod tests {
         assert_eq!(seam.holder_id(), AGENT_TRACE_HOLDER_ID);
     }
 
-    #[test]
-    fn the_impl_floor_names_its_follow_on() {
-        assert!(AGENT_TRACE_IMPL_PROMPT.contains("P-GA-27"));
-    }
 }

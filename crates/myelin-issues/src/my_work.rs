@@ -141,10 +141,6 @@ mod tests {
         page.items.iter().map(|i| i.item_id.clone()).collect()
     }
 
-    #[test]
-    fn my_work_filter_is_the_one_notif_filter() {
-        assert_eq!(my_work_filter(), InboxFilter::issues_my_work());
-    }
 
     #[test]
     fn my_work_is_a_strict_subset_of_the_one_inbox() {

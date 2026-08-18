@@ -160,8 +160,6 @@ pub fn line_range_subdoc_facets() -> BTreeMap<String, FieldType> {
     f
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct M4ProducerSubAnchorFloor;
 
 #[cfg(test)]
 mod tests {
@@ -437,8 +435,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_named_floor_is_constructible() {
-        let _floor = M4ProducerSubAnchorFloor;
-    }
 }

@@ -11,8 +11,6 @@ use myelin_tenancy::TenantId;
 
 pub const COLLAB_SURGE_MULTIPLIER: u32 = 30;
 
-pub const FLEET_HARDWARE_FLOOR: &str = "world-scale-30x-fleet-hardware (testing-strategy §4.1)";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollabShedRejection {
     pub lane: RunClass,

@@ -449,9 +449,3 @@ fn every_dynamic_sql_value_is_quoted_as_data() {
     assert!(p.ddl.contains("props ->> 'owner''); DROP TABLE issue; --'"));
 }
 
-#[test]
-fn the_oq_c_floor_is_named() {
-    assert!((PromotionThreshold::OQ_C_DEFAULT_TO_BEAT - 0.05).abs() < 1e-9);
-    assert!(ProjectionFeederFloors::OQ_C_THRESHOLD.contains("5%"));
-    assert_eq!(ProjectionFeederFloors::WINDOW_CALIBRATION, "ISS-P32");
-}

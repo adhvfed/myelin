@@ -53,15 +53,6 @@ pub fn message_doc_ref(tenant: &str, message_id: &str) -> String {
     format!("myelin://{tenant}/chat/{MESSAGE_TYPE}/{message_id}")
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ChatFiveProducerCorpusNotWorldScaleFloor;
-
-impl ChatFiveProducerCorpusNotWorldScaleFloor {
-    pub const FRESHNESS_FOLLOW_ON: &'static str = "SRCH-P24";
-    pub const SURGE_FOLLOW_ON: &'static str = "SRCH-P25";
-    pub const RESTORE_FOLLOW_ON: &'static str = "SRCH-P28";
-    pub const CHAT_EMITTER_FOLLOW_ON: &'static str = "the Chat M4 emitter prompt";
-}
 
 #[cfg(test)]
 mod tests {
@@ -221,19 +212,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn floor_marker_names_the_follow_ons() {
-        assert_eq!(
-            ChatFiveProducerCorpusNotWorldScaleFloor::FRESHNESS_FOLLOW_ON,
-            "SRCH-P24"
-        );
-        assert_eq!(
-            ChatFiveProducerCorpusNotWorldScaleFloor::SURGE_FOLLOW_ON,
-            "SRCH-P25"
-        );
-        assert_eq!(
-            ChatFiveProducerCorpusNotWorldScaleFloor::RESTORE_FOLLOW_ON,
-            "SRCH-P28"
-        );
-    }
 }

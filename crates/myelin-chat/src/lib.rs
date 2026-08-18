@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-pub mod comment_consolidation;
 pub mod composer;
 pub mod content;
 pub mod conversation;
@@ -23,17 +22,12 @@ pub mod rebac_fragment;
 pub mod replay;
 pub mod restriction;
 pub mod schema;
-pub mod scylla_followon;
 pub mod search;
 pub mod store;
 pub mod subs;
 pub mod tools;
 pub mod unfurl;
 
-pub use comment_consolidation::{
-    comment_consolidation_gap_report, AnchoredCommentPresenceDemand, PresenceDemandBudget,
-    COMMENT_CONSOLIDATION_FLOOR, COMMENT_CONSOLIDATION_FLOORS,
-};
 pub use composer::{
     detect_pasted_url, AutocompleteKind, AutocompletePort, Draft, DraftKey, DraftStore, EditCas,
     EditOutcome, EditRequest, MemDraftStore, SlashCommand, SlashMenu, Suggestion, UnfurlIntent,
@@ -105,17 +99,13 @@ pub use replay::{
 pub use restriction::{
     agent_may_read, analytics_eligible, index_projection_if_allowed, notif_may_route,
     render_body_mentions, render_mention, MentionRender, MentionResolver, ReadPath,
-    RestrictionGate, ERASED_USER, LEGAL_RESIDUAL_FLOOR,
-};
-pub use scylla_followon::{
-    scylla_floor_gap_report, FloorFollowOn, TriggerStatus, MEASURED_TRIGGER_FLOORS,
-    SCYLLA_HOT_TIER_FLOOR,
+    RestrictionGate, ERASED_USER,
 };
 pub use search::{
     admit_message_indexing, may_index_messages, message_doc_ref, message_index_spec,
     message_index_specs, message_search_acl_anchor, message_search_projection, non_member_filter,
     register_message_index_specs, AclConjoinedSearchFeeder, EmbeddingsArePersonalData,
-    ReplayParityFollowOn, CHAT_SUBSYSTEM, FACET_ARTIFACT_REF, FACET_AUTHOR, FACET_CHANNEL,
+    CHAT_SUBSYSTEM, FACET_ARTIFACT_REF, FACET_AUTHOR, FACET_CHANNEL,
     FACET_CREATED_AT, FACET_EMBED, FACET_KIND, FACET_MENTION, FACET_THREAD_ROOT, FT_BODY_FIELD,
     MESSAGE_ACL_OBJECT_TYPE, MESSAGE_READ_PERMISSION, MESSAGE_TYPE,
 };
@@ -125,8 +115,7 @@ pub use store::{
     chat_cold_blob_store_parity, emit_erased_tombstone, AuthorKind, ColdBlobParityVerdict,
     ColdSegments, ConversationId, Message, MessageId, MessageState, MessageStore,
     MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError, SystemUlidSource,
-    TombstoneReason, UlidSource, SCYLLA_HOT_TIER_PROMOTED, SCYLLA_PROMOTION_LANDING,
-    SCYLLA_PROMOTION_TRIGGER,
+    TombstoneReason, UlidSource,
 };
 pub use unfurl::{
     filter_candidates_by_class, precompute_visibility_class, AuthzVisibleIndex, Card,

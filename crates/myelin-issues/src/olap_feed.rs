@@ -11,19 +11,6 @@ use crate::holder::RestrictionFlag;
 use crate::replay::IssueReindexSource;
 use crate::workflow::StateCategory;
 
-pub struct IssueOlapFeedFloors;
-
-impl IssueOlapFeedFloors {
-    pub const MONTE_CARLO_FORECAST: &'static str =
-        "linear forecast over OLAP throughput → Monte-Carlo forecast agent (ADR-08, ISS-P32 / P-495)";
-
-    pub const COLUMNAR_BACKEND: &'static str =
-        "ClickHouse-class columnar OLAP backend behind OlapReadStore (Storage P-ST-18, wired)";
-
-    pub const WORKLOG_ELIGIBILITY: &'static str =
-        "per-individual worklog analytics-eligibility (OQ-H, [OPEN - LEGAL]) via \
-         myelin_storage::olap_restrict::AnalyticsEligibility";
-}
 
 pub const ISSUE_ANALYTICS_OLAP: &str = "issue_analytics_olap";
 

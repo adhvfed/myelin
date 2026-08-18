@@ -393,9 +393,3 @@ fn pause_conditions_is_the_one_query_ast() {
     let _pc: PauseConditions = Predicate::True;
 }
 
-#[test]
-fn floors_are_named() {
-    assert!(SlaCalendarFloors::HISTORY_COMPACTION.contains("R-11"));
-    assert!(SlaCalendarFloors::TZ_DATABASE.contains("tz database"));
-    assert!(SlaCalendarFloors::LIVE_WHEEL.contains("9.3"));
-}

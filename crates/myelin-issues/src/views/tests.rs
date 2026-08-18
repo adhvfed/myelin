@@ -237,8 +237,3 @@ fn cycle_and_calendar_bind_the_frozen_membership_column() {
     assert_eq!(IssueView::Board.cycle_bind_column(), None);
 }
 
-#[test]
-fn floors_are_named() {
-    assert_eq!(ViewFloors::CROSS_CELL_ROLLUP, "ISS-P32");
-    assert_eq!(ViewFloors::REALTIME_SYNC, "ISS-P30");
-}

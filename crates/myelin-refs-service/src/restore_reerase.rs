@@ -13,12 +13,6 @@ use crate::edge_builder::{EdgeProjection, RefsEdgeBuilder};
 use crate::holder::RefsCacheHolder;
 use crate::resolve::{Projection, ProjectionCacheRead};
 
-pub const WORLD_SCALE_BACKUP_FLEET_FLOOR: &str =
-    "REF-D5 at full 30x world-scale backup cardinality over the PgStore-backed edge partition + the \
-     KMS/Valkey backup on real fleet hardware (the ONE legitimate remaining floor); the \
-     0-recoverable-PII property + the restore→re-erase cross-seam are proven here over a deterministic \
-     backup-scale corpus with REAL crypto-shred";
-
 pub const REERASE_RECOVERABLE_PII_SIGNAL: &str = "refs.reerase_recoverable_pii";
 
 #[derive(Clone, Debug, PartialEq, Eq)]

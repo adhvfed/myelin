@@ -198,7 +198,6 @@ fn git_d2_complete_erase_reaches_every_holder_residual_is_the_posture_backups_sh
     );
 
     assert_eq!(receipt.residual, GitResidualPosture::OnePlatformPosture);
-    assert!(GitResidualPosture::RESIDUAL_POSTURE_REF.contains("10.9"));
 
     assert!(
         ledger.is_erased(&SubjectId::new(SUBJECT), &t),

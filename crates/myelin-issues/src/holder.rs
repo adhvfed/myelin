@@ -350,18 +350,6 @@ mod tests {
         assert!(r1.receipt.content_hash.starts_with("blake3:"));
     }
 
-    #[test]
-    fn the_residual_is_by_reference_to_the_one_platform_posture() {
-        assert!(
-            ISSUE_RESIDUAL_POSTURE_REF.contains("10.9")
-                && ISSUE_RESIDUAL_POSTURE_REF.contains("X-7"),
-            "the residual cites the ONE platform posture (10.9 / X-7), by reference"
-        );
-        assert!(
-            ISSUE_RESIDUAL_POSTURE_REF.contains("never an Issues-local restatement"),
-            "the residual is by reference, never restated Issues-local"
-        );
-    }
 
     #[test]
     fn issue_holder_is_object_safe() {

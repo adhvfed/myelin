@@ -179,10 +179,6 @@ mod tests {
     use super::*;
     use myelin_substrate::{is_destructive, HolderRegistry, HotTables};
 
-    #[test]
-    fn store_name_is_consistent() {
-        assert_eq!(CONTROL_PLANE_STORE_NAME, CONTROL_PLANE_STORE);
-    }
 
     #[test]
     fn migrations_are_forward_only_and_pii_free() {

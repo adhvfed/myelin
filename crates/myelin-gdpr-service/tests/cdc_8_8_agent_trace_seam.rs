@@ -1,7 +1,7 @@
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef};
 use myelin_gdpr_service::{
     agent_trace_phase, trace_is_distinct_from_audit, AgentTraceHolderSeam, CanonicalErasePhase,
-    AGENT_TRACE_ERASABLE, AGENT_TRACE_HOLDER_ID, AGENT_TRACE_IMPL_PROMPT, AUDIT_LOG_ERASABLE,
+    AGENT_TRACE_ERASABLE, AGENT_TRACE_HOLDER_ID, AUDIT_LOG_ERASABLE,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
@@ -61,9 +61,5 @@ fn the_consumer_sees_a_loud_named_floor_not_a_silent_false_green() {
     assert!(
         seam.export(&subject, tenant).is_err(),
         "export defers loudly"
-    );
-    assert!(
-        AGENT_TRACE_IMPL_PROMPT.contains("P-GA-27"),
-        "the impl floor names P-GA-27"
     );
 }

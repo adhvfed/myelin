@@ -811,27 +811,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_residual_is_the_one_platform_posture_by_reference() {
-        let r = GitResidualPosture::RESIDUAL_POSTURE_REF;
-        assert!(
-            r.contains("10.9"),
-            "names the ONE platform posture contract"
-        );
-        assert!(r.contains("X-7"), "names the X-7 reconciliation decision");
-        assert!(
-            r.contains("10.6"),
-            "names the on-demand history-rewrite follow-on"
-        );
-        assert!(
-            r.contains("R-7"),
-            "names the lawful-basis residual (parallel/Legal, NOT a code gate)"
-        );
-        assert!(
-            r.contains("pseudonymous-by-default") || r.contains("Id 4.8"),
-            "names the structural floor"
-        );
-    }
 
     struct OkWire;
     impl WireExecutor for OkWire {

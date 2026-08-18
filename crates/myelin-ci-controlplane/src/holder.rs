@@ -403,17 +403,6 @@ mod tests {
         assert!(r1.receipt.content_hash.starts_with("blake3:"));
     }
 
-    #[test]
-    fn the_residual_is_by_reference_to_the_one_platform_posture() {
-        assert!(
-            CI_RESIDUAL_POSTURE_REF.contains("10.9") && CI_RESIDUAL_POSTURE_REF.contains("X-7"),
-            "the residual cites the ONE platform posture (10.9 / X-7), by reference"
-        );
-        assert!(
-            CI_RESIDUAL_POSTURE_REF.contains("never a CI-local restatement"),
-            "the residual is by reference, never restated CI-local"
-        );
-    }
 
     #[test]
     fn ci_holder_is_object_safe() {

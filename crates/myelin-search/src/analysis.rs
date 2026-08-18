@@ -398,8 +398,6 @@ fn stopwords(lang: Language) -> &'static [&'static str] {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SrchP12AnalyzerFloor;
 
 #[cfg(test)]
 mod tests {
@@ -678,8 +676,4 @@ mod tests {
         assert!(!Language::Unknown.is_natural());
     }
 
-    #[test]
-    fn the_named_floor_is_constructible() {
-        let _floor = SrchP12AnalyzerFloor;
-    }
 }

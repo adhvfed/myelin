@@ -218,14 +218,6 @@ impl EmbeddingsArePersonalData {
     pub const SPEC_IS_SEMANTIC: bool = true;
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ReplayParityFollowOn;
-
-impl ReplayParityFollowOn {
-    pub const REPLAY_PARITY: &'static str = "CHAT-P21";
-    pub const ERASURE_RECEIPT: &'static str = "CHAT-P22";
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,9 +599,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn follow_ons_are_named() {
-        assert_eq!(ReplayParityFollowOn::REPLAY_PARITY, "CHAT-P21");
-        assert_eq!(ReplayParityFollowOn::ERASURE_RECEIPT, "CHAT-P22");
-    }
 }

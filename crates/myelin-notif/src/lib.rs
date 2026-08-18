@@ -128,7 +128,7 @@ pub use storm_control::{
 };
 pub use surge::{
     run_notif_surge, NotifShedGate, NotifShedRejection, NotifSurgeReport, ProviderBulkhead,
-    ERASURE_RESIDUAL_FOLLOW_ON, EU_DELIVERY_PROVIDER_FOLLOW_ON, NOTIF_SURGE_MULTIPLIER,
+    NOTIF_SURGE_MULTIPLIER,
     NOTIF_SURGE_SURFACE,
 };
 pub use watch::{

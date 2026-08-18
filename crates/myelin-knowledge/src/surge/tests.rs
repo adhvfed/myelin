@@ -400,11 +400,3 @@ fn the_lexorank_report_predicate_is_not_vacuous() {
     assert!(!escaped.is_green(), "a reorder (escaped gap) MUST read RED");
 }
 
-#[test]
-fn the_floors_are_named() {
-    assert_eq!(COLLAB_SURGE_MULTIPLIER, 30);
-    assert!(
-        FLEET_HARDWARE_FLOOR.contains("fleet"),
-        "the world-scale fleet-hardware load is the named remaining floor"
-    );
-}

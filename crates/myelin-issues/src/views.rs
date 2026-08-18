@@ -236,14 +236,6 @@ pub fn edit_on_board_reflects_on_roadmap(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ViewFloors;
-
-impl ViewFloors {
-    pub const CROSS_CELL_ROLLUP: &'static str = "ISS-P32";
-    pub const REALTIME_SYNC: &'static str = "ISS-P30";
-}
-
 pub fn type_rank_split_is_partition() -> bool {
     ROADMAP_TYPE_RANK_MIN == BOARD_TYPE_RANK_MAX + 1
 }

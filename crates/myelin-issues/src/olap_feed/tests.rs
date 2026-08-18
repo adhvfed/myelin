@@ -672,10 +672,3 @@ fn issue_analytics_adds_sla_compliance_aggregate() {
     );
 }
 
-#[test]
-fn floors_are_named() {
-    assert!(IssueOlapFeedFloors::MONTE_CARLO_FORECAST.contains("ISS-P32"));
-    assert!(IssueOlapFeedFloors::MONTE_CARLO_FORECAST.contains("Monte-Carlo"));
-    assert!(IssueOlapFeedFloors::COLUMNAR_BACKEND.contains("OlapReadStore"));
-    assert!(IssueOlapFeedFloors::WORKLOG_ELIGIBILITY.contains("OQ-H"));
-}

@@ -14,9 +14,8 @@ const CI_P27_ROLE: &str =
     "M4 CI-SIDE COMMITTED-GATE RE-CONFIRM (CI-P27 / P-370): this attestation is the CI control \
      plane's COMMITTED M4-boundary re-confirm of AG-D4 / CI-T1 on the PRODUCTION CI runner image \
      (the config-resolved runner rootfs - dev↔prod is a config swap, MYELIN_REGION=fr-par / \
-     prod=Scaleway). Declared as a committed CI job in \
-     myelin_ci_controlplane::m4_boundary_permanent_gates (an uncommitted re-run is no gate, EI-01 \
-     §5). Production runs on KVM-capable Scaleway Elastic Metal; the prod image is re-drilled there \
+     prod=Scaleway).
+     (an uncommitted re-run is no gate, EI-01 §5). Production runs on KVM-capable Scaleway Elastic Metal; the prod image is re-drilled there \
      at deploy - a NAMED residual, not faked. gVisor (runsc) re-runs this drill on the second \
      backend at CI-P28.";
 

@@ -550,13 +550,6 @@ where
     })
 }
 
-pub const SCYLLA_HOT_TIER_PROMOTED: bool = false;
-
-pub const SCYLLA_PROMOTION_TRIGGER: &str =
-    "measured per-cell message-store write/partition volume crossing the hot-tier budget (R-C6/R-5)";
-
-pub const SCYLLA_PROMOTION_LANDING: &str = "CHAT-P28 / P-502";
-
 fn encode_segment(messages: &[Message]) -> Vec<u8> {
     let mut buf = Vec::new();
     for m in messages {

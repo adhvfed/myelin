@@ -229,8 +229,3 @@ fn accessors_read_back_the_sync_state() {
     assert_eq!(bs.resync_required_count(), 0);
 }
 
-#[test]
-fn board_sync_floors_are_named() {
-    assert_eq!(BoardSyncFloors::OFFLINE_LOCAL_FIRST, "R-8");
-    assert_eq!(BoardSyncFloors::CONNECTION_TIER, "P-403");
-}

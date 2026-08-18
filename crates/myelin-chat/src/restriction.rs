@@ -128,13 +128,6 @@ pub fn analytics_eligible(gate: &RestrictionGate, author: &str) -> bool {
     gate.may_process(author, ReadPath::Analytics)
 }
 
-pub const LEGAL_RESIDUAL_FLOOR: &str =
-    "[OPEN - LEGAL] the free-text third-party residual → the ONE platform posture (contract 10.9 / \
-     recon §X-7), ratified ONCE by counsel/DPO (R-C5). Chat writes NO fifth chat-specific residual: \
-     the structural floor (per-subject DEK crypto-shred [CHAT-P22] + mention pseudonym-shred + \
-     restrict suppression [CHAT-P23]) ships regardless; the lawful-basis statement is the platform's, \
-     parallel-tracked (LEGAL), never a chat blocker - see crate::holder::CHAT_RESIDUAL_POSTURE_REF";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,12 +325,4 @@ mod tests {
         assert!(analytics_eligible(&gate, "psn:bo"));
     }
 
-    #[test]
-    fn the_legal_residual_is_a_named_open_legal_floor_by_reference() {
-        assert!(LEGAL_RESIDUAL_FLOOR.contains("[OPEN - LEGAL]"));
-        assert!(LEGAL_RESIDUAL_FLOOR.contains("10.9"));
-        assert!(LEGAL_RESIDUAL_FLOOR.contains("X-7"));
-        assert!(LEGAL_RESIDUAL_FLOOR.contains("CHAT_RESIDUAL_POSTURE_REF"));
-        assert!(LEGAL_RESIDUAL_FLOOR.contains("ships regardless"));
-    }
 }

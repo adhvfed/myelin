@@ -1,11 +1,6 @@
 use myelin_content::Block;
 use myelin_refs::ArtifactRef;
 
-pub const STATELESS_EXCEPT_TRACE_FLOOR: &str = "v1 agents are stateless across runs EXCEPT for the \
-    content-addressed trace document (a Knowledge doc, erasable); long-term memory / RAG over prior \
-    runs is a NAMED HOLDER SEAM, NOT BUILT (post-M5 AG-P25: embedding store via Search semantic 6.2, \
-    ACL-filtered, purged on *.erased). Full DSR fan-out over the trace is AG-P23 (→ P-479).";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceDocument {
     pub run_id: u128,
@@ -130,17 +125,4 @@ mod tests {
         assert!(is_content_addressed_kn_document(&sample_trace(7, "x")));
     }
 
-    #[test]
-    fn the_stateless_except_trace_floor_is_named() {
-        assert!(STATELESS_EXCEPT_TRACE_FLOOR.contains("stateless across runs"));
-        assert!(STATELESS_EXCEPT_TRACE_FLOOR.contains("NOT BUILT"));
-        assert!(
-            STATELESS_EXCEPT_TRACE_FLOOR.contains("AG-P25"),
-            "names the long-term-memory follow-on"
-        );
-        assert!(
-            STATELESS_EXCEPT_TRACE_FLOOR.contains("AG-P23"),
-            "names the DSR fan-out follow-on"
-        );
-    }
 }

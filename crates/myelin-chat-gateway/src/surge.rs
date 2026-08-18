@@ -4,16 +4,6 @@ use myelin_tenancy::TenantId;
 
 pub const CHAT_SURGE_MULTIPLIER: u32 = 30;
 
-pub const CHAT_SHED_BUDGETS_TUNED: bool = true;
-
-pub const SCYLLA_HOT_TIER_FOLLOW_ON: &str = "CHAT-P28";
-
-pub const HOME_NODE_FOLLOW_ON: &str = "CHAT-P29";
-
-pub const CROSS_ORG_FOLLOW_ON: &str = "CHAT-P30";
-
-pub const COMMENT_CONSOLIDATION_FOLLOW_ON: &str = "CHAT-P31";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChatSurgeReport {
     pub surging_agent_shed_count: u64,
@@ -260,13 +250,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_floors_are_named_and_the_budgets_are_tuned() {
-        const { assert!(CHAT_SHED_BUDGETS_TUNED) };
-        assert_eq!(CHAT_SURGE_MULTIPLIER, 30);
-        assert_eq!(SCYLLA_HOT_TIER_FOLLOW_ON, "CHAT-P28");
-        assert_eq!(HOME_NODE_FOLLOW_ON, "CHAT-P29");
-        assert_eq!(CROSS_ORG_FOLLOW_ON, "CHAT-P30");
-        assert_eq!(COMMENT_CONSOLIDATION_FOLLOW_ON, "CHAT-P31");
-    }
 }

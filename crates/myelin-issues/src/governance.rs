@@ -216,18 +216,6 @@ pub fn workflow_unreachable_states(wf: &Workflow) -> Vec<String> {
     unreachable.into_iter().collect()
 }
 
-pub struct GovernanceFloors;
-
-impl GovernanceFloors {
-    pub const INSPECTOR_READS_EXPLAIN: &'static str =
-        "contract 4.4 (list_subjects/explain); 0 private recompute";
-
-    pub const BREACH_SIM_USES_SLA_ENGINE: &'static str =
-        "crate::sla_calendar::business_fire_at (ISS-P26)";
-
-    pub const GUARD_BUILDER_IS_FROZEN_QUERYAST: &'static str =
-        "myelin_query::QueryAst (no scripting)";
-}
 
 #[cfg(test)]
 mod tests {

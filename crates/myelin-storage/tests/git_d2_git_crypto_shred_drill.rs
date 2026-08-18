@@ -191,12 +191,3 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
     );
 }
 
-#[test]
-fn git_d2_residual_is_handled_by_reference_never_a_storage_local_restatement() {
-    assert!(GitResidual::RESIDUAL_POSTURE_REF.contains("10.9"));
-    assert!(GitResidual::RESIDUAL_POSTURE_REF.contains("pseudonymous-by-default"));
-    assert!(
-        GitResidual::RESIDUAL_POSTURE_REF.contains("10.6"),
-        "the on-demand audited history-rewrite follow-on is NAMED"
-    );
-}

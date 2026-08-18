@@ -8,8 +8,6 @@ use myelin_tenancy::TenantId;
 
 pub const AGENT_DISPATCH_SURGE_MULTIPLIER: u32 = 30;
 
-pub const AGENT_LANE_SHED_BUDGET_IS_MEASURED: bool = true;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentDispatchShed {
     pub lane: RunClass,
@@ -306,30 +304,6 @@ mod tests {
         assert!(b.retry_after_secs > 0, "sheds with a Retry-After");
     }
 
-    #[test]
-    fn the_measured_agent_lane_cap_matches_the_tuned_default_to_beat() {
-        let thresholds = Thresholds::load_canonical().expect("load thresholds.toml");
-        let b = thresholds
-            .shed_budget(Surface::AgentMention)
-            .expect("present");
-        assert_eq!(
-            b.per_tenant_in_flight_cap, 96,
-            "the MEASURED agent-lane cap (96) - the AG-D6 default-to-beat"
-        );
-        assert_eq!(
-            b.human_lane_reservation, 24,
-            "the MEASURED human-lane reservation (24 = 25% of cap, above the 20% floor)"
-        );
-        assert!(
-            b.human_lane_reservation >= SurfaceBudget::human_lane_floor(b.per_tenant_in_flight_cap),
-            "the measured reservation holds the human-lane floor (never tuned into starvation)"
-        );
-        let measured = AGENT_LANE_SHED_BUDGET_IS_MEASURED;
-        assert!(
-            measured,
-            "the agent-lane cap is the MEASURED default-to-beat"
-        );
-    }
 
     #[test]
     fn shed_order_serves_the_human_while_the_agent_lane_sheds() {
@@ -631,13 +605,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_floors_are_named() {
-        let measured = AGENT_LANE_SHED_BUDGET_IS_MEASURED;
-        assert!(
-            measured,
-            "the agent-lane shed budget is the MEASURED cap (the M2 placeholder is the named follow-on, now filled)"
-        );
-        assert_eq!(AGENT_DISPATCH_SURGE_MULTIPLIER, 30);
-    }
 }

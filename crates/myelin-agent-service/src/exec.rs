@@ -782,10 +782,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_routing_split_note_is_documented_once() {
-        assert!(myelin_ci_sandbox::hitl_withhold_note().contains("EffectApi::apply"));
-    }
 
     #[test]
     fn the_exec_hands_carry_a_green_ag_d4_gate_by_construction() {

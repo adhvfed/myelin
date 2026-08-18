@@ -232,16 +232,6 @@ impl std::fmt::Display for MoveCrdtError {
 
 impl std::error::Error for MoveCrdtError {}
 
-pub struct MoveCrdtFloors;
-
-impl MoveCrdtFloors {
-    pub const MEASURED_TRIGGER: &'static str =
-        "order_key + server-arbitrated CAS → move-CRDT (Yrs list) on measured concurrent-reorder pain \
-         (R-3, arch §5, ISS-P32 / P-495)";
-
-    pub const REAL_LLM_RUNTIME_POST_M5: &'static str =
-        "the LlmAgentRuntime real-LLM swap is the post-M5 follow-on (R-10)";
-}
 
 impl Default for ReorderPressure {
     fn default() -> Self {

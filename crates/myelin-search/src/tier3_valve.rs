@@ -217,14 +217,6 @@ impl ListObjectsPort for BoundedSetOnly<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Tier3ValveSurgeFloor;
-
-impl Tier3ValveSurgeFloor {
-    pub const SURGE_FOLLOW_ON: &'static str = "SRCH-P25";
-    pub const SUPPORTED_GATE: &'static str = "ISS-D2";
-    pub const SHARED_LOWERING: &'static str = "pipeline::lower_set_expr (SRCH-P09)";
-}
 
 #[cfg(test)]
 mod tests {
@@ -353,10 +345,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn floor_marker_names_the_surge_follow_on() {
-        assert_eq!(Tier3ValveSurgeFloor::SURGE_FOLLOW_ON, "SRCH-P25");
-        assert_eq!(Tier3ValveSurgeFloor::SUPPORTED_GATE, "ISS-D2");
-        assert!(Tier3ValveSurgeFloor::SHARED_LOWERING.contains("lower_set_expr"));
-    }
 }

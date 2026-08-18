@@ -1884,8 +1884,4 @@ mod tests {
         assert_eq!(fleet.capacity(region).unwrap().provisioned, 0);
     }
 
-    #[test]
-    fn hitl_withhold_note_states_the_routing_split() {
-        assert!(hitl_withhold_note().contains("EffectApi::apply"));
-    }
 }

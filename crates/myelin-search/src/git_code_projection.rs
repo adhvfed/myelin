@@ -155,8 +155,6 @@ fn normalize_for_trigrams(text: &str) -> String {
     out.trim().to_string()
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ScipLsifFindUsagesFloor;
 
 #[cfg(test)]
 mod tests {
@@ -375,8 +373,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_named_floor_is_constructible() {
-        let _floor = ScipLsifFindUsagesFloor;
-    }
 }

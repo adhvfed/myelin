@@ -41,7 +41,6 @@ pub use audit_proofs::{
 pub use ci_instance::{
     ci_holder_schemas, ci_phase_of, ci_registrations, ci_residual, ci_section_references_posture,
     CiHolderRegistration, CiLogHolder, CiLogModel, CI_DB, CI_INSTANCE, CI_SUBSYSTEM,
-    CONSUMER_HOLDER_FOLLOW_ON,
 };
 pub use commit_prerequisite::{
     commit_actor_holds_only_pseudonym, verdict_for, CommitActorVerdict, CommitIdentityPrerequisite,
@@ -109,7 +108,6 @@ pub use issues_chat_instance::{
     issues_section_references_posture, ChatCascadeReceipt, ChatStoreHolder, ChatStoreModel,
     IssuesCascadeReceipt, IssuesChatCascadeDriver, IssuesStoreHolder, IssuesStoreModel, CHAT_DB,
     CHAT_INSTANCE, CHAT_SUBSYSTEM, ISSUES_DB, ISSUES_INSTANCE, ISSUES_SUBSYSTEM,
-    WORKLOG_CLASSIFICATION_FOLLOW_ON,
 };
 pub use multi_cell::{
     MemberCellSet, MultiCellCertificate, MultiCellCoverage, MultiCellFanOut, MultiCellGap,
@@ -154,7 +152,7 @@ pub use structural_floor::{
 };
 pub use tenant_ops::{OffboardingCertificate, TenantDsrError, TenantDsrSurface};
 pub use worklog::{
-    RollupEnablement, WorklogAnalyticsGate, WorksCouncilTrigger, ALL_HOLDERS_EXIST_FOR,
-    BUILD_TRAINING_FORECLOSURE, WORKLOG_BASIS_RESIDUAL, WORKLOG_CROSS_INDIVIDUAL_DENIED,
+    RollupEnablement, WorklogAnalyticsGate, WorksCouncilTrigger,
+    BUILD_TRAINING_FORECLOSURE, WORKLOG_CROSS_INDIVIDUAL_DENIED,
     WORKS_COUNCIL_TRIGGERS_SURFACED,
 };

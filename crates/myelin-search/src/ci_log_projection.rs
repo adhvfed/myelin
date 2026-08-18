@@ -122,14 +122,6 @@ pub fn parse_step_anchor(anchor: &str) -> Option<CiLogStepAnchor> {
     Some(CiLogStepAnchor { run_id, step_no })
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct CiLogDurableSegmentNotFirehoseFloor;
-
-impl CiLogDurableSegmentNotFirehoseFloor {
-    pub const DURABLE_TRANSPORT: &'static str = "evt.* (durable bus)";
-    pub const NOT_THE_FIREHOSE: &'static str = "firehose live tier";
-    pub const PER_SUBJECT_DEK_OWNER: &'static str = "myelin_storage::ci_log_index::CiLogTier";
-}
 
 #[cfg(test)]
 mod tests {
@@ -305,19 +297,4 @@ mod tests {
         assert_eq!(parse_step_anchor("myelin://acme/ci/run/#step-1"), None);
     }
 
-    #[test]
-    fn floor_marker_names_durable_not_firehose() {
-        assert_eq!(
-            CiLogDurableSegmentNotFirehoseFloor::DURABLE_TRANSPORT,
-            "evt.* (durable bus)"
-        );
-        assert_eq!(
-            CiLogDurableSegmentNotFirehoseFloor::NOT_THE_FIREHOSE,
-            "firehose live tier"
-        );
-        assert_eq!(
-            CiLogDurableSegmentNotFirehoseFloor::PER_SUBJECT_DEK_OWNER,
-            "myelin_storage::ci_log_index::CiLogTier"
-        );
-    }
 }

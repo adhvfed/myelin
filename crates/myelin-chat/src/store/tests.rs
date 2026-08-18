@@ -750,20 +750,3 @@ fn cold_blob_parity_verdict_is_load_bearing_per_conjunct() {
     );
 }
 
-#[test]
-fn scylla_hot_tier_promotion_is_a_named_floor_with_its_trigger() {
-    let promoted = std::hint::black_box(super::SCYLLA_HOT_TIER_PROMOTED);
-    assert!(
-        !promoted,
-        "the Scylla hot-tier promotion is a NAMED FLOOR - its measured trigger has not fired; the \
-         v1 Postgres-partitioned hot tier is retained"
-    );
-    assert!(
-        super::SCYLLA_PROMOTION_TRIGGER.contains("write/partition volume"),
-        "the named floor records its MEASURED trigger signal (R-C6/R-5)"
-    );
-    assert!(
-        super::SCYLLA_PROMOTION_LANDING.contains("P-502"),
-        "the named floor points at its landing prompt (the gap is traceable)"
-    );
-}

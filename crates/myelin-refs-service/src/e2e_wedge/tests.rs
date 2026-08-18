@@ -111,7 +111,3 @@ fn whole_wedge_all_three_scenarios_green() {
     }
 }
 
-#[test]
-fn e2e_scenarios_named() {
-    assert_eq!(E2E_SCENARIOS, ["E2E-1", "E2E-3", "E2E-4"]);
-}

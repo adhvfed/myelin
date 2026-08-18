@@ -382,15 +382,5 @@ impl EventHandler for ProjectionFeeder {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ProjectionFeederFloors;
-
-impl ProjectionFeederFloors {
-    pub const OQ_C_THRESHOLD: &'static str =
-        "> 5% of a collection's view executions (OQ-C tunable)";
-    pub const WINDOW_CALIBRATION: &'static str = "ISS-P32";
-    pub const ISS_D2_LIVE_PROOF: &'static str = "ISS-P14 integration drill (ISS-D2)";
-}
-
 #[cfg(test)]
 mod tests;

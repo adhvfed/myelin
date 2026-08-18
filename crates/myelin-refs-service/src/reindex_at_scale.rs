@@ -8,11 +8,6 @@ use crate::reindex::{
 };
 use myelin_refs::ArtifactRef;
 
-pub const WORLD_SCALE_FLEET_LOAD_FLOOR: &str =
-    "REF-D4 at full 30x world-scale cardinality over the PgStore-backed edge index on real fleet \
-     hardware (the ONE legitimate remaining floor); the byte-parity property + both-mirror \
-     reconvergence are proven here over a deterministic scaled corpus";
-
 pub const FIVE_PRODUCERS: [&str; 5] = ["git", "knowledge", "ci", "chat", "issue"];
 
 #[derive(Clone, Debug)]

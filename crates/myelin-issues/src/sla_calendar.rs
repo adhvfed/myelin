@@ -6,16 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::sla_escalation::issue_sla_escalation_policy;
 
-pub struct SlaCalendarFloors;
-
-impl SlaCalendarFloors {
-    pub const HISTORY_COMPACTION: &'static str =
-        "R-11 (M5+): time_to_resolution history-compaction via myelin-flow continue-as-new";
-    pub const TZ_DATABASE: &'static str =
-        "prod: load IANA-zone offset transitions from the system tz database (chrono-tz/VTIMEZONE)";
-    pub const LIVE_WHEEL: &'static str =
-        "app boot: arm on myelin_flow::timer (9.3) + start the chain via Notif EscalationEngine::page";
-}
 
 pub const DEFAULT_AT_RISK_BPS: u32 = 8_000;
 

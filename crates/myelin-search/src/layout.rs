@@ -139,37 +139,6 @@ impl PerTenantIndexLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SrchP03Floor {
-    pub deferred: &'static str,
-    pub filled_by: &'static str,
-}
-
-pub fn srch_p03_floors() -> [SrchP03Floor; 5] {
-    [
-        SrchP03Floor {
-            deferred: "the IndexBackend trait + Tantivy + the FT-inverted and structured/columnar shapes",
-            filled_by: "SRCH-P04",
-        },
-        SrchP03Floor {
-            deferred: "the per-tenant vector (HNSW) shape co-located in the index space",
-            filled_by: "SRCH-P05",
-        },
-        SrchP03Floor {
-            deferred: "the near-real-time incremental indexer (the evt.* consumer)",
-            filled_by: "SRCH-P06",
-        },
-        SrchP03Floor {
-            deferred: "the permission-aware query path (engine.search behind the composed ACL filter)",
-            filled_by: "SRCH-P08",
-        },
-        SrchP03Floor {
-            deferred: "the REAL per-subject erase (purge + reindex incl. vectors) + the SRCH-D4 0-recoverable drill over real index data",
-            filled_by: "SRCH-P15",
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,19 +285,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_engine_shapes_floor_is_named() {
-        let floors = srch_p03_floors();
-        assert_eq!(floors.len(), 5, "the five named engine-shapes follow-ons");
-        let fillers: Vec<&str> = floors.iter().map(|f| f.filled_by).collect();
-        for required in ["SRCH-P04", "SRCH-P05", "SRCH-P06", "SRCH-P08", "SRCH-P15"] {
-            assert!(
-                fillers.contains(&required),
-                "the floor names {required} as a follow-on"
-            );
-        }
-        for f in floors {
-            assert!(!f.deferred.is_empty(), "each floor states what it defers");
-        }
-    }
 }

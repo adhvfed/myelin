@@ -7,8 +7,6 @@ use myelin_tenancy::TenantId;
 
 pub const FLOW_SURGE_MULTIPLIER: u32 = 30;
 
-pub const CROSS_CELL_SPANNING_IS_A_FLOOR: bool = true;
-
 pub struct FlowShedGate {
     lane: ShedLane,
 }
@@ -383,13 +381,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_floors_are_named() {
-        let cross_cell_is_a_floor = CROSS_CELL_SPANNING_IS_A_FLOOR;
-        assert!(
-            cross_cell_is_a_floor,
-            "cross-cell workflow spanning is the §7.4 designed-not-built floor (UNCHANGED here)"
-        );
-        assert_eq!(FLOW_SURGE_MULTIPLIER, 30);
-    }
 }

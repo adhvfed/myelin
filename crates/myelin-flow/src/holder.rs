@@ -391,10 +391,6 @@ mod tests {
         assert_eq!(registry.len(), 1, "exactly the one flow store registered");
     }
 
-    #[test]
-    fn flow_store_name_matches_the_boot_registered_name() {
-        assert_eq!(FLOW_OLTP_STORE, crate::SERVICE_NAME);
-    }
 
     #[test]
     fn re_registration_is_idempotent() {

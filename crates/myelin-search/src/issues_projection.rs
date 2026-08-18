@@ -118,14 +118,6 @@ pub fn issue_search_projection(input: &IssueProjectionInput) -> SearchProjection
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct IssueGinScanProjectionFeederFloor;
-
-impl IssueGinScanProjectionFeederFloor {
-    pub const PROMOTION_FOLLOW_ON: &'static str = "SRCH-P27";
-    pub const TIER3_VALVE_FOLLOW_ON: &'static str = "SRCH-P21";
-    pub const ISSUES_EMITTER_FOLLOW_ON: &'static str = "ISS-P17";
-}
 
 #[cfg(test)]
 mod tests {
@@ -280,19 +272,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn floor_markers_name_the_follow_ons() {
-        assert_eq!(
-            IssueGinScanProjectionFeederFloor::PROMOTION_FOLLOW_ON,
-            "SRCH-P27"
-        );
-        assert_eq!(
-            IssueGinScanProjectionFeederFloor::TIER3_VALVE_FOLLOW_ON,
-            "SRCH-P21"
-        );
-        assert_eq!(
-            IssueGinScanProjectionFeederFloor::ISSUES_EMITTER_FOLLOW_ON,
-            "ISS-P17"
-        );
-    }
 }

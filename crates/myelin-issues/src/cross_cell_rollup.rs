@@ -312,17 +312,6 @@ impl CrossCellDsrFanout {
     }
 }
 
-pub struct CrossCellRollupFloors;
-
-impl CrossCellRollupFloors {
-    pub const CROSS_CELL_ROLLUP_RESOLVED: &'static str =
-        "single-cell rollup → cross-cell portfolio rollup over the CrossCellPointer bridge \
-         (cell-local resolution, R-7 / OQ-I, ISS-P32 / P-495)";
-
-    pub const DSR_FAN_OUT_RESOLVED: &'static str =
-        "DSR fan-out iterates member_cells: 0 cell missed + per-cell receipt + 0 PII crosses \
-         (GA-D1 / CP-D7 / CP-D8, contract 10.4, ISS-P32 / P-495)";
-}
 
 #[cfg(test)]
 mod tests {

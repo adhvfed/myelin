@@ -349,10 +349,4 @@ mod tests {
         assert_eq!(t_receipt.receipt.operation, "erase");
     }
 
-    #[test]
-    fn the_residual_is_the_one_platform_posture_by_reference() {
-        assert!(CHAT_RESIDUAL_POSTURE_REF.contains("10.9"));
-        assert!(CHAT_RESIDUAL_POSTURE_REF.contains("X-7"));
-        assert!(CHAT_RESIDUAL_POSTURE_REF.contains("per-subject DEK"));
-    }
 }

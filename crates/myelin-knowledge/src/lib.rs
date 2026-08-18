@@ -128,7 +128,7 @@ pub use subs::{
 };
 pub use surge::{
     run_collab_surge, run_lexorank_storm, CollabShedReason, CollabShedRejection, CollabSurgeGate,
-    CollabSurgeReport, LexoStormReport, COLLAB_SURGE_MULTIPLIER, FLEET_HARDWARE_FLOOR,
+    CollabSurgeReport, LexoStormReport, COLLAB_SURGE_MULTIPLIER,
 };
 pub use sync_block::{
     render_sync_block, AllowAll, DenyAll, ProjectionFreshness, SourceReadCheck,

@@ -311,15 +311,5 @@ pub fn lower_acl(set_expr: &SetExpr, viewer: &Principal) -> LoweredFilter {
     lower_over_issue_id(set_expr, viewer)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct CostBounderFloors;
-
-impl CostBounderFloors {
-    pub const TIER2_FEEDER: &'static str = "ISS-P15";
-    pub const DISTRIBUTED_SQL: &'static str = "ISS-P32";
-    pub const SURGE_LATENCY: &'static str = "ISS-P33";
-    pub const OQ_C_DEFAULT_TO_BEAT: &'static str = "> 5% of a collection's view executions";
-}
-
 #[cfg(test)]
 mod tests;

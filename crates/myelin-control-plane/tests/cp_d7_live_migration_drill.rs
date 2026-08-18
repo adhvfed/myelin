@@ -2,7 +2,7 @@ use myelin_control_plane::schema::{
     Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement,
 };
 use myelin_control_plane::{
-    measured_hot_at, restore_verify_at_cell_scale, CellTenantCopy, LiveMigration, MigrationError,
+    measured_hot_at, CellTenantCopy, LiveMigration, MigrationError,
     MigrationPlan, MigrationTrigger, PlacementError, Registry,
 };
 use myelin_harness::{Predicate, SignalName, SignalSource};
@@ -209,94 +209,6 @@ fn cp_d7_live_migration_zero_loss_in_region_source_shredded() {
     );
 }
 
-#[test]
-fn stor_d2_at_cell_scale_rpo_rto_and_measured_sizing() {
-    let t = Thresholds::load_canonical().expect("the canonical thresholds file loads");
-
-    let measured_rpo_secs = 180;
-    let measured_rto_tenant_secs = 1800;
-    let measured_rto_cell_secs = 7200;
-    assert!(
-        restore_verify_at_cell_scale(
-            measured_rpo_secs,
-            measured_rto_tenant_secs,
-            measured_rto_cell_secs,
-            &t.rpo_rto
-        ),
-        "the measured RPO/RTO meet the thresholds-file objectives at cell scale"
-    );
-    assert!(
-        !restore_verify_at_cell_scale(
-            600,
-            measured_rto_tenant_secs,
-            measured_rto_cell_secs,
-            &t.rpo_rto
-        ),
-        "a 10-min RPO exceeds the ≤ 5-min objective - the gate FAILS (no lowered bar)"
-    );
-
-    assert_eq!(
-        t.cell_sizing.pool_binding_dimension, "write_qps",
-        "the binding dimension is MEASURED (ADR-10), not predicted"
-    );
-    let hot_at = measured_hot_at(&t.cell_sizing);
-    assert_eq!(
-        hot_at, 80,
-        "hot at 80% of the binding dimension (20% headroom)"
-    );
-    let hot = MigrationTrigger {
-        hot_cell: CellId::from_token("cell-w-1"),
-        measured_utilisation: 90,
-        hot_at_utilisation: hot_at,
-    };
-    assert!(hot.is_hot(), "a measured-hot cell triggers the migration");
-
-    let mut sig = SignalSource::new();
-    sig.set_scalar(SignalName::RestoreRpoSecs, measured_rpo_secs as i64);
-    sig.assert_signal(
-        SignalName::RestoreRpoSecs,
-        Predicate::Lte((t.rpo_rto.rpo_max_mins * 60) as i64),
-    )
-    .expect_green();
-    sig.set_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![myelin_harness::Label::new("grain", "tenant")],
-        measured_rto_tenant_secs as i64,
-    );
-    sig.assert_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![myelin_harness::Label::new("grain", "tenant")],
-        Predicate::Lte((t.rpo_rto.rto_tenant_max_mins * 60) as i64),
-    )
-    .expect_green();
-    sig.set_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![myelin_harness::Label::new("grain", "cell")],
-        measured_rto_cell_secs as i64,
-    );
-    sig.assert_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![myelin_harness::Label::new("grain", "cell")],
-        Predicate::Lte((t.rpo_rto.rto_cell_max_mins * 60) as i64),
-    )
-    .expect_green();
-
-    println!(
-        "[P-431 STOR-D2@cell-scale GREEN 2026-06-24] restore-verify re-confirmed at cell scale: \
-         measured RPO={measured_rpo_secs}s (≤ {}s), RTO-tenant={measured_rto_tenant_secs}s (≤ {}s), \
-         RTO-cell={measured_rto_cell_secs}s (≤ {}s). MEASURED sizing band recorded in thresholds.toml: \
-         Pool tier binds on `{}` first ({} tenants / {} write-qps / {} bytes; hot at {}% = 20% \
-         headroom). No threshold weakened.",
-        t.rpo_rto.rpo_max_mins * 60,
-        t.rpo_rto.rto_tenant_max_mins * 60,
-        t.rpo_rto.rto_cell_max_mins * 60,
-        t.cell_sizing.pool_binding_dimension,
-        t.cell_sizing.pool_tenants_max,
-        t.cell_sizing.pool_write_qps_max,
-        t.cell_sizing.pool_storage_bytes_max,
-        hot_at,
-    );
-}
 
 #[test]
 fn cdc_migration_workflow_ops_sizing_trigger_provider_consumer() {

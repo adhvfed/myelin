@@ -157,11 +157,11 @@ pub use dispatch::{classify, DispatchCounter, DispatchDecision, DispatchTrigger}
 pub use dispatch_surge::{
     run_agent_dispatch_surge, AgentDispatchShed, AgentDispatchSurgeGate, AgentDispatchSurgeReport,
     DispatchFrontError, RetryAfterHonouringRuntime, RuntimeReaction,
-    AGENT_DISPATCH_SURGE_MULTIPLIER, AGENT_LANE_SHED_BUDGET_IS_MEASURED,
+    AGENT_DISPATCH_SURGE_MULTIPLIER,
 };
 
 pub use trace_seam::{
-    is_content_addressed_kn_document, trace_ref_of, TraceDocument, STATELESS_EXCEPT_TRACE_FLOOR,
+    is_content_addressed_kn_document, trace_ref_of, TraceDocument,
 };
 
 pub use dry_run::{

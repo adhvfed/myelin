@@ -412,11 +412,3 @@ fn malformed_event_is_non_retryable() {
     ));
 }
 
-#[test]
-fn the_floors_are_named() {
-    assert!(RollupFloors::READ_TIME_ROLLUP.contains("ISS-P32"));
-    assert!(RollupFloors::DEBOUNCE_WINDOW_CALIBRATION.contains("OQ-K"));
-    assert!(RollupFloors::CROSS_CELL_ANCESTORS.contains("OQ-I"));
-    assert!(RollupFloors::FORECAST_AGENT.contains("Monte-Carlo"));
-    assert_eq!(DebounceWindow::DEFAULT.width, 1);
-}

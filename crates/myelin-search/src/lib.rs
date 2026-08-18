@@ -40,13 +40,13 @@ pub use cache::{
 };
 pub use chat_projection::{
     message_doc_ref, message_index_spec, message_index_specs, message_search_projection,
-    register_message_index_specs, ChatFiveProducerCorpusNotWorldScaleFloor, CHAT_SUBSYSTEM,
+    register_message_index_specs, CHAT_SUBSYSTEM,
     MESSAGE_ACL_OBJECT_TYPE, MESSAGE_TYPE,
 };
 pub use ci_log_projection::{
     ci_log_details_ref, ci_log_doc_ref, ci_log_index_spec, ci_log_index_specs,
     ci_log_search_projection, parse_step_anchor, register_ci_log_index_specs,
-    CiLogDurableSegmentNotFirehoseFloor, CiLogProjectionInput, CiLogStepAnchor,
+    CiLogProjectionInput, CiLogStepAnchor,
     CI_LOG_ACL_OBJECT_TYPE, CI_LOG_TYPE, CI_SUBSYSTEM, FACET_JOB_ID as CI_LOG_FACET_JOB_ID,
     FACET_RUN_ID as CI_LOG_FACET_RUN_ID, FACET_STEP_NO as CI_LOG_FACET_STEP_NO,
 };
@@ -83,7 +83,7 @@ pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_
 pub use git_code_projection::{
     git_blob_search_projection, git_code_projection_spec, git_index_specs,
     register_git_index_specs, trigram_query, trigrams, GitBlobProjectionInput,
-    ScipLsifFindUsagesFloor, FACET_BLOB_OID as GIT_FACET_BLOB_OID,
+    FACET_BLOB_OID as GIT_FACET_BLOB_OID,
     FACET_LANGUAGE as GIT_FACET_LANGUAGE, FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE,
     GIT_BLOB_TYPE, GIT_SUBSYSTEM, TRIGRAM_N,
 };
@@ -104,7 +104,7 @@ pub use indexer::{
 };
 pub use issues_projection::{
     issue_index_spec, issue_index_specs, issue_search_projection, register_issue_index_specs,
-    IssueGinScanProjectionFeederFloor, IssueProjectionInput,
+    IssueProjectionInput,
     FACET_ASSIGNEE as ISSUE_FACET_ASSIGNEE, FACET_CYCLE_ID as ISSUE_FACET_CYCLE_ID,
     FACET_PRIORITY as ISSUE_FACET_PRIORITY, FACET_PROJECT_ID as ISSUE_FACET_PROJECT_ID,
     FACET_STATE_CATEGORY as ISSUE_FACET_STATE_CATEGORY, FACET_TYPE_RANK as ISSUE_FACET_TYPE_RANK,
@@ -116,8 +116,8 @@ pub use kn_projection::{
     KN_ROW_TYPE, KN_SUBSYSTEM,
 };
 pub use layout::{
-    derived_state_invariant_holds, srch_p03_floors, LayoutError, PerTenantIndexLayout,
-    SrchP03Floor, StatefulComponent,
+    derived_state_invariant_holds, LayoutError, PerTenantIndexLayout,
+    StatefulComponent,
 };
 pub use object_store_backstop::{
     ObjectStoreBackstopArtifact, ObjectStoreBackstopFailure, ObjectStoreBackstopGate,
@@ -148,18 +148,18 @@ pub use shell::{
 pub use subartifact::{
     block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
     line_range_subdoc_facets, line_range_subdoc_projection, AnchorState, ContentAnchoredSpan,
-    M4ProducerSubAnchorFloor, SubGrain, FACET_ANCHOR_STATE, FACET_LINE_END, FACET_LINE_START,
+    SubGrain, FACET_ANCHOR_STATE, FACET_LINE_END, FACET_LINE_START,
 };
 pub use surge::{
     run_search_surge, SearchShedGate, SearchShedRejection, SearchSurgeReport,
-    FILTERED_ANN_FOLLOW_ON, SEARCH_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
+    SEARCH_SURGE_MULTIPLIER,
 };
 pub use telemetry::{
     signal as telemetry_signal, LabelledSignal, RedLabels, SearchTelemetry, CACHE_RATIO_ABSENT,
 };
 pub use tier3_valve::{
     board_acl_filter, escalate_to_search, oltp_board_admits, BoardEscalationAuthz, BoardQuery,
-    OltpBudget, ReverseResolver, Tier3ValveSurgeFloor,
+    OltpBudget, ReverseResolver,
 };
 pub use vector::{Embedding, HnswVectorIndex, ModelRef, VectorHit, VectorRecord};
 

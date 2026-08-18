@@ -2,7 +2,6 @@ use myelin_events::{Actor, EmitContextBase, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
     build_full_scale_corpus, run_full_scale_reindex_parity, FIVE_PRODUCERS,
-    WORLD_SCALE_FLEET_LOAD_FLOOR,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -88,11 +87,3 @@ fn parity_hash_distinguishes_different_scales() {
     );
 }
 
-#[test]
-fn world_scale_fleet_floor_is_named_not_claimed() {
-    assert!(
-        WORLD_SCALE_FLEET_LOAD_FLOOR.contains("fleet hardware")
-            && WORLD_SCALE_FLEET_LOAD_FLOOR.contains("30x"),
-        "the fleet-hardware floor is named as the ONE legitimate remaining floor"
-    );
-}

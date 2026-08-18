@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use myelin_refs_service::{
     build_backup_scale_corpus, re_erase_at_backup_scale, EdgeProjection, R2ProjectionCache,
-    RefsDekPin, RefsEdgeBuilder, RefsErasureLedger, WORLD_SCALE_BACKUP_FLEET_FLOOR,
+    RefsDekPin, RefsEdgeBuilder, RefsErasureLedger,
 };
 use myelin_storage::{InMemoryCache, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
@@ -70,8 +70,6 @@ fn ref_d5_restore_then_reerase_leaves_zero_recoverable_pii_at_backup_scale() {
         report.summary()
     );
     assert_eq!(report.re_erased_subjects, targets.len());
-
-    assert!(WORLD_SCALE_BACKUP_FLEET_FLOOR.contains("30x"));
 
     println!(
         "[P-456 REF-D5 BACKUP-SCALE GREEN 2026-06-24] {} (subjects={subjects}, edges_per_subject={edges_per_subject})",

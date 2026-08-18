@@ -24,9 +24,6 @@ pub const ISSUES_SUBSYSTEM: &str = "issues";
 
 pub const CHAT_SUBSYSTEM: &str = "chat";
 
-pub const WORKLOG_CLASSIFICATION_FOLLOW_ON: &str =
-    "P-GA-31 → P-334 (worklog Behavioural classification + works-council trigger + SpecialCategory→DPIA)";
-
 pub fn issues_chat_phase_of(holder_id: &str) -> Option<CanonicalErasePhase> {
     match holder_id {
         ISSUES_DB => Some(CanonicalErasePhase::CryptoShredDek),
@@ -1087,11 +1084,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_worklog_classification_follow_on_is_named() {
-        assert!(
-            WORKLOG_CLASSIFICATION_FOLLOW_ON.contains("P-GA-31"),
-            "the worklog Behavioural classification is the named follow-on"
-        );
-    }
 }

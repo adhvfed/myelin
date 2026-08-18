@@ -10,21 +10,6 @@ use crate::events;
 use crate::refs_glue::{IssueLifecycleRel, IssueRelationGraph, TRAVERSE_MAX_DEPTH};
 use crate::workflow::StateCategory;
 
-pub struct RollupFloors;
-
-impl RollupFloors {
-    pub const READ_TIME_ROLLUP: &'static str =
-        "read-time rollup (small subtree) → materialise-on-measured-large (KN-3, ISS-P32 / P-495)";
-
-    pub const DEBOUNCE_WINDOW_CALIBRATION: &'static str =
-        "debounce-window per-tenant tunable (OQ-K), 50-team fan-out calibration (ISS-P32 / M5)";
-
-    pub const CROSS_CELL_ANCESTORS: &'static str =
-        "cross-cell ancestors (OQ-I) → CrossCellPointer cell-local projection (ISS-P32 / M5)";
-
-    pub const FORECAST_AGENT: &'static str =
-        "forecast agent off issue.rollup.recomputed (linear floor → Monte-Carlo follow-on, ADR-08)";
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeafFact {

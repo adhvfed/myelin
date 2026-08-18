@@ -7,10 +7,6 @@ use myelin_tenancy::TenantId;
 
 pub const SEARCH_SURGE_MULTIPLIER: u32 = 30;
 
-pub const FILTERED_ANN_FOLLOW_ON: &str = "SRCH-P26";
-
-pub const SHARD_SPLIT_IS_MEASURED_ONLY: bool = true;
-
 pub struct SearchShedGate {
     lane: ShedLane,
 }
@@ -369,11 +365,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_floors_are_named() {
-        assert_eq!(FILTERED_ANN_FOLLOW_ON, "SRCH-P26");
-        let measured_only = SHARD_SPLIT_IS_MEASURED_ONLY;
-        assert!(measured_only, "a shard split is measured-only (§6.2)");
-        assert_eq!(SEARCH_SURGE_MULTIPLIER, 30);
-    }
 }

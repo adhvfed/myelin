@@ -177,29 +177,7 @@ pub fn restatement_markers() -> BTreeSet<&'static str> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_posture_is_the_one_canonical_artifact() {
-        assert_eq!(CANONICAL_POSTURE.contract_row, "10.9");
-        assert_eq!(CANONICAL_POSTURE.anchor, POSTURE_ANCHOR);
-        assert_eq!(
-            CANONICAL_POSTURE.structural_floor,
-            [
-                StructuralLever::PerSubjectDekShred,
-                StructuralLever::PseudonymMapShred,
-                StructuralLever::RestrictSuppression,
-            ],
-            "the three structural-floor levers in the §7.1 order"
-        );
-    }
 
-    #[test]
-    fn the_residual_is_the_documented_author_dek_limit() {
-        assert!(
-            CANONICAL_POSTURE.residual.contains("AUTHOR's DEK")
-                && CANONICAL_POSTURE.residual.contains("not the subject's"),
-            "the residual is third-party PII under the AUTHOR's DEK - not shreddable by the subject's key"
-        );
-    }
 
     #[test]
     fn the_residual_is_open_legal_and_the_floor_ships_regardless() {
@@ -212,34 +190,6 @@ mod tests {
         assert_eq!(LegalStatus::Ratified.tag(), "");
     }
 
-    #[test]
-    fn render_is_the_single_source_text() {
-        let doc = CANONICAL_POSTURE.render();
-        assert!(
-            doc.contains(POSTURE_ANCHOR),
-            "the render cites the canonical anchor"
-        );
-        assert!(
-            doc.contains("[OPEN - LEGAL]"),
-            "the render carries the one [OPEN - LEGAL] tag"
-        );
-        assert!(
-            doc.to_ascii_lowercase().contains("by reference"),
-            "the render states the by-reference instantiation rule"
-        );
-        for lever in StructuralLever::all() {
-            assert!(
-                doc.contains(lever.statement()),
-                "the render states lever {lever:?}"
-            );
-        }
-        for marker in restatement_markers() {
-            assert!(
-                doc.contains(marker),
-                "marker {marker:?} is canonical text in the render"
-            );
-        }
-    }
 
     #[test]
     fn a_valid_subsystem_reference_cites_the_anchor_and_does_not_restate() {

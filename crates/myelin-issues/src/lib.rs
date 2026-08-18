@@ -15,7 +15,6 @@ pub mod e2e_lineage;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod events;
-pub mod floor_triggers;
 pub mod governance;
 pub mod holder;
 pub mod holder_erase;
@@ -112,17 +111,13 @@ pub use reorder::{
     ReorderError, ReorderOutcome, ReorderRequest,
 };
 
-pub use move_crdt::{MoveCrdtBoard, MoveCrdtError, MoveCrdtFloors, ReorderPressure};
+pub use move_crdt::{MoveCrdtBoard, MoveCrdtError, ReorderPressure};
 
 pub use cross_cell_rollup::{
-    CellLocalRollupResolver, CrossCellDsrFanout, CrossCellPortfolioRollup, CrossCellRollupFloors,
+    CellLocalRollupResolver, CrossCellDsrFanout, CrossCellPortfolioRollup,
     CrossCellRollupPointer, DsrCellReceipt, PortfolioProjection,
 };
 
-pub use floor_triggers::{
-    ColumnStoreTrigger, DistributedSqlTrigger, Iss32FloorRegister, MaterialisedRollupTrigger,
-    MonteCarloForecastTrigger,
-};
 
 pub use content::{
     emit_content_event, is_issue_block, paragraph_body, roundtrips_md, validate_subtree,
@@ -155,23 +150,23 @@ pub use planner::{
 
 pub use cost_bounder::{
     classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery,
-    CostBounderFloors, CostBudget, FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier,
+    CostBudget, FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier,
     TIER3_FIELDS, TYPED_CORE_FIELDS,
 };
 
 pub use views::{
     board_and_roadmap_share_row, edit_on_board_reflects_on_roadmap, type_rank_split_is_partition,
-    IssueView, RowProjection, ViewFloors, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
+    IssueView, RowProjection, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
     ROADMAP_TYPE_RANK_MIN, STATE_CATEGORY_FIELD, TYPE_RANK_FIELD,
 };
 
 pub use board_sync::{
-    board_stream, BoardCache, BoardCard, BoardOp, BoardSync, BoardSyncFloors, LocalMutationError,
+    board_stream, BoardCache, BoardCard, BoardOp, BoardSync, LocalMutationError,
     BOARD_FIREHOSE_STREAM_PREFIX,
 };
 
 pub use governance::{
-    simulate_breach, workflow_unreachable_states, BreachSimulation, GovernanceFloors,
+    simulate_breach, workflow_unreachable_states, BreachSimulation,
     GovernanceView, GovernanceViewModel, GuardLanguage, InspectorAnswer, PermissionInspector,
     PermissionResolver,
 };
@@ -179,7 +174,7 @@ pub use governance::{
 pub use rollup::{
     aggregate_snapshot, recompute_incremental, rollup_recomputed_draft, walk_parent_edges,
     DebounceCoalescer, DebounceWindow, LeafFact, RecomputeOutcome, RollupAggregate, RollupConsumer,
-    RollupFloors, RollupStore,
+    RollupStore,
 };
 
 pub use holder_erase::{
@@ -189,7 +184,7 @@ pub use holder_erase::{
 };
 
 pub use olap_feed::{
-    issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer, IssueOlapFeedFloors,
+    issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer,
     IssueOlapFeedSignal, IssueRestrictionLeakAudit, ReindexCtx, ISSUE_ANALYTICS_OLAP,
 };
 

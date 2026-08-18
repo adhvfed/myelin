@@ -7,10 +7,6 @@ use myelin_tenancy::TenantId;
 
 pub const NOTIF_SURGE_MULTIPLIER: u32 = 30;
 
-pub const EU_DELIVERY_PROVIDER_FOLLOW_ON: &str = "NOTIF-P26";
-
-pub const ERASURE_RESIDUAL_FOLLOW_ON: &str = "NOTIF-P27";
-
 pub const NOTIF_SURGE_SURFACE: Surface = Surface::AgentMention;
 
 pub struct NotifShedGate {
@@ -644,11 +640,4 @@ mod tests {
         assert!(s.starts_with("NOTIF-D5:"), "the artifact is labelled: {s}");
     }
 
-    #[test]
-    fn the_floors_are_named() {
-        assert_eq!(EU_DELIVERY_PROVIDER_FOLLOW_ON, "NOTIF-P26");
-        assert_eq!(ERASURE_RESIDUAL_FOLLOW_ON, "NOTIF-P27");
-        assert_eq!(NOTIF_SURGE_SURFACE, Surface::AgentMention);
-        assert_eq!(NOTIF_SURGE_MULTIPLIER, 30);
-    }
 }

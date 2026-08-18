@@ -19,8 +19,6 @@ pub const CI_DB: &str = "ci_oltp";
 
 pub const CI_SUBSYSTEM: &str = "ci";
 
-pub const CONSUMER_HOLDER_FOLLOW_ON: &str = "P-GA-30 → P-333 (Issues H3 + Chat H5)";
-
 pub fn ci_phase_of(holder_id: &str) -> Option<CanonicalErasePhase> {
     match holder_id {
         CI_DB => Some(CanonicalErasePhase::CryptoShredDek),
@@ -602,11 +600,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_consumer_holder_follow_on_is_named() {
-        assert!(
-            CONSUMER_HOLDER_FOLLOW_ON.contains("P-GA-30"),
-            "the Issues/Chat consumer holders are the named follow-on"
-        );
-    }
 }

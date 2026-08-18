@@ -147,8 +147,3 @@ fn dropping_the_issue_relation_mirror_flips_parity_red() {
     );
 }
 
-#[test]
-fn world_scale_fleet_load_floor_is_named() {
-    assert!(WORLD_SCALE_FLEET_LOAD_FLOOR.contains("fleet hardware"));
-    assert!(WORLD_SCALE_FLEET_LOAD_FLOOR.contains("30x"));
-}

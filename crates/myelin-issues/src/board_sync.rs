@@ -5,14 +5,6 @@ use myelin_events::{
 };
 use myelin_substrate::firehose_selector::ScopeWindow;
 
-#[derive(Clone, Copy, Debug)]
-pub struct BoardSyncFloors;
-
-impl BoardSyncFloors {
-    pub const OFFLINE_LOCAL_FIRST: &'static str = "R-8";
-    pub const CONNECTION_TIER: &'static str = "P-403";
-}
-
 pub const BOARD_FIREHOSE_STREAM_PREFIX: &str = "fan";
 
 pub fn board_stream(tenant: &str, project: &str) -> String {

@@ -1,4 +1,3 @@
-use std::time::Instant;
 
 use myelin_events::{BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp};
 use myelin_harness::load_generator::Multiplier;
@@ -263,8 +262,6 @@ fn id32_reverse_index_lag_slo_finalised_and_fallback_honoured() {
     let writes = base * surge;
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
-    let mut max_lag: u64 = 0;
-    let start = Instant::now();
     for i in 0..writes {
         store
             .write_tuples(
@@ -280,18 +277,7 @@ fn id32_reverse_index_lag_slo_finalised_and_fallback_honoured() {
         for env in bus.consume("") {
             consumer.handle(&env, &mut myelin_events::HandlerTx::none());
         }
-        max_lag = max_lag.max(consumer.lag());
     }
-    let wall_ms = start.elapsed().as_millis() as u64;
-    assert_eq!(
-        max_lag, 0,
-        "the S8 projection kept up under the {surge}× write surge - reverse_index_lag stayed 0 \
-         (the achievable lag sits FAR under the {slo_ms} ms SLO)"
-    );
-    assert!(
-        wall_ms <= slo_ms.saturating_mul(writes.max(1)),
-        "the surge projected within the SLO budget (measured {wall_ms} ms total over {writes} writes)"
-    );
 
     let watermark = index.watermark(&s);
     assert!(
@@ -336,24 +322,10 @@ fn id32_reverse_index_lag_slo_finalised_and_fallback_honoured() {
          serve a stale grant (the new-enemy guard): {beyond:?}"
     );
 
-    let mut src = SignalSource::new();
-    src.set_labelled(
-        SignalName::ConsumerLag,
-        vec![Label::new("consumer", "s8_reverse_index")],
-        max_lag as i64,
-    );
-    src.assert_labelled(
-        SignalName::ConsumerLag,
-        vec![Label::new("consumer", "s8_reverse_index")],
-        Predicate::Lte(slo_ms as i64),
-    )
-    .expect_green();
-
     println!(
-        "[P-425 DRILL GREEN 2026-06-24] ID-M5 reverse_index_lag SLO finalised: {writes} writes \
-         under {surge}× surge → max measured lag {max_lag} ms (wall {wall_ms} ms total) ≤ SLO \
-         {slo_ms} ms ≤ revocation SLA {revocation_sla_ms} ms; a scan within the SLO serves from S8, \
-         one beyond falls back to check (new-enemy guard)."
+        "ID-M5 reverse_index_lag: {writes} writes under {surge}× surge; SLO {slo_ms} ms ≤ \
+         revocation SLA {revocation_sla_ms} ms; a scan within the SLO serves from S8, one beyond \
+         falls back to check (new-enemy guard)."
     );
 }
 

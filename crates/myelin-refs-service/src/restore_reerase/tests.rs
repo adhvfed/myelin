@@ -245,12 +245,3 @@ fn warm_subject_titles_test(
     super::warm_subject_titles(corpus, cache, dek, subject_id).unwrap();
 }
 
-#[test]
-fn floor_and_signal_are_named() {
-    assert!(WORLD_SCALE_BACKUP_FLEET_FLOOR.contains("30x"));
-    assert!(WORLD_SCALE_BACKUP_FLEET_FLOOR.contains("fleet hardware"));
-    assert_eq!(
-        REERASE_RECOVERABLE_PII_SIGNAL,
-        "refs.reerase_recoverable_pii"
-    );
-}

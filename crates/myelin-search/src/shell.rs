@@ -198,10 +198,5 @@ mod tests {
             spec.consumers.is_empty(),
             "no indexer consumer at the shell (SRCH-P06 floor)"
         );
-        assert_eq!(
-            crate::layout::srch_p03_floors().len(),
-            5,
-            "the engine-shapes floor is named"
-        );
     }
 }

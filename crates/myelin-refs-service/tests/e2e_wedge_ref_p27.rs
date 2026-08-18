@@ -2,7 +2,7 @@ use myelin_events::{Actor, EmitContextBase, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
     run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, run_e2e_4_dsar_fanout, run_refs_e2e_wedge,
-    E2E_SCENARIOS, WORLD_SCALE_BACKUP_FLEET_FLOOR, WORLD_SCALE_FLEET_LOAD_FLOOR,
+    E2E_SCENARIOS,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -97,17 +97,3 @@ fn whole_refs_e2e_wedge_completes_r_m5() {
     }
 }
 
-#[test]
-fn inherited_world_scale_floors_are_named_no_new_floor() {
-    assert!(
-        WORLD_SCALE_FLEET_LOAD_FLOOR.contains("30x")
-            || WORLD_SCALE_FLEET_LOAD_FLOOR.contains("30×"),
-        "E2E-3's reindex leg inherits the named fleet-load floor (REF-P24)"
-    );
-    assert!(
-        WORLD_SCALE_BACKUP_FLEET_FLOOR.contains("30x")
-            || WORLD_SCALE_BACKUP_FLEET_FLOOR.contains("30×")
-            || WORLD_SCALE_BACKUP_FLEET_FLOOR.contains("backup"),
-        "E2E-4's erase leg inherits the named backup-fleet floor (REF-P25)"
-    );
-}

@@ -92,19 +92,3 @@ fn multiple_drops_are_all_named() {
     );
 }
 
-#[test]
-fn the_rust_default_records_a_loud_dated_na() {
-    let na = ShimEnforcement::recorded_na(
-        "chat-connection-tier",
-        "Rust (TE-21 pin; BEAM hatch written-but-closed)",
-        "2026-06-22",
-    );
-    assert!(na.is_na());
-    assert!(!na.is_enforced());
-    let row = na.artifact_row();
-    assert!(row.contains("N/A"));
-    assert!(row.contains("2026-06-22"));
-    assert!(row.contains("chat-connection-tier"));
-    assert!(row.contains("NO-OP"));
-    assert!(row.contains("NOT a silent skip"));
-}

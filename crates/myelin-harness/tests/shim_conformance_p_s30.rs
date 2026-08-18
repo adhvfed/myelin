@@ -24,26 +24,6 @@ fn discharge_shim_against_chat_pin() -> ShimEnforcement {
     }
 }
 
-#[test]
-fn p_s30_gate_shim_discharged_against_chat_real_pin() {
-    let enforcement = discharge_shim_against_chat_pin();
-
-    assert!(
-        enforcement.is_na(),
-        "chat's TE-21 pin is Rust today; the 1.7 shim is a NO-OP recorded as a loud N/A"
-    );
-    assert!(!enforcement.is_enforced());
-
-    let row = enforcement.artifact_row();
-    assert!(row.contains("contract 1.7"));
-    assert!(row.contains("chat-connection-tier"));
-    assert!(row.contains("Rust"));
-    assert!(row.contains("NO-OP"));
-    assert!(row.contains("NOT a silent skip"));
-    assert!(row.contains(&today()));
-
-    println!("P-S30 shim-conformance artifact: {row}");
-}
 
 #[test]
 fn cdc_1_7_provider_pins_rust_consumer_shim_is_a_no_op() {

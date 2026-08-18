@@ -387,10 +387,3 @@ fn served_query_conjoins_acl_prefilter_before_pagination() {
     }
 }
 
-#[test]
-fn floors_are_named() {
-    assert_eq!(CostBounderFloors::TIER2_FEEDER, "ISS-P15");
-    assert_eq!(CostBounderFloors::DISTRIBUTED_SQL, "ISS-P32");
-    assert_eq!(CostBounderFloors::SURGE_LATENCY, "ISS-P33");
-    assert!(CostBounderFloors::OQ_C_DEFAULT_TO_BEAT.contains("5%"));
-}

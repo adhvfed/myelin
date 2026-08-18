@@ -2,16 +2,6 @@ use std::collections::BTreeSet;
 
 use myelin_gdpr::{DataRoleDefault, HasPersonalData, PersonalDataField};
 
-pub const WORKLOG_BASIS_RESIDUAL: &str =
-    "[OPEN - LEGAL] worklog basis = TBD_LEGAL - counsel ratifies special-category (Art. 9) vs \
-     elevated + the per-jurisdiction works-council consultation trigger; the structural floor \
-     (restricted-by-default + per-subject DEK + rollups-off-by-default + the surfaced trigger) \
-     ships regardless (P-GA-31 / P-334, recorded 2026-06-22)";
-
-pub const ALL_HOLDERS_EXIST_FOR: &str =
-    "all H1–H18 holders now exist - GA-D1 precondition → M5 P-GA-32 (full DSR fan-out, 0 holders \
-     missed)";
-
 pub const WORKLOG_CROSS_INDIVIDUAL_DENIED: (&str, &str) =
     ("gdpr.worklog_cross_individual_denied", "count");
 
@@ -328,17 +318,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_open_legal_residual_and_the_ga_d1_precondition_are_named() {
-        assert!(WORKLOG_BASIS_RESIDUAL.contains("TBD_LEGAL"));
-        assert!(WORKLOG_BASIS_RESIDUAL.contains("P-GA-31"));
-        assert!(
-            WORKLOG_BASIS_RESIDUAL.contains("works-council"),
-            "the works-council ratification is the named parallel-legal residual"
-        );
-        assert!(
-            ALL_HOLDERS_EXIST_FOR.contains("GA-D1") && ALL_HOLDERS_EXIST_FOR.contains("P-GA-32"),
-            "all H1–H18 now exist - the GA-D1 precondition, named for P-GA-32"
-        );
-    }
 }

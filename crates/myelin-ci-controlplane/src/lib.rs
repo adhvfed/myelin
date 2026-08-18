@@ -126,7 +126,6 @@ pub use pg_pipeline_starter::{
 pub mod ci_pipeline_driver;
 pub mod ci_pipeline_reporter_router;
 pub mod ci_secret_store;
-pub mod floor_followons;
 pub mod holder;
 pub mod job_queue_region;
 pub mod live_tail;
@@ -135,7 +134,6 @@ pub mod log_sink;
 pub mod log_sink_durable;
 pub mod metering;
 pub mod migrations;
-pub mod permanent_gates;
 pub mod rebac_fragment;
 #[cfg(any(test, feature = "test-support"))]
 pub mod residency_drill;
@@ -397,16 +395,6 @@ pub use migrations::{
     SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL,
     SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL,
     VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL, VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
-};
-
-pub use permanent_gates::{
-    ci_restore_verify_stores, m4_boundary_permanent_gates, run_ci_restore_verify_or_fail,
-    PermanentGate, PermanentGateKind,
-};
-
-pub use floor_followons::{
-    all_floor_followons, FloorFollowOn, TriggerStatus, DEFERRED_BY_REFERENCE_FLOORS,
-    MEASURED_TRIGGER_FLOORS,
 };
 
 pub use surge::{CiDispatchShed, CiSurgeControls, CiSurgeGate, StarvationHistogram};

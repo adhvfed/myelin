@@ -7,10 +7,6 @@ use myelin_tenancy::TenantId;
 
 pub const REFS_SURGE_MULTIPLIER: u32 = 30;
 
-pub const R4_REACH_INDEX_FOLLOW_ON: &str = "REF-P23";
-
-pub const SHARD_SPLIT_IS_MEASURED_ONLY: bool = true;
-
 pub struct RefsShedGate {
     lane: ShedLane,
 }
@@ -376,11 +372,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_floors_are_named() {
-        assert_eq!(R4_REACH_INDEX_FOLLOW_ON, "REF-P23");
-        let measured_only = SHARD_SPLIT_IS_MEASURED_ONLY;
-        assert!(measured_only, "a shard split is measured-only (§6.2)");
-        assert_eq!(REFS_SURGE_MULTIPLIER, 30);
-    }
 }

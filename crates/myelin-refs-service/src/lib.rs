@@ -122,7 +122,7 @@ pub use reindex::{
 #[cfg(any(test, feature = "test-support"))]
 pub use reindex_at_scale::{
     build_full_scale_corpus, run_full_scale_reindex_parity, FiveProducerCorpus,
-    FullScaleParityReport, FIVE_PRODUCERS, WORLD_SCALE_FLEET_LOAD_FLOOR,
+    FullScaleParityReport, FIVE_PRODUCERS,
 };
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
 pub use resolve::{
@@ -134,12 +134,11 @@ pub use resolve::{
 pub use restore_reerase::{
     build_backup_scale_corpus, re_erase_at_backup_scale, BackupScaleErasureCorpus,
     BackupScaleReEraseReport, CorpusEdge, RefsErasedSubject, RefsErasureLedger,
-    REERASE_RECOVERABLE_PII_SIGNAL, WORLD_SCALE_BACKUP_FLEET_FLOOR,
+    REERASE_RECOVERABLE_PII_SIGNAL,
 };
 pub use restrict::RestrictSet;
 pub use surge::{
-    run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, R4_REACH_INDEX_FOLLOW_ON,
-    REFS_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
+    run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, REFS_SURGE_MULTIPLIER,
 };
 pub use traverse::{
     apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
