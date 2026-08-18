@@ -478,3 +478,55 @@ fn membership_change_on_missing_conversation_is_loud() {
         .expect_err("a phantom conversation is LOUD");
     assert!(matches!(err, MembershipError::NotFound(_)));
 }
+
+#[test]
+fn every_channel_envelope_passes_the_real_publishers_admission_check() {
+    // the in-memory outbox used by unit tests publishes anything; the REAL
+    // relay quarantines. every chat channel envelope must clear the same
+    // admission check the publisher runs, or user-visible chat events strand
+    // in outbox_quarantine and everything behind them on the aggregate hangs.
+    let store = MemConversationStore::new();
+    let rebac = SharedRebac::default();
+    let svc = MembershipService::new(rebac);
+    let (ob, minter) = outbox();
+
+    let cid = conv_id("c-admission");
+    let conv = Conversation {
+        home_cell: Conversation::home_cell_for(&cid),
+        id: cid.clone(),
+        kind: ConversationKind::ArtifactLinked,
+        parent_project: Some("proj-1".into()),
+        name: Some("incident".into()),
+        topic: None,
+        linked_ref: Some("myelin://acme/issues/issue/ABC-1".into()),
+        pinned_canvas: None,
+        retention_days: None,
+        archived: false,
+        created_by: "psn:creator".into(),
+        acl_zookie: None,
+    };
+    let mut t = tx(&ob, &minter);
+    svc.create_channel(&mut t, &store, conv).unwrap();
+    svc.add_member(&mut t, &store, Membership::member(cid.clone(), "alice"))
+        .unwrap();
+    svc.archive_channel(&mut t, &cid).unwrap();
+    t.commit().unwrap();
+
+    let rows = ob.committed_rows();
+    assert!(rows.len() >= 3, "channel lifecycle emitted its events");
+    for row in &rows {
+        let config = myelin_storage::pgrelay::RelayValidationConfig::new(
+            row.envelope.region.clone(),
+            256 * 1024,
+        )
+        .unwrap();
+        myelin_storage::pgrelay::publisher_admission(&row.envelope, &config).unwrap_or_else(
+            |(code, detail)| {
+                panic!(
+                    "{} would be QUARANTINED by the publisher ({code}: {detail})",
+                    row.envelope.type_.0
+                )
+            },
+        );
+    }
+}

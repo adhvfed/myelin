@@ -81,6 +81,27 @@ struct ClaimedRow {
     payload: serde_json::Value,
 }
 
+/// The relay's admission check, exposed so every producer can PROVE its real
+/// envelopes publish instead of dying in outbox_quarantine. Returns the
+/// quarantine (code, detail) an envelope would receive, or Ok(()).
+pub fn publisher_admission(
+    envelope: &myelin_events::EventEnvelope,
+    config: &RelayValidationConfig,
+) -> Result<(), (String, String)> {
+    let payload = serde_json::to_value(envelope)
+        .map_err(|e| ("invalid_envelope_json".to_string(), e.to_string()))?;
+    let row = ClaimedRow {
+        event_id: envelope.event_id.0.clone(),
+        aggregate: envelope.aggregate.0.clone(),
+        seq: 0,
+        subject: envelope.subject.0.clone(),
+        payload,
+    };
+    validate_claimed_row(&row, config)
+        .map(|_| ())
+        .map_err(|e| (e.code.to_string(), e.detail.to_string()))
+}
+
 fn validate_claimed_row(
     row: &ClaimedRow,
     config: &RelayValidationConfig,

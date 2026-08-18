@@ -1,4 +1,14 @@
 use myelin_events::validate_event_type;
+use myelin_events::AggregateKey;
+
+/// The ONE canonical CI run ordering partition: `run:<run-id>`, in the
+/// `type:id` aggregate form the outbox publisher requires. Accepts either a
+/// bare run id or any `.../ci/run/<id>`-shaped reference and keeps only the
+/// trailing id segment.
+pub fn run_aggregate(run: &str) -> AggregateKey {
+    let id = run.rsplit('/').next().unwrap_or(run);
+    AggregateKey(format!("run:{id}"))
+}
 
 pub const CI_CHECK_UPDATED: &str = myelin_events::taxonomy::new_tokens::CI_CHECK_UPDATED;
 

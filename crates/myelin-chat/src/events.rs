@@ -1,4 +1,5 @@
 use myelin_events::validate_event_type;
+use myelin_events::AggregateKey;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 
 pub fn event_actor_pseudonym(tenant: &str, subject: &str) -> String {
@@ -49,6 +50,14 @@ pub const CHAT_REACTION_REMOVED: &str = "chat.reaction.removed";
 
 pub const CHAT_THREAD_CREATED: &str = "chat.thread.created";
 pub const CHAT_THREAD_REPLIED: &str = "chat.thread.replied";
+
+// the ONE canonical chat ordering partition: every channel-scoped event
+// (channel lifecycle, membership, messages) shares `channel:<conversation>`
+// so the relay orders them per conversation and the stream subject stays
+// in the canonical `type:id` aggregate form the publisher requires.
+pub fn channel_aggregate(conversation_id: &str) -> AggregateKey {
+    AggregateKey(format!("channel:{conversation_id}"))
+}
 
 pub const CHAT_CHANNEL_CREATED: &str = "chat.channel.created";
 pub const CHAT_CHANNEL_ARCHIVED: &str = "chat.channel.archived";

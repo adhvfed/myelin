@@ -298,7 +298,7 @@ enum GateOutcome {
 
 fn run_aggregate_draft(type_: &str, run_ref: &str, payload: serde_json::Value) -> EventDraft {
     let subject = ArtifactRef(run_ref.to_string());
-    let aggregate = myelin_events::AggregateKey(format!("ci/run/{run_ref}"));
+    let aggregate = myelin_ci_sandbox::events::run_aggregate(run_ref);
     EventDraft {
         type_: EventType(type_.to_string()),
         subject,

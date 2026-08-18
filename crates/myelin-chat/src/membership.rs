@@ -294,7 +294,7 @@ impl<W: MembershipTupleWriter> MembershipService<W> {
         let draft = EventDraft {
             type_: EventType(event_type.to_string()),
             subject,
-            aggregate: AggregateKey(channel_id.conversation_id.clone()),
+            aggregate: crate::events::channel_aggregate(&channel_id.conversation_id),
             payload: serde_json::json!({
                 "conversation_id": channel_id.conversation_id,
                 "principal": principal_id,
@@ -328,7 +328,7 @@ impl<W: MembershipTupleWriter> MembershipService<W> {
         let draft = EventDraft {
             type_: EventType(event_type.to_string()),
             subject,
-            aggregate: AggregateKey(channel_id.conversation_id.clone()),
+            aggregate: crate::events::channel_aggregate(&channel_id.conversation_id),
             payload,
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,

@@ -154,7 +154,7 @@ fn emit_message_event(
     let draft = EventDraft {
         type_: EventType(event_type.to_string()),
         subject,
-        aggregate: AggregateKey(conv.conversation_id.clone()),
+        aggregate: crate::events::channel_aggregate(&conv.conversation_id),
         payload: serde_json::json!({
             "conversation_id": conv.conversation_id,
             "message_id": message_id.as_str(),

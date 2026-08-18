@@ -599,8 +599,11 @@ pub fn reserve_and_start(
 
     let run_started = EventDraft {
         type_: EventType(CI_RUN_STARTED.to_string()),
-        subject: ArtifactRef(format!("ci/run/{}", facts.run_id)),
-        aggregate: AggregateKey(format!("ci/run/{}", facts.run_id)),
+        subject: ArtifactRef(format!(
+            "myelin://{}/ci/run/{}",
+            facts.tenant_id, facts.run_id
+        )),
+        aggregate: myelin_ci_sandbox::events::run_aggregate(&facts.run_id),
         payload: serde_json::json!({
             "run": format!("ci/run/{}", facts.run_id),
             "trust_tier": trust_tier,
@@ -1033,6 +1036,15 @@ mod tests {
         assert_eq!(handoff.run_write.definition_snapshot, snap);
         assert_eq!(handoff.run_write.trust_tier, "trusted");
         assert_eq!(handoff.run_write.trigger_kind, "push");
+        assert_eq!(
+            handoff.run_started.subject.0,
+            "myelin://acme/ci/run/run-0001",
+            "the run subject is a canonical scoped ref, never a bare path"
+        );
+        assert_eq!(
+            handoff.run_started.aggregate.0, "run:run-0001",
+            "the run aggregate is the canonical type:id partition"
+        );
         assert_eq!(handoff.run_started.type_.0, CI_RUN_STARTED);
         assert_eq!(handoff.run_started.payload["trust_tier"], "trusted");
         assert_eq!(handoff.run_started.payload["definition_snapshot"], snap.0);

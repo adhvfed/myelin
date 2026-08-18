@@ -1180,7 +1180,7 @@ async fn emit_rejected_facts(
     let draft = EventDraft {
         type_: EventType(myelin_ci_sandbox::events::CI_RUN_FAILED.into()),
         subject: run_ref.clone(),
-        aggregate: AggregateKey(format!("ci/run/{}", run_ref.0)),
+        aggregate: myelin_ci_sandbox::events::run_aggregate(&run_ref.0),
         payload: serde_json::json!({
             "run": run_ref.0,
             "repo_ref": repo_ref,

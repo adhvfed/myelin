@@ -512,7 +512,7 @@ fn run_event(
     EventDraft {
         type_: EventType(event_type.into()),
         subject: ArtifactRef(manifest.run_ref.clone()),
-        aggregate: AggregateKey(format!("ci/run/{}", manifest.run_ref)),
+        aggregate: myelin_ci_sandbox::events::run_aggregate(&manifest.run_ref),
         payload,
         data_role: DataRole::Controller,
         visibility: Visibility::Internal,

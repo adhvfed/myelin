@@ -1320,4 +1320,45 @@ mod tests {
         assert_eq!(row.envelope.type_.0, IDENTITY_TUPLE_WRITTEN);
         let _ = ConsumerName("s8_reverse_index".into());
     }
+
+    #[test]
+    fn identity_envelopes_pass_the_real_publishers_admission_check() {
+        // tuple objects carry a colon (`project:<uuid>`); with `tuple` and
+        // `agent` in the taxonomy the subject is a canonical ref. before that
+        // fix, EVERY identity.tuple.written event died in outbox_quarantine
+        // and the S8 reverse index consumed nothing in production.
+        let outbox = OutboxStore::new();
+        let store = TupleStore::new(outbox.clone());
+        let s = scope("acme");
+        for object in ["repo:core", "project:461fc0c9-2383-49b2-bc0f-d7c7e632346e"] {
+            store
+                .write_tuples(
+                    &s,
+                    &actor(),
+                    &[TupleDelta::Add(tuple(object, "reader", "p:alice"))],
+                    None,
+                    None,
+                    now(),
+                )
+                .expect("write");
+        }
+        let bus = InProcessBus::new();
+        let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
+        relay.drain_to_empty();
+        for env in bus.consume("") {
+            let config = myelin_storage::pgrelay::RelayValidationConfig::new(
+                env.region.clone(),
+                256 * 1024,
+            )
+            .unwrap();
+            myelin_storage::pgrelay::publisher_admission(&env, &config).unwrap_or_else(
+                |(code, detail)| {
+                    panic!(
+                        "{} on {} would be QUARANTINED ({code}: {detail})",
+                        env.type_.0, env.subject.0
+                    )
+                },
+            );
+        }
+    }
 }

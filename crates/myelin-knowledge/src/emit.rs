@@ -142,8 +142,12 @@ impl KnowledgeChange {
         }
     }
 
-    pub fn aggregate(&self, tenant: &TenantId) -> AggregateKey {
-        let urn = match self {
+    pub fn aggregate(&self, _tenant: &TenantId) -> AggregateKey {
+        // canonical `type:id` aggregate form (the outbox publisher refuses
+        // anything else): page-scoped events share `page:<id>` so a page's
+        // history orders as one partition; database-scoped events share
+        // `database:<id>`.
+        match self {
             KnowledgeChange::PageCreated { page_id }
             | KnowledgeChange::PageUpdated { page_id }
             | KnowledgeChange::PageMoved { page_id }
@@ -156,13 +160,17 @@ impl KnowledgeChange {
             | KnowledgeChange::AccessGranted { page_id }
             | KnowledgeChange::AccessRevoked { page_id }
             | KnowledgeChange::SubjectExportRequested { page_id }
-            | KnowledgeChange::SubjectErasureRequested { page_id } => page_ref(tenant, page_id),
+            | KnowledgeChange::SubjectErasureRequested { page_id } => {
+                AggregateKey(format!("page:{page_id}"))
+            }
             KnowledgeChange::BlockCreated { page_id, .. }
             | KnowledgeChange::BlockUpdated { page_id, .. }
             | KnowledgeChange::BlockDeleted { page_id, .. }
             | KnowledgeChange::CommentCreated { page_id, .. }
             | KnowledgeChange::CommentResolved { page_id, .. }
-            | KnowledgeChange::MentionCreated { page_id, .. } => page_ref(tenant, page_id),
+            | KnowledgeChange::MentionCreated { page_id, .. } => {
+                AggregateKey(format!("page:{page_id}"))
+            }
             KnowledgeChange::DatabaseCreated { db_id }
             | KnowledgeChange::DatabaseSchemaChanged { db_id }
             | KnowledgeChange::ViewCreated { db_id, .. }
@@ -170,9 +178,8 @@ impl KnowledgeChange {
             | KnowledgeChange::RowCreated { db_id, .. }
             | KnowledgeChange::RowUpdated { db_id, .. }
             | KnowledgeChange::RowDeleted { db_id, .. }
-            | KnowledgeChange::RowMoved { db_id, .. } => database_ref(tenant, db_id),
-        };
-        AggregateKey(urn.0)
+            | KnowledgeChange::RowMoved { db_id, .. } => AggregateKey(format!("database:{db_id}")),
+        }
     }
 
     pub fn subject(&self, tenant: &TenantId) -> ArtifactRef {
@@ -340,7 +347,7 @@ mod tests {
             page_id: "7c2".into(),
             block_id: "9".into(),
         };
-        assert_eq!(block.aggregate(&t).0, "myelin://acme/knowledge/page/7c2");
+        assert_eq!(block.aggregate(&t).0, "page:7c2");
         assert_eq!(block.subject(&t).0, "myelin://acme/knowledge/page/7c2#b9");
 
         let row = KnowledgeChange::RowUpdated {
@@ -359,8 +366,7 @@ mod tests {
         let page = KnowledgeChange::PageUpdated {
             page_id: "7c2".into(),
         };
-        assert_eq!(page.aggregate(&t).0, page.subject(&t).0);
-        assert_eq!(page.aggregate(&t).0, "myelin://acme/knowledge/page/7c2");
+        assert_eq!(page.aggregate(&t).0, "page:7c2");
     }
 
     #[test]
@@ -416,8 +422,8 @@ mod tests {
         let row = store.row(&id).expect("the committed row");
         assert_eq!(row.envelope.type_.0, KNOWLEDGE_BLOCK_UPDATED);
         assert_eq!(
-            row.aggregate.0, "myelin://acme/knowledge/page/7c2",
-            "aggregate = the page"
+            row.aggregate.0, "page:7c2",
+            "aggregate = the page partition in canonical type:id form"
         );
 
         {
@@ -632,6 +638,41 @@ mod tests {
             occurred_at: Timestamp("2026-06-21T00:00:00Z".into()),
             recorded_at: Timestamp("2026-06-21T00:00:01Z".into()),
             payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn knowledge_envelopes_pass_the_real_publishers_admission_check() {
+        // knowledge.page.created died in outbox_quarantine as an
+        // aggregate_mismatch when the row and envelope disagreed; the
+        // canonical `page:<id>` partition must clear the publisher's check.
+        let t = tenant();
+        let minter = Arc::new(myelin_events::MonotonicMinter::new());
+        let store = OutboxStore::new();
+        let mut tx = store.begin(Arc::clone(&minter), ctx_base());
+        tx.stage_state_change("admission check emits");
+        for change in [
+            KnowledgeChange::PageCreated { page_id: "7c2".into() },
+            KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "b9".into() },
+            KnowledgeChange::RowCreated { db_id: "db1".into(), row_id: "r1".into() },
+        ] {
+            emit_change(&mut tx, &t, &change, None).expect("emit");
+        }
+        tx.commit().expect("commit");
+        for row in store.committed_rows() {
+            let config = myelin_storage::pgrelay::RelayValidationConfig::new(
+                row.envelope.region.clone(),
+                256 * 1024,
+            )
+            .unwrap();
+            myelin_storage::pgrelay::publisher_admission(&row.envelope, &config).unwrap_or_else(
+                |(code, detail)| {
+                    panic!(
+                        "{} would be QUARANTINED ({code}: {detail})",
+                        row.envelope.type_.0
+                    )
+                },
+            );
         }
     }
 }

@@ -140,7 +140,7 @@ impl PgConversationStore {
             EventDraft {
                 type_: EventType(crate::events::CHAT_CHANNEL_CREATED.into()),
                 subject,
-                aggregate: AggregateKey(conversation.id.conversation_id.clone()),
+                aggregate: crate::events::channel_aggregate(&conversation.id.conversation_id),
                 payload: serde_json::json!({
                     "conversation_id": conversation.id.conversation_id,
                     "parent_project": conversation.parent_project,

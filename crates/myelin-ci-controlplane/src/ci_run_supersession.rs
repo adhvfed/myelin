@@ -1298,7 +1298,7 @@ async fn emit_stale_run_cancelled_on_conn(
     let draft = EventDraft {
         type_: EventType(myelin_ci_sandbox::events::CI_RUN_CANCELLED.into()),
         subject: ArtifactRef(run_ref.clone()),
-        aggregate: AggregateKey(format!("ci/run/{run_ref}")),
+        aggregate: myelin_ci_sandbox::events::run_aggregate(&run_ref),
         payload: serde_json::json!({
             "run": run_ref,
             "repo_ref": &provenance.repo_ref,
@@ -1389,7 +1389,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
     let run_draft = EventDraft {
         type_: EventType(myelin_ci_sandbox::events::CI_RUN_CANCELLED.into()),
         subject: ArtifactRef(manifest.run_ref.clone()),
-        aggregate: AggregateKey(format!("ci/run/{}", manifest.run_ref)),
+        aggregate: myelin_ci_sandbox::events::run_aggregate(&manifest.run_ref),
         payload: serde_json::json!({
             "run": manifest.run_ref,
             "repo_ref": manifest.repo_ref,

@@ -40,6 +40,12 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     "member",
     "project",
     "edge",
+    // identity's event subjects: myelin://<t>/identity/tuple/<object> and
+    // myelin://<t>/identity/agent/<id>. absent from the original table, every
+    // identity.tuple.written / identity.agent.created event was quarantined
+    // as an invalid ref - the S8 reverse index consumed nothing in production.
+    "tuple",
+    "agent",
 ];
 
 /// Artifact subjects whose live read boundary is implemented for governed automations.

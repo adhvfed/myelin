@@ -291,7 +291,7 @@ impl KnowledgePageStore {
             actor.clone(),
             occurred_at.clone(),
         );
-        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &page.page_id, &event)
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &event.aggregate.0, &event)
             .await
             .map_err(|error| {
                 KnowledgePageError::Storage(format!("co-commit page create: {error}"))
@@ -488,7 +488,7 @@ impl KnowledgePageStore {
             actor.clone(),
             occurred_at.clone(),
         );
-        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &page.page_id, &event)
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &event.aggregate.0, &event)
             .await
             .map_err(|error| {
                 KnowledgePageError::Storage(format!("co-commit page save: {error}"))
@@ -900,7 +900,7 @@ fn page_event(
         EventDraft {
             type_: EventType(event_type.to_string()),
             subject: subject.clone(),
-            aggregate: AggregateKey(subject.0.clone()),
+            aggregate: AggregateKey(format!("page:{page_id}")),
             payload: serde_json::json!({ "subject": subject.0, "version": version }),
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,

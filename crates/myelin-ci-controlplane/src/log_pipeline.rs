@@ -510,10 +510,7 @@ impl LogAvailablePointer {
         Ok(EventDraft {
             type_: EventType(CI_LOG_AVAILABLE.to_string()),
             subject: self.subject(tenant)?,
-            aggregate: myelin_events::AggregateKey(format!(
-                "ci/run/{}/job/{}",
-                self.coord.run_id, self.coord.job_id
-            )),
+            aggregate: myelin_ci_sandbox::events::run_aggregate(&self.coord.run_id),
             payload,
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,

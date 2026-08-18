@@ -411,7 +411,7 @@ impl PgMessageStore {
         let draft = EventDraft {
             type_: EventType(crate::events::CHAT_MESSAGE_CREATED.to_string()),
             subject,
-            aggregate: AggregateKey(msg.conv.conversation_id.clone()),
+            aggregate: crate::events::channel_aggregate(&msg.conv.conversation_id),
             payload: serde_json::json!({
                 "conversation_id": msg.conv.conversation_id,
                 "message_id": message_id.as_str(),
