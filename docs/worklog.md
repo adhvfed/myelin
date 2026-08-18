@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-18 — erasure now survives a restore (drilled for real)
+
+The production erase path (`/v1/privacy/me/agent-data/erase` →
+`DurableAgentTraceStore::erase_for_subject`) records every erasure in
+`post_pit_erasure_ledger` BEFORE destroying the subject DEK — a destroyed
+but unrecorded erasure would be silently resurrected by restoring any
+pre-erasure backup. The ledger and the `ReErasePass` replay machinery
+existed but nothing production ever wrote the ledger.
+
+Proof: `integration_erasure_survives_restore` runs against real
+`pg_dump`/`pg_restore` — seed a subject, back up, erase through the
+production path, restore into a scratch database, assert the wrapped DEK
+IS resurrected there (the drill has teeth), replay the live ledger, and
+assert the subject is unreadable again with zero surviving DEK rows.
+The privacy-lifecycle system test passes through the new path.
+
 ## 2026-08-18 — edge input hardening (pagination) landed
 
 The in-flight working-tree changes found on the dev box, snapshotted as
@@ -57,15 +73,13 @@ system suite.
 
 ## known gaps (honest list, in priority order)
 
-1. **erasure does not survive a restore.** the wired erase path (agent-data)
-   crypto-shreds the subject DEK, but a pg backup taken before the erasure
-   contains the wrapped DEK and the plaintext-adjacent rows; restoring it
-   resurrects the person. `restore_erasure_ledger` exists as a table but
-   nothing writes it, and no restore procedure replays erasures. the old
-   "restore-verify permanent gate" simulated this over in-memory vecs and
-   proved nothing. needs: a durable erasure record that survives restores,
-   a restore-time re-erase step, and a drill against a real pg dump
-   (`scripts/backup-drill.sh` is a real capture/restore harness to build on).
+1. **erasure-restore is closed for the wired path, open for the rest.** the
+   agent-data erase now writes the post-PIT ledger and the re-erase pass is
+   drilled against a real dump. remaining: the restore RUNBOOK (an ops
+   entrypoint that runs the replay after a production restore — today it is
+   a library call + drill), and the library-level erase paths (chat, issues,
+   git crypto-shred) still do not write the ledger because nothing wires
+   them to a user surface yet (gap 2).
 2. **DSR is a library, not a product surface.** no service registers a
    PersonalDataHolder; dsr_submit/status/certificate are unwired. the only
    user-facing privacy surface is `/v1/privacy/me/agent-data*`. chat/issues/
