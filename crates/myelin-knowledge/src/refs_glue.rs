@@ -459,6 +459,7 @@ fn sub_opaque_id(sub: &myelin_refs::Sub) -> String {
         | Sub::Comment(id)
         | Sub::Thread(id)
         | Sub::Message(id)
+        | Sub::View(id)
         | Sub::Check(id) => id.clone(),
         Sub::Step(n) => n.to_string(),
         Sub::LineRange { start, end } => format!("L{start}-L{end}"),

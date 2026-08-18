@@ -65,7 +65,7 @@ fn comment_and_thread_mints_are_grammatical_and_classify() {
 
     for r in [&c, &th] {
         let root = strip_sub(r);
-        assert_eq!(format(&root), "page:7c2");
+        assert_eq!(format(&root), "myelin://acme/knowledge/page/7c2");
     }
 }
 

@@ -40,6 +40,10 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     "member",
     "project",
     "edge",
+    // knowledge flex-databases: myelin://<t>/knowledge/database/<id>(#view-)
+    // was unparseable without the token, so knowledge.database/view/row
+    // events died at the publisher.
+    "database",
     // identity's event subjects: myelin://<t>/identity/tuple/<object> and
     // myelin://<t>/identity/agent/<id>. absent from the original table, every
     // identity.tuple.written / identity.agent.created event was quarantined

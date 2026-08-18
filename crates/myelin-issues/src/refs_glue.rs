@@ -548,6 +548,7 @@ fn sub_opaque_id(sub: &myelin_refs::Sub) -> String {
         | Sub::Heading(id)
         | Sub::Thread(id)
         | Sub::Message(id)
+        | Sub::View(id)
         | Sub::Check(id) => id.clone(),
         Sub::CommitCheck {
             commit_oid,
