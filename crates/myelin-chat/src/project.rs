@@ -371,6 +371,7 @@ fn sub_opaque(reference: &ArtifactRef) -> Option<String> {
         | Sub::Heading(id)
         | Sub::Row(id)
         | Sub::Field(id)
+        | Sub::View(id)
         | Sub::Check(id) => Some(id),
         Sub::CommitCheck {
             commit_oid,
