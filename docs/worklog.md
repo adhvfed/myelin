@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-19 — the self-CI loop is closed: fully green self-build
+
+Run 8c952c07 on the self-hosted `myelin` tenant: **build, test, and
+clippy all succeeded** inside myelin's own gVisor sandbox. Getting from
+"caught its first regression" to green took three more real fixes, two
+of them found BY the self-CI itself:
+
+- the ci-sandbox crate's uid-semantics tests (userns leases, foreign
+  ownership refusals) cannot be expressed under the sandbox's fake-root
+  euid; they now skip loudly there (MYELIN_REQUIRE_USERNS_TESTS=1
+  hard-fails on hosts that must prove them). 80 → 8 → 0 across rounds.
+- the self-CI clippy job then caught the skip helper compiling as dead
+  code under test-support feature unification — a lint only a
+  workspace-wide `-D warnings` build sees. now `#[cfg(test)]`.
+
+The dogfood story end to end: myelin hosts its own source, a stock git
+push through its own wire triggers `.myelin/ci.toml`, the pipeline runs
+in its own sandbox, it caught a real regression main was carrying plus
+a lint, and it now verifies every fix. Also observed and noted: the CI
+log read endpoint refuses byte ranges starting at 0 while tail ranges
+read fine (bug, unfixed).
+
 ## 2026-08-19 — self-CI catches its first real regression
 
 The dogfood loop closed: myelin's own sandboxed CI **built and
