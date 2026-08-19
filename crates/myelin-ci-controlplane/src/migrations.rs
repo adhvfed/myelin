@@ -2695,6 +2695,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             (3, SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL),
             (4, SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL),
             (5, SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL),
+            (6, SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL),
         ] {
             assert!(ddl.contains("ON CONFLICT (wf_type, version) DO NOTHING"));
             assert!(ddl.contains(&format!(" {version},")));
@@ -2712,7 +2713,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             );
         }
         assert!(
-            SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL.contains(&format!(
+            SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL.contains(&format!(
                 "\n  {},\n",
                 crate::ci_runtime_composition::CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION
             )),
@@ -2813,6 +2814,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
                 CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID,
                 CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID,
+                CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID,
             ],
             "the append-only tail retains every expand → validate → contract dependency"
         );
@@ -3018,6 +3020,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL);
             } else if m.id == CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID {
                 assert_eq!(m.ddl, SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL);
+            } else if m.id == CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID {
+                assert_eq!(m.ddl, SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL);
             } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL);
             } else if m.id == CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID {
@@ -3075,7 +3079,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            78,
+            79,
             "the runner applied the complete schema plus every additive follow-on"
         );
         assert_eq!(
