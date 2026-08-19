@@ -116,12 +116,35 @@ export default function ChatIndex() {
 
   onMount(() => {
     setInteractive(true);
+    // Safety net only: SSE below is the delivery path. This poll exists so a
+    // silently dead stream degrades to slow refresh instead of a frozen view.
     const timer = window.setInterval(() => {
       const conversationId = validSelectedId();
       if (!conversationId || document.hidden) return;
       void revalidate(getChatMessages.keyFor({ conversationId, limit: 100 }));
-    }, 5_000);
+    }, 30_000);
     onCleanup(() => window.clearInterval(timer));
+  });
+
+  // Live delivery: the edge broadcasts a reference frame (conversation id +
+  // message id, never content) on each accepted post; each frame triggers a
+  // revalidate through the authorized read path. A reconnect revalidates once
+  // to close any gap the dropped stream left.
+  createEffect(() => {
+    const conversationId = validSelectedId();
+    if (!conversationId || !interactive()) return;
+    const source = new EventSource(
+      `/api/chat/conversations/${encodeURIComponent(conversationId)}/events`,
+    );
+    let everOpened = false;
+    const refresh = () =>
+      void revalidate(getChatMessages.keyFor({ conversationId, limit: 100 }));
+    source.addEventListener("chat.message.posted", refresh);
+    source.onopen = () => {
+      if (everOpened) refresh();
+      everOpened = true;
+    };
+    onCleanup(() => source.close());
   });
 
   const openCreate = () => {

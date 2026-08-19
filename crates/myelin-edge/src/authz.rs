@@ -55,6 +55,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "chat.conversation.create",
     "chat.messages.list",
     "chat.message.post",
+    "chat.conversation.events.subscribe",
     "knowledge.pages.list",
     "knowledge.page.create",
     "knowledge.page.view",
@@ -235,6 +236,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("chat.conversation.create", "chat.manage", OP_PAT),
     requirement!("chat.messages.list", "chat.read", OP_PAT),
     requirement!("chat.message.post", "chat.post", OP_PAT),
+    requirement!(
+        "chat.conversation.events.subscribe",
+        "chat.read",
+        OP_PAT
+    ),
     requirement!("knowledge.pages.list", "knowledge.read", OP_PAT),
     requirement!("knowledge.page.create", "knowledge.edit", OP_PAT),
     requirement!("knowledge.page.view", "knowledge.read", OP_PAT),

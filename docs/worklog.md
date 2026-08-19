@@ -4,6 +4,39 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-19 — chat is live: push delivery reaches the browser
+
+The gap: the web chat UI polled every 5 seconds while the edge's "tenant
+firehose" only ever emitted `repo.created`/`repo.pushed` — no chat event
+had ever reached any stream. The SSE hub, the proxy plumbing, and the
+frontend stream helpers all existed; nothing connected chat to them.
+
+Now the edge serves `GET /v1/chat/conversations/{id}/events`. The
+subscription is authorized with the SAME visibility gate as message
+reads (`public_conversation`), so a viewer who cannot read a
+conversation cannot observe its activity either — no metadata leak
+through the stream. On each accepted `chat.message.post` the gateway
+broadcasts a reference frame (conversation id + message id, never
+content) on the conversation-scoped channel; clients revalidate through
+the authorized read path. The web client now subscribes over a
+same-origin proxy and treats its old poll as a 30-second safety net.
+
+Proof, outside-in:
+- `system-tests/tests/chat-live.system.test.ts`: a second collaborator's
+  live subscription receives the posted message's reference frame (and
+  never its content); subscriptions are refused exactly where reads are
+  refused (401 unauthenticated, 400 malformed, 404 for a private-project
+  room probed by a peer).
+- browser: two real sessions — a message sent in one appears in the
+  other within 8 seconds, no reload, far under the 30s fallback poll, so
+  only push delivery explains it.
+- unit: the gateway's post→frame mapping fires only on a 201 post with a
+  bounded conversation id.
+
+Deliberately NOT built yet: tenant-coarse chat pings for sidebar
+liveness (a naive version would leak conversation existence to
+non-project-members; needs a visibility-scoped design).
+
 ## 2026-08-19 — the self-CI loop is closed: fully green self-build
 
 Run 8c952c07 on the self-hosted `myelin` tenant: **build, test, and
@@ -219,7 +252,14 @@ system suite.
 5. **trust-scoped CI cache + agent exec gate are built but unwired**; the CI
    runner does not route cache writes through `CiCacheNamespace`, and
    nothing constructs `AgentExecGate` in production.
-6. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+6. **`agent-governed-trigger-intake` deliveries quarantine with
+   `no_registered_consumer`** — 15,636 rows in `consumer_delivery_quarantine`
+   accumulated 2026-08-11 → 2026-08-19 05:15 UTC on the dev stack (bursty,
+   redelivery-amplified). Something publishes deliveries addressed to a
+   consumer that is never registered; either register the consumer or stop
+   addressing it. found while checking quarantine health after the chat-live
+   landing (which itself added zero rows to either quarantine table).
+7. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.

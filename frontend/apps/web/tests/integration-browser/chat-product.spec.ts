@@ -66,3 +66,41 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
     expect.objectContaining({ content: message, is_you: true, state: "active" }),
   ]));
 });
+
+test("a message posted in one session arrives live in a second session without a reload", async ({
+  page,
+  browser,
+}) => {
+  const suffix = `${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  const channel = `live-${suffix}`;
+  const topic = `standup-${suffix}`;
+  const message = `Deploy ${suffix} is rolling; watch the error budget.`;
+
+  await signIn(page);
+  await navigateToApp(page, "/chat");
+  await page.getByRole("button", { name: "Create a topic" }).click();
+  await page.getByRole("textbox", { name: "Channel", exact: true }).fill(channel);
+  await page.getByRole("textbox", { name: "Topic", exact: true }).fill(topic);
+  await page.getByRole("button", { name: "Create topic" }).click();
+  await page.waitForURL(/\/chat\?conversation=[0-9A-HJKMNP-TV-Z]{26}$/);
+  const conversationPath = new URL(page.url()).pathname + new URL(page.url()).search;
+
+  const secondSession = await browser.newContext();
+  try {
+    const pageB = await secondSession.newPage();
+    await signIn(pageB);
+    await navigateToApp(pageB, conversationPath);
+    await expect(pageB.getByRole("heading", { name: topic })).toBeVisible();
+
+    await page.getByLabel(`Message ${topic}`).fill(message);
+    await page.getByRole("button", { name: "Send" }).click();
+    await expect(page.getByText(message)).toBeVisible();
+
+    // the second session must receive the message pushed over SSE - well inside
+    // the 8s bound and far below the 30s fallback poll, so only live delivery
+    // can explain it. no reload happens here.
+    await expect(pageB.getByText(message)).toBeVisible({ timeout: 8_000 });
+  } finally {
+    await secondSession.close();
+  }
+});

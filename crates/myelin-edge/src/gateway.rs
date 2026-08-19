@@ -177,6 +177,28 @@ fn repo_lifecycle_event(
     }
 }
 
+/// Maps a successful `chat.message.post` dispatch to a live-delivery frame:
+/// (conversation id, message id). References only - the encrypted body never
+/// touches the stream; subscribers revalidate through the authorized read
+/// path.
+fn chat_message_event(
+    action: &str,
+    params: &BTreeMap<String, String>,
+    resp: &EdgeResponse,
+) -> Option<(String, String)> {
+    if action != "chat.message.post" || resp.status() != 201 {
+        return None;
+    }
+    let conversation = params.get("conversation")?;
+    if !is_bounded_resource_id(conversation) {
+        return None;
+    }
+    let message_id = resp
+        .json_body()
+        .and_then(|v| v.get("message_id").and_then(|m| m.as_str()).map(str::to_string))?;
+    Some((conversation.clone(), message_id))
+}
+
 fn is_bounded_resource_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -243,6 +265,14 @@ impl GatewayBuilder {
     pub fn with_shed(mut self, shed: EdgeShed) -> GatewayBuilder {
         self.shed = shed;
         self
+    }
+
+    /// A handle to the hub the built gateway will broadcast on. Handlers that
+    /// serve their own SSE subscriptions (with per-resource authorization)
+    /// clone this at registration time; the clone shares the built gateway's
+    /// channels.
+    pub fn sse_hub(&self) -> SseHub {
+        self.sse.clone()
     }
 
     pub fn registered_actions(&self) -> impl Iterator<Item = &str> {
@@ -597,6 +627,7 @@ impl Gateway {
                 };
                 let resp = handler.handle(&ctx)?;
                 self.broadcast_repo_lifecycle(&route.action, &params, &scope, &resp);
+                self.broadcast_chat_lifecycle(&route.action, &params, &scope, &resp);
                 Ok(resp)
             }
             RouteKind::Sse {
@@ -899,6 +930,31 @@ impl Gateway {
             "edge",
             &sse_scope_for_tenant(tenant),
             SseEvent::typed(event_type, data),
+        );
+    }
+
+    fn broadcast_chat_lifecycle(
+        &self,
+        action: &str,
+        params: &BTreeMap<String, String>,
+        scope: &TenantScope,
+        resp: &EdgeResponse,
+    ) {
+        let Some((conversation, message_id)) = chat_message_event(action, params, resp) else {
+            return;
+        };
+        let tenant = &scope.tenant().0;
+        let data = json!({
+            "type": "chat.message.posted",
+            "conversation": conversation,
+            "message_id": message_id,
+            "at": now_millis(),
+        })
+        .to_string();
+        self.sse.broadcast(
+            "chat",
+            &sse_scope_for_resource(tenant, "conversation", &conversation),
+            SseEvent::typed("chat.message.posted", data),
         );
     }
 
@@ -1943,6 +1999,42 @@ mod tests {
             repo_lifecycle_event("git.repo.create", &empty, &repeated),
             None
         );
+    }
+
+    #[test]
+    fn chat_message_event_maps_only_a_successful_post_with_a_bounded_conversation_id() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "conversation".to_string(),
+            "01J0CONV000000000000000000".to_string(),
+        );
+        let posted = EdgeResponse::json(
+            201,
+            &json!({ "message_id": "01J0MSG0000000000000000000", "durable": true }),
+        );
+        assert_eq!(
+            chat_message_event("chat.message.post", &params, &posted),
+            Some((
+                "01J0CONV000000000000000000".to_string(),
+                "01J0MSG0000000000000000000".to_string()
+            ))
+        );
+
+        // a failed post never reaches the stream
+        let refused = EdgeResponse::json(404, &json!({ "error": { "message": "not found" } }));
+        assert_eq!(chat_message_event("chat.message.post", &params, &refused), None);
+
+        // other chat actions never broadcast
+        assert_eq!(chat_message_event("chat.messages.list", &params, &posted), None);
+
+        // a conversation id that cannot form a bounded scope is dropped, not broadcast coarse
+        let mut hostile = BTreeMap::new();
+        hostile.insert("conversation".to_string(), "a/b".to_string());
+        assert_eq!(chat_message_event("chat.message.post", &hostile, &posted), None);
+
+        // a response without a message id (shape drift) broadcasts nothing
+        let shapeless = EdgeResponse::json(201, &json!({ "durable": true }));
+        assert_eq!(chat_message_event("chat.message.post", &params, &shapeless), None);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::chat_authz::ChatAuthorization;
 use crate::error::EdgeError;
-use crate::gateway::GatewayBuilder;
+use crate::gateway::{sse_scope_for_resource, GatewayBuilder};
 use crate::request::EdgeResponse;
+use crate::sse::SseHub;
 use crate::Method;
 use myelin_chat::conversation::{Conversation, ConversationError, ConversationKind};
 use myelin_chat::events::{event_actor_pseudonym, pseudonymized_event_principal};
@@ -517,6 +518,34 @@ impl Handler for MessagePostHandler {
     }
 }
 
+/// Live delivery for one conversation. The subscription is authorized with
+/// the SAME visibility gate as message reads (`public_conversation`), so a
+/// viewer who cannot read a conversation cannot observe its activity either.
+/// Frames carry references only (conversation id, message id); subscribers
+/// fetch content through the authorized read path.
+struct ConversationEventsHandler {
+    api: DurableChatReadApi,
+    sse: SseHub,
+}
+
+impl Handler for ConversationEventsHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let conversation_id = conversation_param(ctx)?;
+        self.api
+            .drive(self.api.public_conversation(ctx.principal, conversation_id))?;
+        let scope = sse_scope_for_resource(
+            &ctx.principal.tenant.0,
+            "conversation",
+            conversation_id,
+        );
+        Ok(EdgeResponse::sse(
+            self.sse.subscribe("chat", &scope),
+            ctx.identity.capability().expires_at_unix,
+        ))
+    }
+}
+
 pub fn register_chat(
     builder: GatewayBuilder,
     pool: PgPool,
@@ -527,6 +556,7 @@ pub fn register_chat(
 ) -> GatewayBuilder {
     let reads = DurableChatReadApi::new(pool, region, runtime, kms, identity);
     let api = DurableChatMutationApi::new(reads.clone());
+    let sse = builder.sse_hub();
     builder
         .route(
             Method::Get,
@@ -544,13 +574,19 @@ pub fn register_chat(
             Method::Get,
             "/v1/chat/conversations/{conversation}/messages",
             "chat.messages.list",
-            Arc::new(MessageListHandler { api: reads }),
+            Arc::new(MessageListHandler { api: reads.clone() }),
         )
         .route(
             Method::Post,
             "/v1/chat/conversations/{conversation}/messages",
             "chat.message.post",
             Arc::new(MessagePostHandler { api }),
+        )
+        .route(
+            Method::Get,
+            "/v1/chat/conversations/{conversation}/events",
+            "chat.conversation.events.subscribe",
+            Arc::new(ConversationEventsHandler { api: reads, sse }),
         )
 }
 
