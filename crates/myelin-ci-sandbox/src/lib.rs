@@ -12,7 +12,7 @@ pub mod gvisor;
 /// (euid 0 - e.g. this crate's own lib tests running inside myelin's CI
 /// sandbox). Callers skip LOUDLY; MYELIN_REQUIRE_USERNS_TESTS=1 turns the
 /// skip into a hard failure on hosts that must prove the semantics.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) fn fake_root_test_environment_skip(context: &str) -> bool {
     if unsafe { libc::geteuid() } != 0 {
         return false;
