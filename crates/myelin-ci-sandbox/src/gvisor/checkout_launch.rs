@@ -1288,6 +1288,9 @@ mod tests {
 
         #[test]
         fn run_cycle_selects_the_gvisor_arm_on_workspace_shape_before_reserve_or_spawn() {
+        if crate::fake_root_test_environment_skip("real userns lease semantics") {
+            return;
+        }
             let root = unique_root("selector");
             let (backend, image) = deterministic_enabled_backend_for_tests(&root);
             let sink: Arc<dyn SandboxOutputSink> = Arc::new(RecordingOutput::default());

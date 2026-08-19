@@ -1217,6 +1217,9 @@ mod tests {
 
     #[test]
     fn try_new_with_builders_maps_a_workspace_failure_after_userns_succeeds() {
+        if crate::fake_root_test_environment_skip("real userns lease semantics") {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "myelin-gvisor-builders-workspace-fails-{}-{}",
             std::process::id(),
@@ -1267,6 +1270,9 @@ mod tests {
 
     #[test]
     fn try_new_with_builders_produces_enabled_holding_both_managers_when_both_succeed() {
+        if crate::fake_root_test_environment_skip("real userns lease semantics") {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "myelin-gvisor-builders-both-succeed-{}-{}",
             std::process::id(),
@@ -1309,6 +1315,9 @@ mod tests {
 
     #[test]
     fn local_development_selects_directory_storage_and_the_developer_identity_together() {
+        if crate::fake_root_test_environment_skip("real userns lease semantics") {
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "myelin-gvisor-local-development-{}-{}",
             std::process::id(),

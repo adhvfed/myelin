@@ -7,6 +7,23 @@ pub mod escape_corpus;
 pub mod events;
 pub mod firecracker;
 pub mod gvisor;
+
+/// True when this test environment cannot express distinct-uid semantics
+/// (euid 0 - e.g. this crate's own lib tests running inside myelin's CI
+/// sandbox). Callers skip LOUDLY; MYELIN_REQUIRE_USERNS_TESTS=1 turns the
+/// skip into a hard failure on hosts that must prove the semantics.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn fake_root_test_environment_skip(context: &str) -> bool {
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    if std::env::var_os("MYELIN_REQUIRE_USERNS_TESTS").is_some() {
+        panic!("MYELIN_REQUIRE_USERNS_TESTS=1 but this environment reports euid=0 ({context})");
+    }
+    eprintln!("SKIP (loud, NOT a silent pass): euid=0 cannot express {context}");
+    true
+}
+
 pub mod hardening;
 mod launch_gate;
 pub mod notif_rules;
