@@ -4,6 +4,32 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-19 — self-CI catches its first real regression
+
+The dogfood loop closed: myelin's own sandboxed CI **built and
+clippy-checked myelin clean**, and its lib-test job failed on a real
+regression main was carrying — the ci.pipeline@7 cutover added the
+ci_0028 fence-row migration without updating four migration-registry
+pin tests, and the filtered test runs used to validate that landing
+never re-ran them. Fixed, and re-pushed for self-verification.
+
+Getting there surfaced and fixed two more platform truths:
+
+- **the linux-build-v1 limits were fiction for a real Rust workspace**
+  (30-minute timeout, 8 GiB disk). linux-build-v1:2 grants 16 GiB
+  memory / 32 GiB disk / 2 hours, and the dev runner now claims the
+  build profile (`MYELIN_CI_RUNNER_EXECUTION_PROFILES`).
+- **the vendored-cargo boundary admits exactly three recipes** (build /
+  test --lib / clippy). myelin's pipeline now uses those; integration
+  tests and the myelin-lints architecture gate need the recipe set
+  extended (named follow-on).
+
+Open bug from the same session: a workflow whose job-dispatch activity
+retries forever (unlaunchable job) never honored its own wait deadline
+— five due wf_timers sat unfired for 12+ hours while sibling workflows
+completed normally. The stuck run was terminated manually; the
+timer-vs-retry starvation needs a real look.
+
 ## 2026-08-18 — dogfood: myelin's own CI builds myelin
 
 The self-host tenant `myelin` was bootstrapped on the dev stack, the
