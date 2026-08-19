@@ -1,111 +1,17 @@
-import { randomUUID } from "node:crypto";
-
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import type { SystemTestClient } from "../src/client.js";
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
-import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.js";
+import { ExternalEventBus } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
-import { array, record, string, type JsonRecord } from "../src/json.js";
+import {
+  findInboxItem,
+  mentionSignalEnvelope,
+  pullRequestSubject,
+  readInboxPage,
+} from "../src/journeys/inbox.js";
+import { string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
-
-interface SignalOptions {
-  eventId?: string;
-  actor: string;
-  recipient: string;
-  dedupKey: string;
-  subject: string;
-}
-
-function signalEnvelope(options: SignalOptions): ExternalEventEnvelope {
-  const eventId = options.eventId ?? randomUUID();
-  const now = new Date().toISOString();
-  const principal = (principalId: string) => ({
-    tenant: systemTestConfig.tenant,
-    region: systemTestConfig.region,
-    principal_id: principalId,
-    kind: "Human",
-    data_role: "Controller",
-    status: "Active",
-  });
-  return {
-    event_id: eventId,
-    type_: "signal.opened",
-    schema_ver: 1,
-    tenant: systemTestConfig.tenant,
-    region: systemTestConfig.region,
-    actor: principal(options.actor),
-    subject: `sig.${systemTestConfig.tenant}.warning.system_test`,
-    aggregate: `signal:${options.dedupKey}`,
-    causation_id: null,
-    correlation_id: eventId,
-    caused_by: null,
-    depth: 0,
-    contains_personal_data: false,
-    data_role: "Controller",
-    visibility: "Internal",
-    pii_key_ref: null,
-    occurred_at: now,
-    recorded_at: now,
-    payload: {
-      rule_id: "system_test",
-      tenant: systemTestConfig.tenant,
-      severity: "Warning",
-      dedup_key: options.dedupKey,
-      subject: options.subject,
-      count: 1,
-      state: "Open",
-      first_seen: now,
-      last_seen: now,
-      mentions: [{ Mention: principal(options.recipient) }],
-    },
-  };
-}
-
-function pullRequestSubject(repository: string, number: number): string {
-  if (!Number.isSafeInteger(number) || number < 1) {
-    throw new Error("a notification journey needs a canonical positive pull-request number");
-  }
-  return `myelin://${systemTestConfig.tenant}/git/pr/${repository}:${number}`;
-}
-
-async function findInboxItem(
-  client: SystemTestClient,
-  subject: string,
-): Promise<JsonRecord | undefined> {
-  let cursor: string | null = null;
-  const seenCursors = new Set<string>();
-  for (let page = 0; page < 100; page += 1) {
-    const current = await readInboxPage(client, cursor, 100);
-    const found = current.items.find((item) => item.subject === subject);
-    if (found !== undefined || current.nextCursor === null) return found;
-    if (seenCursors.has(current.nextCursor)) {
-      throw new Error("notification inbox repeated an opaque cursor");
-    }
-    seenCursors.add(current.nextCursor);
-    cursor = current.nextCursor;
-  }
-  throw new Error("notification inbox exceeded the bounded search");
-}
-
-async function readInboxPage(
-  client: SystemTestClient,
-  cursor: string | null,
-  limit: number,
-): Promise<{ items: JsonRecord[]; nextCursor: string | null }> {
-  const search = new URLSearchParams({ view: "all", limit: String(limit) });
-  if (cursor !== null) search.set("cursor", cursor);
-  const response = await client.json(`/v1/notif/inbox?${search.toString()}`);
-  const page = record(response.body.page, "notification page envelope");
-  return {
-    items: array(response.body.items, "notification inbox items")
-      .map((item) => record(item, "notification inbox item")),
-    nextCursor: page.next_cursor === null
-      ? null
-      : string(page.next_cursor, "notification page cursor"),
-  };
-}
 
 describe.sequential("notification delivery lifecycle", () => {
   const slug = uniqueName("system-notif");
@@ -124,7 +30,7 @@ describe.sequential("notification delivery lifecycle", () => {
   test("routes, de-duplicates, collapses, scopes, and marks a durable mention read", async () => {
     const dedupKey = uniqueName("mention");
     const subject = pullRequestSubject(slug, 1);
-    const envelope = signalEnvelope({
+    const envelope = mentionSignalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
       dedupKey,
@@ -150,7 +56,7 @@ describe.sequential("notification delivery lifecycle", () => {
     });
     expect(await findInboxItem(reviewerClient, subject)).toBeUndefined();
 
-    await bus.publish(signalEnvelope({
+    await bus.publish(mentionSignalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
       dedupKey,
@@ -202,9 +108,32 @@ describe.sequential("notification delivery lifecycle", () => {
     expect(marked.state).toBe("read");
   });
 
+  test("retires every derived inbox item when its signal resolves", async () => {
+    const dedupKey = uniqueName("resolvable");
+    const subject = pullRequestSubject(slug, 6);
+    const mention = {
+      actor: systemTestConfig.reviewerPrincipal,
+      recipient: systemTestConfig.principal,
+      dedupKey,
+      subject,
+    };
+    await bus.publish(mentionSignalEnvelope(mention));
+    await eventually(
+      () => findInboxItem(systemClient, subject),
+      { description: "the resolvable mention to reach the durable inbox" },
+    );
+
+    await bus.publish(mentionSignalEnvelope({ ...mention, state: "Resolved" }));
+    const retired = await eventually(async () => {
+      const item = await findInboxItem(systemClient, subject);
+      return item?.state === "done" ? item : undefined;
+    }, { description: "the resolved signal to retire its inbox item" });
+    expect(retired.state).toBe("done");
+  });
+
   test("suppresses self-notifications before processing a later delivery", async () => {
     const selfSubject = pullRequestSubject(slug, 2);
-    await bus.publish(signalEnvelope({
+    await bus.publish(mentionSignalEnvelope({
       actor: systemTestConfig.principal,
       recipient: systemTestConfig.principal,
       dedupKey: uniqueName("self"),
@@ -212,7 +141,7 @@ describe.sequential("notification delivery lifecycle", () => {
     }));
 
     const markerSubject = pullRequestSubject(slug, 3);
-    await bus.publish(signalEnvelope({
+    await bus.publish(mentionSignalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
       dedupKey: uniqueName("marker"),
@@ -228,7 +157,7 @@ describe.sequential("notification delivery lifecycle", () => {
   test("walks the whole inbox without losing or repeating a notification", async () => {
     const subjects = [4, 5].map((number) => pullRequestSubject(slug, number));
     for (const [index, subject] of subjects.entries()) {
-      await bus.publish(signalEnvelope({
+      await bus.publish(mentionSignalEnvelope({
         actor: systemTestConfig.reviewerPrincipal,
         recipient: systemTestConfig.principal,
         dedupKey: uniqueName(`page-${index + 1}`),

@@ -4,6 +4,61 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-19 — the system-test suite grows a spine (journeys, splits, scale)
+
+The suite is the product's constitution, and it had two problems: whole
+flows were re-derived inline per file (the collaboration file carried 12
+unrelated journeys across 1,903 lines; the CLI file was one 2,616-line
+test), and whole surfaces had no dedicated coverage at all.
+
+**Elegance:**
+- `src/journeys/` is the new flow vocabulary: `projects` (create/find),
+  `issues` (propose + authorization walk), `chat` (Conversation
+  open/post/messages/events), `refs` (await link/backlink/removal),
+  `inbox` (mention envelopes, paged reads, seed/retire at scale), plus
+  `src/paging.ts` (`walkPaged`/`findPaged` with repeated-cursor and
+  unbounded-walk guards baked in).
+- `collaboration-lifecycle` was split along pillar lines into
+  `issues-lifecycle`, `chat-lifecycle`, `knowledge-lifecycle`,
+  `pull-request-lifecycle`, keeping the three agent/CI governance
+  journeys under the original name. All 12 tests pass unchanged in
+  their new homes.
+- `cli-authentication`'s single test is now 16 staged journeys in one
+  `describe.sequential` with hoisted state - same narrative, same
+  assertions, but each stage reports and fails on its own. All 16 pass
+  live.
+
+**New coverage:**
+- `notification-scale`: seeds 250 delivered mentions into the
+  reviewer's inbox, then pins the two guarantees the O(debris) incident
+  violated - a fresh mention surfaces on the FIRST page within 15s
+  (measured: 1.7s), and one 100-row page stays under 5s (measured:
+  2.3s). The seed retires itself through the product path (Resolved
+  signals -> `done`) so it never becomes the debris it guards against.
+- `notification-lifecycle` gained the resolve->done retirement pin and
+  was rewired onto the journeys.
+- `refs-lifecycle`: a 12-edge backlink fan-out walked page by page with
+  no loss or repetition, the outbound-links walk, and the
+  target-visibility gate (probing a private artifact's reference
+  surface 404s in both directions - indistinguishable from a reference
+  never minted).
+
+**What writing the scale test taught (all fail-closed, all now
+documented in the journey helpers):**
+- Inbox reads authorize EVERY row against its subject and silently drop
+  unreadable ones - a mention about an artifact you cannot read does
+  not exist for you. Correct privacy; also the per-row ~20ms cost that
+  makes reads O(rows). The batch-authz follow-on stands.
+- Ranking is by reason only (`approval_requested`=90 > `mentioned`=70 >
+  `watched`=35); state never demotes a row. So a stale DONE approval
+  card outranks a fresh unread mention forever - that is the concrete
+  mechanism behind the incident's "fresh behind stale" symptom. The
+  fresh-first fix is: rank state, not just reason.
+- The product has no inbox retention: rows live forever and every read
+  pays for them. The scale test contains its own growth (dedicated
+  recipient, SQL-filtered views elsewhere), but retention is now a
+  named product need, not a nice-to-have.
+
 ## 2026-08-19 — the quarantine table means something again (intake scope)
 
 Chasing the 15k+ `no_registered_consumer` rows led to a design flaw, not
