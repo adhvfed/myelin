@@ -765,6 +765,18 @@ mod tests {
 
     #[test]
     fn foreign_owned_asset_entry_refuses_metadata_verification() {
+        // a fake-root environment (euid 0, e.g. inside myelin's own CI
+        // sandbox) reports uid 0 for every file, and root ownership is a
+        // deliberate allowance - the refusal under test cannot fire there.
+        if unsafe { libc::geteuid() } == 0 {
+            if std::env::var_os("MYELIN_REQUIRE_USERNS_TESTS").is_some() {
+                panic!("MYELIN_REQUIRE_USERNS_TESTS=1 but this environment reports euid=0");
+            }
+            eprintln!(
+                "SKIP (loud, NOT a silent pass): euid=0 cannot express foreign ownership"
+            );
+            return;
+        }
         let fixture = Fixture::new("foreign-owner", b"owner-owned content");
         let path = fixture.dir.join("payload");
         let metadata = fs::symlink_metadata(&path).unwrap();
@@ -1129,6 +1141,18 @@ mod tests {
 
     #[test]
     fn cargo_vendor_writable_or_foreign_owned_entry_is_refused_by_shared_tree_walk() {
+        // a fake-root environment (euid 0, e.g. inside myelin's own CI
+        // sandbox) reports uid 0 for every file, and root ownership is a
+        // deliberate allowance - the refusal under test cannot fire there.
+        if unsafe { libc::geteuid() } == 0 {
+            if std::env::var_os("MYELIN_REQUIRE_USERNS_TESTS").is_some() {
+                panic!("MYELIN_REQUIRE_USERNS_TESTS=1 but this environment reports euid=0");
+            }
+            eprintln!(
+                "SKIP (loud, NOT a silent pass): euid=0 cannot express foreign ownership"
+            );
+            return;
+        }
         let (writable_root, writable_reference, lock_sha256) = cargo_vendor_fixture("writable");
         let writable_path = writable_root.join("vendor/itoa-1.0.15/lib.rs");
         fs::set_permissions(&writable_path, fs::Permissions::from_mode(0o664)).unwrap();

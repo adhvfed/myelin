@@ -2279,6 +2279,28 @@ impl UserNamespaceAllocator {
 
 #[cfg(test)]
 mod tests {
+    // these tests exercise real uid/lease semantics; a fake-root environment
+    // (euid 0, e.g. this crate's own tests running inside myelin's CI sandbox)
+    // cannot express them - the allocator itself refuses a privileged runner.
+    // the skip is loud, and MYELIN_REQUIRE_USERNS_TESTS=1 turns it into a
+    // hard failure on hosts that must prove the semantics.
+    macro_rules! require_unprivileged_euid {
+        () => {
+            if unsafe { libc::geteuid() } == 0 {
+                if std::env::var_os("MYELIN_REQUIRE_USERNS_TESTS").is_some() {
+                    panic!(
+                        "MYELIN_REQUIRE_USERNS_TESTS=1 but this environment reports euid=0"
+                    );
+                }
+                eprintln!(
+                    "SKIP (loud, NOT a silent pass): euid=0 (fake-root) cannot express \
+                     distinct-uid lease semantics; run on an unprivileged host to prove them"
+                );
+                return;
+            }
+        };
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
@@ -2358,6 +2380,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_rejects_a_missing_entry() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-missing-entry");
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
@@ -2372,6 +2395,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_rejects_a_zero_count() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-zero-count");
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
@@ -2387,6 +2411,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_rejects_ambiguous_duplicate_entries() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-ambiguous");
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
@@ -2402,6 +2427,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_rejects_an_overlap_with_another_owners_range() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-overlap");
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
@@ -2421,6 +2447,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_accepts_a_non_overlapping_other_owner_entry() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-no-overlap");
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
@@ -2443,6 +2470,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_rejects_overflowing_ranges() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-overflow");
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
@@ -2458,6 +2486,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_accepts_a_username_match() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-username-match");
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
@@ -2475,6 +2504,7 @@ mod tests {
 
     #[test]
     fn subordinate_range_parsing_rejects_a_symlinked_file() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-symlink-refused");
         std::fs::create_dir_all(&base).unwrap();
         let real = base.join("real-subuid");
@@ -2492,6 +2522,7 @@ mod tests {
 
     #[test]
     fn pool_size_is_the_minimum_of_the_two_ranges() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("pool-size-min", 5, 3);
         assert_eq!(allocator.pool_size(), 3);
         let _ = std::fs::remove_dir_all(&base);
@@ -2499,6 +2530,7 @@ mod tests {
 
     #[test]
     fn two_concurrent_leases_get_distinct_uid_gid_pairs() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("distinct-pairs", 5, 5);
         let lease_a = allocator.lease().unwrap();
         let lease_b = allocator.lease().unwrap();
@@ -2511,6 +2543,7 @@ mod tests {
 
     #[test]
     fn concurrent_lease_calls_never_poison_the_allocator() {
+        require_unprivileged_euid!();
         const THREADS: u32 = 8;
         let (allocator, base, _log) = new_allocator_for_test("real-concurrency", THREADS, THREADS);
         let allocator = Arc::new(allocator);
@@ -2550,6 +2583,7 @@ mod tests {
 
     #[test]
     fn lease_config_reports_the_exact_two_entry_mapping_shape() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("config-shape", 5, 5);
         let lease = allocator.lease().unwrap();
         let config = lease.config();
@@ -2563,6 +2597,7 @@ mod tests {
 
     #[test]
     fn pool_exhaustion_is_a_typed_refusal_not_poisoning() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("pool-exhaustion", 2, 2);
         let lease_a = allocator.lease().unwrap();
         let lease_b = allocator.lease().unwrap();
@@ -2582,6 +2617,7 @@ mod tests {
 
     #[test]
     fn releasing_a_lease_frees_its_slot_for_reuse() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-frees-slot", 1, 1);
         let lease = allocator.lease().unwrap();
         let freed_uid = lease.host_uid();
@@ -2594,6 +2630,7 @@ mod tests {
 
     #[test]
     fn from_runtime_evidence_mints_a_matching_proof_and_releases() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("from-runtime-evidence-ok", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -2617,6 +2654,7 @@ mod tests {
 
     #[test]
     fn from_runtime_evidence_refuses_rootless_evidence() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) =
             new_allocator_for_test("from-runtime-evidence-rootless", 1, 1);
         let lease = allocator.lease().unwrap();
@@ -2635,6 +2673,7 @@ mod tests {
 
     #[test]
     fn bind_then_release_succeeds_with_a_matching_proof() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("bind-then-release", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -2655,6 +2694,7 @@ mod tests {
 
     #[test]
     fn bind_refuses_a_lease_that_is_already_bound() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("bind-twice", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -2671,6 +2711,7 @@ mod tests {
 
     #[test]
     fn bind_refuses_an_oversized_container_id_without_rewriting_the_marker() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("bind-oversized-id", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let marker_path = base.join("leases").join(marker_file_name(0));
@@ -2696,6 +2737,7 @@ mod tests {
 
     #[test]
     fn bind_refuses_a_container_id_with_an_unsafe_character() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("bind-unsafe-char", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let result = lease.bind("has a space".to_string(), (1, 1), (1, 1));
@@ -2707,6 +2749,7 @@ mod tests {
 
     #[test]
     fn release_refuses_a_proof_whose_bound_identity_disagrees_with_the_durable_marker() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-wrong-identity", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -2733,6 +2776,7 @@ mod tests {
 
     #[test]
     fn release_refuses_a_lease_that_was_never_bound() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-never-bound", 1, 1);
         let lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -2756,6 +2800,7 @@ mod tests {
 
     #[test]
     fn release_unused_succeeds_for_a_never_bound_lease_and_frees_its_slot() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-unused-ok", 1, 1);
         let lease = allocator.lease().unwrap();
         let freed_uid = lease.host_uid();
@@ -2774,6 +2819,7 @@ mod tests {
 
     #[test]
     fn release_unused_refuses_a_lease_that_was_already_bound() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-unused-wrong-path", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -2791,6 +2837,7 @@ mod tests {
 
     #[test]
     fn release_surfaces_an_internal_invariant_violation_when_active_slots_lost_the_entry() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-invariant-violation", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -2821,6 +2868,7 @@ mod tests {
 
     #[test]
     fn release_unused_surfaces_an_internal_invariant_violation_when_active_slots_lost_the_entry() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) =
             new_allocator_for_test("release-unused-invariant-violation", 1, 1);
         let lease = allocator.lease().unwrap();
@@ -2839,6 +2887,7 @@ mod tests {
 
     #[test]
     fn insert_active_slot_checked_detects_a_bookkeeping_invariant_violation() {
+        require_unprivileged_euid!();
         let mut active_slots = BTreeSet::new();
         active_slots.insert(3);
         let result = insert_active_slot_checked(&mut active_slots, 3);
@@ -2847,6 +2896,7 @@ mod tests {
 
     #[test]
     fn insert_active_slot_checked_succeeds_for_a_fresh_slot() {
+        require_unprivileged_euid!();
         let mut active_slots = BTreeSet::new();
         assert!(insert_active_slot_checked(&mut active_slots, 3).is_ok());
         assert!(active_slots.contains(&3));
@@ -2854,6 +2904,7 @@ mod tests {
 
     #[test]
     fn a_proof_minted_for_one_lease_cannot_release_another() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("proof-cannot-cross-leases", 2, 2);
         let lease_a = allocator.lease().unwrap();
         let lease_b = allocator.lease().unwrap();
@@ -2883,6 +2934,7 @@ mod tests {
 
     #[test]
     fn abandoning_a_lease_quarantines_only_that_slot_and_reports_an_incident() {
+        require_unprivileged_euid!();
         let (allocator, base, log) = new_allocator_for_test("abandon-quarantines-one", 2, 2);
         let lease_a = allocator.lease().unwrap();
         let slot_a_uid = lease_a.host_uid();
@@ -2911,6 +2963,7 @@ mod tests {
 
     #[test]
     fn a_second_allocator_over_the_same_leases_dir_refuses_the_lock() {
+        require_unprivileged_euid!();
         let base = test_base("second-allocator-refused");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -2939,6 +2992,7 @@ mod tests {
 
     #[test]
     fn dropping_the_allocator_while_a_lease_is_outstanding_keeps_the_lock_held() {
+        require_unprivileged_euid!();
         let base = test_base("lock-outlives-allocator-via-lease");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -2976,6 +3030,7 @@ mod tests {
 
     #[test]
     fn a_genuinely_random_abandoned_lease_survives_reopening_and_is_quarantined() {
+        require_unprivileged_euid!();
         let base = test_base("real-random-marker-survives-reboot");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3024,6 +3079,7 @@ mod tests {
 
     #[test]
     fn a_bound_lease_survives_reopening_and_is_quarantined() {
+        require_unprivileged_euid!();
         let base = test_base("bound-marker-survives-reboot");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3075,6 +3131,7 @@ mod tests {
 
     #[test]
     fn a_legacy_schema_v1_bound_marker_survives_reopening_and_is_quarantined() {
+        require_unprivileged_euid!();
         let base = test_base("legacy-v1-marker-survives-reboot");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3141,6 +3198,7 @@ mod tests {
 
     #[test]
     fn a_stray_bind_tmp_file_survives_reopening_and_only_quarantines_its_own_slot() {
+        require_unprivileged_euid!();
         let base = test_base("stray-bind-tmp-survives-reboot");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3207,6 +3265,7 @@ mod tests {
 
     #[test]
     fn a_stray_bind_tmp_file_without_its_primary_marker_refuses_construction() {
+        require_unprivileged_euid!();
         let base = test_base("stray-bind-tmp-without-primary");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3260,6 +3319,7 @@ mod tests {
 
     #[test]
     fn boot_reconciliation_poisons_construction_on_an_unrecognized_entry() {
+        require_unprivileged_euid!();
         let base = test_base("boot-poisons-on-unrecognized-entry");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3282,6 +3342,7 @@ mod tests {
 
     #[test]
     fn boot_reconciliation_poisons_construction_on_an_unknown_schema_version() {
+        require_unprivileged_euid!();
         let base = test_base("boot-poisons-on-unknown-schema");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3308,6 +3369,7 @@ mod tests {
 
     #[test]
     fn boot_reconciliation_poisons_construction_when_a_marker_names_an_out_of_range_slot() {
+        require_unprivileged_euid!();
         let base = test_base("boot-poisons-out-of-range-slot");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3343,6 +3405,7 @@ mod tests {
 
     #[test]
     fn boot_reconciliation_poisons_construction_on_a_range_start_mismatch() {
+        require_unprivileged_euid!();
         let base = test_base("boot-poisons-range-start-mismatch");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3378,6 +3441,7 @@ mod tests {
 
     #[test]
     fn boot_reconciliation_poisons_construction_on_a_symlinked_marker_entry() {
+        require_unprivileged_euid!();
         let base = test_base("boot-poisons-symlinked-marker");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3402,6 +3466,7 @@ mod tests {
 
     #[test]
     fn leases_dir_as_a_symlink_is_refused() {
+        require_unprivileged_euid!();
         let base = test_base("leases-dir-symlink-refused");
         std::fs::create_dir_all(&base).unwrap();
         let real = base.join("real-leases");
@@ -3424,6 +3489,7 @@ mod tests {
 
     #[test]
     fn a_panicking_incident_sink_never_escapes_an_abandoned_lease() {
+        require_unprivileged_euid!();
         let base = test_base("panicking-sink-abandon");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3443,6 +3509,7 @@ mod tests {
 
     #[test]
     fn check_identity_succeeds_while_the_leases_dir_is_unchanged() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("check-identity-happy-path", 5, 5);
         assert!(allocator.check_identity().is_ok());
         assert!(allocator.is_healthy());
@@ -3451,6 +3518,7 @@ mod tests {
 
     #[test]
     fn check_identity_detects_a_replaced_leases_dir_and_poisons_the_allocator() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("check-identity-replaced", 5, 5);
         let leases_dir = base.join("leases");
         std::fs::remove_dir_all(&leases_dir).unwrap();
@@ -3463,6 +3531,7 @@ mod tests {
 
     #[test]
     fn strict_construction_refuses_a_leases_dir_whose_parent_is_writable_by_us() {
+        require_unprivileged_euid!();
         let base = test_base("strict-refuses-writable-parent");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3477,6 +3546,7 @@ mod tests {
 
     #[test]
     fn verify_leases_dir_leaf_strict_refuses_an_owner_non_writable_directory() {
+        require_unprivileged_euid!();
         let base = test_base("leases-dir-0500");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3498,6 +3568,7 @@ mod tests {
 
     #[test]
     fn ancestor_owned_by_us_is_refused_even_when_its_current_mode_denies_write() {
+        require_unprivileged_euid!();
         let base = test_base("ancestor-owned-read-only");
         std::fs::create_dir_all(&base).unwrap();
         let mut perms = std::fs::metadata(&base).unwrap().permissions();
@@ -3568,6 +3639,7 @@ mod tests {
 
     #[test]
     fn try_new_refuses_a_pool_smaller_than_the_callers_stated_minimum() {
+        require_unprivileged_euid!();
         let base = test_base("pool-too-small");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3593,6 +3665,7 @@ mod tests {
 
     #[test]
     fn try_new_refuses_a_subordinate_uid_range_containing_the_runners_own_euid() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-contains-runner-euid");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3614,6 +3687,7 @@ mod tests {
 
     #[test]
     fn try_new_refuses_a_subordinate_range_containing_uid_zero() {
+        require_unprivileged_euid!();
         let base = test_base("subrange-contains-zero");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -3633,6 +3707,7 @@ mod tests {
 
     #[test]
     fn lease_poisons_on_an_untracked_marker_it_never_issued_or_quarantined() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("untracked-marker-poisons", 5, 5);
         let leases_dir = base.join("leases");
         let marker = LeaseMarkerV2 {
@@ -3657,6 +3732,7 @@ mod tests {
 
     #[test]
     fn lease_never_recreates_a_slot_whose_marker_was_externally_deleted_while_still_active() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("active-marker-deleted", 1, 1);
         let leases_dir = base.join("leases");
         let lease = allocator.lease().unwrap();
@@ -3674,6 +3750,7 @@ mod tests {
 
     #[test]
     fn lease_never_reissues_a_quarantined_slot_even_after_its_marker_is_externally_deleted() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("quarantined-marker-deleted", 1, 1);
         let leases_dir = base.join("leases");
         let lease = allocator.lease().unwrap();
@@ -3694,6 +3771,7 @@ mod tests {
 
     #[test]
     fn release_detects_an_externally_deleted_marker_as_tampering_and_poisons() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-detects-deletion", 1, 1);
         let leases_dir = base.join("leases");
         let lease = allocator.lease().unwrap();
@@ -3715,6 +3793,7 @@ mod tests {
 
     #[test]
     fn bind_preparation_succeeds_from_allocated_and_transitions_to_preparation_bound() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("prep-bind-ok", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -3728,6 +3807,7 @@ mod tests {
 
     #[test]
     fn bind_preparation_refuses_a_lease_that_is_already_preparation_bound() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("prep-bind-twice", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -3745,6 +3825,7 @@ mod tests {
 
     #[test]
     fn bind_preparation_refuses_an_oversized_container_id_without_rewriting_the_marker() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("prep-bind-oversized-id", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let marker_path = base.join("leases").join(marker_file_name(0));
@@ -3769,6 +3850,7 @@ mod tests {
 
     #[test]
     fn bind_preparation_poisons_on_an_ambiguous_rewrite_failure() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("prep-bind-rewrite-fails", 1, 1);
         let leases_dir = base.join("leases");
         let mut lease = allocator.lease().unwrap();
@@ -3788,6 +3870,7 @@ mod tests {
 
     #[test]
     fn confirm_prepared_poisons_on_an_ambiguous_rewrite_failure() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) =
             new_allocator_for_test("confirm-prepared-rewrite-fails", 1, 1);
         let leases_dir = base.join("leases");
@@ -3817,6 +3900,7 @@ mod tests {
 
     #[test]
     fn bind_workload_poisons_on_an_ambiguous_rewrite_failure() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("bind-workload-rewrite-fails", 1, 1);
         let leases_dir = base.join("leases");
         let mut lease = allocator.lease().unwrap();
@@ -3848,6 +3932,7 @@ mod tests {
 
     #[test]
     fn release_prepared_poisons_on_an_ambiguous_unlink_failure() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-prepared-unlink-fails", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -3875,6 +3960,7 @@ mod tests {
 
     #[test]
     fn confirm_prepared_succeeds_and_transitions_to_prepared() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("confirm-prepared-ok", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -3906,6 +3992,7 @@ mod tests {
 
     #[test]
     fn confirm_prepared_refuses_a_proof_whose_identity_disagrees_with_the_marker() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("confirm-prepared-wrong-id", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -3944,6 +4031,7 @@ mod tests {
 
     #[test]
     fn confirm_prepared_refuses_a_proof_with_the_wrong_nonce() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("confirm-prepared-wrong-nonce", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -3967,6 +4055,7 @@ mod tests {
 
     #[test]
     fn release_prepared_succeeds_after_confirm_prepared_and_frees_the_slot() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-prepared-ok", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -3997,6 +4086,7 @@ mod tests {
 
     #[test]
     fn release_prepared_refuses_a_lease_still_only_preparation_bound() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-prepared-too-early", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -4014,6 +4104,7 @@ mod tests {
 
     #[test]
     fn release_prepared_refuses_a_lease_already_bound_to_workload() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("release-prepared-too-late", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -4043,6 +4134,7 @@ mod tests {
 
     #[test]
     fn bind_workload_refuses_a_lease_still_only_preparation_bound() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("bind-workload-too-early", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -4060,6 +4152,7 @@ mod tests {
 
     #[test]
     fn bind_workload_refuses_a_lease_that_was_never_prepared() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("bind-workload-never-prepared", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let result = lease.bind_workload("workload-container".to_string(), (1, 1), (2, 2));
@@ -4070,6 +4163,7 @@ mod tests {
 
     #[test]
     fn a_preparation_bound_lease_survives_reopening_and_is_quarantined() {
+        require_unprivileged_euid!();
         let base = test_base("prep-bound-marker-survives-reboot");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -4122,6 +4216,7 @@ mod tests {
 
     #[test]
     fn a_prepared_lease_survives_reopening_and_is_quarantined() {
+        require_unprivileged_euid!();
         let base = test_base("prepared-marker-survives-reboot");
         std::fs::create_dir_all(&base).unwrap();
         let leases_dir = base.join("leases");
@@ -4182,6 +4277,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_happy_path_produces_a_workload_bound_lease() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-happy-path", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -4219,6 +4315,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_confirm_prepared_refuses_a_substituted_lease() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-cross-lease-confirm", 2, 2);
         let mut lease_a = allocator.lease().unwrap();
         let mut lease_b = allocator.lease().unwrap();
@@ -4267,6 +4364,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_bind_workload_refuses_a_substituted_lease() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-cross-lease-workload", 2, 2);
         let mut lease_a = allocator.lease().unwrap();
         let mut lease_b = allocator.lease().unwrap();
@@ -4319,6 +4417,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_bind_workload_survives_a_retryable_refusal() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-workload-retry", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -4361,6 +4460,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_release_prepared_path() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-release-prepared", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -4388,6 +4488,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_refuses_a_second_preparation_bind() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-bind-prep-twice", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let mut session = CheckoutPreparationSession::new();
@@ -4416,6 +4517,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_refuses_confirmation_before_binding() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-confirm-too-early", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
@@ -4439,6 +4541,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_refuses_workload_before_preparation() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-workload-too-early", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let mut session = CheckoutPreparationSession::new();
@@ -4452,6 +4555,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_marks_unreleasable_on_a_poisoning_bind_preparation_failure() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) = new_allocator_for_test("session-marks-unreleasable", 1, 1);
         let mut lease = allocator.lease().unwrap();
         lease
@@ -4467,6 +4571,7 @@ mod tests {
 
     #[test]
     fn checkout_preparation_session_confirm_prepared_wrong_proof_is_a_terminal_abandonment() {
+        require_unprivileged_euid!();
         let (allocator, base, _log) =
             new_allocator_for_test("session-confirm-wrong-proof-terminal", 1, 1);
         let mut lease = allocator.lease().unwrap();
