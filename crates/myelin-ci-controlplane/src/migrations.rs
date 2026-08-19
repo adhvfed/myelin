@@ -2881,7 +2881,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            78,
+            79,
             "the complete append-only schema includes the current predecessor fence seed"
         );
         fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
