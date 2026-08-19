@@ -24,6 +24,7 @@ pub fn issues_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: issues_critical(),
+        intake_scope: None,
     }
 }
 

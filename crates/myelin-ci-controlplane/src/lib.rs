@@ -425,6 +425,7 @@ pub fn controlplane_app_spec(config: Config, outbox: myelin_events::OutboxStore)
         stores: myelin_substrate::StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: controlplane_critical(),
+        intake_scope: None,
     }
 }
 

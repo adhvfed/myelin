@@ -29,6 +29,7 @@ fn cdc_1_2_lifecycle_public_surface_is_tenant_from_token() {
         stores: StoreManifest::new(),
         outbox: OutboxSpec::new(myelin_events::OutboxStore::new(), InProcessBus::new()),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     };
     let handle = boot(spec).expect("the service boots from serve(AppSpec)");
 

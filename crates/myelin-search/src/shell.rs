@@ -49,6 +49,7 @@ pub fn search_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         stores: search_stores(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: search_critical(),
+        intake_scope: None,
     }
 }
 

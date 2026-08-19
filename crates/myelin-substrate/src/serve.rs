@@ -266,6 +266,14 @@ impl Telemetry {
     }
 }
 
+/// Explicit intake scope for a broker-fed service. A delivery whose subject
+/// falls OUTSIDE the scope is terminated without a quarantine record - it is
+/// addressed to a tenant this instance does not host, which is routine in a
+/// multi-cell world. An IN-scope delivery that no registered consumer accepts
+/// still quarantines loudly: that remains real wiring drift. `None` keeps the
+/// strict behavior: every unmatched delivery quarantines.
+pub type IntakeScope = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub struct AppSpec {
     pub name: &'static str,
     pub config: Config,
@@ -278,6 +286,7 @@ pub struct AppSpec {
     pub stores: StoreManifest,
     pub outbox: OutboxSpec,
     pub critical: CriticalDependencies,
+    pub intake_scope: Option<IntakeScope>,
 }
 
 impl AppSpec {
@@ -298,6 +307,7 @@ impl AppSpec {
             stores: StoreManifest::new(),
             outbox,
             critical: CriticalDependencies::default(),
+            intake_scope: None,
         }
     }
 }
@@ -332,6 +342,7 @@ pub struct ServeHandle {
     ports: PortOpener,
     telemetry: Telemetry,
     draining: Arc<AtomicBool>,
+    intake_scope: Option<IntakeScope>,
 }
 
 type RelayTransport = Box<dyn BusTransport>;
@@ -342,6 +353,16 @@ impl ServeHandle {
     fn settle_retry(&self, token: DeliveryToken, delay_secs: u64) {
         if let Some(transport) = &self.consumer_transport {
             if transport.retry(token, delay_secs.min(300)).is_err() {
+                self.health_probe().mark_down("broker");
+            } else {
+                self.health_probe().mark_up("broker");
+            }
+        }
+    }
+
+    fn terminate_out_of_scope(&self, token: DeliveryToken) {
+        if let Some(transport) = &self.consumer_transport {
+            if transport.terminate(token).is_err() {
                 self.health_probe().mark_down("broker");
             } else {
                 self.health_probe().mark_up("broker");
@@ -528,7 +549,16 @@ impl ServeHandle {
                 .filter_map(|(index, consumer)| consumer.accepts(&env.subject.0).then_some(index))
                 .collect();
             if matching.is_empty() {
-                if let Some(broker_ref) = broker_ref.as_ref() {
+                let out_of_scope = self
+                    .intake_scope
+                    .as_ref()
+                    .is_some_and(|scope| !scope(&env.subject.0));
+                if out_of_scope {
+                    // addressed to a tenant this instance does not host:
+                    // routine, terminated without a quarantine record so the
+                    // quarantine table keeps meaning wiring drift.
+                    self.terminate_out_of_scope(token);
+                } else if let Some(broker_ref) = broker_ref.as_ref() {
                     self.quarantine_then_terminate(
                         token,
                         broker_ref,
@@ -675,6 +705,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         stores,
         outbox,
         critical,
+        intake_scope,
     } = spec;
 
     let pool_config = oltp_config_from(&config)?;
@@ -783,6 +814,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         ports,
         telemetry,
         draining: Arc::new(AtomicBool::new(false)),
+        intake_scope,
     })
 }
 
@@ -1321,6 +1353,7 @@ mod tests {
             stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
+            intake_scope: None,
         };
 
         let handle = boot(spec).expect("boot succeeds");
@@ -1454,6 +1487,60 @@ mod tests {
             DeliveryQuarantineReason::NoRegisteredConsumer
         );
         assert!(handle.metrics_health().readiness().is_ready());
+    }
+
+    #[test]
+    fn out_of_scope_delivery_terminates_without_a_quarantine_record() {
+        let event = event_for_transport();
+        let probe = PullProbe::with_batches([vec![event]]);
+        let quarantine = Arc::new(QuarantineProbe::default());
+        let mut spec = external_consumer_spec_with_quarantine(
+            probe.clone(),
+            vec![consumer_named("other", "myelin://acme/chat/", false)],
+            quarantine.clone(),
+        );
+        spec.intake_scope = Some(Arc::new(|subject: &str| {
+            subject.starts_with("myelin://some-hosted-tenant/")
+        }));
+        let handle = boot(spec).unwrap();
+
+        handle.tick();
+
+        assert!(probe.state().acks.is_empty());
+        assert_eq!(
+            probe.state().terms,
+            vec![token(1)],
+            "an out-of-scope delivery is terminated, not redelivered forever"
+        );
+        assert!(
+            quarantine.records.lock().unwrap().is_empty(),
+            "a delivery addressed to a tenant this instance does not host is routine - it must \
+             never become quarantine noise that buries real wiring drift"
+        );
+        assert!(handle.metrics_health().readiness().is_ready());
+    }
+
+    #[test]
+    fn in_scope_unmatched_delivery_still_quarantines_as_wiring_drift() {
+        let event = event_for_transport();
+        let probe = PullProbe::with_batches([vec![event]]);
+        let quarantine = Arc::new(QuarantineProbe::default());
+        let mut spec = external_consumer_spec_with_quarantine(
+            probe.clone(),
+            vec![consumer_named("other", "myelin://acme/chat/", false)],
+            quarantine.clone(),
+        );
+        spec.intake_scope = Some(Arc::new(|_: &str| true));
+        let handle = boot(spec).unwrap();
+
+        handle.tick();
+
+        assert_eq!(probe.state().terms, vec![token(1)]);
+        assert_eq!(
+            quarantine.records.lock().unwrap()[0].1,
+            DeliveryQuarantineReason::NoRegisteredConsumer,
+            "declaring a scope must not silence the drift alarm inside that scope"
+        );
     }
 
     #[test]
@@ -1795,6 +1882,7 @@ mod tests {
             stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
+            intake_scope: None,
         };
         let handle = boot(spec).expect("boot");
 
@@ -1841,6 +1929,7 @@ mod tests {
             stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
+            intake_scope: None,
         };
         let handle = boot(spec).expect("boot");
 
@@ -1873,6 +1962,7 @@ mod tests {
             stores: StoreManifest::new(),
             outbox: OutboxSpec::default(),
             critical: CriticalDependencies::default(),
+            intake_scope: None,
         };
         match boot(spec) {
             Err(e) => assert!(
@@ -1940,6 +2030,7 @@ mod tests {
             stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
+            intake_scope: None,
         };
         let handle = boot(spec).expect("boot");
 

@@ -254,6 +254,7 @@ fn dispatch_app_spec(
         stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: dispatch_critical(),
+        intake_scope: None,
     }
 }
 

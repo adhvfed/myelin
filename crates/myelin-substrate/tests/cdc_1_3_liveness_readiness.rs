@@ -19,6 +19,7 @@ fn cdc_1_3_lifecycle_metrics_health_is_liveness_ne_readiness() {
         stores: StoreManifest::new(),
         outbox: OutboxSpec::new(myelin_events::OutboxStore::new(), InProcessBus::new()),
         critical: CriticalDependencies::new(["identity"]),
+        intake_scope: None,
     };
 
     let handle = boot(spec).expect("the service boots from serve(AppSpec)");

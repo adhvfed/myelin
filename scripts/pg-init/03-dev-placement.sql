@@ -1,6 +1,10 @@
--- Bind the two Fed-managed development tenants to this local cell. This runs
--- after the edge has applied the placement schema and is safe to repeat when
--- a Fed data volume survives a restart.
+-- Bind the Fed-managed development tenants AND the self-host dogfood tenant
+-- to this local cell. This runs after the edge has applied the placement
+-- schema and is safe to repeat when a Fed data volume survives a restart.
+-- The self-host tenant must be placed like any other: an unplaced tenant's
+-- events are out of scope for every cell-bound consumer (agent triggers,
+-- most visibly), which is how the myelin dogfood tenant's CI events ended up
+-- as quarantine noise before this row existed.
 \set ON_ERROR_STOP on
 
 BEGIN;
@@ -20,7 +24,8 @@ INSERT INTO tenant_placement (
   tenant_id, region, home_cell, isolation_tier, slug, status, member_cells
 ) VALUES
   (:'development_tenant', 'fr-par', :'fed_cell', 'Pool', :'development_tenant', 'Active', ARRAY[:'fed_cell']),
-  (:'integration_tenant', 'fr-par', :'fed_cell', 'Pool', :'integration_tenant', 'Active', ARRAY[:'fed_cell'])
+  (:'integration_tenant', 'fr-par', :'fed_cell', 'Pool', :'integration_tenant', 'Active', ARRAY[:'fed_cell']),
+  (:'selfhost_tenant', 'fr-par', :'fed_cell', 'Pool', :'selfhost_tenant', 'Active', ARRAY[:'fed_cell'])
 ON CONFLICT (tenant_id) DO UPDATE SET
   home_cell = EXCLUDED.home_cell,
   isolation_tier = EXCLUDED.isolation_tier,
@@ -30,7 +35,8 @@ ON CONFLICT (tenant_id) DO UPDATE SET
 
 INSERT INTO local_tenant (cell_id, tenant_id, isolation_tier, active) VALUES
   (:'fed_cell', :'development_tenant', 'Pool', true),
-  (:'fed_cell', :'integration_tenant', 'Pool', true)
+  (:'fed_cell', :'integration_tenant', 'Pool', true),
+  (:'fed_cell', :'selfhost_tenant', 'Pool', true)
 ON CONFLICT (cell_id, tenant_id) DO UPDATE SET
   isolation_tier = EXCLUDED.isolation_tier,
   active = EXCLUDED.active;

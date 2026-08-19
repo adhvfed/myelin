@@ -20,6 +20,7 @@ fn spec(name: &'static str) -> AppSpec {
         stores: StoreManifest::new(),
         outbox: OutboxSpec::new(OutboxStore::new(), InProcessBus::new()),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     }
 }
 

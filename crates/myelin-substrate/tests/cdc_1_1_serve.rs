@@ -83,6 +83,7 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         stores: StoreManifest::new(),
         outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     };
 
     let handle = boot(spec).expect("the hello-world service boots from serve(AppSpec)");

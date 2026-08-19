@@ -1185,6 +1185,7 @@ pub fn identity_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         stores: StoreManifest::new(),
         outbox: myelin_substrate::OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     }
 }
 

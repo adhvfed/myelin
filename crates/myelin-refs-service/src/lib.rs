@@ -178,6 +178,7 @@ where
         stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay_with_consumer(outbox, intake, delivery_quarantine),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     };
     myelin_substrate::serve_until_shutdown(spec, shutdown).await
 }

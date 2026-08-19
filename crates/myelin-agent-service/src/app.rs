@@ -60,6 +60,7 @@ fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec
         stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     }
 }
 
@@ -95,16 +96,35 @@ pub fn governed_trigger_consumer_reg(
     ))
 }
 
+/// The intake scope for a cell-bound agent service: exactly the tenants the
+/// placement directory hosts here. The durable intake subscribes to the whole
+/// event stream, so deliveries for tenants placed on OTHER cells (or not
+/// placed at all) are routine and must terminate without quarantine noise;
+/// within a hosted tenant, an unmatched delivery still quarantines loudly.
+pub fn placed_tenant_intake_scope(
+    tenants: &[myelin_tenancy::TenantId],
+) -> myelin_substrate::IntakeScope {
+    let prefixes: Vec<String> = tenants
+        .iter()
+        .map(|tenant| format!("myelin://{}/", tenant.0))
+        .collect();
+    std::sync::Arc::new(move |subject: &str| {
+        prefixes.iter().any(|prefix| subject.starts_with(prefix))
+    })
+}
+
 fn agent_app_spec_with_ingestion(
     config: Config,
     outbox: myelin_events::OutboxStore,
     consumers: Vec<myelin_substrate::ConsumerReg>,
     intake: Box<dyn myelin_events::EventConsumer>,
     delivery_quarantine: std::sync::Arc<dyn myelin_events::DurableDeliveryQuarantine>,
+    intake_scope: Option<myelin_substrate::IntakeScope>,
 ) -> AppSpec {
     let mut spec = agent_app_spec(config, outbox.clone());
     spec.outbox = OutboxSpec::external_relay_with_consumer(outbox, intake, delivery_quarantine);
     spec.consumers = consumers;
+    spec.intake_scope = intake_scope;
     spec
 }
 
@@ -114,13 +134,21 @@ pub async fn run_agent_ingestion_until_shutdown<F>(
     consumers: Vec<myelin_substrate::ConsumerReg>,
     intake: Box<dyn myelin_events::EventConsumer>,
     delivery_quarantine: std::sync::Arc<dyn myelin_events::DurableDeliveryQuarantine>,
+    intake_scope: Option<myelin_substrate::IntakeScope>,
     shutdown: F,
 ) -> Result<(), ServeError>
 where
     F: std::future::Future<Output = ()>,
 {
     myelin_substrate::serve_until_shutdown(
-        agent_app_spec_with_ingestion(config, outbox, consumers, intake, delivery_quarantine),
+        agent_app_spec_with_ingestion(
+            config,
+            outbox,
+            consumers,
+            intake,
+            delivery_quarantine,
+            intake_scope,
+        ),
         shutdown,
     )
     .await
@@ -256,5 +284,27 @@ mod tests {
     fn failed_boot_returns_non_zero() {
         let r = run_agent(Config("BAD_POOL".into()), myelin_events::OutboxStore::new());
         assert!(r.is_err(), "a failed boot must return non-zero (Err)");
+    }
+
+    #[test]
+    fn placed_tenant_scope_admits_exactly_the_hosted_tenants() {
+        let scope = placed_tenant_intake_scope(&[
+            myelin_tenancy::TenantId("acme".into()),
+            myelin_tenancy::TenantId("globex".into()),
+        ]);
+        assert!(scope("myelin://acme/chat/channel/01J0C"));
+        assert!(scope("myelin://globex/ci/run/r1"));
+        assert!(!scope("myelin://initech/ci/run/r1"), "unhosted tenant");
+        assert!(
+            !scope("myelin://acme-evil/chat/channel/01J0C"),
+            "a tenant id prefix must not smuggle another tenant into scope"
+        );
+        assert!(!scope("myelin://acme"), "no trailing slash, no scope");
+
+        let empty = placed_tenant_intake_scope(&[]);
+        assert!(
+            !empty("myelin://acme/chat/channel/01J0C"),
+            "a cell hosting no tenants is in scope for nothing"
+        );
     }
 }

@@ -165,6 +165,7 @@ async fn main() {
         consumers,
         Box::new(intake),
         quarantine,
+        Some(myelin_agent_service::placed_tenant_intake_scope(&tenants)),
         shutdown_signal(),
     )
     .await

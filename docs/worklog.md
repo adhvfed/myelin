@@ -4,6 +4,58 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-19 — the quarantine table means something again (intake scope)
+
+Chasing the 15k+ `no_registered_consumer` rows led to a design flaw, not
+an outage: the agent service's durable intake subscribes to the ENTIRE
+event stream but registers per-tenant trigger consumers only for tenants
+the placement directory hosts on this cell. Every event from any other
+tenant became a quarantine row - including the whole self-CI event flood,
+because the self-host `myelin` tenant was never placed (rows were growing
+in real time while I watched, ~2,400 during one self-CI run). Noise at
+that volume makes the table useless for its actual job: catching drift.
+
+Two fixes, both explicit rather than silently lenient:
+
+- **substrate `IntakeScope`**: a broker-fed service can now declare which
+  subjects it hosts. An out-of-scope delivery (a tenant this cell does
+  not host - routine in a multi-cell world) is terminated WITHOUT a
+  quarantine record; an in-scope delivery with no accepting consumer
+  still quarantines loudly, because inside the declared scope that
+  remains real wiring drift. `None` keeps the old strict behavior; the
+  agent service derives its scope from the placement directory. proof:
+  substrate serve tests (out-of-scope terminates recordless, in-scope
+  drift still alarms) and a prefix-discipline test (`acme-evil` cannot
+  ride `acme`'s scope).
+- **the self-host tenant is placed**: `03-dev-placement.sql` now binds
+  the `myelin` dogfood tenant to the dev cell like any other tenant, so
+  its events are consumed instead of discarded, and its agent triggers
+  can actually fire.
+
+Also corrected en route: an earlier "the intake is wedged" theory was a
+timezone misread (box clock vs UTC); the intake was healthy all along -
+the worklog keeps the correction because the misread cost real time.
+
+Chasing the suite to green after this landing surfaced three more real
+findings (filed in the gap list, not fixed here):
+
+- **the notifications service had died silently.** a stale fed-project
+  boot (the known dual-invocation footgun) came up against a cell with
+  no tenants, refused intake, panicked, and exited - while fed showed
+  "running". restarted under the correct project; the notification
+  suite's failures during the outage window were backlog aftermath.
+- **the inbox read path is O(debris).** each `/v1/notif/inbox` page
+  cost ~2s (per-row issue-authorization checks; 64 of 101 fetched rows
+  survived filtering) and fresh unread mentions sorted behind pages of
+  stale `done` items. 1,133 accumulated dev-stack test rows were enough
+  to push the notification system tests over their 30s budgets even
+  though every write landed in under a second. debris cleaned; the
+  read-path fix (batch authz, fresh-first paging) is a named follow-on.
+- **envelope validation is inconsistent across consumers**: the agent
+  trigger consumer dead-lettered 267 test signal envelopes for a
+  non-canonical `recorded_at` that the notif router accepts. one
+  contract, two verdicts - needs a single answer.
+
 ## 2026-08-19 — chat is live: push delivery reaches the browser
 
 The gap: the web chat UI polled every 5 seconds while the edge's "tenant

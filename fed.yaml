@@ -182,6 +182,7 @@ services:
       --set=edge_endpoint=http://127.0.0.1:{{EDGE_PORT}}
       --set=development_tenant=development-{{FED_PROJECT_ID}}
       --set=integration_tenant=integration-{{FED_PROJECT_ID}}
+      --set=selfhost_tenant=myelin
       --file=/init/03-dev-placement.sql
     startup_message: "Myelin development tenants are placed"
 

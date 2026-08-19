@@ -21,6 +21,7 @@ fn spec(name: &'static str, migrations: Migrations, hot_tables: HotTables) -> Ap
         stores: StoreManifest::new(),
         outbox: OutboxSpec::new(OutboxStore::new(), InProcessBus::new()),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     }
 }
 

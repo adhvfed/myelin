@@ -58,8 +58,8 @@ pub use overlay::{
     Rect, Side,
 };
 pub use serve::{
-    boot, serve, serve_until_shutdown, AppSpec, ConsumerReg, HoldersSpec, InternalRpc, OutboxSpec,
-    PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
+    boot, serve, serve_until_shutdown, AppSpec, ConsumerReg, HoldersSpec, IntakeScope,
+    InternalRpc, OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
 };
 pub use shed::{
     BoundedQueue, RunClass, RunClassHeader, ShedBudgetError, ShedBudgetTable, ShedDecision,
@@ -112,6 +112,7 @@ mod tests {
             stores: StoreManifest::new(),
             outbox: OutboxSpec::default(),
             critical: CriticalDependencies::default(),
+            intake_scope: None,
         };
         assert_eq!(spec.name, "hello");
         assert_eq!(spec.holders, HoldersSpec::Auto);

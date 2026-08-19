@@ -339,6 +339,7 @@ pub fn knowledge_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     }
 }
 

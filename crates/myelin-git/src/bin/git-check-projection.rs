@@ -110,6 +110,7 @@ async fn main() {
         stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay_with_consumer(outbox, Box::new(intake), quarantine),
         critical: CriticalDependencies::default(),
+        intake_scope: None,
     };
     if let Err(error) = myelin_substrate::serve_until_shutdown(spec, shutdown_signal()).await {
         eprintln!("{SERVICE_NAME}: service failed: {error}");
