@@ -853,7 +853,7 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     assert_eq!(blame["hunks"].as_array().unwrap().len(), 1);
     assert_eq!(blame["hunks"][0]["start_line"], 1);
     assert_eq!(blame["hunks"][0]["line_count"], 1);
-    assert_eq!(blame["hunks"][0]["commit"]["summary"], "web edit");
+    assert_eq!(blame["hunks"][0]["commit"]["summary"], "add a.txt");
     assert!(blame["hunks"][0]["commit"]["oid"]
         .as_str()
         .is_some_and(|oid| oid.len() == 40));

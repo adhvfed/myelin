@@ -61,7 +61,7 @@ export class GitProject {
     ref: string,
     path: string,
     contents: string,
-    options: { baseOid?: string; startRef?: string } = {},
+    options: { baseOid?: string; startRef?: string; message?: string } = {},
   ): Promise<{ receipt: JsonRecord; commitOid: string }> {
     const receipt = (await this.client.json(
       `${this.path}/blob/${segment(ref)}/${nestedPath(path)}`,
@@ -71,6 +71,7 @@ export class GitProject {
           base_oid: options.baseOid ?? "",
           contents,
           ...(options.startRef === undefined ? {} : { start_ref: options.startRef }),
+          ...(options.message === undefined ? {} : { message: options.message }),
         },
       },
     )).body;
@@ -95,13 +96,14 @@ export class GitProject {
     ref: string,
     path: string,
     contents: string,
-    options: { startRef?: string } = {},
+    options: { startRef?: string; message?: string } = {},
   ): Promise<{ receipt: JsonRecord; commitOid: string }> {
     const sourceRef = options.startRef ?? ref;
     const current = await this.readFile(sourceRef, path);
     return this.writeFile(ref, path, contents, {
       baseOid: current.baseOid,
       ...(options.startRef === undefined ? {} : { startRef: options.startRef }),
+      ...(options.message === undefined ? {} : { message: options.message }),
     });
   }
 

@@ -1213,23 +1213,8 @@ struct DWebEditCommit {
 }
 impl Handler for DWebEditCommit {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = ctx.request.json_body()?;
-        let expected_base = body
-            .get("base_oid")
-            .and_then(Value::as_str)
-            .ok_or_else(|| EdgeError::BadRequest("commit body missing `base_oid`".into()))?;
-        let contents = body
-            .get("contents")
-            .and_then(Value::as_str)
-            .ok_or_else(|| EdgeError::BadRequest("commit body missing `contents`".into()))?;
-        let start_ref = body
-            .get("start_ref")
-            .map(|value| {
-                value.as_str().ok_or_else(|| {
-                    EdgeError::BadRequest("commit body `start_ref` must be a string".into())
-                })
-            })
-            .transpose()?;
+        let request: WebEditCommitBody = required_json(&ctx.request.body, "file commit")?;
+        let message = request.commit_message()?;
         let outcome = self
             .be
             .web_edit_commit(
@@ -1241,9 +1226,10 @@ impl Handler for DWebEditCommit {
                 ),
                 param(ctx, "ref")?,
                 param(ctx, "path")?,
-                expected_base,
-                contents,
-                start_ref,
+                &request.base_oid,
+                &request.contents,
+                request.start_ref.as_deref(),
+                message,
             )
             .map_err(map_durable_err)?;
         match outcome {
@@ -1266,11 +1252,10 @@ struct DOpenPr {
 }
 impl Handler for DOpenPr {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = if ctx.request.body.is_empty() {
-            Value::Null
-        } else {
-            ctx.request.json_body()?
-        };
+        let body = canonical_json(required_json::<OpenPullRequestBody>(
+            &ctx.request.body,
+            "pull request creation",
+        )?)?;
         let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let rec = self
             .be
@@ -2131,7 +2116,10 @@ struct DPrThreadCreate {
 }
 impl Handler for DPrThreadCreate {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = ctx.request.json_body()?;
+        let body = canonical_json(required_json::<ThreadCreateBody>(
+            &ctx.request.body,
+            "review thread creation",
+        )?)?;
         let operation_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
@@ -2161,7 +2149,10 @@ struct DPrThreadComment {
 }
 impl Handler for DPrThreadComment {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = ctx.request.json_body()?;
+        let body = canonical_json(required_json::<CommentBody>(
+            &ctx.request.body,
+            "review thread comment",
+        )?)?;
         let operation_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
@@ -2192,11 +2183,10 @@ struct DPrThreadResolve {
 }
 impl Handler for DPrThreadResolve {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = if ctx.request.body.is_empty() {
-            Value::Null
-        } else {
-            ctx.request.json_body()?
-        };
+        let body = canonical_json(optional_json::<ResolveThreadBody>(
+            &ctx.request.body,
+            "review thread resolution",
+        )?)?;
         let operation = self
             .be
             .required_request_operation(ctx.request, ctx.principal)?;
@@ -2227,6 +2217,7 @@ struct DPrReviewStart {
 }
 impl Handler for DPrReviewStart {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        optional_json::<EmptyMutationBody>(&ctx.request.body, "review start")?;
         let operation = self
             .be
             .required_request_operation(ctx.request, ctx.principal)?;
@@ -2255,7 +2246,10 @@ struct DPrReviewComment {
 }
 impl Handler for DPrReviewComment {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = ctx.request.json_body()?;
+        let body = canonical_json(required_json::<ThreadCreateBody>(
+            &ctx.request.body,
+            "pending review comment",
+        )?)?;
         let operation_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
@@ -2286,11 +2280,10 @@ struct DPrReviewSubmit {
 }
 impl Handler for DPrReviewSubmit {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = if ctx.request.body.is_empty() {
-            Value::Null
-        } else {
-            ctx.request.json_body()?
-        };
+        let body = canonical_json(optional_json::<SubmitReviewBody>(
+            &ctx.request.body,
+            "review submission",
+        )?)?;
         let operation = self
             .be
             .required_request_operation(ctx.request, ctx.principal)?;
@@ -2322,6 +2315,7 @@ struct DPrReviewDiscard {
 }
 impl Handler for DPrReviewDiscard {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        optional_json::<EmptyMutationBody>(&ctx.request.body, "review discard")?;
         let operation = self
             .be
             .required_request_operation(ctx.request, ctx.principal)?;
@@ -2524,11 +2518,8 @@ struct DPrReview {
 }
 impl Handler for DPrReview {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = ctx.request.json_body()?;
-        let verdict = body
-            .get("verdict")
-            .and_then(Value::as_str)
-            .ok_or_else(|| EdgeError::BadRequest("review body missing `verdict`".into()))?;
+        let request: ReviewBody = required_json(&ctx.request.body, "pull request review")?;
+        let verdict = request.verdict.as_str();
         let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let rec = self
             .be
@@ -2588,6 +2579,7 @@ struct DMerge {
 }
 impl Handler for DMerge {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        optional_json::<EmptyMutationBody>(&ctx.request.body, "pull request merge")?;
         let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let attempt = self
             .be

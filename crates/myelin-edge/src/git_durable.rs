@@ -1368,6 +1368,7 @@ impl DurableGitBackend {
         expected_base: &str,
         contents: &str,
         start_ref: Option<&str>,
+        message: &str,
     ) -> Result<WebEditOutcome, DurableError> {
         self.commit_file(FileCommit {
             target,
@@ -1376,7 +1377,7 @@ impl DurableGitBackend {
             expected_base,
             contents,
             start_ref,
-            message: "web edit",
+            message,
             actor_is_agent: false,
         })
     }

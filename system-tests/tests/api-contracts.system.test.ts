@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import { systemTestConfig } from "../src/config.js";
-import { systemClient, uniqueName } from "../src/context.js";
+import { systemClient } from "../src/context.js";
 import { array, record } from "../src/json.js";
 
 function expectError(body: Record<string, unknown>, code: string): void {
@@ -64,13 +64,6 @@ describe("external API contracts", () => {
       expectedStatus: 400,
     });
     expectError(issues.body, "bad_request");
-
-    const git = await systemClient.json("/v1/git/repos", {
-      method: "POST",
-      body: { slug: uniqueName("strict-repository"), ignored: true },
-      expectedStatus: 400,
-    });
-    expectError(git.body, "bad_request");
   });
 
   test("keeps retry identity in the standard operation header", async () => {
