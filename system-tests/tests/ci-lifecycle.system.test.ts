@@ -34,6 +34,18 @@ image = "${runnerImage}"
 command = ["true"]
 `;
 
+const failingPipeline = `schema_version = 2
+on = "push"
+
+[execution]
+profile = "linux-small-v1"
+
+[[jobs]]
+name = "contract"
+image = "${runnerImage}"
+command = ["sh", "-c", "printf 'the test failed for a useful reason\\n'; exit 17"]
+`;
+
 describe.sequential("CI delivery lifecycle", () => {
   const slug = uniqueName("system-ci");
   const project = new GitProject(slug, systemClient);
@@ -165,6 +177,47 @@ describe.sequential("CI delivery lifecycle", () => {
       { expectedStatus: 404 },
     );
     expect(missing.body).toHaveProperty("error");
+  }, 65_000);
+
+  test("turns a failing command into a settled, inspectable run", async () => {
+    const failingProject = new GitProject(uniqueName("system-ci-failure"), systemClient);
+    await failingProject.create();
+    await failingProject.writeFile("main", "README.md", "# A deliberately failing build\n");
+    const failedCommit = (await failingProject.writeFile(
+      "main",
+      ".myelin/ci.toml",
+      failingPipeline,
+    )).commitOid;
+
+    const failedRun = await eventually<JsonRecord>(async () => {
+      const response = await systemClient.json("/v1/ci/runs?state=all&limit=100");
+      return array(response.body.items, "CI runs after pushing a failing pipeline")
+        .map((item) => record(item, "failing CI run"))
+        .find((item) => item.commit_oid === failedCommit && item.state === "failed");
+    }, {
+      description: "the failing command to become a terminal CI run",
+      timeoutMs: 60_000,
+    });
+
+    const failedRunId = string(failedRun.run_id, "failed CI run id");
+    const detail = (await systemClient.json(
+      `/v1/ci/runs/${encodeURIComponent(failedRunId)}`,
+    )).body;
+    expect(detail).toMatchObject({
+      run: {
+        run_id: failedRunId,
+        state: "failed",
+        cost_settled: true,
+      },
+      jobs: [{ name: "contract", state: "failed", attempt: 1 }],
+    });
+
+    const failedJob = record(array(detail.jobs, "failed CI jobs")[0], "failed CI job");
+    const log = (await systemClient.json(
+      `/v1/ci/runs/${encodeURIComponent(failedRunId)}/jobs/${encodeURIComponent(string(failedJob.job_id, "failed CI job id"))}/log?start=0&limit=65536`,
+    )).body;
+    expect(Buffer.from(string(log.data, "failed CI log bytes"), "base64").toString("utf8"))
+      .toContain("the test failed for a useful reason\n");
   }, 65_000);
 
   test("inherits repository visibility instead of exposing runs platform-wide", async () => {

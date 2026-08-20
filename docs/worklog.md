@@ -4,6 +4,36 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — CI deadlines are runtime work, not test choreography
+
+The dogfood incident was literal: CI's production workflow fan-out discovered
+and drove `running`/`waiting` pipelines, but never called the timer store. Only
+the generic Flow daemon fired timers. CI integration tests hid the missing seam
+by reaching into `PgFlowDriveStore` and firing deadlines themselves, so an
+unclaimed job could remain parked indefinitely even while the CI worker kept
+processing neighbouring runs.
+
+Timer waking now belongs to the Flow worker's bounded ready-work cycle. Every
+cycle attempts one due timer before driving one runnable workflow, making
+deadline progress independent of an ordinary-work backlog. Both the generic
+daemon and the exact-tenant CI fan-out use that same operation, and batch
+telemetry reports timer firings separately from workflow drives. Drive inputs
+are validated before the first timer mutation, preserving fail-before-write
+behaviour for malformed clocks or workers without definitions.
+
+The production accounting test no longer performs timer-store choreography:
+the CI poller itself wakes an unclaimed job's deadline and drives the pipeline
+into its late-accounting path. A second live-Postgres test arms five deadlines,
+adds five ordinary runs, and proves one bounded batch fires all five timers and
+settles all ten workflows. The black-box CI journey now also tells the missing
+failure story: a non-zero sandbox command becomes a terminal, cost-settled run
+whose failed job and diagnostic log remain inspectable through the public API.
+
+**Proof:** Flow unit suite 254/254; CI control-plane unit suite 632/632;
+Clippy `-D warnings` for both touched crates; focused durable Flow fairness
+integration 1/1; focused production CI timeout/accounting integration 1/1;
+TypeScript typecheck; focused black-box CI lifecycle 5/5.
+
 ## 2026-08-20 — completed work no longer buries new work
 
 The inbox scale test claimed to protect fresh work, but its 250 old rows and

@@ -308,6 +308,7 @@ pub enum PgRunOnceOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PgDriveBatch {
     pub driven: usize,
+    pub timers_fired: usize,
     pub saturated: bool,
 }
 
@@ -422,12 +423,25 @@ impl PgFlowWorker {
         now_unix_secs: i64,
         now_rfc3339: &str,
     ) -> Result<PgRunOnceOutcome, PgWorkerError> {
+        self.validate_drive_request(now_rfc3339)?;
+        self.run_once_validated(now_unix_secs, now_rfc3339).await
+    }
+
+    fn validate_drive_request(&self, now_rfc3339: &str) -> Result<(), PgWorkerError> {
         bounded("drive clock", now_rfc3339)?;
         if self.bodies.is_empty() {
             return Err(PgWorkerError::InvalidConfig(
                 "worker has no explicitly registered workflow definitions".into(),
             ));
         }
+        Ok(())
+    }
+
+    async fn run_once_validated(
+        &self,
+        now_unix_secs: i64,
+        now_rfc3339: &str,
+    ) -> Result<PgRunOnceOutcome, PgWorkerError> {
         let mut definitions: Vec<_> = self.bodies.keys().cloned().collect();
         definitions.sort();
         let mut claimed = None;
@@ -700,57 +714,76 @@ impl PgFlowWorker {
 
     pub async fn run_until_idle(
         &self,
-        max_runs: usize,
+        max_cycles: usize,
         now_unix_secs: i64,
         now_rfc3339: &str,
     ) -> Result<PgDriveBatch, PgWorkerError> {
-        self.run_until_idle_inner(max_runs, now_unix_secs, now_rfc3339, None)
+        self.run_until_idle_inner(max_cycles, now_unix_secs, now_rfc3339, None)
             .await
     }
 
     pub async fn run_until_idle_or_shutdown(
         &self,
-        max_runs: usize,
+        max_cycles: usize,
         now_unix_secs: i64,
         now_rfc3339: &str,
         shutdown: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<PgDriveBatch, PgWorkerError> {
-        self.run_until_idle_inner(max_runs, now_unix_secs, now_rfc3339, Some(shutdown))
+        self.run_until_idle_inner(max_cycles, now_unix_secs, now_rfc3339, Some(shutdown))
             .await
     }
 
     async fn run_until_idle_inner(
         &self,
-        max_runs: usize,
+        max_cycles: usize,
         now_unix_secs: i64,
         now_rfc3339: &str,
         shutdown: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<PgDriveBatch, PgWorkerError> {
-        if !(1..=MAX_BATCH).contains(&max_runs) {
+        if !(1..=MAX_BATCH).contains(&max_cycles) {
             return Err(PgWorkerError::InvalidConfig(format!(
-                "max_runs must be between 1 and {MAX_BATCH}"
+                "max_cycles must be between 1 and {MAX_BATCH}"
             )));
         }
+        self.validate_drive_request(now_rfc3339)?;
+        let mut cycles = 0;
         let mut driven = 0;
-        while driven < max_runs {
+        let mut timers_fired = 0;
+        while cycles < max_cycles {
             if shutdown.is_some_and(|receiver| *receiver.borrow()) {
                 return Ok(PgDriveBatch {
                     driven,
+                    timers_fired,
                     saturated: true,
                 });
             }
-            match self.run_once(now_unix_secs, now_rfc3339).await? {
+
+            let timer_fired = self
+                .store
+                .fire_due_timer(self.scope.partition, now_unix_secs)
+                .await?
+                .is_some();
+            timers_fired += usize::from(timer_fired);
+
+            match self.run_once_validated(now_unix_secs, now_rfc3339).await? {
                 PgRunOnceOutcome::Idle => {
+                    if timer_fired {
+                        cycles += 1;
+                        continue;
+                    }
                     return Ok(PgDriveBatch {
                         driven,
+                        timers_fired,
                         saturated: false,
-                    })
+                    });
                 }
                 PgRunOnceOutcome::Driven { .. } => driven += 1,
             }
+            cycles += 1;
         }
         Ok(PgDriveBatch {
             driven,
+            timers_fired,
             saturated: true,
         })
     }
@@ -771,10 +804,6 @@ impl PgFlowWorker {
                 return Ok(());
             }
             let (secs, stamp) = system_clock()?;
-            let _ = self
-                .store
-                .fire_due_timer(self.scope.partition, secs)
-                .await?;
             self.run_until_idle_or_shutdown(max_batch, secs, &stamp, &shutdown)
                 .await?;
             tokio::select! {

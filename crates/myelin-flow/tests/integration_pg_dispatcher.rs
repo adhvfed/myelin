@@ -423,6 +423,89 @@ async fn immutable_input_resolution_retries_without_commit_and_permanent_refusal
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ready_batches_fire_every_due_deadline_amid_ordinary_work() {
+    let _guard = TEST_LOCK.lock().await;
+    let (bare, pool, schema) = setup("timer_fairness").await;
+    let mut flow = worker(&pool, "acme", "no-osl", 6, "worker-fair");
+    flow.register_definition("wf.deadline", 1, "deadline-v1", |_input, ctx| {
+        match ctx
+            .wait_for_signal("finish", Some(10))
+            .map_err(|error| format!("{error:?}"))?
+        {
+            myelin_flow::WaitOutcome::Parked | myelin_flow::WaitOutcome::TimedOut => Ok(Vec::new()),
+            myelin_flow::WaitOutcome::Signalled { payload, .. } => Ok(payload),
+        }
+    })
+    .unwrap();
+    flow.register_definition("wf.ordinary", 1, "ordinary-v1", |_input, ctx| {
+        ctx.now();
+        Ok(Vec::new())
+    })
+    .unwrap();
+
+    let base = chrono::Utc::now().timestamp();
+    for ordinal in 0..5 {
+        seed_run(
+            &pool,
+            "acme",
+            "no-osl",
+            &format!("R-deadline-{ordinal}"),
+            "wf.deadline",
+            0,
+            6,
+        )
+        .await;
+    }
+    let armed = flow
+        .run_until_idle(5, base, "2026-07-18T00:00:00Z")
+        .await
+        .unwrap();
+    assert_eq!((armed.driven, armed.timers_fired), (5, 0));
+
+    for ordinal in 0..5 {
+        seed_run(
+            &pool,
+            "acme",
+            "no-osl",
+            &format!("R-ordinary-{ordinal}"),
+            "wf.ordinary",
+            0,
+            6,
+        )
+        .await;
+    }
+    let settled = flow
+        .run_until_idle(10, base + 10, "2026-07-18T00:00:10Z")
+        .await
+        .unwrap();
+    assert_eq!(
+        (settled.timers_fired, settled.driven),
+        (5, 10),
+        "five deadlines wake and settle even though five ordinary runs are also runnable"
+    );
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM workflow_run
+         WHERE tenant_id='acme' AND region='no-osl'
+           AND state IN ('running', 'waiting')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0, "the fair batch leaves no hidden ready work");
+    let fired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wf_timer
+         WHERE tenant_id='acme' AND region='no-osl' AND fired",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fired, 5, "every user deadline has one durable firing");
+
+    cleanup(bare, pool, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn renewal_failure_joins_body_before_run_once_returns_and_refuses_commit() {
     let _guard = TEST_LOCK.lock().await;
     let (bare, pool, schema) = setup("renewal_join").await;

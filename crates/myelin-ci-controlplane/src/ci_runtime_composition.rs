@@ -257,6 +257,7 @@ pub struct CiWorkflowFanoutBatch {
     pub discovered: usize,
     pub scopes: usize,
     pub driven: usize,
+    pub timers_fired: usize,
     pub saturated: bool,
 }
 
@@ -754,6 +755,7 @@ impl CiProductionWorkflowPoller {
         let mut seen = BTreeSet::new();
         let mut scopes = 0usize;
         let mut driven = 0usize;
+        let mut timers_fired = 0usize;
         let mut saturated = discovered == max_scopes;
         for route in page.routes {
             if shutdown.is_some_and(|receiver| *receiver.borrow()) {
@@ -788,12 +790,14 @@ impl CiProductionWorkflowPoller {
             .map_err(|_| CiRuntimeCompositionError)?;
             scopes += 1;
             driven = driven.saturating_add(batch.driven);
+            timers_fired = timers_fired.saturating_add(batch.timers_fired);
             saturated |= batch.saturated;
         }
         Ok(CiWorkflowFanoutBatch {
             discovered,
             scopes,
             driven,
+            timers_fired,
             saturated,
         })
     }

@@ -36,7 +36,7 @@ use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{
     migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, MicroUsd,
-    PgFlowDriveStore, PgFlowExecutor, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
+    PgFlowExecutor, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{
@@ -3989,19 +3989,14 @@ async fn an_unstarted_job_timeout_retires_its_reservation_and_wakes_its_pipeline
             .fetch_one(&pool)
             .await
             .unwrap();
-            let drive_store = PgFlowDriveStore::new(pool.clone(), tenant.clone(), region.clone());
-            drive_store
-                .fire_due_timer(partition, deadline)
+            let deadline_batch = poller
+                .run_once(8, 8, deadline + 1, "2026-07-21T13:01:01.000000Z")
                 .await
-                .unwrap()
-                .expect("the unclaimed job deadline wakes its parked pipeline");
+                .unwrap();
             assert_eq!(
-                poller
-                    .run_once(8, 8, deadline + 1, "2026-07-21T13:01:01.000000Z")
-                    .await
-                    .unwrap()
-                    .driven,
-                1
+                (deadline_batch.timers_fired, deadline_batch.driven),
+                (1, 1),
+                "the production poller owns the deadline wake and drives the parked pipeline"
             );
             let late_wait: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM wf_history
