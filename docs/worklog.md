@@ -4,6 +4,32 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — the durable inbox is one complete work-state surface
+
+The notification contract promised individual read, snooze, timed resurfacing, and view-scoped
+bulk read, but the production PostgreSQL store and public Edge exposed only the first operation.
+The richer in-memory model therefore described a product people could not actually use, and the CLI
+made even the idempotent mark-read call require a caller-invented retry key.
+
+PostgreSQL now owns every inbox state transition. Snoozing is recipient-scoped, accepts only active
+work and a future instant, removes the item from active pages, and lazily resurfaces due work in the
+same tenant transaction used to read it. Bulk read changes only active rows matching the selected
+view and leaves completed and parked work alone. A typed invalid-state outcome prevents completed
+work from being revived. Edge exposes strict, bounded snooze and bulk-read routes with the same
+notification capability boundary, while the CLI offers retry-safe `inbox read`, `inbox snooze`, and
+`inbox read-all` commands with human-readable receipts.
+
+The TypeScript journey now follows two real signals through NATS and the Notifications worker. A
+person parks a mention without a retry key, sees it leave active work, clears only review requests,
+sees the mention return when its time arrives, resolves both pieces of work, and is refused when
+trying to revive completed work. The shared journey vocabulary performs these actions only through
+the public API.
+
+**Proof:** Notifications unit suite 348/348; Edge unit suite 333/333; CLI suite 168/168 across unit
+and integration targets; strict Clippy for every Notifications, Edge, and CLI target/feature; live
+PostgreSQL Notifications integration 2/2; TypeScript typecheck; focused notification lifecycle 5/5;
+complete black-box system suite 30/30 files and 116/116 tests in 424.58 seconds.
+
 ## 2026-08-20 — mutation instructions mean exactly what they say
 
 Several Git and authentication handlers decoded request bodies as untyped JSON and then selected
