@@ -93,20 +93,22 @@ fn cdc_1_11_git_shed_serves_the_human_and_sheds_the_agent_lane() {
 }
 
 #[test]
-fn cdc_1_11_a_machine_principal_cannot_spoof_the_human_lane() {
+fn cdc_1_11_service_work_is_classified_from_identity_and_may_only_downclass_itself() {
     let thresholds = Thresholds::load_canonical().expect("load");
     let mut gate = GitFrontDoorShed::from_thresholds(&thresholds).expect("open");
 
-    let svc = principal("acme", PrincipalKind::Service);
+    let service = principal("acme", PrincipalKind::Service);
     assert_eq!(
-        gate.admit_for(&svc, None).expect("admitted"),
-        RunClass::BatchCi
+        gate.admit_for(&service, None).expect("batch work admitted"),
+        RunClass::BatchCi,
+        "service identity, rather than a caller-chosen class, supplies the ceiling"
     );
-    let svc2 = principal("acme", PrincipalKind::Service);
+    gate.release(&service.tenant, RunClass::BatchCi);
+
     assert_eq!(
-        gate.admit_for(&svc2, Some(RunClassHeader::Speculative))
-            .expect("admitted"),
+        gate.admit_for(&service, Some(RunClassHeader::Speculative))
+            .expect("downclassified work admitted"),
         RunClass::Speculative,
-        "the human lane is structurally unspoofable (no human header exists)"
+        "a request header may lower service work, never promote it into the human lane"
     );
 }
