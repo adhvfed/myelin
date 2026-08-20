@@ -6,11 +6,11 @@ use myelin_events::{
 use myelin_gdpr::{EraseScope, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine, KmsError};
+use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::dek::{encrypt_body, ChatFreeText};
-use crate::erase::{is_body_unrecoverable, ChatErasureCascade};
+use crate::erase::{is_body_unrecoverable, ChatEraseError, ChatErasureCascade};
 use crate::read_state::{ReadMarker, ReadStateRecord};
 use crate::store::{
     AuthorKind, ConversationId, MemHotTier, MessageId, MessageStore, NewMessage, RangeCursor,
@@ -112,7 +112,7 @@ pub fn run_e2e_4_chat_dsar_holder() -> ChatE2eArtifact {
     }
 }
 
-fn try_run_e2e_4_chat_dsar_holder() -> Result<ChatE2eArtifact, KmsError> {
+fn try_run_e2e_4_chat_dsar_holder() -> Result<ChatE2eArtifact, ChatEraseError> {
     let kms = KmsEngine::new();
     let store = MemHotTier::new();
     let outbox = OutboxStore::new();

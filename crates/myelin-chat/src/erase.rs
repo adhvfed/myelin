@@ -7,7 +7,9 @@ use crate::composer::DraftStore;
 use crate::events::CHAT_MESSAGE_ERASED;
 use crate::holder::{ChatStoreClass, CHAT_OLTP_STORE};
 use crate::read_state::ReadStateRecord;
-use crate::store::{ConversationId, MessageId, MessageStore, OutboxTx, TombstoneReason};
+use crate::store::{
+    ConversationId, MessageId, MessageStore, OutboxTx, StoreError, TombstoneReason,
+};
 use crate::unfurl::UnfurlCache;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +24,47 @@ pub struct ChatEraseReport {
     pub destroyed_key_epoch: Option<u64>,
     pub records_tombstoned: usize,
     pub cascade_published: bool,
+}
+
+#[derive(Debug)]
+pub enum ChatEraseError {
+    Key(KmsError),
+    Store(StoreError),
+}
+
+impl core::fmt::Display for ChatEraseError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Key(error) => write!(formatter, "chat erasure key operation failed: {error}"),
+            Self::Store(error) => {
+                write!(
+                    formatter,
+                    "chat erasure tombstone operation failed: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChatEraseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Key(error) => Some(error),
+            Self::Store(error) => Some(error),
+        }
+    }
+}
+
+impl From<KmsError> for ChatEraseError {
+    fn from(error: KmsError) -> Self {
+        Self::Key(error)
+    }
+}
+
+impl From<StoreError> for ChatEraseError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
 }
 
 impl ChatEraseReport {
@@ -71,7 +114,7 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
         tx: &mut OutboxTx,
         scope: &EraseScope,
         authored: &[(ConversationId, MessageId)],
-    ) -> Result<ChatEraseReport, KmsError> {
+    ) -> Result<ChatEraseReport, ChatEraseError> {
         let (subject_token, tenant) = match scope {
             EraseScope::Subject { subject, tenant } => {
                 (Some(subject_token(subject)), tenant.clone())
@@ -92,12 +135,15 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
         let erased_author = subject_token.clone().unwrap_or_default();
         let mut records_tombstoned = 0usize;
         for (conv, msg_id) in authored {
-            let hot = self
+            match self
                 .store
                 .tombstone(tx, msg_id, TombstoneReason::SubjectErased)
-                .is_ok();
-            if !hot {
-                let _ = crate::store::emit_erased_tombstone(tx, conv, msg_id, &erased_author);
+            {
+                Ok(()) => {}
+                Err(StoreError::NotFound(_)) => {
+                    crate::store::emit_erased_tombstone(tx, conv, msg_id, &erased_author)?;
+                }
+                Err(error) => return Err(error.into()),
             }
             records_tombstoned += 1;
         }
@@ -234,7 +280,9 @@ mod tests {
     use crate::composer::{Draft, DraftKey, MemDraftStore};
     use crate::dek::{encrypt_body, ChatFreeText};
     use crate::read_state::ReadMarker;
-    use crate::store::{AuthorKind, MemHotTier, NewMessage};
+    use crate::store::{
+        AuthorKind, MemHotTier, Message, NewMessage, RangeCursor, Result as StoreResult,
+    };
     use myelin_events::{
         Actor, CausedBy, EmitContextBase, MonotonicMinter, OutboxStore, Timestamp,
     };
@@ -245,6 +293,51 @@ mod tests {
 
     fn region() -> Region {
         Region::new("fr-par")
+    }
+
+    struct UnavailableMessageStore;
+
+    impl MessageStore for UnavailableMessageStore {
+        fn append(&self, _tx: &mut OutboxTx, _message: NewMessage) -> StoreResult<MessageId> {
+            Err(StoreError::Cold("hot tier unavailable".into()))
+        }
+
+        fn range(
+            &self,
+            _conversation: &ConversationId,
+            _cursor: RangeCursor,
+            _limit: u32,
+        ) -> StoreResult<Vec<Message>> {
+            Err(StoreError::Cold("hot tier unavailable".into()))
+        }
+
+        fn revise(
+            &self,
+            _tx: &mut OutboxTx,
+            _message_id: &MessageId,
+            _body_inline: Vec<u8>,
+            _body_nodes: Vec<u8>,
+            _expect_seq: i32,
+        ) -> StoreResult<()> {
+            Err(StoreError::Cold("hot tier unavailable".into()))
+        }
+
+        fn tombstone(
+            &self,
+            _tx: &mut OutboxTx,
+            _message_id: &MessageId,
+            _reason: TombstoneReason,
+        ) -> StoreResult<()> {
+            Err(StoreError::Cold("hot tier unavailable".into()))
+        }
+
+        fn resync_from(
+            &self,
+            _conversation: &ConversationId,
+            _cursor: &MessageId,
+        ) -> StoreResult<Vec<Message>> {
+            Err(StoreError::Cold("hot tier unavailable".into()))
+        }
     }
     fn tenant() -> TenantId {
         TenantId::from_token("acme")
@@ -410,6 +503,38 @@ mod tests {
             assert_eq!(r.state, crate::store::MessageState::Tombstoned);
             assert!(r.body_inline.is_empty(), "the body is dropped (shred)");
         }
+    }
+
+    #[test]
+    fn an_unavailable_message_store_cannot_produce_a_success_receipt() {
+        let kms = KmsEngine::new();
+        let store = UnavailableMessageStore;
+        let outbox = OutboxStore::new();
+        let minter = Arc::new(MonotonicMinter::new());
+        let read_state = ReadStateRecord::new();
+        let drafts = MemDraftStore::new();
+        let cache = UnfurlCache::new();
+        let cascade = ChatErasureCascade::new(&kms, region(), &store, &read_state, &drafts, &cache);
+        let mut tx = begin_tx(&outbox, &minter);
+
+        let error = cascade
+            .erase(
+                &mut tx,
+                &EraseScope::Tenant(tenant()),
+                &[(conv(), MessageId("01J0UNAVAILABLE".into()))],
+            )
+            .expect_err("a storage outage must fail the erasure instead of claiming success");
+
+        assert!(matches!(
+            error,
+            ChatEraseError::Store(StoreError::Cold(ref detail))
+                if detail == "hot tier unavailable"
+        ));
+        assert_eq!(
+            outbox.committed_count(),
+            0,
+            "no false cascade was committed"
+        );
     }
 
     #[test]

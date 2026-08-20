@@ -58,8 +58,8 @@ pub use dispatch::{
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
 pub use erase::{
-    aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
-    CHAT_ERASE_CASCADE_TOKEN,
+    aggregate_receipt, is_body_unrecoverable, ChatEraseError, ChatEraseReport, ChatErasureCascade,
+    StoreReceipt, CHAT_ERASE_CASCADE_TOKEN,
 };
 pub use fanout::{
     activity, activity_filter, ambient_post_inbox_writes, fanout_behaviour,
