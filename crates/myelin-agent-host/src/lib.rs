@@ -379,13 +379,18 @@ impl ToolSurface for ToolCatalogue {
     }
 }
 
-fn tool_schema_to_spec(schema: &ToolSchema) -> ToolSpec {
-    ToolSpec {
+fn tool_schema_to_spec(schema: &ToolSchema) -> Result<ToolSpec, SkeletonError> {
+    let input_schema = serde_json::from_str(&schema.input_schema).map_err(|_| {
+        SkeletonError::ToolValidationRejected(format!(
+            "advertised tool `{}` has an invalid input schema",
+            schema.name.0
+        ))
+    })?;
+    Ok(ToolSpec {
         name: schema.name.0.clone(),
         description: schema.description.clone(),
-        input_schema: serde_json::from_str(&schema.input_schema)
-            .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
-    }
+        input_schema,
+    })
 }
 
 struct RunTokenSeams<'a> {
@@ -431,7 +436,11 @@ fn dispatch_core(
     tools: Tools<'_>,
     seams: RunTokenSeams<'_>,
 ) -> Result<LlmRunReport, AgentHostError> {
-    let tool_specs = tools.advertised.iter().map(tool_schema_to_spec).collect();
+    let tool_specs = tools
+        .advertised
+        .iter()
+        .map(tool_schema_to_spec)
+        .collect::<Result<Vec<_>, _>>()?;
     let (host_client, answer) = HostModelClient::wrap(
         default_system(&task.system),
         task.prompt.clone(),
@@ -828,7 +837,7 @@ mod tests {
     fn host_client_injects_tool_specs_on_every_step() {
         let spy = Spy::new("ok", Usage::NotReported);
         let (_, schema) = platform_read_file_tool();
-        let specs = vec![tool_schema_to_spec(&schema)];
+        let specs = vec![tool_schema_to_spec(&schema).unwrap()];
         let (client, _) = HostModelClient::wrap(
             "SYS".into(),
             "task".into(),
@@ -850,6 +859,23 @@ mod tests {
             assert_eq!(req.tools.len(), 1);
             assert_eq!(req.tools[0].name, "git.read_file");
         }
+    }
+
+    #[test]
+    fn malformed_advertised_tool_schemas_are_refused_instead_of_broadened() {
+        let schema = ToolSchema {
+            name: ToolName("git.read_file".into()),
+            description: "Read a repository file.".into(),
+            input_schema: "this is not JSON".into(),
+        };
+
+        let error = tool_schema_to_spec(&schema).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SkeletonError::ToolValidationRejected(reason)
+                if reason == "advertised tool `git.read_file` has an invalid input schema"
+        ));
     }
 
     #[test]
