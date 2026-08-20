@@ -4,7 +4,7 @@ use myelin_agent_host::{
     dispatch_test_run_with_synthetic_identity, CreditKind, LlmRunTask, MicroUsd,
     RunSubstrateWiring, Tools,
 };
-use myelin_agent_model::{LunaClient, ModelError};
+use myelin_agent_model::LunaClient;
 use myelin_config::MyelinConfig;
 use myelin_events::{MonotonicMinter, OutboxStore};
 use myelin_flow::WfJournal;
@@ -34,19 +34,15 @@ fn uniq() -> String {
     )
 }
 
-async fn migrate_admin() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn migrate_admin() -> SubstrateProvider {
+    let admin = SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4)
+        .await
+        .expect("the explicitly requested live Luna test requires the configured Postgres backend");
     admin
         .migrate(&agent_wallet_migrations(), &HotTables::none())
         .await
         .expect("apply the agent-wallet migration (0080)");
-    Some(admin)
+    admin
 }
 
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
@@ -87,17 +83,9 @@ fn agent_principal(tenant: &TenantId) -> Principal {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "hits real Luna + live Postgres; requires OPENAI_API_KEY and the dev DB (:5433)"]
 async fn live_luna_run_is_metered_end_to_end() {
-    let luna = match LunaClient::from_env() {
-        Ok(c) => c,
-        Err(ModelError::MissingApiKey) => {
-            eprintln!("SKIP: OPENAI_API_KEY not set (no real-brain run)");
-            return;
-        }
-        Err(e) => panic!("unexpected Luna construction error: {e}"),
-    };
-    let Some(_admin) = migrate_admin().await else {
-        return;
-    };
+    let luna = LunaClient::from_env()
+        .expect("the explicitly requested live Luna test requires OPENAI_API_KEY");
+    let _admin = migrate_admin().await;
     let app = SubstrateProvider::connect(MyelinConfig::dev(), 6)
         .await
         .expect("connect app role");
