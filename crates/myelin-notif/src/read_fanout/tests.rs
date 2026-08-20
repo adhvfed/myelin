@@ -305,6 +305,51 @@ fn stale_reverse_index_revision_is_rejected_not_served() {
 }
 
 #[test]
+fn malformed_strong_revision_is_held_instead_of_weakened_to_zero() {
+    struct MalformedRevisionPort;
+
+    impl WatcherResolvePort for MalformedRevisionPort {
+        fn list_objects(
+            &self,
+            _subject: &Principal,
+            _permission: &Permission,
+            _object_type: &ObjectType,
+            _at: &Consistency,
+        ) -> AuthzResult<myelin_identity::ListObjectsResult> {
+            Ok(myelin_identity::ListObjectsResult::Filter {
+                set_expr: SetExpr::InRelation {
+                    relation: RelName(WATCHER_RELATION.into()),
+                    via_column: subject_root_col(),
+                },
+                zookie: Zookie("malformed".into()),
+            })
+        }
+
+        fn resolve_relation(
+            &self,
+            _subject: &Principal,
+            _leaf: &RelationalLeaf,
+            _required: RevisionWatermark,
+        ) -> AuthzResult<ReverseIndexAnswer> {
+            Ok(ReverseIndexAnswer {
+                subject_roots: ["root/b".to_string()].into_iter().collect(),
+                revision: RevisionWatermark(0),
+            })
+        }
+    }
+
+    let (store, _) = seeded();
+    let error = read_fanout(
+        &viewer("u1"),
+        &store,
+        &MalformedRevisionPort,
+        &strong("zk-5"),
+    )
+    .expect_err("malformed authorization revision metadata must fail closed");
+    assert_eq!(error, ReadFanoutError::InvalidRevision);
+}
+
+#[test]
 fn unavailable_resolver_holds_not_leaks() {
     let (store, idx) = seeded();
     idx.set_unavailable(true);

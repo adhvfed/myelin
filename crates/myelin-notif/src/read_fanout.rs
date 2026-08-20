@@ -155,6 +155,7 @@ pub trait WatcherResolvePort {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadFanoutError {
     Unavailable(String),
+    InvalidRevision,
     StaleReverseIndex {
         required: RevisionWatermark,
         served: RevisionWatermark,
@@ -185,7 +186,7 @@ pub fn read_fanout(
         myelin_identity::ListObjectsResult::Filter { set_expr, zookie } => (set_expr, zookie),
     };
 
-    let required = watermark_for(&zookie, at);
+    let required = watermark_for(&zookie, at)?;
     let reachable = lower(viewer, &set_expr, resolver, required)?;
     Ok(project_with(markers, &viewer.tenant, &reachable))
 }
@@ -342,18 +343,22 @@ fn project_with(
     out
 }
 
-fn watermark_for(zookie: &myelin_identity::Zookie, at: &Consistency) -> RevisionWatermark {
+fn watermark_for(
+    zookie: &myelin_identity::Zookie,
+    at: &Consistency,
+) -> Result<RevisionWatermark, ReadFanoutError> {
     match at.mode {
-        ConsistencyMode::Strong => RevisionWatermark(parse_revision(&zookie.0)),
-        ConsistencyMode::BoundedStale => RevisionWatermark(0),
+        ConsistencyMode::Strong => parse_revision(&zookie.0)
+            .map(RevisionWatermark)
+            .ok_or(ReadFanoutError::InvalidRevision),
+        ConsistencyMode::BoundedStale => Ok(RevisionWatermark(0)),
     }
 }
 
-fn parse_revision(zookie: &str) -> u64 {
+fn parse_revision(zookie: &str) -> Option<u64> {
     zookie
         .strip_prefix("zk-")
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0)
+        .and_then(|revision| revision.parse::<u64>().ok())
 }
 
 #[derive(Clone, Default)]
