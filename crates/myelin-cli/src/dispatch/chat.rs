@@ -14,7 +14,7 @@ pub fn chat_dispatch_with_project(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no chat command (try: list | create <channel> --topic <topic> | history <id> | send <id> <message> | ref <id> <ArtifactRef>)"
+            "no chat command (try: list | create <channel> --topic <topic> | history <id> | send <id> <message> | mention <id> <principal> <message> | ref <id> <ArtifactRef>)"
                 .into(),
         )
     })?;
@@ -34,9 +34,10 @@ pub fn chat_dispatch_with_project(
             ))
         }
         "send" | "post" => send_message(rest),
+        "mention" => mention_principal(rest),
         "ref" => reference_message(rest),
         other => Err(CliError::Usage(format!(
-            "unknown chat command `{other}` (try: list | create | history | send | ref)"
+            "unknown chat command `{other}` (try: list | create | history | send | mention | ref)"
         ))),
     }
 }
@@ -96,19 +97,35 @@ fn send_message(args: &[&str]) -> Result<EdgeCall, CliError> {
         ));
     };
     canonical_ulid("conversation id", conversation)?;
-    if content.trim().is_empty()
-        || content.len() > 32 * 1024
-        || content.chars().any(|character| {
-            character == '\0' || (character.is_control() && character != '\n' && character != '\t')
-        })
-    {
+    validate_message(content)?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/chat/conversations/{conversation}/messages"),
+        json!({ "content": content }),
+    ))
+}
+
+fn mention_principal(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let [conversation, principal_id, content] = args else {
         return Err(CliError::Usage(
-            "chat message must contain 1-32768 UTF-8 bytes and no unsupported controls".into(),
+            "`chat mention` needs exactly one <conversation_id>, <principal_id>, and quoted <message>"
+                .into(),
+        ));
+    };
+    canonical_ulid("conversation id", conversation)?;
+    clean_text("mention principal id", principal_id, 255)?;
+    validate_message(content)?;
+    let content = format!("\u{FFFC} {content}");
+    if content.len() > 32 * 1024 {
+        return Err(CliError::Usage(
+            "chat mention plus message must contain at most 32768 UTF-8 bytes".into(),
         ));
     }
     Ok(EdgeCall::post_json(
         format!("/v1/chat/conversations/{conversation}/messages"),
-        json!({ "content": content }),
+        json!({
+            "content": content,
+            "nodes": [{ "kind": "mention", "principal_id": principal_id }],
+        }),
     ))
 }
 
@@ -125,6 +142,21 @@ fn reference_message(args: &[&str]) -> Result<EdgeCall, CliError> {
         format!("/v1/chat/conversations/{conversation}/messages"),
         json!({ "content": "\u{FFFC}", "references": [reference] }),
     ))
+}
+
+fn validate_message(content: &str) -> Result<(), CliError> {
+    if content.trim().is_empty()
+        || content.len() > 32 * 1024
+        || content.chars().any(|character| {
+            character == '\0' || (character.is_control() && character != '\n' && character != '\t')
+        })
+    {
+        Err(CliError::Usage(
+            "chat message must contain 1-32768 UTF-8 bytes and no unsupported controls".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn target_and_flags<'a>(
@@ -265,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn create_send_and_ref_map_to_the_shared_public_mutations() {
+    fn create_send_mention_and_ref_map_to_the_shared_public_mutations() {
         let create = chat_dispatch_with_project(
             &["create", "engineering", "--topic", "Release coordination"],
             Some(PROJECT),
@@ -313,6 +345,23 @@ mod tests {
             json!({"content": "Ready for review."})
         );
 
+        let mention = chat_dispatch(&[
+            "mention",
+            CONVERSATION,
+            "human:reviewer",
+            "Could you review this?",
+        ])
+        .unwrap();
+        assert_eq!(mention.method, HttpMethod::Post);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(mention.payload.as_deref().unwrap())
+                .unwrap(),
+            json!({
+                "content": "\u{FFFC} Could you review this?",
+                "nodes": [{ "kind": "mention", "principal_id": "human:reviewer" }],
+            })
+        );
+
         let reference = "myelin://acme/issue/issue/ENG-41";
         let reference_message = chat_dispatch(&["ref", CONVERSATION, reference]).unwrap();
         assert_eq!(reference_message.method, HttpMethod::Post);
@@ -336,6 +385,9 @@ mod tests {
             vec!["history", "not-an-id"],
             vec!["send", CONVERSATION, ""],
             vec!["send", CONVERSATION],
+            vec!["mention", CONVERSATION, "reviewer"],
+            vec!["mention", CONVERSATION, " reviewer", "please review"],
+            vec!["mention", CONVERSATION, "reviewer", ""],
             vec!["ref", CONVERSATION, "not-a-reference"],
             vec!["ref", CONVERSATION],
             vec!["create", "engineering"],

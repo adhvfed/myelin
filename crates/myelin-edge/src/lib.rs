@@ -7,6 +7,7 @@ pub mod catalogue;
 mod chat_authz;
 pub mod chat_effect;
 pub mod chat_http;
+mod chat_message_input;
 pub mod ci_http;
 pub mod device_auth;
 mod effect_carrier;

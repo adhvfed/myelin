@@ -4,6 +4,40 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — a Chat mention reaches one visible teammate
+
+Chat could deserialize and render mention nodes, and Notifications could fan
+them out, but no production write path connected the two. The public message
+shape only accepted a separate artifact-reference list, so it could not
+express an ordered mixture of mentions and work references. The notification
+read gate also checked a Chat URL directly with the wrong permission instead
+of reducing it to the message or channel object that owns visibility. A
+durable mention row was consequently invisible even when the recipient could
+read the conversation.
+
+Messages now accept one ordered, tagged node list while retaining the old
+reference-only subset. Mention identities are loaded from the tenant-scoped
+durable directory and must be active, different from the author, and able to
+read the conversation; missing and inaccessible recipients have the same
+response. The message, its visibility tuple, reference edges, and one
+de-duplicated `signal.opened` event are committed in the same PostgreSQL
+transaction. Inbox reads map Chat references back to the exact ReBAC object
+and permission. The CLI exposes the result as `chat mention`, without a Slack
+credential or provider key.
+
+The black-box journey first proves that mentioning a known teammate into a
+private room writes no message. In a shared room it retries one reviewer post,
+reads back the structured mention once, follows the real outbox and broker
+through the Notifications worker, and finds exactly one direct unread item in
+the addressed teammate's inbox. Its first run exposed the broken Chat inbox
+authorization reduction; the unchanged journey passed after that bug was
+fixed.
+
+**Proof:** Chat unit suite 283/283; Edge unit/integration suite green; CLI unit
+suite 147/147; Chat lifecycle TypeScript system journey 3/3 against the live
+federation stack; TypeScript typecheck; Clippy `-D warnings` for every Chat,
+Edge, and CLI target/feature.
+
 ## 2026-08-20 — an outbox event has one durable identity
 
 The PostgreSQL relay silently clamped negative sequence and retry counters to

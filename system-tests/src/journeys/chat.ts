@@ -5,6 +5,10 @@ import { randomUUID } from "node:crypto";
 import type { SystemTestClient } from "../client.js";
 import { array, record, string, type JsonRecord } from "../json.js";
 
+export type MessageNode =
+  | { kind: "mention"; principal_id: string }
+  | { kind: "artifact_ref"; ref: string };
+
 export class Conversation {
   constructor(
     readonly id: string,
@@ -28,7 +32,7 @@ export class Conversation {
   async post(
     client: SystemTestClient,
     content: string,
-    options: { references?: string[]; idempotencyKey?: string } = {},
+    options: { references?: string[]; nodes?: MessageNode[]; idempotencyKey?: string } = {},
   ): Promise<string> {
     const posted = await client.json(
       `/v1/chat/conversations/${encodeURIComponent(this.id)}/messages`,
@@ -37,6 +41,7 @@ export class Conversation {
         body: {
           content,
           ...(options.references === undefined ? {} : { references: options.references }),
+          ...(options.nodes === undefined ? {} : { nodes: options.nodes }),
         },
         idempotencyKey: options.idempotencyKey ?? `message-${randomUUID()}`,
         expectedStatus: 201,

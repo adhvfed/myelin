@@ -15,6 +15,7 @@ pub mod glue;
 pub mod hitl;
 pub mod holder;
 pub mod membership;
+mod mention_signal;
 pub mod presence;
 pub mod project;
 pub mod read_state;

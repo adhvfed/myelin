@@ -3,12 +3,93 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "vitest";
 
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
+import { eventually } from "../src/eventually.js";
+import { Conversation } from "../src/journeys/chat.js";
+import { findInboxItem } from "../src/journeys/inbox.js";
 import { awaitActiveIssue } from "../src/journeys/issues.js";
 import { awaitBacklink } from "../src/journeys/refs.js";
 import { array, record, string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
 describe("chat collaboration lifecycle", () => {
+  test("turns a teammate's words into one durable nudge without leaking private rooms", async () => {
+    const privateProject = await systemClient.json("/v1/projects", {
+      method: "POST",
+      body: {
+        name: uniqueName("Private mention project"),
+        issue_prefix: `M${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`,
+      },
+      idempotencyKey: `private-mention-project-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const privateProjectId = string(
+      record(privateProject.body.project, "private mention project").id,
+      "private mention project id",
+    );
+    const privateRoom = await Conversation.open(systemClient, {
+      projectId: privateProjectId,
+      channel: uniqueName("private-mentions"),
+      topic: "Keep the room and its notifications private",
+    });
+    const privateProbe = await systemClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(privateRoom.id)}/messages`,
+      {
+        method: "POST",
+        body: {
+          content: "\uFFFC should never learn that this room exists.",
+          nodes: [{ kind: "mention", principal_id: systemTestConfig.reviewerPrincipal }],
+        },
+        idempotencyKey: `private-mention-${randomUUID()}`,
+        expectedStatus: 400,
+      },
+    );
+    expect(privateProbe.body).toMatchObject({ error: { code: "bad_request" } });
+    expect(await privateRoom.messages(systemClient)).toEqual([]);
+
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("release-mentions"),
+      topic: "Ask a teammate without configuring Slack",
+    });
+    const message = "\uFFFC please review the release while the context is fresh.";
+    const retryKey = `chat-mention-${randomUUID()}`;
+    const firstMessageId = await room.post(reviewerClient, message, {
+      nodes: [{ kind: "mention", principal_id: systemTestConfig.principal }],
+      idempotencyKey: retryKey,
+    });
+    const replayedMessageId = await room.post(reviewerClient, message, {
+      nodes: [{ kind: "mention", principal_id: systemTestConfig.principal }],
+      idempotencyKey: retryKey,
+    });
+    expect(replayedMessageId).toBe(firstMessageId);
+
+    const [storedMention] = (await room.messages(systemClient)).filter(
+      (item) => item.id === firstMessageId,
+    );
+    expect(storedMention).toMatchObject({
+      content: message,
+      is_you: false,
+      nodes: [{ kind: "mention", principal_id: systemTestConfig.principal }],
+    });
+
+    const messageRef =
+      `myelin://${systemTestConfig.tenant}/chat/message/${firstMessageId}` +
+      `#message-${firstMessageId}`;
+    const notification = await eventually(
+      () => findInboxItem(systemClient, messageRef),
+      { description: "the real Chat mention to reach the mentioned teammate's durable inbox" },
+    );
+    expect(notification).toMatchObject({
+      subject: messageRef,
+      subsystem: "chat",
+      reason: "mentioned",
+      class: "direct",
+      coalesce_count: 1,
+      state: "unread",
+    });
+    expect(await findInboxItem(reviewerClient, messageRef)).toBeUndefined();
+  });
+
   test("lets project collaborators talk while private project rooms stay private", async () => {
     const channel = uniqueName("system-chat");
     const topic = "Coordinate the externally tested release";

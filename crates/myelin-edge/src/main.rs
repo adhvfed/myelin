@@ -1224,6 +1224,11 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         handle.clone(),
     );
     builder = register_privacy(builder, agent_traces, handle.clone());
+    let chat_principals = PrincipalStore::with_pg(
+        kms.clone(),
+        DurablePrincipalBacking::new(provider.clone()),
+        handle.clone(),
+    );
     let mcp_chat = DurableChatReadApi::new(
         provider.db_pool().clone(),
         provider.config().region.clone(),
@@ -1253,7 +1258,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                     kms.clone(),
                 ),
                 mcp_chat.clone(),
-                DurableChatMutationApi::new(mcp_chat),
+                DurableChatMutationApi::new(mcp_chat, chat_principals.clone()),
                 myelin_edge::DurableProjectReadApi::new(projects, handle.clone()),
             ),
             handle.clone(),
@@ -1267,6 +1272,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         handle.clone(),
         kms.clone(),
         check.clone(),
+        chat_principals,
     );
     builder = register_knowledge(
         builder,

@@ -408,8 +408,13 @@ fn can_read_subject_cached(
             };
             ("view", object)
         }
-        myelin_notif::list_inbox::Subsystem::Chat
-        | myelin_notif::list_inbox::Subsystem::Knowledge
+        myelin_notif::list_inbox::Subsystem::Chat => {
+            let Some(access) = chat_subject_access(&row.item.subject, &principal.tenant.0) else {
+                return false;
+            };
+            access
+        }
+        myelin_notif::list_inbox::Subsystem::Knowledge
         | myelin_notif::list_inbox::Subsystem::Ci => ("read", row.item.subject.clone()),
         myelin_notif::list_inbox::Subsystem::Git => {
             if row.item.reason == myelin_notif::Reason::ReviewRequested
@@ -463,6 +468,43 @@ fn can_read_subject_cached(
             Ok(Decision::Allow)
         )
     })
+}
+
+fn chat_subject_access(
+    subject: &ArtifactRef,
+    expected_tenant: &str,
+) -> Option<(&'static str, ArtifactRef)> {
+    let parsed = myelin_refs::parse_scoped(&subject.0).ok()?;
+    if parsed.tenant.as_str() != expected_tenant
+        || parsed.subsystem != "chat"
+        || parsed.id.is_empty()
+    {
+        return None;
+    }
+    match parsed.type_.as_str() {
+        "channel" if parsed.sub.is_none() => Some((
+            "read",
+            ArtifactRef(myelin_chat::membership::channel_object(&parsed.id)),
+        )),
+        "message" => Some((
+            "view",
+            ArtifactRef(format!(
+                "{}:{}",
+                myelin_chat::rebac_fragment::object_types::MESSAGE,
+                parsed.id
+            )),
+        )),
+        // A thread is rooted in a message and inherits that message's channel.
+        "thread" => Some((
+            "view",
+            ArtifactRef(format!(
+                "{}:{}",
+                myelin_chat::rebac_fragment::object_types::MESSAGE,
+                parsed.id
+            )),
+        )),
+        _ => None,
+    }
 }
 
 fn git_pr_coordinate(subject: &ArtifactRef, expected_tenant: &str) -> Option<(String, u64)> {
@@ -672,6 +714,43 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn chat_subjects_reduce_to_the_exact_rebac_object_that_owns_visibility() {
+        let message_id = "01J00000000000000000000000";
+        assert_eq!(
+            chat_subject_access(
+                &ArtifactRef(format!(
+                    "myelin://acme/chat/message/{message_id}#message-{message_id}"
+                )),
+                "acme"
+            ),
+            Some(("view", ArtifactRef(format!("message:{message_id}"))))
+        );
+        assert_eq!(
+            chat_subject_access(
+                &ArtifactRef("myelin://acme/chat/channel/room-1".into()),
+                "acme"
+            ),
+            Some(("read", ArtifactRef("channel:room-1".into())))
+        );
+        assert_eq!(
+            chat_subject_access(
+                &ArtifactRef(format!(
+                    "myelin://acme/chat/thread/{message_id}#thread-{message_id}"
+                )),
+                "acme"
+            ),
+            Some(("view", ArtifactRef(format!("message:{message_id}"))))
+        );
+        assert_eq!(
+            chat_subject_access(
+                &ArtifactRef("myelin://other/chat/channel/room-1".into()),
+                "acme"
+            ),
+            None
+        );
     }
 
     #[test]

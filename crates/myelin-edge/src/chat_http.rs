@@ -1,5 +1,6 @@
 use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::chat_authz::ChatAuthorization;
+use crate::chat_message_input::MessageInput;
 use crate::error::EdgeError;
 use crate::gateway::{sse_scope_for_resource, GatewayBuilder};
 use crate::request::EdgeResponse;
@@ -19,9 +20,9 @@ use myelin_chat::{
 };
 use myelin_content::{InlineNode, OBJ};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
-use myelin_identity::{Principal, PrincipalKind, PrincipalStatus};
-use myelin_identity_service::StoreBackedCheck;
-use myelin_storage::{KeyClass, KmsEngine, SubjectId};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_identity_service::{PrincipalStore, StoreBackedCheck};
+use myelin_storage::{KeyClass, KmsEngine, SubjectId, TenantScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -31,9 +32,6 @@ use tokio::runtime::Handle;
 use crate::runtime::drive_result_on_runtime;
 
 const MAX_CHAT_JSON_BYTES: usize = 36 * 1024;
-const MAX_MESSAGE_BYTES: usize = 32 * 1024;
-const MAX_MESSAGE_REFERENCES: usize = 32;
-const MAX_ARTIFACT_REF_BYTES: usize = 1024;
 const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
 
@@ -197,14 +195,16 @@ impl DurableChatReadApi {
 #[derive(Clone)]
 pub struct DurableChatMutationApi {
     reads: DurableChatReadApi,
+    principals: PrincipalStore,
     event_ids: Arc<dyn IdMinter>,
     object_ids: Arc<dyn UlidSource>,
 }
 
 impl DurableChatMutationApi {
-    pub fn new(reads: DurableChatReadApi) -> Self {
+    pub fn new(reads: DurableChatReadApi, principals: PrincipalStore) -> Self {
         Self {
             reads,
+            principals,
             event_ids: Arc::new(myelin_events::UlidMinter::new()),
             object_ids: Arc::new(SystemUlidSource::new()),
         }
@@ -331,19 +331,38 @@ impl DurableChatMutationApi {
         references: &[String],
         client_nonce: String,
     ) -> Result<MessageId, EdgeError> {
+        self.post_message_input(
+            actor,
+            authorized_viewer,
+            conversation_id,
+            &MessageInput::references(content, references),
+            client_nonce,
+        )
+    }
+
+    fn post_message_input(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        conversation_id: &str,
+        input: &MessageInput,
+        client_nonce: String,
+    ) -> Result<MessageId, EdgeError> {
         if actor.tenant != authorized_viewer.tenant || actor.region != authorized_viewer.region {
             return Err(EdgeError::Forbidden(
                 "Chat actor and delegated viewer must share one tenant and region".into(),
             ));
         }
         validate_ulid(conversation_id)?;
-        validate_message(content)?;
+        input.validate_content()?;
         validate_nonce(&client_nonce)?;
-        let structured_nodes = reference_nodes(actor, content, references)?;
         let conversation = self.drive(
             self.reads
                 .postable_public_conversation(authorized_viewer, conversation_id),
         )?;
+        let structured_nodes = input.resolve_nodes(actor, |principal_id| {
+            self.resolve_mention(actor, &conversation, principal_id)
+        })?;
         let event_principal = pseudonymized_event_principal(&actor.tenant.0, actor);
         let author_kind = match actor.kind {
             PrincipalKind::Human => AuthorKind::Human,
@@ -360,7 +379,7 @@ impl DurableChatMutationApi {
                 actor,
                 &event_principal.principal_id.0,
                 ChatFreeText::BodyInline,
-                content.as_bytes(),
+                input.content.as_bytes(),
             )?,
             body_nodes: encrypt_message_column(
                 self.reads.kms.as_ref(),
@@ -393,6 +412,49 @@ impl DurableChatMutationApi {
                 .map_err(map_store_error)
         })
     }
+
+    fn resolve_mention(
+        &self,
+        actor: &Principal,
+        conversation: &Conversation,
+        principal_id: &PrincipalId,
+    ) -> Result<Principal, EdgeError> {
+        let unavailable = || {
+            EdgeError::BadRequest(
+                "Chat mention recipient must be an active member of this conversation".into(),
+            )
+        };
+        if principal_id == &actor.principal_id {
+            return Err(unavailable());
+        }
+        let scope = TenantScope::from_verified_token(actor, actor.region.clone());
+        let row = self
+            .principals
+            .try_get_principal(&scope, principal_id)
+            .map_err(|error| {
+                EdgeError::Internal(format!("Chat mention directory lookup failed: {error}"))
+            })?
+            .ok_or_else(unavailable)?;
+        let mentioned = Principal::new(
+            row.tenant,
+            row.region,
+            row.principal_id,
+            row.kind,
+            row.data_role,
+            row.status,
+        );
+        if mentioned.status != PrincipalStatus::Active {
+            return Err(unavailable());
+        }
+        if !self
+            .reads
+            .authorization
+            .may_read_channel(&mentioned, conversation)
+        {
+            return Err(unavailable());
+        }
+        Ok(mentioned)
+    }
 }
 
 #[derive(Deserialize)]
@@ -401,14 +463,6 @@ struct CreateConversationBody {
     project_id: String,
     channel: String,
     topic: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PostMessageBody {
-    content: String,
-    #[serde(default)]
-    references: Vec<String>,
 }
 
 struct ConversationListHandler {
@@ -499,16 +553,15 @@ impl Handler for MessagePostHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
         let conversation_id = conversation_param(ctx)?.to_string();
-        let body: PostMessageBody = parse_body(&ctx.request.body)?;
+        let body: MessageInput = parse_body(&ctx.request.body)?;
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
-        let message_id = self.api.post_message(
+        let message_id = self.api.post_message_input(
             ctx.principal,
             ctx.principal,
             &conversation_id,
-            &body.content,
-            &body.references,
+            &body,
             client_nonce,
         )?;
         Ok(no_store(EdgeResponse::json(
@@ -550,9 +603,10 @@ pub fn register_chat(
     runtime: Handle,
     kms: Arc<KmsEngine>,
     identity: StoreBackedCheck,
+    principals: PrincipalStore,
 ) -> GatewayBuilder {
     let reads = DurableChatReadApi::new(pool, region, runtime, kms, identity);
-    let api = DurableChatMutationApi::new(reads.clone());
+    let api = DurableChatMutationApi::new(reads.clone(), principals);
     let sse = builder.sse_hub();
     builder
         .route(
@@ -703,62 +757,6 @@ fn validate_project_id(value: &str) -> Result<(), EdgeError> {
         ));
     }
     Ok(())
-}
-
-fn validate_message(content: &str) -> Result<(), EdgeError> {
-    if content.len() > MAX_MESSAGE_BYTES || content.trim().is_empty() {
-        return Err(EdgeError::BadRequest(
-            "Chat message must contain 1-32768 UTF-8 bytes".into(),
-        ));
-    }
-    if content.chars().any(|character| {
-        character == '\0' || (character.is_control() && character != '\n' && character != '\t')
-    }) {
-        return Err(EdgeError::BadRequest(
-            "Chat message contains an unsupported control character".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn reference_nodes(
-    principal: &Principal,
-    content: &str,
-    references: &[String],
-) -> Result<Vec<InlineNode>, EdgeError> {
-    if references.len() > MAX_MESSAGE_REFERENCES {
-        return Err(EdgeError::BadRequest(format!(
-            "Chat message may contain at most {MAX_MESSAGE_REFERENCES} structured references"
-        )));
-    }
-    let placeholders = content
-        .chars()
-        .filter(|character| *character == OBJ)
-        .count();
-    if placeholders != references.len() {
-        return Err(EdgeError::BadRequest(
-            "Chat content must contain one U+FFFC placeholder for each structured reference".into(),
-        ));
-    }
-    references
-        .iter()
-        .map(|reference| {
-            if reference.len() > MAX_ARTIFACT_REF_BYTES {
-                return Err(EdgeError::BadRequest(format!(
-                    "Chat ArtifactRef exceeds {MAX_ARTIFACT_REF_BYTES} bytes"
-                )));
-            }
-            let parsed = myelin_refs::parse_scoped(reference).map_err(|error| {
-                EdgeError::BadRequest(format!("invalid Chat ArtifactRef: {error}"))
-            })?;
-            if parsed.tenant != principal.tenant {
-                return Err(EdgeError::BadRequest(
-                    "Chat cannot store a cross-tenant ArtifactRef".into(),
-                ));
-            }
-            Ok(InlineNode::ArtifactRefNode(parsed.artifact_ref))
-        })
-        .collect()
 }
 
 fn validate_nonce(value: &str) -> Result<(), EdgeError> {
@@ -973,20 +971,29 @@ mod tests {
         assert!(validate_project_id("11111111-1111-1111-1111-11111111111A").is_err());
         assert!(validate_label("channel", "engineering").is_ok());
         assert!(validate_label("channel", " engineering").is_err());
-        assert!(validate_message("Ship it\nwith care").is_ok());
-        assert!(validate_message("  ").is_err());
-        assert!(validate_message("bad\0message").is_err());
+        assert!(MessageInput::references("Ship it\nwith care", &[])
+            .validate_content()
+            .is_ok());
+        assert!(MessageInput::references("  ", &[])
+            .validate_content()
+            .is_err());
+        assert!(MessageInput::references("bad\0message", &[])
+            .validate_content()
+            .is_err());
         assert!(validate_nonce("01J-client_nonce").is_ok());
         assert!(validate_nonce("spaces are not stable").is_err());
     }
 
     #[test]
     fn message_body_contains_domain_input_not_retry_transport_metadata() {
-        let body: PostMessageBody =
+        let body: MessageInput =
             serde_json::from_slice(br#"{"content":"Ship it"}"#).expect("content-only message body");
         assert_eq!(body.content, "Ship it");
-        assert!(body.references.is_empty());
-        assert!(serde_json::from_slice::<PostMessageBody>(
+        assert!(body
+            .resolve_nodes(&principal("acme"), |_| unreachable!())
+            .unwrap()
+            .is_empty());
+        assert!(serde_json::from_slice::<MessageInput>(
             br#"{"content":"Ship it","client_nonce":"legacy-42"}"#
         )
         .is_err());
@@ -1017,39 +1024,5 @@ mod tests {
             Vec::new(),
         );
         assert!(missing.stable_idempotency_nonce("svc:agent").is_err());
-    }
-
-    #[test]
-    fn structured_references_are_positionally_complete_and_tenant_scoped() {
-        let issue_ref = "myelin://acme/issue/issue/ENG-41";
-        assert_eq!(
-            reference_nodes(&principal("acme"), "Tracking \u{FFFC}", &[issue_ref.into()]).unwrap(),
-            vec![InlineNode::ArtifactRefNode(myelin_refs::ArtifactRef(
-                issue_ref.into()
-            ))]
-        );
-
-        assert!(reference_nodes(&principal("acme"), "Tracking", &[issue_ref.into()]).is_err());
-        assert!(reference_nodes(&principal("acme"), "Tracking \u{FFFC}", &[]).is_err());
-        assert!(reference_nodes(
-            &principal("acme"),
-            "Tracking \u{FFFC}",
-            &["not-a-reference".into()]
-        )
-        .is_err());
-        assert!(reference_nodes(
-            &principal("acme"),
-            "Tracking \u{FFFC}",
-            &["myelin://other/issue/issue/ENG-41".into()]
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn structured_reference_count_is_bounded_before_parsing() {
-        let references = vec!["not-a-reference".into(); MAX_MESSAGE_REFERENCES + 1];
-        let content = OBJ.to_string().repeat(references.len());
-        let error = reference_nodes(&principal("acme"), &content, &references).unwrap_err();
-        assert!(matches!(error, EdgeError::BadRequest(message) if message.contains("at most")));
     }
 }

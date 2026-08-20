@@ -284,6 +284,28 @@ impl PgMessageStore {
                 })
                 .collect()
         };
+        let mention_envelope = if structured_nodes
+            .iter()
+            .any(|node| matches!(node, InlineNode::Mention(_)))
+        {
+            let related_event_ids = related_event_ids.ok_or_else(|| {
+                StoreError::Cold(
+                    "structured Chat append requires an event-id source for mention delivery"
+                        .into(),
+                )
+            })?;
+            crate::mention_signal::message_mention_signal(
+                &envelope,
+                related_event_ids.mint().into(),
+                message_id.as_str(),
+                structured_nodes,
+            )
+            .map_err(|error| {
+                StoreError::Cold(format!("derive Chat mention signal payload: {error}"))
+            })?
+        } else {
+            None
+        };
 
         let mut dbtx = conn
             .begin()
@@ -388,6 +410,15 @@ impl PgMessageStore {
                 .map_err(|error| {
                     StoreError::Cold(format!("co-commit Chat reference edge: {error}"))
                 })?;
+        }
+        if let Some(mention) = mention_envelope {
+            myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+                &mut dbtx,
+                &mention.aggregate.0,
+                &mention,
+            )
+            .await
+            .map_err(|error| StoreError::Cold(format!("co-commit Chat mention signal: {error}")))?;
         }
 
         dbtx.commit()
