@@ -31,8 +31,9 @@ seconds total.
 
 **Proof:** notification unit suite 347/347; Edge notification unit tests 5/5;
 Clippy `-D warnings` for both touched crates; TypeScript system-test typecheck;
-`notification-scale.system.test.ts` 3/3 (fresh item 1.7s, 100-row page 2.4s,
-complete paged walk 4.8s); `notification-lifecycle.system.test.ts` 4/4.
+`notification-scale.system.test.ts` 3/3 (fresh item 557ms, 100-row page
+34ms, complete paged lookup 59ms); `notification-lifecycle.system.test.ts`
+4/4; complete black-box suite 109/109 with zero skips.
 
 The journey vocabulary was cleaned while making the bug observable: signals
 carry an explicit closed reason, all inbox walks use the shared guarded pager,
