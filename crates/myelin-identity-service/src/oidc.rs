@@ -559,9 +559,27 @@ impl OidcVerifier {
     }
 }
 
-fn num_claim(claims: &serde_json::Value, key: &str) -> Option<i64> {
-    let v = claims.get(key)?;
-    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+fn numeric_date_claim(claims: &serde_json::Value, key: &str) -> Result<Option<i64>, AuthzError> {
+    let Some(value) = claims.get(key) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        refuse(format!(
+            "credential `{key}` must be a representable NumericDate"
+        ))
+    };
+    let number = value.as_number().ok_or_else(invalid)?;
+    if let Some(seconds) = number.as_i64() {
+        return Ok(Some(seconds));
+    }
+    if number.as_u64().is_some() {
+        return Err(invalid());
+    }
+    let seconds = number.as_f64().ok_or_else(invalid)?;
+    if !seconds.is_finite() || seconds <= i64::MIN as f64 || seconds >= i64::MAX as f64 {
+        return Err(invalid());
+    }
+    Ok(Some(seconds.trunc() as i64))
 }
 
 fn aud_is_exact(claims: &serde_json::Value, want: &str) -> bool {
@@ -709,20 +727,21 @@ impl CredentialVerifier for OidcVerifier {
 
         let now = self.now();
         let leeway = self.config.leeway_secs;
-        let exp = num_claim(&claims, "exp").ok_or_else(|| refuse("token missing `exp`"))?;
+        let exp =
+            numeric_date_claim(&claims, "exp")?.ok_or_else(|| refuse("token missing `exp`"))?;
         if exp.saturating_add(leeway) < now {
             return Err(refuse(format!(
                 "token expired: exp={exp} (+{leeway}s leeway) < now={now}"
             )));
         }
-        if let Some(nbf) = num_claim(&claims, "nbf") {
+        if let Some(nbf) = numeric_date_claim(&claims, "nbf")? {
             if nbf.saturating_sub(leeway) > now {
                 return Err(refuse(format!(
                     "token not yet valid: nbf={nbf} (-{leeway}s leeway) > now={now}"
                 )));
             }
         }
-        if let Some(iat) = num_claim(&claims, "iat") {
+        if let Some(iat) = numeric_date_claim(&claims, "iat")? {
             if iat.saturating_sub(leeway) > now {
                 return Err(refuse(format!(
                     "token `iat` in the future: iat={iat} (-{leeway}s leeway) > now={now}"
@@ -1529,6 +1548,61 @@ mod tests {
             let sig = key.sign(signing_input(&header, &cl).as_bytes());
             let _ = v.verify(&cred(jwt(&header, &cl, &sig)));
         }
+    }
+
+    #[test]
+    fn numeric_dates_distinguish_absent_claims_from_malformed_claims() {
+        assert_eq!(
+            numeric_date_claim(&serde_json::json!({}), "nbf").unwrap(),
+            None
+        );
+        assert_eq!(
+            numeric_date_claim(&serde_json::json!({ "exp": NOW as f64 + 0.75 }), "exp").unwrap(),
+            Some(NOW)
+        );
+
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("tomorrow"),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(u64::MAX),
+        ] {
+            let claims = serde_json::json!({ "nbf": value });
+            let error = numeric_date_claim(&claims, "nbf").unwrap_err();
+            assert!(
+                matches!(&error, AuthzError::FailClosed(message) if message.contains("nbf") && message.contains("NumericDate")),
+                "malformed NumericDate must fail closed: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_signed_numeric_dates_are_refused_before_replay_is_consumed() {
+        let key = RsaKey::generate();
+        let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
+        let verifier = verifier(jwks);
+        let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
+
+        for (index, field) in ["exp", "nbf", "iat"].into_iter().enumerate() {
+            let mut malformed = claims(&format!("malformed-numeric-date-{index}"));
+            malformed[field] = serde_json::json!("not-a-date");
+            let signature = key.sign(signing_input(&header, &malformed).as_bytes());
+            let error = verifier
+                .verify(&cred(jwt(&header, &malformed, &signature)))
+                .unwrap_err();
+            assert!(
+                matches!(&error, AuthzError::FailClosed(message) if message.contains(field) && message.contains("NumericDate")),
+                "a present malformed {field} must not behave like an absent claim: {error:?}"
+            );
+        }
+
+        let valid = claims("malformed-numeric-date-1");
+        let signature = key.sign(signing_input(&header, &valid).as_bytes());
+        verifier
+            .verify(&cred(jwt(&header, &valid, &signature)))
+            .expect("claim validation happens before the replay identity is consumed");
     }
 
     #[test]
