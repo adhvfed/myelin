@@ -309,8 +309,10 @@ pub use reserve_settle_durable::{
     COST_LEDGER_VALUE_INVARIANTS_VALIDATE_MIGRATION,
 };
 pub use restore_verify_durable::{
-    restore_verify_durable_migrations, DurableRestoreErasureLedger,
-    RESTORE_ERASURE_LEDGER_MIGRATION,
+    restore_verify_durable_migrations, restore_wal_offset_invariant_migrations,
+    DurableRestoreErasureLedger, RESTORE_ERASURE_LEDGER_MIGRATION,
+    RESTORE_WAL_OFFSET_INVARIANTS_EXPAND_MIGRATION,
+    RESTORE_WAL_OFFSET_INVARIANTS_VALIDATE_MIGRATION,
 };
 pub use tenant_tx::{
     connect_pool_with_reset, with_tenant_repeatable_read_tx, with_tenant_tx, with_tenant_tx_error,

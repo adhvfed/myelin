@@ -42,6 +42,14 @@ pub type WalOffset = u64;
 
 pub type EpochSecs = u64;
 
+pub(crate) fn wal_offset_to_bigint(offset: WalOffset) -> Option<i64> {
+    i64::try_from(offset).ok()
+}
+
+pub(crate) fn wal_offset_from_bigint(offset: i64) -> Option<WalOffset> {
+    WalOffset::try_from(offset).ok()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalSegment {
     pub end_offset: WalOffset,
@@ -546,5 +554,16 @@ mod tests {
         }
         .to_string()
         .is_empty());
+    }
+
+    #[test]
+    fn wal_offsets_cross_the_signed_database_boundary_without_wrapping() {
+        assert_eq!(wal_offset_to_bigint(0), Some(0));
+        assert_eq!(wal_offset_to_bigint(i64::MAX as u64), Some(i64::MAX));
+        assert_eq!(wal_offset_to_bigint(i64::MAX as u64 + 1), None);
+
+        assert_eq!(wal_offset_from_bigint(0), Some(0));
+        assert_eq!(wal_offset_from_bigint(i64::MAX), Some(i64::MAX as u64));
+        assert_eq!(wal_offset_from_bigint(-1), None);
     }
 }

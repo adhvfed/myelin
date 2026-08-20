@@ -14,7 +14,8 @@ use myelin_storage::reserve_settle_durable::{
 };
 use myelin_storage::restore_verify::{ErasureLedger, GateFailure, GateInputs, RestoreVerifyGate};
 use myelin_storage::restore_verify_durable::{
-    restore_verify_durable_migrations, DurableRestoreErasureLedger,
+    restore_verify_durable_migrations, restore_wal_offset_invariant_migrations,
+    DurableRestoreErasureLedger,
 };
 use myelin_storage::{
     BlobPresence, ContinuousArchiver, KmsEngine, RestoredObject, SourceLog, SubstrateProvider,
@@ -75,6 +76,13 @@ async fn migrate_admin() -> SubstrateProvider {
         .await
         .expect("install and validate the cost-ledger value invariants (0111-0112)");
     admin
+        .migrate(
+            &restore_wal_offset_invariant_migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("install and validate the restore WAL-offset invariants (0122-0123)");
+    admin
 }
 
 async fn app_provider() -> SubstrateProvider {
@@ -113,6 +121,27 @@ async fn mr009b_w6b_storage_ledgers_durable() {
             .await
             .expect("clean erasure-record table for this region");
     }
+
+    let corrupt_tenant = format!("corrupt-offset-{suffix}");
+    sqlx::query(
+        "INSERT INTO restore_erasure_ledger \
+           (tenant_id, region, completed_at_offset) VALUES ($1, $2, -1)",
+    )
+    .bind(&corrupt_tenant)
+    .bind(&region)
+    .execute(admin.db_pool())
+    .await
+    .expect_err("the restore ledger rejects a negative WAL offset at the database boundary");
+    sqlx::query(
+        "INSERT INTO post_pit_erasure_ledger \
+           (tenant_id, region, subject, completed_at_offset) VALUES ($1, $2, $3, -1)",
+    )
+    .bind(&corrupt_tenant)
+    .bind(&region)
+    .bind(format!("corrupt-subject-{suffix}"))
+    .execute(admin.db_pool())
+    .await
+    .expect_err("the post-PIT ledger rejects a negative WAL offset at the database boundary");
 
     let tenant = TenantId(format!("01J0COST{suffix}"));
     let run = RunId::new(format!("run-{suffix}"));
@@ -420,9 +449,22 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     let subj_post = SubjectId::new(format!("subj-post-{suffix}"));
     let subj_pre = SubjectId::new(format!("subj-pre-{suffix}"));
     let pp1 = DurablePostPitLedger::new(app.clone());
+    assert!(
+        pp1.record(
+            &pp_tenant,
+            &SubjectId::new(format!("overflow-{suffix}")),
+            i64::MAX as u64 + 1,
+        )
+        .await
+        .is_err(),
+        "an unsigned WAL offset cannot wrap into a negative PostgreSQL bigint"
+    );
     pp1.record(&pp_tenant, &subj_post, 140)
         .await
         .expect("record a post-PIT erasure (offset 140)");
+    pp1.record(&pp_tenant, &subj_post, 60)
+        .await
+        .expect("an older retry is accepted without rewinding the erasure");
     pp1.record(&pp_tenant, &subj_pre, 60)
         .await
         .expect("record a pre-PIT erasure (offset 60)");
@@ -440,8 +482,16 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     );
 
     let windowed = TenantId(format!("01J0WIN{suffix}"));
+    assert!(
+        DurableRestoreErasureLedger::new(app.clone())
+            .record_async(&windowed, i64::MAX as u64 + 1)
+            .await
+            .is_err(),
+        "the restore ledger refuses an offset outside PostgreSQL's signed range"
+    );
     let led1 = ErasureLedger::with_pg(DurableRestoreErasureLedger::new(app.clone()));
     led1.record_erased_at(windowed.clone(), 140);
+    led1.record_erased_at(windowed.clone(), 60);
 
     let led2 = ErasureLedger::with_pg(DurableRestoreErasureLedger::new(app_provider().await));
     let kms = KmsEngine::new();

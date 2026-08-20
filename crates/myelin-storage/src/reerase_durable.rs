@@ -2,7 +2,7 @@ use sqlx::Row;
 
 use myelin_tenancy::TenantId;
 
-use crate::backup::WalOffset;
+use crate::backup::{wal_offset_from_bigint, wal_offset_to_bigint, WalOffset};
 use crate::encryption::SubjectId;
 use crate::migration::{Migration, Migrations};
 use crate::provider::{ProviderError, SubstrateProvider};
@@ -51,13 +51,20 @@ impl DurablePostPitLedger {
         let tenant = tenant.0.clone();
         let region = self.region();
         let subject = subject.0.clone();
-        let offset = completed_at_offset as i64;
+        let offset = wal_offset_to_bigint(completed_at_offset).ok_or_else(|| {
+            ProviderError::from(crate::pg::PgError::Query(
+                "post-PIT erasure offset exceeds the PostgreSQL bigint range".into(),
+            ))
+        })?;
         sqlx::query(
             "INSERT INTO post_pit_erasure_ledger \
                (tenant_id, region, subject, completed_at_offset) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (tenant_id, region, subject) DO UPDATE SET \
-               completed_at_offset = EXCLUDED.completed_at_offset",
+               completed_at_offset = GREATEST( \
+                   post_pit_erasure_ledger.completed_at_offset, \
+                   EXCLUDED.completed_at_offset \
+               )",
         )
         .bind(&tenant)
         .bind(&region)
@@ -74,7 +81,11 @@ impl DurablePostPitLedger {
         pit: WalOffset,
     ) -> Result<Vec<ErasureRecord>, ProviderError> {
         let region = self.region();
-        let pit_i = pit as i64;
+        let pit_i = wal_offset_to_bigint(pit).ok_or_else(|| {
+            ProviderError::from(crate::pg::PgError::Query(
+                "post-PIT restore target exceeds the PostgreSQL bigint range".into(),
+            ))
+        })?;
         let rows = sqlx::query(
             "SELECT tenant_id, subject, completed_at_offset \
              FROM post_pit_erasure_ledger \
@@ -93,10 +104,15 @@ impl DurablePostPitLedger {
                 let offset: i64 = row
                     .try_get("completed_at_offset")
                     .map_err(post_pit_row_decode)?;
+                let offset = wal_offset_from_bigint(offset).ok_or_else(|| {
+                    ProviderError::from(crate::pg::PgError::Query(
+                        "post-PIT erasure ledger contains a negative WAL offset".into(),
+                    ))
+                })?;
                 Ok(ErasureRecord::new(
                     SubjectId::new(subject),
                     TenantId(tenant),
-                    offset as WalOffset,
+                    offset,
                 ))
             })
             .collect()
