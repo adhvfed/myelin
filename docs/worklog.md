@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — issue dependencies are ordinary CLI work
+
+Issue relations were a complete durable API feature—typed creation, permission-
+filtered reads, monotonic backlink removal, and idempotent deletion—but remained
+unreachable from the CLI. The CLI transport itself only understood GET and
+POST, leaving a developer to drop down to raw HTTP to express that one issue
+blocks another.
+
+The typed Issues grammar now offers `relation list`, `relation add`, and
+`relation remove`. It validates UUIDs, relation vocabulary, and canonical issue
+references locally, maps each operation to its native HTTP verb, and documents
+the exact commands. The browser-approved CLI system journey creates a real
+dependency, reads the typed edge, removes it, and repeats the removal without a
+copied credential or storage-specific knowledge.
+
+**Proof:** Issues CLI-parser tests 7/7; CLI unit suite 147/147; TypeScript
+typecheck; Clippy `-D warnings` for `myelin-issues` and `myelin-cli`; complete
+black-box browser-approved CLI journey 16/16.
+
 ## 2026-08-20 — a model response must contain real work
 
 The hosted-model boundary treated malformed function arguments as JSON `null`

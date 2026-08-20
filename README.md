@@ -153,6 +153,11 @@ myelin project show
 myelin project list
 myelin issue create "Make onboarding uneventful" --idempotency-key onboarding-issue
 myelin issue list
+myelin issue relation add 44444444-4444-4444-4444-444444444444 blocks \
+  myelin://acme/issue/issue/DX-2 --idempotency-key block-release
+myelin issue relation list 44444444-4444-4444-4444-444444444444
+myelin issue relation remove 44444444-4444-4444-4444-444444444444 \
+  55555555-5555-5555-5555-555555555555
 myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \
   --input jira-issues.json --dry-run
 myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \

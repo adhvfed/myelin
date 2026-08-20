@@ -1,5 +1,6 @@
 use crate::import::SourceSystem;
 use crate::pg_issue_store::{is_valid_issue_title, MAX_TITLE_BYTES};
+use crate::refs_glue::IssueLifecycleRel;
 
 pub const DEFAULT_CLI_PAGE_LIMIT: u32 = 50;
 pub const MAX_CLI_PAGE_LIMIT: u32 = 100;
@@ -204,6 +205,18 @@ pub enum CliCommand {
     Close {
         issue_id: String,
     },
+    ListRelations {
+        issue_id: String,
+    },
+    CreateRelation {
+        issue_id: String,
+        relation: IssueLifecycleRel,
+        target_ref: String,
+    },
+    RemoveRelation {
+        issue_id: String,
+        relation_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,7 +235,7 @@ impl core::fmt::Display for CliParseError {
         match self {
             Self::Empty => write!(
                 f,
-                "no Issues command given (try: list | create | import | view | close)"
+                "no Issues command given (try: list | create | import | view | close | relation)"
             ),
             Self::Unknown { token } => write!(f, "unknown Issues command token `{token}`"),
             Self::MissingValue { flag } => write!(f, "missing value for `{flag}`"),
@@ -249,7 +262,66 @@ pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
         "import" => parse_import(rest),
         "view" => parse_issue_id(rest, |issue_id| CliCommand::View { issue_id }),
         "close" => parse_issue_id(rest, |issue_id| CliCommand::Close { issue_id }),
+        "relation" => parse_relation(rest),
         other => Err(CliParseError::Unknown {
+            token: other.to_string(),
+        }),
+    }
+}
+
+fn parse_relation(args: &[&str]) -> Result<CliCommand, CliParseError> {
+    let (action, operands) = args.split_first().ok_or(CliParseError::MissingValue {
+        flag: "relation action (list|add|remove)",
+    })?;
+    match (*action, operands) {
+        ("list", [issue_id]) => {
+            require_uuid("issue UUID", issue_id)?;
+            Ok(CliCommand::ListRelations {
+                issue_id: (*issue_id).to_string(),
+            })
+        }
+        ("add", [issue_id, relation, target_ref]) => {
+            require_uuid("issue UUID", issue_id)?;
+            let relation = IssueLifecycleRel::from_token(relation).ok_or_else(|| {
+                CliParseError::BadValue {
+                    field: "relation (expected parent|blocks|blocked_by|closes|depends_on|relates)",
+                    value: (*relation).to_string(),
+                }
+            })?;
+            let parsed = myelin_refs::parse_scoped(target_ref).map_err(|_| {
+                CliParseError::BadValue {
+                    field: "target (expected a canonical issue reference)",
+                    value: (*target_ref).to_string(),
+                }
+            })?;
+            if parsed.artifact_ref.0 != *target_ref
+                || parsed.subsystem != "issue"
+                || parsed.type_ != "issue"
+                || parsed.sub.is_some()
+            {
+                return Err(CliParseError::BadValue {
+                    field: "target (expected a canonical issue reference)",
+                    value: (*target_ref).to_string(),
+                });
+            }
+            Ok(CliCommand::CreateRelation {
+                issue_id: (*issue_id).to_string(),
+                relation,
+                target_ref: (*target_ref).to_string(),
+            })
+        }
+        ("remove", [issue_id, relation_id]) => {
+            require_uuid("issue UUID", issue_id)?;
+            require_uuid("relation UUID", relation_id)?;
+            Ok(CliCommand::RemoveRelation {
+                issue_id: (*issue_id).to_string(),
+                relation_id: (*relation_id).to_string(),
+            })
+        }
+        ("list" | "add" | "remove", _) => Err(CliParseError::InvalidCombination(
+            "issue relation expects `list <issue-id>`, `add <issue-id> <relation> <target-ref>`, or `remove <issue-id> <relation-id>`",
+        )),
+        (other, _) => Err(CliParseError::Unknown {
             token: other.to_string(),
         }),
     }
@@ -528,6 +600,8 @@ mod tests {
 
     const PROJECT: &str = "11111111-1111-1111-1111-111111111111";
     const TYPE: &str = "22222222-2222-2222-2222-222222222222";
+    const RELATION: &str = "33333333-3333-3333-3333-333333333333";
+    const TARGET_REF: &str = "myelin://acme/issue/issue/ENG-2";
 
     #[test]
     fn parses_every_founder_command_without_scope_selectors() {
@@ -600,6 +674,27 @@ mod tests {
                 issue_id: PROJECT.into()
             }
         );
+        assert_eq!(
+            parse_cli(&["relation", "list", PROJECT]).unwrap(),
+            CliCommand::ListRelations {
+                issue_id: PROJECT.into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&["relation", "add", PROJECT, "blocks", TARGET_REF]).unwrap(),
+            CliCommand::CreateRelation {
+                issue_id: PROJECT.into(),
+                relation: IssueLifecycleRel::Blocks,
+                target_ref: TARGET_REF.into(),
+            }
+        );
+        assert_eq!(
+            parse_cli(&["relation", "remove", PROJECT, RELATION]).unwrap(),
+            CliCommand::RemoveRelation {
+                issue_id: PROJECT.into(),
+                relation_id: RELATION.into(),
+            }
+        );
     }
 
     #[test]
@@ -625,6 +720,15 @@ mod tests {
             parse_cli(&["close"]),
             Err(CliParseError::MissingValue { .. })
         ));
+        for invalid in [
+            vec!["relation"],
+            vec!["relation", "list"],
+            vec!["relation", "add", PROJECT, "blocks"],
+            vec!["relation", "remove", PROJECT],
+            vec!["relation", "archive", PROJECT],
+        ] {
+            assert!(parse_cli(&invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]
@@ -684,6 +788,16 @@ mod tests {
         assert!(parse_cli(&["list", "--state", "OPEN"]).is_err());
         assert!(parse_cli(&["list", "--key", "title search"]).is_err());
         assert!(parse_cli(&["view", "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"]).is_err());
+        assert!(parse_cli(&["relation", "add", PROJECT, "follows", TARGET_REF]).is_err());
+        assert!(parse_cli(&[
+            "relation",
+            "add",
+            PROJECT,
+            "blocks",
+            "myelin://acme/knowledge/page/01J0PAGE"
+        ])
+        .is_err());
+        assert!(parse_cli(&["relation", "remove", PROJECT, "not-a-uuid"]).is_err());
         for prefix in ["E", "engineering", "ENG_TOO_LONG", "ENG-"] {
             assert!(parse_cli(&[
                 "create",

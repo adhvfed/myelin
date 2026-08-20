@@ -89,6 +89,7 @@ impl FormQuery {
 pub enum HttpMethod {
     Get,
     Post,
+    Delete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,7 @@ impl HttpMethod {
         match self {
             HttpMethod::Get => "GET",
             HttpMethod::Post => "POST",
+            HttpMethod::Delete => "DELETE",
         }
     }
 }
@@ -145,6 +147,17 @@ impl EdgeCall {
             path: path.into(),
             query: None,
             payload: Some(payload.to_string().into_bytes()),
+            idempotency_key: None,
+            retry_policy: RetryPolicy::None,
+        }
+    }
+
+    fn delete(path: impl Into<String>) -> EdgeCall {
+        EdgeCall {
+            method: HttpMethod::Delete,
+            path: path.into(),
+            query: None,
+            payload: None,
             idempotency_key: None,
             retry_policy: RetryPolicy::None,
         }

@@ -178,6 +178,24 @@ fn command_to_call(
         CliCommand::Close { issue_id } => {
             EdgeCall::post_retry_safe_json(format!("/v1/issues/{issue_id}/close"), json!({}))
         }
+        CliCommand::ListRelations { issue_id } => {
+            EdgeCall::get(format!("/v1/issues/{issue_id}/relations"))
+        }
+        CliCommand::CreateRelation {
+            issue_id,
+            relation,
+            target_ref,
+        } => EdgeCall::post_json(
+            format!("/v1/issues/{issue_id}/relations"),
+            json!({
+                "target_ref": target_ref,
+                "relation": relation.as_str(),
+            }),
+        ),
+        CliCommand::RemoveRelation {
+            issue_id,
+            relation_id,
+        } => EdgeCall::delete(format!("/v1/issues/{issue_id}/relations/{relation_id}")),
     })
 }
 
@@ -306,5 +324,35 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(close.payload.as_deref().unwrap()).unwrap(),
             json!({}),
         );
+    }
+
+    #[test]
+    fn relations_read_create_and_remove_through_their_native_http_verbs() {
+        let target = "myelin://acme/issue/issue/ENG-2";
+        let relation_id = "55555555-5555-5555-5555-555555555555";
+
+        let list = issues_dispatch(&["relation", "list", ISSUE]).unwrap();
+        assert_eq!(list.method, HttpMethod::Get);
+        assert_eq!(list.path, format!("/v1/issues/{ISSUE}/relations"));
+        assert_eq!(list.retry_policy, RetryPolicy::None);
+
+        let create = issues_dispatch(&["relation", "add", ISSUE, "blocks", target]).unwrap();
+        assert_eq!(create.method, HttpMethod::Post);
+        assert_eq!(create.path, format!("/v1/issues/{ISSUE}/relations"));
+        assert_eq!(create.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(create.payload.as_deref().unwrap())
+                .unwrap(),
+            json!({"target_ref": target, "relation": "blocks"}),
+        );
+
+        let remove = issues_dispatch(&["relation", "remove", ISSUE, relation_id]).unwrap();
+        assert_eq!(remove.method, HttpMethod::Delete);
+        assert_eq!(
+            remove.path,
+            format!("/v1/issues/{ISSUE}/relations/{relation_id}")
+        );
+        assert_eq!(remove.retry_policy, RetryPolicy::None);
+        assert_eq!(remove.payload, None);
     }
 }

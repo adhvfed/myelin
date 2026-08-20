@@ -13,6 +13,7 @@ import { eventually } from "../src/eventually.js";
 import { awaitAuthorizedIssue } from "../src/issues.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
+import { awaitActiveIssue } from "../src/journeys/issues.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import {
   cliEnvironment,
@@ -1442,6 +1443,84 @@ describe.sequential("the CLI authentication journey", () => {
       `authorization for CLI issue ${issueKey}`,
     );
     expect(activeIssue).toMatchObject({ id: issueId, key: issueKey, title: contextualIssueTitle });
+    contextualIssueRef = string(activeIssue.ref, "CLI issue reference");
+
+    // Dependencies are ordinary CLI work, not an API-only graph feature. A developer can add one,
+    // inspect the exact typed edge, and remove it again without learning an internal storage shape.
+    const deliveryIssue = await awaitActiveIssue(
+      systemClient,
+      uniqueName("Deliver the contextual issue"),
+      {
+        projectId: createdProject.project.id,
+        typeId: createdProject.project.default_issue_type_id,
+        prefix: createdProject.project.issue_prefix,
+      },
+    );
+    const deliveryRef = string(deliveryIssue.ref, "dependent issue reference");
+    const relationKey = `cli-issue-relation-${randomUUID()}`;
+    const addedRelation = await runCli(
+      configDirectory,
+      "--json",
+      "--idempotency-key",
+      relationKey,
+      "issue",
+      "relation",
+      "add",
+      issueId,
+      "blocks",
+      deliveryRef,
+    );
+    expect(addedRelation.exitCode, addedRelation.stderr).toBe(0);
+    const addedEnvelope = record(JSON.parse(addedRelation.stdout), "CLI issue relation receipt");
+    const relation = record(addedEnvelope.relation, "CLI issue relation");
+    const relationId = string(relation.id, "CLI issue relation id");
+    expect(addedEnvelope).toMatchObject({ created: true, durable: true });
+    expect(relation).toMatchObject({
+      source_ref: contextualIssueRef,
+      target_ref: deliveryRef,
+      relation: "blocks",
+    });
+
+    const listedRelations = await runCli(
+      configDirectory,
+      "--json",
+      "issue",
+      "relation",
+      "list",
+      issueId,
+    );
+    expect(listedRelations.exitCode, listedRelations.stderr).toBe(0);
+    expect(array(JSON.parse(listedRelations.stdout).items, "CLI issue relations")).toEqual([
+      expect.objectContaining({ id: relationId, target_ref: deliveryRef, relation: "blocks" }),
+    ]);
+
+    const removedRelation = await runCli(
+      configDirectory,
+      "--json",
+      "issue",
+      "relation",
+      "remove",
+      issueId,
+      relationId,
+    );
+    expect(removedRelation.exitCode, removedRelation.stderr).toBe(0);
+    expect(JSON.parse(removedRelation.stdout)).toMatchObject({ removed: true, durable: true });
+
+    const repeatedRemoval = await runCli(
+      configDirectory,
+      "--json",
+      "issue",
+      "relation",
+      "remove",
+      issueId,
+      relationId,
+    );
+    expect(repeatedRemoval.exitCode, repeatedRemoval.stderr).toBe(0);
+    expect(JSON.parse(repeatedRemoval.stdout)).toMatchObject({
+      relation_id: relationId,
+      removed: false,
+      durable: true,
+    });
 
     knowledgeTitle = uniqueName("How we ship safely");
     const contextualPage = await runCli(
@@ -1462,7 +1541,6 @@ describe.sequential("the CLI authentication journey", () => {
     const knowledgePage = record(pageEnvelope.page, "CLI knowledge document");
     knowledgePageId = string(knowledgePage.id, "CLI knowledge page id");
     knowledgePageRef = `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`;
-    contextualIssueRef = `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`;
     expect(pageEnvelope).toMatchObject({ created: true, durable: true });
     expect(knowledgePage).toMatchObject({
       title: knowledgeTitle,
