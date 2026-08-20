@@ -2,12 +2,11 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, test } from "vitest";
 
-import { systemTestConfig } from "../src/config.js";
 import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/context.js";
-import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.js";
-import { eventually } from "../src/eventually.js";
 import { awaitAuthorizedIssue } from "../src/issues.js";
-import { array, integer, record, string, type JsonRecord } from "../src/json.js";
+import { awaitAutomationFiring } from "../src/journeys/automations.js";
+import { announceIssueChange } from "../src/journeys/issues.js";
+import { integer, record, string, type JsonRecord } from "../src/json.js";
 import type { SystemTestClient } from "../src/client.js";
 
 async function createVisibleIssue(
@@ -35,47 +34,6 @@ async function createVisibleIssue(
     requestEventId,
     `the privacy test issue ${requestEventId} to become visible`,
   );
-}
-
-function issueChange(
-  eventId: string,
-  issueRef: string,
-  issueKey: string,
-  changeKind: string,
-): ExternalEventEnvelope {
-  const now = new Date().toISOString();
-  return {
-    event_id: eventId,
-    type_: "issue.issue.updated",
-    schema_ver: 1,
-    tenant: systemTestConfig.tenant,
-    region: systemTestConfig.region,
-    actor: {
-      tenant: systemTestConfig.tenant,
-      region: systemTestConfig.region,
-      principal_id: "issues-service",
-      kind: "Service",
-      data_role: "Controller",
-      status: "Active",
-    },
-    subject: issueRef,
-    aggregate: `issue:${issueKey}`,
-    causation_id: null,
-    correlation_id: eventId,
-    caused_by: null,
-    depth: 1,
-    contains_personal_data: false,
-    data_role: "Controller",
-    visibility: "Internal",
-    pii_key_ref: null,
-    occurred_at: now,
-    recorded_at: now,
-    payload: {
-      issue: issueRef,
-      change_kind: changeKind,
-      changed_fields: ["description"],
-    },
-  };
 }
 
 describe("a person's agent-data privacy lifecycle", () => {
@@ -144,26 +102,17 @@ describe("a person's agent-data privacy lifecycle", () => {
     );
 
     const firstEventId = `privacy-work-${randomUUID()}`;
-    const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
-    try {
-      expect((await bus.publish(
-        issueChange(firstEventId, issueRef, issueKey, changeKind),
-      )).duplicate).toBe(false);
-    } finally {
-      await bus.close();
-    }
+    await announceIssueChange({
+      eventId: firstEventId,
+      issueRef,
+      issueKey,
+      changeKind,
+    });
 
-    const completed = await eventually<JsonRecord>(async () => {
-      const response = await person.json(
-        `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
-      );
-      return array(response.body.items, "privacy automation history")
-        .map((item) => record(item, "privacy automation firing"))
-        .find((item) => item.event_id === firstEventId && item.state === "terminal" &&
-          item.result_state === "available");
-    }, {
+    const completed = await awaitAutomationFiring(person, triggerId, firstEventId, {
+      state: "terminal",
+      resultState: "available",
       description: "the person's hosted agent to leave a recoverable result",
-      timeoutMs: 30_000,
     });
     const runId = string(completed.run_id, "privacy test run id");
     await person.json(
@@ -226,24 +175,15 @@ describe("a person's agent-data privacy lifecycle", () => {
     });
 
     const refusedEventId = `privacy-work-after-erasure-${randomUUID()}`;
-    const secondBus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
-    try {
-      expect((await secondBus.publish(
-        issueChange(refusedEventId, issueRef, issueKey, changeKind),
-      )).duplicate).toBe(false);
-    } finally {
-      await secondBus.close();
-    }
-    const refused = await eventually<JsonRecord>(async () => {
-      const response = await person.json(
-        `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
-      );
-      return array(response.body.items, "privacy automation history after erasure")
-        .map((item) => record(item, "post-erasure automation firing"))
-        .find((item) => item.event_id === refusedEventId && item.state === "terminal");
-    }, {
+    await announceIssueChange({
+      eventId: refusedEventId,
+      issueRef,
+      issueKey,
+      changeKind,
+    });
+    const refused = await awaitAutomationFiring(person, triggerId, refusedEventId, {
+      state: "terminal",
       description: "post-erasure agent processing to be refused",
-      timeoutMs: 30_000,
     });
     expect(refused).toMatchObject({
       outcome: "failed",
