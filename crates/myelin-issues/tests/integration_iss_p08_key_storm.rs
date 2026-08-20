@@ -59,10 +59,11 @@ impl PrefixReserve for PgPrefixReserve {
         .map_err(|e| ReserveError::Backend(format!("{e}")))?;
         let lo: i64 = row.get("lo");
         let hi: i64 = row.get("hi");
-        Ok(ReservedBlock {
-            lo: lo as u64,
-            hi: hi as u64,
-        })
+        let lo = u64::try_from(lo)
+            .map_err(|_| ReserveError::InvalidBlock("PostgreSQL returned a negative lo".into()))?;
+        let hi = u64::try_from(hi)
+            .map_err(|_| ReserveError::InvalidBlock("PostgreSQL returned a negative hi".into()))?;
+        Ok(ReservedBlock { lo, hi })
     }
 }
 

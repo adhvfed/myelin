@@ -43,7 +43,7 @@ pub struct ReservedBlock {
 
 impl ReservedBlock {
     pub fn len(&self) -> u64 {
-        self.hi - self.lo
+        self.hi.saturating_sub(self.lo)
     }
     pub fn is_empty(&self) -> bool {
         self.hi <= self.lo
@@ -53,6 +53,8 @@ impl ReservedBlock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReserveError {
     Backend(String),
+    InvalidBlock(String),
+    Exhausted,
 }
 
 impl std::fmt::Display for ReserveError {
@@ -63,6 +65,12 @@ impl std::fmt::Display for ReserveError {
                     f,
                     "prefix_counter reserve failed (allocation fails closed): {why}"
                 )
+            }
+            ReserveError::InvalidBlock(why) => {
+                write!(f, "prefix_counter returned an unsafe block: {why}")
+            }
+            ReserveError::Exhausted => {
+                write!(f, "prefix_counter exhausted the canonical key space")
             }
         }
     }
@@ -112,7 +120,10 @@ impl PrefixReserve for InMemoryPrefixCounter {
             .map_err(|e| ReserveError::Backend(format!("mutex poisoned: {e}")))?;
         let key = (tenant.0.clone(), prefix.to_string());
         let lo = *map.get(&key).unwrap_or(&0);
-        let hi = lo + block_size as u64;
+        let hi = lo
+            .checked_add(u64::from(block_size))
+            .filter(|hi| *hi < u64::MAX)
+            .ok_or(ReserveError::Exhausted)?;
         map.insert(key, hi);
         Ok(ReservedBlock { lo, hi })
     }
@@ -164,17 +175,49 @@ impl<R: PrefixReserve> HiLoKeyAllocator<R> {
                 block.block_size = grow_block_size(block.block_size);
             }
             let reserved = self.reserve.reserve(tenant, prefix, block.block_size)?;
-            block.next = reserved.lo + 1;
+            validate_reserved_block(reserved, block.block_size, block.block_hi)?;
+            block.next = reserved.lo.checked_add(1).ok_or(ReserveError::Exhausted)?;
             block.block_hi = reserved.hi;
         }
 
         let seqno = block.next;
-        block.next += 1;
+        block.next = block.next.checked_add(1).ok_or(ReserveError::Exhausted)?;
         Ok(CanonicalKey {
             prefix: prefix.to_string(),
             seqno,
         })
     }
+}
+
+fn validate_reserved_block(
+    block: ReservedBlock,
+    requested_size: u32,
+    previous_hi: u64,
+) -> Result<(), ReserveError> {
+    if block.is_empty() {
+        return Err(ReserveError::InvalidBlock(format!(
+            "range {}..{} is empty or reversed",
+            block.lo, block.hi
+        )));
+    }
+    if block.len() != u64::from(requested_size) {
+        return Err(ReserveError::InvalidBlock(format!(
+            "range {}..{} has length {}, expected {requested_size}",
+            block.lo,
+            block.hi,
+            block.len()
+        )));
+    }
+    if block.lo < previous_hi {
+        return Err(ReserveError::InvalidBlock(format!(
+            "range {}..{} overlaps the allocator's prior high-water {previous_hi}",
+            block.lo, block.hi
+        )));
+    }
+    if block.hi == u64::MAX {
+        return Err(ReserveError::Exhausted);
+    }
+    Ok(())
 }
 
 fn grow_block_size(current: u32) -> u32 {
@@ -378,5 +421,57 @@ mod tests {
         assert_eq!(b.len(), 50);
         assert!(!b.is_empty());
         assert!(ReservedBlock { lo: 7, hi: 7 }.is_empty());
+        assert_eq!(ReservedBlock { lo: 8, hi: 7 }.len(), 0);
+    }
+
+    struct ScriptedReserve(Mutex<Vec<ReservedBlock>>);
+
+    impl PrefixReserve for ScriptedReserve {
+        fn reserve(
+            &self,
+            _tenant: &TenantId,
+            _prefix: &str,
+            _block_size: u32,
+        ) -> Result<ReservedBlock, ReserveError> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| ReserveError::Backend("the reserve script is empty".into()))
+        }
+    }
+
+    #[test]
+    fn malformed_backend_blocks_never_become_issue_keys() {
+        for unsafe_block in [
+            ReservedBlock { lo: 50, hi: 50 },
+            ReservedBlock { lo: 51, hi: 50 },
+            ReservedBlock { lo: 0, hi: 49 },
+            ReservedBlock {
+                lo: u64::MAX - u64::from(INITIAL_BLOCK_SIZE),
+                hi: u64::MAX,
+            },
+        ] {
+            let allocator = HiLoKeyAllocator::new(ScriptedReserve(Mutex::new(vec![unsafe_block])));
+            assert!(allocator.allocate(&tenant(), "ENG").is_err());
+        }
+    }
+
+    #[test]
+    fn a_backend_cannot_move_a_live_allocator_back_into_an_old_block() {
+        let allocator = HiLoKeyAllocator::new(ScriptedReserve(Mutex::new(vec![
+            ReservedBlock { lo: 25, hi: 125 },
+            ReservedBlock { lo: 0, hi: 50 },
+        ])));
+        for expected in 1..=INITIAL_BLOCK_SIZE {
+            assert_eq!(
+                allocator.allocate(&tenant(), "ENG").unwrap().seqno,
+                u64::from(expected)
+            );
+        }
+
+        let error = allocator.allocate(&tenant(), "ENG").unwrap_err();
+
+        assert!(matches!(error, ReserveError::InvalidBlock(reason) if reason.contains("overlaps")));
     }
 }
