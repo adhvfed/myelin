@@ -141,11 +141,10 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         }
     );
     assert_eq!(
-        parse_cli(&["pr", "merge", "core", "42", "--auto"]).unwrap(),
+        parse_cli(&["pr", "merge", "core", "42"]).unwrap(),
         CliCommand::PrMerge {
             repo: "core".into(),
-            number: 42,
-            auto: true
+            number: 42
         }
     );
     assert_eq!(
@@ -162,6 +161,37 @@ fn cli_parses_the_arch_section_3_2_verbs() {
             repo: Some("core".into())
         }
     );
+}
+
+#[test]
+fn git_cli_rejects_every_unconsumed_operand_flag_and_counterfeit_feature() {
+    for args in [
+        vec!["repo", "create", "core", "second-slug"],
+        vec!["repo", "create", "../outside"],
+        vec!["repo", "view", "core", "extra"],
+        vec!["pr", "list", "core"],
+        vec!["pr", "list", "--repo", "core", "extra"],
+        vec!["pr", "list", "--repo", "core", "--repo", "other"],
+        vec!["pr", "open", "core", "--title", "Change", "extra"],
+        vec![
+            "pr", "open", "core", "--title", "Change", "--title", "Other",
+        ],
+        vec![
+            "pr", "open", "core", "--title", "Change", "--draft", "--draft",
+        ],
+        vec!["pr", "view", "core", "1", "extra"],
+        vec!["pr", "checks", "core", "1", "--unknown"],
+        vec!["pr", "review", "core", "1", "--approve", "--comment"],
+        vec!["pr", "review", "core", "1", "--approve", "extra"],
+        vec!["pr", "merge", "core", "1", "--auto"],
+        vec!["pr", "merge", "core", "1", "extra"],
+        vec!["pr", "endorse-fork-ci", "core", "1", "extra"],
+    ] {
+        assert!(
+            parse_cli(&args).is_err(),
+            "Git CLI arguments must be consumed exactly: {args:?}"
+        );
+    }
 }
 
 #[test]
@@ -326,8 +356,7 @@ fn cli_each_verb_lowers_to_an_existing_handler() {
     assert_eq!(
         CliCommand::PrMerge {
             repo: "r".into(),
-            number: 1,
-            auto: false
+            number: 1
         }
         .handler(),
         Handler::MergeGate
@@ -354,8 +383,7 @@ fn cli_each_verb_lowers_to_an_existing_handler() {
 fn cli_write_commands_are_classified_for_the_bus2_gate() {
     assert!(CliCommand::PrMerge {
         repo: "r".into(),
-        number: 1,
-        auto: false
+        number: 1
     }
     .is_write());
     assert!(CliCommand::PrReview {

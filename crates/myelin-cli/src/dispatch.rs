@@ -302,7 +302,7 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/reviews"),
             json!({ "verdict": verdict }),
         )),
-        CliCommand::PrMerge { repo, number, .. } => Ok(EdgeCall::post_json(
+        CliCommand::PrMerge { repo, number } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/merge"),
             json!({}),
         )),

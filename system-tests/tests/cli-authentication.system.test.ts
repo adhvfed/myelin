@@ -1689,7 +1689,53 @@ describe.sequential("the CLI authentication journey", () => {
     expect(JSON.parse(sentMessage.stdout)).toMatchObject({ durable: true });
 
     sourceRepository = new GitProject(uniqueName("agent-context"), systemClient);
-    expect(await sourceRepository.create()).toMatchObject({ durable: true });
+
+    // A typo must not be interpreted as a successful subset of a mutation. The exact same
+    // repository name remains available after the rejected command, then succeeds once the
+    // founder gives the complete grammar.
+    const ambiguousRepositoryCreation = await runCli(
+      configDirectory,
+      "--idempotency-key",
+      `cli-repo-ambiguous-${randomUUID()}`,
+      "repo",
+      "create",
+      sourceRepository.slug,
+      "second-slug",
+    );
+    expect(ambiguousRepositoryCreation.exitCode).toBe(2);
+    expect(ambiguousRepositoryCreation.stdout).toBe("");
+    expect(ambiguousRepositoryCreation.stderr).toContain("unknown git command token `second-slug`");
+    await systemClient.json(sourceRepository.path, { expectedStatus: 404 });
+
+    const createdRepository = await runCli(
+      configDirectory,
+      "--json",
+      "--idempotency-key",
+      `cli-repo-${randomUUID()}`,
+      "repo",
+      "create",
+      sourceRepository.slug,
+    );
+    expect(createdRepository.exitCode, createdRepository.stderr).toBe(0);
+    expect(JSON.parse(createdRepository.stdout)).toMatchObject({
+      applied: { action: "git.repo.create", slug: sourceRepository.slug },
+      created: true,
+      durable: true,
+    });
+
+    const imaginaryAutoMerge = await runCli(
+      configDirectory,
+      "repo",
+      "pr",
+      "merge",
+      sourceRepository.slug,
+      "1",
+      "--auto",
+    );
+    expect(imaginaryAutoMerge.exitCode).toBe(2);
+    expect(imaginaryAutoMerge.stdout).toBe("");
+    expect(imaginaryAutoMerge.stderr).toContain("unknown git command token `--auto`");
+
     sourceMarker = `credentialless_release_${randomUUID().replaceAll("-", "")}`;
     sourcePath = "src/release.ts";
     sourceContents = [

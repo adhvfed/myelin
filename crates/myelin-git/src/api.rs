@@ -202,7 +202,6 @@ pub enum CliCommand {
     PrMerge {
         repo: String,
         number: u64,
-        auto: bool,
     },
     PrEndorseForkCi {
         repo: String,
@@ -284,18 +283,12 @@ fn parse_repo(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         .ok_or(CliParseError::MissingArg { what: "repo verb" })?;
     match *verb {
         "list" => parse_repo_list(args),
-        "create" => {
-            let slug = positional(args, 0).ok_or(CliParseError::MissingArg { what: "slug" })?;
-            Ok(CliCommand::RepoCreate {
-                slug: slug.to_string(),
-            })
-        }
-        "view" => {
-            let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
-            Ok(CliCommand::RepoView {
-                repo: repo.to_string(),
-            })
-        }
+        "create" => Ok(CliCommand::RepoCreate {
+            slug: parse_exact_repository(args, "slug")?,
+        }),
+        "view" => Ok(CliCommand::RepoView {
+            repo: parse_exact_repository(args, "repo")?,
+        }),
         other => Err(CliParseError::Unknown {
             token: other.to_string(),
         }),
@@ -359,24 +352,8 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         .split_first()
         .ok_or(CliParseError::MissingArg { what: "pr verb" })?;
     match *verb {
-        "list" => {
-            let repo = flag_value(args, "--repo");
-            Ok(CliCommand::PrList { repo })
-        }
-        "open" => {
-            let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
-            Ok(CliCommand::PrOpen {
-                repo: repo.to_string(),
-                title: flag_value(args, "--title")
-                    .filter(|t| !t.trim().is_empty())
-                    .ok_or(CliParseError::MissingArg { what: "title" })?,
-                body: flag_value(args, "--body"),
-                base_ref: flag_value(args, "--base"),
-                head_ref: flag_value(args, "--head"),
-                head_oid: flag_value(args, "--head-oid"),
-                draft: args.contains(&"--draft"),
-            })
-        }
+        "list" => parse_pr_list(args),
+        "open" => parse_pr_open(args),
         "view" => {
             let (repo, number) = repo_and_number(args)?;
             Ok(CliCommand::PrView { repo, number })
@@ -386,28 +363,17 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             Ok(CliCommand::PrChecks { repo, number })
         }
         "review" => {
-            let (repo, number) = repo_and_number(args)?;
-            let verdict = if args.contains(&"--approve") {
-                "approve"
-            } else if args.contains(&"--request-changes") {
-                "request-changes"
-            } else if args.contains(&"--comment") {
-                "comment"
-            } else {
-                return Err(CliParseError::MissingArg {
-                    what: "review verdict",
-                });
-            };
+            let (repo, number, flags) = repo_and_number_prefix(args)?;
+            let verdict = parse_review_verdict(flags)?;
             Ok(CliCommand::PrReview {
                 repo,
                 number,
-                verdict: verdict.to_string(),
+                verdict,
             })
         }
         "merge" => {
             let (repo, number) = repo_and_number(args)?;
-            let auto = args.contains(&"--auto");
-            Ok(CliCommand::PrMerge { repo, number, auto })
+            Ok(CliCommand::PrMerge { repo, number })
         }
         "endorse-fork-ci" => {
             let (repo, number) = repo_and_number(args)?;
@@ -419,18 +385,180 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
     }
 }
 
-fn positional<'a>(args: &'a [&str], n: usize) -> Option<&'a str> {
-    args.iter().filter(|a| !a.starts_with("--")).nth(n).copied()
+fn parse_pr_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
+    let mut repo = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--repo" => {
+                if repo.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--repo" });
+                }
+                let value = required_flag_value(args, index, "--repo")?;
+                require_repository(value)?;
+                repo = Some(value.to_string());
+                index += 2;
+            }
+            other => {
+                return Err(CliParseError::Unknown {
+                    token: other.to_string(),
+                })
+            }
+        }
+    }
+    Ok(CliCommand::PrList { repo })
+}
+
+fn parse_pr_open(args: &[&str]) -> Result<CliCommand, CliParseError> {
+    let (repo, flags) = args
+        .split_first()
+        .ok_or(CliParseError::MissingArg { what: "repo" })?;
+    if repo.starts_with("--") {
+        return Err(CliParseError::MissingArg { what: "repo" });
+    }
+    require_repository(repo)?;
+
+    let mut title = None;
+    let mut body = None;
+    let mut base_ref = None;
+    let mut head_ref = None;
+    let mut head_oid = None;
+    let mut draft = false;
+    let mut index = 0;
+    while index < flags.len() {
+        match flags[index] {
+            "--title" => parse_value_flag(flags, &mut index, "--title", &mut title)?,
+            "--body" => parse_value_flag(flags, &mut index, "--body", &mut body)?,
+            "--base" => parse_value_flag(flags, &mut index, "--base", &mut base_ref)?,
+            "--head" => parse_value_flag(flags, &mut index, "--head", &mut head_ref)?,
+            "--head-oid" => parse_value_flag(flags, &mut index, "--head-oid", &mut head_oid)?,
+            "--draft" => {
+                if draft {
+                    return Err(CliParseError::DuplicateFlag { flag: "--draft" });
+                }
+                draft = true;
+                index += 1;
+            }
+            other => {
+                return Err(CliParseError::Unknown {
+                    token: other.to_string(),
+                })
+            }
+        }
+    }
+
+    let title = title
+        .filter(|value: &String| !value.trim().is_empty())
+        .ok_or(CliParseError::MissingArg { what: "title" })?;
+    Ok(CliCommand::PrOpen {
+        repo: (*repo).to_string(),
+        title,
+        body,
+        base_ref,
+        head_ref,
+        head_oid,
+        draft,
+    })
+}
+
+fn parse_value_flag(
+    args: &[&str],
+    index: &mut usize,
+    flag: &'static str,
+    slot: &mut Option<String>,
+) -> Result<(), CliParseError> {
+    if slot.is_some() {
+        return Err(CliParseError::DuplicateFlag { flag });
+    }
+    *slot = Some(required_flag_value(args, *index, flag)?.to_string());
+    *index += 2;
+    Ok(())
+}
+
+fn parse_review_verdict(flags: &[&str]) -> Result<String, CliParseError> {
+    let mut verdict = None;
+    for flag in flags {
+        let value = match *flag {
+            "--approve" => "approve",
+            "--request-changes" => "request-changes",
+            "--comment" => "comment",
+            other => {
+                return Err(CliParseError::Unknown {
+                    token: other.to_string(),
+                })
+            }
+        };
+        if verdict.replace(value).is_some() {
+            return Err(CliParseError::DuplicateFlag {
+                flag: "review verdict",
+            });
+        }
+    }
+    verdict
+        .map(str::to_string)
+        .ok_or(CliParseError::MissingArg {
+            what: "review verdict",
+        })
+}
+
+fn parse_exact_repository(args: &[&str], what: &'static str) -> Result<String, CliParseError> {
+    match args {
+        [] => Err(CliParseError::MissingArg { what }),
+        [repo] if !repo.starts_with("--") => {
+            require_repository(repo)?;
+            Ok((*repo).to_string())
+        }
+        [repo, token, ..] if !repo.starts_with("--") => {
+            require_repository(repo)?;
+            Err(CliParseError::Unknown {
+                token: (*token).to_string(),
+            })
+        }
+        [token, ..] => Err(CliParseError::Unknown {
+            token: (*token).to_string(),
+        }),
+    }
+}
+
+fn require_repository(repo: &str) -> Result<(), CliParseError> {
+    if valid_code_search_repo(repo) {
+        Ok(())
+    } else {
+        Err(CliParseError::BadArg {
+            value: repo.to_string(),
+        })
+    }
 }
 
 fn repo_and_number(args: &[&str]) -> Result<(String, u64), CliParseError> {
-    let repo = positional(args, 0).ok_or(CliParseError::MissingArg { what: "repo" })?;
-    let raw = positional(args, 1).ok_or(CliParseError::MissingArg { what: "number" })?;
+    let (repo, number, rest) = repo_and_number_prefix(args)?;
+    if let Some(token) = rest.first() {
+        return Err(CliParseError::Unknown {
+            token: (*token).to_string(),
+        });
+    }
+    Ok((repo, number))
+}
+
+fn repo_and_number_prefix<'args, 'value>(
+    args: &'args [&'value str],
+) -> Result<(String, u64, &'args [&'value str]), CliParseError> {
+    let repo = args
+        .first()
+        .copied()
+        .filter(|value| !value.starts_with("--"))
+        .ok_or(CliParseError::MissingArg { what: "repo" })?;
+    require_repository(repo)?;
+    let raw = args
+        .get(1)
+        .copied()
+        .filter(|value| !value.starts_with("--"))
+        .ok_or(CliParseError::MissingArg { what: "number" })?;
     let number =
         crate::coordinate::parse_positive_decimal(raw).ok_or_else(|| CliParseError::BadArg {
             value: raw.to_string(),
         })?;
-    Ok((repo.to_string(), number))
+    Ok((repo.to_string(), number, &args[2..]))
 }
 
 fn parse_search(rest: &[&str]) -> Result<CliCommand, CliParseError> {
@@ -482,11 +610,6 @@ fn parse_search(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             token: other.to_string(),
         }),
     }
-}
-
-fn flag_value(args: &[&str], flag: &str) -> Option<String> {
-    let idx = args.iter().position(|a| *a == flag)?;
-    args.get(idx + 1).map(|s| s.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

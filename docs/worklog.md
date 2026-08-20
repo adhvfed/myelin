@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — Git commands consume every word
+
+The Git CLI parser found positional operands by skipping anything that looked
+like a flag, then searched the remaining argument list for the handful of flags
+it understood. Repository creation and viewing ignored extra operands; most PR
+commands ignored unknown and duplicate flags; conflicting review verdicts were
+accepted in priority order. Most misleadingly, `pr merge --auto` parsed an
+auto-merge boolean that the HTTP dispatcher discarded, so the advertised flag
+performed an immediate merge.
+
+Every Git verb now has an exact grammar. Repository coordinates are validated
+locally, value and boolean flags are single-use, review accepts exactly one
+verdict, and no operand is left unconsumed. The counterfeit auto-merge option is
+gone until Myelin has a real durable auto-merge lifecycle. The founder system
+journey proves an ambiguous repository-create command exits as usage, leaves no
+repository behind, and then creates that same repository through the exact CLI
+command; it also pins the removed auto-merge promise.
+
+**Proof:** Git API-parser tests 15/15; CLI unit suite 147/147; TypeScript
+typecheck; Clippy `-D warnings` for `myelin-git` and `myelin-cli`; complete
+black-box browser-approved CLI journey 16/16.
+
 ## 2026-08-20 — issue dependencies are ordinary CLI work
 
 Issue relations were a complete durable API feature—typed creation, permission-
