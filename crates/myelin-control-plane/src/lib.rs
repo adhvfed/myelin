@@ -179,7 +179,6 @@ mod tests {
     use super::*;
     use myelin_substrate::{is_destructive, HolderRegistry, HotTables};
 
-
     #[test]
     fn migrations_are_forward_only_and_pii_free() {
         let migrations = control_plane_migrations();

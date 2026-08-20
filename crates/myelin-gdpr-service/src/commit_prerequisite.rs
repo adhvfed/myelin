@@ -68,8 +68,6 @@ pub fn verdict_for(actor_bytes: &str) -> CommitActorVerdict {
 mod tests {
     use super::*;
 
-
-
     #[test]
     fn a_pseudonym_form_commit_actor_passes() {
         let handle = PseudonymHandle::new("anon-7f3a", "acme").expect("valid pseudonym");

@@ -155,7 +155,6 @@ fn normalize_for_trigrams(text: &str) -> String {
     out.trim().to_string()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +371,4 @@ mod tests {
             "still analyzed under the code chain"
         );
     }
-
 }

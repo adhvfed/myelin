@@ -304,7 +304,6 @@ mod tests {
         assert!(b.retry_after_secs > 0, "sheds with a Retry-After");
     }
 
-
     #[test]
     fn shed_order_serves_the_human_while_the_agent_lane_sheds() {
         let mut gate = AgentDispatchSurgeGate::with_budget(small_budget());
@@ -604,5 +603,4 @@ mod tests {
             "an unbounded agent lane (storm not absorbed by shedding) MUST read RED"
         );
     }
-
 }

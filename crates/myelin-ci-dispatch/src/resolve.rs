@@ -1037,8 +1037,7 @@ mod tests {
         assert_eq!(handoff.run_write.trust_tier, "trusted");
         assert_eq!(handoff.run_write.trigger_kind, "push");
         assert_eq!(
-            handoff.run_started.subject.0,
-            "myelin://acme/ci/run/run-0001",
+            handoff.run_started.subject.0, "myelin://acme/ci/run/run-0001",
             "the run subject is a canonical scoped ref, never a bare path"
         );
         assert_eq!(

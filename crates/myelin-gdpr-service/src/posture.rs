@@ -177,8 +177,6 @@ pub fn restatement_markers() -> BTreeSet<&'static str> {
 mod tests {
     use super::*;
 
-
-
     #[test]
     fn the_residual_is_open_legal_and_the_floor_ships_regardless() {
         assert_eq!(CANONICAL_POSTURE.legal_status, LegalStatus::OpenLegal);
@@ -189,7 +187,6 @@ mod tests {
         );
         assert_eq!(LegalStatus::Ratified.tag(), "");
     }
-
 
     #[test]
     fn a_valid_subsystem_reference_cites_the_anchor_and_does_not_restate() {

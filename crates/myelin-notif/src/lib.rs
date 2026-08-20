@@ -128,8 +128,7 @@ pub use storm_control::{
 };
 pub use surge::{
     run_notif_surge, NotifShedGate, NotifShedRejection, NotifSurgeReport, ProviderBulkhead,
-    NOTIF_SURGE_MULTIPLIER,
-    NOTIF_SURGE_SURFACE,
+    NOTIF_SURGE_MULTIPLIER, NOTIF_SURGE_SURFACE,
 };
 pub use watch::{
     cold_rebuild, cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame,

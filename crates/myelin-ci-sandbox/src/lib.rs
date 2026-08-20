@@ -1900,5 +1900,4 @@ mod tests {
         fleet.deprovision(&hosts).unwrap();
         assert_eq!(fleet.capacity(region).unwrap().provisioned, 0);
     }
-
 }

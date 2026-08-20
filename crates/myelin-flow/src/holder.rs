@@ -391,7 +391,6 @@ mod tests {
         assert_eq!(registry.len(), 1, "exactly the one flow store registered");
     }
 
-
     #[test]
     fn re_registration_is_idempotent() {
         let mut registry = register_flow_holder();

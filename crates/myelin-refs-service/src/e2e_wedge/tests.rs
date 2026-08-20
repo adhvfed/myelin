@@ -110,4 +110,3 @@ fn whole_wedge_all_three_scenarios_green() {
         assert_eq!(art.leaks, 0, "{} 0 leak", art.scenario);
     }
 }
-

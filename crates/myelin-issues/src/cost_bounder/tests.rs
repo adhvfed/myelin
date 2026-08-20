@@ -386,4 +386,3 @@ fn served_query_conjoins_acl_prefilter_before_pagination() {
         unreachable!("a small typed-core query with a relational ACL serves on OLTP");
     }
 }
-

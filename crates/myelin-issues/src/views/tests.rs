@@ -236,4 +236,3 @@ fn cycle_and_calendar_bind_the_frozen_membership_column() {
     assert_eq!(IssueView::Calendar.cycle_bind_column(), Some(CYCLE_FIELD));
     assert_eq!(IssueView::Board.cycle_bind_column(), None);
 }
-

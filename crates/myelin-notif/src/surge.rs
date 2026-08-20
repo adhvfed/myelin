@@ -639,5 +639,4 @@ mod tests {
         assert!(s.contains("GREEN"), "names the verdict: {s}");
         assert!(s.starts_with("NOTIF-D5:"), "the artifact is labelled: {s}");
     }
-
 }

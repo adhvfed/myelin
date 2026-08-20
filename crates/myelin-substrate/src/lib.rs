@@ -58,8 +58,8 @@ pub use overlay::{
     Rect, Side,
 };
 pub use serve::{
-    boot, serve, serve_until_shutdown, AppSpec, ConsumerReg, HoldersSpec, IntakeScope,
-    InternalRpc, OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
+    boot, serve, serve_until_shutdown, AppSpec, ConsumerReg, HoldersSpec, IntakeScope, InternalRpc,
+    OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
 };
 pub use shed::{
     BoundedQueue, RunClass, RunClassHeader, ShedBudgetError, ShedBudgetTable, ShedDecision,

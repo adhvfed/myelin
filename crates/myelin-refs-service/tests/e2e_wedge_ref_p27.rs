@@ -96,4 +96,3 @@ fn whole_refs_e2e_wedge_completes_r_m5() {
         assert_eq!(art.leaks, 0, "{}: 0 leak at E2E scale", art.scenario);
     }
 }
-

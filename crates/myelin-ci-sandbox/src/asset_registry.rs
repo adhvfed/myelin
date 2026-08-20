@@ -772,9 +772,7 @@ mod tests {
             if std::env::var_os("MYELIN_REQUIRE_USERNS_TESTS").is_some() {
                 panic!("MYELIN_REQUIRE_USERNS_TESTS=1 but this environment reports euid=0");
             }
-            eprintln!(
-                "SKIP (loud, NOT a silent pass): euid=0 cannot express foreign ownership"
-            );
+            eprintln!("SKIP (loud, NOT a silent pass): euid=0 cannot express foreign ownership");
             return;
         }
         let fixture = Fixture::new("foreign-owner", b"owner-owned content");
@@ -1148,9 +1146,7 @@ mod tests {
             if std::env::var_os("MYELIN_REQUIRE_USERNS_TESTS").is_some() {
                 panic!("MYELIN_REQUIRE_USERNS_TESTS=1 but this environment reports euid=0");
             }
-            eprintln!(
-                "SKIP (loud, NOT a silent pass): euid=0 cannot express foreign ownership"
-            );
+            eprintln!("SKIP (loud, NOT a silent pass): euid=0 cannot express foreign ownership");
             return;
         }
         let (writable_root, writable_reference, lock_sha256) = cargo_vendor_fixture("writable");

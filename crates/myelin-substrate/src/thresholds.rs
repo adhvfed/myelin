@@ -844,8 +844,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn the_canonical_tuned_shed_budgets_validate() {
         let t = Thresholds::load_canonical().expect("load");

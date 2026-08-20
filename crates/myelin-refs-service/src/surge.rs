@@ -371,5 +371,4 @@ mod tests {
             "an unbounded lane MUST read RED"
         );
     }
-
 }

@@ -392,4 +392,3 @@ fn across_restart_a_paused_sla_has_no_live_timer() {
 fn pause_conditions_is_the_one_query_ast() {
     let _pc: PauseConditions = Predicate::True;
 }
-

@@ -598,5 +598,4 @@ mod tests {
             "the embeddings purge rides the chat erase cascade (the OUTBOX fan-out)"
         );
     }
-
 }

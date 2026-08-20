@@ -2,8 +2,8 @@ use myelin_control_plane::schema::{
     Capacity, Cell, CellStatus, IsolationKind, PlacementStatus, TenantPlacement,
 };
 use myelin_control_plane::{
-    measured_hot_at, CellTenantCopy, LiveMigration, MigrationError,
-    MigrationPlan, MigrationTrigger, PlacementError, Registry,
+    measured_hot_at, CellTenantCopy, LiveMigration, MigrationError, MigrationPlan,
+    MigrationTrigger, PlacementError, Registry,
 };
 use myelin_harness::{Predicate, SignalName, SignalSource};
 use myelin_storage::{
@@ -208,7 +208,6 @@ fn cp_d7_live_migration_zero_loss_in_region_source_shredded() {
         receipt.source_key_destroyed,
     );
 }
-
 
 #[test]
 fn cdc_migration_workflow_ops_sizing_trigger_provider_consumer() {

@@ -93,8 +93,7 @@ pub use restore_verify::{
 };
 pub use signal_consumer::{FlowSignalConsumer, SIGNAL_EVENT_TYPE};
 pub use surge::{
-    run_flow_surge, FlowShedGate, FlowShedRejection, FlowSurgeReport,
-    FLOW_SURGE_MULTIPLIER,
+    run_flow_surge, FlowShedGate, FlowShedRejection, FlowSurgeReport, FLOW_SURGE_MULTIPLIER,
 };
 pub use timer::sla::{sla_timer_id, trigger_stale_timer_id, SlaTimerCall};
 pub use timer::{

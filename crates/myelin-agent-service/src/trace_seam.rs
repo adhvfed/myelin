@@ -124,5 +124,4 @@ mod tests {
     fn the_trace_is_a_content_addressed_kn_document() {
         assert!(is_content_addressed_kn_document(&sample_trace(7, "x")));
     }
-
 }

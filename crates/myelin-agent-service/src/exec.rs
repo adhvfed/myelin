@@ -782,7 +782,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn the_exec_hands_carry_a_green_ag_d4_gate_by_construction() {
         let backend = RecordingBackend {

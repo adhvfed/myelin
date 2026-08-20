@@ -114,10 +114,9 @@ pub use reorder::{
 pub use move_crdt::{MoveCrdtBoard, MoveCrdtError, ReorderPressure};
 
 pub use cross_cell_rollup::{
-    CellLocalRollupResolver, CrossCellDsrFanout, CrossCellPortfolioRollup,
-    CrossCellRollupPointer, DsrCellReceipt, PortfolioProjection,
+    CellLocalRollupResolver, CrossCellDsrFanout, CrossCellPortfolioRollup, CrossCellRollupPointer,
+    DsrCellReceipt, PortfolioProjection,
 };
-
 
 pub use content::{
     emit_content_event, is_issue_block, paragraph_body, roundtrips_md, validate_subtree,
@@ -149,9 +148,8 @@ pub use planner::{
 };
 
 pub use cost_bounder::{
-    classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery,
-    CostBudget, FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier,
-    TIER3_FIELDS, TYPED_CORE_FIELDS,
+    classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery, CostBudget,
+    FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier, TIER3_FIELDS, TYPED_CORE_FIELDS,
 };
 
 pub use views::{
@@ -166,9 +164,8 @@ pub use board_sync::{
 };
 
 pub use governance::{
-    simulate_breach, workflow_unreachable_states, BreachSimulation,
-    GovernanceView, GovernanceViewModel, GuardLanguage, InspectorAnswer, PermissionInspector,
-    PermissionResolver,
+    simulate_breach, workflow_unreachable_states, BreachSimulation, GovernanceView,
+    GovernanceViewModel, GuardLanguage, InspectorAnswer, PermissionInspector, PermissionResolver,
 };
 
 pub use rollup::{
@@ -184,8 +181,8 @@ pub use holder_erase::{
 };
 
 pub use olap_feed::{
-    issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer,
-    IssueOlapFeedSignal, IssueRestrictionLeakAudit, ReindexCtx, ISSUE_ANALYTICS_OLAP,
+    issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer, IssueOlapFeedSignal,
+    IssueRestrictionLeakAudit, ReindexCtx, ISSUE_ANALYTICS_OLAP,
 };
 
 pub use import::{

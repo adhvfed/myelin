@@ -146,4 +146,3 @@ fn dropping_the_issue_relation_mirror_flips_parity_red() {
         "the reindex_parity telemetry reads 0 on the dropped-mirror drift"
     );
 }
-

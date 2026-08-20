@@ -122,7 +122,6 @@ pub fn parse_step_anchor(anchor: &str) -> Option<CiLogStepAnchor> {
     Some(CiLogStepAnchor { run_id, step_no })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +295,4 @@ mod tests {
         );
         assert_eq!(parse_step_anchor("myelin://acme/ci/run/#step-1"), None);
     }
-
 }

@@ -534,11 +534,8 @@ impl Handler for ConversationEventsHandler {
         let conversation_id = conversation_param(ctx)?;
         self.api
             .drive(self.api.public_conversation(ctx.principal, conversation_id))?;
-        let scope = sse_scope_for_resource(
-            &ctx.principal.tenant.0,
-            "conversation",
-            conversation_id,
-        );
+        let scope =
+            sse_scope_for_resource(&ctx.principal.tenant.0, "conversation", conversation_id);
         Ok(EdgeResponse::sse(
             self.sse.subscribe("chat", &scope),
             ctx.identity.capability().expires_at_unix,

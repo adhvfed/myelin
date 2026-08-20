@@ -217,7 +217,6 @@ impl ListObjectsPort for BoundedSetOnly<'_> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +343,4 @@ mod tests {
             "a reverse-index revision below the watermark is refused (the new-enemy problem)"
         );
     }
-
 }

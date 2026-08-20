@@ -160,7 +160,6 @@ pub fn line_range_subdoc_facets() -> BTreeMap<String, FieldType> {
     f
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +433,4 @@ mod tests {
             "exactly the blob facets + the three re-derived line-range facets"
         );
     }
-
 }

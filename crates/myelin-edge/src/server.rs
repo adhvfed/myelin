@@ -554,9 +554,8 @@ fn is_machine_classified(req: &EdgeRequest) -> bool {
 }
 
 fn machine_dispatch_shed() -> Response<EdgeBody> {
-    let err = EdgeError::TooManyRequests(
-        "the machine dispatch pool is at capacity; retry later".into(),
-    );
+    let err =
+        EdgeError::TooManyRequests("the machine dispatch pool is at capacity; retry later".into());
     let mut response = to_hyper(EdgeResponse::error(&err));
     response.headers_mut().insert(
         hyper::header::RETRY_AFTER,

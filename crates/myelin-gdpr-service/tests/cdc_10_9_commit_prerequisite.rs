@@ -1,7 +1,6 @@
 use myelin_gdpr_service::{commit_actor_holds_only_pseudonym, verdict_for};
 use myelin_identity::PseudonymHandle;
 
-
 #[test]
 fn a_git_commit_actor_in_pseudonym_form_is_accepted() {
     let actor = PseudonymHandle::new("anon-7f3a", "acme")

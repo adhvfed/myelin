@@ -324,5 +324,4 @@ mod tests {
         assert!(notif_may_route(&gate, "psn:bo"));
         assert!(analytics_eligible(&gate, "psn:bo"));
     }
-
 }

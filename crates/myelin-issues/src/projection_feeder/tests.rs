@@ -448,4 +448,3 @@ fn every_dynamic_sql_value_is_quoted_as_data() {
     assert!(p.ddl.contains("type_id::text = 'type'' OR TRUE --'"));
     assert!(p.ddl.contains("props ->> 'owner''); DROP TABLE issue; --'"));
 }
-

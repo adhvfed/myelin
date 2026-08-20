@@ -1353,11 +1353,9 @@ mod tests {
         let relay = Relay::new(outbox.clone(), bus.clone(), || Timestamp("t".into()));
         relay.drain_to_empty();
         for env in bus.consume("") {
-            let config = myelin_storage::pgrelay::RelayValidationConfig::new(
-                env.region.clone(),
-                256 * 1024,
-            )
-            .unwrap();
+            let config =
+                myelin_storage::pgrelay::RelayValidationConfig::new(env.region.clone(), 256 * 1024)
+                    .unwrap();
             myelin_storage::pgrelay::publisher_admission(&env, &config).unwrap_or_else(
                 |(code, detail)| {
                     panic!(

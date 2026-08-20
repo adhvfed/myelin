@@ -3,8 +3,8 @@ use sqlx::Acquire;
 use sqlx::Row;
 
 use myelin_events::{
-    derive_envelope, Actor, DataRole, EmitContext, EventDraft, EventId, EventType,
-    Timestamp, Visibility,
+    derive_envelope, Actor, DataRole, EmitContext, EventDraft, EventId, EventType, Timestamp,
+    Visibility,
 };
 
 use crate::conversation::{Conversation, ConversationError, ConversationKind};
@@ -183,7 +183,11 @@ impl PgConversationStore {
                 conversation.id.conversation_id.clone(),
             ));
         }
-        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &envelope.aggregate.0, &envelope)
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+            &mut tx,
+            &envelope.aggregate.0,
+            &envelope,
+        )
         .await
         .map_err(|error| {
             ConversationError::Storage(format!("co-commit conversation event: {error}"))

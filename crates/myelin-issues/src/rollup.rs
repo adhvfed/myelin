@@ -10,7 +10,6 @@ use crate::events;
 use crate::refs_glue::{IssueLifecycleRel, IssueRelationGraph, TRAVERSE_MAX_DEPTH};
 use crate::workflow::StateCategory;
 
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeafFact {
     pub estimate: Option<i64>,

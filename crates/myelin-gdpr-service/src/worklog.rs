@@ -317,5 +317,4 @@ mod tests {
             "the foreclosure is documented: no default training-feed path"
         );
     }
-
 }

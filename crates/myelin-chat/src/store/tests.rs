@@ -749,4 +749,3 @@ fn cold_blob_parity_verdict_is_load_bearing_per_conjunct() {
         "a corrupt read-back makes the swap NOT byte-identical (the conjunct is load-bearing)"
     );
 }
-

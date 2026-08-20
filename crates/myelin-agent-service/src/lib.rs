@@ -160,9 +160,7 @@ pub use dispatch_surge::{
     AGENT_DISPATCH_SURGE_MULTIPLIER,
 };
 
-pub use trace_seam::{
-    is_content_addressed_kn_document, trace_ref_of, TraceDocument,
-};
+pub use trace_seam::{is_content_addressed_kn_document, trace_ref_of, TraceDocument};
 
 pub use dry_run::{
     dry_run_plan, proposed_effect_sequence, DryRunBridge, DryRunEntry, DryRunPlanner,
@@ -203,7 +201,7 @@ pub use tool_scope::{
 };
 
 pub use app::{
-    governed_trigger_consumer_reg, placed_tenant_intake_scope,
-    run_agent_ingestion_until_shutdown, trigger_intake_filter, EVENT_DURABLE_CONSUMER,
-    EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT, SERVICE_NAME,
+    governed_trigger_consumer_reg, placed_tenant_intake_scope, run_agent_ingestion_until_shutdown,
+    trigger_intake_filter, EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT,
+    SERVICE_NAME,
 };

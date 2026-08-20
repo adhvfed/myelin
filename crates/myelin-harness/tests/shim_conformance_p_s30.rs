@@ -24,7 +24,6 @@ fn discharge_shim_against_chat_pin() -> ShimEnforcement {
     }
 }
 
-
 #[test]
 fn cdc_1_7_provider_pins_rust_consumer_shim_is_a_no_op() {
     let pin = te21_harness_shim_obligation();

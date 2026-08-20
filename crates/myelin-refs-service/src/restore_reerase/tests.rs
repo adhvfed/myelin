@@ -244,4 +244,3 @@ fn warm_subject_titles_test(
 ) {
     super::warm_subject_titles(corpus, cache, dek, subject_id).unwrap();
 }
-

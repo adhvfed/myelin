@@ -811,7 +811,6 @@ mod tests {
         );
     }
 
-
     struct OkWire;
     impl WireExecutor for OkWire {
         fn run(&self, _inv: &WireInvocation) -> Result<WireOutput, GitCoreError> {

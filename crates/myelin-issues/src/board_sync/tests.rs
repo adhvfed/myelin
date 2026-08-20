@@ -228,4 +228,3 @@ fn accessors_read_back_the_sync_state() {
     assert_eq!(bs.pending_count(), 0);
     assert_eq!(bs.resync_required_count(), 0);
 }
-

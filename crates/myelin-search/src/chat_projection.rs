@@ -53,7 +53,6 @@ pub fn message_doc_ref(tenant: &str, message_id: &str) -> String {
     format!("myelin://{tenant}/chat/{MESSAGE_TYPE}/{message_id}")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +210,4 @@ mod tests {
             "myelin://acme/chat/message/m-7"
         );
     }
-
 }

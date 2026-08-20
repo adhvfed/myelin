@@ -118,7 +118,6 @@ pub fn issue_search_projection(input: &IssueProjectionInput) -> SearchProjection
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +270,4 @@ mod tests {
             );
         }
     }
-
 }

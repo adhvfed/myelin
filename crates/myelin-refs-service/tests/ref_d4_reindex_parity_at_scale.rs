@@ -1,8 +1,6 @@
 use myelin_events::{Actor, EmitContextBase, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_refs_service::{
-    build_full_scale_corpus, run_full_scale_reindex_parity, FIVE_PRODUCERS,
-};
+use myelin_refs_service::{build_full_scale_corpus, run_full_scale_reindex_parity, FIVE_PRODUCERS};
 use myelin_tenancy::{Region, TenantId};
 
 fn tenant() -> TenantId {
@@ -86,4 +84,3 @@ fn parity_hash_distinguishes_different_scales() {
         "a larger corpus yields a different parity hash (the hash is a real content-address)"
     );
 }
-

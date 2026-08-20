@@ -1,4 +1,3 @@
-
 use myelin_events::{BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp};
 use myelin_harness::load_generator::Multiplier;
 use myelin_harness::telemetry::{Label, Predicate, SignalName, SignalSource};

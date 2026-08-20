@@ -275,7 +275,10 @@ fn membership_add_co_commits_row_zookie_and_event_in_one_tx() {
     let rows = ob.committed_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].envelope.type_.0, "chat.channel.member_added");
-    assert_eq!(rows[0].aggregate.0, "channel:c1", "aggregate = the canonical channel partition");
+    assert_eq!(
+        rows[0].aggregate.0, "channel:c1",
+        "aggregate = the canonical channel partition"
+    );
 }
 
 #[test]

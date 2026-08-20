@@ -411,4 +411,3 @@ fn malformed_event_is_non_retryable() {
         HandleOutcome::NonRetryable(_)
     ));
 }
-

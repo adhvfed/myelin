@@ -91,4 +91,3 @@ fn multiple_drops_are_all_named() {
         ]
     );
 }
-

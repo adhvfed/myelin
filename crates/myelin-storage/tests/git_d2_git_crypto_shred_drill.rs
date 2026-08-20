@@ -190,4 +190,3 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         destroyed = git_receipt.blob_dek_destroyed_now,
     );
 }
-

@@ -23,8 +23,8 @@ use myelin_storage::reerase_durable::DurablePostPitLedger;
 use myelin_storage::restore::{ReindexFromSource, RestoreReport, SourceLog};
 use myelin_storage::{
     all_durable_migrations, AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore,
-    DurableKmsBacking, EraseError, EraseHolders, HotTables, KeyClass, KmsError, PiiKeyRef,
-    SealKey, SubstrateProvider,
+    DurableKmsBacking, EraseError, EraseHolders, HotTables, KeyClass, KmsError, PiiKeyRef, SealKey,
+    SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -132,11 +132,7 @@ impl myelin_storage::SearchPurge for NoopHolder {
     }
 }
 impl myelin_storage::RefsTombstone for NoopHolder {
-    fn tombstone(
-        &self,
-        _s: &myelin_storage::SubjectId,
-        _t: &TenantId,
-    ) -> Result<(), EraseError> {
+    fn tombstone(&self, _s: &myelin_storage::SubjectId, _t: &TenantId) -> Result<(), EraseError> {
         Ok(())
     }
 }
@@ -289,10 +285,9 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
         dangling_ref_count: 0,
     };
     let pass = ReErasePass::new(&scratch_kms, region.clone());
-    let re_erase = tokio::task::block_in_place(|| {
-        pass.run(&report, &ledger, &holders, now_secs() * 1000)
-    })
-    .expect("the re-erase pass completes against the restored database");
+    let re_erase =
+        tokio::task::block_in_place(|| pass.run(&report, &ledger, &holders, now_secs() * 1000))
+            .expect("the re-erase pass completes against the restored database");
 
     assert!(
         re_erase.re_erased_subject(&myelin_storage::SubjectId::new("founder"), &tenant),

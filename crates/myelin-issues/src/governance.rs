@@ -216,7 +216,6 @@ pub fn workflow_unreachable_states(wf: &Workflow) -> Vec<String> {
     unreachable.into_iter().collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

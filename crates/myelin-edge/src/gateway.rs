@@ -7,6 +7,7 @@ use crate::device_auth::{
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
 use crate::session::{SessionStore, SESSION_COOKIE};
+use crate::shed_governor::{run_class_header, EdgeShed, RUN_CLASS_HEADER};
 use crate::sse::{SseEvent, SseHub};
 use myelin_events::{IdMinter, UlidMinter};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
@@ -16,7 +17,6 @@ use myelin_identity_service::{
     VerifiedAssertion,
 };
 use myelin_storage::TenantScope;
-use crate::shed_governor::{run_class_header, EdgeShed, RUN_CLASS_HEADER};
 use myelin_substrate::shed::{RunClass, Surface};
 use myelin_substrate::{Authorizer, InjectedIdentity, PublicSurface};
 use myelin_tenancy::{Region, TenantId};
@@ -193,9 +193,11 @@ fn chat_message_event(
     if !is_bounded_resource_id(conversation) {
         return None;
     }
-    let message_id = resp
-        .json_body()
-        .and_then(|v| v.get("message_id").and_then(|m| m.as_str()).map(str::to_string))?;
+    let message_id = resp.json_body().and_then(|v| {
+        v.get("message_id")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    })?;
     Some((conversation.clone(), message_id))
 }
 
@@ -2022,19 +2024,31 @@ mod tests {
 
         // a failed post never reaches the stream
         let refused = EdgeResponse::json(404, &json!({ "error": { "message": "not found" } }));
-        assert_eq!(chat_message_event("chat.message.post", &params, &refused), None);
+        assert_eq!(
+            chat_message_event("chat.message.post", &params, &refused),
+            None
+        );
 
         // other chat actions never broadcast
-        assert_eq!(chat_message_event("chat.messages.list", &params, &posted), None);
+        assert_eq!(
+            chat_message_event("chat.messages.list", &params, &posted),
+            None
+        );
 
         // a conversation id that cannot form a bounded scope is dropped, not broadcast coarse
         let mut hostile = BTreeMap::new();
         hostile.insert("conversation".to_string(), "a/b".to_string());
-        assert_eq!(chat_message_event("chat.message.post", &hostile, &posted), None);
+        assert_eq!(
+            chat_message_event("chat.message.post", &hostile, &posted),
+            None
+        );
 
         // a response without a message id (shape drift) broadcasts nothing
         let shapeless = EdgeResponse::json(201, &json!({ "durable": true }));
-        assert_eq!(chat_message_event("chat.message.post", &params, &shapeless), None);
+        assert_eq!(
+            chat_message_event("chat.message.post", &params, &shapeless),
+            None
+        );
     }
 
     #[test]

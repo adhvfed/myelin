@@ -11,7 +11,6 @@ use crate::holder::RestrictionFlag;
 use crate::replay::IssueReindexSource;
 use crate::workflow::StateCategory;
 
-
 pub const ISSUE_ANALYTICS_OLAP: &str = "issue_analytics_olap";
 
 fn issue_olap_subjects() -> &'static [SubjectPattern] {

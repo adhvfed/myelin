@@ -398,7 +398,6 @@ fn stopwords(lang: Language) -> &'static [&'static str] {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +674,4 @@ mod tests {
         assert!(!Language::Cjk.is_natural());
         assert!(!Language::Unknown.is_natural());
     }
-
 }

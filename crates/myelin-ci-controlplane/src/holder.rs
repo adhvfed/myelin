@@ -403,7 +403,6 @@ mod tests {
         assert!(r1.receipt.content_hash.starts_with("blake3:"));
     }
 
-
     #[test]
     fn ci_holder_is_object_safe() {
         let holders: Vec<Box<dyn PersonalDataHolder>> = vec![Box::new(CiHolder::new())];

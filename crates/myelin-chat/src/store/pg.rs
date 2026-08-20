@@ -3,8 +3,8 @@ use sqlx::{Acquire, Row};
 
 use myelin_content::InlineNode;
 use myelin_events::{
-    derive_envelope, Actor, DataRole, EmitContext, EventDraft, EventEnvelope,
-    EventId, EventType, IdMinter, Timestamp, Visibility,
+    derive_envelope, Actor, DataRole, EmitContext, EventDraft, EventEnvelope, EventId, EventType,
+    IdMinter, Timestamp, Visibility,
 };
 use myelin_identity::{ObjectId, PrincipalId, RelName, RelationTuple, TupleDelta};
 use myelin_identity_service::tuple_written_event;
@@ -375,7 +375,11 @@ impl PgMessageStore {
             ));
         };
 
-        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut dbtx, &envelope.aggregate.0, &envelope)
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+            &mut dbtx,
+            &envelope.aggregate.0,
+            &envelope,
+        )
         .await
         .map_err(|e| StoreError::Cold(format!("co-commit outbox insert: {e}")))?;
         for edge in edge_envelopes {

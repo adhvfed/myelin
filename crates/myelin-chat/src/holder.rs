@@ -348,5 +348,4 @@ mod tests {
             .expect("tenant erase returns a typed receipt");
         assert_eq!(t_receipt.receipt.operation, "erase");
     }
-
 }

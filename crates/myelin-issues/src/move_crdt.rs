@@ -232,7 +232,6 @@ impl std::fmt::Display for MoveCrdtError {
 
 impl std::error::Error for MoveCrdtError {}
 
-
 impl Default for ReorderPressure {
     fn default() -> Self {
         ReorderPressure {

@@ -49,7 +49,10 @@ impl EdgeShed {
     pub fn with_budgets(http: SurfaceBudget, git: SurfaceBudget) -> EdgeShed {
         EdgeShed {
             http: Arc::new(Mutex::new(ShedLane::with_budget(Surface::HttpIntake, http))),
-            git: Arc::new(Mutex::new(ShedLane::with_budget(Surface::GitFrontDoor, git))),
+            git: Arc::new(Mutex::new(ShedLane::with_budget(
+                Surface::GitFrontDoor,
+                git,
+            ))),
         }
     }
 
@@ -134,19 +137,32 @@ mod tests {
         let a2 = shed.admit(Surface::HttpIntake, &t, RunClass::Agent);
         assert!(a1.is_ok() && a2.is_ok(), "machines fill their lane first");
         let a3 = shed.admit(Surface::HttpIntake, &t, RunClass::Agent);
-        assert_eq!(a3.err(), Some(7), "the third machine request sheds with the tuned Retry-After");
+        assert_eq!(
+            a3.err(),
+            Some(7),
+            "the third machine request sheds with the tuned Retry-After"
+        );
 
         let h = shed.admit(Surface::HttpIntake, &t, RunClass::Human);
-        assert!(h.is_ok(), "the reserved human lane admits while machines are saturated");
+        assert!(
+            h.is_ok(),
+            "the reserved human lane admits while machines are saturated"
+        );
     }
 
     #[test]
     fn dropping_the_permit_releases_the_slot() {
         let shed = EdgeShed::with_budgets(tiny(4, 2), tiny(2, 1));
         let t = tenant("acme");
-        let a1 = shed.admit(Surface::HttpIntake, &t, RunClass::Agent).unwrap();
-        let _a2 = shed.admit(Surface::HttpIntake, &t, RunClass::Agent).unwrap();
-        assert!(shed.admit(Surface::HttpIntake, &t, RunClass::Agent).is_err());
+        let a1 = shed
+            .admit(Surface::HttpIntake, &t, RunClass::Agent)
+            .unwrap();
+        let _a2 = shed
+            .admit(Surface::HttpIntake, &t, RunClass::Agent)
+            .unwrap();
+        assert!(shed
+            .admit(Surface::HttpIntake, &t, RunClass::Agent)
+            .is_err());
         drop(a1);
         assert!(
             shed.admit(Surface::HttpIntake, &t, RunClass::Agent).is_ok(),
@@ -159,11 +175,18 @@ mod tests {
         let shed = EdgeShed::with_budgets(tiny(4, 2), tiny(2, 1));
         let acme = tenant("acme");
         let globex = tenant("globex");
-        let _a1 = shed.admit(Surface::HttpIntake, &acme, RunClass::Agent).unwrap();
-        let _a2 = shed.admit(Surface::HttpIntake, &acme, RunClass::Agent).unwrap();
-        assert!(shed.admit(Surface::HttpIntake, &acme, RunClass::Agent).is_err());
+        let _a1 = shed
+            .admit(Surface::HttpIntake, &acme, RunClass::Agent)
+            .unwrap();
+        let _a2 = shed
+            .admit(Surface::HttpIntake, &acme, RunClass::Agent)
+            .unwrap();
+        assert!(shed
+            .admit(Surface::HttpIntake, &acme, RunClass::Agent)
+            .is_err());
         assert!(
-            shed.admit(Surface::HttpIntake, &globex, RunClass::Agent).is_ok(),
+            shed.admit(Surface::HttpIntake, &globex, RunClass::Agent)
+                .is_ok(),
             "one tenant's storm never sheds another tenant"
         );
     }
@@ -172,9 +195,12 @@ mod tests {
     fn git_and_http_surfaces_have_independent_lanes() {
         let shed = EdgeShed::with_budgets(tiny(4, 2), tiny(2, 1));
         let t = tenant("acme");
-        let _g = shed.admit(Surface::GitFrontDoor, &t, RunClass::Agent).unwrap();
+        let _g = shed
+            .admit(Surface::GitFrontDoor, &t, RunClass::Agent)
+            .unwrap();
         assert!(
-            shed.admit(Surface::GitFrontDoor, &t, RunClass::Agent).is_err(),
+            shed.admit(Surface::GitFrontDoor, &t, RunClass::Agent)
+                .is_err(),
             "the git lane's machine budget (cap 2, human 1) is one slot"
         );
         assert!(

@@ -399,4 +399,3 @@ fn the_lexorank_report_predicate_is_not_vacuous() {
     };
     assert!(!escaped.is_green(), "a reorder (escaped gap) MUST read RED");
 }
-

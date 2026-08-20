@@ -662,9 +662,17 @@ mod tests {
         let mut tx = store.begin(Arc::clone(&minter), ctx_base());
         tx.stage_state_change("admission check emits");
         for change in [
-            KnowledgeChange::PageCreated { page_id: "7c2".into() },
-            KnowledgeChange::BlockUpdated { page_id: "7c2".into(), block_id: "b9".into() },
-            KnowledgeChange::RowCreated { db_id: "db1".into(), row_id: "r1".into() },
+            KnowledgeChange::PageCreated {
+                page_id: "7c2".into(),
+            },
+            KnowledgeChange::BlockUpdated {
+                page_id: "7c2".into(),
+                block_id: "b9".into(),
+            },
+            KnowledgeChange::RowCreated {
+                db_id: "db1".into(),
+                row_id: "r1".into(),
+            },
         ] {
             emit_change(&mut tx, &t, &change, None).expect("emit");
         }

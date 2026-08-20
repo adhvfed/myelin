@@ -542,9 +542,9 @@ mod tests {
 
         #[test]
         fn real_userns_preparation_bind_workload_release_transitions() {
-        if crate::fake_root_test_environment_skip("real userns lease semantics") {
-            return;
-        }
+            if crate::fake_root_test_environment_skip("real userns lease semantics") {
+                return;
+            }
             let base = temp_root("t3").join("userns");
             std::fs::create_dir_all(&base).unwrap();
             let alloc = deterministic_userns_allocator_for_tests(&base, 1)
@@ -595,9 +595,9 @@ mod tests {
 
         #[test]
         fn full_capsule_substituted_hopb_and_workload_then_real_settle() {
-        if crate::fake_root_test_environment_skip("real userns lease semantics") {
-            return;
-        }
+            if crate::fake_root_test_environment_skip("real userns lease semantics") {
+                return;
+            }
             let root = temp_root("t4");
             let (obs, wm, workspace_base, alloc, userns_base) =
                 run_substituted_checkout_success(&root, "checkout.sentinel", b"shared-provenance");
@@ -834,9 +834,9 @@ mod tests {
 
         #[test]
         fn injected_delete_failure_quarantines_the_paired_userns_lease() {
-        if crate::fake_root_test_environment_skip("real userns lease semantics") {
-            return;
-        }
+            if crate::fake_root_test_environment_skip("real userns lease semantics") {
+                return;
+            }
             let root = temp_root("t10");
             let workspace_base = root.join("workspace");
             let userns_base = root.join("userns");
@@ -902,9 +902,9 @@ mod tests {
 
         #[test]
         fn substituted_workload_mismatched_evidence_is_rejected_at_settle() {
-        if crate::fake_root_test_environment_skip("real userns lease semantics") {
-            return;
-        }
+            if crate::fake_root_test_environment_skip("real userns lease semantics") {
+                return;
+            }
             let root = temp_root("t11");
             let (obs, wm, workspace_base, alloc, userns_base) =
                 run_substituted_checkout_mismatched_evidence(

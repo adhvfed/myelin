@@ -671,4 +671,3 @@ fn issue_analytics_adds_sla_compliance_aggregate() {
         "four cross-team aggregates + SLA-compliance"
     );
 }
-

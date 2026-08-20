@@ -141,7 +141,6 @@ mod tests {
         page.items.iter().map(|i| i.item_id.clone()).collect()
     }
 
-
     #[test]
     fn my_work_is_a_strict_subset_of_the_one_inbox() {
         let inbox = seeded();

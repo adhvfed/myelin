@@ -183,5 +183,4 @@ mod tests {
         assert!(seam.export(&subject, tenant).is_err());
         assert_eq!(seam.holder_id(), AGENT_TRACE_HOLDER_ID);
     }
-
 }

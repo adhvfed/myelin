@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::sla_escalation::issue_sla_escalation_policy;
 
-
 pub const DEFAULT_AT_RISK_BPS: u32 = 8_000;
 
 const BPS_DENOM: i64 = 10_000;

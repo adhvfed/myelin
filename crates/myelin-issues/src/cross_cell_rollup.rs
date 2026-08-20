@@ -312,7 +312,6 @@ impl CrossCellDsrFanout {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
