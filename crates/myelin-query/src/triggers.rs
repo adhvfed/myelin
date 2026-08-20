@@ -200,10 +200,10 @@ impl TriggerEngine {
         if arming.state != TriggerState::Armed {
             return Ok(false);
         }
-        arming.state = TriggerState::Disarmed;
         if arming.trigger.stale_after.is_some() {
             timer.disarm(&arming.arming_id)?;
         }
+        arming.state = TriggerState::Disarmed;
         Ok(true)
     }
 
@@ -717,6 +717,47 @@ mod tests {
             res,
             Err(TimerError("myelin-flow timer wheel unreachable".into())),
             "a stale_after arm failure is surfaced, never swallowed"
+        );
+    }
+
+    #[test]
+    fn timer_disarm_failure_leaves_the_trigger_armed_for_retry() {
+        struct RefusingDisarm;
+        impl DurableTimer for RefusingDisarm {
+            fn arm(&self, _arming: &ArmingId, _fire_at: &StaleAfter) -> Result<(), TimerError> {
+                Ok(())
+            }
+
+            fn disarm(&self, _arming: &ArmingId) -> Result<(), TimerError> {
+                Err(TimerError("myelin-flow timer wheel unreachable".into()))
+            }
+        }
+
+        let id = TriggerId("keep-armed-until-durable-disarm".into());
+        let mut engine = TriggerEngine::new();
+        engine
+            .arm(
+                id.clone(),
+                notify_trigger(
+                    "issues.issue.unblocked",
+                    Some(StaleAfter("2026-06-21T00:00:00Z".into())),
+                ),
+                &RefusingDisarm,
+            )
+            .expect("the trigger arms before the timer outage");
+
+        let error = engine
+            .disarm_trigger(&id, &RefusingDisarm)
+            .expect_err("an unconfirmed durable disarm cannot look successful");
+
+        assert_eq!(
+            error,
+            TimerError("myelin-flow timer wheel unreachable".into())
+        );
+        assert_eq!(
+            engine.arming(&id).map(|arming| arming.state),
+            Some(TriggerState::Armed),
+            "the owner can safely retry instead of losing track of the live timer"
         );
     }
 }
