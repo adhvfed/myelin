@@ -35,8 +35,9 @@ fixed.
 
 **Proof:** Chat unit suite 283/283; Edge unit/integration suite green; CLI unit
 suite 147/147; Chat lifecycle TypeScript system journey 3/3 against the live
-federation stack; TypeScript typecheck; Clippy `-D warnings` for every Chat,
-Edge, and CLI target/feature.
+federation stack; complete TypeScript system suite 25/25 files and 111/111
+tests; TypeScript typecheck; Clippy `-D warnings` for every Chat, Edge, and CLI
+target/feature.
 
 ## 2026-08-20 — an outbox event has one durable identity
 
