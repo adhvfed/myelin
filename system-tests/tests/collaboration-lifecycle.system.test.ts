@@ -14,7 +14,11 @@ import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { awaitTheOnlyCiRun } from "../src/journeys/ci-runs.js";
 import { findInboxItemMatching } from "../src/journeys/inbox.js";
-import { awaitActiveIssue, expectOpaqueIssueAuthor } from "../src/journeys/issues.js";
+import {
+  awaitActiveIssue,
+  expectOpaqueIssueAuthor,
+  issuesMatching,
+} from "../src/journeys/issues.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
@@ -330,10 +334,11 @@ command = ["true"]
     );
     const triageTitle = `CI failure ${runId} needs triage`;
     const triageIssues = await eventually<JsonRecord[]>(async () => {
-      const response = await systemClient.json("/v1/issues?state=open&limit=100");
-      const matching = array(response.body.items, "open issues after the governed hosted run")
-        .map((item) => record(item, "open issue after the governed hosted run"))
-        .filter((item) => item.title === triageTitle);
+      const matching = await issuesMatching(
+        systemClient,
+        (item) => item.title === triageTitle,
+        { state: "open" },
+      );
       return matching.length > 0 ? matching : undefined;
     }, { description: "the hosted agent to read CI and open exactly one governed issue" });
     expect(triageIssues).toHaveLength(1);

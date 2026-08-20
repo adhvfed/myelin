@@ -4,6 +4,7 @@ import { describe, expect, test } from "vitest";
 
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { eventually } from "../src/eventually.js";
+import { issuesMatching } from "../src/journeys/issues.js";
 import { array, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
@@ -139,17 +140,19 @@ describe("issue migration lifecycle", () => {
     );
     expect(activeIssues.map((issue) => issue.title)).toEqual(records.map((record) => record.title));
 
-    const visibleToATeammate = await reviewerClient.json(
-      `/v1/issues?state=all&key=${encodeURIComponent(`${prefix}-`)}&limit=100`,
+    const visibleToATeammate = await issuesMatching(
+      reviewerClient,
+      () => true,
+      { state: "all", key: `${prefix}-` },
     );
-    expect(array(visibleToATeammate.body.items, "imported issues visible to a teammate")).toEqual(
+    expect(visibleToATeammate).toEqual(
       expect.arrayContaining(
         records.map((source) => expect.objectContaining({ title: source.title })),
       ),
     );
-    expect(array(visibleToATeammate.body.items)).toHaveLength(2);
+    expect(visibleToATeammate).toHaveLength(2);
     expect(
-      array(visibleToATeammate.body.items, "re-addressable imported issues").map(
+      visibleToATeammate.map(
         (issue) => record(issue, "re-addressable imported issue").ref,
       ),
     ).toEqual(expect.arrayContaining(firstIssues.map(({ issue }) => issue.ref)));

@@ -3,7 +3,8 @@
 import { expect } from "vitest";
 
 import { awaitAuthorizedIssue } from "../issues.js";
-import { record, string, type JsonRecord } from "../json.js";
+import { array, integer, record, string, type JsonRecord } from "../json.js";
+import { walkPaged } from "../paging.js";
 import { systemTestConfig } from "../config.js";
 import type { SystemTestClient } from "../client.js";
 
@@ -11,6 +12,57 @@ export interface ProposeIssueOptions {
   projectId?: string;
   typeId?: string;
   prefix?: string;
+}
+
+export type IssueListState = "open" | "closed" | "all";
+
+export interface IssuePage {
+  items: JsonRecord[];
+  nextCursor: string | null;
+  limit: number;
+}
+
+function issueListPath(state: IssueListState, key?: string): string {
+  const query = new URLSearchParams({ state });
+  if (key !== undefined) query.set("key", key);
+  return `/v1/issues?${query.toString()}`;
+}
+
+export async function issuesMatching(
+  client: SystemTestClient,
+  predicate: (issue: JsonRecord) => boolean,
+  options: { state?: IssueListState; key?: string } = {},
+): Promise<JsonRecord[]> {
+  const matches: JsonRecord[] = [];
+  for await (const issue of walkPaged(
+    client,
+    issueListPath(options.state ?? "all", options.key),
+  )) {
+    if (predicate(issue)) matches.push(issue);
+  }
+  return matches;
+}
+
+export async function readIssuePage(
+  client: SystemTestClient,
+  options: { state: IssueListState; limit: number; key?: string; cursor?: string },
+): Promise<IssuePage> {
+  const query = new URLSearchParams({
+    state: options.state,
+    limit: String(options.limit),
+  });
+  if (options.key !== undefined) query.set("key", options.key);
+  if (options.cursor !== undefined) query.set("cursor", options.cursor);
+  const response = await client.json(`/v1/issues?${query.toString()}`);
+  const page = record(response.body.page, "issue page envelope");
+  return {
+    items: array(response.body.items, "issue page items")
+      .map((item) => record(item, "issue page item")),
+    nextCursor: page.next_cursor === null
+      ? null
+      : string(page.next_cursor, "issue page cursor"),
+    limit: integer(page.limit, "issue page limit"),
+  };
 }
 
 /// Proposes an issue and waits for its authorization to complete, returning

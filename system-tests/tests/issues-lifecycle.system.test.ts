@@ -4,7 +4,11 @@ import { describe, expect, test } from "vitest";
 
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { awaitAuthorizedIssue } from "../src/issues.js";
-import { awaitActiveIssue, expectOpaqueIssueAuthor } from "../src/journeys/issues.js";
+import {
+  awaitActiveIssue,
+  expectOpaqueIssueAuthor,
+  issuesMatching,
+} from "../src/journeys/issues.js";
 import { findProject } from "../src/journeys/projects.js";
 import { awaitBacklink, awaitBacklinkGone } from "../src/journeys/refs.js";
 import { array, record, string } from "../src/json.js";
@@ -139,10 +143,11 @@ describe("issue lifecycle", () => {
     const viewed = await reviewerClient.json(`/v1/issues/${encodeURIComponent(issueKey)}`);
     expect(viewed.body).toMatchObject({ id: issueId, title, state_category: "unstarted" });
 
-    const open = await systemClient.json("/v1/issues?state=open&limit=100");
-    expect(array(open.body.items, "open issues")).toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: issueId, title })]),
-    );
+    expect(await issuesMatching(
+      systemClient,
+      (item) => item.id === issueId,
+      { state: "open" },
+    )).toEqual([expect.objectContaining({ id: issueId, title })]);
 
     const closed = await systemClient.json(`/v1/issues/${encodeURIComponent(issueKey)}/close`, {
       method: "POST",
@@ -156,10 +161,11 @@ describe("issue lifecycle", () => {
     });
     expect(retry.body).toMatchObject({ id: issueId, state_category: "completed" });
 
-    const closedList = await systemClient.json("/v1/issues?state=closed&limit=100");
-    expect(array(closedList.body.items, "closed issues")).toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: issueId, title })]),
-    );
+    expect(await issuesMatching(
+      systemClient,
+      (item) => item.id === issueId,
+      { state: "closed" },
+    )).toEqual([expect.objectContaining({ id: issueId, title })]);
   });
 
   test("lets one issue block another until their dependency is removed", async () => {
