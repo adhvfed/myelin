@@ -270,8 +270,15 @@ pub enum PgWorkerError {
     InvalidConfig(String),
     Definition(ExecutorError),
     Store(DriveStoreError),
+    LeaseReleaseFailed {
+        drive: Box<PgWorkerError>,
+        release: DriveStoreError,
+    },
     InputUnavailable(String),
-    MissingDefinition { wf_type: String, version: i32 },
+    MissingDefinition {
+        wf_type: String,
+        version: i32,
+    },
     Staging(String),
 }
 
@@ -503,11 +510,16 @@ impl PgFlowWorker {
             return Ok(PgRunOnceOutcome::Idle);
         };
 
-        let result = self.drive_claimed(&lease, now_unix_secs, now_rfc3339).await;
-        if result.is_err() {
-            let _ = self.store.release_lease(&lease).await;
+        match self.drive_claimed(&lease, now_unix_secs, now_rfc3339).await {
+            Ok(outcome) => Ok(outcome),
+            Err(drive) => match self.store.release_lease(&lease).await {
+                Ok(()) => Err(drive),
+                Err(release) => Err(PgWorkerError::LeaseReleaseFailed {
+                    drive: Box::new(drive),
+                    release,
+                }),
+            },
         }
-        result
     }
 
     async fn drive_claimed(

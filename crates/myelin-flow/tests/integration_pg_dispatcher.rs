@@ -423,6 +423,66 @@ async fn immutable_input_resolution_retries_without_commit_and_permanent_refusal
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_drive_never_hides_that_its_lease_could_not_be_released() {
+    let _guard = TEST_LOCK.lock().await;
+    let (bare, pool, schema) = setup("release_failure").await;
+    let mut flow = worker(&pool, "acme", "no-osl", 5, "worker-release-failure");
+    let fault_pool = pool.clone();
+    flow.register_definition_with_input_resolver(
+        "wf.release-failure",
+        1,
+        "release-failure-v1",
+        move |_input: PgClaimedDriveInput| {
+            let fault_pool = fault_pool.clone();
+            async move {
+                let removed = sqlx::query(
+                    "DELETE FROM workflow_run \
+                     WHERE tenant_id = 'acme' AND region = 'no-osl' \
+                       AND run_id = 'R-release-failure'",
+                )
+                .execute(&fault_pool)
+                .await
+                .expect("remove the isolated claimed run after the drive was claimed")
+                .rows_affected();
+                assert_eq!(removed, 1, "the fault must remove exactly the claimed run");
+                Err(PgInputResolveError::Retry(
+                    "immutable input is temporarily unavailable".into(),
+                ))
+            }
+        },
+        |_input, _ctx| panic!("a retryable input failure must never run the workflow body"),
+    )
+    .unwrap();
+    seed_run(
+        &pool,
+        "acme",
+        "no-osl",
+        "R-release-failure",
+        "wf.release-failure",
+        0,
+        5,
+    )
+    .await;
+
+    let error = flow
+        .run_once(1_752_796_800, "2026-07-18T00:00:00Z")
+        .await
+        .unwrap_err();
+
+    let PgWorkerError::LeaseReleaseFailed { drive, release } = error else {
+        panic!("the worker must preserve both failures, got {error:?}");
+    };
+    assert!(
+        matches!(*drive, PgWorkerError::InputUnavailable(ref detail)
+            if detail == "immutable input is temporarily unavailable"),
+        "the original drive failure must remain inspectable, got {drive:?}"
+    );
+    assert_eq!(release, myelin_flow::DriveStoreError::LeaseLost);
+
+    cleanup(bare, pool, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ready_batches_fire_every_due_deadline_amid_ordinary_work() {
     let _guard = TEST_LOCK.lock().await;
     let (bare, pool, schema) = setup("timer_fairness").await;
