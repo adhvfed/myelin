@@ -139,6 +139,11 @@ impl BudgetGate {
         self
     }
 
+    #[cfg(test)]
+    fn fail_next_settlement_for_test(&self) {
+        self.lock().ledger.fail_next_settlement_for_test();
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, GateInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -330,7 +335,13 @@ impl WfCtx {
                 Ok(result)
             }
             Err(activity_err) => {
-                let _ = gate.settle(self.tenant_id(), &admit.ledger_run, &[]);
+                gate.settle(self.tenant_id(), &admit.ledger_run, &[])
+                    .map_err(|settle_error| {
+                        crate::WfError::CoCommit(format!(
+                            "metered_activity failed ({activity_err:?}); refund settlement also failed: \
+                             {settle_error}; the reservation remains retryable"
+                        ))
+                    })?;
                 Err(activity_err)
             }
         }
@@ -888,6 +899,46 @@ mod tests {
             "the settle-on-exhaustion is recorded"
         );
         assert_eq!(gate.inflight_interrupt_count(), 0, "0 in-flight interrupts");
+    }
+
+    #[test]
+    fn an_activity_failure_cannot_hide_a_refund_settlement_outage() {
+        use myelin_storage::reserve_settle::ReservationState;
+
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
+        let mut ctx = begin_ctx(&outbox, journal, gate.clone());
+        let failing_gate = gate.clone();
+
+        let error = ctx
+            .metered_activity(
+                RetryPolicy { max_attempts: 1 },
+                MicroUsd(100),
+                vec![unit("llm.tokens", 40, 20)],
+                move |_idempotency_key, _attempt| {
+                    failing_gate.fail_next_settlement_for_test();
+                    Err(crate::ActivityError::retryable("provider unavailable"))
+                },
+            )
+            .expect_err("the failed refund must replace the ordinary activity error");
+
+        assert!(matches!(
+            error,
+            crate::WfError::CoCommit(ref detail)
+                if detail.contains("provider unavailable")
+                    && detail.contains("refund settlement also failed")
+                    && detail.contains("reservation remains retryable")
+        ));
+        let ledger_run = LedgerRunId::new("R1/merge.queue:0");
+        assert_eq!(
+            gate.state_of(&tenant(), &ledger_run),
+            Ok(Some(ReservationState::InFlight)),
+            "the unresolved reservation remains explicit rather than masquerading as refunded"
+        );
+        gate.settle(&tenant(), &ledger_run, &[])
+            .expect("a later reconciliation can refund the same reservation");
+        assert_eq!(gate.balance(), MicroUsd(1_000));
     }
 
     #[test]
