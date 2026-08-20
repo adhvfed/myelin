@@ -6,7 +6,7 @@ import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import {
   findInboxItem,
-  mentionSignalEnvelope,
+  notificationSignalEnvelope,
   pullRequestSubject,
   readInboxPage,
 } from "../src/journeys/inbox.js";
@@ -30,7 +30,7 @@ describe.sequential("notification delivery lifecycle", () => {
   test("routes, de-duplicates, collapses, scopes, and marks a durable mention read", async () => {
     const dedupKey = uniqueName("mention");
     const subject = pullRequestSubject(slug, 1);
-    const envelope = mentionSignalEnvelope({
+    const envelope = notificationSignalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
       dedupKey,
@@ -56,7 +56,7 @@ describe.sequential("notification delivery lifecycle", () => {
     });
     expect(await findInboxItem(reviewerClient, subject)).toBeUndefined();
 
-    await bus.publish(mentionSignalEnvelope({
+    await bus.publish(notificationSignalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
       dedupKey,
@@ -117,13 +117,13 @@ describe.sequential("notification delivery lifecycle", () => {
       dedupKey,
       subject,
     };
-    await bus.publish(mentionSignalEnvelope(mention));
+    await bus.publish(notificationSignalEnvelope(mention));
     await eventually(
       () => findInboxItem(systemClient, subject),
       { description: "the resolvable mention to reach the durable inbox" },
     );
 
-    await bus.publish(mentionSignalEnvelope({ ...mention, state: "Resolved" }));
+    await bus.publish(notificationSignalEnvelope({ ...mention, state: "Resolved" }));
     const retired = await eventually(async () => {
       const item = await findInboxItem(systemClient, subject);
       return item?.state === "done" ? item : undefined;
@@ -133,7 +133,7 @@ describe.sequential("notification delivery lifecycle", () => {
 
   test("suppresses self-notifications before processing a later delivery", async () => {
     const selfSubject = pullRequestSubject(slug, 2);
-    await bus.publish(mentionSignalEnvelope({
+    await bus.publish(notificationSignalEnvelope({
       actor: systemTestConfig.principal,
       recipient: systemTestConfig.principal,
       dedupKey: uniqueName("self"),
@@ -141,7 +141,7 @@ describe.sequential("notification delivery lifecycle", () => {
     }));
 
     const markerSubject = pullRequestSubject(slug, 3);
-    await bus.publish(mentionSignalEnvelope({
+    await bus.publish(notificationSignalEnvelope({
       actor: systemTestConfig.reviewerPrincipal,
       recipient: systemTestConfig.principal,
       dedupKey: uniqueName("marker"),
@@ -157,7 +157,7 @@ describe.sequential("notification delivery lifecycle", () => {
   test("walks the whole inbox without losing or repeating a notification", async () => {
     const subjects = [4, 5].map((number) => pullRequestSubject(slug, number));
     for (const [index, subject] of subjects.entries()) {
-      await bus.publish(mentionSignalEnvelope({
+      await bus.publish(notificationSignalEnvelope({
         actor: systemTestConfig.reviewerPrincipal,
         recipient: systemTestConfig.principal,
         dedupKey: uniqueName(`page-${index + 1}`),

@@ -1,4 +1,4 @@
-// Notification journeys: publishing mention signals the way producers do
+// Notification journeys: publishing signals the way producers do
 // (straight onto the event bus) and reading the recipient's durable inbox the
 // way clients do (paged, newest relevance first).
 //
@@ -11,17 +11,45 @@ import type { SystemTestClient } from "../client.js";
 import { ExternalEventBus, type ExternalEventEnvelope } from "../event-bus.js";
 import { eventually } from "../eventually.js";
 import { array, record, string, type JsonRecord } from "../json.js";
+import { findPaged, walkPaged } from "../paging.js";
 import { systemTestConfig } from "../config.js";
 
-export interface MentionOptions {
+export type NotificationReason =
+  | "approval_requested"
+  | "escalated"
+  | "sla"
+  | "review_requested"
+  | "assigned"
+  | "mentioned"
+  | "replied"
+  | "agent_proposal"
+  | "watched"
+  | "state_changed"
+  | "fyi"
+  | "blocked"
+  | "unblocked"
+  | "thread_watched"
+  | "shared"
+  | "comments";
+
+export interface NotificationOptions {
   eventId?: string;
   actor: string;
   recipient: string;
   dedupKey: string;
   subject: string;
+  reason?: NotificationReason;
   /// "Open" (the default) delivers; "Resolved" retires every inbox item the
   /// dedup key produced - the router flips them to `done`.
   state?: "Open" | "Resolved";
+}
+
+export interface InboxSeed {
+  actor: string;
+  recipient: string;
+  subjectPrefix: string;
+  count: number;
+  reason?: NotificationReason;
 }
 
 export function pullRequestSubject(repository: string, number: number): string {
@@ -31,9 +59,12 @@ export function pullRequestSubject(repository: string, number: number): string {
   return `myelin://${systemTestConfig.tenant}/git/pr/${repository}:${number}`;
 }
 
-export function mentionSignalEnvelope(options: MentionOptions): ExternalEventEnvelope {
+export function notificationSignalEnvelope(
+  options: NotificationOptions,
+): ExternalEventEnvelope {
   const eventId = options.eventId ?? randomUUID();
   const state = options.state ?? "Open";
+  const reason = options.reason ?? "mentioned";
   const now = new Date().toISOString();
   const principal = (principalId: string) => ({
     tenant: systemTestConfig.tenant,
@@ -72,6 +103,7 @@ export function mentionSignalEnvelope(options: MentionOptions): ExternalEventEnv
       state,
       first_seen: now,
       last_seen: now,
+      notification_reason: reason,
       mentions: [{ Mention: principal(options.recipient) }],
     },
   };
@@ -100,56 +132,28 @@ export async function findInboxItem(
   client: SystemTestClient,
   subject: string,
 ): Promise<JsonRecord | undefined> {
-  let cursor: string | null = null;
-  const seenCursors = new Set<string>();
-  for (let page = 0; page < 100; page += 1) {
-    const current = await readInboxPage(client, cursor, 100);
-    const found = current.items.find((item) => item.subject === subject);
-    if (found !== undefined || current.nextCursor === null) return found;
-    if (seenCursors.has(current.nextCursor)) {
-      throw new Error("notification inbox repeated an opaque cursor");
-    }
-    seenCursors.add(current.nextCursor);
-    cursor = current.nextCursor;
-  }
-  throw new Error("notification inbox exceeded the bounded search");
-}
-
-/// Publishes a mention and waits until it is readable in the inbox.
-export async function deliverMention(
-  bus: ExternalEventBus,
-  client: SystemTestClient,
-  options: MentionOptions,
-): Promise<JsonRecord> {
-  await bus.publish(mentionSignalEnvelope(options));
-  return eventually(
-    () => findInboxItem(client, options.subject),
-    { description: `the mention for ${options.subject} to reach the durable inbox` },
+  return findPaged(
+    client,
+    "/v1/notif/inbox?view=all",
+    (item) => item.subject === subject,
   );
 }
 
-/// Counts the recipient's inbox items whose subject starts with `prefix`,
-/// walking the whole paged inbox with the standard cursor guards.
-export async function countInboxItems(
+/// Counts matching items across the recipient's whole inbox through the one
+/// shared, guarded cursor walk.
+async function countInboxItems(
   client: SystemTestClient,
-  prefix: string,
+  predicate: (item: JsonRecord) => boolean,
 ): Promise<number> {
-  let cursor: string | null = null;
-  const seenCursors = new Set<string>();
   let count = 0;
-  for (let page = 0; page < 200; page += 1) {
-    const current = await readInboxPage(client, cursor, 100);
-    count += current.items.filter(
-      (item) => typeof item.subject === "string" && item.subject.startsWith(prefix),
-    ).length;
-    if (current.nextCursor === null) return count;
-    if (seenCursors.has(current.nextCursor)) {
-      throw new Error("notification inbox repeated an opaque cursor");
-    }
-    seenCursors.add(current.nextCursor);
-    cursor = current.nextCursor;
+  for await (const item of walkPaged(
+    client,
+    "/v1/notif/inbox?view=all",
+    { maxPages: 200 },
+  )) {
+    if (predicate(item)) count += 1;
   }
-  throw new Error("notification inbox exceeded the bounded count walk");
+  return count;
 }
 
 /// Seeds `count` distinct delivered mentions for one recipient, then waits
@@ -164,19 +168,26 @@ export async function countInboxItems(
 export async function seedInbox(
   bus: ExternalEventBus,
   client: SystemTestClient,
-  options: { actor: string; recipient: string; subjectPrefix: string; count: number },
+  options: InboxSeed,
 ): Promise<void> {
+  const reason = options.reason ?? "mentioned";
   for (let index = 0; index < options.count; index += 1) {
-    await bus.publish(mentionSignalEnvelope({
+    await bus.publish(notificationSignalEnvelope({
       actor: options.actor,
       recipient: options.recipient,
       dedupKey: `${options.subjectPrefix.split("/").pop() ?? "seed"}-${index + 1}`,
       subject: `${options.subjectPrefix}:${index + 1}`,
+      reason,
     }));
   }
   await eventually(
     async () => {
-      const landed = await countInboxItems(client, `${options.subjectPrefix}:`);
+      const landed = await countInboxItems(
+        client,
+        (item) => typeof item.subject === "string" &&
+          item.subject.startsWith(`${options.subjectPrefix}:`) &&
+          item.reason === reason,
+      );
       return landed >= options.count ? landed : undefined;
     },
     {
@@ -193,15 +204,35 @@ export async function seedInbox(
 /// debris the scale test exists to guard against.
 export async function retireSeededInbox(
   bus: ExternalEventBus,
-  options: { actor: string; recipient: string; subjectPrefix: string; count: number },
+  client: SystemTestClient,
+  options: InboxSeed,
 ): Promise<void> {
+  const reason = options.reason ?? "mentioned";
   for (let index = 0; index < options.count; index += 1) {
-    await bus.publish(mentionSignalEnvelope({
+    await bus.publish(notificationSignalEnvelope({
       actor: options.actor,
       recipient: options.recipient,
       dedupKey: `${options.subjectPrefix.split("/").pop() ?? "seed"}-${index + 1}`,
       subject: `${options.subjectPrefix}:${index + 1}`,
+      reason,
       state: "Resolved",
     }));
   }
+  await eventually(
+    async () => {
+      const retired = await countInboxItems(
+        client,
+        (item) => typeof item.subject === "string" &&
+          item.subject.startsWith(`${options.subjectPrefix}:`) &&
+          item.reason === reason &&
+          item.state === "done",
+      );
+      return retired >= options.count ? retired : undefined;
+    },
+    {
+      description: `all ${options.count} seeded ${reason} notifications to retire`,
+      timeoutMs: 300_000,
+      intervalMs: 5_000,
+    },
+  );
 }

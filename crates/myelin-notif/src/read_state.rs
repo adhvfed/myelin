@@ -43,6 +43,18 @@ impl ReadState {
             ReadState::Snoozed | ReadState::Archived | ReadState::Done => false,
         }
     }
+
+    /// How urgently this state belongs in front of a person's inbox.
+    /// Reason priority orders work *within* one attention state; it must not
+    /// let completed critical work bury something new.
+    pub fn attention_rank(self) -> u8 {
+        match self {
+            ReadState::Unread => 3,
+            ReadState::Seen => 2,
+            ReadState::Read => 1,
+            ReadState::Snoozed | ReadState::Archived | ReadState::Done => 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,6 +236,12 @@ mod tests {
         );
         assert!(!ReadState::Archived.is_active());
         assert!(!ReadState::Done.is_active());
+        assert_eq!(ReadState::Unread.attention_rank(), 3);
+        assert_eq!(ReadState::Seen.attention_rank(), 2);
+        assert_eq!(ReadState::Read.attention_rank(), 1);
+        for parked in [ReadState::Snoozed, ReadState::Archived, ReadState::Done] {
+            assert_eq!(parked.attention_rank(), 0);
+        }
     }
 
     #[test]

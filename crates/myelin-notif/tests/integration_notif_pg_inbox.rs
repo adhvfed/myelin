@@ -318,6 +318,27 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
     );
     assert!(second.next_cursor.is_none());
 
+    assert!(store.complete_if_present(&scope, "crit-a").await.unwrap());
+    assert!(store.complete_if_present(&scope, "crit-b").await.unwrap());
+    let after_approvals_finished = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: InboxFilter::all(),
+            limit: 4,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after_approvals_finished
+            .items
+            .iter()
+            .map(|item| item.item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["direct-a", "fyi-a", "crit-b", "crit-a"],
+        "completed critical work must not bury lower-priority unread work"
+    );
+
     let mention_filter = InboxFilter {
         subsystems: None,
         reasons: Some(HashSet::from([Reason::Mentioned])),
@@ -351,6 +372,24 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
     );
 
     store.mark_read(&scope, "direct-a").await.unwrap();
+    let after_reading_the_mention = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: InboxFilter::all(),
+            limit: 4,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        after_reading_the_mention
+            .items
+            .iter()
+            .map(|item| item.item.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["fyi-a", "direct-a", "crit-b", "crit-a"],
+        "unread work precedes read work before reason priority is considered"
+    );
     assert_eq!(
         store
             .mark_read(

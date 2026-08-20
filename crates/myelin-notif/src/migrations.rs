@@ -43,6 +43,10 @@ WHEN 'comments' THEN 55 WHEN 'watched' THEN 35 WHEN 'state_changed' THEN 35 \
 WHEN 'thread_watched' THEN 35 WHEN 'blocked' THEN 35 WHEN 'unblocked' THEN 35 \
 WHEN 'fyi' THEN 15 ELSE NULL END";
 
+pub const INBOX_ATTENTION_CASE_SQL: &str = "CASE state \
+WHEN 'unread' THEN 3 WHEN 'seen' THEN 2 WHEN 'read' THEN 1 \
+WHEN 'snoozed' THEN 0 WHEN 'archived' THEN 0 WHEN 'done' THEN 0 ELSE NULL END";
+
 pub const INBOX_KEYSET_INDEX_MIGRATION_ID: &str = "notif_0010_inbox_recipient_keyset";
 pub const INBOX_KEYSET_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
 notif_inbox_recipient_keyset ON notif_inbox_item \
@@ -67,6 +71,18 @@ WHEN 'shared' THEN 70 WHEN 'replied' THEN 55 WHEN 'agent_proposal' THEN 55 \
 WHEN 'comments' THEN 55 WHEN 'watched' THEN 35 WHEN 'state_changed' THEN 35 \
 WHEN 'thread_watched' THEN 35 WHEN 'blocked' THEN 35 WHEN 'unblocked' THEN 35 \
 WHEN 'fyi' THEN 15 ELSE NULL END) DESC, occurred_at DESC, item_id ASC)";
+
+pub const INBOX_ATTENTION_KEYSET_INDEX_MIGRATION_ID: &str =
+    "notif_0012_inbox_recipient_attention_keyset";
+
+pub fn inbox_attention_keyset_index_ddl() -> String {
+    format!(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS notif_inbox_recipient_attention_keyset \
+         ON notif_inbox_item (tenant_id, region, recipient, \
+         ({INBOX_ATTENTION_CASE_SQL}) DESC, ({INBOX_PRIORITY_CASE_SQL}) DESC, \
+         occurred_at DESC, item_id ASC)"
+    )
+}
 
 pub const NOTIF_PREF_DDL: &str = "\
 CREATE TABLE notif_pref (\
@@ -230,6 +246,14 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "notif_inbox_item",
     ));
+    let attention_index_ddl: &'static str =
+        Box::leak(inbox_attention_keyset_index_ddl().into_boxed_str());
+    migrations.push(Migration::phased(
+        INBOX_ATTENTION_KEYSET_INDEX_MIGRATION_ID,
+        attention_index_ddl,
+        MigrationPhase::Expand,
+        "notif_inbox_item",
+    ));
     Migrations::of(migrations)
 }
 
@@ -247,8 +271,8 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            11,
-            "nine tables plus two additive inbox keyset indexes"
+            12,
+            "nine tables plus three additive inbox keyset indexes"
         );
         let mut runner = MigrationRunner::new();
         runner
@@ -268,8 +292,9 @@ mod tests {
                 "notif_0009_mute",
                 "notif_0010_inbox_recipient_keyset",
                 "notif_0011_inbox_recipient_recency_keyset",
+                "notif_0012_inbox_recipient_attention_keyset",
             ],
-            "9 tables + 2 online indexes, in order - 0 backward migration"
+            "9 tables + 3 online indexes, in order - 0 backward migration"
         );
     }
 

@@ -1,5 +1,6 @@
 use myelin_identity::Principal;
 
+use crate::read_state::ReadState;
 use crate::router::RoutedInboxItem;
 use crate::{Class, Reason};
 
@@ -158,11 +159,21 @@ pub fn rank_and_order(
         })
         .collect();
     ranked.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| a.item.item_id.cmp(&b.item.item_id))
+        attention_rank(&b.item)
+            .cmp(&attention_rank(&a.item))
+            .then_with(|| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then_with(|| a.item.item_id.cmp(&b.item.item_id))
+            })
     });
     ranked
+}
+
+fn attention_rank(item: &RoutedInboxItem) -> u8 {
+    ReadState::parse(&item.state)
+        .map(ReadState::attention_rank)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -414,6 +425,29 @@ mod tests {
                 "every rank carries a non-empty trace"
             );
         }
+    }
+
+    #[test]
+    fn attention_state_precedes_reason_priority() {
+        let mut completed_approval = item("completed-approval", Reason::ApprovalRequested);
+        completed_approval.state = "done".into();
+        let fresh_mention = item("fresh-mention", Reason::Mentioned);
+        let mut read_approval = item("read-approval", Reason::ApprovalRequested);
+        read_approval.state = "read".into();
+
+        let ordered = rank_and_order(
+            vec![completed_approval, fresh_mention, read_approval],
+            &viewer(),
+            &DeterministicV1::default(),
+        );
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|ranked| ranked.item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fresh-mention", "read-approval", "completed-approval"],
+            "new work is seen before read work, and completed work stays parked"
+        );
     }
 
     #[test]

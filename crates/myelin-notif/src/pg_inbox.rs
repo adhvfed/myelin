@@ -11,9 +11,10 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, QueryBuilder, Row};
 
 use crate::list_inbox::{subsystem_of, InboxFilter, Subsystem};
-use crate::migrations::INBOX_PRIORITY_CASE_SQL;
+use crate::migrations::{INBOX_ATTENTION_CASE_SQL, INBOX_PRIORITY_CASE_SQL};
 use crate::prefs::{class_token, reason_token};
 use crate::ranking::base_priority;
+use crate::read_state::ReadState;
 use crate::router::RoutedInboxItem;
 use crate::{Class, Reason};
 
@@ -23,9 +24,9 @@ const MAX_CURSOR_FRAME_BYTES: usize = 768;
 const MAX_KEY_BYTES: usize = 512;
 const MAX_TEMPLATE_ARGS: usize = 32;
 const MAX_TEMPLATE_ARGS_JSON_BYTES: usize = 16 * 1024;
-const CURSOR_VERSION: u8 = 2;
-const CURSOR_PREFIX: &str = "ni2_";
-const SORT_ID: &str = "base-priority-desc:occurred-at-desc:item-id-asc:v2";
+const CURSOR_VERSION: u8 = 3;
+const CURSOR_PREFIX: &str = "ni3_";
+const SORT_ID: &str = "attention-desc:base-priority-desc:occurred-at-desc:item-id-asc:v3";
 
 const UPSERT_SQL: &str = "INSERT INTO notif_inbox_item (
  tenant_id, region, item_id, recipient, subject, subject_root, reason, class, origin_event,
@@ -566,6 +567,7 @@ struct CursorFrame {
     sort: String,
     scope: String,
     limit: u16,
+    attention: u8,
     priority: u8,
     occurred_at: DateTime<Utc>,
     item_id: String,
@@ -599,7 +601,13 @@ fn encode_cursor(
     request: &InboxReadRequest,
     item: &DurableInboxItem,
 ) -> Result<String, PgInboxError> {
-    if !valid_cursor_item_id(&item.item.item_id) || !valid_cursor_priority(item.priority) {
+    let attention = ReadState::parse(&item.item.state)
+        .map(ReadState::attention_rank)
+        .ok_or(PgInboxError::CorruptStoredRow)?;
+    if !valid_cursor_item_id(&item.item.item_id)
+        || !valid_cursor_attention(attention)
+        || !valid_cursor_priority(item.priority)
+    {
         return Err(PgInboxError::CorruptStoredRow);
     }
     let occurred_at = DateTime::parse_from_rfc3339(&item.occurred_at)
@@ -610,6 +618,7 @@ fn encode_cursor(
         sort: SORT_ID.into(),
         scope: cursor_scope(request),
         limit: request.limit,
+        attention,
         priority: item.priority,
         occurred_at,
         item_id: item.item.item_id.clone(),
@@ -650,6 +659,7 @@ fn decode_cursor(value: &str, request: &InboxReadRequest) -> Result<CursorFrame,
         || frame.sort != SORT_ID
         || frame.limit != request.limit
         || !valid_cursor_item_id(&frame.item_id)
+        || !valid_cursor_attention(frame.attention)
         || !valid_cursor_priority(frame.priority)
     {
         return Err(PgInboxError::MalformedCursor);
@@ -666,6 +676,10 @@ fn valid_cursor_item_id(value: &str) -> bool {
 
 fn valid_cursor_priority(value: u8) -> bool {
     matches!(value, 15 | 35 | 55 | 70 | 90)
+}
+
+fn valid_cursor_attention(value: u8) -> bool {
+    value <= ReadState::Unread.attention_rank()
 }
 
 fn cursor_scope(request: &InboxReadRequest) -> String {
@@ -779,27 +793,61 @@ fn build_list_query<'a>(
     query.push_bind(&request.scope.recipient);
     push_filter(&mut query, &request.filter);
     if let Some(cursor) = cursor {
-        query.push(" AND ((");
-        query.push(INBOX_PRIORITY_CASE_SQL);
-        query.push(") < ");
+        query.push(" AND (");
+        push_attention_expression(&mut query);
+        query.push(" < ");
+        query.push_bind(i16::from(cursor.attention));
+        query.push(" OR (");
+        push_attention_expression(&mut query);
+        query.push(" = ");
+        query.push_bind(i16::from(cursor.attention));
+        query.push(" AND ");
+        push_priority_expression(&mut query);
+        query.push(" < ");
         query.push_bind(i16::from(cursor.priority));
-        query.push(" OR ((");
-        query.push(INBOX_PRIORITY_CASE_SQL);
-        query.push(") = ");
+        query.push(") OR (");
+        push_attention_expression(&mut query);
+        query.push(" = ");
+        query.push_bind(i16::from(cursor.attention));
+        query.push(" AND ");
+        push_priority_expression(&mut query);
+        query.push(" = ");
         query.push_bind(i16::from(cursor.priority));
-        query.push(" AND (occurred_at < ");
+        query.push(" AND occurred_at < ");
         query.push_bind(cursor.occurred_at);
-        query.push(" OR (occurred_at = ");
+        query.push(") OR (");
+        push_attention_expression(&mut query);
+        query.push(" = ");
+        query.push_bind(i16::from(cursor.attention));
+        query.push(" AND ");
+        push_priority_expression(&mut query);
+        query.push(" = ");
+        query.push_bind(i16::from(cursor.priority));
+        query.push(" AND occurred_at = ");
         query.push_bind(cursor.occurred_at);
         query.push(" AND item_id > ");
         query.push_bind(&cursor.item_id);
-        query.push("))))");
+        query.push("))");
     }
-    query.push(" ORDER BY (");
-    query.push(INBOX_PRIORITY_CASE_SQL);
-    query.push(") DESC, occurred_at DESC, item_id ASC LIMIT ");
+    query.push(" ORDER BY ");
+    push_attention_expression(&mut query);
+    query.push(" DESC, ");
+    push_priority_expression(&mut query);
+    query.push(" DESC, occurred_at DESC, item_id ASC LIMIT ");
     query.push_bind(i64::from(request.limit) + 1);
     query
+}
+
+fn push_attention_expression(query: &mut QueryBuilder<'_, Postgres>) {
+    query.push("(");
+    query.push(INBOX_ATTENTION_CASE_SQL);
+    query.push(")");
+}
+
+fn push_priority_expression(query: &mut QueryBuilder<'_, Postgres>) {
+    query.push("(");
+    query.push(INBOX_PRIORITY_CASE_SQL);
+    query.push(")");
 }
 
 fn push_filter(query: &mut QueryBuilder<'_, Postgres>, filter: &InboxFilter) {
@@ -1076,6 +1124,7 @@ mod tests {
         let item = cursor_item(70, "itm-7", "2026-07-22T12:00:00Z");
         let token = encode_cursor(&base, &item).unwrap();
         let decoded = decode_cursor(&token, &base).unwrap();
+        assert_eq!(decoded.attention, 3);
         assert_eq!(decoded.priority, 70);
         assert_eq!(
             decoded.occurred_at,
@@ -1110,13 +1159,13 @@ mod tests {
                 Err(PgInboxError::InvalidLimit)
             );
         }
-        for token in ["", "ni2_", "offset:20", "ni2_not-base64!"] {
+        for token in ["", "ni2_legacy", "ni3_", "offset:20", "ni3_not-base64!"] {
             assert_eq!(
                 decode_cursor(token, &request(10, InboxFilter::all())),
                 Err(PgInboxError::MalformedCursor)
             );
         }
-        let oversized = format!("ni2_{}", "A".repeat(MAX_CURSOR_BYTES));
+        let oversized = format!("ni3_{}", "A".repeat(MAX_CURSOR_BYTES));
         assert_eq!(
             decode_cursor(&oversized, &request(10, InboxFilter::all())),
             Err(PgInboxError::MalformedCursor)
@@ -1131,6 +1180,12 @@ mod tests {
                 Err(PgInboxError::CorruptStoredRow)
             );
         }
+        let mut invalid_state = cursor_item(70, "itm-7", "2026-07-22T12:00:00Z");
+        invalid_state.item.state = "unknown".into();
+        assert_eq!(
+            encode_cursor(&request(10, InboxFilter::all()), &invalid_state),
+            Err(PgInboxError::CorruptStoredRow)
+        );
     }
 
     #[test]
@@ -1188,6 +1243,7 @@ mod tests {
             sort: SORT_ID.into(),
             scope: cursor_scope(&request),
             limit: request.limit,
+            attention: 3,
             priority: 70,
             occurred_at: "2026-07-22T12:00:00Z".parse().unwrap(),
             item_id: "itm-7".into(),
@@ -1199,7 +1255,8 @@ mod tests {
             assert!(sql.contains("WHERE tenant_id = "));
             assert!(sql.contains(" AND region = "));
             assert!(sql.contains(" AND recipient = "));
-            assert!(sql.contains(" ORDER BY ("));
+            assert!(sql.contains(" ORDER BY (CASE state "));
+            assert!(sql.contains(") DESC, (CASE reason "));
             assert!(sql.contains(") DESC, occurred_at DESC, item_id ASC LIMIT "));
             assert!(sql.contains("octet_length(template_args_json::text) <= 16384"));
             assert!(!sql.to_ascii_uppercase().contains("OFFSET"));

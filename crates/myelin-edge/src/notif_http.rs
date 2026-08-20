@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use myelin_events::ArtifactRef;
@@ -47,19 +48,21 @@ impl DurableNotifHttpApi {
         &self,
         principal: &Principal,
         row: &DurableInboxItem,
+        cache: &mut SubjectReadCache,
     ) -> Result<bool, PgInboxError> {
         let issue_object =
             if subsystem_of(&row.item.subject) == myelin_notif::list_inbox::Subsystem::Issue {
-                self.issue_authorization_object(principal, &row.item.subject)?
+                self.issue_authorization_object(principal, &row.item.subject, cache)?
             } else {
                 None
             };
-        Ok(can_read_subject(
+        Ok(can_read_subject_cached(
             &self.identity,
             Some(&self.git),
             principal,
             row,
             issue_object,
+            cache,
         ))
     }
 
@@ -67,7 +70,11 @@ impl DurableNotifHttpApi {
         &self,
         principal: &Principal,
         subject: &ArtifactRef,
+        cache: &mut SubjectReadCache,
     ) -> Result<Option<ArtifactRef>, PgInboxError> {
+        if let Some(cached) = cache.issue_objects.get(&subject.0) {
+            return Ok(cached.clone());
+        }
         let Some(key) = myelin_refs::object_key(subject) else {
             return Ok(None);
         };
@@ -102,8 +109,30 @@ impl DurableNotifHttpApi {
                 })
             },
         ))?;
-        Ok(issue_id.map(|id| ArtifactRef(format!("issue:{id}"))))
+        let object = issue_id.map(|id| ArtifactRef(format!("issue:{id}")));
+        cache
+            .issue_objects
+            .insert(subject.0.clone(), object.clone());
+        Ok(object)
     }
+}
+
+#[derive(Default)]
+struct SubjectReadCache {
+    issue_objects: HashMap<String, Option<ArtifactRef>>,
+    decisions: HashMap<SubjectAccess, bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SubjectAccess {
+    Permission {
+        permission: &'static str,
+        object: String,
+    },
+    PullRequestReview {
+        repository: String,
+        number: u64,
+    },
 }
 
 struct InboxListHandler {
@@ -141,9 +170,10 @@ impl Handler for InboxGetHandler {
                     .get(&inbox_scope(ctx.principal), inbox_item_param(ctx)?),
             )
             .map_err(map_inbox_error)?;
+        let mut cache = SubjectReadCache::default();
         if !self
             .api
-            .can_read_subject(ctx.principal, &row)
+            .can_read_subject(ctx.principal, &row, &mut cache)
             .map_err(map_inbox_error)?
         {
             return Err(EdgeError::NotFound("notification not found".into()));
@@ -206,10 +236,11 @@ impl Handler for InboxListHandler {
             .drive(self.api.store.list(&request))
             .map_err(map_inbox_error)?;
         let mut items = Vec::with_capacity(page.items.len());
+        let mut cache = SubjectReadCache::default();
         for row in &page.items {
             if self
                 .api
-                .can_read_subject(ctx.principal, row)
+                .can_read_subject(ctx.principal, row, &mut cache)
                 .map_err(map_inbox_error)?
             {
                 items.push(inbox_item_json(row));
@@ -344,12 +375,31 @@ fn inbox_item_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
     Ok(value)
 }
 
+#[cfg(test)]
 fn can_read_subject(
     identity: &StoreBackedCheck,
     git: Option<&DurableGitBackend>,
     principal: &Principal,
     row: &DurableInboxItem,
     issue_object: Option<ArtifactRef>,
+) -> bool {
+    can_read_subject_cached(
+        identity,
+        git,
+        principal,
+        row,
+        issue_object,
+        &mut SubjectReadCache::default(),
+    )
+}
+
+fn can_read_subject_cached(
+    identity: &StoreBackedCheck,
+    git: Option<&DurableGitBackend>,
+    principal: &Principal,
+    row: &DurableInboxItem,
+    issue_object: Option<ArtifactRef>,
+    cache: &mut SubjectReadCache,
 ) -> bool {
     let (permission, object) = match subsystem_of(&row.item.subject) {
         myelin_notif::list_inbox::Subsystem::Issue => {
@@ -369,13 +419,20 @@ fn can_read_subject(
                     git,
                     git_pr_coordinate(&row.item.subject, &principal.tenant.0),
                 ) {
-                    if git.authorize_pr_review(
-                        &principal.tenant.0,
-                        &principal.region.0,
-                        &repo,
+                    let access = SubjectAccess::PullRequestReview {
+                        repository: repo.clone(),
                         number,
-                        principal,
-                    ) {
+                    };
+                    let allowed = *cache.decisions.entry(access).or_insert_with(|| {
+                        git.authorize_pr_review(
+                            &principal.tenant.0,
+                            &principal.region.0,
+                            &repo,
+                            number,
+                            principal,
+                        )
+                    });
+                    if allowed {
                         return true;
                     }
                 }
@@ -387,19 +444,25 @@ fn can_read_subject(
         }
         myelin_notif::list_inbox::Subsystem::Unknown => return false,
     };
-    matches!(
-        identity.check(
-            principal,
-            &Permission(permission.into()),
-            &object,
-            &Consistency {
-                at_least: Zookie(String::new()),
-                mode: ConsistencyMode::Strong,
-            },
-            None,
-        ),
-        Ok(Decision::Allow)
-    )
+    let access = SubjectAccess::Permission {
+        permission,
+        object: object.0.clone(),
+    };
+    *cache.decisions.entry(access).or_insert_with(|| {
+        matches!(
+            identity.check(
+                principal,
+                &Permission(permission.into()),
+                &object,
+                &Consistency {
+                    at_least: Zookie(String::new()),
+                    mode: ConsistencyMode::Strong,
+                },
+                None,
+            ),
+            Ok(Decision::Allow)
+        )
+    })
 }
 
 fn git_pr_coordinate(subject: &ArtifactRef, expected_tenant: &str) -> Option<(String, u64)> {

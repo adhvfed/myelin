@@ -20,7 +20,7 @@ import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import {
   findInboxItem,
-  mentionSignalEnvelope,
+  notificationSignalEnvelope,
   readInboxPage,
   retireSeededInbox,
   seedInbox,
@@ -28,6 +28,7 @@ import {
 import { systemTestConfig } from "../src/config.js";
 
 const SEED_COUNT = 250;
+const STALE_APPROVAL_COUNT = 30;
 const FRESH_MENTION_BUDGET_MS = 15_000;
 const PAGE_READ_BUDGET_MS = 5_000;
 
@@ -39,12 +40,21 @@ describe.sequential("notification inbox at scale", () => {
   // repository OWNED BY THE RECIPIENT - a mention about someone else's
   // repository is (correctly) invisible to a reviewer without a pull grant.
   const repoSlug = uniqueName("inbox-scale");
+  const staleApprovalRepoSlug = uniqueName("inbox-stale-approvals");
   const seedPrefix = `myelin://${systemTestConfig.tenant}/git/pr/${repoSlug}`;
   const seed = {
     actor: systemTestConfig.principal,
     recipient: systemTestConfig.reviewerPrincipal,
     subjectPrefix: seedPrefix,
     count: SEED_COUNT,
+  };
+  const staleApprovals = {
+    actor: systemTestConfig.principal,
+    recipient: systemTestConfig.reviewerPrincipal,
+    subjectPrefix:
+      `myelin://${systemTestConfig.tenant}/git/pr/${staleApprovalRepoSlug}`,
+    count: STALE_APPROVAL_COUNT,
+    reason: "approval_requested" as const,
   };
   const freshMention = {
     actor: systemTestConfig.principal,
@@ -56,22 +66,25 @@ describe.sequential("notification inbox at scale", () => {
 
   beforeAll(async () => {
     await new GitProject(repoSlug, reviewerClient).create();
+    await new GitProject(staleApprovalRepoSlug, reviewerClient).create();
     bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
     await seedInbox(bus, reviewerClient, seed);
+    await seedInbox(bus, reviewerClient, staleApprovals);
+    await retireSeededInbox(bus, reviewerClient, staleApprovals);
   }, 360_000);
 
   afterAll(async () => {
     if (bus !== undefined) {
-      await retireSeededInbox(bus, seed);
-      await bus.publish(mentionSignalEnvelope({ ...freshMention, state: "Resolved" }));
+      await retireSeededInbox(bus, reviewerClient, seed);
+      await bus.publish(notificationSignalEnvelope({ ...freshMention, state: "Resolved" }));
       await bus.close();
     }
-  }, 120_000);
+  }, 360_000);
 
-  test("surfaces a fresh mention on the first page within budget", async () => {
+  test("surfaces fresh work ahead of completed high-priority approvals", async () => {
     const subject = freshMention.subject;
     const publishedAt = Date.now();
-    await bus.publish(mentionSignalEnvelope(freshMention));
+    await bus.publish(notificationSignalEnvelope(freshMention));
 
     const firstPageItem = await eventually(async () => {
       const page = await readInboxPage(reviewerClient, null, 25);

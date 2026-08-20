@@ -4,6 +4,40 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — completed work no longer buries new work
+
+The inbox scale test claimed to protect fresh work, but its 250 old rows and
+its new row were all mentions. It proved recency inside one reason band while
+missing the incident mechanism it documented: a `done` approval (priority 90)
+still ranked above every unread mention (priority 70), forever.
+
+The journey now creates 30 real approval notifications, waits until the
+product retires all of them, and only then publishes a new mention. Against
+the old ordering it failed deterministically: the completed approvals filled
+the first page until the 15-second wait expired. The durable order is now
+`attention state -> reason priority -> occurrence -> id`: unread, seen, read,
+then parked (`snoozed`/`archived`/`done`). Cursor v3 carries the complete sort
+position, and `notif_0012` adds the matching online keyset index. The in-memory
+ranker follows the same model rather than remaining a friendlier semantic twin.
+
+The same work exposed the other half of the debris incident. Edge rechecked
+one identical repository permission for every inbox row, sequentially. A
+request-local authorization memo now reuses only exact permission/object and
+pull-request-review decisions inside one API call; nothing survives into the
+next request, so revocation is still re-confirmed. Issue key resolution uses
+the same request-local discipline. The ordinary notification lifecycle fell
+from a 30-second timeout to 6.2 seconds; its four journeys now finish in 16.3
+seconds total.
+
+**Proof:** notification unit suite 347/347; Edge notification unit tests 5/5;
+Clippy `-D warnings` for both touched crates; TypeScript system-test typecheck;
+`notification-scale.system.test.ts` 3/3 (fresh item 1.7s, 100-row page 2.4s,
+complete paged walk 4.8s); `notification-lifecycle.system.test.ts` 4/4.
+
+The journey vocabulary was cleaned while making the bug observable: signals
+carry an explicit closed reason, all inbox walks use the shared guarded pager,
+and seed retirement waits for user-visible `done` state before teardown.
+
 ## 2026-08-19 — the system-test suite grows a spine (journeys, splits, scale)
 
 The suite is the product's constitution, and it had two problems: whole
