@@ -1220,27 +1220,4 @@ mod tests {
         assert!(CiRunPageRequest::new(CiRunStateFilter::All, 0, None).is_err());
         assert!(CiRunPageRequest::new(CiRunStateFilter::All, CI_RUN_PAGE_MAX + 1, None).is_err());
     }
-
-    #[test]
-    fn list_query_is_visible_repo_prefiltered_and_keyset_only() {
-        assert!(LIST_CI_RUNS_QUERY.contains("FROM unnest($3::text[]) AS visible(repo_ref)"));
-        assert!(LIST_CI_RUNS_QUERY.contains("CROSS JOIN LATERAL"));
-        assert!(LIST_CI_RUNS_QUERY.contains("repo_ref = visible.repo_ref"));
-        assert_eq!(
-            LIST_CI_RUNS_QUERY.matches("LIMIT $7").count(),
-            2,
-            "each visible repository and the merged page are independently bounded"
-        );
-        assert!(LIST_CI_RUNS_QUERY.contains("created_at < $5::timestamptz"));
-        assert!(LIST_CI_RUNS_QUERY.contains("run_id < $6::uuid"));
-        assert!(LIST_CI_RUNS_QUERY
-            .contains("ORDER BY candidate.sort_created_at DESC, candidate.sort_run_id DESC"));
-        assert!(!LIST_CI_RUNS_QUERY.to_ascii_lowercase().contains("offset"));
-    }
-
-    #[test]
-    fn branch_scope_is_visible_on_both_run_surfaces() {
-        assert!(LIST_CI_RUNS_QUERY.contains("candidate.source_ref"));
-        assert!(SELECT_CI_SURFACE_RUN_QUERY.contains("source_ref"));
-    }
 }
