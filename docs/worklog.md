@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — CI workflow identity no longer hashes Rust spelling
+
+The production `ci.pipeline` definition pin hashed the raw bytes of four Rust
+source files. Reformatting or editing a comment therefore changed the durable
+workflow identity without changing behavior, while a semantic change in any
+helper outside that hand-picked list changed behavior without changing the
+identity. Harmless refactors could refuse a fleet cutover, and the supposed
+semantic hash was incomplete by construction.
+
+The version-7 definition now carries its existing deployed hash as an explicit
+immutable pin. Durable workflow behavior advances through the versioned
+cutover protocol already enforced by the registry; source layout and prose are
+free to evolve independently. Restarting the live CI control plane against its
+existing active version-7 row proves this is a compatible identity-preserving
+cleanup, and the full CI lifecycle still executes pushed commits and surfaces
+both success and failure.
+
+**Proof:** CI runtime-composition tests 3/3; Clippy `-D warnings` for
+`myelin-ci-controlplane`; live control-plane restart against the existing
+definition registry; black-box CI lifecycle 5/5.
+
 ## 2026-08-20 — the issue key is the issue's everyday address
 
 Issues displayed memorable keys such as `DX-2`, but the human HTTP and CLI
@@ -527,14 +548,7 @@ system suite.
 5. **trust-scoped CI cache + agent exec gate are built but unwired**; the CI
    runner does not route cache writes through `CiCacheNamespace`, and
    nothing constructs `AgentExecGate` in production.
-6. **`agent-governed-trigger-intake` deliveries quarantine with
-   `no_registered_consumer`** — 15,636 rows in `consumer_delivery_quarantine`
-   accumulated 2026-08-11 → 2026-08-19 05:15 UTC on the dev stack (bursty,
-   redelivery-amplified). Something publishes deliveries addressed to a
-   consumer that is never registered; either register the consumer or stop
-   addressing it. found while checking quarantine health after the chat-live
-   landing (which itself added zero rows to either quarantine table).
-7. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+6. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.

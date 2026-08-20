@@ -37,22 +37,12 @@ pub const CI_FLOW_WORKER_LEASE_TTL_SECS: i64 = 60;
 pub const CI_FLOW_OUTBOX_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CI_WORKFLOW_SCOPES_PER_PASS: usize = MAX_ACTIVE_CI_RUN_PAGE;
 pub const MAX_CI_WORKFLOW_DRIVES_PER_SCOPE: usize = 64;
-const CI_MANIFEST_PIPELINE_DEFINITION_V1_DOMAIN: &str = "myelin.ci.manifest-pipeline-definition.v1";
+const CI_MANIFEST_PIPELINE_CODE_HASH: &str =
+    "blake3:d1ca2afcc81c9ca76f1744795fa43b083bfceb7703a9dce6bda6d614cea0ee9a";
 
 pub fn ci_manifest_pipeline_definition() -> Result<CiWorkflowDefinitionPin, crate::PgCiStarterError>
 {
-    let mut hasher = blake3::Hasher::new_derive_key(CI_MANIFEST_PIPELINE_DEFINITION_V1_DOMAIN);
-    for source in [
-        include_bytes!("ci_manifest_pipeline.rs").as_slice(),
-        include_bytes!("ci_manifest_job_runner.rs").as_slice(),
-        include_bytes!("ci_claim_window.rs").as_slice(),
-        include_bytes!("ci_pipeline_protocol.rs").as_slice(),
-    ] {
-        hasher.update(&(source.len() as u64).to_be_bytes());
-        hasher.update(source);
-    }
-    let code_hash = format!("blake3:{}", hasher.finalize().to_hex());
-    CiWorkflowDefinitionPin::new(CI_MANIFEST_PIPELINE_VERSION, code_hash)
+    CiWorkflowDefinitionPin::new(CI_MANIFEST_PIPELINE_VERSION, CI_MANIFEST_PIPELINE_CODE_HASH)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -885,13 +875,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_definition_pin_is_source_derived_and_stable_within_the_binary() {
+    fn production_definition_pin_is_explicit_and_stable() {
         let first = ci_manifest_pipeline_definition().unwrap();
         let second = ci_manifest_pipeline_definition().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version(), CI_MANIFEST_PIPELINE_VERSION);
-        assert!(first.code_hash().starts_with("blake3:"));
-        assert_eq!(first.code_hash().len(), "blake3:".len() + 64);
+        assert_eq!(first.code_hash(), CI_MANIFEST_PIPELINE_CODE_HASH);
     }
 
     #[test]
