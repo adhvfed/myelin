@@ -238,13 +238,24 @@ pub(crate) fn parse_response(value: &Value) -> Result<ModelResponse, ModelError>
 
     let usage = parse_usage(value.get("usage"));
 
-    let reply = match message.get("tool_calls").and_then(Value::as_array) {
+    let raw_tool_calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(calls)) => Some(calls),
+        Some(_) => {
+            return Err(ModelError::Parse(
+                "message.tool_calls is not an array".into(),
+            ));
+        }
+    };
+
+    let reply = match raw_tool_calls {
         Some(raw_calls) if !raw_calls.is_empty() => {
             let mut calls = Vec::with_capacity(raw_calls.len());
             for raw in raw_calls {
                 let id = raw
                     .get("id")
                     .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
                     .ok_or_else(|| ModelError::Parse("tool_call missing id".into()))?
                     .to_string();
                 let function = raw
@@ -253,14 +264,26 @@ pub(crate) fn parse_response(value: &Value) -> Result<ModelResponse, ModelError>
                 let name = function
                     .get("name")
                     .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
                     .map(from_wire_tool_name)
                     .ok_or_else(|| ModelError::Parse("tool_call missing function.name".into()))?;
-                let arguments = function
+                let encoded_arguments = function
                     .get("arguments")
                     .and_then(Value::as_str)
                     .filter(|s| !s.trim().is_empty())
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .unwrap_or(Value::Null);
+                    .ok_or_else(|| {
+                        ModelError::Parse(format!("tool_call `{id}` missing function.arguments"))
+                    })?;
+                let arguments = serde_json::from_str::<Value>(encoded_arguments).map_err(|_| {
+                    ModelError::Parse(format!(
+                        "tool_call `{id}` function.arguments is not valid JSON"
+                    ))
+                })?;
+                if !arguments.is_object() {
+                    return Err(ModelError::Parse(format!(
+                        "tool_call `{id}` function.arguments is not a JSON object"
+                    )));
+                }
                 calls.push(ToolCallRequest {
                     id,
                     name,
@@ -273,7 +296,8 @@ pub(crate) fn parse_response(value: &Value) -> Result<ModelResponse, ModelError>
             let content = message
                 .get("content")
                 .and_then(Value::as_str)
-                .unwrap_or("")
+                .filter(|content| !content.trim().is_empty())
+                .ok_or_else(|| ModelError::Parse("final message has no non-empty content".into()))?
                 .to_string();
             ModelReply::Final { content }
         }
@@ -468,6 +492,67 @@ mod tests {
                 cached_input: 40,
                 output: 20
             }
+        );
+    }
+
+    #[test]
+    fn malformed_tool_arguments_never_reach_the_tool_boundary() {
+        for (arguments, expected) in [
+            ("{not-json", "is not valid JSON"),
+            ("null", "is not a JSON object"),
+            ("[]", "is not a JSON object"),
+        ] {
+            let value = serde_json::json!({
+                "choices": [{"message": {"content": null, "tool_calls": [{
+                    "id": "call_bad",
+                    "type": "function",
+                    "function": {"name": "issues-create", "arguments": arguments}
+                }]}}]
+            });
+
+            let error = parse_response(&value).expect_err("malformed arguments are refused");
+            assert!(
+                matches!(error, ModelError::Parse(ref detail) if detail.contains(expected)),
+                "the provider defect is named without fabricating a tool input: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_final_content_is_not_a_successful_agent_answer() {
+        for content in [
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("   ".into()),
+        ] {
+            let value = serde_json::json!({
+                "choices": [{"message": {"content": content}}]
+            });
+
+            assert_eq!(
+                parse_response(&value),
+                Err(ModelError::Parse(
+                    "final message has no non-empty content".into()
+                )),
+                "a charged run must finish with a readable work product"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_tool_collection_is_not_reinterpreted_as_a_final_answer() {
+        let value = serde_json::json!({
+            "choices": [{"message": {
+                "content": "this text must not hide the malformed tool request",
+                "tool_calls": {"id": "call_bad"}
+            }}]
+        });
+
+        assert_eq!(
+            parse_response(&value),
+            Err(ModelError::Parse(
+                "message.tool_calls is not an array".into()
+            ))
         );
     }
 

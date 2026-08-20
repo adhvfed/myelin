@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — a model response must contain real work
+
+The hosted-model boundary treated malformed function arguments as JSON `null`
+and a missing final message as an empty successful answer. Either defect could
+turn an invalid provider response into durable, charged agent progress: a tool
+would receive an input the model never supplied, or a person would receive no
+work product at all.
+
+The Luna response decoder now accepts tool calls only when their collection is
+an array, their identity and name are non-empty, and their arguments are a JSON
+object. A final answer must contain readable text. Invalid provider output maps
+to the existing permanent invalid-response outcome before reaching a governed
+tool boundary. The live collaboration journey still reads a failed CI run,
+opens governed work, pauses for human approval, and merges only after approval.
+
+**Proof:** agent-model unit suite 23/23 (the explicit real-provider smoke remains
+ignored); agent-host unit suite 33/33; Clippy `-D warnings` for
+`myelin-agent-model`; black-box collaboration journeys 3/3.
+
 ## 2026-08-20 — malformed mentions fail visibly instead of disappearing
 
 The notification router decoded a signal's `mentions` collection with
