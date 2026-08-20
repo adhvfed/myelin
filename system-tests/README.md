@@ -65,8 +65,9 @@ The suite is intentionally organized around externally visible contracts:
   executes the pushed commit in the pinned gVisor sandbox, settles successfully, and preserves the
   exact archived output while repository visibility still governs both list and detail reads.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,
-  recipient-scoped delivery, addressable inbox items, broker de-duplication, collapse, read state,
-  self-suppression, and complete duplicate-free traversal through opaque inbox cursors.
+  recipient-scoped delivery, addressable inbox items, broker de-duplication, collapse, individual
+  and view-scoped read state, snooze and timed resurfacing, terminal-state safety, self-suppression,
+  and complete duplicate-free traversal through opaque inbox cursors.
 - `api-contracts` checks strict inputs, resource identifiers, payload limits, notification inbox
   scoping, and public error envelopes.
 

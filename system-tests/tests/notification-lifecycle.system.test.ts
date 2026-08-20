@@ -6,9 +6,12 @@ import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import {
   findInboxItem,
+  markInboxViewRead,
   notificationSignalEnvelope,
   pullRequestSubject,
+  readInboxItem,
   readInboxPage,
+  snoozeInboxItem,
 } from "../src/journeys/inbox.js";
 import { string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
@@ -129,6 +132,96 @@ describe.sequential("notification delivery lifecycle", () => {
       return item?.state === "done" ? item : undefined;
     }, { description: "the resolved signal to retire its inbox item" });
     expect(retired.state).toBe("done");
+  });
+
+  test("lets a person put work aside and clear only the view they chose", async () => {
+    const mention = {
+      actor: systemTestConfig.reviewerPrincipal,
+      recipient: systemTestConfig.principal,
+      dedupKey: uniqueName("snoozed-mention"),
+      subject: pullRequestSubject(slug, 7),
+      reason: "mentioned" as const,
+    };
+    const reviewRequest = {
+      actor: systemTestConfig.reviewerPrincipal,
+      recipient: systemTestConfig.principal,
+      dedupKey: uniqueName("review-request"),
+      subject: pullRequestSubject(slug, 8),
+      reason: "review_requested" as const,
+    };
+
+    await bus.publish(notificationSignalEnvelope(mention));
+    await bus.publish(notificationSignalEnvelope(reviewRequest));
+    const { mentionedItem, reviewItem } = await eventually(async () => {
+      const [mentionedItem, reviewItem] = await Promise.all([
+        findInboxItem(systemClient, mention.subject),
+        findInboxItem(systemClient, reviewRequest.subject),
+      ]);
+      return mentionedItem && reviewItem ? { mentionedItem, reviewItem } : undefined;
+    }, { description: "both kinds of work to arrive in the person's inbox" });
+    const mentionedId = string(mentionedItem.id, "mentioned notification id");
+    const reviewId = string(reviewItem.id, "review-request notification id");
+
+    const past = await systemClient.json(
+      `/v1/notif/inbox/${encodeURIComponent(mentionedId)}/snooze`,
+      {
+        method: "POST",
+        body: { until: new Date(Date.now() - 1_000).toISOString() },
+        idempotencyKey: false,
+        expectedStatus: 400,
+      },
+    );
+    expect(past.body).toHaveProperty("error.code", "bad_request");
+
+    const until = new Date(Date.now() + 6_000).toISOString();
+    const snoozed = await snoozeInboxItem(systemClient, mentionedId, until);
+    expect(snoozed.id).toBe(mentionedId);
+    expect(Date.parse(snoozed.snoozeUntil)).toBe(Date.parse(until));
+    expect(await readInboxItem(systemClient, mentionedId)).toMatchObject({
+      state: "snoozed",
+      subject: mention.subject,
+    });
+
+    const activePage = await readInboxPage(systemClient, null, 100);
+    expect(activePage.items.some((item) => item.id === mentionedId)).toBe(false);
+
+    const updated = await markInboxViewRead(systemClient, "review-requests");
+    expect(updated).toBeGreaterThanOrEqual(1);
+    await eventually(async () => {
+      const item = await readInboxItem(systemClient, reviewId);
+      return item.state === "read" ? item : undefined;
+    }, { description: "the chosen review-request view to become read" });
+    expect(await readInboxItem(systemClient, mentionedId)).toHaveProperty("state", "snoozed");
+
+    await eventually(async () => {
+      const item = await readInboxItem(systemClient, mentionedId);
+      return item.state === "unread" ? item : undefined;
+    }, {
+      description: "the snoozed mention to return when its time arrives",
+      timeoutMs: 15_000,
+    });
+    expect(await readInboxItem(systemClient, reviewId)).toHaveProperty("state", "read");
+
+    await bus.publish(notificationSignalEnvelope({ ...mention, state: "Resolved" }));
+    await bus.publish(notificationSignalEnvelope({ ...reviewRequest, state: "Resolved" }));
+    await eventually(async () => {
+      const states = await Promise.all([
+        readInboxItem(systemClient, mentionedId),
+        readInboxItem(systemClient, reviewId),
+      ]);
+      return states.every((item) => item.state === "done") ? true : undefined;
+    }, { description: "both completed pieces of inbox work to retire" });
+
+    const terminal = await systemClient.json(
+      `/v1/notif/inbox/${encodeURIComponent(mentionedId)}/snooze`,
+      {
+        method: "POST",
+        body: { until: new Date(Date.now() + 60_000).toISOString() },
+        idempotencyKey: false,
+        expectedStatus: 409,
+      },
+    );
+    expect(terminal.body).toHaveProperty("error.code", "conflict");
   });
 
   test("suppresses self-notifications before processing a later delivery", async () => {

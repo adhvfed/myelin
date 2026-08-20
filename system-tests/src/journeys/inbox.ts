@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import type { SystemTestClient } from "../client.js";
 import { ExternalEventBus, type ExternalEventEnvelope } from "../event-bus.js";
 import { eventually } from "../eventually.js";
-import { array, record, string, type JsonRecord } from "../json.js";
+import { array, integer, record, string, type JsonRecord } from "../json.js";
 import { findPaged, walkPaged } from "../paging.js";
 import { systemTestConfig } from "../config.js";
 
@@ -50,6 +50,13 @@ export interface InboxSeed {
   subjectPrefix: string;
   count: number;
   reason?: NotificationReason;
+}
+
+export type InboxView = "all" | "my-work" | "activity" | "review-requests";
+
+export interface SnoozedInboxItem {
+  id: string;
+  snoozeUntil: string;
 }
 
 export function pullRequestSubject(repository: string, number: number): string {
@@ -125,6 +132,54 @@ export async function readInboxPage(
       ? null
       : string(page.next_cursor, "notification page cursor"),
   };
+}
+
+export async function readInboxItem(
+  client: SystemTestClient,
+  itemId: string,
+): Promise<JsonRecord> {
+  const response = await client.json(`/v1/notif/inbox/${encodeURIComponent(itemId)}`);
+  return response.body;
+}
+
+export async function snoozeInboxItem(
+  client: SystemTestClient,
+  itemId: string,
+  until: string,
+): Promise<SnoozedInboxItem> {
+  const response = await client.json(
+    `/v1/notif/inbox/${encodeURIComponent(itemId)}/snooze`,
+    {
+      method: "POST",
+      body: { until },
+      idempotencyKey: false,
+    },
+  );
+  if (response.body.state !== "snoozed") {
+    throw new TypeError("snoozing an inbox item must return the snoozed state");
+  }
+  return {
+    id: string(response.body.id, "snoozed notification id"),
+    snoozeUntil: string(response.body.snooze_until, "notification snooze time"),
+  };
+}
+
+export async function markInboxViewRead(
+  client: SystemTestClient,
+  view: InboxView,
+): Promise<number> {
+  const response = await client.json(
+    `/v1/notif/inbox/read?${new URLSearchParams({ view }).toString()}`,
+    {
+      method: "POST",
+      body: {},
+      idempotencyKey: false,
+    },
+  );
+  if (response.body.state !== "read" || response.body.view !== view) {
+    throw new TypeError("marking an inbox view read must name the completed view");
+  }
+  return integer(response.body.updated, "number of notifications marked read");
 }
 
 /// Bounded search for one subject across the recipient's whole inbox.

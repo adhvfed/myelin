@@ -326,6 +326,17 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
 
     assert!(store.complete_if_present(&scope, "crit-a").await.unwrap());
     assert!(store.complete_if_present(&scope, "crit-b").await.unwrap());
+    assert_eq!(
+        store
+            .snooze(
+                &scope,
+                "crit-a",
+                Utc::now().checked_add_signed(Duration::hours(1)).unwrap(),
+            )
+            .await,
+        Err(PgInboxError::InvalidState),
+        "completed work cannot be returned to an active state by snoozing it"
+    );
     let after_approvals_finished = store
         .list(&InboxReadRequest {
             scope: scope.clone(),

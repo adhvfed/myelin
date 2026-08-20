@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use myelin_events::ArtifactRef;
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
@@ -14,6 +15,7 @@ use myelin_notif::pg_inbox::{
 use myelin_notif::prefs::{class_token, reason_token, subsystem_token};
 use myelin_notif::{agent_effect_approval_action, automation_approval_action};
 use myelin_storage::with_tenant_tx_error;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::types::Uuid;
 use tokio::runtime::Handle;
@@ -147,6 +149,20 @@ struct InboxMarkReadHandler {
     api: DurableNotifHttpApi,
 }
 
+struct InboxSnoozeHandler {
+    api: DurableNotifHttpApi,
+}
+
+struct InboxMarkAllReadHandler {
+    api: DurableNotifHttpApi,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxSnoozeBody {
+    until: String,
+}
+
 fn inbox_scope(principal: &Principal) -> InboxReadScope {
     InboxReadScope {
         tenant: principal.tenant.clone(),
@@ -187,24 +203,8 @@ impl Handler for InboxGetHandler {
 
 impl Handler for InboxMarkReadHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        if !ctx.request.query.is_empty() {
-            return Err(EdgeError::BadRequest(
-                "notification inbox writes accept no query parameters".into(),
-            ));
-        }
-        if ctx.request.body.len() > MAX_INBOX_MUTATION_BYTES {
-            return Err(EdgeError::PayloadTooLarge(
-                "notification inbox request body is too large".into(),
-            ));
-        }
-        if !ctx.request.body.is_empty() {
-            let value = ctx.request.json_body()?;
-            if value.as_object().is_none_or(|object| !object.is_empty()) {
-                return Err(EdgeError::BadRequest(
-                    "mark-read body must be an empty JSON object".into(),
-                ));
-            }
-        }
+        require_inbox_write_query(ctx)?;
+        require_optional_empty_inbox_body(ctx, "mark-read")?;
         let item_id = inbox_item_param(ctx)?;
         let scope = inbox_scope(ctx.principal);
         self.api
@@ -214,6 +214,107 @@ impl Handler for InboxMarkReadHandler {
             EdgeResponse::json(200, &json!({ "id": item_id, "state": "read" }))
                 .with_header("Cache-Control", "no-store"),
         )
+    }
+}
+
+impl Handler for InboxSnoozeHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_inbox_write_query(ctx)?;
+        if ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "notification snooze request body is empty".into(),
+            ));
+        }
+        if ctx.request.body.len() > MAX_INBOX_MUTATION_BYTES {
+            return Err(EdgeError::PayloadTooLarge(
+                "notification inbox request body is too large".into(),
+            ));
+        }
+        let body: InboxSnoozeBody = serde_json::from_slice(&ctx.request.body)
+            .map_err(|error| EdgeError::BadRequest(format!("invalid snooze request: {error}")))?;
+        let until = DateTime::parse_from_rfc3339(&body.until)
+            .map_err(|_| {
+                EdgeError::BadRequest("snooze `until` must be an RFC 3339 timestamp".into())
+            })?
+            .with_timezone(&Utc);
+        if until <= Utc::now() {
+            return Err(EdgeError::BadRequest(
+                "snooze `until` must be in the future".into(),
+            ));
+        }
+        let item_id = inbox_item_param(ctx)?;
+        self.api
+            .drive(
+                self.api
+                    .store
+                    .snooze(&inbox_scope(ctx.principal), item_id, until),
+            )
+            .map_err(map_inbox_error)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({
+                "id": item_id,
+                "state": "snoozed",
+                "snooze_until": until.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            }),
+        )
+        .with_header("Cache-Control", "no-store"))
+    }
+}
+
+impl Handler for InboxMarkAllReadHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_optional_empty_inbox_body(ctx, "mark-all-read")?;
+        let view = parse_inbox_view_query(&ctx.request.query)?;
+        let updated = self
+            .api
+            .drive(
+                self.api
+                    .store
+                    .mark_all_read(&inbox_scope(ctx.principal), &view.filter()),
+            )
+            .map_err(map_inbox_error)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({
+                "state": "read",
+                "view": inbox_view_name(view),
+                "updated": updated,
+            }),
+        )
+        .with_header("Cache-Control", "no-store"))
+    }
+}
+
+fn require_inbox_write_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
+    if ctx.request.query.is_empty() {
+        Ok(())
+    } else {
+        Err(EdgeError::BadRequest(
+            "notification inbox writes accept no query parameters".into(),
+        ))
+    }
+}
+
+fn require_optional_empty_inbox_body(
+    ctx: &HandlerCtx<'_>,
+    operation: &str,
+) -> Result<(), EdgeError> {
+    if ctx.request.body.len() > MAX_INBOX_MUTATION_BYTES {
+        return Err(EdgeError::PayloadTooLarge(
+            "notification inbox request body is too large".into(),
+        ));
+    }
+    if ctx.request.body.is_empty() {
+        return Ok(());
+    }
+    let value = ctx.request.json_body()?;
+    if value.as_object().is_some_and(|object| object.is_empty()) {
+        Ok(())
+    } else {
+        Err(EdgeError::BadRequest(format!(
+            "{operation} body must be an empty JSON object"
+        )))
     }
 }
 
@@ -325,6 +426,30 @@ fn parse_inbox_query(query: &str) -> Result<InboxQuery, EdgeError> {
         limit: limit.unwrap_or(DEFAULT_INBOX_LIMIT),
         cursor,
     })
+}
+
+fn parse_inbox_view_query(query: &str) -> Result<CliView, EdgeError> {
+    if query.is_empty() {
+        return Ok(CliView::All);
+    }
+    let (name, value) = query
+        .split_once('=')
+        .ok_or_else(|| EdgeError::BadRequest("malformed notification inbox view query".into()))?;
+    if name != "view" || value.contains('&') || value.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "mark-all-read accepts only one `view` query parameter".into(),
+        ));
+    }
+    CliView::parse(Some(value)).map_err(EdgeError::BadRequest)
+}
+
+fn inbox_view_name(view: CliView) -> &'static str {
+    match view {
+        CliView::All => "all",
+        CliView::MyWork => "my-work",
+        CliView::Activity => "activity",
+        CliView::ReviewRequests => "review-requests",
+    }
 }
 
 fn inbox_item_json(row: &DurableInboxItem) -> Value {
@@ -552,6 +677,9 @@ fn map_inbox_error(error: PgInboxError) -> EdgeError {
             EdgeError::BadRequest("invalid notification inbox page request".into())
         }
         PgInboxError::NotFound => EdgeError::NotFound("notification not found".into()),
+        PgInboxError::InvalidState => {
+            EdgeError::Conflict("notification is no longer active".into())
+        }
         PgInboxError::Database => {
             EdgeError::Unavailable("notification inbox is temporarily unavailable".into())
         }
@@ -592,7 +720,19 @@ pub fn register_notif(
             Method::Post,
             "/v1/notif/inbox/{item}/read",
             "notif.inbox.mark_read",
-            Arc::new(InboxMarkReadHandler { api }),
+            Arc::new(InboxMarkReadHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/notif/inbox/{item}/snooze",
+            "notif.inbox.snooze",
+            Arc::new(InboxSnoozeHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/notif/inbox/read",
+            "notif.inbox.mark_all_read",
+            Arc::new(InboxMarkAllReadHandler { api }),
         )
 }
 
@@ -649,6 +789,35 @@ mod tests {
     }
 
     #[test]
+    fn inbox_state_mutations_have_one_exact_input_shape() {
+        assert_eq!(parse_inbox_view_query("").unwrap(), CliView::All);
+        assert_eq!(
+            parse_inbox_view_query("view=my-work").unwrap(),
+            CliView::MyWork
+        );
+        for query in [
+            "view=",
+            "view=all&view=my-work",
+            "limit=1",
+            "cursor=ni1_abc",
+            "bare",
+        ] {
+            assert_eq!(parse_inbox_view_query(query).unwrap_err().status(), 400);
+        }
+
+        let body: InboxSnoozeBody =
+            serde_json::from_slice(br#"{"until":"2026-08-20T15:00:00Z"}"#).unwrap();
+        assert_eq!(body.until, "2026-08-20T15:00:00Z");
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"until":42}"#.as_slice(),
+            br#"{"until":"2026-08-20T15:00:00Z","item":"other"}"#.as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<InboxSnoozeBody>(body).is_err());
+        }
+    }
+
+    #[test]
     fn storage_failures_never_leak_database_detail() {
         let error = map_inbox_error(PgInboxError::Database);
         assert_eq!(error.status(), 503);
@@ -659,12 +828,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_items_are_indistinguishable_from_inaccessible_items() {
+    fn absence_and_terminal_state_are_distinct_safe_failures() {
         let error = map_inbox_error(PgInboxError::NotFound);
         assert_eq!(error.status(), 404);
         assert_eq!(
             error.envelope()["error"]["message"],
             "notification not found"
+        );
+
+        let error = map_inbox_error(PgInboxError::InvalidState);
+        assert_eq!(error.status(), 409);
+        assert_eq!(
+            error.envelope()["error"]["message"],
+            "notification is no longer active"
         );
     }
 

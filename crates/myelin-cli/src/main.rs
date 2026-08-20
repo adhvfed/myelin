@@ -110,7 +110,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Read and complete personal notifications.
+    /// Read, snooze, and complete personal notifications.
     #[command(name = "inbox", visible_alias = "notif")]
     Notif {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

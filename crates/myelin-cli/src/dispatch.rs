@@ -363,7 +363,7 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
 pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     use myelin_notif::cli::CliView;
     let (verb, rest) = args.split_first().ok_or_else(|| {
-        CliError::Usage("no notif command (try: list [--view <v>] | show <id> | read <id>)".into())
+        CliError::Usage("no inbox command (try: list | show | read | snooze | read-all)".into())
     })?;
     match *verb {
         "list" => {
@@ -394,14 +394,8 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
                 index += 2;
             }
             let view = CliView::parse(view).map_err(CliError::Usage)?;
-            let view_token = match view {
-                CliView::All => "all",
-                CliView::MyWork => "my-work",
-                CliView::Activity => "activity",
-                CliView::ReviewRequests => "review-requests",
-            };
             let mut query = FormQuery::default();
-            query.push("view", view_token);
+            query.push("view", inbox_view_name(view));
             if let Some(value) = limit {
                 let parsed = value.parse::<u16>().map_err(|_| {
                     CliError::Usage("--limit must be an integer between 1 and 100".into())
@@ -439,12 +433,67 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
             if *verb == "show" {
                 Ok(EdgeCall::get(path))
             } else {
-                Ok(EdgeCall::post_json(format!("{path}/read"), json!({})))
+                Ok(EdgeCall::post_retry_safe_json(
+                    format!("{path}/read"),
+                    json!({}),
+                ))
             }
         }
+        "snooze" => {
+            let [id, "--until", until] = rest else {
+                return Err(CliError::Usage(
+                    "`inbox snooze` needs <item_id> --until <rfc3339>".into(),
+                ));
+            };
+            notif_item_id("snooze", &[*id])?;
+            chrono::DateTime::parse_from_rfc3339(until)
+                .map_err(|_| CliError::Usage("--until must be an RFC 3339 timestamp".into()))?;
+            let path = format!(
+                "/v1/notif/inbox/{}/snooze",
+                utf8_percent_encode(id, FORM_QUERY_COMPONENT_ENCODE_SET)
+            );
+            Ok(EdgeCall::post_retry_safe_json(
+                path,
+                json!({ "until": until }),
+            ))
+        }
+        "read-all" => {
+            let view = notif_view_flag(rest, "read-all")?;
+            let mut query = FormQuery::default();
+            query.push("view", inbox_view_name(view));
+            Ok(EdgeCall {
+                method: HttpMethod::Post,
+                path: "/v1/notif/inbox/read".into(),
+                query: Some(query.finish()),
+                payload: Some(b"{}".to_vec()),
+                idempotency_key: None,
+                retry_policy: RetryPolicy::None,
+            })
+        }
         other => Err(CliError::Usage(format!(
-            "unknown notif command `{other}` (try: list | show <id> | read <id>)"
+            "unknown inbox command `{other}` (try: list | show | read | snooze | read-all)"
         ))),
+    }
+}
+
+fn notif_view_flag(args: &[&str], operation: &str) -> Result<myelin_notif::cli::CliView, CliError> {
+    use myelin_notif::cli::CliView;
+    match args {
+        [] => Ok(CliView::All),
+        ["--view", view] => CliView::parse(Some(view)).map_err(CliError::Usage),
+        _ => Err(CliError::Usage(format!(
+            "`inbox {operation}` accepts only --view <all|my-work|activity|review-requests>"
+        ))),
+    }
+}
+
+fn inbox_view_name(view: myelin_notif::cli::CliView) -> &'static str {
+    use myelin_notif::cli::CliView;
+    match view {
+        CliView::All => "all",
+        CliView::MyWork => "my-work",
+        CliView::Activity => "activity",
+        CliView::ReviewRequests => "review-requests",
     }
 }
 
@@ -663,11 +712,33 @@ mod tests {
         assert_eq!(read.method, HttpMethod::Post);
         assert_eq!(read.path, "/v1/notif/inbox/item-1/read");
         assert_eq!(read.payload, Some(b"{}".to_vec()));
+        assert_eq!(read.retry_policy, RetryPolicy::None);
+
+        let snooze =
+            notif_dispatch(&["snooze", "item/1", "--until", "2026-08-20T15:00:00+02:00"]).unwrap();
+        assert_eq!(snooze.method, HttpMethod::Post);
+        assert_eq!(snooze.path, "/v1/notif/inbox/item%2F1/snooze");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&snooze.payload.unwrap()).unwrap(),
+            json!({"until": "2026-08-20T15:00:00+02:00"})
+        );
+        assert_eq!(snooze.retry_policy, RetryPolicy::None);
+
+        let read_all = notif_dispatch(&["read-all", "--view", "review-requests"]).unwrap();
+        assert_eq!(read_all.method, HttpMethod::Post);
+        assert_eq!(read_all.path, "/v1/notif/inbox/read");
+        assert_eq!(read_all.query.as_deref(), Some("view=review-requests"));
+        assert_eq!(read_all.payload, Some(b"{}".to_vec()));
+        assert_eq!(read_all.retry_policy, RetryPolicy::None);
 
         for args in [
             vec!["show"],
             vec!["read", "item-1", "extra"],
             vec!["show", "item\n1"],
+            vec!["snooze", "item-1", "--until", "tomorrow"],
+            vec!["snooze", "item-1", "until", "2026-08-20T15:00:00Z"],
+            vec!["read-all", "--view", "everything"],
+            vec!["read-all", "--limit", "1"],
         ] {
             assert_eq!(notif_dispatch(&args).unwrap_err().code(), 2);
         }

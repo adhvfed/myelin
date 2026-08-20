@@ -124,6 +124,7 @@ pub struct DurableInboxPage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PgInboxError {
     InvalidInput,
+    InvalidState,
     InvalidLimit,
     MalformedCursor,
     CursorScopeMismatch,
@@ -138,6 +139,7 @@ impl core::fmt::Display for PgInboxError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let message = match self {
             Self::InvalidInput => "invalid durable inbox input",
+            Self::InvalidState => "notification inbox item state cannot make that transition",
             Self::InvalidLimit => "inbox page limit must be between 1 and 100",
             Self::MalformedCursor => "malformed inbox cursor",
             Self::CursorScopeMismatch => "inbox cursor belongs to another query scope",
@@ -367,7 +369,7 @@ impl PgInboxStore {
                 .map_err(|_| PgInboxError::Database)?
                 .ok_or(PgInboxError::NotFound)?;
                 if !matches!(state.as_str(), "unread" | "seen" | "read") {
-                    return Err(PgInboxError::InvalidInput);
+                    return Err(PgInboxError::InvalidState);
                 }
                 let result = sqlx::query(
                     "UPDATE notif_inbox_item SET state = 'snoozed', snooze_until = $5 \

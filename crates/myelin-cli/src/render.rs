@@ -153,6 +153,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if is_notification(value) {
         return format!("{}\n", render_notification(value));
     }
+    if let Some(rendered) = render_inbox_mutation(value) {
+        return rendered;
+    }
     if let (Some(id), Some(state)) = (
         value.get("id").and_then(Value::as_str),
         value.get("state").and_then(Value::as_str),
@@ -564,6 +567,36 @@ fn is_notification(value: &Value) -> bool {
         && value.get("state").and_then(Value::as_str).is_some()
 }
 
+fn render_inbox_mutation(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    if object.len() != 3 {
+        return None;
+    }
+    if let (Some(id), Some("snoozed"), Some(until)) = (
+        object.get("id").and_then(Value::as_str),
+        object.get("state").and_then(Value::as_str),
+        object.get("snooze_until").and_then(Value::as_str),
+    ) {
+        return Some(format!(
+            "{} [snoozed until {}]\n",
+            terminal_safe_single_line(id),
+            terminal_safe_single_line(until),
+        ));
+    }
+    if let (Some("read"), Some(view), Some(updated)) = (
+        object.get("state").and_then(Value::as_str),
+        object.get("view").and_then(Value::as_str),
+        object.get("updated").and_then(Value::as_u64),
+    ) {
+        return Some(format!(
+            "{} [read: {} updated]\n",
+            terminal_safe_single_line(view),
+            updated,
+        ));
+    }
+    None
+}
+
 fn render_notification(value: &Value) -> String {
     let marker = match value.get("state").and_then(Value::as_str) {
         Some("unread") => "●",
@@ -817,6 +850,24 @@ mod tests {
         assert_eq!(
             render(&json!({"id": "item-1", "state": "read"}), false),
             "item-1 [read]\n"
+        );
+        assert_eq!(
+            render(
+                &json!({
+                    "id": "item-1",
+                    "state": "snoozed",
+                    "snooze_until": "2026-08-20T13:00:00.000000Z"
+                }),
+                false,
+            ),
+            "item-1 [snoozed until 2026-08-20T13:00:00.000000Z]\n"
+        );
+        assert_eq!(
+            render(
+                &json!({"state": "read", "view": "my-work", "updated": 3}),
+                false,
+            ),
+            "my-work [read: 3 updated]\n"
         );
     }
 

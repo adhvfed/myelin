@@ -165,6 +165,9 @@ myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \
 myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \
   --input jira-issues.json --run --idempotency-key jira-import-3333
 myelin inbox list
+myelin inbox read 01J...
+myelin inbox snooze 01J... --until 2026-08-21T09:00:00Z
+myelin inbox read-all --view review-requests
 
 myelin chat list
 myelin chat create engineering --topic "Release coordination" --idempotency-key release-room
