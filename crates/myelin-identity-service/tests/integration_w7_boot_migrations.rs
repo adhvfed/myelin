@@ -1,23 +1,14 @@
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::sync::Arc;
 
-use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::principal_store::{PrincipalProfile, PrincipalStore};
 use myelin_storage::migration::HotTables;
-use myelin_storage::{
-    all_durable_migrations, DurablePrincipalBacking, KmsEngine, SubstrateProvider,
-};
+use myelin_storage::{all_durable_migrations, DurablePrincipalBacking, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -41,13 +32,7 @@ fn scope(tenant: &str, region: &str) -> myelin_storage::TenantScope {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn principal_store_with_pg_write_succeeds_after_the_aggregate_boot() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate_foundation()
         .await
@@ -57,9 +42,7 @@ async fn principal_store_with_pg_write_succeeds_after_the_aggregate_boot() {
         .await
         .expect("boot step 2: the FULL durable aggregate (identity 0010–0019 included - the fix)");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 4)
-        .await
-        .expect("open the app-role provider");
+    let app = common::app_provider(4).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let kms = Arc::new(KmsEngine::new());

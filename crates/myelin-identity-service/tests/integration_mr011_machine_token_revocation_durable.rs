@@ -1,6 +1,7 @@
 #![cfg(feature = "integration")]
 
-use myelin_config::MyelinConfig;
+mod common;
+
 use myelin_events::Timestamp;
 use myelin_identity::{Credential, DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::capability_crypto::{
@@ -18,14 +19,6 @@ use std::sync::Arc;
 
 const NOW_UNIX: i64 = 1_780_000_000;
 const NOW_RFC3339: &str = "2026-06-26T00:00:00Z";
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -47,29 +40,13 @@ fn tenant_scope(tenant: &str, region: &str) -> TenantScope {
     TenantScope::from_verified_token(&p, Region(region.into()))
 }
 
-async fn app_provider() -> Option<SubstrateProvider> {
-    match SubstrateProvider::connect(MyelinConfig::dev(), 6).await {
-        Ok(p) => Some(p),
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            None
-        }
-    }
-}
-
-async fn migrate() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn migrate() -> SubstrateProvider {
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations execute against the live DB");
-    Some(admin)
+    admin
 }
 
 async fn cleanup(admin: &SubstrateProvider, tenant: &str) {
@@ -100,10 +77,8 @@ fn seeded_principal_store(tenant: &str, region: &str, subject_key: &str) -> Prin
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
-    let Some(admin) = migrate().await else { return };
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let admin = migrate().await;
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();

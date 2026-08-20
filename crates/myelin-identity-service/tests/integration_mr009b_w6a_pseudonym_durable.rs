@@ -1,8 +1,9 @@
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::sync::Arc;
 
-use myelin_config::MyelinConfig;
 use myelin_events::Timestamp;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PseudonymHandle};
 use myelin_identity_service::pseudonym_erase::PseudonymErasureLedger;
@@ -14,14 +15,6 @@ use myelin_storage::{
     DurablePseudonymBacking, KeyClass, KmsEngine, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -51,24 +44,8 @@ fn at(t: &str) -> Timestamp {
     Timestamp(t.into())
 }
 
-async fn app_provider() -> Option<SubstrateProvider> {
-    match SubstrateProvider::connect(MyelinConfig::dev(), 6).await {
-        Ok(p) => Some(p),
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            None
-        }
-    }
-}
-
-async fn migrate_admin() -> Option<()> {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn migrate_admin() {
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -77,13 +54,10 @@ async fn migrate_admin() -> Option<()> {
         .migrate(&pseudonym_durable_migrations(), &HotTables::none())
         .await
         .expect("W6a pseudonym durable migrations execute against the live DB");
-    Some(())
 }
 
 async fn cleanup(tenant: &str, region: &str) {
-    let Ok(admin) = SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2).await else {
-        return;
-    };
+    let admin = common::admin_provider(2).await;
     let mut conn = admin.db_pool().acquire().await.expect("admin acquire");
     let _ = sqlx::query("SELECT set_config('myelin.tenant_id', $1, false)")
         .bind(tenant)
@@ -125,12 +99,8 @@ fn erasure_ledger(provider: &SubstrateProvider) -> PseudonymErasureLedger {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_survives() {
-    if migrate_admin().await.is_none() {
-        return;
-    }
-    let Some(app1) = app_provider().await else {
-        return;
-    };
+    migrate_admin().await;
+    let app1 = common::app_provider(6).await;
     let region = app1.config().region.clone();
     let suffix = uniq();
     let tenant = format!("mr009b-w6a-cs-{suffix}");
@@ -146,9 +116,7 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
         .expect("durable put_mapping");
     assert_eq!(written.pseudonym, h);
 
-    let Some(app2) = app_provider().await else {
-        return;
-    };
+    let app2 = common::app_provider(6).await;
     let store2 = pseudonym_store(&kms, &app2);
     let row = store2
         .mapping_of(&s, &alice)
@@ -170,9 +138,7 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
         "the per-subject DEK is destroyed"
     );
 
-    let Some(app3) = app_provider().await else {
-        return;
-    };
+    let app3 = common::app_provider(6).await;
     let store3 = pseudonym_store(&kms, &app3);
     assert!(
         store3.mapping_of(&s, &alice).is_some(),
@@ -192,12 +158,8 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_restart() {
-    if migrate_admin().await.is_none() {
-        return;
-    }
-    let Some(app1) = app_provider().await else {
-        return;
-    };
+    migrate_admin().await;
+    let app1 = common::app_provider(6).await;
     let region = app1.config().region.clone();
     let suffix = uniq();
     let tenant = format!("mr009b-w6a-d8-{suffix}");
@@ -237,9 +199,7 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
     );
     assert!(engine1.erasure_ledger().is_erased(&s, &alice));
 
-    let Some(app2) = app_provider().await else {
-        return;
-    };
+    let app2 = common::app_provider(6).await;
     let engine2 = StoreBackedCheck::with_pg(
         app2.clone(),
         kms.clone(),
@@ -298,12 +258,8 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
-    if migrate_admin().await.is_none() {
-        return;
-    }
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    migrate_admin().await;
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let suffix = uniq();
     let tenant_a = format!("mr009b-w6a-a-{suffix}");
@@ -358,9 +314,7 @@ async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
         KeyClass::Subject("p:alice".into()),
         at("2026-06-19T12:00:00Z"),
     );
-    let Some(app2) = app_provider().await else {
-        return;
-    };
+    let app2 = common::app_provider(6).await;
     let ledger2 = erasure_ledger(&app2);
     let entries = ledger2.entries_in(&sa);
     assert_eq!(

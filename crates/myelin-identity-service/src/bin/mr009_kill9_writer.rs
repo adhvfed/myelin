@@ -31,12 +31,22 @@ const EVENTS_N: usize = 8;
 
 const EVENTS_GHOST_N: usize = 4;
 
+fn app_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config() -> MyelinConfig {
-    let mut c = MyelinConfig::dev();
-    c.database_url = c
+    let mut config = app_config();
+    config.database_url = config
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
+    config
 }
 
 fn seal_key() -> SealKey {
@@ -120,7 +130,6 @@ fn kms_secret(run: &str) -> String {
 enum Outcome {
     Ready(serde_json::Value),
     Read(serde_json::Value),
-    Skip(String),
 }
 
 fn main() {
@@ -158,12 +167,9 @@ fn main() {
         Ok(Outcome::Read(json)) => {
             println!("MR009-READ {json}");
         }
-        Ok(Outcome::Skip(why)) => {
-            println!("MR009-SKIP {why}");
-        }
         Err(e) => {
             eprintln!("MR009 child error: {e}");
-            println!("MR009-SKIP error:{e}");
+            println!("MR009-ERROR {e}");
         }
     }
 }
@@ -190,16 +196,16 @@ async fn run_family(
     }
 }
 
-async fn app_provider() -> Result<SubstrateProvider, Outcome> {
-    SubstrateProvider::connect(MyelinConfig::dev(), 6)
+async fn app_provider() -> Result<SubstrateProvider, String> {
+    SubstrateProvider::connect(app_config(), 6)
         .await
-        .map_err(|_| Outcome::Skip("pg-unreachable".into()))
+        .map_err(|error| format!("connect to the required Postgres backend: {error}"))
 }
 
-async fn admin_provider() -> Result<SubstrateProvider, Outcome> {
+async fn admin_provider() -> Result<SubstrateProvider, String> {
     SubstrateProvider::connect(admin_config(), 6)
         .await
-        .map_err(|_| Outcome::Skip("pg-unreachable".into()))
+        .map_err(|error| format!("connect to the required admin Postgres backend: {error}"))
 }
 
 async fn identity_family(
@@ -207,14 +213,8 @@ async fn identity_family(
     run: &str,
     handle: tokio::runtime::Handle,
 ) -> Result<Outcome, String> {
-    let app = match app_provider().await {
-        Ok(p) => p,
-        Err(skip) => return Ok(skip),
-    };
-    let admin = match admin_provider().await {
-        Ok(p) => p,
-        Err(skip) => return Ok(skip),
-    };
+    let app = app_provider().await?;
+    let admin = admin_provider().await?;
     let region = app.config().region.clone();
     let tenant = id_tenant(run);
     let s = scope(&tenant, &region);
@@ -302,10 +302,7 @@ async fn revocation_family(
     run: &str,
     handle: tokio::runtime::Handle,
 ) -> Result<Outcome, String> {
-    let app = match app_provider().await {
-        Ok(p) => p,
-        Err(skip) => return Ok(skip),
-    };
+    let app = app_provider().await?;
     let region = app.config().region.clone();
     let tenant = rev_tenant(run);
     let s = scope(&tenant, &region);
@@ -341,10 +338,7 @@ async fn events_family(
     run: &str,
     handle: tokio::runtime::Handle,
 ) -> Result<Outcome, String> {
-    let admin = match admin_provider().await {
-        Ok(p) => p,
-        Err(skip) => return Ok(skip),
-    };
+    let admin = admin_provider().await?;
     admin
         .migrate_foundation()
         .await
@@ -352,7 +346,7 @@ async fn events_family(
     let cfg = admin.config().clone();
     let aggregate = events_aggregate(run);
 
-    let runtime = match EventsRuntime::over_pool(
+    let runtime = EventsRuntime::over_pool(
         admin.db_pool().clone(),
         &cfg.region,
         &cfg.nats_url,
@@ -360,10 +354,8 @@ async fn events_family(
         &events_subject_root(run),
         &format!("{}_pull", events_stream(run)),
         handle,
-    ) {
-        Ok(r) => r,
-        Err(_) => return Ok(Outcome::Skip("nats-unreachable".into())),
-    };
+    )
+    .map_err(|error| format!("connect to the required NATS backend: {error}"))?;
 
     if writing {
         let store = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
@@ -421,10 +413,9 @@ fn events_ctx_base() -> EmitContextBase {
 }
 
 fn events_draft(run: &str, i: usize, aggregate: &str) -> EventDraft {
-    let _ = run;
     EventDraft {
-        type_: EventType("issues.issue.created".into()),
-        subject: ArtifactRef(format!("myelin://acme/issues/{i}")),
+        type_: EventType("issue.issue.created".into()),
+        subject: ArtifactRef(format!("myelin://acme/issue/issue/MR009-{run}-{i}")),
         aggregate: AggregateKey(aggregate.into()),
         payload: serde_json::json!({ "ref": "mr009" }),
         data_role: myelin_events::DataRole::Controller,
@@ -435,10 +426,7 @@ fn events_draft(run: &str, i: usize, aggregate: &str) -> EventDraft {
 }
 
 async fn placement_family(writing: bool, run: &str) -> Result<Outcome, String> {
-    let admin = match admin_provider().await {
-        Ok(p) => p,
-        Err(skip) => return Ok(skip),
-    };
+    let admin = admin_provider().await?;
     let backing = DurablePlacementBacking::new(admin.db_pool().clone());
     let cell = place_cell(run);
     let tenant = place_tenant_id(run);
@@ -491,10 +479,7 @@ async fn kms_family(
     run: &str,
     handoff: &serde_json::Value,
 ) -> Result<Outcome, String> {
-    let admin = match admin_provider().await {
-        Ok(p) => p,
-        Err(skip) => return Ok(skip),
-    };
+    let admin = admin_provider().await?;
     let backing = DurableKmsBacking::new(admin.db_pool().clone(), kms_cell(run));
     let seal = seal_key();
     let tenant = kms_tenant(run);

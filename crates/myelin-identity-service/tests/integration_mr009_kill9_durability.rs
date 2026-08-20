@@ -1,28 +1,21 @@
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use myelin_config::MyelinConfig;
+use myelin_storage::identity_durable_migrations;
 use myelin_storage::kms_durable::kms_durable_migrations;
 use myelin_storage::migration::HotTables;
 use myelin_storage::placement_durable::placement_durable_migrations;
-use myelin_storage::{identity_durable_migrations, SubstrateProvider};
 
 const DEFAULT_SEAL_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
 const WRITER_BIN: &str = env!("CARGO_BIN_EXE_mr009_kill9_writer");
-
-fn admin_config() -> MyelinConfig {
-    let mut c = MyelinConfig::dev();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn seal_hex() -> String {
     std::env::var("MYELIN_KMS_SEAL_KEY").unwrap_or_else(|_| DEFAULT_SEAL_HEX.to_string())
@@ -39,16 +32,10 @@ fn run_id() -> String {
     )
 }
 
-fn ensure_migrated() -> bool {
+fn ensure_migrated() {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
-        let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-                return false;
-            }
-        };
+        let admin = common::admin_provider(4).await;
         admin
             .migrate(&identity_durable_migrations(), &HotTables::none())
             .await
@@ -65,7 +52,6 @@ fn ensure_migrated() -> bool {
             .migrate(&kms_durable_migrations(), &HotTables::none())
             .await
             .expect("kms durable migrations");
-        true
     })
 }
 
@@ -81,7 +67,7 @@ fn child_cmd(mode: &str, family: &str, run: &str, handoff: &str) -> Command {
 enum Line {
     Ready(String),
     Read(String),
-    Skip(String),
+    Error(String),
 }
 
 fn parse_line(line: &str) -> Option<Line> {
@@ -89,12 +75,12 @@ fn parse_line(line: &str) -> Option<Line> {
     match tag {
         "MR009-READY" => Some(Line::Ready(rest.to_string())),
         "MR009-READ" => Some(Line::Read(rest.to_string())),
-        "MR009-SKIP" => Some(Line::Skip(rest.to_string())),
+        "MR009-ERROR" => Some(Line::Error(rest.to_string())),
         _ => None,
     }
 }
 
-fn spawn_writer_until_ready(family: &str, run: &str) -> Option<(Child, String)> {
+fn spawn_writer_until_ready(family: &str, run: &str) -> (Child, String) {
     let mut child = child_cmd("write", family, run, "{}")
         .spawn()
         .expect("spawn writer child");
@@ -113,18 +99,16 @@ fn spawn_writer_until_ready(family: &str, run: &str) -> Option<(Child, String)> 
     });
 
     match rx.recv_timeout(Duration::from_secs(120)) {
-        Ok(Some(Line::Ready(json))) => Some((child, json)),
-        Ok(Some(Line::Skip(why))) => {
-            eprintln!("SKIP [{family}]: writer skipped: {why}");
+        Ok(Some(Line::Ready(json))) => (child, json),
+        Ok(Some(Line::Error(why))) => {
             let _ = child.kill();
             let _ = child.wait();
-            None
+            panic!("[{family}] the writer failed before becoming ready: {why}");
         }
         Ok(Some(Line::Read(_))) | Ok(None) | Err(_) => {
-            eprintln!("SKIP [{family}]: writer produced no READY line in time");
             let _ = child.kill();
             let _ = child.wait();
-            None
+            panic!("[{family}] the writer produced no READY line within 120 seconds");
         }
     }
 }
@@ -149,7 +133,7 @@ fn sigkill_and_assert_crash(family: &str, mut child: Child) {
     );
 }
 
-fn read_back(family: &str, run: &str, handoff: &str) -> Option<serde_json::Value> {
+fn read_back(family: &str, run: &str, handoff: &str) -> serde_json::Value {
     let out = child_cmd("read", family, run, handoff)
         .output()
         .expect("run read child");
@@ -157,11 +141,10 @@ fn read_back(family: &str, run: &str, handoff: &str) -> Option<serde_json::Value
     for line in stdout.lines() {
         match parse_line(line) {
             Some(Line::Read(json)) => {
-                return Some(serde_json::from_str(&json).expect("parse READ json"));
+                return serde_json::from_str(&json).expect("parse READ json");
             }
-            Some(Line::Skip(why)) => {
-                eprintln!("SKIP [{family}]: reader skipped: {why}");
-                return None;
+            Some(Line::Error(why)) => {
+                panic!("[{family}] the reader failed: {why}");
             }
             _ => {}
         }
@@ -171,18 +154,12 @@ fn read_back(family: &str, run: &str, handoff: &str) -> Option<serde_json::Value
 
 #[test]
 fn kill9_identity_principal_tuple_and_profile_decrypt_across_restart() {
-    if !ensure_migrated() {
-        return;
-    }
+    ensure_migrated();
     let run = run_id();
-    let Some((child, _ready)) = spawn_writer_until_ready("identity", &run) else {
-        return;
-    };
+    let (child, _ready) = spawn_writer_until_ready("identity", &run);
     sigkill_and_assert_crash("identity", child);
 
-    let Some(read) = read_back("identity", &run, "{}") else {
-        return;
-    };
+    let read = read_back("identity", &run, "{}");
     assert_eq!(
         read["principal_kind"], "Human",
         "principal kind durable: {read}"
@@ -214,18 +191,12 @@ fn kill9_identity_principal_tuple_and_profile_decrypt_across_restart() {
 
 #[test]
 fn kill9_revocation_jti_and_run_token_ttl_survive() {
-    if !ensure_migrated() {
-        return;
-    }
+    ensure_migrated();
     let run = run_id();
-    let Some((child, _ready)) = spawn_writer_until_ready("revocation", &run) else {
-        return;
-    };
+    let (child, _ready) = spawn_writer_until_ready("revocation", &run);
     sigkill_and_assert_crash("revocation", child);
 
-    let Some(read) = read_back("revocation", &run, "{}") else {
-        return;
-    };
+    let read = read_back("revocation", &run, "{}");
     assert_eq!(
         read["jti_revoked"], true,
         "the revoked jti reads revoked after kill-9: {read}"
@@ -246,13 +217,9 @@ fn kill9_revocation_jti_and_run_token_ttl_survive() {
 
 #[test]
 fn kill9_events_outbox_rows_survive_and_restart_relay_drains_zero_lost() {
-    if !ensure_migrated() {
-        return;
-    }
+    ensure_migrated();
     let run = run_id();
-    let Some((child, ready)) = spawn_writer_until_ready("events", &run) else {
-        return;
-    };
+    let (child, ready) = spawn_writer_until_ready("events", &run);
     let ready: serde_json::Value = serde_json::from_str(&ready).expect("parse READY json");
     assert_eq!(ready["committed"], 8, "writer committed 8 rows: {ready}");
     assert_eq!(
@@ -273,18 +240,17 @@ fn kill9_events_outbox_rows_survive_and_restart_relay_drains_zero_lost() {
         "rows staged-but-uncommitted at the kill must be ABSENT after the crash (0 ghost)"
     );
 
-    let Some(read) = read_back("events", &run, "{}") else {
-        return;
-    };
+    let read = read_back("events", &run, "{}");
     assert!(
-        read["published"].as_i64().unwrap_or(0) >= 8,
-        "the restart relay re-published the survived rows: {read}"
+        read["published"].is_u64(),
+        "the restarted relay completed a typed drain pass: {read}"
     );
 
     let remaining = count_unsent_for_aggregate(&run);
     assert_eq!(
         remaining, 0,
-        "the restart relay drained every survived row (0 lost across the kill-9 + restart)"
+        "the restarted relay and any concurrently elected publisher drained every survived row \
+         (0 lost across the kill-9 + restart): {read}"
     );
     assert_eq!(
         count_rows_for_ghost_aggregate(&run),
@@ -301,18 +267,12 @@ fn kill9_events_outbox_rows_survive_and_restart_relay_drains_zero_lost() {
 
 #[test]
 fn kill9_control_plane_placement_survives() {
-    if !ensure_migrated() {
-        return;
-    }
+    ensure_migrated();
     let run = run_id();
-    let Some((child, _ready)) = spawn_writer_until_ready("placement", &run) else {
-        return;
-    };
+    let (child, _ready) = spawn_writer_until_ready("placement", &run);
     sigkill_and_assert_crash("placement", child);
 
-    let Some(read) = read_back("placement", &run, "{}") else {
-        return;
-    };
+    let read = read_back("placement", &run, "{}");
     assert_eq!(
         read["home_cell"],
         format!("mr009cell-{run}"),
@@ -326,18 +286,12 @@ fn kill9_control_plane_placement_survives() {
 
 #[test]
 fn kill9_kms_root_kek_dek_survive_and_data_decrypts_post_restart() {
-    if !ensure_migrated() {
-        return;
-    }
+    ensure_migrated();
     let run = run_id();
-    let Some((child, ready)) = spawn_writer_until_ready("kms", &run) else {
-        return;
-    };
+    let (child, ready) = spawn_writer_until_ready("kms", &run);
     sigkill_and_assert_crash("kms", child);
 
-    let Some(read) = read_back("kms", &run, &ready) else {
-        return;
-    };
+    let read = read_back("kms", &run, &ready);
     assert_eq!(
         read["decrypted"],
         format!("mr009 kms secret {run}"),
@@ -352,25 +306,14 @@ fn kill9_kms_root_kek_dek_survive_and_data_decrypts_post_restart() {
 
 #[test]
 fn three_instance_consistency_no_split_brain() {
-    if !ensure_migrated() {
-        return;
-    }
+    ensure_migrated();
     let run = run_id();
-    let Some((child, _ready)) = spawn_writer_until_ready("identity", &run) else {
-        return;
-    };
+    let (child, _ready) = spawn_writer_until_ready("identity", &run);
     sigkill_and_assert_crash("identity", child);
 
     let mut views: Vec<serde_json::Value> = Vec::new();
-    for i in 0..3 {
-        match read_back("identity", &run, "{}") {
-            Some(v) => views.push(v),
-            None => {
-                eprintln!("SKIP: instance {i} could not read");
-                cleanup_identity(&run);
-                return;
-            }
-        }
+    for _ in 0..3 {
+        views.push(read_back("identity", &run, "{}"));
     }
     assert_eq!(views.len(), 3, "spawned 3 reader instances");
     assert_eq!(views[0], views[1], "instance 0 and 1 disagree: {views:?}");
@@ -396,9 +339,7 @@ where
 {
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
-        let Ok(admin) = SubstrateProvider::connect(admin_config(), 2).await else {
-            return;
-        };
+        let admin = common::admin_provider(2).await;
         f(admin.db_pool()).await;
     });
 }
@@ -448,9 +389,7 @@ fn count_outbox_for_identity_tuple(run: &str) -> i64 {
     let aggregate = format!("identity:tuple:mr009id-{run}:repo:core");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
-        let admin = SubstrateProvider::connect(admin_config(), 2)
-            .await
-            .expect("admin pool");
+        let admin = common::admin_provider(2).await;
         sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
             .bind(&aggregate)
             .fetch_one(admin.db_pool())
@@ -463,9 +402,7 @@ fn count_unsent_for_aggregate(run: &str) -> i64 {
     let aggregate = format!("issue:MR009-{run}");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
-        let admin = SubstrateProvider::connect(admin_config(), 2)
-            .await
-            .expect("admin pool");
+        let admin = common::admin_provider(2).await;
         sqlx::query_scalar(
             "SELECT count(*) FROM outbox WHERE aggregate = $1 AND published_at IS NULL",
         )
@@ -480,9 +417,7 @@ fn count_rows_for_ghost_aggregate(run: &str) -> i64 {
     let aggregate = format!("issue:MR009GHOST-{run}");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     rt.block_on(async {
-        let admin = SubstrateProvider::connect(admin_config(), 2)
-            .await
-            .expect("admin pool");
+        let admin = common::admin_provider(2).await;
         sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
             .bind(&aggregate)
             .fetch_one(admin.db_pool())

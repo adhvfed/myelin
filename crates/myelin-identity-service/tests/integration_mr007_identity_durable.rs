@@ -1,8 +1,9 @@
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::sync::Arc;
 
-use myelin_config::MyelinConfig;
 use myelin_events::{EventEnvelope, Timestamp};
 use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{
@@ -19,17 +20,9 @@ use myelin_identity_service::tuple_store::TupleStore;
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     identity_durable_migrations, identity_tuple_revision_migrations, DurablePrincipalBacking,
-    DurableTupleBacking, KmsEngine, SubstrateProvider,
+    DurableTupleBacking, KmsEngine,
 };
 use myelin_tenancy::{Region, TenantId};
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -98,16 +91,6 @@ fn profile(email_addr: &str, name: &str) -> PrincipalProfile {
     }
 }
 
-async fn app_provider() -> Option<SubstrateProvider> {
-    match SubstrateProvider::connect(MyelinConfig::dev(), 6).await {
-        Ok(p) => Some(p),
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            None
-        }
-    }
-}
-
 async fn residual_guc(pool: &sqlx::PgPool) -> String {
     let mut conn = pool.acquire().await.expect("acquire");
     let v: Option<String> = sqlx::query_scalar("SELECT current_setting('myelin.tenant_id', true)")
@@ -119,13 +102,7 @@ async fn residual_guc(pool: &sqlx::PgPool) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -135,9 +112,7 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         .await
         .expect("durable relationship revisions migrate");
 
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
@@ -297,13 +272,7 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relationship_expiry_survives_restart_without_lingering_authority() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -316,9 +285,7 @@ async fn relationship_expiry_survives_restart_without_lingering_authority() {
         .migrate_foundation()
         .await
         .expect("foundation outbox migration");
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let tenant = format!("mr007-expiry-{}", uniq());
@@ -385,13 +352,7 @@ async fn relationship_expiry_survives_restart_without_lingering_authority() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -401,9 +362,7 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         .await
         .expect("durable relationship revisions migrate");
 
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let kms = Arc::new(KmsEngine::new());
@@ -524,13 +483,7 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -543,9 +496,7 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         .migrate_foundation()
         .await
         .expect("foundation (outbox) migration");
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
@@ -667,13 +618,7 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_identity_instances_share_one_monotonic_relationship_clock() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -686,9 +631,7 @@ async fn two_identity_instances_share_one_monotonic_relationship_clock() {
         .migrate_foundation()
         .await
         .expect("foundation (outbox) migration");
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
@@ -779,13 +722,7 @@ async fn two_identity_instances_share_one_monotonic_relationship_clock() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_identity_serves_strong_relationship_reads_before_its_projection_is_warm() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -798,9 +735,7 @@ async fn a_restarted_identity_serves_strong_relationship_reads_before_its_projec
         .migrate_foundation()
         .await
         .expect("foundation (outbox) migration");
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();

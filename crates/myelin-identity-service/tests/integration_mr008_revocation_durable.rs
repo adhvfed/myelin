@@ -1,20 +1,13 @@
 #![cfg(feature = "integration")]
 
-use myelin_config::MyelinConfig;
+mod common;
+
 use myelin_events::Timestamp;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RevokeTarget};
 use myelin_identity_service::revocation::{RevocationStore, RunTokenState};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{identity_durable_migrations, DurableRevocationBacking, SubstrateProvider};
 use myelin_tenancy::{Region, TenantId};
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -40,29 +33,13 @@ fn ts(s: &str) -> Timestamp {
     Timestamp(s.into())
 }
 
-async fn app_provider() -> Option<SubstrateProvider> {
-    match SubstrateProvider::connect(MyelinConfig::dev(), 6).await {
-        Ok(p) => Some(p),
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            None
-        }
-    }
-}
-
-async fn migrate() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn migrate() -> SubstrateProvider {
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations execute against the live DB");
-    Some(admin)
+    admin
 }
 
 async fn residual_guc(pool: &sqlx::PgPool) -> String {
@@ -87,10 +64,8 @@ async fn cleanup(admin: &SubstrateProvider, tenants: &[&str]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revocation_is_durable_and_idempotent_across_a_fresh_store_instance() {
-    let Some(admin) = migrate().await else { return };
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let admin = migrate().await;
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
@@ -138,10 +113,8 @@ async fn revocation_is_durable_and_idempotent_across_a_fresh_store_instance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
-    let Some(admin) = migrate().await else { return };
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let admin = migrate().await;
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
@@ -229,10 +202,8 @@ async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tenant_a_revocations_invisible_to_b_and_no_guc_bleeds() {
-    let Some(admin) = migrate().await else { return };
-    let Some(app) = app_provider().await else {
-        return;
-    };
+    let admin = migrate().await;
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();

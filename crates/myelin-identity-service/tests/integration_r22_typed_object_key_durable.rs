@@ -1,8 +1,9 @@
 #![cfg(feature = "integration")]
 
+mod common;
+
 use std::sync::Arc;
 
-use myelin_config::MyelinConfig;
 use myelin_events::Timestamp;
 use myelin_identity::{
     Consistency, ConsistencyMode, DataRole, Decision, IdentityService, ObjectId, Permission,
@@ -12,16 +13,8 @@ use myelin_identity::{
 use myelin_identity_service::tuple_store::TupleStore;
 use myelin_identity_service::StoreBackedCheck;
 use myelin_storage::migration::HotTables;
-use myelin_storage::{identity_durable_migrations, DurableTupleBacking, SubstrateProvider};
+use myelin_storage::{identity_durable_migrations, DurableTupleBacking};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -73,13 +66,7 @@ fn latest() -> Consistency {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -91,13 +78,7 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
         )
         .await
         .expect("durable relationship revisions migrate");
-    let app = match SubstrateProvider::connect(MyelinConfig::dev(), 6).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let app = common::app_provider(6).await;
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
