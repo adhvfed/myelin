@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use chrono::{Duration, Utc};
 use myelin_config::MyelinConfig;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, DedupLedger, Delivered,
@@ -18,6 +19,8 @@ use myelin_query::signals::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{PgMigrator, PgOutboxBacking};
 use myelin_tenancy::{Region, TenantId};
+
+static DATABASE_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn upsert(
     tenant: &TenantId,
@@ -150,17 +153,20 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         .await
         .expect("connect to dev Postgres as the migration role");
 
-    PgMigrator::apply_validated(
-        &admin,
-        &myelin_notif::migrations::migrations(),
-        &HotTables::none(),
-    )
-    .await
-    .expect("apply the notification schema and online keyset index");
-    sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON notif_inbox_item TO myelin_app")
-        .execute(&admin)
+    {
+        let _setup = DATABASE_SETUP.lock().await;
+        PgMigrator::apply_validated(
+            &admin,
+            &myelin_notif::migrations::migrations(),
+            &HotTables::none(),
+        )
         .await
-        .expect("grant the runtime role access to the migrated inbox table");
+        .expect("apply the notification schema and online keyset index");
+        sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON notif_inbox_item TO myelin_app")
+            .execute(&admin)
+            .await
+            .expect("grant the runtime role access to the migrated inbox table");
+    }
 
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -418,6 +424,114 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         .unwrap();
     assert!(foreign.items.is_empty(), "recipient scope is exact");
 
+    assert_eq!(
+        store
+            .snooze(
+                &scope,
+                "direct-a",
+                Utc::now().checked_sub_signed(Duration::seconds(1)).unwrap(),
+            )
+            .await,
+        Err(PgInboxError::InvalidInput),
+        "an expired snooze is rejected instead of immediately changing state"
+    );
+    store
+        .snooze(
+            &scope,
+            "direct-a",
+            Utc::now()
+                .checked_add_signed(Duration::milliseconds(100))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let resurfaced = store.get(&scope, "direct-a").await.unwrap();
+    assert_eq!(resurfaced.item.state, "unread");
+    assert!(resurfaced.item.snooze_until.is_none());
+
+    let snooze_until = Utc::now().checked_add_signed(Duration::hours(1)).unwrap();
+    store
+        .snooze(&scope, "direct-a", snooze_until)
+        .await
+        .unwrap();
+    let parked = store.get(&scope, "direct-a").await.unwrap();
+    assert_eq!(parked.item.state, "snoozed");
+    assert!(parked.item.snooze_until.is_some());
+    let active = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: InboxFilter::all(),
+            limit: 10,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(active.items.len(), 3);
+    assert!(
+        active
+            .items
+            .iter()
+            .all(|item| item.item.item_id != "direct-a"),
+        "a future snooze parks the item outside every active inbox page"
+    );
+
+    assert_eq!(
+        store
+            .mark_all_read(&scope, &InboxFilter::all())
+            .await
+            .unwrap(),
+        1,
+        "bulk read marks the remaining unread item but leaves completed and snoozed work alone"
+    );
+    assert_eq!(
+        store
+            .mark_all_read(&scope, &InboxFilter::all())
+            .await
+            .unwrap(),
+        0
+    );
+    let all_read = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: InboxFilter::all(),
+            limit: 10,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        all_read
+            .items
+            .iter()
+            .find(|item| item.item.item_id == "fyi-a")
+            .unwrap()
+            .item
+            .state,
+        "read"
+    );
+    assert!(all_read
+        .items
+        .iter()
+        .filter(|item| item.item.item_id.starts_with("crit-"))
+        .all(|item| item.item.state == "done"));
+    assert_eq!(
+        store
+            .mark_all_read(
+                &InboxReadScope {
+                    recipient: "psn:bob".into(),
+                    ..scope.clone()
+                },
+                &InboxFilter::all(),
+            )
+            .await
+            .unwrap(),
+        0,
+        "bulk read state is recipient scoped"
+    );
+
+    store.mark_read(&scope, "direct-a").await.unwrap();
+
     let after_rebuild = PgInboxStore::new(app)
         .list(&InboxReadRequest {
             scope,
@@ -451,27 +565,30 @@ async fn durable_router_co_commits_dedup_inbox_and_outbox() {
         .connect(&config.database_migration_url)
         .await
         .expect("connect migration role");
-    PgMigrator::apply_validated(
-        &admin,
-        &myelin_storage::foundation_migrations(),
-        &HotTables::none(),
-    )
-    .await
-    .expect("apply foundation tables");
-    PgMigrator::apply_validated(
-        &admin,
-        &myelin_notif::migrations::migrations(),
-        &HotTables::none(),
-    )
-    .await
-    .expect("apply notification tables");
-    sqlx::query(
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON \
-         notif_inbox_item, outbox, consumer_dedup, consumer_dead_letter TO myelin_app",
-    )
-    .execute(&admin)
-    .await
-    .expect("grant runtime tables");
+    {
+        let _setup = DATABASE_SETUP.lock().await;
+        PgMigrator::apply_validated(
+            &admin,
+            &myelin_storage::foundation_migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("apply foundation tables");
+        PgMigrator::apply_validated(
+            &admin,
+            &myelin_notif::migrations::migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("apply notification tables");
+        sqlx::query(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON \
+             notif_inbox_item, outbox, consumer_dedup, consumer_dead_letter TO myelin_app",
+        )
+        .execute(&admin)
+        .await
+        .expect("grant runtime tables");
+    }
 
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)

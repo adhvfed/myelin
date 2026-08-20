@@ -337,6 +337,94 @@ impl PgInboxStore {
         .await
     }
 
+    pub async fn snooze(
+        &self,
+        scope: &InboxReadScope,
+        item_id: &str,
+        until: DateTime<Utc>,
+    ) -> Result<(), PgInboxError> {
+        validate_scope(scope)?;
+        if !valid_item_id(item_id) || until <= Utc::now() {
+            return Err(PgInboxError::InvalidInput);
+        }
+        let owned_scope = scope.clone();
+        let owned_item_id = item_id.to_string();
+        let tenant = owned_scope.tenant.0.clone();
+        let region = owned_scope.region.0.clone();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move {
+                let state = sqlx::query_scalar::<_, String>(
+                    "SELECT state FROM notif_inbox_item \
+                     WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND item_id = $4 \
+                     FOR UPDATE",
+                )
+                .bind(&owned_scope.tenant.0)
+                .bind(&owned_scope.region.0)
+                .bind(&owned_scope.recipient)
+                .bind(&owned_item_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|_| PgInboxError::Database)?
+                .ok_or(PgInboxError::NotFound)?;
+                if !matches!(state.as_str(), "unread" | "seen" | "read") {
+                    return Err(PgInboxError::InvalidInput);
+                }
+                let result = sqlx::query(
+                    "UPDATE notif_inbox_item SET state = 'snoozed', snooze_until = $5 \
+                     WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND item_id = $4",
+                )
+                .bind(&owned_scope.tenant.0)
+                .bind(&owned_scope.region.0)
+                .bind(&owned_scope.recipient)
+                .bind(&owned_item_id)
+                .bind(until)
+                .execute(conn)
+                .await
+                .map_err(|_| PgInboxError::Database)?;
+                if result.rows_affected() == 1 {
+                    Ok(())
+                } else {
+                    Err(PgInboxError::NotFound)
+                }
+            })
+        })
+        .await
+    }
+
+    pub async fn mark_all_read(
+        &self,
+        scope: &InboxReadScope,
+        filter: &InboxFilter,
+    ) -> Result<u64, PgInboxError> {
+        validate_scope(scope)?;
+        let owned_scope = scope.clone();
+        let owned_filter = filter.clone();
+        let tenant = owned_scope.tenant.0.clone();
+        let region = owned_scope.region.0.clone();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move {
+                let mut query = QueryBuilder::<Postgres>::new(
+                    "UPDATE notif_inbox_item SET state = 'read', snooze_until = NULL \
+                     WHERE tenant_id = ",
+                );
+                query.push_bind(&owned_scope.tenant.0);
+                query.push(" AND region = ");
+                query.push_bind(&owned_scope.region.0);
+                query.push(" AND recipient = ");
+                query.push_bind(&owned_scope.recipient);
+                query.push(" AND state IN ('unread', 'seen')");
+                push_filter(&mut query, &owned_filter);
+                query
+                    .build()
+                    .execute(conn)
+                    .await
+                    .map(|result| result.rows_affected())
+                    .map_err(|_| PgInboxError::Database)
+            })
+        })
+        .await
+    }
+
     /// Completes an actionable inbox item if it exists. Missing rows are valid for work created
     /// before the projection was introduced, and an already-completed row is retry-safe.
     pub async fn complete_if_present(
@@ -724,6 +812,7 @@ async fn list_on_conn(
     request: &InboxReadRequest,
     cursor: Option<&CursorFrame>,
 ) -> Result<DurableInboxPage, PgInboxError> {
+    resurface_due_on_conn(conn, &request.scope, None).await?;
     let mut query = build_list_query(request, cursor);
     let rows = query
         .build()
@@ -750,6 +839,7 @@ async fn get_on_conn(
     scope: &InboxReadScope,
     item_id: &str,
 ) -> Result<DurableInboxItem, PgInboxError> {
+    resurface_due_on_conn(conn, scope, Some(item_id)).await?;
     let mut query = inbox_row_query();
     query.push(" WHERE tenant_id = ");
     query.push_bind(&scope.tenant.0);
@@ -791,6 +881,7 @@ fn build_list_query<'a>(
     query.push_bind(&request.scope.region.0);
     query.push(" AND recipient = ");
     query.push_bind(&request.scope.recipient);
+    query.push(" AND state <> 'snoozed'");
     push_filter(&mut query, &request.filter);
     if let Some(cursor) = cursor {
         query.push(" AND (");
@@ -836,6 +927,33 @@ fn build_list_query<'a>(
     query.push(" DESC, occurred_at DESC, item_id ASC LIMIT ");
     query.push_bind(i64::from(request.limit) + 1);
     query
+}
+
+async fn resurface_due_on_conn(
+    conn: &mut sqlx::PgConnection,
+    scope: &InboxReadScope,
+    item_id: Option<&str>,
+) -> Result<(), PgInboxError> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "UPDATE notif_inbox_item SET state = 'unread', snooze_until = NULL \
+         WHERE tenant_id = ",
+    );
+    query.push_bind(&scope.tenant.0);
+    query.push(" AND region = ");
+    query.push_bind(&scope.region.0);
+    query.push(" AND recipient = ");
+    query.push_bind(&scope.recipient);
+    query.push(" AND state = 'snoozed' AND snooze_until <= transaction_timestamp()");
+    if let Some(item_id) = item_id {
+        query.push(" AND item_id = ");
+        query.push_bind(item_id);
+    }
+    query
+        .build()
+        .execute(conn)
+        .await
+        .map(|_| ())
+        .map_err(|_| PgInboxError::Database)
 }
 
 fn push_attention_expression(query: &mut QueryBuilder<'_, Postgres>) {
