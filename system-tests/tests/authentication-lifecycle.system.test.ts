@@ -25,6 +25,14 @@ describe("human and CLI authentication", () => {
     expect(authConfig.body).toMatchObject({ cli_login_enabled: true });
 
     const codeVerifier = verifier();
+    const ambiguousStart = await systemClient.json("/v1/auth/device/authorization", {
+      method: "POST",
+      authenticated: false,
+      body: { code_challenge: challenge(codeVerifier), method: "S256" },
+      expectedStatus: 400,
+    });
+    expect(ambiguousStart.body).toMatchObject({ error: { code: "bad_request" } });
+
     const started = await systemClient.json("/v1/auth/device/authorization", {
       method: "POST",
       authenticated: false,
@@ -38,6 +46,21 @@ describe("human and CLI authentication", () => {
     expect(started.body).toMatchObject({ expires_in: 600, interval: 2 });
     expect(started.body.verification_uri_complete).toBe(`${verificationUri}?code=${userCode}`);
     expect(started.headers.get("cache-control")).toBe("no-store");
+
+    const ambiguousClaim = await systemClient.json("/v1/auth/device/token", {
+      method: "POST",
+      authenticated: false,
+      body: { device_code: deviceCode, code_verifier: codeVerifier, poll: true },
+      expectedStatus: 400,
+    });
+    expect(ambiguousClaim.body).toMatchObject({ error: { code: "bad_request" } });
+
+    const ambiguousApproval = await systemClient.json("/v1/auth/device/approval", {
+      method: "POST",
+      body: { user_code: userCode, approved: true },
+      expectedStatus: 400,
+    });
+    expect(ambiguousApproval.body).toMatchObject({ error: { code: "bad_request" } });
 
     const pending = await systemClient.json("/v1/auth/device/token", {
       method: "POST",

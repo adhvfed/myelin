@@ -1,6 +1,7 @@
 mod agent_delegation;
 pub mod agent_http;
 pub mod agent_mcp_http;
+mod auth_request;
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;

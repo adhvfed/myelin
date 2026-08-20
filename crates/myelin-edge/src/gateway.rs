@@ -1,3 +1,7 @@
+use crate::auth_request::{
+    parse_auth_request, require_auth_request_budget, DeviceApprovalRequest, DeviceClaimRequest,
+    DeviceStartRequest, LoginRequest,
+};
 use crate::authz::{authorize_edge_action, human_session_authority};
 use crate::catalogue::{Handler, HandlerCtx, Method};
 use crate::device_auth::{
@@ -435,15 +439,6 @@ fn validate_public_base_url(public_base_url: &str) -> Result<String, String> {
     Ok(public_base_url.trim_end_matches('/').to_string())
 }
 
-fn bounded_auth_body(request: &EdgeRequest) -> Result<(), EdgeError> {
-    if request.body.len() > 4 * 1024 {
-        return Err(EdgeError::PayloadTooLarge(
-            "authentication request exceeds 4 KiB".into(),
-        ));
-    }
-    Ok(())
-}
-
 const DEVICE_AUTHORIZATION_LIMIT_MESSAGE: &str =
     "too many CLI login requests are waiting; retry shortly";
 
@@ -773,15 +768,8 @@ impl Gateway {
         let broker = self.device_authorization.as_ref().ok_or_else(|| {
             EdgeError::Unavailable("interactive CLI login is not configured".into())
         })?;
-        bounded_auth_body(req)?;
-        let body = req.json_body()?;
-        let challenge = body
-            .get("code_challenge")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                EdgeError::BadRequest("device authorization body missing `code_challenge`".into())
-            })?;
-        let started = match broker.begin(challenge) {
+        let body: DeviceStartRequest = parse_auth_request(&req.body, "device login start")?;
+        let started = match broker.begin(&body.code_challenge) {
             Ok(started) => started,
             Err(DeviceAuthorizationError::RateLimited { retry_after_secs }) => {
                 return Ok(no_store(
@@ -810,7 +798,7 @@ impl Gateway {
         let broker = self.device_authorization.as_ref().ok_or_else(|| {
             EdgeError::Unavailable("interactive CLI login is not configured".into())
         })?;
-        bounded_auth_body(req)?;
+        require_auth_request_budget(&req.body)?;
         let identity = self.authenticate(req, None, false)?;
         if !authorize_edge_action(
             self.authorizer.as_ref(),
@@ -841,20 +829,14 @@ impl Gateway {
                 ))
             }
         };
-        let body = req.json_body()?;
-        let user_code = body
-            .get("user_code")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                EdgeError::BadRequest("device approval body missing `user_code`".into())
-            })?;
+        let body: DeviceApprovalRequest = parse_auth_request(&req.body, "device approval")?;
         let approval = DeviceApproval {
             principal: identity.principal.clone(),
             authority,
             source_expires_at_unix: identity.capability().expires_at_unix,
         };
         let outcome = broker
-            .approve(user_code, approval)
+            .approve(&body.user_code, approval)
             .map_err(map_device_authorization_error)?;
         device_approval_response(outcome)
     }
@@ -863,22 +845,9 @@ impl Gateway {
         let broker = self.device_authorization.as_ref().ok_or_else(|| {
             EdgeError::Unavailable("interactive CLI login is not configured".into())
         })?;
-        bounded_auth_body(req)?;
-        let body = req.json_body()?;
-        let device_code = body
-            .get("device_code")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                EdgeError::BadRequest("device token body missing `device_code`".into())
-            })?;
-        let verifier = body
-            .get("code_verifier")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                EdgeError::BadRequest("device token body missing `code_verifier`".into())
-            })?;
+        let body: DeviceClaimRequest = parse_auth_request(&req.body, "device login claim")?;
         match broker
-            .claim(device_code, verifier)
+            .claim(&body.device_code, &body.code_verifier)
             .map_err(map_device_authorization_error)?
         {
             ClaimOutcome::Pending => Ok(no_store(EdgeResponse::json(
@@ -961,28 +930,20 @@ impl Gateway {
     }
 
     fn login(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
-        let body = req.json_body()?;
-        let scheme = body
-            .get("scheme")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| EdgeError::BadRequest("login body missing `scheme`".into()))?;
-        let raw_material = body
-            .get("material")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| EdgeError::BadRequest("login body missing `material`".into()))?;
-        let material = if scheme == myelin_identity_service::scheme::OIDC {
+        let body: LoginRequest = parse_auth_request(&req.body, "login")?;
+        let material = if body.scheme == myelin_identity_service::scheme::OIDC {
             let nonce = body
-                .get("nonce")
-                .and_then(|v| v.as_str())
+                .nonce
+                .as_deref()
                 .ok_or_else(|| EdgeError::BadRequest("OIDC login body missing `nonce`".into()))?;
-            myelin_identity_service::oidc_login_material(raw_material, nonce).map_err(|_| {
+            myelin_identity_service::oidc_login_material(&body.material, nonce).map_err(|_| {
                 EdgeError::BadRequest("OIDC login body has an invalid `nonce`".into())
             })?
         } else {
-            raw_material.to_string()
+            body.material
         };
         let cred = Credential {
-            scheme: scheme.to_string(),
+            scheme: body.scheme,
             material,
         };
         match self.human_login.authenticate_with_assertion(&cred, None) {

@@ -358,7 +358,7 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     let attack_body = format!(
         r#"{{"title":"Attack PR","base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}","required_contexts":[],"required_approvals":0,"green_contexts":["ci/build"]}}"#
     );
-    let (oc1, _o1) = http(
+    let (attack_status, attack_response) = http(
         addr,
         "POST",
         "/v1/git/repos/svc/prs",
@@ -366,7 +366,23 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
         attack_body.into_bytes(),
     )
     .await;
-    assert_eq!(oc1, 201);
+    assert_eq!(
+        attack_status, 400,
+        "PR policy and check facts are not accepted as proposal input: {attack_response}"
+    );
+
+    let proposal = format!(
+        r#"{{"title":"Ordinary PR","base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}"}}"#
+    );
+    let (open_status, open_response) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/svc/prs",
+        &hdr(&author),
+        proposal.into_bytes(),
+    )
+    .await;
+    assert_eq!(open_status, 201, "open the ordinary PR: {open_response}");
     http(
         addr,
         "POST",
