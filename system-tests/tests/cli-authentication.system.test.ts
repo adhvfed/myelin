@@ -13,6 +13,14 @@ import { eventually } from "../src/eventually.js";
 import { awaitAuthorizedIssue } from "../src/issues.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
+import {
+  askAgent,
+  askAgentToAct,
+  askAgentToBeDenied,
+  askAgentToRequestApproval,
+  type ActivatedAgentEnvelope,
+  type AgentRunEnvelope,
+} from "../src/journeys/agents.js";
 import { awaitActiveIssue } from "../src/journeys/issues.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import {
@@ -26,42 +34,6 @@ import {
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
-type AgentRunEnvelope = {
-  run: {
-    id: string;
-    ref: string;
-    agent_id: string;
-    agent_ref: string;
-    principal_id: string;
-    trigger_actor: string;
-    selected_tools: Array<{ name: string; version: number; ref: string }>;
-    effective_grants: string[];
-    state: string;
-    issued_at: string;
-    expires_at: string;
-  };
-  credential: { scheme: string; token: string; expires_at: string };
-  created: boolean;
-  durable: boolean;
-};
-
-type ActivatedAgentEnvelope = {
-  agent: {
-    id: string;
-    ref: string;
-    principal_id: string;
-    name: string;
-    runtime_ref: string;
-    on_behalf_of: string;
-    status: string;
-    selected_tools: Array<{ name: string; version: number; ref: string }>;
-    effective_tools: Array<{ name: string; version: number; ref: string }>;
-    grants: string[];
-  };
-  created: boolean;
-  durable: boolean;
-};
-
 type CreatedProjectEnvelope = {
   project: {
     id: string;
@@ -72,135 +44,6 @@ type CreatedProjectEnvelope = {
   };
   created: boolean;
 };
-
-async function askAgent(
-  run: AgentRunEnvelope,
-  id: number,
-  tool: string,
-  arguments_: JsonRecord,
-): Promise<JsonRecord> {
-  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
-    method: "POST",
-    body: {
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: { name: tool, arguments: arguments_ },
-    },
-    token: run.credential.token,
-    tokenScheme: "agent",
-    expectedStatus: 200,
-  });
-  expect(JSON.stringify(response.body)).not.toContain(run.credential.token);
-  const result = record(response.body.result, `${tool} MCP result`);
-  expect(result, `${tool} MCP call failed: ${JSON.stringify(result)}`).toMatchObject({
-    isError: false,
-    _meta: { tool },
-  });
-  const content = array(result.content, `${tool} MCP content`);
-  expect(content).toHaveLength(1);
-  const text = string(record(content[0], `${tool} MCP content item`).text, `${tool} MCP text`);
-  expect(text).not.toContain(run.credential.token);
-  return record(JSON.parse(text), `${tool} payload`);
-}
-
-async function askAgentToAct(
-  run: AgentRunEnvelope,
-  id: number,
-  tool: string,
-  arguments_: JsonRecord,
-  idempotencyKey: string = `system-${tool}-${randomUUID()}`,
-  approvalGateId?: string,
-): Promise<JsonRecord> {
-  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
-    method: "POST",
-    body: {
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: {
-        name: tool,
-        arguments: arguments_,
-        ...(approvalGateId === undefined ? {} : { approval: { gateId: approvalGateId } }),
-        _meta: { "com.myelin/idempotencyKey": idempotencyKey },
-      },
-    },
-    token: run.credential.token,
-    tokenScheme: "agent",
-    expectedStatus: 200,
-  });
-  expect(JSON.stringify(response.body)).not.toContain(run.credential.token);
-  const result = record(response.body.result, `${tool} MCP result`);
-  expect(result, `${tool} MCP call failed: ${JSON.stringify(result)}`).toMatchObject({
-    isError: false,
-    _meta: { tool, eventId: expect.any(String) },
-  });
-  const metadata = record(result._meta, `${tool} MCP result metadata`);
-  const receipt = record(result.structuredContent, `${tool} MCP structured receipt`);
-  expect(receipt).toMatchObject({ event_id: metadata.eventId });
-  return receipt;
-}
-
-async function askAgentToRequestApproval(
-  run: AgentRunEnvelope,
-  id: number,
-  tool: string,
-  arguments_: JsonRecord,
-  idempotencyKey: string,
-): Promise<string> {
-  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
-    method: "POST",
-    body: {
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: {
-        name: tool,
-        arguments: arguments_,
-        _meta: { "com.myelin/idempotencyKey": idempotencyKey },
-      },
-    },
-    token: run.credential.token,
-    tokenScheme: "agent",
-    expectedStatus: 200,
-  });
-  const result = record(response.body.result, `${tool} approval result`);
-  expect(result).toMatchObject({
-    isError: false,
-    _meta: { tool, gateId: expect.any(String) },
-  });
-  expect(result.structuredContent).toBeUndefined();
-  return string(record(result._meta, `${tool} approval metadata`).gateId, `${tool} gate id`);
-}
-
-async function askAgentToBeDenied(
-  run: AgentRunEnvelope,
-  id: number,
-  tool: string,
-  arguments_: JsonRecord,
-): Promise<string> {
-  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
-    method: "POST",
-    body: {
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: {
-        name: tool,
-        arguments: arguments_,
-        _meta: { "com.myelin/idempotencyKey": `system-denied-${tool}-${randomUUID()}` },
-      },
-    },
-    token: run.credential.token,
-    tokenScheme: "agent",
-    expectedStatus: 200,
-  });
-  const result = record(response.body.result, `${tool} denied MCP result`);
-  expect(result).toMatchObject({ isError: true, _meta: { tool } });
-  const content = array(result.content, `${tool} denied MCP content`);
-  expect(content).toHaveLength(1);
-  return string(record(content[0], `${tool} denied MCP content item`).text, `${tool} denial`);
-}
 
 function gitBlobOid(contents: string): string {
   const bytes = Buffer.from(contents);
