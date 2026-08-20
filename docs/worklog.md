@@ -4,6 +4,33 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — a pull-request dashboard loses no work at page boundaries
+
+Pull-request listing had extensive tests that counted SQL fragments and
+matched exact query spelling, but no user journey proved that the durable
+dashboard remained complete while work crossed repositories and page
+boundaries. Those assertions coupled refactoring to punctuation while still
+being unable to detect a missing or duplicated pull request in the product.
+
+The system-test vocabulary now opens a proposed change through the ordinary
+Git and Edge surfaces and reads the public page envelope as a typed value. A
+new multi-repository journey opens four real pull requests, verifies exact
+repository counts, moves forward and backward across one-row boundaries,
+walks the complete accumulated dashboard without a duplicate or omission, and
+proves that repository and bucket cursors cannot be replayed in a different
+scope. The three superseded SQL-source assertions are gone.
+
+The first focused run also caught a separate dishonest shed drill: it admitted
+service work, never released it, then expected a lower-priority request to fit
+inside the same deliberately tiny budget. The drill now models the request
+lifecycle explicitly and states the real invariant—a service identity sets
+the scheduling ceiling, while a header may only lower it.
+
+**Proof:** Git crate suite 567 unit tests plus every non-feature integration
+test; Clippy `-D warnings` for every Git target/feature; TypeScript typecheck;
+targeted live dashboard journey 1/1; complete black-box system suite 26/26
+files and 112/112 tests in 295.91 seconds.
+
 ## 2026-08-20 — a Chat mention reaches one visible teammate
 
 Chat could deserialize and render mention nodes, and Notifications could fan
