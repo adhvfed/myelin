@@ -306,6 +306,16 @@ pub(crate) struct AgentFileWrite<'a> {
     pub operation_id: &'a PrOperationId,
 }
 
+struct WebFileEdit<'a> {
+    target: RepoActorContext<'a>,
+    gitref: &'a str,
+    path: &'a str,
+    expected_base: &'a str,
+    contents: &'a str,
+    start_ref: Option<&'a str>,
+    message: &'a str,
+}
+
 struct FileCommit<'a> {
     target: RepoActorContext<'a>,
     gitref: &'a str,
@@ -1360,16 +1370,16 @@ impl DurableGitBackend {
         })
     }
 
-    fn web_edit_commit(
-        &self,
-        target: RepoActorContext<'_>,
-        gitref: &str,
-        path: &str,
-        expected_base: &str,
-        contents: &str,
-        start_ref: Option<&str>,
-        message: &str,
-    ) -> Result<WebEditOutcome, DurableError> {
+    fn web_edit_commit(&self, request: WebFileEdit<'_>) -> Result<WebEditOutcome, DurableError> {
+        let WebFileEdit {
+            target,
+            gitref,
+            path,
+            expected_base,
+            contents,
+            start_ref,
+            message,
+        } = request;
         self.commit_file(FileCommit {
             target,
             gitref,
