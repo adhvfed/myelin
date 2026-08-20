@@ -223,17 +223,13 @@ impl AgentRunGate {
             }
         };
 
-        match ledger.begin(&tenant, &run) {
-            Ok(()) => {}
-            Err(SettleError::StoreUnavailable(error)) => {
-                return Err(DispatchError::StoreUnavailable(error));
-            }
-            Err(_) => {
-                if newly_reserved {
-                    let _ = ledger.cancel_unstarted(&tenant, &run);
+        if let Err(begin_error) = ledger.begin(&tenant, &run) {
+            if newly_reserved {
+                if let Err(cancel_error) = ledger.cancel_unstarted(&tenant, &run) {
+                    return Err(dispatch_error_from_settle(cancel_error));
                 }
-                return Err(DispatchError::AlreadyDispatched);
             }
+            return Err(dispatch_error_from_settle(begin_error));
         }
 
         if newly_reserved {
@@ -253,6 +249,16 @@ impl AgentRunGate {
 
     pub fn runs_dispatched(&self) -> u64 {
         self.runs_dispatched
+    }
+}
+
+fn dispatch_error_from_settle(error: SettleError) -> DispatchError {
+    match error {
+        SettleError::StoreUnavailable(error) => DispatchError::StoreUnavailable(error),
+        SettleError::AmountOverflow => DispatchError::AmountOverflow,
+        SettleError::NoSuchReservation | SettleError::UsageDivergence => {
+            DispatchError::AlreadyDispatched
+        }
     }
 }
 
@@ -403,6 +409,31 @@ mod tests {
             "a refused dispatch leaves NO reservation - the run never started"
         );
         assert_eq!(gate.reserve_refusals(), 1);
+        assert_eq!(gate.runs_dispatched(), 0);
+    }
+
+    #[test]
+    fn a_begin_outage_cancels_the_fresh_reservation_before_returning() {
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        ledger.fail_next_begin_for_test();
+
+        let error = gate
+            .dispatch(
+                &mut ledger,
+                tenant(),
+                run(1),
+                MicroUsd(100),
+                MicroUsd(1_000),
+            )
+            .expect_err("a run cannot start while the durable begin step is unavailable");
+
+        assert!(matches!(error, DispatchError::StoreUnavailable(_)));
+        assert_eq!(
+            ledger.state_of(&tenant(), &run(1)),
+            Ok(Some(ReservationState::Cancelled)),
+            "the reserve-before-begin window is compensated instead of leaking funds"
+        );
         assert_eq!(gate.runs_dispatched(), 0);
     }
 

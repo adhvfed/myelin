@@ -205,6 +205,14 @@ impl CostLedger {
         ledger.fail_next_settlement = true;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_begin_for_test(&mut self) {
+        let CostBackend::Memory(ledger) = &mut self.backend else {
+            panic!("begin fault injection requires the in-memory cost ledger");
+        };
+        ledger.fail_next_begin = true;
+    }
+
     pub fn reserve(
         &mut self,
         tenant: TenantId,
@@ -308,6 +316,7 @@ pub struct MemoryCostLedger {
     reservations: HashMap<(TenantId, RunId), Reservation>,
     cost_events: Vec<CostEvent>,
     inflight_interrupt_count: u64,
+    fail_next_begin: bool,
     fail_next_settlement: bool,
 }
 
@@ -347,6 +356,12 @@ impl MemoryCostLedger {
     }
 
     pub fn begin(&mut self, tenant: &TenantId, run: &RunId) -> Result<(), SettleError> {
+        if self.fail_next_begin {
+            self.fail_next_begin = false;
+            return Err(SettleError::StoreUnavailable(LedgerUnavailable::new(
+                "injected begin outage",
+            )));
+        }
         let key = (tenant.clone(), run.clone());
         let reservation = self
             .reservations
