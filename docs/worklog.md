@@ -4,6 +4,36 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — mutation instructions mean exactly what they say
+
+Several Git and authentication handlers decoded request bodies as untyped JSON and then selected
+the fields they happened to recognize. A misspelled field could therefore become successful,
+durable work with a default value: an alleged private repository was created with the ignored
+visibility instruction, a string `draft` flag opened a normal pull request, and browser file edits
+discarded the commit message the client already presented to the user. The login surface also
+accepted unrelated fields and inherited the general one-megabyte request budget.
+
+Git mutations and public authentication exchanges now cross small, typed request boundaries that
+reject unknown fields and wrong types. Repository creation retains its documented legacy name
+alias, but the alias and canonical field cannot be supplied together. Browser edits preserve an
+explicit, bounded commit message in history and blame, while the old `web edit` default remains for
+compatible clients. Empty Git actions accept only no body or an exact empty object. Device start,
+approval, claim, and direct login share a four-kilobyte budget and exact schemas before they may
+change durable state.
+
+The black-box Git contract reads as a negative user story: ambiguous repository creation leaves no
+repository, ambiguous editing leaves the repository empty, malformed pull-request intent opens no
+pull request, malformed review intent grants no approval, and a hidden force flag cannot merge.
+The browser-approved authentication story applies the same standard to every public exchange and
+still completes one real short-lived CLI session. A long collaboration story also exposed that its
+three independent human decisions legitimately cross the suite's default thirty-second budget; it
+now lives in its own focused module with an explicit budget rather than weakening every test.
+
+**Proof:** Edge unit suite 332/332; durable Git object-authorization suite 12/12; focused durable Git
+integration for writes, browse, and merge bypass; TypeScript typecheck; focused Git lifecycle
+12/12, mutation contract 1/1, authentication 1/1, and collaboration 3/3; complete black-box system
+suite 30/30 files and 115/115 tests in 390.48 seconds.
+
 ## 2026-08-20 — CI history remains complete across repositories and pages
 
 CI lifecycle tests found newly created runs by downloading only the first one
