@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — a KMS restore is one exact state transition
+
+KMS snapshot restore performed independent root, KEK, and DEK upserts. A
+failure halfway through could leave a recovery target with a root and only
+some of its keys. It also left any target-only keys untouched, so “restore
+this snapshot” meant merge rather than reproduce; stale key material absent
+from the backup could survive recovery.
+
+Restore now validates the complete snapshot before acquiring a transaction:
+identities are unique and canonical, wrapped key shapes are exact, epochs fit
+the durable representation, and every DEK names a tenant KEK at the same
+epoch. It then replaces that cell's KEK/DEK membership and root in one
+PostgreSQL transaction. A refused snapshot changes nothing; a valid retry is
+idempotent and exact.
+
+The durable recovery journey now creates target-only key material, refuses an
+invalid snapshot while proving that material remains readable, applies the
+valid snapshot, and proves both that original data recovers and that shredded
+and target-only keys are absent from the database.
+
+**Proof:** complete PostgreSQL durable-KMS integration 11/11 against the live
+federation database; KMS codec tests 2/2; Clippy `-D warnings` for every
+storage target/feature.
+
 ## 2026-08-20 — key epochs cannot wrap across PostgreSQL
 
 Durable KMS key epochs are unsigned in the cryptographic domain and signed in

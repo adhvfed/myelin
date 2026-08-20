@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -110,6 +111,7 @@ pub enum KmsDurableError {
     WrongSealKey { cell_id: String },
     SealKeyMissing,
     SealKeyDecode(SealKeyError),
+    InvalidSnapshot(&'static str),
     Kms(KmsError),
     Db(PgError),
 }
@@ -129,6 +131,9 @@ impl core::fmt::Display for KmsDurableError {
                  chars) at boot - fail-closed, never a default key"
             ),
             KmsDurableError::SealKeyDecode(e) => write!(f, "KMS seal key from {SEAL_KEY_ENV}: {e}"),
+            KmsDurableError::InvalidSnapshot(why) => {
+                write!(f, "KMS snapshot restore REFUSED before writing: {why}")
+            }
             KmsDurableError::Kms(e) => write!(f, "KMS engine error: {e}"),
             KmsDurableError::Db(e) => write!(f, "durable KMS store error: {e}"),
         }
@@ -238,7 +243,11 @@ impl DurableKmsBacking {
         Ok(())
     }
 
-    async fn upsert_sealed_root(&self, sealed: &SealedRoot) -> Result<(), PgError> {
+    async fn upsert_sealed_root_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        ex: E,
+        sealed: &SealedRoot,
+    ) -> Result<(), PgError> {
         sqlx::query(
             "INSERT INTO kms_sealed_root (cell_id, nonce, ciphertext) VALUES ($1, $2, $3) \
              ON CONFLICT (cell_id) DO UPDATE SET nonce = EXCLUDED.nonce, ciphertext = EXCLUDED.ciphertext",
@@ -246,7 +255,7 @@ impl DurableKmsBacking {
         .bind(&self.cell_id)
         .bind(sealed.nonce.as_slice())
         .bind(&sealed.ciphertext)
-        .execute(&self.pool)
+        .execute(ex)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
         Ok(())
@@ -265,10 +274,6 @@ impl DurableKmsBacking {
             core.install_wrapped_kek(id, kek.nonce, kek.wrapped, kek.epoch)?;
         }
         Ok(())
-    }
-
-    async fn upsert_kek_row(&self, id: &KekId, k: &ExportedKek) -> Result<(), PgError> {
-        self.upsert_kek_row_on(&self.pool, id, k).await
     }
 
     async fn insert_kek_if_absent(&self, id: &KekId, k: &ExportedKek) -> Result<(), PgError> {
@@ -527,15 +532,6 @@ impl DurableKmsBacking {
         .transpose()
     }
 
-    async fn upsert_dek_row(
-        &self,
-        id: &DekId,
-        w: &WrappedDek,
-        dek_epoch: u64,
-    ) -> Result<(), PgError> {
-        self.upsert_dek_row_on(&self.pool, id, w, dek_epoch).await
-    }
-
     async fn insert_dek_if_absent(
         &self,
         id: &DekId,
@@ -728,13 +724,35 @@ impl DurableKmsBacking {
     }
 
     pub async fn restore(&self, snap: &KmsDurableSnapshot) -> Result<(), KmsDurableError> {
-        self.upsert_sealed_root(&snap.sealed_root).await?;
+        validate_snapshot(snap)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+
+        sqlx::query("DELETE FROM kms_wrapped_dek WHERE cell_id = $1")
+            .bind(&self.cell_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        sqlx::query("DELETE FROM kms_wrapped_kek WHERE cell_id = $1")
+            .bind(&self.cell_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+
+        self.upsert_sealed_root_on(&mut *tx, &snap.sealed_root)
+            .await?;
         for (id, k) in &snap.keks {
-            self.upsert_kek_row(id, k).await?;
+            self.upsert_kek_row_on(&mut *tx, id, k).await?;
         }
         for (id, w, dek_epoch) in &snap.deks {
-            self.upsert_dek_row(id, w, *dek_epoch).await?;
+            self.upsert_dek_row_on(&mut *tx, id, w, *dek_epoch).await?;
         }
+        tx.commit()
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
         Ok(())
     }
 }
@@ -1002,6 +1020,82 @@ impl DurableKms {
         self.ensure_kek_while_synchronized(&kek_id)?;
         self.core.wrap_dek_material(tenant, region, material)
     }
+}
+
+const WRAPPED_KEY_CIPHERTEXT_LEN: usize = KEY_LEN + 16;
+
+fn validate_snapshot(snapshot: &KmsDurableSnapshot) -> Result<(), KmsDurableError> {
+    if snapshot.sealed_root.ciphertext.len() != WRAPPED_KEY_CIPHERTEXT_LEN {
+        return Err(KmsDurableError::InvalidSnapshot(
+            "sealed root ciphertext has the wrong length",
+        ));
+    }
+
+    let mut kek_ids = BTreeSet::new();
+    let mut kek_epochs_by_tenant: BTreeMap<TenantId, BTreeSet<u64>> = BTreeMap::new();
+    for (id, kek) in &snapshot.keks {
+        if id.tenant.as_str().is_empty() || id.region.as_str().is_empty() {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "a KEK identity has an empty tenant or region",
+            ));
+        }
+        if !kek_ids.insert(id.clone()) {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "the same KEK identity appears more than once",
+            ));
+        }
+        if kek.wrapped.len() != WRAPPED_KEY_CIPHERTEXT_LEN {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "a wrapped KEK ciphertext has the wrong length",
+            ));
+        }
+        if encode_epoch("epoch", kek.epoch).is_err() {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "a KEK epoch exceeds the durable range",
+            ));
+        }
+        kek_epochs_by_tenant
+            .entry(id.tenant.clone())
+            .or_default()
+            .insert(kek.epoch);
+    }
+
+    let mut dek_ids = BTreeSet::new();
+    for (id, wrapped, dek_epoch) in &snapshot.deks {
+        if id.tenant.as_str().is_empty()
+            || KeyClass::parse_token(&id.class.as_token()).as_ref() != Some(&id.class)
+        {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "a DEK identity is not canonical",
+            ));
+        }
+        if !dek_ids.insert(id.clone()) {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "the same DEK identity appears more than once",
+            ));
+        }
+        if wrapped.wrapped.len() != WRAPPED_KEY_CIPHERTEXT_LEN {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "a wrapped DEK ciphertext has the wrong length",
+            ));
+        }
+        if encode_epoch("kek_epoch", wrapped.kek_epoch).is_err()
+            || encode_epoch("dek_epoch", *dek_epoch).is_err()
+        {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "a DEK epoch exceeds the durable range",
+            ));
+        }
+        if !kek_epochs_by_tenant
+            .get(&id.tenant)
+            .is_some_and(|epochs| epochs.contains(&wrapped.kek_epoch))
+        {
+            return Err(KmsDurableError::InvalidSnapshot(
+                "a DEK has no matching tenant KEK epoch",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn dek_material_from_row(row: sqlx::postgres::PgRow) -> Result<(WrappedDek, u64), PgError> {

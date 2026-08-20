@@ -244,8 +244,73 @@ async fn backup_snapshot_restore_recovers_data_and_keeps_a_shredded_key_dead() {
         "a crypto-shredded DEK stays unrecoverable after restore (§7.5)"
     );
 
+    let contaminant_tenant = TenantId(format!("01J0TARGETONLY{suffix}"));
+    recovered
+        .ensure_kek(&KekId::new(contaminant_tenant.clone(), region.clone()))
+        .expect("the recovery target acquires a key absent from the snapshot");
+    let contaminant_ref = recovered
+        .ensure_dek(&contaminant_tenant, &region, KeyClass::Tenant)
+        .expect("the target-only DEK exists before exact restore");
+    let (contaminant_nonce, contaminant_ciphertext) = recovered
+        .resolve_dek(&contaminant_ref, &region)
+        .expect("the target-only DEK is live before exact restore")
+        .seal(b"must not survive exact restore");
+
+    let mut invalid = snapshot.clone();
+    invalid.keks[0].1.epoch = i64::MAX as u64 + 1;
+    let refusal = restore_backing
+        .restore(&invalid)
+        .await
+        .expect_err("an unrepresentable snapshot is rejected before changing the target");
+    assert!(matches!(refusal, KmsDurableError::InvalidSnapshot(_)));
+    drop(recovered);
+
+    let unchanged = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("the target remains bootable after a refused restore");
+    assert_eq!(
+        unchanged
+            .resolve_dek(&contaminant_ref, &region)
+            .expect("the refused restore left the target-only key untouched")
+            .open(&contaminant_nonce, &contaminant_ciphertext)
+            .expect("the target-only ciphertext remains readable"),
+        b"must not survive exact restore"
+    );
+    drop(unchanged);
+
+    restore_backing
+        .restore(&snapshot)
+        .await
+        .expect("reapplying the valid snapshot replaces target membership exactly");
+    let exact = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("the exact restored snapshot boots");
+    assert_eq!(
+        exact
+            .resolve_dek(&live_ref, &region)
+            .expect("the snapshot's live key remains")
+            .open(&nonce, &ct)
+            .expect("the original ciphertext still decrypts"),
+        b"value to recover via restore"
+    );
+    assert!(
+        exact.resolve_dek(&contaminant_ref, &region).is_err(),
+        "a key absent from the snapshot is absent after exact restore"
+    );
+    let contaminant_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kms_wrapped_dek WHERE cell_id = $1 AND tenant_id = $2",
+    )
+    .bind(&cell)
+    .bind(contaminant_tenant.as_str())
+    .fetch_one(provider.db_pool())
+    .await
+    .expect("inspect exact restored membership");
+    assert_eq!(contaminant_rows, 0, "the stale durable row was removed");
+
     cleanup(provider.db_pool(), &cell).await;
-    println!("OK [3]: snapshot→restore recovers the data; a crypto-shredded DEK stays dead after restore.");
+    println!("OK [3]: snapshot→restore is atomic and exact; live data recovers while shredded and target-only keys stay dead.");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
