@@ -7,6 +7,7 @@ import { expect } from "vitest";
 
 import { systemClient } from "../context.js";
 import { array, record, string, type JsonRecord } from "../json.js";
+import type { SystemTestClient } from "../client.js";
 
 export interface AgentRunEnvelope {
   run: {
@@ -42,6 +43,72 @@ export interface ActivatedAgentEnvelope {
   };
   created: boolean;
   durable: boolean;
+}
+
+export async function activateExternalAgent(
+  client: SystemTestClient,
+  name: string,
+  tools: string[],
+): Promise<ActivatedAgentEnvelope> {
+  const response = await client.json("/v1/agents", {
+    method: "POST",
+    body: { name, tools },
+    idempotencyKey: `agent-${randomUUID()}`,
+    expectedStatus: 201,
+  });
+  return response.body as unknown as ActivatedAgentEnvelope;
+}
+
+export async function beginAgentRun(
+  client: SystemTestClient,
+  agentId: string,
+): Promise<AgentRunEnvelope> {
+  const response = await client.json(`/v1/agents/${encodeURIComponent(agentId)}/runs`, {
+    method: "POST",
+    body: {},
+    idempotencyKey: `agent-run-${randomUUID()}`,
+    expectedStatus: 201,
+  });
+  return response.body as unknown as AgentRunEnvelope;
+}
+
+export async function closeAgentRun(run: AgentRunEnvelope): Promise<void> {
+  await systemClient.json(`/v1/agent-runs/${encodeURIComponent(run.run.id)}/close`, {
+    method: "POST",
+    body: {},
+    token: run.credential.token,
+    tokenScheme: "agent",
+    expectedStatus: 200,
+  });
+}
+
+export async function findAgentPageItem(
+  run: AgentRunEnvelope,
+  firstRequestId: number,
+  tool: string,
+  arguments_: JsonRecord,
+  predicate: (item: JsonRecord) => boolean,
+  description: string,
+): Promise<JsonRecord> {
+  let cursor: string | undefined;
+  const visited = new Set<string>();
+  for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+    const payload = await askAgent(run, firstRequestId + pageNumber, tool, {
+      ...arguments_,
+      ...(cursor === undefined ? {} : { cursor }),
+    });
+    const found = array(payload.items, `${description} items`)
+      .map((item) => record(item, description))
+      .find(predicate);
+    if (found) return found;
+
+    const next = record(payload.page, `${description} page`).next_cursor;
+    if (next === null) break;
+    cursor = string(next, `${description} next cursor`);
+    if (visited.has(cursor)) throw new Error(`${description} repeated cursor ${cursor}`);
+    visited.add(cursor);
+  }
+  throw new Error(`${description} was absent after walking every agent-visible page`);
 }
 
 export async function askAgent(

@@ -82,12 +82,17 @@ export async function awaitActiveIssue(
   title: string,
   options: ProposeIssueOptions = {},
 ): Promise<JsonRecord> {
+  const usesBootstrappedProject = options.projectId === undefined;
+  const typeId = options.typeId ??
+    (usesBootstrappedProject ? systemTestConfig.issues.typeId : undefined);
+  const prefix = options.prefix ??
+    (usesBootstrappedProject ? systemTestConfig.issues.prefix : undefined);
   const proposed = await client.json("/v1/issues", {
     method: "POST",
     body: {
       project_id: options.projectId ?? systemTestConfig.issues.projectId,
-      type_id: options.typeId ?? systemTestConfig.issues.typeId,
-      prefix: options.prefix ?? systemTestConfig.issues.prefix,
+      ...(typeId === undefined ? {} : { type_id: typeId }),
+      ...(prefix === undefined ? {} : { prefix }),
       title,
     },
     expectedStatus: 202,
