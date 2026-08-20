@@ -432,17 +432,11 @@ async fn exercise_bootstrap(
 #[tokio::test]
 async fn bootstrap_migrates_then_hands_off_only_constrained_runtime() {
     let base = MyelinConfig::dev();
-    let admin_pool = match PgPoolOptions::new()
+    let admin_pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&base.database_migration_url)
         .await
-    {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("SKIP live split-credential bootstrap proof: {error}");
-            return;
-        }
-    };
+        .expect("split-credential bootstrap proof requires the configured migration backend");
 
     let suffix = unique_suffix();
     let schema = format!("myelin_bootstrap_{suffix}");

@@ -118,17 +118,11 @@ async fn exercise(admin: &sqlx::PgPool, schema: &str, suffix: &str) -> Result<()
 #[tokio::test(flavor = "multi_thread")]
 async fn exact_dispatch_migrations_precede_constrained_runtime_handoff() {
     let base = MyelinConfig::dev();
-    let admin = match PgPoolOptions::new()
+    let admin = PgPoolOptions::new()
         .max_connections(2)
         .connect(&base.database_migration_url)
         .await
-    {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("SKIP live CI Dispatch bootstrap proof: {error}");
-            return;
-        }
-    };
+        .expect("CI Dispatch bootstrap proof requires the configured migration Postgres backend");
 
     let suffix = unique_suffix();
     let schema = format!("ci_dispatch_bootstrap_{suffix}");

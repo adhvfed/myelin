@@ -24,17 +24,11 @@ fn with_search_path(url: &str, schema: &str) -> String {
 #[tokio::test]
 async fn legacy_bundled_ci_0004_could_not_be_recorded_by_pg_migrator() {
     let base = MyelinConfig::dev();
-    let admin = match PgPoolOptions::new()
+    let admin = PgPoolOptions::new()
         .max_connections(2)
         .connect(&base.database_migration_url)
         .await
-    {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("SKIP live CI migration activation-boundary proof: {error}");
-            return;
-        }
-    };
+        .expect("CI activation-boundary proof requires the configured migration Postgres backend");
 
     let suffix = unique_suffix();
     let schema = format!("ci_migration_boundary_{suffix}");

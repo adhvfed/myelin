@@ -204,17 +204,13 @@ async fn exercise(
 #[tokio::test(flavor = "multi_thread")]
 async fn complete_controlplane_migrations_precede_constrained_runtime_handoff() {
     let base = test_config();
-    let admin = match PgPoolOptions::new()
+    let admin = PgPoolOptions::new()
         .max_connections(2)
         .connect(&base.database_migration_url)
         .await
-    {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("SKIP live CI Controlplane bootstrap proof: {error}");
-            return;
-        }
-    };
+        .expect(
+            "CI Controlplane bootstrap proof requires the configured migration Postgres backend",
+        );
 
     let suffix = unique_suffix();
     let schema = format!("ci_controlplane_bootstrap_{suffix}");
