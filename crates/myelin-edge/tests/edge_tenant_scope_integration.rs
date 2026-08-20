@@ -4,6 +4,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::TokioIo;
+use myelin_config::MyelinConfig;
 use myelin_edge::{
     serve_edge, AllowAll, EdgeError, EdgeResponse, Gateway, Handler, HandlerCtx, Method,
 };
@@ -67,10 +68,9 @@ fn admin_scope(tenant: &str) -> TenantScope {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        eprintln!("SKIP edge_sets_the_tenant_scope_in_a_real_transaction: DATABASE_URL unset");
-        return;
-    };
+    let database_url = std::env::var("MYELIN_TEST_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .unwrap_or_else(|_| MyelinConfig::dev().database_url);
     let pool = connect_pool_with_reset(&database_url, REGION, 8)
         .await
         .expect("connect to the dev Postgres");
