@@ -1,18 +1,12 @@
 #![cfg(feature = "integration")]
 
-use myelin_config::{Mode, MyelinConfig};
+use myelin_config::Mode;
 use myelin_storage::migration::{HotTables, Migration, Migrations};
 use myelin_storage::pg::PgStore;
 use myelin_storage::tenant_tx::{connect_pool_with_reset, with_tenant_tx};
 use myelin_storage::{PgMigrator, ProviderError, SubstrateProvider};
 
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
+mod common;
 
 fn uniq() -> String {
     format!(
@@ -29,17 +23,6 @@ fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
-async fn admin_provider(max: u32) -> Option<SubstrateProvider> {
-    let cfg = admin_config(&MyelinConfig::dev());
-    match SubstrateProvider::connect(cfg, max).await {
-        Ok(p) => Some(p),
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            None
-        }
-    }
-}
-
 async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
     sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
         .bind(table)
@@ -50,9 +33,7 @@ async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_boot_migration_executes_ddl_and_is_idempotent() {
-    let Some(provider) = admin_provider(6).await else {
-        return;
-    };
+    let provider = common::admin_provider(6).await;
 
     let suffix = uniq();
     let t1 = leak(format!("mr022_a_one_{suffix}"));
@@ -159,13 +140,9 @@ async fn a_boot_migration_executes_ddl_and_is_idempotent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn b_provider_builds_real_pool_from_env_and_migrates_foundation() {
-    let provider = match SubstrateProvider::from_env(Mode::DevDefaults).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let provider = SubstrateProvider::from_env(Mode::DevDefaults)
+        .await
+        .expect("the environment-built provider requires the configured Postgres backend");
     let one: i32 = sqlx::query_scalar("SELECT 1")
         .fetch_one(provider.db_pool())
         .await
@@ -186,9 +163,7 @@ async fn b_provider_builds_real_pool_from_env_and_migrates_foundation() {
         "a closed production pool must report not-ready"
     );
 
-    let Some(admin) = admin_provider(4).await else {
-        return;
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate_foundation()
         .await
@@ -225,16 +200,12 @@ async fn b_provider_builds_real_pool_from_env_and_migrates_foundation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c_tenant_tx_isolates_and_does_not_bleed() {
-    let cfg = MyelinConfig::dev();
-    let admin = admin_config(&cfg);
+    let cfg = common::app_database_config();
+    let admin = common::admin_database_config();
 
-    let store = match PgStore::connect(&admin.database_url, &cfg.region, 4).await {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let store = PgStore::connect(&admin.database_url, &cfg.region, 4)
+        .await
+        .expect("connect to the required admin Postgres backend");
     store
         .migrate()
         .await

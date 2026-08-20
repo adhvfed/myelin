@@ -1,26 +1,12 @@
 #![cfg(feature = "integration")]
 
-use myelin_config::MyelinConfig;
 use myelin_storage::migration::{Migration, Migrations};
 use myelin_storage::PgMigrator;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 mod common;
 
 const N: usize = 12;
-
-async fn admin_pool() -> Option<PgPool> {
-    let cfg = MyelinConfig::dev();
-    let admin_url = cfg
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    PgPoolOptions::new()
-        .max_connections((N as u32) + 4)
-        .connect(&admin_url)
-        .await
-        .ok()
-}
 
 fn concurrent_migration_set() -> (Migrations, Vec<&'static str>) {
     let suffix = format!(
@@ -81,13 +67,7 @@ async fn run_one(pool: PgPool, migrations: Migrations) -> Result<(), myelin_stor
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_migrate_is_race_safe_and_applied_once() {
-    let Some(pool) = admin_pool().await else {
-        eprintln!(
-            "SKIP concurrent_migrate_is_race_safe_and_applied_once: dev Postgres unreachable \
-             (is the docker stack up?)"
-        );
-        return;
-    };
+    let pool = common::admin_pool((N as u32) + 4).await;
     let (migrations, ids) = concurrent_migration_set();
     cleanup(&pool, &ids, &migrations).await;
 

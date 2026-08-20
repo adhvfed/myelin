@@ -1,20 +1,13 @@
 #![cfg(feature = "integration")]
 
-use myelin_config::MyelinConfig;
+mod common;
+
 use myelin_storage::cell_root_durable::{cell_root_durable_migrations, CellRootError};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{DurableCellRootBacking, SealKey, SubstrateProvider};
 
 const SEAL_K_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 const SEAL_WRONG_HEX: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -31,35 +24,22 @@ fn seal_k() -> SealKey {
     SealKey::from_encoded(SEAL_K_HEX).expect("valid 32-byte hex seal key K")
 }
 
-async fn admin_provider() -> Option<SubstrateProvider> {
-    let cfg = admin_config(&MyelinConfig::dev());
-    let provider = match SubstrateProvider::connect(cfg, 6).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn admin_provider() -> SubstrateProvider {
+    let provider = common::admin_provider(6).await;
     provider
         .migrate(&cell_root_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the cell-root migration (cell_token_root)");
-    Some(provider)
+    provider
 }
 
 async fn fresh_pool() -> sqlx::postgres::PgPool {
-    SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
-        .await
-        .expect("fresh pool")
-        .db_pool()
-        .clone()
+    common::admin_provider(2).await.db_pool().clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn load_or_generate_roundtrips_the_same_root_across_a_fresh_backing() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let cell = format!("cell-{}", uniq());
     let seal = seal_k();
 
@@ -91,9 +71,7 @@ async fn load_or_generate_roundtrips_the_same_root_across_a_fresh_backing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let cell = format!("cell-{}", uniq());
     let seal = seal_k();
 
@@ -143,9 +121,7 @@ async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_first_boot_produces_a_single_root() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let cell = format!("cell-{}", uniq());
     let seal = seal_k();
 

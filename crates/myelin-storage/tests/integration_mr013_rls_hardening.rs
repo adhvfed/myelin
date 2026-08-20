@@ -2,14 +2,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use myelin_config::MyelinConfig;
+mod common;
+
 use myelin_storage::pg::{PgError, PgStore};
 use myelin_storage::tenant_tx::{connect_pool_with_reset, with_tenant_tx};
-
-fn admin_url(cfg: &MyelinConfig) -> String {
-    cfg.database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
-}
 
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -39,14 +35,11 @@ async fn residual_tenant_guc(pool: &sqlx::PgPool) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
-    let cfg = MyelinConfig::dev();
-    let admin = match PgStore::connect(&admin_url(&cfg), &cfg.region, 4).await {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let cfg = common::app_database_config();
+    let admin_url = common::admin_database_config().database_url;
+    let admin = PgStore::connect(&admin_url, &cfg.region, 4)
+        .await
+        .expect("connect to the required admin Postgres backend");
     admin
         .migrate()
         .await
@@ -114,7 +107,7 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
 
     for t in [&tenant_a, &tenant_b] {
         let _ = with_tenant_tx(
-            &connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 1)
+            &connect_pool_with_reset(&admin_url, &cfg.region, 1)
                 .await
                 .expect("admin reset pool"),
             t,
@@ -139,16 +132,16 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
-    let cfg = MyelinConfig::dev();
+    let cfg = common::app_database_config();
     let region = cfg.region.clone();
+    let admin_url = common::admin_database_config().database_url;
 
-    match PgStore::connect(&admin_url(&cfg), &region, 2).await {
-        Ok(s) => s.migrate().await.expect("migrate"),
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    }
+    PgStore::connect(&admin_url, &region, 2)
+        .await
+        .expect("connect to the required admin Postgres backend")
+        .migrate()
+        .await
+        .expect("migrate");
 
     let tag = uniq();
     let tenant = format!("mr013-bleed-{tag}");
@@ -216,7 +209,7 @@ async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mr013_region_fail_fast_refuses_blank_region() {
-    let cfg = MyelinConfig::dev();
+    let cfg = common::app_database_config();
 
     let empty = PgStore::connect(&cfg.database_url, "", 2).await;
     assert!(
@@ -229,13 +222,9 @@ async fn mr013_region_fail_fast_refuses_blank_region() {
         "connect with a whitespace-only region must be refused (region fail-fast)"
     );
 
-    let store = match PgStore::connect(&cfg.database_url, &cfg.region, 2).await {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let store = PgStore::connect(&cfg.database_url, &cfg.region, 2)
+        .await
+        .expect("connect to the required app Postgres backend");
     let scoped = store.scoped_conn_in_region("acme", "").await;
     assert!(
         matches!(scoped, Err(PgError::Query(_))),

@@ -1,23 +1,13 @@
 #![cfg(feature = "integration")]
 
-use myelin_config::MyelinConfig;
 use myelin_storage::migration::{Migration, Migrations};
 use myelin_storage::pg_migrator::ddl_checksum;
 use myelin_storage::PgMigrator;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
 mod common;
 
 const DRIFT_RACERS: usize = 8;
-
-async fn admin_pool(max_connections: u32) -> Option<PgPool> {
-    PgPoolOptions::new()
-        .max_connections(max_connections)
-        .connect(&MyelinConfig::dev().database_migration_url)
-        .await
-        .ok()
-}
 
 fn unique_suffix(label: &str) -> String {
     format!(
@@ -50,10 +40,7 @@ async fn cleanup(pool: &PgPool, ids: &[&str], tables: &[&str]) {
 
 #[tokio::test]
 async fn same_id_same_ddl_is_checksum_verified_and_skipped() {
-    let Some(pool) = admin_pool(4).await else {
-        eprintln!("SKIP: dev Postgres is unreachable");
-        return;
-    };
+    let pool = common::admin_pool(4).await;
     let suffix = unique_suffix("checksum_same");
     let id = leaked(format!("{suffix}_0001"));
     let table = leaked(format!("{suffix}_table"));
@@ -94,10 +81,7 @@ async fn same_id_same_ddl_is_checksum_verified_and_skipped() {
 
 #[tokio::test]
 async fn same_id_different_ddl_fails_before_any_later_migration() {
-    let Some(pool) = admin_pool(4).await else {
-        eprintln!("SKIP: dev Postgres is unreachable");
-        return;
-    };
+    let pool = common::admin_pool(4).await;
     let suffix = unique_suffix("checksum_drift");
     let id = leaked(format!("{suffix}_0001"));
     let first_table = leaked(format!("{suffix}_original"));
@@ -158,10 +142,7 @@ async fn same_id_different_ddl_fails_before_any_later_migration() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_drift_attempts_all_fail_closed_without_running_later_ddl() {
-    let Some(pool) = admin_pool((DRIFT_RACERS as u32) + 4).await else {
-        eprintln!("SKIP: dev Postgres is unreachable");
-        return;
-    };
+    let pool = common::admin_pool((DRIFT_RACERS as u32) + 4).await;
     let suffix = unique_suffix("checksum_race");
     let id = leaked(format!("{suffix}_0001"));
     let original_table = leaked(format!("{suffix}_original"));

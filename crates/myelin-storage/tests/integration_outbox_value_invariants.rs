@@ -3,7 +3,6 @@
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use myelin_config::MyelinConfig;
 use myelin_events::relay::InProcessBus;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
@@ -15,11 +14,7 @@ use myelin_storage::{foundation_migrations, PgMigrator};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
-fn admin_url() -> String {
-    MyelinConfig::dev()
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
-}
+mod common;
 
 fn unique_schema() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -34,7 +29,7 @@ fn envelope(event_id: &str) -> EventEnvelope {
     let tenant = TenantId("acme".into());
     EventEnvelope {
         event_id: EventId(event_id.into()),
-        type_: EventType("issues.issue.updated".into()),
+        type_: EventType("issue.issue.updated".into()),
         schema_ver: 1,
         tenant: tenant.clone(),
         region: Region("fr-par".into()),
@@ -43,7 +38,7 @@ fn envelope(event_id: &str) -> EventEnvelope {
             PrincipalKind::Service,
             tenant,
         )),
-        subject: ArtifactRef("myelin://acme/issues/issue/OUTBOX-1".into()),
+        subject: ArtifactRef("myelin://acme/issue/issue/OUTBOX-1".into()),
         aggregate: AggregateKey("issue:OUTBOX-1".into()),
         causation_id: None,
         correlation_id: CorrelationId(event_id.into()),
@@ -59,17 +54,18 @@ fn envelope(event_id: &str) -> EventEnvelope {
     }
 }
 
-async fn isolated_pool(schema: &str) -> Option<(PgPool, PgPool)> {
+async fn isolated_pool(schema: &str) -> (PgPool, PgPool) {
+    let admin_url = common::admin_database_config().database_url;
     let bootstrap = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&admin_url())
+        .connect(&admin_url)
         .await
-        .ok()?;
+        .expect("connect to the required admin Postgres backend");
     sqlx::query(&format!("CREATE SCHEMA {schema}"))
         .execute(&bootstrap)
         .await
         .expect("create the isolated outbox schema");
-    let options = PgConnectOptions::from_str(&admin_url())
+    let options = PgConnectOptions::from_str(&admin_url)
         .expect("parse the integration database URL")
         .options([("search_path", format!("{schema},public").as_str())]);
     let pool = PgPoolOptions::new()
@@ -77,7 +73,7 @@ async fn isolated_pool(schema: &str) -> Option<(PgPool, PgPool)> {
         .connect_with(options)
         .await
         .expect("connect to the isolated outbox schema");
-    Some((bootstrap, pool))
+    (bootstrap, pool)
 }
 
 async fn insert_raw(pool: &PgPool, envelope: &EventEnvelope, seq: i64, attempts: i32) {
@@ -99,10 +95,7 @@ async fn insert_raw(pool: &PgPool, envelope: &EventEnvelope, seq: i64, attempts:
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_outbox_refuses_corrupt_counters_and_split_identity() {
     let schema = unique_schema();
-    let Some((bootstrap, pool)) = isolated_pool(&schema).await else {
-        eprintln!("SKIP: dev Postgres unreachable");
-        return;
-    };
+    let (bootstrap, pool) = isolated_pool(&schema).await;
     sqlx::raw_sql(OUTBOX_MIGRATION)
         .execute(&pool)
         .await
@@ -134,7 +127,7 @@ async fn durable_outbox_refuses_corrupt_counters_and_split_identity() {
         .to_string()
         .contains("negative durable outbox attempts"));
 
-    sqlx::query("UPDATE outbox SET attempts = 0, subject = 'myelin://acme/issues/issue/OTHER'")
+    sqlx::query("UPDATE outbox SET attempts = 0, subject = 'myelin://acme/issue/issue/OTHER'")
         .execute(&pool)
         .await
         .expect("isolate the split identity decoder");
@@ -153,7 +146,7 @@ async fn durable_outbox_refuses_corrupt_counters_and_split_identity() {
 
     let mut legacy = envelope("outbox-legacy-aggregate");
     legacy.aggregate = AggregateKey("issue:OUTBOX-2".into());
-    legacy.subject = ArtifactRef("myelin://acme/issues/issue/OUTBOX-2".into());
+    legacy.subject = ArtifactRef("myelin://acme/issue/issue/OUTBOX-2".into());
     insert_raw(&pool, &legacy, 0, 0).await;
     sqlx::query("UPDATE outbox SET aggregate = 'raw-object-id' WHERE event_id = $1")
         .bind(&legacy.event_id.0)
@@ -267,7 +260,7 @@ async fn durable_outbox_refuses_corrupt_counters_and_split_identity() {
     for corrupting_write in [
         "UPDATE outbox SET seq = -1 WHERE event_id = 'outbox-invariant-1'",
         "UPDATE outbox SET attempts = -1 WHERE event_id = 'outbox-invariant-1'",
-        "UPDATE outbox SET subject = 'myelin://acme/issues/issue/OTHER' \
+        "UPDATE outbox SET subject = 'myelin://acme/issue/issue/OTHER' \
          WHERE event_id = 'outbox-invariant-1'",
     ] {
         assert!(

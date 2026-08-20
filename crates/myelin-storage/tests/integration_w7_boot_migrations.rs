@@ -2,25 +2,14 @@
 
 use std::str::FromStr;
 
-use myelin_config::MyelinConfig;
+mod common;
+
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     all_durable_migrations, foundation_migrations, DurablePrincipalBacking, DurablePrincipalRow,
-    DurableReplayBacking, PgMigrator, SubstrateProvider,
+    DurableReplayBacking, PgMigrator,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-
-fn admin_url() -> String {
-    MyelinConfig::dev()
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
-}
-
-fn admin_config() -> MyelinConfig {
-    let mut c = MyelinConfig::dev();
-    c.database_url = admin_url();
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -44,24 +33,19 @@ async fn table_exists_in(pool: &PgPool, schema: &str, table: &str) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_schema_principal_table_absent_after_foundation_then_present_after_aggregate() {
     let schema = format!("w7_boot_{}", uniq());
+    let admin_url = common::admin_database_config().database_url;
 
-    let bootstrap = match PgPoolOptions::new()
+    let bootstrap = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&admin_url())
+        .connect(&admin_url)
         .await
-    {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+        .expect("connect to the required admin Postgres backend");
     sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
         .execute(&bootstrap)
         .await
         .expect("create the fresh isolation schema");
 
-    let opts = PgConnectOptions::from_str(&admin_url())
+    let opts = PgConnectOptions::from_str(&admin_url)
         .expect("parse admin DSN")
         .options([("search_path", format!("\"{schema}\",public").as_str())]);
     let pool = PgPoolOptions::new()
@@ -123,13 +107,7 @@ async fn fresh_schema_principal_table_absent_after_foundation_then_present_after
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_principal_write_succeeds_after_the_boot_sequence() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = common::admin_provider(4).await;
     admin
         .migrate_foundation()
         .await
@@ -139,9 +117,7 @@ async fn durable_principal_write_succeeds_after_the_boot_sequence() {
         .await
         .expect("boot step 2: the durable aggregate (the W7.2 fix)");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 4)
-        .await
-        .expect("open the app-role provider");
+    let app = common::app_provider(4).await;
     let region = app.config().region.clone();
     let suffix = uniq();
     let tenant = format!("w7-boot-{suffix}");

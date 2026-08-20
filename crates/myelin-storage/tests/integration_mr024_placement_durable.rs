@@ -1,20 +1,13 @@
 #![cfg(feature = "integration")]
 
-use myelin_config::MyelinConfig;
+mod common;
+
 use myelin_storage::migration::HotTables;
 use myelin_storage::placement_durable::{
     cell_value_invariant_migrations, placement_durable_migrations, DurableCellRow,
     DurableMisrouteAuditBacking, DurablePlacementBacking, DurablePlacementRow, PlacementWriteError,
 };
 use myelin_storage::SubstrateProvider;
-
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
 
 fn uniq() -> String {
     format!(
@@ -27,15 +20,8 @@ fn uniq() -> String {
     )
 }
 
-async fn admin_provider() -> Option<SubstrateProvider> {
-    let cfg = admin_config(&MyelinConfig::dev());
-    let provider = match SubstrateProvider::connect(cfg, 6).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn admin_provider() -> SubstrateProvider {
+    let provider = common::admin_provider(6).await;
     provider
         .migrate(&placement_durable_migrations(), &HotTables::none())
         .await
@@ -46,7 +32,7 @@ async fn admin_provider() -> Option<SubstrateProvider> {
         .migrate(&cell_value_invariant_migrations(), &HotTables::none())
         .await
         .expect("apply the cell value-shape invariants");
-    Some(provider)
+    provider
 }
 
 fn cell_row(cell_id: &str, region: &str) -> DurableCellRow {
@@ -84,9 +70,7 @@ fn placement_row(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn placement_survives_a_fresh_instance_over_a_fresh_pool() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell_id = format!("cell-w-{suffix}");
     let tenant = format!("01J0ACME{suffix}");
@@ -108,11 +92,7 @@ async fn placement_survives_a_fresh_instance_over_a_fresh_pool() {
         .await
         .expect("a single-region placement is admitted by the trigger");
 
-    let fresh_pool = SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
-        .await
-        .expect("fresh pool")
-        .db_pool()
-        .clone();
+    let fresh_pool = common::admin_provider(2).await.db_pool().clone();
     let backing2 = DurablePlacementBacking::new(fresh_pool);
     let read = backing2
         .get_placement(&tenant)
@@ -142,9 +122,7 @@ async fn placement_survives_a_fresh_instance_over_a_fresh_pool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn placement_invariant_is_a_real_db_trigger() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let west = format!("cell-w-{suffix}");
     let north = format!("cell-n-{suffix}");
@@ -263,9 +241,7 @@ async fn placement_invariant_is_a_real_db_trigger() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn misroute_audit_survives_a_fresh_instance() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let tenant = format!("01J0MIS{suffix}");
     let received = format!("cell-w2-{suffix}");
@@ -282,11 +258,7 @@ async fn misroute_audit_survives_a_fresh_instance() {
         .await
         .expect("record an unknown-tenant misroute (no home)");
 
-    let fresh_pool = SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
-        .await
-        .expect("fresh pool")
-        .db_pool()
-        .clone();
+    let fresh_pool = common::admin_provider(2).await.db_pool().clone();
     let audit2 = DurableMisrouteAuditBacking::new(fresh_pool);
     assert_eq!(
         audit2.count().await.expect("count") - before,
@@ -324,9 +296,7 @@ async fn misroute_audit_survives_a_fresh_instance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_cell_registry_only_persists_values_the_domain_can_read() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let backing = DurablePlacementBacking::new(provider.db_pool().clone());
     let sound = cell_row(&format!("cell-boundary-{suffix}"), "eu-west");
