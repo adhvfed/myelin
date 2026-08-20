@@ -741,13 +741,16 @@ pub trait SandboxBackend: Sync {
         output: Arc<dyn SandboxOutputSink>,
         _cancellation: SandboxCancellation,
     ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
-        let launch = self.launch(spec, hooks)?;
-        if !launch.result.stdout.is_empty() {
-            let _ = output.emit(SandboxOutputStream::Stdout, &launch.result.stdout);
-        }
-        if !launch.result.stderr.is_empty() {
-            let _ = output.emit(SandboxOutputStream::Stderr, &launch.result.stderr);
-        }
+        let mut launch = self.launch(spec, hooks)?;
+        let stdout_complete = launch.result.stdout.is_empty()
+            || output
+                .emit(SandboxOutputStream::Stdout, &launch.result.stdout)
+                .is_ok();
+        let stderr_complete = launch.result.stderr.is_empty()
+            || output
+                .emit(SandboxOutputStream::Stderr, &launch.result.stderr)
+                .is_ok();
+        launch.output_complete &= stdout_complete && stderr_complete;
         Ok(launch)
     }
 
@@ -1596,10 +1599,11 @@ mod tests {
                     hooks.release_unused(spec, &res)?;
                     return Err(attribute_error);
                 }
-                let result = SandboxResult::stub_ok(ResourceUsage {
+                let mut result = SandboxResult::stub_ok(ResourceUsage {
                     cpu_seconds: 1,
                     mem_byte_seconds: 1,
                 });
+                result.stdout = b"the workload spoke".to_vec();
                 hooks.settle_completed(spec, &res, result.usage)?;
                 Ok(SandboxLaunch {
                     handle: SandboxHandle {
@@ -1707,6 +1711,30 @@ mod tests {
                 "the default run_cycle must wrap launch_streaming as WorkloadLaunched, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn default_streaming_marks_output_incomplete_when_the_sink_refuses_a_frame() {
+        struct RefusingSink;
+        impl SandboxOutputSink for RefusingSink {
+            fn emit(&self, _stream: SandboxOutputStream, _frame: &[u8]) -> Result<(), String> {
+                Err("durable output is unavailable".into())
+            }
+        }
+
+        let outcome = NoopBackend
+            .run_cycle(
+                &ci_spec(),
+                &test_hooks(),
+                std::sync::Arc::new(RefusingSink),
+                SandboxCancellation::default(),
+            )
+            .unwrap();
+
+        let SandboxCycleOutcome::WorkloadLaunched(launch) = outcome else {
+            panic!("ordinary launches remain workload outcomes after an output refusal");
+        };
+        assert!(!launch.output_complete);
     }
 
     #[test]
