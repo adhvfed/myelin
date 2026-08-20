@@ -2,7 +2,6 @@
 
 mod common;
 
-use myelin_config::MyelinConfig;
 use myelin_control_plane::place::{CounterMinter, PlacementService};
 use myelin_control_plane::{
     Capacity, Cell, CellGateway, CellProvisioning, CellStatus, DegenerateControlPlane,
@@ -16,14 +15,6 @@ use myelin_storage::placement_durable::{
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::{ArtifactRef, CellId, Region, TenantId};
 
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
-
 fn uniq() -> String {
     format!(
         "{}_{}",
@@ -35,24 +26,19 @@ fn uniq() -> String {
     )
 }
 
-async fn admin_provider() -> Option<SubstrateProvider> {
-    let cfg = admin_config(&MyelinConfig::dev());
-    let provider = match SubstrateProvider::connect(cfg, 6).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn admin_provider() -> SubstrateProvider {
+    let provider = SubstrateProvider::connect(common::admin_database_config(), 6)
+        .await
+        .expect("control-plane integration tests require the configured Postgres backend");
     provider
         .migrate(&placement_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the placement migrations 0030–0039 (W6d whole surface + triggers)");
-    Some(provider)
+    provider
 }
 
 async fn fresh_pool() -> sqlx::PgPool {
-    SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
+    SubstrateProvider::connect(common::admin_database_config(), 2)
         .await
         .expect("fresh pool")
         .db_pool()
@@ -104,9 +90,7 @@ async fn cleanup(pool: &sqlx::PgPool, suffix: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_five_registry_surfaces_survive_a_fresh_pool() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let west = format!("cellw{suffix}");
     let tenant = format!("01J0ACME{suffix}");
@@ -196,9 +180,7 @@ async fn all_five_registry_surfaces_survive_a_fresh_pool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repo_placement_region_derivation_cannot_drift() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let west = format!("cellw{suffix}");
     let north = format!("celln{suffix}");
@@ -316,9 +298,7 @@ async fn repo_placement_region_derivation_cannot_drift() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provisioning_log_is_append_ordered_and_durable() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell_id = format!("cellp{suffix}");
 
@@ -369,9 +349,7 @@ async fn provisioning_log_is_append_ordered_and_durable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_gateway_misroute_lands_in_the_durable_audit_sink() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let home = format!("cellh{suffix}");
     let wrong = format!("cellx{suffix}");
@@ -453,9 +431,7 @@ async fn a_gateway_misroute_lands_in_the_durable_audit_sink() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn self_host_boots_on_pg_and_routing_survives_restart() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let suffix = uniq();
     let cell_id = format!("cellself{suffix}");
     let pool = provider.db_pool();

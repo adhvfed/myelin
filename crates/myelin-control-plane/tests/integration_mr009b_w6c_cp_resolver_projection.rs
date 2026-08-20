@@ -4,7 +4,6 @@ mod common;
 
 use std::sync::Arc;
 
-use myelin_config::MyelinConfig;
 use myelin_control_plane::cross_cell_bridge::{
     BridgeMode, BridgeProjection, BridgeResolution, BridgeTombstoneReason, CellLocalResolver,
     ViewerId,
@@ -19,14 +18,6 @@ use myelin_tenancy::{
     ArtifactRef, ArtifactType, CellId, CorrelationId, CrossCellPointer, OpaqueSubjectId,
 };
 
-fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
-    let mut c = cfg.clone();
-    c.database_url = c
-        .database_url
-        .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
-    c
-}
-
 fn uniq() -> String {
     format!(
         "{}_{}",
@@ -38,20 +29,15 @@ fn uniq() -> String {
     )
 }
 
-async fn admin_provider() -> Option<SubstrateProvider> {
-    let cfg = admin_config(&MyelinConfig::dev());
-    let provider = match SubstrateProvider::connect(cfg, 6).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn admin_provider() -> SubstrateProvider {
+    let provider = SubstrateProvider::connect(common::admin_database_config(), 6)
+        .await
+        .expect("control-plane integration tests require the configured Postgres backend");
     provider
         .migrate(&placement_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the placement migrations (cell table + endpoint column)");
-    Some(provider)
+    provider
 }
 
 fn cell_row(cell_id: &str, region: &str, endpoint: &str) -> DurableCellRow {
@@ -128,9 +114,7 @@ async fn cleanup(pool: &sqlx::PgPool, cell_ids: &[String]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolver_registry_projects_from_the_durable_cell_table() {
-    let Some(provider) = admin_provider().await else {
-        return;
-    };
+    let provider = admin_provider().await;
     let pool = provider.db_pool().clone();
     let suffix = uniq();
     let cell_b = format!("cell-b-{suffix}");
@@ -185,7 +169,7 @@ async fn resolver_registry_projects_from_the_durable_cell_table() {
             );
             assert_eq!(ghost.tombstone_reason(), Some(BridgeTombstoneReason::Gone));
 
-            let fresh = SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
+            let fresh = SubstrateProvider::connect(common::admin_database_config(), 2)
                 .await
                 .expect("a fresh pool connects");
             let fresh_backing = DurablePlacementBacking::new(fresh.db_pool().clone());
