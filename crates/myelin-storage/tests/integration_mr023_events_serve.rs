@@ -13,7 +13,7 @@ use myelin_events::relay::BusTransport;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, ConsumerName, CorrelationId, DataRole, DedupLedger,
     EventEnvelope, EventHandler, EventId, EventType, HandleOutcome, SubjectPattern, Timestamp,
-    Visibility, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION,
+    Visibility, CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::events_durable::DurableDedupBacking;
@@ -44,7 +44,7 @@ fn principal() -> Principal {
 fn envelope(id: &str, subject: &str, aggregate: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(id.into()),
-        type_: EventType("issues.issue.created".into()),
+        type_: EventType("issue.issue.created".into()),
         schema_ver: 1,
         tenant: TenantId("acme".into()),
         region: Region("fr-par".into()),
@@ -70,10 +70,36 @@ async fn ensure_foundation(pool: &sqlx::PgPool) {
         .execute(pool)
         .await
         .expect("apply OUTBOX_MIGRATION");
+    sqlx::raw_sql(OUTBOX_QUARANTINE_MIGRATION)
+        .execute(pool)
+        .await
+        .expect("apply OUTBOX_QUARANTINE_MIGRATION");
     sqlx::raw_sql(CONSUMER_DEDUP_MIGRATION)
         .execute(pool)
         .await
         .expect("apply CONSUMER_DEDUP_MIGRATION");
+}
+
+async fn persist_legacy_poison(pool: &sqlx::PgPool, tag: &str) -> EventId {
+    let event_id = EventId(format!("mr023-legacy-poison-{tag}"));
+    let aggregate = format!("000-legacy-poison-{tag}");
+    let envelope = envelope(
+        &event_id.0,
+        "myelin://acme/issue/issue/LEGACY-POISON",
+        &aggregate,
+    );
+    sqlx::query(
+        "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
+         VALUES ($1, $2, 0, $3, $4)",
+    )
+    .bind(&event_id.0)
+    .bind(&aggregate)
+    .bind(&envelope.subject.0)
+    .bind(serde_json::to_value(&envelope).expect("serialize the legacy envelope"))
+    .execute(pool)
+    .await
+    .expect("persist an outbox row written before stream-subject admission existed");
+    event_id
 }
 
 struct CountingHandler {
@@ -153,7 +179,7 @@ async fn mr023_serve_zero_lost_zero_ghost_under_crash() {
     let ids: Vec<String> = (0..N).map(|i| format!("mr023-evt-{tag}-{i}")).collect();
 
     for (i, id) in ids.iter().enumerate() {
-        let env = envelope(id, &format!("myelin://acme/issues/{i}"), &agg);
+        let env = envelope(id, &format!("myelin://acme/issue/issue/PROJ-{i}"), &agg);
         let st = state_table.clone();
         let agg_c = agg.clone();
         let state_id = format!("state-{i}");
@@ -195,23 +221,43 @@ async fn mr023_serve_zero_lost_zero_ghost_under_crash() {
         "0 lost: the crash recorded NO marks → every committed row stays claimable"
     );
 
+    let poison_id = persist_legacy_poison(&pool, &tag).await;
+
     let published = runtime.drain_relay_to_empty().await.expect("restart drain");
+    let quarantined: Vec<(String, String)> =
+        sqlx::query_as("SELECT event_id, reason_code FROM outbox_quarantine ORDER BY event_id")
+            .fetch_all(&pool)
+            .await
+            .expect("read restart quarantine outcomes");
     assert_eq!(
         published, N,
-        "the restarted relay re-claims all N unsent rows"
+        "the restarted relay re-claims all N unsent rows; quarantine={quarantined:?}"
     );
+    let healthy_depth: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE aggregate = $1 AND published_at IS NULL",
+    )
+    .bind(&agg)
+    .fetch_one(&pool)
+    .await
+    .expect("count healthy rows after restart drain");
     assert_eq!(
-        runtime.outbox_depth().await.expect("final depth"),
-        0,
-        "outbox-depth drains to 0 (every committed row recorded sent)"
+        healthy_depth, 0,
+        "the historical poison row cannot wedge healthy user events after restart"
     );
+    let quarantine_reason: String =
+        sqlx::query_scalar("SELECT reason_code FROM outbox_quarantine WHERE event_id = $1")
+            .bind(&poison_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the poison row is durably quarantined for operators");
+    assert_eq!(quarantine_reason, "invalid_stream_subject");
 
     let handler = CountingHandler {
         runs: std::sync::atomic::AtomicU32::new(0),
     };
     let spec = ConsumerSpec::new(
         ConsumerName(format!("indexer-{tag}")),
-        &["myelin://acme/issues/"],
+        &["myelin://acme/issue/"],
     );
     let consumer = runtime.consumer(spec, handler).expect("build consumer");
     let _ = runtime.pump_consumer(&consumer, 16);
@@ -240,7 +286,8 @@ async fn mr023_serve_zero_lost_zero_ghost_under_crash() {
     println!(
         "[MR-023] PASS  test=SERVE-0-LOST-0-GHOST-UNDER-CRASH  committed={N} delivered={N} \
          handler_runs={N} lost=0 ghost=0  crash_window={crash_after} (re-published+deduped)  \
-         outbox_depth=0  backend=real-PG+real-NATS-JetStream via EventsRuntime"
+         healthy_outbox_depth=0 poison_row=quarantined  \
+         backend=real-PG+real-NATS-JetStream via EventsRuntime"
     );
 
     sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
@@ -288,7 +335,7 @@ async fn mr023_durable_dedup_survives_restart() {
         );
     }
 
-    let subject = "myelin://acme/issues/issue/PROJ-1";
+    let subject = "myelin://acme/issue/issue/PROJ-1";
     let evt = envelope(&format!("mr023-c-{tag}"), subject, "issue:PROJ-1");
     let durable_name = ConsumerName(format!("consumer-{tag}"));
     let msg = Message {
@@ -302,7 +349,7 @@ async fn mr023_durable_dedup_survives_restart() {
             rt.clone(),
         )));
         let c = myelin_events::consume(
-            ConsumerSpec::new(durable_name.clone(), &["myelin://acme/issues/"]),
+            ConsumerSpec::new(durable_name.clone(), &["myelin://acme/issue/"]),
             CountingHandler {
                 runs: std::sync::atomic::AtomicU32::new(0),
             },
@@ -316,7 +363,7 @@ async fn mr023_durable_dedup_survives_restart() {
     assert_eq!(runs_first, 1, "consumer 1 ran the handler once");
 
     let c2 = myelin_events::consume(
-        ConsumerSpec::new(durable_name.clone(), &["myelin://acme/issues/"]),
+        ConsumerSpec::new(durable_name.clone(), &["myelin://acme/issue/"]),
         CountingHandler {
             runs: std::sync::atomic::AtomicU32::new(0),
         },
@@ -390,7 +437,7 @@ async fn mr023_co_commit_is_emit_iff_committed_atomic() {
     let agg = format!("issue:ATOM-{tag}");
 
     let abort_id = format!("mr023-atom-abort-{tag}");
-    let abort_env = envelope(&abort_id, "myelin://acme/issues/abort", &agg);
+    let abort_env = envelope(&abort_id, "myelin://acme/issue/issue/PROJ-ABORT", &agg);
     let st = state_table.clone();
     let agg_c = agg.clone();
     let res: Result<(), PgError> = runtime
@@ -428,7 +475,7 @@ async fn mr023_co_commit_is_emit_iff_committed_atomic() {
     );
 
     let ok_id = format!("mr023-atom-ok-{tag}");
-    let ok_env = envelope(&ok_id, "myelin://acme/issues/ok", &agg);
+    let ok_env = envelope(&ok_id, "myelin://acme/issue/issue/PROJ-OK", &agg);
     let st2 = state_table.clone();
     let agg_c2 = agg.clone();
     runtime

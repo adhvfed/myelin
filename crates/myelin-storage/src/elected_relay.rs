@@ -79,14 +79,14 @@ impl ElectedPgRelay {
         }
 
         let relay = PgRelay::new(self.pool.clone());
-        let published = relay
+        let progress = relay
             .relay_once_scoped_in_tx(&mut tx, publisher, batch, &self.validation)
             .await
             .map_err(ElectedRelayError::Relay)?;
         tx.commit()
             .await
             .map_err(|e| ElectedRelayError::Relay(PgError::Query(e.to_string())))?;
-        Ok(ElectedDrainOutcome::Published(published))
+        Ok(ElectedDrainOutcome::Published(progress.published))
     }
 }
 

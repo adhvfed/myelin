@@ -16,6 +16,18 @@ const SEQ_CONTENTION_RETRIES: u32 = 128;
 
 pub const MAX_CONFIGURED_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayBatchProgress {
+    pub published: usize,
+    pub quarantined: usize,
+}
+
+impl RelayBatchProgress {
+    pub fn made_progress(self) -> bool {
+        self.published > 0 || self.quarantined > 0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayValidationConfig {
     region: Region,
@@ -650,21 +662,21 @@ impl PgRelay {
         publisher: &P,
         batch: i64,
         config: &RelayValidationConfig,
-    ) -> Result<usize, PgError> {
+    ) -> Result<RelayBatchProgress, PgError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
 
-        let published = self
+        let progress = self
             .relay_once_scoped_in_tx(&mut tx, publisher, batch, config)
             .await?;
 
         tx.commit()
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(published)
+        Ok(progress)
     }
 
     pub(crate) async fn relay_once_scoped_in_tx<P: EventPublisher + ?Sized>(
@@ -673,7 +685,7 @@ impl PgRelay {
         publisher: &P,
         batch: i64,
         config: &RelayValidationConfig,
-    ) -> Result<usize, PgError> {
+    ) -> Result<RelayBatchProgress, PgError> {
         let rows = sqlx::query(
             "SELECT o.event_id, o.aggregate, o.seq, o.subject, o.envelope FROM outbox o \
              WHERE o.published_at IS NULL \
@@ -693,7 +705,7 @@ impl PgRelay {
         .map_err(|e| PgError::Query(e.to_string()))?;
 
         let mut blocked_aggregates = HashSet::new();
-        let mut published = 0usize;
+        let mut progress = RelayBatchProgress::default();
         for row in rows {
             let claimed = ClaimedRow {
                 event_id: row.get("event_id"),
@@ -709,7 +721,7 @@ impl PgRelay {
             let envelope = match validate_claimed_row(&claimed, config) {
                 Ok(envelope) => envelope,
                 Err(reason) => {
-                    sqlx::query(
+                    let quarantined = sqlx::query(
                         "INSERT INTO outbox_quarantine \
                          (event_id, aggregate, seq, reason_code, reason_detail) \
                          VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
@@ -722,6 +734,9 @@ impl PgRelay {
                     .execute(&mut **tx)
                     .await
                     .map_err(|e| PgError::Query(e.to_string()))?;
+                    if quarantined.rows_affected() > 0 {
+                        progress.quarantined += 1;
+                    }
                     blocked_aggregates.insert(claimed.aggregate);
                     continue;
                 }
@@ -736,10 +751,10 @@ impl PgRelay {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| PgError::Query(e.to_string()))?;
-            published += 1;
+            progress.published += 1;
         }
 
-        Ok(published)
+        Ok(progress)
     }
 
     pub async fn drain_once_dead_letter<B: BusTransport + ?Sized>(

@@ -346,7 +346,7 @@ fn validate_consumer_config(
 
 fn event_subject(subject_root: &str, envelope: &EventEnvelope) -> Result<String, TransportError> {
     let structured = crate::partition::StreamSubject::of(envelope)
-        .map_err(|_| TransportError("invalid event routing subject".into()))?;
+        .map_err(|error| TransportError(format!("invalid event routing subject: {error}")))?;
     let subject = format!("{subject_root}.{}", structured.to_subject());
     if subject.len() > crate::partition::MAX_STREAM_SUBJECT_BYTES {
         return Err(TransportError(
@@ -594,7 +594,11 @@ mod routing_tests {
         invalid.aggregate = AggregateKey("issue:*".into());
         assert_eq!(
             event_subject("myelin.no-osl", &invalid),
-            Err(TransportError("invalid event routing subject".into()))
+            Err(TransportError(
+                "invalid event routing subject: aggregate_id token `*` is empty or contains a \
+                 subject delimiter, wildcard, or whitespace"
+                    .into(),
+            ))
         );
     }
 

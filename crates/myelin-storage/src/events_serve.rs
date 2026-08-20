@@ -14,16 +14,18 @@ use crate::events_durable::{
     DurableBusErasureBacking, DurableDeadLetterBacking, DurableDedupBacking,
 };
 use crate::pg::PgError;
-use crate::pgrelay::PgRelay;
+use crate::pgrelay::{PgRelay, RelayValidationConfig, RelayValidationConfigError};
 use crate::provider::SubstrateProvider;
 use crate::tenant_tx::{with_tenant_tx, TxScope};
 
 pub const DEFAULT_DRAIN_BATCH: i64 = 256;
+pub const DEFAULT_RELAY_MAX_ENVELOPE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum EventsServeError {
     Transport(TransportError),
     Pg(PgError),
+    RelayConfiguration(RelayValidationConfigError),
 }
 
 impl core::fmt::Display for EventsServeError {
@@ -31,6 +33,9 @@ impl core::fmt::Display for EventsServeError {
         match self {
             EventsServeError::Transport(e) => write!(f, "events serve transport error: {}", e.0),
             EventsServeError::Pg(e) => write!(f, "events serve backend error: {e}"),
+            EventsServeError::RelayConfiguration(e) => {
+                write!(f, "events serve relay configuration error: {e}")
+            }
         }
     }
 }
@@ -49,12 +54,19 @@ impl From<PgError> for EventsServeError {
     }
 }
 
+impl From<RelayValidationConfigError> for EventsServeError {
+    fn from(error: RelayValidationConfigError) -> Self {
+        EventsServeError::RelayConfiguration(error)
+    }
+}
+
 pub struct EventsRuntime {
     pool: PgPool,
     region: String,
     subject_root: String,
     consumer_name: String,
     relay: PgRelay,
+    relay_validation: RelayValidationConfig,
     bus: NatsJetStreamBus,
     dedup_backing: DurableDedupBacking,
     dead_letter_backing: DurableDeadLetterBacking,
@@ -91,6 +103,10 @@ impl EventsRuntime {
         consumer_name: &str,
         rt: tokio::runtime::Handle,
     ) -> Result<EventsRuntime, EventsServeError> {
+        let relay_validation = RelayValidationConfig::new(
+            Region(region.to_string()),
+            DEFAULT_RELAY_MAX_ENVELOPE_BYTES,
+        )?;
         let bus = NatsJetStreamBus::connect(
             nats_url,
             stream_name,
@@ -108,6 +124,7 @@ impl EventsRuntime {
             subject_root: subject_root.to_string(),
             consumer_name: consumer_name.to_string(),
             relay,
+            relay_validation,
             bus,
             dedup_backing,
             dead_letter_backing,
@@ -159,18 +176,22 @@ impl EventsRuntime {
     }
 
     pub async fn drain_relay(&self, batch: i64) -> Result<usize, PgError> {
-        self.relay.relay_once(&self.bus, batch).await
+        Ok(self
+            .relay
+            .relay_once_scoped(&self.bus, batch, &self.relay_validation)
+            .await?
+            .published)
     }
 
     pub async fn drain_relay_to_empty(&self) -> Result<usize, PgError> {
         let mut total = 0usize;
         loop {
-            let n = self
+            let progress = self
                 .relay
-                .relay_once(&self.bus, DEFAULT_DRAIN_BATCH)
+                .relay_once_scoped(&self.bus, DEFAULT_DRAIN_BATCH, &self.relay_validation)
                 .await?;
-            total += n;
-            if n == 0 {
+            total += progress.published;
+            if !progress.made_progress() {
                 break;
             }
         }
