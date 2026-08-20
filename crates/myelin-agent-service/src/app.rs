@@ -42,7 +42,6 @@ fn agent_service_migrations() -> Migrations {
         ddl.push('\n');
         ddl.push_str(&rls_scope_sql(table));
         ddl.push(';');
-        let ddl: &'static str = Box::leak(ddl.into_boxed_str());
         Migration::phased(id, ddl, MigrationPhase::Plain, table)
     }))
 }
@@ -240,7 +239,7 @@ mod tests {
             5,
             "the AppSpec wires the AG-P2 five-table data model"
         );
-        let ids: Vec<&str> = spec.migrations.0.iter().map(|m| m.id).collect();
+        let ids: Vec<&str> = spec.migrations.0.iter().map(|m| m.id.as_ref()).collect();
         assert_eq!(
             ids,
             vec![

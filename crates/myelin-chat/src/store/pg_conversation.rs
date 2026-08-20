@@ -478,45 +478,30 @@ fn storage(context: &'static str) -> impl FnOnce(sqlx::Error) -> ConversationErr
 pub fn chat_migrations() -> myelin_substrate::Migrations {
     use myelin_substrate::{Migration, Migrations};
 
-    let conversation = Box::leak(
-        format!(
-            "{CONVERSATION_TABLE_DDL}\nSELECT myelin_make_tenant_scoped('{CONVERSATION_TABLE}');"
-        )
-        .into_boxed_str(),
+    let conversation = format!(
+        "{CONVERSATION_TABLE_DDL}\nSELECT myelin_make_tenant_scoped('{CONVERSATION_TABLE}');"
     );
     let message_ddl = super::pg::MESSAGE_TABLE_DDL.replace("{table}", MESSAGE_TABLE);
-    let message = Box::leak(
-        format!("{message_ddl}\nSELECT myelin_make_tenant_scoped('{MESSAGE_TABLE}');")
-            .into_boxed_str(),
-    );
-    let conversation_client_nonce = Box::leak(
-        format!(
-            "ALTER TABLE {CONVERSATION_TABLE} ADD COLUMN IF NOT EXISTS client_nonce text;
+    let message = format!("{message_ddl}\nSELECT myelin_make_tenant_scoped('{MESSAGE_TABLE}');");
+    let conversation_client_nonce = format!(
+        "ALTER TABLE {CONVERSATION_TABLE} ADD COLUMN IF NOT EXISTS client_nonce text;
              CREATE UNIQUE INDEX IF NOT EXISTS {CONVERSATION_CLIENT_NONCE_INDEX}
                ON {CONVERSATION_TABLE} (tenant_id, region, client_nonce)
                WHERE client_nonce IS NOT NULL;"
-        )
-        .into_boxed_str(),
     );
-    let conversation_project_recent = Box::leak(
-        format!(
-            "CREATE INDEX IF NOT EXISTS {CONVERSATION_PROJECT_RECENT_INDEX}
+    let conversation_project_recent = format!(
+        "CREATE INDEX IF NOT EXISTS {CONVERSATION_PROJECT_RECENT_INDEX}
                ON {CONVERSATION_TABLE}
                  (tenant_id, region, parent_project, conversation_id DESC)
                WHERE kind = 'channel_public' AND NOT archived AND acl_zookie IS NOT NULL;"
-        )
-        .into_boxed_str(),
     );
-    let conversation_project_topic = Box::leak(
-        format!(
-            "ALTER TABLE {CONVERSATION_TABLE}
+    let conversation_project_topic = format!(
+        "ALTER TABLE {CONVERSATION_TABLE}
                DROP CONSTRAINT IF EXISTS chat_conversation_tenant_id_region_name_topic_key;
              CREATE UNIQUE INDEX IF NOT EXISTS {CONVERSATION_PROJECT_TOPIC_INDEX}
                ON {CONVERSATION_TABLE}
                  (tenant_id, region, parent_project, name, topic)
                WHERE parent_project IS NOT NULL;"
-        )
-        .into_boxed_str(),
     );
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),

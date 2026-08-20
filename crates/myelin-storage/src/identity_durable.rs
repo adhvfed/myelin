@@ -997,7 +997,7 @@ mod recent_list_migration_tests {
         let migration = migrations.0.first().expect("the recency index migration");
 
         assert_eq!(migration.phase, MigrationPhase::Expand);
-        assert_eq!(migration.table, Some(table));
+        assert_eq!(migration.table.as_deref(), Some(table));
         assert!(ddl.contains("CREATE INDEX CONCURRENTLY IF NOT EXISTS"));
         assert!(ddl.contains(ordered_columns));
     }

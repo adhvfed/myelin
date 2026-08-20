@@ -190,7 +190,7 @@ mod tests {
         );
         for m in &migrations.0 {
             assert!(
-                !is_destructive(m.ddl),
+                !is_destructive(m.ddl.as_ref()),
                 "migration {} must be forward-only (no DROP)",
                 m.id
             );

@@ -6,7 +6,7 @@ pub use myelin_storage::migration::{
 
 #[derive(Default)]
 pub struct MigrationRunner {
-    applied: Vec<&'static str>,
+    applied: Vec<String>,
 }
 
 impl MigrationRunner {
@@ -22,15 +22,15 @@ impl MigrationRunner {
         hot_tables: &HotTables,
     ) -> Result<(), ServeError> {
         for m in &migrations.0 {
-            if is_destructive(m.ddl) {
+            if is_destructive(m.ddl.as_ref()) {
                 return Err(ServeError(format!(
                     "migration {} is destructive (DROP) - forward-only migrations only; \
                      a rollback is a NEW forward migration, never a down (§9.1)",
                     m.id
                 )));
             }
-            if let Some(table) = m.table {
-                if hot_tables.is_hot(table) && is_blocking_alter(m.ddl) {
+            if let Some(table) = m.table.as_deref() {
+                if hot_tables.is_hot(table) && is_blocking_alter(m.ddl.as_ref()) {
                     return Err(ServeError(format!(
                         "migration {} takes a blocking ALTER on the declared-HOT table `{}` \
                          (§9.4) - a hot-table change must be expand→backfill→contract \
@@ -40,12 +40,12 @@ impl MigrationRunner {
                     )));
                 }
             }
-            self.applied.push(m.id);
+            self.applied.push(m.id.to_string());
         }
         Ok(())
     }
 
-    pub fn applied(&self) -> &[&'static str] {
+    pub fn applied(&self) -> &[String] {
         &self.applied
     }
 }

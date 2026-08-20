@@ -928,17 +928,11 @@ fn storage(context: &'static str) -> impl FnOnce(sqlx::Error) -> KnowledgePageEr
 pub fn knowledge_page_migrations() -> myelin_substrate::Migrations {
     use myelin_substrate::{Migration, MigrationPhase, Migrations};
 
-    let page = Box::leak(
-        format!(
-            "{KNOWLEDGE_PAGE_DDL}\nSELECT myelin_make_tenant_scoped('{KNOWLEDGE_PAGE_TABLE}');"
-        )
-        .into_boxed_str(),
+    let page = format!(
+        "{KNOWLEDGE_PAGE_DDL}\nSELECT myelin_make_tenant_scoped('{KNOWLEDGE_PAGE_TABLE}');"
     );
-    let block = Box::leak(
-        format!(
-            "{KNOWLEDGE_BLOCK_DDL}\nSELECT myelin_make_tenant_scoped('{KNOWLEDGE_BLOCK_TABLE}');"
-        )
-        .into_boxed_str(),
+    let block = format!(
+        "{KNOWLEDGE_BLOCK_DDL}\nSELECT myelin_make_tenant_scoped('{KNOWLEDGE_BLOCK_TABLE}');"
     );
     Migrations::of([
         Migration::plain_on("knowledge_web_0001_page", page, KNOWLEDGE_PAGE_TABLE),

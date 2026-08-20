@@ -92,7 +92,6 @@ pub fn edge_table_migrations() -> Migrations {
     ddl.push('\n');
     ddl.push_str(MAKE_EDGE_TENANT_SCOPED_DDL);
     ddl.push(';');
-    let ddl: &'static str = Box::leak(ddl.into_boxed_str());
     Migrations::of([
         Migration::phased(EDGE_MIGRATION_ID, ddl, MigrationPhase::Plain, EDGE_TABLE),
         Migration::phased(
@@ -247,14 +246,14 @@ mod tests {
         assert_eq!(migrations.0.len(), 6);
         let m = &migrations.0[0];
         assert_eq!(m.id, EDGE_MIGRATION_ID);
-        assert_eq!(m.table, Some(EDGE_TABLE));
+        assert_eq!(m.table.as_deref(), Some(EDGE_TABLE));
         assert_eq!(
             m.phase,
             MigrationPhase::Plain,
             "a CREATE TABLE is a plain forward migration"
         );
         assert!(
-            edge_ddl_is_forward_only(m.ddl),
+            edge_ddl_is_forward_only(m.ddl.as_ref()),
             "the edge migration is forward-only (no DROP)"
         );
         assert!(
@@ -274,11 +273,11 @@ mod tests {
         );
         let keyset = &migrations.0[1];
         assert_eq!(keyset.id, EDGE_INBOUND_KEYSET_MIGRATION_ID);
-        assert_eq!(keyset.table, Some(EDGE_TABLE));
+        assert_eq!(keyset.table.as_deref(), Some(EDGE_TABLE));
         assert_eq!(keyset.phase, MigrationPhase::Expand);
         assert_eq!(keyset.ddl, CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL);
         assert!(keyset.ddl.contains("CREATE INDEX CONCURRENTLY"));
-        assert!(edge_ddl_is_forward_only(keyset.ddl));
+        assert!(edge_ddl_is_forward_only(keyset.ddl.as_ref()));
 
         let identity_index = &migrations.0[2];
         assert_eq!(identity_index.id, EDGE_REGION_IDENTITY_INDEX_MIGRATION_ID);
@@ -303,7 +302,7 @@ mod tests {
         assert!(contract
             .ddl
             .contains("UNIQUE USING INDEX edge_region_semantics"));
-        assert!(edge_ddl_is_forward_only(contract.ddl));
+        assert!(edge_ddl_is_forward_only(contract.ddl.as_ref()));
 
         let outbound_keyset = &migrations.0[5];
         assert_eq!(outbound_keyset.id, EDGE_OUTBOUND_KEYSET_MIGRATION_ID);

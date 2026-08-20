@@ -36,10 +36,10 @@ pub fn migration_checksum_collisions<'a>(
     let mut collisions = Vec::new();
     for (set_name, migrations) in sets {
         for migration in &migrations.0 {
-            let checksum = ddl_checksum(migration.ddl);
-            match first_by_id.get(migration.id) {
+            let checksum = ddl_checksum(migration.ddl.as_ref());
+            match first_by_id.get(migration.id.as_ref()) {
                 None => {
-                    first_by_id.insert(migration.id, (set_name, checksum));
+                    first_by_id.insert(migration.id.as_ref(), (set_name, checksum));
                 }
                 Some((_first_set, first_checksum)) if *first_checksum == checksum => {}
                 Some((first_set, first_checksum)) => {
@@ -87,15 +87,15 @@ impl PgMigrator {
         hot_tables: &HotTables,
     ) -> Result<(), PgError> {
         for m in &migrations.0 {
-            if is_destructive(m.ddl) {
+            if is_destructive(m.ddl.as_ref()) {
                 return Err(PgError::Migrate(format!(
                     "migration {} is destructive (DROP) - forward-only migrations only; a rollback \
                      is a NEW forward migration, never a down (§9.1)",
                     m.id
                 )));
             }
-            if let Some(table) = m.table {
-                if hot_tables.is_hot(table) && is_blocking_alter(m.ddl) {
+            if let Some(table) = m.table.as_deref() {
+                if hot_tables.is_hot(table) && is_blocking_alter(m.ddl.as_ref()) {
                     return Err(PgError::Migrate(format!(
                         "migration {} takes a blocking ALTER on the declared-HOT table `{}` - a \
                          hot-table change must be expand→backfill→contract, never one blocking \
@@ -117,7 +117,7 @@ impl PgMigrator {
             .map_err(|e| PgError::Migrate(format!("create myelin_applied_migration: {e}")))?;
 
         for m in &migrations.0 {
-            if is_destructive(m.ddl) {
+            if is_destructive(m.ddl.as_ref()) {
                 return Err(PgError::Migrate(format!(
                     "migration {} is destructive (DROP) - forward-only migrations only; a rollback \
                      is a NEW forward migration, never a down (storage §3.1)",
@@ -125,21 +125,21 @@ impl PgMigrator {
                 )));
             }
 
-            let expected_checksum = ddl_checksum(m.ddl);
+            let expected_checksum = ddl_checksum(m.ddl.as_ref());
             let recorded_checksum: Option<String> =
                 sqlx::query_scalar("SELECT checksum FROM myelin_applied_migration WHERE id = $1")
-                    .bind(m.id)
+                    .bind(m.id.as_ref())
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| {
                         PgError::Migrate(format!("check applied migration {}: {e}", m.id))
                     })?;
             if let Some(recorded_checksum) = recorded_checksum {
-                verify_recorded_checksum(m.id, &recorded_checksum, &expected_checksum)?;
+                verify_recorded_checksum(m.id.as_ref(), &recorded_checksum, &expected_checksum)?;
                 continue;
             }
 
-            conn.execute(m.ddl)
+            conn.execute(m.ddl.as_ref())
                 .await
                 .map_err(|e| PgError::Migrate(format!("apply migration {}: {e}", m.id)))?;
 
@@ -147,7 +147,7 @@ impl PgMigrator {
                 "INSERT INTO myelin_applied_migration (id, checksum) VALUES ($1, $2) \
                  ON CONFLICT (id) DO NOTHING",
             )
-            .bind(m.id)
+            .bind(m.id.as_ref())
             .bind(&expected_checksum)
             .execute(&mut *conn)
             .await
@@ -183,7 +183,7 @@ impl PgMigrator {
         for migration in &migrations.0 {
             let recorded_checksum: Option<String> =
                 sqlx::query_scalar("SELECT checksum FROM myelin_applied_migration WHERE id = $1")
-                    .bind(migration.id)
+                    .bind(migration.id.as_ref())
                     .fetch_optional(pool)
                     .await
                     .map_err(|e| {
@@ -193,8 +193,12 @@ impl PgMigrator {
                         ))
                     })?;
             if let Some(recorded_checksum) = recorded_checksum {
-                let expected_checksum = ddl_checksum(migration.ddl);
-                verify_recorded_checksum(migration.id, &recorded_checksum, &expected_checksum)?;
+                let expected_checksum = ddl_checksum(migration.ddl.as_ref());
+                verify_recorded_checksum(
+                    migration.id.as_ref(),
+                    &recorded_checksum,
+                    &expected_checksum,
+                )?;
             }
         }
         Ok(())

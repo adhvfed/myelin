@@ -88,10 +88,11 @@ async fn columns(p: &PgPool, schema: &str, table: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
-    let agg_ids: Vec<&str> = all_durable_migrations().0.iter().map(|m| m.id).collect();
+    let aggregate = all_durable_migrations();
+    let agg_ids: Vec<&str> = aggregate.0.iter().map(|m| m.id.as_ref()).collect();
     for m in reserve_settle_durable_migrations().0.iter() {
         assert!(
-            agg_ids.contains(&m.id),
+            agg_ids.contains(&m.id.as_ref()),
             "reserve_settle migration {} must be in all_durable_migrations()",
             m.id
         );
@@ -114,12 +115,12 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         .expect("create the per-pid schema");
 
     for m in reserve_settle_durable_migrations().0.iter() {
-        p.execute(m.ddl)
+        p.execute(m.ddl.as_ref())
             .await
             .unwrap_or_else(|e| panic!("apply Storage migration {}: {e}", m.id));
     }
     for m in ci_durable_migrations().0.iter() {
-        p.execute(m.ddl)
+        p.execute(m.ddl.as_ref())
             .await
             .unwrap_or_else(|e| panic!("apply CI migration {}: {e}", m.id));
     }

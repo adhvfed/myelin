@@ -78,7 +78,7 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
 
     for migration in ci_controlplane_migrations().0.iter().filter(|migration| {
         matches!(
-            migration.id,
+            migration.id.as_ref(),
             "ci_0001_ci_run"
                 | "ci_0001e_ci_run_source_ref"
                 | "ci_0002_ci_job"
@@ -88,7 +88,7 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         )
     }) {
         admin
-            .execute(migration.ddl)
+            .execute(migration.ddl.as_ref())
             .await
             .unwrap_or_else(|error| panic!("apply {}: {error}", migration.id));
     }

@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(
             e,
             MigrationError::Destructive {
-                id: "0006_drop_run"
+                id: "0006_drop_run".into()
             }
         );
         assert!(e.to_string().contains("forward-only"), "loud reason: {e}");
@@ -239,8 +239,8 @@ mod tests {
         assert_eq!(
             e,
             MigrationError::BlockingAlterOnHotTable {
-                id: "0006_run_add_notnull",
-                table: "agent_run"
+                id: "0006_run_add_notnull".into(),
+                table: "agent_run".into()
             }
         );
     }

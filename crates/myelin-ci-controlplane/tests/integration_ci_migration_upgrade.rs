@@ -68,7 +68,7 @@ fn old_sequence() -> Migrations {
         ci_controlplane_migrations()
             .0
             .into_iter()
-            .filter(|m| !NEW_SUB_MIGRATION_IDS.contains(&m.id))
+            .filter(|m| !NEW_SUB_MIGRATION_IDS.contains(&m.id.as_ref()))
             .collect::<Vec<_>>(),
     )
 }

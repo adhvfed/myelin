@@ -485,7 +485,7 @@ mod tests {
         let migrations = knowledge_service_migrations();
         for m in &migrations.0 {
             assert!(
-                !myelin_substrate::is_destructive(m.ddl),
+                !myelin_substrate::is_destructive(m.ddl.as_ref()),
                 "migration {} is forward-only (no backward/destructive DDL)",
                 m.id
             );

@@ -87,7 +87,7 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .chain(ci_controlplane_migrations().0.iter())
     {
         admin
-            .execute(migration.ddl)
+            .execute(migration.ddl.as_ref())
             .await
             .unwrap_or_else(|error| panic!("apply {}: {error}", migration.id));
     }

@@ -36,7 +36,7 @@ impl WriteLoad {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepLockMeasure {
-    pub id: &'static str,
+    pub id: String,
     pub lock_class: LockClass,
     pub lock_wait_ms: u64,
     pub caused_downtime: bool,
@@ -84,13 +84,13 @@ pub fn lock_cost_ms(ddl: &str, phase: MigrationPhase, rows: u64) -> (u64, LockCl
 pub enum MigrationLoadFailure {
     RunnerRefused(MigrationError),
     LockBudgetExceeded {
-        id: &'static str,
+        id: String,
         lock_class: LockClass,
         observed_p99_ms: u64,
         budget_ms: u64,
     },
     DowntimeIncurred {
-        id: &'static str,
+        id: String,
         downtime_ms: u64,
     },
 }
@@ -202,14 +202,14 @@ impl MigrationUnderLoad {
         let mut steps: Vec<StepLockMeasure> = Vec::with_capacity(migrations.0.len());
         for m in &migrations.0 {
             debug_assert!(
-                !is_destructive(m.ddl),
+                !is_destructive(m.ddl.as_ref()),
                 "a destructive migration must be refused before measure"
             );
 
-            let (lock_wait_ms, lock_class) = lock_cost_ms(m.ddl, m.phase, load.rows);
+            let (lock_wait_ms, lock_class) = lock_cost_ms(m.ddl.as_ref(), m.phase, load.rows);
             let caused_downtime = lock_class.blocks_writers();
             steps.push(StepLockMeasure {
-                id: m.id,
+                id: m.id.to_string(),
                 lock_class,
                 lock_wait_ms,
                 caused_downtime,
@@ -227,7 +227,7 @@ impl MigrationUnderLoad {
                 .find(|s| s.caused_downtime)
                 .expect("downtime > 0 ⇒ an offline step");
             return MigrationLoadVerdict::Red(MigrationLoadFailure::DowntimeIncurred {
-                id: offline.id,
+                id: offline.id.clone(),
                 downtime_ms,
             });
         }
@@ -239,7 +239,7 @@ impl MigrationUnderLoad {
                 .max_by_key(|s| s.lock_wait_ms)
                 .expect("a non-empty migration has a worst step");
             return MigrationLoadVerdict::Red(MigrationLoadFailure::LockBudgetExceeded {
-                id: worst.id,
+                id: worst.id.clone(),
                 lock_class: worst.lock_class,
                 observed_p99_ms: p99,
                 budget_ms: budget.lock_wait_p99_max_ms,

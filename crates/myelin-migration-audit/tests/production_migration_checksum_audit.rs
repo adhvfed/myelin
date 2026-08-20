@@ -17,7 +17,10 @@ fn production_catalog_has_no_incompatible_duplicate_migration_ids() {
     let mut owners: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (set_name, migrations) in &sets {
         for migration in &migrations.0 {
-            owners.entry(migration.id).or_default().push(set_name);
+            owners
+                .entry(migration.id.as_ref())
+                .or_default()
+                .push(set_name);
         }
     }
     let exact_reuse: Vec<_> = owners
@@ -62,7 +65,7 @@ async fn self_tenant_applied_rows_match_every_authoritative_production_ddl() {
     let mut expected = BTreeMap::new();
     for (_, migrations) in &sets {
         for migration in &migrations.0 {
-            expected.insert(migration.id, ddl_checksum(migration.ddl));
+            expected.insert(migration.id.as_ref(), ddl_checksum(migration.ddl.as_ref()));
         }
     }
     let historical_only: BTreeSet<_> = applied

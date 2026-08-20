@@ -8,7 +8,7 @@ mod common;
 
 const N: usize = 12;
 
-fn concurrent_migration_set() -> (Migrations, Vec<&'static str>) {
+fn concurrent_migration_set() -> (Migrations, Vec<String>) {
     let suffix = format!(
         "{}_{}",
         std::process::id(),
@@ -21,25 +21,22 @@ fn concurrent_migration_set() -> (Migrations, Vec<&'static str>) {
     let mut migrations = Vec::new();
     let mut ids = Vec::new();
     for n in 0..4u32 {
-        let id: &'static str = Box::leak(format!("racetest_{suffix}_{n:04}").into_boxed_str());
-        let table: &'static str = Box::leak(format!("racetest_{suffix}_t{n}").into_boxed_str());
-        let ddl: &'static str = Box::leak(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {table} (\
+        let id = format!("racetest_{suffix}_{n:04}");
+        let table = format!("racetest_{suffix}_t{n}");
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {table} (\
                     id text PRIMARY KEY, tenant_id text NOT NULL, body text NOT NULL);\
                  CREATE INDEX IF NOT EXISTS {table}_tenant_idx ON {table} (tenant_id);"
-            )
-            .into_boxed_str(),
         );
-        migrations.push(Migration::plain(id, ddl));
+        migrations.push(Migration::plain(id.clone(), ddl));
         ids.push(id);
     }
     (Migrations::of(migrations), ids)
 }
 
-async fn cleanup(pool: &PgPool, ids: &[&'static str], migrations: &Migrations) {
+async fn cleanup(pool: &PgPool, ids: &[String], migrations: &Migrations) {
     for m in &migrations.0 {
-        if let Some(table) = table_name_of(m.ddl) {
+        if let Some(table) = table_name_of(m.ddl.as_ref()) {
             let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {table}"))
                 .execute(pool)
                 .await;
@@ -47,7 +44,7 @@ async fn cleanup(pool: &PgPool, ids: &[&'static str], migrations: &Migrations) {
     }
     for id in ids {
         let _ = sqlx::query("DELETE FROM myelin_applied_migration WHERE id = $1")
-            .bind(*id)
+            .bind(id)
             .execute(pool)
             .await;
     }
@@ -103,7 +100,7 @@ async fn concurrent_migrate_is_race_safe_and_applied_once() {
             }
 
             for m in &migrations.0 {
-                let table = table_name_of(m.ddl).expect("ddl names a table");
+                let table = table_name_of(m.ddl.as_ref()).expect("ddl names a table");
                 let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                     .bind(table)
                     .fetch_one(&pool)

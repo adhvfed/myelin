@@ -43,9 +43,9 @@ mod tests {
         );
         let m = &migrations.0[0];
         assert_eq!(m.id, CONSUMER_DEDUP_MIGRATION_ID);
-        assert_eq!(m.table, Some(CONSUMER_DEDUP_TABLE));
+        assert_eq!(m.table.as_deref(), Some(CONSUMER_DEDUP_TABLE));
         assert!(
-            !myelin_substrate::is_destructive(m.ddl),
+            !myelin_substrate::is_destructive(m.ddl.as_ref()),
             "the dedup migration is forward-only (no DROP)"
         );
         assert!(

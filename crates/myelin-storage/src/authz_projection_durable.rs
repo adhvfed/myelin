@@ -129,12 +129,15 @@ mod tests {
         let ids: Vec<_> = authz_projection_durable_migrations()
             .0
             .iter()
-            .map(|migration| migration.id)
+            .map(|migration| migration.id.to_string())
             .collect();
-        assert_eq!(ids.first(), Some(&"0067_authz_projection_state"));
         assert_eq!(
-            ids.last(),
-            Some(&"0069c_authz_projection_scoped_invalidator")
+            ids.first().map(String::as_str),
+            Some("0067_authz_projection_state")
+        );
+        assert_eq!(
+            ids.last().map(String::as_str),
+            Some("0069c_authz_projection_scoped_invalidator")
         );
     }
 }

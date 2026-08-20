@@ -83,7 +83,7 @@ async fn setup_schema(schema: &str, reserve_outbox_ddl: &str) -> PgPool {
         .await
         .expect("create schema");
     for m in ci_durable_migrations().0.iter() {
-        p.execute(m.ddl)
+        p.execute(m.ddl.as_ref())
             .await
             .unwrap_or_else(|e| panic!("apply CI durable migration {}: {e}", m.id));
     }

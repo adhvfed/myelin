@@ -143,7 +143,10 @@ mod tests {
             "outbox",
         ] {
             assert!(
-                spec.migrations.0.iter().any(|migration| migration.table == Some(table)),
+                spec.migrations
+                    .0
+                    .iter()
+                    .any(|migration| migration.table.as_deref() == Some(table)),
                 "spine table `{table}` is present alongside its standalone online index/expand steps"
             );
         }

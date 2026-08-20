@@ -811,8 +811,8 @@ impl SubstrateProvider {
 mod boot_migrations_tests {
     use super::*;
 
-    fn ids(m: &Migrations) -> Vec<&'static str> {
-        m.0.iter().map(|mg| mg.id).collect()
+    fn ids(m: &Migrations) -> Vec<String> {
+        m.0.iter().map(|mg| mg.id.to_string()).collect()
     }
 
     #[test]
@@ -827,9 +827,9 @@ mod boot_migrations_tests {
                 w[1]
             );
         }
-        assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
+        assert_eq!(ids.first().unwrap(), "0010_rebac_tuple");
         assert_eq!(
-            *ids.last().unwrap(),
+            ids.last().unwrap(),
             "0123_restore_wal_offset_invariants_validate"
         );
     }
@@ -838,7 +838,7 @@ mod boot_migrations_tests {
     fn aggregate_is_exactly_the_concatenation_of_every_group() {
         let groups = durable_migration_groups();
         let agg = ids(&all_durable_migrations());
-        let mut rebuilt: Vec<&'static str> = Vec::new();
+        let mut rebuilt = Vec::new();
         for g in &groups {
             let g_ids = ids(g);
             assert!(!g_ids.is_empty(), "no group is empty");

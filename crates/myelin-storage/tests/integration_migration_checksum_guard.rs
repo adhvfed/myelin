@@ -20,11 +20,7 @@ fn unique_suffix(label: &str) -> String {
     )
 }
 
-fn leaked(value: String) -> &'static str {
-    Box::leak(value.into_boxed_str())
-}
-
-async fn cleanup(pool: &PgPool, ids: &[&str], tables: &[&str]) {
+async fn cleanup(pool: &PgPool, ids: &[String], tables: &[String]) {
     for table in tables {
         let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {table}"))
             .execute(pool)
@@ -42,11 +38,11 @@ async fn cleanup(pool: &PgPool, ids: &[&str], tables: &[&str]) {
 async fn same_id_same_ddl_is_checksum_verified_and_skipped() {
     let pool = common::admin_pool(4).await;
     let suffix = unique_suffix("checksum_same");
-    let id = leaked(format!("{suffix}_0001"));
-    let table = leaked(format!("{suffix}_table"));
-    let ddl = leaked(format!("CREATE TABLE {table} (id text PRIMARY KEY)"));
-    let migrations = Migrations::of([Migration::plain(id, ddl)]);
-    let ids = [id];
+    let id = format!("{suffix}_0001");
+    let table = format!("{suffix}_table");
+    let ddl = format!("CREATE TABLE {table} (id text PRIMARY KEY)");
+    let migrations = Migrations::of([Migration::plain(id.clone(), ddl.clone())]);
+    let ids = [id.clone()];
     let tables = [table];
     cleanup(&pool, &ids, &tables).await;
 
@@ -61,13 +57,13 @@ async fn same_id_same_ddl_is_checksum_verified_and_skipped() {
 
             let stored: String =
                 sqlx::query_scalar("SELECT checksum FROM myelin_applied_migration WHERE id = $1")
-                    .bind(id)
+                    .bind(&id)
                     .fetch_one(&pool)
                     .await
                     .expect("migration row is recorded");
-            assert_eq!(stored, ddl_checksum(ddl));
+            assert_eq!(stored, ddl_checksum(&ddl));
             assert_eq!(
-                PgMigrator::applied_count(&pool, id)
+                PgMigrator::applied_count(&pool, &id)
                     .await
                     .expect("count migration rows"),
                 1,
@@ -83,53 +79,56 @@ async fn same_id_same_ddl_is_checksum_verified_and_skipped() {
 async fn same_id_different_ddl_fails_before_any_later_migration() {
     let pool = common::admin_pool(4).await;
     let suffix = unique_suffix("checksum_drift");
-    let id = leaked(format!("{suffix}_0001"));
-    let first_table = leaked(format!("{suffix}_original"));
-    let drift_table = leaked(format!("{suffix}_drift"));
-    let later_id = leaked(format!("{suffix}_0002"));
-    let later_table = leaked(format!("{suffix}_later"));
-    let original_ddl = leaked(format!("CREATE TABLE {first_table} (id text PRIMARY KEY)"));
-    let drifted_ddl = leaked(format!("CREATE TABLE {drift_table} (id text PRIMARY KEY)"));
-    let later_ddl = leaked(format!("CREATE TABLE {later_table} (id text PRIMARY KEY)"));
-    let ids = [id, later_id];
-    let tables = [first_table, drift_table, later_table];
+    let id = format!("{suffix}_0001");
+    let first_table = format!("{suffix}_original");
+    let drift_table = format!("{suffix}_drift");
+    let later_id = format!("{suffix}_0002");
+    let later_table = format!("{suffix}_later");
+    let original_ddl = format!("CREATE TABLE {first_table} (id text PRIMARY KEY)");
+    let drifted_ddl = format!("CREATE TABLE {drift_table} (id text PRIMARY KEY)");
+    let later_ddl = format!("CREATE TABLE {later_table} (id text PRIMARY KEY)");
+    let ids = [id.clone(), later_id.clone()];
+    let tables = [first_table, drift_table.clone(), later_table.clone()];
     cleanup(&pool, &ids, &tables).await;
 
     common::with_cleanup(
         || async {
-            PgMigrator::apply(&pool, &Migrations::of([Migration::plain(id, original_ddl)]))
-                .await
-                .expect("seed the original immutable migration");
+            PgMigrator::apply(
+                &pool,
+                &Migrations::of([Migration::plain(id.clone(), original_ddl.clone())]),
+            )
+            .await
+            .expect("seed the original immutable migration");
 
             let error = PgMigrator::apply(
                 &pool,
                 &Migrations::of([
-                    Migration::plain(id, drifted_ddl),
-                    Migration::plain(later_id, later_ddl),
+                    Migration::plain(id.clone(), drifted_ddl.clone()),
+                    Migration::plain(later_id.clone(), later_ddl.clone()),
                 ]),
             )
             .await
             .expect_err("changed DDL behind an applied id must fail");
             let message = error.to_string();
             assert!(message.contains("checksum mismatch"), "{message}");
-            assert!(message.contains(id), "{message}");
-            assert!(message.contains(&ddl_checksum(original_ddl)), "{message}");
-            assert!(message.contains(&ddl_checksum(drifted_ddl)), "{message}");
+            assert!(message.contains(&id), "{message}");
+            assert!(message.contains(&ddl_checksum(&original_ddl)), "{message}");
+            assert!(message.contains(&ddl_checksum(&drifted_ddl)), "{message}");
 
             let drift_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-                .bind(drift_table)
+                .bind(&drift_table)
                 .fetch_one(&pool)
                 .await
                 .expect("probe drift table");
             let later_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-                .bind(later_table)
+                .bind(&later_table)
                 .fetch_one(&pool)
                 .await
                 .expect("probe later table");
             assert!(!drift_exists, "the drifted DDL itself never executes");
             assert!(!later_exists, "no migration after the mismatch executes");
             assert!(
-                !PgMigrator::is_applied(&pool, later_id)
+                !PgMigrator::is_applied(&pool, &later_id)
                     .await
                     .expect("probe later migration row"),
                 "the later migration is not recorded"
@@ -144,29 +143,30 @@ async fn same_id_different_ddl_fails_before_any_later_migration() {
 async fn concurrent_drift_attempts_all_fail_closed_without_running_later_ddl() {
     let pool = common::admin_pool((DRIFT_RACERS as u32) + 4).await;
     let suffix = unique_suffix("checksum_race");
-    let id = leaked(format!("{suffix}_0001"));
-    let original_table = leaked(format!("{suffix}_original"));
-    let drift_table = leaked(format!("{suffix}_drift"));
-    let later_id = leaked(format!("{suffix}_0002"));
-    let later_table = leaked(format!("{suffix}_later"));
-    let original_ddl = leaked(format!(
-        "CREATE TABLE {original_table} (id text PRIMARY KEY)"
-    ));
-    let drifted_ddl = leaked(format!("CREATE TABLE {drift_table} (id text PRIMARY KEY)"));
-    let later_ddl = leaked(format!("CREATE TABLE {later_table} (id text PRIMARY KEY)"));
-    let ids = [id, later_id];
-    let tables = [original_table, drift_table, later_table];
+    let id = format!("{suffix}_0001");
+    let original_table = format!("{suffix}_original");
+    let drift_table = format!("{suffix}_drift");
+    let later_id = format!("{suffix}_0002");
+    let later_table = format!("{suffix}_later");
+    let original_ddl = format!("CREATE TABLE {original_table} (id text PRIMARY KEY)");
+    let drifted_ddl = format!("CREATE TABLE {drift_table} (id text PRIMARY KEY)");
+    let later_ddl = format!("CREATE TABLE {later_table} (id text PRIMARY KEY)");
+    let ids = [id.clone(), later_id.clone()];
+    let tables = [original_table, drift_table.clone(), later_table.clone()];
     cleanup(&pool, &ids, &tables).await;
 
     common::with_cleanup(
         || async {
-            PgMigrator::apply(&pool, &Migrations::of([Migration::plain(id, original_ddl)]))
-                .await
-                .expect("seed the original immutable migration");
+            PgMigrator::apply(
+                &pool,
+                &Migrations::of([Migration::plain(id.clone(), original_ddl.clone())]),
+            )
+            .await
+            .expect("seed the original immutable migration");
 
             let drifted = Migrations::of([
-                Migration::plain(id, drifted_ddl),
-                Migration::plain(later_id, later_ddl),
+                Migration::plain(id.clone(), drifted_ddl.clone()),
+                Migration::plain(later_id.clone(), later_ddl.clone()),
             ]);
             let mut tasks = Vec::with_capacity(DRIFT_RACERS);
             for _ in 0..DRIFT_RACERS {
@@ -189,12 +189,12 @@ async fn concurrent_drift_attempts_all_fail_closed_without_running_later_ddl() {
 
             let stored: String =
                 sqlx::query_scalar("SELECT checksum FROM myelin_applied_migration WHERE id = $1")
-                    .bind(id)
+                    .bind(&id)
                     .fetch_one(&pool)
                     .await
                     .expect("original checksum remains recorded");
-            assert_eq!(stored, ddl_checksum(original_ddl));
-            for table in [drift_table, later_table] {
+            assert_eq!(stored, ddl_checksum(&original_ddl));
+            for table in [&drift_table, &later_table] {
                 let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
                     .bind(table)
                     .fetch_one(&pool)
@@ -203,7 +203,7 @@ async fn concurrent_drift_attempts_all_fail_closed_without_running_later_ddl() {
                 assert!(!exists, "concurrent mismatch never executes {table}");
             }
             assert!(
-                !PgMigrator::is_applied(&pool, later_id)
+                !PgMigrator::is_applied(&pool, &later_id)
                     .await
                     .expect("probe later migration row"),
                 "the later migration remains unapplied across all racers"

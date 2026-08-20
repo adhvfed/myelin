@@ -1245,6 +1245,6 @@ mod tests {
         assert!(migrations
             .0
             .iter()
-            .all(|migration| !crate::migration::is_destructive(migration.ddl)));
+            .all(|migration| !crate::migration::is_destructive(migration.ddl.as_ref())));
     }
 }

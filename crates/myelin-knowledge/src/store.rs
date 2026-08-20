@@ -321,7 +321,7 @@ mod tests {
     fn store_schema_is_forward_only() {
         for m in &knowledge_store_migrations().0 {
             assert!(
-                !is_destructive(m.ddl),
+                !is_destructive(m.ddl.as_ref()),
                 "store migration {} is forward-only (no DROP)",
                 m.id
             );
@@ -336,10 +336,10 @@ mod tests {
             .run(&knowledge_store_migrations(), &hot)
             .expect("the whole Knowledge store schema applies (no blocking ALTER on a hot table)");
         for m in &knowledge_store_migrations().0 {
-            if let Some(table) = m.table {
+            if let Some(table) = m.table.as_deref() {
                 if hot.is_hot(table) {
                     assert!(
-                        !is_blocking_alter(m.ddl),
+                        !is_blocking_alter(m.ddl.as_ref()),
                         "hot-table migration {} must be online (no blocking ALTER): {}",
                         m.id,
                         m.ddl

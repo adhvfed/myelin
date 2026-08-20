@@ -83,7 +83,7 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
         .unwrap();
 
     for migration in &spec.migrations.0 {
-        for stmt in split_sql_statements(migration.ddl) {
+        for stmt in split_sql_statements(migration.ddl.as_ref()) {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;

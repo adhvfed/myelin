@@ -79,7 +79,7 @@ fn provider_migration_runner_refuses_destructive_migration() {
         .0
     {
         assert!(
-            !is_destructive(m.ddl),
+            !is_destructive(m.ddl.as_ref()),
             "the Knowledge migration `{}` is forward-only",
             m.id
         );

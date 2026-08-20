@@ -57,7 +57,6 @@ async fn legacy_bundled_ci_0004_could_not_be_recorded_by_pg_migrator() {
     }
     legacy.push('\n');
     legacy.push_str("SELECT myelin_make_tenant_scoped('job_queue');");
-    let legacy: &'static str = Box::leak(legacy.into_boxed_str());
     let error = bootstrap
         .migrate(
             &Migrations::of([Migration::plain_on(

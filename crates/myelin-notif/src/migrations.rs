@@ -224,13 +224,13 @@ pub fn rls_scope_sql(table: &str) -> String {
 pub fn migrations() -> Migrations {
     let mut migrations = TABLE_DDLS
         .iter()
+        .copied()
         .map(|(id, create_ddl, table)| {
             let mut ddl = String::new();
             ddl.push_str(create_ddl);
             ddl.push_str(";\n");
             ddl.push_str(&rls_scope_sql(table));
             ddl.push(';');
-            let ddl: &'static str = Box::leak(ddl.into_boxed_str());
             Migration::phased(id, ddl, MigrationPhase::Plain, table)
         })
         .collect::<Vec<_>>();
@@ -246,11 +246,9 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "notif_inbox_item",
     ));
-    let attention_index_ddl: &'static str =
-        Box::leak(inbox_attention_keyset_index_ddl().into_boxed_str());
     migrations.push(Migration::phased(
         INBOX_ATTENTION_KEYSET_INDEX_MIGRATION_ID,
-        attention_index_ddl,
+        inbox_attention_keyset_index_ddl(),
         MigrationPhase::Expand,
         "notif_inbox_item",
     ));

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -11,42 +12,46 @@ pub enum MigrationPhase {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Migration {
-    pub id: &'static str,
-    pub ddl: &'static str,
+    pub id: Cow<'static, str>,
+    pub ddl: Cow<'static, str>,
     pub phase: MigrationPhase,
-    pub table: Option<&'static str>,
+    pub table: Option<Cow<'static, str>>,
 }
 
 impl Migration {
-    pub fn plain(id: &'static str, ddl: &'static str) -> Migration {
+    pub fn plain(id: impl Into<Cow<'static, str>>, ddl: impl Into<Cow<'static, str>>) -> Migration {
         Migration {
-            id,
-            ddl,
+            id: id.into(),
+            ddl: ddl.into(),
             phase: MigrationPhase::Plain,
             table: None,
         }
     }
 
-    pub fn plain_on(id: &'static str, ddl: &'static str, table: &'static str) -> Migration {
+    pub fn plain_on(
+        id: impl Into<Cow<'static, str>>,
+        ddl: impl Into<Cow<'static, str>>,
+        table: impl Into<Cow<'static, str>>,
+    ) -> Migration {
         Migration {
-            id,
-            ddl,
+            id: id.into(),
+            ddl: ddl.into(),
             phase: MigrationPhase::Plain,
-            table: Some(table),
+            table: Some(table.into()),
         }
     }
 
     pub fn phased(
-        id: &'static str,
-        ddl: &'static str,
+        id: impl Into<Cow<'static, str>>,
+        ddl: impl Into<Cow<'static, str>>,
         phase: MigrationPhase,
-        table: &'static str,
+        table: impl Into<Cow<'static, str>>,
     ) -> Migration {
         Migration {
-            id,
-            ddl,
+            id: id.into(),
+            ddl: ddl.into(),
             phase,
-            table: Some(table),
+            table: Some(table.into()),
         }
     }
 }
@@ -127,19 +132,19 @@ pub fn is_blocking_alter(ddl: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MigrationError {
     Destructive {
-        id: &'static str,
+        id: String,
     },
     BlockingAlterOnHotTable {
-        id: &'static str,
-        table: &'static str,
+        id: String,
+        table: String,
     },
     HotTableNotOnline {
-        id: &'static str,
-        table: &'static str,
+        id: String,
+        table: String,
     },
     PhaseOutOfOrder {
-        id: &'static str,
-        table: &'static str,
+        id: String,
+        table: String,
         phase: MigrationPhase,
         after: PhaseProgress,
     },
@@ -192,7 +197,7 @@ impl std::error::Error for MigrationError {}
 
 #[derive(Default)]
 pub struct OnlineMigrationRunner {
-    applied: Vec<&'static str>,
+    applied: Vec<String>,
 }
 
 impl OnlineMigrationRunner {
@@ -208,22 +213,30 @@ impl OnlineMigrationRunner {
         hot_tables: &HotTables,
     ) -> Result<(), MigrationError> {
         use std::collections::BTreeMap;
-        let mut progress: BTreeMap<&'static str, PhaseProgress> = BTreeMap::new();
+        let mut progress: BTreeMap<&str, PhaseProgress> = BTreeMap::new();
 
         for m in &migrations.0 {
-            if is_destructive(m.ddl) {
-                return Err(MigrationError::Destructive { id: m.id });
+            if is_destructive(m.ddl.as_ref()) {
+                return Err(MigrationError::Destructive {
+                    id: m.id.to_string(),
+                });
             }
 
-            if let Some(table) = m.table {
+            if let Some(table) = m.table.as_deref() {
                 let hot = hot_tables.is_hot(table);
 
-                if hot && is_blocking_alter(m.ddl) {
-                    return Err(MigrationError::BlockingAlterOnHotTable { id: m.id, table });
+                if hot && is_blocking_alter(m.ddl.as_ref()) {
+                    return Err(MigrationError::BlockingAlterOnHotTable {
+                        id: m.id.to_string(),
+                        table: table.to_string(),
+                    });
                 }
 
                 if hot && m.phase == MigrationPhase::Plain {
-                    return Err(MigrationError::HotTableNotOnline { id: m.id, table });
+                    return Err(MigrationError::HotTableNotOnline {
+                        id: m.id.to_string(),
+                        table: table.to_string(),
+                    });
                 }
 
                 if m.phase != MigrationPhase::Plain {
@@ -234,8 +247,8 @@ impl OnlineMigrationRunner {
                         }
                         None => {
                             return Err(MigrationError::PhaseOutOfOrder {
-                                id: m.id,
-                                table,
+                                id: m.id.to_string(),
+                                table: table.to_string(),
                                 phase: m.phase,
                                 after: current,
                             });
@@ -244,12 +257,12 @@ impl OnlineMigrationRunner {
                 }
             }
 
-            self.applied.push(m.id);
+            self.applied.push(m.id.to_string());
         }
         Ok(())
     }
 
-    pub fn applied(&self) -> &[&'static str] {
+    pub fn applied(&self) -> &[String] {
         &self.applied
     }
 }
@@ -267,6 +280,21 @@ fn next_progress(current: PhaseProgress, phase: MigrationPhase) -> Option<PhaseP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_composed_migrations_own_their_descriptor_text() {
+        let table = String::from("runtime_table");
+        let migration = Migration::phased(
+            format!("create_{table}"),
+            format!("CREATE TABLE {table} (id bigint PRIMARY KEY)"),
+            MigrationPhase::Plain,
+            table,
+        );
+
+        assert!(matches!(&migration.id, Cow::Owned(_)));
+        assert!(matches!(&migration.ddl, Cow::Owned(_)));
+        assert!(matches!(&migration.table, Some(Cow::Owned(_))));
+    }
 
     #[test]
     fn admits_expand_backfill_contract_on_a_hot_table() {
@@ -325,8 +353,8 @@ mod tests {
         assert_eq!(
             e,
             MigrationError::PhaseOutOfOrder {
-                id: "0011_contract",
-                table: "issue",
+                id: "0011_contract".into(),
+                table: "issue".into(),
                 phase: MigrationPhase::Contract,
                 after: PhaseProgress::Expanded,
             }
@@ -354,8 +382,8 @@ mod tests {
         assert_eq!(
             e,
             MigrationError::PhaseOutOfOrder {
-                id: "0010_backfill",
-                table: "issue",
+                id: "0010_backfill".into(),
+                table: "issue".into(),
                 phase: MigrationPhase::Backfill,
                 after: PhaseProgress::None,
             }
@@ -377,8 +405,8 @@ mod tests {
         assert_eq!(
             e,
             MigrationError::HotTableNotOnline {
-                id: "0010_plain_hot",
-                table: "issue"
+                id: "0010_plain_hot".into(),
+                table: "issue".into()
             }
         );
         assert!(e.to_string().contains("online path"), "loud reason: {e}");
@@ -391,7 +419,12 @@ mod tests {
         let e = runner
             .run(&migrations, &HotTables::none())
             .expect_err("a DROP must be rejected");
-        assert_eq!(e, MigrationError::Destructive { id: "0010_bad" });
+        assert_eq!(
+            e,
+            MigrationError::Destructive {
+                id: "0010_bad".into()
+            }
+        );
         assert!(e.to_string().contains("forward-only"), "loud reason: {e}");
     }
 
@@ -411,8 +444,8 @@ mod tests {
         assert_eq!(
             e,
             MigrationError::BlockingAlterOnHotTable {
-                id: "0010_hot",
-                table: "issue"
+                id: "0010_hot".into(),
+                table: "issue".into()
             }
         );
     }

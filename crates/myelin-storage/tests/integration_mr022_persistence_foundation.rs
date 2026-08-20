@@ -19,10 +19,6 @@ fn uniq() -> String {
     )
 }
 
-fn leak(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
-}
-
 async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
     sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
         .bind(table)
@@ -36,22 +32,18 @@ async fn a_boot_migration_executes_ddl_and_is_idempotent() {
     let provider = common::admin_provider(6).await;
 
     let suffix = uniq();
-    let t1 = leak(format!("mr022_a_one_{suffix}"));
-    let t2 = leak(format!("mr022_a_two_{suffix}"));
-    let id1 = leak(format!("mr022a_{suffix}_0001"));
-    let id2 = leak(format!("mr022a_{suffix}_0002"));
+    let t1 = format!("mr022_a_one_{suffix}");
+    let t2 = format!("mr022_a_two_{suffix}");
+    let id1 = format!("mr022a_{suffix}_0001");
+    let id2 = format!("mr022a_{suffix}_0002");
     let migrations = Migrations::of([
         Migration::plain(
-            id1,
-            leak(format!(
-                "CREATE TABLE IF NOT EXISTS {t1} (id text PRIMARY KEY, body text NOT NULL);"
-            )),
+            id1.clone(),
+            format!("CREATE TABLE IF NOT EXISTS {t1} (id text PRIMARY KEY, body text NOT NULL);"),
         ),
         Migration::plain(
-            id2,
-            leak(format!(
-                "CREATE TABLE IF NOT EXISTS {t2} (id text PRIMARY KEY, n int NOT NULL);"
-            )),
+            id2.clone(),
+            format!("CREATE TABLE IF NOT EXISTS {t2} (id text PRIMARY KEY, n int NOT NULL);"),
         ),
     ]);
 
@@ -61,21 +53,21 @@ async fn a_boot_migration_executes_ddl_and_is_idempotent() {
         .expect("boot migration executes DDL against the live DB");
 
     assert!(
-        table_exists(provider.db_pool(), t1).await,
+        table_exists(provider.db_pool(), &t1).await,
         "{t1} must exist after boot migrate"
     );
     assert!(
-        table_exists(provider.db_pool(), t2).await,
+        table_exists(provider.db_pool(), &t2).await,
         "{t2} must exist after boot migrate"
     );
     assert_eq!(
-        PgMigrator::applied_count(provider.db_pool(), id1)
+        PgMigrator::applied_count(provider.db_pool(), &id1)
             .await
             .unwrap(),
         1
     );
     assert_eq!(
-        PgMigrator::applied_count(provider.db_pool(), id2)
+        PgMigrator::applied_count(provider.db_pool(), &id2)
             .await
             .unwrap(),
         1
@@ -86,22 +78,24 @@ async fn a_boot_migration_executes_ddl_and_is_idempotent() {
         .await
         .expect("re-running the same migrations is idempotent");
     assert_eq!(
-        PgMigrator::applied_count(provider.db_pool(), id1)
+        PgMigrator::applied_count(provider.db_pool(), &id1)
             .await
             .unwrap(),
         1,
         "a second boot migrate must NOT duplicate-apply id1"
     );
     assert_eq!(
-        PgMigrator::applied_count(provider.db_pool(), id2)
+        PgMigrator::applied_count(provider.db_pool(), &id2)
             .await
             .unwrap(),
         1
     );
 
-    let drop_id = leak(format!("mr022a_{suffix}_drop"));
-    let destructive =
-        Migrations::of([Migration::plain(drop_id, leak(format!("DROP TABLE {t1};")))]);
+    let drop_id = format!("mr022a_{suffix}_drop");
+    let destructive = Migrations::of([Migration::plain(
+        drop_id.clone(),
+        format!("DROP TABLE {t1};"),
+    )]);
     let err = provider
         .migrate(&destructive, &HotTables::none())
         .await
@@ -114,22 +108,22 @@ async fn a_boot_migration_executes_ddl_and_is_idempotent() {
         other => panic!("expected a Pg(forward-only) rejection, got {other}"),
     }
     assert_eq!(
-        PgMigrator::applied_count(provider.db_pool(), drop_id)
+        PgMigrator::applied_count(provider.db_pool(), &drop_id)
             .await
             .unwrap(),
         0
     );
     assert!(
-        table_exists(provider.db_pool(), t1).await,
+        table_exists(provider.db_pool(), &t1).await,
         "{t1} must survive the rejected DROP"
     );
 
-    for t in [t1, t2] {
+    for t in [&t1, &t2] {
         let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS {t}"))
             .execute(provider.db_pool())
             .await;
     }
-    for id in [id1, id2] {
+    for id in [&id1, &id2] {
         let _ = sqlx::query("DELETE FROM myelin_applied_migration WHERE id = $1")
             .bind(id)
             .execute(provider.db_pool())

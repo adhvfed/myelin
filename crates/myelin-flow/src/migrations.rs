@@ -197,24 +197,24 @@ pub fn rls_scope_sql(table: &str) -> String {
 pub fn migrations() -> Migrations {
     let mut items = TABLE_DDLS
         .iter()
+        .copied()
         .map(|(id, create_ddl, table, rls_scoped)| {
             let mut ddl = String::new();
             ddl.push_str(create_ddl);
             ddl.push(';');
-            for (idx_table, idx_ddl) in TABLE_INDEXES {
+            for &(idx_table, idx_ddl) in TABLE_INDEXES {
                 if idx_table == table {
                     ddl.push('\n');
                     ddl.push_str(idx_ddl);
                     ddl.push(';');
                 }
             }
-            if *rls_scoped {
+            if rls_scoped {
                 ddl.push('\n');
                 ddl.push_str(&rls_scope_sql(table));
                 ddl.push(';');
             }
-            let ddl: &'static str = Box::leak(ddl.into_boxed_str());
-            if *table == "workflow_run" {
+            if table == "workflow_run" {
                 Migration::plain(id, ddl)
             } else {
                 Migration::phased(id, ddl, MigrationPhase::Plain, table)
@@ -407,7 +407,7 @@ mod tests {
         let m = migrations();
         let timer =
             m.0.iter()
-                .find(|m| m.table == Some("wf_timer"))
+                .find(|m| m.table.as_deref() == Some("wf_timer"))
                 .expect("the wf_timer migration");
         assert!(
             timer.ddl.contains(

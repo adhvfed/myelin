@@ -119,7 +119,7 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         .await
         .expect("create the per-pid schema");
     for m in ci_durable_migrations().0.iter() {
-        p1.execute(m.ddl)
+        p1.execute(m.ddl.as_ref())
             .await
             .unwrap_or_else(|e| panic!("apply CI durable migration {} into the schema: {e}", m.id));
     }

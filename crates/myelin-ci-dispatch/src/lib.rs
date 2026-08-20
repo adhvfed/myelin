@@ -424,7 +424,7 @@ mod tests {
             "Dispatch repeats the one foundation-owned dedup declaration"
         );
         assert_eq!(
-            spec.migrations.0[0].table,
+            spec.migrations.0[0].table.as_deref(),
             Some(CONSUMER_DEDUP_TABLE),
             "the migration declares the shared consumer_dedup ledger"
         );

@@ -60,9 +60,8 @@ async fn exercise_bootstrap(
         .map_err(|e| format!("migrate foundation: {e}"))?;
 
     let table = format!("bootstrap_rls_{suffix}");
-    let ddl: &'static str = Box::leak(
-        format!(
-            "CREATE TABLE {table} (
+    let ddl = format!(
+        "CREATE TABLE {table} (
                  tenant_id text NOT NULL,
                  region text NOT NULL,
                  value text NOT NULL,
@@ -79,11 +78,8 @@ async fn exercise_bootstrap(
                  tenant_id = current_setting('myelin.tenant_id', true)
                  AND region = current_setting('myelin.region', true)
                );"
-        )
-        .into_boxed_str(),
     );
-    let migration_id: &'static str =
-        Box::leak(format!("9000_pg_bootstrap_{suffix}").into_boxed_str());
+    let migration_id = format!("9000_pg_bootstrap_{suffix}");
     bootstrap
         .migrate(
             &Migrations::of([Migration::plain(migration_id, ddl)]),
@@ -93,15 +89,11 @@ async fn exercise_bootstrap(
         .map_err(|e| format!("migrate isolated RLS table: {e}"))?;
 
     let index = format!("bootstrap_exact_{suffix}");
-    let index_ddl: &'static str = Box::leak(
-        format!(
-            "CREATE INDEX CONCURRENTLY {index} ON {table} \
+    let index_ddl = format!(
+        "CREATE INDEX CONCURRENTLY {index} ON {table} \
              (tenant_id, region, value DESC) WHERE value <> ''"
-        )
-        .into_boxed_str(),
     );
-    let index_migration_id: &'static str =
-        Box::leak(format!("9001_pg_bootstrap_index_{suffix}").into_boxed_str());
+    let index_migration_id = format!("9001_pg_bootstrap_index_{suffix}");
     bootstrap
         .migrate(
             &Migrations::of([Migration::plain(index_migration_id, index_ddl)]),

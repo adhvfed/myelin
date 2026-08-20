@@ -452,15 +452,14 @@ pub fn issues_migrations() -> Migrations {
             ddl.push_str(&make_tenant_scoped_ddl(table));
             ddl.push(';');
         }
-        let ddl: &'static str = Box::leak(ddl.into_boxed_str());
         migrations.push(Migration::plain_on(id, ddl, table));
     }
-    for (name, ddl) in CREATE_ISSUE_INDEXES_DDL {
-        let id = Box::leak(format!("iss_0012_{name}").into_boxed_str());
+    for &(name, ddl) in CREATE_ISSUE_INDEXES_DDL {
+        let id = format!("iss_0012_{name}");
         migrations.push(Migration::plain_on(id, ddl, ISSUE_TABLE));
     }
-    for (name, ddl) in CREATE_ISSUE_RELATION_INDEXES_DDL {
-        let id = Box::leak(format!("iss_0013_{name}").into_boxed_str());
+    for &(name, ddl) in CREATE_ISSUE_RELATION_INDEXES_DDL {
+        let id = format!("iss_0013_{name}");
         migrations.push(Migration::plain_on(id, ddl, ISSUE_RELATION_TABLE));
     }
     migrations.push(Migration::plain_on(
@@ -473,13 +472,10 @@ pub fn issues_migrations() -> Migrations {
         EXPAND_NULLABLE_REPORTER_DDL,
         ISSUE_TABLE,
     ));
-    let authz_binding_ddl = Box::leak(
-        format!(
-            "{}\n{};",
-            CREATE_ISSUE_AUTHZ_BINDING_DDL,
-            make_tenant_scoped_ddl(ISSUE_AUTHZ_BINDING_TABLE)
-        )
-        .into_boxed_str(),
+    let authz_binding_ddl = format!(
+        "{}\n{};",
+        CREATE_ISSUE_AUTHZ_BINDING_DDL,
+        make_tenant_scoped_ddl(ISSUE_AUTHZ_BINDING_TABLE)
     );
     migrations.push(Migration::plain_on(
         "iss_0016_issue_authz_binding",
@@ -491,13 +487,10 @@ pub fn issues_migrations() -> Migrations {
         EXPAND_ISSUE_AUTHZ_CREATED_EVENT_DDL,
         ISSUE_AUTHZ_BINDING_TABLE,
     ));
-    let issue_authz_visible_ddl = Box::leak(
-        format!(
-            "{}\n{};",
-            CREATE_ISSUE_AUTHZ_VISIBLE_DDL,
-            make_tenant_scoped_ddl(ISSUE_AUTHZ_VISIBLE_TABLE)
-        )
-        .into_boxed_str(),
+    let issue_authz_visible_ddl = format!(
+        "{}\n{};",
+        CREATE_ISSUE_AUTHZ_VISIBLE_DDL,
+        make_tenant_scoped_ddl(ISSUE_AUTHZ_VISIBLE_TABLE)
     );
     migrations.push(Migration::plain_on(
         "iss_0018_issue_authz_visible",
@@ -524,26 +517,20 @@ pub fn issues_migrations() -> Migrations {
         NARROW_ISSUE_AUTHZ_INVALIDATION_TRIGGER_DDL,
         ISSUE_TABLE,
     ));
-    let import_map_ddl = Box::leak(
-        format!(
-            "{};\n{};",
-            CREATE_IMPORT_MAP_DDL,
-            make_tenant_scoped_ddl(IMPORT_MAP_TABLE)
-        )
-        .into_boxed_str(),
+    let import_map_ddl = format!(
+        "{};\n{};",
+        CREATE_IMPORT_MAP_DDL,
+        make_tenant_scoped_ddl(IMPORT_MAP_TABLE)
     );
     migrations.push(Migration::plain_on(
         "iss_0023_import_map",
         import_map_ddl,
         IMPORT_MAP_TABLE,
     ));
-    let create_idempotency_ddl = Box::leak(
-        format!(
-            "{};\n{};",
-            CREATE_ISSUE_CREATE_IDEMPOTENCY_DDL,
-            make_tenant_scoped_ddl(ISSUE_CREATE_IDEMPOTENCY_TABLE)
-        )
-        .into_boxed_str(),
+    let create_idempotency_ddl = format!(
+        "{};\n{};",
+        CREATE_ISSUE_CREATE_IDEMPOTENCY_DDL,
+        make_tenant_scoped_ddl(ISSUE_CREATE_IDEMPOTENCY_TABLE)
     );
     migrations.push(Migration::plain_on(
         "iss_0024_issue_create_idempotency",
@@ -611,8 +598,8 @@ mod tests {
         let tables: Vec<&str> = migrations
             .0
             .iter()
-            .filter(|m| create_ids.contains(m.id))
-            .map(|m| m.table.unwrap())
+            .filter(|m| create_ids.contains(m.id.as_ref()))
+            .map(|m| m.table.as_deref().expect("create migrations name a table"))
             .collect();
         assert_eq!(
             tables,
@@ -664,9 +651,12 @@ mod tests {
         for m in issues_migrations()
             .0
             .iter()
-            .filter(|m| create_ids.contains(m.id))
+            .filter(|m| create_ids.contains(m.id.as_ref()))
         {
-            if m.table == Some(OUTBOX_TABLE) || m.table == Some(CONSUMER_DEDUP_TABLE) {
+            if matches!(
+                m.table.as_deref(),
+                Some(table) if table == OUTBOX_TABLE || table == CONSUMER_DEDUP_TABLE
+            ) {
                 assert!(
                     !m.ddl.contains("myelin_make_tenant_scoped"),
                     "cell-wide bus plumbing is not given an Issues-local RLS policy"
@@ -727,7 +717,7 @@ mod tests {
         );
         for m in &migrations.0 {
             assert!(
-                !myelin_substrate::is_destructive(m.ddl),
+                !myelin_substrate::is_destructive(m.ddl.as_ref()),
                 "migration {} is forward-only (no DROP): {}",
                 m.id,
                 m.ddl
@@ -737,10 +727,11 @@ mod tests {
 
     #[test]
     fn effective_projection_migrations_require_the_storage_invalidator_first() {
-        let durable_ids: Vec<_> = myelin_storage::all_durable_migrations()
+        let durable_migrations = myelin_storage::all_durable_migrations();
+        let durable_ids: Vec<_> = durable_migrations
             .0
             .iter()
-            .map(|migration| migration.id)
+            .map(|migration| migration.id.as_ref())
             .collect();
         let invalidator = durable_ids
             .iter()
@@ -760,7 +751,7 @@ mod tests {
             .iter()
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
-            issues.0.last().map(|migration| migration.id),
+            issues.0.last().map(|migration| migration.id.as_ref()),
             Some("iss_0030_issue_relation_creator_kind")
         );
         for invariant in [
@@ -792,7 +783,7 @@ mod tests {
             .into_iter()
             .find(|migration| migration.id == "iss_0023_import_map")
             .expect("the import map migration");
-        assert_eq!(migration.table, Some(IMPORT_MAP_TABLE));
+        assert_eq!(migration.table.as_deref(), Some(IMPORT_MAP_TABLE));
         for invariant in [
             "PRIMARY KEY (tenant_id, import_job, source, source_id)",
             "source IN ('jira','linear','github','csv','canonical')",
@@ -849,7 +840,10 @@ mod tests {
             .into_iter()
             .find(|migration| migration.id == "iss_0024_issue_create_idempotency")
             .expect("the interactive create idempotency migration");
-        assert_eq!(migration.table, Some(ISSUE_CREATE_IDEMPOTENCY_TABLE));
+        assert_eq!(
+            migration.table.as_deref(),
+            Some(ISSUE_CREATE_IDEMPOTENCY_TABLE)
+        );
         for invariant in [
             "PRIMARY KEY (tenant_id, region, storage_nonce)",
             "status IN ('pending','created')",
@@ -1018,7 +1012,7 @@ mod tests {
                 .iter()
                 .find(|migration| migration.id == id)
                 .expect("creator-kind migration");
-            assert_eq!(migration.table, Some(table));
+            assert_eq!(migration.table.as_deref(), Some(table));
             assert_eq!(migration.phase, MigrationPhase::Expand);
             assert!(migration.ddl.contains("created_by_kind"));
             assert!(migration.ddl.contains("'{actor,kind}'"));
@@ -1033,7 +1027,7 @@ mod tests {
             let matching: Vec<_> = migrations
                 .0
                 .iter()
-                .filter(|m| m.table == Some(ISSUE_TABLE) && m.ddl == *ddl)
+                .filter(|m| m.table.as_deref() == Some(ISSUE_TABLE) && m.ddl.as_ref() == *ddl)
                 .collect();
             assert_eq!(
                 matching.len(),
@@ -1069,7 +1063,7 @@ mod tests {
         let outbox = issues_migrations()
             .0
             .into_iter()
-            .find(|m| m.table == Some(OUTBOX_TABLE))
+            .find(|m| m.table.as_deref() == Some(OUTBOX_TABLE))
             .unwrap();
         assert!(
             outbox.ddl.contains("CREATE TABLE IF NOT EXISTS outbox"),

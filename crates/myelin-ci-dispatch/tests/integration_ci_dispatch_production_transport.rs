@@ -71,7 +71,7 @@ async fn isolated_pool(schema: &str) -> PgPool {
         .await
         .unwrap();
     for migration in ci_durable_migrations().0.iter() {
-        pool.execute(migration.ddl).await.unwrap();
+        pool.execute(migration.ddl.as_ref()).await.unwrap();
     }
     for ddl in [
         OUTBOX_MIGRATION,

@@ -112,7 +112,7 @@ async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
         .filter(|m| m.id.contains("log_segment") || m.id.contains("log_anchor"))
     {
         admin
-            .execute(m.ddl)
+            .execute(m.ddl.as_ref())
             .await
             .unwrap_or_else(|e| panic!("apply CI durable migration {} into the schema: {e}", m.id));
     }

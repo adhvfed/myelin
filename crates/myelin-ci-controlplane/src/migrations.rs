@@ -1738,7 +1738,6 @@ fn assemble_ci_migration(id: &'static str, table: &'static str, create: String) 
     ddl.push('\n');
     ddl.push_str(&make_tenant_scoped_ddl(table));
     ddl.push(';');
-    let ddl: &'static str = Box::leak(ddl.into_boxed_str());
     Migration::plain_on(id, ddl, table)
 }
 
@@ -1783,7 +1782,7 @@ pub fn ci_controlplane_migrations() -> Migrations {
             ));
         }
         if table == JOB_QUEUE_TABLE {
-            for ((index_id, expected_name), (actual_name, ddl)) in CI_JOB_QUEUE_INDEX_MIGRATIONS
+            for (&(index_id, expected_name), &(actual_name, ddl)) in CI_JOB_QUEUE_INDEX_MIGRATIONS
                 .iter()
                 .zip(CREATE_JOB_QUEUE_INDEXES_DDL.iter())
             {
@@ -2155,7 +2154,7 @@ mod tests {
             .0
             .iter()
             .filter(|m| m.ddl.contains("CREATE TABLE"))
-            .map(|m| m.table.unwrap())
+            .map(|m| m.table.as_deref().expect("table migration names its table"))
             .collect();
         assert_eq!(
             tables,
@@ -2764,11 +2763,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
 
     #[test]
     fn migration_follow_ons_keep_their_dependency_order() {
-        let ids: Vec<&str> = ci_controlplane_migrations()
-            .0
-            .iter()
-            .map(|m| m.id)
-            .collect();
+        let migrations = ci_controlplane_migrations();
+        let ids: Vec<&str> = migrations.0.iter().map(|m| m.id.as_ref()).collect();
 
         let position = |migration_id: &str| {
             ids.iter()
@@ -2899,7 +2895,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         }
         for m in &migrations.0 {
             assert!(
-                !myelin_substrate::is_destructive(m.ddl),
+                !myelin_substrate::is_destructive(m.ddl.as_ref()),
                 "migration {} is forward-only (no DROP): {}",
                 m.id,
                 m.ddl
@@ -2928,7 +2924,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                     CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
                 ];
                 assert!(
-                    CONSTRAINT_REPLACEMENT_ALLOWLIST.contains(&m.id),
+                    CONSTRAINT_REPLACEMENT_ALLOWLIST.contains(&m.id.as_ref()),
                     "migration {} uses DROP CONSTRAINT but is not on the audited constraint-replacement \
                      allowlist - add it there AND pin its exact DDL below, only after confirming every \
                      re-added constraint is a STRICT SUPERSET of the one it replaces",
@@ -3101,7 +3097,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             workflow_discovery.id,
             CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID
         );
-        assert_eq!(workflow_discovery.table, Some("workflow_run"));
+        assert_eq!(workflow_discovery.table.as_deref(), Some("workflow_run"));
         assert_eq!(
             workflow_discovery.ddl,
             GRANT_SCHEDULER_CI_WORKFLOW_DISCOVERY_DDL
@@ -3115,7 +3111,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             run_surface_index.id,
             CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID
         );
-        assert_eq!(run_surface_index.table, Some(CI_RUN_TABLE));
+        assert_eq!(run_surface_index.table.as_deref(), Some(CI_RUN_TABLE));
         assert_eq!(
             run_surface_index.ddl,
             CREATE_CI_RUN_SURFACE_REPO_CREATED_INDEX_DDL
@@ -3126,7 +3122,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .find(|migration| migration.id == CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID)
             .expect("the retry-attempt accrual column remains present");
         assert_eq!(retry_attempts.id, CI_JOB_QUEUE_RETRY_ATTEMPTS_MIGRATION_ID);
-        assert_eq!(retry_attempts.table, Some(JOB_QUEUE_TABLE));
+        assert_eq!(retry_attempts.table.as_deref(), Some(JOB_QUEUE_TABLE));
         assert_eq!(retry_attempts.ddl, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL);
         let workflow_id_grant = migrations
             .0
@@ -3137,7 +3133,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             workflow_id_grant.id,
             CI_SCHEDULER_CI_RUN_WORKFLOW_ID_GRANT_MIGRATION_ID
         );
-        assert_eq!(workflow_id_grant.table, Some(CI_RUN_TABLE));
+        assert_eq!(workflow_id_grant.table.as_deref(), Some(CI_RUN_TABLE));
         assert_eq!(
             workflow_id_grant.ddl,
             GRANT_SCHEDULER_CI_RUN_WORKFLOW_ID_DDL
@@ -3151,7 +3147,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             ci_job_reap_reset_grant.id,
             CI_SCHEDULER_CI_JOB_REAP_RESET_GRANT_MIGRATION_ID
         );
-        assert_eq!(ci_job_reap_reset_grant.table, Some(CI_JOB_TABLE));
+        assert_eq!(ci_job_reap_reset_grant.table.as_deref(), Some(CI_JOB_TABLE));
         assert_eq!(
             ci_job_reap_reset_grant.ddl,
             GRANT_SCHEDULER_CI_JOB_REAP_RESET_DDL
@@ -3161,7 +3157,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .iter()
             .find(|migration| migration.id == CI_RUN_ACTIVE_WORKFLOW_INDEX_MIGRATION_ID)
             .expect("the active CI workflow lookup is indexed");
-        assert_eq!(active_workflow_index.table, Some(CI_RUN_TABLE));
+        assert_eq!(active_workflow_index.table.as_deref(), Some(CI_RUN_TABLE));
         assert_eq!(
             active_workflow_index.ddl,
             CREATE_CI_RUN_ACTIVE_WORKFLOW_INDEX_DDL
@@ -3179,14 +3175,14 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .find(|migration| migration.id == CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID)
             .expect("the scheduler ci_run discovery grant remains present");
         assert_eq!(discovery.id, CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID);
-        assert_eq!(discovery.table, Some(CI_RUN_TABLE));
+        assert_eq!(discovery.table.as_deref(), Some(CI_RUN_TABLE));
         assert_eq!(discovery.ddl, GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL);
         let discovery_index = migrations
             .0
             .iter()
             .find(|m| m.id == CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID)
             .expect("queued-run discovery index remains present");
-        assert_eq!(discovery_index.table, Some(CI_RUN_TABLE));
+        assert_eq!(discovery_index.table.as_deref(), Some(CI_RUN_TABLE));
         assert_eq!(discovery_index.ddl, CREATE_CI_RUN_QUEUED_REGION_INDEX_DDL);
         for required in [
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS ci_run_queued_region",
@@ -3204,7 +3200,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .iter()
             .find(|m| m.id == CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID)
             .expect("active-workflow recovery index remains present");
-        assert_eq!(running_index.table, Some("workflow_run"));
+        assert_eq!(running_index.table.as_deref(), Some("workflow_run"));
         assert_eq!(
             running_index.ddl,
             CREATE_CI_WORKFLOW_ACTIVE_REGION_INDEX_DDL
@@ -3240,10 +3236,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .iter()
             .find(|m| m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID)
             .expect("scheduler boundary is present");
-        assert_eq!(scheduler.table, Some(JOB_QUEUE_TABLE));
+        assert_eq!(scheduler.table.as_deref(), Some(JOB_QUEUE_TABLE));
         assert_eq!(scheduler.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
 
-        let ddl = scheduler.ddl;
+        let ddl = scheduler.ddl.as_ref();
         assert_eq!(ddl.matches("AS PERMISSIVE").count(), 2);
         assert_eq!(ddl.matches("AS RESTRICTIVE").count(), 2);
         assert_eq!(
@@ -3278,7 +3274,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let old_ids: Vec<&str> = create_statements().iter().map(|(id, _, _)| *id).collect();
         assert!(!old_ids.contains(&CI_REGION_SCHEDULER_RLS_MIGRATION_ID));
 
-        let discovery_ddl = discovery.ddl;
+        let discovery_ddl = discovery.ddl.as_ref();
         assert_eq!(discovery_ddl.matches("AS PERMISSIVE").count(), 1);
         assert_eq!(discovery_ddl.matches("AS RESTRICTIVE").count(), 1);
         for required in [
@@ -3415,7 +3411,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 .iter()
                 .find(|migration| migration.ddl.contains(name))
                 .unwrap_or_else(|| panic!("index `{name}` has a migration"));
-            assert_eq!(index.table, Some(JOB_QUEUE_TABLE));
+            assert_eq!(index.table.as_deref(), Some(JOB_QUEUE_TABLE));
             assert_eq!(index.ddl.matches(';').count(), 0);
         }
     }
@@ -3462,10 +3458,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         assert_eq!(validation_pos, index_pos + 1);
         assert_eq!(next_table_pos, validation_pos + 1);
         let migration = &migrations.0[index_pos];
-        assert_eq!(migration.table, Some(CI_JOB_TABLE));
+        assert_eq!(migration.table.as_deref(), Some(CI_JOB_TABLE));
         assert_eq!(migration.ddl, CREATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
         let validation = &migrations.0[validation_pos];
-        assert_eq!(validation.table, Some(CI_JOB_TABLE));
+        assert_eq!(validation.table.as_deref(), Some(CI_JOB_TABLE));
         assert_eq!(validation.ddl, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL);
         for required_catalog_fragment in [
             "FROM pg_catalog.pg_index AS index_state",
@@ -3527,7 +3523,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
     fn ci_durable_subset_matches_the_full_set_for_the_writer_tables() {
         let full = ci_controlplane_migrations();
         let subset = ci_durable_migrations();
-        let subset_ids: Vec<&str> = subset.0.iter().map(|m| m.id).collect();
+        let subset_ids: Vec<&str> = subset.0.iter().map(|m| m.id.as_ref()).collect();
         assert_eq!(
             subset_ids,
             [
@@ -3580,7 +3576,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         );
         for m in &subset.0 {
             assert!(
-                !myelin_substrate::is_destructive(m.ddl),
+                !myelin_substrate::is_destructive(m.ddl.as_ref()),
                 "subset migration {} is forward-only",
                 m.id
             );
