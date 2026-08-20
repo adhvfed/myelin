@@ -8,10 +8,11 @@ use crate::runtime::drive_result_on_runtime;
 use crate::{IssueReconciliationWakeup, Method, StoreBackedIssueAuthorizer};
 use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
-    api::IssueListState, is_canonical_request_event_id, public_issue_actor, CreateIssue,
-    CreateIssueIntent, IssueAuthorizationStatus, IssueAuthorizer, IssueCreationOutcome,
-    IssueLifecycleRel, IssuePageRequest, IssuePermission, IssueRelationCreationOutcome,
-    IssueStoreError, PgIssueStore, StoredIssue, StoredIssueRelation, MAX_RELATIONS_PER_ISSUE,
+    api::{is_canonical_issue_key, is_canonical_uuid, IssueListState},
+    is_canonical_request_event_id, public_issue_actor, CreateIssue, CreateIssueIntent,
+    IssueAuthorizationStatus, IssueAuthorizer, IssueCreationOutcome, IssueLifecycleRel,
+    IssuePageRequest, IssuePermission, IssueRelationCreationOutcome, IssueStoreError, PgIssueStore,
+    StoredIssue, StoredIssueRelation, MAX_RELATIONS_PER_ISSUE,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -89,6 +90,23 @@ impl DurableIssueReadApi {
             .drive(self.store.resolve_id_by_key(principal, &key))
             .map_err(map_store_error)?;
         self.view(principal, &issue_id)
+    }
+
+    pub fn resolve_locator(
+        &self,
+        principal: &myelin_identity::Principal,
+        locator: &str,
+    ) -> Result<String, EdgeError> {
+        if is_canonical_uuid(locator) {
+            return Ok(locator.to_string());
+        }
+        if !is_canonical_issue_key(locator) {
+            return Err(EdgeError::BadRequest(
+                "issue locator must be a canonical UUID or PROJECT-123 key".into(),
+            ));
+        }
+        self.drive(self.store.resolve_id_by_key(principal, locator))
+            .map_err(map_store_error)
     }
 
     pub fn list_relations(
@@ -401,18 +419,24 @@ fn finish_create_request(
     })
 }
 
-fn issue_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
-    let value = ctx
-        .params
-        .get("issue")
-        .map(String::as_str)
-        .ok_or_else(|| EdgeError::BadRequest("route did not bind an issue id".into()))?;
+fn resolved_issue_id<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    let value =
+        ctx.params.get("issue").map(String::as_str).ok_or_else(|| {
+            EdgeError::BadRequest("route did not bind a resolved issue id".into())
+        })?;
     if !is_canonical_uuid(value) {
         return Err(EdgeError::BadRequest(
-            "issue id must be a canonical UUID".into(),
+            "resolved issue id must be a canonical UUID".into(),
         ));
     }
     Ok(value)
+}
+
+fn issue_locator<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    ctx.params
+        .get("issue")
+        .map(String::as_str)
+        .ok_or_else(|| EdgeError::BadRequest("route did not bind an issue locator".into()))
 }
 
 fn issue_key_from_ref(
@@ -466,14 +490,6 @@ fn authorization_request_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, E
         ));
     }
     Ok(value)
-}
-
-fn is_canonical_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
-        })
 }
 
 fn map_store_error(error: IssueStoreError) -> EdgeError {
@@ -684,7 +700,7 @@ struct IssueViewHandler {
 
 impl Handler for IssueViewHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let id = issue_param(ctx)?;
+        let id = resolved_issue_id(ctx)?;
         Ok(no_store(EdgeResponse::json(
             200,
             &self.api.view(ctx.principal, id)?,
@@ -711,7 +727,7 @@ impl Handler for IssueCloseHandler {
                 ));
             }
         }
-        let id = issue_param(ctx)?;
+        let id = resolved_issue_id(ctx)?;
         let issue = self.api.close_issue(ctx.principal, ctx.principal, id)?;
         Ok(no_store(EdgeResponse::json(
             200,
@@ -731,7 +747,7 @@ impl Handler for IssueRelationListHandler {
                 "issue relation listing accepts no query parameters or request body".into(),
             ));
         }
-        let issue_id = issue_param(ctx)?;
+        let issue_id = resolved_issue_id(ctx)?;
         Ok(no_store(EdgeResponse::json(
             200,
             &self.api.list_relations(ctx.principal, issue_id)?,
@@ -745,7 +761,7 @@ struct IssueRelationCreateHandler {
 
 impl Handler for IssueRelationCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let issue_id = issue_param(ctx)?;
+        let issue_id = resolved_issue_id(ctx)?;
         let request = parse_relation_create_body(ctx)?;
         let outcome = self.api.create_relation(
             ctx.principal,
@@ -775,7 +791,7 @@ impl Handler for IssueRelationRemoveHandler {
                 "issue relation removal accepts no query parameters or request body".into(),
             ));
         }
-        let issue_id = issue_param(ctx)?;
+        let issue_id = resolved_issue_id(ctx)?;
         let relation_id = relation_param(ctx)?;
         let removed = self
             .api
@@ -800,30 +816,44 @@ impl Handler for IssueRelationRemoveHandler {
 
 struct IssueObjectGuard {
     authorizer: StoreBackedIssueAuthorizer,
+    reads: DurableIssueReadApi,
     permission: IssuePermission,
     inner: Arc<dyn Handler>,
 }
 
 impl Handler for IssueObjectGuard {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let id = issue_param(ctx)?;
+        let id = self
+            .reads
+            .resolve_locator(ctx.principal, issue_locator(ctx)?)?;
         if !self
             .authorizer
-            .may_access(ctx.principal, id, self.permission)
+            .may_access(ctx.principal, &id, self.permission)
         {
             return Err(EdgeError::NotFound("issue not found".into()));
         }
-        self.inner.handle(ctx)
+
+        let mut resolved_params = ctx.params.clone();
+        resolved_params.insert("issue".into(), id);
+        self.inner.handle(&HandlerCtx {
+            identity: ctx.identity,
+            principal: ctx.principal,
+            scope: ctx.scope,
+            params: &resolved_params,
+            request: ctx.request,
+        })
     }
 }
 
 fn guarded(
     authorizer: &StoreBackedIssueAuthorizer,
+    reads: &DurableIssueReadApi,
     permission: IssuePermission,
     inner: Arc<dyn Handler>,
 ) -> Arc<dyn Handler> {
     Arc::new(IssueObjectGuard {
         authorizer: authorizer.clone(),
+        reads: reads.clone(),
         permission,
         inner,
     })
@@ -858,6 +888,7 @@ pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) ->
             "issues.relations.list",
             guarded(
                 &authorizer,
+                &reads,
                 IssuePermission::View,
                 Arc::new(IssueRelationListHandler { api: reads.clone() }),
             ),
@@ -868,6 +899,7 @@ pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) ->
             "issues.relations.create",
             guarded(
                 &authorizer,
+                &reads,
                 IssuePermission::ManageRelations,
                 Arc::new(IssueRelationCreateHandler { api: api.clone() }),
             ),
@@ -878,6 +910,7 @@ pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) ->
             "issues.relations.remove",
             guarded(
                 &authorizer,
+                &reads,
                 IssuePermission::ManageRelations,
                 Arc::new(IssueRelationRemoveHandler { api: api.clone() }),
             ),
@@ -888,8 +921,9 @@ pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) ->
             "issues.view",
             guarded(
                 &authorizer,
+                &reads,
                 IssuePermission::View,
-                Arc::new(IssueViewHandler { api: reads }),
+                Arc::new(IssueViewHandler { api: reads.clone() }),
             ),
         )
         .route(
@@ -898,6 +932,7 @@ pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) ->
             "issues.close",
             guarded(
                 &authorizer,
+                &reads,
                 IssuePermission::Close,
                 Arc::new(IssueCloseHandler { api }),
             ),

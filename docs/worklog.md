@@ -4,6 +4,32 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — the issue key is the issue's everyday address
+
+Issues displayed memorable keys such as `DX-2`, but the human HTTP and CLI
+workflows for viewing, closing, and managing dependencies accepted only the
+storage UUID. A person could discover an issue by key and still have to recover
+an opaque implementation identifier before doing ordinary work.
+
+The Issues grammar now has one shared definition of a canonical issue locator:
+either the durable UUID or the displayed `PROJECT-123` key. At the HTTP
+boundary, the object guard resolves a key once within the caller's tenant,
+authorizes the resulting UUID, and rebinds that UUID for the existing handlers.
+Storage and authorization therefore retain their unambiguous internal identity
+while the public interface speaks the address people actually remember. The
+CLI and examples use the key throughout, and malformed lookalikes still fail
+locally.
+
+The system journeys carry live issue keys through reads, idempotent closure,
+and the complete dependency lifecycle. UUID-addressed paths remain compatible,
+so integrations can keep stable machine identifiers while humans use concise
+keys.
+
+**Proof:** Issues API-parser tests 7/7; Edge Issues-handler tests 10/10; CLI
+Issues-dispatch tests 4/4; TypeScript typecheck; Clippy `-D warnings` for
+`myelin-issues`, `myelin-edge`, and `myelin-cli`; focused black-box Issues and
+browser-approved CLI journeys 19/19.
+
 ## 2026-08-20 — Git commands consume every word
 
 The Git CLI parser found positional operands by skipping anything that looked

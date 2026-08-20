@@ -174,28 +174,30 @@ fn command_to_call(
                 ImportMode::Run => EdgeCall::post_json(path, payload),
             }
         }
-        CliCommand::View { issue_id } => EdgeCall::get(format!("/v1/issues/{issue_id}")),
-        CliCommand::Close { issue_id } => {
-            EdgeCall::post_retry_safe_json(format!("/v1/issues/{issue_id}/close"), json!({}))
+        CliCommand::View { issue_locator } => EdgeCall::get(format!("/v1/issues/{issue_locator}")),
+        CliCommand::Close { issue_locator } => {
+            EdgeCall::post_retry_safe_json(format!("/v1/issues/{issue_locator}/close"), json!({}))
         }
-        CliCommand::ListRelations { issue_id } => {
-            EdgeCall::get(format!("/v1/issues/{issue_id}/relations"))
+        CliCommand::ListRelations { issue_locator } => {
+            EdgeCall::get(format!("/v1/issues/{issue_locator}/relations"))
         }
         CliCommand::CreateRelation {
-            issue_id,
+            issue_locator,
             relation,
             target_ref,
         } => EdgeCall::post_json(
-            format!("/v1/issues/{issue_id}/relations"),
+            format!("/v1/issues/{issue_locator}/relations"),
             json!({
                 "target_ref": target_ref,
                 "relation": relation.as_str(),
             }),
         ),
         CliCommand::RemoveRelation {
-            issue_id,
+            issue_locator,
             relation_id,
-        } => EdgeCall::delete(format!("/v1/issues/{issue_id}/relations/{relation_id}")),
+        } => EdgeCall::delete(format!(
+            "/v1/issues/{issue_locator}/relations/{relation_id}"
+        )),
     })
 }
 

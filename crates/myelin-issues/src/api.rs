@@ -200,21 +200,21 @@ pub enum CliCommand {
         mode: ImportMode,
     },
     View {
-        issue_id: String,
+        issue_locator: String,
     },
     Close {
-        issue_id: String,
+        issue_locator: String,
     },
     ListRelations {
-        issue_id: String,
+        issue_locator: String,
     },
     CreateRelation {
-        issue_id: String,
+        issue_locator: String,
         relation: IssueLifecycleRel,
         target_ref: String,
     },
     RemoveRelation {
-        issue_id: String,
+        issue_locator: String,
         relation_id: String,
     },
 }
@@ -260,8 +260,8 @@ pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
         "list" => parse_list(rest),
         "create" => parse_create(rest),
         "import" => parse_import(rest),
-        "view" => parse_issue_id(rest, |issue_id| CliCommand::View { issue_id }),
-        "close" => parse_issue_id(rest, |issue_id| CliCommand::Close { issue_id }),
+        "view" => parse_issue_locator(rest, |issue_locator| CliCommand::View { issue_locator }),
+        "close" => parse_issue_locator(rest, |issue_locator| CliCommand::Close { issue_locator }),
         "relation" => parse_relation(rest),
         other => Err(CliParseError::Unknown {
             token: other.to_string(),
@@ -274,14 +274,14 @@ fn parse_relation(args: &[&str]) -> Result<CliCommand, CliParseError> {
         flag: "relation action (list|add|remove)",
     })?;
     match (*action, operands) {
-        ("list", [issue_id]) => {
-            require_uuid("issue UUID", issue_id)?;
+        ("list", [issue_locator]) => {
+            require_issue_locator(issue_locator)?;
             Ok(CliCommand::ListRelations {
-                issue_id: (*issue_id).to_string(),
+                issue_locator: (*issue_locator).to_string(),
             })
         }
-        ("add", [issue_id, relation, target_ref]) => {
-            require_uuid("issue UUID", issue_id)?;
+        ("add", [issue_locator, relation, target_ref]) => {
+            require_issue_locator(issue_locator)?;
             let relation = IssueLifecycleRel::from_token(relation).ok_or_else(|| {
                 CliParseError::BadValue {
                     field: "relation (expected parent|blocks|blocked_by|closes|depends_on|relates)",
@@ -305,16 +305,16 @@ fn parse_relation(args: &[&str]) -> Result<CliCommand, CliParseError> {
                 });
             }
             Ok(CliCommand::CreateRelation {
-                issue_id: (*issue_id).to_string(),
+                issue_locator: (*issue_locator).to_string(),
                 relation,
                 target_ref: (*target_ref).to_string(),
             })
         }
-        ("remove", [issue_id, relation_id]) => {
-            require_uuid("issue UUID", issue_id)?;
+        ("remove", [issue_locator, relation_id]) => {
+            require_issue_locator(issue_locator)?;
             require_uuid("relation UUID", relation_id)?;
             Ok(CliCommand::RemoveRelation {
-                issue_id: (*issue_id).to_string(),
+                issue_locator: (*issue_locator).to_string(),
                 relation_id: (*relation_id).to_string(),
             })
         }
@@ -543,7 +543,7 @@ fn parse_create(args: &[&str]) -> Result<CliCommand, CliParseError> {
     })
 }
 
-fn parse_issue_id(
+fn parse_issue_locator(
     args: &[&str],
     command: impl FnOnce(String) -> CliCommand,
 ) -> Result<CliCommand, CliParseError> {
@@ -553,10 +553,23 @@ fn parse_issue_id(
                 token: (*token).to_string(),
             });
         }
-        return Err(CliParseError::MissingValue { flag: "issue UUID" });
+        return Err(CliParseError::MissingValue {
+            flag: "issue UUID or key",
+        });
     };
-    require_uuid("issue UUID", value)?;
+    require_issue_locator(value)?;
     Ok(command((*value).to_string()))
+}
+
+fn require_issue_locator(value: &str) -> Result<(), CliParseError> {
+    if is_canonical_uuid(value) || is_canonical_issue_key(value) {
+        Ok(())
+    } else {
+        Err(CliParseError::BadValue {
+            field: "issue locator (expected a canonical UUID or PROJECT-123 key)",
+            value: value.to_string(),
+        })
+    }
 }
 
 fn flag_value<'a>(
@@ -592,6 +605,20 @@ pub fn is_canonical_uuid(value: &str) -> bool {
             8 | 13 | 18 | 23 => byte == b'-',
             _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
         })
+}
+
+pub fn is_canonical_issue_key(value: &str) -> bool {
+    let Some((prefix, sequence)) = value.rsplit_once('-') else {
+        return false;
+    };
+    (2..=10).contains(&prefix.len())
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && !sequence.is_empty()
+        && !sequence.starts_with('0')
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.parse::<u64>().is_ok()
 }
 
 #[cfg(test)]
@@ -665,25 +692,25 @@ mod tests {
         assert_eq!(
             parse_cli(&["view", PROJECT]).unwrap(),
             CliCommand::View {
-                issue_id: PROJECT.into()
+                issue_locator: PROJECT.into()
             }
         );
         assert_eq!(
             parse_cli(&["close", PROJECT]).unwrap(),
             CliCommand::Close {
-                issue_id: PROJECT.into()
+                issue_locator: PROJECT.into()
             }
         );
         assert_eq!(
             parse_cli(&["relation", "list", PROJECT]).unwrap(),
             CliCommand::ListRelations {
-                issue_id: PROJECT.into()
+                issue_locator: PROJECT.into()
             }
         );
         assert_eq!(
             parse_cli(&["relation", "add", PROJECT, "blocks", TARGET_REF]).unwrap(),
             CliCommand::CreateRelation {
-                issue_id: PROJECT.into(),
+                issue_locator: PROJECT.into(),
                 relation: IssueLifecycleRel::Blocks,
                 target_ref: TARGET_REF.into(),
             }
@@ -691,8 +718,21 @@ mod tests {
         assert_eq!(
             parse_cli(&["relation", "remove", PROJECT, RELATION]).unwrap(),
             CliCommand::RemoveRelation {
-                issue_id: PROJECT.into(),
+                issue_locator: PROJECT.into(),
                 relation_id: RELATION.into(),
+            }
+        );
+
+        assert_eq!(
+            parse_cli(&["view", "ENG-41"]).unwrap(),
+            CliCommand::View {
+                issue_locator: "ENG-41".into(),
+            }
+        );
+        assert_eq!(
+            parse_cli(&["relation", "list", "ENG-41"]).unwrap(),
+            CliCommand::ListRelations {
+                issue_locator: "ENG-41".into(),
             }
         );
     }
@@ -720,6 +760,15 @@ mod tests {
             parse_cli(&["close"]),
             Err(CliParseError::MissingValue { .. })
         ));
+        for locator in ["eng-41", "ENG-01", "ENG", "not-an-issue"] {
+            assert!(
+                matches!(
+                    parse_cli(&["view", locator]),
+                    Err(CliParseError::BadValue { .. })
+                ),
+                "accepted `{locator}`"
+            );
+        }
         for invalid in [
             vec!["relation"],
             vec!["relation", "list"],

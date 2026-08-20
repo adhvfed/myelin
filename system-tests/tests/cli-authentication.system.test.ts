@@ -1466,7 +1466,7 @@ describe.sequential("the CLI authentication journey", () => {
       "issue",
       "relation",
       "add",
-      issueId,
+      issueKey,
       "blocks",
       deliveryRef,
     );
@@ -1487,7 +1487,7 @@ describe.sequential("the CLI authentication journey", () => {
       "issue",
       "relation",
       "list",
-      issueId,
+      issueKey,
     );
     expect(listedRelations.exitCode, listedRelations.stderr).toBe(0);
     expect(array(JSON.parse(listedRelations.stdout).items, "CLI issue relations")).toEqual([
@@ -1500,7 +1500,7 @@ describe.sequential("the CLI authentication journey", () => {
       "issue",
       "relation",
       "remove",
-      issueId,
+      issueKey,
       relationId,
     );
     expect(removedRelation.exitCode, removedRelation.stderr).toBe(0);
@@ -1512,7 +1512,7 @@ describe.sequential("the CLI authentication journey", () => {
       "issue",
       "relation",
       "remove",
-      issueId,
+      issueKey,
       relationId,
     );
     expect(repeatedRemoval.exitCode, repeatedRemoval.stderr).toBe(0);
@@ -2414,7 +2414,7 @@ describe.sequential("the CLI authentication journey", () => {
       "--json",
       "issue",
       "close",
-      issueId,
+      issueKey,
     );
     expect(closedContextualIssue.exitCode, closedContextualIssue.stderr).toBe(0);
     expect(JSON.parse(closedContextualIssue.stdout)).toMatchObject({
@@ -2429,7 +2429,7 @@ describe.sequential("the CLI authentication journey", () => {
       "--json",
       "issue",
       "close",
-      issueId,
+      issueKey,
     );
     expect(repeatedClose.exitCode, repeatedClose.stderr).toBe(0);
     expect(JSON.parse(repeatedClose.stdout)).toEqual(JSON.parse(closedContextualIssue.stdout));

@@ -124,8 +124,9 @@ describe("issue lifecycle", () => {
     const summary = record(proposed.body.issue, "issue proposal");
     const authorization = record(proposed.body.authorization, "issue authorization");
     const issueId = string(summary.id, "issue id");
+    const issueKey = string(summary.key, "issue key");
     const requestEventId = string(authorization.request_event_id, "authorization request id");
-    expect(summary.key).toMatch(/^MYL-\d+$/);
+    expect(issueKey).toMatch(/^MYL-\d+$/);
     expect(authorization.status).toBe("pending");
 
     const active = await awaitAuthorizedIssue(
@@ -135,7 +136,7 @@ describe("issue lifecycle", () => {
     );
     expect(active).toMatchObject({ id: issueId, title, state_category: "unstarted" });
 
-    const viewed = await reviewerClient.json(`/v1/issues/${encodeURIComponent(issueId)}`);
+    const viewed = await reviewerClient.json(`/v1/issues/${encodeURIComponent(issueKey)}`);
     expect(viewed.body).toMatchObject({ id: issueId, title, state_category: "unstarted" });
 
     const open = await systemClient.json("/v1/issues?state=open&limit=100");
@@ -143,13 +144,13 @@ describe("issue lifecycle", () => {
       expect.arrayContaining([expect.objectContaining({ id: issueId, title })]),
     );
 
-    const closed = await systemClient.json(`/v1/issues/${encodeURIComponent(issueId)}/close`, {
+    const closed = await systemClient.json(`/v1/issues/${encodeURIComponent(issueKey)}/close`, {
       method: "POST",
       body: {},
     });
     expect(closed.body).toMatchObject({ id: issueId, title, state_category: "completed" });
 
-    const retry = await systemClient.json(`/v1/issues/${encodeURIComponent(issueId)}/close`, {
+    const retry = await systemClient.json(`/v1/issues/${encodeURIComponent(issueKey)}/close`, {
       method: "POST",
       body: {},
     });
@@ -164,13 +165,13 @@ describe("issue lifecycle", () => {
   test("lets one issue block another until their dependency is removed", async () => {
     const planning = await awaitActiveIssue(systemClient, uniqueName("Plan the shared release"));
     const delivery = await awaitActiveIssue(systemClient, uniqueName("Ship the shared release"));
-    const planningId = string(planning.id, "planning issue id");
+    const planningKey = string(planning.key, "planning issue key");
     const planningRef = string(planning.ref, "planning issue ref");
     const deliveryRef = string(delivery.ref, "delivery issue ref");
     const intent = { target_ref: deliveryRef, relation: "blocks" };
 
     const created = await systemClient.json(
-      `/v1/issues/${encodeURIComponent(planningId)}/relations`,
+      `/v1/issues/${encodeURIComponent(planningKey)}/relations`,
       {
         method: "POST",
         body: intent,
@@ -194,7 +195,7 @@ describe("issue lifecycle", () => {
     expect(publicRelationAuthor).not.toContain(systemTestConfig.principal);
 
     const replay = await systemClient.json(
-      `/v1/issues/${encodeURIComponent(planningId)}/relations`,
+      `/v1/issues/${encodeURIComponent(planningKey)}/relations`,
       { method: "POST", body: intent, expectedStatus: 200 },
     );
     expect(replay.body).toMatchObject({
@@ -203,7 +204,7 @@ describe("issue lifecycle", () => {
     });
 
     const listed = await reviewerClient.json(
-      `/v1/issues/${encodeURIComponent(planningId)}/relations`,
+      `/v1/issues/${encodeURIComponent(planningKey)}/relations`,
     );
     const visibleRelations = array(listed.body.items, "visible issue dependencies");
     expect(visibleRelations).toEqual([
@@ -227,7 +228,7 @@ describe("issue lifecycle", () => {
     });
 
     const removed = await systemClient.json(
-      `/v1/issues/${encodeURIComponent(planningId)}/relations/${encodeURIComponent(relationId)}`,
+      `/v1/issues/${encodeURIComponent(planningKey)}/relations/${encodeURIComponent(relationId)}`,
       { method: "DELETE" },
     );
     expect(removed.body).toMatchObject({ removed: true, durable: true });
@@ -236,7 +237,7 @@ describe("issue lifecycle", () => {
     await awaitBacklinkGone(systemClient, planningRef, deliveryRef, "blocked_by");
 
     const removalReplay = await systemClient.json(
-      `/v1/issues/${encodeURIComponent(planningId)}/relations/${encodeURIComponent(relationId)}`,
+      `/v1/issues/${encodeURIComponent(planningKey)}/relations/${encodeURIComponent(relationId)}`,
       { method: "DELETE" },
     );
     expect(removalReplay.body).toMatchObject({ relation_id: relationId, removed: false });

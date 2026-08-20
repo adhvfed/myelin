@@ -2588,21 +2588,7 @@ fn validate_create(proposal: &CreateIssue) -> Result<(), IssueStoreError> {
 }
 
 fn validate_issue_key(issue_key: &str) -> Result<(), IssueStoreError> {
-    let Some((prefix, sequence)) = issue_key.rsplit_once('-') else {
-        return Err(IssueStoreError::BadInput(
-            "issue key must use the canonical PROJECT-123 form".into(),
-        ));
-    };
-    if prefix.len() < 2
-        || prefix.len() > 10
-        || !prefix
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        || sequence.is_empty()
-        || sequence.starts_with('0')
-        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
-        || sequence.parse::<u64>().is_err()
-    {
+    if !crate::api::is_canonical_issue_key(issue_key) {
         return Err(IssueStoreError::BadInput(
             "issue key must use the canonical PROJECT-123 form".into(),
         ));
