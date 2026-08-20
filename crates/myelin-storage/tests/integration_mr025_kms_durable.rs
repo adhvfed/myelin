@@ -1,7 +1,9 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
-use myelin_storage::kms_durable::{kms_durable_migrations, DurableKmsBacking, KmsDurableError};
+use myelin_storage::kms_durable::{
+    kms_durable_migrations, kms_epoch_invariant_migrations, DurableKmsBacking, KmsDurableError,
+};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{KekId, KeyClass, SealKey, SubstrateProvider};
 use myelin_tenancy::{Region, TenantId};
@@ -52,6 +54,10 @@ async fn admin_provider() -> SubstrateProvider {
         .migrate(&kms_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the KMS migrations (kms_sealed_root + kms_wrapped_kek + kms_wrapped_dek)");
+    provider
+        .migrate(&kms_epoch_invariant_migrations(), &HotTables::none())
+        .await
+        .expect("apply the KMS epoch invariants");
     provider
 }
 
@@ -572,6 +578,81 @@ async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_re
     println!(
         "OK [5]: rotation persists the KEK + all re-wrapped DEK rows consistently (one PG tx) and \
          everything decrypts after restart."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_key_epochs_are_refused_without_poisoning_the_next_restart() {
+    let provider = admin_provider().await;
+    let suffix = uniq();
+    let cell = format!("cell-epoch-guard-{suffix}");
+    let tenant = TenantId(format!("01J0EPOCH{suffix}"));
+    let region = Region("eu-west".into());
+    let seal = seal_k();
+
+    let engine = DurableKmsBacking::new(provider.db_pool().clone(), &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("the cell KMS boots");
+    engine
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("the tenant KEK exists");
+    let key_ref = engine
+        .ensure_dek(&tenant, &region, KeyClass::Tenant)
+        .expect("the tenant DEK exists");
+    let (nonce, ciphertext) = engine
+        .resolve_dek(&key_ref, &region)
+        .expect("resolve before the rejected corruption")
+        .seal(b"still readable after rejected corruption");
+
+    let kek_error =
+        sqlx::query("UPDATE kms_wrapped_kek SET epoch = -1 WHERE cell_id = $1 AND tenant_id = $2")
+            .bind(&cell)
+            .bind(tenant.as_str())
+            .execute(provider.db_pool())
+            .await
+            .expect_err("a negative KEK epoch is not durable state");
+    assert_eq!(
+        kek_error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("kms_wrapped_kek_epoch_nonnegative")
+    );
+
+    for column in ["kek_epoch", "dek_epoch"] {
+        let statement = format!(
+            "UPDATE kms_wrapped_dek SET {column} = -1 WHERE cell_id = $1 AND tenant_id = $2"
+        );
+        let error = sqlx::query(&statement)
+            .bind(&cell)
+            .bind(tenant.as_str())
+            .execute(provider.db_pool())
+            .await
+            .expect_err("a negative DEK epoch is not durable state");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.constraint()),
+            Some("kms_wrapped_dek_epochs_nonnegative"),
+            "the {column} write is rejected by the named invariant"
+        );
+    }
+
+    drop(engine);
+    let restarted = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("the same cell restarts from the unchanged valid rows");
+    let plaintext = restarted
+        .resolve_dek(&key_ref, &region)
+        .expect("the unchanged DEK resolves after restart")
+        .open(&nonce, &ciphertext)
+        .expect("the unchanged ciphertext decrypts after restart");
+    assert_eq!(plaintext, b"still readable after rejected corruption");
+
+    cleanup(provider.db_pool(), &cell).await;
+    println!(
+        "OK [9]: negative KEK and DEK epochs are rejected atomically; valid ciphertext survives restart."
     );
 }
 

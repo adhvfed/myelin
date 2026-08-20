@@ -280,8 +280,9 @@ pub use identity_durable::{
     IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION, IDENTITY_PROJECT_RECENT_LIST_INDEX_MIGRATION,
 };
 pub use kms_durable::{
-    kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,
-    KMS_SEALED_ROOT_MIGRATION, KMS_WRAPPED_DEK_MIGRATION, KMS_WRAPPED_KEK_MIGRATION, SEAL_KEY_ENV,
+    kms_durable_migrations, kms_epoch_invariant_migrations, seal_key_from_env, DurableKmsBacking,
+    KmsDurableError, KMS_SEALED_ROOT_MIGRATION, KMS_WRAPPED_DEK_MIGRATION,
+    KMS_WRAPPED_KEK_MIGRATION, SEAL_KEY_ENV,
 };
 pub use outbox_durable::PgOutboxBacking;
 pub use pg::{PgError, PgStore};

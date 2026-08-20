@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — key epochs cannot wrap across PostgreSQL
+
+Durable KMS key epochs are unsigned in the cryptographic domain and signed in
+PostgreSQL. Individual lookup paths rejected negative rows, but boot loading
+and other paths still cast them unchecked; writes also cast epochs above
+`i64::MAX` to negative values. The same corrupt row could therefore be refused
+by a live lookup yet accepted as an enormous epoch during restart.
+
+Every KEK and DEK read/write path now uses the same checked epoch codec,
+including boot, lookup, backup snapshots, restore, and atomic rotation. A
+forward database invariant rejects negative epochs even from direct SQL or an
+older writer. The durable integration journey provisions real key material,
+attempts to corrupt each epoch column, observes the named database rejection,
+restarts from the unchanged rows, and decrypts the original ciphertext.
+
+**Proof:** storage unit suite 514/514 (including KMS codec and migration
+catalog); complete PostgreSQL durable-KMS integration 11/11 against the live
+federation database; Clippy `-D warnings` for every storage target/feature.
+
 ## 2026-08-20 — cell capacity cannot change sign at rest
 
 The durable cell registry translated signed PostgreSQL integers into unsigned
