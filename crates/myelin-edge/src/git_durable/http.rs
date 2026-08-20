@@ -20,16 +20,9 @@ struct DRepoCreate {
 }
 impl Handler for DRepoCreate {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let body = if ctx.request.body.is_empty() {
-            Value::Null
-        } else {
-            ctx.request.json_body()?
-        };
-        let slug = body
-            .get("slug")
-            .or_else(|| body.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| EdgeError::BadRequest("create-repo body missing `slug`".into()))?;
+        let request: CreateRepositoryBody =
+            required_json(&ctx.request.body, "repository creation")?;
+        let slug = request.slug.as_str();
         let created = self
             .be
             .create_repo_as(tenant_of(ctx), region_of(ctx), slug, ctx.principal)

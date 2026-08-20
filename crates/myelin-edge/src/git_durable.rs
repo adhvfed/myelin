@@ -69,6 +69,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use self::mutation_input::*;
 use self::mutation_support::*;
 use self::pr_queries::*;
 use self::repo_summary::*;
@@ -3256,6 +3257,7 @@ mod durable_error_mapping_tests {
 mod blame;
 mod check_projection;
 mod http;
+mod mutation_input;
 mod mutation_support;
 mod pr_queries;
 mod recovery;
