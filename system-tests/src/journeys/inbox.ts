@@ -132,10 +132,20 @@ export async function findInboxItem(
   client: SystemTestClient,
   subject: string,
 ): Promise<JsonRecord | undefined> {
+  return findInboxItemMatching(client, (item) => item.subject === subject);
+}
+
+/// Bounded search for one item across the recipient's whole inbox. Prefer
+/// this to a first-page read whenever an item may have moved to a lower
+/// attention band such as `done`.
+export async function findInboxItemMatching(
+  client: SystemTestClient,
+  predicate: (item: JsonRecord) => boolean,
+): Promise<JsonRecord | undefined> {
   return findPaged(
     client,
     "/v1/notif/inbox?view=all",
-    (item) => item.subject === subject,
+    predicate,
   );
 }
 

@@ -12,6 +12,8 @@ import {
 import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
+import { awaitTheOnlyCiRun } from "../src/journeys/ci-runs.js";
+import { findInboxItemMatching } from "../src/journeys/inbox.js";
 import { awaitActiveIssue, expectOpaqueIssueAuthor } from "../src/journeys/issues.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
@@ -143,12 +145,11 @@ name = "contract"
 image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
 command = ["true"]
 `)).commitOid;
-    const run = await eventually<JsonRecord>(async () => {
-      const response = await systemClient.json("/v1/ci/runs?state=all&limit=100");
-      return array(response.body.items, "visible CI runs")
-        .map((item) => record(item, "visible CI run"))
-        .find((item) => item.repo_ref === repoRef && item.commit_oid === commitOid);
-    }, { description: "the founder's mainline CI run to become visible" });
+    const run = await awaitTheOnlyCiRun(
+      systemClient,
+      (candidate) => candidate.repo_ref === repoRef && candidate.commit_oid === commitOid,
+      "the founder's mainline CI run to become visible",
+    );
     const runId = string(run.run_id, "triggering CI run id");
     const eventId = `ci-failed-${randomUUID()}`;
     const now = new Date().toISOString();
@@ -581,11 +582,11 @@ command = ["true"]
     expect(awaiting).toMatchObject({ event_id: eventId, run_id: null, approval: null });
 
     const approvalNotice = await eventually<JsonRecord>(async () => {
-      const response = await founder.json("/v1/notif/inbox?view=all&limit=100");
-      return array(response.body.items, "one human inbox")
-        .map((item) => record(item, "inbox item"))
-        .find((item) => item.action !== null && typeof item.action === "object" &&
-          record(item.action, "inbox action").event_id === eventId);
+      return findInboxItemMatching(
+        founder,
+        (item) => item.action !== null && typeof item.action === "object" &&
+          record(item.action, "inbox action").event_id === eventId,
+      );
     }, { description: "the exact parked automation to appear in its owner's inbox" });
     expect(approvalNotice).toMatchObject({
       reason: "approval_requested",
@@ -607,12 +608,11 @@ command = ["true"]
     expect(array(history.body.items, "filtered issue automation history")).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ event_id: ignoredEventId })]),
     );
-    const inboxBeforeDecision = await founder.json("/v1/notif/inbox?view=all&limit=100");
-    expect(array(inboxBeforeDecision.body.items, "filtered human inbox")).not.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ action: expect.objectContaining({ event_id: ignoredEventId }) }),
-      ]),
-    );
+    expect(await findInboxItemMatching(
+      founder,
+      (item) => item.action !== null && typeof item.action === "object" &&
+        record(item.action, "filtered inbox action").event_id === ignoredEventId,
+    )).toBeUndefined();
     const afterMatch = await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}`);
     expect(afterMatch.body).toMatchObject({ trigger: { id: triggerId, firings_used: 1 } });
 
@@ -631,10 +631,10 @@ command = ["true"]
       },
     });
     const completedNotice = await eventually<JsonRecord>(async () => {
-      const response = await founder.json("/v1/notif/inbox?view=all&limit=100");
-      return array(response.body.items, "one human inbox")
-        .map((item) => record(item, "inbox item"))
-        .find((item) => item.id === approvalNoticeId && item.state === "done");
+      return findInboxItemMatching(
+        founder,
+        (item) => item.id === approvalNoticeId && item.state === "done",
+      );
     }, { description: "the decided automation approval to leave the active inbox" });
     expect(completedNotice.action).toEqual({
       kind: "automation_firing_approval",
@@ -762,12 +762,12 @@ command = ["true"]
       }
     };
     const awaitUnreadApproval = (description: string) => eventually<JsonRecord>(async () => {
-      const response = await founder.json("/v1/notif/inbox?view=all&limit=100");
-      return array(response.body.items, "founder's agent approval inbox")
-        .map((item) => record(item, "agent approval inbox item"))
-        .find((item) => item.subject === pullRequestRef && item.state === "unread" &&
+      return findInboxItemMatching(
+        founder,
+        (item) => item.subject === pullRequestRef && item.state === "unread" &&
           item.action !== null && typeof item.action === "object" &&
-          record(item.action, "agent approval action").kind === "agent_effect_approval");
+          record(item.action, "agent approval action").kind === "agent_effect_approval",
+      );
     }, { description });
     const awaitTerminalFiring = (
       automationId: string,
@@ -832,10 +832,10 @@ command = ["true"]
     });
     await eventually(async () => {
       const response = await founder.json(`${project.path}/prs/${pullRequestNumber}`);
-      const notice = await founder.json("/v1/notif/inbox?view=all&limit=100");
-      const done = array(notice.body.items, "completed rejected approvals")
-        .map((item) => record(item, "completed rejected approval"))
-        .some((item) => item.id === rejectedNotice.id && item.state === "done");
+      const done = await findInboxItemMatching(
+        founder,
+        (item) => item.id === rejectedNotice.id && item.state === "done",
+      );
       return response.body.pr_state === "open" && done ? true : undefined;
     }, { description: "the rejected effect to finish without touching the pull request" });
     expect(await awaitTerminalFiring(
@@ -880,12 +880,11 @@ command = ["true"]
     );
     expect(lateApproval.body).toMatchObject({ error: { code: "conflict" } });
     await eventually(async () => {
-      const notices = await founder.json("/v1/notif/inbox?view=all&limit=100");
-      return array(notices.body.items, "inbox after automation disable")
-          .map((item) => record(item, "approval after automation disable"))
-          .some((item) => item.id === stoppedNotice.id && item.state === "done")
-        ? true
-        : undefined;
+      const done = await findInboxItemMatching(
+        founder,
+        (item) => item.id === stoppedNotice.id && item.state === "done",
+      );
+      return done === undefined ? undefined : true;
     }, { description: "disable to remove its stale approval card" });
     expect((await founder.json(`${project.path}/prs/${pullRequestNumber}`)).body)
       .toMatchObject({ pr_state: "open" });
@@ -942,10 +941,10 @@ command = ["true"]
       "A human approved this exact agent effect.\n",
     );
     const completedNotice = await eventually<JsonRecord>(async () => {
-      const response = await founder.json("/v1/notif/inbox?view=all&limit=100");
-      return array(response.body.items, "founder's completed agent approvals")
-        .map((item) => record(item, "completed agent approval"))
-        .find((item) => item.id === approvalNotice.id && item.state === "done");
+      return findInboxItemMatching(
+        founder,
+        (item) => item.id === approvalNotice.id && item.state === "done",
+      );
     }, { description: "the decided agent effect to leave the active inbox" });
     expect(completedNotice.action).toEqual(action);
 

@@ -5,6 +5,10 @@ import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { array, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
+import {
+  awaitTheOnlyCiRun,
+  ciRunsMatching,
+} from "../src/journeys/ci-runs.js";
 
 const runnerImage =
   "myelin.local/linux-small-v1-rootfs@sha256:65f0f6f242cd4412b4ad56250eadb0a459a59a71b49d21485e68da6a3d5cb975";
@@ -61,17 +65,10 @@ describe.sequential("CI delivery lifecycle", () => {
   test("dispatches exactly one run for a pushed pipeline", async () => {
     pipelineCommitOid = (await project.writeFile("main", ".myelin/ci.toml", pipeline)).commitOid;
 
-    run = await eventually<JsonRecord>(
-      async () => {
-        const response = await systemClient.json("/v1/ci/runs?state=all&limit=100");
-        const matches = array(response.body.items, "CI run list items")
-          .map((item) => record(item, "CI run list item"))
-          .filter((item) => item.repo_ref === repoRef && item.commit_oid === pipelineCommitOid);
-        if (matches.length === 0) return undefined;
-        expect(matches).toHaveLength(1);
-        return matches[0];
-      },
-      { description: `CI run for ${repoRef} at ${pipelineCommitOid}` },
+    run = await awaitTheOnlyCiRun(
+      systemClient,
+      (candidate) => candidate.repo_ref === repoRef && candidate.commit_oid === pipelineCommitOid,
+      `CI run for ${repoRef} at ${pipelineCommitOid}`,
     );
 
     expect(run).toMatchObject({
@@ -104,14 +101,10 @@ describe.sequential("CI delivery lifecycle", () => {
       expectedStatus: 201,
     });
 
-    const pullRequestRun = await eventually<JsonRecord>(
-      async () => {
-        const response = await systemClient.json("/v1/ci/runs?state=all&limit=100");
-        return array(response.body.items, "CI runs after opening a pull request")
-          .map((item) => record(item, "pull request CI run"))
-          .find((item) => item.repo_ref === repoRef && item.commit_oid === pullRequestCommit);
-      },
-      { description: "the pull request CI run to retain its target branch" },
+    const pullRequestRun = await awaitTheOnlyCiRun(
+      systemClient,
+      (candidate) => candidate.repo_ref === repoRef && candidate.commit_oid === pullRequestCommit,
+      "the pull request CI run to retain its target branch",
     );
     expect(pullRequestRun).toMatchObject({
       repo_ref: repoRef,
@@ -189,15 +182,12 @@ describe.sequential("CI delivery lifecycle", () => {
       failingPipeline,
     )).commitOid;
 
-    const failedRun = await eventually<JsonRecord>(async () => {
-      const response = await systemClient.json("/v1/ci/runs?state=all&limit=100");
-      return array(response.body.items, "CI runs after pushing a failing pipeline")
-        .map((item) => record(item, "failing CI run"))
-        .find((item) => item.commit_oid === failedCommit && item.state === "failed");
-    }, {
-      description: "the failing command to become a terminal CI run",
-      timeoutMs: 60_000,
-    });
+    const failedRun = await awaitTheOnlyCiRun(
+      systemClient,
+      (candidate) => candidate.commit_oid === failedCommit && candidate.state === "failed",
+      "the failing command to become a terminal CI run",
+      60_000,
+    );
 
     const failedRunId = string(failedRun.run_id, "failed CI run id");
     const detail = (await systemClient.json(
@@ -222,12 +212,8 @@ describe.sequential("CI delivery lifecycle", () => {
 
   test("inherits repository visibility instead of exposing runs platform-wide", async () => {
     const runId = string(run.run_id, "CI run id");
-    const reviewerRuns = await reviewerClient.json("/v1/ci/runs?state=all&limit=100");
-    expect(
-      array(reviewerRuns.body.items, "reviewer-visible CI runs")
-        .map((item) => record(item, "reviewer-visible CI run"))
-        .some((item) => item.run_id === runId),
-    ).toBe(false);
+    expect(await ciRunsMatching(reviewerClient, (candidate) => candidate.run_id === runId))
+      .toEqual([]);
 
     const hiddenDetail = await reviewerClient.json(
       `/v1/ci/runs/${encodeURIComponent(runId)}`,
