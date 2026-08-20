@@ -68,6 +68,7 @@ pub struct ModelResponse {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
     MissingApiKey,
+    InvalidRequest(String),
     Transport(String),
     Http { status: u16, body: String },
     Parse(String),
@@ -78,7 +79,7 @@ pub enum ModelError {
 impl ModelError {
     pub fn runtime_step_error(&self) -> RuntimeStepError {
         match self {
-            Self::MissingApiKey => RuntimeStepError::Misconfigured,
+            Self::MissingApiKey | Self::InvalidRequest(_) => RuntimeStepError::Misconfigured,
             Self::Transport(_) => RuntimeStepError::Unavailable,
             Self::Http { status, .. } => RuntimeStepError::Rejected {
                 status: Some(*status),
@@ -95,6 +96,9 @@ impl core::fmt::Display for ModelError {
         match self {
             ModelError::MissingApiKey => {
                 write!(f, "model API key is not set (fail-closed; no call made)")
+            }
+            ModelError::InvalidRequest(message) => {
+                write!(f, "model request is invalid: {message}")
             }
             ModelError::Transport(m) => write!(f, "model transport error: {m}"),
             ModelError::Http { status, body } => {

@@ -32,7 +32,7 @@ impl LlmAgentRuntime {
     }
 
     pub fn try_step(&self, conv: &Conversation) -> Result<StepReport, ModelError> {
-        let request = build_request(conv, self.max_output_tokens);
+        let request = build_request(conv, self.max_output_tokens)?;
         let response = self.client.complete(&request)?;
         let outcome = map_reply(response.reply);
         Ok(StepReport {
@@ -81,17 +81,34 @@ pub(crate) fn map_usage(usage: Usage) -> TokenUsage {
     }
 }
 
-pub(crate) fn build_request(conv: &Conversation, max_output_tokens: Option<u32>) -> ModelRequest {
+pub(crate) fn build_request(
+    conv: &Conversation,
+    max_output_tokens: Option<u32>,
+) -> Result<ModelRequest, ModelError> {
     let tools = conv
         .tools
         .iter()
-        .map(|schema| ToolSpec {
-            name: schema.name.0.clone(),
-            description: schema.description.clone(),
-            input_schema: serde_json::from_str(&schema.input_schema)
-                .unwrap_or_else(|_| serde_json::json!({"type": "object"})),
+        .map(|schema| {
+            let input_schema: serde_json::Value = serde_json::from_str(&schema.input_schema)
+                .map_err(|error| {
+                    ModelError::InvalidRequest(format!(
+                        "tool `{}` has malformed input schema JSON: {error}",
+                        schema.name.0
+                    ))
+                })?;
+            if !input_schema.is_object() {
+                return Err(ModelError::InvalidRequest(format!(
+                    "tool `{}` input schema must be a JSON object",
+                    schema.name.0
+                )));
+            }
+            Ok(ToolSpec {
+                name: schema.name.0.clone(),
+                description: schema.description.clone(),
+                input_schema,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut turns = Vec::new();
     for turn in conv.turns.iter() {
@@ -135,12 +152,12 @@ pub(crate) fn build_request(conv: &Conversation, max_output_tokens: Option<u32>)
         }
     }
 
-    ModelRequest {
+    Ok(ModelRequest {
         system: conv.system.0.clone(),
         turns,
         tools,
         max_output_tokens,
-    }
+    })
 }
 
 pub(crate) fn map_reply(reply: ModelReply) -> StepOutcome {
@@ -165,6 +182,14 @@ mod tests {
     use crate::client::{ModelReply, ModelResponse, Usage};
     use crate::mock::MockModelClient;
     use myelin_agent::{BudgetView, SystemContext, ToolOutcome, ToolResult, ToolSchema};
+
+    struct ModelMustNotBeCalled;
+
+    impl ModelClient for ModelMustNotBeCalled {
+        fn complete(&self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+            panic!("invalid local input must be refused before the provider call")
+        }
+    }
 
     fn conv_with_tools() -> Conversation {
         Conversation {
@@ -291,7 +316,7 @@ mod tests {
             result: ToolResult::Succeeded("match at foo.rs:10".into()),
         }]));
 
-        let request = build_request(&conv, Some(128));
+        let request = build_request(&conv, Some(128)).expect("valid tools build a model request");
         assert_eq!(request.system, "you are labelled as an agent");
         assert_eq!(request.tools.len(), 2);
         assert_eq!(request.tools[0].name, "search");
@@ -307,6 +332,23 @@ mod tests {
                 assert!(!results[0].is_error);
             }
             other => panic!("unexpected reconstruction: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_tool_schema_refuses_the_step_before_calling_the_model() {
+        let runtime = LlmAgentRuntime::new(Box::new(ModelMustNotBeCalled));
+
+        for malformed in ["not json", "[]", "null"] {
+            let mut conversation = conv_with_tools();
+            conversation.tools[0].input_schema = malformed.into();
+
+            let error = runtime
+                .try_step(&conversation)
+                .expect_err("an invalid tool schema must fail closed locally");
+            assert!(matches!(error, ModelError::InvalidRequest(_)));
+            assert_eq!(error.runtime_step_error(), RuntimeStepError::Misconfigured);
+            assert!(error.to_string().contains("`search`"));
         }
     }
 
