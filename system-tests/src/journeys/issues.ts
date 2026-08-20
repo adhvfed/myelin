@@ -2,6 +2,7 @@
 // hold that every issue passes before it becomes ordinary visible work.
 import { expect } from "vitest";
 
+import { ExternalEventBus, type ExternalEventEnvelope } from "../event-bus.js";
 import { awaitAuthorizedIssue } from "../issues.js";
 import { array, integer, record, string, type JsonRecord } from "../json.js";
 import { walkPaged } from "../paging.js";
@@ -20,6 +21,13 @@ export interface IssuePage {
   items: JsonRecord[];
   nextCursor: string | null;
   limit: number;
+}
+
+export interface IssueChangeOptions {
+  eventId: string;
+  issueRef: string;
+  issueKey: string;
+  changeKind: string;
 }
 
 function issueListPath(state: IssueListState, key?: string): string {
@@ -87,6 +95,50 @@ export async function awaitActiveIssue(
   const authorization = record(proposed.body.authorization, "issue authorization");
   const requestEventId = string(authorization.request_event_id, "authorization request id");
   return awaitAuthorizedIssue(client, requestEventId, `issue authorization ${requestEventId}`);
+}
+
+/// Publishes the canonical event an Issues producer emits after one visible
+/// change. System stories use this when the interesting behavior starts at the
+/// shared event boundary rather than at an Issues mutation endpoint.
+export async function announceIssueChange(options: IssueChangeOptions): Promise<void> {
+  const now = new Date().toISOString();
+  const envelope: ExternalEventEnvelope = {
+    event_id: options.eventId,
+    type_: "issue.issue.updated",
+    schema_ver: 1,
+    tenant: systemTestConfig.tenant,
+    region: systemTestConfig.region,
+    actor: {
+      tenant: systemTestConfig.tenant,
+      region: systemTestConfig.region,
+      principal_id: "issues-service",
+      kind: "Service",
+      data_role: "Controller",
+      status: "Active",
+    },
+    subject: options.issueRef,
+    aggregate: `issue:${options.issueKey}`,
+    causation_id: null,
+    correlation_id: options.eventId,
+    caused_by: null,
+    depth: 1,
+    contains_personal_data: false,
+    data_role: "Controller",
+    visibility: "Internal",
+    pii_key_ref: null,
+    occurred_at: now,
+    recorded_at: now,
+    payload: {
+      issue: options.issueRef,
+      change_kind: options.changeKind,
+    },
+  };
+  const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
+  try {
+    expect((await bus.publish(envelope)).duplicate).toBe(false);
+  } finally {
+    await bus.close();
+  }
 }
 
 /// Asserts the pseudonymous author shape every issue surface must present:

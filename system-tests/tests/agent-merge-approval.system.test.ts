@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, onTestFinished, test } from "vitest";
 
 import {
   browserApprovedCliClient,
@@ -8,12 +8,12 @@ import {
   systemClient,
   uniqueName,
 } from "../src/context.js";
-import { ExternalEventBus } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
+import { awaitAutomationFiring } from "../src/journeys/automations.js";
 import { findInboxItemMatching } from "../src/journeys/inbox.js";
-import { awaitActiveIssue } from "../src/journeys/issues.js";
-import { array, integer, record, string, type JsonRecord } from "../src/json.js";
+import { announceIssueChange, awaitActiveIssue } from "../src/journeys/issues.js";
+import { integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
 describe("human-governed agent merges", () => {
@@ -99,42 +99,12 @@ describe("human-governed agent merges", () => {
       "merge trigger id",
     );
 
-    const publishMergeRequest = async (eventId: string): Promise<void> => {
-      const now = new Date().toISOString();
-      const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
-      try {
-        expect((await bus.publish({
-          event_id: eventId,
-          type_: "issue.issue.updated",
-          schema_ver: 1,
-          tenant: systemTestConfig.tenant,
-          region: systemTestConfig.region,
-          actor: {
-            tenant: systemTestConfig.tenant,
-            region: systemTestConfig.region,
-            principal_id: "issues-service",
-            kind: "Service",
-            data_role: "Controller",
-            status: "Active",
-          },
-          subject: issueRef,
-          aggregate: `issue:${issueKey}`,
-          causation_id: null,
-          correlation_id: eventId,
-          caused_by: null,
-          depth: 1,
-          contains_personal_data: false,
-          data_role: "Controller",
-          visibility: "Internal",
-          pii_key_ref: null,
-          occurred_at: now,
-          recorded_at: now,
-          payload: { issue: issueRef, change_kind: "merge_request" },
-        })).duplicate).toBe(false);
-      } finally {
-        await bus.close();
-      }
-    };
+    const publishMergeRequest = (eventId: string) => announceIssueChange({
+      eventId,
+      issueRef,
+      issueKey,
+      changeKind: "merge_request",
+    });
     const awaitUnreadApproval = (description: string) => eventually<JsonRecord>(async () => {
       return findInboxItemMatching(
         founder,
@@ -147,15 +117,10 @@ describe("human-governed agent merges", () => {
       automationId: string,
       eventId: string,
       description: string,
-    ) =>
-      eventually<JsonRecord>(async () => {
-        const response = await founder.json(
-          `/v1/triggers/${encodeURIComponent(automationId)}/firings?limit=100`,
-        );
-        return array(response.body.items, "merge trigger history")
-          .map((item) => record(item, "merge trigger firing"))
-          .find((item) => item.event_id === eventId && item.state === "terminal");
-      }, { description });
+    ) => awaitAutomationFiring(founder, automationId, eventId, {
+      state: "terminal",
+      description,
+    });
 
     const rejectedEventId = `merge-request-rejected-${randomUUID()}`;
     await publishMergeRequest(rejectedEventId);
@@ -328,5 +293,112 @@ describe("human-governed agent merges", () => {
       "the resumed hosted workflow to finish after the approved effect",
     );
     expect(completedFiring).toMatchObject({ outcome: "succeeded" });
+  }, 90_000);
+
+  test("keeps a repository-scoped agent inside the repository it was given", async () => {
+    const founder = await browserApprovedCliClient();
+    const issue = await awaitActiveIssue(systemClient, uniqueName("Repository boundary"));
+    const permittedRepository = new GitProject(uniqueName("agent-permitted"), founder);
+    const protectedRepository = new GitProject(uniqueName("agent-out-of-scope"), founder);
+    await permittedRepository.create();
+    await protectedRepository.create();
+    await protectedRepository.writeFile("main", "README.md", "# Outside the delegation\n");
+    const proposedCommit = (await protectedRepository.writeFile(
+      "feature/outside-delegation",
+      "proposal.txt",
+      "This change belongs to another repository.\n",
+      { startRef: "main" },
+    )).commitOid;
+    const opened = await founder.json(`${protectedRepository.path}/prs`, {
+      method: "POST",
+      body: {
+        title: "A merge outside the delegated repository",
+        base_ref: "refs/heads/main",
+        head_ref: "refs/heads/feature/outside-delegation",
+        head_oid: proposedCommit,
+        reviewers: [],
+      },
+      idempotencyKey: `out-of-scope-pr-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const pullRequest = record(
+      record(opened.body.applied, "out-of-scope PR receipt").pr,
+      "out-of-scope pull request",
+    );
+    const pullRequestNumber = integer(pullRequest.number, "out-of-scope PR number");
+    const pullRequestRef =
+      `myelin://${systemTestConfig.tenant}/git/pr/${protectedRepository.slug}:${pullRequestNumber}`;
+
+    const activated = await founder.json("/v1/agents", {
+      method: "POST",
+      body: {
+        name: uniqueName("Repository-bound merge companion"),
+        runtime: "hosted",
+        tools: ["git.merge"],
+      },
+      idempotencyKey: `repository-bound-agent-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const agentId = string(
+      record(activated.body.agent, "repository-bound agent").id,
+      "repository-bound agent id",
+    );
+    const created = await founder.json("/v1/triggers", {
+      method: "POST",
+      body: {
+        event_type: "issue.issue.updated",
+        filter: "payload.change_kind == 'merge_request'",
+        run_as_agent_id: agentId,
+        task: `Merge pull request ${protectedRepository.slug}#${pullRequestNumber}.`,
+        budget_minor_units: 100_000,
+        max_firings: 1,
+        delegation_caveats: [`repo:${permittedRepository.slug}`, "pull_request.merge"],
+      },
+      idempotencyKey: `repository-bound-trigger-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const automationId = string(
+      record(created.body.trigger, "repository-bound automation").id,
+      "repository-bound automation id",
+    );
+    onTestFinished(async () => {
+      await founder.json(`/v1/triggers/${encodeURIComponent(automationId)}/disable`, {
+        method: "POST",
+        body: {},
+      });
+    });
+
+    const eventId = `out-of-scope-merge-${randomUUID()}`;
+    await announceIssueChange({
+      eventId,
+      issueRef: string(issue.ref, "repository-bound issue ref"),
+      issueKey: string(issue.key, "repository-bound issue key"),
+      changeKind: "merge_request",
+    });
+
+    const firing = await awaitAutomationFiring(founder, automationId, eventId, {
+      state: "terminal",
+      resultState: "available",
+      description: "the repository-scoped agent to finish without crossing its boundary",
+    });
+    expect(firing).toMatchObject({ outcome: "succeeded", terminal_reason: null });
+    expect((await founder.json(
+      `${protectedRepository.path}/prs/${pullRequestNumber}`,
+    )).body).toMatchObject({ pr_state: "open" });
+    expect(await findInboxItemMatching(
+      founder,
+      (item) => item.subject === pullRequestRef && item.state !== "done",
+    )).toBeUndefined();
+
+    const runId = string(firing.run_id, "repository-bound run id");
+    const result = await founder.json(
+      `/v1/triggers/${encodeURIComponent(automationId)}/runs/${encodeURIComponent(runId)}/result`,
+    );
+    expect(result.body).toMatchObject({
+      result: {
+        run_id: runId,
+        answer: "The governed pull-request merge was refused; no merge was applied.",
+      },
+    });
   }, 90_000);
 });
