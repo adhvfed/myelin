@@ -216,6 +216,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::identity_durable::identity_tuple_revision_migrations(),
         crate::identity_durable::identity_project_recent_list_migrations(),
         crate::identity_durable::identity_agent_recent_list_migrations(),
+        crate::placement_durable::cell_value_invariant_migrations(),
     ]
 }
 
@@ -805,10 +806,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(
-            *ids.last().unwrap(),
-            "0117_identity_agent_recent_list_index"
-        );
+        assert_eq!(*ids.last().unwrap(), "0119_cell_value_invariants_validate");
     }
 
     #[test]

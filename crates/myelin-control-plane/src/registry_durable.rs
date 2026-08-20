@@ -4,9 +4,9 @@ use myelin_tenancy::{CellId, TenantId};
 use crate::placement_of::{MisrouteAuditRecord, PlacementOf};
 #[cfg(any(test, feature = "test-support"))]
 use crate::registry::Registry;
-use crate::registry::{
-    cell_to_durable, corrupt_row_panic, durable_to_cell, durable_to_placement, placement_db_panic,
-    placement_to_durable,
+use crate::registry::{corrupt_row_panic, placement_db_panic};
+use crate::registry_codec::{
+    decode_cell, decode_placement, encode_cell, encode_placement, validate_cell,
 };
 use crate::schema::{Cell, TenantPlacement};
 
@@ -65,15 +65,19 @@ impl DurablePlacementRegistry {
     }
 
     pub fn insert_cell(&mut self, cell: Cell) -> Result<(), PlacementWriteError> {
+        validate_cell(&cell).map_err(|why| PlacementWriteError::InvalidValue(why.to_string()))?;
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PlacementBackend::Memory(reg) => {
                 reg.insert_cell(cell);
                 Ok(())
             }
-            PlacementBackend::Pg(pg) => pg
-                .block(pg.placement.insert_cell(&cell_to_durable(&cell)))
-                .map_err(|e| PlacementWriteError::Db(e.to_string())),
+            PlacementBackend::Pg(pg) => {
+                let row = encode_cell(&cell)
+                    .expect("validate_cell established that the cell is durably representable");
+                pg.block(pg.placement.insert_cell(&row))
+                    .map_err(|e| PlacementWriteError::Db(e.to_string()))
+            }
         }
     }
 
@@ -85,7 +89,8 @@ impl DurablePlacementRegistry {
                 .block(pg.placement.get_cell(cell_id.as_str()))
                 .unwrap_or_else(|e| placement_db_panic("cell read", &e))
                 .map(|r| {
-                    durable_to_cell(&r).unwrap_or_else(|| corrupt_row_panic("cell", &r.cell_id))
+                    decode_cell(&r)
+                        .unwrap_or_else(|why| corrupt_row_panic("cell", &r.cell_id, &why))
                 }),
         }
     }
@@ -98,7 +103,7 @@ impl DurablePlacementRegistry {
                 Err(e) => Err(PlacementWriteError::InvariantRejected(e.to_string())),
             },
             PlacementBackend::Pg(pg) => {
-                pg.block(pg.placement.place_tenant(&placement_to_durable(&placement)))
+                pg.block(pg.placement.place_tenant(&encode_placement(&placement)))
             }
         }
     }
@@ -111,8 +116,9 @@ impl DurablePlacementRegistry {
                 .block(pg.placement.get_placement(tenant_id.as_str()))
                 .unwrap_or_else(|e| placement_db_panic("placement read", &e))
                 .map(|r| {
-                    durable_to_placement(&r)
-                        .unwrap_or_else(|| corrupt_row_panic("tenant_placement", &r.tenant_id))
+                    decode_placement(&r).unwrap_or_else(|why| {
+                        corrupt_row_panic("tenant_placement", &r.tenant_id, &why)
+                    })
                 }),
         }
     }
@@ -223,8 +229,28 @@ mod tests {
     #[test]
     fn converters_round_trip_through_opaque_text() {
         let c = cell("cell-w-1", "eu-west");
-        assert_eq!(durable_to_cell(&cell_to_durable(&c)).unwrap(), c);
+        assert_eq!(decode_cell(&encode_cell(&c).unwrap()).unwrap(), c);
         let p = placement("01J0ACME", "eu-west", "cell-w-1", &["cell-w-1"]);
-        assert_eq!(durable_to_placement(&placement_to_durable(&p)).unwrap(), p);
+        assert_eq!(decode_placement(&encode_placement(&p)).unwrap(), p);
+    }
+
+    #[test]
+    fn an_unrepresentable_cell_is_a_typed_rejection_before_storage() {
+        let mut reg = DurablePlacementRegistry::in_memory();
+        let mut impossible = cell("cell-too-large", "eu-west");
+        impossible.capacity.storage_bytes_max = i64::MAX as u64 + 1;
+
+        let error = reg
+            .insert_cell(impossible)
+            .expect_err("the database boundary must not wrap an oversized u64");
+        assert!(
+            matches!(error, PlacementWriteError::InvalidValue(_)),
+            "the caller receives an actionable value rejection: {error}"
+        );
+        assert_eq!(
+            reg.cell(&CellId::from_token("cell-too-large")),
+            None,
+            "a rejected cell never reaches even the in-memory test backing"
+        );
     }
 }

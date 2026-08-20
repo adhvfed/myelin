@@ -287,8 +287,8 @@ pub use outbox_durable::PgOutboxBacking;
 pub use pg::{PgError, PgStore};
 pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
 pub use placement_durable::{
-    placement_durable_migrations, DurableCellProvisioningRow, DurableCellRow,
-    DurableLocalTenantRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
+    cell_value_invariant_migrations, placement_durable_migrations, DurableCellProvisioningRow,
+    DurableCellRow, DurableLocalTenantRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
     DurablePlacementBacking, DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
 };
 pub use provider::{

@@ -17,6 +17,32 @@ CREATE TABLE IF NOT EXISTS cell (
     endpoint           text   NOT NULL
 );";
 
+pub const CELL_VALUE_INVARIANTS_EXPAND_MIGRATION: &str = "\
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'cell'::regclass
+           AND conname = 'cell_value_shape'
+    ) THEN
+        ALTER TABLE cell
+            ADD CONSTRAINT cell_value_shape
+            CHECK (
+                status IN ('Provisioning', 'Active', 'Draining')
+                AND isolation_kind IN ('Pool', 'Bridge', 'Dedicated')
+                AND tenants_max BETWEEN 0 AND 4294967295
+                AND write_qps_max BETWEEN 0 AND 4294967295
+                AND storage_bytes_max >= 0
+                AND utilisation BETWEEN 0 AND 100
+                AND version BETWEEN 0 AND 4294967295
+            ) NOT VALID;
+    END IF;
+END
+$$;";
+
+pub const CELL_VALUE_INVARIANTS_VALIDATE_MIGRATION: &str = "\
+ALTER TABLE cell VALIDATE CONSTRAINT cell_value_shape;";
+
 pub const TENANT_PLACEMENT_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS tenant_placement (
     tenant_id      text PRIMARY KEY,
@@ -153,6 +179,20 @@ pub fn placement_durable_migrations() -> crate::migration::Migrations {
     ])
 }
 
+pub fn cell_value_invariant_migrations() -> crate::migration::Migrations {
+    use crate::migration::{Migration, Migrations};
+    Migrations::of([
+        Migration::plain(
+            "0118_cell_value_invariants_expand",
+            CELL_VALUE_INVARIANTS_EXPAND_MIGRATION,
+        ),
+        Migration::plain(
+            "0119_cell_value_invariants_validate",
+            CELL_VALUE_INVARIANTS_VALIDATE_MIGRATION,
+        ),
+    ])
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableCellRow {
     pub cell_id: String,
@@ -211,6 +251,7 @@ pub struct DurableMisrouteRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlacementWriteError {
     InvariantRejected(String),
+    InvalidValue(String),
     Db(String),
 }
 
@@ -221,6 +262,11 @@ impl core::fmt::Display for PlacementWriteError {
                 f,
                 "placement write REJECTED by the DB placement-invariant trigger (the write did NOT \
                  land): {why}"
+            ),
+            PlacementWriteError::InvalidValue(why) => write!(
+                f,
+                "placement write REJECTED because its value cannot be represented durably (the \
+                 write did NOT land): {why}"
             ),
             PlacementWriteError::Db(why) => {
                 write!(

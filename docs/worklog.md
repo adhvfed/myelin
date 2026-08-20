@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — cell capacity cannot change sign at rest
+
+The durable cell registry translated signed PostgreSQL integers into unsigned
+domain values with unchecked casts. A corrupt `-1` capacity therefore became a
+plausible-looking multi-billion or multi-exabyte limit, while a domain storage
+capacity above `i64::MAX` wrapped negative on its way into PostgreSQL. Cell
+utilisation also admitted values above one hundred despite being used as a
+percentage by placement.
+
+Cell persistence now has one explicit codec, separated from the registry's
+routing behavior. Encoding rejects values PostgreSQL cannot represent;
+decoding names the precise corrupt field and fails closed; and all numeric
+conversions are checked. A forward database invariant admits exactly the enum
+and numeric ranges the domain can read, protecting direct SQL and older
+writers as well as current Rust code. Its durable integration story rejects
+negative, oversized, unknown-enum, and impossible-percentage rows, verifies no
+partial entry remains, and accepts the exact largest valid boundary.
+
+**Proof:** registry boundary tests 21/21; storage unit suite 513/513;
+control-plane suite 195/195 plus all drills; PostgreSQL placement integration
+4/4 against the live federation database; Clippy `-D warnings` for all
+control-plane and storage targets/features.
+
 ## 2026-08-20 — CI workflow identity no longer hashes Rust spelling
 
 The production `ci.pipeline` definition pin hashed the raw bytes of four Rust

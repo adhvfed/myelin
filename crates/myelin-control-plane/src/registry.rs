@@ -1,11 +1,13 @@
 use crate::placement_of_repo::{RepoPlacementRow, StorageGroup};
-use crate::schema::{
-    Capacity, Cell, CellProvisioning, CellStatus, IsolationKind, LocalTenant, PlacementStatus,
-    ProvisioningOutcome, TenantPlacement,
+use crate::registry_codec::{
+    cell_status_text, decode_cell, decode_placement, encode_cell, encode_placement, isolation_from,
+    isolation_text, placement_status_text, provisioning_outcome_from, provisioning_outcome_text,
+    validate_cell, RegistryRowError,
 };
+use crate::schema::{Cell, CellProvisioning, LocalTenant, TenantPlacement};
 use myelin_storage::placement_durable::{
-    DurableCellProvisioningRow, DurableCellRow, DurableLocalTenantRow, DurablePlacementBacking,
-    DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
+    DurableCellProvisioningRow, DurableLocalTenantRow, DurablePlacementBacking,
+    DurableRepoPlacementRow, PlacementWriteError,
 };
 use myelin_tenancy::{CellId, Region, TenantId};
 #[cfg(any(test, feature = "test-support"))]
@@ -57,134 +59,6 @@ impl std::fmt::Display for PlacementError {
 
 impl std::error::Error for PlacementError {}
 
-pub(crate) fn cell_status_text(s: CellStatus) -> &'static str {
-    match s {
-        CellStatus::Provisioning => "Provisioning",
-        CellStatus::Active => "Active",
-        CellStatus::Draining => "Draining",
-    }
-}
-
-pub(crate) fn cell_status_from(s: &str) -> Option<CellStatus> {
-    match s {
-        "Provisioning" => Some(CellStatus::Provisioning),
-        "Active" => Some(CellStatus::Active),
-        "Draining" => Some(CellStatus::Draining),
-        _ => None,
-    }
-}
-
-pub(crate) fn isolation_text(k: IsolationKind) -> &'static str {
-    match k {
-        IsolationKind::Pool => "Pool",
-        IsolationKind::Bridge => "Bridge",
-        IsolationKind::Dedicated => "Dedicated",
-    }
-}
-
-pub(crate) fn isolation_from(s: &str) -> Option<IsolationKind> {
-    match s {
-        "Pool" => Some(IsolationKind::Pool),
-        "Bridge" => Some(IsolationKind::Bridge),
-        "Dedicated" => Some(IsolationKind::Dedicated),
-        _ => None,
-    }
-}
-
-pub(crate) fn placement_status_text(s: PlacementStatus) -> &'static str {
-    match s {
-        PlacementStatus::Pending => "Pending",
-        PlacementStatus::Active => "Active",
-        PlacementStatus::Offboarding => "Offboarding",
-    }
-}
-
-pub(crate) fn placement_status_from(s: &str) -> Option<PlacementStatus> {
-    match s {
-        "Pending" => Some(PlacementStatus::Pending),
-        "Active" => Some(PlacementStatus::Active),
-        "Offboarding" => Some(PlacementStatus::Offboarding),
-        _ => None,
-    }
-}
-
-pub(crate) fn provisioning_outcome_text(o: ProvisioningOutcome) -> &'static str {
-    match o {
-        ProvisioningOutcome::Running => "Running",
-        ProvisioningOutcome::Passed => "Passed",
-        ProvisioningOutcome::Failed => "Failed",
-    }
-}
-
-pub(crate) fn provisioning_outcome_from(s: &str) -> Option<ProvisioningOutcome> {
-    match s {
-        "Running" => Some(ProvisioningOutcome::Running),
-        "Passed" => Some(ProvisioningOutcome::Passed),
-        "Failed" => Some(ProvisioningOutcome::Failed),
-        _ => None,
-    }
-}
-
-pub(crate) fn cell_to_durable(c: &Cell) -> DurableCellRow {
-    DurableCellRow {
-        cell_id: c.cell_id.as_str().to_string(),
-        region: c.region.as_str().to_string(),
-        status: cell_status_text(c.status).to_string(),
-        isolation_kind: isolation_text(c.isolation_kind).to_string(),
-        tenants_max: c.capacity.tenants_max as i64,
-        write_qps_max: c.capacity.write_qps_max as i64,
-        storage_bytes_max: c.capacity.storage_bytes_max as i64,
-        utilisation: c.utilisation as i16,
-        version: c.version as i64,
-        endpoint: c.endpoint.clone(),
-    }
-}
-
-pub(crate) fn durable_to_cell(r: &DurableCellRow) -> Option<Cell> {
-    Some(Cell {
-        cell_id: CellId::from_token(&r.cell_id),
-        region: Region::new(&r.region),
-        status: cell_status_from(&r.status)?,
-        isolation_kind: isolation_from(&r.isolation_kind)?,
-        capacity: Capacity {
-            tenants_max: r.tenants_max as u32,
-            write_qps_max: r.write_qps_max as u32,
-            storage_bytes_max: r.storage_bytes_max as u64,
-        },
-        utilisation: r.utilisation as u8,
-        version: r.version as u32,
-        endpoint: r.endpoint.clone(),
-    })
-}
-
-pub(crate) fn placement_to_durable(p: &TenantPlacement) -> DurablePlacementRow {
-    DurablePlacementRow {
-        tenant_id: p.tenant_id.as_str().to_string(),
-        region: p.region.as_str().to_string(),
-        home_cell: p.home_cell.as_str().to_string(),
-        isolation_tier: isolation_text(p.isolation_tier).to_string(),
-        slug: p.slug.clone(),
-        status: placement_status_text(p.status).to_string(),
-        member_cells: p
-            .member_cells
-            .iter()
-            .map(|c| c.as_str().to_string())
-            .collect(),
-    }
-}
-
-pub(crate) fn durable_to_placement(r: &DurablePlacementRow) -> Option<TenantPlacement> {
-    Some(TenantPlacement {
-        tenant_id: TenantId::from_token(&r.tenant_id),
-        region: Region::new(&r.region),
-        home_cell: CellId::from_token(&r.home_cell),
-        isolation_tier: isolation_from(&r.isolation_tier)?,
-        slug: r.slug.clone(),
-        status: placement_status_from(&r.status)?,
-        member_cells: r.member_cells.iter().map(CellId::from_token).collect(),
-    })
-}
-
 pub(crate) fn placement_db_panic(op: &str, why: &dyn core::fmt::Display) -> ! {
     panic!(
         "control-plane placement registry: durable {op} FAILED (fail-static loud - the placement \
@@ -193,11 +67,18 @@ pub(crate) fn placement_db_panic(op: &str, why: &dyn core::fmt::Display) -> ! {
     )
 }
 
-pub(crate) fn corrupt_row_panic(table: &str, key: &str) -> ! {
+pub(crate) fn corrupt_row_panic(table: &str, key: &str, why: &dyn core::fmt::Display) -> ! {
     panic!(
-        "control-plane placement registry: durable `{table}` row `{key}` carries an unknown \
-         status/tier text - fail closed (the closed enums admit no silent coercion; the row is \
-         corrupt or written by a newer schema)"
+        "control-plane placement registry: durable `{table}` row `{key}` is invalid: {why} - \
+         fail closed (no silent coercion; the row is corrupt or written by an incompatible schema)"
+    )
+}
+
+fn unstorable_cell_panic(cell: &Cell, why: &RegistryRowError) -> ! {
+    panic!(
+        "control-plane placement registry: cell `{}` cannot be represented durably: {why} - \
+         refusing the write before any value can wrap or truncate",
+        cell.cell_id.as_str()
     )
 }
 
@@ -268,6 +149,7 @@ impl Registry {
     }
 
     pub fn insert_cell(&mut self, cell: Cell) -> Option<Cell> {
+        validate_cell(&cell).unwrap_or_else(|why| unstorable_cell_panic(&cell, &why));
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
             RegistryBackend::Memory(m) => m.cells.insert(cell.cell_id.as_str().to_string(), cell),
@@ -276,9 +158,12 @@ impl Registry {
                     .block(pg.backing.get_cell(cell.cell_id.as_str()))
                     .unwrap_or_else(|e| placement_db_panic("cell read (insert prior)", &e))
                     .map(|r| {
-                        durable_to_cell(&r).unwrap_or_else(|| corrupt_row_panic("cell", &r.cell_id))
+                        decode_cell(&r)
+                            .unwrap_or_else(|why| corrupt_row_panic("cell", &r.cell_id, &why))
                     });
-                pg.block(pg.backing.insert_cell(&cell_to_durable(&cell)))
+                let row = encode_cell(&cell)
+                    .expect("validate_cell established that the cell is durably representable");
+                pg.block(pg.backing.insert_cell(&row))
                     .unwrap_or_else(|e| placement_db_panic("cell insert", &e));
                 prior
             }
@@ -293,7 +178,8 @@ impl Registry {
                 .block(pg.backing.get_cell(cell_id.as_str()))
                 .unwrap_or_else(|e| placement_db_panic("cell read", &e))
                 .map(|r| {
-                    durable_to_cell(&r).unwrap_or_else(|| corrupt_row_panic("cell", &r.cell_id))
+                    decode_cell(&r)
+                        .unwrap_or_else(|why| corrupt_row_panic("cell", &r.cell_id, &why))
                 }),
         }
     }
@@ -318,7 +204,7 @@ impl Registry {
                 .unwrap_or_else(|e| placement_db_panic("cell scan", &e))
                 .iter()
                 .map(|r| {
-                    durable_to_cell(r).unwrap_or_else(|| corrupt_row_panic("cell", &r.cell_id))
+                    decode_cell(r).unwrap_or_else(|why| corrupt_row_panic("cell", &r.cell_id, &why))
                 })
                 .collect(),
         };
@@ -341,10 +227,11 @@ impl Registry {
                     .block(pg.backing.get_placement(placement.tenant_id.as_str()))
                     .unwrap_or_else(|e| placement_db_panic("placement read (prior)", &e))
                     .map(|r| {
-                        durable_to_placement(&r)
-                            .unwrap_or_else(|| corrupt_row_panic("tenant_placement", &r.tenant_id))
+                        decode_placement(&r).unwrap_or_else(|why| {
+                            corrupt_row_panic("tenant_placement", &r.tenant_id, &why)
+                        })
                     });
-                match pg.block(pg.backing.place_tenant(&placement_to_durable(&placement))) {
+                match pg.block(pg.backing.place_tenant(&encode_placement(&placement))) {
                     Ok(()) => Ok(prior),
                     Err(e @ PlacementWriteError::InvariantRejected(_)) => placement_db_panic(
                         "place_tenant (DB trigger refused a write the in-code invariant admitted \
@@ -413,8 +300,9 @@ impl Registry {
                 .block(pg.backing.get_placement(tenant_id.as_str()))
                 .unwrap_or_else(|e| placement_db_panic("placement read", &e))
                 .map(|r| {
-                    durable_to_placement(&r)
-                        .unwrap_or_else(|| corrupt_row_panic("tenant_placement", &r.tenant_id))
+                    decode_placement(&r).unwrap_or_else(|why| {
+                        corrupt_row_panic("tenant_placement", &r.tenant_id, &why)
+                    })
                 }),
         }
     }
@@ -428,8 +316,9 @@ impl Registry {
                 .unwrap_or_else(|e| placement_db_panic("placement scan", &e))
                 .iter()
                 .map(|r| {
-                    durable_to_placement(r)
-                        .unwrap_or_else(|| corrupt_row_panic("tenant_placement", &r.tenant_id))
+                    decode_placement(r).unwrap_or_else(|why| {
+                        corrupt_row_panic("tenant_placement", &r.tenant_id, &why)
+                    })
                 })
                 .collect(),
         };
@@ -467,8 +356,9 @@ impl Registry {
                 .block(pg.backing.get_placement_by_slug(slug))
                 .unwrap_or_else(|e| placement_db_panic("placement slug read", &e))
                 .map(|r| {
-                    durable_to_placement(&r)
-                        .unwrap_or_else(|| corrupt_row_panic("tenant_placement", &r.tenant_id))
+                    decode_placement(&r).unwrap_or_else(|why| {
+                        corrupt_row_panic("tenant_placement", &r.tenant_id, &why)
+                    })
                 }),
         }
     }
@@ -509,8 +399,9 @@ impl Registry {
                 .map(|r| CellProvisioning {
                     cell_id: CellId::from_token(&r.cell_id),
                     step: r.step.clone(),
-                    outcome: provisioning_outcome_from(&r.outcome)
-                        .unwrap_or_else(|| corrupt_row_panic("cell_provisioning", &r.cell_id)),
+                    outcome: provisioning_outcome_from(&r.outcome).unwrap_or_else(|why| {
+                        corrupt_row_panic("cell_provisioning", &r.cell_id, &why)
+                    }),
                 })
                 .collect(),
         }
@@ -538,8 +429,9 @@ impl Registry {
                 .unwrap_or_else(|e| placement_db_panic("local-tenant upsert", &e))
                 .map(|r| LocalTenant {
                     tenant_id: TenantId::from_token(&r.tenant_id),
-                    isolation_tier: isolation_from(&r.isolation_tier)
-                        .unwrap_or_else(|| corrupt_row_panic("local_tenant", &r.tenant_id)),
+                    isolation_tier: isolation_from(&r.isolation_tier).unwrap_or_else(|why| {
+                        corrupt_row_panic("local_tenant", &r.tenant_id, &why)
+                    }),
                     active: r.active,
                 }),
         }
@@ -559,8 +451,9 @@ impl Registry {
                 .iter()
                 .map(|r| LocalTenant {
                     tenant_id: TenantId::from_token(&r.tenant_id),
-                    isolation_tier: isolation_from(&r.isolation_tier)
-                        .unwrap_or_else(|| corrupt_row_panic("local_tenant", &r.tenant_id)),
+                    isolation_tier: isolation_from(&r.isolation_tier).unwrap_or_else(|why| {
+                        corrupt_row_panic("local_tenant", &r.tenant_id, &why)
+                    }),
                     active: r.active,
                 })
                 .collect(),

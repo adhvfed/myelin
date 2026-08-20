@@ -3,8 +3,8 @@
 use myelin_config::MyelinConfig;
 use myelin_storage::migration::HotTables;
 use myelin_storage::placement_durable::{
-    placement_durable_migrations, DurableCellRow, DurableMisrouteAuditBacking,
-    DurablePlacementBacking, DurablePlacementRow, PlacementWriteError,
+    cell_value_invariant_migrations, placement_durable_migrations, DurableCellRow,
+    DurableMisrouteAuditBacking, DurablePlacementBacking, DurablePlacementRow, PlacementWriteError,
 };
 use myelin_storage::SubstrateProvider;
 
@@ -42,6 +42,10 @@ async fn admin_provider() -> Option<SubstrateProvider> {
         .expect(
             "apply the placement migrations (cell + tenant_placement + TRIGGER + misroute_audit)",
         );
+    provider
+        .migrate(&cell_value_invariant_migrations(), &HotTables::none())
+        .await
+        .expect("apply the cell value-shape invariants");
     Some(provider)
 }
 
@@ -316,4 +320,95 @@ async fn misroute_audit_survives_a_fresh_instance() {
         .execute(provider.db_pool())
         .await;
     println!("OK [3]: the misroute audit trail survived a fresh instance (durable SI-028).");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cell_registry_only_persists_values_the_domain_can_read() {
+    let Some(provider) = admin_provider().await else {
+        return;
+    };
+    let suffix = uniq();
+    let backing = DurablePlacementBacking::new(provider.db_pool().clone());
+    let sound = cell_row(&format!("cell-boundary-{suffix}"), "eu-west");
+
+    let mut cases = Vec::new();
+
+    let mut negative_capacity = sound.clone();
+    negative_capacity.cell_id = format!("cell-negative-capacity-{suffix}");
+    negative_capacity.tenants_max = -1;
+    cases.push(("a negative capacity", negative_capacity));
+
+    let mut oversized_capacity = sound.clone();
+    oversized_capacity.cell_id = format!("cell-oversized-capacity-{suffix}");
+    oversized_capacity.write_qps_max = i64::from(u32::MAX) + 1;
+    cases.push(("a capacity wider than the domain", oversized_capacity));
+
+    let mut negative_storage = sound.clone();
+    negative_storage.cell_id = format!("cell-negative-storage-{suffix}");
+    negative_storage.storage_bytes_max = -1;
+    cases.push(("negative storage", negative_storage));
+
+    let mut impossible_utilisation = sound.clone();
+    impossible_utilisation.cell_id = format!("cell-impossible-utilisation-{suffix}");
+    impossible_utilisation.utilisation = 101;
+    cases.push((
+        "utilisation above one hundred percent",
+        impossible_utilisation,
+    ));
+
+    let mut negative_version = sound.clone();
+    negative_version.cell_id = format!("cell-negative-version-{suffix}");
+    negative_version.version = -1;
+    cases.push(("a negative version", negative_version));
+
+    let mut unknown_status = sound.clone();
+    unknown_status.cell_id = format!("cell-unknown-status-{suffix}");
+    unknown_status.status = "HealthyEnough".into();
+    cases.push(("an unknown lifecycle status", unknown_status));
+
+    let mut unknown_isolation = sound.clone();
+    unknown_isolation.cell_id = format!("cell-unknown-isolation-{suffix}");
+    unknown_isolation.isolation_kind = "MostlyDedicated".into();
+    cases.push(("an unknown isolation kind", unknown_isolation));
+
+    for (description, row) in cases {
+        let error = backing.insert_cell(&row).await.expect_err(description);
+        assert!(
+            error.to_string().contains("cell_value_shape"),
+            "{description} is rejected by the named database invariant: {error}"
+        );
+        assert_eq!(
+            backing
+                .get_cell(&row.cell_id)
+                .await
+                .expect("read after rejection"),
+            None,
+            "a rejected cell leaves no half-written registry entry"
+        );
+    }
+
+    let mut boundary = sound;
+    boundary.tenants_max = i64::from(u32::MAX);
+    boundary.write_qps_max = i64::from(u32::MAX);
+    boundary.storage_bytes_max = i64::MAX;
+    boundary.utilisation = 100;
+    boundary.version = i64::from(u32::MAX);
+    backing
+        .insert_cell(&boundary)
+        .await
+        .expect("the largest values the domain can read remain valid");
+    assert_eq!(
+        backing.get_cell(&boundary.cell_id).await.expect("read"),
+        Some(boundary.clone()),
+        "the durable boundary is exact, not artificially narrower"
+    );
+
+    sqlx::query("DELETE FROM cell WHERE cell_id = $1")
+        .bind(&boundary.cell_id)
+        .execute(provider.db_pool())
+        .await
+        .expect("clean up boundary cell");
+    println!(
+        "OK [4]: cell registry values are constrained to exactly what the domain can represent."
+    );
 }

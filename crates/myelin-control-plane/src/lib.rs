@@ -14,6 +14,7 @@ pub mod placement_of;
 pub mod placement_of_repo;
 pub mod provision;
 pub mod registry;
+mod registry_codec;
 pub mod registry_durable;
 pub mod residency_verify;
 pub mod runner_claim_pin;
