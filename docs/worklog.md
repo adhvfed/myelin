@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — malformed mentions fail visibly instead of disappearing
+
+The notification router decoded a signal's `mentions` collection with
+`unwrap_or_default`. A malformed collection therefore became “zero mentions,”
+the delivery was acknowledged, and the intended direct notification vanished
+without an inbox row or a dead letter. This was inconsistent with the same
+router's strict signal and notification-reason decoding.
+
+Mention decoding now returns the router's existing non-retryable poison error.
+The consumer dead-letters the bad event, commits no partial notification row,
+and remains free to deliver the next valid signal. The regression describes
+that operational sequence rather than merely testing the decoder in isolation.
+
+**Proof:** notification unit suite 348/348; Clippy `-D warnings` for
+`myelin-notif`; black-box notification lifecycle and scale journeys 7/7.
+
 ## 2026-08-20 — CI deadlines are runtime work, not test choreography
 
 The dogfood incident was literal: CI's production workflow fan-out discovered

@@ -326,7 +326,7 @@ impl SignalRouter {
         signal: &Signal,
         handler_tx: &mut myelin_events::HandlerTx<'_>,
     ) -> Result<(), RouteError> {
-        let mentions = mentions_of(signal_event);
+        let mentions = mentions_of(signal_event)?;
         if !mentions.is_empty() {
             let reason = notification_reason_of(signal_event)?;
             for principal in &mentions {
@@ -368,7 +368,7 @@ impl SignalRouter {
         signal: &Signal,
         handler_tx: &mut myelin_events::HandlerTx<'_>,
     ) -> Result<(), RouteError> {
-        let mentions = mentions_of(signal_event);
+        let mentions = mentions_of(signal_event)?;
         if mentions.is_empty() {
             return Ok(());
         }
@@ -706,12 +706,14 @@ fn item_id_for(tenant: &TenantId, recipient: &str, dedup_key: &str) -> String {
 
 pub const SIGNAL_MENTIONS_KEY: &str = "mentions";
 
-fn mentions_of(env: &EventEnvelope) -> Vec<Principal> {
+fn mentions_of(env: &EventEnvelope) -> Result<Vec<Principal>, RouteError> {
     let Some(value) = env.payload.get(SIGNAL_MENTIONS_KEY) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let nodes: Vec<InlineNode> = serde_json::from_value(value.clone()).unwrap_or_default();
-    extract_mentions(&nodes)
+    let nodes: Vec<InlineNode> = serde_json::from_value(value.clone()).map_err(|_| {
+        RouteError::MalformedSignal("signal mentions are not a valid inline-node collection".into())
+    })?;
+    Ok(extract_mentions(&nodes))
 }
 
 fn emit_base_from(env: &EventEnvelope) -> EmitContextBase {
@@ -1138,6 +1140,47 @@ mod tests {
             1,
             "only the good Signal emitted (the poison did not)"
         );
+    }
+
+    #[test]
+    fn malformed_mentions_are_poison_not_a_silent_notification_drop() {
+        let outbox = OutboxStore::new();
+        let (consumer, inbox) = router_over(&outbox);
+        let mut poison = signal_msg(
+            "evt-malformed-mentions",
+            &signal(
+                "review_requested",
+                Severity::Notice,
+                "myelin://acme/git/repo/app/pr/7",
+                "review-7",
+            ),
+        );
+        poison.envelope.payload[SIGNAL_MENTIONS_KEY] =
+            serde_json::json!({"recipient": "p-reviewer"});
+
+        assert!(matches!(
+            consumer.deliver(&poison),
+            Delivered::DeadLettered(ref reason)
+                if reason.0 == "signal mentions are not a valid inline-node collection"
+        ));
+        assert_eq!(inbox.len(), 0, "malformed fanout commits no partial row");
+
+        let good = signal_msg(
+            "evt-after-malformed-mentions",
+            &signal(
+                "ci_run_failed",
+                Severity::Error,
+                "myelin://acme/ci/run/42",
+                "run-42",
+            ),
+        );
+        assert_eq!(
+            consumer.deliver(&good),
+            Delivered::Acked,
+            "the next valid notification is not stalled behind poison"
+        );
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(consumer.dead_letters().len(), 1);
     }
 
     #[test]
