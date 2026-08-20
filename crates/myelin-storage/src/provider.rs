@@ -179,6 +179,26 @@ pub fn foundation_migrations() -> Migrations {
             "0006_outbox_publisher_grant_scope",
             myelin_events::OUTBOX_PUBLISHER_GRANT_SCOPE_MIGRATION,
         ),
+        Migration::plain(
+            "0007_outbox_value_invariants_expand",
+            myelin_events::OUTBOX_VALUE_INVARIANTS_EXPAND_MIGRATION,
+        ),
+        Migration::plain(
+            "0008_outbox_identity_backfill",
+            myelin_events::OUTBOX_IDENTITY_BACKFILL_MIGRATION,
+        ),
+        Migration::plain(
+            "0009_outbox_value_invariants_validate",
+            myelin_events::OUTBOX_VALUE_INVARIANTS_VALIDATE_MIGRATION,
+        ),
+        Migration::plain(
+            "0009a_outbox_quarantine_resolution",
+            myelin_events::OUTBOX_QUARANTINE_RESOLUTION_MIGRATION,
+        ),
+        Migration::plain(
+            "0009b_outbox_chat_aggregate_backfill",
+            myelin_events::OUTBOX_CHAT_AGGREGATE_BACKFILL_MIGRATION,
+        ),
     ])
 }
 

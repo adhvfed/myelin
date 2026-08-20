@@ -106,6 +106,12 @@ fn validate_claimed_row(
     row: &ClaimedRow,
     config: &RelayValidationConfig,
 ) -> Result<EventEnvelope, PermanentRowError> {
+    if row.seq < 0 {
+        return Err(PermanentRowError::new(
+            "invalid_sequence",
+            "outbox sequence must not be negative",
+        ));
+    }
     let encoded = serde_json::to_vec(&row.payload).map_err(|_| {
         PermanentRowError::new(
             "invalid_envelope_json",
@@ -266,25 +272,91 @@ enum CommitAttempt {
     Db(PgError),
 }
 
-fn row_from_pg(row: &sqlx::postgres::PgRow) -> Result<OutboxRow, PgError> {
-    let event_id: String = row.get("event_id");
-    let aggregate: String = row.get("aggregate");
-    let seq: i64 = row.get("seq");
-    let subject: String = row.get("subject");
-    let payload: serde_json::Value = row.get("envelope");
-    let published_at: Option<String> = row.get("published_at_str");
-    let attempts: i32 = row.get("attempts");
-    let envelope: EventEnvelope = serde_json::from_value(payload)
-        .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
-    Ok(OutboxRow {
-        event_id: EventId(event_id),
-        aggregate: AggregateKey(aggregate),
-        seq: seq.max(0) as u64,
-        subject: ArtifactRef(subject),
+struct StoredEnvelope {
+    event_id: String,
+    aggregate: String,
+    subject: String,
+    envelope: EventEnvelope,
+}
+
+fn row_decode_error(field: &str, error: impl core::fmt::Display) -> PgError {
+    PgError::Query(format!("decode durable outbox {field}: {error}"))
+}
+
+fn stored_envelope_from_pg(row: &sqlx::postgres::PgRow) -> Result<StoredEnvelope, PgError> {
+    let event_id: String = row
+        .try_get("event_id")
+        .map_err(|error| row_decode_error("event_id", error))?;
+    let aggregate: String = row
+        .try_get("aggregate")
+        .map_err(|error| row_decode_error("aggregate", error))?;
+    let subject: String = row
+        .try_get("subject")
+        .map_err(|error| row_decode_error("subject", error))?;
+    let payload: serde_json::Value = row
+        .try_get("envelope")
+        .map_err(|error| row_decode_error("envelope", error))?;
+    let envelope: EventEnvelope =
+        serde_json::from_value(payload).map_err(|error| row_decode_error("envelope", error))?;
+    if event_id != envelope.event_id.0
+        || aggregate != envelope.aggregate.0
+        || subject != envelope.subject.0
+    {
+        return Err(PgError::Query(
+            "durable outbox columns disagree with the serialized envelope identity".into(),
+        ));
+    }
+    Ok(StoredEnvelope {
+        event_id,
+        aggregate,
+        subject,
         envelope,
-        published_at: published_at.map(Timestamp),
-        attempts: attempts.max(0) as u32,
     })
+}
+
+fn row_from_pg(row: &sqlx::postgres::PgRow) -> Result<OutboxRow, PgError> {
+    let stored = stored_envelope_from_pg(row)?;
+    let seq: i64 = row
+        .try_get("seq")
+        .map_err(|error| row_decode_error("seq", error))?;
+    let published_at: Option<String> = row
+        .try_get("published_at_str")
+        .map_err(|error| row_decode_error("published_at", error))?;
+    let attempts: i32 = row
+        .try_get("attempts")
+        .map_err(|error| row_decode_error("attempts", error))?;
+    Ok(OutboxRow {
+        event_id: EventId(stored.event_id),
+        aggregate: AggregateKey(stored.aggregate),
+        seq: u64::try_from(seq)
+            .map_err(|_| PgError::Query("negative durable outbox seq".into()))?,
+        subject: ArtifactRef(stored.subject),
+        envelope: stored.envelope,
+        published_at: published_at.map(Timestamp),
+        attempts: u32::try_from(attempts)
+            .map_err(|_| PgError::Query("negative durable outbox attempts".into()))?,
+    })
+}
+
+fn encode_max_attempts(max_attempts: u32) -> Result<i32, PgError> {
+    let encoded = i32::try_from(max_attempts)
+        .map_err(|_| PgError::Query("outbox retry bound exceeds the durable range".into()))?;
+    if encoded == 0 {
+        return Err(PgError::Query(
+            "outbox retry bound must be at least one".into(),
+        ));
+    }
+    Ok(encoded)
+}
+
+fn validate_aggregate_identity(aggregate: &str, envelope: &EventEnvelope) -> Result<(), PgError> {
+    if aggregate == envelope.aggregate.0 {
+        Ok(())
+    } else {
+        Err(PgError::Query(
+            "outbox aggregate column must equal the serialized envelope aggregate".into(),
+        ))
+    }
 }
 
 fn classify_insert_error(e: sqlx::Error, event_id: &str) -> CommitAttempt {
@@ -345,6 +417,12 @@ impl PgRelay {
         seq: i64,
         envelope: &EventEnvelope,
     ) -> Result<(), PgError> {
+        if seq < 0 {
+            return Err(PgError::Query(
+                "outbox sequence must not be negative".into(),
+            ));
+        }
+        validate_aggregate_identity(aggregate, envelope)?;
         let payload = serde_json::to_value(envelope)
             .map_err(|e| PgError::Query(format!("serialize envelope: {e}")))?;
         sqlx::query(
@@ -392,6 +470,7 @@ impl PgRelay {
         aggregate: &str,
         envelope: &EventEnvelope,
     ) -> Result<(), PgError> {
+        validate_aggregate_identity(aggregate, envelope)?;
         let payload = serde_json::to_value(envelope)
             .map_err(|e| PgError::Query(format!("serialize envelope: {e}")))?;
         let inserted = sqlx::query(
@@ -480,6 +559,12 @@ impl PgRelay {
         seq: i64,
         envelope: &EventEnvelope,
     ) -> Result<(), PgError> {
+        if seq < 0 {
+            return Err(PgError::Query(
+                "outbox sequence must not be negative".into(),
+            ));
+        }
+        validate_aggregate_identity(aggregate, envelope)?;
         let payload = serde_json::to_value(envelope)
             .map_err(|e| PgError::Query(format!("serialize envelope: {e}")))?;
         let mut tx = self
@@ -525,7 +610,7 @@ impl PgRelay {
             .map_err(|e| PgError::Query(e.to_string()))?;
 
         let rows = sqlx::query(
-            "SELECT event_id, subject, envelope FROM outbox \
+            "SELECT event_id, aggregate, subject, envelope FROM outbox \
              WHERE published_at IS NULL \
              ORDER BY aggregate, seq \
              FOR UPDATE SKIP LOCKED LIMIT $1",
@@ -537,10 +622,9 @@ impl PgRelay {
 
         let mut published = 0usize;
         for row in &rows {
-            let event_id: String = row.get("event_id");
-            let payload: serde_json::Value = row.get("envelope");
-            let envelope: EventEnvelope = serde_json::from_value(payload)
-                .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
+            let stored = stored_envelope_from_pg(row)?;
+            let event_id = stored.event_id;
+            let envelope = stored.envelope;
 
             match publisher.publish(&envelope.subject, &envelope, &envelope.event_id) {
                 Ok(Delivery::Accepted) | Ok(Delivery::Deduplicated) => {}
@@ -664,6 +748,7 @@ impl PgRelay {
         batch: i64,
         max_attempts: u32,
     ) -> Result<DrainReport, PgError> {
+        let durable_max_attempts = encode_max_attempts(max_attempts)?;
         let mut tx = self
             .pool
             .begin()
@@ -671,23 +756,22 @@ impl PgRelay {
             .map_err(|e| PgError::Query(e.to_string()))?;
 
         let rows = sqlx::query(
-            "SELECT event_id, subject, envelope FROM outbox \
+            "SELECT event_id, aggregate, subject, envelope FROM outbox \
              WHERE published_at IS NULL AND attempts < $2 \
              ORDER BY aggregate, seq \
              FOR UPDATE SKIP LOCKED LIMIT $1",
         )
         .bind(batch)
-        .bind(max_attempts as i32)
+        .bind(durable_max_attempts)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
 
         let mut report = DrainReport::default();
         for row in &rows {
-            let event_id: String = row.get("event_id");
-            let payload: serde_json::Value = row.get("envelope");
-            let envelope: EventEnvelope = serde_json::from_value(payload)
-                .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
+            let stored = stored_envelope_from_pg(row)?;
+            let event_id = stored.event_id;
+            let envelope = stored.envelope;
 
             match bus.put(&envelope.subject, &envelope, &envelope.event_id) {
                 Ok(Delivery::Accepted) => {
@@ -715,7 +799,10 @@ impl PgRelay {
                     .fetch_one(&mut *tx)
                     .await
                     .map_err(|e| PgError::Query(e.to_string()))?;
-                    if new_attempts as u32 >= max_attempts {
+                    let new_attempts = u32::try_from(new_attempts).map_err(|_| {
+                        PgError::Query("negative durable outbox attempts after retry".into())
+                    })?;
+                    if new_attempts >= max_attempts {
                         let subsystem = envelope
                             .type_
                             .0
@@ -755,7 +842,7 @@ impl PgRelay {
             .map_err(|e| PgError::Query(e.to_string()))?;
 
         let rows = sqlx::query(
-            "SELECT event_id, subject, envelope FROM outbox \
+            "SELECT event_id, aggregate, subject, envelope FROM outbox \
              WHERE published_at IS NULL \
              ORDER BY aggregate, seq \
              FOR UPDATE SKIP LOCKED LIMIT $1",
@@ -767,10 +854,9 @@ impl PgRelay {
 
         let mut published = 0usize;
         for row in &rows {
-            let event_id: String = row.get("event_id");
-            let payload: serde_json::Value = row.get("envelope");
-            let envelope: EventEnvelope = serde_json::from_value(payload)
-                .map_err(|e| PgError::Query(format!("deserialize envelope: {e}")))?;
+            let stored = stored_envelope_from_pg(row)?;
+            let event_id = stored.event_id;
+            let envelope = stored.envelope;
 
             match publisher.publish(&envelope.subject, &envelope, &envelope.event_id) {
                 Ok(Delivery::Accepted) | Ok(Delivery::Deduplicated) => {}
@@ -1231,6 +1317,27 @@ mod validation_config_tests {
     }
 
     #[test]
+    fn durable_retry_bounds_are_positive_and_representable() {
+        assert_eq!(encode_max_attempts(1).unwrap(), 1);
+        assert_eq!(encode_max_attempts(i32::MAX as u32).unwrap(), i32::MAX);
+        assert!(encode_max_attempts(0).is_err());
+        assert!(encode_max_attempts(i32::MAX as u32 + 1).is_err());
+    }
+
+    #[test]
+    fn claimed_sequences_are_never_reinterpreted() {
+        let envelope = envelope();
+        let mut claimed = claimed(&envelope);
+        claimed.seq = -1;
+        assert_eq!(
+            validate_claimed_row(&claimed, &validation())
+                .expect_err("a corrupt sequence is quarantinable, not publishable")
+                .code,
+            "invalid_sequence"
+        );
+    }
+
+    #[test]
     fn staged_rows_cannot_bypass_in_transaction_sequence_allocation() {
         let envelope = envelope();
         let mut row = OutboxRow {
@@ -1248,5 +1355,12 @@ mod validation_config_tests {
         let error = PgRelay::validate_staged_shape(&row)
             .expect_err("a staged caller must not preallocate the relay sequence");
         assert!(error.to_string().contains("preallocated sequence"));
+    }
+
+    #[test]
+    fn raw_writers_cannot_split_ordering_from_event_identity() {
+        let envelope = envelope();
+        assert!(validate_aggregate_identity(&envelope.aggregate.0, &envelope).is_ok());
+        assert!(validate_aggregate_identity("raw-object-id", &envelope).is_err());
     }
 }

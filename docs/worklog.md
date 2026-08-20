@@ -4,6 +4,40 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — an outbox event has one durable identity
+
+The PostgreSQL relay silently clamped negative sequence and retry counters to
+zero. A corrupt row could therefore re-enter the domain as plausible state.
+Several publishing paths also decoded the serialized envelope without proving
+that its event, aggregate, and subject matched the columns used to order and
+acknowledge the row. A split identity could be published under one event ID
+and marked complete under another.
+
+All durable row reads now use checked counter conversions and bind the three
+stored identity columns to the envelope before returning or publishing it.
+Retry bounds must be positive and fit PostgreSQL, and raw enqueue paths refuse
+negative sequences before SQL. Forward-only foundation migrations add the
+same counter and identity invariants to PostgreSQL without changing the frozen
+original outbox migration. Their bounded backfills refuse canonical sequence
+collisions, repair legacy ordering identities, retain released quarantine
+barriers in a resolution ledger, and canonicalize old Chat partitions to
+`channel:<conversation>`.
+
+The live upgrade journey begins with a deliberately corrupt legacy row. It
+proves the decoder fails closed, the validation migration refuses to bless the
+row, an explicit repair lets the migration resume, and subsequent direct SQL
+corruption is rejected. It also reproduces both historical producer shapes and
+proves their event, quarantine, audit, and replay states move together. On the
+shared product database the migration repaired 665 split identities and 670
+legacy Chat partitions without a sequence collision. The restarted publisher
+then drained every affected Knowledge and Chat event to the real broker; none
+remain unsent or quarantined.
+
+**Proof:** event suite 215/215; focused relay unit tests 8/8; live PostgreSQL
+outbox invariant and upgrade journey 1/1; boot migration journey 2/2; durable
+outbox parity 8/8; live publisher replay with zero affected events left
+unsent; Clippy `-D warnings` for every storage and event target/feature.
+
 ## 2026-08-20 — a KMS restore is one exact state transition
 
 KMS snapshot restore performed independent root, KEK, and DEK upserts. A

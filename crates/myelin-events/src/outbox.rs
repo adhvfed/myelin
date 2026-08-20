@@ -70,6 +70,182 @@ CREATE TABLE IF NOT EXISTS outbox_quarantine (
 CREATE INDEX IF NOT EXISTS outbox_quarantine_aggregate_seq_idx
     ON outbox_quarantine (aggregate, seq);";
 
+pub const OUTBOX_VALUE_INVARIANTS_EXPAND_MIGRATION: &str = "\
+ALTER TABLE outbox
+    ADD CONSTRAINT outbox_sequence_nonnegative
+        CHECK (seq >= 0) NOT VALID,
+    ADD CONSTRAINT outbox_attempts_nonnegative
+        CHECK (attempts >= 0) NOT VALID,
+    ADD CONSTRAINT outbox_envelope_identity_consistent
+        CHECK ((
+            jsonb_typeof(envelope) = 'object'
+            AND envelope ->> 'event_id' = event_id
+            AND envelope ->> 'aggregate' = aggregate
+            AND envelope ->> 'subject' = subject
+        ) IS TRUE) NOT VALID;
+ALTER TABLE outbox_quarantine
+    ADD CONSTRAINT outbox_quarantine_sequence_nonnegative
+        CHECK (seq >= 0) NOT VALID;";
+
+pub const OUTBOX_IDENTITY_BACKFILL_MIGRATION: &str = "\
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM outbox
+         WHERE jsonb_typeof(envelope) IS DISTINCT FROM 'object'
+            OR envelope ->> 'event_id' IS DISTINCT FROM event_id
+            OR envelope ->> 'subject' IS DISTINCT FROM subject
+            OR envelope ->> 'aggregate' IS NULL
+    ) THEN
+        RAISE EXCEPTION
+            'outbox identity backfill refused: event_id, subject, or envelope shape is corrupt';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM outbox
+         GROUP BY envelope ->> 'aggregate', seq
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION
+            'outbox identity backfill refused: canonical aggregate sequence collision';
+    END IF;
+
+    UPDATE outbox_quarantine AS quarantine
+       SET aggregate = envelope ->> 'aggregate'
+      FROM outbox AS source
+     WHERE source.event_id = quarantine.event_id
+       AND source.aggregate IS DISTINCT FROM source.envelope ->> 'aggregate';
+
+    UPDATE outbox
+       SET aggregate = envelope ->> 'aggregate'
+     WHERE aggregate IS DISTINCT FROM envelope ->> 'aggregate';
+END
+$$;";
+
+pub const OUTBOX_VALUE_INVARIANTS_VALIDATE_MIGRATION: &str = "\
+ALTER TABLE outbox VALIDATE CONSTRAINT outbox_sequence_nonnegative;
+ALTER TABLE outbox VALIDATE CONSTRAINT outbox_attempts_nonnegative;
+ALTER TABLE outbox VALIDATE CONSTRAINT outbox_envelope_identity_consistent;
+ALTER TABLE outbox_quarantine
+    VALIDATE CONSTRAINT outbox_quarantine_sequence_nonnegative;";
+
+pub const OUTBOX_QUARANTINE_RESOLUTION_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS outbox_quarantine_resolution (
+    event_id          TEXT        PRIMARY KEY,
+    aggregate         TEXT        NOT NULL,
+    seq               BIGINT      NOT NULL,
+    reason_code       TEXT        NOT NULL,
+    reason_detail     TEXT        NOT NULL,
+    quarantined_at    TIMESTAMPTZ NOT NULL,
+    resolved_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolution_code   TEXT        NOT NULL,
+    CONSTRAINT outbox_quarantine_resolution_code_bounded CHECK (
+        resolution_code ~ '^[a-z0-9_]{1,64}$'
+    )
+);
+INSERT INTO outbox_quarantine_resolution (
+    event_id, aggregate, seq, reason_code, reason_detail, quarantined_at, resolution_code
+)
+SELECT quarantine.event_id,
+       quarantine.aggregate,
+       quarantine.seq,
+       quarantine.reason_code,
+       quarantine.reason_detail,
+       quarantine.quarantined_at,
+       'canonical_aggregate_backfill'
+  FROM outbox_quarantine AS quarantine
+  JOIN outbox AS source USING (event_id)
+ WHERE quarantine.reason_code = 'aggregate_mismatch'
+   AND source.aggregate = source.envelope ->> 'aggregate'
+   AND source.event_id = source.envelope ->> 'event_id'
+   AND source.subject = source.envelope ->> 'subject'
+ON CONFLICT (event_id) DO NOTHING;
+DELETE FROM outbox_quarantine AS quarantine
+ USING outbox_quarantine_resolution AS resolution
+ WHERE resolution.event_id = quarantine.event_id
+   AND quarantine.reason_code = 'aggregate_mismatch'
+   AND resolution.resolution_code = 'canonical_aggregate_backfill';";
+
+pub const OUTBOX_CHAT_AGGREGATE_BACKFILL_MIGRATION: &str = "\
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM outbox
+         GROUP BY CASE
+                    WHEN envelope ->> 'type_' IN (
+                        'chat.channel.created', 'chat.message.created'
+                    ) AND aggregate !~ '^[^:]+:.+$'
+                    THEN 'channel:' || aggregate
+                    ELSE aggregate
+                  END,
+                  seq
+        HAVING count(*) > 1
+    ) THEN
+        RAISE EXCEPTION
+            'chat aggregate backfill refused: canonical channel sequence collision';
+    END IF;
+
+    UPDATE outbox_quarantine AS quarantine
+       SET aggregate = 'channel:' || source.aggregate
+      FROM outbox AS source
+     WHERE source.event_id = quarantine.event_id
+       AND source.envelope ->> 'type_' IN (
+           'chat.channel.created', 'chat.message.created'
+       )
+       AND source.aggregate !~ '^[^:]+:.+$';
+
+    UPDATE outbox
+       SET envelope = jsonb_set(
+               envelope,
+               '{aggregate}',
+               to_jsonb('channel:' || aggregate),
+               false
+           ),
+           aggregate = 'channel:' || aggregate
+     WHERE envelope ->> 'type_' IN (
+         'chat.channel.created', 'chat.message.created'
+     )
+       AND aggregate !~ '^[^:]+:.+$';
+
+    INSERT INTO outbox_quarantine_resolution (
+        event_id, aggregate, seq, reason_code, reason_detail, quarantined_at, resolution_code
+    )
+    SELECT quarantine.event_id,
+           quarantine.aggregate,
+           quarantine.seq,
+           quarantine.reason_code,
+           quarantine.reason_detail,
+           quarantine.quarantined_at,
+           'canonical_chat_aggregate_backfill'
+      FROM outbox_quarantine AS quarantine
+      JOIN outbox AS source USING (event_id)
+     WHERE quarantine.reason_code IN ('aggregate_mismatch', 'invalid_stream_subject')
+       AND source.envelope ->> 'type_' IN (
+           'chat.channel.created', 'chat.message.created'
+       )
+       AND source.aggregate ~ '^channel:[A-Za-z0-9_-]+$'
+       AND source.aggregate = source.envelope ->> 'aggregate'
+    ON CONFLICT (event_id) DO UPDATE
+        SET resolution_code = EXCLUDED.resolution_code,
+            resolved_at = now();
+
+    DELETE FROM outbox_quarantine AS quarantine
+     USING outbox AS source, outbox_quarantine_resolution AS resolution
+     WHERE quarantine.event_id = source.event_id
+       AND resolution.event_id = quarantine.event_id
+       AND quarantine.reason_code IN ('aggregate_mismatch', 'invalid_stream_subject')
+       AND resolution.resolution_code = 'canonical_chat_aggregate_backfill'
+       AND source.envelope ->> 'type_' IN (
+           'chat.channel.created', 'chat.message.created'
+       )
+       AND source.aggregate ~ '^channel:[A-Za-z0-9_-]+$'
+       AND source.aggregate = source.envelope ->> 'aggregate';
+END
+$$;";
+
 pub const OUTBOX_PUBLISHER_GRANTS_MIGRATION: &str = "\
 DO $$
 BEGIN
