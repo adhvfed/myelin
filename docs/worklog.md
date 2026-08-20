@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-20 — CI history remains complete across repositories and pages
+
+CI lifecycle tests found newly created runs by downloading only the first one
+hundred visible rows. The durable store had lower-level coverage, but its two
+pagination tests asserted SQL spelling rather than proving what a developer
+sees through Edge. A sufficiently busy organization could therefore lose the
+run under investigation from the test's horizon without revealing a product
+or test failure.
+
+The system-test vocabulary now pushes a minimal passing pipeline and locates
+the resulting run by walking the public history to exhaustion. A new journey
+creates builds in two repositories, crosses a one-row page boundary in exact
+newest-first order, and proves that the complete accumulated history contains
+each run exactly once. It also proves that an unrelated teammate sees neither
+run and that cursors become stale when either the state filter or the caller's
+visible repository set changes. The two SQL-source assertions are gone; the
+behavior is covered at both the PostgreSQL boundary and the user boundary.
+
+**Proof:** CI control-plane library suite 630/630; Clippy `-D warnings` for
+every CI control-plane target/feature; live PostgreSQL surface integration
+1/1 through the federation harness; TypeScript typecheck; targeted live CI
+history journey 1/1; complete black-box system suite 27/27 files and 113/113
+tests in 315.42 seconds.
+
 ## 2026-08-20 — a pull-request dashboard loses no work at page boundaries
 
 Pull-request listing had extensive tests that counted SQL fragments and
