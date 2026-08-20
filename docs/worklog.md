@@ -32,7 +32,8 @@ whose failed job and diagnostic log remain inspectable through the public API.
 **Proof:** Flow unit suite 254/254; CI control-plane unit suite 632/632;
 Clippy `-D warnings` for both touched crates; focused durable Flow fairness
 integration 1/1; focused production CI timeout/accounting integration 1/1;
-TypeScript typecheck; focused black-box CI lifecycle 5/5.
+TypeScript typecheck; focused black-box CI lifecycle 5/5; complete black-box
+suite 110/110 across 25 files with zero skips (256.97 seconds).
 
 ## 2026-08-20 — completed work no longer buries new work
 
