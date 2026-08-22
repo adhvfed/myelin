@@ -42,6 +42,22 @@ impl DurableAgentThreadBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
+                    if let Some(existing) = by_nonce(
+                        conn,
+                        &tenant,
+                        &region,
+                        &proposal.owner_principal_id,
+                        &proposal.client_nonce,
+                    )
+                    .await?
+                    {
+                        return Ok(if same_intent(&existing, &proposal) {
+                            CreateAgentThreadOutcome::Replayed(existing)
+                        } else {
+                            CreateAgentThreadOutcome::Conflict
+                        });
+                    }
+
                     let owner = sqlx::query_as::<_, (String, String)>(
                         "SELECT kind, status FROM principal
                           WHERE tenant_id = $1 AND region = $2 AND principal_id = $3
@@ -80,21 +96,6 @@ impl DurableAgentThreadBacking {
                         return Ok(CreateAgentThreadOutcome::AgentUnavailable);
                     }
 
-                    if let Some(existing) = by_nonce(
-                        conn,
-                        &tenant,
-                        &region,
-                        &proposal.owner_principal_id,
-                        &proposal.client_nonce,
-                    )
-                    .await?
-                    {
-                        return Ok(if same_intent(&existing, &proposal) {
-                            CreateAgentThreadOutcome::Replayed(existing)
-                        } else {
-                            CreateAgentThreadOutcome::Conflict
-                        });
-                    }
                     if live_name_exists(
                         conn,
                         &tenant,
@@ -249,6 +250,46 @@ impl DurableAgentThreadBacking {
                     Ok(by_id(conn, &tenant, &region, thread_id)
                         .await?
                         .filter(|thread| thread.owner_principal_id == owner))
+                })
+            })
+            .await
+    }
+
+    pub async fn list_for_owner(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        before: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<DurableAgentThread>, ProviderError> {
+        if limit == 0 || limit > 101 {
+            return Err(query("agent thread page limit must be between 1 and 101"));
+        }
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
+                           conversation_id, workspace_id, workspace_generation, name, project_id,
+                           retention_days, state, storage_locator, failure_reason, created_at,
+                           expires_at, updated_at
+                         FROM agent_thread
+                        WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3
+                          AND state <> 'deleted' AND ($4::uuid IS NULL OR thread_id < $4)
+                        ORDER BY thread_id DESC LIMIT $5",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&owner)
+                    .bind(before)
+                    .bind(i64::from(limit))
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(query_error("list agent threads"))?;
+                    rows.iter().map(row_to_thread).collect()
                 })
             })
             .await

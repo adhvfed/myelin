@@ -119,6 +119,35 @@ async fn seed_agent(provider: &SubstrateProvider, tenant: &str, owner: &str, age
         .unwrap();
 }
 
+async fn set_agent_status(
+    provider: &SubstrateProvider,
+    tenant: &str,
+    agent_id: Uuid,
+    status: PrincipalStatus,
+) {
+    let tenant = tenant.to_string();
+    let region = provider.config().region.clone();
+    provider
+        .with_tenant_tx(&tenant.clone(), move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE principal SET status = $4
+                      WHERE tenant_id = $1 AND region = $2 AND principal_id = $3",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(format!("agent:{agent_id}"))
+                .bind(serde_json::to_string(&status).unwrap())
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     let config = test_config();
@@ -163,8 +192,10 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         expires_at: intended.expires_at + Duration::hours(1),
         ..intended.clone()
     };
+    set_agent_status(&app, &tenant, agent_id, PrincipalStatus::Suspended).await;
     let replay = threads.create(&tenant, replay_proposal).await.unwrap();
     assert_eq!(replay, CreateAgentThreadOutcome::Replayed(created.clone()));
+    set_agent_status(&app, &tenant, agent_id, PrincipalStatus::Active).await;
 
     let conflicting_retry = threads
         .create(
@@ -247,6 +278,12 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             .unwrap(),
         Some(ready)
     );
+    let listed = threads
+        .list_for_owner(&tenant, owner, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].thread_id, intended.thread_id.to_string());
     assert!(threads
         .get_for_owner(&tenant, "p:bob", intended.thread_id)
         .await
