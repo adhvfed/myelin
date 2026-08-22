@@ -55,6 +55,12 @@ use run::{
     PreparedRuntimeMode,
 };
 
+mod workspace_session;
+pub use workspace_session::{
+    ConfinedWorkspaceSession, ConfinedWorkspaceSessionExit, ConfinedWorkspaceSessionIo,
+    VerifiedWorkspaceMount, WorkspaceSessionCommand, WorkspaceSessionError, WorkspaceSessionLimits,
+};
+
 mod output_capture;
 pub(crate) use output_capture::RunFailure;
 use output_capture::{

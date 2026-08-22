@@ -25,7 +25,17 @@ pub(crate) struct SandboxCommand {
 
 enum LaunchFence {
     Unfenced,
+    Guarded(LivenessGuard),
     Fenced(FencedLaunch),
+}
+
+struct LivenessGuard {
+    liveness_read: OwnedFd,
+    liveness_write: OwnedFd,
+    ready_read: OwnedFd,
+    ready_write: OwnedFd,
+    cgroup_kill: Option<File>,
+    watchdog_timeout: Duration,
 }
 
 struct FencedLaunch {
@@ -91,6 +101,31 @@ impl SandboxCommand {
         })
     }
 
+    pub(crate) fn guarded(
+        program: impl AsRef<OsStr>,
+        watchdog_timeout: Duration,
+    ) -> io::Result<Self> {
+        if watchdog_timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a guarded sandbox command requires a positive watchdog deadline",
+            ));
+        }
+        let (liveness_read, liveness_write) = cloexec_pipe()?;
+        let (ready_read, ready_write) = cloexec_pipe()?;
+        Ok(Self {
+            command: Command::new(program),
+            fence: LaunchFence::Guarded(LivenessGuard {
+                liveness_read,
+                liveness_write,
+                ready_read,
+                ready_write,
+                cgroup_kill: None,
+                watchdog_timeout,
+            }),
+        })
+    }
+
     pub(crate) fn command_mut(&mut self) -> &mut Command {
         &mut self.command
     }
@@ -105,7 +140,7 @@ impl SandboxCommand {
                 fence.post_gate_stdin = PostGateStdin::ReturnToCaller;
                 Ok(())
             }
-            LaunchFence::Unfenced => Err(io::Error::new(
+            LaunchFence::Unfenced | LaunchFence::Guarded(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "only a fenced sandbox command has a launch-gate pipe to retain",
             )),
@@ -114,6 +149,10 @@ impl SandboxCommand {
 
     pub(crate) fn kill_cgroup_on_liveness_loss(&mut self, kill_file: File) -> io::Result<()> {
         match &mut self.fence {
+            LaunchFence::Guarded(guard) => {
+                guard.cgroup_kill = Some(kill_file);
+                Ok(())
+            }
             LaunchFence::Fenced(fence) => {
                 fence.cgroup_kill = Some(kill_file);
                 Ok(())
@@ -128,9 +167,88 @@ impl SandboxCommand {
     pub(crate) fn spawn(self) -> Result<SandboxChild, SpawnFailure> {
         match self.fence {
             LaunchFence::Unfenced => spawn_unfenced(self.command),
+            LaunchFence::Guarded(guard) => spawn_guarded(self.command, guard),
             LaunchFence::Fenced(fence) => spawn_fenced(self.command, fence),
         }
     }
+}
+
+fn spawn_guarded(mut command: Command, guard: LivenessGuard) -> Result<SandboxChild, SpawnFailure> {
+    let LivenessGuard {
+        liveness_read,
+        liveness_write,
+        mut ready_read,
+        ready_write,
+        cgroup_kill,
+        watchdog_timeout,
+    } = guard;
+    let watchdog_timer = boottime_timer(watchdog_timeout).map_err(|error| {
+        SpawnFailure::uncommitted(
+            format!("arm sandbox liveness deadline: {error}"),
+            DirectChildRetirement::NoChildReturned,
+        )
+    })?;
+    let liveness_fd = liveness_read.as_raw_fd();
+    let liveness_write_fd = liveness_write.as_raw_fd();
+    let ready_fd = ready_write.as_raw_fd();
+    let timer_fd = watchdog_timer.as_raw_fd();
+    let cgroup_kill_fd = cgroup_kill.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let process_group = libc::getpid();
+            let watchdog = libc::fork();
+            if watchdog == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if watchdog == 0 {
+                if libc::setpgid(0, 0) == -1 {
+                    libc::_exit(126);
+                }
+                native_watchdog(
+                    liveness_fd,
+                    liveness_write_fd,
+                    ready_fd,
+                    timer_fd,
+                    cgroup_kill_fd,
+                    process_group,
+                );
+            }
+            Ok(())
+        });
+    }
+    let executed_at = Instant::now();
+    let mut child = command.spawn().map_err(|error| {
+        SpawnFailure::uncommitted(
+            format!("spawn guarded sandbox process: {error}"),
+            DirectChildRetirement::NoChildReturned,
+        )
+    })?;
+    drop(liveness_read);
+    drop(ready_write);
+    drop(cgroup_kill);
+
+    let group_id = child.id() as i32;
+    let ready_result = wait_until_ready(&mut ready_read);
+    drop(ready_read);
+    if let Err(error) = ready_result {
+        kill_process_group(group_id);
+        let child_retirement = DirectChildRetirement::from_wait_result(child.wait());
+        return Err(SpawnFailure::executed(
+            format!("sandbox liveness watchdog did not arm: {error}"),
+            executed_at,
+            child_retirement,
+        ));
+    }
+    Ok(SandboxChild {
+        child,
+        liveness_write: Some(liveness_write),
+        watchdog_timer: Some(watchdog_timer),
+        process_group: Some(group_id),
+        executed_at,
+    })
 }
 
 fn spawn_unfenced(mut command: Command) -> Result<SandboxChild, SpawnFailure> {
@@ -920,6 +1038,47 @@ mod tests {
             !marker.exists(),
             "runtime outlived the independent kernel deadline"
         );
+    }
+
+    #[test]
+    fn guarded_session_deadline_needs_no_durable_launch_permit() {
+        let marker = marker_path("guarded-deadline");
+        let mut command = SandboxCommand::guarded("/bin/sh", Duration::from_millis(100)).unwrap();
+        command
+            .command_mut()
+            .arg("-c")
+            .arg("sleep 0.35; printf escaped > \"$1\"; sleep 5")
+            .arg("myelin-guarded-runtime")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = command.spawn().expect("the liveness guard should arm");
+        wait_for_exit(&mut child);
+        assert!(child.watchdog_deadline_expired());
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists(), "the guarded session escaped its deadline");
+    }
+
+    #[test]
+    fn dropping_a_guarded_session_kills_its_complete_process_group() {
+        let marker = marker_path("guarded-owner-died");
+        let mut command = SandboxCommand::guarded("/bin/sh", Duration::from_secs(2)).unwrap();
+        command
+            .command_mut()
+            .arg("-c")
+            .arg("sleep 0.25; printf escaped > \"$1\"; sleep 5")
+            .arg("myelin-guarded-runtime")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let child = command.spawn().expect("the liveness guard should arm");
+        drop(child);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "the guarded session outlived its owner");
     }
 
     #[test]

@@ -172,6 +172,18 @@ impl OciWorkspaceMount {
     pub(crate) fn for_tests(host_source: PathBuf) -> Self {
         OciWorkspaceMount { host_source }
     }
+
+    pub(super) fn from_revalidated_source(host_source: &Path) -> Result<Self, String> {
+        if !host_source.is_absolute() || host_source.parent().is_none() {
+            return Err(format!(
+                "a confined workspace mount source must be an absolute non-root path, got \
+                 {host_source:?}"
+            ));
+        }
+        Ok(Self {
+            host_source: host_source.to_path_buf(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,6 +241,10 @@ pub(super) enum OciExecutionLayout {
     RootlessWithHostMounts {
         absolute_rootfs: AbsoluteRootfs,
         mounts: GitWireMounts,
+    },
+    RootlessWithWorkspace {
+        absolute_rootfs: AbsoluteRootfs,
+        workspace: OciWorkspaceMount,
     },
     ExplicitUserNamespace {
         config: UserNamespaceConfig,
@@ -327,7 +343,8 @@ impl OciConfig {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn workspace_host_source_for_tests(&self) -> Option<&Path> {
         match &self.layout {
-            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { workspace, .. } => {
+            OciExecutionLayout::RootlessWithWorkspace { workspace, .. }
+            | OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { workspace, .. } => {
                 Some(&workspace.host_source)
             }
             _ => None,
@@ -387,6 +404,19 @@ impl OciConfig {
         self.layout = OciExecutionLayout::RootlessWithHostMounts {
             absolute_rootfs: AbsoluteRootfs::new(absolute_rootfs)?,
             mounts: GitWireMounts::new(repo_source, quarantine_source),
+        };
+        Ok(self)
+    }
+
+    pub(super) fn with_rootless_workspace(
+        mut self,
+        absolute_rootfs: PathBuf,
+        workspace: OciWorkspaceMount,
+    ) -> Result<OciConfig, String> {
+        self.require_still_rootless()?;
+        self.layout = OciExecutionLayout::RootlessWithWorkspace {
+            absolute_rootfs: AbsoluteRootfs::new(absolute_rootfs)?,
+            workspace,
         };
         Ok(self)
     }
@@ -607,9 +637,9 @@ impl OciConfig {
 
     pub fn invocation_mode(&self) -> RunscInvocationMode {
         match &self.layout {
-            OciExecutionLayout::Rootless | OciExecutionLayout::RootlessWithHostMounts { .. } => {
-                RunscInvocationMode::Rootless
-            }
+            OciExecutionLayout::Rootless
+            | OciExecutionLayout::RootlessWithHostMounts { .. }
+            | OciExecutionLayout::RootlessWithWorkspace { .. } => RunscInvocationMode::Rootless,
             OciExecutionLayout::ExplicitUserNamespace { config }
             | OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { config, .. } => {
                 RunscInvocationMode::ExplicitUserNamespace(*config)
@@ -668,6 +698,9 @@ impl OciConfig {
         }
         let has_cargo_vendor = self.has_cargo_vendor();
         let process_identity = match &self.layout {
+            OciExecutionLayout::RootlessWithWorkspace { .. } => {
+                WorkspaceProcessIdentity::LocalDeveloper
+            }
             OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
                 process_identity, ..
             } => *process_identity,
@@ -698,6 +731,13 @@ impl OciConfig {
                 ..
             } => {
                 mounts.extend(wire_mounts.bind_mounts_json());
+            }
+            OciExecutionLayout::RootlessWithWorkspace { workspace, .. } => {
+                mounts.push(bind_mount_json(
+                    OCI_WORKSPACE_MOUNT,
+                    &workspace.host_source,
+                    false,
+                ));
             }
             OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
                 workspace,
@@ -741,18 +781,24 @@ impl OciConfig {
             OciExecutionLayout::RootlessWithHostMounts {
                 absolute_rootfs, ..
             }
+            | OciExecutionLayout::RootlessWithWorkspace {
+                absolute_rootfs, ..
+            }
             | OciExecutionLayout::ExplicitUserNamespaceWithWorkspace {
                 absolute_rootfs, ..
             } => absolute_rootfs.as_path().to_string_lossy().to_string(),
         };
         let process_cwd = match &self.layout {
-            OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { .. } => OCI_WORKSPACE_MOUNT,
+            OciExecutionLayout::RootlessWithWorkspace { .. }
+            | OciExecutionLayout::ExplicitUserNamespaceWithWorkspace { .. } => OCI_WORKSPACE_MOUNT,
             OciExecutionLayout::Rootless
             | OciExecutionLayout::RootlessWithHostMounts { .. }
             | OciExecutionLayout::ExplicitUserNamespace { .. } => "/",
         };
         let (namespaces_json, id_mappings_json) = match &self.layout {
-            OciExecutionLayout::Rootless | OciExecutionLayout::RootlessWithHostMounts { .. } => {
+            OciExecutionLayout::Rootless
+            | OciExecutionLayout::RootlessWithHostMounts { .. }
+            | OciExecutionLayout::RootlessWithWorkspace { .. } => {
                 (net_ns.to_string(), String::new())
             }
             OciExecutionLayout::ExplicitUserNamespace { config }

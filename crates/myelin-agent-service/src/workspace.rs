@@ -109,6 +109,13 @@ impl std::fmt::Debug for VerifiedWorkspaceDirectory {
     }
 }
 
+impl myelin_ci_sandbox::gvisor::VerifiedWorkspaceMount for VerifiedWorkspaceDirectory {
+    fn revalidated_mount_source(&self) -> Result<&Path, String> {
+        VerifiedWorkspaceDirectory::revalidated_mount_source(self)
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl core::fmt::Display for WorkspaceProvisionError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

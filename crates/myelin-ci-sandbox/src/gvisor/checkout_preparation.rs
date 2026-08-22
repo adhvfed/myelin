@@ -482,7 +482,7 @@ impl Drop for ScopedDacReadSearch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 fn verify_materialized_checkout_no_follow(
     workspace_host_path: &Path,
     expected: &ExpectedGitCommitId,
@@ -848,7 +848,7 @@ pub(super) fn run_checkout_preparation_inner(
     outcome
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 fn evaluate_checkout_finalization(
     finalization: RuntimeFinalization<Result<RunscOutcome, RunFailure>>,
     lease: &mut UserNamespaceLease,
