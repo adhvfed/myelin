@@ -6,7 +6,6 @@ pub mod chat_tools;
 pub mod ci_tools;
 pub mod cost_gate;
 pub mod defaults;
-pub mod dispatch_surge;
 pub mod dry_run;
 pub mod dsr;
 pub mod effect_api;
@@ -156,12 +155,6 @@ pub use ci_tools::{
     register_ci_tools, run_pipeline_required_caps, run_pipeline_tool_def,
     write_secret_required_caps, write_secret_tool_def, APPROVE_DEPLOY_TOOL, CI_SUBSYSTEM,
     CI_TOOL_VERSION, DEPLOY_TOOL, RUN_PIPELINE_TOOL, WRITE_SECRET_TOOL,
-};
-
-pub use dispatch_surge::{
-    run_agent_dispatch_surge, AgentDispatchShed, AgentDispatchSurgeGate, AgentDispatchSurgeReport,
-    DispatchFrontError, RetryAfterHonouringRuntime, RuntimeReaction,
-    AGENT_DISPATCH_SURGE_MULTIPLIER,
 };
 
 pub use trace_seam::{is_content_addressed_kn_document, trace_ref_of, TraceDocument};

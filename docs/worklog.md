@@ -879,6 +879,16 @@ work starts only through a named thread, and automations start only through a
 durable trigger binding. The remaining 293 Agent Service unit tests, ten real
 consumer-tool drill cases, and downstream clippy all pass.
 
+The subsequent surge audit removed one more convincing double. `dispatch_surge`
+combined an in-memory shed lane, an in-memory cost ledger, and a pretend runtime
+which accumulated `Retry-After` integers. No request, event consumer, hosted
+worker, or workflow called it. The production Edge already owns synchronous
+HTTP/Git admission and proves the protected human lane against a live 300-request
+storm; governed automation is durably queued and handed to partitioned workflow
+workers. Removing the fake AgentMention front makes the remaining asynchronous
+worker-admission gap visible instead of reporting it GREEN. Net removal: roughly
+760 lines of unused implementation and self-testing drill.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -897,9 +907,10 @@ consumer-tool drill cases, and downstream clippy all pass.
    traffic; a coordinated cross-tenant storm of requests that lie about
    their class is bounded only by the flat caps. fixing this properly means
    authenticating before dispatch admission (an edge refactor).
-4. **the per-service shed gates (search, refs, notif, flow, …) are still
-   test-only.** those services are NATS consumers without an admission
-   point today; their thresholds.toml rows are targets, not enforcement.
+4. **asynchronous worker admission is not explicit yet.** search, refs,
+   notification, and automation work arrives through durable NATS/SQL queues;
+   queue bounds and worker concurrency provide backpressure, but the matching
+   thresholds.toml shed rows are targets rather than production enforcement.
 5. **trust-scoped CI cache + agent exec gate are built but unwired**; the CI
    runner does not route cache writes through `CiCacheNamespace`, and
    nothing constructs `AgentExecGate` in production.
