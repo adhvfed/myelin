@@ -10,7 +10,7 @@ import {
 import {
   activateExternalAgent,
   askAgent,
-  beginAgentRun,
+  beginAgentThreadRun,
   closeAgentRun,
 } from "../src/journeys/agents.js";
 import {
@@ -91,7 +91,41 @@ describe("private work with an agent", () => {
     );
     expect(hiddenPost.body).toMatchObject({ error: { code: "not_found" } });
 
-    const firstContext = await beginAgentRun(founder, companion.agent.id);
+    const hiddenRun = await teammate.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/runs`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: `hidden-thread-run-${randomUUID()}`,
+        expectedStatus: 404,
+      },
+    );
+    expect(hiddenRun.body).toMatchObject({ error: { code: "not_found" } });
+
+    const firstRunKey = `private-agent-run-${randomUUID()}`;
+    const firstContext = await beginAgentThreadRun(founder, first.thread.id, {
+      idempotencyKey: firstRunKey,
+    });
+    expect(firstContext.run.context).toEqual({
+      thread_id: first.thread.id,
+      thread_ref: first.thread.ref,
+      conversation_id: first.thread.conversation_id,
+      conversation_ref: first.thread.conversation_ref,
+      workspace: {
+        id: first.thread.workspace.id,
+        generation: first.thread.workspace.generation,
+        expires_at: first.thread.workspace.expires_at,
+      },
+    });
+    expect(Date.parse(firstContext.run.expires_at)).toBeLessThanOrEqual(
+      Date.parse(first.thread.workspace.expires_at),
+    );
+    const retriedContext = await beginAgentThreadRun(founder, first.thread.id, {
+      idempotencyKey: firstRunKey,
+      expectedStatus: 200,
+    });
+    expect(retriedContext.run.id).toBe(firstContext.run.id);
+    expect(retriedContext.run.context).toEqual(firstContext.run.context);
     const rememberedProblem = await askAgent(firstContext, 1, "chat.read_messages", {
       conversation_id: conversation.id,
       limit: 10,
@@ -101,7 +135,9 @@ describe("private work with an agent", () => {
     );
     await closeAgentRun(firstContext);
 
-    const freshContext = await beginAgentRun(founder, companion.agent.id);
+    const freshContext = await beginAgentThreadRun(founder, first.thread.id);
+    expect(freshContext.run.id).not.toBe(firstContext.run.id);
+    expect(freshContext.run.context).toEqual(firstContext.run.context);
     const resumedProblem = await askAgent(freshContext, 1, "chat.read_messages", {
       conversation_id: conversation.id,
       limit: 10,

@@ -1,22 +1,24 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-use myelin_agent_service::workspace::AgentWorkspaceProvisioner;
+use myelin_agent_service::{workspace::AgentWorkspaceProvisioner, PlatformToolCatalogue};
 use myelin_chat::conversation::{Conversation, ConversationKind};
 use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::{ConversationId, SystemUlidSource, UlidSource};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::{Principal, PrincipalId};
+use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
-    ActivateAgentThreadOutcome, AgentThreadState, CreateAgentThreadOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, NewAgentThread, MAX_AGENT_THREAD_NAME_BYTES,
-    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    ActivateAgentThreadOutcome, AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome,
+    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, NewAgentThread,
+    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::types::Uuid;
 use tokio::runtime::Handle;
 
+use crate::agent_http::{agent_session_json, map_session_error};
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::chat_http::{DurableChatMutationApi, DurableChatReadApi, PrivateConversationCreation};
 use crate::gateway::GatewayBuilder;
@@ -33,6 +35,8 @@ struct AgentThreadHttpApi {
     chat_reads: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
     workspaces: Arc<dyn AgentWorkspaceProvisioner>,
+    sessions: AgentSessionIssuer,
+    catalogue: Arc<PlatformToolCatalogue>,
     event_ids: Arc<dyn IdMinter>,
     conversation_ids: Arc<dyn UlidSource>,
     runtime: Handle,
@@ -270,6 +274,91 @@ struct AgentThreadGetHandler {
     api: AgentThreadHttpApi,
 }
 
+struct AgentThreadRunCreateHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadRunCreateHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "private agent thread run",
+            MAX_AGENT_THREAD_JSON_BYTES,
+        )?;
+        let thread_id = thread_param(ctx)?;
+        let thread = self
+            .api
+            .drive(self.api.threads.get_for_owner(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                thread_id,
+            ))?
+            .map_err(|_| EdgeError::Internal("agent thread lookup failed".into()))?
+            .ok_or_else(|| EdgeError::NotFound("agent thread not found".into()))?;
+        let now = Utc::now();
+        let workspace_expires_at = parse_stored_timestamp(&thread.expires_at)?;
+        if thread.state != AgentThreadState::Ready || workspace_expires_at <= now {
+            return Err(EdgeError::Conflict(
+                "agent thread workspace is not available for a new run".into(),
+            ));
+        }
+
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let capability = ctx.identity.capability();
+        let issued = self
+            .api
+            .drive(self.api.sessions.start_until(
+                ctx.principal,
+                AgentSessionRequest {
+                    agent_id: thread.agent_id.clone(),
+                    client_nonce,
+                    trigger_credential_jti: capability.jti.clone(),
+                    trigger_expires_at_unix: capability.expires_at_unix,
+                    trigger_authority: capability.effective_authority.clone(),
+                    now,
+                },
+                workspace_expires_at,
+            ))?
+            .map_err(map_session_error)?;
+        let run_id = parse_uuid("stored run id", &issued.session.run_id)
+            .map_err(|_| EdgeError::Internal("stored agent run id is invalid".into()))?;
+        let binding = self
+            .api
+            .drive(self.api.threads.bind_run(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                thread_id,
+                run_id,
+                now,
+            ))?
+            .map_err(|_| EdgeError::Internal("agent thread run binding failed".into()))?;
+        let binding = match binding {
+            BindAgentThreadRunOutcome::Bound(binding)
+            | BindAgentThreadRunOutcome::Replayed(binding) => binding,
+            BindAgentThreadRunOutcome::NotFound | BindAgentThreadRunOutcome::Conflict => {
+                self.api
+                    .drive(self.api.sessions.revoke_unreturned(ctx.principal, &issued))?
+                    .map_err(map_session_error)?;
+                return Err(EdgeError::Conflict(
+                    "agent thread changed while its run was starting".into(),
+                ));
+            }
+        };
+        Ok(no_store(EdgeResponse::json(
+            if issued.created { 201 } else { 200 },
+            &thread_run_json(
+                &ctx.principal.tenant.0,
+                &self.api.catalogue,
+                &issued,
+                &binding,
+            ),
+        )))
+    }
+}
+
 impl Handler for AgentThreadGetHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
@@ -330,6 +419,7 @@ pub fn register_agent_threads(
     chat_reads: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
     workspaces: Arc<dyn AgentWorkspaceProvisioner>,
+    sessions: AgentSessionIssuer,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = AgentThreadHttpApi {
@@ -337,6 +427,11 @@ pub fn register_agent_threads(
         chat_reads,
         chat_mutations,
         workspaces,
+        sessions,
+        catalogue: Arc::new(
+            PlatformToolCatalogue::platform()
+                .expect("the built-in platform ToolDef catalogue must be valid"),
+        ),
         event_ids: Arc::new(myelin_events::UlidMinter::new()),
         conversation_ids: Arc::new(SystemUlidSource::new()),
         runtime,
@@ -358,8 +453,38 @@ pub fn register_agent_threads(
             Method::Get,
             "/v1/agent-threads/{thread}",
             "identity.agent_thread.view",
-            Arc::new(AgentThreadGetHandler { api }),
+            Arc::new(AgentThreadGetHandler { api: api.clone() }),
         )
+        .route(
+            Method::Post,
+            "/v1/agent-threads/{thread}/runs",
+            "identity.agent_thread.run.create",
+            Arc::new(AgentThreadRunCreateHandler { api }),
+        )
+}
+
+fn thread_run_json(
+    tenant: &str,
+    catalogue: &PlatformToolCatalogue,
+    issued: &myelin_identity_service::IssuedAgentSession,
+    binding: &AgentThreadRunBinding,
+) -> Value {
+    let mut value = agent_session_json(tenant, catalogue, issued);
+    value["run"]["context"] = json!({
+        "thread_id": binding.thread_id,
+        "thread_ref": thread_ref(tenant, &binding.thread_id),
+        "conversation_id": binding.conversation_id,
+        "conversation_ref": format!(
+            "myelin://{tenant}/chat/channel/{}",
+            binding.conversation_id
+        ),
+        "workspace": {
+            "id": binding.workspace_id,
+            "generation": binding.workspace_generation,
+            "expires_at": binding.workspace_expires_at,
+        },
+    });
+    value
 }
 
 fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
@@ -416,6 +541,12 @@ fn parse_uuid(field: &str, value: &str) -> Result<Uuid, EdgeError> {
         )));
     }
     Ok(parsed)
+}
+
+fn parse_stored_timestamp(value: &str) -> Result<DateTime<Utc>, EdgeError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| EdgeError::Internal("stored agent thread expiry is invalid".into()))
 }
 
 fn validate_name(name: &str) -> Result<(), EdgeError> {

@@ -24,6 +24,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.agent_threads.list",
     "identity.agent_thread.create",
     "identity.agent_thread.view",
+    "identity.agent_thread.run.create",
     "identity.triggers.list",
     "identity.trigger.create",
     "identity.trigger.pause",
@@ -179,6 +180,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         HUMAN_SESSION
     ),
     requirement!("identity.agent_thread.view", "agent.view", HUMAN_SESSION),
+    requirement!(
+        "identity.agent_thread.run.create",
+        "agent.run",
+        HUMAN_SESSION
+    ),
     requirement!(
         "identity.agent.approval.decide",
         "agent.manage",

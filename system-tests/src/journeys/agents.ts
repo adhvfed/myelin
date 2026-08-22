@@ -28,6 +28,22 @@ export interface AgentRunEnvelope {
   durable: boolean;
 }
 
+export interface AgentThreadRunEnvelope extends AgentRunEnvelope {
+  run: AgentRunEnvelope["run"] & {
+    context: {
+      thread_id: string;
+      thread_ref: string;
+      conversation_id: string;
+      conversation_ref: string;
+      workspace: {
+        id: string;
+        generation: number;
+        expires_at: string;
+      };
+    };
+  };
+}
+
 export interface ActivatedAgentEnvelope {
   agent: {
     id: string;
@@ -70,6 +86,23 @@ export async function beginAgentRun(
     expectedStatus: 201,
   });
   return response.body as unknown as AgentRunEnvelope;
+}
+
+export async function beginAgentThreadRun(
+  client: SystemTestClient,
+  threadId: string,
+  options: { idempotencyKey?: string; expectedStatus?: 200 | 201 } = {},
+): Promise<AgentThreadRunEnvelope> {
+  const response = await client.json(
+    `/v1/agent-threads/${encodeURIComponent(threadId)}/runs`,
+    {
+      method: "POST",
+      body: {},
+      idempotencyKey: options.idempotencyKey ?? `agent-thread-run-${randomUUID()}`,
+      expectedStatus: options.expectedStatus ?? 201,
+    },
+  );
+  return response.body as unknown as AgentThreadRunEnvelope;
 }
 
 export async function closeAgentRun(run: AgentRunEnvelope): Promise<void> {

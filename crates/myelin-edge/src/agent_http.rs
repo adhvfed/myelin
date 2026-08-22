@@ -475,7 +475,7 @@ fn agent_json(tenant: &str, catalogue: &PlatformToolCatalogue, agent: &AgentRegi
     })
 }
 
-fn agent_session_json(
+pub(crate) fn agent_session_json(
     tenant: &str,
     catalogue: &PlatformToolCatalogue,
     issued: &IssuedAgentSession,
@@ -665,7 +665,7 @@ fn map_registry_error(error: AgentRegistryError) -> EdgeError {
     }
 }
 
-fn map_session_error(error: AgentSessionError) -> EdgeError {
+pub(crate) fn map_session_error(error: AgentSessionError) -> EdgeError {
     match error {
         AgentSessionError::BadInput(message) => EdgeError::BadRequest(message),
         AgentSessionError::NotFound => EdgeError::NotFound("agent not found".into()),

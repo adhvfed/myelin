@@ -248,6 +248,33 @@ impl AgentSessionIssuer {
         })
     }
 
+    /// Revoke a run whose credential was minted but could not be returned because a later
+    /// orchestration step failed. This keeps a partial HTTP request from leaving usable authority
+    /// behind even though the bearer never reached its intended caller.
+    pub async fn revoke_unreturned(
+        &self,
+        actor: &Principal,
+        issued: &IssuedAgentSession,
+    ) -> Result<ClosedAgentSession, AgentSessionError> {
+        require_active_human(actor)?;
+        if issued.session.trigger_actor_id != actor.principal_id.0 {
+            return Err(AgentSessionError::RunNotFound);
+        }
+        let run_id = canonical_uuid("run id", &issued.session.run_id)?;
+        let agent_id = canonical_uuid("agent id", &issued.session.agent_id)?;
+        let terminal = self
+            .runs
+            .terminate(&actor.tenant.0, run_id, agent_id, &issued.run_token.jti)
+            .await
+            .map_err(storage_error)?
+            .ok_or(AgentSessionError::RunNotFound)?;
+        Ok(ClosedAgentSession {
+            run_id: terminal.run_id,
+            agent_id: terminal.agent_id,
+            state: terminal.state,
+        })
+    }
+
     pub async fn authorize(
         &self,
         actor: &Principal,

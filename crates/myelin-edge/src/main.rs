@@ -1271,7 +1271,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         AgentMcpServices::new(
             AgentMcpAuthority::new(
                 agent_registry,
-                agent_sessions,
+                agent_sessions.clone(),
                 check.run_token_minter().clone(),
                 Arc::new(run_token_authorizer),
                 mcp_principals,
@@ -1300,6 +1300,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         mcp_chat,
         agent_thread_chat_mutations,
         agent_workspaces,
+        agent_sessions,
         handle.clone(),
     );
     builder = register_tools(builder);
