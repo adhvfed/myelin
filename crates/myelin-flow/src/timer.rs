@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 pub const SECS_PER_MINUTE: i64 = 60;
 
 pub fn epoch_minute(fire_at_secs: i64) -> i32 {
-    (fire_at_secs.max(0) / SECS_PER_MINUTE) as i32
+    i32::try_from(fire_at_secs.max(0) / SECS_PER_MINUTE).unwrap_or(i32::MAX)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,6 +412,11 @@ mod tests {
             epoch_minute(-5),
             0,
             "a pre-epoch deadline floors to bucket 0 (immediately due)"
+        );
+        assert_eq!(
+            epoch_minute(i64::MAX),
+            i32::MAX,
+            "a far-future deadline saturates forward instead of wrapping into a due bucket"
         );
     }
 

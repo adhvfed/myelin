@@ -228,15 +228,8 @@ impl SignalEngine {
             let store_key = (envelope.tenant.clone(), key.clone());
             let now = envelope.recorded_at.0.clone();
 
-            let within_window = |first_seen: &str| -> bool {
-                if rule.dedup_window.seconds == 0 {
-                    return true;
-                }
-                match (parse_rfc3339_secs(first_seen), parse_rfc3339_secs(&now)) {
-                    (Some(f), Some(n)) => n.saturating_sub(f) <= rule.dedup_window.seconds as i64,
-                    _ => true,
-                }
-            };
+            let within_window =
+                |first_seen: &str| within_dedup_window(first_seen, &now, rule.dedup_window.seconds);
 
             match self.store.get_mut(&store_key) {
                 Some(sig) if sig.state == SignalState::Open && within_window(&sig.first_seen) => {
@@ -270,6 +263,18 @@ impl SignalEngine {
             }
         }
         drafts
+    }
+}
+
+fn within_dedup_window(first_seen: &str, now: &str, window_secs: u64) -> bool {
+    if window_secs == 0 {
+        return true;
+    }
+    match (parse_rfc3339_secs(first_seen), parse_rfc3339_secs(now)) {
+        (Some(first), Some(current)) => u64::try_from(current.saturating_sub(first))
+            .map(|elapsed| elapsed <= window_secs)
+            .unwrap_or(true),
+        _ => true,
     }
 }
 
@@ -551,6 +556,37 @@ mod tests {
             outside[0].kind,
             PublishKind::Opened,
             "a repeat past the window is a fresh incident"
+        );
+    }
+
+    #[test]
+    fn a_maximum_window_does_not_wrap_and_split_one_incident() {
+        let mut engine = SignalEngine::new();
+        engine.add_rule(define_signal_rule(
+            RuleId("ci_run_failed".into()),
+            type_matcher("ci.run.failed"),
+            Severity::Error,
+            DedupKeyTpl("ci.run.failed:{event.subject}".into()),
+            DedupWindow { seconds: u64::MAX },
+            None,
+        ));
+
+        let opened = engine.ingest(
+            &envelope_at("ci.run.failed", "42", "2026-06-20T00:00:00Z"),
+            &SetExpr::All,
+            &see_all,
+        );
+        let much_later = engine.ingest(
+            &envelope_at("ci.run.failed", "42", "9999-12-31T23:59:59Z"),
+            &SetExpr::All,
+            &see_all,
+        );
+
+        assert_eq!(opened[0].kind, PublishKind::Opened);
+        assert_eq!(
+            much_later[0].kind,
+            PublishKind::Collapsed,
+            "a representable u64 window remains a large window instead of narrowing negative"
         );
     }
 
