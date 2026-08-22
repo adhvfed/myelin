@@ -116,7 +116,8 @@ services:
       agent_workspace_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/agent-workspaces";
       git_wire_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/git-rootfs}";
       runsc_bin="${MYELIN_RUNSC_BIN:-$(command -v runsc)}";
-      umask 077; mkdir -p "$git_root" "$agent_workspace_root";
+      mkdir -p "$git_root";
+      install -d -m 700 "$agent_workspace_root";
       export MYELIN_GIT_ROOT="$git_root" MYELIN_CI_CHECKOUT_REPO_ROOT="$git_root"
       MYELIN_AGENT_WORKSPACE_ROOT="$agent_workspace_root"
       MYELIN_GVISOR_GIT_ROOTFS="$git_wire_rootfs" MYELIN_RUNSC_BIN="$runsc_bin";
