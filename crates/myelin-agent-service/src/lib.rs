@@ -38,6 +38,7 @@ pub mod trace_seam;
 pub mod trigger_consumer;
 #[cfg(feature = "integration")]
 pub mod trigger_handoff;
+pub mod workspace;
 
 pub use holder::{
     agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
