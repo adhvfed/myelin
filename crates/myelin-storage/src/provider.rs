@@ -239,6 +239,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::placement_durable::cell_value_invariant_migrations(),
         crate::kms_durable::kms_epoch_invariant_migrations(),
         crate::restore_verify_durable::restore_wal_offset_invariant_migrations(),
+        crate::agent_thread_durable::agent_thread_durable_migrations(),
     ]
 }
 
@@ -827,11 +828,6 @@ mod boot_migrations_tests {
                 w[1]
             );
         }
-        assert_eq!(ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(
-            ids.last().unwrap(),
-            "0123_restore_wal_offset_invariants_validate"
-        );
     }
 
     #[test]

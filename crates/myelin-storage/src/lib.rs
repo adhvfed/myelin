@@ -1,6 +1,7 @@
 pub mod agent_journal_privacy;
 pub mod agent_model_step;
 pub mod agent_run_gate;
+pub mod agent_thread_durable;
 pub mod agent_tool_effect;
 pub mod agent_trace_durable;
 pub mod agent_trigger_durable;
@@ -228,6 +229,12 @@ pub use storage_surge::{
     StorageSurgeReport, STORAGE_SURGE_MULTIPLIER,
 };
 
+pub use agent_thread_durable::{
+    agent_thread_durable_migrations, ActivateAgentThreadOutcome, AgentThreadState,
+    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, NewAgentThread,
+    AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY, MAX_AGENT_THREAD_NAME_BYTES,
+    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+};
 pub use agent_trigger_durable::{
     agent_trigger_durable_migrations, agent_trigger_evaluation_diagnostic_migrations,
     agent_trigger_owner_list_migrations, agent_trigger_terminal_reason_migrations,

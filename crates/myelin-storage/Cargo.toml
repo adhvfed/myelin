@@ -26,6 +26,7 @@ fred.workspace = true
 tokio.workspace = true
 myelin-config.workspace = true
 serde_json.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [features]
 default = []
