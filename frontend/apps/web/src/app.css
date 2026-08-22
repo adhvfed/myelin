@@ -1,6 +1,7 @@
 /* Global application styles built on the design-system token layer. */
 @import "@myelin/design-system/tokens.css";
 @import "./chat.css";
+@import "./agent-threads.css";
 @import "@myelin/design-system/block-editor.css";
 @import "./knowledge.css";
 @import "./profile.css";

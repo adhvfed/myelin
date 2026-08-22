@@ -1,67 +1,12 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import AxeBuilder from "@axe-core/playwright";
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import {
+  browserApprovedSession,
+  postProductJson as post,
+  type JsonObject,
+} from "./product-api";
 import { signIn, waitForAppHydration } from "./session";
-
-type JsonObject = Record<string, unknown>;
-
-function requiredEnvironment(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required; run this test with fed test:integration`);
-  return value;
-}
-
-const edgeUrl = requiredEnvironment("MYELIN_INTEGRATION_EDGE_URL").replace(/\/$/, "");
-const token = requiredEnvironment("MYELIN_BROWSER_EDGE_TOKEN");
-
-async function post(
-  request: APIRequestContext,
-  path: string,
-  body: unknown,
-  options: { token?: string; scheme?: string; status: number },
-): Promise<JsonObject> {
-  const response = await request.post(`${edgeUrl}${path}`, {
-    headers: {
-      ...(options.token
-        ? {
-            authorization: `Bearer ${options.token}`,
-            "x-myelin-token-scheme": options.scheme ?? "agent",
-          }
-        : {}),
-      "idempotency-key": randomUUID(),
-    },
-    data: body,
-    failOnStatusCode: false,
-  });
-  const text = await response.text();
-  expect(response.status(), `POST ${path}: ${text}`).toBe(options.status);
-  return JSON.parse(text) as JsonObject;
-}
-
-async function browserApprovedSession(request: APIRequestContext): Promise<string> {
-  const verifier = randomBytes(32).toString("base64url");
-  const challenge = createHash("sha256").update(verifier).digest("base64url");
-  const started = await post(
-    request,
-    "/v1/auth/device/authorization",
-    { code_challenge: challenge },
-    { status: 201 },
-  );
-  await post(
-    request,
-    "/v1/auth/device/approval",
-    { user_code: String(started.user_code) },
-    { token, scheme: "agent", status: 200 },
-  );
-  const claimed = await post(
-    request,
-    "/v1/auth/device/token",
-    { device_code: String(started.device_code), code_verifier: verifier },
-    { status: 200 },
-  );
-  expect(claimed).toMatchObject({ scheme: "session", token_type: "Bearer" });
-  return String(claimed.access_token);
-}
 
 async function expectAccessible(page: Page, context: string): Promise<void> {
   const result = await new AxeBuilder({ page })

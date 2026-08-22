@@ -4,6 +4,36 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-22 — private agent work is visible, resumable, and accountable
+
+An agent could already participate in public Chat and automation runs, but a person had no coherent
+place to keep a sensitive problem with one agent. The pieces that did exist stopped at API
+boundaries: there was no named private-work surface, no durable continuation contract for a fresh
+agent context, and no owner-visible record of who entered the associated workspace. That left the
+product vision's human-and-agent collaboration model dependent on public rooms or hidden operator
+knowledge.
+
+Private agent threads now bind an owner, one active agent, an encrypted private conversation, and a
+generation-fenced workspace with an explicit one-to-thirty-day retention period. The owner can
+create, list, inspect, message, and resume the work through Edge and the CLI without configuring a
+GitHub, Slack, Linear, or agent-provider credential. Agents consume the same thread through a
+scoped run protocol. Workspace expiry is durable and reconciled, while SSH access uses one-shot
+credentials, pins the routed host and workspace generation, and records only an accountable access
+receipt—never commands, keys, routes, or file contents.
+
+The web application now makes this contract a first-class Agents surface. A person names the
+problem, chooses an available external agent, chooses retention, sends private messages, returns to
+the same history after reload, sees exact workspace state and expiry, copies the CLI SSH command,
+and pages through workspace-entry history. Live messages use authorized SSE reads with reconnect
+catch-up and a slow safety refresh. Chat and private work share one timeline renderer rather than
+forking message semantics, and strict decoders reject crossed aggregate identities at the browser
+boundary.
+
+**Proof:** frontend typecheck and lint; 637/637 frontend unit tests; four live browser product
+stories covering automations, public Chat, live Chat delivery, and private agent work; two
+TypeScript full-system stories covering the owner/agent privacy boundary, fresh-context resume,
+bounded workspace lifetime, CLI history, and workspace entry.
+
 ## 2026-08-20 — the durable inbox is one complete work-state surface
 
 The notification contract promised individual read, snooze, timed resurfacing, and view-scoped
