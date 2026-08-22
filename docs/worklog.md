@@ -889,6 +889,14 @@ workers. Removing the fake AgentMention front makes the remaining asynchronous
 worker-admission gap visible instead of reporting it GREEN. Net removal: roughly
 760 lines of unused implementation and self-testing drill.
 
+The same audit retired `cost_gate`, a mock-brain loop that declared itself GREEN
+after driving an in-memory wallet through a closure. Its only caller was the drill
+that assembled those doubles. The real safety property remains covered where it
+lives: Agent Service tests exercise reserve/settle semantics, and live-Postgres
+host tests debit the durable organization wallet, refuse an exhausted run without
+going negative, reconcile terminal reservations, and prove replay does not bill
+twice. Net removal: another roughly 650 lines of production-shaped test machinery.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the

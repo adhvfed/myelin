@@ -4,7 +4,6 @@ pub mod catalogue;
 pub mod chat_read_tools;
 pub mod chat_tools;
 pub mod ci_tools;
-pub mod cost_gate;
 pub mod defaults;
 pub mod dry_run;
 pub mod dsr;
@@ -62,8 +61,6 @@ pub use metering::{price, ModelRates, PriceError, Priced, LUNA_RATES};
 #[cfg(any(test, feature = "test-support"))]
 pub use tool_exec::{MockToolExecutor, MockToolSurface};
 pub use tool_exec::{ToolExecError, ToolExecutionContext, ToolExecutor};
-
-pub use cost_gate::{runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep};
 
 pub use mock::{
     build_conversation, model_turns_taken, replay, replay_bounded, select_runtime, HistoryEntry,
