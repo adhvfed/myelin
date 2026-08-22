@@ -7,6 +7,9 @@ use crate::dispatch::{is_canonical_agent_id, EdgeCall};
 use super::{query_field, terminal_safe_single_line};
 
 pub(super) fn render_response(value: &Value) -> Option<String> {
+    if let Some(thread) = value.get("thread") {
+        return render_thread_response(value, thread);
+    }
     let agent = value.get("agent")?;
     let summary = render_agent(agent)?;
     if let Some(action) = value.get("action") {
@@ -85,11 +88,11 @@ fn selected_tool_label(value: &Value) -> Option<String> {
 }
 
 pub(super) fn render_item(value: &Value) -> Option<String> {
-    render_agent(value)
+    render_thread(value).or_else(|| render_agent(value))
 }
 
 pub(super) fn page_command(call: &EdgeCall, cursor: &str) -> Option<String> {
-    if call.path != "/v1/agents" || !is_canonical_agent_id(cursor) {
+    if !is_canonical_agent_id(cursor) {
         return None;
     }
     let limit = call
@@ -100,8 +103,66 @@ pub(super) fn page_command(call: &EdgeCall, cursor: &str) -> Option<String> {
     if parsed.to_string() != limit || !(1..=100).contains(&parsed) {
         return None;
     }
+    match call.path.as_str() {
+        "/v1/agents" => Some(format!(
+            "myelin agent list --limit {limit} --cursor {cursor}"
+        )),
+        "/v1/agent-threads" => Some(format!(
+            "myelin agent thread list --limit {limit} --cursor {cursor}"
+        )),
+        _ => None,
+    }
+}
+
+fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
+    let summary = render_thread(thread)?;
+    let id = terminal_safe_single_line(thread.get("id")?.as_str()?);
+    let conversation = terminal_safe_single_line(thread.get("conversation_ref")?.as_str()?);
+    let agent = terminal_safe_single_line(thread.get("agent_ref")?.as_str()?);
+    let workspace = thread.get("workspace")?;
+    let state = terminal_safe_single_line(workspace.get("state")?.as_str()?);
+    let expires_at = terminal_safe_single_line(workspace.get("expires_at")?.as_str()?);
+    let prefix = match value.get("created").and_then(Value::as_bool) {
+        Some(true) => "Started private agent thread",
+        Some(false) => "Private agent thread already exists",
+        None => "Private agent thread",
+    };
+    let mut output = format!(
+        "{prefix}: {summary}\n  agent: {agent}\n  conversation: {conversation}\n  workspace: {state}; retained until {expires_at}\n"
+    );
+    if state == "ready" {
+        let _ = writeln!(
+            output,
+            "  message: myelin agent thread say {id} \"<message>\""
+        );
+        let _ = writeln!(output, "  workspace: myelin agent thread ssh {id}");
+    }
+    Some(output)
+}
+
+fn render_thread(value: &Value) -> Option<String> {
+    let id = value.get("id")?.as_str()?;
+    let reference = value.get("ref")?.as_str()?;
+    let name = value.get("name")?.as_str()?;
+    let workspace = value.get("workspace")?;
+    let state = workspace.get("state")?.as_str()?;
+    let expires_at = workspace.get("expires_at")?.as_str()?;
+    if !is_canonical_agent_id(id)
+        || !reference.starts_with("myelin://")
+        || !reference.contains("/agent/thread/")
+        || !matches!(
+            state,
+            "provisioning" | "ready" | "failed" | "expiring" | "deleted"
+        )
+    {
+        return None;
+    }
     Some(format!(
-        "myelin agent list --limit {limit} --cursor {cursor}"
+        "{}  [{}, until {}]  {}",
+        terminal_safe_single_line(name),
+        terminal_safe_single_line(state),
+        terminal_safe_single_line(expires_at),
+        terminal_safe_single_line(reference),
     ))
 }
 
@@ -134,6 +195,7 @@ mod tests {
     use crate::dispatch::agent_dispatch;
 
     const ID: &str = "11111111-1111-1111-1111-111111111111";
+    const THREAD_ID: &str = "22222222-2222-2222-2222-222222222222";
 
     fn agent() -> Value {
         json!({
@@ -152,6 +214,28 @@ mod tests {
             "effective_tools": [],
             "grants": ["run.view"],
             "created_at": "2026-08-09T12:00:00Z",
+        })
+    }
+
+    fn thread() -> Value {
+        json!({
+            "id": THREAD_ID,
+            "ref": format!("myelin://acme/agent/thread/{THREAD_ID}"),
+            "name": "Checkout\nrace",
+            "agent_id": ID,
+            "agent_ref": format!("myelin://acme/identity/agent/{ID}"),
+            "project_id": null,
+            "conversation_id": "01J00000000000000000000000",
+            "conversation_ref": "myelin://acme/chat/channel/01J00000000000000000000000",
+            "workspace": {
+                "id": "33333333-3333-3333-3333-333333333333",
+                "generation": 1,
+                "state": "ready",
+                "retention_days": 3,
+                "expires_at": "2026-08-25T12:00:00Z",
+            },
+            "created_at": "2026-08-22T12:00:00Z",
+            "updated_at": "2026-08-22T12:00:00Z",
         })
     }
 
@@ -227,5 +311,37 @@ mod tests {
         assert!(rendered.starts_with("Retired agent:"));
         assert!(rendered.contains("stopped 2 active runs"));
         assert!(rendered.contains("cannot be resumed"));
+    }
+
+    #[test]
+    fn private_thread_receipts_explain_how_to_continue_the_work() {
+        let rendered = render_response(&json!({
+            "thread": thread(),
+            "created": true,
+            "durable": true,
+        }))
+        .unwrap();
+        assert!(rendered.starts_with("Started private agent thread: Checkout\\nrace"));
+        assert!(rendered.contains("workspace: ready; retained until 2026-08-25T12:00:00Z"));
+        assert!(rendered.contains(&format!("myelin agent thread say {THREAD_ID}")));
+        assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID}")));
+        assert!(!rendered.contains("storage_locator"));
+
+        let mut expiring = thread();
+        expiring["workspace"]["state"] = json!("expiring");
+        let rendered = render_response(&json!({ "thread": expiring })).unwrap();
+        assert!(rendered.starts_with("Private agent thread:"));
+        assert!(!rendered.contains("myelin agent thread ssh"));
+    }
+
+    #[test]
+    fn private_thread_pagination_hint_round_trips_through_dispatch() {
+        let call = agent_dispatch(&["thread", "list", "--limit", "7"]).unwrap();
+        let hint = page_command(&call, THREAD_ID).unwrap();
+        let words = hint.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            agent_dispatch(&words[2..]).unwrap().query.as_deref(),
+            Some("limit=7&cursor=22222222-2222-2222-2222-222222222222")
+        );
     }
 }

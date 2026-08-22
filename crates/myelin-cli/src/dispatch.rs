@@ -4,6 +4,7 @@ use myelin_git::api::{parse_cli, CliCommand, CliParseError};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
 
+mod agent_threads;
 mod agents;
 mod automations;
 mod chat;
@@ -14,7 +15,7 @@ mod projects;
 mod refs;
 mod tools;
 
-pub use agents::{agent_dispatch, is_canonical_agent_id};
+pub use agents::{agent_dispatch, agent_dispatch_with_project, is_canonical_agent_id};
 pub use automations::{automation_dispatch, is_canonical_automation_id};
 pub use chat::{chat_dispatch, chat_dispatch_with_project};
 pub use issues::{issues_dispatch, issues_dispatch_with_context, issues_dispatch_with_project};

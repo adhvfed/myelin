@@ -11,9 +11,16 @@ const MAX_NAME_BYTES: usize = 80;
 const MAX_TOOLS: usize = 128;
 
 pub fn agent_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
+    agent_dispatch_with_project(args, None)
+}
+
+pub fn agent_dispatch_with_project(
+    args: &[&str],
+    default_project: Option<&str>,
+) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent command given (try: create <name> --tool <name> | list | show <id> | approve|reject <gate>)".into(),
+            "no agent command given (try: create <name> --tool <name> | list | show <id> | thread start|list|show | approve|reject <gate>)".into(),
         )
     })?;
     match *verb {
@@ -23,9 +30,38 @@ pub fn agent_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
         "suspend" => lifecycle_call(rest, "suspend"),
         "resume" => lifecycle_call(rest, "resume"),
         "retire" => lifecycle_call(rest, "retire"),
+        "thread" => super::agent_threads::agent_thread_dispatch(rest, default_project),
         "approve" | "reject" => approval_call(rest, verb),
         other => Err(CliError::Usage(format!(
             "unknown agent command token `{other}`"
+        ))),
+    }
+}
+
+pub(super) fn validate_clean_name(label: &str, value: &str) -> Result<(), CliError> {
+    if value.is_empty()
+        || value.len() > MAX_NAME_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        Err(CliError::Usage(format!(
+            "{label} must contain 1..={MAX_NAME_BYTES} bytes, without surrounding whitespace or control characters"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn exactly_one_id<'a>(
+    args: &'a [&str],
+    command: &str,
+    label: &str,
+) -> Result<&'a str, CliError> {
+    match args {
+        [id] => Ok(*id),
+        [] => Err(CliError::Usage(format!("{command} needs a {label}"))),
+        [_, extra, ..] => Err(CliError::Usage(format!(
+            "unexpected {command} argument `{extra}`"
         ))),
     }
 }
@@ -109,15 +145,7 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     }
 
     let name = name.ok_or_else(|| CliError::Usage("agent create needs a name".into()))?;
-    if name.is_empty()
-        || name.len() > MAX_NAME_BYTES
-        || name.trim() != name
-        || name.chars().any(char::is_control)
-    {
-        return Err(CliError::Usage(format!(
-            "agent name must contain 1..={MAX_NAME_BYTES} bytes, without surrounding whitespace or control characters"
-        )));
-    }
+    validate_clean_name("agent name", name)?;
     if tools.is_empty() {
         return Err(CliError::Usage(
             "agent create needs at least one --tool <subsystem.name>".into(),
@@ -158,6 +186,15 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
 }
 
 fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    paginated_call(args, "agent list", "agent cursor", "/v1/agents")
+}
+
+pub(super) fn paginated_call(
+    args: &[&str],
+    command: &str,
+    cursor_label: &str,
+    path: &str,
+) -> Result<EdgeCall, CliError> {
     let mut limit = None;
     let mut cursor = None;
     let mut index = 0;
@@ -165,24 +202,20 @@ fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
         let (slot, flag): (&mut Option<&str>, &str) = match args[index] {
             "--limit" => (&mut limit, "--limit"),
             "--cursor" => (&mut cursor, "--cursor"),
-            token => {
-                return Err(CliError::Usage(format!(
-                    "unknown agent list flag `{token}`"
-                )))
-            }
+            token => return Err(CliError::Usage(format!("unknown {command} flag `{token}`"))),
         };
         if slot.is_some() {
             return Err(CliError::Usage(format!(
-                "duplicate agent list flag `{flag}`"
+                "duplicate {command} flag `{flag}`"
             )));
         }
         *slot = Some(flag_value(args, &mut index, flag)?);
         index += 1;
     }
 
-    let limit = canonical_limit(limit)?;
+    let limit = canonical_limit(limit, command)?;
     if let Some(cursor) = cursor {
-        require_agent_id("agent cursor", cursor)?;
+        require_agent_id(cursor_label, cursor)?;
     }
     let mut query = FormQuery::default();
     query.push("limit", &limit.to_string());
@@ -191,7 +224,7 @@ fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     }
     Ok(EdgeCall {
         method: HttpMethod::Get,
-        path: "/v1/agents".into(),
+        path: path.into(),
         query: Some(query.finish()),
         payload: None,
         idempotency_key: None,
@@ -213,7 +246,7 @@ fn show_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     Ok(EdgeCall::get(format!("/v1/agents/{id}")))
 }
 
-fn canonical_limit(value: Option<&str>) -> Result<u32, CliError> {
+pub(super) fn canonical_limit(value: Option<&str>, command: &str) -> Result<u32, CliError> {
     let Some(value) = value else {
         return Ok(DEFAULT_PAGE_LIMIT);
     };
@@ -223,18 +256,24 @@ fn canonical_limit(value: Option<&str>) -> Result<u32, CliError> {
         .filter(|parsed| parsed.to_string() == value)
         .filter(|parsed| (1..=MAX_PAGE_LIMIT).contains(parsed))
         .ok_or_else(|| {
-            CliError::Usage("agent list limit must be an integer between 1 and 100".into())
+            CliError::Usage(format!(
+                "{command} limit must be an integer between 1 and 100"
+            ))
         })
 }
 
-fn flag_value<'a>(args: &'a [&str], index: &mut usize, flag: &str) -> Result<&'a str, CliError> {
+pub(super) fn flag_value<'a>(
+    args: &'a [&str],
+    index: &mut usize,
+    flag: &str,
+) -> Result<&'a str, CliError> {
     *index += 1;
     args.get(*index)
         .copied()
         .ok_or_else(|| CliError::Usage(format!("`{flag}` needs a value")))
 }
 
-fn require_agent_id(label: &str, value: &str) -> Result<(), CliError> {
+pub(super) fn require_agent_id(label: &str, value: &str) -> Result<(), CliError> {
     if is_canonical_agent_id(value) {
         Ok(())
     } else {

@@ -144,7 +144,7 @@ fn reference_message(args: &[&str]) -> Result<EdgeCall, CliError> {
     ))
 }
 
-fn validate_message(content: &str) -> Result<(), CliError> {
+pub(super) fn validate_message(content: &str) -> Result<(), CliError> {
     if content.trim().is_empty()
         || content.len() > 32 * 1024
         || content.chars().any(|character| {
@@ -230,7 +230,7 @@ fn parse_limit(value: &str) -> Result<u16, CliError> {
     Ok(parsed)
 }
 
-fn canonical_ulid(label: &str, value: &str) -> Result<(), CliError> {
+pub(super) fn canonical_ulid(label: &str, value: &str) -> Result<(), CliError> {
     if value.len() == 26
         && value
             .bytes()

@@ -91,7 +91,39 @@ describe("private work with an agent", () => {
 
     const conversation = new Conversation(first.thread.conversation_id, {});
     const problem = "Please find why checkout cleanup occasionally races its final reader.";
-    await conversation.post(founder, problem);
+    const postedProblem = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/messages`,
+      {
+        method: "POST",
+        body: { content: problem },
+        idempotencyKey: `private-agent-problem-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    expect(postedProblem.body).toMatchObject({
+      thread_id: first.thread.id,
+      durable: true,
+    });
+    const threadHistory = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/messages?limit=10`,
+    );
+    expect(array(threadHistory.body.items, "private thread messages")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ content: problem })]),
+    );
+
+    await teammate.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/messages?limit=10`,
+      { expectedStatus: 404 },
+    );
+    await teammate.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/messages`,
+      {
+        method: "POST",
+        body: { content: "I should not be able to discover this private work." },
+        idempotencyKey: `hidden-thread-message-${randomUUID()}`,
+        expectedStatus: 404,
+      },
+    );
     const hiddenHistory = await teammate.json(
       `/v1/chat/conversations/${encodeURIComponent(conversation.id)}/messages?limit=10`,
       { expectedStatus: 404 },
@@ -330,6 +362,19 @@ describe("private work with an agent", () => {
         {
           method: "POST",
           body: { content: "An expired thread cannot quietly become live again." },
+          expectedStatus: 404,
+        },
+      );
+      await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/messages?limit=10`,
+        { expectedStatus: 404 },
+      );
+      await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/messages`,
+        {
+          method: "POST",
+          body: { content: "An expired aggregate cannot quietly become live again." },
+          idempotencyKey: `expired-thread-message-${randomUUID()}`,
           expectedStatus: 404,
         },
       );

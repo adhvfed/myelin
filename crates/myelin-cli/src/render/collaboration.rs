@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
-use crate::dispatch::EdgeCall;
+use crate::dispatch::{is_canonical_agent_id, EdgeCall};
 
 use super::{query_field, terminal_safe_single_line};
 
@@ -68,11 +68,19 @@ pub(super) fn page_command(call: &EdgeCall, cursor: &str) -> Option<String> {
             "myelin doc page list --limit {limit} --cursor {cursor}"
         )),
         path => {
-            let conversation = path
-                .strip_prefix("/v1/chat/conversations/")?
+            if let Some(conversation) = path
+                .strip_prefix("/v1/chat/conversations/")
+                .and_then(|path| path.strip_suffix("/messages"))
+            {
+                return canonical_ulid(conversation).then(|| {
+                    format!("myelin chat history {conversation} --limit {limit} --before {cursor}")
+                });
+            }
+            let thread = path
+                .strip_prefix("/v1/agent-threads/")?
                 .strip_suffix("/messages")?;
-            canonical_ulid(conversation).then(|| {
-                format!("myelin chat history {conversation} --limit {limit} --before {cursor}")
+            is_canonical_agent_id(thread).then(|| {
+                format!("myelin agent thread history {thread} --limit {limit} --before {cursor}")
             })
         }
     }

@@ -21,7 +21,9 @@ use tokio::runtime::Handle;
 
 use crate::agent_http::{agent_session_json, map_session_error};
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
-use crate::chat_http::{DurableChatMutationApi, DurableChatReadApi, PrivateConversationCreation};
+use crate::chat_http::{
+    parse_messages_query, DurableChatMutationApi, DurableChatReadApi, PrivateConversationCreation,
+};
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
@@ -310,6 +312,65 @@ struct AgentThreadRunCreateHandler {
     api: AgentThreadHttpApi,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentThreadMessageBody {
+    content: String,
+}
+
+struct AgentThreadMessageListHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadMessageListHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_body(ctx)?;
+        let thread = self.api.owner_thread(ctx.principal, thread_param(ctx)?)?;
+        let (limit, before) = parse_messages_query(&ctx.request.query)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &self.api.chat_reads.read_messages(
+                ctx.principal,
+                &thread.conversation_id,
+                limit,
+                before,
+            )?,
+        )))
+    }
+}
+
+struct AgentThreadMessagePostHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadMessagePostHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let body: AgentThreadMessageBody =
+            parse_interactive_body(&ctx.request.body, "agent thread message")?;
+        let thread = self.api.owner_thread(ctx.principal, thread_param(ctx)?)?;
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let message_id = self.api.chat_mutations.post_message(
+            ctx.principal,
+            ctx.principal,
+            &thread.conversation_id,
+            &body.content,
+            &[],
+            client_nonce,
+        )?;
+        Ok(no_store(EdgeResponse::json(
+            201,
+            &json!({
+                "message_id": message_id.as_str(),
+                "thread_id": thread.thread_id,
+                "durable": true,
+            }),
+        )))
+    }
+}
+
 impl Handler for AgentThreadRunCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
@@ -476,7 +537,19 @@ pub fn register_agent_threads(
             Method::Post,
             "/v1/agent-threads/{thread}/runs",
             "identity.agent_thread.run.create",
-            Arc::new(AgentThreadRunCreateHandler { api }),
+            Arc::new(AgentThreadRunCreateHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/agent-threads/{thread}/messages",
+            "chat.messages.list",
+            Arc::new(AgentThreadMessageListHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agent-threads/{thread}/messages",
+            "chat.message.post",
+            Arc::new(AgentThreadMessagePostHandler { api }),
         );
     register_workspace_ssh_access(builder, ssh)
 }
@@ -535,18 +608,25 @@ fn thread_ref(tenant: &str, thread_id: &str) -> String {
 }
 
 fn parse_create_body(body: &[u8]) -> Result<CreateAgentThreadBody, EdgeError> {
+    parse_interactive_body(body, "agent thread")
+}
+
+fn parse_interactive_body<T: for<'de> Deserialize<'de>>(
+    body: &[u8],
+    resource: &str,
+) -> Result<T, EdgeError> {
     if body.is_empty() {
-        return Err(EdgeError::BadRequest(
-            "agent thread request body is empty".into(),
-        ));
+        return Err(EdgeError::BadRequest(format!(
+            "{resource} request body is empty"
+        )));
     }
     if body.len() > MAX_AGENT_THREAD_JSON_BYTES {
-        return Err(EdgeError::PayloadTooLarge(
-            "agent thread request exceeds the interactive body limit".into(),
-        ));
+        return Err(EdgeError::PayloadTooLarge(format!(
+            "{resource} request exceeds the interactive body limit"
+        )));
     }
     serde_json::from_slice(body)
-        .map_err(|error| EdgeError::BadRequest(format!("invalid agent thread request: {error}")))
+        .map_err(|error| EdgeError::BadRequest(format!("invalid {resource} request: {error}")))
 }
 
 fn parse_uuid(field: &str, value: &str) -> Result<Uuid, EdgeError> {

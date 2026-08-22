@@ -737,7 +737,7 @@ fn parse_page_query(query: &str) -> Result<(u32, Option<String>), EdgeError> {
     parse_query(query, "cursor")
 }
 
-fn parse_messages_query(query: &str) -> Result<(u32, Option<String>), EdgeError> {
+pub(crate) fn parse_messages_query(query: &str) -> Result<(u32, Option<String>), EdgeError> {
     parse_query(query, "before")
 }
 
