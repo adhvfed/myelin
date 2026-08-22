@@ -15,6 +15,16 @@ pub struct LiveAdmissionRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveSessionRequest {
+    pub tenant: String,
+    pub grant_id: Uuid,
+    pub route_username: String,
+    pub public_key_fingerprint: String,
+    pub admitted_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionLookupError {
     operation: &'static str,
 }
@@ -48,6 +58,17 @@ pub trait WorkspaceSshAdmissionStore: Clone + Send + Sync + 'static {
                 + 'a,
         >,
     >;
+
+    fn live_session<'a>(
+        &'a self,
+        request: &'a LiveSessionRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<LiveWorkspaceSshAdmission>, AdmissionLookupError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
 
 impl WorkspaceSshAdmissionStore for DurableAgentThreadBacking {
@@ -71,6 +92,30 @@ impl WorkspaceSshAdmissionStore for DurableAgentThreadBacking {
             )
             .await
             .map_err(|_| AdmissionLookupError::unavailable("checking a live grant"))
+        })
+    }
+
+    fn live_session<'a>(
+        &'a self,
+        request: &'a LiveSessionRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<LiveWorkspaceSshAdmission>, AdmissionLookupError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.live_ssh_session(
+                &request.tenant,
+                request.grant_id,
+                &request.route_username,
+                &request.public_key_fingerprint,
+                request.admitted_at,
+                request.observed_at,
+            )
+            .await
+            .map_err(|_| AdmissionLookupError::unavailable("rechecking a live session"))
         })
     }
 }

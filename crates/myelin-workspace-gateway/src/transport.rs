@@ -12,9 +12,10 @@ use russh::keys::PublicKeyBase64;
 use russh::server::{Auth, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, Pty};
 use tokio::io::AsyncWriteExt as _;
+use uuid::Uuid;
 
 use crate::{
-    AdmissionLookupError, LiveAdmissionRequest, LocalConfinedWorkspaceLauncher,
+    AdmissionLookupError, LiveAdmissionRequest, LiveSessionRequest, LocalConfinedWorkspaceLauncher,
     WorkspaceSshAdmissionStore,
 };
 use myelin_ci_sandbox::gvisor::{
@@ -27,6 +28,7 @@ type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub struct AuthenticatedWorkspace {
     pub tenant: String,
     pub admission: LiveWorkspaceSshAdmission,
+    admitted_at: DateTime<Utc>,
     credential: Option<AuthenticatedCredential>,
 }
 
@@ -42,6 +44,7 @@ impl AuthenticatedWorkspace {
         Self {
             tenant,
             admission,
+            admitted_at: Utc::now(),
             credential: None,
         }
     }
@@ -142,6 +145,7 @@ where
             public_key_fingerprint,
             observed_at: (self.clock)(),
         };
+        let admitted_at = request.observed_at;
         Ok(self
             .admissions
             .live_admission(&request)
@@ -149,6 +153,7 @@ where
             .map(|admission| AuthenticatedWorkspace {
                 tenant: route.tenant,
                 admission,
+                admitted_at,
                 credential: Some(AuthenticatedCredential {
                     route_username: route_username.to_string(),
                     public_key: public_key.clone(),
@@ -163,9 +168,31 @@ where
         let Some(credential) = authenticated.credential.as_ref() else {
             return Ok(None);
         };
+        let authorized_key = format!("ssh-ed25519 {}", credential.public_key.public_key_base64());
+        let Ok(public_key_fingerprint) = workspace_ssh_public_key_fingerprint(&authorized_key)
+        else {
+            return Ok(None);
+        };
+        let Ok(grant_id) = Uuid::parse_str(&authenticated.admission.grant_id) else {
+            return Ok(None);
+        };
         let current = self
-            .authenticate(&credential.route_username, &credential.public_key)
-            .await?;
+            .admissions
+            .live_session(&LiveSessionRequest {
+                tenant: authenticated.tenant.clone(),
+                grant_id,
+                route_username: credential.route_username.clone(),
+                public_key_fingerprint,
+                admitted_at: authenticated.admitted_at,
+                observed_at: (self.clock)(),
+            })
+            .await?
+            .map(|admission| AuthenticatedWorkspace {
+                tenant: authenticated.tenant.clone(),
+                admission,
+                admitted_at: authenticated.admitted_at,
+                credential: Some(credential.clone()),
+            });
         Ok(current.filter(|current| same_workspace_authority(current, authenticated)))
     }
 }
@@ -483,8 +510,21 @@ mod tests {
 
     #[derive(Clone)]
     struct RecordingAdmissions {
-        seen: Arc<Mutex<Vec<LiveAdmissionRequest>>>,
+        admissions: Arc<Mutex<Vec<LiveAdmissionRequest>>>,
+        sessions: Arc<Mutex<Vec<LiveSessionRequest>>>,
         result: Result<Option<LiveWorkspaceSshAdmission>, AdmissionLookupError>,
+    }
+
+    impl RecordingAdmissions {
+        fn returning(
+            result: Result<Option<LiveWorkspaceSshAdmission>, AdmissionLookupError>,
+        ) -> Self {
+            Self {
+                admissions: Arc::new(Mutex::new(Vec::new())),
+                sessions: Arc::new(Mutex::new(Vec::new())),
+                result,
+            }
+        }
     }
 
     impl WorkspaceSshAdmissionStore for RecordingAdmissions {
@@ -499,7 +539,23 @@ mod tests {
             >,
         > {
             Box::pin(async move {
-                self.seen.lock().unwrap().push(request.clone());
+                self.admissions.lock().unwrap().push(request.clone());
+                self.result.clone()
+            })
+        }
+
+        fn live_session<'a>(
+            &'a self,
+            request: &'a LiveSessionRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<LiveWorkspaceSshAdmission>, AdmissionLookupError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.sessions.lock().unwrap().push(request.clone());
                 self.result.clone()
             })
         }
@@ -535,15 +591,10 @@ mod tests {
         let grant_id = Uuid::from_u128(11);
         let username = routes.seal("acme", grant_id).unwrap();
         let key = public_key([0x82; KEY_LEN]);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let authenticator = WorkspaceSshAuthenticator::new(
-            routes,
-            RecordingAdmissions {
-                seen: seen.clone(),
-                result: Ok(Some(admission(grant_id))),
-            },
-        )
-        .with_clock(move || now);
+        let admissions = RecordingAdmissions::returning(Ok(Some(admission(grant_id))));
+        let seen = admissions.admissions.clone();
+        let authenticator =
+            WorkspaceSshAuthenticator::new(routes, admissions).with_clock(move || now);
 
         let authenticated = authenticator
             .authenticate(&username, &key)
@@ -567,13 +618,11 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_routes_are_refused_without_touching_tenant_storage() {
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let admissions = RecordingAdmissions::returning(Ok(Some(admission(Uuid::from_u128(21)))));
+        let seen = admissions.admissions.clone();
         let authenticator = WorkspaceSshAuthenticator::new(
             WorkspaceSshRouteKey::from_seal_key(&SealKey::from_bytes([0x91; KEY_LEN])),
-            RecordingAdmissions {
-                seen: seen.clone(),
-                result: Ok(Some(admission(Uuid::from_u128(21)))),
-            },
+            admissions,
         );
 
         assert!(authenticator
@@ -593,10 +642,7 @@ mod tests {
 
         let expired = WorkspaceSshAuthenticator::new(
             routes.clone(),
-            RecordingAdmissions {
-                seen: Arc::new(Mutex::new(Vec::new())),
-                result: Ok(None),
-            },
+            RecordingAdmissions::returning(Ok(None)),
         );
         assert!(expired
             .authenticate(&username, &key)
@@ -606,12 +652,44 @@ mod tests {
 
         let unavailable = WorkspaceSshAuthenticator::new(
             routes,
-            RecordingAdmissions {
-                seen: Arc::new(Mutex::new(Vec::new())),
-                result: Err(AdmissionLookupError::unavailable("checking a live grant")),
-            },
+            RecordingAdmissions::returning(Err(AdmissionLookupError::unavailable(
+                "checking a live grant",
+            ))),
         );
         assert!(unavailable.authenticate(&username, &key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_rechecks_preserve_the_admission_instant() {
+        let admitted_at = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let later = admitted_at + chrono::Duration::hours(1);
+        let now = Arc::new(Mutex::new(admitted_at));
+        let grant_id = Uuid::from_u128(41);
+        let routes = WorkspaceSshRouteKey::from_seal_key(&SealKey::from_bytes([0xb1; KEY_LEN]));
+        let username = routes.seal("acme", grant_id).unwrap();
+        let admissions = RecordingAdmissions::returning(Ok(Some(admission(grant_id))));
+        let seen_sessions = admissions.sessions.clone();
+        let clock = now.clone();
+        let authenticator = WorkspaceSshAuthenticator::new(routes, admissions)
+            .with_clock(move || *clock.lock().unwrap());
+        let authenticated = authenticator
+            .authenticate(&username, &public_key([0xb2; KEY_LEN]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        *now.lock().unwrap() = later;
+        assert!(authenticator
+            .revalidate(&authenticated)
+            .await
+            .unwrap()
+            .is_some());
+
+        let sessions = seen_sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].admitted_at, admitted_at);
+        assert_eq!(sessions[0].observed_at, later);
+        assert_eq!(sessions[0].grant_id, grant_id);
     }
 
     #[test]

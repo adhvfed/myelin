@@ -154,6 +154,55 @@ impl DurableAgentThreadBacking {
         public_key_fingerprint: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<LiveWorkspaceSshAdmission>, ProviderError> {
+        self.live_ssh_authority(
+            tenant,
+            grant_id,
+            route_username,
+            public_key_fingerprint,
+            now,
+            now,
+        )
+        .await
+    }
+
+    /// Rechecks an already admitted SSH session without turning the short-lived
+    /// connection grant into the session lifetime.
+    ///
+    /// `admitted_at` is the instant at which the gateway accepted the key. The
+    /// grant must have been valid then. The thread and its principals must still
+    /// be live at `now`, and explicit grant revocation takes effect immediately.
+    pub async fn live_ssh_session(
+        &self,
+        tenant: &str,
+        grant_id: Uuid,
+        route_username: &str,
+        public_key_fingerprint: &str,
+        admitted_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<LiveWorkspaceSshAdmission>, ProviderError> {
+        if now < admitted_at {
+            return Ok(None);
+        }
+        self.live_ssh_authority(
+            tenant,
+            grant_id,
+            route_username,
+            public_key_fingerprint,
+            admitted_at,
+            now,
+        )
+        .await
+    }
+
+    async fn live_ssh_authority(
+        &self,
+        tenant: &str,
+        grant_id: Uuid,
+        route_username: &str,
+        public_key_fingerprint: &str,
+        admitted_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<LiveWorkspaceSshAdmission>, ProviderError> {
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         let route_username = route_username.to_string();
@@ -181,19 +230,21 @@ impl DurableAgentThreadBacking {
                           WHERE access.tenant_id = $1 AND access.region = $2
                             AND access.grant_id = $3 AND access.route_username = $4
                             AND access.public_key_fingerprint = $5
-                            AND access.revoked_at IS NULL AND access.expires_at > $6
-                            AND thread.state = 'ready' AND thread.expires_at > $6
+                            AND access.revoked_at IS NULL
+                            AND access.issued_at <= $6 AND access.expires_at > $6
+                            AND thread.state = 'ready' AND thread.expires_at > $7
                             AND access.owner_principal_id = thread.owner_principal_id
                             AND access.workspace_id = thread.workspace_id
                             AND access.workspace_generation = thread.workspace_generation
-                            AND owner.kind = $7 AND owner.status = $8 AND agent.status = $8",
+                            AND owner.kind = $8 AND owner.status = $9 AND agent.status = $9",
                     )
                     .bind(&tenant)
                     .bind(&region)
                     .bind(grant_id)
                     .bind(&route_username)
                     .bind(&fingerprint)
-                    .bind(now)
+                    .bind(admitted_at)
+                    .bind(observed_at)
                     .bind(HUMAN_PRINCIPAL_KIND_JSON)
                     .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
                     .fetch_optional(&mut *connection)

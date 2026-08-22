@@ -407,6 +407,54 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .await
         .unwrap()
         .is_none());
+    assert!(threads
+        .live_ssh_admission(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_intent.issued_at - Duration::seconds(1),
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let continuing_session = threads
+        .live_ssh_session(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_issued_at,
+            ssh_intent.expires_at + Duration::hours(1),
+        )
+        .await
+        .unwrap()
+        .expect("a session admitted in time continues after its connection grant expires");
+    assert_eq!(continuing_session.workspace_id, admitted.workspace_id);
+    assert!(threads
+        .live_ssh_session(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_issued_at,
+            intended.expires_at,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert!(threads
+        .live_ssh_session(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_issued_at,
+            ssh_issued_at - Duration::seconds(1),
+        )
+        .await
+        .unwrap()
+        .is_none());
     set_agent_status(&app, &tenant, agent_id, PrincipalStatus::Suspended).await;
     assert!(threads
         .live_ssh_admission(
@@ -415,6 +463,18 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             &route_username,
             &ssh_intent.public_key_fingerprint,
             ssh_issued_at,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert!(threads
+        .live_ssh_session(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_issued_at,
+            ssh_intent.expires_at + Duration::hours(1),
         )
         .await
         .unwrap()
