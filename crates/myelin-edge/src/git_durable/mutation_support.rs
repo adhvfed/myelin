@@ -66,10 +66,15 @@ pub(super) fn branch_ref(gitref: &str) -> String {
     }
 }
 
-pub(super) fn file_write_request_hash(request: &AgentFileWrite<'_>) -> String {
+pub(super) fn file_write_request_hash(request: &FileCommit<'_>) -> String {
     let full_ref = branch_ref(request.gitref);
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"myelin.git.file-write-request.v1\0");
+    hasher.update(if request.actor_is_agent {
+        // Preserve the deployed agent-write identity so an in-flight retry still finds its receipt.
+        b"myelin.git.file-write-request.v1\0".as_slice()
+    } else {
+        b"myelin.git.human-file-write-request.v1\0".as_slice()
+    });
     for part in [
         request.target.tenant,
         request.target.principal.principal_id.0.as_str(),
@@ -83,6 +88,10 @@ pub(super) fn file_write_request_hash(request: &AgentFileWrite<'_>) -> String {
         hasher.update(&(part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
+    if !request.actor_is_agent {
+        hasher.update(&(request.message.len() as u64).to_be_bytes());
+        hasher.update(request.message.as_bytes());
+    }
     hasher.finalize().to_hex().to_string()
 }
 
@@ -90,13 +99,15 @@ pub(super) fn replayed_file_write(
     commit_oid: String,
     commit_message: &str,
     request_trailer: &str,
-) -> Result<String, DurableError> {
+) -> Result<WebEditOutcome, DurableError> {
     if !commit_message.lines().any(|line| line == request_trailer) {
-        return Err(DurableError::Git(
+        return Err(DurableError::Conflict(
             "idempotency key is already bound to a different file write".into(),
         ));
     }
-    Ok(commit_oid)
+    Ok(WebEditOutcome::Committed {
+        new_oid: commit_oid,
+    })
 }
 
 pub(super) fn require_body_md(body: &Value) -> Result<String, DurableError> {

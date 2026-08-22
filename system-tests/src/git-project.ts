@@ -61,7 +61,12 @@ export class GitProject {
     ref: string,
     path: string,
     contents: string,
-    options: { baseOid?: string; startRef?: string; message?: string } = {},
+    options: {
+      baseOid?: string;
+      startRef?: string;
+      message?: string;
+      idempotencyKey?: string;
+    } = {},
   ): Promise<{ receipt: JsonRecord; commitOid: string }> {
     const receipt = (await this.client.json(
       `${this.path}/blob/${segment(ref)}/${nestedPath(path)}`,
@@ -73,6 +78,7 @@ export class GitProject {
           ...(options.startRef === undefined ? {} : { start_ref: options.startRef }),
           ...(options.message === undefined ? {} : { message: options.message }),
         },
+        idempotencyKey: options.idempotencyKey ?? randomUUID(),
       },
     )).body;
     const applied = record(receipt.applied, "git write receipt.applied");

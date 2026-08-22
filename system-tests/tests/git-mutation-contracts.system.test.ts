@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "vitest";
 
 import { systemTestConfig } from "../src/config.js";
@@ -15,6 +16,39 @@ async function expectBadRequest(
 }
 
 describe("Git mutation contracts", () => {
+  test("a lost file-edit response is safe to retry", async () => {
+    const project = new GitProject(uniqueName("retry-file-edit"), systemClient);
+    await project.create();
+
+    const retryIdentity = `write-readme-${randomUUID()}`;
+    const first = await project.writeFile("main", "README.md", "# One durable edit\n", {
+      message: "Start the project",
+      idempotencyKey: retryIdentity,
+    });
+    const recovered = await project.writeFile("main", "README.md", "# One durable edit\n", {
+      message: "Start the project",
+      idempotencyKey: retryIdentity,
+    });
+
+    expect(recovered).toEqual(first);
+    await expect(systemClient.json(`${project.path}/blob/main/README.md`))
+      .resolves.toMatchObject({ body: { contents: "# One durable edit\n" } });
+
+    const conflict = await systemClient.json(`${project.path}/blob/main/README.md`, {
+      method: "POST",
+      body: {
+        base_oid: "",
+        contents: "# A different edit must not borrow the retry identity\n",
+        message: "Start something else",
+      },
+      idempotencyKey: retryIdentity,
+      expectedStatus: 409,
+    });
+    expect(conflict.body).toMatchObject({ error: { code: "conflict" } });
+    await expect(project.readFile("main", "README.md"))
+      .resolves.toMatchObject({ contents: "# One durable edit\n" });
+  });
+
   test("ambiguous instructions never become durable work", async () => {
     const project = new GitProject(uniqueName("strict-git"), systemClient);
 

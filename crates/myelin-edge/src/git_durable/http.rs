@@ -535,6 +535,9 @@ impl Handler for DWebEditCommit {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let request: WebEditCommitBody = required_json(&ctx.request.body, "file commit")?;
         let message = request.commit_message()?;
+        let operation = self
+            .be
+            .required_request_operation(ctx.request, ctx.principal)?;
         let outcome = self
             .be
             .web_edit_commit(WebFileEdit {
@@ -550,6 +553,7 @@ impl Handler for DWebEditCommit {
                 contents: &request.contents,
                 start_ref: request.start_ref.as_deref(),
                 message,
+                operation_id: &operation.pr_id,
             })
             .map_err(map_durable_err)?;
         match outcome {

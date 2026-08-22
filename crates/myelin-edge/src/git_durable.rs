@@ -314,6 +314,7 @@ struct WebFileEdit<'a> {
     contents: &'a str,
     start_ref: Option<&'a str>,
     message: &'a str,
+    operation_id: &'a PrOperationId,
 }
 
 struct FileCommit<'a> {
@@ -1379,24 +1380,27 @@ impl DurableGitBackend {
             contents,
             start_ref,
             message,
+            operation_id,
         } = request;
-        self.commit_file(FileCommit {
-            target,
-            gitref,
-            path,
-            expected_base,
-            contents,
-            start_ref,
-            message,
-            actor_is_agent: false,
-        })
+        self.commit_file_with_operation(
+            FileCommit {
+                target,
+                gitref,
+                path,
+                expected_base,
+                contents,
+                start_ref,
+                message,
+                actor_is_agent: false,
+            },
+            operation_id,
+        )
     }
 
     pub(crate) fn write_file_with_operation(
         &self,
         request: AgentFileWrite<'_>,
     ) -> Result<String, DurableError> {
-        let request_hash = file_write_request_hash(&request);
         let AgentFileWrite {
             target,
             gitref,
@@ -1409,7 +1413,7 @@ impl DurableGitBackend {
         let RepoActorContext {
             tenant,
             region,
-            slug,
+            slug: _,
             principal: actor,
         } = target;
         if actor.tenant.0 != tenant || actor.region.0 != region {
@@ -1422,18 +1426,7 @@ impl DurableGitBackend {
                 "file contents exceed the {AGENT_FILE_WRITE_MAX_BYTES}-byte agent write limit"
             )));
         }
-        let full_ref = branch_ref(gitref);
-        let operation_trailer = format!("Myelin-Operation: {}", operation_id.digest());
-        let request_trailer = format!("Myelin-Request: {request_hash}");
-        let loc = Self::loc(tenant, region, slug);
-        let repo = Arc::new(self.store.open_repo(&loc)?);
-        if let Some(previous) = repo.find_reflog_commit_by_trailer(&full_ref, &operation_trailer)? {
-            return replayed_file_write(previous.oid.0, &previous.message, &request_trailer);
-        }
-
-        let message = format!("agent file edit\n\n{operation_trailer}\n{request_trailer}");
-        let outcome = self.commit_file_in_repo(
-            repo.clone(),
+        match self.commit_file_with_operation(
             FileCommit {
                 target,
                 gitref,
@@ -1441,34 +1434,59 @@ impl DurableGitBackend {
                 expected_base,
                 contents,
                 start_ref,
-                message: &message,
+                message: "agent file edit",
                 actor_is_agent: true,
             },
-        )?;
-        match outcome {
+            operation_id,
+        )? {
             WebEditOutcome::Committed { new_oid } => Ok(new_oid),
-            WebEditOutcome::StaleBase { .. } => {
-                if let Some(previous) =
-                    repo.find_reflog_commit_by_trailer(&full_ref, &operation_trailer)?
-                {
-                    replayed_file_write(previous.oid.0, &previous.message, &request_trailer)
-                } else {
-                    Err(DurableError::Git(
-                        "the file changed since it was read; nothing was overwritten".into(),
-                    ))
-                }
-            }
+            WebEditOutcome::StaleBase { .. } => Err(DurableError::Conflict(
+                "the file changed since it was read; nothing was overwritten".into(),
+            )),
             WebEditOutcome::Denied => Err(DurableError::Forbidden(
                 "no write permission for this ref".into(),
             )),
         }
     }
 
-    fn commit_file(&self, request: FileCommit<'_>) -> Result<WebEditOutcome, DurableError> {
-        let target = request.target;
-        let loc = Self::loc(target.tenant, target.region, target.slug);
+    fn commit_file_with_operation(
+        &self,
+        request: FileCommit<'_>,
+        operation_id: &PrOperationId,
+    ) -> Result<WebEditOutcome, DurableError> {
+        let request_hash = file_write_request_hash(&request);
+        let full_ref = branch_ref(request.gitref);
+        let operation_trailer = format!("Myelin-Operation: {}", operation_id.digest());
+        let request_trailer = format!("Myelin-Request: {request_hash}");
+        let loc = Self::loc(
+            request.target.tenant,
+            request.target.region,
+            request.target.slug,
+        );
         let repo = Arc::new(self.store.open_repo(&loc)?);
-        self.commit_file_in_repo(repo, request)
+        if let Some(previous) = repo.find_reflog_commit_by_trailer(&full_ref, &operation_trailer)? {
+            return replayed_file_write(previous.oid.0, &previous.message, &request_trailer);
+        }
+
+        let message = format!(
+            "{}\n\n{operation_trailer}\n{request_trailer}",
+            request.message.trim_end()
+        );
+        let outcome = self.commit_file_in_repo(
+            repo.clone(),
+            FileCommit {
+                message: &message,
+                ..request
+            },
+        )?;
+        if matches!(outcome, WebEditOutcome::StaleBase { .. }) {
+            if let Some(previous) =
+                repo.find_reflog_commit_by_trailer(&full_ref, &operation_trailer)?
+            {
+                return replayed_file_write(previous.oid.0, &previous.message, &request_trailer);
+            }
+        }
+        Ok(outcome)
     }
 
     fn commit_file_in_repo(
