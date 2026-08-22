@@ -209,6 +209,10 @@ and Chat workspaces discover the same authorized project catalogue. A new organi
 its first project inside the New issue flow; established organizations choose a project by name
 and key. The browser never needs deployment-provided project, type, or prefix identifiers.
 Git helpers are scoped to an exact Edge and profile.
+The repository browser can create the first file, add another file, and edit a branch text file
+without leaving Myelin. Every save is a branch-policy-aware compare-and-swap commit with a stable
+retry identity, so a lost response is safe to repeat and a teammate's intervening edit preserves
+the browser draft instead of being overwritten.
 
 External MCP clients can use `myelin mcp serve --as <agent-id>` as their server command. The CLI
 exchanges the saved browser-approved session for a one-minute run identity, keeps the bearer off

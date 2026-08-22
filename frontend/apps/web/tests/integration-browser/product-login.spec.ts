@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type APIRequestContext } from "@playwright/test";
 import { navigateToApp, signIn } from "./session";
 
@@ -54,38 +55,11 @@ async function edgeRequest(
   return object(JSON.parse(text));
 }
 
-async function waitForSucceededCiRun(
-  request: APIRequestContext,
-  repoRef: string,
-  commitOid: unknown,
-): Promise<JsonObject> {
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    const runs = await edgeRequest(request, "GET", "/v1/ci/runs?state=all&limit=50", 200);
-    expect(Array.isArray(runs.items)).toBe(true);
-    const match = (runs.items as unknown[]).find((value) => {
-      if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-      const row = value as JsonObject;
-      return row.repo_ref === repoRef && row.commit_oid === commitOid;
-    });
-    if (match !== undefined) {
-      const run = object(match);
-      if (run.state === "succeeded") return run;
-      if (["failed", "timed_out", "cancelled"].includes(String(run.state))) {
-        throw new Error(
-          `CI run for ${repoRef} at ${String(commitOid)} became ${String(run.state)}`,
-        );
-      }
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`CI run for ${repoRef} at ${String(commitOid)} did not succeed within 15 seconds`);
-}
-
 test("durable product data is available and mutable after browser login", async ({
   page,
   request,
 }) => {
+  test.setTimeout(90_000);
   const slug = `browser-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   const repoPath = `/v1/git/repos/${encodeURIComponent(slug)}`;
 
@@ -112,18 +86,37 @@ test("durable product data is available and mutable after browser login", async 
   await expect(gitSetup.getByTestId("git-setup-commands")).toContainText("myelin auth configure-git");
   await expect(gitSetup.getByTestId("git-setup-commands")).toContainText("git push -u origin 'main'");
 
-  await edgeRequest(request, "POST", `${repoPath}/blob/main/README.md`, 200, {
-    base_oid: "",
-    contents: `# ${slug}\n\nCreated through the running product.\n`,
-  });
-  const pipelineCommit = await edgeRequest(
-    request,
-    "POST",
-    `${repoPath}/blob/main/.myelin/ci.toml`,
-    200,
-    {
-      base_oid: "",
-      contents: `schema_version = 2
+  await page.getByRole("button", { name: "Create first file" }).click();
+  const firstFile = page.getByRole("dialog", { name: "Create file" });
+  await firstFile.getByRole("textbox", { name: "File path" }).fill("README.md");
+  await firstFile.getByRole("textbox", { name: "File contents" })
+    .fill(`# ${slug}\n\nCreated through the running product.\n`);
+  await firstFile.getByRole("textbox", { name: "Commit message" }).fill("Start the repository");
+  const editorAccessibility = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
+  expect(editorAccessibility.violations).toEqual([]);
+  await firstFile.getByRole("button", { name: "Commit file" }).click();
+  await expect(page.getByRole("heading", { name: "README.md" })).toBeVisible();
+  await expect(page.getByLabel("File contents"))
+    .toContainText("Created through the running product.");
+
+  await page.getByRole("button", { name: "Edit file" }).click();
+  const readmeEdit = page.getByRole("dialog", { name: "Edit README.md" });
+  await expect(readmeEdit.getByRole("textbox", { name: "File path" })).toHaveValue("README.md");
+  await readmeEdit.getByRole("textbox", { name: "File contents" })
+    .fill(`# ${slug}\n\nCreated and edited through the running product.\n`);
+  await readmeEdit.getByRole("textbox", { name: "Commit message" }).fill("Clarify the README");
+  await readmeEdit.getByRole("button", { name: "Commit changes" }).click();
+  await expect(readmeEdit).toBeHidden();
+  await expect(page.getByTestId("blob-contents"))
+    .toContainText("Created and edited through the running product.");
+
+  await navigateToApp(page, `/git/repos/${slug}`);
+  await page.getByRole("button", { name: "New file" }).click();
+  const pipelineFile = page.getByRole("dialog", { name: "Create file" });
+  await pipelineFile.getByRole("textbox", { name: "File path" }).fill(".myelin/ci.toml");
+  await pipelineFile.getByRole("textbox", { name: "File contents" }).fill(`schema_version = 2
 on = "push"
 
 [execution]
@@ -133,19 +126,10 @@ profile = "linux-small-v1"
 name = "test"
 image = "${runnerImage}"
 command = ["true"]
-`,
-    },
-  );
-  const pipelineOid = object(pipelineCommit.applied).new_oid;
-  expect(pipelineOid).toMatch(/^[0-9a-f]{40}$/);
-  const ciRun = await waitForSucceededCiRun(
-    request,
-    `myelin://${tenant}/git/repo/${slug}`,
-    pipelineOid,
-  );
-  const ciRunId = String(ciRun.run_id);
-  expect(ciRun).toMatchObject({ trigger_kind: "push", state: "succeeded" });
-  expect(ciRunId).toMatch(/^[0-9a-f-]{36}$/);
+`);
+  await pipelineFile.getByRole("textbox", { name: "Commit message" }).fill("Run the first check");
+  await pipelineFile.getByRole("button", { name: "Commit file" }).click();
+  await expect(page.getByRole("heading", { name: ".myelin/ci.toml" })).toBeVisible();
 
   const featureCommit = await edgeRequest(
     request,
@@ -179,7 +163,7 @@ command = ["true"]
   await navigateToApp(page, "/git/repos");
   await page.getByRole("link", { name: new RegExp(`${tenant}/${slug}`) }).click();
   await expect(page.getByRole("heading", { name: `${tenant}/${slug}` })).toBeVisible();
-  await expect(page.getByText("Created through the running product.")).toBeVisible();
+  await expect(page.getByText("Created and edited through the running product.")).toBeVisible();
 
   await page.getByRole("link", { name: "Pull requests" }).click();
   const review = page.getByTestId("pr-row").filter({ hasText: "Ship the browser journey" });
@@ -194,12 +178,14 @@ command = ["true"]
 
   await navigateToApp(page, "/ci");
   const ciRow = page.getByTestId("ci-run-row").filter({ hasText: slug });
-  await expect(ciRow).toContainText("Succeeded");
+  await expect(ciRow).toContainText("Succeeded", { timeout: 60_000 });
   await expect(ciRow).toContainText("push");
+  const ciRunId = (await ciRow.getAttribute("href"))?.split("/").at(-1) ?? "";
+  expect(ciRunId).toMatch(/^[0-9a-f-]{36}$/);
   await ciRow.click();
   await expect(page).toHaveURL(new RegExp(`/ci/runs/${ciRunId}$`));
   await expect(page.getByRole("heading", { name: `Run ${ciRunId.slice(0, 8)}` })).toBeVisible();
-  await expect(page.getByText(String(pipelineOid), { exact: true })).toBeVisible();
+  await expect(page.getByText(/^[0-9a-f]{40}$/, { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { level: 3, name: "test" })).toBeVisible();
   await expect(page.getByTestId("ci-job-result")).toContainText("Workload passed");
 

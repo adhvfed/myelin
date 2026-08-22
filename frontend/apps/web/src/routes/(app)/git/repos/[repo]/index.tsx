@@ -1,7 +1,7 @@
 // Repository overview with refs, recent commit, root tree, and rendered README.
-import { ErrorBoundary, For, Show, Suspense, Switch, Match } from "solid-js";
+import { createSignal, ErrorBoundary, For, Show, Suspense, Switch, Match } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { A, createAsync, useParams } from "@solidjs/router";
+import { A, createAsync, useNavigate, useParams } from "@solidjs/router";
 import { Icon, useToast, Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { getRepo, type RepoEntry } from "~/lib/api";
 import { fmtDate } from "~/lib/format";
@@ -12,7 +12,8 @@ import { CloneUrl, GitSetupGuide } from "~/components/GitCloneSetup";
 import { repoHomeContinuationHref } from "~/lib/tree-browse-state";
 import { useAppViewer } from "~/components/AppShell";
 import { CopyArtifactRef } from "~/components/CopyArtifactRef";
-import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
+import { GitFileEditorDialog } from "~/components/repos/GitFileEditorDialog";
+import { gitBlobPath, gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -23,6 +24,8 @@ const card = {
 
 export default function RepoHomeScreen() {
   const params = useParams();
+  const navigate = useNavigate();
+  const [createFileOpen, setCreateFileOpen] = createSignal(false);
   const routeRepo = () => parseGitRepositoryRouteParam(params.repo) ?? "";
   const repoPath = () => gitRepositoryPath(routeRepo());
   const repo = createAsync(
@@ -69,6 +72,9 @@ export default function RepoHomeScreen() {
                         </div>
                         <div data-testid="repo-empty" style={{ ...card, display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
                           <p style={{ margin: "0", color: "var(--text-muted)" }}>This repository has no commits yet.</p>
+                          <button type="button" class="repo-file-action primary" onClick={() => setCreateFileOpen(true)}>
+                            <Icon name="file" /> Create first file
+                          </button>
                           <CloneUrl url={empty.clone_url} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
                           <GitSetupGuide
                             url={empty.clone_url}
@@ -109,6 +115,9 @@ export default function RepoHomeScreen() {
                         <A href={`${repoPath()}/commits/${encodeURIComponent(defaultBranch())}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
                           <Icon name="commit" /> Commits
                         </A>
+                        <button type="button" class="repo-file-action" onClick={() => setCreateFileOpen(true)}>
+                          <Icon name="file" /> New file
+                        </button>
                         {/* R3.1 — the missing front door: mirror the Commits link (ux-git critical #1). */}
                         <A href={`${repoPath()}/prs`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
                           <Icon name="pull-request" /> Pull requests
@@ -165,6 +174,17 @@ export default function RepoHomeScreen() {
           </Show>
         </Suspense>
       </ErrorBoundary>
+      <GitFileEditorDialog
+        open={createFileOpen()}
+        mode="create"
+        repo={routeRepo()}
+        refName={defaultBranch()}
+        onClose={() => setCreateFileOpen(false)}
+        onCommitted={(file) => {
+          toast.show({ title: `${file.path} committed`, variant: "success" });
+          navigate(gitBlobPath(routeRepo(), file.ref, file.path));
+        }}
+      />
     </section>
   );
 }

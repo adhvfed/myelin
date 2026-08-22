@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  gitBlobPath,
   gitRepositoryPath,
   parseGitPullRequestRouteParam,
   parseGitRepositoryRouteParam,
@@ -12,6 +13,11 @@ describe("Git repository routes", () => {
     expect(path).toBe("/git/repos/platform%2Fmyelin");
     expect(parseGitRepositoryRouteParam(path.slice("/git/repos/".length)))
       .toBe("platform/myelin");
+  });
+
+  it("keeps a nested file path below one encoded repository and ref", () => {
+    expect(gitBlobPath("platform/myelin", "refs/heads/main", ".myelin/ci.toml"))
+      .toBe("/git/repos/platform%2Fmyelin/blob/refs%2Fheads%2Fmain/.myelin/ci.toml");
   });
 
   it.each([

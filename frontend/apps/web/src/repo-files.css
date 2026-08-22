@@ -1,0 +1,63 @@
+.repo-file-editor,
+.repo-file-editor label {
+  display: flex;
+  flex-direction: column;
+}
+
+.repo-file-editor { gap: var(--space-3); }
+.repo-file-editor label { gap: var(--space-1); font-weight: var(--weight-medium); }
+
+.repo-file-editor input,
+.repo-file-editor textarea {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-1);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.repo-file-editor textarea {
+  min-height: 22rem;
+  resize: vertical;
+  tab-size: 2;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+
+.repo-file-editor input:read-only { color: var(--text-muted); }
+
+.repo-file-button,
+.repo-file-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-1);
+  background: var(--surface);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.repo-file-action { align-self: flex-start; }
+
+.repo-file-button.primary,
+.repo-file-action.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.repo-file-button:disabled { cursor: wait; opacity: .65; }
+.repo-file-button:not(:disabled):hover,
+.repo-file-action:hover { background: var(--surface-hover); }
+.repo-file-button.primary:not(:disabled):hover,
+.repo-file-action.primary:hover { background: var(--accent); filter: brightness(1.08); }
+
+.repo-file-note,
+.repo-file-error { margin: 0; font-size: var(--fs-caption); }
+.repo-file-note { color: var(--text-subtle); }
+.repo-file-error { color: var(--danger); }

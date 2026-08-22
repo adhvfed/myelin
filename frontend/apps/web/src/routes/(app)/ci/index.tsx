@@ -1,8 +1,8 @@
 // CT-005 CI run front door. Durable server-side data only: the browser never receives a bearer token,
 // and pagination is the Edge's opaque repository-visibility-bound keyset cursor.
-import { ErrorBoundary, For, Show, Suspense } from "solid-js";
+import { ErrorBoundary, For, onCleanup, onMount, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { A, createAsync, useSearchParams } from "@solidjs/router";
+import { A, createAsync, revalidate, useSearchParams } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
 import { CiRouteError, getCiRuns } from "~/lib/api";
 import { CI_RUN_STATES, type CiRunStateFilter } from "~/lib/ci-read-input";
@@ -33,6 +33,16 @@ export default function CIIndex() {
     typeof search.limit === "string" && /^(?:[1-9]|[1-9][0-9]|100)$/.test(search.limit)
       ? Number(search.limit)
       : CI_WEB_PAGE_LIMIT;
+
+  onMount(() => {
+    const timer = window.setInterval(() => {
+      if (document.hidden || !runs.latest?.items.some((run) =>
+        run.state === "queued" || run.state === "running")) return;
+      const input = ciRunsInputFromSearch(search.state, search.limit, search.cursor);
+      if (input) void revalidate(getCiRuns.keyFor(input));
+    }, 1_000);
+    onCleanup(() => window.clearInterval(timer));
+  });
 
   return (
     <section aria-labelledby="ci-runs-heading" class="ci-screen">

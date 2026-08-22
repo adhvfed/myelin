@@ -19,6 +19,12 @@ export function gitRepositoryPath(repo: string): string {
   return `/git/repos/${encodeURIComponent(repo)}`;
 }
 
+/** Build a file route without letting nested file paths become repository or ref segments. */
+export function gitBlobPath(repo: string, refName: string, path: string): string {
+  const nestedPath = path.split("/").map(encodeURIComponent).join("/");
+  return `${gitRepositoryPath(repo)}/blob/${encodeURIComponent(refName)}/${nestedPath}`;
+}
+
 /** Parse the canonical positive integer coordinate supported by the browser client. */
 export function parseGitPullRequestRouteParam(value: unknown): number | null {
   return parseGitPullRequestNumberText(value);

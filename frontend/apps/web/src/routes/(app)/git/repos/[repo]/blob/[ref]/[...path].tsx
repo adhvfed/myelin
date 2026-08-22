@@ -1,12 +1,14 @@
 // Blob preview with raw/download links and line attribution. Binary and oversized files use a
 // download or metadata fallback; directory responses redirect to the tree route.
-import { ErrorBoundary, For, Show, Suspense } from "solid-js";
+import { createSignal, ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { A, Navigate, createAsync, useParams } from "@solidjs/router";
-import { Icon, Skeleton, SkeletonBlock } from "@myelin/design-system";
+import { A, Navigate, createAsync, revalidate, useParams } from "@solidjs/router";
+import { Icon, Skeleton, SkeletonBlock, useToast } from "@myelin/design-system";
 import { getBlob } from "~/lib/api";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { RepoBreadcrumb } from "~/components/RepoBreadcrumb";
+import { GitFileEditorDialog } from "~/components/repos/GitFileEditorDialog";
+import { isEditableBranch } from "~/lib/git-file-edit-contract";
 import { gitRepositoryPath, parseGitRepositoryRouteParam } from "~/lib/git-route";
 
 function fmtBytes(n?: number): string {
@@ -18,6 +20,8 @@ function fmtBytes(n?: number): string {
 
 export default function BlobScreen() {
   const params = useParams();
+  const toast = useToast();
+  const [editorOpen, setEditorOpen] = createSignal(false);
   const ref = () => {
     try {
       return decodeURIComponent(params.ref ?? "");
@@ -86,10 +90,15 @@ export default function BlobScreen() {
                         <Icon name="human" /> Blame
                       </A>
                     </Show>
+                    <Show when={file.viewer_may_edit && isEditableBranch(ref()) &&
+                      !file.preview_unavailable && !file.is_binary && !file.is_truncated}>
+                      <button type="button" class="repo-file-action" onClick={() => setEditorOpen(true)}>
+                        <Icon name="file" /> Edit file
+                      </button>
+                    </Show>
                   </div>
                   <p style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)", margin: "0" }}>
                     blob <code style={{ "font-family": "var(--font-mono)" }}>{file.base_oid}</code>
-                    {" · "}editing in the browser is GT-004b
                   </p>
 
                   <Show
@@ -143,6 +152,20 @@ export default function BlobScreen() {
                       </pre>
                     </Show>
                   </Show>
+                  <GitFileEditorDialog
+                    open={editorOpen()}
+                    mode="edit"
+                    repo={repo()}
+                    refName={ref()}
+                    initialPath={file.path}
+                    initialContents={file.contents}
+                    initialBaseOid={file.base_oid}
+                    onClose={() => setEditorOpen(false)}
+                    onCommitted={(committed) => {
+                      toast.show({ title: `${committed.path} committed`, variant: "success" });
+                      void revalidate(getBlob.keyFor({ repo: repo(), ref: ref(), path: path() }));
+                    }}
+                  />
                 </Show>
               )}
             </Show>

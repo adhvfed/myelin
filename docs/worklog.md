@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — a new repository becomes useful without leaving Myelin
+
+The browser could create a repository, but its first useful-hour story then crossed a hidden API
+shortcut to create `README.md` and the CI definition. Blob pages explicitly deferred editing to a
+future milestone. This made the polished product journey depend on knowledge and tooling that a
+new organization does not yet have, and a lost file-edit response could tempt a client to repeat
+an ambiguous mutation.
+
+Repository pages now create the first file or another text file directly on a branch, and eligible
+blob pages edit the current file in place. The browser validates one narrow mutation contract,
+keeps a stable retry identity while a draft is unchanged, and submits a compare-and-swap commit;
+branch protection remains authoritative. A concurrent commit is reported without discarding the
+person's draft, while retrying after a lost response returns the original durable receipt instead
+of creating another commit. Active CI rows refresh only while visible and stop polling once the
+run is terminal, so the first repository-to-CI journey tells the truth without test-only polling.
+
+**Proof:** 640/640 frontend unit tests; 132/132 browser stories; six live-stack browser stories
+covering first-file creation, existing-file editing, CI completion, concurrent-edit draft
+preservation, private agent work, public Chat, and automation; two TypeScript full-system Git
+mutation stories; 85 Edge Git unit tests; 21 durable Edge Git integration tests; frontend
+typecheck, lint, and production build; Rust formatting and warning-free Edge clippy.
+
 ## 2026-08-22 — private agent work is visible, resumable, and accountable
 
 An agent could already participate in public Chat and automation runs, but a person had no coherent
