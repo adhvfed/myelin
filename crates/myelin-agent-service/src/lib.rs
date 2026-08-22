@@ -25,7 +25,6 @@ pub mod issues_tools;
 pub mod knowledge_mcp_tools;
 pub mod knowledge_tools;
 pub mod long_park;
-pub mod loop_guards;
 pub mod metering;
 pub mod migrations;
 pub mod mock;
@@ -189,11 +188,6 @@ pub use card_text::{
 pub use hitl_batch::{
     per_effect_idem_key, run_batch_hitl_loop, ApplyLedger, BatchApprovalCard, BatchGatedEffect,
     BatchHitlWait, BatchOutcome, DecisionScript, EffectOutcome,
-};
-
-pub use loop_guards::{
-    AgentLoopGuards, GuardRefusal, GuardVerdict, IdempotentToolLedger, ReferenceGate, SelfGuard,
-    AGENT_CEILING, AGENT_DISPATCH_POOL_CAP, AGENT_SHARED_ROOT_CAP,
 };
 
 pub use long_park::{

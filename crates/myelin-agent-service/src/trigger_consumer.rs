@@ -9,8 +9,6 @@ use myelin_storage::{
     MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT,
 };
 
-use crate::loop_guards::SelfGuard;
-
 pub const TRIGGER_CONSUMER_NAME: &str = "agent-governed-trigger";
 pub const MAX_EVENT_BINDINGS: u32 = MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT;
 
@@ -115,7 +113,7 @@ impl GovernedTriggerConsumer {
 
         for binding in bindings {
             let run_as = PrincipalId(format!("agent:{}", binding.run_as_agent_id));
-            if SelfGuard::new(run_as).admit_envelope(event).is_refused() {
+            if is_agent_echo(event, &run_as) {
                 continue;
             }
             if !self
@@ -213,6 +211,10 @@ impl EventHandler for GovernedTriggerConsumer {
 
 fn no_relation(_: &RelMembership) -> bool {
     false
+}
+
+fn is_agent_echo(event: &EventEnvelope, agent: &PrincipalId) -> bool {
+    event.actor.0.principal_id == *agent
 }
 
 fn evaluation_diagnostic(error: &EvalError) -> (AgentTriggerEvaluationErrorCode, String) {

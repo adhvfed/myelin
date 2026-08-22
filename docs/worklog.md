@@ -858,6 +858,20 @@ passes through Query, Agent Service, and Edge; TypeScript typecheck passes; the
 restarted stack passes all six automation-delegation journeys. Net removal:
 roughly 1,480 lines of unused implementation and self-referential drills.
 
+## 2026-08-23 — the trigger consumer no longer carries a shadow guard framework
+
+Following the dispatch-tier removal exposed a second unused composite in Agent
+Service. Production called only `SelfGuard`; reference gating, causal breakers,
+pool accounting, and an in-memory effect ledger were public solely for two Rust
+drill files. The trigger consumer now says what it does directly with
+`is_agent_echo`, while causal depth and firing capacity remain transactionally
+owned by the durable trigger store.
+
+Proof: 299 Agent Service unit tests and the remaining contract suite pass;
+clippy `-D warnings` passes through Agent Service and Edge; after rebuilding and
+restarting Edge, all six automation-delegation system journeys pass again. Net
+removal: roughly 940 lines of unused abstractions and their private simulation.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
