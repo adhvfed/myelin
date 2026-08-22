@@ -442,6 +442,7 @@ pub const GOVERNED_DIRECT_READ_TOOLS: &[&str] = &[
     "knowledge.list_pages",
     "knowledge.read_page",
     "projects.list",
+    "workspace.read_file",
 ];
 
 fn read_resource_ref(

@@ -196,6 +196,8 @@ mod tests {
                 "knowledge.list_pages",
                 "knowledge.read_page",
                 "projects.list",
+                "workspace.read_file",
+                "workspace.write_file",
             ]
         );
         assert!(registry.resolve("git.merge").unwrap().requires_approval());

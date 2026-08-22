@@ -39,6 +39,7 @@ pub mod trigger_consumer;
 #[cfg(feature = "integration")]
 pub mod trigger_handoff;
 pub mod workspace;
+pub mod workspace_tools;
 
 pub use holder::{
     agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
@@ -138,6 +139,11 @@ pub use chat_read_tools::{chat_read_tool_defs, LIST_CONVERSATIONS_TOOL, READ_MES
 
 pub use git_read_tools::{
     git_read_tool_defs, LIST_REPOSITORIES_TOOL, READ_FILE_TOOL, SEARCH_CODE_TOOL,
+};
+
+pub use workspace_tools::{
+    workspace_tool_defs, READ_WORKSPACE_FILE_TOOL, WORKSPACE_SUBSYSTEM, WORKSPACE_TOOL_VERSION,
+    WRITE_WORKSPACE_FILE_TOOL,
 };
 
 pub use chat_tools::{

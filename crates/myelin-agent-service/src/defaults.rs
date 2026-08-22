@@ -65,6 +65,9 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
 
         ("projects", "list") => false,
 
+        ("workspace", "read_file") => false,
+        ("workspace", "write_file") => false,
+
         _ => true,
     }
 }
