@@ -8,8 +8,6 @@ pub mod defaults;
 pub mod dry_run;
 pub mod dsr;
 pub mod effect_api;
-pub mod escape_gate;
-pub mod exec;
 pub mod git_read_tools;
 pub mod git_tools;
 pub mod hitl;
@@ -21,7 +19,6 @@ pub mod issues_read_tools;
 pub mod issues_tools;
 pub mod knowledge_mcp_tools;
 pub mod knowledge_tools;
-pub mod long_park;
 pub mod metering;
 pub mod migrations;
 pub mod mock;
@@ -73,13 +70,6 @@ pub use effect_api::{
     EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
     PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
 };
-
-pub use exec::{
-    compute_tool_def, route_of, ExecError, RoutingError, SandboxJob, SandboxToolHands, ToolRoute,
-    PLATFORM_TOKEN_ENV,
-};
-
-pub use escape_gate::{AgentExecGate, GateRefusal, ProductionBackendId};
 
 pub use defaults::{
     assert_no_silent_loosening, default_for_tool, requires_approval_default,
@@ -175,11 +165,6 @@ pub use card_text::{
 pub use hitl_batch::{
     per_effect_idem_key, run_batch_hitl_loop, ApplyLedger, BatchApprovalCard, BatchGatedEffect,
     BatchHitlWait, BatchOutcome, DecisionScript, EffectOutcome,
-};
-
-pub use long_park::{
-    dispatch_long_compute, dispatch_long_compute_metered, AgentJobDispatcher, LongComputeProfile,
-    LongParkOutcome,
 };
 
 pub use tool_scope::{

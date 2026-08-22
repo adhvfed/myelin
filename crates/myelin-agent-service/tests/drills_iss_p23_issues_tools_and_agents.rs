@@ -1,14 +1,9 @@
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
-use myelin_agent_service::escape_gate::{AgentExecGate, ProductionBackendId};
 use myelin_agent_service::{
     close_tool_def, create_tool_def, full_issues_tool_defs, register_full_issues_tools,
     replay_forecast_agent, transition_caveat, transition_tool_def, triage_suggestion_strip,
     ApplyError, CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, ForecastInput,
     LinearForecast, PipelineSignals, PlanThenApply, PlannedEffect, SubsystemApply, TenantGuard,
-};
-use myelin_ci_sandbox::escape_corpus::{BEGIN_MARKER, END_MARKER};
-use myelin_ci_sandbox::{
-    parse_console, Backend, BackendRun, EscapeAttestation, CORPUS, CORPUS_VERSION,
 };
 use myelin_identity::{
     CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
@@ -419,56 +414,5 @@ fn ag_d9_triage_strip_is_byte_identical_and_proposes_one_effect() {
         a[0].0.contains("tool=triage") && a[0].0.contains("ENG-1421"),
         "the proposed effect is the triage suggestion for the named issue: {}",
         a[0].0
-    );
-}
-
-fn prod_id() -> ProductionBackendId {
-    ProductionBackendId {
-        backend: Backend::FirecrackerMicrovm,
-        rootfs_sha256: "7a2bc8ed2c64ed78994971439b00c234b1ce46d247123314d683df7579c77923".into(),
-        kernel_sha256: "467367e6b8e88323dd23dedae3119ade9c9fca6a102a84fc2155e3ef1bec00eb".into(),
-        corpus_version: CORPUS_VERSION,
-    }
-}
-
-fn green_attestation() -> Result<EscapeAttestation, String> {
-    let mut console = format!("{BEGIN_MARKER} corpus_version=1 kernel=6.1.168 guest_euid=0\n");
-    for atk in CORPUS {
-        console.push_str(&format!("{} CONTAINED\n", atk.id));
-    }
-    console.push_str(&format!("{END_MARKER}\n"));
-    let report = parse_console(&console);
-    let id = prod_id();
-    EscapeAttestation::from_green_drill(
-        "2026-06-21",
-        &report,
-        vec![
-            BackendRun {
-                backend: Backend::FirecrackerMicrovm,
-                exercised: true,
-                residual_note: None,
-            },
-            BackendRun {
-                backend: Backend::GvisorRunsc,
-                exercised: false,
-                residual_note: Some("runsc residual (CI-P28)".into()),
-            },
-        ],
-        Backend::FirecrackerMicrovm,
-        id.rootfs_sha256,
-        id.kernel_sha256,
-        "6.1.168",
-    )
-}
-
-#[test]
-fn ag_d4_escape_gate_is_green_for_the_production_backend() {
-    let att = green_attestation().expect("a real green drill mints a green attestation");
-    let gate = AgentExecGate::admit(Some(&att), &prod_id())
-        .expect("AG-D4 is GREEN - the gate admits untrusted compute for the production backend");
-    assert_eq!(gate.backend_id().backend, Backend::FirecrackerMicrovm);
-    assert!(
-        AgentExecGate::admit(None, &prod_id()).is_err(),
-        "no green AG-D4 attestation ⇒ no untrusted compute (the Issues agent tools are gated on it)"
     );
 }

@@ -911,6 +911,27 @@ the live-Postgres pull-request boundary proves isolation, atomicity, idempotency
 pagination, and merge recovery; after restarting Edge, all twelve TypeScript Git
 lifecycle journeys pass through the public HTTP surface.
 
+## 2026-08-23 — agent command execution is an honest gap
+
+The old `AgentExecGate`, `SandboxToolHands`, and long-park dispatcher looked like
+the untrusted-compute half of the agent product, but no service constructed any
+of them. Their backends existed only inside their own tests: inline execution
+returned a synthetic guest id after immediately killing the guest, asynchronous
+execution parked against an in-memory signal store, and the escape attestation
+was rebuilt from a synthetic console transcript. None could execute a command
+in the durable workspace used by a private agent thread.
+
+That 3,249-line false front and its self-referential drills are gone. The real
+boundary remains explicit: private threads provision durable, expiring
+workspaces and expose thread-bound file reads and writes, while command execution
+still needs a production sandbox dispatch, output, cancellation, accounting,
+and workspace-mount contract before `workspace.exec` may enter the catalogue.
+
+Proof: the remaining 234 Agent Service unit tests and contract suite pass;
+Agent Service and Edge are warning-clean under clippy; after rebuilding the
+three agent-serving processes, both private-thread TypeScript journeys pass,
+including fresh-context continuation and workspace persistence.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -933,10 +954,14 @@ lifecycle journeys pass through the public HTTP surface.
    notification, and automation work arrives through durable NATS/SQL queues;
    queue bounds and worker concurrency provide backpressure, but the matching
    thresholds.toml shed rows are targets rather than production enforcement.
-5. **trust-scoped CI cache + agent exec gate are built but unwired**; the CI
-   runner does not route cache writes through `CiCacheNamespace`, and
-   nothing constructs `AgentExecGate` in production.
-6. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+5. **trust-scoped CI cache is built but unwired**; the CI runner does not route
+   cache writes through `CiCacheNamespace`. its in-memory index is not a durable
+   product cache and must not be presented as one.
+6. **private agent workspaces cannot execute commands yet.** the shipped
+   thread-bound catalogue deliberately contains only bounded file reads and
+   writes. a real `workspace.exec` must use the production sandbox and mount the
+   exact durable workspace; the former mock execution framework has been removed.
+7. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.
