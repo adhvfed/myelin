@@ -39,6 +39,7 @@ members = [
     "crates/myelin-cli",
     "crates/myelin-mcp",
     "crates/myelin-agent-host",
+    "crates/myelin-workspace-gateway",
 ]
 
 [workspace.dependencies]
