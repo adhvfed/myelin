@@ -78,6 +78,13 @@ struct MintedAgentRun {
     effective_grants: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+struct AgentRunLifetime {
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    not_after: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentSessionError {
     BadInput(String),
@@ -132,12 +139,36 @@ impl AgentSessionIssuer {
         actor: &Principal,
         request: AgentSessionRequest,
     ) -> Result<IssuedAgentSession, AgentSessionError> {
+        self.start_before(actor, request, None).await
+    }
+
+    pub async fn start_until(
+        &self,
+        actor: &Principal,
+        request: AgentSessionRequest,
+        not_after: DateTime<Utc>,
+    ) -> Result<IssuedAgentSession, AgentSessionError> {
+        self.start_before(actor, request, Some(not_after)).await
+    }
+
+    async fn start_before(
+        &self,
+        actor: &Principal,
+        request: AgentSessionRequest,
+        not_after: Option<DateTime<Utc>>,
+    ) -> Result<IssuedAgentSession, AgentSessionError> {
         require_active_human(actor)?;
         let agent_id = canonical_uuid("agent id", &request.agent_id)?;
         validate_nonce(&request.client_nonce)?;
         validate_trigger_credential(&request)?;
         let now = truncate_to_seconds(request.now)?;
-        let expires_at = run_expiry(&request, now, self.ttl_secs)?;
+        let not_after = not_after.map(truncate_to_seconds).transpose()?;
+        let expires_at = run_expiry(&request, now, self.ttl_secs, not_after)?;
+        let lifetime = AgentRunLifetime {
+            issued_at: now,
+            expires_at,
+            not_after,
+        };
 
         let registration = self
             .agents
@@ -164,7 +195,7 @@ impl AgentSessionIssuer {
         }
 
         let claimed = self
-            .claim(actor, &registration, agent_id, &request, now, expires_at)
+            .claim(actor, &registration, agent_id, &request, lifetime)
             .await?;
         let minted = self
             .mint_claimed(actor, &registration, &claimed.run, now)
@@ -268,12 +299,11 @@ impl AgentSessionIssuer {
         registration: &AgentRegistration,
         agent_id: Uuid,
         request: &AgentSessionRequest,
-        issued_at: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
+        lifetime: AgentRunLifetime,
     ) -> Result<ClaimedExternalAgentRun, AgentSessionError> {
         let run_id = Uuid::new_v4();
         let agent_principal_id = PrincipalId(registration.principal_id.clone());
-        let issued_at_stamp = timestamp(issued_at);
+        let issued_at_stamp = timestamp(lifetime.issued_at);
         let proposed_jti = run_token_jti(
             &agent_principal_id,
             &RunId(run_id.to_string()),
@@ -295,8 +325,8 @@ impl AgentSessionIssuer {
                 &request.client_nonce,
                 run_id,
                 &proposed_jti,
-                issued_at,
-                expires_at,
+                lifetime.issued_at,
+                lifetime.expires_at,
             )
             .await
             .map_err(storage_error)?;
@@ -305,7 +335,8 @@ impl AgentSessionIssuer {
             agent_id,
             &request.trigger_authority,
             &claimed.run,
-            issued_at,
+            lifetime.issued_at,
+            lifetime.not_after,
         )?;
         Ok(claimed)
     }
@@ -397,6 +428,7 @@ fn run_expiry(
     request: &AgentSessionRequest,
     issued_at: DateTime<Utc>,
     configured_ttl_secs: u64,
+    not_after: Option<DateTime<Utc>>,
 ) -> Result<DateTime<Utc>, AgentSessionError> {
     let remaining_secs = request
         .trigger_expires_at_unix
@@ -409,9 +441,16 @@ fn run_expiry(
         .filter(|seconds| *seconds > 0)
         .ok_or(AgentSessionError::Expired)?;
     let ttl_secs = configured_ttl_secs.min(remaining_secs);
-    issued_at
+    let configured_expiry = issued_at
         .checked_add_signed(Duration::seconds(ttl_secs as i64))
-        .ok_or_else(|| AgentSessionError::BadInput("agent session expiry overflowed".into()))
+        .ok_or_else(|| AgentSessionError::BadInput("agent session expiry overflowed".into()))?;
+    let expires_at = not_after
+        .map(|bound| configured_expiry.min(bound))
+        .unwrap_or(configured_expiry);
+    if expires_at <= issued_at {
+        return Err(AgentSessionError::Expired);
+    }
+    Ok(expires_at)
 }
 
 fn validate_claim(
@@ -420,6 +459,7 @@ fn validate_claim(
     current_authority: &Authority,
     run: &DurableExternalAgentRun,
     now: DateTime<Utc>,
+    not_after: Option<DateTime<Utc>>,
 ) -> Result<(), AgentSessionError> {
     if run.agent_id != requested_agent_id.to_string()
         || run.trigger_actor_id != actor.principal_id.0
@@ -445,7 +485,13 @@ fn validate_claim(
             "idempotency key belongs to a finished agent run".into(),
         ));
     }
-    if now >= parse_datetime("expires_at", &run.expires_at)? {
+    let durable_expires_at = parse_datetime("expires_at", &run.expires_at)?;
+    if not_after.is_some_and(|bound| durable_expires_at > bound) {
+        return Err(AgentSessionError::Conflict(
+            "idempotency key belongs to an agent run outside the requested lifetime".into(),
+        ));
+    }
+    if now >= durable_expires_at {
         return Err(AgentSessionError::Expired);
     }
     Ok(())
@@ -589,6 +635,7 @@ mod tests {
             &Authority::of(["repo.pull"]),
             &run,
             now,
+            None,
         )
         .is_err());
         assert!(validate_claim(
@@ -597,8 +644,33 @@ mod tests {
             &Authority::of(["repo.pull", "run.view", "repo.push"]),
             &run,
             now,
+            None,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_thread_boundary_caps_the_run_without_extending_the_trigger_session() {
+        let now = DateTime::parse_from_rfc3339("2026-08-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let request = AgentSessionRequest {
+            agent_id: "22222222-2222-2222-2222-222222222222".into(),
+            client_nonce: "thread-run".into(),
+            trigger_credential_jti: "browser-session".into(),
+            trigger_expires_at_unix: (now + Duration::minutes(10)).timestamp(),
+            trigger_authority: Authority::of(["agent.run"]),
+            now,
+        };
+
+        assert_eq!(
+            run_expiry(&request, now, 300, Some(now + Duration::seconds(45))).unwrap(),
+            now + Duration::seconds(45)
+        );
+        assert!(matches!(
+            run_expiry(&request, now, 300, Some(now)),
+            Err(AgentSessionError::Expired)
+        ));
     }
 
     #[test]
