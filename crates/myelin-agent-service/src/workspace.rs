@@ -1,5 +1,8 @@
+use std::ffi::CString;
 use std::fs::{DirBuilder, File};
-use std::io;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -7,6 +10,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+pub const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
+const MAX_WORKSPACE_PATH_BYTES: usize = 1024;
+const MAX_WORKSPACE_PATH_DEPTH: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionedWorkspace {
@@ -18,6 +24,44 @@ pub enum WorkspaceProvisionError {
     InvalidRoot(String),
     UnsafeRoot(String),
     Io(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkspaceAccessError {
+    InvalidPath(String),
+    NotFound,
+    NotRegularFile,
+    TooLarge,
+    UnsafeStorage(String),
+    Io(String),
+}
+
+impl core::fmt::Display for WorkspaceAccessError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidPath(reason) => write!(formatter, "invalid workspace path: {reason}"),
+            Self::NotFound => formatter.write_str("workspace file not found"),
+            Self::NotRegularFile => formatter.write_str("workspace path is not a regular file"),
+            Self::TooLarge => formatter.write_str("workspace file exceeds the interactive limit"),
+            Self::UnsafeStorage(reason) => write!(formatter, "unsafe workspace storage: {reason}"),
+            Self::Io(reason) => write!(formatter, "workspace access failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceAccessError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrittenWorkspaceFile {
+    pub path: String,
+    pub byte_len: usize,
+    pub content_digest: String,
 }
 
 impl core::fmt::Display for WorkspaceProvisionError {
@@ -38,6 +82,23 @@ pub trait AgentWorkspaceProvisioner: Send + Sync {
         tenant: &str,
         workspace_id: Uuid,
     ) -> Result<ProvisionedWorkspace, WorkspaceProvisionError>;
+}
+
+pub trait AgentWorkspaceStore: AgentWorkspaceProvisioner {
+    fn read_file(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        path: &str,
+    ) -> Result<WorkspaceFile, WorkspaceAccessError>;
+
+    fn write_file(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<WrittenWorkspaceFile, WorkspaceAccessError>;
 }
 
 #[derive(Clone)]
@@ -147,6 +208,285 @@ impl AgentWorkspaceProvisioner for LocalDevelopmentWorkspaceProvisioner {
             locator: Self::locator(tenant, workspace_id),
         })
     }
+}
+
+impl AgentWorkspaceStore for LocalDevelopmentWorkspaceProvisioner {
+    fn read_file(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        path: &str,
+    ) -> Result<WorkspaceFile, WorkspaceAccessError> {
+        let relative = WorkspaceRelativePath::parse(path)?;
+        let workspace = self.open_workspace(tenant, workspace_id)?;
+        let (parent, filename) = open_parent(workspace, &relative, false)?;
+        let mut file = open_regular_at(&parent, filename)?;
+        let metadata = file
+            .metadata()
+            .map_err(access_io("inspect workspace file"))?;
+        if !metadata.file_type().is_file() {
+            return Err(WorkspaceAccessError::NotRegularFile);
+        }
+        if metadata.len() > MAX_WORKSPACE_FILE_BYTES as u64 {
+            return Err(WorkspaceAccessError::TooLarge);
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Read::by_ref(&mut file)
+            .take(MAX_WORKSPACE_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(access_io("read workspace file"))?;
+        if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+            return Err(WorkspaceAccessError::TooLarge);
+        }
+        Ok(WorkspaceFile {
+            path: relative.rendered,
+            bytes,
+        })
+    }
+
+    fn write_file(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<WrittenWorkspaceFile, WorkspaceAccessError> {
+        if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+            return Err(WorkspaceAccessError::TooLarge);
+        }
+        let relative = WorkspaceRelativePath::parse(path)?;
+        let workspace = self.open_workspace(tenant, workspace_id)?;
+        let (parent, filename) = open_parent(workspace, &relative, true)?;
+        let temporary_name = format!(".myelin-write-{}", Uuid::new_v4());
+        let temporary = cstring(&temporary_name)?;
+        let destination = cstring(filename)?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                temporary.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(access_io("create atomic workspace file")(
+                io::Error::last_os_error(),
+            ));
+        }
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let write_result = file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(access_io("persist workspace file"));
+        drop(file);
+        if let Err(error) = write_result {
+            unlink_at(&parent, &temporary);
+            return Err(error);
+        }
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                temporary.as_ptr(),
+                parent.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        } < 0
+        {
+            let error = access_io("publish workspace file")(io::Error::last_os_error());
+            unlink_at(&parent, &temporary);
+            return Err(error);
+        }
+        parent
+            .sync_all()
+            .map_err(access_io("sync workspace directory"))?;
+        Ok(WrittenWorkspaceFile {
+            path: relative.rendered,
+            byte_len: bytes.len(),
+            content_digest: blake3::hash(bytes).to_hex().to_string(),
+        })
+    }
+}
+
+impl LocalDevelopmentWorkspaceProvisioner {
+    fn open_workspace(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+    ) -> Result<File, WorkspaceAccessError> {
+        self.verify_root().map_err(map_unsafe_storage)?;
+        let root = open_directory_path(self.root.as_path())?;
+        let metadata = root
+            .metadata()
+            .map_err(access_io("inspect open workspace root"))?;
+        if metadata.dev() != self.root_identity.device || metadata.ino() != self.root_identity.inode
+        {
+            return Err(WorkspaceAccessError::UnsafeStorage(
+                "workspace root identity changed while opening it".into(),
+            ));
+        }
+        let tenant_name = self
+            .tenant_directory(tenant)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| WorkspaceAccessError::UnsafeStorage("tenant key is invalid".into()))?
+            .to_string();
+        let tenant_directory = open_directory_at(&root, &tenant_name)?;
+        open_directory_at(&tenant_directory, &workspace_id.to_string())
+    }
+}
+
+struct WorkspaceRelativePath {
+    components: Vec<String>,
+    rendered: String,
+}
+
+impl WorkspaceRelativePath {
+    fn parse(path: &str) -> Result<Self, WorkspaceAccessError> {
+        if path.is_empty() || path.len() > MAX_WORKSPACE_PATH_BYTES || path.contains('\0') {
+            return Err(WorkspaceAccessError::InvalidPath(
+                "path must contain 1..=1024 bytes".into(),
+            ));
+        }
+        let parsed = Path::new(path);
+        let components = parsed
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => name
+                    .to_str()
+                    .filter(|name| !name.is_empty() && name.len() <= 255)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        WorkspaceAccessError::InvalidPath(
+                            "every component must be clean UTF-8 of at most 255 bytes".into(),
+                        )
+                    }),
+                _ => Err(WorkspaceAccessError::InvalidPath(
+                    "absolute, current, and parent components are forbidden".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if components.is_empty()
+            || components.len() > MAX_WORKSPACE_PATH_DEPTH
+            || components.join("/") != path
+        {
+            return Err(WorkspaceAccessError::InvalidPath(
+                "path must be one canonical relative spelling with at most 32 components".into(),
+            ));
+        }
+        Ok(Self {
+            rendered: components.join("/"),
+            components,
+        })
+    }
+}
+
+fn open_parent(
+    workspace: File,
+    path: &WorkspaceRelativePath,
+    create: bool,
+) -> Result<(File, &str), WorkspaceAccessError> {
+    let (filename, parents) = path
+        .components
+        .split_last()
+        .expect("validated workspace paths have at least one component");
+    let mut directory = workspace;
+    for component in parents {
+        directory = if create {
+            create_or_open_directory_at(&directory, component)?
+        } else {
+            open_directory_at(&directory, component)?
+        };
+    }
+    Ok((directory, filename))
+}
+
+fn open_directory_path(path: &Path) -> Result<File, WorkspaceAccessError> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        WorkspaceAccessError::UnsafeStorage("workspace root contains a NUL byte".into())
+    })?;
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    owned_descriptor(descriptor, "open workspace root")
+}
+
+fn open_directory_at(parent: &File, name: &str) -> Result<File, WorkspaceAccessError> {
+    let name = cstring(name)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    owned_descriptor(descriptor, "open workspace directory")
+}
+
+fn create_or_open_directory_at(parent: &File, name: &str) -> Result<File, WorkspaceAccessError> {
+    let name_c = cstring(name)?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), PRIVATE_DIRECTORY_MODE) } < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(access_io("create workspace directory")(error));
+        }
+    }
+    open_directory_at(parent, name)
+}
+
+fn open_regular_at(parent: &File, name: &str) -> Result<File, WorkspaceAccessError> {
+    let name = cstring(name)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return Err(match error.kind() {
+            io::ErrorKind::NotFound => WorkspaceAccessError::NotFound,
+            _ => access_io("open workspace file")(error),
+        });
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn owned_descriptor(
+    descriptor: i32,
+    operation: &'static str,
+) -> Result<File, WorkspaceAccessError> {
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return Err(match error.kind() {
+            io::ErrorKind::NotFound => WorkspaceAccessError::NotFound,
+            _ => access_io(operation)(error),
+        });
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn cstring(value: &str) -> Result<CString, WorkspaceAccessError> {
+    CString::new(value).map_err(|_| {
+        WorkspaceAccessError::InvalidPath("path components must not contain NUL bytes".into())
+    })
+}
+
+fn unlink_at(parent: &File, name: &CString) {
+    unsafe {
+        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0);
+    }
+}
+
+fn map_unsafe_storage(error: WorkspaceProvisionError) -> WorkspaceAccessError {
+    WorkspaceAccessError::UnsafeStorage(error.to_string())
+}
+
+fn access_io(context: &'static str) -> impl FnOnce(io::Error) -> WorkspaceAccessError {
+    move |error| WorkspaceAccessError::Io(format!("{context}: {error}"))
 }
 
 fn validate_root_spelling(root: &Path) -> Result<(), WorkspaceProvisionError> {
@@ -277,5 +617,47 @@ mod tests {
             LocalDevelopmentWorkspaceProvisioner::open(std::env::temp_dir().join("myelin-work")),
             Err(WorkspaceProvisionError::InvalidRoot(_))
         ));
+    }
+
+    #[test]
+    fn files_survive_calls_and_nested_paths_cannot_follow_symlinks() {
+        let temporary = durable_test_root();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalDevelopmentWorkspaceProvisioner::open(temporary.path()).unwrap();
+        let workspace_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        store.provision("acme", workspace_id).unwrap();
+
+        let written = store
+            .write_file(
+                "acme",
+                workspace_id,
+                "notes/continuity.txt",
+                b"still here\n",
+            )
+            .unwrap();
+        assert_eq!(written.path, "notes/continuity.txt");
+        assert_eq!(written.byte_len, 11);
+        assert_eq!(
+            store
+                .read_file("acme", workspace_id, "notes/continuity.txt")
+                .unwrap()
+                .bytes,
+            b"still here\n"
+        );
+
+        for path in ["../outside", "/etc/passwd", "notes//ambiguous", "./notes"] {
+            assert!(matches!(
+                store.read_file("acme", workspace_id, path),
+                Err(WorkspaceAccessError::InvalidPath(_))
+            ));
+        }
+
+        let workspace = store
+            .tenant_directory("acme")
+            .join(workspace_id.to_string());
+        std::os::unix::fs::symlink("/etc", workspace.join("escape")).unwrap();
+        assert!(store
+            .read_file("acme", workspace_id, "escape/passwd")
+            .is_err());
     }
 }

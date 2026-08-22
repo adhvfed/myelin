@@ -2566,6 +2566,7 @@ dependencies = [
  "blake3",
  "chrono",
  "hex",
+ "libc",
  "myelin-agent",
  "myelin-agent-service",
  "myelin-chat",
