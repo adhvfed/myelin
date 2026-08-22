@@ -112,6 +112,28 @@ fn public_channel(
     }
 }
 
+fn private_channel(
+    tenant: &str,
+    region: &str,
+    conversation_id: &str,
+    name: &str,
+    creator: &str,
+) -> Conversation {
+    Conversation {
+        kind: ConversationKind::ChannelPrivate,
+        parent_project: None,
+        retention_days: Some(3),
+        ..public_channel(
+            tenant,
+            region,
+            conversation_id,
+            "11111111-1111-4111-8111-111111111111",
+            name,
+            creator,
+        )
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_channel_list_forgets_every_expired_authority_path() {
     let config = test_config();
@@ -269,7 +291,7 @@ async fn public_channel_list_forgets_every_expired_authority_path() {
     .await;
 
     let visible = conversations
-        .list_visible_public(&tenant, &region, &alice.principal_id.0, None, 100)
+        .list_visible(&tenant, &region, &alice.principal_id.0, None, 100)
         .await
         .expect("list Alice's current public channels");
     assert_eq!(
@@ -279,6 +301,117 @@ async fn public_channel_list_forgets_every_expired_authority_path() {
             .collect::<Vec<_>>(),
         vec![live_channel.as_str()],
         "the user sees the live channel, while expired project, parent, and membership paths reveal nothing"
+    );
+
+    sqlx::query("DELETE FROM chat_conversation WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM rebac_tuple WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant' = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn private_channels_are_visible_only_through_live_direct_membership() {
+    let config = test_config();
+    let admin = SubstrateProvider::connect(admin_config(&config), 4)
+        .await
+        .expect("connect to PostgreSQL for the private-channel story");
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    admin
+        .migrate(&chat_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    let app = SubstrateProvider::connect(config, 6)
+        .await
+        .expect("connect the constrained runtime role");
+    let region = app.config().region.clone();
+    let tenant = format!("chat-private-{}", unique());
+    let alice = principal(&tenant, &region, "p:alice");
+    let scope = TenantScope::from_verified_token(&alice, alice.region.clone());
+    let tuples = TupleStore::with_pg(
+        DurableTupleBacking::new(app.clone()),
+        tokio::runtime::Handle::current(),
+    );
+    let conversations = PgConversationStore::new(app.db_pool().clone());
+    let alice_channel = format!("channel-{}-alice", unique());
+    let bob_channel = format!("channel-{}-bob", unique());
+    let expired_channel = format!("channel-{}-expired", unique());
+
+    for conversation in [
+        private_channel(
+            &tenant,
+            &region,
+            &alice_channel,
+            "Alice and her agent",
+            &alice.principal_id.0,
+        ),
+        private_channel(&tenant, &region, &bob_channel, "Bob and his agent", "p:bob"),
+        private_channel(
+            &tenant,
+            &region,
+            &expired_channel,
+            "Alice's expired thread",
+            &alice.principal_id.0,
+        ),
+    ] {
+        conversations
+            .create(&conversation)
+            .await
+            .expect("create private channel metadata");
+    }
+    write_until(
+        &tuples,
+        &scope,
+        &alice,
+        vec![
+            add(
+                format!("channel:{alice_channel}"),
+                "member",
+                &alice.principal_id.0,
+            ),
+            add(format!("channel:{bob_channel}"), "member", "p:bob"),
+        ],
+        None,
+    )
+    .await;
+    write_until(
+        &tuples,
+        &scope,
+        &alice,
+        vec![add(
+            format!("channel:{expired_channel}"),
+            "member",
+            &alice.principal_id.0,
+        )],
+        Some(Timestamp("2020-01-01T00:01:00Z".into())),
+    )
+    .await;
+
+    let visible = conversations
+        .list_visible(&tenant, &region, &alice.principal_id.0, None, 100)
+        .await
+        .expect("list Alice's private conversations");
+    assert_eq!(
+        visible
+            .iter()
+            .map(|conversation| conversation.id.conversation_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![alice_channel.as_str()],
+        "Alice sees her live private thread, never Bob's or an expired membership"
     );
 
     sqlx::query("DELETE FROM chat_conversation WHERE tenant_id = $1")

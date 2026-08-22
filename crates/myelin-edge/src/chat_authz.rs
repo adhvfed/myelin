@@ -87,6 +87,61 @@ impl ChatAuthorization {
             })
     }
 
+    pub(crate) fn bind_direct_members(
+        &self,
+        actor: &Principal,
+        conversation: &Conversation,
+        members: &[PrincipalId],
+        expires_at: Option<Timestamp>,
+        occurred_at: Timestamp,
+    ) -> Result<Zookie, EdgeError> {
+        if !conversation.kind.membership_is_acl() {
+            return Err(EdgeError::Internal(
+                "direct Chat membership is only valid for private conversations".into(),
+            ));
+        }
+        if conversation.id.tenant != actor.tenant.0 || conversation.id.region != actor.region.0 {
+            return Err(EdgeError::Internal(
+                "a Chat authorization grant crossed its verified tenant scope".into(),
+            ));
+        }
+        if members.is_empty() || !members.iter().any(|member| member == &actor.principal_id) {
+            return Err(EdgeError::Internal(
+                "a private Chat conversation must include its creator".into(),
+            ));
+        }
+        let mut unique_members = members.iter().collect::<Vec<_>>();
+        unique_members.sort_by(|left, right| left.0.cmp(&right.0));
+        unique_members.dedup();
+        if unique_members.len() != members.len() {
+            return Err(EdgeError::Internal(
+                "private Chat conversation members must be distinct".into(),
+            ));
+        }
+
+        let channel = ObjectId(channel_object(&conversation.id.conversation_id));
+        let deltas = unique_members
+            .into_iter()
+            .map(|member| {
+                TupleDelta::Add(RelationTuple {
+                    object: channel.clone(),
+                    relation: RelName("member".into()),
+                    subject: member.clone(),
+                    caveat: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let scope = TenantScope::from_verified_token(actor, actor.region.clone());
+        self.identity
+            .tuples()
+            .write_tuples(&scope, actor, &deltas, None, expires_at, occurred_at)
+            .map_err(|error| {
+                EdgeError::Internal(format!(
+                    "private Chat authorization could not be persisted: {error}"
+                ))
+            })
+    }
+
     fn may_use_channel(
         &self,
         principal: &Principal,
@@ -127,7 +182,7 @@ mod tests {
     use myelin_chat::conversation::{Conversation, ConversationKind};
     use myelin_chat::store::ConversationId;
     use myelin_events::OutboxStore;
-    use myelin_identity::{FragmentAdmit, PrincipalKind};
+    use myelin_identity::{FragmentAdmit, PrincipalKind, RuntimeRef};
     use myelin_identity_service::TupleStore;
     use myelin_tenancy::TenantId;
 
@@ -229,5 +284,48 @@ mod tests {
             .unwrap();
         assert!(!authorization.may_read_channel(&collaborator, &room));
         assert!(!authorization.may_post_to_channel(&collaborator, &room));
+    }
+
+    #[test]
+    fn a_private_room_belongs_only_to_its_direct_members() {
+        let owner = principal("owner");
+        let agent = Principal::stub(
+            PrincipalId("agent:helper".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("external:mcp".into()),
+                on_behalf_of: Some(owner.principal_id.clone()),
+            },
+            owner.tenant.clone(),
+        );
+        let project_peer = principal("project-peer");
+        let tuples = TupleStore::new(OutboxStore::new());
+        let identity = StoreBackedCheck::new(tuples);
+        for admitted in identity.admit_chat_fragment() {
+            assert!(matches!(admitted, FragmentAdmit::Admitted { .. }));
+        }
+        let authorization = ChatAuthorization::new(identity);
+        let mut room = Conversation {
+            kind: ConversationKind::ChannelPrivate,
+            ..conversation(&owner)
+        };
+        room.acl_zookie = Some(
+            authorization
+                .bind_direct_members(
+                    &owner,
+                    &room,
+                    &[owner.principal_id.clone(), agent.principal_id.clone()],
+                    None,
+                    Timestamp("2026-08-22T00:00:00Z".into()),
+                )
+                .unwrap()
+                .0,
+        );
+
+        assert!(authorization.may_read_channel(&owner, &room));
+        assert!(authorization.may_post_to_channel(&owner, &room));
+        assert!(authorization.may_read_channel(&agent, &room));
+        assert!(authorization.may_post_to_channel(&agent, &room));
+        assert!(!authorization.may_read_channel(&project_peer, &room));
+        assert!(!authorization.may_post_to_channel(&project_peer, &room));
     }
 }

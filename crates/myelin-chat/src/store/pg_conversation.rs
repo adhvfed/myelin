@@ -98,7 +98,7 @@ impl PgConversationStore {
     }
 
     pub async fn create(&self, conversation: &Conversation) -> Result<(), ConversationError> {
-        validate_public_topic(conversation)?;
+        validate_durable_channel(conversation)?;
         let mut conn = self
             .pool
             .acquire()
@@ -130,7 +130,7 @@ impl PgConversationStore {
         occurred: Timestamp,
         recorded: Timestamp,
     ) -> Result<(), ConversationError> {
-        validate_public_topic(conversation)?;
+        validate_durable_channel(conversation)?;
         let subject =
             crate::subs::mint_channel(&conversation.id.tenant, &conversation.id.conversation_id)
                 .map_err(|error| {
@@ -281,7 +281,7 @@ impl PgConversationStore {
         row.as_ref().map(row_to_conversation).transpose()
     }
 
-    pub async fn find_public_by_client_nonce(
+    pub async fn find_by_client_nonce(
         &self,
         tenant: &str,
         region: &str,
@@ -297,19 +297,18 @@ impl PgConversationStore {
             "SELECT tenant_id, region, conversation_id, kind, home_cell, parent_project, name,
                     topic, linked_ref, pinned_canvas, retention_days, archived, created_by, acl_zookie
                FROM chat_conversation
-              WHERE tenant_id = $1 AND region = $2 AND kind = 'channel_public' AND NOT archived
-                AND client_nonce = $3",
+              WHERE tenant_id = $1 AND region = $2 AND client_nonce = $3",
         )
         .bind(tenant)
         .bind(region)
         .bind(client_nonce)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(storage("find public conversation by client nonce"))?;
+        .map_err(storage("find conversation by client nonce"))?;
         row.as_ref().map(row_to_conversation).transpose()
     }
 
-    pub async fn list_visible_public(
+    pub async fn list_visible(
         &self,
         tenant: &str,
         region: &str,
@@ -337,25 +336,25 @@ impl PgConversationStore {
                     conversation.retention_days, conversation.archived,
                     conversation.created_by, conversation.acl_zookie
                FROM chat_conversation conversation
-               JOIN visible_project project
-                 ON project.object_id = 'project:' || conversation.parent_project
-               JOIN rebac_tuple parent_acl
-                 ON parent_acl.tenant_id = conversation.tenant_id
-                AND parent_acl.region = conversation.region
-                AND parent_acl.object_id = 'channel:' || conversation.conversation_id
-                AND parent_acl.relation = 'parent_project'
-                AND parent_acl.subject = project.object_id || '#view'
-                AND (parent_acl.expires_at IS NULL OR parent_acl.expires_at > CURRENT_TIMESTAMP)
-               JOIN rebac_tuple member_acl
-                 ON member_acl.tenant_id = conversation.tenant_id
-                AND member_acl.region = conversation.region
-                AND member_acl.object_id = 'channel:' || conversation.conversation_id
-                AND member_acl.relation = 'member'
-                AND member_acl.subject = project.object_id || '#view'
-                AND (member_acl.expires_at IS NULL OR member_acl.expires_at > CURRENT_TIMESTAMP)
               WHERE conversation.tenant_id = $1 AND conversation.region = $2
-                AND conversation.kind = 'channel_public' AND NOT conversation.archived
+                AND NOT conversation.archived
                 AND conversation.acl_zookie IS NOT NULL
+                AND (
+                  conversation.conversation_id IN (
+                    SELECT conversation_id FROM visible_conversation
+                  )
+                  OR EXISTS (
+                    SELECT 1
+                      FROM rebac_tuple direct_member
+                     WHERE direct_member.tenant_id = conversation.tenant_id
+                       AND direct_member.region = conversation.region
+                       AND direct_member.object_id = 'channel:' || conversation.conversation_id
+                       AND direct_member.relation = 'member'
+                       AND direct_member.subject = $3
+                       AND (direct_member.expires_at IS NULL
+                            OR direct_member.expires_at > CURRENT_TIMESTAMP)
+                  )
+                )
                 AND ($4::text IS NULL OR conversation.conversation_id < $4)
               ORDER BY conversation.conversation_id DESC LIMIT $5",
             visible_public_conversations_cte(),
@@ -406,24 +405,32 @@ async fn insert_conversation(
     Ok(result.rows_affected())
 }
 
-fn validate_public_topic(conversation: &Conversation) -> Result<(), ConversationError> {
-    if conversation.kind != ConversationKind::ChannelPublic {
+fn validate_durable_channel(conversation: &Conversation) -> Result<(), ConversationError> {
+    if !matches!(
+        conversation.kind,
+        ConversationKind::ChannelPublic | ConversationKind::ChannelPrivate
+    ) {
         return Err(ConversationError::SchemaViolation(
-            "the public topic store accepts only public channel conversations".into(),
+            "the durable channel store accepts only public or private channel conversations".into(),
         ));
     }
-    let project_id = conversation.parent_project.as_deref().ok_or_else(|| {
-        ConversationError::SchemaViolation("a public topic requires a parent project".into())
-    })?;
-    let parsed_project = sqlx::types::Uuid::parse_str(project_id).map_err(|_| {
-        ConversationError::SchemaViolation(
-            "a public topic parent project must be a canonical UUID".into(),
-        )
-    })?;
-    if parsed_project.to_string() != project_id {
+    if conversation.kind == ConversationKind::ChannelPublic && conversation.parent_project.is_none()
+    {
         return Err(ConversationError::SchemaViolation(
-            "a public topic parent project must be a canonical UUID".into(),
+            "a public topic requires a parent project".into(),
         ));
+    }
+    if let Some(project_id) = conversation.parent_project.as_deref() {
+        let parsed_project = sqlx::types::Uuid::parse_str(project_id).map_err(|_| {
+            ConversationError::SchemaViolation(
+                "a channel parent project must be a canonical UUID".into(),
+            )
+        })?;
+        if parsed_project.to_string() != project_id {
+            return Err(ConversationError::SchemaViolation(
+                "a channel parent project must be a canonical UUID".into(),
+            ));
+        }
     }
     for (field, value) in [
         ("channel name", conversation.name.as_deref()),
@@ -503,6 +510,13 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
                  (tenant_id, region, parent_project, name, topic)
                WHERE parent_project IS NOT NULL;"
     );
+    let public_conversation_project_topic = format!(
+        "DROP INDEX IF EXISTS {CONVERSATION_PROJECT_TOPIC_INDEX};
+             CREATE UNIQUE INDEX {CONVERSATION_PROJECT_TOPIC_INDEX}
+               ON {CONVERSATION_TABLE}
+                 (tenant_id, region, parent_project, name, topic)
+               WHERE kind = 'channel_public' AND parent_project IS NOT NULL;"
+    );
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
@@ -521,6 +535,11 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
             conversation_project_topic,
             CONVERSATION_TABLE,
         ),
+        Migration::plain_on(
+            "chat_0006_public_conversation_project_topic",
+            public_conversation_project_topic,
+            CONVERSATION_TABLE,
+        ),
     ])
 }
 
@@ -531,7 +550,7 @@ mod tests {
     #[test]
     fn migrations_create_and_tenant_scope_both_tables() {
         let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 5);
+        assert_eq!(migrations.0.len(), 6);
         for (migration, table) in migrations.0[..2]
             .iter()
             .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
@@ -556,10 +575,13 @@ mod tests {
         assert!(migrations.0[4].ddl.contains(
             "DROP CONSTRAINT IF EXISTS chat_conversation_tenant_id_region_name_topic_key"
         ));
+        assert!(migrations.0[5]
+            .ddl
+            .contains("WHERE kind = 'channel_public'"));
     }
 
     #[test]
-    fn public_topic_validation_is_strict() {
+    fn durable_channel_validation_is_strict() {
         let id = ConversationId::new("acme", "fr-par", "01J00000000000000000000000");
         let valid = Conversation {
             id,
@@ -575,11 +597,17 @@ mod tests {
             created_by: "chat-author:1".into(),
             acl_zookie: None,
         };
-        assert!(validate_public_topic(&valid).is_ok());
-        assert!(validate_public_topic(&Conversation {
+        assert!(validate_durable_channel(&valid).is_ok());
+        assert!(validate_durable_channel(&Conversation {
             topic: Some(" bad".into()),
-            ..valid
+            ..valid.clone()
         })
         .is_err());
+        assert!(validate_durable_channel(&Conversation {
+            kind: ConversationKind::ChannelPrivate,
+            parent_project: None,
+            ..valid
+        })
+        .is_ok());
     }
 }
