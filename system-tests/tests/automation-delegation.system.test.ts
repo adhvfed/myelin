@@ -123,7 +123,7 @@ describe("automation delegation", () => {
     expect(closed.body).toMatchObject({ run: { id: runId, state: "closed" }, closed: true });
   });
 
-  test("lets another actor wake an automation without feeding an agent its own work", async () => {
+  test("lets another actor wake an automation without feeding it echoes or over-deep work", async () => {
     const founder = await browserApprovedCliClient();
     const activated = await founder.json("/v1/agents", {
       method: "POST",
@@ -170,6 +170,7 @@ describe("automation delegation", () => {
         task: "Read the message and prepare one concise response.",
         budget_minor_units: 10_000,
         max_firings: 2,
+        max_causal_depth: 2,
         require_human_approval: true,
       },
       idempotencyKey: `self-quiet-trigger-${randomUUID()}`,
@@ -189,6 +190,7 @@ describe("automation delegation", () => {
 
     const now = new Date().toISOString();
     const selfEventId = `self-authored-chat-${randomUUID()}`;
+    const overDeepEventId = `over-deep-chat-${randomUUID()}`;
     const humanEventId = `human-authored-chat-${randomUUID()}`;
     const base: ExternalEventEnvelope = {
       event_id: selfEventId,
@@ -228,6 +230,21 @@ describe("automation delegation", () => {
       expect((await bus.publish(base)).duplicate).toBe(false);
       expect((await bus.publish({
         ...base,
+        event_id: overDeepEventId,
+        correlation_id: overDeepEventId,
+        depth: 3,
+        actor: {
+          tenant: systemTestConfig.tenant,
+          region: systemTestConfig.region,
+          principal_id: systemTestConfig.principal,
+          kind: "Human",
+          data_role: "Controller",
+          status: "Active",
+        },
+        data_role: "Controller",
+      })).duplicate).toBe(false);
+      expect((await bus.publish({
+        ...base,
         event_id: humanEventId,
         correlation_id: humanEventId,
         actor: {
@@ -258,9 +275,9 @@ describe("automation delegation", () => {
         state: "awaiting_approval",
       }),
     ]);
-    expect(firings).not.toEqual(expect.arrayContaining([
-      expect.objectContaining({ event_id: selfEventId }),
-    ]));
+    const firedEventIds = firings.map((firing) => firing.event_id);
+    expect(firedEventIds).not.toContain(selfEventId);
+    expect(firedEventIds).not.toContain(overDeepEventId);
     expect(await findAutomation(founder, triggerId)).toMatchObject({
       id: triggerId,
       firings_used: 1,

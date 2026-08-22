@@ -41,14 +41,6 @@ pub use triggers::{
     StaleAfter, TimerError, Trigger, TriggerArming, TriggerEngine, TriggerId, TriggerState,
 };
 
-pub mod dispatch;
-pub use dispatch::{
-    CostGate, DispatchBreaker, DispatchError, DispatchRequest, DispatchTarget, DispatchTelemetry,
-    DispatchTier, Disposition, InMemoryCostGate, RecordingTarget, Reservation, ShedReason,
-    ShedSignal, SignalBinding, TriggerKind, CAUSAL_DEPTH_CEILING, DISPATCH_INFLIGHT_CAP,
-    SHARED_ROOT_TRIPWIRE_K, SHED_RETRY_AFTER_SECONDS,
-};
-
 pub const MAX_PREDICATE_NODES: usize = 256;
 
 pub const MAX_PREDICATE_DEPTH: usize = 32;

@@ -837,6 +837,27 @@ Proof: Myelin Chat's remaining 269 unit tests and contract suite pass; clippy
 typecheck; the restarted full stack passes the four Chat lifecycle journeys.
 Net removal: roughly 1,800 lines of production-shaped doubles and tests.
 
+## 2026-08-23 — automation guards have one durable truth
+
+The Query crate's generic `DispatchTier` was another uncalled implementation
+of agent dispatch. Its in-memory balance, breaker, reconnect, replay, and loop
+guard drills tested only themselves. The shipped automation path instead runs
+through `GovernedTriggerConsumer` and the transactional agent-trigger store,
+where self-authored events are ignored and causal-depth, privacy, firing-count,
+ownership, lifecycle, and idempotency gates are applied while locking the
+durable binding.
+
+The orphan module and its four drill files are gone. The full-system automation
+journey now publishes three otherwise matching events: the agent's own echo, a
+human event beyond the configured depth, and a shallow human event. Only the
+last reserves a firing, leaving one durable history row and one unit of budget
+used.
+
+Proof: 101 Query unit tests plus its contract suite pass; clippy `-D warnings`
+passes through Query, Agent Service, and Edge; TypeScript typecheck passes; the
+restarted stack passes all six automation-delegation journeys. Net removal:
+roughly 1,480 lines of unused implementation and self-referential drills.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
