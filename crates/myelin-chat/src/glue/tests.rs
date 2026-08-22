@@ -240,34 +240,6 @@ fn the_write_fanout_set_is_a_bounded_subset_of_the_durable_tokens() {
 }
 
 #[test]
-fn a_casual_agent_mention_is_notify_only() {
-    assert_eq!(
-        agent_dispatch_class(CHAT_MESSAGE_MENTIONED, false),
-        AgentDispatchClass::NotifyOnly,
-        "a casual @agent mention notifies - it does not auto-spawn a costed run (CHAT-1)"
-    );
-    assert_eq!(
-        agent_dispatch_class(CHAT_MESSAGE_MENTIONED, true),
-        AgentDispatchClass::NotifyOnly,
-        "a mention is never an explicit dispatch - the explicit-first floor is structural"
-    );
-}
-
-#[test]
-fn only_an_explicit_action_dispatches_a_costed_run() {
-    assert_eq!(
-        agent_dispatch_class("chat.reaction.added", true),
-        AgentDispatchClass::ExplicitDispatch,
-        "a deliberate approve-action dispatches a costed run (after the guards + reserve)"
-    );
-    assert_eq!(
-        agent_dispatch_class("chat.message.created", false),
-        AgentDispatchClass::NotifyOnly,
-        "a non-mention chat event without an explicit action only notifies (the safe default)"
-    );
-}
-
-#[test]
 fn hitl_card_facets_render_action_risk_and_cost_through_the_one_surface() {
     let mut store = TemplateStore::with_platform_defaults();
     register_chat_humanise_templates(&mut store);

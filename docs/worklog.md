@@ -818,6 +818,25 @@ Validated on linux: full workspace tests, clippy `-D warnings`, the
 contract-coverage gate (99 rows, 0 falsely claimed), and the complete
 system suite.
 
+## 2026-08-23 — chat dispatch fiction replaced by a product boundary
+
+The Chat crate exposed an in-memory "explicit dispatcher" as production API,
+but no service called it. Its mock identity, wallet, effect sink, and flagship
+tests could all be green while the shipped product did something unrelated.
+The duplicate dispatcher, its feature-gated flagship, and four mock drills are
+gone. The load-bearing agent attribution model now lives alone in
+`provenance.rs`.
+
+The replacement proof is a user journey against the live Edge: activating an
+agent does not make it a public-room member, a public mention is rejected
+without writing a message, and no private thread or workspace is silently
+provisioned. Deliberate agent work remains the named private-thread flow.
+
+Proof: Myelin Chat's remaining 269 unit tests and contract suite pass; clippy
+`-D warnings` passes for Chat, the gateway, and Edge; TypeScript system tests
+typecheck; the restarted full stack passes the four Chat lifecycle journeys.
+Net removal: roughly 1,800 lines of production-shaped doubles and tests.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the

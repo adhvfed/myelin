@@ -155,23 +155,6 @@ pub fn fanout_class_is_total_over_durable_tokens() -> bool {
         .all(|t| fanout_class(t).is_some())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentDispatchClass {
-    NotifyOnly,
-    ExplicitDispatch,
-}
-
-pub fn agent_dispatch_class(token: &str, is_explicit_action: bool) -> AgentDispatchClass {
-    if token == CHAT_MESSAGE_MENTIONED {
-        return AgentDispatchClass::NotifyOnly;
-    }
-    if is_explicit_action {
-        AgentDispatchClass::ExplicitDispatch
-    } else {
-        AgentDispatchClass::NotifyOnly
-    }
-}
-
 pub const CHAT_FIREHOSE_STREAM_PREFIX: &str = "fan";
 
 pub fn chat_channel_scope(channel_id: &str) -> Result<FirehoseScope, FirehoseError> {

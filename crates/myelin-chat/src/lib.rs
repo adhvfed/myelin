@@ -5,7 +5,6 @@ pub mod content;
 pub mod conversation;
 pub mod cross_org;
 pub mod dek;
-pub mod dispatch;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod erase;
@@ -18,6 +17,7 @@ pub mod membership;
 mod mention_signal;
 pub mod presence;
 pub mod project;
+pub mod provenance;
 pub mod read_state;
 pub mod rebac_fragment;
 pub mod replay;
@@ -49,11 +49,6 @@ pub use cross_org::{
 pub use dek::{
     decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, plaintext_at_rest,
     subject_dek_erasure, ChatBodyEnvelopeError, ChatFreeText,
-};
-pub use dispatch::{
-    agent_provenance, dispatch_disposition_class, dispatch_explicit, mention_is_always_notify_only,
-    no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,
-    ExplicitDispatchError, L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
@@ -89,6 +84,7 @@ pub use project::{
     Projection as ChatProjection, Projector, RenderHint, ThreadMeta, Tombstone as ProjectTombstone,
     TombstoneReason as ProjectTombstoneReason,
 };
+pub use provenance::{agent_provenance, AgentProvenance, PROVENANCE_AUDIT_LINK_KIND};
 pub use read_state::{
     ReadMarker, ReadStatePush, ReadStateRecord, ReadStateService, CHAT_READ_STATE_STORE,
     DEFAULT_FLUSH_CADENCE, HOT_MARKER_TTL, READ_STATE_UPDATED,

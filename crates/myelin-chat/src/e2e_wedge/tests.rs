@@ -18,18 +18,6 @@ fn e2e_1_freshness_budget_is_the_named_threshold() {
 }
 
 #[test]
-fn e2e_2_flagship_terminates_green_in_chat() {
-    let art = e2e_flagship::run_e2e_2_chat_flagship();
-    assert_eq!(art.scenario, "E2E-2");
-    assert!(
-        art.is_green(),
-        "E2E-2 (the agent-native flagship) terminates green in chat: {}",
-        art.evidence
-    );
-    assert_eq!(art.leaks, 0);
-}
-
-#[test]
 fn e2e_4_dsar_holder_is_green_zero_recoverable_pii() {
     let art = e2e_dsar::run_e2e_4_chat_dsar_holder();
     assert_eq!(art.scenario, "E2E-4");
@@ -45,11 +33,11 @@ fn e2e_4_dsar_holder_is_green_zero_recoverable_pii() {
 }
 
 #[test]
-fn run_chat_e2e_wedge_emits_three_green_artifacts() {
+fn run_chat_e2e_wedge_emits_its_two_green_artifacts() {
     let arts = run_chat_e2e_wedge();
-    assert_eq!(arts.len(), 3, "E2E-1 + E2E-2 + E2E-4");
+    assert_eq!(arts.len(), 2, "E2E-1 + E2E-4");
     let scenarios: Vec<&str> = arts.iter().map(|a| a.scenario).collect();
-    assert_eq!(scenarios, vec!["E2E-1", "E2E-2", "E2E-4"]);
+    assert_eq!(scenarios, vec!["E2E-1", "E2E-4"]);
     for art in &arts {
         assert!(
             art.is_green(),

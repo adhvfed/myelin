@@ -1,15 +1,15 @@
 use myelin_chat::{run_chat_e2e_wedge, ChatE2eArtifact};
 
 #[test]
-fn chat_e2e_wedge_three_legs_green() {
+fn chat_e2e_wedge_two_legs_green() {
     let arts: Vec<ChatE2eArtifact> = run_chat_e2e_wedge();
-    assert_eq!(arts.len(), 3, "E2E-1 + E2E-2 + E2E-4 - chat's three legs");
+    assert_eq!(arts.len(), 2, "E2E-1 + E2E-4 - chat's two live legs");
 
     let scenarios: Vec<&str> = arts.iter().map(|a| a.scenario).collect();
     assert_eq!(
         scenarios,
-        vec!["E2E-1", "E2E-2", "E2E-4"],
-        "chat crosses E2E-1/E2E-2/E2E-4"
+        vec!["E2E-1", "E2E-4"],
+        "chat crosses E2E-1/E2E-4"
     );
 
     for art in &arts {
@@ -25,25 +25,6 @@ fn chat_e2e_wedge_three_legs_green() {
             art.scenario
         );
     }
-}
-
-#[test]
-fn chat_e2e_2_flagship_terminates_green_in_chat() {
-    let arts = run_chat_e2e_wedge();
-    let flagship = arts
-        .iter()
-        .find(|a| a.scenario == "E2E-2")
-        .expect("the flagship leg exists");
-    assert!(
-        flagship.is_green(),
-        "the flagship terminates green in chat (exactly-once HITL + merge, 0 leak): {}",
-        flagship.evidence
-    );
-    assert!(flagship.evidence.contains("merge_applied_once=true"));
-    assert!(flagship
-        .evidence
-        .contains("dispatched_through_one_wallet=true"));
-    assert!(flagship.evidence.contains("double_click_deduped=true"));
 }
 
 #[test]

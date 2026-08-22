@@ -2,8 +2,15 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, test } from "vitest";
 
-import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
+import {
+  browserApprovedCliClient,
+  reviewerClient,
+  systemClient,
+  uniqueName,
+} from "../src/context.js";
 import { eventually } from "../src/eventually.js";
+import { listPrivateAgentThreads } from "../src/journeys/agent-threads.js";
+import { activateExternalAgent } from "../src/journeys/agents.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { findInboxItem } from "../src/journeys/inbox.js";
 import { awaitActiveIssue } from "../src/journeys/issues.js";
@@ -12,6 +19,46 @@ import { array, record, string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
 describe("chat collaboration lifecycle", () => {
+  test("requires a private thread instead of turning a public mention into agent work", async () => {
+    const founder = await browserApprovedCliClient();
+    const agent = await activateExternalAgent(
+      founder,
+      uniqueName("Public-room helper"),
+      ["chat.read_messages", "chat.post"],
+    );
+    const room = await Conversation.open(founder, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("public-agent-mentions"),
+      topic: "A mention is conversation, not permission to spend or provision",
+    });
+
+    const message = "\uFFFC please keep an eye on this discussion.";
+    const rejectedMention = await founder.json(
+      `/v1/chat/conversations/${encodeURIComponent(room.id)}/messages`,
+      {
+        method: "POST",
+        body: {
+          content: message,
+          nodes: [{ kind: "mention", principal_id: agent.agent.principal_id }],
+        },
+        idempotencyKey: `public-agent-mention-${randomUUID()}`,
+        expectedStatus: 400,
+      },
+    );
+    expect(rejectedMention.body).toMatchObject({
+      error: {
+        code: "bad_request",
+        message: "Chat mention recipient must be an active member of this conversation",
+      },
+    });
+    expect(await room.messages(founder)).toEqual([]);
+    expect(
+      (await listPrivateAgentThreads(founder))
+        .filter((thread) => thread.agent_id === agent.agent.id),
+      "a public mention must not silently provision a private thread or workspace",
+    ).toEqual([]);
+  });
+
   test("turns a teammate's words into one durable nudge without leaking private rooms", async () => {
     const privateProject = await systemClient.json("/v1/projects", {
       method: "POST",
