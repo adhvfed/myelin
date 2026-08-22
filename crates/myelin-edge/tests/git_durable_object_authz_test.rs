@@ -15,6 +15,7 @@ use myelin_storage::{KmsEngine, TenantScope};
 use myelin_substrate::FailStaticThreshold;
 use myelin_tenancy::{Region, TenantId};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -210,16 +211,23 @@ impl Harness {
         ci_job: bool,
     ) -> (u16, serde_json::Value) {
         let (scheme, token) = self.token(subject_key, ci_job);
-        let resp: EdgeResponse = self.gw.handle(EdgeRequest::new(
-            method,
-            path,
-            "",
-            vec![
-                ("authorization".into(), format!("Bearer {token}")),
-                ("x-myelin-token-scheme".into(), scheme),
-            ],
-            body.to_vec(),
-        ));
+        static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+        let mut headers = vec![
+            ("authorization".into(), format!("Bearer {token}")),
+            ("x-myelin-token-scheme".into(), scheme),
+        ];
+        if method == "POST" {
+            headers.push((
+                "idempotency-key".into(),
+                format!(
+                    "git-authz-integration-{}",
+                    NEXT_OPERATION.fetch_add(1, Ordering::Relaxed)
+                ),
+            ));
+        }
+        let resp: EdgeResponse =
+            self.gw
+                .handle(EdgeRequest::new(method, path, "", headers, body.to_vec()));
         let status = resp.status();
         let v = resp.json_body().unwrap_or(serde_json::Value::Null);
         (status, v)

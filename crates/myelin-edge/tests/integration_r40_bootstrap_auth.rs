@@ -52,9 +52,14 @@ fn http(
 ) -> (u16, serde_json::Value) {
     let mut s = TcpStream::connect(addr).expect("connect edge");
     let body = body.unwrap_or("");
+    let operation = (method == "POST").then(|| format!("r40-integration-{}", uniq()));
+    let operation_header = operation
+        .as_deref()
+        .map(|key| format!("Idempotency-Key: {key}\r\n"))
+        .unwrap_or_default();
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\
-         X-Myelin-Token-Scheme: agent\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         X-Myelin-Token-Scheme: agent\r\n{operation_header}Content-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
     );

@@ -18,6 +18,7 @@ use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
@@ -187,6 +188,20 @@ async fn open(
         .method(method)
         .uri(path)
         .header("host", "edge.test");
+    static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+    if method == "POST"
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+    {
+        builder = builder.header(
+            "idempotency-key",
+            format!(
+                "git-edge-integration-{}",
+                NEXT_OPERATION.fetch_add(1, Ordering::Relaxed)
+            ),
+        );
+    }
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
