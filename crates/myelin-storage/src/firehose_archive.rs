@@ -56,7 +56,7 @@ impl SegmentBytes {
         let mut frames = Vec::with_capacity(count.min(1 << 16));
         for _ in 0..count {
             let seq = read_u64(bytes, &mut cur)?;
-            let len = read_u64(bytes, &mut cur)? as usize;
+            let len = usize::try_from(read_u64(bytes, &mut cur)?).ok()?;
             let end = cur.checked_add(len)?;
             if end > bytes.len() {
                 return None;
@@ -416,6 +416,19 @@ mod tests {
         );
         assert!(SegmentBytes::decode_bounded(&bytes, bytes.len() - 1, 2).is_none());
         assert!(SegmentBytes::decode_bounded(&bytes, bytes.len(), 1).is_none());
+    }
+
+    #[test]
+    fn segment_decode_rejects_a_payload_length_that_cannot_name_a_memory_range() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&7_u64.to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        assert!(
+            SegmentBytes::decode(&bytes).is_none(),
+            "an untrusted archive length must not wrap into a small platform-sized range"
+        );
     }
 
     #[test]

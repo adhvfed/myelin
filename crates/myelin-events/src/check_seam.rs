@@ -62,6 +62,9 @@ impl CheckSeamOrder {
     }
 
     pub fn ingest(&mut self, env: &EventEnvelope, seq: u64) -> Result<bool, CheckSeamError> {
+        if seq == 0 {
+            return Err(CheckSeamError::InvalidSequence(seq));
+        }
         if env.type_.0 != CI_CHECK_UPDATED {
             return Err(CheckSeamError::WrongType(env.type_.0.clone()));
         }
@@ -102,6 +105,7 @@ impl CheckSeamOrder {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckSeamError {
+    InvalidSequence(u64),
     WrongType(String),
     WrongAggregate { expected: String, got: String },
 }
@@ -109,6 +113,9 @@ pub enum CheckSeamError {
 impl std::fmt::Display for CheckSeamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CheckSeamError::InvalidSequence(seq) => {
+                write!(f, "check stream sequence must be positive: seq={seq}")
+            }
             CheckSeamError::WrongType(t) => {
                 write!(f, "not a ci.check.updated event: type_={t}")
             }
@@ -405,6 +412,27 @@ mod tests {
             "every op delivered → contiguous, 0 gap"
         );
         assert_eq!(order.observed_seqs(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn ingest_rejects_sequence_zero_before_it_can_corrupt_gap_accounting() {
+        let mut order = CheckSeamOrder::new("repo:core", "deadbeef");
+
+        let valid = check_env("repo:core", "deadbeef", "build", 1, "success");
+        assert_eq!(
+            order.ingest(&valid, 0),
+            Err(CheckSeamError::InvalidSequence(0)),
+            "broker sequences start at one; admitting zero would make gap accounting underflow"
+        );
+        assert!(
+            order.observed_seqs().is_empty(),
+            "the invalid fact was not stored"
+        );
+        assert_eq!(
+            order.ordering_gap(),
+            0,
+            "an empty stream has no missing facts"
+        );
     }
 
     #[test]
