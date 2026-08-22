@@ -1,6 +1,6 @@
 use myelin_agent_service::workspace::LocalDevelopmentWorkspaceProvisioner;
 use myelin_ci_sandbox::gvisor::{
-    ConfinedWorkspaceSession, WorkspaceSessionCommand, WorkspaceSessionLimits,
+    ConfinedWorkspaceSession, WorkspaceSessionCommand, WorkspaceSessionLimits, WorkspaceTerminal,
 };
 use uuid::Uuid;
 
@@ -29,6 +29,7 @@ impl LocalConfinedWorkspaceLauncher {
         &self,
         authenticated: &AuthenticatedWorkspace,
         command: WorkspaceSessionCommand,
+        terminal: Option<WorkspaceTerminal>,
     ) -> Result<ConfinedWorkspaceSession, WorkspaceLaunchError> {
         let tenant = authenticated.tenant.clone();
         let workspace_id = Uuid::parse_str(&authenticated.admission.workspace_id)
@@ -40,7 +41,7 @@ impl LocalConfinedWorkspaceLauncher {
             let workspace = workspaces
                 .open_verified_directory(&tenant, workspace_id, &locator)
                 .map_err(|_| WorkspaceLaunchError::WorkspaceUnavailable)?;
-            ConfinedWorkspaceSession::launch(&workspace, command, limits)
+            ConfinedWorkspaceSession::launch(&workspace, command, limits, terminal)
                 .map_err(|_| WorkspaceLaunchError::ConfinementUnavailable)
         })
         .await
@@ -106,7 +107,7 @@ mod tests {
 
         assert!(matches!(
             launcher
-                .launch(&authenticated, WorkspaceSessionCommand::Shell)
+                .launch(&authenticated, WorkspaceSessionCommand::Shell, None)
                 .await,
             Err(WorkspaceLaunchError::WorkspaceUnavailable)
         ));

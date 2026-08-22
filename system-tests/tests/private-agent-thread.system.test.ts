@@ -249,6 +249,7 @@ describe("private work with an agent", () => {
         workspaceKey.publicKey,
       );
       const workspace = await connectToWorkspace(workspaceKey, workspaceAccess.access);
+      expect(await workspace.hasInteractiveTerminal()).toBe(true);
       expect(await workspace.readText(notebookPath)).toBe(notebook);
       await workspace.writeText(ownerNotePath, ownerNote);
     } finally {

@@ -62,6 +62,10 @@ pub use workspace_session::{
     WorkspaceSessionError, WorkspaceSessionLimits,
 };
 
+mod workspace_terminal;
+pub use workspace_terminal::WorkspaceTerminal;
+use workspace_terminal::{PreparedWorkspaceTerminal, WorkspaceTerminalControl};
+
 mod output_capture;
 pub(crate) use output_capture::RunFailure;
 use output_capture::{

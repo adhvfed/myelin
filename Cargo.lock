@@ -3145,6 +3145,7 @@ dependencies = [
  "myelin-notif",
  "myelin-refs",
  "myelin-tenancy",
+ "nix",
  "serde",
  "serde_json",
  "sha2 0.10.9",

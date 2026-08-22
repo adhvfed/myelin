@@ -4,6 +4,7 @@ use crate::hardening::HardeningProfile;
 use crate::launch_gate::{DirectChildRetirement, SandboxChild, SandboxCommand};
 use crate::user_namespace::RunscInvocationMode;
 use crate::{EgressPolicy, ResourceLimits};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,10 +135,16 @@ impl core::fmt::Display for WorkspaceSessionError {
 
 impl std::error::Error for WorkspaceSessionError {}
 
-pub struct ConfinedWorkspaceSessionIo {
-    pub stdin: ChildStdin,
-    pub stdout: ChildStdout,
-    pub stderr: ChildStderr,
+pub enum ConfinedWorkspaceSessionIo {
+    Pipes {
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    },
+    Terminal {
+        input: File,
+        output: File,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,23 +155,36 @@ pub struct ConfinedWorkspaceSessionExit {
 
 pub struct ConfinedWorkspaceSession {
     child: Option<SandboxChild>,
-    input: Option<ChildStdin>,
-    output: Option<ChildStdout>,
-    error: Option<ChildStderr>,
+    io: Option<ConfinedWorkspaceSessionIo>,
     runtime: Option<WorkspaceRuntime>,
     started_at: Instant,
     max_duration: Duration,
     cancellation: Arc<AtomicBool>,
+    terminal: Option<WorkspaceTerminalControl>,
 }
 
 #[derive(Clone)]
 pub struct ConfinedWorkspaceSessionHandle {
     cancellation: Arc<AtomicBool>,
+    terminal: Option<WorkspaceTerminalControl>,
 }
 
 impl ConfinedWorkspaceSessionHandle {
     pub fn terminate(&self) {
         self.cancellation.store(true, Ordering::Release);
+    }
+
+    pub fn resize_terminal(
+        &self,
+        columns: u32,
+        rows: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<(), String> {
+        self.terminal
+            .as_ref()
+            .ok_or_else(|| "workspace session has no pseudo-terminal".to_string())?
+            .resize(columns, rows, pixel_width, pixel_height)
     }
 }
 
@@ -180,39 +200,31 @@ impl ConfinedWorkspaceSession {
         workspace: &impl VerifiedWorkspaceMount,
         command: WorkspaceSessionCommand,
         limits: WorkspaceSessionLimits,
+        terminal: Option<WorkspaceTerminal>,
     ) -> Result<Self, WorkspaceSessionError> {
         let rootfs =
             verified_gvisor_git_rootfs().map_err(WorkspaceSessionError::RuntimeUnavailable)?;
-        let plan = WorkspaceSessionPlan::build(workspace, command, limits, rootfs)?;
+        let plan = WorkspaceSessionPlan::build(workspace, command, limits, rootfs, terminal)?;
         plan.launch(workspace)
     }
 
     pub fn take_io(&mut self) -> Result<ConfinedWorkspaceSessionIo, WorkspaceSessionError> {
-        let stdin = self.input.take();
-        let stdout = self.output.take();
-        let stderr = self.error.take();
-        match (stdin, stdout, stderr) {
-            (Some(stdin), Some(stdout), Some(stderr)) => Ok(ConfinedWorkspaceSessionIo {
-                stdin,
-                stdout,
-                stderr,
-            }),
-            _ => Err(WorkspaceSessionError::InvalidRequest(
+        self.io.take().ok_or_else(|| {
+            WorkspaceSessionError::InvalidRequest(
                 "workspace session I/O was already claimed".into(),
-            )),
-        }
+            )
+        })
     }
 
     pub fn handle(&self) -> ConfinedWorkspaceSessionHandle {
         ConfinedWorkspaceSessionHandle {
             cancellation: self.cancellation.clone(),
+            terminal: self.terminal.clone(),
         }
     }
 
     pub fn wait(mut self) -> Result<ConfinedWorkspaceSessionExit, WorkspaceSessionError> {
-        self.input.take();
-        self.output.take();
-        self.error.take();
+        self.io.take();
         let (status, timed_out, retirement) = loop {
             let child = self
                 .child
@@ -273,9 +285,7 @@ impl ConfinedWorkspaceSession {
 
 impl Drop for ConfinedWorkspaceSession {
     fn drop(&mut self) {
-        self.input.take();
-        self.output.take();
-        self.error.take();
+        self.io.take();
         let retirement = self.child.as_mut().map_or(
             DirectChildRetirement::NoChildReturned,
             SandboxChild::kill_and_wait,
@@ -292,6 +302,7 @@ struct WorkspaceSessionPlan {
     rootfs: PathBuf,
     mount_source: PathBuf,
     limits: WorkspaceSessionLimits,
+    terminal: Option<WorkspaceTerminal>,
 }
 
 impl WorkspaceSessionPlan {
@@ -300,6 +311,7 @@ impl WorkspaceSessionPlan {
         command: WorkspaceSessionCommand,
         limits: WorkspaceSessionLimits,
         rootfs: PathBuf,
+        terminal: Option<WorkspaceTerminal>,
     ) -> Result<Self, WorkspaceSessionError> {
         let mount_source = workspace
             .revalidated_mount_source()
@@ -312,13 +324,17 @@ impl WorkspaceSessionPlan {
             .map_err(WorkspaceSessionError::RuntimeUnavailable)?;
         let mount = OciWorkspaceMount::from_revalidated_source(&mount_source)
             .map_err(WorkspaceSessionError::InvalidRequest)?;
+        let mut environment = vec![
+            "HOME=/workspace".into(),
+            "SHELL=/bin/sh".into(),
+            "MYELIN_WORKSPACE=1".into(),
+        ];
+        if let Some(terminal) = terminal.as_ref() {
+            environment.push(terminal.environment());
+        }
         let config =
             OciConfig::for_fixed_command(command.argv()?, resource_limits.mem_bytes, &profile)
-                .with_extra_env(vec![
-                    "HOME=/workspace".into(),
-                    "SHELL=/bin/sh".into(),
-                    "MYELIN_WORKSPACE=1".into(),
-                ])
+                .with_extra_env(environment)
                 .with_rootless_workspace(rootfs.clone(), mount)
                 .map_err(WorkspaceSessionError::InvalidRequest)?;
         Ok(Self {
@@ -326,6 +342,7 @@ impl WorkspaceSessionPlan {
             rootfs,
             mount_source,
             limits,
+            terminal,
         })
     }
 
@@ -333,6 +350,12 @@ impl WorkspaceSessionPlan {
         self,
         workspace: &impl VerifiedWorkspaceMount,
     ) -> Result<ConfinedWorkspaceSession, WorkspaceSessionError> {
+        let prepared_terminal = self
+            .terminal
+            .as_ref()
+            .map(PreparedWorkspaceTerminal::open)
+            .transpose()
+            .map_err(WorkspaceSessionError::RuntimeUnavailable)?;
         let resource_limits = self.limits.resource_limits();
         let cgroup = MemoryCgroup::create(resource_limits.mem_bytes, resource_limits.cpu_millis)
             .map_err(WorkspaceSessionError::RuntimeUnavailable)?;
@@ -368,10 +391,17 @@ impl WorkspaceSessionPlan {
                 .arg("run")
                 .arg("-bundle")
                 .arg(&bundle.path)
-                .arg(&container_id)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .arg(&container_id);
+            if let Some(terminal) = prepared_terminal.as_ref() {
+                terminal
+                    .wire_child(process)
+                    .map_err(WorkspaceSessionError::Launch)?;
+            } else {
+                process
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            }
             cgroup
                 .place_child(process)
                 .map_err(|error| WorkspaceSessionError::Launch(error.to_string()))?;
@@ -386,31 +416,55 @@ impl WorkspaceSessionPlan {
         let mut child = command
             .spawn()
             .map_err(|error| WorkspaceSessionError::Launch(error.to_string()))?;
-        let input = child.stdin().take();
-        let output = child.stdout().take();
-        let error = child.stderr().take();
-        let (Some(input), Some(output), Some(error)) = (input, output, error) else {
-            let retirement = child.kill_and_wait();
-            let teardown = finalize_runtime(
-                &bin,
-                &container_id,
-                &PreparedRuntimeMode::Rootless,
-                cgroup,
-                RUNTIME_QUIESCE_TIMEOUT,
-                retirement,
-            );
-            let cleanup = bundle.cleanup();
-            return Err(WorkspaceSessionError::Launch(format!(
-                "runsc did not expose all three session pipes; teardown={teardown:?}; \
-                 cleanup={cleanup:?}"
-            )));
+        let io = match prepared_terminal {
+            Some(terminal) => terminal.finish().map(|terminal| {
+                (
+                    ConfinedWorkspaceSessionIo::Terminal {
+                        input: terminal.input,
+                        output: terminal.output,
+                    },
+                    Some(terminal.control),
+                )
+            }),
+            None => match (
+                child.stdin().take(),
+                child.stdout().take(),
+                child.stderr().take(),
+            ) {
+                (Some(stdin), Some(stdout), Some(stderr)) => Ok((
+                    ConfinedWorkspaceSessionIo::Pipes {
+                        stdin,
+                        stdout,
+                        stderr,
+                    },
+                    None,
+                )),
+                _ => Err("runsc did not expose all three session pipes".into()),
+            },
+        };
+        let (io, terminal) = match io {
+            Ok(io) => io,
+            Err(reason) => {
+                let retirement = child.kill_and_wait();
+                let teardown = finalize_runtime(
+                    &bin,
+                    &container_id,
+                    &PreparedRuntimeMode::Rootless,
+                    cgroup,
+                    RUNTIME_QUIESCE_TIMEOUT,
+                    retirement,
+                );
+                let cleanup = bundle.cleanup();
+                return Err(WorkspaceSessionError::Launch(format!(
+                    "workspace session I/O setup failed ({reason}); teardown={teardown:?}; \
+                     cleanup={cleanup:?}"
+                )));
+            }
         };
 
         Ok(ConfinedWorkspaceSession {
             child: Some(child),
-            input: Some(input),
-            output: Some(output),
-            error: Some(error),
+            io: Some(io),
             runtime: Some(WorkspaceRuntime {
                 bin,
                 container_id,
@@ -420,6 +474,7 @@ impl WorkspaceSessionPlan {
             started_at: Instant::now(),
             max_duration: self.limits.max_duration,
             cancellation: Arc::new(AtomicBool::new(false)),
+            terminal,
         })
     }
 }
@@ -453,6 +508,7 @@ mod tests {
             WorkspaceSessionCommand::Shell,
             WorkspaceSessionLimits::default(),
             PathBuf::from("/srv/myelin/rootfs/small-v1"),
+            None,
         )
         .unwrap();
         let json = plan.config.to_json().unwrap();
@@ -481,6 +537,7 @@ mod tests {
             WorkspaceSessionCommand::Exec("printf '%s\\n' hello > marker".into()),
             WorkspaceSessionLimits::default(),
             PathBuf::from("/srv/myelin/rootfs/small-v1"),
+            None,
         )
         .unwrap();
 
@@ -511,7 +568,29 @@ mod tests {
             WorkspaceSessionCommand::Shell,
             WorkspaceSessionLimits::default(),
             PathBuf::from("/srv/myelin/rootfs/small-v1"),
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn an_interactive_shell_receives_only_its_validated_terminal_type() {
+        let mount = Mount {
+            path: PathBuf::from("/srv/myelin/workspaces/opaque/workspace"),
+            calls: AtomicUsize::new(0),
+        };
+        let plan = WorkspaceSessionPlan::build(
+            &mount,
+            WorkspaceSessionCommand::Shell,
+            WorkspaceSessionLimits::default(),
+            PathBuf::from("/srv/myelin/rootfs/small-v1"),
+            Some(WorkspaceTerminal::new("xterm-256color", 120, 40, 0, 0).unwrap()),
+        )
+        .unwrap();
+
+        assert!(plan
+            .config
+            .extra_env
+            .contains(&"TERM=xterm-256color".into()));
     }
 }

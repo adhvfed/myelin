@@ -24,16 +24,23 @@ pub(crate) fn spawn_session_bridge<A>(
         let session_handle = confined.handle();
         let mut wait = tokio::task::spawn_blocking(move || confined.wait());
         let (mut channel_input, channel_output) = channel.split();
-        let ConfinedWorkspaceSessionIo {
-            stdin,
-            stdout,
-            stderr,
-        } = io;
-        let mut child_input = async_pipe(stdin);
-        let mut child_output = async_pipe(stdout);
-        let mut child_error = async_pipe(stderr);
+        let (mut child_input, mut child_output, child_error) = match io {
+            ConfinedWorkspaceSessionIo::Pipes {
+                stdin,
+                stdout,
+                stderr,
+            } => (
+                async_pipe(stdin),
+                async_pipe(stdout),
+                Some(async_pipe(stderr)),
+            ),
+            ConfinedWorkspaceSessionIo::Terminal { input, output } => (
+                tokio::fs::File::from_std(input),
+                tokio::fs::File::from_std(output),
+                None,
+            ),
+        };
         let mut output_destination = channel_output.make_writer();
-        let mut error_destination = channel_output.make_writer_ext(Some(1));
 
         let input_handle = session_handle.clone();
         let input = tokio::spawn(async move {
@@ -50,12 +57,15 @@ pub(crate) fn spawn_session_bridge<A>(
                 output_handle.terminate();
             }
         });
-        let error_handle = session_handle.clone();
-        let mut error = tokio::spawn(async move {
-            let result = tokio::io::copy(&mut child_error, &mut error_destination).await;
-            if result.is_err() {
-                error_handle.terminate();
-            }
+        let mut error = child_error.map(|mut child_error| {
+            let error_handle = session_handle.clone();
+            let mut error_destination = channel_output.make_writer_ext(Some(1));
+            tokio::spawn(async move {
+                let result = tokio::io::copy(&mut child_error, &mut error_destination).await;
+                if result.is_err() {
+                    error_handle.terminate();
+                }
+            })
         });
 
         let mut recheck = tokio::time::interval(Duration::from_secs(15));
@@ -76,7 +86,9 @@ pub(crate) fn spawn_session_bridge<A>(
         input.abort();
         let _ = input.await;
         drain_or_abort(&mut output).await;
-        drain_or_abort(&mut error).await;
+        if let Some(error) = error.as_mut() {
+            drain_or_abort(error).await;
+        }
         let code = exit
             .ok()
             .and_then(Result::ok)

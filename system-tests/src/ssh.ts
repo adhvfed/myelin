@@ -20,6 +20,7 @@ interface WorkspaceSshAccess {
 }
 
 export interface WorkspaceOverSsh {
+  hasInteractiveTerminal(): Promise<boolean>;
   readText(path: string): Promise<string>;
   writeText(path: string, content: string): Promise<void>;
 }
@@ -60,6 +61,16 @@ export async function connectToWorkspace(
   await writeFile(knownHostsPath, `${host} ${access.host_public_key}\n`, { mode: 0o600 });
 
   return {
+    async hasInteractiveTerminal(): Promise<boolean> {
+      const answer = await runWorkspaceCommand(
+        key,
+        access,
+        knownHostsPath,
+        "if test -t 0 && test -t 1; then printf yes; else printf no; fi",
+        true,
+      );
+      return answer.trim() === "yes";
+    },
     async readText(path: string): Promise<string> {
       const relative = workspacePath(path);
       return runWorkspaceCommand(key, access, knownHostsPath, `cat ${shellWord(relative)}`);
@@ -83,12 +94,13 @@ async function runWorkspaceCommand(
   access: WorkspaceSshAccess,
   knownHostsPath: string,
   command: string,
+  terminal = false,
 ): Promise<string> {
   try {
     const result = await run(
       "ssh",
       [
-        "-T",
+        terminal ? "-tt" : "-T",
         "-i",
         key.privateKeyPath,
         "-l",
