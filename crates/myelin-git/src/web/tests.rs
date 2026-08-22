@@ -95,70 +95,50 @@ fn fork_badge_appears_only_for_unendorsed_fork_success() {
 }
 
 #[test]
-fn fork_trust_action_is_absent_for_a_viewer_without_the_capability() {
+fn fork_trust_capability_is_explicit_in_the_view_model() {
     let fork = row(CheckState::Success, TrustTier::UntrustedFork, "build");
-
-    let with_cap = ForkTrustBadge::for_row(&fork, true, false)
-        .unwrap()
-        .render();
-    assert!(
-        with_cap.contains("Trust this run"),
-        "a maintainer sees the trust action"
-    );
-
-    let without_cap = ForkTrustBadge::for_row(&fork, false, false)
-        .unwrap()
-        .render();
-    assert!(
-        !without_cap.contains("Trust this run"),
-        "a viewer without approve_untrusted_ci must NOT see the trust action (no leaked affordance)"
-    );
-    assert!(without_cap.contains("untrusted fork") || without_cap.contains("FORK run"));
-}
-
-#[test]
-fn checks_panel_renders_humanised_summary_not_a_raw_ci_string() {
-    let r = row(CheckState::Failure, TrustTier::Trusted, "test");
-    let view = CheckRowView::from_row(&r, "3 tests failed", true, false, false);
-    let html = view.render();
-    assert!(
-        html.contains("3 tests failed"),
-        "the humanised summary renders"
-    );
-    assert!(html.contains("ci/test"), "the context renders");
-    assert!(html.contains("required"));
-    assert!(
-        html.contains("failed"),
-        "the failure label renders (never colour alone)"
-    );
-}
-
-#[test]
-fn checks_panel_covers_empty_loading_error_states() {
-    let empty = ChecksPanel::Empty.render();
-    assert!(empty.contains("No checks configured"));
-
-    let loading = ChecksPanel::Loading { skeleton_rows: 3 }.render();
     assert_eq!(
-        loading.matches("skeleton-row").count(),
-        3,
-        "skeleton matches the final layout"
+        ForkTrustBadge::for_row(&fork, true, false)
+            .unwrap()
+            .to_json(),
+        serde_json::json!({ "viewer_may_endorse": true })
     );
-    assert!(
-        loading.contains("aria-busy=\"true\""),
-        "skeleton sets aria-busy (DESIGN-MANUAL §6)"
+    assert_eq!(
+        ForkTrustBadge::for_row(&fork, false, false)
+            .unwrap()
+            .to_json(),
+        serde_json::json!({ "viewer_may_endorse": false })
     );
-    assert!(
-        loading.contains("aria-live=\"polite\""),
-        "one polite live region announces loading"
-    );
-    assert!(!loading.to_lowercase().contains("spinner"));
+}
 
-    let error = ChecksPanel::Error.render();
-    assert!(error.contains("Checks unavailable"));
-    assert!(
-        error.contains("Retry"),
-        "error offers a scoped retry path, never a dead end"
+#[test]
+fn check_rows_expose_humanised_status_and_context() {
+    let r = row(CheckState::Failure, TrustTier::Trusted, "test");
+    assert_eq!(
+        CheckRowView::from_row(&r, "3 tests failed", true, false, false).to_json(),
+        serde_json::json!({
+            "context": "ci/test",
+            "cue": { "token": "danger", "glyph": "✗", "label": "failed" },
+            "required": true,
+            "summary": "3 tests failed",
+            "fork_badge": null,
+        })
+    );
+}
+
+#[test]
+fn checks_panel_states_have_exact_transport_shapes() {
+    assert_eq!(
+        ChecksPanel::Empty.to_json(),
+        serde_json::json!({ "state": "empty" })
+    );
+    assert_eq!(
+        ChecksPanel::Loading { skeleton_rows: 3 }.to_json(),
+        serde_json::json!({ "state": "loading", "skeleton_rows": 3 })
+    );
+    assert_eq!(
+        ChecksPanel::Error.to_json(),
+        serde_json::json!({ "state": "error" })
     );
 }
 
@@ -178,24 +158,27 @@ fn merge_readiness_names_which_gate_is_unmet_never_a_bare_blocked() {
             },
         ],
     };
-    let html = MergeReadiness::from_gate(&outcome, (0, 2)).render();
-    assert!(html.contains("test"), "names the failing context");
-    assert!(html.contains("e2e"), "names the fork-neutral context");
-    assert!(
-        html.contains("awaiting fork trust"),
-        "humanises the fork-neutral reason"
+    assert_eq!(
+        MergeReadiness::from_gate(&outcome, (0, 2)).to_json(),
+        serde_json::json!({
+            "state": "blocked",
+            "unmet": [
+                { "context": "test", "reason": "test failed" },
+                { "context": "e2e", "reason": "e2e awaiting fork trust" },
+            ],
+        })
     );
-    assert!(html.contains("Blocked:"));
-    assert!(html.len() > "Blocked".len() + 20);
 }
 
 #[test]
-fn merge_readiness_ready_shows_merge_and_auto_merge() {
-    let html = MergeReadiness::from_gate(&MergeGateOutcome::Admitted, (2, 2)).render();
-    assert!(html.contains("All required checks green"));
-    assert!(html.contains("2/2 approvals"));
-    assert!(html.contains("Merge"));
-    assert!(html.contains("auto-merge"));
+fn merge_readiness_ready_carries_the_approval_count() {
+    assert_eq!(
+        MergeReadiness::from_gate(&MergeGateOutcome::Admitted, (2, 2)).to_json(),
+        serde_json::json!({
+            "state": "ready",
+            "approvals": { "current": 2, "required": 2 },
+        })
+    );
 }
 
 #[test]
@@ -209,23 +192,14 @@ fn pr_overview_tombstone_never_leaks_a_title() {
         checks: ChecksPanel::Empty,
         merge: MergeReadiness::Queued { position: 1 },
     };
-    let html = page.render();
-    assert!(
-        html.contains("not available to you"),
-        "dignified permission state"
-    );
-    assert!(
-        !html.contains("pr-title"),
-        "no title element for a tombstone"
-    );
-    assert!(
-        !html.contains("checks-panel"),
-        "no checks surface leaked for a tombstone"
+    assert_eq!(
+        page.to_json(),
+        serde_json::json!({ "visible": false, "restricted": true })
     );
 }
 
 #[test]
-fn pr_overview_visible_renders_title_state_checks_merge() {
+fn pr_overview_visible_carries_title_state_checks_and_merge() {
     let projection = crate::project::Projection {
         title: "Fix the receive-pack CAS".into(),
         state: "open".into(),
@@ -258,15 +232,13 @@ fn pr_overview_visible_renders_title_state_checks_merge() {
             }],
         },
     };
-    let html = page.render();
-    assert!(
-        html.contains("Fix the receive-pack CAS"),
-        "title renders for a visible projection"
-    );
-    assert!(html.contains("pr-state-pill"));
-    assert!(html.contains("checks-panel"));
-    assert!(html.contains("merge-readiness"));
-    assert!(html.contains("1/2 approvals"));
+    let json = page.to_json();
+    assert_eq!(json["visible"], true);
+    assert_eq!(json["title"], "Fix the receive-pack CAS");
+    assert_eq!(json["pr_state"], "open");
+    assert_eq!(json["render_hint"]["approvals"]["current"], 1);
+    assert_eq!(json["checks"]["rows"][0]["summary"], "3 tests failed");
+    assert_eq!(json["merge"]["unmet"][0]["reason"], "test failed");
 }
 
 #[test]
@@ -294,72 +266,6 @@ fn web_edit_refuses_a_stale_base_no_silent_overwrite() {
         WebEditOutcome::Denied,
         "no write permission is denied"
     );
-}
-
-#[test]
-fn web_edit_form_omits_composer_for_a_read_only_viewer() {
-    let editable = WebEditForm {
-        path: "src/lib.rs".into(),
-        contents: "fn main() {}".into(),
-        base_oid: "base".into(),
-        viewer_may_edit: true,
-    };
-    let ro = WebEditForm {
-        viewer_may_edit: false,
-        ..editable.clone()
-    };
-    assert!(
-        editable.render().contains("Commit change"),
-        "an editor sees the composer"
-    );
-    assert!(
-        !ro.render().contains("Commit change"),
-        "a read-only viewer: composer ABSENT, not greyed"
-    );
-    assert!(
-        ro.render().contains("fn main()"),
-        "the file still renders read-only"
-    );
-}
-
-#[test]
-fn rendered_markup_carries_no_inline_interactive_colour() {
-    let r = row(CheckState::Success, TrustTier::UntrustedFork, "build");
-    let badge = ForkTrustBadge::for_row(&r, true, false).unwrap().render();
-    let checks = ChecksPanel::Live {
-        rows: vec![CheckRowView::from_row(&r, "ok", true, true, false)],
-    }
-    .render();
-    for html in [badge, checks] {
-        assert!(
-            !html.contains("style=\"color"),
-            "no inline colour on rendered elements"
-        );
-        assert!(
-            !html.contains("style='color"),
-            "no inline colour on rendered elements"
-        );
-    }
-}
-
-#[test]
-fn page_shell_is_well_formed_and_uses_semantic_tokens() {
-    let html = page("PR #1", &ChecksPanel::Empty.render());
-    assert!(html.starts_with("<!doctype html>"));
-    assert!(html.contains("lang=\"en\""));
-    assert!(html.contains("data-theme=\"dark\""));
-    assert!(STYLE.contains("var(--success)"));
-    assert!(STYLE.contains("var(--focus-ring)"));
-    assert!(STYLE.contains("--focus-ring:") && STYLE.contains("--accent:"));
-    assert!(
-        STYLE.contains("prefers-reduced-motion"),
-        "reduced-motion is a first-class path"
-    );
-}
-
-#[test]
-fn escape_neutralises_html_metacharacters() {
-    assert_eq!(escape("<script>&\"'"), "&lt;script&gt;&amp;&quot;&#39;");
 }
 
 #[test]

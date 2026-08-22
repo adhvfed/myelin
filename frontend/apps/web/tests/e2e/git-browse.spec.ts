@@ -83,7 +83,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "searched ref switcher");
   });
 
-  test("blob view renders the file contents from the WebEditForm ViewModel", async ({ page }) => {
+  test("blob view renders file contents from the durable ViewModel", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin");
     await page.getByTestId("repo-tree").getByRole("link", { name: "README.md" }).click();

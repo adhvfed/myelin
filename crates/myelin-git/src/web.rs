@@ -5,21 +5,6 @@ use crate::project::{ChecksSummary, Projected, RenderHint};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-pub fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusToken {
     Success,
@@ -31,17 +16,6 @@ pub enum StatusToken {
 }
 
 impl StatusToken {
-    pub fn css_class(self) -> &'static str {
-        match self {
-            StatusToken::Success => "st-success",
-            StatusToken::Danger => "st-danger",
-            StatusToken::Warning => "st-warning",
-            StatusToken::Info => "st-info",
-            StatusToken::Muted => "st-muted",
-            StatusToken::Agent => "st-agent",
-        }
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             StatusToken::Success => "success",
@@ -120,32 +94,6 @@ impl ForkTrustBadge {
             TrustTier::UntrustedFork => Some(ForkTrustBadge { viewer_may_endorse }),
         }
     }
-
-    pub fn render(&self) -> String {
-        let mut h = String::new();
-        h.push_str(&format!(
-            "<div class=\"fork-trust-badge {}\" role=\"note\">",
-            StatusToken::Warning.css_class()
-        ));
-        h.push_str(
-            "<span class=\"badge-line\"><span class=\"glyph\" aria-hidden=\"true\">\u{26A8}</span>\
-             <strong>passed on a FORK run \u{2014} neutral until trusted</strong></span>",
-        );
-        h.push_str(
-            "<p class=\"badge-explain\">This run executed code from an untrusted fork. \
-             It does NOT satisfy the gate by itself. A maintainer must review and trust it.</p>",
-        );
-        if self.viewer_may_endorse {
-            h.push_str(
-                "<div class=\"badge-actions\">\
-                 <button class=\"btn btn-primary\" data-action=\"endorse-fork-ci\">Trust this run</button>\
-                 <button class=\"btn\" data-action=\"rerun-trusted\">Re-run</button>\
-                 </div>",
-            );
-        }
-        h.push_str("</div>");
-        h
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,39 +121,6 @@ impl CheckRowView {
             fork_badge: ForkTrustBadge::for_row(row, viewer_may_endorse, endorsed),
         }
     }
-
-    pub fn render(&self) -> String {
-        let mut h = String::new();
-        h.push_str("<li class=\"check-row\">");
-        h.push_str(&format!(
-            "<span class=\"check-status {}\"><span class=\"glyph\" aria-hidden=\"true\">{}</span>\
-             <span class=\"label\">{}</span></span>",
-            self.cue.token.css_class(),
-            self.cue.glyph,
-            escape(self.cue.label),
-        ));
-        h.push_str(&format!(
-            "<code class=\"check-context\">{}</code>",
-            escape(&self.context)
-        ));
-        h.push_str(&format!(
-            "<span class=\"check-required\">{}</span>",
-            if self.required {
-                "required"
-            } else {
-                "optional"
-            }
-        ));
-        h.push_str(&format!(
-            "<span class=\"check-summary\">{}</span>",
-            escape(&self.summary)
-        ));
-        if let Some(badge) = &self.fork_badge {
-            h.push_str(&badge.render());
-        }
-        h.push_str("</li>");
-        h
-    }
 }
 
 fn provider_label(row: &CheckStatusRow) -> &'static str {
@@ -224,48 +139,6 @@ pub enum ChecksPanel {
     Error,
 }
 
-impl ChecksPanel {
-    pub fn render(&self) -> String {
-        let mut h = String::new();
-        h.push_str("<section class=\"checks-panel\" aria-label=\"Checks\">");
-        h.push_str("<h3 class=\"panel-title\">Checks</h3>");
-        match self {
-            ChecksPanel::Live { rows } => {
-                h.push_str("<ul class=\"check-rows\">");
-                for r in rows {
-                    h.push_str(&r.render());
-                }
-                h.push_str("</ul>");
-            }
-            ChecksPanel::Empty => {
-                h.push_str(
-                    "<div class=\"state-empty\"><p>No checks configured for this branch.</p>\
-                     <a class=\"btn\" href=\"settings/rulesets\">Configure required checks</a></div>",
-                );
-            }
-            ChecksPanel::Loading { skeleton_rows } => {
-                h.push_str("<div class=\"state-loading\" aria-busy=\"true\">");
-                for _ in 0..*skeleton_rows {
-                    h.push_str("<div class=\"skeleton-row\" aria-hidden=\"true\"></div>");
-                }
-                h.push_str(
-                    "<span class=\"sr-only\" role=\"status\" aria-live=\"polite\">Checks queued\u{2026}</span>",
-                );
-                h.push_str("</div>");
-            }
-            ChecksPanel::Error => {
-                h.push_str(
-                    "<div class=\"state-error\" role=\"alert\">\
-                     <p>Checks unavailable.</p>\
-                     <button class=\"btn\" data-action=\"retry-checks\">Retry</button></div>",
-                );
-            }
-        }
-        h.push_str("</section>");
-        h
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeReadiness {
     Ready { approvals: (u32, u32) },
@@ -282,56 +155,6 @@ impl MergeReadiness {
                 unmet: unmet.clone(),
             },
         }
-    }
-
-    pub fn render(&self) -> String {
-        let mut h = String::new();
-        h.push_str("<section class=\"merge-readiness\" aria-label=\"Merge readiness\">");
-        h.push_str("<h3 class=\"panel-title\">Merge readiness</h3>");
-        match self {
-            MergeReadiness::Ready { approvals } => {
-                h.push_str(&format!(
-                    "<p class=\"ready {}\"><span class=\"glyph\" aria-hidden=\"true\">\u{2714}</span>\
-                     All required checks green \u{00B7} {}/{} approvals \u{00B7} threads resolved</p>",
-                    StatusToken::Success.css_class(),
-                    approvals.0,
-                    approvals.1,
-                ));
-                h.push_str(
-                    "<div class=\"merge-actions\">\
-                     <button class=\"btn btn-primary\" data-action=\"merge\">Merge</button>\
-                     <button class=\"btn\" data-action=\"auto-merge\">Enable auto-merge when green</button>\
-                     </div>",
-                );
-            }
-            MergeReadiness::Blocked { unmet } => {
-                let reasons: Vec<String> = unmet.iter().map(humanise_unmet).collect();
-                h.push_str(&format!(
-                    "<p class=\"blocked {}\"><span class=\"glyph\" aria-hidden=\"true\">\u{26A0}</span>\
-                     Blocked: {}</p>",
-                    StatusToken::Warning.css_class(),
-                    escape(&reasons.join(" \u{00B7} ")),
-                ));
-            }
-            MergeReadiness::Queued { position } => {
-                h.push_str(&format!(
-                    "<p class=\"queued {}\"><span class=\"glyph\" aria-hidden=\"true\">\u{27F3}</span>\
-                     Queued (position {}) \u{2192} testing \u{2192} merged</p>",
-                    StatusToken::Info.css_class(),
-                    position,
-                ));
-            }
-            MergeReadiness::HitlHold { awaiting } => {
-                h.push_str(&format!(
-                    "<p class=\"hitl-hold {}\"><span class=\"glyph\" aria-hidden=\"true\">\u{27F3}</span>\
-                     {}</p>",
-                    StatusToken::Warning.css_class(),
-                    escape(awaiting),
-                ));
-            }
-        }
-        h.push_str("</section>");
-        h
     }
 }
 
@@ -354,131 +177,6 @@ pub struct PrOverviewPage {
     pub pr_state: PrState,
     pub checks: ChecksPanel,
     pub merge: MergeReadiness,
-}
-
-impl PrOverviewPage {
-    pub fn render(&self) -> String {
-        let mut h = String::new();
-        h.push_str("<main class=\"pr-overview\">");
-        match &self.projected {
-            Projected::Tombstoned(_t) => {
-                h.push_str(
-                    "<div class=\"state-restricted\" role=\"note\">\
-                     <span class=\"glyph\" aria-hidden=\"true\">\u{1F512}</span>\
-                     <p>This pull request is not available to you.</p></div>",
-                );
-            }
-            Projected::Visible(p) => {
-                h.push_str(&format!("<h1 class=\"pr-title\">{}</h1>", escape(&p.title)));
-                h.push_str(&format!(
-                    "<span class=\"pr-state-pill {}\">{}</span>",
-                    pr_state_token(self.pr_state).css_class(),
-                    pr_state_label(self.pr_state),
-                ));
-                if let Some(hint) = &p.render_hint {
-                    h.push_str(&render_pr_hint(hint));
-                }
-                h.push_str(&self.checks.render());
-                h.push_str(&self.merge.render());
-            }
-        }
-        h.push_str("</main>");
-        h
-    }
-}
-
-pub fn representative_pr_page(tenant: &str) -> PrOverviewPage {
-    use crate::check_status::{CheckContext, CheckStatus, GitOid, HumanisedRef, Timestamp};
-    use myelin_tenancy::{ArtifactRef, TenantId};
-    let fact = CheckStatus {
-        tenant: TenantId(tenant.into()),
-        repo: ArtifactRef(format!("myelin://{tenant}/git/repo/myelin")),
-        commit_oid: GitOid("blake3:representativehead".into()),
-        context: CheckContext::ci("build"),
-        state: CheckState::Success,
-        required: true,
-        run: ArtifactRef(format!("myelin://{tenant}/ci/run/1")),
-        run_attempt: 1,
-        trust_tier: TrustTier::Trusted,
-        details_ref: ArtifactRef(format!("myelin://{tenant}/ci/run/1#step-1")),
-        summary: HumanisedRef {
-            template_key: "ci.check.updated".into(),
-            args: std::collections::BTreeMap::new(),
-        },
-        started_at: Timestamp("2026-06-26T00:00:00Z".into()),
-        completed_at: Some(Timestamp("2026-06-26T00:01:00Z".into())),
-        cost_settled: true,
-    };
-    let row = CheckStatusRow::from_fact(&fact);
-    PrOverviewPage {
-        projected: Projected::Visible(crate::project::Projection {
-            title: format!("[{tenant}] Verify backup recovery at cell scale"),
-            state: "open".into(),
-            icon: "pr".into(),
-            render_hint: Some(RenderHint {
-                checks: ChecksSummary::Green,
-                approvals: (2, 2),
-                is_draft: false,
-            }),
-            sub_anchor: None,
-        }),
-        pr_state: PrState::Open,
-        checks: ChecksPanel::Live {
-            rows: vec![CheckRowView::from_row(
-                &row,
-                "build passed",
-                true,
-                false,
-                false,
-            )],
-        },
-        merge: MergeReadiness::from_gate(&MergeGateOutcome::Admitted, (2, 2)),
-    }
-}
-
-fn render_pr_hint(hint: &RenderHint) -> String {
-    let cue = match hint.checks {
-        ChecksSummary::Green => StatusCue {
-            token: StatusToken::Success,
-            glyph: "\u{2714}",
-            label: "checks green",
-        },
-        ChecksSummary::Red => StatusCue {
-            token: StatusToken::Danger,
-            glyph: "\u{2717}",
-            label: "checks blocked",
-        },
-        ChecksSummary::Neutral => StatusCue {
-            token: StatusToken::Muted,
-            glyph: "\u{2296}",
-            label: "no required checks",
-        },
-    };
-    format!(
-        "<div class=\"pr-hint\"><span class=\"check-status {}\">\
-         <span class=\"glyph\" aria-hidden=\"true\">{}</span>\
-         <span class=\"label\">{}</span></span>\
-         <span class=\"approvals\">{}/{} approvals</span>{}</div>",
-        cue.token.css_class(),
-        cue.glyph,
-        escape(cue.label),
-        hint.approvals.0,
-        hint.approvals.1,
-        if hint.is_draft {
-            "<span class=\"draft-pill\">draft</span>"
-        } else {
-            ""
-        },
-    )
-}
-
-fn pr_state_token(s: PrState) -> StatusToken {
-    match s {
-        PrState::Merged => StatusToken::Success,
-        PrState::Open => StatusToken::Info,
-        PrState::Draft => StatusToken::Muted,
-        PrState::Closed => StatusToken::Danger,
-    }
 }
 
 fn pr_state_label(s: PrState) -> &'static str {
@@ -896,55 +594,6 @@ fn validated_repo_list_clone_url(clone_url: String) -> Result<String, RepoListRo
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WebEditForm {
-    pub path: String,
-    pub contents: String,
-    pub base_oid: String,
-    pub viewer_may_edit: bool,
-}
-
-impl WebEditForm {
-    pub fn render(&self) -> String {
-        let mut h = String::new();
-        h.push_str("<main class=\"web-edit\">");
-        h.push_str(&format!(
-            "<h3 class=\"edit-path\"><code>{}</code></h3>",
-            escape(&self.path)
-        ));
-        if self.viewer_may_edit {
-            h.push_str(&format!(
-                "<form data-action=\"web-commit\" data-base-oid=\"{}\">",
-                escape(&self.base_oid)
-            ));
-            h.push_str(&format!(
-                "<textarea class=\"edit-buffer\" name=\"contents\" aria-label=\"File contents\">{}</textarea>",
-                escape(&self.contents)
-            ));
-            h.push_str(
-                "<label class=\"commit-msg-label\">Commit message\
-                 <input class=\"commit-msg\" name=\"message\" /></label>",
-            );
-            h.push_str(
-                "<p class=\"edit-note st-muted\">Single-file edit. If the file changed since you \
-                 opened it, this edit will be refused so nothing is silently overwritten.</p>",
-            );
-            h.push_str(
-                "<button class=\"btn btn-primary\" type=\"submit\" data-action=\"commit-file\">\
-                 Commit change</button>",
-            );
-            h.push_str("</form>");
-        } else {
-            h.push_str(&format!(
-                "<pre class=\"edit-buffer readonly\">{}</pre>",
-                escape(&self.contents)
-            ));
-        }
-        h.push_str("</main>");
-        h
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebEditOutcome {
     Committed { new_oid: String },
     StaleBase { current_oid: String },
@@ -971,57 +620,6 @@ impl WebEditOutcome {
             }
         }
     }
-}
-
-pub const STYLE: &str = "\
-:root{\
-  --surface:#0e1116;--surface-raised:#161b22;--surface-overlay:#1c2230;\
-  --text-primary:#e6edf3;--text-muted:#8b949e;--border:#30363d;\
-  --accent:#3b82f6;--focus-ring:#7aa2ff;\
-  --success:#3fb950;--danger:#f85149;--warning:#d29922;--info:#58a6ff;--agent:#a371f7;\
-}\
-body{background:var(--surface);color:var(--text-primary);\
-  font-family:-apple-system,system-ui,sans-serif;font-size:14px;margin:0;padding:16px;}\
-code,pre,.check-context{font-family:ui-monospace,'JetBrains Mono',monospace;font-size:13px;}\
-h1,h2,h3{font-weight:600;}\
-.panel-title{font-size:16px;}\
-section,.fork-trust-badge,.web-edit form{background:var(--surface-raised);\
-  border:1px solid var(--border);border-radius:3px;padding:12px;margin:12px 0;}\
-.st-success,.check-status.st-success .label{color:var(--success);}\
-.st-danger,.check-status.st-danger .label{color:var(--danger);}\
-.st-warning,.check-status.st-warning .label{color:var(--warning);}\
-.st-info,.check-status.st-info .label{color:var(--info);}\
-.st-muted,.check-status.st-muted .label{color:var(--text-muted);}\
-.st-agent{color:var(--agent);}\
-.check-row{display:flex;gap:12px;align-items:baseline;list-style:none;padding:4px 0;}\
-.check-rows{padding:0;margin:0;}\
-.check-summary{color:var(--text-muted);}\
-.fork-trust-badge{border-color:var(--warning);}\
-.badge-explain{color:var(--text-muted);font-size:13px;}\
-.btn{background:var(--surface-overlay);color:var(--text-primary);\
-  border:1px solid var(--border);border-radius:3px;padding:4px 12px;cursor:pointer;}\
-.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent);}\
-.btn:focus-visible,.btn-primary:focus-visible,a:focus-visible,textarea:focus-visible,\
-input:focus-visible{outline:2px solid var(--focus-ring);outline-offset:2px;}\
-.skeleton-row{height:20px;background:var(--surface-overlay);border-radius:3px;margin:6px 0;}\
-.state-restricted,.state-empty,.state-error,.state-loading{color:var(--text-muted);}\
-.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);}\
-.pr-state-pill,.draft-pill{border:1px solid var(--border);border-radius:999px;\
-  padding:2px 8px;font-size:12px;}\
-.edit-buffer{width:100%;min-height:160px;background:var(--surface);color:var(--text-primary);\
-  border:1px solid var(--border);}\
-@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}\
-";
-
-pub fn page(title: &str, body: &str) -> String {
-    format!(
-        "<!doctype html><html lang=\"en\" dir=\"ltr\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>{}</title><style>{}</style></head><body data-theme=\"dark\">{}</body></html>",
-        escape(title),
-        STYLE,
-        body,
-    )
 }
 
 impl StatusCue {
@@ -1123,17 +721,6 @@ fn render_hint_json(h: &RenderHint) -> Value {
         "approvals": { "current": h.approvals.0, "required": h.approvals.1 },
         "is_draft": h.is_draft,
     })
-}
-
-impl WebEditForm {
-    pub fn to_json(&self) -> Value {
-        json!({
-            "path": self.path,
-            "contents": self.contents,
-            "base_oid": self.base_oid,
-            "viewer_may_edit": self.viewer_may_edit,
-        })
-    }
 }
 
 impl WebEditOutcome {
