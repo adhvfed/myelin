@@ -15,9 +15,15 @@ export const privacyClient = new SystemTestClient({
   principal: systemTestConfig.privacyPrincipal,
 });
 
-export async function browserApprovedCliClient(
+export interface BrowserApprovedCliCredential {
+  client: SystemTestClient;
+  token: string;
+  tokenScheme: "session";
+}
+
+export async function browserApprovedCliCredential(
   approver: SystemTestClient = systemClient,
-): Promise<SystemTestClient> {
+): Promise<BrowserApprovedCliCredential> {
   const codeVerifier = randomBytes(32).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier, "utf8").digest("base64url");
   const started = await systemClient.json("/v1/auth/device/authorization", {
@@ -39,11 +45,22 @@ export async function browserApprovedCliClient(
     body: { device_code: deviceCode, code_verifier: codeVerifier },
   });
 
-  return new SystemTestClient({
-    ...systemTestConfig,
-    token: string(claimed.body.access_token, "browser-approved CLI token"),
+  const token = string(claimed.body.access_token, "browser-approved CLI token");
+  return {
+    client: new SystemTestClient({
+      ...systemTestConfig,
+      token,
+      tokenScheme: "session",
+    }),
+    token,
     tokenScheme: "session",
-  });
+  };
+}
+
+export async function browserApprovedCliClient(
+  approver: SystemTestClient = systemClient,
+): Promise<SystemTestClient> {
+  return (await browserApprovedCliCredential(approver)).client;
 }
 
 export function uniqueName(prefix: string): string {

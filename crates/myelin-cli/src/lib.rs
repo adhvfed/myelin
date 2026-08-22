@@ -11,6 +11,7 @@ pub mod git_credential;
 pub mod mcp_bridge;
 mod profiles;
 pub mod render;
+pub mod workspace_ssh;
 
 pub use config::EdgeConfig;
 pub use dispatch::{EdgeCall, HttpMethod};

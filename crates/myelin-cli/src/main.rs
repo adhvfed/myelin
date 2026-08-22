@@ -3,7 +3,7 @@ use myelin_cli::client::execute;
 use myelin_cli::config::{
     self, load_profile_credential, remove_profile_credential, resolve_edge,
     resolve_profile_credential, resolve_project, selected_saved_profile, set_profile_project,
-    store_profile_credential, EdgeConfig, SESSION_SCHEME,
+    store_profile_credential, Credential, EdgeConfig, SESSION_SCHEME,
 };
 use myelin_cli::context as cli_context;
 use myelin_cli::device_auth::{
@@ -303,16 +303,22 @@ async fn run() -> Result<(), CliError> {
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Agent { args } => {
-            let project = resolve_project(
-                cli.project.as_deref(),
-                cli.profile.as_deref(),
-                &getenv,
-                &read_file,
-            )?;
-            let (call, command_key) = dispatch_command(args, |args| {
-                agent_dispatch_with_project(args, project.as_deref())
-            })?;
-            run_call(&cli, &getenv, &read_file, call, command_key).await
+            if let Some(command) =
+                myelin_cli::workspace_ssh::WorkspaceSshCommand::parse_agent_args(args)?
+            {
+                run_workspace_ssh(&cli, &getenv, &read_file, &command).await
+            } else {
+                let project = resolve_project(
+                    cli.project.as_deref(),
+                    cli.profile.as_deref(),
+                    &getenv,
+                    &read_file,
+                )?;
+                let (call, command_key) = dispatch_command(args, |args| {
+                    agent_dispatch_with_project(args, project.as_deref())
+                })?;
+                run_call(&cli, &getenv, &read_file, call, command_key).await
+            }
         }
         Command::Automation { args } => {
             let (call, command_key) = dispatch_command(args, automation_dispatch)?;
@@ -808,6 +814,12 @@ enum ResponseEffect {
     SelectCreatedProject,
 }
 
+struct ResolvedEdgeInvocation {
+    edge: EdgeConfig,
+    credential: Credential,
+    context_profile: Option<String>,
+}
+
 async fn run_call_with_effect(
     cli: &Cli,
     getenv: &dyn Fn(&str) -> Option<String>,
@@ -840,6 +852,43 @@ async fn run_call_with_effect(
             call
         }
     };
+    let invocation = resolve_edge_invocation(cli, getenv, read_file)?;
+    if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        return myelin_cli::ci_watch::execute_ci_watch(
+            &invocation.edge,
+            &invocation.credential.token,
+            &call,
+            cli.json,
+            &mut output,
+        )
+        .await;
+    }
+    let value = execute(&invocation.edge, &invocation.credential.token, &call).await?;
+    let context_message = apply_response_effect(
+        effect,
+        &value,
+        invocation.context_profile.as_deref(),
+        getenv,
+    )?;
+    print!(
+        "{}",
+        myelin_cli::render::render_for_call(&value, cli.json, &call)
+    );
+    if !cli.json {
+        if let Some(message) = context_message {
+            println!("{message}");
+        }
+    }
+    Ok(())
+}
+
+fn resolve_edge_invocation(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Result<ResolvedEdgeInvocation, CliError> {
     let credential = resolve_profile_credential(
         cli.profile.as_deref(),
         cli.token.as_deref(),
@@ -866,31 +915,37 @@ async fn run_call_with_effect(
                 && edge.url == profile.edge_url
         })
         .map(|profile| profile.name.clone());
-    if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
-        let stdout = std::io::stdout();
-        let mut output = stdout.lock();
-        return myelin_cli::ci_watch::execute_ci_watch(
-            &edge,
-            &credential.token,
-            &call,
-            cli.json,
-            &mut output,
-        )
-        .await;
+    Ok(ResolvedEdgeInvocation {
+        edge,
+        credential,
+        context_profile,
+    })
+}
+
+async fn run_workspace_ssh(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+    command: &myelin_cli::workspace_ssh::WorkspaceSshCommand,
+) -> Result<(), CliError> {
+    if cli.json {
+        return Err(CliError::Usage(
+            "agent thread ssh is an interactive transport and does not support --json".into(),
+        ));
     }
-    let value = execute(&edge, &credential.token, &call).await?;
-    let context_message =
-        apply_response_effect(effect, &value, context_profile.as_deref(), getenv)?;
-    print!(
-        "{}",
-        myelin_cli::render::render_for_call(&value, cli.json, &call)
-    );
-    if !cli.json {
-        if let Some(message) = context_message {
-            println!("{message}");
-        }
+    if cli.project.is_some() {
+        return Err(CliError::Usage(
+            "--project does not apply to agent thread ssh".into(),
+        ));
     }
-    Ok(())
+    if cli.idempotency_key.is_some() {
+        return Err(CliError::Usage(
+            "agent thread ssh owns its one-shot retry identity; do not pass --idempotency-key"
+                .into(),
+        ));
+    }
+    let invocation = resolve_edge_invocation(cli, getenv, read_file)?;
+    myelin_cli::workspace_ssh::enter(&invocation.edge, &invocation.credential.token, command).await
 }
 
 fn apply_response_effect(

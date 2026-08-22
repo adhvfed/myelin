@@ -33,6 +33,7 @@ keyring = "4.1.6"
 rand = "0.8"
 sha2 = { workspace = true }
 zeroize = "1"
+tempfile.workspace = true
 
 percent-encoding = "2.3"
 
@@ -50,4 +51,3 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-tenancy = { path = "../myelin-tenancy" }
-tempfile.workspace = true
