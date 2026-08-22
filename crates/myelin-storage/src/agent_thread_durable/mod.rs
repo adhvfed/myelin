@@ -42,6 +42,8 @@ use crate::{
     HUMAN_PRINCIPAL_KIND_JSON,
 };
 
+const RESUMABLE_AGENT_RUNTIME_REF: &str = "external:mcp";
+
 #[derive(Clone)]
 pub struct DurableAgentThreadBacking {
     provider: SubstrateProvider,
@@ -96,8 +98,8 @@ impl DurableAgentThreadBacking {
                         return Ok(CreateAgentThreadOutcome::OwnerUnavailable);
                     }
 
-                    let agent_status = sqlx::query_scalar::<_, String>(
-                        "SELECT principal.status FROM identity_agent agent
+                    let agent = sqlx::query_as::<_, (String, String)>(
+                        "SELECT principal.status, agent.runtime_ref FROM identity_agent agent
                            JOIN principal
                              ON principal.tenant_id = agent.tenant_id
                             AND principal.region = agent.region
@@ -113,8 +115,14 @@ impl DurableAgentThreadBacking {
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("verify agent thread agent"))?;
-                    if agent_status.as_deref() != Some(ACTIVE_PRINCIPAL_STATUS_JSON) {
+                    let Some((agent_status, runtime_ref)) = agent else {
                         return Ok(CreateAgentThreadOutcome::AgentUnavailable);
+                    };
+                    if agent_status != ACTIVE_PRINCIPAL_STATUS_JSON {
+                        return Ok(CreateAgentThreadOutcome::AgentUnavailable);
+                    }
+                    if runtime_ref != RESUMABLE_AGENT_RUNTIME_REF {
+                        return Ok(CreateAgentThreadOutcome::AgentRuntimeUnsupported);
                     }
 
                     if live_name_exists(

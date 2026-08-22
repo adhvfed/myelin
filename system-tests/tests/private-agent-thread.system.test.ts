@@ -31,6 +31,38 @@ import { connectToWorkspace, generateEphemeralSshKey } from "../src/ssh.js";
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
 
 describe("private work with an agent", () => {
+  test("refuses an agent runtime that cannot resume private work before provisioning anything", async () => {
+    const founder = await browserApprovedCliClient();
+    const threadName = uniqueName("Hosted thread that must not exist");
+    const activated = await founder.json("/v1/agents", {
+      method: "POST",
+      body: {
+        name: uniqueName("Hosted automation specialist"),
+        runtime: "hosted",
+        tools: ["chat.read_messages"],
+      },
+      idempotencyKey: `hosted-agent-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const hostedAgent = record(activated.body.agent, "hosted agent");
+
+    const rejected = await founder.json("/v1/agent-threads", {
+      method: "POST",
+      body: {
+        name: threadName,
+        agent_id: string(hostedAgent.id, "hosted agent id"),
+        retention_days: 3,
+      },
+      idempotencyKey: `hosted-agent-thread-${randomUUID()}`,
+      expectedStatus: 400,
+    });
+
+    expect(rejected.body).toMatchObject({ error: { code: "bad_request" } });
+    expect(await listPrivateAgentThreads(founder)).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: threadName })]),
+    );
+  });
+
   test("keeps one named problem and workspace private while fresh agent context resumes it", async () => {
     const founder = await browserApprovedCliClient();
     const teammate = await browserApprovedCliClient(reviewerClient);

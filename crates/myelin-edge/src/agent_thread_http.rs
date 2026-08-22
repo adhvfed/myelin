@@ -91,6 +91,11 @@ impl AgentThreadHttpApi {
             CreateAgentThreadOutcome::AgentUnavailable => {
                 return Err(EdgeError::NotFound("agent not found".into()))
             }
+            CreateAgentThreadOutcome::AgentRuntimeUnsupported => {
+                return Err(EdgeError::BadRequest(
+                    "private agent threads require an external MCP agent".into(),
+                ))
+            }
         };
         if !created && thread.state != AgentThreadState::Provisioning {
             return Ok((thread, false));

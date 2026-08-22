@@ -153,6 +153,36 @@ async fn set_agent_status(
         .unwrap();
 }
 
+async fn set_agent_runtime(
+    provider: &SubstrateProvider,
+    tenant: &str,
+    agent_id: Uuid,
+    runtime_ref: &str,
+) {
+    let tenant = tenant.to_string();
+    let region = provider.config().region.clone();
+    let runtime_ref = runtime_ref.to_string();
+    provider
+        .with_tenant_tx(&tenant.clone(), move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE identity_agent SET runtime_ref = $4
+                      WHERE tenant_id = $1 AND region = $2 AND agent_id = $3",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(agent_id)
+                .bind(&runtime_ref)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
 async fn seed_ready_run(
     provider: &SubstrateProvider,
     tenant: &str,
@@ -213,6 +243,13 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     seed_agent(&app, &tenant, owner, agent_id).await;
     let threads = DurableAgentThreadBacking::new(app.clone());
     let intended = proposal(owner, agent_id, 101);
+
+    set_agent_runtime(&app, &tenant, agent_id, "hosted:luna").await;
+    assert_eq!(
+        threads.create(&tenant, intended.clone()).await.unwrap(),
+        CreateAgentThreadOutcome::AgentRuntimeUnsupported
+    );
+    set_agent_runtime(&app, &tenant, agent_id, "external:mcp").await;
 
     let created = threads
         .create(&tenant, intended.clone())

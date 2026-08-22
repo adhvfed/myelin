@@ -85,6 +85,7 @@ pub enum CreateAgentThreadOutcome {
     NameConflict,
     OwnerUnavailable,
     AgentUnavailable,
+    AgentRuntimeUnsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
