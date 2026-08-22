@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-use myelin_agent_service::{workspace::AgentWorkspaceProvisioner, PlatformToolCatalogue};
+use myelin_agent_service::{workspace::AgentWorkspaceStore, PlatformToolCatalogue};
 use myelin_chat::conversation::{Conversation, ConversationKind};
 use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::{ConversationId, SystemUlidSource, UlidSource};
@@ -34,7 +34,7 @@ struct AgentThreadHttpApi {
     threads: DurableAgentThreadBacking,
     chat_reads: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
-    workspaces: Arc<dyn AgentWorkspaceProvisioner>,
+    workspaces: Arc<dyn AgentWorkspaceStore>,
     sessions: AgentSessionIssuer,
     catalogue: Arc<PlatformToolCatalogue>,
     event_ids: Arc<dyn IdMinter>,
@@ -418,7 +418,7 @@ pub fn register_agent_threads(
     threads: DurableAgentThreadBacking,
     chat_reads: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
-    workspaces: Arc<dyn AgentWorkspaceProvisioner>,
+    workspaces: Arc<dyn AgentWorkspaceStore>,
     sessions: AgentSessionIssuer,
     runtime: Handle,
 ) -> GatewayBuilder {

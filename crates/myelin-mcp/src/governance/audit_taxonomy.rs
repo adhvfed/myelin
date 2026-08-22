@@ -99,6 +99,14 @@ pub(super) fn effect_event_type(
             denied: myelin_content::events::KNOWLEDGE_LINK_WORK_DENIED,
             indeterminate: myelin_content::events::KNOWLEDGE_LINK_WORK_INDETERMINATE,
         },
+        "workspace.write_file" => EffectAuditEvents {
+            attempted: myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_ATTEMPTED,
+            applied: myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_APPLIED,
+            gated: myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_GATED,
+            denied: myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_DENIED,
+            indeterminate:
+                myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_INDETERMINATE,
+        },
         _ => return Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     };
     Ok(events.event_for(outcome))
@@ -121,5 +129,32 @@ pub(super) fn approval_event_type(
             AuditPhase::Expired => Ok(myelin_issues::events::ISSUE_CLOSE_EXPIRED),
             _ => Err("invalid approval audit phase".into()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_writes_have_a_complete_durable_audit_lifecycle() {
+        let expected = [
+            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_ATTEMPTED,
+            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_APPLIED,
+            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_GATED,
+            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_DENIED,
+            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_INDETERMINATE,
+        ];
+        let outcomes = [
+            EffectAuditOutcome::Attempted,
+            EffectAuditOutcome::Applied,
+            EffectAuditOutcome::Gated,
+            EffectAuditOutcome::Denied,
+            EffectAuditOutcome::Indeterminate,
+        ];
+        assert_eq!(
+            outcomes.map(|outcome| effect_event_type("workspace.write_file", outcome).unwrap()),
+            expected
+        );
     }
 }

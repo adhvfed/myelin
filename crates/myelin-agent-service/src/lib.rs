@@ -39,6 +39,7 @@ pub mod trigger_consumer;
 #[cfg(feature = "integration")]
 pub mod trigger_handoff;
 pub mod workspace;
+pub mod workspace_events;
 pub mod workspace_tools;
 
 pub use holder::{

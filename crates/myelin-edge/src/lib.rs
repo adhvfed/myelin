@@ -46,10 +46,13 @@ pub mod sse;
 pub mod tool_http;
 pub mod trigger_http;
 mod trigger_lifecycle;
+mod workspace_access;
+mod workspace_effect;
 
 pub use agent_http::register_agents;
 pub use agent_mcp_http::{
-    register_agent_mcp, AgentMcpAuthority, AgentMcpResources, AgentMcpServices,
+    register_agent_mcp, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources,
+    AgentMcpServices,
 };
 pub use agent_thread_http::register_agent_threads;
 #[cfg(any(test, feature = "test-support"))]
@@ -129,3 +132,4 @@ pub use session::{SessionRecord, SessionStore, SESSION_COOKIE};
 pub use sse::{SseEvent, SseHub, SseSubscription};
 pub use tool_http::register_tools;
 pub use trigger_http::register_triggers;
+pub use workspace_access::DurableAgentWorkspaceAccess;

@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::agent_delegation::ActiveDelegation;
+use crate::workspace_access::{WorkspaceRunAccess, WorkspaceRunAccessError};
 use crate::DurableGitBackend;
 
 pub struct McpReadExecutor {
@@ -25,6 +26,7 @@ pub struct McpReadExecutor {
     chat: Option<DurableChatReadApi>,
     git: Option<Arc<DurableGitBackend>>,
     projects: Option<DurableProjectReadApi>,
+    workspace: Option<WorkspaceRunAccess>,
     authority: Arc<RunTokenAuthorizer>,
     access_subject: Principal,
 }
@@ -42,6 +44,7 @@ impl McpReadExecutor {
             chat: None,
             git: None,
             projects: None,
+            workspace: None,
             authority,
             access_subject,
         }
@@ -69,6 +72,11 @@ impl McpReadExecutor {
 
     pub fn with_projects(mut self, projects: DurableProjectReadApi) -> Self {
         self.projects = Some(projects);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: Option<WorkspaceRunAccess>) -> Self {
+        self.workspace = workspace;
         self
     }
 }
@@ -247,8 +255,38 @@ impl DirectReadExecutor for McpReadExecutor {
                     .list(access_subject, limit, cursor)
                     .map_err(map_edge_error)
             }
+            "workspace.read_file" => {
+                exact_fields(arguments, &["path"], &["path"])?;
+                let path = required_string(arguments, "path")?;
+                let outcome = self
+                    .workspace
+                    .as_ref()
+                    .ok_or(DirectReadError::Denied)?
+                    .read_file(path)
+                    .map_err(map_workspace_error)?;
+                let content = String::from_utf8(outcome.file.bytes)
+                    .map_err(|_| invalid("workspace file is not valid UTF-8"))?;
+                Ok(serde_json::json!({
+                    "path": outcome.file.path,
+                    "content": content,
+                    "byte_len": content.len(),
+                    "content_digest": blake3::hash(content.as_bytes()).to_hex().to_string(),
+                    "workspace_generation": outcome.binding.workspace_generation,
+                }))
+            }
             _ => Err(DirectReadError::Unavailable),
         }
+    }
+}
+
+fn map_workspace_error(error: WorkspaceRunAccessError) -> DirectReadError {
+    match error {
+        WorkspaceRunAccessError::InvalidPath(reason) => invalid(reason),
+        WorkspaceRunAccessError::NotFound => DirectReadError::NotFound,
+        WorkspaceRunAccessError::TooLarge => {
+            invalid("workspace file exceeds the interactive limit")
+        }
+        WorkspaceRunAccessError::Unavailable => DirectReadError::Unavailable,
     }
 }
 

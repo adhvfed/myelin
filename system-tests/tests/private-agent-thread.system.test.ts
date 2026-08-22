@@ -10,6 +10,9 @@ import {
 import {
   activateExternalAgent,
   askAgent,
+  askAgentToAct,
+  askAgentToBeDenied,
+  beginAgentRun,
   beginAgentThreadRun,
   closeAgentRun,
 } from "../src/journeys/agents.js";
@@ -19,7 +22,7 @@ import {
   startPrivateAgentThread,
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
-import { array } from "../src/json.js";
+import { array, record, string } from "../src/json.js";
 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
 
@@ -30,10 +33,17 @@ describe("private work with an agent", () => {
     const companion = await activateExternalAgent(
       founder,
       uniqueName("Checkout companion"),
-      ["chat.read_messages", "chat.post"],
+      [
+        "chat.read_messages",
+        "chat.post",
+        "workspace.read_file",
+        "workspace.write_file",
+      ],
     );
     const threadName = uniqueName("Investigate checkout race");
     const retryKey = `private-agent-thread-${randomUUID()}`;
+    const notebookPath = "notes/continuity.md";
+    const notebook = `${uniqueName("Checkout investigation")}\n\nThe final reader still owns the lease.`;
 
     const first = await startPrivateAgentThread(founder, {
       name: threadName,
@@ -102,6 +112,16 @@ describe("private work with an agent", () => {
     );
     expect(hiddenRun.body).toMatchObject({ error: { code: "not_found" } });
 
+    const unboundRun = await beginAgentRun(founder, companion.agent.id);
+    const unboundWorkspace = await askAgentToBeDenied(
+      unboundRun,
+      1,
+      "workspace.read_file",
+      { path: notebookPath },
+    );
+    expect(unboundWorkspace).toContain("did not find a visible resource");
+    await closeAgentRun(unboundRun);
+
     const firstRunKey = `private-agent-run-${randomUUID()}`;
     const firstContext = await beginAgentThreadRun(founder, first.thread.id, {
       idempotencyKey: firstRunKey,
@@ -133,6 +153,31 @@ describe("private work with an agent", () => {
     expect(array(rememberedProblem.items, "first agent context messages")).toEqual(
       expect.arrayContaining([expect.objectContaining({ content: problem })]),
     );
+    const notebookWriteKey = `private-agent-notebook-${randomUUID()}`;
+    const writtenNotebook = await askAgentToAct(
+      firstContext,
+      2,
+      "workspace.write_file",
+      { path: notebookPath, content: notebook },
+      notebookWriteKey,
+    );
+    const replayedWrite = await askAgentToAct(
+      firstContext,
+      3,
+      "workspace.write_file",
+      { path: notebookPath, content: notebook },
+      notebookWriteKey,
+    );
+    expect(replayedWrite).toEqual(writtenNotebook);
+    expect(writtenNotebook.ref).toEqual(
+      expect.stringContaining(`/agent/workspace/${first.thread.workspace.id}`),
+    );
+    const writtenFile = record(writtenNotebook.data, "workspace write receipt");
+    expect(writtenFile).toMatchObject({
+      path: notebookPath,
+      byte_len: Buffer.byteLength(notebook),
+      workspace_generation: first.thread.workspace.generation,
+    });
     await closeAgentRun(firstContext);
 
     const freshContext = await beginAgentThreadRun(founder, first.thread.id);
@@ -145,6 +190,19 @@ describe("private work with an agent", () => {
     expect(array(resumedProblem.items, "fresh agent context messages")).toEqual(
       expect.arrayContaining([expect.objectContaining({ content: problem })]),
     );
+    const resumedNotebook = await askAgent(
+      freshContext,
+      2,
+      "workspace.read_file",
+      { path: notebookPath },
+    );
+    expect(resumedNotebook).toMatchObject({
+      path: notebookPath,
+      content: notebook,
+      byte_len: Buffer.byteLength(notebook),
+      content_digest: string(writtenFile.content_digest, "workspace write digest"),
+      workspace_generation: first.thread.workspace.generation,
+    });
     await closeAgentRun(freshContext);
 
     const fetched = await founder.json(

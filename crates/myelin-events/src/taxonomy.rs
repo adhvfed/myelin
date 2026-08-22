@@ -8,6 +8,7 @@ pub const SUBSYSTEM_TOKENS: &[&str] = &[
     "signal",
     "identity",
     "agent",
+    "workspace",
     "refs",
 ];
 
@@ -50,6 +51,7 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     // as an invalid ref - the S8 reverse index consumed nothing in production.
     "tuple",
     "agent",
+    "workspace",
 ];
 
 /// Artifact subjects whose live read boundary is implemented for governed automations.
@@ -213,7 +215,7 @@ impl std::fmt::Display for TaxonomyError {
             TaxonomyError::UnknownSubsystem { name, token } => write!(
                 f,
                 "`{name}`: `{token}` is not a canonical subsystem token \
-                 (git/ci/issue/knowledge/chat/notif/signal/identity/agent/refs)"
+                 (git/ci/issue/knowledge/chat/notif/signal/identity/agent/workspace/refs)"
             ),
             TaxonomyError::PresentTenseVerb { name, token } => write!(
                 f,
@@ -485,6 +487,7 @@ mod tests {
                 "signal",
                 "identity",
                 "agent",
+                "workspace",
                 "refs"
             ]
         );

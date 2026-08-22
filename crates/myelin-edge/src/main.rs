@@ -3,7 +3,7 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::{Request, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use myelin_agent_service::workspace::LocalDevelopmentWorkspaceProvisioner;
+use myelin_agent_service::workspace::{AgentWorkspaceStore, LocalDevelopmentWorkspaceProvisioner};
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
@@ -11,8 +11,9 @@ use myelin_edge::{
     register_git_durable, register_git_wire, register_issues, register_knowledge, register_notif,
     register_privacy, register_projects, register_refs, register_tools,
     serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AgentMcpAuthority,
-    AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy,
-    BootstrapParams, CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableChatMutationApi,
+    AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
+    DeviceAuthorizationBroker, DurableAgentWorkspaceAccess, DurableChatMutationApi,
     DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeMutationApi,
     DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
     ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
@@ -872,7 +873,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     let git_root = git_root.expect("serving config carries a Git root");
     let agent_workspace_root =
         agent_workspace_root.expect("serving config carries an agent workspace root");
-    let agent_workspaces = Arc::new(
+    let agent_workspaces: Arc<dyn AgentWorkspaceStore> = Arc::new(
         LocalDevelopmentWorkspaceProvisioner::open(agent_workspace_root).unwrap_or_else(|error| {
             eprintln!("edge: agent workspace storage refused to start: {error}");
             std::process::exit(1);
@@ -1266,6 +1267,12 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     );
     let agent_thread_chat_mutations =
         DurableChatMutationApi::new(mcp_chat.clone(), chat_principals.clone());
+    let agent_threads = DurableAgentThreadBacking::new(provider.clone());
+    let agent_workspace_access = DurableAgentWorkspaceAccess::new(
+        agent_threads.clone(),
+        agent_workspaces.clone(),
+        handle.clone(),
+    );
     builder = register_agent_mcp(
         builder,
         AgentMcpServices::new(
@@ -1278,25 +1285,29 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 myelin_storage::DurableAgentTriggerBacking::new(provider.clone()),
             ),
             provider.clone(),
-            AgentMcpResources::new(
-                git_backend.clone(),
-                mcp_ci,
-                issue_mutations,
-                DurableKnowledgeMutationApi::new(
+            AgentMcpResources::new(AgentMcpResourceInputs {
+                git: git_backend.clone(),
+                ci: mcp_ci,
+                issues: issue_mutations,
+                knowledge: DurableKnowledgeMutationApi::new(
                     provider.db_pool().clone(),
                     handle.clone(),
                     kms.clone(),
                 ),
-                mcp_chat.clone(),
-                DurableChatMutationApi::new(mcp_chat.clone(), chat_principals.clone()),
-                myelin_edge::DurableProjectReadApi::new(projects, handle.clone()),
-            ),
+                chat: mcp_chat.clone(),
+                chat_mutations: DurableChatMutationApi::new(
+                    mcp_chat.clone(),
+                    chat_principals.clone(),
+                ),
+                projects: myelin_edge::DurableProjectReadApi::new(projects, handle.clone()),
+                workspace: agent_workspace_access,
+            }),
             handle.clone(),
         ),
     );
     builder = register_agent_threads(
         builder,
-        DurableAgentThreadBacking::new(provider.clone()),
+        agent_threads,
         mcp_chat,
         agent_thread_chat_mutations,
         agent_workspaces,

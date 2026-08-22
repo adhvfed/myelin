@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use myelin_agent::McpApprovalContract;
+use myelin_agent::{EffectApi, McpApprovalContract};
 use myelin_agent_service::hosted_run_contract::{
     hosted_agent_decision_ref, HostedAgentDecision, HOSTED_AGENT_APPROVAL_SIGNAL,
 };
@@ -34,6 +34,8 @@ use crate::gateway::GatewayBuilder;
 use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
+use crate::workspace_access::DurableAgentWorkspaceAccess;
+use crate::workspace_effect::WorkspaceEffectApi;
 use crate::{
     ChatEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
     DurableIssueMutationApi, DurableKnowledgeMutationApi, DurableKnowledgeReadApi,
@@ -81,27 +83,32 @@ pub struct AgentMcpResources {
     chat: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
     projects: DurableProjectReadApi,
+    workspace: DurableAgentWorkspaceAccess,
+}
+
+pub struct AgentMcpResourceInputs {
+    pub git: Arc<DurableGitBackend>,
+    pub ci: DurableCiReadApi,
+    pub issues: DurableIssueMutationApi,
+    pub knowledge: DurableKnowledgeMutationApi,
+    pub chat: DurableChatReadApi,
+    pub chat_mutations: DurableChatMutationApi,
+    pub projects: DurableProjectReadApi,
+    pub workspace: DurableAgentWorkspaceAccess,
 }
 
 impl AgentMcpResources {
-    pub fn new(
-        git: Arc<DurableGitBackend>,
-        ci: DurableCiReadApi,
-        issues: DurableIssueMutationApi,
-        knowledge: DurableKnowledgeMutationApi,
-        chat: DurableChatReadApi,
-        chat_mutations: DurableChatMutationApi,
-        projects: DurableProjectReadApi,
-    ) -> Self {
+    pub fn new(inputs: AgentMcpResourceInputs) -> Self {
         Self {
-            git,
-            ci,
-            issues,
-            knowledge: knowledge.reads(),
-            knowledge_mutations: knowledge,
-            chat,
-            chat_mutations,
-            projects,
+            git: inputs.git,
+            ci: inputs.ci,
+            issues: inputs.issues,
+            knowledge: inputs.knowledge.reads(),
+            knowledge_mutations: inputs.knowledge,
+            chat: inputs.chat,
+            chat_mutations: inputs.chat_mutations,
+            projects: inputs.projects,
+            workspace: inputs.workspace,
         }
     }
 }
@@ -414,6 +421,17 @@ impl Handler for AgentMcpHandler {
             ctx.scope,
             &PrincipalId(authorized.delegator_id(&registration).to_string()),
         )?;
+        let workspace = authorized
+            .is_external()
+            .then(|| {
+                self.services.resources.workspace.for_run(
+                    &ctx.principal.tenant.0,
+                    run_id,
+                    authorized.agent_id(),
+                    &capability.jti,
+                )
+            })
+            .transpose()?;
 
         let registry = ToolRegistry::for_cursors(&registration.tools)
             .map_err(|error| EdgeError::Unavailable(error.to_string()))?;
@@ -427,49 +445,58 @@ impl Handler for AgentMcpHandler {
             agent: ctx.principal.clone(),
             run_id: RunId(run_id.to_string()),
         };
-        let effect_api = Box::new(
-            RoutedEffectApi::try_new([
-                (
-                    "git",
-                    Box::new(GitEffectApi::new(
-                        self.services.resources.git.clone(),
-                        ctx.principal.tenant.0.clone(),
-                        ctx.principal.region.0.clone(),
-                        ctx.principal.clone(),
-                        delegator.clone(),
-                        self.services.authority.boundary.clone(),
-                    )) as Box<dyn myelin_agent::EffectApi>,
-                ),
-                (
-                    "chat",
-                    Box::new(ChatEffectApi::new(
-                        self.services.resources.chat_mutations.clone(),
-                        ctx.principal.clone(),
-                        delegator.clone(),
-                        self.services.authority.boundary.clone(),
-                    )) as Box<dyn myelin_agent::EffectApi>,
-                ),
-                (
-                    "issues",
-                    Box::new(IssueEffectApi::new(
-                        self.services.resources.issues.clone(),
-                        ctx.principal.clone(),
-                        delegator.clone(),
-                        self.services.authority.boundary.clone(),
-                    )) as Box<dyn myelin_agent::EffectApi>,
-                ),
-                (
-                    "knowledge",
-                    Box::new(KnowledgeEffectApi::new(
-                        self.services.resources.knowledge_mutations.clone(),
-                        ctx.principal.clone(),
-                        delegator.clone(),
-                        self.services.authority.boundary.clone(),
-                    )) as Box<dyn myelin_agent::EffectApi>,
-                ),
-            ])
-            .map_err(EdgeError::Unavailable)?,
-        );
+        let mut effect_routes: Vec<(&'static str, Box<dyn EffectApi>)> = vec![
+            (
+                "git",
+                Box::new(GitEffectApi::new(
+                    self.services.resources.git.clone(),
+                    ctx.principal.tenant.0.clone(),
+                    ctx.principal.region.0.clone(),
+                    ctx.principal.clone(),
+                    delegator.clone(),
+                    self.services.authority.boundary.clone(),
+                )) as Box<dyn EffectApi>,
+            ),
+            (
+                "chat",
+                Box::new(ChatEffectApi::new(
+                    self.services.resources.chat_mutations.clone(),
+                    ctx.principal.clone(),
+                    delegator.clone(),
+                    self.services.authority.boundary.clone(),
+                )) as Box<dyn EffectApi>,
+            ),
+            (
+                "issues",
+                Box::new(IssueEffectApi::new(
+                    self.services.resources.issues.clone(),
+                    ctx.principal.clone(),
+                    delegator.clone(),
+                    self.services.authority.boundary.clone(),
+                )) as Box<dyn EffectApi>,
+            ),
+            (
+                "knowledge",
+                Box::new(KnowledgeEffectApi::new(
+                    self.services.resources.knowledge_mutations.clone(),
+                    ctx.principal.clone(),
+                    delegator.clone(),
+                    self.services.authority.boundary.clone(),
+                )) as Box<dyn EffectApi>,
+            ),
+        ];
+        if let Some(workspace) = workspace.clone() {
+            effect_routes.push((
+                "workspace",
+                Box::new(WorkspaceEffectApi::new(
+                    workspace,
+                    ctx.principal.clone(),
+                    self.services.authority.boundary.clone(),
+                )),
+            ));
+        }
+        let effect_api =
+            Box::new(RoutedEffectApi::try_new(effect_routes).map_err(EdgeError::Unavailable)?);
         let approvers = Arc::new(CreatorApproverPolicy {
             creator_id: PrincipalId(authorized.delegator_id(&registration).to_string()),
             scope: ctx.scope.clone(),
@@ -500,7 +527,8 @@ impl Handler for AgentMcpHandler {
             .with_knowledge(self.services.resources.knowledge.clone())
             .with_chat(self.services.resources.chat.clone())
             .with_git(self.services.resources.git.clone())
-            .with_projects(self.services.resources.projects.clone()),
+            .with_projects(self.services.resources.projects.clone())
+            .with_workspace(workspace),
         );
         let server = McpServer::with_router_and_reads(registry, router, reads);
         let frame = std::str::from_utf8(&ctx.request.body)

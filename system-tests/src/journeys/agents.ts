@@ -174,7 +174,7 @@ export async function askAgentToAct(
     idempotencyKey,
     ...(approvalGateId === undefined ? {} : { approvalGateId }),
   });
-  expect(result, `${tool} MCP call failed: ${JSON.stringify(result)}`).toMatchObject({
+  expect(result, `${tool} MCP call failed: ${publicMcpContent(result, tool)}`).toMatchObject({
     isError: false,
     _meta: { tool, eventId: expect.any(String) },
   });
@@ -182,6 +182,16 @@ export async function askAgentToAct(
   const receipt = record(result.structuredContent, `${tool} MCP structured receipt`);
   expect(receipt).toMatchObject({ event_id: metadata.eventId });
   return receipt;
+}
+
+function publicMcpContent(result: JsonRecord, tool: string): string {
+  try {
+    return array(result.content, `${tool} MCP content`)
+      .map((item) => string(record(item, `${tool} MCP content item`).text, `${tool} MCP text`))
+      .join("\n");
+  } catch {
+    return "malformed MCP result";
+  }
 }
 
 export async function askAgentToRequestApproval(
