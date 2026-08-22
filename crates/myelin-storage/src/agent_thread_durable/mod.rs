@@ -1,9 +1,14 @@
+mod expiry;
 mod model;
 mod run;
 mod schema;
 mod ssh_access;
 mod ssh_route;
 
+pub use expiry::{
+    AgentThreadExpiry, AgentThreadExpiryCompletion, AgentThreadExpiryFailure,
+    AGENT_THREAD_EXPIRY_GRACE_SECONDS,
+};
 pub use model::{
     ActivateAgentThreadOutcome, AgentThreadState, CreateAgentThreadOutcome, DurableAgentThread,
     NewAgentThread, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,

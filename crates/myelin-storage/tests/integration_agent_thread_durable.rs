@@ -4,9 +4,11 @@ use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
 use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
-    all_durable_migrations, ActivateAgentThreadOutcome, BindAgentThreadRunOutcome,
-    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
-    NewAgentThread, NewWorkspaceSshGrant, SealKey, SubstrateProvider, WorkspaceSshRouteKey,
+    all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadExpiryCompletion,
+    AgentThreadExpiryFailure, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
+    CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables, NewAgentThread,
+    NewWorkspaceSshGrant, SealKey, SubstrateProvider, WorkspaceSshRouteKey,
+    AGENT_THREAD_EXPIRY_GRACE_SECONDS,
 };
 use sqlx::types::Uuid;
 
@@ -572,6 +574,131 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .await
         .unwrap()
         .is_none());
+
+    assert!(threads
+        .start_due_expirations(&tenant, intended.expires_at - Duration::seconds(1), 10)
+        .await
+        .unwrap()
+        .is_empty());
+    let expirations = threads
+        .start_due_expirations(&tenant, intended.expires_at, 10)
+        .await
+        .unwrap();
+    assert_eq!(expirations.len(), 1);
+    let expiration = &expirations[0];
+    assert_eq!(expiration.thread_id, intended.thread_id);
+    assert_eq!(expiration.workspace_id, intended.workspace_id);
+    assert_eq!(
+        expiration.storage_locator.as_deref(),
+        Some("workspace://local/101")
+    );
+    assert!(threads
+        .live_ssh_session(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_issued_at,
+            ssh_intent.expires_at + Duration::hours(1),
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert!(threads
+        .live_binding_for_run(&tenant, run_id, agent_id, "thread-run-jti", run_started_at,)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM external_agent_run WHERE tenant_id = $1 AND run_id = $2",
+        )
+        .bind(&tenant)
+        .bind(run_id)
+        .fetch_one(admin.db_pool())
+        .await
+        .unwrap(),
+        "terminal"
+    );
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+               SELECT 1 FROM run_token_teardown WHERE tenant_id = $1 AND jti = $2
+             )",
+    )
+    .bind(&tenant)
+    .bind("thread-run-jti")
+    .fetch_one(admin.db_pool())
+    .await
+    .unwrap());
+
+    let grace = Duration::seconds(AGENT_THREAD_EXPIRY_GRACE_SECONDS);
+    assert!(threads
+        .expirations_ready_for_cleanup(
+            &tenant,
+            intended.expires_at + grace - Duration::seconds(1),
+            10
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        threads
+            .expirations_ready_for_cleanup(&tenant, intended.expires_at + grace, 10)
+            .await
+            .unwrap(),
+        expirations
+    );
+    assert!(threads
+        .record_expiration_failure(
+            &tenant,
+            expiration,
+            AgentThreadExpiryFailure::WorkspaceCleanupFailed,
+            intended.expires_at + grace,
+        )
+        .await
+        .unwrap());
+    assert!(threads
+        .expirations_ready_for_cleanup(
+            &tenant,
+            intended.expires_at + grace + grace - Duration::seconds(1),
+            10,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        threads
+            .expirations_ready_for_cleanup(&tenant, intended.expires_at + grace + grace, 10)
+            .await
+            .unwrap(),
+        expirations
+    );
+    assert_eq!(
+        threads
+            .complete_expiration(&tenant, expiration, intended.expires_at + grace + grace)
+            .await
+            .unwrap(),
+        AgentThreadExpiryCompletion::Deleted
+    );
+    assert_eq!(
+        threads
+            .complete_expiration(&tenant, expiration, intended.expires_at + grace + grace)
+            .await
+            .unwrap(),
+        AgentThreadExpiryCompletion::AlreadyDeleted
+    );
+    let receipt = threads
+        .get_for_owner(&tenant, owner, intended.thread_id)
+        .await
+        .unwrap()
+        .expect("the owner retains a lifecycle receipt after cleanup");
+    assert_eq!(receipt.state, myelin_storage::AgentThreadState::Deleted);
+    assert!(receipt.storage_locator.is_none());
+    assert!(threads
+        .list_for_owner(&tenant, owner, None, 100)
+        .await
+        .unwrap()
+        .is_empty());
 
     sqlx::query("DELETE FROM agent_thread_ssh_grant WHERE tenant_id = $1")
         .bind(&tenant)
