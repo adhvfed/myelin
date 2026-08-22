@@ -3763,6 +3763,7 @@ dependencies = [
  "chrono",
  "myelin-agent-service",
  "myelin-ci-sandbox",
+ "myelin-config",
  "myelin-identity-service",
  "myelin-storage",
  "russh",
