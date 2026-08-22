@@ -152,6 +152,37 @@ services:
       timeout: 120s
     startup_message: "Myelin edge: http://127.0.0.1:{{EDGE_PORT}}"
 
+  workspace-gateway:
+    depends_on: [edge]
+    process: >-
+      sh -c 'agent_workspace_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/agent-workspaces";
+      git_wire_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/git-rootfs}";
+      runsc_candidate="${MYELIN_RUNSC_BIN:-runsc}";
+      runsc_bin="$(readlink -f "$(command -v "$runsc_candidate")")";
+      install -d -m 700 "$agent_workspace_root";
+      export MYELIN_AGENT_WORKSPACE_ROOT="$agent_workspace_root"
+      MYELIN_GVISOR_GIT_ROOTFS="$git_wire_rootfs" MYELIN_RUNSC_BIN="$runsc_bin";
+      exec systemd-run --user --scope --quiet --property=Delegate=yes
+      cargo run --quiet -p myelin-workspace-gateway --bin myelin-workspace-gateway'
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_DATABASE_MAX_CONNECTIONS: "8"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_WORKSPACE_SSH_ADDR: "127.0.0.1:{{WORKSPACE_SSH_PORT}}"
+    healthcheck:
+      command: "ssh-keyscan -T 2 -p {{WORKSPACE_SSH_PORT}} 127.0.0.1 >/dev/null 2>&1"
+      timeout: 120s
+    startup_message: "Myelin workspace SSH: 127.0.0.1:{{WORKSPACE_SSH_PORT}}"
+
   event-stream-ready:
     depends_on: [edge]
     migrate: cargo run --quiet -p myelin-outbox-publisher -- provision
@@ -376,7 +407,7 @@ services:
     startup_message: "Myelin reference graph is projecting durable edges"
 
   web:
-    depends_on: [edge, outbox-publisher, ci-dispatch, ci-controlplane, git-checks, notifications, refs]
+    depends_on: [edge, workspace-gateway, outbox-publisher, ci-dispatch, ci-controlplane, git-checks, notifications, refs]
     install: pnpm --dir frontend install --frozen-lockfile
     process: >-
       sh -c 'set -eu;
@@ -455,7 +486,7 @@ scripts:
     script: pnpm --dir frontend check
 
   test:system:
-    depends_on: [outbox-publisher, agent-service, hosted-agent-worker, ci-controlplane, git-checks, notifications, refs]
+    depends_on: [workspace-gateway, outbox-publisher, agent-service, hosted-agent-worker, ci-controlplane, git-checks, notifications, refs]
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
