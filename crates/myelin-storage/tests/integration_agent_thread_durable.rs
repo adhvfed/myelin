@@ -1,11 +1,12 @@
 #![cfg(feature = "integration")]
 
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
 use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
-    all_durable_migrations, ActivateAgentThreadOutcome, CreateAgentThreadOutcome,
-    DurableAgentThreadBacking, HotTables, NewAgentThread, SubstrateProvider,
+    all_durable_migrations, ActivateAgentThreadOutcome, BindAgentThreadRunOutcome,
+    CreateAgentThreadOutcome, DurableAgentThreadBacking, HotTables, NewAgentThread,
+    SubstrateProvider,
 };
 use sqlx::types::Uuid;
 
@@ -148,6 +149,46 @@ async fn set_agent_status(
         .unwrap();
 }
 
+async fn seed_ready_run(
+    provider: &SubstrateProvider,
+    tenant: &str,
+    owner: &str,
+    agent_id: Uuid,
+    run_id: Uuid,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) {
+    let tenant = tenant.to_string();
+    let region = provider.config().region.clone();
+    let owner = owner.to_string();
+    provider
+        .with_tenant_tx(&tenant.clone(), move |connection| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO external_agent_run (
+                       tenant_id, region, run_id, agent_id, trigger_actor_id,
+                       trigger_credential_jti, trigger_authority, client_nonce, token_jti,
+                       state, issued_at, expires_at)
+                     VALUES ($1,$2,$3,$4,$5,'browser-session',ARRAY['agent.run'],
+                             'thread-run-retry','thread-run-jti','ready',$6,$7)",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(run_id)
+                .bind(agent_id)
+                .bind(&owner)
+                .bind(issued_at)
+                .bind(expires_at)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     let config = test_config();
@@ -271,6 +312,80 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             .unwrap(),
         ActivateAgentThreadOutcome::AlreadyReady(ready.clone())
     );
+
+    let run_id = Uuid::from_u128(201);
+    let run_started_at = intended.created_at + Duration::hours(1);
+    seed_ready_run(
+        &app,
+        &tenant,
+        owner,
+        agent_id,
+        run_id,
+        run_started_at,
+        run_started_at + Duration::minutes(5),
+    )
+    .await;
+    let bound = threads
+        .bind_run(&tenant, owner, intended.thread_id, run_id, run_started_at)
+        .await
+        .unwrap();
+    let BindAgentThreadRunOutcome::Bound(binding) = bound else {
+        panic!("the exact live run and thread should bind: {bound:?}");
+    };
+    assert_eq!(binding.thread_id, intended.thread_id.to_string());
+    assert_eq!(binding.conversation_id, intended.conversation_id);
+    assert_eq!(binding.workspace_id, intended.workspace_id.to_string());
+    assert_eq!(binding.workspace_generation, 1);
+    assert_eq!(
+        binding.workspace_expires_at,
+        intended
+            .expires_at
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    assert_eq!(
+        threads
+            .bind_run(&tenant, owner, intended.thread_id, run_id, run_started_at)
+            .await
+            .unwrap(),
+        BindAgentThreadRunOutcome::Replayed(binding.clone())
+    );
+    assert_eq!(
+        threads
+            .live_binding_for_run(&tenant, run_id, agent_id, "thread-run-jti", run_started_at,)
+            .await
+            .unwrap(),
+        Some(binding)
+    );
+    assert!(threads
+        .live_binding_for_run(
+            &tenant,
+            run_id,
+            agent_id,
+            "another-credential",
+            run_started_at,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        threads
+            .bind_run(&tenant, "p:bob", intended.thread_id, run_id, run_started_at)
+            .await
+            .unwrap(),
+        BindAgentThreadRunOutcome::NotFound
+    );
+    assert!(threads
+        .live_binding_for_run(
+            &tenant,
+            run_id,
+            agent_id,
+            "thread-run-jti",
+            intended.expires_at,
+        )
+        .await
+        .unwrap()
+        .is_none());
+
     assert_eq!(
         threads
             .get_for_owner(&tenant, owner, intended.thread_id)
@@ -290,6 +405,16 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .unwrap()
         .is_none());
 
+    sqlx::query("DELETE FROM agent_thread_run WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM external_agent_run WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM agent_thread WHERE tenant_id = $1")
         .bind(&tenant)
         .execute(admin.db_pool())

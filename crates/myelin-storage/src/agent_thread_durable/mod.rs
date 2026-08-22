@@ -1,4 +1,5 @@
 mod model;
+mod run;
 mod schema;
 
 pub use model::{
@@ -6,8 +7,10 @@ pub use model::{
     NewAgentThread, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
     MIN_AGENT_THREAD_RETENTION_DAYS,
 };
+pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
     agent_thread_durable_migrations, AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY,
+    AGENT_THREAD_RUN_MIGRATION,
 };
 
 use chrono::Duration;

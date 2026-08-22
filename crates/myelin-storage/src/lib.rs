@@ -230,10 +230,11 @@ pub use storage_surge::{
 };
 
 pub use agent_thread_durable::{
-    agent_thread_durable_migrations, ActivateAgentThreadOutcome, AgentThreadState,
-    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, NewAgentThread,
-    AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY, MAX_AGENT_THREAD_NAME_BYTES,
-    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    agent_thread_durable_migrations, ActivateAgentThreadOutcome, AgentThreadRunBinding,
+    AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
+    DurableAgentThreadBacking, NewAgentThread, AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY,
+    AGENT_THREAD_RUN_MIGRATION, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use agent_trigger_durable::{
     agent_trigger_durable_migrations, agent_trigger_evaluation_diagnostic_migrations,

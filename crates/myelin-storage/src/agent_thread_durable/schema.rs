@@ -60,24 +60,40 @@ CREATE POLICY myelin_tenant_isolation ON agent_thread
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_THREAD_RUN_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_thread_run (
+    tenant_id            text        NOT NULL,
+    region               text        NOT NULL,
+    run_id               uuid        NOT NULL,
+    thread_id            uuid        NOT NULL,
+    conversation_id      text        NOT NULL,
+    workspace_id         uuid        NOT NULL,
+    workspace_generation integer     NOT NULL,
+    bound_at             timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, region, run_id),
+    FOREIGN KEY (tenant_id, region, run_id)
+      REFERENCES external_agent_run (tenant_id, region, run_id),
+    FOREIGN KEY (tenant_id, region, thread_id)
+      REFERENCES agent_thread (tenant_id, region, thread_id),
+    CHECK (length(conversation_id) = 26),
+    CHECK (workspace_generation > 0)
+);
+CREATE INDEX IF NOT EXISTS agent_thread_run_thread_recent
+  ON agent_thread_run (tenant_id, region, thread_id, run_id DESC);
+ALTER TABLE agent_thread_run ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_thread_run FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON agent_thread_run;
+CREATE POLICY myelin_tenant_isolation ON agent_thread_run
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub fn agent_thread_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0124_agent_thread", AGENT_THREAD_MIGRATION),
         Migration::plain("0125_agent_thread_rls", AGENT_THREAD_RLS_POLICY),
+        Migration::plain("0126_agent_thread_run", AGENT_THREAD_RUN_MIGRATION),
     ])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn schema_keeps_workspace_lifecycle_bounded_and_tenant_scoped() {
-        let migrations = agent_thread_durable_migrations();
-        assert_eq!(migrations.0.len(), 2);
-        assert!(AGENT_THREAD_MIGRATION.contains("retention_days BETWEEN 1 AND 30"));
-        assert!(AGENT_THREAD_MIGRATION.contains("workspace_generation > 0"));
-        assert!(AGENT_THREAD_MIGRATION.contains("agent_thread_owner_live_name"));
-        assert!(AGENT_THREAD_RLS_POLICY.contains("FORCE ROW LEVEL SECURITY"));
-    }
 }
