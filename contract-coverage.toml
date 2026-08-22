@@ -236,7 +236,6 @@ title = "reactive/dispatch tier"
 status = "covered"
 cdc = [
     "crates/myelin-agent-service/src/trigger_consumer/tests.rs",
-    "crates/myelin-agent-service/tests/cdc_3_6_13_1_loop_guards.rs",
 ]
 
 [[contract]]
@@ -604,7 +603,6 @@ cdc = [
     "crates/myelin-agent/tests/cdc_8_2_effect_api.rs",
     "crates/myelin-knowledge/tests/cdc_8_2_knowledge_agent_governance.rs",
     "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
-    "crates/myelin-chat/tests/cdc_8_6_11_7_4_7_8_2_chat_dispatch.rs",
 ]
 
 [[contract]]
@@ -619,13 +617,8 @@ cdc = [
 [[contract]]
 row = "8.4"
 title = "ToolHands::exec (unified sandbox)"
-status = "covered"
-cdc = [
-    "crates/myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs",
-    "crates/myelin-agent-service/tests/cdc_8_4_exec_routing.rs",
-    "crates/myelin-agent-service/tests/cdc_8_4_escape_gate.rs",
-    "crates/myelin-agent-service/tests/cdc_8_4_prod_image_reconfirm.rs",
-]
+status = "deferred"
+landing = "P-AGENT-WORKSPACE-EXEC"
 
 [[contract]]
 row = "8.5"
@@ -639,8 +632,6 @@ title = "EventInbox::deliver"
 status = "covered"
 cdc = [
     "crates/myelin-agent/tests/cdc_8_6_event_inbox.rs",
-    "crates/myelin-chat/tests/cdc_8_6_chat_explicit_first.rs",
-    "crates/myelin-chat/tests/cdc_8_6_11_7_4_7_8_2_chat_dispatch.rs",
 ]
 
 [[contract]]
@@ -814,11 +805,9 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-storage/tests/cdc_11_2_c3_cdn_clone_class.rs",
-    "crates/myelin-storage/tests/cdc_11_2_c4_trust_scoped_cache.rs",
     "crates/myelin-git/tests/cdc_11_2_git_pack_tier_consumer.rs",
     "crates/myelin-git/tests/cdc_11_2_c3_git_bundle_uri.rs",
     "crates/myelin-ci-dispatch/tests/cdc_ci_p11_resolve_dispatch.rs",
-    "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
     "crates/myelin-issues/tests/cdc_11_2_issues_attachment_pointer.rs",
     "crates/myelin-chat/tests/cdc_11_1_11_2_12_1_chat_store_consumer.rs",
 ]
@@ -840,7 +829,6 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_4_classify_key_choice.rs",
     "crates/myelin-storage/tests/cdc_11_4_erase_algorithm.rs",
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
-    "crates/myelin-ci-controlplane/tests/cdc_11_2_11_4_ci_artifact_cache.rs",
     "crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs",
     "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
     "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
@@ -878,7 +866,6 @@ cdc = [
     "crates/myelin-ci-controlplane/tests/drills_ci_p17_reserve_settle_parity.rs",
     "crates/myelin-issues/tests/cdc_11_7_issues_reserve_settle.rs",
     "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
-    "crates/myelin-chat/tests/cdc_8_6_11_7_4_7_8_2_chat_dispatch.rs",
 ]
 
 [[contract]]

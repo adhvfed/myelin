@@ -932,6 +932,27 @@ Agent Service and Edge are warning-clean under clippy; after rebuilding the
 three agent-serving processes, both private-thread TypeScript journeys pass,
 including fresh-context continuation and workspace persistence.
 
+## 2026-08-23 — CI cache coverage no longer means a process-local map
+
+The trust-scoped CI cache had the same misleading shape. No pipeline definition
+could request a cache, no runner restored or saved one, and the `cache_entry`
+schema had no store. `CiCacheNamespace` put blobs behind a mutex-protected
+`HashMap`; even its “real object store” integration constructed that map inside
+one test process, so it proved neither durable lookup nor runner isolation.
+
+The in-memory namespace, its duplicated poison drills, and a synthetic unified
+sandbox CDC are gone. The historical `cache_entry` migration stays immutable,
+but it is now clearly unused schema awaiting a real design. The contract ledger
+also stops pointing at deleted mock tests and marks `ToolHands::exec` deferred to
+the production workspace-exec landing rather than manufacturing coverage.
+
+Proof: 624 Storage and 511 CI Control Plane library tests pass; all Storage, CI
+Control Plane, and Edge targets are warning-clean under clippy; the contract
+coverage gate reconciles all 99 rows with no missing paths; after rebuilding the
+live services, all five TypeScript CI delivery journeys pass, including real
+sandbox output, failure settlement, and repository visibility. Net removal:
+roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -954,9 +975,10 @@ including fresh-context continuation and workspace persistence.
    notification, and automation work arrives through durable NATS/SQL queues;
    queue bounds and worker concurrency provide backpressure, but the matching
    thresholds.toml shed rows are targets rather than production enforcement.
-5. **trust-scoped CI cache is built but unwired**; the CI runner does not route
-   cache writes through `CiCacheNamespace`. its in-memory index is not a durable
-   product cache and must not be presented as one.
+5. **CI has no user-visible cache yet.** the old process-local namespace is gone;
+   the historical `cache_entry` table has no store, pipeline syntax, runner
+   restore/save operation, retention policy, or full-system journey. the eventual
+   design must derive its namespace from the durable run trust stamp.
 6. **private agent workspaces cannot execute commands yet.** the shipped
    thread-bound catalogue deliberately contains only bounded file reads and
    writes. a real `workspace.exec` must use the production sandbox and mount the

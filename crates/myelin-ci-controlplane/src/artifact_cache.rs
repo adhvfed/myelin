@@ -3,81 +3,10 @@ use myelin_events::{
     AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, PiiKeyRef as EnvelopePiiKeyRef,
     Visibility,
 };
-use myelin_storage::ci_cache_scope::{CacheScope, TrustTier};
 use myelin_storage::kms::{KeyClass, PiiKeyRef};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::log_pipeline::CrossRegionLogWrite;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunProvenance {
-    pub trust_tier: String,
-    pub protected_branch: Option<String>,
-    pub pr_id: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ScopeDerivationError {
-    UnknownTrustTier(String),
-    ForkRunMissingPrId,
-}
-
-impl std::fmt::Display for ScopeDerivationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ScopeDerivationError::UnknownTrustTier(t) => write!(
-                f,
-                "cache-scope derivation: unknown trust_tier `{t}` (expected `trusted` or \
-                 `untrusted_fork`) - REFUSED, never coerced to the trusted scope (the poisoned-cache \
-                 defence, contract 11.2-C4)"
-            ),
-            ScopeDerivationError::ForkRunMissingPrId => write!(
-                f,
-                "cache-scope derivation: an untrusted_fork run carried no pr_id - cannot derive its \
-                 confined fork:<pr_id> scope; REFUSED, never falls through to the trusted scope (the \
-                 poisoned-cache breach, contract 11.2-C4)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ScopeDerivationError {}
-
-fn parse_trust_tier(s: &str) -> Result<TrustTier, ScopeDerivationError> {
-    match s {
-        "trusted" => Ok(TrustTier::Trusted),
-        "untrusted_fork" => Ok(TrustTier::UntrustedFork),
-        other => Err(ScopeDerivationError::UnknownTrustTier(other.to_string())),
-    }
-}
-
-pub fn derive_cache_scope(
-    prov: &RunProvenance,
-) -> Result<(TrustTier, CacheScope, String), ScopeDerivationError> {
-    let tier = parse_trust_tier(&prov.trust_tier)?;
-    match tier {
-        TrustTier::Trusted => {
-            let scope = match &prov.protected_branch {
-                Some(name) => CacheScope::Branch { name: name.clone() },
-                None => CacheScope::Trusted,
-            };
-            Ok((TrustTier::Trusted, scope, String::new()))
-        }
-        TrustTier::UntrustedFork => {
-            let pr_id = prov
-                .pr_id
-                .clone()
-                .ok_or(ScopeDerivationError::ForkRunMissingPrId)?;
-            Ok((
-                TrustTier::UntrustedFork,
-                CacheScope::Fork {
-                    pr_id: pr_id.clone(),
-                },
-                pr_id,
-            ))
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SegmentPii {
@@ -169,136 +98,17 @@ impl PublishedArtifact {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForkPoisonOutcome {
-    pub fork_to_trusted_attempts: u64,
-    pub fork_to_trusted_landings: u64,
-}
-
-impl ForkPoisonOutcome {
-    pub fn is_green(&self) -> bool {
-        self.fork_to_trusted_landings == 0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use myelin_events::validate_event_type;
-    use myelin_storage::blob::{ContentHash, FsBlobStore};
-    use myelin_storage::ci_cache_scope::{CacheScopeError, CiCacheNamespace};
+    use myelin_storage::blob::ContentHash;
 
     fn tenant() -> TenantId {
         TenantId::from_token("acme")
     }
     fn fr_par() -> Region {
         Region::new("fr-par")
-    }
-
-    #[test]
-    fn trusted_run_derives_the_trusted_scope() {
-        let prov = RunProvenance {
-            trust_tier: "trusted".into(),
-            protected_branch: None,
-            pr_id: None,
-        };
-        let (tier, scope, pr) = derive_cache_scope(&prov).expect("trusted derives");
-        assert_eq!(tier, TrustTier::Trusted);
-        assert_eq!(scope, CacheScope::Trusted);
-        assert_eq!(pr, "");
-    }
-
-    #[test]
-    fn trusted_protected_branch_run_derives_a_branch_scope() {
-        let prov = RunProvenance {
-            trust_tier: "trusted".into(),
-            protected_branch: Some("main".into()),
-            pr_id: None,
-        };
-        let (tier, scope, _) = derive_cache_scope(&prov).expect("branch derives");
-        assert_eq!(tier, TrustTier::Trusted);
-        assert_eq!(
-            scope,
-            CacheScope::Branch {
-                name: "main".into()
-            }
-        );
-    }
-
-    #[test]
-    fn fork_run_derives_only_its_own_fork_scope() {
-        let prov = RunProvenance {
-            trust_tier: "untrusted_fork".into(),
-            protected_branch: None,
-            pr_id: Some("42".into()),
-        };
-        let (tier, scope, pr) = derive_cache_scope(&prov).expect("fork derives");
-        assert_eq!(tier, TrustTier::UntrustedFork);
-        assert_eq!(scope, CacheScope::Fork { pr_id: "42".into() });
-        assert_eq!(pr, "42");
-        assert!(!scope.is_trusted());
-    }
-
-    #[test]
-    fn fork_run_with_no_pr_id_is_refused_never_falls_through_to_trusted() {
-        let prov = RunProvenance {
-            trust_tier: "untrusted_fork".into(),
-            protected_branch: None,
-            pr_id: None,
-        };
-        let err = derive_cache_scope(&prov).expect_err("a fork with no pr_id is refused");
-        assert_eq!(err, ScopeDerivationError::ForkRunMissingPrId);
-    }
-
-    #[test]
-    fn unknown_trust_tier_is_refused_never_coerced_to_trusted() {
-        let prov = RunProvenance {
-            trust_tier: "definitely-trusted-wink".into(),
-            protected_branch: None,
-            pr_id: None,
-        };
-        let err = derive_cache_scope(&prov).expect_err("unknown tier refused");
-        assert!(matches!(err, ScopeDerivationError::UnknownTrustTier(_)));
-        let rendered = format!("{err}");
-        assert!(rendered.contains("11.2-C4"), "attributed to C4: {rendered}");
-    }
-
-    #[test]
-    fn ci_d6_fork_cannot_poison_the_trusted_cache_end_to_end() {
-        let base = FsBlobStore::new();
-        let cache = CiCacheNamespace::over(tenant(), &base);
-
-        let prov = RunProvenance {
-            trust_tier: "untrusted_fork".into(),
-            protected_branch: None,
-            pr_id: Some("42".into()),
-        };
-        let (tier, _own_scope, run_pr) = derive_cache_scope(&prov).expect("fork derives");
-
-        let mut outcome = ForkPoisonOutcome {
-            fork_to_trusted_attempts: 0,
-            fork_to_trusted_landings: 0,
-        };
-
-        outcome.fork_to_trusted_attempts += 1;
-        let attempt = cache.put(
-            tier,
-            &run_pr,
-            &CacheScope::Trusted,
-            "build-cache",
-            b"poison",
-        );
-        match attempt {
-            Err(CacheScopeError::ForkWriteToTrusted { .. }) => {}
-            Ok(_) => outcome.fork_to_trusted_landings += 1,
-            other => panic!("unexpected put result: {other:?}"),
-        }
-
-        assert_eq!(outcome.fork_to_trusted_attempts, 1);
-        assert_eq!(outcome.fork_to_trusted_landings, 0);
-        assert!(outcome.is_green(), "CI-D6: 0 fork→trusted writes");
-        assert_eq!(cache.telemetry().cache_scope_violation(), 1);
-        assert!(!cache.contains(&CacheScope::Trusted, "build-cache").unwrap());
     }
 
     #[test]

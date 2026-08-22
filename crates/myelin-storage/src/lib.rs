@@ -12,7 +12,6 @@ pub mod bus_shred;
 pub mod cache;
 pub mod cdn;
 pub mod cell_migration;
-pub mod ci_cache_scope;
 #[cfg(any(test, feature = "test-support"))]
 pub mod ci_log_index;
 pub mod coloc;
@@ -116,9 +115,6 @@ pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
 pub use cell_migration::{
     is_cell_local, migrate_cell_to_cell, storage_resolves_locally, CellMigrationError,
     CellMigrationReceipt, CellMigrationRequest, CellTenantTiers,
-};
-pub use ci_cache_scope::{
-    CacheScope, CacheScopeError, CacheScopeTelemetry, CiCacheNamespace, TrustTier,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use ci_log_index::{
