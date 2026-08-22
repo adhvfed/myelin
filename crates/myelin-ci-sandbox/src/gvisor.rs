@@ -57,8 +57,9 @@ use run::{
 
 mod workspace_session;
 pub use workspace_session::{
-    ConfinedWorkspaceSession, ConfinedWorkspaceSessionExit, ConfinedWorkspaceSessionIo,
-    VerifiedWorkspaceMount, WorkspaceSessionCommand, WorkspaceSessionError, WorkspaceSessionLimits,
+    ConfinedWorkspaceSession, ConfinedWorkspaceSessionExit, ConfinedWorkspaceSessionHandle,
+    ConfinedWorkspaceSessionIo, VerifiedWorkspaceMount, WorkspaceSessionCommand,
+    WorkspaceSessionError, WorkspaceSessionLimits,
 };
 
 mod output_capture;

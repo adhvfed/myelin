@@ -6,6 +6,8 @@ use crate::user_namespace::RunscInvocationMode;
 use crate::{EgressPolicy, ResourceLimits};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MIN_SESSION_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -152,6 +154,18 @@ pub struct ConfinedWorkspaceSession {
     runtime: Option<WorkspaceRuntime>,
     started_at: Instant,
     max_duration: Duration,
+    cancellation: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub struct ConfinedWorkspaceSessionHandle {
+    cancellation: Arc<AtomicBool>,
+}
+
+impl ConfinedWorkspaceSessionHandle {
+    pub fn terminate(&self) {
+        self.cancellation.store(true, Ordering::Release);
+    }
 }
 
 struct WorkspaceRuntime {
@@ -189,6 +203,12 @@ impl ConfinedWorkspaceSession {
         }
     }
 
+    pub fn handle(&self) -> ConfinedWorkspaceSessionHandle {
+        ConfinedWorkspaceSessionHandle {
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
     pub fn wait(mut self) -> Result<ConfinedWorkspaceSessionExit, WorkspaceSessionError> {
         self.input.take();
         self.output.take();
@@ -203,7 +223,10 @@ impl ConfinedWorkspaceSession {
                     let timed_out = child.watchdog_deadline_expired();
                     break (Some(status), timed_out, DirectChildRetirement::Reaped);
                 }
-                Ok(None) if self.started_at.elapsed() < self.max_duration => {
+                Ok(None)
+                    if !self.cancellation.load(Ordering::Acquire)
+                        && self.started_at.elapsed() < self.max_duration =>
+                {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Ok(None) => break (None, true, child.kill_and_wait()),
@@ -396,6 +419,7 @@ impl WorkspaceSessionPlan {
             }),
             started_at: Instant::now(),
             max_duration: self.limits.max_duration,
+            cancellation: Arc::new(AtomicBool::new(false)),
         })
     }
 }

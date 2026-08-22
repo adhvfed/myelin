@@ -8,9 +8,12 @@ publish = false
 [dependencies]
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-storage = { path = "../myelin-storage" }
+myelin-agent-service = { path = "../myelin-agent-service" }
+myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 russh = { version = "=0.63.0", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }
 uuid = "1"
 
 [dev-dependencies]
-tokio = { workspace = true }
+tempfile.workspace = true

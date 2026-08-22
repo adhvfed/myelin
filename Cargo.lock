@@ -3761,9 +3761,12 @@ name = "myelin-workspace-gateway"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "myelin-agent-service",
+ "myelin-ci-sandbox",
  "myelin-identity-service",
  "myelin-storage",
  "russh",
+ "tempfile",
  "tokio",
  "uuid",
 ]
