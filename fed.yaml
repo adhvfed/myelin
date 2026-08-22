@@ -511,6 +511,8 @@ scripts:
       MYELIN_SYSTEM_TEST_ISSUES_PREFIX: MYL
     script: >-
       sh -c 'set -eu;
+      agent_workspace_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/agent-workspaces";
+      export MYELIN_AGENT_WORKSPACE_ROOT="$agent_workspace_root";
       token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
       --principal "$MYELIN_SYSTEM_TEST_PRINCIPAL" --display-name "System Test"

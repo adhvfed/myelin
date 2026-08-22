@@ -37,6 +37,33 @@ pub enum WorkspaceAccessError {
     Io(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkspaceDeletionError {
+    LocatorMismatch,
+    UnsafeStorage(String),
+    Io(String),
+}
+
+impl core::fmt::Display for WorkspaceDeletionError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LocatorMismatch => {
+                formatter.write_str("workspace locator does not identify the deletion target")
+            }
+            Self::UnsafeStorage(reason) => write!(formatter, "unsafe workspace storage: {reason}"),
+            Self::Io(reason) => write!(formatter, "workspace deletion failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceDeletionError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceDeletion {
+    Deleted,
+    AlreadyAbsent,
+}
+
 impl core::fmt::Display for WorkspaceAccessError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -151,6 +178,13 @@ pub trait AgentWorkspaceStore: AgentWorkspaceProvisioner {
         path: &str,
         bytes: &[u8],
     ) -> Result<WrittenWorkspaceFile, WorkspaceAccessError>;
+
+    fn delete_workspace(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        storage_locator: Option<&str>,
+    ) -> Result<WorkspaceDeletion, WorkspaceDeletionError>;
 }
 
 #[derive(Clone)]
@@ -386,6 +420,57 @@ impl AgentWorkspaceStore for LocalDevelopmentWorkspaceProvisioner {
             content_digest: blake3::hash(bytes).to_hex().to_string(),
         })
     }
+
+    fn delete_workspace(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        storage_locator: Option<&str>,
+    ) -> Result<WorkspaceDeletion, WorkspaceDeletionError> {
+        if storage_locator.is_some_and(|locator| locator != Self::locator(tenant, workspace_id)) {
+            return Err(WorkspaceDeletionError::LocatorMismatch);
+        }
+        self.verify_root().map_err(deletion_storage_error)?;
+        let workspace = match self.open_workspace(tenant, workspace_id) {
+            Ok(workspace) => workspace,
+            Err(WorkspaceAccessError::NotFound) => return Ok(WorkspaceDeletion::AlreadyAbsent),
+            Err(error) => return Err(deletion_access_error(error)),
+        };
+        let workspace_path = self.tenant_directory(tenant).join(workspace_id.to_string());
+        let opened = workspace
+            .metadata()
+            .map_err(|error| deletion_io("inspect open workspace deletion target", error))?;
+        let current = workspace_path
+            .symlink_metadata()
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => WorkspaceDeletionError::UnsafeStorage(
+                    "workspace disappeared after its deletion target was opened".into(),
+                ),
+                _ => deletion_io("inspect workspace deletion target", error),
+            })?;
+        require_private_directory(&workspace_path, &current).map_err(deletion_storage_error)?;
+        if DirectoryIdentity::from_metadata(&opened) != DirectoryIdentity::from_metadata(&current) {
+            return Err(WorkspaceDeletionError::UnsafeStorage(
+                "workspace identity changed before deletion".into(),
+            ));
+        }
+
+        match std::fs::remove_dir_all(&workspace_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(WorkspaceDeletion::AlreadyAbsent)
+            }
+            Err(error) => return Err(deletion_io("remove workspace tree", error)),
+        }
+        sync_directory(&self.tenant_directory(tenant)).map_err(deletion_storage_error)?;
+        match workspace_path.symlink_metadata() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(WorkspaceDeletion::Deleted),
+            Err(error) => Err(deletion_io("verify workspace deletion", error)),
+            Ok(_) => Err(WorkspaceDeletionError::UnsafeStorage(
+                "workspace remained present after deletion".into(),
+            )),
+        }
+    }
 }
 
 impl LocalDevelopmentWorkspaceProvisioner {
@@ -564,6 +649,38 @@ fn unlink_at(parent: &File, name: &CString) {
 
 fn map_unsafe_storage(error: WorkspaceProvisionError) -> WorkspaceAccessError {
     WorkspaceAccessError::UnsafeStorage(error.to_string())
+}
+
+fn deletion_storage_error(error: WorkspaceProvisionError) -> WorkspaceDeletionError {
+    match error {
+        WorkspaceProvisionError::InvalidRoot(reason)
+        | WorkspaceProvisionError::UnsafeRoot(reason) => {
+            WorkspaceDeletionError::UnsafeStorage(reason)
+        }
+        WorkspaceProvisionError::Io(reason) => WorkspaceDeletionError::Io(reason),
+    }
+}
+
+fn deletion_access_error(error: WorkspaceAccessError) -> WorkspaceDeletionError {
+    match error {
+        WorkspaceAccessError::LocatorMismatch => WorkspaceDeletionError::LocatorMismatch,
+        WorkspaceAccessError::Io(reason) => WorkspaceDeletionError::Io(reason),
+        WorkspaceAccessError::InvalidPath(reason) | WorkspaceAccessError::UnsafeStorage(reason) => {
+            WorkspaceDeletionError::UnsafeStorage(reason)
+        }
+        WorkspaceAccessError::NotFound => {
+            WorkspaceDeletionError::UnsafeStorage("workspace disappeared during deletion".into())
+        }
+        WorkspaceAccessError::NotRegularFile | WorkspaceAccessError::TooLarge => {
+            WorkspaceDeletionError::UnsafeStorage(
+                "workspace deletion resolved through an invalid storage object".into(),
+            )
+        }
+    }
+}
+
+fn deletion_io(context: &'static str, error: io::Error) -> WorkspaceDeletionError {
+    WorkspaceDeletionError::Io(format!("{context}: {error}"))
 }
 
 fn access_io(context: &'static str) -> impl FnOnce(io::Error) -> WorkspaceAccessError {
@@ -786,5 +903,46 @@ mod tests {
         assert!(store
             .read_file("acme", workspace_id, "escape/passwd")
             .is_err());
+    }
+
+    #[test]
+    fn deletion_is_exact_idempotent_and_never_follows_workspace_symlinks() {
+        let temporary = durable_test_root();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalDevelopmentWorkspaceProvisioner::open(temporary.path()).unwrap();
+        let workspace_id = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
+        let provisioned = store.provision("acme", workspace_id).unwrap();
+        store
+            .write_file("acme", workspace_id, "notes/final.txt", b"done")
+            .unwrap();
+        let outside = store.root().join("must-survive");
+        create_private_directory(&outside).unwrap();
+        std::fs::write(outside.join("marker"), b"outside").unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            store
+                .tenant_directory("acme")
+                .join(workspace_id.to_string())
+                .join("outside-link"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.delete_workspace("acme", workspace_id, Some(&provisioned.locator)),
+            Ok(WorkspaceDeletion::Deleted)
+        );
+        assert_eq!(std::fs::read(outside.join("marker")).unwrap(), b"outside");
+        assert_eq!(
+            store.delete_workspace("acme", workspace_id, Some(&provisioned.locator)),
+            Ok(WorkspaceDeletion::AlreadyAbsent)
+        );
+
+        let other = Uuid::parse_str("55555555-5555-4555-8555-555555555555").unwrap();
+        store.provision("acme", other).unwrap();
+        assert_eq!(
+            store.delete_workspace("acme", other, Some(&provisioned.locator)),
+            Err(WorkspaceDeletionError::LocatorMismatch)
+        );
+        assert!(store.open_workspace("acme", other).is_ok());
     }
 }

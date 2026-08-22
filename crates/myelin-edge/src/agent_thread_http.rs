@@ -90,6 +90,9 @@ impl AgentThreadHttpApi {
                 return Err(EdgeError::NotFound("agent not found".into()))
             }
         };
+        if !created && thread.state != AgentThreadState::Provisioning {
+            return Ok((thread, false));
+        }
         if thread.state == AgentThreadState::Ready {
             return Ok((thread, created));
         }

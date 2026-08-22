@@ -5,6 +5,7 @@ import { describe, expect, test } from "vitest";
 import {
   browserApprovedCliClient,
   reviewerClient,
+  systemClient,
   uniqueName,
 } from "../src/context.js";
 import {
@@ -24,6 +25,7 @@ import {
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { array, record, string } from "../src/json.js";
+import { reconcileAgentThreads } from "../src/operator.js";
 import { connectToWorkspace, generateEphemeralSshKey } from "../src/ssh.js";
 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
@@ -292,8 +294,6 @@ describe("private work with an agent", () => {
       byte_len: Buffer.byteLength(ownerNote),
       workspace_generation: first.thread.workspace.generation,
     });
-    await closeAgentRun(freshContext);
-
     const fetched = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(first.thread.id)}`,
     );
@@ -302,5 +302,95 @@ describe("private work with an agent", () => {
     expect(fetched.body.thread).not.toHaveProperty("storage_locator");
     expect(fetched.body.thread).not.toHaveProperty("failure_reason");
     expect(fetched.body.thread).not.toHaveProperty("tenant_id");
-  });
+
+    const expiryKey = await generateEphemeralSshKey();
+    try {
+      const accessBeforeExpiry = await requestWorkspaceSshAccess(
+        founder,
+        first.thread.id,
+        expiryKey.publicKey,
+      );
+      const workspaceBeforeExpiry = await connectToWorkspace(expiryKey, accessBeforeExpiry.access);
+      expect(await workspaceBeforeExpiry.readText(notebookPath)).toBe(notebook);
+
+      const inaccessible = await reconcileAgentThreads(first.thread.workspace.expires_at);
+      expect(inaccessible.madeInaccessible).toBeGreaterThanOrEqual(1);
+      expect(inaccessible.cleanupFailures).toBe(0);
+
+      const expiring = await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}`,
+      );
+      expect(parsePrivateAgentThread(expiring.body.thread).workspace.state).toBe("expiring");
+      await founder.json(
+        `/v1/chat/conversations/${encodeURIComponent(conversation.id)}/messages?limit=10`,
+        { expectedStatus: 404 },
+      );
+      await founder.json(
+        `/v1/chat/conversations/${encodeURIComponent(conversation.id)}/messages`,
+        {
+          method: "POST",
+          body: { content: "An expired thread cannot quietly become live again." },
+          expectedStatus: 404,
+        },
+      );
+      await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/runs`,
+        {
+          method: "POST",
+          body: {},
+          idempotencyKey: `expired-thread-run-${randomUUID()}`,
+          expectedStatus: 409,
+        },
+      );
+      await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/ssh-access`,
+        {
+          method: "POST",
+          body: { public_key: expiryKey.publicKey },
+          idempotencyKey: `expired-workspace-ssh-${randomUUID()}`,
+          expectedStatus: 409,
+        },
+      );
+      await systemClient.json("/v1/whoami", {
+        token: freshContext.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 401,
+      });
+      await expect(workspaceBeforeExpiry.readText(notebookPath)).rejects.toThrow(
+        "the host-key-pinned workspace SSH command failed",
+      );
+
+      const cleanupClock = new Date(
+        Date.parse(first.thread.workspace.expires_at) + 30_000,
+      ).toISOString();
+      const cleaned = await reconcileAgentThreads(cleanupClock);
+      expect(cleaned.deleted).toBeGreaterThanOrEqual(1);
+      expect(cleaned.cleanupFailures).toBe(0);
+
+      const deleted = await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}`,
+      );
+      const receipt = parsePrivateAgentThread(deleted.body.thread);
+      expect(receipt.workspace).toMatchObject({
+        id: first.thread.workspace.id,
+        generation: first.thread.workspace.generation,
+        state: "deleted",
+        expires_at: first.thread.workspace.expires_at,
+      });
+      expect(await listPrivateAgentThreads(founder)).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: first.thread.id })]),
+      );
+
+      const retriedReceipt = await startPrivateAgentThread(founder, {
+        name: threadName,
+        agentId: companion.agent.id,
+        retentionDays: 3,
+        idempotencyKey: retryKey,
+        expectedStatus: 200,
+      });
+      expect(retriedReceipt).toEqual({ created: false, thread: receipt });
+    } finally {
+      await expiryKey.remove();
+    }
+  }, 120_000);
 });
