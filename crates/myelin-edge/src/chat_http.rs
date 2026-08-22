@@ -80,6 +80,10 @@ impl DurableChatReadApi {
         )
     }
 
+    pub fn may_view_project(&self, principal: &Principal, project_id: &str) -> bool {
+        self.authorization.may_view_project(principal, project_id)
+    }
+
     async fn visible_conversation(
         &self,
         principal: &Principal,

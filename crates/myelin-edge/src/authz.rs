@@ -21,6 +21,9 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.agent.run.close",
     "identity.agent.run.mcp",
     "identity.agent.approval.decide",
+    "identity.agent_threads.list",
+    "identity.agent_thread.create",
+    "identity.agent_thread.view",
     "identity.triggers.list",
     "identity.trigger.create",
     "identity.trigger.pause",
@@ -169,6 +172,13 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("identity.agent.resume", "agent.manage", HUMAN_SESSION),
     requirement!("identity.agent.retire", "agent.manage", HUMAN_SESSION),
     requirement!("identity.agent.run.create", "agent.run", HUMAN_SESSION),
+    requirement!("identity.agent_threads.list", "agent.view", HUMAN_SESSION),
+    requirement!(
+        "identity.agent_thread.create",
+        "agent.manage",
+        HUMAN_SESSION
+    ),
+    requirement!("identity.agent_thread.view", "agent.view", HUMAN_SESSION),
     requirement!(
         "identity.agent.approval.decide",
         "agent.manage",

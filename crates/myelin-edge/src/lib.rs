@@ -1,6 +1,7 @@
 mod agent_delegation;
 pub mod agent_http;
 pub mod agent_mcp_http;
+pub mod agent_thread_http;
 mod auth_request;
 pub mod authz;
 pub mod bootstrap;
@@ -50,6 +51,7 @@ pub use agent_http::register_agents;
 pub use agent_mcp_http::{
     register_agent_mcp, AgentMcpAuthority, AgentMcpResources, AgentMcpServices,
 };
+pub use agent_thread_http::register_agent_threads;
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
 pub use authz::{

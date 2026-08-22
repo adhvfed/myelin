@@ -3,15 +3,16 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::{Request, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use myelin_agent_service::workspace::LocalDevelopmentWorkspaceProvisioner;
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
-    register_agent_mcp, register_agents, register_chat, register_ci, register_git_durable,
-    register_git_wire, register_issues, register_knowledge, register_notif, register_privacy,
-    register_projects, register_refs, register_tools, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, AgentMcpAuthority, AgentMcpResources, AgentMcpServices,
-    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
-    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableChatMutationApi,
+    register_agent_mcp, register_agent_threads, register_agents, register_chat, register_ci,
+    register_git_durable, register_git_wire, register_issues, register_knowledge, register_notif,
+    register_privacy, register_projects, register_refs, register_tools,
+    serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AgentMcpAuthority,
+    AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy,
+    BootstrapParams, CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableChatMutationApi,
     DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeMutationApi,
     DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
     ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
@@ -29,10 +30,10 @@ use myelin_identity_service::{
 };
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_storage::{
-    all_durable_migrations, seal_key_from_env, BlobStore, DurableCellRootBacking,
-    DurableKmsBacking, DurablePrincipalBacking, DurableReplayBacking, DurableRevocationBacking,
-    DurableTupleBacking, HotTables, KmsEngine, PgBootstrap, PgOutboxBacking, SubstrateProvider,
-    TenantScope,
+    all_durable_migrations, seal_key_from_env, BlobStore, DurableAgentThreadBacking,
+    DurableCellRootBacking, DurableKmsBacking, DurablePrincipalBacking, DurableReplayBacking,
+    DurableRevocationBacking, DurableTupleBacking, HotTables, KmsEngine, PgBootstrap,
+    PgOutboxBacking, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::{
@@ -302,6 +303,7 @@ struct ComposedCore {
 struct EdgeRuntimeConfig {
     cell_id: String,
     git_root: Option<PathBuf>,
+    agent_workspace_root: Option<PathBuf>,
     git_wire: Option<GitWireRuntime>,
     public_base_url: Option<String>,
     listen_addr: Option<String>,
@@ -331,39 +333,10 @@ impl EdgeRuntimeConfig {
     ) -> Result<Self, String> {
         let cell_id = required_runtime_value("MYELIN_CELL_ID", read("MYELIN_CELL_ID"))?;
         let git_root = if serving {
-            let raw = required_runtime_value("MYELIN_GIT_ROOT", read("MYELIN_GIT_ROOT"))?;
-            let path = PathBuf::from(raw);
-            if !path.is_absolute() {
-                return Err("MYELIN_GIT_ROOT must be an absolute persistent path".into());
-            }
-            if path
-                .components()
-                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-            {
-                return Err("MYELIN_GIT_ROOT must not contain `.` or `..` components".into());
-            }
-            if path.parent().is_none() {
-                return Err("MYELIN_GIT_ROOT must not be the filesystem root".into());
-            }
-            let path = path.canonicalize().map_err(|error| {
-                format!("MYELIN_GIT_ROOT must name an existing persistent directory: {error}")
-            })?;
-            if path.parent().is_none() {
-                return Err("MYELIN_GIT_ROOT must not resolve to the filesystem root".into());
-            }
-            if !path.is_dir() {
-                return Err("MYELIN_GIT_ROOT must name a directory".into());
-            }
-            let temp_dir = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
-            if path.starts_with(temp_dir) {
-                return Err(
-                    "MYELIN_GIT_ROOT must not live under the operating-system temp directory"
-                        .into(),
-                );
-            }
-            Some(path)
+            Some(validated_persistent_directory(
+                "MYELIN_GIT_ROOT",
+                read("MYELIN_GIT_ROOT"),
+            )?)
         } else {
             None
         };
@@ -406,9 +379,18 @@ impl EdgeRuntimeConfig {
         )?;
         let token_login_enabled = serving
             && optional_runtime_switch("MYELIN_TOKEN_LOGIN", read("MYELIN_TOKEN_LOGIN"), false)?;
+        let agent_workspace_root = if serving {
+            Some(validated_persistent_directory(
+                "MYELIN_AGENT_WORKSPACE_ROOT",
+                read("MYELIN_AGENT_WORKSPACE_ROOT"),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             cell_id,
             git_root,
+            agent_workspace_root,
             git_wire,
             public_base_url,
             listen_addr,
@@ -416,6 +398,43 @@ impl EdgeRuntimeConfig {
             token_login_enabled,
         })
     }
+}
+
+fn validated_persistent_directory(
+    name: &'static str,
+    value: Result<String, VarError>,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(required_runtime_value(name, value)?);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be an absolute persistent path"));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!("{name} must not contain `.` or `..` components"));
+    }
+    if path.parent().is_none() {
+        return Err(format!("{name} must not be the filesystem root"));
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("{name} must name an existing persistent directory: {error}"))?;
+    if path.parent().is_none() {
+        return Err(format!("{name} must not resolve to the filesystem root"));
+    }
+    if !path.is_dir() {
+        return Err(format!("{name} must name a directory"));
+    }
+    let temporary = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    if path.starts_with(temporary) {
+        return Err(format!(
+            "{name} must not live under the operating-system temp directory"
+        ));
+    }
+    Ok(path)
 }
 
 fn validated_public_base_url(value: Result<String, VarError>) -> Result<String, String> {
@@ -843,6 +862,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     let EdgeRuntimeConfig {
         cell_id: _,
         git_root,
+        agent_workspace_root,
         git_wire,
         public_base_url,
         listen_addr,
@@ -850,6 +870,14 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         token_login_enabled,
     } = runtime;
     let git_root = git_root.expect("serving config carries a Git root");
+    let agent_workspace_root =
+        agent_workspace_root.expect("serving config carries an agent workspace root");
+    let agent_workspaces = Arc::new(
+        LocalDevelopmentWorkspaceProvisioner::open(agent_workspace_root).unwrap_or_else(|error| {
+            eprintln!("edge: agent workspace storage refused to start: {error}");
+            std::process::exit(1);
+        }),
+    );
     let public_base_url = public_base_url.expect("serving config carries a public base URL");
     let listen_addr = listen_addr.expect("serving config carries a listen address");
     let ComposedCore {
@@ -1236,6 +1264,8 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         kms.clone(),
         check.clone(),
     );
+    let agent_thread_chat_mutations =
+        DurableChatMutationApi::new(mcp_chat.clone(), chat_principals.clone());
     builder = register_agent_mcp(
         builder,
         AgentMcpServices::new(
@@ -1258,11 +1288,19 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                     kms.clone(),
                 ),
                 mcp_chat.clone(),
-                DurableChatMutationApi::new(mcp_chat, chat_principals.clone()),
+                DurableChatMutationApi::new(mcp_chat.clone(), chat_principals.clone()),
                 myelin_edge::DurableProjectReadApi::new(projects, handle.clone()),
             ),
             handle.clone(),
         ),
+    );
+    builder = register_agent_threads(
+        builder,
+        DurableAgentThreadBacking::new(provider.clone()),
+        mcp_chat,
+        agent_thread_chat_mutations,
+        agent_workspaces,
+        handle.clone(),
     );
     builder = register_tools(builder);
     builder = register_chat(
@@ -1810,12 +1848,26 @@ mod runtime_config_tests {
         );
 
         let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert_eq!(
+            parse(
+                true,
+                &[
+                    ("MYELIN_CELL_ID", "cell-eu-1".into()),
+                    ("MYELIN_GIT_ROOT", root.display().to_string()),
+                    ("MYELIN_GIT_WIRE_ENABLED", "0".into()),
+                    ("MYELIN_PUBLIC_BASE_URL", "http://127.0.0.1:8080".into()),
+                ],
+            )
+            .unwrap_err(),
+            "required env var MYELIN_AGENT_WORKSPACE_ROOT is not set"
+        );
         let (rootfs, runsc) = git_wire_fixture();
         let config = parse(
             true,
             &[
                 ("MYELIN_CELL_ID", " cell-eu-1 ".into()),
                 ("MYELIN_GIT_ROOT", root.display().to_string()),
+                ("MYELIN_AGENT_WORKSPACE_ROOT", root.display().to_string()),
                 ("MYELIN_GVISOR_GIT_ROOTFS", rootfs),
                 ("MYELIN_RUNSC_BIN", runsc),
                 (
@@ -1827,6 +1879,7 @@ mod runtime_config_tests {
         .unwrap();
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root.as_deref(), Some(root.as_path()));
+        assert_eq!(config.agent_workspace_root.as_deref(), Some(root.as_path()));
         assert!(config.git_wire.is_some());
         assert_eq!(
             config.public_base_url.as_deref(),
@@ -1839,6 +1892,7 @@ mod runtime_config_tests {
         let config = parse(false, &[("MYELIN_CELL_ID", "cell-eu-1".into())]).unwrap();
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root, None);
+        assert_eq!(config.agent_workspace_root, None);
         assert_eq!(config.git_wire, None);
         assert_eq!(config.public_base_url, None);
         assert_eq!(config.listen_addr, None);
@@ -2041,6 +2095,7 @@ mod runtime_config_tests {
             &[
                 ("MYELIN_CELL_ID", "cell-dev".into()),
                 ("MYELIN_GIT_ROOT", root.display().to_string()),
+                ("MYELIN_AGENT_WORKSPACE_ROOT", root.display().to_string()),
                 ("MYELIN_GIT_WIRE_ENABLED", "0".into()),
                 ("MYELIN_PUBLIC_BASE_URL", "http://127.0.0.1:8080".into()),
             ],
