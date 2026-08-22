@@ -31,6 +31,7 @@ pub mod saml;
 pub mod ssh_auth;
 pub mod tuple_store;
 pub mod webauthn;
+pub mod workspace_ssh;
 
 pub use agent_registry::{
     agent_ref, validate_new_agent, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
@@ -149,6 +150,7 @@ pub use webauthn::{
     ChallengeGuard as WebauthnChallengeGuard, CoseKey, CredentialBindingIndex, WebauthnConfig,
     WebauthnVerifier,
 };
+pub use workspace_ssh::{workspace_ssh_public_key_fingerprint, WorkspaceSshHostIdentity};
 
 use myelin_events::OutboxStore;
 use myelin_identity::{

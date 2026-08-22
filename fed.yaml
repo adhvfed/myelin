@@ -11,6 +11,7 @@ parameters:
   NATS_PORT: { type: port, default: 4222 }
   NATS_MONITOR_PORT: { type: port, default: 8222 }
   EDGE_PORT: { type: port, default: 8080 }
+  WORKSPACE_SSH_PORT: { type: port, default: 2224 }
   WEB_PORT: { type: port, default: 3000 }
 
 services:
@@ -141,6 +142,8 @@ services:
       MYELIN_PUBLIC_BASE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
       MYELIN_WEB_PUBLIC_URL: "http://127.0.0.1:{{WEB_PORT}}"
       MYELIN_EDGE_ADDR: "127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_WORKSPACE_SSH_HOST: "127.0.0.1"
+      MYELIN_WORKSPACE_SSH_PORT: "{{WORKSPACE_SSH_PORT}}"
       MYELIN_DEV_LOGIN: "1"
       MYELIN_TOKEN_LOGIN: "1"
       MYELIN_ISSUES_RECONCILE_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"

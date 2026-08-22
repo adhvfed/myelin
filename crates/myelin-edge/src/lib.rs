@@ -48,13 +48,14 @@ pub mod trigger_http;
 mod trigger_lifecycle;
 mod workspace_access;
 mod workspace_effect;
+mod workspace_ssh_http;
 
 pub use agent_http::register_agents;
 pub use agent_mcp_http::{
     register_agent_mcp, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources,
     AgentMcpServices,
 };
-pub use agent_thread_http::register_agent_threads;
+pub use agent_thread_http::{register_agent_threads, AgentThreadHttpInputs};
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
 pub use authz::{
@@ -133,3 +134,4 @@ pub use sse::{SseEvent, SseHub, SseSubscription};
 pub use tool_http::register_tools;
 pub use trigger_http::register_triggers;
 pub use workspace_access::DurableAgentWorkspaceAccess;
+pub use workspace_ssh_http::WorkspaceSshEndpoint;

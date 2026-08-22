@@ -11,13 +11,14 @@ use myelin_edge::{
     register_git_durable, register_git_wire, register_issues, register_knowledge, register_notif,
     register_privacy, register_projects, register_refs, register_tools,
     serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AgentMcpAuthority,
-    AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DeviceAuthorizationBroker, DurableAgentWorkspaceAccess, DurableChatMutationApi,
-    DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeMutationApi,
-    DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
-    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
-    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices, AgentThreadHttpInputs,
+    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
+    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableAgentWorkspaceAccess,
+    DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
+    DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway, GitDatabaseProviders,
+    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
+    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -27,14 +28,14 @@ use myelin_identity::{
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, DpopReplayGuard, HumanSsoAuthenticator, JwkSet,
     OidcConfig, PasetoCapabilityVerifier, PrincipalStore, ReplayGuard, RevocationStore,
-    StoreBackedCheck, TokenVerifier, TupleStore,
+    StoreBackedCheck, TokenVerifier, TupleStore, WorkspaceSshHostIdentity,
 };
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, BlobStore, DurableAgentThreadBacking,
     DurableCellRootBacking, DurableKmsBacking, DurablePrincipalBacking, DurableReplayBacking,
     DurableRevocationBacking, DurableTupleBacking, HotTables, KmsEngine, PgBootstrap,
-    PgOutboxBacking, SubstrateProvider, TenantScope,
+    PgOutboxBacking, SubstrateProvider, TenantScope, WorkspaceSshRouteKey,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::{
@@ -296,6 +297,8 @@ struct ComposedCore {
     kms: Arc<KmsEngine>,
     cell: Arc<CellTokenAuthority>,
     ci_surface_cursor_key: zeroize::Zeroizing<[u8; 32]>,
+    workspace_ssh_host: WorkspaceSshHostIdentity,
+    workspace_ssh_routes: WorkspaceSshRouteKey,
     cell_id: String,
     handle: tokio::runtime::Handle,
 }
@@ -305,6 +308,7 @@ struct EdgeRuntimeConfig {
     cell_id: String,
     git_root: Option<PathBuf>,
     agent_workspace_root: Option<PathBuf>,
+    workspace_ssh: Option<WorkspaceSshRuntime>,
     git_wire: Option<GitWireRuntime>,
     public_base_url: Option<String>,
     listen_addr: Option<String>,
@@ -316,6 +320,12 @@ struct EdgeRuntimeConfig {
 struct GitWireRuntime {
     rootfs: PathBuf,
     runsc: PathBuf,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspaceSshRuntime {
+    host: String,
+    port: u16,
 }
 
 impl EdgeRuntimeConfig {
@@ -388,10 +398,30 @@ impl EdgeRuntimeConfig {
         } else {
             None
         };
+        let workspace_ssh = if serving {
+            let host = required_runtime_value(
+                "MYELIN_WORKSPACE_SSH_HOST",
+                read("MYELIN_WORKSPACE_SSH_HOST"),
+            )?;
+            let port = required_runtime_value(
+                "MYELIN_WORKSPACE_SSH_PORT",
+                read("MYELIN_WORKSPACE_SSH_PORT"),
+            )?
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| {
+                "MYELIN_WORKSPACE_SSH_PORT must be an integer between 1 and 65535".to_string()
+            })?;
+            Some(WorkspaceSshRuntime { host, port })
+        } else {
+            None
+        };
         Ok(Self {
             cell_id,
             git_root,
             agent_workspace_root,
+            workspace_ssh,
             git_wire,
             public_base_url,
             listen_addr,
@@ -791,6 +821,8 @@ async fn compose_core(cell_id: String) -> ComposedCore {
     };
     let ci_surface_cursor_key =
         seal_key.derive_service_key("myelin 2026-07-24 ci run surface cursor v1");
+    let workspace_ssh_host = WorkspaceSshHostIdentity::from_seal_key(&seal_key);
+    let workspace_ssh_routes = WorkspaceSshRouteKey::from_seal_key(&seal_key);
     let kms_backing = DurableKmsBacking::new(provider.db_pool().clone(), cell_id.clone());
     let kms = match kms_backing.load_or_generate(&seal_key).await {
         Ok(engine) => Arc::new(engine),
@@ -823,6 +855,8 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         kms,
         cell,
         ci_surface_cursor_key,
+        workspace_ssh_host,
+        workspace_ssh_routes,
         cell_id,
         handle,
     }
@@ -864,6 +898,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         cell_id: _,
         git_root,
         agent_workspace_root,
+        workspace_ssh,
         git_wire,
         public_base_url,
         listen_addr,
@@ -873,6 +908,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     let git_root = git_root.expect("serving config carries a Git root");
     let agent_workspace_root =
         agent_workspace_root.expect("serving config carries an agent workspace root");
+    let workspace_ssh = workspace_ssh.expect("serving config carries a workspace SSH endpoint");
     let agent_workspaces: Arc<dyn AgentWorkspaceStore> = Arc::new(
         LocalDevelopmentWorkspaceProvisioner::open(agent_workspace_root).unwrap_or_else(|error| {
             eprintln!("edge: agent workspace storage refused to start: {error}");
@@ -886,9 +922,20 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         kms,
         cell,
         ci_surface_cursor_key,
+        workspace_ssh_host,
+        workspace_ssh_routes,
         cell_id,
         handle,
     } = core;
+    let workspace_ssh_endpoint = WorkspaceSshEndpoint::new(
+        workspace_ssh.host,
+        workspace_ssh.port,
+        workspace_ssh_host.public_key(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("edge: workspace SSH endpoint refused to start: {error}");
+        std::process::exit(1);
+    });
     let readiness = Arc::new(EdgeReadiness {
         provider: provider.clone(),
         git_root: git_root.clone(),
@@ -1307,12 +1354,16 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     );
     builder = register_agent_threads(
         builder,
-        agent_threads,
-        mcp_chat,
-        agent_thread_chat_mutations,
-        agent_workspaces,
-        agent_sessions,
-        handle.clone(),
+        AgentThreadHttpInputs {
+            threads: agent_threads,
+            chat_reads: mcp_chat,
+            chat_mutations: agent_thread_chat_mutations,
+            workspaces: agent_workspaces,
+            sessions: agent_sessions,
+            ssh_routes: workspace_ssh_routes,
+            ssh_endpoint: workspace_ssh_endpoint,
+            runtime: handle.clone(),
+        },
     );
     builder = register_tools(builder);
     builder = register_chat(
@@ -1880,6 +1931,8 @@ mod runtime_config_tests {
                 ("MYELIN_CELL_ID", " cell-eu-1 ".into()),
                 ("MYELIN_GIT_ROOT", root.display().to_string()),
                 ("MYELIN_AGENT_WORKSPACE_ROOT", root.display().to_string()),
+                ("MYELIN_WORKSPACE_SSH_HOST", "ssh.myelin.example".into()),
+                ("MYELIN_WORKSPACE_SSH_PORT", "22".into()),
                 ("MYELIN_GVISOR_GIT_ROOTFS", rootfs),
                 ("MYELIN_RUNSC_BIN", runsc),
                 (
@@ -1892,6 +1945,13 @@ mod runtime_config_tests {
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root.as_deref(), Some(root.as_path()));
         assert_eq!(config.agent_workspace_root.as_deref(), Some(root.as_path()));
+        assert_eq!(
+            config.workspace_ssh,
+            Some(WorkspaceSshRuntime {
+                host: "ssh.myelin.example".into(),
+                port: 22,
+            })
+        );
         assert!(config.git_wire.is_some());
         assert_eq!(
             config.public_base_url.as_deref(),
@@ -1905,6 +1965,7 @@ mod runtime_config_tests {
         assert_eq!(config.cell_id, "cell-eu-1");
         assert_eq!(config.git_root, None);
         assert_eq!(config.agent_workspace_root, None);
+        assert_eq!(config.workspace_ssh, None);
         assert_eq!(config.git_wire, None);
         assert_eq!(config.public_base_url, None);
         assert_eq!(config.listen_addr, None);
@@ -2108,6 +2169,8 @@ mod runtime_config_tests {
                 ("MYELIN_CELL_ID", "cell-dev".into()),
                 ("MYELIN_GIT_ROOT", root.display().to_string()),
                 ("MYELIN_AGENT_WORKSPACE_ROOT", root.display().to_string()),
+                ("MYELIN_WORKSPACE_SSH_HOST", "127.0.0.1".into()),
+                ("MYELIN_WORKSPACE_SSH_PORT", "2224".into()),
                 ("MYELIN_GIT_WIRE_ENABLED", "0".into()),
                 ("MYELIN_PUBLIC_BASE_URL", "http://127.0.0.1:8080".into()),
             ],

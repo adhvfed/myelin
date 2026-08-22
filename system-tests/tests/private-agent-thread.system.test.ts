@@ -19,10 +19,12 @@ import {
 import {
   listPrivateAgentThreads,
   parsePrivateAgentThread,
+  requestWorkspaceSshAccess,
   startPrivateAgentThread,
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { array, record, string } from "../src/json.js";
+import { generateEphemeralSshKey } from "../src/ssh.js";
 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
 
@@ -111,6 +113,64 @@ describe("private work with an agent", () => {
       },
     );
     expect(hiddenRun.body).toMatchObject({ error: { code: "not_found" } });
+
+    const sshKey = await generateEphemeralSshKey();
+    const anotherSshKey = await generateEphemeralSshKey();
+    try {
+      const hiddenSsh = await teammate.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/ssh-access`,
+        {
+          method: "POST",
+          body: { public_key: sshKey.publicKey },
+          idempotencyKey: `hidden-workspace-ssh-${randomUUID()}`,
+          expectedStatus: 404,
+        },
+      );
+      expect(hiddenSsh.body).toMatchObject({ error: { code: "not_found" } });
+
+      const sshRetryKey = `workspace-ssh-${randomUUID()}`;
+      const sshAccess = await requestWorkspaceSshAccess(
+        founder,
+        first.thread.id,
+        sshKey.publicKey,
+        { idempotencyKey: sshRetryKey },
+      );
+      expect(sshAccess.created).toBe(true);
+      expect(sshAccess.workspace).toEqual({
+        id: first.thread.workspace.id,
+        generation: first.thread.workspace.generation,
+      });
+      expect(sshAccess.access.username).toMatch(/^ws1_[A-Za-z0-9_-]+$/);
+      expect(sshAccess.access.public_key_fingerprint).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
+      expect(sshAccess.access.host_public_key).toMatch(/^ssh-ed25519 [A-Za-z0-9+/=]+$/);
+      expect(sshAccess.access.host_key_fingerprint).toMatch(/^SHA256:[A-Za-z0-9+/]{43}$/);
+      expect(Date.parse(sshAccess.access.expires_at)).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
+      expect(Date.parse(sshAccess.access.expires_at)).toBeLessThanOrEqual(
+        Date.parse(first.thread.workspace.expires_at),
+      );
+
+      const replayedSshAccess = await requestWorkspaceSshAccess(
+        founder,
+        first.thread.id,
+        sshKey.publicKey,
+        { idempotencyKey: sshRetryKey, expectedStatus: 200 },
+      );
+      expect(replayedSshAccess).toEqual({ ...sshAccess, created: false });
+      const changedKey = await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/ssh-access`,
+        {
+          method: "POST",
+          body: { public_key: anotherSshKey.publicKey },
+          idempotencyKey: sshRetryKey,
+          expectedStatus: 409,
+        },
+      );
+      expect(changedKey.body).toMatchObject({ error: { code: "conflict" } });
+      expect(JSON.stringify(sshAccess)).not.toContain(sshKey.privateKeyPath);
+      expect(JSON.stringify(sshAccess)).not.toContain("private_key");
+    } finally {
+      await Promise.all([sshKey.remove(), anotherSshKey.remove()]);
+    }
 
     const unboundRun = await beginAgentRun(founder, companion.agent.id);
     const unboundWorkspace = await askAgentToBeDenied(

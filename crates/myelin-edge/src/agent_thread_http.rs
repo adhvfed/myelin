@@ -11,7 +11,8 @@ use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome,
     CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, NewAgentThread,
-    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,9 +25,12 @@ use crate::chat_http::{DurableChatMutationApi, DurableChatReadApi, PrivateConver
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
+use crate::workspace_ssh_http::{
+    register_workspace_ssh_access, WorkspaceSshEndpoint, WorkspaceSshHttpInputs,
+};
 use crate::{EdgeError, Method};
 
-const MAX_AGENT_THREAD_JSON_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_AGENT_THREAD_JSON_BYTES: usize = 16 * 1024;
 const DEFAULT_RETENTION_DAYS: i16 = 3;
 
 #[derive(Clone)]
@@ -125,6 +129,20 @@ impl AgentThreadHttpApi {
         }
     }
 
+    fn owner_thread(
+        &self,
+        principal: &Principal,
+        thread_id: Uuid,
+    ) -> Result<DurableAgentThread, EdgeError> {
+        self.drive(self.threads.get_for_owner(
+            &principal.tenant.0,
+            &principal.principal_id.0,
+            thread_id,
+        ))?
+        .map_err(|_| EdgeError::Internal("agent thread lookup failed".into()))?
+        .ok_or_else(|| EdgeError::NotFound("agent thread not found".into()))
+    }
+
     fn create_private_conversation(
         &self,
         principal: &Principal,
@@ -167,6 +185,17 @@ impl AgentThreadHttpApi {
         )?;
         Ok(())
     }
+}
+
+pub struct AgentThreadHttpInputs {
+    pub threads: DurableAgentThreadBacking,
+    pub chat_reads: DurableChatReadApi,
+    pub chat_mutations: DurableChatMutationApi,
+    pub workspaces: Arc<dyn AgentWorkspaceStore>,
+    pub sessions: AgentSessionIssuer,
+    pub ssh_routes: WorkspaceSshRouteKey,
+    pub ssh_endpoint: WorkspaceSshEndpoint,
+    pub runtime: Handle,
 }
 
 #[derive(Deserialize)]
@@ -254,7 +283,7 @@ struct AgentThreadCreateHandler {
 impl Handler for AgentThreadCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
-        let body = parse_body(&ctx.request.body)?;
+        let body = parse_create_body(&ctx.request.body)?;
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
@@ -287,15 +316,7 @@ impl Handler for AgentThreadRunCreateHandler {
             MAX_AGENT_THREAD_JSON_BYTES,
         )?;
         let thread_id = thread_param(ctx)?;
-        let thread = self
-            .api
-            .drive(self.api.threads.get_for_owner(
-                &ctx.principal.tenant.0,
-                &ctx.principal.principal_id.0,
-                thread_id,
-            ))?
-            .map_err(|_| EdgeError::Internal("agent thread lookup failed".into()))?
-            .ok_or_else(|| EdgeError::NotFound("agent thread not found".into()))?;
+        let thread = self.api.owner_thread(ctx.principal, thread_id)?;
         let now = Utc::now();
         let workspace_expires_at = parse_stored_timestamp(&thread.expires_at)?;
         if thread.state != AgentThreadState::Ready || workspace_expires_at <= now {
@@ -364,15 +385,7 @@ impl Handler for AgentThreadGetHandler {
         require_empty_query(ctx)?;
         require_empty_body(ctx)?;
         let thread_id = thread_param(ctx)?;
-        let thread = self
-            .api
-            .drive(self.api.threads.get_for_owner(
-                &ctx.principal.tenant.0,
-                &ctx.principal.principal_id.0,
-                thread_id,
-            ))?
-            .map_err(|_| EdgeError::Internal("agent thread lookup failed".into()))?
-            .ok_or_else(|| EdgeError::NotFound("agent thread not found".into()))?;
+        let thread = self.api.owner_thread(ctx.principal, thread_id)?;
         Ok(no_store(EdgeResponse::json(
             200,
             &json!({ "thread": thread_json(&ctx.principal.tenant.0, &thread) }),
@@ -415,28 +428,29 @@ impl Handler for AgentThreadListHandler {
 
 pub fn register_agent_threads(
     builder: GatewayBuilder,
-    threads: DurableAgentThreadBacking,
-    chat_reads: DurableChatReadApi,
-    chat_mutations: DurableChatMutationApi,
-    workspaces: Arc<dyn AgentWorkspaceStore>,
-    sessions: AgentSessionIssuer,
-    runtime: Handle,
+    inputs: AgentThreadHttpInputs,
 ) -> GatewayBuilder {
+    let ssh = WorkspaceSshHttpInputs {
+        threads: inputs.threads.clone(),
+        routes: inputs.ssh_routes,
+        endpoint: inputs.ssh_endpoint,
+        runtime: inputs.runtime.clone(),
+    };
     let api = AgentThreadHttpApi {
-        threads,
-        chat_reads,
-        chat_mutations,
-        workspaces,
-        sessions,
+        threads: inputs.threads,
+        chat_reads: inputs.chat_reads,
+        chat_mutations: inputs.chat_mutations,
+        workspaces: inputs.workspaces,
+        sessions: inputs.sessions,
         catalogue: Arc::new(
             PlatformToolCatalogue::platform()
                 .expect("the built-in platform ToolDef catalogue must be valid"),
         ),
         event_ids: Arc::new(myelin_events::UlidMinter::new()),
         conversation_ids: Arc::new(SystemUlidSource::new()),
-        runtime,
+        runtime: inputs.runtime,
     };
-    builder
+    let builder = builder
         .route(
             Method::Get,
             "/v1/agent-threads",
@@ -460,7 +474,8 @@ pub fn register_agent_threads(
             "/v1/agent-threads/{thread}/runs",
             "identity.agent_thread.run.create",
             Arc::new(AgentThreadRunCreateHandler { api }),
-        )
+        );
+    register_workspace_ssh_access(builder, ssh)
 }
 
 fn thread_run_json(
@@ -516,7 +531,7 @@ fn thread_ref(tenant: &str, thread_id: &str) -> String {
     format!("myelin://{tenant}/agent/thread/{thread_id}")
 }
 
-fn parse_body(body: &[u8]) -> Result<CreateAgentThreadBody, EdgeError> {
+fn parse_create_body(body: &[u8]) -> Result<CreateAgentThreadBody, EdgeError> {
     if body.is_empty() {
         return Err(EdgeError::BadRequest(
             "agent thread request body is empty".into(),
@@ -543,7 +558,7 @@ fn parse_uuid(field: &str, value: &str) -> Result<Uuid, EdgeError> {
     Ok(parsed)
 }
 
-fn parse_stored_timestamp(value: &str) -> Result<DateTime<Utc>, EdgeError> {
+pub(crate) fn parse_stored_timestamp(value: &str) -> Result<DateTime<Utc>, EdgeError> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|_| EdgeError::Internal("stored agent thread expiry is invalid".into()))
@@ -604,7 +619,7 @@ fn page_query(query: &str) -> Result<(u32, Option<Uuid>), EdgeError> {
     Ok((limit, cursor))
 }
 
-fn thread_param(ctx: &HandlerCtx<'_>) -> Result<Uuid, EdgeError> {
+pub(crate) fn thread_param(ctx: &HandlerCtx<'_>) -> Result<Uuid, EdgeError> {
     let value = ctx
         .params
         .get("thread")
@@ -612,7 +627,7 @@ fn thread_param(ctx: &HandlerCtx<'_>) -> Result<Uuid, EdgeError> {
     parse_uuid("id", value)
 }
 
-fn require_empty_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
+pub(crate) fn require_empty_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
     if ctx.request.query.is_empty() {
         Ok(())
     } else {
@@ -632,7 +647,7 @@ fn require_empty_body(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
     }
 }
 
-fn no_store(response: EdgeResponse) -> EdgeResponse {
+pub(crate) fn no_store(response: EdgeResponse) -> EdgeResponse {
     response.with_header("Cache-Control", "no-store")
 }
 
@@ -674,7 +689,7 @@ mod tests {
             br#"{"name":"x","agent_id":"11111111-1111-4111-8111-111111111111","retention_days":31}"#,
             br#"{"name":"x","agent_id":"11111111-1111-4111-8111-111111111111","extra":true}"#,
         ] {
-            let refused = parse_body(body)
+            let refused = parse_create_body(body)
                 .and_then(|body| ValidatedThreadIntent::new(&principal(), body, "retry".into()))
                 .is_err();
             assert!(refused, "unexpectedly accepted {}", String::from_utf8_lossy(body));

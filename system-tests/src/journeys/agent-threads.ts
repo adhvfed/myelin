@@ -25,6 +25,22 @@ export interface PrivateAgentThread {
   updated_at: string;
 }
 
+export interface WorkspaceSshAccess {
+  host: string;
+  port: number;
+  username: string;
+  expires_at: string;
+  public_key_fingerprint: string;
+  host_public_key: string;
+  host_key_fingerprint: string;
+}
+
+export interface WorkspaceSshGrant {
+  access: WorkspaceSshAccess;
+  workspace: { id: string; generation: number };
+  created: boolean;
+}
+
 export async function startPrivateAgentThread(
   client: SystemTestClient,
   intent: {
@@ -59,6 +75,50 @@ export async function listPrivateAgentThreads(
   const response = await client.json("/v1/agent-threads?limit=100");
   return array(response.body.items, "private agent threads")
     .map((item) => parsePrivateAgentThread(item));
+}
+
+export async function requestWorkspaceSshAccess(
+  client: SystemTestClient,
+  threadId: string,
+  publicKey: string,
+  options: {
+    idempotencyKey?: string;
+    expectedStatus?: 200 | 201;
+  } = {},
+): Promise<WorkspaceSshGrant> {
+  const response = await client.json(
+    `/v1/agent-threads/${encodeURIComponent(threadId)}/ssh-access`,
+    {
+      method: "POST",
+      body: { public_key: publicKey },
+      idempotencyKey: options.idempotencyKey ?? `workspace-ssh-${randomUUID()}`,
+      expectedStatus: options.expectedStatus ?? 201,
+    },
+  );
+  const access = record(response.body.access, "workspace SSH access");
+  const workspace = record(response.body.workspace, "workspace SSH workspace");
+  return {
+    access: {
+      host: string(access.host, "workspace SSH host"),
+      port: positiveInteger(access.port, "workspace SSH port"),
+      username: string(access.username, "workspace SSH username"),
+      expires_at: string(access.expires_at, "workspace SSH expiry"),
+      public_key_fingerprint: string(
+        access.public_key_fingerprint,
+        "workspace SSH public key fingerprint",
+      ),
+      host_public_key: string(access.host_public_key, "workspace SSH host public key"),
+      host_key_fingerprint: string(
+        access.host_key_fingerprint,
+        "workspace SSH host key fingerprint",
+      ),
+    },
+    workspace: {
+      id: string(workspace.id, "workspace SSH workspace id"),
+      generation: positiveInteger(workspace.generation, "workspace SSH workspace generation"),
+    },
+    created: response.body.created === true,
+  };
 }
 
 export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
