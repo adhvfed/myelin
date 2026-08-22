@@ -14,6 +14,7 @@ export function AgentThreadSidebar(props: {
   loadingMore: boolean;
   onLoadMore: () => void;
   onNew: () => void;
+  onActivateAgent: () => void;
 }) {
   return (
     <aside
@@ -26,15 +27,26 @@ export function AgentThreadSidebar(props: {
           <p>Private work</p>
           <h1><Icon name="agent" /> Agents</h1>
         </div>
-        <button
-          type="button"
-          class="agent-thread-icon-button"
-          aria-label="New private thread"
-          disabled={!props.interactive}
-          onClick={() => props.onNew()}
-        >
-          <Icon name="message" />
-        </button>
+        <div class="agent-thread-sidebar-actions">
+          <button
+            type="button"
+            class="agent-thread-icon-button"
+            aria-label="Activate an agent"
+            disabled={!props.interactive}
+            onClick={() => props.onActivateAgent()}
+          >
+            <Icon name="agent" />
+          </button>
+          <button
+            type="button"
+            class="agent-thread-icon-button"
+            aria-label="New private thread"
+            disabled={!props.interactive}
+            onClick={() => props.onNew()}
+          >
+            <Icon name="message" />
+          </button>
+        </div>
       </header>
       <Show when={!props.loading} fallback={
         <Skeleton label="Loading private work…" rows={3}>

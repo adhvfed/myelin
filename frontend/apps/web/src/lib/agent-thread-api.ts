@@ -3,6 +3,7 @@ import { action, json, query, redirect } from "@solidjs/router";
 import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
 import {
   isAgentThreadId,
+  parseAgentActivationReceipt,
   parseAgentChoices,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
@@ -11,6 +12,7 @@ import {
   parseAgentThreads,
   parseWorkspaceSessions,
   type AgentChoicePage,
+  type AgentActivationReceipt,
   type AgentThread,
   type AgentThreadCreateReceipt,
   type AgentThreadPage,
@@ -21,11 +23,18 @@ import type { ChatMessagePage } from "./chat-response";
 export type AgentThreadErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
 export type AgentThreadMutationResult =
   | { ok: true; op: "create"; receipt: AgentThreadCreateReceipt }
+  | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
   | { ok: true; op: "post-message"; messageId: string; threadId: string }
   | { ok: false; error: AgentThreadErrorKind };
 
 const AGENT_THREAD_ERR_PREFIX = "AGENT_THREAD_ERR:";
 const utf8 = new TextEncoder();
+const PRIVATE_WORK_AGENT_TOOLS = [
+  "chat.read_messages",
+  "chat.post",
+  "workspace.read_file",
+  "workspace.write_file",
+] as const;
 
 export class AgentThreadRouteError extends Error {
   readonly kind: AgentThreadErrorKind;
@@ -188,6 +197,18 @@ export const mutateAgentThread = action(async (input: unknown) => {
   }
   const mutation = input as Record<string, unknown>;
   try {
+    if (mutation.op === "activate-agent" && Object.keys(mutation).every((key) =>
+      ["op", "name", "clientNonce"].includes(key)) && Object.keys(mutation).length === 3 &&
+        cleanText(mutation.name, 80) && cleanNonce(mutation.clientNonce)) {
+      const receipt = parseAgentActivationReceipt(await edgePost("/v1/agents", {
+        name: mutation.name,
+        runtime: "external",
+        tools: PRIVATE_WORK_AGENT_TOOLS,
+      }, { idempotencyKey: mutation.clientNonce }));
+      return receipt
+        ? respond({ ok: true, op: "activate-agent", receipt })
+        : respond({ ok: false, error: "error" });
+    }
     if (mutation.op === "create" && Object.keys(mutation).every((key) =>
       ["op", "name", "agentId", "retentionDays", "clientNonce"].includes(key)) &&
         Object.keys(mutation).length === 5 && cleanText(mutation.name, 80) &&

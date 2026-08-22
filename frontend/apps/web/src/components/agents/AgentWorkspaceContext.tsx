@@ -17,6 +17,7 @@ export function AgentWorkspaceContext(props: {
   sessionsLoadingMore: boolean;
   onLoadMoreSessions: () => void;
 }) {
+  const agentCommand = () => `myelin mcp serve --as ${props.thread.agent_id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
   return (
     <div class="agent-workspace-context">
@@ -29,6 +30,11 @@ export function AgentWorkspaceContext(props: {
           <div><dt>Expires</dt><dd><time datetime={props.thread.workspace.expires_at}>{dateTime(props.thread.workspace.expires_at)}</time></dd></div>
           <div><dt>Workspace</dt><dd><code>{props.thread.workspace.id}</code></dd></div>
         </dl>
+      </section>
+      <section>
+        <h3>Connect the agent</h3>
+        <p>Use this as the MCP server command for an external client. Myelin exchanges your signed-in session for short-lived run authority.</p>
+        <code class="agent-workspace-command" data-testid="agent-connect-command">{agentCommand()}</code>
       </section>
       <section>
         <h3>Enter with SSH</h3>

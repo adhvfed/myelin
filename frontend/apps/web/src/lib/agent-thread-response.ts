@@ -19,6 +19,12 @@ export interface AgentChoicePage {
   page: { next_cursor: string | null; limit: number };
 }
 
+export interface AgentActivationReceipt {
+  agent: AgentChoice;
+  created: boolean;
+  durable: true;
+}
+
 export interface AgentThread {
   id: string;
   ref: string;
@@ -149,6 +155,26 @@ export function parseAgentChoices(value: unknown): AgentChoicePage | null {
       !paging || envelope.items.length > paging.limit) return null;
   const items = envelope.items.map(agentChoice);
   return items.every((item): item is AgentChoice => item !== null) ? { items, page: paging } : null;
+}
+
+export function parseAgentActivationReceipt(value: unknown): AgentActivationReceipt | null {
+  const receipt = record(value);
+  const agent = agentChoice(receipt?.agent);
+  const governance = record(receipt?.governance);
+  return receipt && exact(receipt, ["agent", "created", "durable", "governance"]) && agent &&
+    governance && exact(governance, ["policy_versions", "policy_revisions"]) &&
+    policyCoordinates(governance.policy_versions) && policyCoordinates(governance.policy_revisions) &&
+    typeof receipt.created === "boolean" && receipt.durable === true
+    ? { agent, created: receipt.created, durable: true }
+    : null;
+}
+
+function policyCoordinates(value: unknown): boolean {
+  const coordinates = record(value);
+  return Boolean(coordinates && exact(coordinates, [
+    "agent", "delegation", "tenant", "trigger_actor",
+  ]) && positiveInteger(coordinates.agent) && positiveInteger(coordinates.delegation) &&
+    positiveInteger(coordinates.tenant) && positiveInteger(coordinates.trigger_actor));
 }
 
 function thread(value: unknown): AgentThread | null {

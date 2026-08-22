@@ -21,13 +21,13 @@ scoped run protocol. Workspace expiry is durable and reconciled, while SSH acces
 credentials, pins the routed host and workspace generation, and records only an accountable access
 receipt—never commands, keys, routes, or file contents.
 
-The web application now makes this contract a first-class Agents surface. A person names the
-problem, chooses an available external agent, chooses retention, sends private messages, returns to
-the same history after reload, sees exact workspace state and expiry, copies the CLI SSH command,
-and pages through workspace-entry history. Live messages use authorized SSE reads with reconnect
-catch-up and a slow safety refresh. Chat and private work share one timeline renderer rather than
-forking message semantics, and strict decoders reject crossed aggregate identities at the browser
-boundary.
+The web application now makes this contract a first-class Agents surface. A person activates a
+least-privilege external agent without creating a credential, names the problem, chooses retention,
+sends private messages, and returns to the same history after reload. The workspace pane shows exact
+state and expiry, the MCP connection and CLI SSH commands, and paged workspace-entry history. Live
+messages use authorized SSE reads with reconnect catch-up and a slow safety refresh. Chat and
+private work share one timeline renderer rather than forking message semantics, and strict decoders
+reject crossed aggregate identities at the browser boundary.
 
 **Proof:** frontend typecheck and lint; 637/637 frontend unit tests; four live browser product
 stories covering automations, public Chat, live Chat delivery, and private agent work; two

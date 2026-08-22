@@ -5,7 +5,6 @@ import { expect, test } from "@playwright/test";
 import {
   browserApprovedSession,
   integrationEdgeUrl,
-  postProductJson,
   type JsonObject,
 } from "./product-api";
 import { signIn, waitForAppHydration } from "./session";
@@ -19,22 +18,22 @@ test("an engineer keeps a named problem and its workspace with one agent", async
   const threadName = `Investigate checkout race ${suffix}`;
   const problem = `The final reader for ${suffix} still owns its checkout lease.`;
   const sessionToken = await browserApprovedSession(request);
-  const owner = { token: sessionToken, scheme: "session" };
-  const createdAgent = await postProductJson(request, "/v1/agents", {
-    name: agentName,
-    runtime: "external",
-    tools: ["chat.read_messages", "chat.post", "workspace.read_file", "workspace.write_file"],
-  }, { ...owner, status: 201 });
-  const agent = createdAgent.agent as JsonObject;
-  expect(String(agent.id)).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
 
   await signIn(page);
   await page.getByRole("link", { name: "Agents" }).click();
   await page.waitForURL("**/agents");
-  await page.getByRole("button", { name: "Start private thread" }).click();
+  await page.getByRole("button", { name: "Activate an agent" }).click();
+  const activation = page.getByRole("dialog", { name: "Activate private-work agent" });
+  await activation.getByRole("textbox", { name: "Agent name" }).fill(agentName);
+  await activation.getByRole("button", { name: "Activate agent" }).click();
+
   const dialog = page.getByRole("dialog", { name: "Start private agent thread" });
+  await expect(dialog).toBeVisible();
   await dialog.getByRole("textbox", { name: "Problem name" }).fill(threadName);
-  await dialog.getByRole("combobox", { name: "Agent" }).selectOption(String(agent.id));
+  const agentChoice = dialog.getByRole("combobox", { name: "Agent" });
+  await agentChoice.selectOption({ label: agentName });
+  const agentId = await agentChoice.inputValue();
+  expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");
   await dialog.getByRole("button", { name: "Start thread" }).click();
 
@@ -45,6 +44,8 @@ test("an engineer keeps a named problem and its workspace with one agent", async
   const workspace = page.getByRole("dialog", { name: "Agent workspace" });
   await expect(workspace.getByText("Generation 1", { exact: true })).toBeVisible();
   await expect(workspace.getByText("No workspace entries yet.")).toBeVisible();
+  await expect(workspace.getByTestId("agent-connect-command"))
+    .toContainText(`myelin mcp serve --as ${agentId}`);
   const sshCommand = workspace.getByTestId("agent-workspace-command");
   await expect(sshCommand).toContainText("myelin agent thread ssh");
   await expect(sshCommand).toContainText(new URL(page.url()).searchParams.get("thread")!);

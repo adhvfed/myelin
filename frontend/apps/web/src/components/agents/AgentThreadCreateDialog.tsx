@@ -1,6 +1,6 @@
 import { Dialog, Icon } from "@myelin/design-system";
 import { useAction } from "@solidjs/router";
-import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 
 import {
   mutateAgentThread,
@@ -19,10 +19,12 @@ function errorCopy(kind: AgentThreadErrorKind): string {
 export function AgentThreadCreateDialog(props: {
   open: boolean;
   agents: AgentChoice[];
+  preferredAgentId?: string;
   agentsLoading: boolean;
   agentsHaveMore: boolean;
   agentsLoadingMore: boolean;
   onLoadMoreAgents: () => void;
+  onActivateAgent: () => void;
   onClose: () => void;
   onCreated: (receipt: AgentThreadCreateReceipt) => void;
 }) {
@@ -43,7 +45,9 @@ export function AgentThreadCreateDialog(props: {
     openingGeneration += 1;
     if (!props.open) return;
     setName("");
-    setAgentId("");
+    const preferred = untrack(() => props.preferredAgentId);
+    const canUsePreferred = untrack(() => available().some((agent) => agent.id === preferred));
+    setAgentId(canUsePreferred && preferred ? preferred : "");
     setRetentionDays(3);
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
@@ -133,9 +137,16 @@ export function AgentThreadCreateDialog(props: {
           </select>
         </label>
         <Show when={!props.agentsLoading && available().length === 0}>
-          <p class="agent-thread-note">
-            No active external agents are available. Create one with <code>myelin agent create</code>, then return here.
-          </p>
+          <div class="agent-thread-empty-choice">
+            <p class="agent-thread-note">No active external agents are available.</p>
+            <button
+              type="button"
+              class="agent-thread-button secondary"
+              onClick={() => props.onActivateAgent()}
+            >
+              <Icon name="agent" /> Activate an agent
+            </button>
+          </div>
         </Show>
         <Show when={props.agentsHaveMore}>
           <button

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseAgentActivationReceipt,
   parseAgentChoices,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
@@ -16,6 +17,27 @@ const WORKSPACE = "44444444-4444-4444-8444-444444444444";
 const CONVERSATION = "01J00000000000000000000000";
 const MESSAGE = "01J00000000000000000000001";
 const SESSION = "01J00000000000000000000002";
+const agent = {
+  id: AGENT,
+  ref: `myelin://acme/identity/agent/${AGENT}`,
+  principal_id: `agent:${AGENT}`,
+  name: "Checkout companion",
+  runtime_ref: "external:mcp",
+  on_behalf_of: "developer",
+  status: "active",
+  selected_tools: [{
+    name: "chat.post",
+    version: 1,
+    ref: "myelin://acme/agent/tool/chat.post@1",
+  }],
+  effective_tools: [],
+  grants: ["chat.post"],
+  created_at: "2026-08-22T12:00:00Z",
+};
+const governance = {
+  policy_versions: { agent: 1, delegation: 1, tenant: 1, trigger_actor: 1 },
+  policy_revisions: { agent: 11, delegation: 12, tenant: 13, trigger_actor: 14 },
+};
 const subject = {
   id: THREAD,
   ref: `myelin://acme/agent/thread/${THREAD}`,
@@ -82,23 +104,7 @@ describe("private agent work wire projection", () => {
       page: { next_cursor: null, limit: 100 },
     })?.items).toHaveLength(1);
     expect(parseAgentChoices({
-      items: [{
-        id: AGENT,
-        ref: `myelin://acme/identity/agent/${AGENT}`,
-        principal_id: `agent:${AGENT}`,
-        name: "Checkout companion",
-        runtime_ref: "external:mcp",
-        on_behalf_of: "developer",
-        status: "active",
-        selected_tools: [{
-          name: "chat.post",
-          version: 1,
-          ref: "myelin://acme/agent/tool/chat.post@1",
-        }],
-        effective_tools: [],
-        grants: ["chat.post"],
-        created_at: "2026-08-22T12:00:00Z",
-      }],
+      items: [agent],
       page: { next_cursor: null, limit: 100 },
     })?.items).toEqual([{
       id: AGENT,
@@ -106,6 +112,16 @@ describe("private agent work wire projection", () => {
       runtime_ref: "external:mcp",
       status: "active",
     }]);
+    expect(parseAgentActivationReceipt({ agent, created: true, durable: true, governance })).toEqual({
+      agent: {
+        id: AGENT,
+        name: "Checkout companion",
+        runtime_ref: "external:mcp",
+        status: "active",
+      },
+      created: true,
+      durable: true,
+    });
   });
 
   it("refuses crossed aggregates and surplus connection material", () => {
@@ -133,5 +149,14 @@ describe("private agent work wire projection", () => {
       thread_id: AGENT,
       durable: true,
     }, THREAD)).toBeNull();
+    expect(parseAgentActivationReceipt({
+      agent,
+      created: true,
+      durable: true,
+      governance: {
+        ...governance,
+        policy_revisions: { ...governance.policy_revisions, tenant: -1 },
+      },
+    })).toBeNull();
   });
 });

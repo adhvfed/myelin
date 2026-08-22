@@ -10,6 +10,7 @@ import {
   Show,
 } from "solid-js";
 
+import { AgentActivationDialog } from "~/components/agents/AgentActivationDialog";
 import { AgentThreadCreateDialog } from "~/components/agents/AgentThreadCreateDialog";
 import { AgentThreadSidebar } from "~/components/agents/AgentThreadSidebar";
 import {
@@ -31,6 +32,7 @@ import {
 } from "~/lib/agent-thread-api";
 import {
   isAgentThreadId,
+  type AgentChoice,
   type AgentChoicePage,
   type AgentThread,
   type AgentThreadPage,
@@ -62,11 +64,14 @@ export default function AgentThreadsIndex() {
   const selectedId = () => typeof search.thread === "string" ? search.thread : undefined;
   const validSelectedId = () => isAgentThreadId(selectedId()) ? selectedId() : undefined;
   const createOpen = () => search.new === "1";
+  const activationOpen = () => search.activate === "1";
   const [interactive, setInteractive] = createSignal(false);
 
   const [threadPages, setThreadPages] = createSignal<AgentThreadPage[]>([]);
   const [loadingMoreThreads, setLoadingMoreThreads] = createSignal(false);
   const [agentPages, setAgentPages] = createSignal<AgentChoicePage[]>([]);
+  const [activatedAgents, setActivatedAgents] = createSignal<AgentChoice[]>([]);
+  const [preferredAgentId, setPreferredAgentId] = createSignal<string>();
   const [loadingMoreAgents, setLoadingMoreAgents] = createSignal(false);
   const [earlierMessagePages, setEarlierMessagePages] = createSignal<Awaited<ReturnType<typeof getAgentThreadMessages>>[]>([]);
   const [loadingEarlier, setLoadingEarlier] = createSignal(false);
@@ -133,8 +138,8 @@ export default function AgentThreadsIndex() {
     threadPages().map((page) => page.items),
   ));
   const agents = createMemo(() => mergeById(
-    firstAgents()?.page?.items,
-    agentPages().map((page) => page.items),
+    activatedAgents(),
+    [firstAgents()?.page?.items ?? [], ...agentPages().map((page) => page.items)],
   ));
   const messages = createMemo(() => mergeMessagePages(
     recentMessages()?.page,
@@ -289,6 +294,12 @@ export default function AgentThreadsIndex() {
   const closeCreate = () => navigate(validSelectedId()
     ? `/agents?thread=${encodeURIComponent(validSelectedId()!)}`
     : "/agents", { replace: true });
+  const openActivation = () => navigate(validSelectedId()
+    ? `/agents?thread=${encodeURIComponent(validSelectedId()!)}&activate=1`
+    : "/agents?activate=1");
+  const closeActivation = () => navigate(validSelectedId()
+    ? `/agents?thread=${encodeURIComponent(validSelectedId()!)}`
+    : "/agents", { replace: true });
 
   return (
     <>
@@ -308,6 +319,7 @@ export default function AgentThreadsIndex() {
           loadingMore={loadingMoreThreads()}
           onLoadMore={() => void loadMoreThreads()}
           onNew={openCreate}
+          onActivateAgent={openActivation}
         />
         <section class="agent-thread-workspace" aria-label="Private agent work">
           <Show when={selectedId()} fallback={<AgentThreadWelcome onNew={openCreate} interactive={interactive()} />}>
@@ -334,10 +346,12 @@ export default function AgentThreadsIndex() {
       <AgentThreadCreateDialog
         open={createOpen()}
         agents={agents()}
+        preferredAgentId={preferredAgentId()}
         agentsLoading={firstAgents() === undefined}
         agentsHaveMore={Boolean(nextAgentCursor())}
         agentsLoadingMore={loadingMoreAgents()}
         onLoadMoreAgents={() => void loadMoreAgents()}
+        onActivateAgent={openActivation}
         onClose={closeCreate}
         onCreated={(receipt) => {
           threadGeneration += 1;
@@ -345,6 +359,17 @@ export default function AgentThreadsIndex() {
           void revalidate("agent-threads");
           navigate(`/agents?thread=${encodeURIComponent(receipt.thread.id)}`);
           toast.show({ title: `Private thread started with ${receipt.thread.workspace.retention_days} days of workspace`, variant: "success" });
+        }}
+      />
+      <AgentActivationDialog
+        open={activationOpen()}
+        onClose={closeActivation}
+        onActivated={(receipt) => {
+          setActivatedAgents((current) => mergeById([receipt.agent], [current]));
+          setPreferredAgentId(receipt.agent.id);
+          void revalidate(getAgentChoices.keyFor({ limit: 100 }));
+          openCreate();
+          toast.show({ title: `${receipt.agent.name} is ready for private work`, variant: "success" });
         }}
       />
     </>

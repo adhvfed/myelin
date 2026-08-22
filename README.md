@@ -102,6 +102,17 @@ myelin agent resume 22222222-2222-2222-2222-222222222222 \
 myelin agent retire 22222222-2222-2222-2222-222222222222 \
   --idempotency-key retire-review-companion
 
+# Keep one named problem private with that external agent. The conversation and workspace survive
+# fresh agent contexts until the chosen retention window ends.
+myelin agent thread start "Investigate checkout race" \
+  --agent 22222222-2222-2222-2222-222222222222 --retention-days 3 \
+  --idempotency-key investigate-checkout-race
+myelin agent thread list
+myelin agent thread say 33333333-3333-4333-8333-333333333333 \
+  "The final reader still owns its checkout lease."
+myelin agent thread history 33333333-3333-4333-8333-333333333333
+myelin agent thread ssh 33333333-3333-4333-8333-333333333333
+
 myelin agent create "Mainline triage" --runtime hosted \
   --tool ci.read_run --tool issues.create --idempotency-key mainline-triage
 myelin automation create --event ci.run.failed --repo core --branch main \
