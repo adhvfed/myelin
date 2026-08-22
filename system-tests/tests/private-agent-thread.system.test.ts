@@ -326,6 +326,36 @@ describe("private work with an agent", () => {
       byte_len: Buffer.byteLength(ownerNote),
       workspace_generation: first.thread.workspace.generation,
     });
+    const answer = "The cleanup races because the final reader still owns its lease.";
+    const answerKey = `private-agent-answer-${randomUUID()}`;
+    const postedAnswer = await askAgentToAct(
+      freshContext,
+      4,
+      "chat.post",
+      { conversation_id: conversation.id, content: answer },
+      answerKey,
+    );
+    const replayedAnswer = await askAgentToAct(
+      freshContext,
+      5,
+      "chat.post",
+      { conversation_id: conversation.id, content: answer },
+      answerKey,
+    );
+    expect(replayedAnswer).toEqual(postedAnswer);
+    const answeredHistory = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/messages?limit=10`,
+    );
+    expect(
+      array(answeredHistory.body.items, "answered private thread messages")
+        .filter((message) => record(message, "private thread message").content === answer),
+    ).toEqual([
+      expect.objectContaining({
+        author_kind: "agent",
+        is_you: false,
+        state: "active",
+      }),
+    ]);
     const fetched = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(first.thread.id)}`,
     );
