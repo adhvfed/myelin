@@ -897,6 +897,20 @@ host tests debit the durable organization wallet, refuse an exhausted run withou
 going negative, reconcile terminal reservations, and prove replay does not bill
 twice. Net removal: another roughly 650 lines of production-shaped test machinery.
 
+## 2026-08-23 — pull-request listing has a narrow durable boundary
+
+The durable pull-request store had accumulated query generation, schema setup,
+transaction orchestration, mutation replay, and projection repair in one file.
+Its two pagination query families and cross-repository input validation are now
+isolated in a private `list_queries` module. The store keeps ownership of binding
+parameters and decoding, so the extraction changes no transaction or tenancy
+boundary while giving the intricate keyset SQL a focused home for the next pass.
+
+Proof: all 563 Git unit tests pass; Git and Edge are warning-clean under clippy;
+the live-Postgres pull-request boundary proves isolation, atomicity, idempotency,
+pagination, and merge recovery; after restarting Edge, all twelve TypeScript Git
+lifecycle journeys pass through the public HTTP surface.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
