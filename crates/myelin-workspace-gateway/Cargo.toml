@@ -11,6 +11,7 @@ myelin-storage = { path = "../myelin-storage" }
 myelin-agent-service = { path = "../myelin-agent-service" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 myelin-config = { workspace = true }
+myelin-events = { path = "../myelin-events" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 russh = { version = "=0.63.0", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

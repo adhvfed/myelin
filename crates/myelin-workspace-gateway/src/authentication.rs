@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use myelin_identity_service::workspace_ssh_public_key_fingerprint;
-use myelin_storage::agent_thread_durable::{LiveWorkspaceSshAdmission, WorkspaceSshRouteKey};
+use myelin_storage::agent_thread_durable::{
+    LiveWorkspaceSshAdmission, WorkspaceSessionMode, WorkspaceSshRouteKey,
+};
 use russh::keys::ssh_key::{Algorithm, PublicKey};
 use russh::keys::PublicKeyBase64;
 use uuid::Uuid;
 
 use crate::{
-    AdmissionLookupError, LiveAdmissionRequest, LiveSessionRequest, WorkspaceSshAdmissionStore,
+    AdmissionLookupError, LiveAdmissionRequest, LiveSessionRequest, WorkspaceSessionStartRequest,
+    WorkspaceSshAdmissionStore,
 };
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -25,6 +28,12 @@ pub struct AuthenticatedWorkspace {
 struct AuthenticatedCredential {
     route_username: String,
     public_key: PublicKey,
+}
+
+struct SessionCredential<'a> {
+    grant_id: Uuid,
+    route_username: &'a str,
+    public_key_fingerprint: String,
 }
 
 impl AuthenticatedWorkspace {
@@ -152,22 +161,16 @@ where
         &self,
         authenticated: &AuthenticatedWorkspace,
     ) -> Result<Option<AuthenticatedWorkspace>, AdmissionLookupError> {
-        let Some(credential) = authenticated.credential.as_ref() else {
-            return Ok(None);
-        };
-        let Some(public_key_fingerprint) = fingerprint(&credential.public_key) else {
-            return Ok(None);
-        };
-        let Ok(grant_id) = Uuid::parse_str(&authenticated.admission.grant_id) else {
+        let Some(credential) = session_credential(authenticated) else {
             return Ok(None);
         };
         let current = self
             .admissions
             .live_session(&LiveSessionRequest {
                 tenant: authenticated.tenant.clone(),
-                grant_id,
-                route_username: credential.route_username.clone(),
-                public_key_fingerprint,
+                grant_id: credential.grant_id,
+                route_username: credential.route_username.to_string(),
+                public_key_fingerprint: credential.public_key_fingerprint,
                 admitted_at: authenticated.admitted_at,
                 observed_at: (self.clock)(),
             })
@@ -176,10 +179,53 @@ where
                 tenant: authenticated.tenant.clone(),
                 admission,
                 admitted_at: authenticated.admitted_at,
-                credential: Some(credential.clone()),
+                credential: authenticated.credential.clone(),
             });
         Ok(current.filter(|current| same_workspace_authority(current, authenticated)))
     }
+
+    pub(crate) async fn start_session(
+        &self,
+        authenticated: &AuthenticatedWorkspace,
+        session_id: String,
+        mode: WorkspaceSessionMode,
+        terminal: bool,
+    ) -> Result<Option<AuthenticatedWorkspace>, AdmissionLookupError> {
+        let Some(credential) = session_credential(authenticated) else {
+            return Ok(None);
+        };
+        let started_at = (self.clock)();
+        let current = self
+            .admissions
+            .start_session(&WorkspaceSessionStartRequest {
+                tenant: authenticated.tenant.clone(),
+                session_id,
+                grant_id: credential.grant_id,
+                route_username: credential.route_username.to_string(),
+                public_key_fingerprint: credential.public_key_fingerprint,
+                admitted_at: authenticated.admitted_at,
+                started_at,
+                mode,
+                terminal,
+            })
+            .await?
+            .map(|started| AuthenticatedWorkspace {
+                tenant: authenticated.tenant.clone(),
+                admission: started.admission,
+                admitted_at: authenticated.admitted_at,
+                credential: authenticated.credential.clone(),
+            });
+        Ok(current.filter(|current| same_workspace_authority(current, authenticated)))
+    }
+}
+
+fn session_credential(authenticated: &AuthenticatedWorkspace) -> Option<SessionCredential<'_>> {
+    let credential = authenticated.credential.as_ref()?;
+    Some(SessionCredential {
+        grant_id: Uuid::parse_str(&authenticated.admission.grant_id).ok()?,
+        route_username: &credential.route_username,
+        public_key_fingerprint: fingerprint(&credential.public_key)?,
+    })
 }
 
 fn fingerprint(public_key: &PublicKey) -> Option<String> {
@@ -208,7 +254,7 @@ mod tests {
 
     use chrono::TimeZone;
     use myelin_identity_service::WorkspaceSshHostIdentity;
-    use myelin_storage::{SealKey, KEY_LEN};
+    use myelin_storage::{DurableWorkspaceSession, SealKey, StartedWorkspaceSshSession, KEY_LEN};
     use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
     use russh::keys::PrivateKey;
 
@@ -218,6 +264,7 @@ mod tests {
     struct RecordingAdmissions {
         admissions: Arc<Mutex<Vec<LiveAdmissionRequest>>>,
         sessions: Arc<Mutex<Vec<LiveSessionRequest>>>,
+        starts: Arc<Mutex<Vec<WorkspaceSessionStartRequest>>>,
         result: Result<Option<LiveWorkspaceSshAdmission>, AdmissionLookupError>,
     }
 
@@ -228,6 +275,7 @@ mod tests {
             Self {
                 admissions: Arc::new(Mutex::new(Vec::new())),
                 sessions: Arc::new(Mutex::new(Vec::new())),
+                starts: Arc::new(Mutex::new(Vec::new())),
                 result,
             }
         }
@@ -263,6 +311,38 @@ mod tests {
             Box::pin(async move {
                 self.sessions.lock().unwrap().push(request.clone());
                 self.result.clone()
+            })
+        }
+
+        fn start_session<'a>(
+            &'a self,
+            request: &'a WorkspaceSessionStartRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<Option<StartedWorkspaceSshSession>, AdmissionLookupError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.starts.lock().unwrap().push(request.clone());
+                self.result.clone().map(|result| {
+                    result.map(|admission| StartedWorkspaceSshSession {
+                        session: DurableWorkspaceSession {
+                            session_id: request.session_id.clone(),
+                            thread_id: admission.thread_id.clone(),
+                            owner_principal_id: admission.owner_principal_id.clone(),
+                            workspace_id: admission.workspace_id.clone(),
+                            workspace_generation: admission.workspace_generation,
+                            access_method: "ssh".into(),
+                            mode: request.mode,
+                            terminal: request.terminal,
+                            started_at: request.started_at.to_rfc3339(),
+                        },
+                        admission,
+                    })
+                })
             })
         }
     }
@@ -396,6 +476,47 @@ mod tests {
         assert_eq!(sessions[0].admitted_at, admitted_at);
         assert_eq!(sessions[0].observed_at, later);
         assert_eq!(sessions[0].grant_id, grant_id);
+    }
+
+    #[tokio::test]
+    async fn starting_a_confined_session_records_only_its_minimized_shape() {
+        let admitted_at = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let started_at = admitted_at + chrono::Duration::seconds(1);
+        let now = Arc::new(Mutex::new(admitted_at));
+        let grant_id = Uuid::from_u128(51);
+        let routes = WorkspaceSshRouteKey::from_seal_key(&SealKey::from_bytes([0xc1; KEY_LEN]));
+        let username = routes.seal("acme", grant_id).unwrap();
+        let admissions = RecordingAdmissions::returning(Ok(Some(admission(grant_id))));
+        let starts = admissions.starts.clone();
+        let clock = now.clone();
+        let authenticator = WorkspaceSshAuthenticator::new(routes, admissions)
+            .with_clock(move || *clock.lock().unwrap());
+        let authenticated = authenticator
+            .authenticate(&username, &public_key([0xc2; KEY_LEN]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        *now.lock().unwrap() = started_at;
+        assert!(authenticator
+            .start_session(
+                &authenticated,
+                "01J00000000000000000000001".into(),
+                WorkspaceSessionMode::Command,
+                true,
+            )
+            .await
+            .unwrap()
+            .is_some());
+
+        let starts = starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].tenant, "acme");
+        assert_eq!(starts[0].grant_id, grant_id);
+        assert_eq!(starts[0].admitted_at, admitted_at);
+        assert_eq!(starts[0].started_at, started_at);
+        assert_eq!(starts[0].mode, WorkspaceSessionMode::Command);
+        assert!(starts[0].terminal);
     }
 
     #[test]

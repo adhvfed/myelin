@@ -4,6 +4,7 @@ mod run;
 mod schema;
 mod ssh_access;
 mod ssh_route;
+mod workspace_session;
 
 pub use expiry::{
     AgentThreadExpiry, AgentThreadExpiryCompletion, AgentThreadExpiryFailure,
@@ -18,12 +19,17 @@ pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
     agent_thread_durable_migrations, AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY,
     AGENT_THREAD_RUN_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
+    AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
 };
 pub use ssh_access::{
     CreateWorkspaceSshGrantOutcome, DurableWorkspaceSshGrant, LiveWorkspaceSshAdmission,
     NewWorkspaceSshGrant, MAX_WORKSPACE_SSH_GRANT_SECONDS,
 };
 pub use ssh_route::{WorkspaceSshRoute, WorkspaceSshRouteError, WorkspaceSshRouteKey};
+pub use workspace_session::{
+    DurableWorkspaceSession, ListWorkspaceSessionsOutcome, NewWorkspaceSshSession,
+    StartedWorkspaceSshSession, WorkspaceSessionMode, WORKSPACE_SSH_SESSION_STARTED,
+};
 
 use chrono::Duration;
 #[cfg(test)]

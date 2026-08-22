@@ -51,6 +51,16 @@ pub struct LiveWorkspaceSshAdmission {
     pub expires_at: String,
 }
 
+pub(super) struct LiveWorkspaceSshAuthorityRequest<'a> {
+    pub tenant: &'a str,
+    pub region: &'a str,
+    pub grant_id: Uuid,
+    pub route_username: &'a str,
+    pub public_key_fingerprint: &'a str,
+    pub admitted_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+}
+
 impl DurableAgentThreadBacking {
     pub async fn create_ssh_grant(
         &self,
@@ -210,51 +220,71 @@ impl DurableAgentThreadBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    let row = sqlx::query(
-                        "SELECT access.grant_id, access.thread_id, access.owner_principal_id,
-                                access.workspace_id, access.workspace_generation,
-                                thread.storage_locator, access.expires_at
-                           FROM agent_thread_ssh_grant access
-                           JOIN agent_thread thread
-                             ON thread.tenant_id = access.tenant_id
-                            AND thread.region = access.region
-                            AND thread.thread_id = access.thread_id
-                           JOIN principal owner
-                             ON owner.tenant_id = thread.tenant_id
-                            AND owner.region = thread.region
-                            AND owner.principal_id = thread.owner_principal_id
-                           JOIN principal agent
-                             ON agent.tenant_id = thread.tenant_id
-                            AND agent.region = thread.region
-                            AND agent.principal_id = 'agent:' || thread.agent_id::text
-                          WHERE access.tenant_id = $1 AND access.region = $2
-                            AND access.grant_id = $3 AND access.route_username = $4
-                            AND access.public_key_fingerprint = $5
-                            AND access.revoked_at IS NULL
-                            AND access.issued_at <= $6 AND access.expires_at > $6
-                            AND thread.state = 'ready' AND thread.expires_at > $7
-                            AND access.owner_principal_id = thread.owner_principal_id
-                            AND access.workspace_id = thread.workspace_id
-                            AND access.workspace_generation = thread.workspace_generation
-                            AND owner.kind = $8 AND owner.status = $9 AND agent.status = $9",
+                    lookup_live_authority(
+                        connection,
+                        &LiveWorkspaceSshAuthorityRequest {
+                            tenant: &tenant,
+                            region: &region,
+                            grant_id,
+                            route_username: &route_username,
+                            public_key_fingerprint: &fingerprint,
+                            admitted_at,
+                            observed_at,
+                        },
                     )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(grant_id)
-                    .bind(&route_username)
-                    .bind(&fingerprint)
-                    .bind(admitted_at)
-                    .bind(observed_at)
-                    .bind(HUMAN_PRINCIPAL_KIND_JSON)
-                    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
-                    .fetch_optional(&mut *connection)
                     .await
-                    .map_err(query_error("admit private workspace SSH key"))?;
-                    row.as_ref().map(admission_from_row).transpose()
                 })
             })
             .await
     }
+}
+
+pub(super) async fn lookup_live_authority(
+    connection: &mut sqlx::PgConnection,
+    request: &LiveWorkspaceSshAuthorityRequest<'_>,
+) -> Result<Option<LiveWorkspaceSshAdmission>, PgError> {
+    let row = sqlx::query(
+        "SELECT access.grant_id, access.thread_id, access.owner_principal_id,
+                access.workspace_id, access.workspace_generation,
+                thread.storage_locator, access.expires_at
+           FROM agent_thread_ssh_grant access
+           JOIN agent_thread thread
+             ON thread.tenant_id = access.tenant_id
+            AND thread.region = access.region
+            AND thread.thread_id = access.thread_id
+           JOIN principal owner
+             ON owner.tenant_id = thread.tenant_id
+            AND owner.region = thread.region
+            AND owner.principal_id = thread.owner_principal_id
+           JOIN principal agent
+             ON agent.tenant_id = thread.tenant_id
+            AND agent.region = thread.region
+            AND agent.principal_id = 'agent:' || thread.agent_id::text
+          WHERE access.tenant_id = $1 AND access.region = $2
+            AND access.grant_id = $3 AND access.route_username = $4
+            AND access.public_key_fingerprint = $5
+            AND access.revoked_at IS NULL
+            AND access.issued_at <= $6 AND access.expires_at > $6
+            AND thread.state = 'ready' AND thread.expires_at > $7
+            AND access.owner_principal_id = thread.owner_principal_id
+            AND access.workspace_id = thread.workspace_id
+            AND access.workspace_generation = thread.workspace_generation
+            AND owner.kind = $8 AND owner.status = $9 AND agent.status = $9
+          FOR SHARE OF access, thread, owner, agent",
+    )
+    .bind(request.tenant)
+    .bind(request.region)
+    .bind(request.grant_id)
+    .bind(request.route_username)
+    .bind(request.public_key_fingerprint)
+    .bind(request.admitted_at)
+    .bind(request.observed_at)
+    .bind(HUMAN_PRINCIPAL_KIND_JSON)
+    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+    .fetch_optional(connection)
+    .await
+    .map_err(query_error("admit private workspace SSH key"))?;
+    row.as_ref().map(admission_from_row).transpose()
 }
 
 fn validate_proposal(proposal: &NewWorkspaceSshGrant) -> Result<(), ProviderError> {

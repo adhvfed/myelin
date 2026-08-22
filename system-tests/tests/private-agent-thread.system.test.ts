@@ -149,6 +149,10 @@ describe("private work with an agent", () => {
       },
     );
     expect(hiddenRun.body).toMatchObject({ error: { code: "not_found" } });
+    await teammate.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
+      { expectedStatus: 404 },
+    );
 
     const sshKey = await generateEphemeralSshKey();
     const anotherSshKey = await generateEphemeralSshKey();
@@ -289,6 +293,42 @@ describe("private work with an agent", () => {
     } finally {
       await workspaceKey.remove();
     }
+    const workspaceHistory = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
+    );
+    const workspaceSessions = array(
+      workspaceHistory.body.items,
+      "private workspace access history",
+    );
+    expect(workspaceSessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "ssh",
+          mode: "command",
+          terminal: true,
+          workspace: {
+            id: first.thread.workspace.id,
+            generation: first.thread.workspace.generation,
+          },
+        }),
+        expect.objectContaining({
+          method: "ssh",
+          mode: "command",
+          terminal: false,
+          workspace: {
+            id: first.thread.workspace.id,
+            generation: first.thread.workspace.generation,
+          },
+        }),
+      ]),
+    );
+    expect(workspaceHistory.body.page).toEqual({ next_cursor: null, limit: 10 });
+    expect(workspaceHistory.headers.get("cache-control")).toBe("no-store");
+    expect(JSON.stringify(workspaceHistory.body)).not.toMatch(
+      /fingerprint|grant|host|locator|public_key|route|username/i,
+    );
+    expect(workspaceSessions.every((session) => !("command" in record(session, "workspace session"))))
+      .toBe(true);
     await closeAgentRun(firstContext);
 
     const freshContext = await beginAgentThreadRun(founder, first.thread.id);

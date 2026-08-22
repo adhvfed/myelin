@@ -132,6 +132,40 @@ CREATE POLICY myelin_tenant_isolation ON agent_thread_ssh_grant
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_THREAD_WORKSPACE_SESSION_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_thread_workspace_session (
+    tenant_id            text        NOT NULL,
+    region               text        NOT NULL,
+    session_id           text        NOT NULL,
+    grant_id             uuid        NOT NULL,
+    thread_id            uuid        NOT NULL,
+    owner_principal_id   text        NOT NULL,
+    workspace_id         uuid        NOT NULL,
+    workspace_generation integer     NOT NULL,
+    access_method        text        NOT NULL CHECK (access_method = 'ssh'),
+    session_mode         text        NOT NULL CHECK (session_mode IN ('shell', 'command')),
+    terminal             boolean     NOT NULL,
+    started_at           timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, region, session_id),
+    FOREIGN KEY (tenant_id, region, thread_id)
+      REFERENCES agent_thread (tenant_id, region, thread_id),
+    CHECK (length(session_id) = 26),
+    CHECK (length(owner_principal_id) BETWEEN 1 AND 255),
+    CHECK (workspace_generation > 0)
+);
+CREATE INDEX IF NOT EXISTS agent_thread_workspace_session_recent
+  ON agent_thread_workspace_session
+    (tenant_id, region, owner_principal_id, thread_id, session_id DESC);
+ALTER TABLE agent_thread_workspace_session ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_thread_workspace_session FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON agent_thread_workspace_session;
+CREATE POLICY myelin_tenant_isolation ON agent_thread_workspace_session
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub fn agent_thread_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0124_agent_thread", AGENT_THREAD_MIGRATION),
@@ -140,6 +174,10 @@ pub fn agent_thread_durable_migrations() -> Migrations {
         Migration::plain(
             "0127_agent_thread_ssh_grant",
             AGENT_THREAD_SSH_GRANT_MIGRATION,
+        ),
+        Migration::plain(
+            "0130_agent_thread_workspace_session",
+            AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
         ),
     ])
 }

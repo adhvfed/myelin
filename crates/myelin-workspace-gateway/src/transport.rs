@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use myelin_ci_sandbox::gvisor::{
     ConfinedWorkspaceSessionHandle, WorkspaceSessionCommand, WorkspaceTerminal,
 };
+use myelin_events::{IdMinter, UlidMinter};
+use myelin_storage::WorkspaceSessionMode;
 use russh::keys::ssh_key::PublicKey;
 use russh::server::{Auth, Handler, Msg, Server, Session};
 use russh::{Channel, ChannelId, Pty};
@@ -17,6 +20,7 @@ use crate::{
 pub struct WorkspaceSshGateway<A> {
     authenticator: WorkspaceSshAuthenticator<A>,
     launcher: LocalConfinedWorkspaceLauncher,
+    session_ids: Arc<UlidMinter>,
 }
 
 impl<A> WorkspaceSshGateway<A>
@@ -30,6 +34,7 @@ where
         Self {
             authenticator,
             launcher,
+            session_ids: Arc::new(UlidMinter::new()),
         }
     }
 }
@@ -44,6 +49,7 @@ where
         WorkspaceSshConnection {
             authenticator: self.authenticator.clone(),
             launcher: self.launcher.clone(),
+            session_ids: Arc::clone(&self.session_ids),
             authenticated: None,
             pending_channels: HashMap::new(),
             pending_terminals: HashMap::new(),
@@ -56,6 +62,7 @@ where
 pub struct WorkspaceSshConnection<A> {
     authenticator: WorkspaceSshAuthenticator<A>,
     launcher: LocalConfinedWorkspaceLauncher,
+    session_ids: Arc<UlidMinter>,
     authenticated: Option<AuthenticatedWorkspace>,
     pending_channels: HashMap<ChannelId, Channel<Msg>>,
     pending_terminals: HashMap<ChannelId, WorkspaceTerminal>,
@@ -114,7 +121,20 @@ where
             session.channel_failure(channel_id)?;
             return Ok(());
         };
+        let mode = match &command {
+            WorkspaceSessionCommand::Shell => WorkspaceSessionMode::Shell,
+            WorkspaceSessionCommand::Exec(_) => WorkspaceSessionMode::Command,
+        };
+        let has_terminal = terminal.is_some();
         let Ok(confined) = self.launcher.launch(&revalidated, command, terminal).await else {
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        };
+        let Some(recorded) = self
+            .authenticator
+            .start_session(&revalidated, self.session_ids.mint().0, mode, has_terminal)
+            .await?
+        else {
             session.channel_failure(channel_id)?;
             return Ok(());
         };
@@ -124,7 +144,7 @@ where
             handle: confined.handle(),
         });
         session.channel_success(channel_id)?;
-        spawn_session_bridge(confined, channel, self.authenticator.clone(), revalidated);
+        spawn_session_bridge(confined, channel, self.authenticator.clone(), recorded);
         Ok(())
     }
 }

@@ -2,13 +2,15 @@
 
 use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
 use myelin_config::MyelinConfig;
+use myelin_events::IdMinter;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
     all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadExpiryCompletion,
     AgentThreadExpiryFailure, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
-    CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables, NewAgentThread,
-    NewWorkspaceSshGrant, SealKey, SubstrateProvider, WorkspaceSshRouteKey,
-    AGENT_THREAD_EXPIRY_GRACE_SECONDS,
+    CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
+    ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant, NewWorkspaceSshSession,
+    SealKey, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
+    AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
 };
 use sqlx::types::Uuid;
 
@@ -433,6 +435,105 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .unwrap()
         .expect("a session admitted in time continues after its connection grant expires");
     assert_eq!(continuing_session.workspace_id, admitted.workspace_id);
+    let session_ids = myelin_events::UlidMinter::new();
+    let first_session_id = session_ids.mint().0;
+    let first_session = threads
+        .start_ssh_session(
+            &tenant,
+            NewWorkspaceSshSession {
+                session_id: first_session_id.clone(),
+                grant_id: ssh_grant_id,
+                route_username: route_username.clone(),
+                public_key_fingerprint: ssh_intent.public_key_fingerprint.clone(),
+                admitted_at: ssh_issued_at,
+                started_at: ssh_issued_at + Duration::seconds(1),
+                mode: WorkspaceSessionMode::Shell,
+                terminal: true,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a launched confined shell records its exact workspace generation");
+    assert_eq!(first_session.admission, admitted);
+    assert_eq!(first_session.session.session_id, first_session_id);
+    assert_eq!(first_session.session.access_method, "ssh");
+    assert_eq!(first_session.session.mode, WorkspaceSessionMode::Shell);
+    assert!(first_session.session.terminal);
+
+    let second_session_id = session_ids.mint().0;
+    threads
+        .start_ssh_session(
+            &tenant,
+            NewWorkspaceSshSession {
+                session_id: second_session_id.clone(),
+                started_at: ssh_issued_at + Duration::seconds(2),
+                mode: WorkspaceSessionMode::Command,
+                terminal: false,
+                grant_id: ssh_grant_id,
+                route_username: route_username.clone(),
+                public_key_fingerprint: ssh_intent.public_key_fingerprint.clone(),
+                admitted_at: ssh_issued_at,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a launched confined command records a distinct access");
+    let ListWorkspaceSessionsOutcome::Page(first_page) = threads
+        .list_workspace_sessions_for_owner(&tenant, owner, intended.thread_id, None, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("the first workspace history page has no cursor to resolve");
+    };
+    assert_eq!(first_page[0].session_id, second_session_id);
+    let ListWorkspaceSessionsOutcome::Page(second_page) = threads
+        .list_workspace_sessions_for_owner(
+            &tenant,
+            owner,
+            intended.thread_id,
+            Some(second_session_id.clone()),
+            2,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the second workspace history page resolves its own cursor");
+    };
+    assert_eq!(second_page, vec![first_session.session.clone()]);
+    assert_eq!(
+        threads
+            .list_workspace_sessions_for_owner(
+                &tenant,
+                owner,
+                intended.thread_id,
+                Some(session_ids.mint().0),
+                2,
+            )
+            .await
+            .unwrap(),
+        ListWorkspaceSessionsOutcome::CursorNotFound
+    );
+    let event: serde_json::Value =
+        sqlx::query_scalar("SELECT envelope FROM outbox WHERE event_id = $1")
+            .bind(&first_session_id)
+            .fetch_one(admin.db_pool())
+            .await
+            .unwrap();
+    assert_eq!(event["type_"], WORKSPACE_SSH_SESSION_STARTED);
+    assert_eq!(event["payload"]["method"], "ssh");
+    assert_eq!(event["payload"]["mode"], "shell");
+    let minimized = event["payload"].to_string();
+    for forbidden in [
+        "fingerprint",
+        "grant",
+        "host",
+        "locator",
+        "public_key",
+        "route",
+        "username",
+    ] {
+        assert!(!minimized.contains(forbidden));
+    }
     assert!(threads
         .live_ssh_session(
             &tenant,
@@ -699,9 +800,27 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .await
         .unwrap()
         .is_empty());
+    let ListWorkspaceSessionsOutcome::Page(retained_access_history) = threads
+        .list_workspace_sessions_for_owner(&tenant, owner, intended.thread_id, None, 10)
+        .await
+        .unwrap()
+    else {
+        panic!("workspace history remains owner-visible beside the deleted receipt");
+    };
+    assert_eq!(retained_access_history.len(), 2);
 
     sqlx::query("DELETE FROM agent_thread_ssh_grant WHERE tenant_id = $1")
         .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM agent_thread_workspace_session WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM outbox WHERE event_id = ANY($1)")
+        .bind(vec![first_session_id, second_session_id])
         .execute(admin.db_pool())
         .await
         .unwrap();

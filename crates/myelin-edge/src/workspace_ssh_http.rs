@@ -3,8 +3,9 @@ use myelin_identity::Principal;
 use myelin_identity_service::workspace_ssh_public_key_fingerprint;
 use myelin_storage::{
     AgentThreadState, CreateWorkspaceSshGrantOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, DurableWorkspaceSshGrant, NewWorkspaceSshGrant,
-    WorkspaceSshRouteKey, MAX_WORKSPACE_SSH_GRANT_SECONDS,
+    DurableAgentThreadBacking, DurableWorkspaceSession, DurableWorkspaceSshGrant,
+    ListWorkspaceSessionsOutcome, NewWorkspaceSshGrant, WorkspaceSshRouteKey,
+    MAX_WORKSPACE_SSH_GRANT_SECONDS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -16,7 +17,7 @@ use crate::agent_thread_http::{
     no_store, parse_stored_timestamp, require_empty_query, thread_param,
     MAX_AGENT_THREAD_JSON_BYTES,
 };
-use crate::catalogue::{Handler, HandlerCtx};
+use crate::catalogue::{page_envelope, Handler, HandlerCtx, Page};
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
@@ -100,6 +101,63 @@ struct CreateWorkspaceSshAccessBody {
 
 struct WorkspaceSshAccessCreateHandler {
     api: WorkspaceSshHttpApi,
+}
+
+struct WorkspaceSessionListHandler {
+    api: WorkspaceSshHttpApi,
+}
+
+impl Handler for WorkspaceSessionListHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "workspace session history accepts no request body".into(),
+            ));
+        }
+        let page = Page::parse(&ctx.request.query, "workspace session history")?;
+        if page
+            .cursor
+            .as_deref()
+            .is_some_and(|cursor| !canonical_ulid(cursor))
+        {
+            return Err(EdgeError::BadRequest(
+                "workspace session cursor must be a canonical ULID".into(),
+            ));
+        }
+        let thread_id = thread_param(ctx)?;
+        self.api.owner_thread(ctx.principal, thread_id)?;
+        let outcome = self
+            .api
+            .drive(
+                self.api.threads.list_workspace_sessions_for_owner(
+                    &ctx.principal.tenant.0,
+                    &ctx.principal.principal_id.0,
+                    thread_id,
+                    page.cursor,
+                    u32::try_from(page.limit + 1)
+                        .expect("the bounded HTTP page limit fits a storage page"),
+                ),
+            )?
+            .map_err(|_| EdgeError::Internal("workspace session history failed".into()))?;
+        let ListWorkspaceSessionsOutcome::Page(mut sessions) = outcome else {
+            return Err(EdgeError::BadRequest(
+                "workspace session cursor does not identify this thread's history".into(),
+            ));
+        };
+        let has_more = sessions.len() > page.limit;
+        sessions.truncate(page.limit);
+        let next_cursor = has_more
+            .then(|| sessions.last().map(|session| session.session_id.clone()))
+            .flatten();
+        let items = sessions
+            .iter()
+            .map(|session| workspace_session_json(&ctx.principal.tenant.0, session))
+            .collect::<Vec<_>>();
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &page_envelope(json!(items), next_cursor, page.limit),
+        )))
+    }
 }
 
 impl Handler for WorkspaceSshAccessCreateHandler {
@@ -191,12 +249,44 @@ pub(crate) fn register_workspace_ssh_access(
         endpoint: inputs.endpoint,
         runtime: inputs.runtime,
     };
-    builder.route(
-        Method::Post,
-        "/v1/agent-threads/{thread}/ssh-access",
-        "identity.agent_thread.ssh_access.create",
-        Arc::new(WorkspaceSshAccessCreateHandler { api }),
-    )
+    builder
+        .route(
+            Method::Post,
+            "/v1/agent-threads/{thread}/ssh-access",
+            "identity.agent_thread.ssh_access.create",
+            Arc::new(WorkspaceSshAccessCreateHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/agent-threads/{thread}/workspace-sessions",
+            "identity.agent_thread.workspace_sessions.list",
+            Arc::new(WorkspaceSessionListHandler { api }),
+        )
+}
+
+fn workspace_session_json(tenant: &str, session: &DurableWorkspaceSession) -> Value {
+    json!({
+        "id": session.session_id,
+        "ref": format!(
+            "myelin://{tenant}/agent/workspace/{}#ssh-session-{}",
+            session.workspace_id, session.session_id
+        ),
+        "method": session.access_method,
+        "mode": session.mode.token(),
+        "terminal": session.terminal,
+        "workspace": {
+            "id": session.workspace_id,
+            "generation": session.workspace_generation,
+        },
+        "started_at": session.started_at,
+    })
+}
+
+fn canonical_ulid(value: &str) -> bool {
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
 }
 
 fn access_json(
@@ -303,6 +393,50 @@ mod tests {
                 "unexpectedly accepted {}",
                 String::from_utf8_lossy(body)
             );
+        }
+    }
+
+    #[test]
+    fn session_history_projects_accountability_without_connection_material() {
+        let session = DurableWorkspaceSession {
+            session_id: "01J00000000000000000000001".into(),
+            thread_id: "22222222-2222-4222-8222-222222222222".into(),
+            owner_principal_id: "p:alice".into(),
+            workspace_id: "33333333-3333-4333-8333-333333333333".into(),
+            workspace_generation: 4,
+            access_method: "ssh".into(),
+            mode: myelin_storage::WorkspaceSessionMode::Command,
+            terminal: true,
+            started_at: "2026-08-22T12:00:00.000Z".into(),
+        };
+
+        let projected = workspace_session_json("acme", &session);
+        assert_eq!(
+            projected,
+            json!({
+                "id": session.session_id,
+                "ref": format!(
+                    "myelin://acme/agent/workspace/{}#ssh-session-{}",
+                    session.workspace_id, session.session_id
+                ),
+                "method": "ssh",
+                "mode": "command",
+                "terminal": true,
+                "workspace": { "id": session.workspace_id, "generation": 4 },
+                "started_at": session.started_at,
+            })
+        );
+        let body = projected.to_string();
+        for sensitive_name in [
+            "fingerprint",
+            "grant",
+            "host",
+            "locator",
+            "public_key",
+            "route",
+            "username",
+        ] {
+            assert!(!body.contains(sensitive_name));
         }
     }
 }
