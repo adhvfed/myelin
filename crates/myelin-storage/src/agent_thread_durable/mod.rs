@@ -1,6 +1,8 @@
 mod model;
 mod run;
 mod schema;
+mod ssh_access;
+mod ssh_route;
 
 pub use model::{
     ActivateAgentThreadOutcome, AgentThreadState, CreateAgentThreadOutcome, DurableAgentThread,
@@ -10,8 +12,13 @@ pub use model::{
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
     agent_thread_durable_migrations, AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY,
-    AGENT_THREAD_RUN_MIGRATION,
+    AGENT_THREAD_RUN_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
 };
+pub use ssh_access::{
+    CreateWorkspaceSshGrantOutcome, DurableWorkspaceSshGrant, LiveWorkspaceSshAdmission,
+    NewWorkspaceSshGrant, MAX_WORKSPACE_SSH_GRANT_SECONDS,
+};
+pub use ssh_route::{WorkspaceSshRoute, WorkspaceSshRouteError, WorkspaceSshRouteKey};
 
 use chrono::Duration;
 #[cfg(test)]
@@ -317,13 +324,7 @@ fn validate_proposal(proposal: &NewAgentThread) -> Result<(), ProviderError> {
             "agent thread conversation id is not a canonical ULID",
         ));
     }
-    if proposal.client_nonce.is_empty()
-        || proposal.client_nonce.len() > 128
-        || !proposal
-            .client_nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if !valid_client_nonce(&proposal.client_nonce) {
         return Err(query(
             "agent thread client nonce is not URL-safe bounded text",
         ));
@@ -338,6 +339,14 @@ fn validate_proposal(proposal: &NewAgentThread) -> Result<(), ProviderError> {
         ));
     }
     Ok(())
+}
+
+fn valid_client_nonce(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn validate_storage_locator(locator: &str) -> Result<(), ProviderError> {

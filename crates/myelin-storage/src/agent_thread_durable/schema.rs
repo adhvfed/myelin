@@ -90,10 +90,56 @@ CREATE POLICY myelin_tenant_isolation ON agent_thread_run
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_THREAD_SSH_GRANT_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_thread_ssh_grant (
+    tenant_id             text        NOT NULL,
+    region                text        NOT NULL,
+    grant_id              uuid        NOT NULL,
+    route_username        text        NOT NULL,
+    thread_id             uuid        NOT NULL,
+    owner_principal_id    text        NOT NULL,
+    workspace_id          uuid        NOT NULL,
+    workspace_generation  integer     NOT NULL,
+    public_key_fingerprint text       NOT NULL,
+    client_nonce          text        NOT NULL,
+    issued_at             timestamptz NOT NULL,
+    expires_at            timestamptz NOT NULL,
+    revoked_at            timestamptz,
+    PRIMARY KEY (tenant_id, region, grant_id),
+    UNIQUE (tenant_id, region, owner_principal_id, client_nonce),
+    UNIQUE (route_username),
+    FOREIGN KEY (tenant_id, region, thread_id)
+      REFERENCES agent_thread (tenant_id, region, thread_id),
+    CHECK (length(route_username) BETWEEN 16 AND 384),
+    CHECK (length(owner_principal_id) BETWEEN 1 AND 255),
+    CHECK (workspace_generation > 0),
+    CHECK (length(public_key_fingerprint) = 50),
+    CHECK (length(client_nonce) BETWEEN 1 AND 128),
+    CHECK (expires_at > issued_at),
+    CHECK (expires_at <= issued_at + interval '5 minutes'),
+    CHECK (revoked_at IS NULL OR revoked_at >= issued_at)
+);
+CREATE INDEX IF NOT EXISTS agent_thread_ssh_grant_expiry
+  ON agent_thread_ssh_grant (tenant_id, region, expires_at, grant_id)
+  WHERE revoked_at IS NULL;
+ALTER TABLE agent_thread_ssh_grant ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_thread_ssh_grant FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON agent_thread_ssh_grant;
+CREATE POLICY myelin_tenant_isolation ON agent_thread_ssh_grant
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub fn agent_thread_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0124_agent_thread", AGENT_THREAD_MIGRATION),
         Migration::plain("0125_agent_thread_rls", AGENT_THREAD_RLS_POLICY),
         Migration::plain("0126_agent_thread_run", AGENT_THREAD_RUN_MIGRATION),
+        Migration::plain(
+            "0127_agent_thread_ssh_grant",
+            AGENT_THREAD_SSH_GRANT_MIGRATION,
+        ),
     ])
 }

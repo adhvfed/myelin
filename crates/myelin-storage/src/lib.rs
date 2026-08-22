@@ -231,9 +231,12 @@ pub use storage_surge::{
 
 pub use agent_thread_durable::{
     agent_thread_durable_migrations, ActivateAgentThreadOutcome, AgentThreadRunBinding,
-    AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, NewAgentThread, AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY,
-    AGENT_THREAD_RUN_MIGRATION, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
+    CreateWorkspaceSshGrantOutcome, DurableAgentThread, DurableAgentThreadBacking,
+    DurableWorkspaceSshGrant, LiveWorkspaceSshAdmission, NewAgentThread, NewWorkspaceSshGrant,
+    WorkspaceSshRoute, WorkspaceSshRouteError, WorkspaceSshRouteKey, AGENT_THREAD_MIGRATION,
+    AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
+    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MAX_WORKSPACE_SSH_GRANT_SECONDS,
     MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use agent_trigger_durable::{

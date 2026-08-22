@@ -5,8 +5,8 @@ use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
     all_durable_migrations, ActivateAgentThreadOutcome, BindAgentThreadRunOutcome,
-    CreateAgentThreadOutcome, DurableAgentThreadBacking, HotTables, NewAgentThread,
-    SubstrateProvider,
+    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
+    NewAgentThread, NewWorkspaceSshGrant, SealKey, SubstrateProvider, WorkspaceSshRouteKey,
 };
 use sqlx::types::Uuid;
 
@@ -313,6 +313,114 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         ActivateAgentThreadOutcome::AlreadyReady(ready.clone())
     );
 
+    let ssh_issued_at = intended.created_at + Duration::hours(1);
+    let ssh_grant_id = Uuid::from_u128(151);
+    let route_key = WorkspaceSshRouteKey::from_seal_key(&SealKey::from_bytes([0x51; 32]));
+    let route_username = route_key.seal(&tenant, ssh_grant_id).unwrap();
+    let ssh_intent = NewWorkspaceSshGrant {
+        grant_id: ssh_grant_id,
+        route_username: route_username.clone(),
+        thread_id: intended.thread_id,
+        owner_principal_id: owner.into(),
+        public_key_fingerprint: format!("SHA256:{}", "A".repeat(43)),
+        client_nonce: "private-workspace-ssh-retry".into(),
+        issued_at: ssh_issued_at,
+        expires_at: ssh_issued_at + Duration::minutes(5),
+    };
+    let ssh_grant = threads
+        .create_ssh_grant(&tenant, ssh_intent.clone())
+        .await
+        .unwrap();
+    let CreateWorkspaceSshGrantOutcome::Created(ssh_grant) = ssh_grant else {
+        panic!("the owner and ephemeral key should receive one grant: {ssh_grant:?}");
+    };
+    assert_eq!(ssh_grant.workspace_id, intended.workspace_id.to_string());
+    assert_eq!(ssh_grant.workspace_generation, 1);
+    assert_eq!(ssh_grant.route_username, route_username);
+    assert_eq!(
+        route_key.open(&route_username).unwrap().grant_id,
+        ssh_grant_id
+    );
+
+    let retried_ssh_intent = NewWorkspaceSshGrant {
+        grant_id: Uuid::from_u128(152),
+        route_username: route_key.seal(&tenant, Uuid::from_u128(152)).unwrap(),
+        issued_at: ssh_issued_at + Duration::seconds(30),
+        expires_at: ssh_issued_at + Duration::minutes(5),
+        ..ssh_intent.clone()
+    };
+    assert_eq!(
+        threads
+            .create_ssh_grant(&tenant, retried_ssh_intent)
+            .await
+            .unwrap(),
+        CreateWorkspaceSshGrantOutcome::Replayed(ssh_grant.clone())
+    );
+    assert_eq!(
+        threads
+            .create_ssh_grant(
+                &tenant,
+                NewWorkspaceSshGrant {
+                    public_key_fingerprint: format!("SHA256:{}", "B".repeat(43)),
+                    ..ssh_intent.clone()
+                },
+            )
+            .await
+            .unwrap(),
+        CreateWorkspaceSshGrantOutcome::Conflict
+    );
+
+    let admitted = threads
+        .live_ssh_admission(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_issued_at,
+        )
+        .await
+        .unwrap()
+        .expect("the exact ephemeral key enters the exact live workspace generation");
+    assert_eq!(admitted.thread_id, intended.thread_id.to_string());
+    assert_eq!(admitted.workspace_id, intended.workspace_id.to_string());
+    assert_eq!(admitted.workspace_generation, 1);
+    assert_eq!(admitted.storage_locator, "workspace://local/101");
+    assert!(threads
+        .live_ssh_admission(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &format!("SHA256:{}", "B".repeat(43)),
+            ssh_issued_at,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    assert!(threads
+        .live_ssh_admission(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_intent.expires_at,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    set_agent_status(&app, &tenant, agent_id, PrincipalStatus::Suspended).await;
+    assert!(threads
+        .live_ssh_admission(
+            &tenant,
+            ssh_grant_id,
+            &route_username,
+            &ssh_intent.public_key_fingerprint,
+            ssh_issued_at,
+        )
+        .await
+        .unwrap()
+        .is_none());
+    set_agent_status(&app, &tenant, agent_id, PrincipalStatus::Active).await;
+
     let run_id = Uuid::from_u128(201);
     let run_started_at = intended.created_at + Duration::hours(1);
     seed_ready_run(
@@ -405,6 +513,11 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .unwrap()
         .is_none());
 
+    sqlx::query("DELETE FROM agent_thread_ssh_grant WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM agent_thread_run WHERE tenant_id = $1")
         .bind(&tenant)
         .execute(admin.db_pool())
