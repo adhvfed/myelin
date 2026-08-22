@@ -8,11 +8,13 @@ type WireRecord = Record<string, unknown>;
 export interface ChatConversation {
   id: string;
   ref: string;
-  project_id: string;
+  kind: "channel_public" | "channel_private";
+  project_id: string | null;
   channel: string;
   topic: string;
   linked_ref: string | null;
   pinned_canvas: string | null;
+  retention_days: number | null;
 }
 
 export interface ChatConversationPage {
@@ -103,10 +105,17 @@ function identity(value: unknown): value is string {
 
 function conversation(value: unknown): ChatConversation | null {
   const row = record(value);
-  if (!row || !exact(row, ["id", "ref", "project_id", "channel", "topic", "linked_ref", "pinned_canvas"]) ||
-      !isChatUlid(row.id) || !cleanText(row.ref, 4 * 1024) || !isProjectId(row.project_id) ||
+  if (!row || !exact(row, [
+    "id", "ref", "kind", "project_id", "channel", "topic", "linked_ref", "pinned_canvas",
+    "retention_days",
+  ]) || !isChatUlid(row.id) || !cleanText(row.ref, 4 * 1024) ||
+      !["channel_public", "channel_private"].includes(row.kind as string) ||
+      (row.project_id !== null && !isProjectId(row.project_id)) ||
+      (row.kind === "channel_public" && row.project_id === null) ||
       !cleanText(row.channel, 255) || !cleanText(row.topic, 255) ||
-      !nullableText(row.linked_ref, 4 * 1024) || !nullableText(row.pinned_canvas, 4 * 1024)) {
+      !nullableText(row.linked_ref, 4 * 1024) || !nullableText(row.pinned_canvas, 4 * 1024) ||
+      (row.retention_days !== null &&
+        (!Number.isSafeInteger(row.retention_days) || (row.retention_days as number) < 1))) {
     return null;
   }
   return row as unknown as ChatConversation;

@@ -16,11 +16,22 @@ const REF = `myelin://acme/chat/channel/${ID}`;
 const conversation = {
   id: ID,
   ref: REF,
+  kind: "channel_public",
   project_id: PROJECT,
   channel: "engineering",
   topic: "release readiness",
   linked_ref: null,
   pinned_canvas: null,
+  retention_days: null,
+};
+const privateConversation = {
+  ...conversation,
+  kind: "channel_private",
+  project_id: null,
+  channel: "Investigate checkout race",
+  topic: "Private agent work",
+  linked_ref: "myelin://acme/agent/thread/22222222-2222-4222-8222-222222222222",
+  retention_days: 3,
 };
 const message = {
   id: NEXT,
@@ -37,9 +48,9 @@ const message = {
 describe("Chat wire projection", () => {
   it("strictly decodes bounded conversations, messages, and receipts", () => {
     expect(parseChatConversations({
-      items: [conversation],
+      items: [conversation, privateConversation],
       page: { next_cursor: null, limit: 50 },
-    })?.items).toEqual([conversation]);
+    })?.items).toEqual([conversation, privateConversation]);
     expect(parseChatMessages({
       conversation,
       items: [message],

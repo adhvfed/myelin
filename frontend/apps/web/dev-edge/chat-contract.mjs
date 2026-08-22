@@ -61,11 +61,13 @@ function conversationJson(row) {
   return {
     id: row.id,
     ref: `myelin://${TENANT}/chat/channel/${row.id}`,
+    kind: "channel_public",
     project_id: row.project_id,
     channel: row.channel,
     topic: row.topic,
     linked_ref: null,
     pinned_canvas: null,
+    retention_days: null,
   };
 }
 

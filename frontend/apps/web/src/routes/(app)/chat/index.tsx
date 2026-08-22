@@ -280,7 +280,7 @@ export default function ChatIndex() {
 
       <ChatTopicDialog
         open={createOpen()}
-        preferredProjectId={selectedConversation()?.project_id}
+        preferredProjectId={selectedConversation()?.project_id ?? undefined}
         onClose={closeCreate}
         onCreated={(receipt) => {
           restartConversations();
