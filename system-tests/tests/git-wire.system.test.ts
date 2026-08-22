@@ -18,13 +18,70 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
   const namespacedProject = new GitProject(namespacedSlug, systemClient);
   let root = "";
   let working = "";
-  let mainOid = "";
-  let featureOid = "";
 
-  function requireWorkingCopy(): void {
-    if (!mainOid) {
-      throw new Error("native Git working copy was not initialized by the preceding lifecycle step");
+  async function authorFirstCommitWithPersonalIdentity(): Promise<void> {
+    await git(["clone", repositoryUrl, working], { token: systemTestConfig.token });
+    await git(["config", "user.name", "Myelin System Test"], { cwd: working });
+    await git(["config", "user.email", "system-test@myelin.invalid"], { cwd: working });
+    await writeFile(
+      join(working, "README.md"),
+      `# ${slug}\n\nPushed with a stock Git client over smart HTTP.\n`,
+      "utf8",
+    );
+    await git(["add", "README.md"], { cwd: working });
+    await git(["commit", "-m", "feat: initialize through smart HTTP"], { cwd: working });
+  }
+
+  async function expectPersonalCommitToBeRejected(): Promise<void> {
+    await expect(
+      git(["push", "origin", "HEAD:refs/heads/main"], {
+        cwd: working,
+        token: systemTestConfig.token,
+      }),
+    ).rejects.toMatchObject({
+      stderr: expect.stringContaining("NonPseudonymousCommit"),
+    });
+    expect(
+      (await git(["ls-remote", repositoryUrl, "refs/heads/main"], {
+        token: systemTestConfig.token,
+      })).stdout,
+    ).toBe("");
+  }
+
+  async function publishMainAsPseudonym(): Promise<string> {
+    const pseudonym = `${systemTestConfig.principal}@${systemTestConfig.tenant}.noreply`;
+    await git(["config", "user.name", pseudonym], { cwd: working });
+    await git(["config", "user.email", pseudonym], { cwd: working });
+    await git(["commit", "--amend", "--no-edit", "--reset-author"], { cwd: working });
+    await git(["push", "origin", "HEAD:refs/heads/main"], {
+      cwd: working,
+      token: systemTestConfig.token,
+    });
+    return (await git(["rev-parse", "HEAD"], { cwd: working })).stdout.trim();
+  }
+
+  async function publishFeatureBranch(): Promise<string> {
+    await git(["checkout", "-b", "feature/native-wire"], { cwd: working });
+    await writeFile(join(working, "delivery.txt"), "native wire delivery\n", "utf8");
+    await git(["add", "delivery.txt"], { cwd: working });
+    await git(["commit", "-m", "feat: exercise feature push"], { cwd: working });
+    const featureOid = (await git(["rev-parse", "HEAD"], { cwd: working })).stdout.trim();
+    await git(["push", "origin", "HEAD:refs/heads/feature/native-wire"], {
+      cwd: working,
+      token: systemTestConfig.token,
+    });
+    return featureOid;
+  }
+
+  async function expectReviewerCannotReadRepository(): Promise<void> {
+    let failure: unknown;
+    try {
+      await git(["ls-remote", repositoryUrl], { token: systemTestConfig.reviewerToken });
+    } catch (error) {
+      failure = error;
     }
+    expect(failure).toBeInstanceOf(GitCommandError);
+    expect((failure as GitCommandError).stderr).not.toContain(systemTestConfig.reviewerToken);
   }
 
   beforeAll(async () => {
@@ -48,40 +105,10 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
     expect((failure as GitCommandError).stderr).not.toContain(systemTestConfig.token);
   });
 
-  test("rejects personal commit identity, then accepts a pseudonymous first push", async () => {
-    await git(["clone", repositoryUrl, working], { token: systemTestConfig.token });
-    await git(["config", "user.name", "Myelin System Test"], { cwd: working });
-    await git(["config", "user.email", "system-test@myelin.invalid"], { cwd: working });
-    await writeFile(
-      join(working, "README.md"),
-      `# ${slug}\n\nPushed with a stock Git client over smart HTTP.\n`,
-      "utf8",
-    );
-    await git(["add", "README.md"], { cwd: working });
-    await git(["commit", "-m", "feat: initialize through smart HTTP"], { cwd: working });
-    await expect(
-      git(["push", "origin", "HEAD:refs/heads/main"], {
-        cwd: working,
-        token: systemTestConfig.token,
-      }),
-    ).rejects.toMatchObject({
-      stderr: expect.stringContaining("NonPseudonymousCommit"),
-    });
-    expect(
-      (await git(["ls-remote", repositoryUrl, "refs/heads/main"], {
-        token: systemTestConfig.token,
-      })).stdout,
-    ).toBe("");
-
-    const pseudonym = `${systemTestConfig.principal}@${systemTestConfig.tenant}.noreply`;
-    await git(["config", "user.name", pseudonym], { cwd: working });
-    await git(["config", "user.email", pseudonym], { cwd: working });
-    await git(["commit", "--amend", "--no-edit", "--reset-author"], { cwd: working });
-    await git(["push", "origin", "HEAD:refs/heads/main"], {
-      cwd: working,
-      token: systemTestConfig.token,
-    });
-    mainOid = (await git(["rev-parse", "HEAD"], { cwd: working })).stdout.trim();
+  test("governs a native Git journey from first commit through clean clone", async () => {
+    await authorFirstCommitWithPersonalIdentity();
+    await expectPersonalCommitToBeRejected();
+    const mainOid = await publishMainAsPseudonym();
 
     const remote = await git(["ls-remote", repositoryUrl, "refs/heads/main"], {
       token: systemTestConfig.token,
@@ -93,19 +120,8 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
       snapshot_oid: mainOid,
       readme: expect.stringContaining("stock Git client"),
     });
-  });
 
-  test("pushes a feature branch and exposes both refs through Edge", async () => {
-    requireWorkingCopy();
-    await git(["checkout", "-b", "feature/native-wire"], { cwd: working });
-    await writeFile(join(working, "delivery.txt"), "native wire delivery\n", "utf8");
-    await git(["add", "delivery.txt"], { cwd: working });
-    await git(["commit", "-m", "feat: exercise feature push"], { cwd: working });
-    featureOid = (await git(["rev-parse", "HEAD"], { cwd: working })).stdout.trim();
-    await git(["push", "origin", "HEAD:refs/heads/feature/native-wire"], {
-      cwd: working,
-      token: systemTestConfig.token,
-    });
+    const featureOid = await publishFeatureBranch();
 
     const refs = await systemClient.json(`${project.path}/refs?limit=100`);
     expect(array(refs.body.branches, "smart-HTTP repository branches")).toEqual(
@@ -114,22 +130,9 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
         expect.objectContaining({ name: "feature/native-wire", oid: featureOid }),
       ]),
     );
-  });
 
-  test("enforces repository read grants for an authenticated native Git client", async () => {
-    requireWorkingCopy();
-    let failure: unknown;
-    try {
-      await git(["ls-remote", repositoryUrl], { token: systemTestConfig.reviewerToken });
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(GitCommandError);
-    expect((failure as GitCommandError).stderr).not.toContain(systemTestConfig.reviewerToken);
-  });
+    await expectReviewerCannotReadRepository();
 
-  test("clones the published default branch into a clean worktree", async () => {
-    requireWorkingCopy();
     const clean = join(root, "clean-clone");
     await git(["clone", "--branch", "main", repositoryUrl, clean], {
       token: systemTestConfig.token,
