@@ -24,7 +24,7 @@ import {
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { array, record, string } from "../src/json.js";
-import { generateEphemeralSshKey } from "../src/ssh.js";
+import { connectToWorkspace, generateEphemeralSshKey } from "../src/ssh.js";
 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
 
@@ -46,6 +46,8 @@ describe("private work with an agent", () => {
     const retryKey = `private-agent-thread-${randomUUID()}`;
     const notebookPath = "notes/continuity.md";
     const notebook = `${uniqueName("Checkout investigation")}\n\nThe final reader still owns the lease.`;
+    const ownerNotePath = "notes/from-owner.md";
+    const ownerNote = `${uniqueName("Owner observation")}: cleanup waits for the final reader.`;
 
     const first = await startPrivateAgentThread(founder, {
       name: threadName,
@@ -238,6 +240,20 @@ describe("private work with an agent", () => {
       byte_len: Buffer.byteLength(notebook),
       workspace_generation: first.thread.workspace.generation,
     });
+
+    const workspaceKey = await generateEphemeralSshKey();
+    try {
+      const workspaceAccess = await requestWorkspaceSshAccess(
+        founder,
+        first.thread.id,
+        workspaceKey.publicKey,
+      );
+      const workspace = await connectToWorkspace(workspaceKey, workspaceAccess.access);
+      expect(await workspace.readText(notebookPath)).toBe(notebook);
+      await workspace.writeText(ownerNotePath, ownerNote);
+    } finally {
+      await workspaceKey.remove();
+    }
     await closeAgentRun(firstContext);
 
     const freshContext = await beginAgentThreadRun(founder, first.thread.id);
@@ -261,6 +277,18 @@ describe("private work with an agent", () => {
       content: notebook,
       byte_len: Buffer.byteLength(notebook),
       content_digest: string(writtenFile.content_digest, "workspace write digest"),
+      workspace_generation: first.thread.workspace.generation,
+    });
+    const noteFromOwner = await askAgent(
+      freshContext,
+      3,
+      "workspace.read_file",
+      { path: ownerNotePath },
+    );
+    expect(noteFromOwner).toMatchObject({
+      path: ownerNotePath,
+      content: ownerNote,
+      byte_len: Buffer.byteLength(ownerNote),
       workspace_generation: first.thread.workspace.generation,
     });
     await closeAgentRun(freshContext);

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -10,6 +10,18 @@ export interface EphemeralSshKey {
   privateKeyPath: string;
   publicKey: string;
   remove(): Promise<void>;
+}
+
+interface WorkspaceSshAccess {
+  host: string;
+  port: number;
+  username: string;
+  host_public_key: string;
+}
+
+export interface WorkspaceOverSsh {
+  readText(path: string): Promise<string>;
+  writeText(path: string, content: string): Promise<void>;
 }
 
 export async function generateEphemeralSshKey(): Promise<EphemeralSshKey> {
@@ -37,4 +49,96 @@ export async function generateEphemeralSshKey(): Promise<EphemeralSshKey> {
     await rm(directory, { recursive: true, force: true });
     throw error;
   }
+}
+
+export async function connectToWorkspace(
+  key: EphemeralSshKey,
+  access: WorkspaceSshAccess,
+): Promise<WorkspaceOverSsh> {
+  const knownHostsPath = join(dirname(key.privateKeyPath), "known_hosts");
+  const host = knownHostName(access.host, access.port);
+  await writeFile(knownHostsPath, `${host} ${access.host_public_key}\n`, { mode: 0o600 });
+
+  return {
+    async readText(path: string): Promise<string> {
+      const relative = workspacePath(path);
+      return runWorkspaceCommand(key, access, knownHostsPath, `cat ${shellWord(relative)}`);
+    },
+    async writeText(path: string, content: string): Promise<void> {
+      const relative = workspacePath(path);
+      const parent = dirname(relative);
+      const prepare = parent === "." ? "" : `mkdir -p ${shellWord(parent)} && `;
+      await runWorkspaceCommand(
+        key,
+        access,
+        knownHostsPath,
+        `${prepare}printf %s ${shellWord(content)} > ${shellWord(relative)}`,
+      );
+    },
+  };
+}
+
+async function runWorkspaceCommand(
+  key: EphemeralSshKey,
+  access: WorkspaceSshAccess,
+  knownHostsPath: string,
+  command: string,
+): Promise<string> {
+  try {
+    const result = await run(
+      "ssh",
+      [
+        "-T",
+        "-i",
+        key.privateKeyPath,
+        "-l",
+        access.username,
+        "-p",
+        String(access.port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "KbdInteractiveAuthentication=no",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        `UserKnownHostsFile=${knownHostsPath}`,
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "ConnectTimeout=10",
+        access.host,
+        command,
+      ],
+      { timeout: 30_000, maxBuffer: 512 * 1024 },
+    );
+    return result.stdout;
+  } catch {
+    throw new Error("the host-key-pinned workspace SSH command failed");
+  }
+}
+
+function knownHostName(host: string, port: number): string {
+  return port === 22 ? host : `[${host}]:${port}`;
+}
+
+function workspacePath(path: string): string {
+  const parts = path.split("/");
+  if (
+    path.length === 0
+    || path.length > 1_024
+    || path.startsWith("/")
+    || parts.some((part) => part.length === 0 || part === "." || part === ".." || part.includes("\0"))
+  ) {
+    throw new TypeError("workspace SSH paths must be relative canonical paths");
+  }
+  return path;
+}
+
+function shellWord(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
