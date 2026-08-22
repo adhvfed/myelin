@@ -1,13 +1,13 @@
 use myelin_agent::GateId;
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
 use myelin_agent_service::{
-    chat_tool_defs, ci_tool_defs, classify, deploy_tool_def, forecast_tool_def, issues_tool_defs,
+    chat_tool_defs, ci_tool_defs, deploy_tool_def, forecast_tool_def, issues_tool_defs,
     landing_requires_approval, post_message_tool_def, react_tool_def, register_chat_tools,
     register_ci_tools, register_issues_tools, run_pipeline_tool_def, transition_caveat,
     transition_tool_def, ApplyError, ApplyLedger, ApprovedTools, BatchApprovalCard,
-    BatchGatedEffect, CapabilityCheck, DecisionScript, DelegationLookup, DispatchCounter,
-    DispatchDecision, DispatchTrigger, EffectBudget, EffectCost, PipelineSignals, PlanThenApply,
-    PlannedEffect, RiskSummary, SubsystemApply, TenantGuard, WaitDecision,
+    BatchGatedEffect, CapabilityCheck, DecisionScript, DelegationLookup, EffectBudget, EffectCost,
+    PipelineSignals, PlanThenApply, PlannedEffect, RiskSummary, SubsystemApply, TenantGuard,
+    WaitDecision,
 };
 use myelin_identity::{
     CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
@@ -229,42 +229,6 @@ fn chat_invoked_effect_is_governed_where_it_lands() {
         !landing_requires_approval("issues", "forecast"),
         "a chat-invoked issues.forecast lands in issues → advisory (NOT gated)"
     );
-}
-
-#[test]
-fn chat_d17_casual_mention_zero_spawn_explicit_run_dispatches() {
-    let mut counter = DispatchCounter::new();
-    for i in 0..12 {
-        let d = counter.dispatch(&DispatchTrigger::Mention(format!("msg/{i}")));
-        assert!(d.notifies(), "each casual mention NOTIFIES (0 spawn)");
-    }
-    assert_eq!(
-        counter.auto_spawns(),
-        0,
-        "CHAT-D17: 0 auto-spawn on casual mentions (the dispatch-counter stays 0)"
-    );
-
-    let explicit = counter.dispatch(&DispatchTrigger::ExplicitRun("run-req/1".into()));
-    assert_eq!(
-        explicit,
-        DispatchDecision::Dispatch("run-req/1".into()),
-        "the explicit run dispatches (and the costed run passes reserve downstream, 11.7)"
-    );
-    assert_eq!(
-        counter.auto_spawns(),
-        1,
-        "exactly ONE costed run was dispatched - the explicit one (the twelve mentions spawned 0)"
-    );
-}
-
-#[test]
-fn the_l3_auto_dispatch_floor_is_structural() {
-    for r in ["a", "@agent ship it", "please run the agent"] {
-        assert!(
-            !classify(&DispatchTrigger::Mention(r.into())).dispatches(),
-            "a casual mention can NEVER dispatch (the L-3 floor): {r}"
-        );
-    }
 }
 
 #[test]

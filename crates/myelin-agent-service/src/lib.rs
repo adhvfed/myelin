@@ -6,7 +6,6 @@ pub mod chat_tools;
 pub mod ci_tools;
 pub mod cost_gate;
 pub mod defaults;
-pub mod dispatch;
 pub mod dispatch_surge;
 pub mod dry_run;
 pub mod dsr;
@@ -158,8 +157,6 @@ pub use ci_tools::{
     write_secret_required_caps, write_secret_tool_def, APPROVE_DEPLOY_TOOL, CI_SUBSYSTEM,
     CI_TOOL_VERSION, DEPLOY_TOOL, RUN_PIPELINE_TOOL, WRITE_SECRET_TOOL,
 };
-
-pub use dispatch::{classify, DispatchCounter, DispatchDecision, DispatchTrigger};
 
 pub use dispatch_surge::{
     run_agent_dispatch_surge, AgentDispatchShed, AgentDispatchSurgeGate, AgentDispatchSurgeReport,

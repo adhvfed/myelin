@@ -872,6 +872,13 @@ clippy `-D warnings` passes through Agent Service and Edge; after rebuilding and
 restarting Edge, all six automation-delegation system journeys pass again. Net
 removal: roughly 940 lines of unused abstractions and their private simulation.
 
+The same pass also removed Agent Service's final 160-line mention classifier.
+It had no caller beyond two assertions in a mixed drill and duplicated the
+already-live Chat boundary: public-room membership is explicit, private agent
+work starts only through a named thread, and automations start only through a
+durable trigger binding. The remaining 293 Agent Service unit tests, ten real
+consumer-tool drill cases, and downstream clippy all pass.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
