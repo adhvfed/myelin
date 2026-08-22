@@ -137,8 +137,24 @@ fn map_file_error(error: WorkspaceAccessError) -> WorkspaceRunAccessError {
             WorkspaceRunAccessError::NotFound
         }
         WorkspaceAccessError::TooLarge => WorkspaceRunAccessError::TooLarge,
-        WorkspaceAccessError::UnsafeStorage(_) | WorkspaceAccessError::Io(_) => {
-            WorkspaceRunAccessError::Unavailable
+        WorkspaceAccessError::LocatorMismatch
+        | WorkspaceAccessError::UnsafeStorage(_)
+        | WorkspaceAccessError::Io(_) => WorkspaceRunAccessError::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_workspace_identity_failures_are_never_projected_as_user_input_errors() {
+        for error in [
+            WorkspaceAccessError::LocatorMismatch,
+            WorkspaceAccessError::UnsafeStorage("host path changed".into()),
+            WorkspaceAccessError::Io("disk unavailable".into()),
+        ] {
+            assert_eq!(map_file_error(error), WorkspaceRunAccessError::Unavailable);
         }
     }
 }
