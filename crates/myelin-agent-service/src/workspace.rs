@@ -29,6 +29,7 @@ pub enum WorkspaceProvisionError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkspaceAccessError {
     InvalidPath(String),
+    LocatorMismatch,
     NotFound,
     NotRegularFile,
     TooLarge,
@@ -40,6 +41,9 @@ impl core::fmt::Display for WorkspaceAccessError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::InvalidPath(reason) => write!(formatter, "invalid workspace path: {reason}"),
+            Self::LocatorMismatch => {
+                formatter.write_str("workspace locator does not identify this workspace")
+            }
             Self::NotFound => formatter.write_str("workspace file not found"),
             Self::NotRegularFile => formatter.write_str("workspace path is not a regular file"),
             Self::TooLarge => formatter.write_str("workspace file exceeds the interactive limit"),
@@ -62,6 +66,47 @@ pub struct WrittenWorkspaceFile {
     pub path: String,
     pub byte_len: usize,
     pub content_digest: String,
+}
+
+pub struct VerifiedWorkspaceDirectory {
+    descriptor: File,
+    path: PathBuf,
+    identity: DirectoryIdentity,
+}
+
+impl VerifiedWorkspaceDirectory {
+    pub fn revalidated_mount_source(&self) -> Result<&Path, WorkspaceAccessError> {
+        let opened = self
+            .descriptor
+            .metadata()
+            .map_err(access_io("reinspect open workspace directory"))?;
+        let current = self
+            .path
+            .symlink_metadata()
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => WorkspaceAccessError::NotFound,
+                _ => access_io("reinspect workspace mount source")(error),
+            })?;
+        require_private_directory(&self.path, &current).map_err(map_unsafe_storage)?;
+        let opened_identity = DirectoryIdentity::from_metadata(&opened);
+        let current_identity = DirectoryIdentity::from_metadata(&current);
+        if opened_identity != self.identity || current_identity != self.identity {
+            return Err(WorkspaceAccessError::UnsafeStorage(
+                "workspace directory identity changed after admission".into(),
+            ));
+        }
+        Ok(&self.path)
+    }
+}
+
+impl std::fmt::Debug for VerifiedWorkspaceDirectory {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("VerifiedWorkspaceDirectory")
+            .field("device", &self.identity.device)
+            .field("inode", &self.identity.inode)
+            .finish_non_exhaustive()
+    }
 }
 
 impl core::fmt::Display for WorkspaceProvisionError {
@@ -107,10 +152,19 @@ pub struct LocalDevelopmentWorkspaceProvisioner {
     root_identity: DirectoryIdentity,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct DirectoryIdentity {
     device: u64,
     inode: u64,
+}
+
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
 }
 
 impl LocalDevelopmentWorkspaceProvisioner {
@@ -132,10 +186,7 @@ impl LocalDevelopmentWorkspaceProvisioner {
             .symlink_metadata()
             .map_err(io_error("inspect workspace root"))?;
         require_private_directory(&canonical, &metadata)?;
-        let root_identity = DirectoryIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        };
+        let root_identity = DirectoryIdentity::from_metadata(&metadata);
         Ok(Self {
             root: Arc::new(canonical),
             root_identity,
@@ -144,6 +195,29 @@ impl LocalDevelopmentWorkspaceProvisioner {
 
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    pub fn open_verified_directory(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        storage_locator: &str,
+    ) -> Result<VerifiedWorkspaceDirectory, WorkspaceAccessError> {
+        if storage_locator != Self::locator(tenant, workspace_id) {
+            return Err(WorkspaceAccessError::LocatorMismatch);
+        }
+        let descriptor = self.open_workspace(tenant, workspace_id)?;
+        let metadata = descriptor
+            .metadata()
+            .map_err(access_io("inspect open workspace directory"))?;
+        let identity = DirectoryIdentity::from_metadata(&metadata);
+        let verified = VerifiedWorkspaceDirectory {
+            descriptor,
+            path: self.tenant_directory(tenant).join(workspace_id.to_string()),
+            identity,
+        };
+        verified.revalidated_mount_source()?;
+        Ok(verified)
     }
 
     fn verify_root(&self) -> Result<(), WorkspaceProvisionError> {
@@ -603,6 +677,52 @@ mod tests {
             entries[0].metadata().unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn a_durable_locator_opens_only_its_inode_pinned_workspace() {
+        let temporary = durable_test_root();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalDevelopmentWorkspaceProvisioner::open(temporary.path()).unwrap();
+        let workspace_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let provisioned = store.provision("acme", workspace_id).unwrap();
+
+        let verified = store
+            .open_verified_directory("acme", workspace_id, &provisioned.locator)
+            .expect("the durable locator should resolve to the workspace it names");
+        assert!(verified.revalidated_mount_source().unwrap().is_dir());
+        assert!(!format!("{verified:?}").contains(temporary.path().to_str().unwrap()));
+
+        assert!(matches!(
+            store.open_verified_directory("other", workspace_id, &provisioned.locator),
+            Err(WorkspaceAccessError::LocatorMismatch)
+        ));
+        assert!(matches!(
+            store.open_verified_directory("acme", Uuid::from_u128(23), &provisioned.locator),
+            Err(WorkspaceAccessError::LocatorMismatch)
+        ));
+    }
+
+    #[test]
+    fn an_admitted_workspace_path_cannot_be_swapped_before_mounting() {
+        let temporary = durable_test_root();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalDevelopmentWorkspaceProvisioner::open(temporary.path()).unwrap();
+        let workspace_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let provisioned = store.provision("acme", workspace_id).unwrap();
+        let verified = store
+            .open_verified_directory("acme", workspace_id, &provisioned.locator)
+            .unwrap();
+        let original = verified.revalidated_mount_source().unwrap().to_path_buf();
+        let parked = original.with_extension("parked");
+        std::fs::rename(&original, &parked).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(
+            verified.revalidated_mount_source(),
+            Err(WorkspaceAccessError::UnsafeStorage(_))
+        ));
     }
 
     #[test]
