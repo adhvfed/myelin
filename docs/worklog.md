@@ -4,6 +4,23 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — Search coverage names the surface users have
+
+`myelin-search` carried an 866-line test-only E2E wedge which built a private Tantivy corpus,
+authorization adapter, projection fetcher, reindex source, erasure store, and holder registry. It
+then declared three product-spanning journeys green from those process-local objects. Its only
+callers were its inline tests and a second Rust suite; Edge, workers, browser, CLI, and MCP never
+constructed it.
+
+The synthetic wedge is gone. The product's current search proof is the TypeScript code-search
+journey: exact coordinates from the current default-branch snapshot, no repository disclosure to
+an unrelated principal, replacement of stale matches, branch isolation, promotion when work lands,
+and removal after an ordinary Git delete and push. Cross-product issue, Knowledge, Chat, and CI
+search is now an explicit product gap rather than a green library artifact.
+
+**Proof:** all remaining Search tests; warning-free Search clippy across all targets and features;
+the 99-row contract gate; restarted-stack TypeScript code-search lifecycle.
+
 ## 2026-08-23 — Knowledge journeys exercise the durable product
 
 The Knowledge crate exposed a test-only “E2E wedge” which created its own in-memory identity
@@ -1039,15 +1056,18 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
    notification, and automation work arrives through durable NATS/SQL queues;
    queue bounds and worker concurrency provide backpressure, but the matching
    thresholds.toml shed rows are targets rather than production enforcement.
-5. **Issues has no production live-board transport yet.** the browser offers durable,
+5. **cross-product search is not surfaced yet.** the running product has bounded,
+   authorization-filtered repository code search, but no Edge/CLI/browser surface over the
+   Search service's issue, Knowledge, Chat, and CI projections.
+6. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade
    was removed rather than counted as shipped behavior.
-6. **CI has no user-visible cache yet.** the old process-local namespace is gone;
+7. **CI has no user-visible cache yet.** the old process-local namespace is gone;
    the historical `cache_entry` table has no store, pipeline syntax, runner
    restore/save operation, retention policy, or full-system journey. the eventual
    design must derive its namespace from the durable run trust stamp.
-7. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+8. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.
