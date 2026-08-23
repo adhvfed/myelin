@@ -567,7 +567,7 @@ fn decode_segment(bytes: &[u8]) -> Result<Vec<Message>> {
         }
         let row: SegmentRow = serde_json::from_slice(line)
             .map_err(|e| StoreError::Cold(format!("decode segment row: {e}")))?;
-        out.push(row.into());
+        out.push(row.try_into()?);
     }
     Ok(out)
 }
@@ -607,9 +607,15 @@ impl SegmentRow {
     }
 }
 
-impl From<SegmentRow> for Message {
-    fn from(r: SegmentRow) -> Message {
-        Message {
+impl TryFrom<SegmentRow> for Message {
+    type Error = StoreError;
+
+    fn try_from(r: SegmentRow) -> Result<Message> {
+        let author_kind = author_kind_from_code(r.author_kind)
+            .ok_or_else(|| StoreError::Cold("stored segment author kind is invalid".into()))?;
+        let state = state_from_code(r.state)
+            .ok_or_else(|| StoreError::Cold("stored segment message state is invalid".into()))?;
+        Ok(Message {
             message_id: MessageId(r.message_id),
             conv: ConversationId {
                 tenant: r.tenant,
@@ -618,13 +624,13 @@ impl From<SegmentRow> for Message {
             },
             thread_root_id: r.thread_root_id.map(MessageId),
             author: r.author,
-            author_kind: author_kind_from_code(r.author_kind),
+            author_kind,
             body_inline: r.body_inline,
             body_nodes: r.body_nodes,
             client_nonce: r.client_nonce,
             edited_seq: r.edited_seq,
-            state: state_from_code(r.state),
-        }
+            state,
+        })
     }
 }
 
@@ -636,11 +642,12 @@ fn author_kind_code(k: AuthorKind) -> u8 {
     }
 }
 
-fn author_kind_from_code(c: u8) -> AuthorKind {
+fn author_kind_from_code(c: u8) -> Option<AuthorKind> {
     match c {
-        1 => AuthorKind::Agent,
-        2 => AuthorKind::Service,
-        _ => AuthorKind::Human,
+        0 => Some(AuthorKind::Human),
+        1 => Some(AuthorKind::Agent),
+        2 => Some(AuthorKind::Service),
+        _ => None,
     }
 }
 
@@ -653,12 +660,13 @@ fn state_code(s: MessageState) -> u8 {
     }
 }
 
-fn state_from_code(c: u8) -> MessageState {
+fn state_from_code(c: u8) -> Option<MessageState> {
     match c {
-        1 => MessageState::Edited,
-        2 => MessageState::Deleted,
-        3 => MessageState::Tombstoned,
-        _ => MessageState::Active,
+        0 => Some(MessageState::Active),
+        1 => Some(MessageState::Edited),
+        2 => Some(MessageState::Deleted),
+        3 => Some(MessageState::Tombstoned),
+        _ => None,
     }
 }
 

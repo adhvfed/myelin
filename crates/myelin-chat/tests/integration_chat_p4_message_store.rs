@@ -150,6 +150,43 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
         "no second row from the retried send"
     );
 
+    let invalid_author = sqlx::query(&format!(
+        "UPDATE {table} SET author_kind = 3 WHERE tenant_id = $1 AND region = $2 AND conversation_id = $3 AND message_id = $4"
+    ))
+    .bind(&conv.tenant)
+    .bind(&conv.region)
+    .bind(&conv.conversation_id)
+    .bind(pg_ids[0].as_str())
+    .execute(&admin)
+    .await
+    .expect_err("Postgres refuses an unknown author kind before a message can be reattributed");
+    assert_eq!(
+        invalid_author
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some(format!("{table}_author_kind_known").as_str()),
+        "the refusal came from the durable attribution invariant"
+    );
+    let invalid_state = sqlx::query(&format!(
+        "UPDATE {table} SET state = 4 WHERE tenant_id = $1 AND region = $2 AND conversation_id = $3 AND message_id = $4"
+    ))
+    .bind(&conv.tenant)
+    .bind(&conv.region)
+    .bind(&conv.conversation_id)
+    .bind(pg_ids[0].as_str())
+    .execute(&admin)
+    .await
+    .expect_err(
+        "Postgres refuses an unknown lifecycle state before a deleted message can be resurrected",
+    );
+    assert_eq!(
+        invalid_state
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some(format!("{table}_state_known").as_str()),
+        "the refusal came from the durable message-lifecycle invariant"
+    );
+
     store
         .revise_storage_only(&conv, &pg_ids[0], b"edited".to_vec(), Vec::new(), 0)
         .await

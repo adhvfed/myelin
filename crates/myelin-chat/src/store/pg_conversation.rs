@@ -17,6 +17,34 @@ pub const CONVERSATION_CLIENT_NONCE_INDEX: &str = "chat_conversation_client_nonc
 pub const CONVERSATION_PROJECT_RECENT_INDEX: &str = "chat_conversation_project_recent";
 pub const CONVERSATION_PROJECT_TOPIC_INDEX: &str = "chat_conversation_project_topic_unique";
 
+pub const MESSAGE_ENUM_CONSTRAINTS_EXPAND_DDL: &str = r#"
+DO $myelin$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid = 'chat_message'::regclass
+       AND conname = 'chat_message_author_kind_known'
+  ) THEN
+    ALTER TABLE chat_message
+      ADD CONSTRAINT chat_message_author_kind_known
+      CHECK (author_kind BETWEEN 0 AND 2) NOT VALID;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid = 'chat_message'::regclass
+       AND conname = 'chat_message_state_known'
+  ) THEN
+    ALTER TABLE chat_message
+      ADD CONSTRAINT chat_message_state_known
+      CHECK (state BETWEEN 0 AND 3) NOT VALID;
+  END IF;
+END
+$myelin$;"#;
+
+pub const MESSAGE_ENUM_CONSTRAINTS_VALIDATE_DDL: &str = r#"
+ALTER TABLE chat_message VALIDATE CONSTRAINT chat_message_author_kind_known;
+ALTER TABLE chat_message VALIDATE CONSTRAINT chat_message_state_known;"#;
+
 pub fn visible_public_conversations_cte() -> String {
     format!(
         "{},
@@ -540,6 +568,16 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
             public_conversation_project_topic,
             CONVERSATION_TABLE,
         ),
+        Migration::plain_on(
+            "chat_0007_message_enum_constraints_expand",
+            MESSAGE_ENUM_CONSTRAINTS_EXPAND_DDL,
+            MESSAGE_TABLE,
+        ),
+        Migration::plain_on(
+            "chat_0008_message_enum_constraints_validate",
+            MESSAGE_ENUM_CONSTRAINTS_VALIDATE_DDL,
+            MESSAGE_TABLE,
+        ),
     ])
 }
 
@@ -550,7 +588,7 @@ mod tests {
     #[test]
     fn migrations_create_and_tenant_scope_both_tables() {
         let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 6);
+        assert_eq!(migrations.0.len(), 8);
         for (migration, table) in migrations.0[..2]
             .iter()
             .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
@@ -578,6 +616,14 @@ mod tests {
         assert!(migrations.0[5]
             .ddl
             .contains("WHERE kind = 'channel_public'"));
+        assert_eq!(
+            migrations.0[6].id,
+            "chat_0007_message_enum_constraints_expand"
+        );
+        assert_eq!(
+            migrations.0[7].id,
+            "chat_0008_message_enum_constraints_validate"
+        );
     }
 
     #[test]

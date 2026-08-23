@@ -15,10 +15,7 @@ use myelin_tenancy::Region;
 
 #[cfg(any(test, feature = "test-support"))]
 use super::TombstoneReason;
-use super::{
-    AuthorKind, ConversationId, Message, MessageId, MessageState, NewMessage, RangeCursor,
-    StoreError,
-};
+use super::{AuthorKind, ConversationId, Message, MessageId, NewMessage, RangeCursor, StoreError};
 
 pub const MESSAGE_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS {table} (
@@ -71,6 +68,28 @@ impl PgMessageStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("message DDL: {e}")))?;
+        sqlx::raw_sql(&format!(
+            "DO $myelin$ \
+             BEGIN \
+               IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint \
+                 WHERE conrelid = '{table}'::regclass \
+                   AND conname = '{table}_author_kind_known') THEN \
+                 ALTER TABLE {table} ADD CONSTRAINT {table}_author_kind_known \
+                   CHECK (author_kind BETWEEN 0 AND 2); \
+               END IF; \
+               IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint \
+                 WHERE conrelid = '{table}'::regclass \
+                   AND conname = '{table}_state_known') THEN \
+                 ALTER TABLE {table} ADD CONSTRAINT {table}_state_known \
+                   CHECK (state BETWEEN 0 AND 3); \
+               END IF; \
+             END \
+             $myelin$;",
+            table = self.table,
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Cold(format!("message enum constraints: {e}")))?;
         sqlx::raw_sql(&format!(
             "SELECT myelin_make_tenant_scoped('{}')",
             self.table
@@ -507,7 +526,7 @@ impl PgMessageStore {
             .await
             .map_err(|e| StoreError::Cold(format!("range select: {e}")))?;
 
-        let mut out: Vec<Message> = rows.iter().map(row_to_message).collect();
+        let mut out: Vec<Message> = rows.iter().map(row_to_message).collect::<Result<_, _>>()?;
         out.sort_by(|a, b| a.message_id.cmp(&b.message_id));
         Ok(out)
     }
@@ -538,7 +557,7 @@ impl PgMessageStore {
         .fetch_all(&mut *conn)
         .await
         .map_err(|e| StoreError::Cold(format!("resync select: {e}")))?;
-        Ok(rows.iter().map(row_to_message).collect())
+        rows.iter().map(row_to_message).collect()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -654,8 +673,10 @@ fn message_visibility_event_id(message_event_id: &EventId) -> EventId {
     ))
 }
 
-fn row_to_message(r: &sqlx::postgres::PgRow) -> Message {
-    Message {
+fn row_to_message(r: &sqlx::postgres::PgRow) -> Result<Message, StoreError> {
+    let author_kind = decode_author_kind(r.get("author_kind"))?;
+    let state = decode_message_state(r.get("state"))?;
+    Ok(Message {
         message_id: MessageId(r.get::<String, _>("message_id")),
         conv: ConversationId {
             tenant: r.get::<String, _>("tenant_id"),
@@ -664,13 +685,27 @@ fn row_to_message(r: &sqlx::postgres::PgRow) -> Message {
         },
         thread_root_id: r.get::<Option<String>, _>("thread_root_id").map(MessageId),
         author: r.get::<String, _>("author"),
-        author_kind: author_kind_from_code(r.get::<i16, _>("author_kind") as u8),
+        author_kind,
         body_inline: r.get::<Vec<u8>, _>("body_inline"),
         body_nodes: r.get::<Vec<u8>, _>("body_nodes"),
         client_nonce: r.get::<String, _>("client_nonce"),
         edited_seq: r.get::<i32, _>("edited_seq"),
-        state: state_from_code(r.get::<i16, _>("state") as u8),
-    }
+        state,
+    })
+}
+
+fn decode_author_kind(code: i16) -> Result<AuthorKind, StoreError> {
+    u8::try_from(code)
+        .ok()
+        .and_then(super::author_kind_from_code)
+        .ok_or_else(|| StoreError::Cold("stored message author kind is invalid".into()))
+}
+
+fn decode_message_state(code: i16) -> Result<super::MessageState, StoreError> {
+    u8::try_from(code)
+        .ok()
+        .and_then(super::state_from_code)
+        .ok_or_else(|| StoreError::Cold("stored message state is invalid".into()))
 }
 
 fn author_kind_code(k: AuthorKind) -> u8 {
@@ -681,19 +716,35 @@ fn author_kind_code(k: AuthorKind) -> u8 {
     }
 }
 
-fn author_kind_from_code(c: u8) -> AuthorKind {
-    match c {
-        1 => AuthorKind::Agent,
-        2 => AuthorKind::Service,
-        _ => AuthorKind::Human,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn state_from_code(c: u8) -> MessageState {
-    match c {
-        1 => MessageState::Edited,
-        2 => MessageState::Deleted,
-        3 => MessageState::Tombstoned,
-        _ => MessageState::Active,
+    #[test]
+    fn durable_enum_codes_never_fall_back_to_human_or_active() {
+        assert_eq!(decode_author_kind(0).unwrap(), AuthorKind::Human);
+        assert_eq!(decode_author_kind(1).unwrap(), AuthorKind::Agent);
+        assert_eq!(decode_author_kind(2).unwrap(), AuthorKind::Service);
+        for invalid in [-1, 3, i16::MAX] {
+            assert!(
+                decode_author_kind(invalid).is_err(),
+                "unknown author kind {invalid} must not be attributed to a human"
+            );
+        }
+
+        assert_eq!(
+            decode_message_state(0).unwrap(),
+            crate::store::MessageState::Active
+        );
+        assert_eq!(
+            decode_message_state(3).unwrap(),
+            crate::store::MessageState::Tombstoned
+        );
+        for invalid in [-1, 4, i16::MAX] {
+            assert!(
+                decode_message_state(invalid).is_err(),
+                "unknown message state {invalid} must not resurrect as active"
+            );
+        }
     }
 }

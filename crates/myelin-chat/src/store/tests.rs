@@ -565,6 +565,32 @@ fn cold_segment_round_trips_body_verbatim() {
     assert_eq!(read[0].author_kind, AuthorKind::Agent);
 }
 
+#[test]
+fn cold_segments_refuse_unknown_attribution_and_lifecycle_codes() {
+    let message = sample_cold_batch()
+        .into_iter()
+        .next()
+        .expect("the cold-segment fixture has a message");
+    let original = serde_json::to_value(super::SegmentRow::from(&message)).unwrap();
+
+    for (field, invalid, consequence) in [
+        ("author_kind", 255, "reattributed to a human"),
+        ("state", 255, "resurrected as active"),
+    ] {
+        let mut row = original.clone();
+        row[field] = serde_json::json!(invalid);
+        let mut encoded = serde_json::to_vec(&row).unwrap();
+        encoded.push(b'\n');
+
+        let error = super::decode_segment(&encoded)
+            .expect_err("an unknown durable enum code must fail the whole cold-segment read");
+        assert!(
+            error.to_string().contains("invalid"),
+            "the corrupt row was refused instead of being {consequence}: {error}"
+        );
+    }
+}
+
 fn sample_cold_batch() -> Vec<Message> {
     (0..8u128)
         .map(|i| Message {
