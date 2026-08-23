@@ -113,7 +113,7 @@ fn cdc_2_2_emit_change_co_commits_with_the_state() {
 }
 
 #[test]
-fn cdc_2_3_aggregate_is_the_doc_or_db_with_monotonic_seq() {
+fn cdc_2_3_aggregate_is_the_canonical_page_or_database_partition() {
     let store = OutboxStore::new();
     let mut tx = store.begin(minter(), ctx_base());
     let b1 = emit_change(
@@ -148,7 +148,7 @@ fn cdc_2_3_aggregate_is_the_doc_or_db_with_monotonic_seq() {
     .unwrap();
     tx.commit().unwrap();
 
-    let agg = "myelin://acme/knowledge/page/p1";
+    let agg = "page:p1";
     assert_eq!(store.row(&b1).unwrap().aggregate.0, agg);
     assert_eq!(store.row(&b2).unwrap().aggregate.0, agg);
     assert_eq!(store.row(&b1).unwrap().seq, 0);
@@ -157,10 +157,7 @@ fn cdc_2_3_aggregate_is_the_doc_or_db_with_monotonic_seq() {
         1,
         "the second block of p1 is seq 1 (per-doc ordering)"
     );
-    assert_eq!(
-        store.row(&row).unwrap().aggregate.0,
-        "myelin://acme/knowledge/database/tasks"
-    );
+    assert_eq!(store.row(&row).unwrap().aggregate.0, "database:tasks");
     assert_eq!(
         store.row(&row).unwrap().seq,
         0,

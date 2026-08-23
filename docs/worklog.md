@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — Knowledge journeys exercise the durable product
+
+The Knowledge crate exposed a test-only “E2E wedge” which created its own in-memory identity
+service, page store, reindex source, and lineage chain. It then hashed its own synthesized result
+and called the hash a citable green artifact. A second Rust suite did nothing beyond rerunning and
+endorsing that artifact; neither layer contacted a Myelin service.
+
+The 634-line harness is gone. Knowledge's user-facing proof is now the black-box TypeScript story:
+a person creates and safely retries a durable page, a reader can view but not overwrite it, stale
+edits lose, saved content survives a reread, and references to delivery work appear as independently
+pageable backlinks before disappearing cleanly when the document is unlinked.
+The remaining in-memory and PostgreSQL CDC tests now agree with the production publisher's
+canonical `page:<id>` / `database:<id>` ordering partitions instead of asserting artifact refs the
+publisher rejects.
+
+**Proof:** all remaining Knowledge tests; warning-free Knowledge clippy across all targets and
+features; restarted-stack TypeScript Knowledge lifecycle.
+
 ## 2026-08-23 — Issues E2E means crossing the running system
 
 Two public-looking, test-only Issues modules assembled private in-memory identity policies,

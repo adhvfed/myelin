@@ -204,8 +204,8 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         .unwrap()
         .get("aggregate");
     assert_eq!(
-        agg, "myelin://tenantA/knowledge/page/7c2",
-        "the aggregate is the PAGE (the doc, §4)"
+        agg, "page:7c2",
+        "the aggregate is the canonical page ordering partition"
     );
 
     let mut tx2 = app.begin().await.expect("begin a second state transaction");

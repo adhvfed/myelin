@@ -6,8 +6,6 @@ pub mod comments;
 pub mod compaction;
 pub mod crypto;
 pub mod database;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_wedge;
 pub mod editor;
 pub mod emit;
 pub mod export;
@@ -52,11 +50,6 @@ pub use database::{
     DbRow, FacetIndexHint, FacetPath, FacetTelemetry, FieldDef, FieldSchema, LoweredViewFilter,
     PageBound, PropertyBag, RelationEdgeEvent, RelationKind, RelationStore, SchemaError, ViewError,
     ViewQuery, FACET_PROMOTION_THRESHOLD,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::{
-    run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, run_knowledge_e2e_legs, E2eArtifact,
-    E2E_SCENARIOS as KNOWLEDGE_E2E_SCENARIOS,
 };
 pub use editor::{
     Document, EditOp, Editor, EditorBlock, EditorError, SecondViewer, BROWSER_DRIVE_EVIDENCE,
