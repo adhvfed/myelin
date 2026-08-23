@@ -106,23 +106,34 @@ pub fn encode_ci_result(result: &CiResult) -> Vec<ArtifactRef> {
 
 pub fn decode_ci_result(refs: &[ArtifactRef], idem_token: &str) -> Option<CiResult> {
     let mut overall = None;
-    let mut commit_oid = String::new();
+    let mut commit_oid = None;
     let mut contexts = Vec::new();
     for r in refs {
         if let Some(v) = r.0.strip_prefix(CI_RESULT_VERDICT_PREFIX) {
+            if overall.is_some() {
+                return None;
+            }
             overall = match v {
                 "success" => Some(CiOverall::Success),
                 "failure" => Some(CiOverall::Failure),
                 _ => return None,
             };
         } else if let Some(c) = r.0.strip_prefix(CI_RESULT_COMMIT_PREFIX) {
-            commit_oid = c.to_string();
+            if commit_oid.is_some() || c.is_empty() {
+                return None;
+            }
+            commit_oid = Some(c.to_string());
         } else if let Some(ctx) = r.0.strip_prefix(CI_RESULT_CONTEXT_PREFIX) {
+            if ctx.is_empty() {
+                return None;
+            }
             contexts.push(ctx.to_string());
+        } else {
+            return None;
         }
     }
     Some(CiResult {
-        commit_oid,
+        commit_oid: commit_oid?,
         overall: overall?,
         contexts,
         idem_token: idem_token.to_string(),
@@ -187,6 +198,14 @@ impl WfCtx {
                          (a producer protocol violation, §6.5)"
                     ))
                 })?;
+                if result.commit_oid != request.speculative_commit_oid {
+                    return Err(WfError::CoCommit(format!(
+                        "ci.result for merge_attempt `{attempt_id}` names commit `{}`, not the \
+                         dispatched speculative commit `{}` (a stale or misrouted result cannot \
+                         authorize a merge, §6.5)",
+                        result.commit_oid, request.speculative_commit_oid
+                    )));
+                }
 
                 if result.overall == CiOverall::Failure {
                     let failing: Vec<String> = request.required_contexts.clone();
@@ -884,6 +903,45 @@ mod tests {
     }
 
     #[test]
+    fn a_green_result_for_another_commit_cannot_authorize_this_merge() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let ci = RecordingCi::default();
+        let merger = RecordingMerger::default();
+
+        let producer = MockCiResultProducer::new(&signals, tenant(), region(), "R1");
+        let attempt = merge_attempt_id("R1", "merge.queue:0");
+        producer.deliver(
+            &attempt,
+            "an-older-commit",
+            CiOverall::Success,
+            vec!["build".into(), "test".into()],
+        );
+
+        let mut ctx = begin(&outbox, journal, signals);
+        let error = ctx
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
+            .expect_err("green checks are authority only for the commit they verified");
+
+        assert!(
+            matches!(error, WfError::CoCommit(ref message)
+                if message.contains("an-older-commit") && message.contains("deadbeef")),
+            "the protocol error explains both sides of the broken binding: {error:?}"
+        );
+        assert_eq!(
+            merger.merges.load(Ordering::SeqCst),
+            0,
+            "the stale green result never reaches the merge side effect"
+        );
+        assert_eq!(
+            ctx.staged_emit_len(),
+            0,
+            "the stale green result emits no merged fact"
+        );
+    }
+
+    #[test]
     fn a_failed_ci_dispatch_retries_reusing_the_same_attempt_id() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
@@ -1027,6 +1085,50 @@ mod tests {
         assert!(
             matches!(err, WfError::CoCommit(ref m) if m.contains("no decodable verdict")),
             "loud CoCommit, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_ci_result_cannot_choose_the_more_permissive_verdict() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let ci = RecordingCi::default();
+        let merger = RecordingMerger::default();
+        let attempt = merge_attempt_id("R1", "merge.queue:0");
+
+        signals.deliver(crate::SignalRow {
+            tenant: tenant(),
+            region: region(),
+            run_id: "R1".into(),
+            signal_name: CI_RESULT_SIGNAL.into(),
+            idem_key: attempt,
+            payload: vec![
+                ArtifactRef("ci.result:verdict:failure".into()),
+                ArtifactRef("ci.result:verdict:success".into()),
+                ArtifactRef("ci.result:commit:deadbeef".into()),
+                ArtifactRef("ci.result:context:build".into()),
+                ArtifactRef("ci.result:context:test".into()),
+            ],
+            payload_key_ref: None,
+            received_unix_ms: 0,
+            consumed_seq: None,
+        });
+
+        let mut ctx = begin(&outbox, journal, signals);
+        let error = ctx
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
+            .expect_err("two verdicts are a protocol error, never a last-value-wins merge");
+
+        assert!(
+            matches!(error, WfError::CoCommit(ref message)
+                if message.contains("no decodable verdict")),
+            "the ambiguous result fails closed: {error:?}"
+        );
+        assert_eq!(
+            merger.merges.load(Ordering::SeqCst),
+            0,
+            "the ambiguous result never reaches the merge side effect"
         );
     }
 
