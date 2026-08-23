@@ -3,7 +3,6 @@
 pub mod agent_spend;
 pub mod api;
 pub mod app;
-pub mod board_sync;
 pub mod ci_guard;
 pub mod content;
 pub mod cost_bounder;
@@ -156,11 +155,6 @@ pub use views::{
     board_and_roadmap_share_row, edit_on_board_reflects_on_roadmap, type_rank_split_is_partition,
     IssueView, RowProjection, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
     ROADMAP_TYPE_RANK_MIN, STATE_CATEGORY_FIELD, TYPE_RANK_FIELD,
-};
-
-pub use board_sync::{
-    board_stream, BoardCache, BoardCard, BoardOp, BoardSync, LocalMutationError,
-    BOARD_FIREHOSE_STREAM_PREFIX,
 };
 
 pub use governance::{

@@ -224,7 +224,6 @@ cdc = [
     "crates/myelin-knowledge/tests/cdc_3_5_knowledge_resume_cursor.rs",
     "crates/myelin-ci-controlplane/tests/cdc_live_tail_3_5_11_8.rs",
     "crates/myelin-edge/tests/integration_ci_http_surface.rs",
-    "crates/myelin-issues/tests/cdc_3_5_issues_board_sync.rs",
     "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
     "crates/myelin-chat/tests/cdc_8_3_3_5_chat_presence_streaming.rs",
     "crates/myelin-events/tests/cdc_3_5_retention.rs",

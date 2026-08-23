@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — Issues coverage no longer points at an in-memory board
+
+`myelin-issues::BoardSync` presented a board-specific Firehose client, optimistic cache, reconnect,
+snapshot, and mutation protocol as public product code. No Edge route, worker, browser, or CLI
+constructed it. Four parallel integration/drill/E2E suites and an inline unit suite drove only that
+process-local facade, while the real Issues application serves durable paged lists and mutations over
+HTTP. The contract ledger therefore made live board collaboration look more complete than the
+running product.
+
+The facade and its self-contained tests are gone. Contract 3.5 remains covered by its real Events,
+Chat, Knowledge, CI, notification, and Edge consumers; the Issues-only false pointer was removed.
+The existing black-box Issues lifecycle remains the proof for what users can actually do today, and
+live board updates are named as an open product seam rather than simulated in a library.
+
+**Proof:** all 445 remaining Issues unit tests; the real 99-row contract-coverage gate; Issues
+warning-free under clippy across all targets and features; rebuilt-stack TypeScript Issues lifecycle.
+Net removal: 1,703 lines of unwired implementation and self-testing scaffolding.
+
 ## 2026-08-23 — a new repository becomes useful without leaving Myelin
 
 The browser could create a repository, but its first useful-hour story then crossed a hidden API
@@ -987,11 +1005,15 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
    notification, and automation work arrives through durable NATS/SQL queues;
    queue bounds and worker concurrency provide backpressure, but the matching
    thresholds.toml shed rows are targets rather than production enforcement.
-5. **CI has no user-visible cache yet.** the old process-local namespace is gone;
+5. **Issues has no production live-board transport yet.** the browser offers durable,
+   paged issue views and mutations, but there is no Edge board-op stream, authenticated
+   resume/snapshot boundary, or reconnecting board client. the former in-memory facade
+   was removed rather than counted as shipped behavior.
+6. **CI has no user-visible cache yet.** the old process-local namespace is gone;
    the historical `cache_entry` table has no store, pipeline syntax, runner
    restore/save operation, retention policy, or full-system journey. the eventual
    design must derive its namespace from the durable run trust stamp.
-6. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+7. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.
