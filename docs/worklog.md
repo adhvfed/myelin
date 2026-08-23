@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — Refs E2E follows real edges
+
+The Refs service exposed a test-only E2E module which constructed an in-memory authorization
+service, projection owner, lineage graph, reindex path, and restore/erasure simulation. Its inline
+tests and a duplicate Rust suite endorsed three locally generated `green` values, but no production
+caller used the module and none of the scenarios crossed the Refs service.
+
+That 694-line harness is gone. The Refs product proof is now the black-box TypeScript journey that
+creates real Chat references to Issues, waits for the durable projection, walks a twelve-source
+fan-out page by page without loss or repetition, walks outbound links with an independent cursor,
+and verifies that both directions of a private artifact's reference surface are indistinguishable
+from absence to an unauthorized peer.
+
+**Proof:** all remaining Refs Service tests; warning-free Refs Service clippy across all targets and
+features; the 99-row contract gate; restarted-stack TypeScript reference-graph lifecycle.
+
 ## 2026-08-23 — Search coverage names the surface users have
 
 `myelin-search` carried an 866-line test-only E2E wedge which built a private Tantivy corpus,

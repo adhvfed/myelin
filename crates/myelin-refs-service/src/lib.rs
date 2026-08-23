@@ -13,8 +13,6 @@ pub mod cache;
 pub mod chat_producer;
 pub mod cross_cell;
 pub mod dek;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_wedge;
 pub mod edge_builder;
 pub mod emit;
 pub mod erasure_posture;
@@ -56,10 +54,6 @@ pub use cross_cell::{
     CROSS_CELL_RAW_ROWS_SIGNAL, CROSS_CELL_RESOLVES_SIGNAL,
 };
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::{run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, E2eArtifact, E2E_SCENARIOS};
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::{run_e2e_4_dsar_fanout, run_refs_e2e_wedge};
 pub use edge_builder::{
     edge_id, edge_mutation, EdgeMutation, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder,
     RelClass, EDGE_BUILDER_CONSUMER, EDGE_BUILDER_SUBJECTS, EDGE_BUILDER_SUBJECT_PREFIXES,
