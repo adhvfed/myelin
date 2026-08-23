@@ -6,8 +6,8 @@ use myelin_events::crosscell_propagation::{
     pointer_for_propagation, CrossCellStream, PropagatedPointer,
 };
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, CellId, CorrelationId, CrossCellPointer, DataRole,
-    EventEnvelope, EventId, EventType, OpaqueSubjectId, Timestamp, Visibility,
+    Actor, ArtifactRef, CellId, CorrelationId, CrossCellPointer, DataRole, EventEnvelope, EventId,
+    EventType, OpaqueSubjectId, Timestamp, Visibility,
 };
 use myelin_identity::Principal;
 use myelin_tenancy::{Region, TenantId};
@@ -191,7 +191,7 @@ impl CrossOrgChannel {
                 TenantId(conv.tenant.clone()),
             )),
             subject,
-            aggregate: AggregateKey(format!("channel:{}", conv.conversation_id)),
+            aggregate: crate::events::channel_aggregate(&conv.conversation_id),
             causation_id: None,
             correlation_id: correlation_id.clone(),
             caused_by: None,

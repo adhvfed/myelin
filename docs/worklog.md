@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — Chat E2E names what users can actually do
+
+Chat's test-only E2E wedge supplied its own mutex-backed authorization service and reference
+resolver, then declared an unfurl pane fresh at an invented age of zero seconds. Its privacy leg
+assembled an in-memory message store, KMS, outbox, drafts, and read state before certifying its own
+erase report. The duplicate external suite only called those functions and inspected their prose.
+
+That 627-line harness is gone. Chat's product proof now rests on black-box TypeScript journeys that
+create and page durable conversations, deliver mentions exactly once, keep private project rooms
+non-enumerable, stream reference-only live frames only to readers, hand an Issue into a conversation
+through its canonical reference, and keep named agent work out of public rooms. Focused Chat tests
+still own the unfurl authorization/invalidation and erasure-cascade contracts, without calling them
+end to end. The two missing production compositions are stated explicitly in the gap ledger.
+
+The complete backend run also caught stale Postgres assertions that still queried messages under a
+bare conversation id after channel lifecycle, membership, and messages had been unified on the
+canonical `channel:<conversation>` ordering partition. Those tests now obtain the key from the same
+constructor as production, and the cross-organization event path no longer spells the key itself.
+
+**Proof:** the complete all-feature Chat suite (266 unit cases plus every CDC, drill, and durable
+PostgreSQL/object-store integration); warning-free all-target/all-feature clippy; the 99-row contract
+gate; rebuilt Edge and Workspace Gateway services; all eight live Chat collaboration, live-delivery,
+and private-agent-thread assertions against the resulting system.
+
 ## 2026-08-23 — CI E2E crosses the product boundary
 
 CI's two test-only E2E modules joined production value objects in memory and sealed a prose summary
@@ -1106,15 +1130,20 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
 5. **cross-product search is not surfaced yet.** the running product has bounded,
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.
-6. **Issues has no production live-board transport yet.** the browser offers durable,
+6. **Chat reference cards are not surfaced yet.** durable messages carry canonical references and
+   the Refs graph projects their edges, while Chat owns tested unfurl authorization, tombstones,
+   cache invalidation, and live-update components. Edge, CLI, and browser message reads do not
+   compose those pieces into a viewer-scoped card, so the removed in-memory pane was not a product
+   journey.
+7. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade
    was removed rather than counted as shipped behavior.
-7. **CI has no user-visible cache yet.** the old process-local namespace is gone;
+8. **CI has no user-visible cache yet.** the old process-local namespace is gone;
    the historical `cache_entry` table has no store, pipeline syntax, runner
    restore/save operation, retention policy, or full-system journey. the eventual
    design must derive its namespace from the durable run trust stamp.
-8. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+9. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.

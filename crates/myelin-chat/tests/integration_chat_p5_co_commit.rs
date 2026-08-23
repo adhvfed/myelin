@@ -146,10 +146,11 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     let (admin, table, store, suffix) = fresh_store().await;
 
     let conv = ConversationId::new("acmeP399", region(), format!("01J0CONVP399{suffix}"));
+    let channel_aggregate = myelin_chat::events::channel_aggregate(&conv.conversation_id).0;
     let src = SystemUlidSource::new();
     let event_ids = UlidMinter::new();
 
-    delete_outbox_aggregate(&admin, &conv.conversation_id).await;
+    delete_outbox_aggregate(&admin, &channel_aggregate).await;
 
     let first_message = new_msg(&conv, "n0", "alice", "hello world");
     let (left, right) = tokio::join!(
@@ -232,7 +233,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     let ob_rows = sqlx::query(
         "SELECT event_id, aggregate, seq, subject, envelope FROM outbox WHERE aggregate = $1 ORDER BY seq",
     )
-    .bind(&conv.conversation_id)
+    .bind(&channel_aggregate)
     .fetch_all(&admin)
     .await
     .unwrap();
@@ -248,8 +249,8 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     );
     assert_eq!(
         ob_rows[0].get::<String, _>("aggregate"),
-        conv.conversation_id,
-        "aggregate = conversation_id (contract 2.3)"
+        channel_aggregate,
+        "messages share the canonical channel ordering partition (contract 2.3)"
     );
     assert_eq!(
         ob_rows[0].get::<i64, _>("seq"),
@@ -291,7 +292,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     .unwrap();
     assert_eq!(msg_count2, 1, "CHAT-D14: message-count = 1 (no second row)");
     let ob_count: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
-        .bind(&conv.conversation_id)
+        .bind(&channel_aggregate)
         .fetch_one(&admin)
         .await
         .unwrap();
@@ -328,7 +329,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         );
     }
     let mut seqs: Vec<i64> = sqlx::query_scalar("SELECT seq FROM outbox WHERE aggregate = $1")
-        .bind(&conv.conversation_id)
+        .bind(&channel_aggregate)
         .fetch_all(&admin)
         .await
         .unwrap();
@@ -339,7 +340,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         "CHAT-D2: per-conversation seqs are contiguous + gap-free + no-dup (0 ordering violations)"
     );
 
-    delete_outbox_aggregate(&admin, &conv.conversation_id).await;
+    delete_outbox_aggregate(&admin, &channel_aggregate).await;
     for message_id in message_ids {
         delete_message_visibility(&admin, message_id.as_str()).await;
     }
@@ -354,6 +355,8 @@ async fn a_structured_reference_is_one_atomic_durable_action() {
 
     let referenced_conv =
         ConversationId::new("acmeP399", region(), format!("01J0REFSP399{suffix}"));
+    let channel_aggregate =
+        myelin_chat::events::channel_aggregate(&referenced_conv.conversation_id).0;
     let target = ArtifactRef("myelin://acmeP399/issue/issue/ENG-41".into());
     let nodes = vec![InlineNode::ArtifactRefNode(target.clone())];
     let source_message_id = store
@@ -382,7 +385,7 @@ async fn a_structured_reference_is_one_atomic_durable_action() {
     let reference_rows = sqlx::query(
         "SELECT aggregate, envelope FROM outbox WHERE aggregate = $1 OR aggregate = $2",
     )
-    .bind(&referenced_conv.conversation_id)
+    .bind(&channel_aggregate)
     .bind(&edge_aggregate.0)
     .fetch_all(&admin)
     .await
@@ -499,7 +502,7 @@ async fn a_structured_reference_is_one_atomic_durable_action() {
         "the failed append also leaves no authorization relationship or projection event",
     );
 
-    delete_outbox_aggregate(&admin, &referenced_conv.conversation_id).await;
+    delete_outbox_aggregate(&admin, &channel_aggregate).await;
     delete_outbox_aggregate(&admin, &edge_aggregate.0).await;
     delete_message_visibility(&admin, source_message_id.as_str()).await;
     drop_store(&admin, &table).await;

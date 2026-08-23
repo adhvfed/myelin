@@ -5,8 +5,6 @@ pub mod content;
 pub mod conversation;
 pub mod cross_org;
 pub mod dek;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_wedge;
 pub mod erase;
 pub mod events;
 pub mod fanout;
@@ -50,8 +48,6 @@ pub use dek::{
     decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, plaintext_at_rest,
     subject_dek_erasure, ChatBodyEnvelopeError, ChatFreeText,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseError, ChatEraseReport, ChatErasureCascade,
     StoreReceipt, CHAT_ERASE_CASCADE_TOKEN,
