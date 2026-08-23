@@ -65,6 +65,7 @@ pub enum PrincipalError {
     CrossTenant { detail: String },
     Kms(String),
     CorruptProfile,
+    CorruptPrincipal { field: &'static str },
     UnknownPrincipal { principal_id: String },
     Storage(String),
 }
@@ -89,6 +90,11 @@ impl core::fmt::Display for PrincipalError {
                 f,
                 "principal profile decrypted to a non-conforming shape (a wrong-key/corrupt open \
                  - refused, never silently coerced)"
+            ),
+            PrincipalError::CorruptPrincipal { field } => write!(
+                f,
+                "principal row contains an invalid `{field}` value (the durable identity is \
+                 refused, never silently promoted to authority)"
             ),
             PrincipalError::UnknownPrincipal { principal_id } => write!(
                 f,
@@ -409,8 +415,9 @@ impl PrincipalStore {
             }
             PrincipalBackend::Pg(pg) => pg
                 .block(pg.backing.get_principal(&scope.tenant().0, &principal_id.0))
-                .map(|row| row.map(|drow| Self::durable_to_row(scope, drow)))
-                .map_err(|e| PrincipalError::Storage(e.to_string())),
+                .map_err(|e| PrincipalError::Storage(e.to_string()))?
+                .map(|drow| Self::durable_to_row(scope, drow))
+                .transpose(),
         }
     }
 
@@ -527,12 +534,10 @@ impl PrincipalStore {
             }
             PrincipalBackend::Pg(pg) => pg
                 .block(pg.backing.principals_in(&scope.tenant().0))
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|drow| Self::durable_to_row(scope, drow))
-                        .collect()
-                })
-                .map_err(|e| PrincipalError::Storage(e.to_string())),
+                .map_err(|e| PrincipalError::Storage(e.to_string()))?
+                .into_iter()
+                .map(|drow| Self::durable_to_row(scope, drow))
+                .collect(),
         }
     }
 
@@ -621,8 +626,9 @@ impl PrincipalStore {
                         &Self::link_key(scheme, subject_key),
                     ),
                 )
-                .map(|row| row.map(|drow| Self::durable_to_row(scope, drow)))
-                .map_err(|e| PrincipalError::Storage(e.to_string())),
+                .map_err(|e| PrincipalError::Storage(e.to_string()))?
+                .map(|drow| Self::durable_to_row(scope, drow))
+                .transpose(),
         }
     }
 
@@ -694,22 +700,30 @@ impl PrincipalStore {
     fn durable_to_row(
         scope: &TenantScope,
         drow: myelin_storage::DurablePrincipalRow,
-    ) -> PrincipalRow {
+    ) -> Result<PrincipalRow, PrincipalError> {
         let profile_ref = drow
             .profile
             .as_ref()
-            .and_then(|b| PiiKeyRef::parse(&b.key_ref))
-            .map(|key_ref| ProfileRef { key_ref });
-        PrincipalRow {
+            .map(|blob| {
+                PiiKeyRef::parse(&blob.key_ref)
+                    .map(|key_ref| ProfileRef { key_ref })
+                    .ok_or(PrincipalError::CorruptPrincipal {
+                        field: "profile_key_ref",
+                    })
+            })
+            .transpose()?;
+        Ok(PrincipalRow {
             tenant: scope.tenant().clone(),
             region: scope.region().clone(),
             principal_id: PrincipalId(drow.principal_id),
-            kind: serde_json::from_str(&drow.kind).expect("principal.kind round-trips"),
+            kind: serde_json::from_str(&drow.kind)
+                .map_err(|_| PrincipalError::CorruptPrincipal { field: "kind" })?,
             profile_ref,
             data_role: serde_json::from_str(&drow.data_role)
-                .expect("principal.data_role round-trips"),
-            status: serde_json::from_str(&drow.status).expect("principal.status round-trips"),
-        }
+                .map_err(|_| PrincipalError::CorruptPrincipal { field: "data_role" })?,
+            status: serde_json::from_str(&drow.status)
+                .map_err(|_| PrincipalError::CorruptPrincipal { field: "status" })?,
+        })
     }
 }
 

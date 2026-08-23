@@ -14,7 +14,7 @@ use myelin_identity::{
 use myelin_identity_service::expand::Expand;
 use myelin_identity_service::list_objects::ListObjects;
 use myelin_identity_service::namespace::{FragmentDef, NamespaceEngine, PermissionRule, Userset};
-use myelin_identity_service::principal_store::{PrincipalProfile, PrincipalStore};
+use myelin_identity_service::principal_store::{PrincipalError, PrincipalProfile, PrincipalStore};
 use myelin_identity_service::reverse_index::ReverseIndex;
 use myelin_identity_service::tuple_store::TupleStore;
 use myelin_storage::migration::HotTables;
@@ -268,6 +268,104 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
     println!(
         "OK [1]: principal row + profile ciphertext + tuple edges durable across a fresh instance."
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_durable_principal_fields_never_become_identity_authority() {
+    let admin = common::admin_provider(4).await;
+    admin
+        .migrate(&identity_durable_migrations(), &HotTables::none())
+        .await
+        .expect("identity durable migrations execute against the live DB");
+
+    let app = common::app_provider(6).await;
+    let region = app.config().region.clone();
+    let tenant = format!("mr007-corrupt-principal-{}", uniq());
+    let principal_id = PrincipalId("p:alice".into());
+    let tenant_scope = scope(&tenant, &region);
+    let store = PrincipalStore::with_pg(
+        Arc::new(KmsEngine::new()),
+        DurablePrincipalBacking::new(app),
+        tokio::runtime::Handle::current(),
+    );
+
+    store
+        .put_principal(
+            &tenant_scope,
+            principal_id.clone(),
+            PrincipalKind::Human,
+            DataRole::Processor,
+            PrincipalStatus::Active,
+            Some(&profile("alice@acme.test", "Alice")),
+        )
+        .expect("Alice's durable identity is provisioned");
+    store
+        .link_credential(&tenant_scope, "oidc", "alice", &principal_id)
+        .expect("Alice's verified OIDC subject is linked");
+
+    for (column, corrupt_value, original_value) in [
+        ("kind", "not-json", r#""Human""#),
+        ("data_role", r#""Owner""#, r#""Processor""#),
+        ("status", r#""Superuser""#, r#""Active""#),
+    ] {
+        let update = format!(
+            "UPDATE principal SET {column} = $1 \
+             WHERE tenant_id = $2 AND region = $3 AND principal_id = $4"
+        );
+        sqlx::query(&update)
+            .bind(corrupt_value)
+            .bind(&tenant)
+            .bind(&region)
+            .bind(&principal_id.0)
+            .execute(admin.db_pool())
+            .await
+            .expect("the drill corrupts one durable identity field");
+
+        assert_eq!(
+            store.try_resolve_credential(&tenant_scope, "oidc", "alice"),
+            Err(PrincipalError::CorruptPrincipal { field: column }),
+            "an invalid {column} fails closed at the credential-to-authority boundary"
+        );
+
+        sqlx::query(&update)
+            .bind(original_value)
+            .bind(&tenant)
+            .bind(&region)
+            .bind(&principal_id.0)
+            .execute(admin.db_pool())
+            .await
+            .expect("the drill restores the valid field before checking the next one");
+    }
+
+    sqlx::query(
+        "UPDATE principal SET profile_key_ref = 'not-a-key-reference' \
+         WHERE tenant_id = $1 AND region = $2 AND principal_id = $3",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .bind(&principal_id.0)
+    .execute(admin.db_pool())
+    .await
+    .expect("the drill corrupts the encrypted profile reference");
+
+    assert_eq!(
+        store.try_resolve_credential(&tenant_scope, "oidc", "alice"),
+        Err(PrincipalError::CorruptPrincipal {
+            field: "profile_key_ref"
+        }),
+        "a malformed erasure-key reference cannot silently erase the profile binding"
+    );
+
+    sqlx::query("DELETE FROM credential_link WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .expect("clean up the drill's credential link");
+    sqlx::query("DELETE FROM principal WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await
+        .expect("clean up the drill's principal");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
