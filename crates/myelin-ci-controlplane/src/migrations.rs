@@ -1262,6 +1262,9 @@ VALUES (
 )
 ON CONFLICT (wf_type, version) DO NOTHING";
 
+pub const SEED_CI_PIPELINE_PREDECESSOR_CUTOVER_FENCE_ROW_DDL: &str =
+    SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL;
+
 pub const ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL: &str = "\
 ALTER TABLE job_queue ADD COLUMN IF NOT EXISTS reservation_write_version smallint;
 DO $myelin$
@@ -2712,7 +2715,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             );
         }
         assert!(
-            SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL.contains(&format!(
+            SEED_CI_PIPELINE_PREDECESSOR_CUTOVER_FENCE_ROW_DDL.contains(&format!(
                 "\n  {},\n",
                 crate::ci_runtime_composition::CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION
             )),

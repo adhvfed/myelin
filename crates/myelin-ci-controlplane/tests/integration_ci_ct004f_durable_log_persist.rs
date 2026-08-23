@@ -228,7 +228,10 @@ async fn read_back(
 }
 
 async fn outbox_count(app: &sqlx::PgPool, run: &str, job: &str) -> i64 {
-    let aggregate = format!("ci/run/{run}/job/{job}");
+    let aggregate = LogCoord::new(run, job, SINGLE_STEP_NO)
+        .aggregate_key()
+        .expect("the durable log coordinate is canonical")
+        .0;
     sqlx::query(
         "SELECT COUNT(*) AS c FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = 'ci.log.available'",
     )

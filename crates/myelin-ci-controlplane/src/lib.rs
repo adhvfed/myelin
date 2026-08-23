@@ -96,10 +96,6 @@ pub mod ci_scheduler_db;
 pub mod cost_store;
 pub mod crypto_shred_erase;
 pub mod deployment;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_flagship;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_wedge;
 pub mod events;
 pub mod fairness;
 pub mod fleet;
@@ -245,12 +241,6 @@ pub use surfacing::{
     AUTHZ_VISIBLE_TABLE, CI_SUBSYSTEM, RUN_LIST_PERMISSION, VIEW,
 };
 
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::{
-    run_ci_e2e_slices, run_e2e1_pr_context_pane, run_e2e3_spec_to_ship_lineage, E2eArtifact,
-    E2E_SCENARIOS,
-};
-
 pub use surfacing_index::{
     ci_run_index_spec, ci_summary, register_ci_run_index_spec, register_ci_summary_templates,
     run_doc_is_indexable, summary_template_key, CheckVerdict, CiReindexSource, CiReplayKind,
@@ -392,10 +382,10 @@ pub use migrations::{
     GRANT_SCHEDULER_CLAIM_NONCE_DDL, GRANT_SCHEDULER_CLAIM_TIME_DDL,
     GRANT_SCHEDULER_LEASE_EPOCH_DDL, JOB_QUEUE_TABLE, JQ_CLAIMABLE_INDEX, JQ_IDEM_INDEX,
     JQ_SERIALIZE_INDEX, LOG_ANCHOR_TABLE, LOG_SEGMENT_TABLE, RUNNER_TABLE, SECRET_BINDING_TABLE,
-    SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL,
-    SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL,
-    SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL, VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL,
-    VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
+    SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_PREDECESSOR_CUTOVER_FENCE_ROW_DDL,
+    SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL,
+    SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL,
+    VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL, VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
 };
 
 pub use surge::{CiDispatchShed, CiSurgeControls, CiSurgeGate, StarvationHistogram};

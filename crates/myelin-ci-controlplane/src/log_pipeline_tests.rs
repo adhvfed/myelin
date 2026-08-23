@@ -448,10 +448,7 @@ fn the_log_available_pointer_is_references_not_payloads() {
         draft.pii_key_ref.is_none(),
         "no inline-PII key (the bytes are behind the ref)"
     );
-    assert_eq!(
-        draft.aggregate.0, "log:run-1-job-1",
-        "per-run-aggregate ordering (canonical run:<id> partition)"
-    );
+    assert!(draft.aggregate.0.starts_with("log:v1-"));
     assert_eq!(
         draft.subject.0, "myelin://01J0ACME/ci/log/run-1:job-1:1",
         "the searchable document identity is canonical and tenant-bound"
@@ -463,6 +460,28 @@ fn the_log_available_pointer_is_references_not_payloads() {
     assert_eq!(
         payload["details_ref"], "myelin://01J0ACME/ci/run/run-1#step-1",
         "the separate human deep link is canonical and tenant-bound"
+    );
+}
+
+#[test]
+fn log_aggregate_identity_is_injective_without_repartitioning_deployed_uuid_jobs() {
+    let left = LogCoord::new("a-b", "c", 1)
+        .aggregate_key()
+        .expect("the first bounded coordinate");
+    let right = LogCoord::new("a", "b-c", 1)
+        .aggregate_key()
+        .expect("the second bounded coordinate");
+    assert_ne!(left, right, "delimiter placement cannot merge two jobs");
+
+    let run = "10000000-0000-0000-0000-000000000001";
+    let job = "20000000-0000-0000-0000-000000000002";
+    let deployed = LogCoord::new(run, job, 1)
+        .aggregate_key()
+        .expect("canonical UUID coordinates");
+    assert_eq!(
+        deployed.0,
+        format!("log:{run}-{job}"),
+        "existing UUID-backed log streams keep their ordering partition"
     );
 }
 

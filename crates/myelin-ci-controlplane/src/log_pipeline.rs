@@ -1,7 +1,7 @@
 use myelin_events::firehose::{
     Firehose, FirehoseError, FirehoseScope, FrameDraft, FIREHOSE_MAX_SCOPE_ID_BYTES,
 };
-use myelin_events::{ArtifactRef, DataRole, EventDraft, EventType, Visibility};
+use myelin_events::{AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_storage::{BlobError, BlobStore, ContentHash};
 use myelin_tenancy::{Region, TenantId};
 
@@ -292,6 +292,29 @@ impl LogCoord {
         Ok(mint(&run, Sub::Step(u64::from(self.step_no)))?)
     }
 
+    pub fn aggregate_key(&self) -> Result<AggregateKey, LogReferenceError> {
+        self.validate_identity()?;
+        let canonical_uuid = |value: &str| {
+            sqlx::types::Uuid::parse_str(value)
+                .ok()
+                .filter(|parsed| parsed.to_string() == value)
+        };
+        if canonical_uuid(&self.run_id).is_some() && canonical_uuid(&self.job_id).is_some() {
+            return Ok(AggregateKey(format!("log:{}-{}", self.run_id, self.job_id)));
+        }
+
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"myelin.ci.log.aggregate.v1\0");
+        for value in [&self.run_id, &self.job_id] {
+            digest.update(&(value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        Ok(AggregateKey(format!(
+            "log:v1-{}",
+            digest.finalize().to_hex()
+        )))
+    }
+
     fn validate_identity(&self) -> Result<(), LogReferenceError> {
         for (component, value) in [("run id", self.run_id.as_str()), ("job id", &self.job_id)] {
             if value.is_empty() {
@@ -513,10 +536,7 @@ impl LogAvailablePointer {
             // logs get their own per-(run, job) partition: canonical type:id
             // form, ordered within the job, and never contending with the run
             // lifecycle events for the run partition's outbox seq lock.
-            aggregate: myelin_events::AggregateKey(format!(
-                "log:{}-{}",
-                self.coord.run_id, self.coord.job_id
-            )),
+            aggregate: self.coord.aggregate_key()?,
             payload,
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,

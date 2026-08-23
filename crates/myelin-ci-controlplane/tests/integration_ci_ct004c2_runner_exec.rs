@@ -9,12 +9,12 @@ use common::with_schema_cleanup;
 use myelin_ci_controlplane::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 use myelin_ci_controlplane::{
     ci_job_queue_store, ci_region_queue_store_test_support, DurableEnqueue, DurableLeaseAdapter,
-    DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogPipelineSink,
+    DurableLogPersist, EnqueueOutcome, JobSpecResolver, Lane, LeasedJob, LogCoord, LogPipelineSink,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
     ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
     CREATE_CI_JOB_SPEC_DDL, CREATE_FAIR_DEFICIT_DDL, CREATE_JOB_QUEUE_DDL,
-    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL,
+    CREATE_JOB_QUEUE_INDEXES_DDL, CREATE_LOG_ANCHOR_DDL, CREATE_LOG_SEGMENT_DDL, SINGLE_STEP_NO,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -638,7 +638,10 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         "the anchor closed with the job verdict"
     );
 
-    let aggregate = format!("ci/run/{run_uuid}/job/{}", job_id);
+    let aggregate = LogCoord::new(&run_uuid, job_id.to_string(), SINGLE_STEP_NO)
+        .aggregate_key()
+        .expect("the capstone log coordinate is canonical")
+        .0;
     let pointer_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = 'ci.log.available'",
     )

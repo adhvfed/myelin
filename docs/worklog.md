@@ -4,6 +4,37 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — CI E2E crosses the product boundary
+
+CI's two test-only E2E modules joined production value objects in memory and sealed a prose summary
+as a `green` artifact. The supposed flagship never launched a runner or agent, opened a pull
+request, applied a deployment, touched a database, or crossed a service boundary. Its second Rust
+suite only called the same functions again and asserted phrases from their summaries.
+
+That 1,198-line self-certifying layer is gone. Focused unit and durable integration tests continue
+to own check emission, deployment approval, result deduplication, sandbox hardening, reindexing, and
+reserve/settle invariants. Product-level CI proof now comes from TypeScript journeys through the
+running stack: pushed definitions execute their exact commits in a real sandbox, successful and
+failed logs remain inspectable, costs settle, repository visibility holds, history pages without
+loss, and a scoped CI-failure automation waits for its owner before a hosted agent reads the run and
+opens exactly one durable triage issue.
+
+The complete suite then found two kinds of drift the aggregate harnesses had hidden. Durable log tests
+still queried an obsolete aggregate spelling; `LogCoord` now owns the canonical per-job aggregate so
+the writer and readers cannot diverge. That centralization also exposed a delimiter collision for
+non-UUID coordinates. Canonical UUID jobs retain their deployed partition, while every other valid
+coordinate now uses a bounded, length-framed, domain-separated digest. Two definition-cutover tests
+also invoked the version-5 fence seed after production had advanced to a version-6 predecessor,
+causing one failure and one vacuous green. They now use a current-predecessor alias guarded against
+the production version constant.
+
+**Proof:** the complete all-feature CI Control Plane suite, including real gVisor execution and every
+durable PostgreSQL/object-store integration, followed after aggregate hardening by all 28 log-pipeline
+unit cases and both five-case durable log suites; warning-free all-target/all-feature clippy; the
+99-row contract gate; rebuilt CI Control Plane and Edge services; all eight live CI lifecycle,
+history, and governed-collaboration assertions, then the five-case CI lifecycle once more against the
+final binary.
+
 ## 2026-08-23 — Refs E2E follows real edges
 
 The Refs service exposed a test-only E2E module which constructed an in-memory authorization

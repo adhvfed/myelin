@@ -948,7 +948,9 @@ async fn a_missing_predecessor_row_refuses_instead_of_skipping_the_fence() {
         );
 
                 admin
-                    .execute(myelin_ci_controlplane::SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL)
+                    .execute(
+                        myelin_ci_controlplane::SEED_CI_PIPELINE_PREDECESSOR_CUTOVER_FENCE_ROW_DDL,
+                    )
                     .await
                     .unwrap();
                 let (hash, status) =
@@ -992,7 +994,9 @@ async fn the_predecessor_seed_never_disturbs_an_existing_definition_row() {
                 assert_eq!(before.as_ref().map(|(_, s)| s.as_str()), Some("active"));
                 for _ in 0..3 {
                     admin
-                        .execute(myelin_ci_controlplane::SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL)
+                        .execute(
+                            myelin_ci_controlplane::SEED_CI_PIPELINE_PREDECESSOR_CUTOVER_FENCE_ROW_DDL,
+                        )
                         .await
                         .expect("the seed is idempotent");
                 }
