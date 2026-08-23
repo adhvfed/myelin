@@ -939,9 +939,10 @@ workspace reference.
 Proof: focused Agent Service, Storage, MCP, Edge, and Agent Host unit suites;
 warning-free clippy across all targets and features of those crates; live
 PostgreSQL tests for thread/run locator binding and both retry policies; and the
-two rebuilt-stack TypeScript private-thread stories, including exact replay,
-fresh-context and SSH visibility of command changes, and active cancellation at
-workspace expiry.
+three rebuilt-stack TypeScript private-thread stories, including exact replay,
+fresh-context and SSH visibility of command changes, timeout and combined-output
+enforcement, recovery after retired sandboxes, retry conflicts, and active
+cancellation at workspace expiry.
 
 ## 2026-08-23 — CI cache coverage no longer means a process-local map
 

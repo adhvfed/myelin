@@ -215,9 +215,10 @@ export async function askAgentToBeDenied(
   id: number,
   tool: string,
   arguments_: JsonRecord,
+  idempotencyKey: string = `system-denied-${tool}-${randomUUID()}`,
 ): Promise<string> {
   const result = await callAgent(run, id, tool, arguments_, {
-    idempotencyKey: `system-denied-${tool}-${randomUUID()}`,
+    idempotencyKey,
   });
   expect(result).toMatchObject({ isError: true, _meta: { tool } });
   const content = array(result.content, `${tool} denied MCP content`);
