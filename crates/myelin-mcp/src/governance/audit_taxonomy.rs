@@ -107,6 +107,13 @@ pub(super) fn effect_event_type(
             indeterminate:
                 myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_INDETERMINATE,
         },
+        "workspace.exec" => EffectAuditEvents {
+            attempted: myelin_agent_service::workspace_events::WORKSPACE_EXEC_ATTEMPTED,
+            applied: myelin_agent_service::workspace_events::WORKSPACE_EXEC_APPLIED,
+            gated: myelin_agent_service::workspace_events::WORKSPACE_EXEC_GATED,
+            denied: myelin_agent_service::workspace_events::WORKSPACE_EXEC_DENIED,
+            indeterminate: myelin_agent_service::workspace_events::WORKSPACE_EXEC_INDETERMINATE,
+        },
         _ => return Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     };
     Ok(events.event_for(outcome))
@@ -137,14 +144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_writes_have_a_complete_durable_audit_lifecycle() {
-        let expected = [
-            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_ATTEMPTED,
-            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_APPLIED,
-            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_GATED,
-            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_DENIED,
-            myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_INDETERMINATE,
-        ];
+    fn workspace_mutations_have_complete_durable_audit_lifecycles() {
         let outcomes = [
             EffectAuditOutcome::Attempted,
             EffectAuditOutcome::Applied,
@@ -152,9 +152,32 @@ mod tests {
             EffectAuditOutcome::Denied,
             EffectAuditOutcome::Indeterminate,
         ];
-        assert_eq!(
-            outcomes.map(|outcome| effect_event_type("workspace.write_file", outcome).unwrap()),
-            expected
-        );
+        for (tool, expected) in [
+            (
+                "workspace.write_file",
+                [
+                    myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_ATTEMPTED,
+                    myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_APPLIED,
+                    myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_GATED,
+                    myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_DENIED,
+                    myelin_agent_service::workspace_events::WORKSPACE_WRITE_FILE_INDETERMINATE,
+                ],
+            ),
+            (
+                "workspace.exec",
+                [
+                    myelin_agent_service::workspace_events::WORKSPACE_EXEC_ATTEMPTED,
+                    myelin_agent_service::workspace_events::WORKSPACE_EXEC_APPLIED,
+                    myelin_agent_service::workspace_events::WORKSPACE_EXEC_GATED,
+                    myelin_agent_service::workspace_events::WORKSPACE_EXEC_DENIED,
+                    myelin_agent_service::workspace_events::WORKSPACE_EXEC_INDETERMINATE,
+                ],
+            ),
+        ] {
+            assert_eq!(
+                outcomes.map(|outcome| effect_event_type(tool, outcome).unwrap()),
+                expected
+            );
+        }
     }
 }

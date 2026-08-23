@@ -228,6 +228,7 @@ mod tests {
             "projects.list",
             "workspace.read_file",
             "workspace.write_file",
+            "workspace.exec",
         ] {
             assert!(names.contains(expected), "manifest omitted {expected}");
         }

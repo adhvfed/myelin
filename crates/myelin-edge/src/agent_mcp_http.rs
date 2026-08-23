@@ -491,6 +491,7 @@ impl Handler for AgentMcpHandler {
                 Box::new(WorkspaceEffectApi::new(
                     workspace,
                     ctx.principal.clone(),
+                    delegator.principal_id.0.clone(),
                     self.services.authority.boundary.clone(),
                 )),
             ));

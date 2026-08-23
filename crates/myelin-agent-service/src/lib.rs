@@ -33,6 +33,7 @@ pub mod trigger_consumer;
 pub mod trigger_handoff;
 pub mod workspace;
 pub mod workspace_events;
+pub mod workspace_execution;
 pub mod workspace_tools;
 
 pub use holder::{
@@ -127,8 +128,8 @@ pub use git_read_tools::{
 };
 
 pub use workspace_tools::{
-    workspace_tool_defs, READ_WORKSPACE_FILE_TOOL, WORKSPACE_SUBSYSTEM, WORKSPACE_TOOL_VERSION,
-    WRITE_WORKSPACE_FILE_TOOL,
+    workspace_tool_defs, EXEC_WORKSPACE_COMMAND_TOOL, READ_WORKSPACE_FILE_TOOL,
+    WORKSPACE_SUBSYSTEM, WORKSPACE_TOOL_VERSION, WRITE_WORKSPACE_FILE_TOOL,
 };
 
 pub use chat_tools::{

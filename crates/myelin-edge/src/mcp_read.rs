@@ -282,6 +282,8 @@ impl DirectReadExecutor for McpReadExecutor {
 fn map_workspace_error(error: WorkspaceRunAccessError) -> DirectReadError {
     match error {
         WorkspaceRunAccessError::InvalidPath(reason) => invalid(reason),
+        WorkspaceRunAccessError::InvalidCommand(reason) => invalid(reason),
+        WorkspaceRunAccessError::Indeterminate => DirectReadError::Unavailable,
         WorkspaceRunAccessError::NotFound => DirectReadError::NotFound,
         WorkspaceRunAccessError::TooLarge => {
             invalid("workspace file exceeds the interactive limit")

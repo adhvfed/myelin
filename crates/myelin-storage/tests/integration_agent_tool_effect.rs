@@ -75,6 +75,52 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
             .expect("restart with a fresh database pool"),
         kms.clone(),
     );
+    let at_most_once_key = "workspace.exec/retry-key";
+    assert_eq!(
+        first_process.begin_at_most_once(
+            &tenant,
+            &run_id,
+            at_most_once_key,
+            &request_hash,
+            requested_by,
+        ),
+        Ok(ToolEffectBegin::Execute),
+        "the first command request durably admits one execution",
+    );
+    assert_eq!(
+        restarted_process.begin_at_most_once(
+            &tenant,
+            &run_id,
+            at_most_once_key,
+            &request_hash,
+            requested_by,
+        ),
+        Ok(ToolEffectBegin::Indeterminate),
+        "a process crash after command admission never becomes a second execution",
+    );
+    assert_eq!(
+        restarted_process.complete(
+            &tenant,
+            &run_id,
+            at_most_once_key,
+            &request_hash,
+            requested_by,
+            "bounded command result",
+        ),
+        Ok(ToolEffectCompletion::Applied),
+        "the admitted command can publish its one durable observation",
+    );
+    assert_eq!(
+        restarted_process.begin_at_most_once(
+            &tenant,
+            &run_id,
+            at_most_once_key,
+            &request_hash,
+            requested_by,
+        ),
+        Ok(ToolEffectBegin::Completed("bounded command result".into())),
+        "a completed command replays its exact observation without execution",
+    );
     assert_eq!(
         restarted_process.begin(
             &tenant,

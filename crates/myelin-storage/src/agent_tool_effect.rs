@@ -82,6 +82,7 @@ pub fn agent_tool_effect_migrations() -> Migrations {
 pub enum ToolEffectBegin {
     Execute,
     Completed(String),
+    Indeterminate,
     Unreplayable,
 }
 
@@ -93,6 +94,7 @@ pub enum ToolEffectCompletion {
 
 enum StoredToolEffectBegin {
     Execute,
+    Started,
     Completed(StoredToolResult),
     Unreplayable,
 }
@@ -172,6 +174,36 @@ impl AgentToolEffectStore {
         request_hash: &str,
         requested_by: &str,
     ) -> Result<ToolEffectBegin, ToolEffectError> {
+        self.begin_with_policy(tenant, run_id, effect_key, request_hash, requested_by, true)
+    }
+
+    pub fn begin_at_most_once(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        effect_key: &str,
+        request_hash: &str,
+        requested_by: &str,
+    ) -> Result<ToolEffectBegin, ToolEffectError> {
+        self.begin_with_policy(
+            tenant,
+            run_id,
+            effect_key,
+            request_hash,
+            requested_by,
+            false,
+        )
+    }
+
+    fn begin_with_policy(
+        &self,
+        tenant: &TenantId,
+        run_id: &str,
+        effect_key: &str,
+        request_hash: &str,
+        requested_by: &str,
+        retry_started: bool,
+    ) -> Result<ToolEffectBegin, ToolEffectError> {
         validate_identity(run_id, effect_key, request_hash, requested_by)?;
         let context = JournalPayloadContext::new(
             &tenant.0,
@@ -191,6 +223,8 @@ impl AgentToolEffectStore {
         }))??;
         match stored {
             StoredToolEffectBegin::Execute => Ok(ToolEffectBegin::Execute),
+            StoredToolEffectBegin::Started if retry_started => Ok(ToolEffectBegin::Execute),
+            StoredToolEffectBegin::Started => Ok(ToolEffectBegin::Indeterminate),
             StoredToolEffectBegin::Unreplayable => Ok(ToolEffectBegin::Unreplayable),
             StoredToolEffectBegin::Completed(payload) => {
                 open_tool_result(payload, &self.kms, &context).map(ToolEffectBegin::Completed)
@@ -341,7 +375,7 @@ async fn begin_on_connection(
         .map_err(store_query)?
         .as_str()
     {
-        "started" => Ok(Ok(StoredToolEffectBegin::Execute)),
+        "started" => Ok(Ok(StoredToolEffectBegin::Started)),
         "redacted" => Ok(Ok(StoredToolEffectBegin::Unreplayable)),
         "completed" => stored_tool_result_from_row(&row)
             .map(StoredToolEffectBegin::Completed)

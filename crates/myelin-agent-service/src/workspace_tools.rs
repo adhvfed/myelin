@@ -6,6 +6,7 @@ pub const WORKSPACE_SUBSYSTEM: &str = "workspace";
 pub const WORKSPACE_TOOL_VERSION: u32 = 1;
 pub const READ_WORKSPACE_FILE_TOOL: &str = "read_file";
 pub const WRITE_WORKSPACE_FILE_TOOL: &str = "write_file";
+pub const EXEC_WORKSPACE_COMMAND_TOOL: &str = "exec";
 
 pub fn workspace_tool_defs() -> Vec<ToolDef> {
     vec![
@@ -31,6 +32,17 @@ pub fn workspace_tool_defs() -> Vec<ToolDef> {
             requires_approval: false,
             exposed_over_mcp: true,
         }),
+        seed_requires_approval(ToolDef {
+            name: ToolName(EXEC_WORKSPACE_COMMAND_TOOL.into()),
+            subsystem: WORKSPACE_SUBSYSTEM.into(),
+            version: WORKSPACE_TOOL_VERSION,
+            input_schema: r#"{"type":"object","description":"Runs one bounded command without network access in this private thread's durable workspace.","required":["command"],"properties":{"command":{"type":"string","minLength":1,"maxLength":16384},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300}},"additionalProperties":false}"#.into(),
+            required_caps: vec!["agent.run".into()],
+            effect_kind: EffectKind::Mutate,
+            side_effecting: true,
+            requires_approval: false,
+            exposed_over_mcp: true,
+        }),
     ]
 }
 
@@ -46,7 +58,11 @@ mod tests {
                 .iter()
                 .map(ToolDef::canonical_name)
                 .collect::<Vec<_>>(),
-            ["workspace.read_file", "workspace.write_file"]
+            [
+                "workspace.read_file",
+                "workspace.write_file",
+                "workspace.exec"
+            ]
         );
         for definition in definitions {
             definition.validate().unwrap();

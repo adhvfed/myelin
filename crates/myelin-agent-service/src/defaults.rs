@@ -67,6 +67,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
 
         ("workspace", "read_file") => false,
         ("workspace", "write_file") => false,
+        ("workspace", "exec") => false,
 
         _ => true,
     }
@@ -320,6 +321,10 @@ mod tests {
         assert!(
             !requires_approval_default("chat", "react"),
             "react is reversible → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("workspace", "exec"),
+            "a confined command affects only the already-delegated durable workspace"
         );
     }
 

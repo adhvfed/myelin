@@ -4,7 +4,15 @@ use chrono::Utc;
 use myelin_agent_service::workspace::{
     AgentWorkspaceStore, WorkspaceAccessError, WorkspaceFile, WrittenWorkspaceFile,
 };
-use myelin_storage::{AgentThreadRunBinding, DurableAgentThreadBacking};
+use myelin_agent_service::workspace_execution::{
+    AgentWorkspaceExecutor, WorkspaceCommandRequest, WorkspaceCommandResult,
+    WorkspaceExecutionError, WorkspaceExecutionLease,
+};
+use myelin_storage::{
+    AgentThreadRunBinding, AgentToolEffectStore, DurableAgentThreadBacking, ToolEffectBegin,
+    ToolEffectCompletion, ToolEffectError,
+};
+use myelin_tenancy::TenantId;
 use sqlx::types::Uuid;
 use tokio::runtime::Handle;
 
@@ -15,6 +23,8 @@ use crate::EdgeError;
 pub struct DurableAgentWorkspaceAccess {
     threads: DurableAgentThreadBacking,
     files: Arc<dyn AgentWorkspaceStore>,
+    executor: Arc<dyn AgentWorkspaceExecutor>,
+    effects: AgentToolEffectStore,
     runtime: Handle,
 }
 
@@ -22,11 +32,15 @@ impl DurableAgentWorkspaceAccess {
     pub fn new(
         threads: DurableAgentThreadBacking,
         files: Arc<dyn AgentWorkspaceStore>,
+        executor: Arc<dyn AgentWorkspaceExecutor>,
+        effects: AgentToolEffectStore,
         runtime: Handle,
     ) -> Self {
         Self {
             threads,
             files,
+            executor,
+            effects,
             runtime,
         }
     }
@@ -67,9 +81,16 @@ pub struct WrittenWorkspaceFileOutcome {
     pub file: WrittenWorkspaceFile,
 }
 
+pub struct ExecutedWorkspaceCommandOutcome {
+    pub binding: AgentThreadRunBinding,
+    pub command: WorkspaceCommandResult,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceRunAccessError {
     InvalidPath(String),
+    InvalidCommand(String),
+    Indeterminate,
     NotFound,
     TooLarge,
     Unavailable,
@@ -100,6 +121,65 @@ impl WorkspaceRunAccess {
         Ok(WrittenWorkspaceFileOutcome { binding, file })
     }
 
+    pub fn execute(
+        &self,
+        request: WorkspaceCommandRequest,
+        idempotency_key: &str,
+        requested_by: &str,
+    ) -> Result<ExecutedWorkspaceCommandOutcome, WorkspaceRunAccessError> {
+        let (binding, workspace_id) = self.live_workspace()?;
+        let effect_key = workspace_exec_effect_key(idempotency_key);
+        let request_hash = request.identity_hash();
+        match self
+            .service
+            .effects
+            .begin_at_most_once(
+                &TenantId(self.tenant.clone()),
+                &self.run_id.to_string(),
+                &effect_key,
+                &request_hash,
+                requested_by,
+            )
+            .map_err(map_effect_error)?
+        {
+            ToolEffectBegin::Completed(result) => return decode_execution_replay(binding, &result),
+            ToolEffectBegin::Indeterminate | ToolEffectBegin::Unreplayable => {
+                return Err(WorkspaceRunAccessError::Indeterminate)
+            }
+            ToolEffectBegin::Execute => {}
+        }
+        let command = tokio::task::block_in_place(|| {
+            self.service.executor.execute(
+                &self.tenant,
+                workspace_id,
+                &binding.workspace_storage_locator,
+                request,
+                self,
+            )
+        })
+        .map_err(map_execution_error)?;
+        let encoded =
+            serde_json::to_string(&command).map_err(|_| WorkspaceRunAccessError::Unavailable)?;
+        match self
+            .service
+            .effects
+            .complete(
+                &TenantId(self.tenant.clone()),
+                &self.run_id.to_string(),
+                &effect_key,
+                &request_hash,
+                requested_by,
+                &encoded,
+            )
+            .map_err(map_effect_error)?
+        {
+            ToolEffectCompletion::Applied => {
+                Ok(ExecutedWorkspaceCommandOutcome { binding, command })
+            }
+            ToolEffectCompletion::Replayed(result) => decode_execution_replay(binding, &result),
+        }
+    }
+
     fn live_workspace(&self) -> Result<(AgentThreadRunBinding, Uuid), WorkspaceRunAccessError> {
         let result = drive_edge_future(
             &self.service.runtime,
@@ -120,6 +200,55 @@ impl WorkspaceRunAccess {
             .filter(|id| id.to_string() == result.workspace_id)
             .ok_or(WorkspaceRunAccessError::Unavailable)?;
         Ok((result, workspace_id))
+    }
+}
+
+fn workspace_exec_effect_key(idempotency_key: &str) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"myelin.workspace-command.effect.v1\0");
+    digest.update(&(idempotency_key.len() as u64).to_be_bytes());
+    digest.update(idempotency_key.as_bytes());
+    format!("workspace.exec:{}", digest.finalize().to_hex())
+}
+
+fn decode_execution_replay(
+    binding: AgentThreadRunBinding,
+    encoded: &str,
+) -> Result<ExecutedWorkspaceCommandOutcome, WorkspaceRunAccessError> {
+    let command =
+        serde_json::from_str(encoded).map_err(|_| WorkspaceRunAccessError::Unavailable)?;
+    Ok(ExecutedWorkspaceCommandOutcome { binding, command })
+}
+
+fn map_effect_error(error: ToolEffectError) -> WorkspaceRunAccessError {
+    match error {
+        ToolEffectError::Conflict => WorkspaceRunAccessError::InvalidCommand(
+            "the idempotency key was already used for another workspace command".into(),
+        ),
+        ToolEffectError::Unreplayable => WorkspaceRunAccessError::Indeterminate,
+        ToolEffectError::InvalidInput(_)
+        | ToolEffectError::Missing
+        | ToolEffectError::Erased
+        | ToolEffectError::Restricted
+        | ToolEffectError::Storage(_) => WorkspaceRunAccessError::Unavailable,
+    }
+}
+
+impl WorkspaceExecutionLease for WorkspaceRunAccess {
+    fn is_live(&self) -> bool {
+        self.live_workspace().is_ok()
+    }
+}
+
+fn map_execution_error(error: WorkspaceExecutionError) -> WorkspaceRunAccessError {
+    match error {
+        WorkspaceExecutionError::InvalidRequest(reason) => {
+            WorkspaceRunAccessError::InvalidCommand(reason)
+        }
+        WorkspaceExecutionError::WorkspaceUnavailable => WorkspaceRunAccessError::NotFound,
+        WorkspaceExecutionError::ConfinementUnavailable | WorkspaceExecutionError::Io(_) => {
+            WorkspaceRunAccessError::Unavailable
+        }
     }
 }
 
@@ -155,6 +284,19 @@ mod tests {
             WorkspaceAccessError::Io("disk unavailable".into()),
         ] {
             assert_eq!(map_file_error(error), WorkspaceRunAccessError::Unavailable);
+        }
+    }
+
+    #[test]
+    fn confinement_failures_are_not_misreported_as_agent_input_errors() {
+        for error in [
+            WorkspaceExecutionError::ConfinementUnavailable,
+            WorkspaceExecutionError::Io("runsc pipe closed".into()),
+        ] {
+            assert_eq!(
+                map_execution_error(error),
+                WorkspaceRunAccessError::Unavailable
+            );
         }
     }
 }

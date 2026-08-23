@@ -911,7 +911,7 @@ the live-Postgres pull-request boundary proves isolation, atomicity, idempotency
 pagination, and merge recovery; after restarting Edge, all twelve TypeScript Git
 lifecycle journeys pass through the public HTTP surface.
 
-## 2026-08-23 — agent command execution is an honest gap
+## 2026-08-23 — private agent commands run where the work persists
 
 The old `AgentExecGate`, `SandboxToolHands`, and long-park dispatcher looked like
 the untrusted-compute half of the agent product, but no service constructed any
@@ -922,15 +922,26 @@ was rebuilt from a synthetic console transcript. None could execute a command
 in the durable workspace used by a private agent thread.
 
 That 3,249-line false front and its self-referential drills are gone. The real
-boundary remains explicit: private threads provision durable, expiring
-workspaces and expose thread-bound file reads and writes, while command execution
-still needs a production sandbox dispatch, output, cancellation, accounting,
-and workspace-mount contract before `workspace.exec` may enter the catalogue.
+boundary is now shipped: `workspace.exec` opens the opaque storage locator bound
+to the exact live agent run, revalidates it as a verified mount, and launches the
+production gVisor workspace session with deny-all networking and bounded time,
+memory, processes, temporary storage, and combined output. The same durable run
+lease is checked while the command is active, so closing or expiring the private
+thread terminates the sandbox instead of leaving unowned compute behind.
 
-Proof: the remaining 234 Agent Service unit tests and contract suite pass;
-Agent Service and Edge are warning-clean under clippy; after rebuilding the
-three agent-serving processes, both private-thread TypeScript journeys pass,
-including fresh-context continuation and workspace persistence.
+Command admission uses the encrypted durable tool-effect journal in at-most-once
+mode. A completed retry returns the exact recorded exit and output; a crash after
+admission but before recording the result is reported as indeterminate and is
+never silently executed twice. The public receipt names the workspace generation
+and bounded result, while governance audit records only the event and opaque
+workspace reference.
+
+Proof: focused Agent Service, Storage, MCP, Edge, and Agent Host unit suites;
+warning-free clippy across all targets and features of those crates; live
+PostgreSQL tests for thread/run locator binding and both retry policies; and the
+two rebuilt-stack TypeScript private-thread stories, including exact replay,
+fresh-context and SSH visibility of command changes, and active cancellation at
+workspace expiry.
 
 ## 2026-08-23 — CI cache coverage no longer means a process-local map
 
@@ -979,11 +990,7 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
    the historical `cache_entry` table has no store, pipeline syntax, runner
    restore/save operation, retention policy, or full-system journey. the eventual
    design must derive its namespace from the durable run trust stamp.
-6. **private agent workspaces cannot execute commands yet.** the shipped
-   thread-bound catalogue deliberately contains only bounded file reads and
-   writes. a real `workspace.exec` must use the production sandbox and mount the
-   exact durable workspace; the former mock execution framework has been removed.
-7. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+6. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.

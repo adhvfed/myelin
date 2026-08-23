@@ -615,6 +615,7 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "workspace.write_file"));
+        assert!(tools.iter().any(|tool| tool["name"] == "workspace.exec"));
     }
 
     #[test]

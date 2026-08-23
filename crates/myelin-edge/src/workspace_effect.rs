@@ -3,6 +3,7 @@ use std::sync::Arc;
 use myelin_agent::{
     EffectApi, EffectAuthority, EffectResource, EffectResult, EventId, ProposedEffect, RunCtx,
 };
+use myelin_agent_service::workspace_execution::WorkspaceCommandRequest;
 use myelin_agent_service::workspace_tools::workspace_tool_defs;
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
@@ -14,6 +15,7 @@ use crate::workspace_access::{WorkspaceRunAccess, WorkspaceRunAccessError};
 pub struct WorkspaceEffectApi {
     access: WorkspaceRunAccess,
     principal: Principal,
+    requested_by: String,
     authority: Arc<RunTokenAuthorizer>,
 }
 
@@ -21,11 +23,13 @@ impl WorkspaceEffectApi {
     pub fn new(
         access: WorkspaceRunAccess,
         principal: Principal,
+        requested_by: String,
         authority: Arc<RunTokenAuthorizer>,
     ) -> Self {
         Self {
             access,
             principal,
+            requested_by,
             authority,
         }
     }
@@ -71,9 +75,21 @@ impl EffectApi for WorkspaceEffectApi {
         if let Err(reason) = self.authorize(authority, &tool) {
             return EffectResult::Denied(reason);
         }
-        if tool != "workspace.write_file" {
-            return EffectResult::Denied(format!("workspace tool `{tool}` is not a mutation"));
+        match tool.as_str() {
+            "workspace.write_file" => self.write_file(run, authority, &arguments),
+            "workspace.exec" => self.execute(run, authority, &arguments),
+            _ => EffectResult::Denied(format!("workspace tool `{tool}` is not a mutation")),
         }
+    }
+}
+
+impl WorkspaceEffectApi {
+    fn write_file(
+        &self,
+        run: &RunCtx,
+        authority: &EffectAuthority,
+        arguments: &serde_json::Value,
+    ) -> EffectResult {
         let Some(path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
             return EffectResult::Denied("workspace write requires `path`".into());
         };
@@ -108,6 +124,77 @@ impl EffectApi for WorkspaceEffectApi {
             Err(error) => EffectResult::Denied(public_error(error)),
         }
     }
+
+    fn execute(
+        &self,
+        run: &RunCtx,
+        authority: &EffectAuthority,
+        arguments: &serde_json::Value,
+    ) -> EffectResult {
+        let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str) else {
+            return EffectResult::Denied("workspace command requires `command`".into());
+        };
+        let timeout_seconds = match arguments.get("timeout_seconds") {
+            Some(value) => match value.as_u64() {
+                Some(value) => Some(value),
+                None => {
+                    return EffectResult::Denied(
+                        "workspace command `timeout_seconds` must be an integer".into(),
+                    )
+                }
+            },
+            None => None,
+        };
+        let request = match WorkspaceCommandRequest::new(command, timeout_seconds) {
+            Ok(request) => request,
+            Err(error) => return EffectResult::Denied(error.to_string()),
+        };
+        match self
+            .access
+            .execute(request, &authority.idempotency_key, &self.requested_by)
+        {
+            Ok(outcome) => {
+                let event_id = workspace_exec_event_id(
+                    &outcome.binding.thread_id,
+                    &authority.idempotency_key,
+                    command,
+                    run,
+                );
+                let output_bytes = outcome
+                    .command
+                    .stdout
+                    .len()
+                    .saturating_add(outcome.command.stderr.len());
+                let (stdout, stdout_utf8_lossy) = utf8_output(outcome.command.stdout);
+                let (stderr, stderr_utf8_lossy) = utf8_output(outcome.command.stderr);
+                let elapsed_ms =
+                    u64::try_from(outcome.command.elapsed.as_millis()).unwrap_or(u64::MAX);
+                EffectResult::AppliedResource {
+                    event_id: EventId(event_id),
+                    resource: EffectResource::new(
+                        format!(
+                            "myelin://{}/agent/workspace/{}",
+                            self.principal.tenant.0, outcome.binding.workspace_id
+                        ),
+                        serde_json::json!({
+                            "exit_code": outcome.command.exit_code,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "stdout_utf8_lossy": stdout_utf8_lossy,
+                            "stderr_utf8_lossy": stderr_utf8_lossy,
+                            "timed_out": outcome.command.timed_out,
+                            "cancelled": outcome.command.cancelled,
+                            "output_limit_exceeded": outcome.command.output_limit_exceeded,
+                            "output_bytes": output_bytes,
+                            "elapsed_ms": elapsed_ms,
+                            "workspace_generation": outcome.binding.workspace_generation,
+                        }),
+                    ),
+                }
+            }
+            Err(error) => EffectResult::Denied(public_error(error)),
+        }
+    }
 }
 
 fn workspace_write_event_id(
@@ -125,9 +212,35 @@ fn workspace_write_event_id(
     format!("workspace.file.write:{}", digest.finalize().to_hex())
 }
 
+fn workspace_exec_event_id(
+    thread_id: &str,
+    idempotency_key: &str,
+    command: &str,
+    run: &RunCtx,
+) -> String {
+    let mut digest = blake3::Hasher::new();
+    for part in [thread_id, idempotency_key, command, &run.0] {
+        digest.update(&(part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("workspace.command.exec:{}", digest.finalize().to_hex())
+}
+
+fn utf8_output(bytes: Vec<u8>) -> (String, bool) {
+    match String::from_utf8(bytes) {
+        Ok(text) => (text, false),
+        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
+    }
+}
+
 fn public_error(error: WorkspaceRunAccessError) -> String {
     match error {
         WorkspaceRunAccessError::InvalidPath(reason) => reason,
+        WorkspaceRunAccessError::InvalidCommand(reason) => reason,
+        WorkspaceRunAccessError::Indeterminate => {
+            "the workspace command was admitted but its result is indeterminate; it will not be repeated"
+                .into()
+        }
         WorkspaceRunAccessError::NotFound => {
             "workspace or file is unavailable to this agent run".into()
         }
@@ -171,6 +284,43 @@ mod tests {
             )
         );
         for secret in ["sensitive-jti", "thread-sensitive", "retry-sensitive"] {
+            assert!(!event.contains(secret));
+        }
+    }
+
+    #[test]
+    fn command_identity_is_retry_stable_bound_and_opaque() {
+        let run = RunCtx("runtok:sensitive-jti|principal:agent-1|tool:workspace.exec".into());
+        let event = workspace_exec_event_id(
+            "thread-sensitive",
+            "retry-sensitive",
+            "printf command-sensitive",
+            &run,
+        );
+        assert_eq!(
+            event,
+            workspace_exec_event_id(
+                "thread-sensitive",
+                "retry-sensitive",
+                "printf command-sensitive",
+                &run,
+            )
+        );
+        assert_ne!(
+            event,
+            workspace_exec_event_id(
+                "thread-sensitive",
+                "retry-sensitive",
+                "printf changed",
+                &run,
+            )
+        );
+        for secret in [
+            "sensitive-jti",
+            "thread-sensitive",
+            "retry-sensitive",
+            "command-sensitive",
+        ] {
             assert!(!event.contains(secret));
         }
     }

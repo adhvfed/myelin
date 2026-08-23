@@ -31,6 +31,7 @@ myelin-issues = { path = "../myelin-issues" }
 myelin-chat = { path = "../myelin-chat" }
 myelin-identity-service = { path = "../myelin-identity-service" }
 serde_json.workspace = true
+serde.workspace = true
 blake3.workspace = true
 hex.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }

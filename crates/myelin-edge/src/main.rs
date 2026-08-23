@@ -6,6 +6,7 @@ use hyper::{Request, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_agent_service::workspace::{AgentWorkspaceStore, LocalDevelopmentWorkspaceProvisioner};
+use myelin_agent_service::workspace_execution::AgentWorkspaceExecutor;
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
@@ -916,12 +917,14 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     let agent_workspace_root =
         agent_workspace_root.expect("serving config carries an agent workspace root");
     let workspace_ssh = workspace_ssh.expect("serving config carries a workspace SSH endpoint");
-    let agent_workspaces: Arc<dyn AgentWorkspaceStore> = Arc::new(
+    let local_agent_workspaces = Arc::new(
         LocalDevelopmentWorkspaceProvisioner::open(agent_workspace_root).unwrap_or_else(|error| {
             eprintln!("edge: agent workspace storage refused to start: {error}");
             std::process::exit(1);
         }),
     );
+    let agent_workspaces: Arc<dyn AgentWorkspaceStore> = local_agent_workspaces.clone();
+    let agent_workspace_executor: Arc<dyn AgentWorkspaceExecutor> = local_agent_workspaces;
     let public_base_url = public_base_url.expect("serving config carries a public base URL");
     let listen_addr = listen_addr.expect("serving config carries a listen address");
     let ComposedCore {
@@ -1325,6 +1328,12 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     let agent_workspace_access = DurableAgentWorkspaceAccess::new(
         agent_threads.clone(),
         agent_workspaces.clone(),
+        agent_workspace_executor,
+        myelin_storage::AgentToolEffectStore::with_runtime(
+            provider.clone(),
+            handle.clone(),
+            kms.clone(),
+        ),
         handle.clone(),
     );
     builder = register_agent_mcp(

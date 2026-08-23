@@ -198,6 +198,7 @@ mod tests {
                 "projects.list",
                 "workspace.read_file",
                 "workspace.write_file",
+                "workspace.exec",
             ]
         );
         assert!(registry.resolve("git.merge").unwrap().requires_approval());

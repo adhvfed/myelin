@@ -13,6 +13,7 @@ pub struct AgentThreadRunBinding {
     pub workspace_id: String,
     pub workspace_generation: u32,
     pub workspace_expires_at: String,
+    pub workspace_storage_locator: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,11 +73,11 @@ impl DurableAgentThreadBacking {
                     .await
                     .map_err(query_error("bind external agent run to private thread"))?;
                     if let Some(row) = inserted {
-                        return binding_from_row(
-                            &row,
-                            thread_expiry(&mut *connection, &tenant, &region, thread_id).await?,
-                        )
-                        .map(BindAgentThreadRunOutcome::Bound);
+                        let (expires_at, storage_locator) =
+                            thread_workspace_details(&mut *connection, &tenant, &region, thread_id)
+                                .await?;
+                        return binding_from_row(&row, expires_at, storage_locator)
+                            .map(BindAgentThreadRunOutcome::Bound);
                     }
 
                     if let Some(binding) = binding_for_intent(
@@ -129,7 +130,8 @@ impl DurableAgentThreadBacking {
                     let row = sqlx::query(
                         "SELECT binding.run_id, binding.thread_id, binding.conversation_id,
                                 binding.workspace_id, binding.workspace_generation,
-                                thread.expires_at AS workspace_expires_at
+                                thread.expires_at AS workspace_expires_at,
+                                thread.storage_locator AS workspace_storage_locator
                            FROM agent_thread_run binding
                            JOIN agent_thread thread
                              ON thread.tenant_id = binding.tenant_id
@@ -176,7 +178,8 @@ async fn binding_for_intent(
     let row = sqlx::query(
         "SELECT binding.run_id, binding.thread_id, binding.conversation_id,
                 binding.workspace_id, binding.workspace_generation,
-                thread.expires_at AS workspace_expires_at
+                thread.expires_at AS workspace_expires_at,
+                thread.storage_locator AS workspace_storage_locator
            FROM agent_thread_run binding
            JOIN agent_thread thread
              ON thread.tenant_id = binding.tenant_id
@@ -235,14 +238,14 @@ async fn run_binding_belongs_to_owner(
     .map_err(query_error("check private thread run retry ownership"))
 }
 
-async fn thread_expiry(
+async fn thread_workspace_details(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
     thread_id: Uuid,
-) -> Result<DateTime<Utc>, PgError> {
-    sqlx::query_scalar(
-        "SELECT expires_at FROM agent_thread
+) -> Result<(DateTime<Utc>, String), PgError> {
+    let row = sqlx::query(
+        "SELECT expires_at, storage_locator FROM agent_thread
           WHERE tenant_id = $1 AND region = $2 AND thread_id = $3",
     )
     .bind(tenant)
@@ -250,7 +253,13 @@ async fn thread_expiry(
     .bind(thread_id)
     .fetch_one(connection)
     .await
-    .map_err(query_error("read private thread workspace expiry"))
+    .map_err(query_error("read private thread workspace details"))?;
+    Ok((
+        row.try_get("expires_at")
+            .map_err(row_error("workspace_expires_at"))?,
+        row.try_get("storage_locator")
+            .map_err(row_error("workspace_storage_locator"))?,
+    ))
 }
 
 fn binding_from_joined_row(row: &sqlx::postgres::PgRow) -> Result<AgentThreadRunBinding, PgError> {
@@ -258,12 +267,15 @@ fn binding_from_joined_row(row: &sqlx::postgres::PgRow) -> Result<AgentThreadRun
         row,
         row.try_get("workspace_expires_at")
             .map_err(row_error("workspace_expires_at"))?,
+        row.try_get("workspace_storage_locator")
+            .map_err(row_error("workspace_storage_locator"))?,
     )
 }
 
 fn binding_from_row(
     row: &sqlx::postgres::PgRow,
     workspace_expires_at: DateTime<Utc>,
+    workspace_storage_locator: String,
 ) -> Result<AgentThreadRunBinding, PgError> {
     let generation = row
         .try_get::<i32, _>("workspace_generation")
@@ -287,6 +299,7 @@ fn binding_from_row(
         workspace_generation: u32::try_from(generation)
             .map_err(|_| PgError::Query("private thread run has an invalid generation".into()))?,
         workspace_expires_at: workspace_expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        workspace_storage_locator,
     })
 }
 

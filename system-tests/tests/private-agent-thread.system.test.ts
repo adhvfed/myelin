@@ -74,6 +74,7 @@ describe("private work with an agent", () => {
         "chat.post",
         "workspace.read_file",
         "workspace.write_file",
+        "workspace.exec",
       ],
     );
     const threadName = uniqueName("Investigate checkout race");
@@ -82,6 +83,8 @@ describe("private work with an agent", () => {
     const notebook = `${uniqueName("Checkout investigation")}\n\nThe final reader still owns the lease.`;
     const ownerNotePath = "notes/from-owner.md";
     const ownerNote = `${uniqueName("Owner observation")}: cleanup waits for the final reader.`;
+    const executionLogPath = "notes/agent-command.log";
+    const executionMarker = `agent-command-${randomUUID()}`;
 
     const first = await startPrivateAgentThread(founder, {
       name: threadName,
@@ -311,6 +314,36 @@ describe("private work with an agent", () => {
       workspace_generation: first.thread.workspace.generation,
     });
 
+    const commandKey = `private-agent-command-${randomUUID()}`;
+    const command = [
+      `printf '%s\\n' '${executionMarker}' >> ${executionLogPath}`,
+      "printf 'workspace command complete\\n'",
+    ].join("; ");
+    const executed = await askAgentToAct(
+      firstContext,
+      4,
+      "workspace.exec",
+      { command, timeout_seconds: 10 },
+      commandKey,
+    );
+    const replayedExecution = await askAgentToAct(
+      firstContext,
+      5,
+      "workspace.exec",
+      { command, timeout_seconds: 10 },
+      commandKey,
+    );
+    expect(replayedExecution).toEqual(executed);
+    expect(record(executed.data, "workspace command result")).toMatchObject({
+      exit_code: 0,
+      stdout: "workspace command complete\n",
+      stderr: "",
+      timed_out: false,
+      cancelled: false,
+      output_limit_exceeded: false,
+      workspace_generation: first.thread.workspace.generation,
+    });
+
     const workspaceKey = await generateEphemeralSshKey();
     try {
       const workspaceAccess = await requestWorkspaceSshAccess(
@@ -321,6 +354,7 @@ describe("private work with an agent", () => {
       const workspace = await connectToWorkspace(workspaceKey, workspaceAccess.access);
       expect(await workspace.hasInteractiveTerminal()).toBe(true);
       expect(await workspace.readText(notebookPath)).toBe(notebook);
+      expect(await workspace.readText(executionLogPath)).toBe(`${executionMarker}\n`);
       await workspace.writeText(ownerNotePath, ownerNote);
     } finally {
       await workspaceKey.remove();
@@ -386,9 +420,20 @@ describe("private work with an agent", () => {
       content_digest: string(writtenFile.content_digest, "workspace write digest"),
       workspace_generation: first.thread.workspace.generation,
     });
-    const noteFromOwner = await askAgent(
+    const executionLog = await askAgent(
       freshContext,
       3,
+      "workspace.read_file",
+      { path: executionLogPath },
+    );
+    expect(executionLog).toMatchObject({
+      path: executionLogPath,
+      content: `${executionMarker}\n`,
+      workspace_generation: first.thread.workspace.generation,
+    });
+    const noteFromOwner = await askAgent(
+      freshContext,
+      4,
       "workspace.read_file",
       { path: ownerNotePath },
     );
@@ -402,14 +447,14 @@ describe("private work with an agent", () => {
     const answerKey = `private-agent-answer-${randomUUID()}`;
     const postedAnswer = await askAgentToAct(
       freshContext,
-      4,
+      5,
       "chat.post",
       { conversation_id: conversation.id, content: answer },
       answerKey,
     );
     const replayedAnswer = await askAgentToAct(
       freshContext,
-      5,
+      6,
       "chat.post",
       { conversation_id: conversation.id, content: answer },
       answerKey,
@@ -447,9 +492,48 @@ describe("private work with an agent", () => {
       const workspaceBeforeExpiry = await connectToWorkspace(expiryKey, accessBeforeExpiry.access);
       expect(await workspaceBeforeExpiry.readText(notebookPath)).toBe(notebook);
 
+      const runningCommandPath = "notes/running-command.txt";
+      const runningCommand = askAgentToAct(
+        freshContext,
+        7,
+        "workspace.exec",
+        {
+          command: [
+            `printf 'running\\n' > ${runningCommandPath}`,
+            "sleep 30",
+            `printf 'finished\\n' >> ${runningCommandPath}`,
+          ].join("; "),
+          timeout_seconds: 60,
+        },
+        `private-agent-cancel-${randomUUID()}`,
+      );
+      let commandStarted = false;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        try {
+          commandStarted = await workspaceBeforeExpiry.readText(runningCommandPath) === "running\n";
+        } catch {
+          commandStarted = false;
+        }
+        if (commandStarted) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(commandStarted).toBe(true);
+
       const inaccessible = await reconcileAgentThreads(first.thread.workspace.expires_at);
       expect(inaccessible.madeInaccessible).toBeGreaterThanOrEqual(1);
       expect(inaccessible.cleanupFailures).toBe(0);
+      const cancelledCommand = record(
+        (await runningCommand).data,
+        "cancelled workspace command",
+      );
+      expect(cancelledCommand).toMatchObject({
+        timed_out: false,
+        cancelled: true,
+        output_limit_exceeded: false,
+        workspace_generation: first.thread.workspace.generation,
+      });
+      expect(cancelledCommand.exit_code).not.toBe(0);
+      expect(Number(cancelledCommand.elapsed_ms)).toBeLessThan(30_000);
 
       const expiring = await founder.json(
         `/v1/agent-threads/${encodeURIComponent(first.thread.id)}`,

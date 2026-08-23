@@ -116,6 +116,12 @@ impl ToolExecutor for DurableToolExecutor<'_> {
             ToolEffectBegin::Unreplayable => {
                 return Err(journal_failed(ToolEffectError::Unreplayable));
             }
+            ToolEffectBegin::Indeterminate => {
+                return Err(ToolExecError::Failed(
+                    "tool effect was admitted but has no durable result; repeating it is refused"
+                        .into(),
+                ));
+            }
             ToolEffectBegin::Execute => {}
         }
 
