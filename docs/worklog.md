@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-23 — Issues E2E means crossing the running system
+
+Two public-looking, test-only Issues modules assembled private in-memory identity policies,
+projection stores, relation graphs, and replay sources, then returned a bespoke `green` artifact.
+Their only consumers were two more Rust test suites which repeated the same assertions. They never
+crossed the Edge, PostgreSQL, authorization worker, Events relay, or Refs service, yet their names
+claimed both the PR-pane and spec-to-ship user journeys.
+
+Those synthetic orchestrators and their duplicate suites are gone. Component behavior remains
+covered where it is implemented; user-facing Issues coverage now comes from the TypeScript story
+that creates a project, waits for authorization, discovers and completes work, and creates and
+removes a durable dependency with observable backlinks through the running stack.
+
+**Proof:** all remaining Issues tests; warning-free Issues clippy across all targets and features;
+restarted-stack TypeScript Issues lifecycle. Net removal: 1,200 lines of self-certifying test code.
+
 ## 2026-08-23 — Issues coverage no longer points at an in-memory board
 
 `myelin-issues::BoardSync` presented a board-specific Firehose client, optimistic cache, reconnect,
@@ -20,7 +36,7 @@ live board updates are named as an open product seam rather than simulated in a 
 
 **Proof:** all 445 remaining Issues unit tests; the real 99-row contract-coverage gate; Issues
 warning-free under clippy across all targets and features; rebuilt-stack TypeScript Issues lifecycle.
-Net removal: 1,703 lines of unwired implementation and self-testing scaffolding.
+Net removal: roughly 1,350 lines of unwired implementation and self-testing scaffolding.
 
 ## 2026-08-23 — a new repository becomes useful without leaving Myelin
 

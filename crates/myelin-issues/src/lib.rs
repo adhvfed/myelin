@@ -9,10 +9,6 @@ pub mod cost_bounder;
 pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_lineage;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_wedge;
 pub mod events;
 pub mod governance;
 pub mod holder;
@@ -211,17 +207,6 @@ pub use refs_glue::{
 pub use agent_spend::{
     per_effect_idem_key, spend_bearing_run, BalancedRunSignal, DispatchedRun, IssueRunKind,
     IssueSpendGate, SpendError,
-};
-
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::{
-    run_e2e_1_pr_pane, run_issues_e2e_wedge, IssuesE2eArtifact, E2E_SCENARIO, FRESHNESS_BUDGET_SECS,
-};
-
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_lineage::{
-    lineage_audit_anchor, run_e2e_3_lineage, run_issues_e2e_3, E2E_LINEAGE_SCENARIO,
-    LINEAGE_DEPTH_BOUND,
 };
 
 pub use trigger::{
