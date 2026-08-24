@@ -307,6 +307,33 @@ async fn run_list_and_detail_are_visibility_scoped_keyset_and_rls_safe() {
             "a non-visible parent repository never enters pagination"
         );
 
+        let exact = store
+            .get_run_summaries(
+                TENANT,
+                REGION,
+                &[
+                    RUN_2.into(),
+                    RUN_HIDDEN.into(),
+                    RUN_2.into(),
+                    "71000000-0000-4000-8000-000000000099".into(),
+                ],
+            )
+            .await
+            .expect("exact summary batch");
+        assert_eq!(
+            exact
+                .iter()
+                .map(|run| (run.run_id.as_str(), run.repo_ref.as_str()))
+                .collect::<Vec<_>>(),
+            [(RUN_2, BETA), (RUN_HIDDEN, HIDDEN)],
+            "duplicates and missing ids are omitted without applying Edge authorization"
+        );
+        let other_tenant = store
+            .get_run_summaries(OTHER_TENANT, REGION, &[RUN_2.into(), RUN_HIDDEN.into()])
+            .await
+            .expect("cross-tenant exact summary batch");
+        assert!(other_tenant.is_empty(), "FORCE RLS keeps the batch tenant scoped");
+
         let stale = store
             .list_surface_runs(
                 TENANT,

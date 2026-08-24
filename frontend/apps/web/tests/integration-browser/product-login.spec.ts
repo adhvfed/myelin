@@ -189,6 +189,24 @@ command = ["true"]
   await expect(page.getByRole("heading", { level: 3, name: "test" })).toBeVisible();
   await expect(page.getByTestId("ci-job-result")).toContainText("Workload passed");
 
+  const ciReference = `myelin://${tenant}/ci/run/${ciRunId}`;
+  const chatTopic = `Release confidence for ${slug}`;
+  await navigateToApp(page, "/chat");
+  await page.getByRole("button", { name: "Create a topic" }).click();
+  await page.getByRole("textbox", { name: "Channel", exact: true }).fill(`delivery-${slug}`);
+  await page.getByRole("textbox", { name: "Topic", exact: true }).fill(chatTopic);
+  await page.getByRole("button", { name: "Create topic" }).click();
+  await page.getByLabel(`Message ${chatTopic}`).fill("The sandbox passed this exact revision.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(ciReference);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const ciCard = page.getByRole("link", { name: `${slug} CI, succeeded` });
+  await expect(ciCard).toHaveAttribute("href", `/ci/runs/${ciRunId}`);
+  await ciCard.click();
+  await expect(page).toHaveURL(new RegExp(`/ci/runs/${ciRunId}$`));
+  await expect(page.getByRole("heading", { name: `Run ${ciRunId.slice(0, 8)}` })).toBeVisible();
+
   await navigateToApp(page, "/issues");
   const issuePrefix = `B${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;
   const issueTitle = `Track ${slug}`;

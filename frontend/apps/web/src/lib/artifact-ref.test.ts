@@ -61,6 +61,11 @@ describe("artifact references", () => {
       .toBe("/git/repos/platform%2Fapi");
     expect(artifactRefHref("myelin://acme/git/repo/platform.git/api")).toBeUndefined();
     expect(artifactRefHref("myelin://acme/git/pr/platform:9007199254740992")).toBeUndefined();
+    expect(artifactRefLabel("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
+      .toBe("CI run · 00000001");
+    expect(artifactRefHref("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
+      .toBe("/ci/runs/91000000-0000-4000-8000-000000000001");
+    expect(artifactRefHref("myelin://acme/ci/run/NOT-A-UUID")).toBeUndefined();
   });
 
   it("parses a nested pull-request coordinate once without losing numeric precision", () => {

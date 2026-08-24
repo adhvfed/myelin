@@ -40,16 +40,7 @@ impl DurableGitBackend {
         let requested_pull_requests = requested_pull_requests(pull_requests)?;
         let tenant = principal.tenant.as_str();
         let region = principal.region.as_str();
-        let authorized =
-            self.repo_authz
-                .visible_repos(principal, tenant, region, &requested_repositories);
-        let existing = authorized
-            .into_iter()
-            .filter(|repository| {
-                self.store
-                    .repo_exists(&Self::loc(tenant, region, repository))
-            })
-            .collect::<BTreeSet<_>>();
+        let existing = self.visible_existing_repositories(principal, &requested_repositories)?;
 
         let repositories = repositories
             .iter()

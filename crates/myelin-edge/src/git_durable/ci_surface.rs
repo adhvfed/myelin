@@ -20,6 +20,17 @@ impl DurableGitBackend {
         self.repo_authorizer()
             .authorize_repo_permission(principal, &loc, RepoPermission::Pull)
     }
+
+    pub(crate) fn visible_requested_repo_slugs_for_ci(
+        &self,
+        principal: &Principal,
+        candidates: &[String],
+    ) -> Result<Vec<String>, DurableError> {
+        Ok(self
+            .visible_existing_repositories(principal, candidates)?
+            .into_iter()
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -54,12 +65,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let repo_dir = root.join(TENANT).join(REGION);
-        std::fs::create_dir_all(repo_dir.join("alpha.git")).unwrap();
-        std::fs::create_dir_all(repo_dir.join("hidden.git")).unwrap();
         let authz = GrantBackedRepos::new().grant_read("viewer", TENANT, "alpha");
         let backend =
             DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(authz));
+        backend.create_repo(TENANT, REGION, "alpha").unwrap();
+        backend.create_repo(TENANT, REGION, "hidden").unwrap();
         let viewer = principal("viewer");
         let stranger = principal("stranger");
 
@@ -74,6 +84,22 @@ mod tests {
         assert!(backend.may_view_ci_repo(&viewer, "alpha"));
         assert!(!backend.may_view_ci_repo(&viewer, "hidden"));
         assert!(!backend.may_view_ci_repo(&stranger, "alpha"));
+        assert_eq!(
+            backend
+                .visible_requested_repo_slugs_for_ci(
+                    &viewer,
+                    &["hidden".into(), "alpha".into(), "alpha".into()],
+                )
+                .unwrap(),
+            ["alpha"]
+        );
+        assert!(backend
+            .visible_requested_repo_slugs_for_ci(&stranger, &["alpha".into()])
+            .unwrap()
+            .is_empty());
+        assert!(backend
+            .visible_requested_repo_slugs_for_ci(&viewer, &["not a slug".into()])
+            .is_err());
 
         std::fs::remove_dir_all(root).unwrap();
     }

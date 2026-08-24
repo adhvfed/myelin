@@ -1234,6 +1234,28 @@ live services, all five TypeScript CI delivery journeys pass, including real
 sandbox output, failure settlement, and repository visibility. Net removal:
 roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
 
+## 2026-08-24 — CI results remain useful when they enter a conversation
+
+A CI run reference in Chat used to remain an opaque UUID even for its owner. It
+now resolves through an exact, bounded PostgreSQL summary read and one exact Git
+visibility decision. The card names the repository and current run state without
+loading jobs, steps, logs, or artifacts. Missing, malformed, inaccessible, and
+temporarily unavailable runs all collapse to the same content-free tombstone.
+The shared Git visibility seam validates canonical slugs, authorizes the requested
+set once, and rejects directory-shaped impostors by consulting the durable store.
+
+The TypeScript journey creates and executes two private repositories, puts both
+opaque run references in one shared message, and reads it as each engineer. Each
+reader sees only their own useful card and cannot find the other's repository name
+anywhere in the response. The Chromium product spine now carries its real sandbox
+result into Chat, follows the projected card, and lands back on the durable run.
+
+Proof: all 351 Edge and 602 CI Control Plane library tests; the real PostgreSQL
+run-surface integration with RLS and exact duplicate/missing ids; warning-free
+clippy across all targets and features of both crates; 640 browser units; six
+live TypeScript CI journeys; and the real Chromium product journey after an Edge
+restart.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1260,11 +1282,11 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.
 6. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
-   viewer-scoped Issue, Knowledge page, Git repository, and Git pull-request cards through bounded
-   owner queries, with content-free tombstones for denied or unavailable artifacts. Git commits,
-   blobs, refs, reviews, and comments, plus CI and Chat artifacts, still retain their canonical link
-   rather than a rich card because their durable owner projectors are not composed. Event-driven
-   cache invalidation and live card updates also remain unwired.
+   viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, and CI run cards through
+   bounded owner queries, with content-free tombstones for denied or unavailable artifacts. Git
+   commits, blobs, refs, reviews, and comments, other CI artifacts, plus Chat artifacts still retain
+   their canonical link rather than a rich card because their durable owner projectors are not
+   composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade

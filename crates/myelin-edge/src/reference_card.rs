@@ -5,6 +5,7 @@ use myelin_issues::StoredIssue;
 use serde::Serialize;
 use std::sync::Arc;
 
+use crate::ci_http::{canonical_uuid, repo_slug_from_ref, DurableCiReadApi};
 use crate::{DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -80,6 +81,12 @@ impl DurableReferenceCardResolver {
     pub fn with_git(mut self, git: Arc<DurableGitBackend>) -> Self {
         self.projectors
             .push(Arc::new(GitReferenceCardProjector { git }));
+        self
+    }
+
+    pub fn with_ci(mut self, ci: DurableCiReadApi) -> Self {
+        self.projectors
+            .push(Arc::new(CiReferenceCardProjector { ci }));
         self
     }
 }
@@ -160,6 +167,40 @@ struct GitReferenceCardProjector {
     git: Arc<DurableGitBackend>,
 }
 
+struct CiReferenceCardProjector {
+    ci: DurableCiReadApi,
+}
+
+impl ReferenceCardProjector for CiReferenceCardProjector {
+    fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
+        let run_roots = root_references(viewer, references, "ci", "run");
+        if run_roots.is_empty() {
+            return HashMap::new();
+        }
+        let mut cards = claimed_tombstones(&run_roots);
+        let run_references = canonical_ci_run_references(&run_roots);
+        let run_ids = run_references.keys().cloned().collect::<Vec<_>>();
+        let Ok(visible_runs) = self.ci.project_run_summaries(viewer, &run_ids) else {
+            return cards;
+        };
+
+        for run in visible_runs {
+            let (Some(repository), Some(references)) = (
+                repo_slug_from_ref(viewer.tenant.as_str(), &run.repo_ref),
+                run_references.get(&run.run_id),
+            ) else {
+                continue;
+            };
+            let card =
+                ReferenceCard::projection(format!("{repository} CI"), run.state, "ci", "ci_run");
+            for reference in references {
+                cards.insert(reference.clone(), card.clone());
+            }
+        }
+        cards
+    }
+}
+
 impl ReferenceCardProjector for GitReferenceCardProjector {
     fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
         let repository_references = root_references(viewer, references, "git", "repo");
@@ -224,6 +265,16 @@ fn canonical_pull_request_references(
             i64::try_from(number).ok()?;
             Some(((repository.to_owned(), number), references.clone()))
         })
+        .collect()
+}
+
+fn canonical_ci_run_references(
+    roots: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    roots
+        .iter()
+        .filter(|(run_id, _)| canonical_uuid(run_id))
+        .map(|(run_id, references)| (run_id.clone(), references.clone()))
         .collect()
 }
 
@@ -317,6 +368,29 @@ mod tests {
             BTreeMap::from([(
                 ("team/api".into(), 41),
                 vec!["myelin://acme/git/pr/team/api:41".into()]
+            )])
+        );
+    }
+
+    #[test]
+    fn ci_run_roots_accept_only_canonical_lowercase_uuids() {
+        let canonical = "3d782b25-2fb0-4f44-aa7c-3cb434e5ead7";
+        let roots = BTreeMap::from([
+            (
+                canonical.into(),
+                vec![format!("myelin://acme/ci/run/{canonical}")],
+            ),
+            (
+                "3D782B25-2FB0-4F44-AA7C-3CB434E5EAD7".into(),
+                vec!["myelin://acme/ci/run/3D782B25-2FB0-4F44-AA7C-3CB434E5EAD7".into()],
+            ),
+        ]);
+
+        assert_eq!(
+            canonical_ci_run_references(&roots),
+            BTreeMap::from([(
+                canonical.into(),
+                vec![format!("myelin://acme/ci/run/{canonical}")]
             )])
         );
     }

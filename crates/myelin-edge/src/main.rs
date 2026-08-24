@@ -1278,7 +1278,8 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         myelin_edge::DurableReferenceCardResolver::new()
             .with_issues(issue_mutations.reads())
             .with_knowledge(knowledge_mutations.reads())
-            .with_git(git_backend.clone()),
+            .with_git(git_backend.clone())
+            .with_ci(mcp_ci.clone()),
     );
     builder = register_issues(builder, issue_mutations.clone());
     builder = register_projects(builder, projects.clone(), check.clone(), handle.clone());

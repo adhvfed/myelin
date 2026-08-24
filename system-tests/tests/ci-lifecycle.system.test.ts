@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, test } from "vitest";
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
+import { Conversation } from "../src/journeys/chat.js";
 import { array, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 import {
@@ -223,4 +224,80 @@ describe.sequential("CI delivery lifecycle", () => {
       error: { code: "not_found" },
     });
   });
+
+  test("keeps each engineer's CI result legible without exposing the other's repository", async () => {
+    const reviewersProject = new GitProject(uniqueName("reviewer-private-ci"), reviewerClient);
+    await reviewersProject.create();
+    await reviewersProject.writeFile("main", "README.md", `# ${reviewersProject.slug}\n`);
+    const reviewersCommit = (await reviewersProject.writeFile(
+      "main",
+      ".myelin/ci.toml",
+      pipeline,
+    )).commitOid;
+    const reviewersRun = await awaitTheOnlyCiRun(
+      reviewerClient,
+      (candidate) => candidate.commit_oid === reviewersCommit && candidate.state === "succeeded",
+      "the reviewer's private CI run to finish",
+      60_000,
+    );
+
+    const foundersRunId = string(run.run_id, "founder's CI run id");
+    const reviewersRunId = string(reviewersRun.run_id, "reviewer's CI run id");
+    const foundersRef = `myelin://${systemTestConfig.tenant}/ci/run/${foundersRunId}`;
+    const reviewersRef = `myelin://${systemTestConfig.tenant}/ci/run/${reviewersRunId}`;
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("private-ci-cards"),
+      topic: "Compare delivery signals without broadening source access",
+    });
+    await room.post(systemClient, "My run \uFFFC is green; compare yours \uFFFC.", {
+      references: [foundersRef, reviewersRef],
+    });
+
+    const foundersHistory = await room.messages(systemClient);
+    expect(foundersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: `${slug} CI`,
+              state: "succeeded",
+              icon: "ci",
+              render_hint: "ci_run",
+            }),
+          }),
+          expect.objectContaining({
+            ref: reviewersRef,
+            card: { kind: "tombstone" },
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersProject.slug);
+
+    const reviewersHistory = await room.messages(reviewerClient);
+    expect(reviewersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersRef,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: reviewersRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: `${reviewersProject.slug} CI`,
+              state: "succeeded",
+              icon: "ci",
+              render_hint: "ci_run",
+            }),
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(slug);
+  }, 65_000);
 });

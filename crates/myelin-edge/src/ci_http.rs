@@ -16,6 +16,7 @@ use myelin_identity::Principal;
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -68,6 +69,45 @@ impl DurableCiReadApi {
             future,
             CiRunStoreError::Db("CI HTTP requires the Edge multi-thread runtime".into()),
         )
+    }
+
+    pub(crate) fn project_run_summaries(
+        &self,
+        principal: &Principal,
+        run_ids: &[String],
+    ) -> Result<Vec<CiRunSummary>, CiRunSurfaceError> {
+        let tenant = principal.tenant.as_str();
+        let summaries = self.drive(self.runs.get_run_summaries(
+            tenant,
+            principal.region.as_str(),
+            run_ids,
+        ))?;
+        let repositories = summaries
+            .iter()
+            .map(|summary| {
+                repo_slug_from_ref(tenant, &summary.repo_ref)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CiRunSurfaceError::Storage(
+                            "CI run repository provenance is unavailable".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let visible = self
+            .git
+            .visible_requested_repo_slugs_for_ci(principal, &repositories)
+            .map_err(|_| {
+                CiRunSurfaceError::Storage("CI repository visibility is unavailable".into())
+            })?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        Ok(summaries
+            .into_iter()
+            .zip(repositories)
+            .filter_map(|(summary, repository)| visible.contains(&repository).then_some(summary))
+            .collect())
     }
 
     pub fn read_run(&self, principal: &Principal, run_id: &str) -> Result<Value, EdgeError> {
@@ -466,7 +506,7 @@ fn job_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
     Ok(value)
 }
 
-fn canonical_uuid(value: &str) -> bool {
+pub(crate) fn canonical_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
@@ -474,7 +514,7 @@ fn canonical_uuid(value: &str) -> bool {
         })
 }
 
-fn repo_slug_from_ref<'a>(tenant: &str, repo_ref: &'a str) -> Option<&'a str> {
+pub(crate) fn repo_slug_from_ref<'a>(tenant: &str, repo_ref: &'a str) -> Option<&'a str> {
     let prefix = format!("myelin://{tenant}/git/repo/");
     let slug = repo_ref.strip_prefix(&prefix)?;
     if slug.is_empty()

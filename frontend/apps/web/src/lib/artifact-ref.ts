@@ -59,6 +59,10 @@ function isCanonicalU64(value: string): boolean {
     (value.length === MAX_U64.length && value <= MAX_U64);
 }
 
+function isCanonicalUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+}
+
 export function parseGitPullRequestRef(value: unknown): GitPullRequestRef | null {
   const parsed = parseArtifactRef(value);
   if (!parsed || parsed.subsystem !== "git" || parsed.type !== "pr") return null;
@@ -143,7 +147,7 @@ export function artifactRefHref(reference: string): string | undefined {
   if (pullRequest && parseGitPullRequestNumberText(pullRequest.number) !== null) {
     return `/git/repos/${encodeURIComponent(pullRequest.repo)}/prs/${pullRequest.number}`;
   }
-  if (parsed.subsystem === "ci" && parsed.type === "run") {
+  if (parsed.subsystem === "ci" && parsed.type === "run" && isCanonicalUuid(parsed.id)) {
     return `/ci/runs/${encodeURIComponent(parsed.id)}`;
   }
   return undefined;

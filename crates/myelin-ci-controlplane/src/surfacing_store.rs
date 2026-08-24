@@ -10,6 +10,7 @@ use sqlx::Row;
 pub const CI_RUN_PAGE_DEFAULT: u32 = 50;
 pub const CI_RUN_PAGE_MAX: u32 = 100;
 pub const CI_RUN_VISIBLE_REPO_MAX: usize = 4_096;
+pub const CI_RUN_SUMMARY_BATCH_MAX: usize = 10_000;
 pub const CI_RUN_CURSOR_PREFIX: &str = "cr1_";
 pub const CI_LOG_RANGE_DEFAULT: u32 = 64 * 1024;
 pub const CI_LOG_RANGE_MAX: u32 = 256 * 1024;
@@ -100,6 +101,25 @@ SELECT
   END AS finished_at
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND repo_ref = $4";
+
+pub const SELECT_CI_RUN_SUMMARIES_QUERY: &str = "\
+SELECT
+  run_id::text AS run_id,
+  pipeline_id::text AS pipeline_id,
+  repo_ref,
+  source_ref,
+  commit_oid,
+  trigger_kind,
+  trust_tier,
+  state,
+  cost_settled,
+  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at,
+  CASE WHEN finished_at IS NULL THEN NULL
+       ELSE to_char(finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+  END AS finished_at
+FROM ci_run
+WHERE tenant_id = $1 AND region = $2 AND run_id = ANY($3::uuid[])
+ORDER BY run_id ASC";
 
 pub const SELECT_CI_SURFACE_STEPS_QUERY: &str = "\
 SELECT
@@ -577,6 +597,35 @@ impl CiRunStore {
         }))
     }
 
+    /// Read an exact bounded set of run summaries without materializing jobs, steps, or logs.
+    /// Repository authorization remains the caller's responsibility.
+    pub async fn get_run_summaries(
+        &self,
+        tenant_id: &str,
+        region: &str,
+        run_ids: &[String],
+    ) -> Result<Vec<CiRunSummary>, CiRunSurfaceError> {
+        let run_ids = canonical_run_id_batch(run_ids)?;
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tenant_id_owned = tenant_id.to_string();
+        let region_owned = region.to_string();
+        let rows = with_tenant_tx(self.pool(), tenant_id, region, move |conn| {
+            Box::pin(async move {
+                sqlx::query(SELECT_CI_RUN_SUMMARIES_QUERY)
+                    .bind(tenant_id_owned)
+                    .bind(region_owned)
+                    .bind(run_ids)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|error| PgError::Query(error.to_string()))
+            })
+        })
+        .await?;
+        Ok(rows.into_iter().map(run_from_row).collect())
+    }
+
     pub async fn get_surface_log_archive(
         &self,
         tenant_id: &str,
@@ -1021,6 +1070,11 @@ fn canonical_timestamp(value: &str) -> bool {
 }
 
 fn canonical_uuid(field: &str, value: &str) -> Result<String, CiRunSurfaceError> {
+    parse_canonical_uuid(field, value)?;
+    Ok(value.to_string())
+}
+
+fn parse_canonical_uuid(field: &str, value: &str) -> Result<Uuid, CiRunSurfaceError> {
     let parsed = Uuid::parse_str(value)
         .map_err(|_| CiRunSurfaceError::BadInput(format!("{field} must be a canonical UUID")))?;
     if parsed.to_string() != value {
@@ -1028,7 +1082,22 @@ fn canonical_uuid(field: &str, value: &str) -> Result<String, CiRunSurfaceError>
             "{field} must be a canonical UUID"
         )));
     }
-    Ok(value.to_string())
+    Ok(parsed)
+}
+
+fn canonical_run_id_batch(run_ids: &[String]) -> Result<Vec<Uuid>, CiRunSurfaceError> {
+    if run_ids.len() > CI_RUN_SUMMARY_BATCH_MAX {
+        return Err(CiRunSurfaceError::BadInput(format!(
+            "at most {CI_RUN_SUMMARY_BATCH_MAX} CI run ids may be read at once"
+        )));
+    }
+    let mut run_ids = run_ids
+        .iter()
+        .map(|run_id| parse_canonical_uuid("run id", run_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    run_ids.sort_unstable();
+    run_ids.dedup();
+    Ok(run_ids)
 }
 
 fn run_from_row(row: sqlx::postgres::PgRow) -> CiRunSummary {
@@ -1219,5 +1288,21 @@ mod tests {
         assert!(CiRunPageRequest::new(CiRunStateFilter::All, CI_RUN_PAGE_MAX, None).is_ok());
         assert!(CiRunPageRequest::new(CiRunStateFilter::All, 0, None).is_err());
         assert!(CiRunPageRequest::new(CiRunStateFilter::All, CI_RUN_PAGE_MAX + 1, None).is_err());
+    }
+
+    #[test]
+    fn exact_run_summary_batches_are_canonical_bounded_and_deduplicated() {
+        let first = "71000000-0000-4000-8000-000000000001".to_string();
+        let second = "71000000-0000-4000-8000-000000000002".to_string();
+        assert!(canonical_run_id_batch(&[]).unwrap().is_empty());
+        assert_eq!(
+            canonical_run_id_batch(&[second.clone(), first.clone(), second]).unwrap(),
+            [
+                Uuid::parse_str(&first).unwrap(),
+                Uuid::parse_str("71000000-0000-4000-8000-000000000002").unwrap()
+            ]
+        );
+        assert!(canonical_run_id_batch(&["NOT-A-UUID".into()]).is_err());
+        assert!(canonical_run_id_batch(&vec![first; CI_RUN_SUMMARY_BATCH_MAX + 1]).is_err());
     }
 }
