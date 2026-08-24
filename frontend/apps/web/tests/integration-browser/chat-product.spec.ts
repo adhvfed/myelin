@@ -108,6 +108,73 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   const commitRef = `myelin://${tenant}/git/commit/${repository}:${commitOid}`;
   const blobRef =
     `myelin://${tenant}/git/blob/${repository}:refs%2Fheads%2Fmain:README%2Emd#L1-L1`;
+  const reviewBranch = `review-${suffix}`;
+  const reviewCommit = await request.post(
+    `${edgeUrl}/v1/git/repos/${encodeURIComponent(repository)}/blob/${encodeURIComponent(reviewBranch)}/review.md`,
+    {
+      headers: { ...headers, "idempotency-key": randomUUID() },
+      data: {
+        base_oid: "",
+        start_ref: "main",
+        contents: "The durable handoff keeps one exact discussion.\n",
+        message: `Open the review ${suffix}`,
+      },
+    },
+  );
+  const reviewCommitText = await reviewCommit.text();
+  expect(reviewCommit.status(), reviewCommitText).toBe(200);
+  const reviewOid = (JSON.parse(reviewCommitText) as { applied: { new_oid: string } })
+    .applied.new_oid;
+  const pullRequestTitle = `Review the durable handoff ${suffix}`;
+  const pullRequestResponse = await request.post(
+    `${edgeUrl}/v1/git/repos/${encodeURIComponent(repository)}/prs`,
+    {
+      headers: { ...headers, "idempotency-key": randomUUID() },
+      data: {
+        title: pullRequestTitle,
+        base_ref: "refs/heads/main",
+        head_ref: `refs/heads/${reviewBranch}`,
+        head_oid: reviewOid,
+        reviewers: [],
+      },
+    },
+  );
+  const pullRequestText = await pullRequestResponse.text();
+  expect(pullRequestResponse.status(), pullRequestText).toBe(201);
+  const pullRequest = (JSON.parse(pullRequestText) as {
+    applied: { pr: { number: number; ref: string } };
+  }).applied.pr;
+  const commentBody = `The exact retry boundary is visible ${suffix}.`;
+  const commentResponse = await request.post(
+    `${edgeUrl}/v1/git/repos/${encodeURIComponent(repository)}/prs/${pullRequest.number}/threads`,
+    {
+      headers: { ...headers, "idempotency-key": randomUUID() },
+      data: { body_md: commentBody },
+    },
+  );
+  const commentText = await commentResponse.text();
+  expect(commentResponse.status(), commentText).toBe(201);
+  const commentId = (JSON.parse(commentText) as {
+    applied: { thread: { comments: Array<{ id: string }> } };
+  }).applied.thread.comments[0]!.id;
+  const commentRef = `${pullRequest.ref}#comment-${commentId}`;
+  const inlineCommentBody = `The exact changed line remains idempotent ${suffix}.`;
+  const inlineCommentResponse = await request.post(
+    `${edgeUrl}/v1/git/repos/${encodeURIComponent(repository)}/prs/${pullRequest.number}/threads`,
+    {
+      headers: { ...headers, "idempotency-key": randomUUID() },
+      data: {
+        body_md: inlineCommentBody,
+        anchor: { path: "review.md", line: 1, side: "new" },
+      },
+    },
+  );
+  const inlineCommentText = await inlineCommentResponse.text();
+  expect(inlineCommentResponse.status(), inlineCommentText).toBe(201);
+  const inlineCommentId = (JSON.parse(inlineCommentText) as {
+    applied: { thread: { comments: Array<{ id: string }> } };
+  }).applied.thread.comments[0]!.id;
+  const inlineCommentRef = `${pullRequest.ref}#comment-${inlineCommentId}`;
 
   await signIn(page);
   await navigateToApp(page, "/chat");
@@ -143,6 +210,45 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await commitCard.click();
   await expect(page).toHaveURL(new RegExp(`/git/repos/${repository}/commit/${commitOid}$`));
   await expect(page.getByRole("heading", { level: 1, name: commitTitle })).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: topic })).toBeVisible();
+
+  await page.getByLabel(`Message ${topic}`).fill("Continue at the exact review observation.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(commentRef);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const commentCard = page.getByRole("link", { name: `${commentBody}, open` });
+  await expect(commentCard)
+    .toHaveAttribute(
+      "href",
+      `/git/repos/${repository}/prs/${pullRequest.number}#comment-${commentId}`,
+    );
+  await commentCard.click();
+  await expect(page).toHaveURL(
+    new RegExp(`/git/repos/${repository}/prs/${pullRequest.number}#comment-${commentId}$`),
+  );
+  await expect(page.getByRole("heading", { level: 1, name: pullRequestTitle })).toBeVisible();
+  await expect(page.locator(`#comment-${commentId}`)).toContainText(commentBody);
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: topic })).toBeVisible();
+
+  await page.getByLabel(`Message ${topic}`).fill("Inspect the exact changed line.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(inlineCommentRef);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const inlineCommentCard = page.getByRole("link", { name: `${inlineCommentBody}, open` });
+  await expect(inlineCommentCard)
+    .toHaveAttribute(
+      "href",
+      `/git/repos/${repository}/prs/${pullRequest.number}/diff#comment-${inlineCommentId}`,
+    );
+  await inlineCommentCard.click();
+  await expect(page).toHaveURL(
+    new RegExp(`/git/repos/${repository}/prs/${pullRequest.number}/diff#comment-${inlineCommentId}$`),
+  );
+  await expect(page.locator(`#comment-${inlineCommentId}`)).toContainText(inlineCommentBody);
   await page.goBack();
   await expect(page.getByRole("heading", { name: topic })).toBeVisible();
 

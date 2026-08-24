@@ -184,9 +184,17 @@ impl PrRecord {
         pr
     }
 
-    fn counting_approvals(&self) -> u32 {
-        let mut approvers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for r in &self.reviews {
+    fn latest_reviews(&self) -> std::collections::BTreeMap<&str, &ReviewRecord> {
+        let mut reviews = std::collections::BTreeMap::new();
+        for review in &self.reviews {
+            reviews.insert(review.reviewer_pseudonym.as_str(), review);
+        }
+        reviews
+    }
+
+    pub fn counting_approvals(&self) -> u32 {
+        let mut approvers = std::collections::BTreeSet::new();
+        for r in self.latest_reviews().into_values() {
             if r.is_current_approval()
                 && !r.is_agent
                 && r.reviewer_pseudonym != self.author_pseudonym
@@ -197,15 +205,21 @@ impl PrRecord {
         approvers.len() as u32
     }
 
+    pub fn has_blocking_review(&self) -> bool {
+        self.latest_reviews()
+            .into_values()
+            .any(ReviewRecord::is_blocking)
+    }
+
     pub fn review_state_label(&self) -> &'static str {
-        if self.reviews.iter().any(|r| r.is_blocking()) {
+        let current = self.latest_reviews();
+        if current.values().any(|review| review.is_blocking()) {
             "changes"
         } else if self.counting_approvals() > 0 {
             "approved"
-        } else if self
-            .reviews
-            .iter()
-            .any(|r| matches!(r.state, ReviewState::Requested))
+        } else if current
+            .values()
+            .any(|review| matches!(review.state, ReviewState::Requested))
         {
             "requested"
         } else {
@@ -214,9 +228,17 @@ impl PrRecord {
     }
 
     pub fn is_review_requested_of(&self, viewer_pseudonym: &str) -> bool {
-        self.reviews.iter().any(|r| {
-            matches!(r.state, ReviewState::Requested) && r.reviewer_pseudonym == viewer_pseudonym
-        })
+        self.reviews
+            .iter()
+            .rev()
+            .find(|review| review.reviewer_pseudonym == viewer_pseudonym)
+            .is_some_and(|review| matches!(review.state, ReviewState::Requested))
+    }
+
+    pub fn has_review_relationship_with(&self, viewer_pseudonym: &str) -> bool {
+        self.reviews
+            .iter()
+            .any(|review| review.reviewer_pseudonym == viewer_pseudonym)
     }
 
     pub fn checks_summary(&self, ruleset: &BranchProtectionRuleset) -> ChecksSummary {
@@ -703,7 +725,7 @@ pub fn evaluate_merge(
         green_contexts: Vec::new(),
         current_approvals: rec.counting_approvals(),
         codeowner_review_satisfied: rec.codeowner_review_satisfied,
-        has_blocking_review: rec.reviews.iter().any(|r| r.is_blocking()),
+        has_blocking_review: rec.has_blocking_review(),
         outstanding_conversations: rec.outstanding_conversations,
     };
     let ruleset_outcome = evaluate_ruleset(&ruleset_def, &mctx);
@@ -1982,6 +2004,51 @@ mod tests {
             2,
             "two DISTINCT human reviewers count as two"
         );
+    }
+
+    #[test]
+    fn the_latest_state_per_reviewer_drives_work_and_merge_readiness() {
+        let reviewer = "psn:reviewer@acme";
+        let mut rec = open_record(1, "refs/heads/main", &"a".repeat(40), "psn:author@acme");
+        let review = |state| ReviewRecord {
+            reviewer_pseudonym: reviewer.into(),
+            state,
+            is_agent: false,
+        };
+
+        rec.reviews.push(review(ReviewState::Requested));
+        assert!(rec.is_review_requested_of(reviewer));
+        assert!(rec.has_review_relationship_with(reviewer));
+        assert_eq!(rec.review_state_label(), "requested");
+
+        rec.reviews
+            .push(review(ReviewState::Submitted(ReviewVerdict::Approve)));
+        assert!(
+            !rec.is_review_requested_of(reviewer),
+            "a submitted decision completes the active request"
+        );
+        assert!(
+            rec.has_review_relationship_with(reviewer),
+            "completion does not erase the reviewer's access relationship"
+        );
+        assert_eq!(rec.counting_approvals(), 1);
+        assert!(!rec.has_blocking_review());
+
+        rec.reviews.push(review(ReviewState::Submitted(
+            ReviewVerdict::RequestChanges,
+        )));
+        assert_eq!(
+            rec.counting_approvals(),
+            0,
+            "an older approval cannot survive a newer decision by the same reviewer"
+        );
+        assert!(rec.has_blocking_review());
+        assert_eq!(rec.review_state_label(), "changes");
+
+        rec.reviews.push(review(ReviewState::Requested));
+        assert!(rec.is_review_requested_of(reviewer));
+        assert!(!rec.has_blocking_review());
+        assert_eq!(rec.review_state_label(), "requested");
     }
 
     #[test]

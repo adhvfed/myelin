@@ -82,11 +82,13 @@ pub(super) fn pr_list_page_sql(query: &PrListQuery) -> String {
                   count(*) FILTER (WHERE g.record->>'state' = 'Closed')::bigint AS closed_count, \
                   count(*)::bigint AS all_count, \
                   count(*) FILTER (WHERE g.record->>'author_pseudonym' = $4)::bigint AS yours_count, \
-                  count(*) FILTER (WHERE EXISTS(\
-                    SELECT 1 FROM jsonb_array_elements(COALESCE(g.record->'reviews','[]'::jsonb)) review \
-                     WHERE review->>'reviewer_pseudonym' = $4 \
-                       AND review->>'state' = 'Requested'\
-                  ))::bigint AS needs_review_count \
+                  count(*) FILTER (WHERE (\
+                    SELECT review.item->>'state' \
+                      FROM jsonb_array_elements(COALESCE(g.record->'reviews','[]'::jsonb)) \
+                           WITH ORDINALITY AS review(item, position) \
+                     WHERE review.item->>'reviewer_pseudonym' = $4 \
+                     ORDER BY review.position DESC LIMIT 1\
+                  ) = 'Requested')::bigint AS needs_review_count \
              FROM git_pr g \
             WHERE g.tenant_id=$1 AND g.region=$2 AND g.repo_slug=$3\
          ), page_rows AS (\
@@ -125,8 +127,11 @@ fn pr_cross_bucket_predicate(bucket: PrListBucket) -> &'static str {
         PrListBucket::NeedsReview => {
             "g.record->>'author_pseudonym' <> $4 \
              AND g.record->>'state' IN ('Open','Draft') \
-             AND (g.record->'reviews') @> jsonb_build_array(\
-               jsonb_build_object('reviewer_pseudonym',$4,'state','Requested'))"
+             AND (SELECT review.item->>'state' \
+                    FROM jsonb_array_elements(COALESCE(g.record->'reviews','[]'::jsonb)) \
+                         WITH ORDINALITY AS review(item, position) \
+                   WHERE review.item->>'reviewer_pseudonym' = $4 \
+                   ORDER BY review.position DESC LIMIT 1) = 'Requested'"
         }
     }
 }

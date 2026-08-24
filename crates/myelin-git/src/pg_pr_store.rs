@@ -670,8 +670,8 @@ impl PgPrStore {
 
     /// Read an exact, bounded set of pull requests from one tenant cell.
     ///
-    /// Callers are responsible for authorization before supplying coordinates. Missing records are
-    /// omitted, and duplicate coordinates are read once.
+    /// This primitive makes no access decision. Callers must authorize every returned record before
+    /// exposing it. Missing records are omitted, and duplicate coordinates are read once.
     pub fn get_many(
         &self,
         scope: &TenantScope,
@@ -2845,7 +2845,7 @@ mod tests {
     #[cfg(feature = "integration")]
     use crate::events::{GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_SYNCHRONIZED};
     #[cfg(feature = "integration")]
-    use crate::pr_store::{PrListSort, PrListState};
+    use crate::pr_store::{PrListBucket, PrListSort, PrListState};
 
     #[test]
     fn accepted_merge_requires_one_exact_nonzero_move_witness() {
@@ -3587,6 +3587,84 @@ mod tests {
             lifecycle_events, 12,
             "10 opens (including projection admission) + 2 mutations, exactly once"
         );
+
+        let assigned_reviewer = "assigned-reviewer@tenant.noreply";
+        store
+            .apply_mutation(
+                &scope_a,
+                repo,
+                opened.number,
+                PrMutation::SubmitReview(crate::pr_store::ReviewRecord {
+                    reviewer_pseudonym: assigned_reviewer.into(),
+                    state: crate::lifecycle::ReviewState::Requested,
+                    is_agent: false,
+                }),
+                &PrOperationId::parse("request-assigned-review").unwrap(),
+                &actor,
+            )
+            .unwrap();
+        let reviewer_page_query = PrListQuery::new(
+            PrListState::All,
+            PrListSort::Created,
+            0,
+            10,
+            assigned_reviewer,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .list_page(&scope_a, repo, &reviewer_page_query)
+                .unwrap()
+                .counts
+                .needs_review,
+            1
+        );
+        let reviewer_cross_query = PrCrossListQuery::initial(
+            PrListBucket::NeedsReview,
+            PrListSort::Created,
+            10,
+            assigned_reviewer,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .list_cross_page(&scope_a, &[repo.into()], &reviewer_cross_query)
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+
+        store
+            .apply_mutation(
+                &scope_a,
+                repo,
+                opened.number,
+                PrMutation::SubmitReview(crate::pr_store::ReviewRecord {
+                    reviewer_pseudonym: assigned_reviewer.into(),
+                    state: crate::lifecycle::ReviewState::Submitted(
+                        crate::lifecycle::ReviewVerdict::Approve,
+                    ),
+                    is_agent: false,
+                }),
+                &PrOperationId::parse("complete-assigned-review").unwrap(),
+                &actor,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_page(&scope_a, repo, &reviewer_page_query)
+                .unwrap()
+                .counts
+                .needs_review,
+            0,
+            "the latest decision closes the earlier requested-review work item"
+        );
+        assert!(store
+            .list_cross_page(&scope_a, &[repo.into()], &reviewer_cross_query)
+            .unwrap()
+            .records
+            .is_empty());
 
         assert!(store.get(&scope_b, repo, opened.number).unwrap().is_none());
         let tenant_a_for_probe = tenant_a.clone();

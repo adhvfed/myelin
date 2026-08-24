@@ -60,6 +60,12 @@ describe("artifact references", () => {
     expect(artifactRefLabel("myelin://acme/git/pr/platform/api:42")).toBe("platform/api #42");
     expect(artifactRefHref("myelin://acme/git/pr/platform/api:42"))
       .toBe("/git/repos/platform%2Fapi/prs/42");
+    expect(artifactRefHref("myelin://acme/git/pr/platform/api:42#comment-c-7"))
+      .toBe("/git/repos/platform%2Fapi/prs/42#comment-c-7");
+    expect(artifactRefHref(
+      "myelin://acme/git/pr/platform/api:42#comment-c-7",
+      "git_pr_inline_comment",
+    )).toBe("/git/repos/platform%2Fapi/prs/42/diff#comment-c-7");
     expect(artifactRefHref("myelin://acme/git/repo/platform/api"))
       .toBe("/git/repos/platform%2Fapi");
     expect(artifactRefHref("myelin://acme/git/repo/platform.git/api")).toBeUndefined();

@@ -41,6 +41,7 @@ async function createKnowledgePage(title: string, visibility: "private" | "team"
 async function createPrivatePullRequest(
   owner: SystemTestClient,
   label: string,
+  reviewers: string[] = [],
 ) {
   const coordinate = label.replaceAll(" ", "-");
   const repository = new GitProject(uniqueName(`${coordinate}-repository`), owner);
@@ -55,10 +56,17 @@ async function createPrivatePullRequest(
     contents: `# ${title}\n`,
     title,
     commitMessage: commitTitle,
+    reviewers,
   });
+  const pullRequestNumber = Number(opened.pullRequest.number);
+  if (!Number.isSafeInteger(pullRequestNumber) || pullRequestNumber <= 0) {
+    throw new Error(`${label} pull request number is malformed`);
+  }
   return {
+    repositoryPath: repository.path,
     repositoryRef: `myelin://${systemTestConfig.tenant}/git/repo/${repository.slug}`,
     repositoryTitle: repository.slug,
+    pullRequestNumber,
     pullRequestRef: string(opened.pullRequest.ref, `${label} pull request reference`),
     pullRequestTitle: title,
     pullRequestState: string(opened.pullRequest.pr_state, `${label} pull request state`),
@@ -737,6 +745,174 @@ describe("chat collaboration lifecycle", () => {
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.commitTitle);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.branchTitle);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.blobTitle);
+  });
+
+  test("lets a requested reviewer follow one exact discussion without granting the repository", async () => {
+    const work = await createPrivatePullRequest(
+      systemClient,
+      "assigned review",
+      [systemTestConfig.reviewerPrincipal],
+    );
+    const commentBody = uniqueName("The retry boundary is clear");
+    const createdComment = await reviewerClient.json(
+      `${work.repositoryPath}/prs/${work.pullRequestNumber}/threads`,
+      {
+        method: "POST",
+        body: { body_md: commentBody },
+        idempotencyKey: `requested-review-comment-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const thread = record(
+      record(createdComment.body.applied, "requested review comment receipt").thread,
+      "requested review thread",
+    );
+    const comment = record(
+      array(thread.comments, "requested review thread comments")[0],
+      "requested review comment",
+    );
+    const commentId = string(comment.id, "requested review comment id");
+    const commentRef = `${work.pullRequestRef}#comment-${commentId}`;
+    const inlineCommentBody = uniqueName("The changed line keeps the retry idempotent");
+    const createdInlineComment = await reviewerClient.json(
+      `${work.repositoryPath}/prs/${work.pullRequestNumber}/threads`,
+      {
+        method: "POST",
+        body: {
+          body_md: inlineCommentBody,
+          anchor: { path: "plan.md", line: 1, side: "new" },
+        },
+        idempotencyKey: `requested-review-inline-comment-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const inlineThread = record(
+      record(createdInlineComment.body.applied, "requested inline review comment receipt").thread,
+      "requested inline review thread",
+    );
+    const inlineComment = record(
+      array(inlineThread.comments, "requested inline review thread comments")[0],
+      "requested inline review comment",
+    );
+    const inlineCommentId = string(inlineComment.id, "requested inline review comment id");
+    const inlineCommentRef = `${work.pullRequestRef}#comment-${inlineCommentId}`;
+
+    await reviewerClient.json(work.repositoryPath, { expectedStatus: 404 });
+    expect(
+      (await reviewerClient.json(
+        `${work.repositoryPath}/prs/${work.pullRequestNumber}`,
+      )).body,
+    ).toMatchObject({ title: work.pullRequestTitle });
+
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("requested-review-context"),
+      topic: "Share only the review context the teammate was assigned",
+    });
+    await room.post(
+      systemClient,
+      "Review the change \uFFFC, continue the discussion at \uFFFC, and inspect the exact changed line at \uFFFC; the repository \uFFFC remains private.",
+      {
+        references: [
+          work.pullRequestRef,
+          commentRef,
+          inlineCommentRef,
+          work.repositoryRef,
+        ],
+      },
+    );
+
+    expect(await room.messages(reviewerClient)).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: work.pullRequestRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: work.pullRequestTitle,
+              render_hint: "git_pull_request",
+            }),
+          }),
+          expect.objectContaining({
+            ref: commentRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: commentBody,
+              state: "open",
+              icon: "comment",
+              render_hint: "git_pr_comment",
+              sub_anchor: `comment-${commentId}`,
+            }),
+          }),
+          expect.objectContaining({
+            ref: inlineCommentRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: inlineCommentBody,
+              state: "open",
+              icon: "comment",
+              render_hint: "git_pr_inline_comment",
+              sub_anchor: `comment-${inlineCommentId}`,
+              flag: null,
+            }),
+          }),
+          expect.objectContaining({
+            ref: work.repositoryRef,
+            card: { kind: "tombstone" },
+          }),
+        ],
+      }),
+    ]);
+
+    const startedReview = await reviewerClient.json(
+      `${work.repositoryPath}/prs/${work.pullRequestNumber}/reviews/start`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: `requested-review-start-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const reviewId = string(
+      record(
+        record(startedReview.body.applied, "requested review start receipt").review,
+        "requested review",
+      ).id,
+      "requested review id",
+    );
+    await reviewerClient.json(
+      `${work.repositoryPath}/prs/${work.pullRequestNumber}/reviews/${encodeURIComponent(reviewId)}/submit`,
+      {
+        method: "POST",
+        body: { verdict: "approved", summary_md: "The assigned context is complete." },
+        idempotencyKey: `requested-review-submit-${randomUUID()}`,
+      },
+    );
+    expect(
+      (await reviewerClient.json(
+        `${work.repositoryPath}/prs/${work.pullRequestNumber}`,
+      )).body,
+      "submitting the review completes the work item without revoking its history",
+    ).toMatchObject({ title: work.pullRequestTitle });
+    expect(await room.messages(reviewerClient)).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: work.pullRequestRef,
+            card: expect.objectContaining({ kind: "projection", title: work.pullRequestTitle }),
+          }),
+          expect.objectContaining({
+            ref: commentRef,
+            card: expect.objectContaining({ kind: "projection", title: commentBody }),
+          }),
+          expect.objectContaining({
+            ref: inlineCommentRef,
+            card: expect.objectContaining({ kind: "projection", title: inlineCommentBody }),
+          }),
+          expect.objectContaining({ ref: work.repositoryRef, card: { kind: "tombstone" } }),
+        ],
+      }),
+    ]);
   });
 
   test("keeps a shared runbook legible while a private notebook stays nameless", async () => {

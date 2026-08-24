@@ -708,12 +708,52 @@ impl SubjectThreads {
             .collect();
         ViewedThreads { threads, reviews }
     }
+
+    /// Returns only the requested comments visible to this viewer. A pending review comment is
+    /// private to its author until submission; removed comments retain their address but not useful
+    /// content. The containing thread state travels with the comment so callers do not have to
+    /// reconstruct conversation semantics.
+    pub fn comments_for(
+        &self,
+        viewer_display: &str,
+        requested_ids: &BTreeSet<String>,
+    ) -> Vec<ViewedComment> {
+        if requested_ids.is_empty() {
+            return Vec::new();
+        }
+        self.threads
+            .iter()
+            .flat_map(|thread| {
+                thread
+                    .comments
+                    .iter()
+                    .filter(|comment| {
+                        requested_ids.contains(&comment.id)
+                            && (!comment.pending || comment.author.display == viewer_display)
+                    })
+                    .map(|comment| ViewedComment {
+                        comment: comment.clone(),
+                        thread_id: thread.id.clone(),
+                        anchor: thread.anchor.clone(),
+                        resolved: thread.resolved,
+                    })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewedThreads {
     pub threads: Vec<ThreadRecord>,
     pub reviews: Vec<ReviewBatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewedComment {
+    pub comment: CommentRecord,
+    pub thread_id: String,
+    pub anchor: Option<ThreadAnchor>,
+    pub resolved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1852,7 +1892,7 @@ mod tests {
         let batch = store
             .start_review(&loc(), KEY, human("psn:reviewer@acme"), "private-review")
             .unwrap();
-        store
+        let pending = store
             .add_pending_comment(pending_comment(
                 &batch.id,
                 human("psn:reviewer@acme"),
@@ -1862,6 +1902,18 @@ mod tests {
             .unwrap();
 
         let doc = store.load(&loc(), KEY).unwrap();
+        let requested = BTreeSet::from([pending.id.clone(), "c-absent".into()]);
+        assert_eq!(
+            doc.comments_for("psn:reviewer@acme", &requested),
+            vec![ViewedComment {
+                comment: pending.clone(),
+                thread_id: doc.threads[0].id.clone(),
+                anchor: doc.threads[0].anchor.clone(),
+                resolved: false,
+            }],
+            "an exact owner lookup returns the pending comment without scanning it into the result"
+        );
+        assert!(doc.comments_for("psn:other@acme", &requested).is_empty());
         let mine = doc.view_for("psn:reviewer@acme");
         assert_eq!(mine.threads.len(), 1, "author sees their own pending draft");
         assert_eq!(mine.reviews.len(), 1);
@@ -1887,6 +1939,11 @@ mod tests {
             ))
             .unwrap();
         let doc = store.load(&loc(), KEY).unwrap();
+        assert_eq!(
+            doc.comments_for("psn:other@acme", &requested).len(),
+            1,
+            "submission makes the exact comment visible"
+        );
         let other = doc.view_for("psn:other@acme");
         assert_eq!(
             other.threads.len(),

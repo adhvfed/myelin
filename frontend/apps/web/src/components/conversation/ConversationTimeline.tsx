@@ -15,7 +15,7 @@ function MessageReference(props: { node: ReferenceNode }) {
     : artifactRefLabel(props.node.ref));
   const href = () => props.node.card.kind === "tombstone"
     ? undefined
-    : artifactRefHref(props.node.ref);
+    : artifactRefHref(props.node.ref, projection()?.render_hint);
   const accessibleLabel = () => {
     const card = projection();
     return card ? `${card.title}, ${card.state}` : label();

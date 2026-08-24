@@ -61,6 +61,24 @@ impl ReferenceCard {
         card
     }
 
+    fn projection_at_with_flag(
+        title: String,
+        state: impl Into<String>,
+        icon: impl Into<String>,
+        render_hint: impl Into<String>,
+        sub_anchor: Option<String>,
+        flag: Option<String>,
+    ) -> Self {
+        let mut card = Self::projection_at(title, state, icon, render_hint, sub_anchor);
+        if let Self::Projection {
+            flag: card_flag, ..
+        } = &mut card
+        {
+            *card_flag = flag;
+        }
+        card
+    }
+
     fn issue(issue: &StoredIssue) -> Self {
         Self::projection(issue.title.clone(), issue.state.clone(), "issue", "issue")
     }
@@ -318,11 +336,13 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
     fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
         let repository_references = root_references(viewer, references, "git", "repo");
         let pull_request_roots = root_references(viewer, references, "git", "pr");
+        let pull_request_comment_roots = pull_request_comment_references(viewer, references);
         let commit_roots = root_references(viewer, references, "git", "commit");
         let ref_roots = root_references(viewer, references, "git", "ref");
         let blob_roots = blob_root_references(viewer, references);
         if repository_references.is_empty()
             && pull_request_roots.is_empty()
+            && pull_request_comment_roots.is_empty()
             && commit_roots.is_empty()
             && ref_roots.is_empty()
             && blob_roots.is_empty()
@@ -331,6 +351,7 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
         }
         let mut cards = claimed_tombstones(&repository_references);
         cards.extend(claimed_tombstones(&pull_request_roots));
+        cards.extend(claimed_pr_comment_tombstones(&pull_request_comment_roots));
         cards.extend(claimed_tombstones(&commit_roots));
         cards.extend(claimed_tombstones(&ref_roots));
         cards.extend(claimed_blob_tombstones(&blob_roots));
@@ -342,6 +363,12 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
             .collect::<Vec<_>>();
         let pull_request_references = canonical_pull_request_references(&pull_request_roots);
         let pull_requests = pull_request_references.keys().cloned().collect::<Vec<_>>();
+        let pull_request_comment_references =
+            canonical_pull_request_comment_references(&pull_request_comment_roots);
+        let comments = pull_request_comment_references
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         let commit_references = canonical_commit_references(&commit_roots);
         let commits = commit_references.keys().cloned().collect::<Vec<_>>();
         let ref_references = canonical_git_ref_references(&ref_roots);
@@ -354,6 +381,7 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
             commits: &commits,
             refs: &refs,
             blobs: &blobs,
+            comments: &comments,
         };
         let Ok(visible) = self.git.visible_reference_cards(viewer, request) else {
             return cards;
@@ -425,6 +453,25 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
                 );
             }
         }
+        for comment in visible.comments {
+            let Some(references) = pull_request_comment_references.get(&comment.location) else {
+                continue;
+            };
+            let (render_hint, flag) = comment.presentation();
+            for reference in references {
+                cards.insert(
+                    reference.original.clone(),
+                    ReferenceCard::projection_at_with_flag(
+                        comment.title.clone(),
+                        comment.state.clone(),
+                        "comment",
+                        render_hint,
+                        Some(reference.sub_anchor.clone()),
+                        flag.map(str::to_owned),
+                    ),
+                );
+            }
+        }
         cards
     }
 }
@@ -435,13 +482,77 @@ fn canonical_pull_request_references(
     roots
         .iter()
         .filter_map(|(id, references)| {
-            let (repository, number) = id.rsplit_once(':')?;
-            myelin_git::coordinate::RepositorySlug::parse(repository).ok()?;
-            let number = myelin_git::coordinate::parse_positive_decimal(number)?;
-            i64::try_from(number).ok()?;
-            Some(((repository.to_owned(), number), references.clone()))
+            parse_pull_request_coordinate(id).map(|coordinate| (coordinate, references.clone()))
         })
         .collect()
+}
+
+fn parse_pull_request_coordinate(id: &str) -> Option<(String, u64)> {
+    let (repository, number) = id.rsplit_once(':')?;
+    myelin_git::coordinate::RepositorySlug::parse(repository).ok()?;
+    let number = myelin_git::coordinate::parse_positive_decimal(number)?;
+    i64::try_from(number).ok()?;
+    Some((repository.to_owned(), number))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedPrCommentReference {
+    original: String,
+    sub_anchor: String,
+}
+
+fn pull_request_comment_references(
+    viewer: &Principal,
+    references: &[String],
+) -> BTreeMap<String, Vec<OwnedPrCommentReference>> {
+    let mut owned = BTreeMap::<String, Vec<OwnedPrCommentReference>>::new();
+    for reference in references {
+        let Ok(parsed) = myelin_refs::parse_scoped(reference) else {
+            continue;
+        };
+        if parsed.tenant != viewer.tenant || parsed.subsystem != "git" || parsed.type_ != "pr" {
+            continue;
+        }
+        let Some(myelin_refs::Sub::Comment(comment_id)) = parsed.sub else {
+            continue;
+        };
+        owned
+            .entry(parsed.id)
+            .or_default()
+            .push(OwnedPrCommentReference {
+                original: reference.clone(),
+                sub_anchor: format!("comment-{comment_id}"),
+            });
+    }
+    owned
+}
+
+fn canonical_pull_request_comment_references(
+    roots: &BTreeMap<String, Vec<OwnedPrCommentReference>>,
+) -> BTreeMap<crate::git_durable::GitPrCommentLocation, Vec<OwnedPrCommentReference>> {
+    let mut canonical = BTreeMap::new();
+    for (id, references) in roots {
+        let Some((repository, number)) = parse_pull_request_coordinate(id) else {
+            continue;
+        };
+        for reference in references {
+            let Some(comment_id) = reference.sub_anchor.strip_prefix("comment-") else {
+                continue;
+            };
+            let Some(location) = crate::git_durable::GitPrCommentLocation::new(
+                repository.clone(),
+                number,
+                comment_id.to_owned(),
+            ) else {
+                continue;
+            };
+            canonical
+                .entry(location)
+                .or_insert_with(Vec::new)
+                .push(reference.clone());
+        }
+    }
+    canonical
 }
 
 fn canonical_ci_run_references(
@@ -568,6 +679,16 @@ fn claimed_tombstones(
 
 fn claimed_blob_tombstones(
     owned_references: &BTreeMap<String, Vec<OwnedBlobReference>>,
+) -> HashMap<String, ReferenceCard> {
+    owned_references
+        .values()
+        .flatten()
+        .map(|reference| (reference.original.clone(), ReferenceCard::Tombstone))
+        .collect()
+}
+
+fn claimed_pr_comment_tombstones(
+    owned_references: &BTreeMap<String, Vec<OwnedPrCommentReference>>,
 ) -> HashMap<String, ReferenceCard> {
     owned_references
         .values()
@@ -742,6 +863,32 @@ mod tests {
                 .map(|reference| reference.sub_anchor)
                 .collect::<Vec<_>>(),
             vec![None, Some("L7-L9".into())]
+        );
+    }
+
+    #[test]
+    fn pull_request_comments_are_claimed_as_exact_canonical_coordinates() {
+        let root = "myelin://acme/git/pr/team/api:41";
+        let references = [
+            format!("{root}#comment-c-7"),
+            format!("{root}#comment-c-07"),
+            format!("{root}#thread-t-8"),
+            "myelin://other/git/pr/team/api:41#comment-c-7".into(),
+        ];
+
+        let roots = pull_request_comment_references(&viewer(), &references);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots.values().next().unwrap().len(), 2);
+        assert_eq!(
+            canonical_pull_request_comment_references(&roots),
+            BTreeMap::from([(
+                crate::git_durable::GitPrCommentLocation::new("team/api".into(), 41, "c-7".into(),)
+                    .unwrap(),
+                vec![OwnedPrCommentReference {
+                    original: format!("{root}#comment-c-7"),
+                    sub_anchor: "comment-c-7".into(),
+                }],
+            )])
         );
     }
 

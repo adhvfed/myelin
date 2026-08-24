@@ -486,7 +486,7 @@ impl DurableGitBackend {
         let viewer = Self::pseudonym(tenant, principal);
         matches!(
             self.pr_get(&loc, number, principal),
-            Ok(Some(record)) if record.is_review_requested_of(&viewer)
+            Ok(Some(record)) if record.has_review_relationship_with(&viewer)
         )
     }
 
@@ -3291,7 +3291,7 @@ mod mutation_support;
 mod pr_queries;
 mod recovery;
 mod reference_cards;
-pub(crate) use reference_cards::GitReferenceCardRequest;
+pub(crate) use reference_cards::{GitPrCommentLocation, GitReferenceCardRequest};
 mod repo_summary;
 mod repo_visibility;
 mod repository_views;

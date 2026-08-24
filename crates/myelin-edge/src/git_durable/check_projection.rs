@@ -2,7 +2,7 @@ use super::{DurableGitBackend, EnrichedPr, ObjectPromotion};
 use myelin_git::check_status::{CheckContext, CheckState, CheckStatusRow, GitOid, TrustTier};
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::{DurableError, DurableGitRepo};
-use myelin_git::lifecycle::{BranchProtectionRuleset, ReviewState, ReviewVerdict};
+use myelin_git::lifecycle::BranchProtectionRuleset;
 use myelin_git::merge_gate::MergeGatePolicy;
 use myelin_git::pr_store::{
     effective_ruleset, evaluate_merge, ChecksSummary, PrCrossListRecord, PrRecord,
@@ -338,20 +338,8 @@ impl DurableGitBackend {
         let required_contexts = canonical_required_context_tokens(&ruleset.required_contexts)?;
         let evaluation = evaluate_merge(&ruleset, &record)
             .map_err(|error| DurableError::Git(error.to_string()))?;
-        let has_blocking_review = record.reviews.iter().any(|review| {
-            matches!(
-                review.state,
-                ReviewState::Submitted(ReviewVerdict::RequestChanges)
-            )
-        });
-        let counting_approvals = record
-            .reviews
-            .iter()
-            .filter(|review| {
-                matches!(review.state, ReviewState::Submitted(ReviewVerdict::Approve))
-                    && review.reviewer_pseudonym != record.author_pseudonym
-            })
-            .count() as u32;
+        let has_blocking_review = record.has_blocking_review();
+        let counting_approvals = record.counting_approvals();
         Ok(json!({
             "required_contexts": required_contexts,
             "required_approvals": ruleset.required_approvals,

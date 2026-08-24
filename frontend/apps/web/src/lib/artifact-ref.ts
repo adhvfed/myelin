@@ -243,7 +243,7 @@ export function artifactRefLabel(reference: string): string {
   return `${parsed.type} · ${parsed.id.length > 16 ? `…${parsed.id.slice(-12)}` : parsed.id}`;
 }
 
-export function artifactRefHref(reference: string): string | undefined {
+export function artifactRefHref(reference: string, renderHint?: string): string | undefined {
   const parsed = parseArtifactRef(reference);
   if (!parsed) return undefined;
   if (parsed.subsystem === "issue" && parsed.type === "issue") {
@@ -257,7 +257,11 @@ export function artifactRefHref(reference: string): string | undefined {
   }
   const pullRequest = parseGitPullRequestRef(reference);
   if (pullRequest && parseGitPullRequestNumberText(pullRequest.number) !== null) {
-    return `/git/repos/${encodeURIComponent(pullRequest.repo)}/prs/${pullRequest.number}`;
+    const anchor = pullRequest.sub && /^(?:comment|thread)-/.test(pullRequest.sub)
+      ? `#${pullRequest.sub}`
+      : "";
+    const view = anchor && renderHint === "git_pr_inline_comment" ? "/diff" : "";
+    return `/git/repos/${encodeURIComponent(pullRequest.repo)}/prs/${pullRequest.number}${view}${anchor}`;
   }
   const commit = parseGitCommitRef(reference);
   if (commit) {

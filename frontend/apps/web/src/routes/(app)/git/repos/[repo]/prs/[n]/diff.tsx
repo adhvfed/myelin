@@ -430,7 +430,7 @@ const barBtn = {
 /** An anchored-thread card. Outdated anchors retain their former line number. */
 function ThreadCard(props: { thread: PrThreadVM; outdated?: boolean }) {
   return (
-    <div style={{ ...card, "margin-block": "var(--space-1)" }} data-testid="line-thread">
+    <div id={`thread-${props.thread.id}`} style={{ ...card, "margin-block": "var(--space-1)" }} data-testid="line-thread">
       <Show when={props.outdated && props.thread.anchor}>
         {(a) => (
           <span data-testid="outdated-pill" style={{ "font-size": "var(--fs-caption)", color: "var(--warning)", display: "inline-flex", "align-items": "center", gap: "var(--space-1)" }}>
@@ -440,7 +440,7 @@ function ThreadCard(props: { thread: PrThreadVM; outdated?: boolean }) {
       </Show>
       <For each={props.thread.comments}>
         {(c) => (
-          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)", "padding-block": "var(--space-1)" }}>
+          <div id={`comment-${c.id}`} style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)", "padding-block": "var(--space-1)" }}>
             <span style={{ "font-size": "var(--fs-caption)", color: "var(--text-muted)" }}>{c.author.display}</span>
             <Show when={c.state === "visible" && c.body_md} fallback={<span style={{ color: "var(--text-muted)", "font-style": "italic" }}>Comment removed</span>}>
               <Markdown source={c.body_md ?? ""} />

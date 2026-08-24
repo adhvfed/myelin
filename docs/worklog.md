@@ -1375,6 +1375,30 @@ exact-file-batch, and line-range tests; warning-free clippy across all three
 crates and every target/feature; 643 browser units; all eight rebuilt live Chat
 lifecycle stories; and both real Chromium Chat journeys.
 
+## 2026-08-25 — an assigned review remains useful without repository access
+
+A requested reviewer can now open the exact pull request and comments entrusted
+to them without receiving repository enumeration or clone access. The same
+durable review relationship governs the PR HTTP boundary and Chat projection;
+submitting a decision completes the active request without erasing the
+reviewer's historical access. PR summaries, merge gates, and both PostgreSQL
+needs-review queries now derive each reviewer's state from their latest durable
+decision, so an old request, approval, or block cannot survive a newer one.
+
+Chat comment cards are resolved from one exact, viewer-scoped comment batch.
+Pending review comments remain author-only, removed bodies never resurface, and
+missing or denied coordinates become content-free tombstones. PR-level comments
+route to the overview; line-anchored comments carry their live, moved, or
+outdated placement and route to the exact comment on the diff. The TypeScript
+story assigns a reviewer, gives them both kinds of comment, proves the repository
+stays hidden, submits an approval, and proves the entrusted context remains
+readable. Chromium follows both cards to their real rendered comments.
+
+Proof: the complete Git and Edge library suites; the live PostgreSQL list
+transition from requested to approved; warning-free Git/Edge clippy; 643 browser
+units; TypeScript typechecks and lint; all nine rebuilt live Chat lifecycle
+stories; and both real Chromium Chat journeys.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1403,8 +1427,9 @@ lifecycle stories; and both real Chromium Chat journeys.
 6. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
-   content-free tombstones for denied or unavailable artifacts. Git
-   reviews and comments, other CI artifacts, plus Chat messages and threads
+   content-free tombstones for denied or unavailable artifacts. Git comments
+   now resolve to their exact discussion or diff location. Git review decisions,
+   other CI artifacts, plus Chat messages and threads
    still retain their canonical link rather than a rich card because their durable owner projectors
    are not composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,

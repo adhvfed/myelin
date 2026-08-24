@@ -536,7 +536,7 @@ function ReviewsSection(props: {
             {(r) => {
               const v = VERDICT[r.verdict];
               return (
-                <li style={{ display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
+                <li id={`review-${r.id}`} style={{ display: "flex", "align-items": "center", gap: "var(--space-2)" }}>
                   <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: v.color }}>
                     <Icon name={v.icon} /> <span>{v.label}</span>
                   </span>
@@ -895,7 +895,7 @@ function ThreadView(props: {
     }
   };
   return (
-    <li style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-2)", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+    <li id={`thread-${props.thread.id}`} style={{ border: "var(--hairline) solid var(--border)", "border-radius": "var(--radius-1)", padding: "var(--space-2)", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
       <div style={{ display: "flex", "justify-content": "space-between", "align-items": "center", gap: "var(--space-2)" }}>
         <span style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
           {props.thread.resolved ? "Resolved discussion" : "Open discussion"}
@@ -914,7 +914,7 @@ function ThreadView(props: {
       </div>
       <For each={props.thread.comments}>
         {(c) => (
-          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
+          <div id={`comment-${c.id}`} style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
             <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", "font-size": "var(--fs-caption)" }}>
               <PrincipalBadge who={c.author} />
               <Show when={c.pending}>
