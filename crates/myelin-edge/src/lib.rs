@@ -3,6 +3,7 @@ pub mod agent_http;
 pub mod agent_mcp_http;
 pub mod agent_thread_http;
 pub mod agent_thread_reconcile;
+mod agent_thread_reference;
 mod auth_request;
 pub mod authz;
 pub mod bootstrap;
@@ -62,6 +63,7 @@ pub use agent_thread_http::{register_agent_threads, AgentThreadHttpInputs};
 pub use agent_thread_reconcile::{
     AgentThreadReconciler, AgentThreadReconciliationError, AgentThreadReconciliationReport,
 };
+pub use agent_thread_reference::DurableAgentThreadReferenceApi;
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
 pub use authz::{

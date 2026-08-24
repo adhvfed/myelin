@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, HashMap};
 use myelin_identity::Principal;
 use myelin_issues::StoredIssue;
 use serde::Serialize;
+use sqlx::types::Uuid;
 use std::sync::Arc;
 
 use crate::ci_http::{canonical_uuid, repo_slug_from_ref, DurableCiReadApi};
 use crate::{
-    DurableChatReferenceApi, DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi,
+    DurableAgentThreadReferenceApi, DurableChatReferenceApi, DurableGitBackend,
+    DurableIssueReadApi, DurableKnowledgeReadApi,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -97,6 +99,12 @@ impl DurableReferenceCardResolver {
             .push(Arc::new(ChatReferenceCardProjector { chat }));
         self
     }
+
+    pub fn with_agent_threads(mut self, threads: DurableAgentThreadReferenceApi) -> Self {
+        self.projectors
+            .push(Arc::new(AgentThreadReferenceCardProjector { threads }));
+        self
+    }
 }
 
 impl ReferenceCardResolver for DurableReferenceCardResolver {
@@ -181,6 +189,48 @@ struct CiReferenceCardProjector {
 
 struct ChatReferenceCardProjector {
     chat: DurableChatReferenceApi,
+}
+
+struct AgentThreadReferenceCardProjector {
+    threads: DurableAgentThreadReferenceApi,
+}
+
+impl ReferenceCardProjector for AgentThreadReferenceCardProjector {
+    fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
+        let thread_roots = root_references(viewer, references, "agent", "thread");
+        if thread_roots.is_empty() {
+            return HashMap::new();
+        }
+        let mut cards = claimed_tombstones(&thread_roots);
+        let canonical_references = thread_roots
+            .iter()
+            .filter(|(thread_id, _)| canonical_uuid(thread_id))
+            .map(|(thread_id, references)| (thread_id.clone(), references.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let thread_ids = canonical_references
+            .keys()
+            .filter_map(|thread_id| Uuid::parse_str(thread_id).ok())
+            .collect::<Vec<_>>();
+        let Ok(visible_threads) = self.threads.project_threads(viewer, &thread_ids) else {
+            return cards;
+        };
+
+        for thread in visible_threads {
+            let Some(references) = canonical_references.get(&thread.thread_id) else {
+                continue;
+            };
+            let card = ReferenceCard::projection(
+                thread.name,
+                thread.state.token(),
+                "agent",
+                "agent_thread",
+            );
+            for reference in references {
+                cards.insert(reference.clone(), card.clone());
+            }
+        }
+        cards
+    }
 }
 
 impl ReferenceCardProjector for ChatReferenceCardProjector {

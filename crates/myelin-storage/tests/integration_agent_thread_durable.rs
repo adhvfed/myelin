@@ -338,6 +338,23 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         ready.storage_locator.as_deref(),
         Some("workspace://local/101")
     );
+    assert_eq!(
+        threads
+            .get_live_exact_for_owner(
+                &tenant,
+                owner,
+                &[Uuid::from_u128(999), intended.thread_id, intended.thread_id],
+            )
+            .await
+            .unwrap(),
+        vec![ready.clone()],
+        "an exact owner read returns one durable row without widening to missing or duplicate ids"
+    );
+    assert!(threads
+        .get_live_exact_for_owner(&tenant, "p:bob", &[intended.thread_id])
+        .await
+        .unwrap()
+        .is_empty());
 
     assert_eq!(
         threads
@@ -832,6 +849,11 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .expect("the owner retains a lifecycle receipt after cleanup");
     assert_eq!(receipt.state, myelin_storage::AgentThreadState::Deleted);
     assert!(receipt.storage_locator.is_none());
+    assert!(threads
+        .get_live_exact_for_owner(&tenant, owner, &[intended.thread_id])
+        .await
+        .unwrap()
+        .is_empty());
     assert!(threads
         .list_for_owner(&tenant, owner, None, 100)
         .await

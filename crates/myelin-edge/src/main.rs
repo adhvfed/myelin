@@ -16,12 +16,13 @@ use myelin_edge::{
     serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AgentMcpAuthority,
     AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices, AgentThreadHttpInputs,
     AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
-    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableAgentWorkspaceAccess,
-    DurableChatMutationApi, DurableChatReadApi, DurableChatReferenceApi, DurableCiReadApi,
-    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway,
-    GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe,
-    SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
-    TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
+    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableAgentThreadReferenceApi,
+    DurableAgentWorkspaceAccess, DurableChatMutationApi, DurableChatReadApi,
+    DurableChatReferenceApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeMutationApi,
+    DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
+    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
+    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    WorkspaceSshEndpoint,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -1274,6 +1275,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     );
     let knowledge_mutations =
         DurableKnowledgeMutationApi::new(provider.db_pool().clone(), handle.clone(), kms.clone());
+    let agent_threads = DurableAgentThreadBacking::new(provider.clone());
     let reference_cards = Arc::new(
         myelin_edge::DurableReferenceCardResolver::new()
             .with_issues(issue_mutations.reads())
@@ -1282,6 +1284,10 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             .with_ci(mcp_ci.clone())
             .with_chat(DurableChatReferenceApi::new(
                 provider.db_pool().clone(),
+                handle.clone(),
+            ))
+            .with_agent_threads(DurableAgentThreadReferenceApi::new(
+                agent_threads.clone(),
                 handle.clone(),
             )),
     );
@@ -1338,7 +1344,6 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     );
     let agent_thread_chat_mutations =
         DurableChatMutationApi::new(mcp_chat.clone(), chat_principals.clone());
-    let agent_threads = DurableAgentThreadBacking::new(provider.clone());
     let agent_workspace_access = DurableAgentWorkspaceAccess::new(
         agent_threads.clone(),
         agent_workspaces.clone(),

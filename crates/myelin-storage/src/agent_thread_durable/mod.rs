@@ -43,6 +43,7 @@ use crate::{
 };
 
 const RESUMABLE_AGENT_RUNTIME_REF: &str = "external:mcp";
+const EXACT_AGENT_THREAD_BATCH_MAX: usize = 10_000;
 
 #[derive(Clone)]
 pub struct DurableAgentThreadBacking {
@@ -323,6 +324,60 @@ impl DurableAgentThreadBacking {
             })
             .await
     }
+
+    /// Reads one exact bounded set for an owner without turning reference projection into an N+1
+    /// lookup. Deleted rows remain available through `get_for_owner` as lifecycle receipts, but
+    /// are deliberately absent here because their workspaces can no longer be resumed.
+    pub async fn get_live_exact_for_owner(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        thread_ids: &[Uuid],
+    ) -> Result<Vec<DurableAgentThread>, ProviderError> {
+        let thread_ids = bounded_exact_thread_batch(thread_ids)?;
+        if thread_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
+                           conversation_id, workspace_id, workspace_generation, name, project_id,
+                           retention_days, state, storage_locator, failure_reason, created_at,
+                           expires_at, updated_at
+                         FROM agent_thread
+                        WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3
+                          AND thread_id = ANY($4::uuid[]) AND state <> 'deleted'
+                        ORDER BY thread_id",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&owner)
+                    .bind(thread_ids)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(query_error("read exact live agent threads"))?;
+                    rows.iter().map(row_to_thread).collect()
+                })
+            })
+            .await
+    }
+}
+
+fn bounded_exact_thread_batch(thread_ids: &[Uuid]) -> Result<Vec<Uuid>, ProviderError> {
+    if thread_ids.len() > EXACT_AGENT_THREAD_BATCH_MAX {
+        return Err(query(&format!(
+            "at most {EXACT_AGENT_THREAD_BATCH_MAX} agent threads may be read at once"
+        )));
+    }
+    let mut thread_ids = thread_ids.to_vec();
+    thread_ids.sort_unstable();
+    thread_ids.dedup();
+    Ok(thread_ids)
 }
 
 fn validate_proposal(proposal: &NewAgentThread) -> Result<(), ProviderError> {
@@ -549,5 +604,19 @@ mod tests {
         ] {
             assert!(validate_proposal(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn exact_thread_batches_are_bounded_and_deduplicated() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        assert!(bounded_exact_thread_batch(&[]).unwrap().is_empty());
+        assert_eq!(
+            bounded_exact_thread_batch(&[second, first, second]).unwrap(),
+            vec![first, second]
+        );
+        assert!(
+            bounded_exact_thread_batch(&vec![first; EXACT_AGENT_THREAD_BATCH_MAX + 1]).is_err()
+        );
     }
 }

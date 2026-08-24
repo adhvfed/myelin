@@ -76,6 +76,37 @@ test("an engineer keeps a named problem and its workspace with one agent", async
     expect.objectContaining({ content: problem, is_you: true, state: "active" }),
   ]));
 
+  const threadResponse = await request.get(
+    `${integrationEdgeUrl}/v1/agent-threads/${encodeURIComponent(threadId)}`,
+    {
+      headers: {
+        authorization: `Bearer ${sessionToken}`,
+        "x-myelin-token-scheme": "session",
+      },
+    },
+  );
+  const threadText = await threadResponse.text();
+  expect(threadResponse.status(), threadText).toBe(200);
+  const threadRef = (JSON.parse(threadText) as { thread: { ref: string } }).thread.ref;
+
+  await page.getByRole("link", { name: "Chat" }).click();
+  await page.waitForURL("**/chat");
+  await page.getByRole("button", { name: "Create a topic" }).click();
+  await page.getByRole("textbox", { name: "Channel", exact: true }).fill(`private-work-${suffix}`);
+  const handoffTopic = `Fresh-context handoff ${suffix}`;
+  await page.getByRole("textbox", { name: "Topic", exact: true }).fill(handoffTopic);
+  await page.getByRole("button", { name: "Create topic" }).click();
+  await page.getByLabel(`Message ${handoffTopic}`).fill("Resume the investigation where it lives.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(threadRef);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const threadCard = page.getByRole("link", { name: `${threadName}, ready` });
+  await expect(threadCard).toHaveAttribute("href", `/agents?thread=${threadId}`);
+  await threadCard.click();
+  await expect(page).toHaveURL(new RegExp(`/agents\\?thread=${threadId}$`));
+  await expect(page.getByRole("heading", { level: 2, name: threadName })).toBeVisible();
+
   const accessibility = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
     .analyze();

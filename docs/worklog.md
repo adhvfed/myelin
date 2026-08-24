@@ -1280,6 +1280,31 @@ across every Chat and Edge target and feature; 640 browser units; all seven live
 Chat lifecycle stories; and both real Chromium Chat journeys after rebuilding
 Edge.
 
+## 2026-08-24 — named private agent work survives a fresh-context handoff
+
+The canonical reference returned by a private agent thread now resolves to its
+name and workspace lifecycle only for its owner. Everyone else receives the same
+content-free tombstone used for missing and unavailable work. Resolution is one
+bounded, deduplicated PostgreSQL query over the exact requested UUIDs, scoped by
+tenant, region, and owner. Deleted rows remain available through the lifecycle
+receipt API for audit, but are excluded from reference projection because their
+workspaces can no longer be resumed.
+
+The TypeScript story gives two engineers their own external agent and named
+three-day workspace, carries both thread references into one shared room, and
+reads the same message as each person. Each sees only the work they own; neither
+response contains the other thread's name or workspace id. The Chromium product
+journey now creates private work through the UI, reloads its durable message,
+links the thread from Chat, and follows the projected card back to the exact
+workspace. This makes a canonical thread reference a genuine fresh-context
+handoff instead of an opaque identifier.
+
+Proof: the complete Storage and Edge library suites; the real PostgreSQL private
+thread lifecycle including exact owner reads and post-cleanup exclusion;
+warning-free clippy across every Storage and Edge target and feature; 640 browser
+units; all eight live Chat lifecycle stories; and the real Chromium private-agent
+workspace journey after rebuilding Edge.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1307,8 +1332,8 @@ Edge.
    Search service's issue, Knowledge, Chat, and CI projections.
 6. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
-   conversation cards through bounded owner queries, with content-free tombstones for denied or
-   unavailable artifacts. Git
+   conversation cards, plus named private agent threads, through bounded owner queries, with
+   content-free tombstones for denied or unavailable artifacts. Git
    commits, blobs, refs, reviews, and comments, other CI artifacts, plus Chat messages and threads
    still retain their canonical link rather than a rich card because their durable owner projectors
    are not composed. Event-driven cache invalidation and live card updates also remain unwired.

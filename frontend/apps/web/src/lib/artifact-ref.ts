@@ -157,5 +157,8 @@ export function artifactRefHref(reference: string): string | undefined {
   if (parsed.subsystem === "chat" && parsed.type === "channel" && isCanonicalUlid(parsed.id)) {
     return `/chat?conversation=${encodeURIComponent(parsed.id)}`;
   }
+  if (parsed.subsystem === "agent" && parsed.type === "thread" && isCanonicalUuid(parsed.id)) {
+    return `/agents?thread=${encodeURIComponent(parsed.id)}`;
+  }
   return undefined;
 }

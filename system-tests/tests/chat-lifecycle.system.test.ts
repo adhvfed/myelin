@@ -11,7 +11,10 @@ import {
 } from "../src/context.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
-import { listPrivateAgentThreads } from "../src/journeys/agent-threads.js";
+import {
+  listPrivateAgentThreads,
+  startPrivateAgentThread,
+} from "../src/journeys/agent-threads.js";
 import { activateExternalAgent } from "../src/journeys/agents.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { findInboxItem } from "../src/journeys/inbox.js";
@@ -743,5 +746,88 @@ describe("chat collaboration lifecycle", () => {
       }),
     ]);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersTopic.topic);
+  });
+
+  test("lets each engineer resume named private agent work without exposing the other workspace", async () => {
+    const founder = await browserApprovedCliClient();
+    const reviewer = await browserApprovedCliClient(reviewerClient);
+    const foundersAgent = await activateExternalAgent(
+      founder,
+      uniqueName("Founder's private-work companion"),
+      ["chat.read_messages"],
+    );
+    const reviewersAgent = await activateExternalAgent(
+      reviewer,
+      uniqueName("Reviewer's private-work companion"),
+      ["chat.read_messages"],
+    );
+    const foundersThread = (await startPrivateAgentThread(founder, {
+      name: uniqueName("Founder investigates checkout contention"),
+      agentId: foundersAgent.agent.id,
+      retentionDays: 3,
+    })).thread;
+    const reviewersThread = (await startPrivateAgentThread(reviewer, {
+      name: uniqueName("Reviewer investigates rollout safety"),
+      agentId: reviewersAgent.agent.id,
+      retentionDays: 3,
+    })).thread;
+    const room = await Conversation.open(founder, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("private-agent-thread-cards"),
+      topic: "Carry private work by reference, never by copied context",
+    });
+    await room.post(
+      founder,
+      "I will resume ￼; your private investigation remains in ￼.",
+      { references: [foundersThread.ref, reviewersThread.ref] },
+    );
+
+    const foundersHistory = await room.messages(founder);
+    expect(foundersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersThread.ref,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: foundersThread.name,
+              state: "ready",
+              icon: "agent",
+              render_hint: "agent_thread",
+            }),
+          }),
+          expect.objectContaining({
+            ref: reviewersThread.ref,
+            card: { kind: "tombstone" },
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersThread.name);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersThread.workspace.id);
+
+    const reviewersHistory = await room.messages(reviewer);
+    expect(reviewersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersThread.ref,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: reviewersThread.ref,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: reviewersThread.name,
+              state: "ready",
+              icon: "agent",
+              render_hint: "agent_thread",
+            }),
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersThread.name);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersThread.workspace.id);
   });
 });

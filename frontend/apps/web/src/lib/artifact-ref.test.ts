@@ -69,6 +69,10 @@ describe("artifact references", () => {
     expect(artifactRefHref("myelin://acme/chat/channel/01J00000000000000000000000"))
       .toBe("/chat?conversation=01J00000000000000000000000");
     expect(artifactRefHref("myelin://acme/chat/channel/not-a-ulid")).toBeUndefined();
+    expect(artifactRefHref(
+      "myelin://acme/agent/thread/92000000-0000-4000-8000-000000000001",
+    )).toBe("/agents?thread=92000000-0000-4000-8000-000000000001");
+    expect(artifactRefHref("myelin://acme/agent/thread/NOT-A-UUID")).toBeUndefined();
   });
 
   it("parses a nested pull-request coordinate once without losing numeric precision", () => {
