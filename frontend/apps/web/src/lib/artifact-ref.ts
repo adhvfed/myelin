@@ -2,9 +2,12 @@ import {
   isGitRepositorySlug,
   parseGitPullRequestNumberText,
 } from "./git-coordinate";
+import { isFullGitRef } from "./git-ref";
 
 const utf8 = new TextEncoder();
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_ARTIFACT_REF_BYTES = 4 * 1024;
+const MAX_SUBJECT_COMPONENT_BYTES = 1024;
 const SUBSYSTEMS = new Set([
   "git", "ci", "issue", "knowledge", "chat", "notif", "signal", "identity", "agent", "refs",
 ]);
@@ -35,6 +38,14 @@ export interface GitCommitRef {
   tenant: string;
   repo: string;
   oid: string;
+  sub: string | null;
+  root: string;
+}
+
+export interface GitReferenceRef {
+  tenant: string;
+  repo: string;
+  ref: string;
   sub: string | null;
   root: string;
 }
@@ -79,6 +90,38 @@ function isCanonicalGitOid(value: string): boolean {
   return /^[0-9a-f]{40}$/.test(value);
 }
 
+function encodeSubjectComponent(value: string): string {
+  return [...utf8.encode(value)]
+    .map((byte) =>
+      (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+          (byte >= 97 && byte <= 122) || byte === 45 || byte === 95
+        ? String.fromCharCode(byte)
+        : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`
+    )
+    .join("");
+}
+
+function decodeSubjectComponent(value: string): string | null {
+  if (value.length > MAX_SUBJECT_COMPONENT_BYTES ||
+      !/^(?:[A-Za-z0-9_-]|%[0-9A-F]{2})+$/.test(value)) return null;
+  const bytes: number[] = [];
+  for (let index = 0; index < value.length;) {
+    if (value[index] === "%") {
+      bytes.push(Number.parseInt(value.slice(index + 1, index + 3), 16));
+      index += 3;
+    } else {
+      bytes.push(value.charCodeAt(index));
+      index += 1;
+    }
+  }
+  try {
+    const decoded = utf8Decoder.decode(new Uint8Array(bytes));
+    return encodeSubjectComponent(decoded) === value ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseGitPullRequestRef(value: unknown): GitPullRequestRef | null {
   const parsed = parseArtifactRef(value);
   if (!parsed || parsed.subsystem !== "git" || parsed.type !== "pr") return null;
@@ -99,6 +142,17 @@ export function parseGitCommitRef(value: unknown): GitCommitRef | null {
   const oid = parsed.id.slice(separator + 1);
   if (!isGitRepositorySlug(repo) || !isCanonicalGitOid(oid)) return null;
   return { tenant: parsed.tenant, repo, oid, sub: parsed.sub, root: parsed.root };
+}
+
+export function parseGitReferenceRef(value: unknown): GitReferenceRef | null {
+  const parsed = parseArtifactRef(value);
+  if (!parsed || parsed.subsystem !== "git" || parsed.type !== "ref") return null;
+  const separator = parsed.id.indexOf(":");
+  if (separator <= 0 || parsed.id.indexOf(":", separator + 1) !== -1) return null;
+  const repo = decodeSubjectComponent(parsed.id.slice(0, separator));
+  const ref = decodeSubjectComponent(parsed.id.slice(separator + 1));
+  if (!repo || !ref || !isGitRepositorySlug(repo) || !isFullGitRef(ref)) return null;
+  return { tenant: parsed.tenant, repo, ref, sub: parsed.sub, root: parsed.root };
 }
 
 function unsignedLessThanOrEqual(left: string, right: string): boolean {
@@ -153,6 +207,8 @@ export function artifactRefLabel(reference: string): string {
   if (pullRequest) return `${pullRequest.repo} #${pullRequest.number}`;
   const commit = parseGitCommitRef(reference);
   if (commit) return `${commit.repo} · ${commit.oid.slice(0, 12)}`;
+  const gitRef = parseGitReferenceRef(reference);
+  if (gitRef) return `${gitRef.repo} · ${gitRef.ref.replace(/^refs\/(?:heads|tags)\//, "")}`;
   if (parsed.subsystem === "knowledge" && parsed.type === "page") {
     return `Knowledge · ${parsed.id.slice(-6)}`;
   }
@@ -179,6 +235,10 @@ export function artifactRefHref(reference: string): string | undefined {
   const commit = parseGitCommitRef(reference);
   if (commit) {
     return `/git/repos/${encodeURIComponent(commit.repo)}/commit/${commit.oid}`;
+  }
+  const gitRef = parseGitReferenceRef(reference);
+  if (gitRef) {
+    return `/git/repos/${encodeURIComponent(gitRef.repo)}/tree/${encodeURIComponent(gitRef.ref)}`;
   }
   if (parsed.subsystem === "ci" && parsed.type === "run" && isCanonicalUuid(parsed.id)) {
     return `/ci/runs/${encodeURIComponent(parsed.id)}`;

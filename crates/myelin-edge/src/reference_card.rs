@@ -302,15 +302,18 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
         let repository_references = root_references(viewer, references, "git", "repo");
         let pull_request_roots = root_references(viewer, references, "git", "pr");
         let commit_roots = root_references(viewer, references, "git", "commit");
+        let ref_roots = root_references(viewer, references, "git", "ref");
         if repository_references.is_empty()
             && pull_request_roots.is_empty()
             && commit_roots.is_empty()
+            && ref_roots.is_empty()
         {
             return HashMap::new();
         }
         let mut cards = claimed_tombstones(&repository_references);
         cards.extend(claimed_tombstones(&pull_request_roots));
         cards.extend(claimed_tombstones(&commit_roots));
+        cards.extend(claimed_tombstones(&ref_roots));
 
         let repositories = repository_references
             .keys()
@@ -321,10 +324,15 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
         let pull_requests = pull_request_references.keys().cloned().collect::<Vec<_>>();
         let commit_references = canonical_commit_references(&commit_roots);
         let commits = commit_references.keys().cloned().collect::<Vec<_>>();
-        let Ok(visible) =
-            self.git
-                .visible_reference_cards(viewer, &repositories, &pull_requests, &commits)
-        else {
+        let ref_references = canonical_git_ref_references(&ref_roots);
+        let refs = ref_references.keys().cloned().collect::<Vec<_>>();
+        let request = crate::git_durable::GitReferenceCardRequest {
+            repositories: &repositories,
+            pull_requests: &pull_requests,
+            commits: &commits,
+            refs: &refs,
+        };
+        let Ok(visible) = self.git.visible_reference_cards(viewer, request) else {
             return cards;
         };
 
@@ -358,6 +366,20 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
                 continue;
             };
             let card = ReferenceCard::projection(commit.title, "committed", "commit", "git_commit");
+            for reference in references {
+                cards.insert(reference.clone(), card.clone());
+            }
+        }
+        for git_ref in visible.refs {
+            let coordinate = (git_ref.repository, git_ref.qualified_name);
+            let Some(references) = ref_references.get(&coordinate) else {
+                continue;
+            };
+            let (state, icon) = match git_ref.kind {
+                myelin_git::durable::RefKind::Branch => ("branch", "branch"),
+                myelin_git::durable::RefKind::Tag => ("tag", "tag"),
+            };
+            let card = ReferenceCard::projection(git_ref.title, state, icon, "git_ref");
             for reference in references {
                 cards.insert(reference.clone(), card.clone());
             }
@@ -401,6 +423,21 @@ fn canonical_commit_references(
             myelin_git::coordinate::RepositorySlug::parse(repository).ok()?;
             myelin_git::core::is_canonical_object_id(oid)
                 .then(|| ((repository.to_owned(), oid.to_owned()), references.clone()))
+        })
+        .collect()
+}
+
+fn canonical_git_ref_references(
+    roots: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<(String, String), Vec<String>> {
+    roots
+        .iter()
+        .filter_map(|(id, references)| {
+            let (repository, ref_name) =
+                myelin_git::receive_pack::GitRefEventKey::parse_id(id).ok()?;
+            myelin_git::coordinate::RepositorySlug::parse(&repository).ok()?;
+            myelin_git::durable::RefKind::from_qualified_name(&ref_name.0)?;
+            Some(((repository, ref_name.0), references.clone()))
         })
         .collect()
 }
@@ -548,6 +585,32 @@ mod tests {
             BTreeMap::from([(
                 ("team/api".into(), oid.into()),
                 vec![format!("myelin://acme/git/commit/team/api:{oid}")]
+            )])
+        );
+    }
+
+    #[test]
+    fn git_ref_roots_require_canonical_event_components_and_a_browsable_namespace() {
+        let roots = BTreeMap::from([
+            (
+                "team%2Fapi:refs%2Fheads%2Frelease%2Fone".into(),
+                vec!["myelin://acme/git/ref/team%2Fapi:refs%2Fheads%2Frelease%2Fone".into()],
+            ),
+            (
+                "team%2fapi:refs%2Fheads%2Fmain".into(),
+                vec!["myelin://acme/git/ref/team%2fapi:refs%2Fheads%2Fmain".into()],
+            ),
+            (
+                "team%2Fapi:refs%2Fnotes%2Fbuild".into(),
+                vec!["myelin://acme/git/ref/team%2Fapi:refs%2Fnotes%2Fbuild".into()],
+            ),
+        ]);
+
+        assert_eq!(
+            canonical_git_ref_references(&roots),
+            BTreeMap::from([(
+                ("team/api".into(), "refs/heads/release/one".into()),
+                vec!["myelin://acme/git/ref/team%2Fapi:refs%2Fheads%2Frelease%2Fone".into()]
             )])
         );
     }

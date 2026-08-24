@@ -3291,6 +3291,7 @@ mod mutation_support;
 mod pr_queries;
 mod recovery;
 mod reference_cards;
+pub(crate) use reference_cards::GitReferenceCardRequest;
 mod repo_summary;
 mod repo_visibility;
 mod repository_views;

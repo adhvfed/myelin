@@ -52,7 +52,7 @@ impl RefKind {
         }
     }
 
-    fn classify(full_name: &str) -> Option<(Self, &str)> {
+    pub fn from_qualified_name(full_name: &str) -> Option<(Self, &str)> {
         full_name
             .strip_prefix("refs/heads/")
             .map(|name| (Self::Branch, name))
@@ -254,7 +254,7 @@ impl Cursor {
             .to_string();
         let full_name = kind.full_name(&name);
         if full_name.len() > WIRE_MAX_REF_NAME_BYTES
-            || RefKind::classify(&full_name).is_none()
+            || RefKind::from_qualified_name(&full_name).is_none()
             || !git2::Reference::is_valid_name(&full_name)
         {
             return Err(RefsPageError::MalformedCursor);
@@ -410,7 +410,7 @@ impl DurableGitRepo {
         let query = normalize_query(request.query.as_deref())?;
         let current_ref = match request.current_ref.as_deref() {
             Some(value)
-                if RefKind::classify(value).is_some()
+                if RefKind::from_qualified_name(value).is_some()
                     && value.len() <= WIRE_MAX_REF_NAME_BYTES
                     && git2::Reference::is_valid_name(value) =>
             {
@@ -589,7 +589,7 @@ fn scan_refs(
             continue;
         };
         namespace.add(full_name, target);
-        let Some((kind, short_name)) = RefKind::classify(full_name) else {
+        let Some((kind, short_name)) = RefKind::from_qualified_name(full_name) else {
             continue;
         };
         match kind {

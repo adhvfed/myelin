@@ -1328,6 +1328,28 @@ and hostile-summary tests; warning-free clippy across every Git and Edge target
 and feature; 641 browser units; all eight live Chat lifecycle stories; and both
 real Chromium Chat journeys after rebuilding Edge.
 
+## 2026-08-25 — branches and tags become private, navigable Chat context
+
+Canonical Git ref event coordinates now resolve to useful branch or tag cards
+for repository readers and content-free tombstones for everyone else. The Git
+projector accepts only canonically encoded repository/ref components and only
+the browsable `refs/heads/*` and `refs/tags/*` namespaces. It authorizes the
+union of Git coordinates once, deduplicates exact ref names, and opens each
+visible repository once for the bounded ref batch. Missing refs stay absent;
+malformed and symbolic data fail closed.
+
+The TypeScript privacy story now gives each engineer a distinct branch beside
+their repository, pull request, and commit. Each person sees a named, navigable
+card for all four of their own objects while the other repository's four names
+remain undisclosed. Browser parsing independently rejects abbreviated,
+non-canonical, or non-browsable coordinates and routes valid branch/tag cards
+to the exact tree.
+
+Proof: the complete Git and Edge library suites; focused exact-ref,
+canonical-coordinate, deduplication, and UTF-8-boundary tests; warning-free
+clippy across every Git and Edge target and feature; 642 browser units; and the
+eight rebuilt live Chat lifecycle stories.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1357,7 +1379,7 @@ real Chromium Chat journeys after rebuilding Edge.
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
    content-free tombstones for denied or unavailable artifacts. Git
-   blobs, refs, reviews, and comments, other CI artifacts, plus Chat messages and threads
+   blobs, reviews, and comments, other CI artifacts, plus Chat messages and threads
    still retain their canonical link rather than a rich card because their durable owner projectors
    are not composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,

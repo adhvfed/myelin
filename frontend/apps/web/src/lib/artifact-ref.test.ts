@@ -6,6 +6,7 @@ import {
   parseArtifactRef,
   parseGitCommitRef,
   parseGitPullRequestRef,
+  parseGitReferenceRef,
   relatedArtifactRefError,
 } from "./artifact-ref";
 
@@ -69,6 +70,12 @@ describe("artifact references", () => {
       "myelin://acme/git/commit/platform/api:0123456789abcdef0123456789abcdef01234567",
     )).toBe("/git/repos/platform%2Fapi/commit/0123456789abcdef0123456789abcdef01234567");
     expect(artifactRefHref("myelin://acme/git/commit/platform:deadbeef")).toBeUndefined();
+    expect(artifactRefLabel(
+      "myelin://acme/git/ref/platform%2Fapi:refs%2Fheads%2Frelease%2Fone",
+    )).toBe("platform/api · release/one");
+    expect(artifactRefHref(
+      "myelin://acme/git/ref/platform%2Fapi:refs%2Fheads%2Frelease%2Fone",
+    )).toBe("/git/repos/platform%2Fapi/tree/refs%2Fheads%2Frelease%2Fone");
     expect(artifactRefLabel("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
       .toBe("CI run · 00000001");
     expect(artifactRefHref("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
@@ -112,6 +119,31 @@ describe("artifact references", () => {
     });
     expect(parseGitCommitRef("myelin://acme/git/commit/platform:deadbeef")).toBeNull();
     expect(parseGitCommitRef(`myelin://acme/git/commit/platform:${oid.toUpperCase()}`)).toBeNull();
+  });
+
+  it("parses only canonically encoded branch and tag event coordinates", () => {
+    const branch = "myelin://acme/git/ref/platform%2Fapi:refs%2Fheads%2Frelease%2Fone";
+    expect(parseGitReferenceRef(branch)).toEqual({
+      tenant: "acme",
+      repo: "platform/api",
+      ref: "refs/heads/release/one",
+      sub: null,
+      root: branch,
+    });
+    expect(parseGitReferenceRef("myelin://acme/git/ref/platform:refs%2Ftags%2Fv1")).toEqual({
+      tenant: "acme",
+      repo: "platform",
+      ref: "refs/tags/v1",
+      sub: null,
+      root: "myelin://acme/git/ref/platform:refs%2Ftags%2Fv1",
+    });
+    for (const value of [
+      "myelin://acme/git/ref/platform%2fapi:refs%2Fheads%2Fmain",
+      "myelin://acme/git/ref/platform:refs%2Fnotes%2Fbuild",
+      "myelin://acme/git/ref/platform:refs%252Fheads%252Fmain",
+      "myelin://acme/git/ref/%70latform:refs%2Fheads%2Fmain",
+      `myelin://acme/git/ref/${"a".repeat(1025)}:refs%2Fheads%2Fmain`,
+    ]) expect(parseGitReferenceRef(value), value).toBeNull();
   });
 
   it("validates a related-work edge against source, tenant, and existing edges", () => {

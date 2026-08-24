@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_git::coordinate::RepositorySlug;
 use myelin_git::core::{is_canonical_object_id, Oid};
-use myelin_git::durable::DurableError;
+use myelin_git::durable::{DurableError, RefKind};
+use myelin_git::receive_pack::RefName;
 use myelin_identity::Principal;
 use myelin_storage::TenantScope;
 
@@ -15,6 +16,24 @@ pub(crate) struct GitReferenceCardBatch {
     pub repositories: Vec<String>,
     pub pull_requests: Vec<GitPullRequestCard>,
     pub commits: Vec<GitCommitCard>,
+    pub refs: Vec<GitRefCard>,
+}
+
+pub(crate) struct GitReferenceCardRequest<'a> {
+    pub repositories: &'a [String],
+    pub pull_requests: &'a [(String, u64)],
+    pub commits: &'a [(String, String)],
+    pub refs: &'a [(String, String)],
+}
+
+impl GitReferenceCardRequest<'_> {
+    fn coordinate_count(&self) -> usize {
+        self.repositories
+            .len()
+            .saturating_add(self.pull_requests.len())
+            .saturating_add(self.commits.len())
+            .saturating_add(self.refs.len())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,33 +51,36 @@ pub(crate) struct GitCommitCard {
     pub title: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GitRefCard {
+    pub repository: String,
+    pub qualified_name: String,
+    pub title: String,
+    pub kind: RefKind,
+}
+
 impl DurableGitBackend {
     pub(crate) fn visible_reference_cards(
         &self,
         principal: &Principal,
-        repositories: &[String],
-        pull_requests: &[(String, u64)],
-        commits: &[(String, String)],
+        request: GitReferenceCardRequest<'_>,
     ) -> Result<GitReferenceCardBatch, DurableError> {
-        if repositories
-            .len()
-            .saturating_add(pull_requests.len())
-            .saturating_add(commits.len())
-            > MAX_COORDINATES
-        {
+        if request.coordinate_count() > MAX_COORDINATES {
             return Err(DurableError::Git(format!(
                 "at most {MAX_COORDINATES} Git references may be projected at once"
             )));
         }
 
-        let requested_repositories = requested_repositories(repositories, pull_requests, commits)?;
-        let requested_pull_requests = requested_pull_requests(pull_requests)?;
-        let requested_commits = requested_commits(commits)?;
+        let requested_repositories = requested_repositories(&request)?;
+        let requested_pull_requests = requested_pull_requests(request.pull_requests)?;
+        let requested_commits = requested_commits(request.commits)?;
+        let requested_refs = requested_refs(request.refs)?;
         let tenant = principal.tenant.as_str();
         let region = principal.region.as_str();
         let existing = self.visible_existing_repositories(principal, &requested_repositories)?;
 
-        let repositories = repositories
+        let repositories = request
+            .repositories
             .iter()
             .filter(|repository| existing.contains(*repository))
             .cloned()
@@ -122,30 +144,76 @@ impl DurableGitBackend {
                 });
             }
         }
+        let mut refs = Vec::new();
+        let mut visible_refs = BTreeMap::<String, Vec<RefName>>::new();
+        for (repository, ref_name) in requested_refs {
+            if existing.contains(&repository) {
+                visible_refs.entry(repository).or_default().push(ref_name);
+            }
+        }
+        for (repository, ref_names) in visible_refs {
+            let repo = self
+                .store
+                .open_repo(&Self::loc(tenant, region, &repository))?;
+            for (qualified_name, _) in repo.read_refs_at_names(&ref_names)? {
+                let Some((kind, short_name)) = RefKind::from_qualified_name(&qualified_name.0)
+                else {
+                    continue;
+                };
+                refs.push(GitRefCard {
+                    title: ref_card_title(&repository, short_name),
+                    repository: repository.clone(),
+                    qualified_name: qualified_name.0,
+                    kind,
+                });
+            }
+        }
         Ok(GitReferenceCardBatch {
             repositories,
             pull_requests,
             commits,
+            refs,
         })
     }
 }
 
 fn requested_repositories(
-    repositories: &[String],
-    pull_requests: &[(String, u64)],
-    commits: &[(String, String)],
+    request: &GitReferenceCardRequest<'_>,
 ) -> Result<Vec<String>, DurableError> {
     let mut requested = BTreeSet::new();
-    for repository in repositories
+    for repository in request
+        .repositories
         .iter()
-        .chain(pull_requests.iter().map(|(repository, _)| repository))
-        .chain(commits.iter().map(|(repository, _)| repository))
+        .chain(
+            request
+                .pull_requests
+                .iter()
+                .map(|(repository, _)| repository),
+        )
+        .chain(request.commits.iter().map(|(repository, _)| repository))
+        .chain(request.refs.iter().map(|(repository, _)| repository))
     {
         RepositorySlug::parse(repository)
             .map_err(|_| DurableError::Git("Git reference repository slug is malformed".into()))?;
         requested.insert(repository.clone());
     }
     Ok(requested.into_iter().collect())
+}
+
+fn requested_refs(refs: &[(String, String)]) -> Result<BTreeSet<(String, RefName)>, DurableError> {
+    refs.iter()
+        .map(|(repository, name)| {
+            let name = RefName::new(name);
+            name.validate()
+                .map_err(|_| DurableError::Git("Git reference name is malformed".into()))?;
+            if RefKind::from_qualified_name(&name.0).is_none() {
+                return Err(DurableError::Git(
+                    "Git reference must name a branch or tag".into(),
+                ));
+            }
+            Ok((repository.clone(), name))
+        })
+        .collect()
 }
 
 fn requested_commits(
@@ -165,19 +233,27 @@ fn requested_commits(
 }
 
 fn commit_card_title(repository: &str, oid: &str, summary: &str) -> String {
-    const MAX_TITLE_BYTES: usize = 512;
     let summary = summary.trim();
     if summary.is_empty() || summary.chars().any(char::is_control) {
         return format!("{repository} {}", oid.chars().take(12).collect::<String>());
     }
-    if summary.len() <= MAX_TITLE_BYTES {
-        return summary.to_string();
+    bounded_card_title(summary)
+}
+
+fn ref_card_title(repository: &str, short_name: &str) -> String {
+    bounded_card_title(&format!("{repository} · {short_name}"))
+}
+
+fn bounded_card_title(value: &str) -> String {
+    const MAX_TITLE_BYTES: usize = 512;
+    if value.len() <= MAX_TITLE_BYTES {
+        return value.to_string();
     }
     let mut end = MAX_TITLE_BYTES;
-    while !summary.is_char_boundary(end) {
+    while !value.is_char_boundary(end) {
         end -= 1;
     }
-    summary[..end].to_string()
+    value[..end].to_string()
 }
 
 fn requested_pull_requests(
@@ -224,5 +300,28 @@ mod tests {
         let title = commit_card_title("team/api", oid, &multibyte);
         assert_eq!(title.len(), 512);
         assert_eq!(title.chars().count(), 256);
+    }
+
+    #[test]
+    fn branch_and_tag_coordinates_are_typed_deduplicated_and_bounded() {
+        assert_eq!(
+            requested_refs(&[
+                ("team/api".into(), "refs/heads/release/one".into()),
+                ("team/api".into(), "refs/heads/release/one".into()),
+                ("team/api".into(), "refs/tags/v1".into()),
+            ])
+            .unwrap(),
+            BTreeSet::from([
+                ("team/api".into(), RefName::new("refs/heads/release/one")),
+                ("team/api".into(), RefName::new("refs/tags/v1")),
+            ])
+        );
+        assert!(requested_refs(&[("team/api".into(), "refs/notes/build".into())]).is_err());
+        assert!(requested_refs(&[("team/api".into(), "refs/heads/../hidden".into())]).is_err());
+
+        let title = ref_card_title("team/api", &"ø".repeat(300));
+        assert_eq!(title.len(), 512);
+        assert!(title.starts_with("team/api · "));
+        assert_eq!(title.chars().count(), 261);
     }
 }

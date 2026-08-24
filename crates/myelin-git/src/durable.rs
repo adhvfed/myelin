@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::core::{Oid, RepoLoc};
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
+use crate::receive_pack::RefName;
 pub use crate::refs_pagination::{
     CatalogueRepoState, RefKind, RefPageItem, RefsPage, RefsPageError, RefsPageRequest,
     RefsSummary, REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT, REFS_PAGE_MAX_QUERY_BYTES,
@@ -322,6 +323,7 @@ pub const COMMIT_META_MAX_PARENTS: usize = 64;
 pub const COMMIT_META_MAX_SUMMARY_BYTES: usize = 8 * 1024;
 pub const COMMIT_META_MAX_IDENTITY_BYTES: usize = 1_024;
 pub const COMMIT_META_BATCH_MAX: usize = 10_000;
+pub const REF_LOOKUP_BATCH_MAX: usize = 10_000;
 pub const COMMIT_LOG_MAX_OFFSET: usize = 100_000;
 pub const COMMIT_LOG_MAX_PAGE: usize = 500;
 pub const PR_COMMIT_MAX_POSITION: usize = 100_000;
@@ -669,6 +671,45 @@ impl DurableGitRepo {
             Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
             Err(e) => Err(git_err(&format!("find_reference {name}"), e)),
         }
+    }
+
+    /// Resolves an exact bounded set of direct refs while opening the repository once.
+    /// Missing refs are absent; malformed or symbolic inputs fail the whole read closed.
+    pub fn read_refs_at_names(
+        &self,
+        names: &[RefName],
+    ) -> Result<Vec<(RefName, Oid)>, DurableError> {
+        if names.len() > REF_LOOKUP_BATCH_MAX {
+            return Err(DurableError::InvalidInput(format!(
+                "at most {REF_LOOKUP_BATCH_MAX} refs may be read at once"
+            )));
+        }
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let repo = self.open_git()?;
+        let mut seen = HashSet::new();
+        let mut refs = Vec::new();
+        for name in names {
+            name.validate()
+                .map_err(|_| DurableError::InvalidInput("Git ref name is malformed".into()))?;
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            match repo.find_reference(&name.0) {
+                Ok(reference) => {
+                    let target = reference
+                        .target()
+                        .ok_or_else(|| DurableError::Git(format!("ref {} is symbolic", name.0)))?;
+                    refs.push((name.clone(), Oid::new(target.to_string())));
+                }
+                Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+                Err(error) => {
+                    return Err(git_err(&format!("find_reference {}", name.0), error));
+                }
+            }
+        }
+        Ok(refs)
     }
 
     pub fn list_refs_bounded(&self, maximum: usize) -> Result<Vec<(String, Oid)>, DurableError> {
@@ -2930,6 +2971,18 @@ mod tests {
             Some(commit.clone()),
             "the ref survived the restart (SI-012 fixed - open loads from disk)"
         );
+        let refs = repo2
+            .read_refs_at_names(&[
+                RefName::new("refs/heads/missing"),
+                RefName::new("refs/heads/main"),
+                RefName::new("refs/heads/main"),
+            ])
+            .expect("read an exact ref batch");
+        assert_eq!(
+            refs,
+            vec![(RefName::new("refs/heads/main"), commit.clone())]
+        );
+        assert!(repo2.read_refs_at_names(&[RefName::new("main")]).is_err());
         assert!(
             repo2.has_object(&commit),
             "the commit object survived the restart (F-git-2 - on-disk odb)"
