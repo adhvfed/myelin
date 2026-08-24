@@ -355,10 +355,31 @@ describe("chat collaboration lifecycle", () => {
     );
   });
 
-  test("hands an issue into a shared conversation by its canonical reference", async () => {
-    const issue = await awaitActiveIssue(systemClient, uniqueName("Coordinate the referenced rollout"));
-    const issueRef = string(issue.ref, "issue reference");
-    expect(issueRef).toMatch(/^myelin:\/\/[^/]+\/issue\/issue\/MYL-\d+$/);
+  test("shows useful reference cards without copying private work into chat", async () => {
+    const sharedTitle = uniqueName("Coordinate the referenced rollout");
+    const sharedIssue = await awaitActiveIssue(systemClient, sharedTitle);
+    const sharedIssueRef = string(sharedIssue.ref, "shared issue reference");
+    const sharedState = string(sharedIssue.state, "shared issue state");
+    expect(sharedIssueRef).toMatch(/^myelin:\/\/[^/]+\/issue\/issue\/MYL-\d+$/);
+
+    const privateProject = await systemClient.json("/v1/projects", {
+      method: "POST",
+      body: {
+        name: uniqueName("Private reference cards"),
+        issue_prefix: `R${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`,
+      },
+      idempotencyKey: `private-reference-project-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const privateProjectId = string(
+      record(privateProject.body.project, "private reference project").id,
+      "private reference project id",
+    );
+    const privateTitle = uniqueName("Leadership compensation review");
+    const privateIssue = await awaitActiveIssue(systemClient, privateTitle, {
+      projectId: privateProjectId,
+    });
+    const privateIssueRef = string(privateIssue.ref, "private issue reference");
 
     const created = await systemClient.json("/v1/chat/conversations", {
       method: "POST",
@@ -378,8 +399,8 @@ describe("chat collaboration lifecycle", () => {
       {
         method: "POST",
         body: {
-          content: "Follow progress in \uFFFC.",
-          references: [issueRef],
+          content: "Follow \uFFFC, but keep \uFFFC private.",
+          references: [sharedIssueRef, privateIssueRef],
         },
         idempotencyKey: `message-ref-${randomUUID()}`,
         expectedStatus: 201,
@@ -389,11 +410,50 @@ describe("chat collaboration lifecycle", () => {
     const history = await reviewerClient.json(
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?limit=10`,
     );
-    expect(array(history.body.items, "referenced conversation messages")).toEqual([
+    expect(array(history.body.items, "teammate's referenced conversation messages")).toEqual([
       expect.objectContaining({
-        content: "Follow progress in \uFFFC.",
-        nodes: [{ kind: "artifact_ref", ref: issueRef }],
+        content: "Follow \uFFFC, but keep \uFFFC private.",
+        nodes: [
+          {
+            kind: "artifact_ref",
+            ref: sharedIssueRef,
+            card: {
+              kind: "projection",
+              title: sharedTitle,
+              state: sharedState,
+              icon: "issue",
+              render_hint: "issue",
+              sub_anchor: null,
+              flag: null,
+            },
+          },
+          {
+            kind: "artifact_ref",
+            ref: privateIssueRef,
+            card: { kind: "tombstone" },
+          },
+        ],
       }),
     ]);
+    expect(JSON.stringify(history.body)).not.toContain(privateTitle);
+
+    const authorsHistory = await systemClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?limit=10`,
+    );
+    expect(array(authorsHistory.body.items, "author's referenced conversation messages"))
+      .toEqual([
+        expect.objectContaining({
+          nodes: [
+            expect.objectContaining({
+              ref: sharedIssueRef,
+              card: expect.objectContaining({ kind: "projection", title: sharedTitle }),
+            }),
+            expect.objectContaining({
+              ref: privateIssueRef,
+              card: expect.objectContaining({ kind: "projection", title: privateTitle }),
+            }),
+          ],
+        }),
+      ]);
   });
 });

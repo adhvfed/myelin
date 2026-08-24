@@ -161,6 +161,7 @@ describe.sequential("the CLI authentication journey", () => {
   let agentVisiblePageRef: string;
   let agentPullRequestRef: string;
   let agentIssueRef: string;
+  let agentIssueTitle: string;
 
   beforeAll(async () => {
     configDirectory = await mkdtemp(resolve(tmpdir(), "myelin-cli-system-"));
@@ -1940,7 +1941,7 @@ describe.sequential("the CLI authentication journey", () => {
 
     // The human's live project access bounds the write, and a lost MCP response can be retried
     // without creating a second ticket.
-    const agentIssueTitle = uniqueName("Investigate the credentialless release failure");
+    agentIssueTitle = uniqueName("Investigate the credentialless release failure");
     const agentIssueKey = `agent-issue-${randomUUID()}`;
     const createdByAgent = await askAgentToAct(
       resumedRun,
@@ -2333,6 +2334,17 @@ describe.sequential("the CLI authentication journey", () => {
         ],
       }),
     ]);
+    const renderedHumanHistory = await runCli(
+      configDirectory,
+      "chat",
+      "history",
+      conversationId,
+      "--limit",
+      "100",
+    );
+    expect(renderedHumanHistory.exitCode, renderedHumanHistory.stderr).toBe(0);
+    expect(renderedHumanHistory.stdout).toContain(agentIssueTitle);
+    expect(renderedHumanHistory.stdout).toContain(`<${agentIssueRef}>`);
 
     // References are not merely syntax inside the message. Once projected, either artifact can
     // lead the developer back to the same visible piece of agent-authored context. The graph is

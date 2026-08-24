@@ -43,7 +43,11 @@ describe("development Chat contract", () => {
     expect(chat.listMessages(created.json.conversation.id, { before: undefined, limit: 50 })
       ?.items[0]).toMatchObject({
       content: "Track \uFFFC.",
-      nodes: [{ kind: "artifact_ref", ref: reference }],
+      nodes: [{
+        kind: "artifact_ref",
+        ref: reference,
+        card: { kind: "projection", title: "Issue MYL-7", state: "open" },
+      }],
     });
   });
 

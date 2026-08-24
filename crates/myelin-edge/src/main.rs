@@ -1272,6 +1272,9 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         issue_reconciler.wakeup(),
         handle.clone(),
     );
+    let reference_cards = Arc::new(myelin_edge::DurableReferenceCardResolver::new(
+        issue_mutations.reads(),
+    ));
     builder = register_issues(builder, issue_mutations.clone());
     builder = register_projects(builder, projects.clone(), check.clone(), handle.clone());
     builder = register_refs(
@@ -1321,6 +1324,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         handle.clone(),
         kms.clone(),
         check.clone(),
+        reference_cards,
     );
     let agent_thread_chat_mutations =
         DurableChatMutationApi::new(mcp_chat.clone(), chat_principals.clone());
@@ -1372,7 +1376,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         builder,
         AgentThreadHttpInputs {
             threads: agent_threads,
-            chat_reads: mcp_chat,
+            chat_reads: mcp_chat.clone(),
             chat_mutations: agent_thread_chat_mutations,
             workspaces: agent_workspaces,
             sessions: agent_sessions,
@@ -1382,15 +1386,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         },
     );
     builder = register_tools(builder);
-    builder = register_chat(
-        builder,
-        provider.db_pool().clone(),
-        provider.config().region.clone(),
-        handle.clone(),
-        kms.clone(),
-        check.clone(),
-        chat_principals,
-    );
+    builder = register_chat(builder, mcp_chat, chat_principals);
     builder = register_knowledge(
         builder,
         provider.db_pool().clone(),

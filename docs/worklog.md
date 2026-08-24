@@ -4,6 +4,37 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-24 — Chat references become viewer-scoped work cards
+
+A canonical reference in Chat was durable and traversable, but readers still saw only its URI. The
+browser and CLI therefore made people leave the conversation to learn even the title or state of
+work they were allowed to see. More importantly, composing an unfurl without an owner-side batch
+authorization seam would either create an N+1 query or turn the message response into an existence
+oracle.
+
+Chat history now resolves one deduplicated viewport of references for the current reader. Issues
+owns the first production projector and resolves the whole key set through the same durable
+effective `issue:view` projection as its list route. A visible Issue yields its title, state, icon,
+and render hint; a missing, denied, stale, or temporarily unavailable Issue yields the same
+content-free tombstone. Unsupported artifact types deliberately retain their canonical link until
+their owner adapter exists. Resolution failure does not disclose which of those safe cases occurred,
+and a system journey proves that the same stored message gives its author two useful cards while a
+teammate sees one useful card and one tombstone with no private title anywhere in the response.
+
+The Edge decrypts each message once, resolves all page references once, and attaches the card to the
+structured node instead of inventing a parallel response index. The browser renders an accessible
+title/state link or an inert neutral tombstone. The human CLI renders the same card inline while JSON
+mode preserves the exact wire response. Production composition now builds one Chat read API and
+reuses it for public Chat, MCP, and private agent threads instead of reconstructing the service from
+an eight-argument registrar.
+
+**Proof:** warning-free all-target/all-feature clippy for Edge, Issues, and CLI; web typecheck and
+lint; system-test typecheck; the complete all-feature Edge, Issues, and CLI backend suites, including
+the million-Issue cost-bound test and the durable visibility restart/revocation/rebuild-race test;
+restarted Edge; the four-case live Chat lifecycle; the sixteen-stage CLI authentication and
+collaboration journey; both real-browser Chat product journeys; and all twelve Chat browser-contract
+cases.
+
 ## 2026-08-24 — CI residency proof lives at the enforced boundaries
 
 CI Control Plane carried a 707-line test-support module that assembled fleet placement, log and
@@ -1173,11 +1204,11 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
 5. **cross-product search is not surfaced yet.** the running product has bounded,
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.
-6. **Chat reference cards are not surfaced yet.** durable messages carry canonical references and
-   the Refs graph projects their edges, while Chat owns tested unfurl authorization, tombstones,
-   cache invalidation, and live-update components. Edge, CLI, and browser message reads do not
-   compose those pieces into a viewer-scoped card, so the removed in-memory pane was not a product
-   journey.
+6. **Chat reference cards have one owner adapter, not the full projection fabric yet.** Edge, CLI,
+   and browser now surface viewer-scoped Issue cards through one bounded owner query, with
+   content-free tombstones for denied or unavailable Issues. Git, Knowledge, CI, and Chat artifacts
+   still retain their canonical link rather than a rich card because their durable owner projectors
+   are not composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade

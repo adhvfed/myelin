@@ -37,7 +37,7 @@ test.describe("Chat workspace", () => {
     await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
     await expect(page.getByRole("heading", { name: "release readiness", level: 2 })).toBeVisible();
     await expect(page.getByText("The canary is healthy.", { exact: false })).toBeVisible();
-    await expect(page.getByRole("link", { name: "MYL-204", exact: true }))
+    await expect(page.getByRole("link", { name: "Issue MYL-204, open", exact: true }))
       .toHaveAttribute("href", "/issues?state=all&key=MYL-204");
     await expect(page.getByText("I’m watching error rate", { exact: false })).toBeVisible();
     await expect(page.getByText("Agent · 543210", { exact: true })).toBeVisible();
@@ -81,13 +81,13 @@ test.describe("Chat workspace", () => {
     await page.getByRole("button", { name: "Send" }).click();
     const posted = page.locator(".chat-message-you").filter({ hasText: message });
     await expect(posted).toHaveCount(1);
-    await expect(posted.getByRole("link", { name: "MYL-777" }))
+    await expect(posted.getByRole("link", { name: "Issue MYL-777, open" }))
       .toHaveAttribute("href", "/issues?state=all&key=MYL-777");
 
     await page.reload();
     const durable = page.locator(".chat-message-you").filter({ hasText: message });
     await expect(durable).toHaveCount(1);
-    await expect(durable.getByRole("link", { name: "MYL-777" })).toBeVisible();
+    await expect(durable.getByRole("link", { name: "Issue MYL-777, open" })).toBeVisible();
   });
 
   test("a first user can create a topic, send with Enter, and reload without losing it", async ({ page, request }) => {

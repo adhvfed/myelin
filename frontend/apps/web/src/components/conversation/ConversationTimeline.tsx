@@ -9,23 +9,40 @@ import { chatAuthorLabel, chatTimestamp } from "~/lib/chat-view";
 type ReferenceNode = Extract<ChatMessageNode, { ref: string }>;
 
 function MessageReference(props: { node: ReferenceNode }) {
-  const label = () => props.node.kind === "embed"
-    ? `Embedded · ${artifactRefLabel(props.node.ref)}`
-    : artifactRefLabel(props.node.ref);
-  const href = () => artifactRefHref(props.node.ref);
+  const projection = () => props.node.card.kind === "projection" ? props.node.card : undefined;
+  const label = () => projection()?.title ?? (props.node.card.kind === "tombstone"
+    ? "Referenced work is not available"
+    : artifactRefLabel(props.node.ref));
+  const href = () => props.node.card.kind === "tombstone"
+    ? undefined
+    : artifactRefHref(props.node.ref);
+  const accessibleLabel = () => {
+    const card = projection();
+    return card ? `${card.title}, ${card.state}` : label();
+  };
+  const content = () => <>
+    <span>{label()}</span>
+    <Show when={projection()}>{(card) => <small>{card().state}</small>}</Show>
+  </>;
   return <Show
     when={href()}
-    fallback={<span class="chat-message-node" data-kind={props.node.kind} title={props.node.ref}>
-      {label()}
+    fallback={<span
+      class="chat-message-node"
+      data-kind={props.node.kind}
+      data-card={props.node.card.kind}
+    >
+      {content()}
     </span>}
   >
     {(target) => <A
       class="chat-message-node"
       data-kind={props.node.kind}
+      data-card={props.node.card.kind}
+      aria-label={accessibleLabel()}
       href={target()}
-      title={props.node.ref}
+      title={`${artifactRefLabel(props.node.ref)} · ${props.node.ref}`}
     >
-      {label()}
+      {content()}
     </A>}
   </Show>;
 }

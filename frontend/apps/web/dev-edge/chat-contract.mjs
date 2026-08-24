@@ -71,6 +71,21 @@ function conversationJson(row) {
   };
 }
 
+function referenceCard(reference) {
+  const issueKey = /^myelin:\/\/[^/]+\/issue\/issue\/([^/#]+)$/.exec(reference)?.[1];
+  return issueKey
+    ? {
+      kind: "projection",
+      title: `Issue ${issueKey}`,
+      state: "open",
+      icon: "issue",
+      render_hint: "issue",
+      sub_anchor: null,
+      flag: null,
+    }
+    : { kind: "reference" };
+}
+
 function messageJson(row) {
   return {
     id: row.id,
@@ -78,7 +93,11 @@ function messageJson(row) {
     author_kind: row.author_kind,
     is_you: row.author === AUTHOR,
     content: row.content,
-    nodes: row.nodes ?? [],
+    nodes: (row.nodes ?? []).map((node) =>
+      node.kind === "artifact_ref" || node.kind === "embed"
+        ? { ...node, card: referenceCard(node.ref) }
+        : node
+    ),
     edited: false,
     state: "active",
     created_at: row.created_at,

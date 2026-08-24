@@ -6,6 +6,7 @@ use crate::gateway::{sse_scope_for_resource, GatewayBuilder};
 use crate::request::EdgeResponse;
 use crate::sse::SseHub;
 use crate::Method;
+use crate::{ReferenceCard, ReferenceCardResolver};
 use myelin_chat::conversation::{Conversation, ConversationError, ConversationKind};
 use myelin_chat::events::{event_actor_pseudonym, pseudonymized_event_principal};
 use myelin_chat::store::pg::PgMessageStore;
@@ -26,6 +27,7 @@ use myelin_storage::{KeyClass, KmsEngine, SubjectId, TenantScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
@@ -42,6 +44,7 @@ pub struct DurableChatReadApi {
     runtime: Handle,
     kms: Arc<KmsEngine>,
     authorization: ChatAuthorization,
+    reference_cards: Arc<dyn ReferenceCardResolver>,
 }
 
 impl DurableChatReadApi {
@@ -51,6 +54,7 @@ impl DurableChatReadApi {
         runtime: Handle,
         kms: Arc<KmsEngine>,
         identity: StoreBackedCheck,
+        reference_cards: Arc<dyn ReferenceCardResolver>,
     ) -> Self {
         Self {
             conversations: PgConversationStore::new(pool.clone()),
@@ -58,6 +62,7 @@ impl DurableChatReadApi {
             runtime,
             kms,
             authorization: ChatAuthorization::new(identity),
+            reference_cards,
         }
     }
 
@@ -183,10 +188,21 @@ impl DurableChatReadApi {
             .then(|| visible.first().map(|message| message.message_id.0.clone()))
             .flatten();
         let viewer = event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0);
-        let items = visible
+        let readable = visible
             .iter()
-            .map(|message| message_json(message, &viewer, self.kms.as_ref()))
+            .map(|message| decode_readable_message(message, self.kms.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
+        let references = readable
+            .iter()
+            .flat_map(|message| message.reference_nodes())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let cards = self.reference_cards.resolve(principal, &references);
+        let items = readable
+            .iter()
+            .map(|message| readable_message_json(message, &viewer, &cards))
+            .collect::<Vec<_>>();
         Ok(json!({
             "conversation": conversation_json(&conversation),
             "items": items,
@@ -677,14 +693,9 @@ impl Handler for ConversationEventsHandler {
 
 pub fn register_chat(
     builder: GatewayBuilder,
-    pool: PgPool,
-    region: impl Into<String>,
-    runtime: Handle,
-    kms: Arc<KmsEngine>,
-    identity: StoreBackedCheck,
+    reads: DurableChatReadApi,
     principals: PrincipalStore,
 ) -> GatewayBuilder {
-    let reads = DurableChatReadApi::new(pool, region, runtime, kms, identity);
     let api = DurableChatMutationApi::new(reads.clone(), principals);
     let sse = builder.sse_hub();
     builder
@@ -887,10 +898,31 @@ fn same_conversation_intent(left: &Conversation, right: &Conversation) -> bool {
         && left.created_by == right.created_by
 }
 
-fn message_json(message: &Message, viewer: &str, kms: &KmsEngine) -> Result<Value, EdgeError> {
+struct ReadableMessage<'a> {
+    stored: &'a Message,
+    content: String,
+    nodes: Vec<InlineNode>,
+}
+
+impl ReadableMessage<'_> {
+    fn reference_nodes(&self) -> impl Iterator<Item = String> + '_ {
+        self.nodes.iter().filter_map(|node| match node {
+            InlineNode::ArtifactRefNode(reference) | InlineNode::Embed(reference) => {
+                Some(reference.0.clone())
+            }
+            InlineNode::Mention(_) => None,
+        })
+    }
+}
+
+fn decode_readable_message<'a>(
+    message: &'a Message,
+    kms: &KmsEngine,
+) -> Result<ReadableMessage<'a>, EdgeError> {
     let content = decrypt_message_column(message, kms, &message.body_inline, "body_inline")?;
     let content = std::str::from_utf8(&content)
-        .map_err(|_| EdgeError::Internal("stored Chat message is not valid UTF-8".into()))?;
+        .map_err(|_| EdgeError::Internal("stored Chat message is not valid UTF-8".into()))?
+        .to_string();
     let nodes = decode_message_nodes(message, kms)?;
     if content
         .chars()
@@ -902,26 +934,39 @@ fn message_json(message: &Message, viewer: &str, kms: &KmsEngine) -> Result<Valu
             "stored Chat content and structured nodes disagree".into(),
         ));
     }
-    Ok(json!({
-        "id": message.message_id.as_str(),
-        "author": message.author,
-        "author_kind": match message.author_kind {
+    Ok(ReadableMessage {
+        stored: message,
+        content,
+        nodes,
+    })
+}
+
+fn readable_message_json(
+    message: &ReadableMessage<'_>,
+    viewer: &str,
+    cards: &HashMap<String, ReferenceCard>,
+) -> Value {
+    let stored = message.stored;
+    json!({
+        "id": stored.message_id.as_str(),
+        "author": stored.author,
+        "author_kind": match stored.author_kind {
             AuthorKind::Human => "human",
             AuthorKind::Agent => "agent",
             AuthorKind::Service => "service",
         },
-        "is_you": message.author == viewer,
-        "content": content,
-        "nodes": nodes.iter().map(message_node_json).collect::<Vec<_>>(),
-        "edited": message.edited_seq > 0,
-        "state": match message.state {
+        "is_you": stored.author == viewer,
+        "content": message.content,
+        "nodes": message.nodes.iter().map(|node| message_node_json(node, cards)).collect::<Vec<_>>(),
+        "edited": stored.edited_seq > 0,
+        "state": match stored.state {
             MessageState::Active => "active",
             MessageState::Edited => "edited",
             MessageState::Deleted => "deleted",
             MessageState::Tombstoned => "tombstoned",
         },
-        "created_at": message.message_id.timestamp_ms().map(|value| value / 1000),
-    }))
+        "created_at": stored.message_id.timestamp_ms().map(|value| value / 1000),
+    })
 }
 
 fn decode_message_nodes(message: &Message, kms: &KmsEngine) -> Result<Vec<InlineNode>, EdgeError> {
@@ -936,21 +981,29 @@ fn decode_message_nodes(message: &Message, kms: &KmsEngine) -> Result<Vec<Inline
         .map_err(|_| EdgeError::Internal("stored Chat structured nodes are not valid".into()))
 }
 
-fn message_node_json(node: &InlineNode) -> Value {
+fn message_node_json(node: &InlineNode, cards: &HashMap<String, ReferenceCard>) -> Value {
     match node {
         InlineNode::Mention(principal) => json!({
             "kind": "mention",
             "principal_id": principal.principal_id.0,
         }),
-        InlineNode::ArtifactRefNode(reference) => json!({
-            "kind": "artifact_ref",
-            "ref": reference.0,
-        }),
-        InlineNode::Embed(reference) => json!({
-            "kind": "embed",
-            "ref": reference.0,
-        }),
+        InlineNode::ArtifactRefNode(reference) => {
+            reference_node_json("artifact_ref", reference, cards)
+        }
+        InlineNode::Embed(reference) => reference_node_json("embed", reference, cards),
     }
+}
+
+fn reference_node_json(
+    kind: &str,
+    reference: &myelin_refs::ArtifactRef,
+    cards: &HashMap<String, ReferenceCard>,
+) -> Value {
+    json!({
+        "kind": kind,
+        "ref": reference.0,
+        "card": cards.get(&reference.0).unwrap_or(&ReferenceCard::Tombstone),
+    })
 }
 
 fn decrypt_message_column(
@@ -1068,6 +1121,45 @@ mod tests {
             .is_err());
         assert!(validate_nonce("01J-client_nonce").is_ok());
         assert!(validate_nonce("spaces are not stable").is_err());
+    }
+
+    #[test]
+    fn reference_nodes_carry_the_viewers_card_or_a_safe_tombstone() {
+        let reference = myelin_refs::ArtifactRef("myelin://acme/issue/issue/ENG-41".into());
+        let node = InlineNode::ArtifactRefNode(reference.clone());
+        let card = ReferenceCard::Projection {
+            title: "Coordinate the rollout".into(),
+            state: "open".into(),
+            icon: "issue".into(),
+            render_hint: "issue".into(),
+            sub_anchor: None,
+            flag: None,
+        };
+
+        assert_eq!(
+            message_node_json(&node, &HashMap::from([(reference.0.clone(), card)])),
+            json!({
+                "kind": "artifact_ref",
+                "ref": reference.0.clone(),
+                "card": {
+                    "kind": "projection",
+                    "title": "Coordinate the rollout",
+                    "state": "open",
+                    "icon": "issue",
+                    "render_hint": "issue",
+                    "sub_anchor": null,
+                    "flag": null,
+                }
+            })
+        );
+        assert_eq!(
+            message_node_json(&node, &HashMap::new()),
+            json!({
+                "kind": "artifact_ref",
+                "ref": reference.0.clone(),
+                "card": { "kind": "tombstone" }
+            })
+        );
     }
 
     #[test]

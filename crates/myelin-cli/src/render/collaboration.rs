@@ -150,11 +150,29 @@ fn render_structured_content(content: &str, nodes: Option<&Value>) -> Option<Str
                 rendered.push('@');
                 rendered.push_str(node.get("principal_id")?.as_str()?);
             }
-            "artifact_ref" | "embed" => rendered.push_str(node.get("ref")?.as_str()?),
+            "artifact_ref" | "embed" => rendered.push_str(&render_reference(node)?),
             _ => return None,
         }
     }
     Some(rendered)
+}
+
+fn render_reference(node: &Value) -> Option<String> {
+    let reference = node.get("ref")?.as_str()?;
+    let Some(card) = node.get("card") else {
+        return Some(reference.to_string());
+    };
+    match card.get("kind")?.as_str()? {
+        "projection" => Some(format!(
+            "{} [{}] <{}>",
+            card.get("title")?.as_str()?,
+            card.get("state")?.as_str()?,
+            reference,
+        )),
+        "reference" => Some(reference.to_string()),
+        "tombstone" => Some("(referenced work is not available)".into()),
+        _ => None,
+    }
 }
 
 fn render_page_summary(value: &Value) -> Option<String> {
@@ -230,14 +248,30 @@ mod tests {
                 "content": "Tracking \u{FFFC}",
                 "nodes": [{
                     "kind": "artifact_ref",
-                    "ref": "myelin://acme/issue/issue/ENG-41"
+                    "ref": "myelin://acme/issue/issue/ENG-41",
+                    "card": {
+                        "kind": "projection",
+                        "title": "Coordinate the rollout",
+                        "state": "open"
+                    }
                 }],
                 "state": "active",
                 "edited": false
             })),
             Some(format!(
-                "opaque-author  Tracking myelin://acme/issue/issue/ENG-41  [active]  ({ID})"
+                "opaque-author  Tracking Coordinate the rollout [open] <myelin://acme/issue/issue/ENG-41>  [active]  ({ID})"
             ))
+        );
+        assert_eq!(
+            render_structured_content(
+                "Private: \u{FFFC}",
+                Some(&json!([{
+                    "kind": "artifact_ref",
+                    "ref": "myelin://acme/issue/issue/SECRET-1",
+                    "card": { "kind": "tombstone" }
+                }]))
+            ),
+            Some("Private: (referenced work is not available)".into())
         );
         assert_eq!(
             render_item(&json!({

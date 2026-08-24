@@ -21,7 +21,7 @@ use sqlx::types::Uuid;
 use sqlx::Row;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 mod create_idempotency;
 mod import_creation;
@@ -1565,7 +1565,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
-                    sqlx::query(LIST_EFFECTIVE_ISSUE_VIEW_SQL)
+                    sqlx::query(effective_issue_list_sql())
                         .bind(&tenant_id)
                         .bind(&region)
                         .bind(&principal_id)
@@ -1582,17 +1582,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .await
             .map_err(|e| IssueStoreError::Storage(e.to_string()))?;
 
-        let mut rows = rows.into_iter();
-        let sentinel = rows.next().ok_or_else(|| {
-            IssueStoreError::Storage("issue visibility query omitted its status sentinel".into())
-        })?;
-        let status: String = sentinel.get("projection_status");
-        if status != "ready" {
-            return Err(IssueStoreError::AuthorizationUnavailable(format!(
-                "effective issue:view projection is {status}"
-            )));
-        }
-        let rows: Vec<_> = rows.collect();
+        let rows: Vec<_> = ready_issue_view_rows(rows)?.collect();
         let has_more = rows.len() > page.limit as usize;
         let mut items = Vec::with_capacity(rows.len().min(page.limit as usize));
         let mut next_position = None;
@@ -1623,6 +1613,55 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             next_cursor,
             limit: page.limit,
         })
+    }
+
+    /// Resolve a bounded set of issue keys through the same effective authorization projection as
+    /// the issue list. Missing or invisible keys are omitted; an unavailable projection fails the
+    /// whole read rather than exposing a partial authorization view.
+    pub async fn view_by_keys(
+        &self,
+        principal: &Principal,
+        issue_keys: &[String],
+    ) -> Result<Vec<StoredIssue>, IssueStoreError> {
+        if issue_keys.len() > MAX_AUTHORIZED_ISSUE_IDS {
+            return Err(IssueStoreError::BadInput(format!(
+                "at most {MAX_AUTHORIZED_ISSUE_IDS} issue keys may be resolved at once"
+            )));
+        }
+        let mut keys = issue_keys.to_vec();
+        for key in &keys {
+            validate_issue_key(key)?;
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let scope = self.scope(principal)?;
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let principal_id = principal.principal_id.0.clone();
+        let rows = self
+            .provider
+            .with_tenant_tx(&tenant_id.clone(), move |connection| {
+                Box::pin(async move {
+                    sqlx::query(effective_issue_keys_sql())
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .bind(&principal_id)
+                        .bind(&keys)
+                        .fetch_all(&mut *connection)
+                        .await
+                        .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))?;
+
+        ready_issue_view_rows(rows)?
+            .map(|row| decode_row(&self.kms, &principal.region, row))
+            .collect()
     }
 
     pub async fn rebuild_effective_issue_view(
@@ -2010,7 +2049,7 @@ JOIN issue i
 WHERE b.tenant_id = $1 AND b.region = $2 AND b.request_event_id = $3
   AND i.created_by_principal = $4 AND i.deleted_at IS NULL AND NOT i.archived
 "#;
-const LIST_EFFECTIVE_ISSUE_VIEW_SQL: &str = r#"
+const EFFECTIVE_ISSUE_VIEW_PREFIX: &str = r#"
 WITH projection AS MATERIALIZED (
   SELECT source_revision, applied_revision, status
   FROM authz_projection_state
@@ -2044,14 +2083,9 @@ authorized AS (
    AND b.relation = 'parent_project'
   WHERE i.tenant_id = $1 AND i.region = $2
     AND i.deleted_at IS NULL AND NOT i.archived
-    AND ($4::bigint IS NULL OR
-         (i.updated_at, i.id) < (to_timestamp($4::double precision / 1000000.0), $5))
-    AND ($6 = 'all'
-         OR ($6 = 'open' AND i.state_category IN ('unstarted', 'started'))
-         OR ($6 = 'closed' AND i.state_category IN ('completed', 'cancelled')))
-    AND ($7::text IS NULL OR i.key LIKE $7 || '%')
-  ORDER BY i.updated_at DESC, i.id DESC
-  LIMIT $8
+"#;
+
+const EFFECTIVE_ISSUE_VIEW_RESULT: &str = r#"
 )
 SELECT 0::int AS sort_key,
        CASE
@@ -2075,10 +2109,44 @@ FROM authorized
 ORDER BY sort_key ASC, updated_at_micros DESC NULLS FIRST, id DESC NULLS FIRST
 "#;
 
+const EFFECTIVE_ISSUE_LIST_FILTER: &str = r#"
+    AND ($4::bigint IS NULL OR
+         (i.updated_at, i.id) < (to_timestamp($4::double precision / 1000000.0), $5))
+    AND ($6 = 'all'
+         OR ($6 = 'open' AND i.state_category IN ('unstarted', 'started'))
+         OR ($6 = 'closed' AND i.state_category IN ('completed', 'cancelled')))
+    AND ($7::text IS NULL OR i.key LIKE $7 || '%')
+  ORDER BY i.updated_at DESC, i.id DESC
+  LIMIT $8
+"#;
+
+const EFFECTIVE_ISSUE_KEYS_FILTER: &str = r#"
+    AND i.key = ANY($4)
+"#;
+
+fn effective_issue_view_sql(filter: &str) -> String {
+    [
+        EFFECTIVE_ISSUE_VIEW_PREFIX,
+        filter,
+        EFFECTIVE_ISSUE_VIEW_RESULT,
+    ]
+    .concat()
+}
+
+fn effective_issue_list_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| effective_issue_view_sql(EFFECTIVE_ISSUE_LIST_FILTER))
+}
+
+fn effective_issue_keys_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| effective_issue_view_sql(EFFECTIVE_ISSUE_KEYS_FILTER))
+}
+
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn authoritative_issue_list_sql() -> &'static str {
-    LIST_EFFECTIVE_ISSUE_VIEW_SQL
+    effective_issue_list_sql()
 }
 
 const ISSUE_VIEW_WALK_CTE: &str = r#"
@@ -2565,6 +2633,22 @@ fn decode_row(
     })
 }
 
+fn ready_issue_view_rows(
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Result<std::vec::IntoIter<sqlx::postgres::PgRow>, IssueStoreError> {
+    let mut rows = rows.into_iter();
+    let sentinel = rows.next().ok_or_else(|| {
+        IssueStoreError::Storage("issue visibility query omitted its status sentinel".into())
+    })?;
+    let status: String = sentinel.get("projection_status");
+    if status != "ready" {
+        return Err(IssueStoreError::AuthorizationUnavailable(format!(
+            "effective issue:view projection is {status}"
+        )));
+    }
+    Ok(rows)
+}
+
 fn validate_create(proposal: &CreateIssue) -> Result<(), IssueStoreError> {
     parse_uuid("project_id", &proposal.project_id)?;
     parse_uuid("type_id", &proposal.type_id)?;
@@ -2681,11 +2765,12 @@ mod tests {
             Some(cursor),
         )
         .is_err());
-        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("ORDER BY i.updated_at DESC, i.id DESC"));
-        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("(i.updated_at, i.id) <"));
-        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("AND NOT i.archived"));
-        assert!(LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("b.issue_object = 'issue:' || i.id::text"));
-        assert!(!LIST_EFFECTIVE_ISSUE_VIEW_SQL.contains("title LIKE"));
+        let sql = effective_issue_list_sql();
+        assert!(sql.contains("ORDER BY i.updated_at DESC, i.id DESC"));
+        assert!(sql.contains("(i.updated_at, i.id) <"));
+        assert!(sql.contains("AND NOT i.archived"));
+        assert!(sql.contains("b.issue_object = 'issue:' || i.id::text"));
+        assert!(!sql.contains("title LIKE"));
     }
 
     #[test]

@@ -13,6 +13,15 @@ const ID = "01J00000000000000000000000";
 const NEXT = "01J00000000000000000000001";
 const PROJECT = "11111111-1111-1111-1111-111111111111";
 const REF = `myelin://acme/chat/channel/${ID}`;
+const issueCard = {
+  kind: "projection",
+  title: "Investigate the rollout",
+  state: "open",
+  icon: "issue",
+  render_hint: "issue",
+  sub_anchor: null,
+  flag: null,
+};
 const conversation = {
   id: ID,
   ref: REF,
@@ -90,8 +99,12 @@ describe("Chat wire projection", () => {
       content: "Ask \uFFFC to compare \uFFFC with \uFFFC.",
       nodes: [
         { kind: "mention", principal_id: "p:alice" },
-        { kind: "artifact_ref", ref: "myelin://acme/issue/issue/MYL-7" },
-        { kind: "embed", ref: "myelin://acme/knowledge/page/runbook" },
+        { kind: "artifact_ref", ref: "myelin://acme/issue/issue/MYL-7", card: issueCard },
+        {
+          kind: "embed",
+          ref: "myelin://acme/knowledge/page/runbook",
+          card: { kind: "reference" },
+        },
       ],
     };
     expect(parseChatMessages({
@@ -103,7 +116,18 @@ describe("Chat wire projection", () => {
     for (const invalid of [
       { ...structured, content: "One marker \uFFFC", nodes: structured.nodes.slice(0, 2) },
       { ...structured, nodes: [{ kind: "mention", principal_id: "alice smith" }] },
-      { ...structured, nodes: [{ kind: "artifact_ref", ref: "https://example.test/work" }] },
+      {
+        ...structured,
+        nodes: [{ kind: "artifact_ref", ref: "https://example.test/work", card: issueCard }],
+      },
+      {
+        ...structured,
+        nodes: [{
+          kind: "artifact_ref",
+          ref: "myelin://acme/issue/issue/MYL-7",
+          card: { ...issueCard, title: "" },
+        }],
+      },
       { ...structured, nodes: [{ kind: "embed", ref: structured.nodes[2]!.ref, secret: true }] },
     ]) {
       expect(parseChatMessages({

@@ -24,9 +24,21 @@ export interface ChatConversationPage {
 
 export type ChatAuthorKind = "human" | "agent" | "service";
 export type ChatMessageState = "active" | "edited" | "deleted" | "tombstoned";
+export type ChatReferenceCard =
+  | {
+    kind: "projection";
+    title: string;
+    state: string;
+    icon: string;
+    render_hint: string;
+    sub_anchor: string | null;
+    flag: "moved" | "outdated" | null;
+  }
+  | { kind: "reference" }
+  | { kind: "tombstone" };
 export type ChatMessageNode =
   | { kind: "mention"; principal_id: string }
-  | { kind: "artifact_ref" | "embed"; ref: string };
+  | { kind: "artifact_ref" | "embed"; ref: string; card: ChatReferenceCard };
 
 export interface ChatMessage {
   id: string;
@@ -151,11 +163,27 @@ function messageNode(value: unknown): ChatMessageNode | null {
       : null;
   }
   if (node.kind === "artifact_ref" || node.kind === "embed") {
-    return exact(node, ["kind", "ref"]) && isStorableArtifactRef(node.ref)
-      ? { kind: node.kind, ref: node.ref }
+    const card = referenceCard(node.card);
+    return exact(node, ["kind", "ref", "card"]) && isStorableArtifactRef(node.ref) && card
+      ? { kind: node.kind, ref: node.ref, card }
       : null;
   }
   return null;
+}
+
+function referenceCard(value: unknown): ChatReferenceCard | null {
+  const card = record(value);
+  if (!card || typeof card.kind !== "string") return null;
+  if (card.kind === "reference" || card.kind === "tombstone") {
+    return exact(card, ["kind"]) ? { kind: card.kind } : null;
+  }
+  if (card.kind !== "projection" || !exact(card, [
+    "kind", "title", "state", "icon", "render_hint", "sub_anchor", "flag",
+  ]) || !cleanText(card.title, 512) || !cleanText(card.state, 255) ||
+      !cleanText(card.icon, 64) || !cleanText(card.render_hint, 64) ||
+      !nullableText(card.sub_anchor, 1024) ||
+      ![null, "moved", "outdated"].includes(card.flag as string | null)) return null;
+  return card as unknown as ChatReferenceCard;
 }
 
 function message(value: unknown): ChatMessage | null {

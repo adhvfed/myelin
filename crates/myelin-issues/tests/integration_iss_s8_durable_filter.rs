@@ -295,6 +295,12 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
             .await,
         Err(IssueStoreError::AuthorizationUnavailable(_))
     ));
+    assert!(matches!(
+        store
+            .view_by_keys(&alice, std::slice::from_ref(&staged.key))
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
     let built = store
         .rebuild_effective_issue_view(&worker)
         .await
@@ -309,6 +315,16 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
             .id,
         staged.id
     );
+    let cards = store
+        .view_by_keys(
+            &alice,
+            &[staged.key.clone(), "S8D-999999".into(), staged.key.clone()],
+        )
+        .await
+        .expect("the card viewport uses the ready effective projection");
+    assert_eq!(cards.len(), 1, "missing keys and duplicates add no cards");
+    assert_eq!(cards[0].id, staged.id);
+    assert_eq!(cards[0].title, "durable effective visibility");
     assert_eq!(
         store
             .list(&bob, IssuePageRequest::new(20, None).unwrap())
@@ -323,6 +339,11 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .await
         .unwrap()
         .items
+        .is_empty());
+    assert!(store
+        .view_by_keys(&outsider, std::slice::from_ref(&staged.key))
+        .await
+        .unwrap()
         .is_empty());
     for (principal, grant) in [
         (&expired_project_reader, "direct project grant"),

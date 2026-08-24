@@ -34,6 +34,7 @@ pub mod mcp_read;
 pub mod notif_http;
 pub mod privacy_http;
 pub mod project_http;
+mod reference_card;
 pub mod refs_http;
 pub mod repo_authz;
 pub mod repo_authz_live;
@@ -119,6 +120,7 @@ pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
 pub use privacy_http::register_privacy;
 pub use project_http::{register_projects, DurableProjectReadApi};
+pub use reference_card::{DurableReferenceCardResolver, ReferenceCard, ReferenceCardResolver};
 pub use refs_http::{register_refs, DurableRefsReadApi};
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
 pub use repo_authz_live::{

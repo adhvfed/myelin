@@ -92,6 +92,15 @@ impl DurableIssueReadApi {
         self.view(principal, &issue_id)
     }
 
+    pub(crate) fn view_keys(
+        &self,
+        principal: &myelin_identity::Principal,
+        issue_keys: &[String],
+    ) -> Result<Vec<StoredIssue>, EdgeError> {
+        self.drive(self.store.view_by_keys(principal, issue_keys))
+            .map_err(map_store_error)
+    }
+
     pub fn resolve_locator(
         &self,
         principal: &myelin_identity::Principal,

@@ -318,6 +318,17 @@
   font-weight: var(--weight-medium);
   white-space: nowrap;
 }
+.chat-message-node small {
+  margin-inline-start: 0.4em;
+  color: var(--text-subtle);
+  font-size: 0.86em;
+  font-weight: var(--weight-regular);
+}
+.chat-message-node[data-card="tombstone"] {
+  border-style: dashed;
+  color: var(--text-subtle);
+  font-weight: var(--weight-regular);
+}
 a.chat-message-node:hover {
   border-color: var(--accent);
   color: var(--accent);
