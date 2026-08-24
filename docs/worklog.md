@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-24 — Storage recovery proof belongs to the real owners
+
+Storage exposed a 533-line test-support module that labelled three arbitrary in-process replay
+sources “OLAP,” “Search,” and “Refs,” projected every source through the same generic `DerivedStore`,
+hard-coded that none had a backup path, and hashed the resulting self-authored report into a green
+certificate. Inline tests, a CDC suite, and a drill then repeated the same assertions. No production
+caller constructed the module, and the generic projection could not detect drift in any of the real
+derived stores it claimed to cover.
+
+That 991-line synthetic composition and its duplicate suites are gone. Refs retains its owner-side
+byte-identical live/cold projection proof; Search retains its live-consumer rebuild contract and
+stronger ranked-result parity coverage; Storage retains its real OLAP bus rebuild and the actual
+backup policy that refuses derived tiers. Removing the copied consumer tests also removed Storage's
+otherwise-unused Search and Refs Service dev dependencies. This exposed a hidden test dependency:
+the durable agent-trigger integration used UUID v4 only because an unrelated dev dependency happened
+to enable that feature. Storage now declares and imports its own UUID requirement explicitly.
+
+**Proof:** the complete all-feature Storage suite (504 unit cases plus every durable PostgreSQL,
+object-store, backup/restore, re-erasure, OLAP, migration, RLS, and agent-workspace integration);
+warning-free all-target/all-feature Storage clippy; the four-case owner-side Refs reindex suite; the
+two-case owner-side Search reindex suite; and the real 99-row contract gate.
+
 ## 2026-08-23 — Chat E2E names what users can actually do
 
 Chat's test-only E2E wedge supplied its own mutex-backed authorization service and reference

@@ -15,8 +15,6 @@ pub mod cell_migration;
 #[cfg(any(test, feature = "test-support"))]
 pub mod ci_log_index;
 pub mod coloc;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e3_reindex_parity;
 pub mod encryption;
 pub mod erase;
 #[cfg(any(test, feature = "test-support"))]
@@ -122,11 +120,6 @@ pub use ci_log_index::{
     CI_LOG_STREAM,
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e3_reindex_parity::{
-    run_e2e3_storage_half, DerivedReindexSource, DerivedStoreClass, DerivedStoreParity,
-    E2e3StorageArtifact,
-};
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
 };

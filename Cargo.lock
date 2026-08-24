@@ -3716,8 +3716,6 @@ dependencies = [
  "myelin-harness",
  "myelin-identity",
  "myelin-refs",
- "myelin-refs-service",
- "myelin-search",
  "myelin-storage",
  "myelin-tenancy",
  "serde",
@@ -3726,6 +3724,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml",
+ "uuid",
  "zeroize",
 ]
 

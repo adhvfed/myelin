@@ -12,8 +12,8 @@ use myelin_storage::{
     StartAgentTriggerFiringOutcome, SubstrateProvider, TerminalizeAgentTriggerClaimOutcome,
 };
 use sqlx::types::chrono::Utc;
-use sqlx::types::Uuid;
 use std::time::Duration;
+use uuid::Uuid;
 
 fn app_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
