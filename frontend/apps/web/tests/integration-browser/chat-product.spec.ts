@@ -106,6 +106,8 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   const commitOid = (JSON.parse(commitText) as { applied: { new_oid: string } }).applied.new_oid;
   expect(commitOid).toMatch(/^[0-9a-f]{40}$/);
   const commitRef = `myelin://${tenant}/git/commit/${repository}:${commitOid}`;
+  const blobRef =
+    `myelin://${tenant}/git/blob/${repository}:refs%2Fheads%2Fmain:README%2Emd#L1-L1`;
 
   await signIn(page);
   await navigateToApp(page, "/chat");
@@ -141,6 +143,26 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await commitCard.click();
   await expect(page).toHaveURL(new RegExp(`/git/repos/${repository}/commit/${commitOid}$`));
   await expect(page.getByRole("heading", { level: 1, name: commitTitle })).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: topic })).toBeVisible();
+
+  await page.getByLabel(`Message ${topic}`).fill("Open the exact file discussed here.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(blobRef);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const blobCard = page.getByRole("link", { name: `${repository} · README.md, file` });
+  await expect(blobCard)
+    .toHaveAttribute(
+      "href",
+      `/git/repos/${repository}/blob/refs%2Fheads%2Fmain/README.md#L1-L1`,
+    );
+  await blobCard.click();
+  await expect(page).toHaveURL(
+    new RegExp(`/git/repos/${repository}/blob/refs%2Fheads%2Fmain/README.md#L1-L1$`),
+  );
+  await expect(page.getByRole("heading", { level: 1, name: "README.md" })).toBeVisible();
+  await expect(page.locator("#L1")).toContainText(`# ${repository}`);
   await page.goBack();
   await expect(page.getByRole("heading", { name: topic })).toBeVisible();
 

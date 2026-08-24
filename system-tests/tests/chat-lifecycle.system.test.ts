@@ -66,6 +66,8 @@ async function createPrivatePullRequest(
     commitTitle,
     branchRef: `myelin://${systemTestConfig.tenant}/git/ref/${repository.slug}:${encodeSubjectComponent(`refs/heads/${branch}`)}`,
     branchTitle: `${repository.slug} · ${branch}`,
+    blobRef: `myelin://${systemTestConfig.tenant}/git/blob/${encodeSubjectComponent(repository.slug)}:${encodeSubjectComponent(`refs/heads/${branch}`)}:${encodeSubjectComponent("plan.md")}`,
+    blobTitle: `${repository.slug} · plan.md`,
   };
 }
 
@@ -555,17 +557,19 @@ describe("chat collaboration lifecycle", () => {
     });
     await room.post(
       systemClient,
-      "Compare my repository \uFFFC, change \uFFFC, commit \uFFFC, and branch \uFFFC with yours \uFFFC, \uFFFC, \uFFFC, and \uFFFC.",
+      "Compare my repository \uFFFC, change \uFFFC, commit \uFFFC, branch \uFFFC, and file \uFFFC with yours \uFFFC, \uFFFC, \uFFFC, \uFFFC, and \uFFFC.",
       {
         references: [
           foundersWork.repositoryRef,
           foundersWork.pullRequestRef,
           foundersWork.commitRef,
           foundersWork.branchRef,
+          foundersWork.blobRef,
           reviewersWork.repositoryRef,
           reviewersWork.pullRequestRef,
           reviewersWork.commitRef,
           reviewersWork.branchRef,
+          reviewersWork.blobRef,
         ],
       },
     );
@@ -615,6 +619,16 @@ describe("chat collaboration lifecycle", () => {
             }),
           }),
           expect.objectContaining({
+            ref: foundersWork.blobRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: foundersWork.blobTitle,
+              state: "file",
+              icon: "file",
+              render_hint: "git_blob",
+            }),
+          }),
+          expect.objectContaining({
             ref: reviewersWork.repositoryRef,
             card: { kind: "tombstone" },
           }),
@@ -630,12 +644,17 @@ describe("chat collaboration lifecycle", () => {
             ref: reviewersWork.branchRef,
             card: { kind: "tombstone" },
           }),
+          expect.objectContaining({
+            ref: reviewersWork.blobRef,
+            card: { kind: "tombstone" },
+          }),
         ],
       }),
     ]);
     expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWork.pullRequestTitle);
     expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWork.commitTitle);
     expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWork.branchTitle);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWork.blobTitle);
 
     const reviewersHistory = await room.messages(reviewerClient);
     expect(reviewersHistory).toEqual([
@@ -655,6 +674,10 @@ describe("chat collaboration lifecycle", () => {
           }),
           expect.objectContaining({
             ref: foundersWork.branchRef,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: foundersWork.blobRef,
             card: { kind: "tombstone" },
           }),
           expect.objectContaining({
@@ -697,12 +720,23 @@ describe("chat collaboration lifecycle", () => {
               render_hint: "git_ref",
             }),
           }),
+          expect.objectContaining({
+            ref: reviewersWork.blobRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: reviewersWork.blobTitle,
+              state: "file",
+              icon: "file",
+              render_hint: "git_blob",
+            }),
+          }),
         ],
       }),
     ]);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.pullRequestTitle);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.commitTitle);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.branchTitle);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.blobTitle);
   });
 
   test("keeps a shared runbook legible while a private notebook stays nameless", async () => {

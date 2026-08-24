@@ -16,8 +16,8 @@ fn provider_mints() -> Vec<(SubKind, ArtifactRef)> {
         ),
         (
             SubKind::LineRange,
-            mint_blob_line_range("acme-eu", "repo7", "main", "src/lib.rs", 42, 88)
-                .expect("line-range mint is grammatical (path percent-encoded, REF-3 deviation)"),
+            mint_blob_line_range("acme-eu", "repo7", "refs/heads/main", "src/lib.rs", 42, 88)
+                .expect("line-range mint uses the canonical blob event coordinate"),
         ),
     ]
 }
@@ -58,7 +58,7 @@ fn cdc_5_7_git_provider_mints_consumer_accepts_and_classifies_every_kind() {
 #[test]
 fn cdc_5_7_consumer_rejects_a_malformed_git_mint_loudly() {
     assert!(mint_pr_comment("acme", "r", 1, "").is_err());
-    assert!(mint_blob_line_range("acme", "r", "main", "f.rs", 88, 42).is_err());
+    assert!(mint_blob_line_range("acme", "r", "refs/heads/main", "f.rs", 88, 42).is_err());
 }
 
 #[test]

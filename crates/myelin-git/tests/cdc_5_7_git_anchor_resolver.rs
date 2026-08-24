@@ -50,7 +50,8 @@ fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
     let commit = oid("commit");
 
     {
-        let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 5, 6).unwrap();
+        let minted =
+            mint_blob_line_range("acme", "repo7", "refs/heads/main", "src/a.rs", 5, 6).unwrap();
         let anchor = LineAnchor::mint(
             &pre,
             "src/a.rs",
@@ -67,7 +68,8 @@ fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
     }
 
     {
-        let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 5, 6).unwrap();
+        let minted =
+            mint_blob_line_range("acme", "repo7", "refs/heads/main", "src/a.rs", 5, 6).unwrap();
         let anchor = LineAnchor::mint(
             &pre,
             "src/a.rs",
@@ -101,7 +103,8 @@ fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
     }
 
     {
-        let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 5, 6).unwrap();
+        let minted =
+            mint_blob_line_range("acme", "repo7", "refs/heads/main", "src/a.rs", 5, 6).unwrap();
         let anchor = LineAnchor::mint(
             &pre,
             "src/a.rs",
@@ -128,7 +131,8 @@ fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
     }
 
     {
-        let minted = mint_blob_line_range("acme", "repo7", "main", "src/a.rs", 9, 10).unwrap();
+        let minted =
+            mint_blob_line_range("acme", "repo7", "refs/heads/main", "src/a.rs", 9, 10).unwrap();
         let anchor = LineAnchor::mint(
             &pre,
             "src/a.rs",
@@ -156,9 +160,13 @@ fn cdc_5_7_git_resolver_returns_exactly_one_of_the_four_frozen_states() {
 
 #[test]
 fn cdc_5_7_resolver_seam_is_line_range_only_and_strips_to_a_git_blob_root() {
-    let minted = mint_blob_line_range("acme", "repo7", "main", "src/lib.rs", 42, 88).unwrap();
+    let minted =
+        mint_blob_line_range("acme", "repo7", "refs/heads/main", "src/lib.rs", 42, 88).unwrap();
     let root = strip_sub(&minted);
-    assert!(myelin_refs::format(&root).starts_with("myelin://acme/git/blob/repo7:main:"));
+    assert_eq!(
+        myelin_refs::format(&root),
+        "myelin://acme/git/blob/repo7:refs%2Fheads%2Fmain:src%2Flib%2Ers"
+    );
     assert!(!myelin_refs::format(&root).contains('#'));
     let comment = myelin_refs::mint(&pr_root(), Sub::Comment("c1".into())).unwrap();
     assert_eq!(line_range_of(&comment), None);

@@ -279,7 +279,8 @@ pub fn blob_root(reference: &ArtifactRef) -> ArtifactRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subs::{decode_path_segment, mint_blob_line_range};
+    use crate::blob_coordinate::GitBlobEventKey;
+    use crate::subs::mint_blob_line_range;
 
     fn blob(lines: &[&str]) -> Vec<u8> {
         lines.join("\n").into_bytes()
@@ -476,11 +477,18 @@ mod tests {
 
     #[test]
     fn minted_sub_round_trips_to_the_resolver_range() {
-        let r = mint_blob_line_range("acme", "repo7", "main", "src/charge.rs", 4, 5).unwrap();
+        let r = mint_blob_line_range("acme", "repo7", "refs/heads/main", "src/charge.rs", 4, 5)
+            .unwrap();
         assert_eq!(line_range_of(&r), Some(LineRange::new(4, 5)));
         let root = blob_root(&r);
         assert!(!myelin_refs::format(&root).contains('#'));
-        assert_eq!(decode_path_segment("src%2Fcharge.rs"), "src/charge.rs");
+        assert_eq!(
+            GitBlobEventKey::parse_id("repo7:refs%2Fheads%2Fmain:src%2Fcharge%2Ers")
+                .unwrap()
+                .1
+                .path(),
+            "src/charge.rs"
+        );
     }
 
     #[test]

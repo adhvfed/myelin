@@ -4,6 +4,7 @@ import {
   artifactRefHref,
   artifactRefLabel,
   parseArtifactRef,
+  parseGitBlobRef,
   parseGitCommitRef,
   parseGitPullRequestRef,
   parseGitReferenceRef,
@@ -76,6 +77,12 @@ describe("artifact references", () => {
     expect(artifactRefHref(
       "myelin://acme/git/ref/platform%2Fapi:refs%2Fheads%2Frelease%2Fone",
     )).toBe("/git/repos/platform%2Fapi/tree/refs%2Fheads%2Frelease%2Fone");
+    expect(artifactRefLabel(
+      "myelin://acme/git/blob/platform%2Fapi:refs%2Fheads%2Fmain:src%2Flib%2Ets#L7-L9",
+    )).toBe("platform/api · src/lib.ts");
+    expect(artifactRefHref(
+      "myelin://acme/git/blob/platform%2Fapi:refs%2Fheads%2Fmain:src%2Flib%2Ets#L7-L9",
+    )).toBe("/git/repos/platform%2Fapi/blob/refs%2Fheads%2Fmain/src/lib.ts#L7-L9");
     expect(artifactRefLabel("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
       .toBe("CI run · 00000001");
     expect(artifactRefHref("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
@@ -144,6 +151,25 @@ describe("artifact references", () => {
       "myelin://acme/git/ref/%70latform:refs%2Fheads%2Fmain",
       `myelin://acme/git/ref/${"a".repeat(1025)}:refs%2Fheads%2Fmain`,
     ]) expect(parseGitReferenceRef(value), value).toBeNull();
+  });
+
+  it("parses a canonical Git file and carries its line range to the exact blob route", () => {
+    const root = "myelin://acme/git/blob/platform%2Fapi:refs%2Fheads%2Fmain:src%2Flib%2Ets";
+    expect(parseGitBlobRef(`${root}#L7-L9`)).toEqual({
+      tenant: "acme",
+      repo: "platform/api",
+      ref: "refs/heads/main",
+      path: "src/lib.ts",
+      sub: "L7-L9",
+      root,
+    });
+    for (const value of [
+      "myelin://acme/git/blob/platform/api:main:src%2Flib.ts",
+      "myelin://acme/git/blob/platform:refs%2Fnotes%2Fbuild:src%2Flib%2Ets",
+      "myelin://acme/git/blob/platform:refs%2Fheads%2Fmain:src%2F..%2Fsecret",
+      "myelin://acme/git/blob/platform:refs%2Fheads%2Fmain:src%2Flib%2Ets#comment-x",
+      "myelin://acme/git/blob/platform:refs%2fheads%2fmain:src%2Flib%2Ets",
+    ]) expect(parseGitBlobRef(value), value).toBeNull();
   });
 
   it("validates a related-work edge against source, tenant, and existing edges", () => {

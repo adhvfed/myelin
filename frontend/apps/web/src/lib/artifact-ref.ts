@@ -3,6 +3,8 @@ import {
   parseGitPullRequestNumberText,
 } from "./git-coordinate";
 import { isFullGitRef } from "./git-ref";
+import { isGitPath } from "./git-read-input";
+import { gitBlobPath } from "./git-route";
 
 const utf8 = new TextEncoder();
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
@@ -46,6 +48,15 @@ export interface GitReferenceRef {
   tenant: string;
   repo: string;
   ref: string;
+  sub: string | null;
+  root: string;
+}
+
+export interface GitBlobRef {
+  tenant: string;
+  repo: string;
+  ref: string;
+  path: string;
   sub: string | null;
   root: string;
 }
@@ -155,6 +166,20 @@ export function parseGitReferenceRef(value: unknown): GitReferenceRef | null {
   return { tenant: parsed.tenant, repo, ref, sub: parsed.sub, root: parsed.root };
 }
 
+export function parseGitBlobRef(value: unknown): GitBlobRef | null {
+  const parsed = parseArtifactRef(value);
+  if (!parsed || parsed.subsystem !== "git" || parsed.type !== "blob" ||
+      (parsed.sub !== null && !/^L[1-9][0-9]*-L[1-9][0-9]*$/.test(parsed.sub))) return null;
+  const components = parsed.id.split(":");
+  if (components.length !== 3) return null;
+  const repo = decodeSubjectComponent(components[0]!);
+  const ref = decodeSubjectComponent(components[1]!);
+  const path = decodeSubjectComponent(components[2]!);
+  if (!repo || !ref || !path || !isGitRepositorySlug(repo) ||
+      (!isFullGitRef(ref) && !isCanonicalGitOid(ref)) || !isGitPath(path)) return null;
+  return { tenant: parsed.tenant, repo, ref, path, sub: parsed.sub, root: parsed.root };
+}
+
 function unsignedLessThanOrEqual(left: string, right: string): boolean {
   return left.length < right.length || (left.length === right.length && left <= right);
 }
@@ -209,6 +234,8 @@ export function artifactRefLabel(reference: string): string {
   if (commit) return `${commit.repo} · ${commit.oid.slice(0, 12)}`;
   const gitRef = parseGitReferenceRef(reference);
   if (gitRef) return `${gitRef.repo} · ${gitRef.ref.replace(/^refs\/(?:heads|tags)\//, "")}`;
+  const blob = parseGitBlobRef(reference);
+  if (blob) return `${blob.repo} · ${blob.path}`;
   if (parsed.subsystem === "knowledge" && parsed.type === "page") {
     return `Knowledge · ${parsed.id.slice(-6)}`;
   }
@@ -239,6 +266,10 @@ export function artifactRefHref(reference: string): string | undefined {
   const gitRef = parseGitReferenceRef(reference);
   if (gitRef) {
     return `/git/repos/${encodeURIComponent(gitRef.repo)}/tree/${encodeURIComponent(gitRef.ref)}`;
+  }
+  const blob = parseGitBlobRef(reference);
+  if (blob) {
+    return `${gitBlobPath(blob.repo, blob.ref, blob.path)}${blob.sub ? `#${blob.sub}` : ""}`;
   }
   if (parsed.subsystem === "ci" && parsed.type === "run" && isCanonicalUuid(parsed.id)) {
     return `/ci/runs/${encodeURIComponent(parsed.id)}`;

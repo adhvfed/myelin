@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_events::{
     AggregateKey, ArtifactRef, DataRole, EmitContextBase, EventDraft, EventType, IdMinter,
-    OutboxError, OutboxStore, OutboxTx, SubjectComponent, Visibility,
+    OutboxError, OutboxStore, OutboxTx, Visibility,
 };
 use myelin_query::FieldValue;
 use myelin_search::SearchProjection;
 
+use crate::blob_coordinate::GitBlobEventKey;
 use crate::events::GIT_BLOB_SNAPSHOT;
 use crate::receive_pack::{GitRefEventKey, RefName};
 use crate::search_projection::{FACET_BLOB_OID, FACET_LANGUAGE, FACET_PATH};
@@ -497,20 +498,9 @@ impl<'a, R: RestrictionPolicy> CodeProjectionEmitter<'a, R> {
     }
 
     fn blob_ref(&self, ref_name: &str, path: &str) -> Result<ArtifactRef, OutboxError> {
-        let repo = SubjectComponent::encode(&self.repo)
-            .map_err(|_| OutboxError("invalid blob repository component".into()))?;
-        let ref_name = SubjectComponent::encode(ref_name)
-            .map_err(|_| OutboxError("invalid blob ref component".into()))?;
-        let path = SubjectComponent::encode(path)
-            .map_err(|_| OutboxError("invalid blob path component".into()))?;
-        myelin_refs::parse(&format!(
-            "myelin://{}/git/blob/{}:{}:{}",
-            self.ctx_base.tenant.0,
-            repo.as_str(),
-            ref_name.as_str(),
-            path.as_str()
-        ))
-        .map_err(|_| OutboxError("invalid canonical blob reference".into()))
+        GitBlobEventKey::new(&self.repo, ref_name, path)
+            .and_then(|key| key.subject(&self.ctx_base.tenant.0))
+            .map_err(|_| OutboxError("invalid canonical blob reference".into()))
     }
 
     fn aggregate(&self, ref_name: &str) -> Result<AggregateKey, OutboxError> {

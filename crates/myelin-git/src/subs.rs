@@ -1,5 +1,7 @@
 use myelin_refs::{mint, ArtifactRef, ParseError, Sub, SubKind, SubKindRegistration};
 
+use crate::blob_coordinate::{GitBlobEventKey, GitBlobEventKeyError};
+
 pub const GIT_SUBSYSTEM: &str = "git";
 
 pub const GIT_OWNED_SUB_KINDS: &[SubKind] =
@@ -22,19 +24,8 @@ fn blob_root(
     repo: &str,
     git_ref: &str,
     path: &str,
-) -> Result<ArtifactRef, ParseError> {
-    let encoded_path = encode_path_segment(path);
-    myelin_refs::parse(&format!(
-        "myelin://{tenant}/git/blob/{repo}:{git_ref}:{encoded_path}"
-    ))
-}
-
-pub fn encode_path_segment(path: &str) -> String {
-    path.replace('%', "%25").replace('/', "%2F")
-}
-
-pub fn decode_path_segment(encoded: &str) -> String {
-    encoded.replace("%2F", "/").replace("%25", "%")
+) -> Result<ArtifactRef, GitSubMintError> {
+    Ok(GitBlobEventKey::new(repo, git_ref, path)?.subject(tenant)?)
 }
 
 pub fn mint_pr_comment(
@@ -64,9 +55,32 @@ pub fn mint_blob_line_range(
     path: &str,
     start: u64,
     end: u64,
-) -> Result<ArtifactRef, ParseError> {
+) -> Result<ArtifactRef, GitSubMintError> {
     let root = blob_root(tenant, repo, git_ref, path)?;
-    mint(&root, Sub::LineRange { start, end })
+    mint(&root, Sub::LineRange { start, end }).map_err(GitSubMintError::Reference)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitSubMintError {
+    BlobCoordinate(GitBlobEventKeyError),
+    Reference(ParseError),
+}
+
+impl std::fmt::Display for GitSubMintError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BlobCoordinate(error) => error.fmt(formatter),
+            Self::Reference(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for GitSubMintError {}
+
+impl From<GitBlobEventKeyError> for GitSubMintError {
+    fn from(error: GitBlobEventKeyError) -> Self {
+        Self::BlobCoordinate(error)
+    }
 }
 
 #[cfg(test)]
@@ -106,26 +120,35 @@ mod tests {
         );
         assert_eq!(sub_kind(&t).map(|s| s.kind()), Some(SubKind::Thread));
 
-        let l = mint_blob_line_range("acme-eu", "repo7", "main", "src/lib.rs", 42, 88).unwrap();
+        let l = mint_blob_line_range("acme-eu", "repo7", "refs/heads/main", "src/lib.rs", 42, 88)
+            .unwrap();
         assert_eq!(
             myelin_refs::format(&l),
-            "myelin://acme-eu/git/blob/repo7:main:src%2Flib.rs#L42-L88"
+            "myelin://acme-eu/git/blob/repo7:refs%2Fheads%2Fmain:src%2Flib%2Ers#L42-L88"
         );
         assert_eq!(sub_kind(&l).map(|s| s.kind()), Some(SubKind::LineRange));
         assert_eq!(
             myelin_refs::format(&strip_sub(&l)),
-            "myelin://acme-eu/git/blob/repo7:main:src%2Flib.rs"
+            "myelin://acme-eu/git/blob/repo7:refs%2Fheads%2Fmain:src%2Flib%2Ers"
         );
-        assert_eq!(decode_path_segment("src%2Flib.rs"), "src/lib.rs");
-        assert_eq!(decode_path_segment("a%25b%2Fc"), "a%b/c");
+        assert_eq!(
+            GitBlobEventKey::parse_id("repo7:refs%2Fheads%2Fmain:src%2Flib%2Ers").unwrap(),
+            (
+                "repo7".into(),
+                crate::blob_coordinate::GitBlobLocation::new("refs/heads/main", "src/lib.rs")
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
     fn line_range_endpoints_are_grammar_checked_at_mint_time() {
-        assert!(mint_blob_line_range("acme", "r", "main", "f.rs", 7, 7).is_ok());
+        assert!(mint_blob_line_range("acme", "r", "refs/heads/main", "f.rs", 7, 7).is_ok());
         assert!(matches!(
-            mint_blob_line_range("acme", "r", "main", "f.rs", 88, 42),
-            Err(ParseError::UnknownSubKind { .. })
+            mint_blob_line_range("acme", "r", "refs/heads/main", "f.rs", 88, 42),
+            Err(GitSubMintError::Reference(
+                ParseError::UnknownSubKind { .. }
+            ))
         ));
     }
 

@@ -3,6 +3,7 @@
 pub mod agent_author;
 pub mod anchor;
 pub mod backup;
+pub mod blob_coordinate;
 pub mod body;
 pub mod check_status;
 pub mod check_status_store;

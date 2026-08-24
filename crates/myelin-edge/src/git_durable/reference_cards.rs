@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use myelin_git::blob_coordinate::GitBlobLocation;
 use myelin_git::coordinate::RepositorySlug;
 use myelin_git::core::{is_canonical_object_id, Oid};
 use myelin_git::durable::{DurableError, RefKind};
@@ -17,6 +18,7 @@ pub(crate) struct GitReferenceCardBatch {
     pub pull_requests: Vec<GitPullRequestCard>,
     pub commits: Vec<GitCommitCard>,
     pub refs: Vec<GitRefCard>,
+    pub blobs: Vec<GitBlobCard>,
 }
 
 pub(crate) struct GitReferenceCardRequest<'a> {
@@ -24,6 +26,7 @@ pub(crate) struct GitReferenceCardRequest<'a> {
     pub pull_requests: &'a [(String, u64)],
     pub commits: &'a [(String, String)],
     pub refs: &'a [(String, String)],
+    pub blobs: &'a [(String, GitBlobLocation)],
 }
 
 impl GitReferenceCardRequest<'_> {
@@ -33,6 +36,7 @@ impl GitReferenceCardRequest<'_> {
             .saturating_add(self.pull_requests.len())
             .saturating_add(self.commits.len())
             .saturating_add(self.refs.len())
+            .saturating_add(self.blobs.len())
     }
 }
 
@@ -59,6 +63,13 @@ pub(crate) struct GitRefCard {
     pub kind: RefKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GitBlobCard {
+    pub repository: String,
+    pub location: GitBlobLocation,
+    pub title: String,
+}
+
 impl DurableGitBackend {
     pub(crate) fn visible_reference_cards(
         &self,
@@ -75,6 +86,7 @@ impl DurableGitBackend {
         let requested_pull_requests = requested_pull_requests(request.pull_requests)?;
         let requested_commits = requested_commits(request.commits)?;
         let requested_refs = requested_refs(request.refs)?;
+        let requested_blobs = request.blobs.iter().cloned().collect::<BTreeSet<_>>();
         let tenant = principal.tenant.as_str();
         let region = principal.region.as_str();
         let existing = self.visible_existing_repositories(principal, &requested_repositories)?;
@@ -161,10 +173,29 @@ impl DurableGitBackend {
                     continue;
                 };
                 refs.push(GitRefCard {
-                    title: ref_card_title(&repository, short_name),
+                    title: named_card_title(&repository, short_name),
                     repository: repository.clone(),
                     qualified_name: qualified_name.0,
                     kind,
+                });
+            }
+        }
+        let mut blobs = Vec::new();
+        let mut visible_blobs = BTreeMap::<String, Vec<GitBlobLocation>>::new();
+        for (repository, location) in requested_blobs {
+            if existing.contains(&repository) {
+                visible_blobs.entry(repository).or_default().push(location);
+            }
+        }
+        for (repository, locations) in visible_blobs {
+            let repo = self
+                .store
+                .open_repo(&Self::loc(tenant, region, &repository))?;
+            for (location, _) in repo.blob_oids_at_locations(&locations)? {
+                blobs.push(GitBlobCard {
+                    title: named_card_title(&repository, location.path()),
+                    repository: repository.clone(),
+                    location,
                 });
             }
         }
@@ -173,6 +204,7 @@ impl DurableGitBackend {
             pull_requests,
             commits,
             refs,
+            blobs,
         })
     }
 }
@@ -192,6 +224,7 @@ fn requested_repositories(
         )
         .chain(request.commits.iter().map(|(repository, _)| repository))
         .chain(request.refs.iter().map(|(repository, _)| repository))
+        .chain(request.blobs.iter().map(|(repository, _)| repository))
     {
         RepositorySlug::parse(repository)
             .map_err(|_| DurableError::Git("Git reference repository slug is malformed".into()))?;
@@ -240,7 +273,7 @@ fn commit_card_title(repository: &str, oid: &str, summary: &str) -> String {
     bounded_card_title(summary)
 }
 
-fn ref_card_title(repository: &str, short_name: &str) -> String {
+fn named_card_title(repository: &str, short_name: &str) -> String {
     bounded_card_title(&format!("{repository} · {short_name}"))
 }
 
@@ -319,7 +352,7 @@ mod tests {
         assert!(requested_refs(&[("team/api".into(), "refs/notes/build".into())]).is_err());
         assert!(requested_refs(&[("team/api".into(), "refs/heads/../hidden".into())]).is_err());
 
-        let title = ref_card_title("team/api", &"ø".repeat(300));
+        let title = named_card_title("team/api", &"ø".repeat(300));
         assert_eq!(title.len(), 512);
         assert!(title.starts_with("team/api · "));
         assert_eq!(title.chars().count(), 261);

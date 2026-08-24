@@ -3,6 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::blob_coordinate::GitBlobLocation;
 use crate::core::{Oid, RepoLoc};
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
 use crate::receive_pack::RefName;
@@ -324,6 +325,7 @@ pub const COMMIT_META_MAX_SUMMARY_BYTES: usize = 8 * 1024;
 pub const COMMIT_META_MAX_IDENTITY_BYTES: usize = 1_024;
 pub const COMMIT_META_BATCH_MAX: usize = 10_000;
 pub const REF_LOOKUP_BATCH_MAX: usize = 10_000;
+pub const BLOB_LOOKUP_BATCH_MAX: usize = 10_000;
 pub const COMMIT_LOG_MAX_OFFSET: usize = 100_000;
 pub const COMMIT_LOG_MAX_PAGE: usize = 500;
 pub const PR_COMMIT_MAX_POSITION: usize = 100_000;
@@ -1100,6 +1102,51 @@ impl DurableGitRepo {
             }
             BlobPathLookup::IsDir | BlobPathLookup::Missing => Ok(None),
         }
+    }
+
+    /// Resolves an exact bounded set of files while opening the repository once. Missing refs,
+    /// directories, and missing paths are absent; unexpected repository failures remain loud.
+    pub fn blob_oids_at_locations(
+        &self,
+        locations: &[GitBlobLocation],
+    ) -> Result<Vec<(GitBlobLocation, Oid)>, DurableError> {
+        if locations.len() > BLOB_LOOKUP_BATCH_MAX {
+            return Err(DurableError::InvalidInput(format!(
+                "at most {BLOB_LOOKUP_BATCH_MAX} blob locations may be read at once"
+            )));
+        }
+        if locations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let repo = self.open_git()?;
+        let mut grouped = std::collections::BTreeMap::<String, Vec<GitBlobLocation>>::new();
+        for location in locations.iter().cloned().collect::<HashSet<_>>() {
+            grouped
+                .entry(location.ref_name().to_owned())
+                .or_default()
+                .push(location);
+        }
+        let mut blobs = Vec::new();
+        for (ref_name, mut locations) in grouped {
+            locations.sort();
+            let Some(commit) = self.resolve_commit(&repo, &ref_name)? else {
+                continue;
+            };
+            let tree = commit
+                .tree()
+                .map_err(|error| git_err("commit tree", error))?;
+            for location in locations {
+                match tree.get_path(Path::new(location.path())) {
+                    Ok(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {
+                        blobs.push((location, Oid::new(entry.id().to_string())));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+                    Err(error) => return Err(git_err("tree get_path", error)),
+                }
+            }
+        }
+        Ok(blobs)
     }
 
     fn read_blob_from_commit(
@@ -4442,6 +4489,28 @@ mod tests {
             repo.blob_oid_at_path("main", "crates/inner/deep.rs")
                 .unwrap(),
             Some(oid)
+        );
+        let exact = repo
+            .blob_oids_at_locations(&[
+                GitBlobLocation::new("refs/tags/v1.0", "README.md").unwrap(),
+                GitBlobLocation::new("refs/heads/main", "crates/inner/deep.rs").unwrap(),
+                GitBlobLocation::new("refs/heads/main", "no/such/file").unwrap(),
+                GitBlobLocation::new("refs/heads/main", "crates/inner").unwrap(),
+                GitBlobLocation::new("refs/tags/v1.0", "README.md").unwrap(),
+            ])
+            .expect("exact blob locations");
+        assert_eq!(
+            exact
+                .iter()
+                .map(|(location, oid)| {
+                    assert_eq!(oid.as_str().len(), 40);
+                    (location.ref_name(), location.path())
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("refs/heads/main", "crates/inner/deep.rs"),
+                ("refs/tags/v1.0", "README.md"),
+            ]
         );
         assert!(matches!(
             repo.read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1).unwrap(),

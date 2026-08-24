@@ -80,9 +80,15 @@ fn commit_trailer_reference_sources_from_the_commit_root() {
 #[test]
 fn force_pushed_line_range_resolves_moved_with_shifted_anchor() {
     let owner = GitOwner::new();
-    let ref_ =
-        myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "main", "src/lib.rs", 42, 44)
-            .expect("grammatical line-range mint");
+    let ref_ = myelin_git::subs::mint_blob_line_range(
+        "acme-eu",
+        "repo7",
+        "refs/heads/main",
+        "src/lib.rs",
+        42,
+        44,
+    )
+    .expect("grammatical line-range mint");
 
     let original = [
         "// header",
@@ -110,7 +116,7 @@ fn force_pushed_line_range_resolves_moved_with_shifted_anchor() {
             );
             assert_eq!(
                 p.sub_anchor.as_deref().unwrap(),
-                "myelin://acme-eu/git/blob/repo7:main:src%2Flib.rs#L45-L47"
+                "myelin://acme-eu/git/blob/repo7:refs%2Fheads%2Fmain:src%2Flib%2Ers#L45-L47"
             );
         }
         other => panic!("expected MOVED Live, got {other:?}"),
@@ -120,8 +126,9 @@ fn force_pushed_line_range_resolves_moved_with_shifted_anchor() {
 #[test]
 fn partially_edited_line_range_resolves_outdated() {
     let owner = GitOwner::new();
-    let ref_ = myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "main", "f.rs", 1, 3)
-        .expect("grammatical");
+    let ref_ =
+        myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "refs/heads/main", "f.rs", 1, 3)
+            .expect("grammatical");
     let original = vec!["line A", "line B", "line C"];
     let minted = MintedLineRange::mint("oid-1", &original, 1, 3);
     let edited = vec!["line A", "line B", "line C REWRITTEN", "tail"];
@@ -133,7 +140,7 @@ fn partially_edited_line_range_resolves_outdated() {
             assert_eq!(p.flag, Some(crate::resolve::ProjectionFlag::Outdated));
             assert_eq!(
                 p.sub_anchor.as_deref().unwrap(),
-                "myelin://acme-eu/git/blob/repo7:main:f.rs#L1-L2"
+                "myelin://acme-eu/git/blob/repo7:refs%2Fheads%2Fmain:f%2Ers#L1-L2"
             );
         }
         other => panic!("expected OUTDATED Live, got {other:?}"),
@@ -143,8 +150,9 @@ fn partially_edited_line_range_resolves_outdated() {
 #[test]
 fn content_gone_line_range_tombstones_carrying_the_root() {
     let owner = GitOwner::new();
-    let ref_ = myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "main", "g.rs", 1, 2)
-        .expect("grammatical");
+    let ref_ =
+        myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "refs/heads/main", "g.rs", 1, 2)
+            .expect("grammatical");
     let original = vec!["secret line 1", "secret line 2"];
     let minted = MintedLineRange::mint("oid-1", &original, 1, 2);
     let rewritten = vec!["// file is now empty-ish", "// nothing here"];
@@ -167,15 +175,19 @@ fn content_gone_line_range_tombstones_carrying_the_root() {
     assert_eq!(res.tombstone_reason(), Some(TombstoneReason::SubGone));
     if let crate::resolve::Resolution::Tombstone(t) = res {
         assert_eq!(t.root, strip_sub(&ref_));
-        assert_eq!(t.root.0, "myelin://acme-eu/git/blob/repo7:main:g.rs");
+        assert_eq!(
+            t.root.0,
+            "myelin://acme-eu/git/blob/repo7:refs%2Fheads%2Fmain:g%2Ers"
+        );
     }
 }
 
 #[test]
 fn exact_line_range_resolves_live() {
     let owner = GitOwner::new();
-    let ref_ = myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "main", "h.rs", 1, 1)
-        .expect("grammatical");
+    let ref_ =
+        myelin_git::subs::mint_blob_line_range("acme-eu", "repo7", "refs/heads/main", "h.rs", 1, 1)
+            .expect("grammatical");
     let lines = vec!["fn main() {}"];
     let minted = MintedLineRange::mint("oid-X", &lines, 1, 1);
     owner.record_line_range(&ref_, minted, "oid-X", &lines);

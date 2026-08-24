@@ -1350,6 +1350,31 @@ canonical-coordinate, deduplication, and UTF-8-boundary tests; warning-free
 clippy across every Git and Edge target and feature; 642 browser units; and the
 eight rebuilt live Chat lifecycle stories.
 
+## 2026-08-25 — one canonical Git file coordinate reaches Chat and the browser
+
+Git file references no longer have two producer spellings. Code search
+projection and line-range minting now share `GitBlobEventKey`, which owns the
+repository, full branch/tag-or-exact-commit selector, safe path, canonical
+subject-component encoding, parsing, and bounded shape. The weaker
+`repo:main:src%2Ffile.rs` helper and its slash-only codec are gone; producers now
+emit the same coordinate the durable owner and browser consume.
+
+For a repository reader, Chat verifies an exact bounded set of file locations
+through one repository open and projects a file card without reading file
+contents. Missing paths, directories, hidden repositories, and malformed
+coordinates become content-free tombstones. Canonical line-range subanchors are
+preserved on the card and in the exact browser URL. The two-owner TypeScript
+story now compares each engineer's repository, pull request, commit, branch,
+and file without revealing the other engineer's card titles. Chromium follows
+a real `README.md#L1-L1` card into the repository file viewer and back to the
+durable conversation.
+
+Proof: the complete Git, Edge, and Refs-service library suites; the Git 5.7
+provider/consumer and anchor contracts; focused canonical-coordinate,
+exact-file-batch, and line-range tests; warning-free clippy across all three
+crates and every target/feature; 643 browser units; all eight rebuilt live Chat
+lifecycle stories; and both real Chromium Chat journeys.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1379,7 +1404,7 @@ eight rebuilt live Chat lifecycle stories.
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
    content-free tombstones for denied or unavailable artifacts. Git
-   blobs, reviews, and comments, other CI artifacts, plus Chat messages and threads
+   reviews and comments, other CI artifacts, plus Chat messages and threads
    still retain their canonical link rather than a rich card because their durable owner projectors
    are not composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,

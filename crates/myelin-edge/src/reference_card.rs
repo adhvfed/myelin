@@ -44,6 +44,23 @@ impl ReferenceCard {
         }
     }
 
+    fn projection_at(
+        title: String,
+        state: impl Into<String>,
+        icon: impl Into<String>,
+        render_hint: impl Into<String>,
+        sub_anchor: Option<String>,
+    ) -> Self {
+        let mut card = Self::projection(title, state, icon, render_hint);
+        if let Self::Projection {
+            sub_anchor: anchor, ..
+        } = &mut card
+        {
+            *anchor = sub_anchor;
+        }
+        card
+    }
+
     fn issue(issue: &StoredIssue) -> Self {
         Self::projection(issue.title.clone(), issue.state.clone(), "issue", "issue")
     }
@@ -303,10 +320,12 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
         let pull_request_roots = root_references(viewer, references, "git", "pr");
         let commit_roots = root_references(viewer, references, "git", "commit");
         let ref_roots = root_references(viewer, references, "git", "ref");
+        let blob_roots = blob_root_references(viewer, references);
         if repository_references.is_empty()
             && pull_request_roots.is_empty()
             && commit_roots.is_empty()
             && ref_roots.is_empty()
+            && blob_roots.is_empty()
         {
             return HashMap::new();
         }
@@ -314,6 +333,7 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
         cards.extend(claimed_tombstones(&pull_request_roots));
         cards.extend(claimed_tombstones(&commit_roots));
         cards.extend(claimed_tombstones(&ref_roots));
+        cards.extend(claimed_blob_tombstones(&blob_roots));
 
         let repositories = repository_references
             .keys()
@@ -326,11 +346,14 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
         let commits = commit_references.keys().cloned().collect::<Vec<_>>();
         let ref_references = canonical_git_ref_references(&ref_roots);
         let refs = ref_references.keys().cloned().collect::<Vec<_>>();
+        let blob_references = canonical_blob_references(&blob_roots);
+        let blobs = blob_references.keys().cloned().collect::<Vec<_>>();
         let request = crate::git_durable::GitReferenceCardRequest {
             repositories: &repositories,
             pull_requests: &pull_requests,
             commits: &commits,
             refs: &refs,
+            blobs: &blobs,
         };
         let Ok(visible) = self.git.visible_reference_cards(viewer, request) else {
             return cards;
@@ -382,6 +405,24 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
             let card = ReferenceCard::projection(git_ref.title, state, icon, "git_ref");
             for reference in references {
                 cards.insert(reference.clone(), card.clone());
+            }
+        }
+        for blob in visible.blobs {
+            let coordinate = (blob.repository, blob.location);
+            let Some(references) = blob_references.get(&coordinate) else {
+                continue;
+            };
+            for reference in references {
+                cards.insert(
+                    reference.original.clone(),
+                    ReferenceCard::projection_at(
+                        blob.title.clone(),
+                        "file",
+                        "file",
+                        "git_blob",
+                        reference.sub_anchor.clone(),
+                    ),
+                );
             }
         }
         cards
@@ -442,6 +483,53 @@ fn canonical_git_ref_references(
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedBlobReference {
+    original: String,
+    sub_anchor: Option<String>,
+}
+
+fn blob_root_references(
+    viewer: &Principal,
+    references: &[String],
+) -> BTreeMap<String, Vec<OwnedBlobReference>> {
+    let mut owned = BTreeMap::<String, Vec<OwnedBlobReference>>::new();
+    for reference in references {
+        let Ok(parsed) = myelin_refs::parse_scoped(reference) else {
+            continue;
+        };
+        if parsed.tenant != viewer.tenant || parsed.subsystem != "git" || parsed.type_ != "blob" {
+            continue;
+        }
+        let sub_anchor = match parsed.sub {
+            None => None,
+            Some(myelin_refs::Sub::LineRange { start, end }) => Some(format!("L{start}-L{end}")),
+            Some(_) => continue,
+        };
+        owned
+            .entry(parsed.id)
+            .or_default()
+            .push(OwnedBlobReference {
+                original: reference.clone(),
+                sub_anchor,
+            });
+    }
+    owned
+}
+
+fn canonical_blob_references(
+    roots: &BTreeMap<String, Vec<OwnedBlobReference>>,
+) -> BTreeMap<(String, myelin_git::blob_coordinate::GitBlobLocation), Vec<OwnedBlobReference>> {
+    roots
+        .iter()
+        .filter_map(|(id, references)| {
+            myelin_git::blob_coordinate::GitBlobEventKey::parse_id(id)
+                .ok()
+                .map(|coordinate| (coordinate, references.clone()))
+        })
+        .collect()
+}
+
 fn root_references(
     viewer: &Principal,
     references: &[String],
@@ -475,6 +563,16 @@ fn claimed_tombstones(
         .flatten()
         .cloned()
         .map(|reference| (reference, ReferenceCard::Tombstone))
+        .collect()
+}
+
+fn claimed_blob_tombstones(
+    owned_references: &BTreeMap<String, Vec<OwnedBlobReference>>,
+) -> HashMap<String, ReferenceCard> {
+    owned_references
+        .values()
+        .flatten()
+        .map(|reference| (reference.original.clone(), ReferenceCard::Tombstone))
         .collect()
 }
 
@@ -612,6 +710,38 @@ mod tests {
                 ("team/api".into(), "refs/heads/release/one".into()),
                 vec!["myelin://acme/git/ref/team%2Fapi:refs%2Fheads%2Frelease%2Fone".into()]
             )])
+        );
+    }
+
+    #[test]
+    fn blob_roots_share_one_coordinate_and_preserve_only_line_range_subanchors() {
+        let root = "myelin://acme/git/blob/team%2Fapi:refs%2Fheads%2Fmain:src%2Fmain%2Ers";
+        let references = [
+            root.into(),
+            format!("{root}#L7-L9"),
+            format!("{root}#comment-not-a-blob-anchor"),
+            "myelin://acme/git/blob/team/api:main:src%2Fmain.rs".into(),
+            "myelin://other/git/blob/team%2Fapi:refs%2Fheads%2Fmain:src%2Fmain%2Ers".into(),
+        ];
+
+        let roots = blob_root_references(&viewer(), &references);
+        assert_eq!(
+            roots.len(),
+            2,
+            "the malformed legacy id is claimed but not canonical"
+        );
+        let canonical = canonical_blob_references(&roots);
+        assert_eq!(canonical.len(), 1);
+        let ((repository, location), references) = canonical.into_iter().next().unwrap();
+        assert_eq!(repository, "team/api");
+        assert_eq!(location.ref_name(), "refs/heads/main");
+        assert_eq!(location.path(), "src/main.rs");
+        assert_eq!(
+            references
+                .into_iter()
+                .map(|reference| reference.sub_anchor)
+                .collect::<Vec<_>>(),
+            vec![None, Some("L7-L9".into())]
         );
     }
 
