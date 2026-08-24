@@ -1,6 +1,7 @@
 use sqlx::postgres::PgPool;
 use sqlx::Acquire;
 use sqlx::Row;
+use std::collections::BTreeSet;
 
 use myelin_events::{
     derive_envelope, Actor, DataRole, EmitContext, EventDraft, EventId, EventType, Timestamp,
@@ -8,7 +9,9 @@ use myelin_events::{
 };
 
 use crate::conversation::{Conversation, ConversationError, ConversationKind};
-use crate::store::ConversationId;
+use crate::store::{is_canonical_ulid, ConversationId};
+
+const EXACT_CONVERSATION_BATCH_MAX: usize = 10_000;
 
 pub const CONVERSATION_TABLE: &str = "chat_conversation";
 pub const MESSAGE_TABLE: &str = "chat_message";
@@ -73,6 +76,65 @@ pub fn visible_public_conversations_cte() -> String {
          )",
         myelin_identity_service::VISIBLE_PROJECTS_CTE,
     )
+}
+
+const VISIBLE_CONVERSATION_COLUMNS: &str = "
+  conversation.tenant_id, conversation.region, conversation.conversation_id,
+  conversation.kind, conversation.home_cell, conversation.parent_project,
+  conversation.name, conversation.topic, conversation.linked_ref,
+  conversation.pinned_canvas, conversation.retention_days, conversation.archived,
+  conversation.created_by, conversation.acl_zookie";
+
+fn visible_conversations_query(tail: &str) -> String {
+    format!(
+        "{}
+         SELECT {VISIBLE_CONVERSATION_COLUMNS}
+           FROM chat_conversation conversation
+          WHERE conversation.tenant_id = $1 AND conversation.region = $2
+            AND NOT conversation.archived
+            AND conversation.acl_zookie IS NOT NULL
+            AND (
+              conversation.conversation_id IN (
+                SELECT conversation_id FROM visible_conversation
+              )
+              OR EXISTS (
+                SELECT 1
+                  FROM rebac_tuple direct_member
+                 WHERE direct_member.tenant_id = conversation.tenant_id
+                   AND direct_member.region = conversation.region
+                   AND direct_member.object_id = 'channel:' || conversation.conversation_id
+                   AND direct_member.relation = 'member'
+                   AND direct_member.subject = $3
+                   AND (direct_member.expires_at IS NULL
+                        OR direct_member.expires_at > CURRENT_TIMESTAMP)
+              )
+            )
+            {tail}",
+        visible_public_conversations_cte(),
+    )
+}
+
+fn canonical_conversation_batch(
+    conversation_ids: &[String],
+) -> Result<Vec<String>, ConversationError> {
+    if conversation_ids.len() > EXACT_CONVERSATION_BATCH_MAX {
+        return Err(ConversationError::SchemaViolation(format!(
+            "at most {EXACT_CONVERSATION_BATCH_MAX} conversations may be read at once"
+        )));
+    }
+    conversation_ids
+        .iter()
+        .map(|conversation_id| {
+            is_canonical_ulid(conversation_id)
+                .then_some(conversation_id.clone())
+                .ok_or_else(|| {
+                    ConversationError::SchemaViolation(
+                        "conversation reference id must be a canonical ULID".into(),
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|ids| ids.into_iter().collect())
 }
 
 pub const CONVERSATION_TABLE_DDL: &str = "\
@@ -355,37 +417,9 @@ impl PgConversationStore {
             .await
             .map_err(storage("acquire conversation connection"))?;
         self.set_session_scope(&mut conn, tenant, region).await?;
-        let query = format!(
-            "{}
-             SELECT conversation.tenant_id, conversation.region,
-                    conversation.conversation_id, conversation.kind,
-                    conversation.home_cell, conversation.parent_project, conversation.name,
-                    conversation.topic, conversation.linked_ref, conversation.pinned_canvas,
-                    conversation.retention_days, conversation.archived,
-                    conversation.created_by, conversation.acl_zookie
-               FROM chat_conversation conversation
-              WHERE conversation.tenant_id = $1 AND conversation.region = $2
-                AND NOT conversation.archived
-                AND conversation.acl_zookie IS NOT NULL
-                AND (
-                  conversation.conversation_id IN (
-                    SELECT conversation_id FROM visible_conversation
-                  )
-                  OR EXISTS (
-                    SELECT 1
-                      FROM rebac_tuple direct_member
-                     WHERE direct_member.tenant_id = conversation.tenant_id
-                       AND direct_member.region = conversation.region
-                       AND direct_member.object_id = 'channel:' || conversation.conversation_id
-                       AND direct_member.relation = 'member'
-                       AND direct_member.subject = $3
-                       AND (direct_member.expires_at IS NULL
-                            OR direct_member.expires_at > CURRENT_TIMESTAMP)
-                  )
-                )
-                AND ($4::text IS NULL OR conversation.conversation_id < $4)
-              ORDER BY conversation.conversation_id DESC LIMIT $5",
-            visible_public_conversations_cte(),
+        let query = visible_conversations_query(
+            "AND ($4::text IS NULL OR conversation.conversation_id < $4)
+             ORDER BY conversation.conversation_id DESC LIMIT $5",
         );
         let rows = sqlx::query(&query)
             .bind(tenant)
@@ -396,6 +430,40 @@ impl PgConversationStore {
             .fetch_all(&mut *conn)
             .await
             .map_err(storage("list conversations"))?;
+        rows.iter().map(row_to_conversation).collect()
+    }
+
+    /// Resolve an exact bounded set through the same live membership predicate as the list.
+    pub async fn get_visible_exact(
+        &self,
+        tenant: &str,
+        region: &str,
+        subject: &str,
+        conversation_ids: &[String],
+    ) -> Result<Vec<Conversation>, ConversationError> {
+        let conversation_ids = canonical_conversation_batch(conversation_ids)?;
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(storage("acquire exact conversation connection"))?;
+        self.set_session_scope(&mut conn, tenant, region).await?;
+        let query = visible_conversations_query(
+            "AND conversation.conversation_id = ANY($4::text[])
+             ORDER BY conversation.conversation_id ASC",
+        );
+        let rows = sqlx::query(&query)
+            .bind(tenant)
+            .bind(region)
+            .bind(subject)
+            .bind(conversation_ids)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(storage("read exact visible conversations"))?;
         rows.iter().map(row_to_conversation).collect()
     }
 }
@@ -655,5 +723,20 @@ mod tests {
             ..valid
         })
         .is_ok());
+    }
+
+    #[test]
+    fn exact_conversation_batches_are_canonical_bounded_and_deduplicated() {
+        let first = "01J00000000000000000000000".to_string();
+        let second = "01J00000000000000000000001".to_string();
+        assert!(canonical_conversation_batch(&[]).unwrap().is_empty());
+        assert_eq!(
+            canonical_conversation_batch(&[second.clone(), first.clone(), second]).unwrap(),
+            [first.clone(), "01J00000000000000000000001".into()]
+        );
+        assert!(canonical_conversation_batch(&["not-a-ulid".into()]).is_err());
+        assert!(
+            canonical_conversation_batch(&vec![first; EXACT_CONVERSATION_BATCH_MAX + 1]).is_err()
+        );
     }
 }

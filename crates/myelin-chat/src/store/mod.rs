@@ -18,7 +18,7 @@ use crate::events::CHAT_MESSAGE_ERASED;
 #[cfg(any(test, feature = "test-support"))]
 use crate::events::{CHAT_MESSAGE_CREATED, CHAT_MESSAGE_EDITED};
 
-pub use ulid::{MessageId, MonotonicUlidSource, SystemUlidSource, UlidSource};
+pub use ulid::{is_canonical_ulid, MessageId, MonotonicUlidSource, SystemUlidSource, UlidSource};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConversationId {

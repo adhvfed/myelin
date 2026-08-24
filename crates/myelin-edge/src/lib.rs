@@ -11,6 +11,7 @@ mod chat_authz;
 pub mod chat_effect;
 pub mod chat_http;
 mod chat_message_input;
+mod chat_reference;
 pub mod ci_http;
 pub mod device_auth;
 mod effect_carrier;
@@ -77,6 +78,7 @@ pub use catalogue::{
 };
 pub use chat_effect::ChatEffectApi;
 pub use chat_http::{register_chat, DurableChatMutationApi, DurableChatReadApi};
+pub use chat_reference::DurableChatReferenceApi;
 pub use ci_http::{register_ci, DurableCiReadApi};
 pub use device_auth::{device_authorization_migrations, DeviceAuthorizationBroker};
 pub use effect_router::RoutedEffectApi;

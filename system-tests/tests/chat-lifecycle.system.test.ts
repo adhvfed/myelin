@@ -59,6 +59,32 @@ async function createPrivatePullRequest(
   };
 }
 
+async function createPrivateConversation(owner: SystemTestClient, label: string) {
+  const project = await owner.json("/v1/projects", {
+    method: "POST",
+    body: {
+      name: uniqueName(`${label} private project`),
+      issue_prefix: `T${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`,
+    },
+    idempotencyKey: `private-conversation-project-${randomUUID()}`,
+    expectedStatus: 201,
+  });
+  const projectId = string(
+    record(project.body.project, `${label} private project`).id,
+    `${label} private project id`,
+  );
+  const topic = uniqueName(`${label} private topic`);
+  const conversation = await Conversation.open(owner, {
+    projectId,
+    channel: uniqueName(`${label}-private`),
+    topic,
+  });
+  return {
+    ref: string(conversation.created.ref, `${label} private conversation reference`),
+    topic,
+  };
+}
+
 describe("chat collaboration lifecycle", () => {
   test("requires a private thread instead of turning a public mention into agent work", async () => {
     const founder = await browserApprovedCliClient();
@@ -656,5 +682,66 @@ describe("chat collaboration lifecycle", () => {
         ],
       }),
     ]);
+  });
+
+  test("lets each engineer carry a private conversation without revealing the other's topic", async () => {
+    const foundersTopic = await createPrivateConversation(systemClient, "founder planning");
+    const reviewersTopic = await createPrivateConversation(reviewerClient, "reviewer planning");
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("private-conversation-cards"),
+      topic: "Resume private context without moving it into the public room",
+    });
+    await room.post(
+      systemClient,
+      "I will continue in ￼; keep your notes in ￼.",
+      { references: [foundersTopic.ref, reviewersTopic.ref] },
+    );
+
+    const foundersHistory = await room.messages(systemClient);
+    expect(foundersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersTopic.ref,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: foundersTopic.topic,
+              state: "active",
+              icon: "chat",
+              render_hint: "chat_conversation",
+            }),
+          }),
+          expect.objectContaining({
+            ref: reviewersTopic.ref,
+            card: { kind: "tombstone" },
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersTopic.topic);
+
+    const reviewersHistory = await room.messages(reviewerClient);
+    expect(reviewersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersTopic.ref,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: reviewersTopic.ref,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: reviewersTopic.topic,
+              state: "active",
+              icon: "chat",
+              render_hint: "chat_conversation",
+            }),
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersTopic.topic);
   });
 });

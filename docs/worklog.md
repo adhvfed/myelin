@@ -1256,6 +1256,30 @@ clippy across all targets and features of both crates; 640 browser units; six
 live TypeScript CI journeys; and the real Chromium product journey after an Edge
 restart.
 
+## 2026-08-24 — a private conversation stays resumable by reference
+
+Canonical Chat conversation references now resolve to the topic for a current
+member and to a content-free tombstone for everyone else. Exact resolution uses
+the same durable SQL predicate as conversation listing: public rooms inherit a
+live project view, private rooms require unexpired direct membership, archived
+or unstamped rooms remain absent, and all coordinates are tenant/region scoped.
+The shared query shape removed the previous duplicated list predicate while
+adding a bounded, canonical, deduplicated exact read.
+
+The TypeScript story gives two engineers separate private topics, carries both
+references into one shared room, and reads the same message from both identities.
+Each engineer sees only the topic they can resume; neither response contains the
+other topic's name. In Chromium, an engineer links a second encrypted durable
+topic from the first and follows the projected card into that exact conversation.
+This also makes the canonical conversation reference returned by a private agent
+thread a useful fresh-context handoff without broadening its membership.
+
+Proof: all 268 Chat and 351 Edge library tests through the database-backed
+harness; the real PostgreSQL membership-expiry integration; warning-free clippy
+across every Chat and Edge target and feature; 640 browser units; all seven live
+Chat lifecycle stories; and both real Chromium Chat journeys after rebuilding
+Edge.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1282,11 +1306,12 @@ restart.
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.
 6. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
-   viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, and CI run cards through
-   bounded owner queries, with content-free tombstones for denied or unavailable artifacts. Git
-   commits, blobs, refs, reviews, and comments, other CI artifacts, plus Chat artifacts still retain
-   their canonical link rather than a rich card because their durable owner projectors are not
-   composed. Event-driven cache invalidation and live card updates also remain unwired.
+   viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
+   conversation cards through bounded owner queries, with content-free tombstones for denied or
+   unavailable artifacts. Git
+   commits, blobs, refs, reviews, and comments, other CI artifacts, plus Chat messages and threads
+   still retain their canonical link rather than a rich card because their durable owner projectors
+   are not composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade

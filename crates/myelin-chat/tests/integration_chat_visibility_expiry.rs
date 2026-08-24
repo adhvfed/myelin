@@ -2,7 +2,7 @@
 
 use myelin_chat::conversation::{Conversation, ConversationKind};
 use myelin_chat::store::pg_conversation::{chat_migrations, PgConversationStore};
-use myelin_chat::store::ConversationId;
+use myelin_chat::store::{ConversationId, SystemUlidSource, UlidSource};
 use myelin_config::MyelinConfig;
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -347,9 +347,11 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
         tokio::runtime::Handle::current(),
     );
     let conversations = PgConversationStore::new(app.db_pool().clone());
-    let alice_channel = format!("channel-{}-alice", unique());
-    let bob_channel = format!("channel-{}-bob", unique());
-    let expired_channel = format!("channel-{}-expired", unique());
+    let ids = SystemUlidSource::new();
+    let alice_channel = ids.mint().0;
+    let bob_channel = ids.mint().0;
+    let expired_channel = ids.mint().0;
+    let missing_channel = ids.mint().0;
 
     for conversation in [
         private_channel(
@@ -412,6 +414,29 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
             .collect::<Vec<_>>(),
         vec![alice_channel.as_str()],
         "Alice sees her live private thread, never Bob's or an expired membership"
+    );
+    let exact = conversations
+        .get_visible_exact(
+            &tenant,
+            &region,
+            &alice.principal_id.0,
+            &[
+                bob_channel,
+                alice_channel.clone(),
+                expired_channel,
+                alice_channel.clone(),
+                missing_channel,
+            ],
+        )
+        .await
+        .expect("resolve Alice's exact private conversation references");
+    assert_eq!(
+        exact
+            .iter()
+            .map(|conversation| conversation.id.conversation_id.as_str())
+            .collect::<Vec<_>>(),
+        [alice_channel.as_str()],
+        "exact resolution deduplicates ids and applies live membership before returning metadata"
     );
 
     sqlx::query("DELETE FROM chat_conversation WHERE tenant_id = $1")

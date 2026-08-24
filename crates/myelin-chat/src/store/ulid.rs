@@ -2,6 +2,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+pub fn is_canonical_ulid(value: &str) -> bool {
+    value.len() == 26 && value.bytes().all(|byte| CROCKFORD.contains(&byte))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageId(pub String);
 
@@ -132,5 +136,13 @@ mod tests {
         let id = MessageId::from_u128((timestamp as u128) << 80);
         assert_eq!(id.timestamp_ms(), Some(timestamp));
         assert_eq!(MessageId("not-a-ulid".into()).timestamp_ms(), None);
+    }
+
+    #[test]
+    fn canonical_ulids_use_the_single_upper_case_crockford_spelling() {
+        assert!(is_canonical_ulid("01J00000000000000000000000"));
+        assert!(!is_canonical_ulid("01j00000000000000000000000"));
+        assert!(!is_canonical_ulid("01I00000000000000000000000"));
+        assert!(!is_canonical_ulid("01J0000000000000000000000"));
     }
 }

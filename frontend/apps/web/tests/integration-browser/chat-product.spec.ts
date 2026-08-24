@@ -67,6 +67,20 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
     const body = JSON.parse(await visible.text()) as { items: Array<{ ref: string }> };
     return body.items.some((candidate) => candidate.ref === issue!.ref);
   }, { message: "the referenced issue should enter the effective viewer projection" }).toBe(true);
+  const relatedTopic = `incident-notes-${suffix}`;
+  const relatedResponse = await request.post(`${edgeUrl}/v1/chat/conversations`, {
+    headers: { ...headers, "idempotency-key": randomUUID() },
+    data: {
+      project_id: project.id,
+      channel: `private-context-${suffix}`,
+      topic: relatedTopic,
+    },
+  });
+  const relatedText = await relatedResponse.text();
+  expect(relatedResponse.status(), relatedText).toBe(201);
+  const relatedConversation = (JSON.parse(relatedText) as {
+    conversation: { id: string; ref: string };
+  }).conversation;
 
   await signIn(page);
   await navigateToApp(page, "/chat");
@@ -90,6 +104,19 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await waitForAppHydration(page);
   await expect(page.getByText(message)).toBeVisible();
   await expect(page.getByRole("link", { name: `${issueTitle}, ${issue!.state}` })).toBeVisible();
+
+  await page.getByLabel(`Message ${topic}`).fill("Continue the sensitive investigation here.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" })
+    .fill(relatedConversation.ref);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const relatedCard = page.getByRole("link", { name: `${relatedTopic}, active` });
+  await expect(relatedCard)
+    .toHaveAttribute("href", `/chat?conversation=${relatedConversation.id}`);
+  await relatedCard.click();
+  await expect(page).toHaveURL(new RegExp(`/chat\\?conversation=${relatedConversation.id}$`));
+  await expect(page.getByRole("heading", { name: relatedTopic })).toBeVisible();
 
   const conversations = await request.get(`${edgeUrl}/v1/chat/conversations?limit=100`, {
     headers,

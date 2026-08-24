@@ -105,10 +105,10 @@ pub use search::{
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemHotTier;
 pub use store::{
-    chat_cold_blob_store_parity, emit_erased_tombstone, AuthorKind, ColdBlobParityVerdict,
-    ColdSegments, ConversationId, Message, MessageId, MessageState, MessageStore,
-    MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError, SystemUlidSource,
-    TombstoneReason, UlidSource,
+    chat_cold_blob_store_parity, emit_erased_tombstone, is_canonical_ulid, AuthorKind,
+    ColdBlobParityVerdict, ColdSegments, ConversationId, Message, MessageId, MessageState,
+    MessageStore, MonotonicUlidSource, NewMessage, OutboxTx, RangeCursor, StoreError,
+    SystemUlidSource, TombstoneReason, UlidSource,
 };
 pub use unfurl::{
     filter_candidates_by_class, precompute_visibility_class, AuthzVisibleIndex, Card,

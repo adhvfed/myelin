@@ -811,11 +811,7 @@ fn conversation_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError>
 }
 
 fn validate_ulid(value: &str) -> Result<(), EdgeError> {
-    if value.len() == 26
-        && value
-            .bytes()
-            .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
-    {
+    if myelin_chat::is_canonical_ulid(value) {
         Ok(())
     } else {
         Err(EdgeError::BadRequest(

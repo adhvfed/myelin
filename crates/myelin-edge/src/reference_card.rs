@@ -6,7 +6,9 @@ use serde::Serialize;
 use std::sync::Arc;
 
 use crate::ci_http::{canonical_uuid, repo_slug_from_ref, DurableCiReadApi};
-use crate::{DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi};
+use crate::{
+    DurableChatReferenceApi, DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -89,6 +91,12 @@ impl DurableReferenceCardResolver {
             .push(Arc::new(CiReferenceCardProjector { ci }));
         self
     }
+
+    pub fn with_chat(mut self, chat: DurableChatReferenceApi) -> Self {
+        self.projectors
+            .push(Arc::new(ChatReferenceCardProjector { chat }));
+        self
+    }
 }
 
 impl ReferenceCardResolver for DurableReferenceCardResolver {
@@ -169,6 +177,44 @@ struct GitReferenceCardProjector {
 
 struct CiReferenceCardProjector {
     ci: DurableCiReadApi,
+}
+
+struct ChatReferenceCardProjector {
+    chat: DurableChatReferenceApi,
+}
+
+impl ReferenceCardProjector for ChatReferenceCardProjector {
+    fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
+        let conversation_roots = root_references(viewer, references, "chat", "channel");
+        if conversation_roots.is_empty() {
+            return HashMap::new();
+        }
+        let mut cards = claimed_tombstones(&conversation_roots);
+        let canonical_references = conversation_roots
+            .iter()
+            .filter(|(conversation_id, _)| myelin_chat::is_canonical_ulid(conversation_id))
+            .map(|(conversation_id, references)| (conversation_id.clone(), references.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let conversation_ids = canonical_references.keys().cloned().collect::<Vec<_>>();
+        let Ok(visible_conversations) = self.chat.project_conversations(viewer, &conversation_ids)
+        else {
+            return cards;
+        };
+
+        for conversation in visible_conversations {
+            let (Some(title), Some(references)) = (
+                conversation.topic,
+                canonical_references.get(&conversation.id.conversation_id),
+            ) else {
+                continue;
+            };
+            let card = ReferenceCard::projection(title, "active", "chat", "chat_conversation");
+            for reference in references {
+                cards.insert(reference.clone(), card.clone());
+            }
+        }
+        cards
+    }
 }
 
 impl ReferenceCardProjector for CiReferenceCardProjector {

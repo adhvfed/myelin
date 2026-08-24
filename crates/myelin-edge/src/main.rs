@@ -17,10 +17,10 @@ use myelin_edge::{
     AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices, AgentThreadHttpInputs,
     AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableAgentWorkspaceAccess,
-    DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
-    DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway, GitDatabaseProviders,
-    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
-    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    DurableChatMutationApi, DurableChatReadApi, DurableChatReferenceApi, DurableCiReadApi,
+    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway,
+    GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe,
+    SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
     TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
 };
 use myelin_events::{OutboxStore, Timestamp};
@@ -1279,7 +1279,11 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             .with_issues(issue_mutations.reads())
             .with_knowledge(knowledge_mutations.reads())
             .with_git(git_backend.clone())
-            .with_ci(mcp_ci.clone()),
+            .with_ci(mcp_ci.clone())
+            .with_chat(DurableChatReferenceApi::new(
+                provider.db_pool().clone(),
+                handle.clone(),
+            )),
     );
     builder = register_issues(builder, issue_mutations.clone());
     builder = register_projects(builder, projects.clone(), check.clone(), handle.clone());

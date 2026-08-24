@@ -63,6 +63,10 @@ function isCanonicalUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
 }
 
+function isCanonicalUlid(value: string): boolean {
+  return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
+}
+
 export function parseGitPullRequestRef(value: unknown): GitPullRequestRef | null {
   const parsed = parseArtifactRef(value);
   if (!parsed || parsed.subsystem !== "git" || parsed.type !== "pr") return null;
@@ -149,6 +153,9 @@ export function artifactRefHref(reference: string): string | undefined {
   }
   if (parsed.subsystem === "ci" && parsed.type === "run" && isCanonicalUuid(parsed.id)) {
     return `/ci/runs/${encodeURIComponent(parsed.id)}`;
+  }
+  if (parsed.subsystem === "chat" && parsed.type === "channel" && isCanonicalUlid(parsed.id)) {
+    return `/chat?conversation=${encodeURIComponent(parsed.id)}`;
   }
   return undefined;
 }
