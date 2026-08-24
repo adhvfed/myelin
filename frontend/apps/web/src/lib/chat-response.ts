@@ -58,6 +58,11 @@ export interface ChatMessagePage {
   page: { next_cursor: string | null; limit: number };
 }
 
+export interface ChatMessageView {
+  conversation: ChatConversation;
+  message: ChatMessage;
+}
+
 export interface ChatConversationReceipt {
   conversation: ChatConversation;
   durable: true;
@@ -216,6 +221,15 @@ export function parseChatMessages(value: unknown): ChatMessagePage | null {
   const items = envelope.items.map(message);
   return items.every((item): item is ChatMessage => item !== null)
     ? { conversation: subject, items, page: paging }
+    : null;
+}
+
+export function parseChatMessage(value: unknown): ChatMessageView | null {
+  const envelope = record(value);
+  const subject = conversation(envelope?.conversation);
+  const item = message(envelope?.message);
+  return envelope && exact(envelope, ["conversation", "message"]) && subject && item
+    ? { conversation: subject, message: item }
     : null;
 }
 

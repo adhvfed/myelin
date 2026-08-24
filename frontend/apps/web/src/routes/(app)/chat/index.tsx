@@ -21,6 +21,7 @@ import { ChatTimeline } from "~/components/chat/ChatTimeline";
 import { ChatTopicDialog } from "~/components/chat/ChatTopicDialog";
 import {
   getChatConversations,
+  getChatMessage,
   getChatMessages,
   type ChatConversationPage,
   type ChatErrorKind,
@@ -43,8 +44,14 @@ export default function ChatIndex() {
   const [search] = useSearchParams();
   const navigate = useNavigate();
   const toast = useToast();
-  const selectedId = () => typeof search.conversation === "string" ? search.conversation : undefined;
-  const validSelectedId = () => isChatUlid(selectedId()) ? selectedId() : undefined;
+  const requestedConversationId = () =>
+    typeof search.conversation === "string" ? search.conversation : undefined;
+  const requestedMessageId = () => typeof search.message === "string" ? search.message : undefined;
+  const validConversationId = () =>
+    isChatUlid(requestedConversationId()) ? requestedConversationId() : undefined;
+  const validFocusedMessageId = () =>
+    isChatUlid(requestedMessageId()) ? requestedMessageId() : undefined;
+  const hasSelection = () => Boolean(requestedConversationId() || requestedMessageId());
   const createOpen = () => search.new === "1";
 
   const [conversationPages, setConversationPages] = createSignal<ChatConversationPage[]>([]);
@@ -69,7 +76,25 @@ export default function ChatIndex() {
   }, { deferStream: true });
 
   const recentMessages = createAsync(async (): Promise<PageResult<ChatMessagePage> | null> => {
-    const raw = selectedId();
+    const focused = requestedMessageId();
+    if (focused) {
+      if (!isChatUlid(focused)) return { page: null, error: "bad-input" };
+      try {
+        const exact = await getChatMessage(focused);
+        return {
+          page: {
+            conversation: exact.conversation,
+            items: [exact.message],
+            page: { next_cursor: null, limit: 1 },
+          },
+          error: null,
+        };
+      } catch (error) {
+        if (error instanceof Response) throw error;
+        return { page: null, error: chatErrorKind(error) };
+      }
+    }
+    const raw = requestedConversationId();
     if (!raw) return null;
     if (!isChatUlid(raw)) return { page: null, error: "bad-input" };
     try {
@@ -85,6 +110,9 @@ export default function ChatIndex() {
 
   const conversations = createMemo(() =>
     mergeConversationPages(firstConversations()?.page, conversationPages()));
+  const validSelectedId = () => validFocusedMessageId()
+    ? recentMessages()?.page?.conversation.id
+    : validConversationId();
   const selectedConversation = createMemo(() => {
     const id = validSelectedId();
     if (!id) return undefined;
@@ -106,7 +134,8 @@ export default function ChatIndex() {
   };
 
   createEffect(() => {
-    validSelectedId();
+    requestedConversationId();
+    requestedMessageId();
     messageGeneration += 1;
     earlierMessageRequest += 1;
     setEarlierMessagePages([]);
@@ -120,7 +149,7 @@ export default function ChatIndex() {
     // silently dead stream degrades to slow refresh instead of a frozen view.
     const timer = window.setInterval(() => {
       const conversationId = validSelectedId();
-      if (!conversationId || document.hidden) return;
+      if (!conversationId || validFocusedMessageId() || document.hidden) return;
       void revalidate(getChatMessages.keyFor({ conversationId, limit: 100 }));
     }, 30_000);
     onCleanup(() => window.clearInterval(timer));
@@ -132,7 +161,7 @@ export default function ChatIndex() {
   // to close any gap the dropped stream left.
   createEffect(() => {
     const conversationId = validSelectedId();
-    if (!conversationId || !interactive()) return;
+    if (!conversationId || validFocusedMessageId() || !interactive()) return;
     const source = new EventSource(
       `/api/chat/conversations/${encodeURIComponent(conversationId)}/events`,
     );
@@ -225,7 +254,7 @@ export default function ChatIndex() {
       <Title>Chat · Myelin</Title>
       <div
         class="chat-screen"
-        classList={{ "chat-has-selection": Boolean(selectedId()) }}
+        classList={{ "chat-has-selection": hasSelection() }}
         data-testid="chat-screen"
       >
         <ChatSidebar
@@ -248,7 +277,7 @@ export default function ChatIndex() {
             <p role="alert" class="chat-inline-error">Earlier messages couldn’t be loaded. Try again.</p>
           </Show>
           <Show
-            when={selectedId()}
+            when={hasSelection()}
             fallback={<ChatWelcome onNew={openCreate} hasTopics={conversations().length > 0} interactive={interactive()} />}
           >
             <Show
@@ -259,7 +288,8 @@ export default function ChatIndex() {
                 when={validSelectedId() && selectedConversation() && recentMessages()?.page}
                 fallback={
                   <ChatConversationError
-                    kind={recentMessages()?.error ?? (validSelectedId() ? "error" : "bad-input")}
+                    kind={recentMessages()?.error ??
+                      ((validConversationId() || validFocusedMessageId()) ? "error" : "bad-input")}
                   />
                 }
               >
@@ -271,6 +301,7 @@ export default function ChatIndex() {
                   loadingEarlier={loadingEarlier()}
                   onLoadEarlier={() => void loadEarlier()}
                   onPosted={messagePosted}
+                  focusedMessageId={validFocusedMessageId()}
                 />
               </Show>
             </Show>

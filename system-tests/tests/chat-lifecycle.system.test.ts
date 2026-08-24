@@ -111,6 +111,7 @@ async function createPrivateConversation(owner: SystemTestClient, label: string)
     topic,
   });
   return {
+    conversation,
     ref: string(conversation.created.ref, `${label} private conversation reference`),
     topic,
   };
@@ -1038,6 +1039,92 @@ describe("chat collaboration lifecycle", () => {
       }),
     ]);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersTopic.topic);
+  });
+
+  test("lets each engineer carry one exact private message without copying its room", async () => {
+    const foundersRoom = await createPrivateConversation(systemClient, "founder message");
+    const reviewersRoom = await createPrivateConversation(reviewerClient, "reviewer message");
+    const foundersWords = uniqueName("Founder will resume the rollout decision here");
+    const reviewersWords = uniqueName("Reviewer will resume the safety decision here");
+    const foundersMessageId = await foundersRoom.conversation.post(systemClient, foundersWords);
+    const reviewersMessageId = await reviewersRoom.conversation.post(
+      reviewerClient,
+      reviewersWords,
+    );
+    const foundersMessageRef =
+      `myelin://${systemTestConfig.tenant}/chat/message/${foundersMessageId}`;
+    const reviewersMessageRef =
+      `myelin://${systemTestConfig.tenant}/chat/message/${reviewersMessageId}` +
+      `#message-${reviewersMessageId}`;
+    const handoff = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("private-message-cards"),
+      topic: "Point to the exact decision without copying its private words",
+    });
+    await handoff.post(
+      systemClient,
+      "My exact decision remains in ￼; yours remains in ￼.",
+      { references: [foundersMessageRef, reviewersMessageRef] },
+    );
+
+    const foundersHistory = await handoff.messages(systemClient);
+    expect(foundersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersMessageRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: `Message in ${foundersRoom.topic}`,
+              state: "active",
+              icon: "message",
+              render_hint: "chat_message",
+              sub_anchor: `message-${foundersMessageId}`,
+            }),
+          }),
+          expect.objectContaining({ ref: reviewersMessageRef, card: { kind: "tombstone" } }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersRoom.topic);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWords);
+
+    const reviewersHistory = await handoff.messages(reviewerClient);
+    expect(reviewersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({ ref: foundersMessageRef, card: { kind: "tombstone" } }),
+          expect.objectContaining({
+            ref: reviewersMessageRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: `Message in ${reviewersRoom.topic}`,
+              state: "active",
+              icon: "message",
+              render_hint: "chat_message",
+              sub_anchor: `message-${reviewersMessageId}`,
+            }),
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersRoom.topic);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWords);
+
+    const exactMessage = await systemClient.json(
+      `/v1/chat/messages/${encodeURIComponent(foundersMessageId)}`,
+    );
+    expect(exactMessage.body).toMatchObject({
+      conversation: { id: foundersRoom.conversation.id, topic: foundersRoom.topic },
+      message: { id: foundersMessageId, content: foundersWords, state: "active" },
+    });
+    const deniedExactMessage = await reviewerClient.json(
+      `/v1/chat/messages/${encodeURIComponent(foundersMessageId)}`,
+      { expectedStatus: 404 },
+    );
+    expect(deniedExactMessage.body).toMatchObject({ error: { code: "not_found" } });
+    expect(JSON.stringify(deniedExactMessage.body)).not.toContain(foundersRoom.topic);
+    expect(JSON.stringify(deniedExactMessage.body)).not.toContain(foundersWords);
   });
 
   test("lets each engineer resume named private agent work without exposing the other workspace", async () => {

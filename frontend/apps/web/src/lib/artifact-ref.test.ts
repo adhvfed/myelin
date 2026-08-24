@@ -97,6 +97,16 @@ describe("artifact references", () => {
     expect(artifactRefHref("myelin://acme/chat/channel/01J00000000000000000000000"))
       .toBe("/chat?conversation=01J00000000000000000000000");
     expect(artifactRefHref("myelin://acme/chat/channel/not-a-ulid")).toBeUndefined();
+    expect(artifactRefLabel("myelin://acme/chat/message/01J00000000000000000000000"))
+      .toBe("Message · 00000000");
+    expect(artifactRefHref("myelin://acme/chat/message/01J00000000000000000000000"))
+      .toBe("/chat?message=01J00000000000000000000000#message-01J00000000000000000000000");
+    expect(artifactRefHref(
+      "myelin://acme/chat/message/01J00000000000000000000000#message-01J00000000000000000000000",
+    )).toBe("/chat?message=01J00000000000000000000000#message-01J00000000000000000000000");
+    expect(artifactRefHref(
+      "myelin://acme/chat/message/01J00000000000000000000000#message-01J00000000000000000000001",
+    )).toBeUndefined();
     expect(artifactRefHref(
       "myelin://acme/agent/thread/92000000-0000-4000-8000-000000000001",
     )).toBe("/agents?thread=92000000-0000-4000-8000-000000000001");

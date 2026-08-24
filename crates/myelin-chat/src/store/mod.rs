@@ -56,6 +56,17 @@ pub enum MessageState {
     Tombstoned,
 }
 
+impl MessageState {
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Edited => "edited",
+            Self::Deleted => "deleted",
+            Self::Tombstoned => "tombstoned",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TombstoneReason {
     SubjectErased,
@@ -85,6 +96,16 @@ pub struct Message {
     pub body_nodes: Vec<u8>,
     pub client_nonce: String,
     pub edited_seq: i32,
+    pub state: MessageState,
+}
+
+/// Content-free coordinates for resolving a globally addressed Chat message.
+/// The message body remains behind the conversation's live visibility check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageLocation {
+    pub message_id: MessageId,
+    pub conv: ConversationId,
+    pub thread_root_id: Option<MessageId>,
     pub state: MessageState,
 }
 

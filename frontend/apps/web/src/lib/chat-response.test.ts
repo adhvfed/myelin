@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseChatMessage,
   parseChatConversationDraft,
   parseChatConversationReceipt,
   parseChatConversations,
@@ -65,6 +66,7 @@ describe("Chat wire projection", () => {
       items: [message],
       page: { next_cursor: null, limit: 50 },
     })?.items).toEqual([message]);
+    expect(parseChatMessage({ conversation, message })).toEqual({ conversation, message });
     expect(parseChatConversationReceipt({ conversation, durable: true })).toEqual({
       conversation,
       durable: true,

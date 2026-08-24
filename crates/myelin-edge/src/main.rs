@@ -1284,6 +1284,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             .with_ci(mcp_ci.clone())
             .with_chat(DurableChatReferenceApi::new(
                 provider.db_pool().clone(),
+                provider.config().region.clone(),
                 handle.clone(),
             ))
             .with_agent_threads(DurableAgentThreadReferenceApi::new(

@@ -7,6 +7,7 @@ import {
   parseChatConversationReceipt,
   parseChatConversations,
   parseChatMessageDraft,
+  parseChatMessage,
   parseChatMessageReceipt,
   parseChatMessages,
   type ChatConversationDraft,
@@ -14,6 +15,7 @@ import {
   type ChatConversationReceipt,
   type ChatMessageDraft,
   type ChatMessagePage,
+  type ChatMessageView,
   type ChatMessageReceipt,
 } from "./chat-response";
 
@@ -25,6 +27,7 @@ export type {
   ChatMessage,
   ChatMessageNode,
   ChatMessagePage,
+  ChatMessageView,
   ChatMessageReceipt,
   ChatMessageState,
 } from "./chat-response";
@@ -118,6 +121,17 @@ export const getChatMessages = query(async (request: {
     return decoded;
   });
 }, "chat-messages");
+
+/** One exact message, authorized through its current parent conversation. */
+export const getChatMessage = query(async (messageId: string): Promise<ChatMessageView> => {
+  "use server";
+  if (!isChatUlid(messageId)) throw new ChatRouteError("bad-input");
+  return chatAuthed(async () => {
+    const decoded = parseChatMessage(await edgeGet(`/v1/chat/messages/${segment(messageId)}`));
+    if (!decoded || decoded.message.id !== messageId) throw new ChatRouteError("error");
+    return decoded;
+  });
+}, "chat-message");
 
 export type ChatMutation =
   | ({ op: "create-conversation" } & ChatConversationDraft)

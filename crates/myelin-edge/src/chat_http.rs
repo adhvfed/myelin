@@ -209,6 +209,33 @@ impl DurableChatReadApi {
             "page": { "next_cursor": next, "limit": limit },
         }))
     }
+
+    pub fn read_message(
+        &self,
+        principal: &Principal,
+        message_id: &str,
+    ) -> Result<Value, EdgeError> {
+        validate_ulid(message_id)?;
+        let message_id = MessageId(message_id.to_owned());
+        let message = self
+            .drive(async {
+                self.messages
+                    .get_exact(principal.tenant.as_str(), &message_id)
+                    .await
+                    .map_err(map_store_error)
+            })?
+            .ok_or_else(|| EdgeError::NotFound("message not found".into()))?;
+        let conversation =
+            self.drive(self.visible_conversation(principal, &message.conv.conversation_id))?;
+        let readable = decode_readable_message(&message, self.kms.as_ref())?;
+        let references = readable.reference_nodes().collect::<Vec<_>>();
+        let cards = self.reference_cards.resolve(principal, &references);
+        let viewer = event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0);
+        Ok(json!({
+            "conversation": conversation_json(&conversation),
+            "message": readable_message_json(&readable, &viewer, &cards),
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -642,6 +669,20 @@ struct MessagePostHandler {
     api: DurableChatMutationApi,
 }
 
+struct MessageViewHandler {
+    api: DurableChatReadApi,
+}
+
+impl Handler for MessageViewHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &self.api.read_message(ctx.principal, message_param(ctx)?)?,
+        )))
+    }
+}
+
 impl Handler for MessagePostHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
@@ -716,6 +757,12 @@ pub fn register_chat(
             "/v1/chat/conversations/{conversation}/messages",
             "chat.messages.list",
             Arc::new(MessageListHandler { api: reads.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/chat/messages/{message}",
+            "chat.message.view",
+            Arc::new(MessageViewHandler { api: reads.clone() }),
         )
         .route(
             Method::Post,
@@ -810,12 +857,22 @@ fn conversation_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError>
     Ok(value)
 }
 
+fn message_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    let value = ctx
+        .params
+        .get("message")
+        .map(String::as_str)
+        .ok_or_else(|| EdgeError::BadRequest("route did not bind a message id".into()))?;
+    validate_ulid(value)?;
+    Ok(value)
+}
+
 fn validate_ulid(value: &str) -> Result<(), EdgeError> {
     if myelin_chat::is_canonical_ulid(value) {
         Ok(())
     } else {
         Err(EdgeError::BadRequest(
-            "Chat cursor and conversation ids must be canonical ULIDs".into(),
+            "Chat ids and cursors must be canonical ULIDs".into(),
         ))
     }
 }
@@ -864,7 +921,7 @@ fn require_empty_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
         Ok(())
     } else {
         Err(EdgeError::BadRequest(
-            "Chat mutation accepts no query parameters".into(),
+            "Chat endpoint accepts no query parameters".into(),
         ))
     }
 }
@@ -915,6 +972,16 @@ fn decode_readable_message<'a>(
     message: &'a Message,
     kms: &KmsEngine,
 ) -> Result<ReadableMessage<'a>, EdgeError> {
+    if matches!(
+        message.state,
+        MessageState::Deleted | MessageState::Tombstoned
+    ) {
+        return Ok(ReadableMessage {
+            stored: message,
+            content: String::new(),
+            nodes: Vec::new(),
+        });
+    }
     let content = decrypt_message_column(message, kms, &message.body_inline, "body_inline")?;
     let content = std::str::from_utf8(&content)
         .map_err(|_| EdgeError::Internal("stored Chat message is not valid UTF-8".into()))?
@@ -955,12 +1022,7 @@ fn readable_message_json(
         "content": message.content,
         "nodes": message.nodes.iter().map(|node| message_node_json(node, cards)).collect::<Vec<_>>(),
         "edited": stored.edited_seq > 0,
-        "state": match stored.state {
-            MessageState::Active => "active",
-            MessageState::Edited => "edited",
-            MessageState::Deleted => "deleted",
-            MessageState::Tombstoned => "tombstoned",
-        },
+        "state": stored.state.token(),
         "created_at": stored.message_id.timestamp_ms().map(|value| value / 1000),
     })
 }
@@ -1154,6 +1216,40 @@ mod tests {
                 "kind": "artifact_ref",
                 "ref": reference.0.clone(),
                 "card": { "kind": "tombstone" }
+            })
+        );
+    }
+
+    #[test]
+    fn a_removed_message_stays_readable_after_its_ciphertext_is_destroyed() {
+        let message = Message {
+            message_id: MessageId("01J00000000000000000000000".into()),
+            conv: ConversationId::new("acme", "stub-region", "01J00000000000000000000001"),
+            thread_root_id: None,
+            author: "chat-author:0123456789abcdef0123456789abcdef".into(),
+            author_kind: AuthorKind::Human,
+            body_inline: Vec::new(),
+            body_nodes: Vec::new(),
+            client_nonce: "removed-message".into(),
+            edited_seq: 0,
+            state: MessageState::Tombstoned,
+        };
+
+        let readable = decode_readable_message(&message, &KmsEngine::new()).unwrap();
+        assert_eq!(readable.content, "");
+        assert!(readable.nodes.is_empty());
+        assert_eq!(
+            readable_message_json(&readable, message.author.as_str(), &HashMap::new()),
+            json!({
+                "id": message.message_id.as_str(),
+                "author": message.author,
+                "author_kind": "human",
+                "is_you": true,
+                "content": "",
+                "nodes": [],
+                "edited": false,
+                "state": "tombstoned",
+                "created_at": message.message_id.timestamp_ms().map(|value| value / 1000),
             })
         );
     }

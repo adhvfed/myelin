@@ -13,6 +13,7 @@ export interface ChatTimelineProps {
   hasEarlier: boolean;
   onLoadEarlier: () => void;
   onPosted: (conversationId: string) => Promise<void> | void;
+  focusedMessageId?: string;
 }
 
 export function ChatTimeline(props: ChatTimelineProps) {
@@ -27,19 +28,25 @@ export function ChatTimeline(props: ChatTimelineProps) {
           <p><Icon name="channel" /> {props.conversation.channel}</p>
           <h2 id="chat-topic-heading">{props.conversation.topic}</h2>
         </div>
-        <span class="chat-live-cue"><span aria-hidden="true" /> Updates automatically</span>
+        {props.focusedMessageId
+          ? <A
+              href={`/chat?conversation=${encodeURIComponent(props.conversation.id)}`}
+              class="chat-live-cue"
+            >View latest messages</A>
+          : <span class="chat-live-cue"><span aria-hidden="true" /> Updates automatically</span>}
       </>}
       messages={props.messages}
+      focusedMessageId={props.focusedMessageId}
       loading={props.loading}
       hasEarlier={props.hasEarlier}
       loadingEarlier={props.loadingEarlier}
       onLoadEarlier={props.onLoadEarlier}
-      composer={<ChatComposer
-        conversationId={props.conversation.id}
-        conversationRef={props.conversation.ref}
-        topic={props.conversation.topic}
-        onPosted={props.onPosted}
-      />}
+      composer={props.focusedMessageId ? undefined : <ChatComposer
+          conversationId={props.conversation.id}
+          conversationRef={props.conversation.ref}
+          topic={props.conversation.topic}
+          onPosted={props.onPosted}
+        />}
     />
   );
 }

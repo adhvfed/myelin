@@ -1399,6 +1399,37 @@ transition from requested to approved; warning-free Git/Edge clippy; 643 browser
 units; TypeScript typechecks and lint; all nine rebuilt live Chat lifecycle
 stories; and both real Chromium Chat journeys.
 
+## 2026-08-25 — one exact private message is a resumable handoff
+
+A Chat message now has one durable tenant-and-region-scoped identity outside its
+parent timeline. The forward-only `chat_0009` migration enforces that identity;
+metadata-only batch lookup powers cards, while the exact content endpoint reads
+one row and then rechecks the parent conversation's live membership before it
+decrypts anything. Both the root reference and its matching message subanchor
+resolve to a topic-named card for a viewer who can still enter the room. Missing,
+malformed, mismatched, and denied coordinates remain content-free tombstones.
+
+The browser opens `/chat?message=…` through that exact endpoint rather than
+assuming the message sits in the latest page. It renders the focused message at
+its stable DOM anchor and offers a clear return to current conversation traffic.
+This work also closed an adjacent erasure bug: deleted and tombstoned rows no
+longer ask the KMS to decrypt deliberately destroyed bytes and take the whole
+timeline down; they render as an explicit removed-message state with no body or
+nodes.
+
+The TypeScript story gives two engineers separate private messages, carries both
+references into one shared handoff, and reads it as each identity. Each engineer
+sees and can open only their own exact words; neither the private topic nor body
+crosses the reciprocal denial. Chromium creates a real referenced message,
+follows its projected card to the exact focused view, verifies its anchor and
+body, and returns to the latest conversation.
+
+Proof: all 269 Chat and 359 Edge library tests; the real PostgreSQL exact-lookup,
+deduplication, and cross-tenant RLS integration; an immutable-migration restart
+through `chat_0009`; warning-free Chat/Edge clippy; 643 browser units plus
+TypeScript and ESLint; all ten live Chat lifecycle stories; and both real
+Chromium Chat journeys.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1428,8 +1459,9 @@ stories; and both real Chromium Chat journeys.
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
    content-free tombstones for denied or unavailable artifacts. Git comments
-   now resolve to their exact discussion or diff location. Git review decisions,
-   other CI artifacts, plus Chat messages and threads
+   now resolve to their exact discussion or diff location, and Chat messages
+   open one exact permission-reconfirmed focused view. Git review decisions,
+   other CI artifacts, plus Chat threads
    still retain their canonical link rather than a rich card because their durable owner projectors
    are not composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,

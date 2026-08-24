@@ -240,6 +240,9 @@ export function artifactRefLabel(reference: string): string {
     return `Knowledge · ${parsed.id.slice(-6)}`;
   }
   if (parsed.subsystem === "ci" && parsed.type === "run") return `CI run · ${parsed.id.slice(-8)}`;
+  if (parsed.subsystem === "chat" && parsed.type === "message") {
+    return `Message · ${parsed.id.slice(-8)}`;
+  }
   return `${parsed.type} · ${parsed.id.length > 16 ? `…${parsed.id.slice(-12)}` : parsed.id}`;
 }
 
@@ -280,6 +283,11 @@ export function artifactRefHref(reference: string, renderHint?: string): string 
   }
   if (parsed.subsystem === "chat" && parsed.type === "channel" && isCanonicalUlid(parsed.id)) {
     return `/chat?conversation=${encodeURIComponent(parsed.id)}`;
+  }
+  if (parsed.subsystem === "chat" && parsed.type === "message" &&
+      isCanonicalUlid(parsed.id) &&
+      (parsed.sub === null || parsed.sub === `message-${parsed.id}`)) {
+    return `/chat?message=${encodeURIComponent(parsed.id)}#message-${parsed.id}`;
   }
   if (parsed.subsystem === "agent" && parsed.type === "thread" && isCanonicalUuid(parsed.id)) {
     return `/agents?thread=${encodeURIComponent(parsed.id)}`;

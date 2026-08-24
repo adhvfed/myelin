@@ -19,6 +19,7 @@ pub const CONVERSATION_RECENT_INDEX: &str = "chat_conversation_recent";
 pub const CONVERSATION_CLIENT_NONCE_INDEX: &str = "chat_conversation_client_nonce";
 pub const CONVERSATION_PROJECT_RECENT_INDEX: &str = "chat_conversation_project_recent";
 pub const CONVERSATION_PROJECT_TOPIC_INDEX: &str = "chat_conversation_project_topic_unique";
+pub const MESSAGE_IDENTITY_INDEX: &str = "chat_message_identity";
 
 pub const MESSAGE_ENUM_CONSTRAINTS_EXPAND_DDL: &str = r#"
 DO $myelin$
@@ -613,6 +614,10 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
                  (tenant_id, region, parent_project, name, topic)
                WHERE kind = 'channel_public' AND parent_project IS NOT NULL;"
     );
+    let message_identity = format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {MESSAGE_IDENTITY_INDEX}
+               ON {MESSAGE_TABLE} (tenant_id, region, message_id);"
+    );
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
@@ -646,6 +651,11 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
             MESSAGE_ENUM_CONSTRAINTS_VALIDATE_DDL,
             MESSAGE_TABLE,
         ),
+        Migration::plain_on(
+            "chat_0009_message_identity",
+            message_identity,
+            MESSAGE_TABLE,
+        ),
     ])
 }
 
@@ -656,7 +666,7 @@ mod tests {
     #[test]
     fn migrations_create_and_tenant_scope_both_tables() {
         let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 8);
+        assert_eq!(migrations.0.len(), 9);
         for (migration, table) in migrations.0[..2]
             .iter()
             .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
@@ -692,6 +702,8 @@ mod tests {
             migrations.0[7].id,
             "chat_0008_message_enum_constraints_validate"
         );
+        assert_eq!(migrations.0[8].id, "chat_0009_message_identity");
+        assert!(migrations.0[8].ddl.contains(MESSAGE_IDENTITY_INDEX));
     }
 
     #[test]

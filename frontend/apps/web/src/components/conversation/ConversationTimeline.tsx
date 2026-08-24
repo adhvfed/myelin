@@ -61,13 +61,18 @@ function InlineNode(props: { node: ChatMessageNode }) {
 }
 
 function MessageBody(props: { message: ChatMessage }) {
-  return <p dir="auto">
-    <For each={props.message.content.split("\uFFFC")}>
-      {(part, index) => <>{part}<Show when={index() < props.message.nodes.length}>
-        <InlineNode node={props.message.nodes[index()]!} />
-      </Show></>}
-    </For>
-  </p>;
+  return <Show
+    when={props.message.state === "deleted" || props.message.state === "tombstoned"}
+    fallback={<p dir="auto">
+      <For each={props.message.content.split("\uFFFC")}>
+        {(part, index) => <>{part}<Show when={index() < props.message.nodes.length}>
+          <InlineNode node={props.message.nodes[index()]!} />
+        </Show></>}
+      </For>
+    </p>}
+  >
+    <p dir="auto"><em>Message removed</em></p>
+  </Show>;
 }
 
 export interface ConversationTimelineProps {
@@ -81,6 +86,7 @@ export interface ConversationTimelineProps {
   onLoadEarlier: () => void;
   emptyHeading?: string;
   emptyCopy?: string;
+  focusedMessageId?: string;
 }
 
 export function ConversationTimeline(props: ConversationTimelineProps) {
@@ -93,6 +99,14 @@ export function ConversationTimeline(props: ConversationTimelineProps) {
       timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 140;
     previousCount = count;
     if (wasNearBottom) queueMicrotask(() => timeline?.scrollTo({ top: timeline.scrollHeight }));
+  });
+
+  createEffect(() => {
+    const focused = props.focusedMessageId;
+    if (!focused || !props.messages.some((message) => message.id === focused)) return;
+    queueMicrotask(() => document.getElementById(`message-${focused}`)?.scrollIntoView({
+      block: "center",
+    }));
   });
 
   return (
@@ -126,7 +140,11 @@ export function ConversationTimeline(props: ConversationTimelineProps) {
           }>
             <ol class="chat-message-list">
               <For each={props.messages}>{(message) => (
-                <li class="chat-message" classList={{ "chat-message-you": message.is_you }}>
+                <li
+                  id={`message-${message.id}`}
+                  class="chat-message"
+                  classList={{ "chat-message-you": message.is_you }}
+                >
                   <div class="chat-avatar" data-kind={message.author_kind} aria-hidden="true">
                     <Icon name={message.author_kind === "agent" ? "agent" : "human"} />
                   </div>

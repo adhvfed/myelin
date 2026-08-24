@@ -135,6 +135,29 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     let want: Vec<String> = pg_ids[15..20].iter().map(|m| m.0.clone()).collect();
     assert_eq!(ids(&pg_before), want);
 
+    let exact = store
+        .get_exact(&conv.tenant, &pg_ids[20])
+        .await
+        .expect("exact message lookup")
+        .expect("the addressed message remains present");
+    assert_eq!(exact.message_id, pg_ids[20]);
+    assert_eq!(exact.conv, conv);
+    let locations = store
+        .locate_exact(
+            &conv.tenant,
+            &[pg_ids[20].clone(), pg_ids[5].clone(), pg_ids[20].clone()],
+        )
+        .await
+        .expect("bounded exact message locations");
+    assert_eq!(
+        locations
+            .iter()
+            .map(|location| location.message_id.clone())
+            .collect::<Vec<_>>(),
+        vec![pg_ids[5].clone(), pg_ids[20].clone()],
+        "one metadata-only query returns canonical unique coordinates"
+    );
+
     let again = store
         .append_storage_only(&pg_src, new_msg(&conv, "n0", "alice", "m0 retry"))
         .await
@@ -245,6 +268,14 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
         other_view.len(),
         0,
         "0 cross-tenant rows: the partition isolates tenants"
+    );
+    assert!(
+        other_store
+            .get_exact(&other_tenant.tenant, &pg_ids[20])
+            .await
+            .unwrap()
+            .is_none(),
+        "the globally addressed lookup cannot cross the tenant RLS boundary"
     );
 
     assert!(

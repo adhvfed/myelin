@@ -82,6 +82,18 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   const relatedConversation = (JSON.parse(relatedText) as {
     conversation: { id: string; ref: string };
   }).conversation;
+  const relatedMessageBody = `The exact private decision remains here ${suffix}.`;
+  const relatedMessageResponse = await request.post(
+    `${edgeUrl}/v1/chat/conversations/${relatedConversation.id}/messages`,
+    {
+      headers: { ...headers, "idempotency-key": randomUUID() },
+      data: { content: relatedMessageBody },
+    },
+  );
+  const relatedMessageText = await relatedMessageResponse.text();
+  expect(relatedMessageResponse.status(), relatedMessageText).toBe(201);
+  const relatedMessageId = (JSON.parse(relatedMessageText) as { message_id: string }).message_id;
+  const relatedMessageRef = `myelin://${tenant}/chat/message/${relatedMessageId}`;
   const repository = `chat-handoff-${suffix}`;
   const repositoryResponse = await request.post(`${edgeUrl}/v1/git/repos`, {
     headers: { ...headers, "idempotency-key": randomUUID() },
@@ -272,13 +284,38 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await page.goBack();
   await expect(page.getByRole("heading", { name: topic })).toBeVisible();
 
+  await page.getByLabel(`Message ${topic}`).fill("Resume the exact private decision.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" })
+    .fill(relatedMessageRef);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const messageCard = page.getByRole("link", {
+    name: `Message in ${relatedTopic}, active`,
+    exact: true,
+  });
+  await expect(messageCard).toHaveAttribute(
+    "href",
+    `/chat?message=${relatedMessageId}#message-${relatedMessageId}`,
+  );
+  await messageCard.click();
+  await expect(page).toHaveURL(
+    new RegExp(`/chat\\?message=${relatedMessageId}#message-${relatedMessageId}$`),
+  );
+  await expect(page.getByRole("heading", { name: relatedTopic })).toBeVisible();
+  await expect(page.locator(`#message-${relatedMessageId}`)).toContainText(relatedMessageBody);
+  await expect(page.getByRole("link", { name: "View latest messages" }))
+    .toHaveAttribute("href", `/chat?conversation=${relatedConversation.id}`);
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: topic })).toBeVisible();
+
   await page.getByLabel(`Message ${topic}`).fill("Continue the sensitive investigation here.");
   await page.getByRole("button", { name: "Link work" }).click();
   await page.getByRole("textbox", { name: "Canonical Myelin reference" })
     .fill(relatedConversation.ref);
   await page.getByRole("button", { name: "Add reference" }).click();
   await page.getByRole("button", { name: "Send" }).click();
-  const relatedCard = page.getByRole("link", { name: `${relatedTopic}, active` });
+  const relatedCard = page.getByRole("link", { name: `${relatedTopic}, active`, exact: true });
   await expect(relatedCard)
     .toHaveAttribute("href", `/chat?conversation=${relatedConversation.id}`);
   await relatedCard.click();

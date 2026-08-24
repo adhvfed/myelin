@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use sqlx::postgres::PgPool;
 use sqlx::{Acquire, Row};
 
@@ -15,7 +17,12 @@ use myelin_tenancy::Region;
 
 #[cfg(any(test, feature = "test-support"))]
 use super::TombstoneReason;
-use super::{AuthorKind, ConversationId, Message, MessageId, NewMessage, RangeCursor, StoreError};
+use super::{
+    is_canonical_ulid, AuthorKind, ConversationId, Message, MessageId, MessageLocation, NewMessage,
+    RangeCursor, StoreError,
+};
+
+const EXACT_MESSAGE_BATCH_MAX: usize = 100;
 
 pub const MESSAGE_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS {table} (
@@ -68,6 +75,14 @@ impl PgMessageStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("message DDL: {e}")))?;
+        sqlx::raw_sql(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {table}_identity \
+             ON {table} (tenant_id, region, message_id)",
+            table = self.table,
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Cold(format!("message identity index: {e}")))?;
         sqlx::raw_sql(&format!(
             "DO $myelin$ \
              BEGIN \
@@ -560,6 +575,69 @@ impl PgMessageStore {
         rows.iter().map(row_to_message).collect()
     }
 
+    /// Finds one message by its artifact identity without materializing any other conversation.
+    /// Callers must still authorize the returned parent conversation before exposing the row.
+    pub async fn get_exact(
+        &self,
+        tenant: &str,
+        message_id: &MessageId,
+    ) -> Result<Option<Message>, StoreError> {
+        validate_exact_message_ids(std::slice::from_ref(message_id))?;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StoreError::Cold(format!("acquire: {e}")))?;
+        self.set_session_scope(&mut conn, tenant, &self.region)
+            .await?;
+        let row = sqlx::query(&format!(
+            "SELECT tenant_id, region, conversation_id, message_id, thread_root_id, author, \
+             author_kind, body_inline, body_nodes, client_nonce, edited_seq, state \
+             FROM {} WHERE tenant_id = $1 AND region = $2 AND message_id = $3",
+            self.table
+        ))
+        .bind(tenant)
+        .bind(&self.region)
+        .bind(message_id.as_str())
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Cold(format!("exact message select: {e}")))?;
+        row.as_ref().map(row_to_message).transpose()
+    }
+
+    /// Resolves a bounded card viewport to content-free message coordinates in one query.
+    /// Conversation visibility is deliberately not inferred here; the Edge composes that owner.
+    pub async fn locate_exact(
+        &self,
+        tenant: &str,
+        message_ids: &[MessageId],
+    ) -> Result<Vec<MessageLocation>, StoreError> {
+        let message_ids = validate_exact_message_ids(message_ids)?;
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StoreError::Cold(format!("acquire: {e}")))?;
+        self.set_session_scope(&mut conn, tenant, &self.region)
+            .await?;
+        let rows = sqlx::query(&format!(
+            "SELECT tenant_id, region, conversation_id, message_id, thread_root_id, state \
+             FROM {} WHERE tenant_id = $1 AND region = $2 AND message_id = ANY($3::text[]) \
+             ORDER BY message_id ASC",
+            self.table
+        ))
+        .bind(tenant)
+        .bind(&self.region)
+        .bind(message_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| StoreError::Cold(format!("exact message location select: {e}")))?;
+        rows.iter().map(row_to_message_location).collect()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     /// Mutates only the message table for storage-parity tests; emits no event.
     pub async fn revise_storage_only(
@@ -694,6 +772,39 @@ fn row_to_message(r: &sqlx::postgres::PgRow) -> Result<Message, StoreError> {
     })
 }
 
+fn row_to_message_location(row: &sqlx::postgres::PgRow) -> Result<MessageLocation, StoreError> {
+    Ok(MessageLocation {
+        message_id: MessageId(row.get("message_id")),
+        conv: ConversationId {
+            tenant: row.get("tenant_id"),
+            region: row.get("region"),
+            conversation_id: row.get("conversation_id"),
+        },
+        thread_root_id: row
+            .get::<Option<String>, _>("thread_root_id")
+            .map(MessageId),
+        state: decode_message_state(row.get("state"))?,
+    })
+}
+
+fn validate_exact_message_ids(message_ids: &[MessageId]) -> Result<Vec<String>, StoreError> {
+    if message_ids.len() > EXACT_MESSAGE_BATCH_MAX {
+        return Err(StoreError::Cold(format!(
+            "exact message lookup exceeds {EXACT_MESSAGE_BATCH_MAX} coordinates"
+        )));
+    }
+    let mut canonical = BTreeSet::new();
+    for message_id in message_ids {
+        if !is_canonical_ulid(message_id.as_str()) {
+            return Err(StoreError::Cold(
+                "exact message lookup requires canonical identifiers".into(),
+            ));
+        }
+        canonical.insert(message_id.0.clone());
+    }
+    Ok(canonical.into_iter().collect())
+}
+
 fn decode_author_kind(code: i16) -> Result<AuthorKind, StoreError> {
     u8::try_from(code)
         .ok()
@@ -746,5 +857,22 @@ mod tests {
                 "unknown message state {invalid} must not resurrect as active"
             );
         }
+    }
+
+    #[test]
+    fn exact_message_lookups_are_canonical_deduplicated_and_bounded() {
+        let first = MessageId("01J00000000000000000000000".into());
+        let second = MessageId("01J00000000000000000000001".into());
+        assert_eq!(
+            validate_exact_message_ids(&[second.clone(), first.clone(), second]),
+            Ok(vec![first.0, "01J00000000000000000000001".into()])
+        );
+        assert!(validate_exact_message_ids(&[MessageId("not-an-id".into())]).is_err());
+        assert!(validate_exact_message_ids(
+            &(0..=EXACT_MESSAGE_BATCH_MAX)
+                .map(|_| MessageId("01J00000000000000000000000".into()))
+                .collect::<Vec<_>>()
+        )
+        .is_err());
     }
 }
