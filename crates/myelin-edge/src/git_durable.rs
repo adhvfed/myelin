@@ -3290,6 +3290,7 @@ mod mutation_input;
 mod mutation_support;
 mod pr_queries;
 mod recovery;
+mod reference_cards;
 mod repo_summary;
 mod repository_views;
 mod review_threads;

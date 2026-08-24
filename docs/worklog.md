@@ -4,6 +4,36 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-24 — private Git work becomes useful Chat context without becoming public
+
+A repository or pull-request reference in Chat previously stayed a bare canonical URI even for its
+owner. Teaching the central resolver to call ordinary Git reads one reference at a time would have
+made a message viewport an N+1 authorization and PostgreSQL path; resolving once as the message
+author would have copied private titles to every later reader.
+
+Git now contributes a typed owner projector alongside Issues and Knowledge. It canonicalizes and
+deduplicates the requested repository and `repo:number` coordinates, asks the production
+repository authorizer for the whole set once, verifies only the authorized exact repositories, and
+loads every visible PR through one zipped-array PostgreSQL query. That query reuses the authoritative
+encrypted-row decoder, omits missing records, and is bounded before storage. Missing repositories,
+missing PRs, denial, malformed owner coordinates, and owner-query failure all remain the same
+content-free tombstone. Hierarchical repository slugs use exact probes rather than inheriting the
+flat browse catalogue's scan. The cohesive read path lives in its own `git_durable/reference_cards`
+module instead of adding another concern to the oversized Git facade.
+
+The black-box story is deliberately symmetric: two engineers each create a private repository and
+PR, put all four references in one shared Chat message, and read that same persisted message. Each
+reader receives their own repository and PR cards plus two tombstones, with the inaccessible PR
+title absent from the entire response. The existing sequential CLI organization journey now also
+requires the agent-authored PR title and canonical ref in ordinary rendered Chat output.
+
+**Proof:** warning-free all-target/all-feature Edge and Git clippy; system-test and web typecheck;
+the real PostgreSQL PR boundary including exact batch selection, title decryption, deduplication,
+missing-record omission, and tenant isolation; the complete all-feature Edge and Git backend suites
+(350 Edge and 565 Git library cases plus every durable/CDC/drill integration); rebuilt and healthy
+Edge; all six live Chat collaboration journeys; all sixteen sequential CLI organization journeys;
+both real-browser Chat product journeys; and the 99-row contract gate with zero falsely claimed.
+
 ## 2026-08-24 — Knowledge pages join the reference-card fabric
 
 The first Chat card implementation was intentionally narrow, but its resolver owned Issues
@@ -1230,10 +1260,11 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.
 6. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
-   viewer-scoped Issue and Knowledge page cards through bounded owner queries, with content-free
-   tombstones for denied or unavailable artifacts. Git, CI, and Chat artifacts still retain their
-   canonical link rather than a rich card because their durable owner projectors are not composed.
-   Event-driven cache invalidation and live card updates also remain unwired.
+   viewer-scoped Issue, Knowledge page, Git repository, and Git pull-request cards through bounded
+   owner queries, with content-free tombstones for denied or unavailable artifacts. Git commits,
+   blobs, refs, reviews, and comments, plus CI and Chat artifacts, still retain their canonical link
+   rather than a rich card because their durable owner projectors are not composed. Event-driven
+   cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade

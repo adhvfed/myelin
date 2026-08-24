@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, test } from "vitest";
 
+import type { SystemTestClient } from "../src/client.js";
 import {
   browserApprovedCliClient,
   reviewerClient,
@@ -9,11 +10,13 @@ import {
   uniqueName,
 } from "../src/context.js";
 import { eventually } from "../src/eventually.js";
+import { GitProject } from "../src/git-project.js";
 import { listPrivateAgentThreads } from "../src/journeys/agent-threads.js";
 import { activateExternalAgent } from "../src/journeys/agents.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { findInboxItem } from "../src/journeys/inbox.js";
 import { awaitActiveIssue } from "../src/journeys/issues.js";
+import { proposeChange } from "../src/journeys/pull-requests.js";
 import { awaitBacklink } from "../src/journeys/refs.js";
 import { array, record, string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
@@ -29,6 +32,30 @@ async function createKnowledgePage(title: string, visibility: "private" | "team"
   return {
     ref: string(page.ref, `${visibility} Knowledge page reference`),
     title: string(page.title, `${visibility} Knowledge page title`),
+  };
+}
+
+async function createPrivatePullRequest(
+  owner: SystemTestClient,
+  label: string,
+) {
+  const coordinate = label.replaceAll(" ", "-");
+  const repository = new GitProject(uniqueName(`${coordinate}-repository`), owner);
+  await repository.create();
+  await repository.writeFile("main", "README.md", `# ${repository.slug}\n`);
+  const title = uniqueName(`${label} pull request`);
+  const opened = await proposeChange(owner, repository, {
+    branch: uniqueName(`${coordinate}-branch`),
+    path: "plan.md",
+    contents: `# ${title}\n`,
+    title,
+  });
+  return {
+    repositoryRef: `myelin://${systemTestConfig.tenant}/git/repo/${repository.slug}`,
+    repositoryTitle: repository.slug,
+    pullRequestRef: string(opened.pullRequest.ref, `${label} pull request reference`),
+    pullRequestTitle: title,
+    pullRequestState: string(opened.pullRequest.pr_state, `${label} pull request state`),
   };
 }
 
@@ -469,6 +496,102 @@ describe("chat collaboration lifecycle", () => {
           ],
         }),
       ]);
+  });
+
+  test("lets each engineer recognize their private Git work without exposing the other's", async () => {
+    const foundersWork = await createPrivatePullRequest(systemClient, "founder rollout");
+    const reviewersWork = await createPrivatePullRequest(reviewerClient, "reviewer rollout");
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("private-git-cards"),
+      topic: "Coordinate changes without broadening repository access",
+    });
+    await room.post(
+      systemClient,
+      "Compare my repository \uFFFC and change \uFFFC with yours \uFFFC and \uFFFC.",
+      {
+        references: [
+          foundersWork.repositoryRef,
+          foundersWork.pullRequestRef,
+          reviewersWork.repositoryRef,
+          reviewersWork.pullRequestRef,
+        ],
+      },
+    );
+
+    const foundersHistory = await room.messages(systemClient);
+    expect(foundersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersWork.repositoryRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: foundersWork.repositoryTitle,
+              state: "active",
+              icon: "git",
+              render_hint: "git_repository",
+            }),
+          }),
+          expect.objectContaining({
+            ref: foundersWork.pullRequestRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: foundersWork.pullRequestTitle,
+              state: foundersWork.pullRequestState,
+              icon: "pull_request",
+              render_hint: "git_pull_request",
+            }),
+          }),
+          expect.objectContaining({
+            ref: reviewersWork.repositoryRef,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: reviewersWork.pullRequestRef,
+            card: { kind: "tombstone" },
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWork.pullRequestTitle);
+
+    const reviewersHistory = await room.messages(reviewerClient);
+    expect(reviewersHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: foundersWork.repositoryRef,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: foundersWork.pullRequestRef,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: reviewersWork.repositoryRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: reviewersWork.repositoryTitle,
+              state: "active",
+              icon: "git",
+              render_hint: "git_repository",
+            }),
+          }),
+          expect.objectContaining({
+            ref: reviewersWork.pullRequestRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: reviewersWork.pullRequestTitle,
+              state: reviewersWork.pullRequestState,
+              icon: "pull_request",
+              render_hint: "git_pull_request",
+            }),
+          }),
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.pullRequestTitle);
   });
 
   test("keeps a shared runbook legible while a private notebook stays nameless", async () => {

@@ -39,6 +39,7 @@ use list_queries::{pr_cross_list_page_sql, pr_list_page_sql, validate_cross_visi
 pub const GIT_PR_TABLE: &str = "git_pr";
 pub const GIT_PR_COUNTER_TABLE: &str = "git_pr_counter";
 pub const GIT_PR_COMMAND_TABLE: &str = "git_pr_command";
+const PR_BATCH_MAX_COORDINATES: usize = 10_000;
 const PR_RECORD_COLUMNS: &str = "record, head_repo_slug, title_nonce, title_ciphertext, \
 title_pii_key_ref, body_nonce, body_ciphertext, body_pii_key_ref, author_subject_id";
 
@@ -665,6 +666,67 @@ impl PgPrStore {
         .map_err(pg_error)?
         .map(|row| decode_record(&kms, &crypto_region, &expected_tenant, row))
         .transpose()
+    }
+
+    /// Read an exact, bounded set of pull requests from one tenant cell.
+    ///
+    /// Callers are responsible for authorization before supplying coordinates. Missing records are
+    /// omitted, and duplicate coordinates are read once.
+    pub fn get_many(
+        &self,
+        scope: &TenantScope,
+        coordinates: &[(String, u64)],
+    ) -> Result<Vec<(String, PrRecord)>, DurableError> {
+        let cell = self.scoped_cell(scope)?;
+        let coordinates = normalize_pr_batch_coordinates(coordinates)?;
+        if coordinates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (repos, numbers): (Vec<_>, Vec<_>) = coordinates.into_iter().unzip();
+        let provider = self.provider.clone();
+        let kms = self.kms.clone();
+        let tenant_id = cell.tenant_id;
+        let region = cell.region;
+        let transaction_tenant = tenant_id.0.clone();
+        let crypto_region = region.clone();
+        let expected_tenant = tenant_id.0.clone();
+        let rows = self
+            .block_on(async move {
+                provider
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
+                        Box::pin(async move {
+                            let read_sql = format!(
+                                "SELECT pr.repo_slug AS requested_repo_slug, {PR_RECORD_COLUMNS} \
+                                 FROM git_pr AS pr \
+                                 JOIN unnest($3::text[], $4::bigint[]) \
+                                   AS requested(repo_slug, number) \
+                                   ON pr.repo_slug=requested.repo_slug \
+                                  AND pr.number=requested.number \
+                                 WHERE pr.tenant_id=$1 AND pr.region=$2 \
+                                 ORDER BY pr.repo_slug ASC, pr.number ASC"
+                            );
+                            sqlx::query(&read_sql)
+                                .bind(&tenant_id.0)
+                                .bind(&region.0)
+                                .bind(&repos)
+                                .bind(&numbers)
+                                .fetch_all(&mut *conn)
+                                .await
+                                .map_err(|_| pg_query("read PR batch"))
+                        })
+                    })
+                    .await
+            })
+            .map_err(pg_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let repo = row
+                    .try_get("requested_repo_slug")
+                    .map_err(|_| DurableError::Io("PR batch repository malformed".into()))?;
+                let record = decode_record(&kms, &crypto_region, &expected_tenant, row)?;
+                Ok((repo, record))
+            })
+            .collect()
     }
 
     pub fn list_bounded(
@@ -2679,6 +2741,30 @@ fn db_number(number: u64) -> Result<i64, DurableError> {
     i64::try_from(number).map_err(|_| DurableError::Git("PR number exceeds bigint".into()))
 }
 
+fn normalize_pr_batch_coordinates(
+    coordinates: &[(String, u64)],
+) -> Result<Vec<(String, i64)>, DurableError> {
+    if coordinates.len() > PR_BATCH_MAX_COORDINATES {
+        return Err(DurableError::Git(format!(
+            "at most {PR_BATCH_MAX_COORDINATES} pull requests may be read at once"
+        )));
+    }
+    let mut normalized = Vec::with_capacity(coordinates.len());
+    for (repo, number) in coordinates {
+        crate::coordinate::RepositorySlug::parse(repo)
+            .map_err(|_| DurableError::Git("PR batch repository slug is malformed".into()))?;
+        if *number == 0 {
+            return Err(DurableError::Git(
+                "PR batch numbers must be positive".into(),
+            ));
+        }
+        normalized.push((repo.clone(), db_number(*number)?));
+    }
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 fn qualify_ref(value: &str) -> String {
     if value.starts_with("refs/") {
         value.to_owned()
@@ -2779,6 +2865,32 @@ mod tests {
             &base,
             &PushOid::new("0123456789012345678901234567890123456789"),
         )
+        .is_err());
+    }
+
+    #[test]
+    fn pull_request_batches_are_canonical_bounded_and_deduplicated() {
+        assert!(normalize_pr_batch_coordinates(&[]).unwrap().is_empty());
+        assert_eq!(
+            normalize_pr_batch_coordinates(&[
+                ("team/api".into(), 2),
+                ("core".into(), 1),
+                ("team/api".into(), 2),
+            ])
+            .unwrap(),
+            [("core".into(), 1), ("team/api".into(), 2)]
+        );
+        for malformed in [
+            vec![("contains a space".into(), 1)],
+            vec![("core".into(), 0)],
+            vec![("core".into(), u64::MAX)],
+        ] {
+            assert!(normalize_pr_batch_coordinates(&malformed).is_err());
+        }
+        assert!(normalize_pr_batch_coordinates(&vec![
+            ("core".into(), 1);
+            PR_BATCH_MAX_COORDINATES + 1
+        ])
         .is_err());
     }
 
@@ -3345,6 +3457,41 @@ mod tests {
         }
         numbers.sort_unstable();
         assert_eq!(numbers, (2..=9).collect::<Vec<_>>());
+
+        let exact_batch = store
+            .get_many(
+                &scope_a,
+                &[
+                    (projection_slug.clone(), projected_pr.number),
+                    (repo.into(), opened.number),
+                    (repo.into(), opened.number),
+                    (repo.into(), 10_000),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            exact_batch.len(),
+            2,
+            "duplicates and missing PRs are omitted"
+        );
+        assert!(exact_batch.iter().any(|(batch_repo, record)| {
+            batch_repo == repo && record.number == opened.number && record.title == "private-title"
+        }));
+        assert!(exact_batch.iter().any(|(batch_repo, record)| {
+            batch_repo == &projection_slug
+                && record.number == projected_pr.number
+                && record.title == "legacy green"
+        }));
+        assert!(store
+            .get_many(
+                &scope_b,
+                &[
+                    (repo.into(), opened.number),
+                    (projection_slug.clone(), projected_pr.number)
+                ],
+            )
+            .unwrap()
+            .is_empty());
 
         let page_query = PrListQuery::new(
             PrListState::All,

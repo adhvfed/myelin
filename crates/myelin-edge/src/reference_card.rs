@@ -5,7 +5,7 @@ use myelin_issues::StoredIssue;
 use serde::Serialize;
 use std::sync::Arc;
 
-use crate::{DurableIssueReadApi, DurableKnowledgeReadApi};
+use crate::{DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -74,6 +74,12 @@ impl DurableReferenceCardResolver {
     pub fn with_knowledge(mut self, knowledge: DurableKnowledgeReadApi) -> Self {
         self.projectors
             .push(Arc::new(KnowledgeReferenceCardProjector { knowledge }));
+        self
+    }
+
+    pub fn with_git(mut self, git: Arc<DurableGitBackend>) -> Self {
+        self.projectors
+            .push(Arc::new(GitReferenceCardProjector { git }));
         self
     }
 }
@@ -150,6 +156,77 @@ impl ReferenceCardProjector for KnowledgeReferenceCardProjector {
     }
 }
 
+struct GitReferenceCardProjector {
+    git: Arc<DurableGitBackend>,
+}
+
+impl ReferenceCardProjector for GitReferenceCardProjector {
+    fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
+        let repository_references = root_references(viewer, references, "git", "repo");
+        let pull_request_roots = root_references(viewer, references, "git", "pr");
+        if repository_references.is_empty() && pull_request_roots.is_empty() {
+            return HashMap::new();
+        }
+        let mut cards = claimed_tombstones(&repository_references);
+        cards.extend(claimed_tombstones(&pull_request_roots));
+
+        let repositories = repository_references
+            .keys()
+            .filter(|slug| myelin_git::coordinate::RepositorySlug::parse(slug).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        let pull_request_references = canonical_pull_request_references(&pull_request_roots);
+        let pull_requests = pull_request_references.keys().cloned().collect::<Vec<_>>();
+        let Ok(visible) = self
+            .git
+            .visible_reference_cards(viewer, &repositories, &pull_requests)
+        else {
+            return cards;
+        };
+
+        for repository in visible.repositories {
+            let Some(references) = repository_references.get(&repository) else {
+                continue;
+            };
+            let card = ReferenceCard::projection(repository, "active", "git", "git_repository");
+            for reference in references {
+                cards.insert(reference.clone(), card.clone());
+            }
+        }
+        for pull_request in visible.pull_requests {
+            let coordinate = (pull_request.repository, pull_request.number);
+            let Some(references) = pull_request_references.get(&coordinate) else {
+                continue;
+            };
+            let card = ReferenceCard::projection(
+                pull_request.title,
+                pull_request.state,
+                "pull_request",
+                "git_pull_request",
+            );
+            for reference in references {
+                cards.insert(reference.clone(), card.clone());
+            }
+        }
+        cards
+    }
+}
+
+fn canonical_pull_request_references(
+    roots: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<(String, u64), Vec<String>> {
+    roots
+        .iter()
+        .filter_map(|(id, references)| {
+            let (repository, number) = id.rsplit_once(':')?;
+            myelin_git::coordinate::RepositorySlug::parse(repository).ok()?;
+            let number = myelin_git::coordinate::parse_positive_decimal(number)?;
+            i64::try_from(number).ok()?;
+            Some(((repository.to_owned(), number), references.clone()))
+        })
+        .collect()
+}
+
 fn root_references(
     viewer: &Principal,
     references: &[String],
@@ -214,6 +291,32 @@ mod tests {
             BTreeMap::from([(
                 "ENG-41".into(),
                 vec!["myelin://acme/issue/issue/ENG-41".into()]
+            )])
+        );
+    }
+
+    #[test]
+    fn pull_request_roots_have_one_canonical_coordinate_shape() {
+        let roots = BTreeMap::from([
+            (
+                "team/api:41".into(),
+                vec!["myelin://acme/git/pr/team/api:41".into()],
+            ),
+            (
+                "team/api:041".into(),
+                vec!["myelin://acme/git/pr/team/api:041".into()],
+            ),
+            (
+                "team api:42".into(),
+                vec!["myelin://acme/git/pr/team api:42".into()],
+            ),
+        ]);
+
+        assert_eq!(
+            canonical_pull_request_references(&roots),
+            BTreeMap::from([(
+                ("team/api".into(), 41),
+                vec!["myelin://acme/git/pr/team/api:41".into()]
             )])
         );
     }

@@ -160,6 +160,7 @@ describe.sequential("the CLI authentication journey", () => {
   let sourceFile: JsonRecord;
   let agentVisiblePageRef: string;
   let agentPullRequestRef: string;
+  let agentPullRequestTitle: string;
   let agentIssueRef: string;
   let agentIssueTitle: string;
 
@@ -1844,7 +1845,7 @@ describe.sequential("the CLI authentication journey", () => {
     // Authorship and authorization stay separate: the PR is authored by the agent, while the
     // founder's live repository grant is the authorization basis. The agent receives neither a
     // copied Git credential nor a durable repository grant of its own.
-    const agentPullRequestTitle = uniqueName("Make credentialless intent explicit");
+    agentPullRequestTitle = uniqueName("Make credentialless intent explicit");
     const agentPullRequestKey = `agent-pr-${randomUUID()}`;
     const openedByAgent = await askAgentToAct(
       resumedRun,
@@ -2345,6 +2346,8 @@ describe.sequential("the CLI authentication journey", () => {
     expect(renderedHumanHistory.exitCode, renderedHumanHistory.stderr).toBe(0);
     expect(renderedHumanHistory.stdout).toContain(agentIssueTitle);
     expect(renderedHumanHistory.stdout).toContain(`<${agentIssueRef}>`);
+    expect(renderedHumanHistory.stdout).toContain(agentPullRequestTitle);
+    expect(renderedHumanHistory.stdout).toContain(`<${agentPullRequestRef}>`);
 
     // References are not merely syntax inside the message. Once projected, either artifact can
     // lead the developer back to the same visible piece of agent-authored context. The graph is
