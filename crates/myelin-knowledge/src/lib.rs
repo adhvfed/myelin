@@ -87,10 +87,11 @@ pub use merge::{
 };
 pub use notif_resolve::KnowledgeRefResolver;
 pub use pg_page::{
-    knowledge_page_migrations, KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord,
-    KnowledgePageStore, KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
-    EXPAND_KNOWLEDGE_BLOCK_REFERENCES_DDL, KNOWLEDGE_BLOCK_TABLE, KNOWLEDGE_PAGE_RECENT_INDEX,
-    KNOWLEDGE_PAGE_TABLE, MAX_BLOCK_REFERENCES, MAX_PAGE_REFERENCES,
+    is_canonical_knowledge_id, knowledge_page_migrations, KnowledgeBlockRecord, KnowledgePageError,
+    KnowledgePageRecord, KnowledgePageStore, KnowledgeVisibility, NewKnowledgePage,
+    SaveKnowledgePage, EXPAND_KNOWLEDGE_BLOCK_REFERENCES_DDL, KNOWLEDGE_BLOCK_TABLE,
+    KNOWLEDGE_PAGE_RECENT_INDEX, KNOWLEDGE_PAGE_TABLE, MAX_BLOCK_REFERENCES, MAX_PAGE_REFERENCES,
+    MAX_VISIBLE_PAGE_IDS,
 };
 pub use rebac_fragment::{
     block_read_fragment, database_row_read_fragment, field_view_permission,

@@ -4,6 +4,31 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-24 — Knowledge pages join the reference-card fabric
+
+The first Chat card implementation was intentionally narrow, but its resolver owned Issues
+directly. Adding another artifact that way would have grown a central switch and encouraged
+single-object reads. Knowledge also had two separately constructed production APIs—one serving HTTP
+and another serving agents—even though both represented the same durable page owner.
+
+Reference-card resolution is now a composition of typed owner projectors. Knowledge contributes one
+bounded, deduplicated page-summary query using the same owner-or-team visibility predicate as its
+ordinary page reads; it never loads blocks or bodies. Visible encrypted titles become active
+Knowledge cards. Private, missing, archived, erased-title, and unavailable pages all stay the same
+content-free tombstone. Canonical Knowledge ids now have one owner-side validator shared by page
+storage and Edge input handling, and invalid, empty, or over-cap batches are decided before a
+database connection.
+
+Production now constructs one Knowledge mutation/read service and shares it between HTTP, hosted
+agents, MCP, and the card projector. A black-box story posts a team runbook and a private notebook
+into the same shared conversation: a teammate gets one useful card and one nameless tombstone, while
+the owner gets both real titles.
+
+**Proof:** warning-free all-target/all-feature Edge and Knowledge clippy; system-test typecheck; the
+complete all-feature Edge and Knowledge backend suites (349 Edge and 390 Knowledge library cases,
+plus every CDC, drill, and durable integration); focused pre-storage batch-bound tests; rebuilt and
+healthy Edge; and all five live Chat collaboration journeys against the final binary.
+
 ## 2026-08-24 — Chat references become viewer-scoped work cards
 
 A canonical reference in Chat was durable and traversable, but readers still saw only its URI. The
@@ -1204,11 +1229,11 @@ roughly 1,430 lines of non-durable implementation and self-testing scaffolding.
 5. **cross-product search is not surfaced yet.** the running product has bounded,
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.
-6. **Chat reference cards have one owner adapter, not the full projection fabric yet.** Edge, CLI,
-   and browser now surface viewer-scoped Issue cards through one bounded owner query, with
-   content-free tombstones for denied or unavailable Issues. Git, Knowledge, CI, and Chat artifacts
-   still retain their canonical link rather than a rich card because their durable owner projectors
-   are not composed. Event-driven cache invalidation and live card updates also remain unwired.
+6. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
+   viewer-scoped Issue and Knowledge page cards through bounded owner queries, with content-free
+   tombstones for denied or unavailable artifacts. Git, CI, and Chat artifacts still retain their
+   canonical link rather than a rich card because their durable owner projectors are not composed.
+   Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade

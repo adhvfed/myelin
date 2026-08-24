@@ -22,6 +22,7 @@ pub const KNOWLEDGE_BLOCK_TABLE: &str = "knowledge_block";
 pub const KNOWLEDGE_PAGE_RECENT_INDEX: &str = "knowledge_page_recent";
 pub const MAX_BLOCK_REFERENCES: usize = 32;
 pub const MAX_PAGE_REFERENCES: usize = 100;
+pub const MAX_VISIBLE_PAGE_IDS: usize = 10_000;
 
 pub const KNOWLEDGE_PAGE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS knowledge_page (
@@ -407,6 +408,63 @@ impl KnowledgePageStore {
             .await
             .map_err(storage("commit Knowledge page read"))?;
         Ok(page)
+    }
+
+    /// Read a bounded set of page summaries through the same visibility predicate as list and get.
+    /// Missing and invisible pages are omitted, and blocks are deliberately not materialized.
+    pub async fn list_visible_by_ids(
+        &self,
+        tenant: &str,
+        region: &str,
+        viewer: &str,
+        page_ids: &[String],
+    ) -> Result<Vec<KnowledgePageRecord>, KnowledgePageError> {
+        if page_ids.len() > MAX_VISIBLE_PAGE_IDS {
+            return Err(KnowledgePageError::Invalid(format!(
+                "at most {MAX_VISIBLE_PAGE_IDS} Knowledge page ids may be read at once"
+            )));
+        }
+        let mut page_ids = page_ids.to_vec();
+        if page_ids
+            .iter()
+            .any(|page_id| !is_canonical_knowledge_id(page_id))
+        {
+            return Err(KnowledgePageError::Invalid(
+                "Knowledge page ids must be canonical ULIDs".into(),
+            ));
+        }
+        page_ids.sort_unstable();
+        page_ids.dedup();
+        if page_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self.begin_scoped(tenant, region).await?;
+        let rows = sqlx::query(
+            "SELECT tenant_id, region, page_id, space_key, parent_page_id,
+                    title_key_ref, title_nonce, title_ciphertext, owner, visibility, version,
+                    EXTRACT(EPOCH FROM created_at)::bigint AS created_at_epoch,
+                    EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_epoch
+               FROM knowledge_page
+              WHERE tenant_id = $1 AND region = $2 AND page_id = ANY($3) AND NOT archived
+                AND (owner = $4 OR visibility = 'team')
+              ORDER BY page_id ASC",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(&page_ids)
+        .bind(viewer)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage("read visible Knowledge page summaries"))?;
+        let pages = rows
+            .iter()
+            .map(row_to_page)
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit()
+            .await
+            .map_err(storage("commit Knowledge page summary read"))?;
+        Ok(pages)
     }
 
     pub async fn save(
@@ -828,12 +886,7 @@ fn validate_blocks(
     let mut ids = std::collections::HashSet::with_capacity(blocks.len());
     let mut reference_count = 0usize;
     for block in blocks {
-        if block.block_id.len() != 26
-            || !block
-                .block_id
-                .bytes()
-                .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
-        {
+        if !is_canonical_knowledge_id(&block.block_id) {
             return Err(KnowledgePageError::Invalid(
                 "block ids must be canonical ULIDs".into(),
             ));
@@ -882,6 +935,13 @@ fn validate_blocks(
         }
     }
     Ok(())
+}
+
+pub fn is_canonical_knowledge_id(value: &str) -> bool {
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1009,6 +1069,43 @@ mod tests {
         let mut unknown = block("01J00000000000000000000001");
         unknown.block_type = "raw_html".into();
         assert!(validate_blocks("acme", &[unknown]).is_err());
+    }
+
+    #[test]
+    fn page_ids_have_one_canonical_address_shape() {
+        assert!(is_canonical_knowledge_id("01J00000000000000000000000"));
+        assert!(!is_canonical_knowledge_id("01j00000000000000000000000"));
+        assert!(!is_canonical_knowledge_id("01J0000000000000000000000I"));
+        assert!(!is_canonical_knowledge_id("01J0000000000000000000000"));
+    }
+
+    #[tokio::test]
+    async fn page_summary_batches_are_bounded_before_postgres() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let store = KnowledgePageStore::new(pool);
+
+        assert_eq!(
+            store
+                .list_visible_by_ids("acme", "fr-par", "reader", &[])
+                .await
+                .unwrap(),
+            Vec::new()
+        );
+        assert!(matches!(
+            store
+                .list_visible_by_ids("acme", "fr-par", "reader", &["not-an-id".into()])
+                .await,
+            Err(KnowledgePageError::Invalid(_))
+        ));
+        let too_many = vec!["01J00000000000000000000000".into(); MAX_VISIBLE_PAGE_IDS + 1];
+        assert!(matches!(
+            store
+                .list_visible_by_ids("acme", "fr-par", "reader", &too_many)
+                .await,
+            Err(KnowledgePageError::Invalid(_))
+        ));
     }
 
     #[test]

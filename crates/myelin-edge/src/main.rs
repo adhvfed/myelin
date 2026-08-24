@@ -1272,9 +1272,13 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         issue_reconciler.wakeup(),
         handle.clone(),
     );
-    let reference_cards = Arc::new(myelin_edge::DurableReferenceCardResolver::new(
-        issue_mutations.reads(),
-    ));
+    let knowledge_mutations =
+        DurableKnowledgeMutationApi::new(provider.db_pool().clone(), handle.clone(), kms.clone());
+    let reference_cards = Arc::new(
+        myelin_edge::DurableReferenceCardResolver::new()
+            .with_issues(issue_mutations.reads())
+            .with_knowledge(knowledge_mutations.reads()),
+    );
     builder = register_issues(builder, issue_mutations.clone());
     builder = register_projects(builder, projects.clone(), check.clone(), handle.clone());
     builder = register_refs(
@@ -1356,11 +1360,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 git: git_backend.clone(),
                 ci: mcp_ci,
                 issues: issue_mutations,
-                knowledge: DurableKnowledgeMutationApi::new(
-                    provider.db_pool().clone(),
-                    handle.clone(),
-                    kms.clone(),
-                ),
+                knowledge: knowledge_mutations.clone(),
                 chat: mcp_chat.clone(),
                 chat_mutations: DurableChatMutationApi::new(
                     mcp_chat.clone(),
@@ -1387,12 +1387,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     );
     builder = register_tools(builder);
     builder = register_chat(builder, mcp_chat, chat_principals);
-    builder = register_knowledge(
-        builder,
-        provider.db_pool().clone(),
-        handle.clone(),
-        kms.clone(),
-    );
+    builder = register_knowledge(builder, knowledge_mutations);
     builder = register_notif(
         builder,
         inbox_store,

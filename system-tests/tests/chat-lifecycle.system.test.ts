@@ -18,6 +18,20 @@ import { awaitBacklink } from "../src/journeys/refs.js";
 import { array, record, string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
+async function createKnowledgePage(title: string, visibility: "private" | "team") {
+  const created = await systemClient.json("/v1/knowledge/pages", {
+    method: "POST",
+    body: { title, template: "blank", visibility },
+    idempotencyKey: `knowledge-card-${randomUUID()}`,
+    expectedStatus: 201,
+  });
+  const page = record(created.body.page, `${visibility} Knowledge page`);
+  return {
+    ref: string(page.ref, `${visibility} Knowledge page reference`),
+    title: string(page.title, `${visibility} Knowledge page title`),
+  };
+}
+
 describe("chat collaboration lifecycle", () => {
   test("requires a private thread instead of turning a public mention into agent work", async () => {
     const founder = await browserApprovedCliClient();
@@ -455,5 +469,69 @@ describe("chat collaboration lifecycle", () => {
           ],
         }),
       ]);
+  });
+
+  test("keeps a shared runbook legible while a private notebook stays nameless", async () => {
+    const sharedPage = await createKnowledgePage(
+      uniqueName("Release handover runbook"),
+      "team",
+    );
+    const privatePage = await createKnowledgePage(
+      uniqueName("Founder succession notes"),
+      "private",
+    );
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("knowledge-cards"),
+      topic: "Bring living documentation into the work without copying it",
+    });
+    await room.post(
+      systemClient,
+      "Read \uFFFC before release; leave \uFFFC with its owner.",
+      { references: [sharedPage.ref, privatePage.ref] },
+    );
+
+    const teammatesHistory = await room.messages(reviewerClient);
+    expect(teammatesHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          {
+            kind: "artifact_ref",
+            ref: sharedPage.ref,
+            card: {
+              kind: "projection",
+              title: sharedPage.title,
+              state: "active",
+              icon: "knowledge",
+              render_hint: "knowledge_page",
+              sub_anchor: null,
+              flag: null,
+            },
+          },
+          {
+            kind: "artifact_ref",
+            ref: privatePage.ref,
+            card: { kind: "tombstone" },
+          },
+        ],
+      }),
+    ]);
+    expect(JSON.stringify(teammatesHistory)).not.toContain(privatePage.title);
+
+    const authorsHistory = await room.messages(systemClient);
+    expect(authorsHistory).toEqual([
+      expect.objectContaining({
+        nodes: [
+          expect.objectContaining({
+            ref: sharedPage.ref,
+            card: expect.objectContaining({ kind: "projection", title: sharedPage.title }),
+          }),
+          expect.objectContaining({
+            ref: privatePage.ref,
+            card: expect.objectContaining({ kind: "projection", title: privatePage.title }),
+          }),
+        ],
+      }),
+    ]);
   });
 });

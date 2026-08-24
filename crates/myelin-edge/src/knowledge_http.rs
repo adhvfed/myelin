@@ -44,6 +44,11 @@ pub struct DurableKnowledgeReadApi {
     kms: Arc<KmsEngine>,
 }
 
+pub(crate) struct KnowledgePageCardProjection {
+    pub page_id: String,
+    pub title: Option<String>,
+}
+
 impl DurableKnowledgeReadApi {
     pub fn new(pool: PgPool, runtime: Handle, kms: Arc<KmsEngine>) -> Self {
         Self {
@@ -115,6 +120,28 @@ impl DurableKnowledgeReadApi {
     ) -> Result<Value, EdgeError> {
         let page_id = page_id_from_ref(principal, page_reference)?;
         self.read_page(principal, &page_id)
+    }
+
+    pub(crate) fn project_pages(
+        &self,
+        principal: &Principal,
+        page_ids: &[String],
+    ) -> Result<Vec<KnowledgePageCardProjection>, EdgeError> {
+        let viewer = self.viewer(principal);
+        self.drive(self.store.list_visible_by_ids(
+            &principal.tenant.0,
+            &principal.region.0,
+            &viewer,
+            page_ids,
+        ))?
+        .iter()
+        .map(|page| {
+            Ok(KnowledgePageCardProjection {
+                page_id: page.page_id.clone(),
+                title: visible_page_title(self.kms.as_ref(), page)?,
+            })
+        })
+        .collect()
     }
 }
 
@@ -460,11 +487,8 @@ impl Handler for PageLinkHandler {
 
 pub fn register_knowledge(
     builder: GatewayBuilder,
-    pool: PgPool,
-    runtime: Handle,
-    kms: Arc<KmsEngine>,
+    api: DurableKnowledgeMutationApi,
 ) -> GatewayBuilder {
-    let api = DurableKnowledgeMutationApi::new(pool, runtime, kms);
     let reads = api.reads();
     builder
         .route(
@@ -571,11 +595,7 @@ fn page_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
 }
 
 fn validate_ulid(value: &str) -> Result<(), EdgeError> {
-    if value.len() == 26
-        && value
-            .bytes()
-            .all(|byte| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte))
-    {
+    if myelin_knowledge::is_canonical_knowledge_id(value) {
         Ok(())
     } else {
         Err(EdgeError::BadRequest(
@@ -833,16 +853,7 @@ fn summary_json(
     viewer: &str,
     kms: &KmsEngine,
 ) -> Result<Value, EdgeError> {
-    let title = open_visible(
-        kms,
-        page,
-        &page.title,
-        &page.owner,
-        &title_scope(&page.page_id),
-    )?
-    .map(String::from_utf8)
-    .transpose()
-    .map_err(|_| EdgeError::Internal("stored Knowledge title is not valid UTF-8".into()))?;
+    let title = visible_page_title(kms, page)?;
     Ok(json!({
         "id": page.page_id,
         "ref": page_ref(&TenantId(page.tenant.clone()), &page.page_id).0,
@@ -856,6 +867,22 @@ fn summary_json(
         "created_at": page.created_at_epoch,
         "updated_at": page.updated_at_epoch,
     }))
+}
+
+fn visible_page_title(
+    kms: &KmsEngine,
+    page: &KnowledgePageRecord,
+) -> Result<Option<String>, EdgeError> {
+    open_visible(
+        kms,
+        page,
+        &page.title,
+        &page.owner,
+        &title_scope(&page.page_id),
+    )?
+    .map(String::from_utf8)
+    .transpose()
+    .map_err(|_| EdgeError::Internal("stored Knowledge title is not valid UTF-8".into()))
 }
 
 fn document_json(
