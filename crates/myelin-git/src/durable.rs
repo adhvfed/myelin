@@ -321,6 +321,7 @@ pub const PR_DIFF_MAX_FILES: usize = 1_000;
 pub const COMMIT_META_MAX_PARENTS: usize = 64;
 pub const COMMIT_META_MAX_SUMMARY_BYTES: usize = 8 * 1024;
 pub const COMMIT_META_MAX_IDENTITY_BYTES: usize = 1_024;
+pub const COMMIT_META_BATCH_MAX: usize = 10_000;
 pub const COMMIT_LOG_MAX_OFFSET: usize = 100_000;
 pub const COMMIT_LOG_MAX_PAGE: usize = 500;
 pub const PR_COMMIT_MAX_POSITION: usize = 100_000;
@@ -1197,6 +1198,41 @@ impl DurableGitRepo {
             Err(error) => Err(git_err("find commit metadata", error)),
         };
         result
+    }
+
+    /// Reads an exact bounded metadata set while opening the repository once. Malformed and
+    /// missing object ids are absent, matching the single-object lookup without turning a card
+    /// viewport into one repository open per commit.
+    pub fn commit_meta_at_oids(&self, oids: &[Oid]) -> Result<Vec<CommitMeta>, DurableError> {
+        if oids.len() > COMMIT_META_BATCH_MAX {
+            return Err(DurableError::InvalidInput(format!(
+                "at most {COMMIT_META_BATCH_MAX} commit metadata rows may be read at once"
+            )));
+        }
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let repo = self.open_git()?;
+        let mut seen = HashSet::new();
+        let mut commits = Vec::new();
+        for oid in oids {
+            let Ok(oid) = git2::Oid::from_str(oid.as_str()) else {
+                continue;
+            };
+            if !seen.insert(oid) {
+                continue;
+            }
+            match repo.find_commit(oid) {
+                Ok(commit) => commits.push(commit_meta(&commit)),
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        git2::ErrorCode::NotFound | git2::ErrorCode::InvalidSpec
+                    ) => {}
+                Err(error) => return Err(git_err("find commit metadata batch", error)),
+            }
+        }
+        Ok(commits)
     }
 
     fn latest_commits_for_entries_from_tip(
@@ -3047,6 +3083,22 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].oid, c2.0);
         assert_eq!(rows[0].summary, "feat: second");
+        let metadata = repo
+            .commit_meta_at_oids(&[
+                c2.clone(),
+                Oid::new("not-an-object-id"),
+                c1.clone(),
+                c2.clone(),
+                Oid::new("0000000000000000000000000000000000000000"),
+            ])
+            .expect("exact commit metadata batch");
+        assert_eq!(
+            metadata
+                .iter()
+                .map(|commit| commit.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["feat: second", "feat: first"]
+        );
         assert_eq!(rows[0].parents, vec![c1.0.clone()]);
         assert_eq!(rows[1].oid, c1.0);
 

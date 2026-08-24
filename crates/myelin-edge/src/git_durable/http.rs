@@ -913,19 +913,12 @@ fn parse_file_lines_query(query: &str) -> Result<FileLinesQuery, EdgeError> {
     Ok(FileLinesQuery { path, start, end })
 }
 
-fn canonical_blob_oid(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 impl Handler for DFileLines {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let FileLinesQuery { path, start, end } = parse_file_lines_query(&ctx.request.query)?;
         debug_assert!(!path.is_empty());
         let oid = param(ctx, "oid")?;
-        if !canonical_blob_oid(oid) {
+        if !myelin_git::core::is_canonical_object_id(oid) {
             return Err(EdgeError::BadRequest(
                 "file-lines oid must be a canonical lowercase object id".into(),
             ));

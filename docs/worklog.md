@@ -1305,6 +1305,29 @@ warning-free clippy across every Storage and Edge target and feature; 640 browse
 units; all eight live Chat lifecycle stories; and the real Chromium private-agent
 workspace journey after rebuilding Edge.
 
+## 2026-08-25 — an exact Git revision becomes useful conversation context
+
+A canonical Git commit reference now resolves to its bounded summary for a
+viewer who can read the repository and to a content-free tombstone for everyone
+else. Repository visibility is decided once over the union of repository,
+pull-request, and commit coordinates. Visible commit metadata is then read in one
+repository-open batch per repository rather than reopening the object store for
+every card. Only a full lowercase object id is accepted; missing or malformed
+objects disclose nothing. Hostile or oversized commit summaries fall back to a
+safe repository-plus-short-id title or a UTF-8-safe 512-byte prefix.
+
+The TypeScript story gives two engineers private repositories, pull requests,
+and uniquely named commits, then carries all six references in one shared
+message. Each engineer sees useful cards for their own three objects and no name
+from the other repository. In Chromium, an engineer creates a real commit,
+links its canonical reference from Chat, follows the card to the exact diff, and
+returns to the durable conversation.
+
+Proof: the complete Git and Edge library suites; focused batch, canonical-shape,
+and hostile-summary tests; warning-free clippy across every Git and Edge target
+and feature; 641 browser units; all eight live Chat lifecycle stories; and both
+real Chromium Chat journeys after rebuilding Edge.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1334,7 +1357,7 @@ workspace journey after rebuilding Edge.
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
    content-free tombstones for denied or unavailable artifacts. Git
-   commits, blobs, refs, reviews, and comments, other CI artifacts, plus Chat messages and threads
+   blobs, refs, reviews, and comments, other CI artifacts, plus Chat messages and threads
    still retain their canonical link rather than a rich card because their durable owner projectors
    are not composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,

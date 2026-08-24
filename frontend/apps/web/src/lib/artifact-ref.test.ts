@@ -4,6 +4,7 @@ import {
   artifactRefHref,
   artifactRefLabel,
   parseArtifactRef,
+  parseGitCommitRef,
   parseGitPullRequestRef,
   relatedArtifactRefError,
 } from "./artifact-ref";
@@ -61,6 +62,13 @@ describe("artifact references", () => {
       .toBe("/git/repos/platform%2Fapi");
     expect(artifactRefHref("myelin://acme/git/repo/platform.git/api")).toBeUndefined();
     expect(artifactRefHref("myelin://acme/git/pr/platform:9007199254740992")).toBeUndefined();
+    expect(artifactRefLabel(
+      "myelin://acme/git/commit/platform/api:0123456789abcdef0123456789abcdef01234567",
+    )).toBe("platform/api · 0123456789ab");
+    expect(artifactRefHref(
+      "myelin://acme/git/commit/platform/api:0123456789abcdef0123456789abcdef01234567",
+    )).toBe("/git/repos/platform%2Fapi/commit/0123456789abcdef0123456789abcdef01234567");
+    expect(artifactRefHref("myelin://acme/git/commit/platform:deadbeef")).toBeUndefined();
     expect(artifactRefLabel("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
       .toBe("CI run · 00000001");
     expect(artifactRefHref("myelin://acme/ci/run/91000000-0000-4000-8000-000000000001"))
@@ -91,6 +99,19 @@ describe("artifact references", () => {
       "myelin://acme/git/pr/platform/api:18446744073709551616",
       "myelin://acme/git/pr/platform.git/api:1",
     ]) expect(parseGitPullRequestRef(value), value).toBeNull();
+  });
+
+  it("parses a nested repository commit without accepting an abbreviated or uppercase object id", () => {
+    const oid = "0123456789abcdef0123456789abcdef01234567";
+    expect(parseGitCommitRef(`myelin://acme/git/commit/platform/api:${oid}`)).toEqual({
+      tenant: "acme",
+      repo: "platform/api",
+      oid,
+      sub: null,
+      root: `myelin://acme/git/commit/platform/api:${oid}`,
+    });
+    expect(parseGitCommitRef("myelin://acme/git/commit/platform:deadbeef")).toBeNull();
+    expect(parseGitCommitRef(`myelin://acme/git/commit/platform:${oid.toUpperCase()}`)).toBeNull();
   });
 
   it("validates a related-work edge against source, tenant, and existing edges", () => {

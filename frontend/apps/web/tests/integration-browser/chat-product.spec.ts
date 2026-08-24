@@ -10,6 +10,7 @@ function requiredEnvironment(name: string): string {
 
 const edgeUrl = requiredEnvironment("MYELIN_INTEGRATION_EDGE_URL").replace(/\/$/, "");
 const token = requiredEnvironment("MYELIN_BROWSER_EDGE_TOKEN");
+const tenant = requiredEnvironment("MYELIN_BROWSER_TENANT");
 
 test("a signed-in engineer creates and resumes an encrypted durable Chat topic", async ({
   page,
@@ -81,6 +82,30 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   const relatedConversation = (JSON.parse(relatedText) as {
     conversation: { id: string; ref: string };
   }).conversation;
+  const repository = `chat-handoff-${suffix}`;
+  const repositoryResponse = await request.post(`${edgeUrl}/v1/git/repos`, {
+    headers: { ...headers, "idempotency-key": randomUUID() },
+    data: { slug: repository },
+  });
+  const repositoryText = await repositoryResponse.text();
+  expect(repositoryResponse.status(), repositoryText).toBe(201);
+  const commitTitle = `Preserve the handoff ${suffix}`;
+  const commitResponse = await request.post(
+    `${edgeUrl}/v1/git/repos/${encodeURIComponent(repository)}/blob/main/README.md`,
+    {
+      headers: { ...headers, "idempotency-key": randomUUID() },
+      data: {
+        base_oid: "",
+        contents: `# ${repository}\n`,
+        message: commitTitle,
+      },
+    },
+  );
+  const commitText = await commitResponse.text();
+  expect(commitResponse.status(), commitText).toBe(200);
+  const commitOid = (JSON.parse(commitText) as { applied: { new_oid: string } }).applied.new_oid;
+  expect(commitOid).toMatch(/^[0-9a-f]{40}$/);
+  const commitRef = `myelin://${tenant}/git/commit/${repository}:${commitOid}`;
 
   await signIn(page);
   await navigateToApp(page, "/chat");
@@ -104,6 +129,20 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await waitForAppHydration(page);
   await expect(page.getByText(message)).toBeVisible();
   await expect(page.getByRole("link", { name: `${issueTitle}, ${issue!.state}` })).toBeVisible();
+
+  await page.getByLabel(`Message ${topic}`).fill("Resume from this exact revision.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(commitRef);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const commitCard = page.getByRole("link", { name: `${commitTitle}, committed` });
+  await expect(commitCard)
+    .toHaveAttribute("href", `/git/repos/${repository}/commit/${commitOid}`);
+  await commitCard.click();
+  await expect(page).toHaveURL(new RegExp(`/git/repos/${repository}/commit/${commitOid}$`));
+  await expect(page.getByRole("heading", { level: 1, name: commitTitle })).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole("heading", { name: topic })).toBeVisible();
 
   await page.getByLabel(`Message ${topic}`).fill("Continue the sensitive investigation here.");
   await page.getByRole("button", { name: "Link work" }).click();

@@ -301,11 +301,16 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
     fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
         let repository_references = root_references(viewer, references, "git", "repo");
         let pull_request_roots = root_references(viewer, references, "git", "pr");
-        if repository_references.is_empty() && pull_request_roots.is_empty() {
+        let commit_roots = root_references(viewer, references, "git", "commit");
+        if repository_references.is_empty()
+            && pull_request_roots.is_empty()
+            && commit_roots.is_empty()
+        {
             return HashMap::new();
         }
         let mut cards = claimed_tombstones(&repository_references);
         cards.extend(claimed_tombstones(&pull_request_roots));
+        cards.extend(claimed_tombstones(&commit_roots));
 
         let repositories = repository_references
             .keys()
@@ -314,9 +319,11 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
             .collect::<Vec<_>>();
         let pull_request_references = canonical_pull_request_references(&pull_request_roots);
         let pull_requests = pull_request_references.keys().cloned().collect::<Vec<_>>();
-        let Ok(visible) = self
-            .git
-            .visible_reference_cards(viewer, &repositories, &pull_requests)
+        let commit_references = canonical_commit_references(&commit_roots);
+        let commits = commit_references.keys().cloned().collect::<Vec<_>>();
+        let Ok(visible) =
+            self.git
+                .visible_reference_cards(viewer, &repositories, &pull_requests, &commits)
         else {
             return cards;
         };
@@ -341,6 +348,16 @@ impl ReferenceCardProjector for GitReferenceCardProjector {
                 "pull_request",
                 "git_pull_request",
             );
+            for reference in references {
+                cards.insert(reference.clone(), card.clone());
+            }
+        }
+        for commit in visible.commits {
+            let coordinate = (commit.repository, commit.oid);
+            let Some(references) = commit_references.get(&coordinate) else {
+                continue;
+            };
+            let card = ReferenceCard::projection(commit.title, "committed", "commit", "git_commit");
             for reference in references {
                 cards.insert(reference.clone(), card.clone());
             }
@@ -371,6 +388,20 @@ fn canonical_ci_run_references(
         .iter()
         .filter(|(run_id, _)| canonical_uuid(run_id))
         .map(|(run_id, references)| (run_id.clone(), references.clone()))
+        .collect()
+}
+
+fn canonical_commit_references(
+    roots: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<(String, String), Vec<String>> {
+    roots
+        .iter()
+        .filter_map(|(id, references)| {
+            let (repository, oid) = id.rsplit_once(':')?;
+            myelin_git::coordinate::RepositorySlug::parse(repository).ok()?;
+            myelin_git::core::is_canonical_object_id(oid)
+                .then(|| ((repository.to_owned(), oid.to_owned()), references.clone()))
+        })
         .collect()
 }
 
@@ -487,6 +518,36 @@ mod tests {
             BTreeMap::from([(
                 canonical.into(),
                 vec![format!("myelin://acme/ci/run/{canonical}")]
+            )])
+        );
+    }
+
+    #[test]
+    fn commit_roots_require_a_repository_and_full_lowercase_object_id() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let roots = BTreeMap::from([
+            (
+                format!("team/api:{oid}"),
+                vec![format!("myelin://acme/git/commit/team/api:{oid}")],
+            ),
+            (
+                format!("team/api:{}", oid.to_uppercase()),
+                vec![format!(
+                    "myelin://acme/git/commit/team/api:{}",
+                    oid.to_uppercase()
+                )],
+            ),
+            (
+                "team/api:deadbeef".into(),
+                vec!["myelin://acme/git/commit/team/api:deadbeef".into()],
+            ),
+        ]);
+
+        assert_eq!(
+            canonical_commit_references(&roots),
+            BTreeMap::from([(
+                ("team/api".into(), oid.into()),
+                vec![format!("myelin://acme/git/commit/team/api:{oid}")]
             )])
         );
     }

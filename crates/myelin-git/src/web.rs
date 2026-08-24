@@ -1,4 +1,5 @@
 use crate::check_status::{CheckState, CheckStatusRow, TrustTier};
+use crate::core::is_canonical_object_id;
 use crate::lifecycle::PrState;
 use crate::merge_gate::{MergeGateOutcome, UnmetContext, UnmetReason};
 use crate::project::{ChecksSummary, Projected, RenderHint};
@@ -486,11 +487,7 @@ impl PrCommitCursor {
 }
 
 fn parse_cursor_oid(value: &str) -> Result<[u8; 20], PrCommitCursorError> {
-    if value.len() != 40
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if !is_canonical_object_id(value) {
         return Err(PrCommitCursorError);
     }
     let mut bytes = [0_u8; 20];

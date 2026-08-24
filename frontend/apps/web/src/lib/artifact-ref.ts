@@ -31,6 +31,14 @@ export interface GitPullRequestRef {
   root: string;
 }
 
+export interface GitCommitRef {
+  tenant: string;
+  repo: string;
+  oid: string;
+  sub: string | null;
+  root: string;
+}
+
 export function parseArtifactRef(value: unknown): ArtifactRefParts | null {
   if (typeof value !== "string" || utf8.encode(value).byteLength > MAX_ARTIFACT_REF_BYTES ||
       [...value].some((character) => character.charCodeAt(0) <= 0x20 || character.charCodeAt(0) === 0x7f)) {
@@ -67,6 +75,10 @@ function isCanonicalUlid(value: string): boolean {
   return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
 }
 
+function isCanonicalGitOid(value: string): boolean {
+  return /^[0-9a-f]{40}$/.test(value);
+}
+
 export function parseGitPullRequestRef(value: unknown): GitPullRequestRef | null {
   const parsed = parseArtifactRef(value);
   if (!parsed || parsed.subsystem !== "git" || parsed.type !== "pr") return null;
@@ -76,6 +88,17 @@ export function parseGitPullRequestRef(value: unknown): GitPullRequestRef | null
   const number = parsed.id.slice(separator + 1);
   if (!isGitRepositorySlug(repo) || number === "0" || !isCanonicalU64(number)) return null;
   return { tenant: parsed.tenant, repo, number, sub: parsed.sub, root: parsed.root };
+}
+
+export function parseGitCommitRef(value: unknown): GitCommitRef | null {
+  const parsed = parseArtifactRef(value);
+  if (!parsed || parsed.subsystem !== "git" || parsed.type !== "commit") return null;
+  const separator = parsed.id.lastIndexOf(":");
+  if (separator <= 0) return null;
+  const repo = parsed.id.slice(0, separator);
+  const oid = parsed.id.slice(separator + 1);
+  if (!isGitRepositorySlug(repo) || !isCanonicalGitOid(oid)) return null;
+  return { tenant: parsed.tenant, repo, oid, sub: parsed.sub, root: parsed.root };
 }
 
 function unsignedLessThanOrEqual(left: string, right: string): boolean {
@@ -128,6 +151,8 @@ export function artifactRefLabel(reference: string): string {
   if (parsed.subsystem === "issue" && parsed.type === "issue") return parsed.id;
   const pullRequest = parseGitPullRequestRef(reference);
   if (pullRequest) return `${pullRequest.repo} #${pullRequest.number}`;
+  const commit = parseGitCommitRef(reference);
+  if (commit) return `${commit.repo} · ${commit.oid.slice(0, 12)}`;
   if (parsed.subsystem === "knowledge" && parsed.type === "page") {
     return `Knowledge · ${parsed.id.slice(-6)}`;
   }
@@ -150,6 +175,10 @@ export function artifactRefHref(reference: string): string | undefined {
   const pullRequest = parseGitPullRequestRef(reference);
   if (pullRequest && parseGitPullRequestNumberText(pullRequest.number) !== null) {
     return `/git/repos/${encodeURIComponent(pullRequest.repo)}/prs/${pullRequest.number}`;
+  }
+  const commit = parseGitCommitRef(reference);
+  if (commit) {
+    return `/git/repos/${encodeURIComponent(commit.repo)}/commit/${commit.oid}`;
   }
   if (parsed.subsystem === "ci" && parsed.type === "run" && isCanonicalUuid(parsed.id)) {
     return `/ci/runs/${encodeURIComponent(parsed.id)}`;

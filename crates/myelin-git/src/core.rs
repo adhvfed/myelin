@@ -33,6 +33,13 @@ impl Oid {
     }
 }
 
+pub fn is_canonical_object_id(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Service {
     UploadPack,
@@ -393,6 +400,14 @@ pub fn routing_table() -> BTreeMap<String, Backend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_ids_have_one_full_lowercase_spelling() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        assert!(is_canonical_object_id(oid));
+        assert!(!is_canonical_object_id("deadbeef"));
+        assert!(!is_canonical_object_id(&oid.to_uppercase()));
+    }
 
     #[test]
     fn routing_splits_wire_to_shell_read_to_gix() {

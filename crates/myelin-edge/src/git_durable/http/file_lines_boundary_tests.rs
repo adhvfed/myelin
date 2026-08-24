@@ -38,14 +38,14 @@ fn file_lines_query_is_exact_decoded_and_bounded() {
 
 #[test]
 fn file_lines_oid_requires_the_full_lowercase_content_address() {
-    assert!(canonical_blob_oid(
+    assert!(myelin_git::core::is_canonical_object_id(
         "0123456789abcdef0123456789abcdef01234567"
     ));
-    assert!(!canonical_blob_oid("01234567"));
-    assert!(!canonical_blob_oid(
+    assert!(!myelin_git::core::is_canonical_object_id("01234567"));
+    assert!(!myelin_git::core::is_canonical_object_id(
         "0123456789ABCDEF0123456789ABCDEF01234567"
     ));
-    assert!(!canonical_blob_oid(
+    assert!(!myelin_git::core::is_canonical_object_id(
         "g123456789abcdef0123456789abcdef01234567"
     ));
 }

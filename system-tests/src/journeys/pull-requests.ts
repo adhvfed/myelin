@@ -7,12 +7,14 @@ export interface PullRequestProposal {
   path: string;
   contents: string;
   title: string;
+  commitMessage?: string;
   reviewers?: string[];
 }
 
 export interface OpenedPullRequest {
   repository: string;
   number: number;
+  headOid: string;
   pullRequest: JsonRecord;
   receipt: JsonRecord;
 }
@@ -35,7 +37,10 @@ export async function proposeChange(
     proposal.branch,
     proposal.path,
     proposal.contents,
-    { startRef: "main" },
+    {
+      startRef: "main",
+      ...(proposal.commitMessage === undefined ? {} : { message: proposal.commitMessage }),
+    },
   )).commitOid;
   const response = await client.json(`${project.path}/prs`, {
     method: "POST",
@@ -56,6 +61,7 @@ export async function proposeChange(
   return {
     repository: project.slug,
     number: integer(pullRequest.number, "opened pull request number"),
+    headOid,
     pullRequest,
     receipt,
   };

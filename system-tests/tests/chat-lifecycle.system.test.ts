@@ -47,11 +47,13 @@ async function createPrivatePullRequest(
   await repository.create();
   await repository.writeFile("main", "README.md", `# ${repository.slug}\n`);
   const title = uniqueName(`${label} pull request`);
+  const commitTitle = uniqueName(`${label} implementation`);
   const opened = await proposeChange(owner, repository, {
     branch: uniqueName(`${coordinate}-branch`),
     path: "plan.md",
     contents: `# ${title}\n`,
     title,
+    commitMessage: commitTitle,
   });
   return {
     repositoryRef: `myelin://${systemTestConfig.tenant}/git/repo/${repository.slug}`,
@@ -59,6 +61,8 @@ async function createPrivatePullRequest(
     pullRequestRef: string(opened.pullRequest.ref, `${label} pull request reference`),
     pullRequestTitle: title,
     pullRequestState: string(opened.pullRequest.pr_state, `${label} pull request state`),
+    commitRef: `myelin://${systemTestConfig.tenant}/git/commit/${repository.slug}:${opened.headOid}`,
+    commitTitle,
   };
 }
 
@@ -537,13 +541,15 @@ describe("chat collaboration lifecycle", () => {
     });
     await room.post(
       systemClient,
-      "Compare my repository \uFFFC and change \uFFFC with yours \uFFFC and \uFFFC.",
+      "Compare my repository \uFFFC, change \uFFFC, and commit \uFFFC with yours \uFFFC, \uFFFC, and \uFFFC.",
       {
         references: [
           foundersWork.repositoryRef,
           foundersWork.pullRequestRef,
+          foundersWork.commitRef,
           reviewersWork.repositoryRef,
           reviewersWork.pullRequestRef,
+          reviewersWork.commitRef,
         ],
       },
     );
@@ -573,6 +579,16 @@ describe("chat collaboration lifecycle", () => {
             }),
           }),
           expect.objectContaining({
+            ref: foundersWork.commitRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: foundersWork.commitTitle,
+              state: "committed",
+              icon: "commit",
+              render_hint: "git_commit",
+            }),
+          }),
+          expect.objectContaining({
             ref: reviewersWork.repositoryRef,
             card: { kind: "tombstone" },
           }),
@@ -580,10 +596,15 @@ describe("chat collaboration lifecycle", () => {
             ref: reviewersWork.pullRequestRef,
             card: { kind: "tombstone" },
           }),
+          expect.objectContaining({
+            ref: reviewersWork.commitRef,
+            card: { kind: "tombstone" },
+          }),
         ],
       }),
     ]);
     expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWork.pullRequestTitle);
+    expect(JSON.stringify(foundersHistory)).not.toContain(reviewersWork.commitTitle);
 
     const reviewersHistory = await room.messages(reviewerClient);
     expect(reviewersHistory).toEqual([
@@ -595,6 +616,10 @@ describe("chat collaboration lifecycle", () => {
           }),
           expect.objectContaining({
             ref: foundersWork.pullRequestRef,
+            card: { kind: "tombstone" },
+          }),
+          expect.objectContaining({
+            ref: foundersWork.commitRef,
             card: { kind: "tombstone" },
           }),
           expect.objectContaining({
@@ -617,10 +642,21 @@ describe("chat collaboration lifecycle", () => {
               render_hint: "git_pull_request",
             }),
           }),
+          expect.objectContaining({
+            ref: reviewersWork.commitRef,
+            card: expect.objectContaining({
+              kind: "projection",
+              title: reviewersWork.commitTitle,
+              state: "committed",
+              icon: "commit",
+              render_hint: "git_commit",
+            }),
+          }),
         ],
       }),
     ]);
     expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.pullRequestTitle);
+    expect(JSON.stringify(reviewersHistory)).not.toContain(foundersWork.commitTitle);
   });
 
   test("keeps a shared runbook legible while a private notebook stays nameless", async () => {
