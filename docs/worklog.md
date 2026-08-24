@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-24 — CI residency proof lives at the enforced boundaries
+
+CI Control Plane carried a 707-line test-support module that assembled fleet placement, log and
+artifact residency, CDN behaviour, and self-hosted runner scope into mutable report structs. Its
+inline tests and a duplicate external drill then mutation-tested those reports and printed green
+summaries. The supposed self-hosted secret isolation check never reached a secret store: when an
+in-memory admission boolean was true, the harness incremented the counter it later asserted was
+zero. No production caller used the module.
+
+That 908-line synthetic report layer is gone. Runner locality remains proved where the control plane
+actually claims jobs; provider scope and attestation remain proved where the sandbox admits a
+self-hosted runner; durable regional claims, logs, artifacts, execution, and accounting remain
+exercised through the real CI persistence and sandbox paths. Storage's owner-side CDN and object
+residency tests continue to cover the data boundary without CI relabelling their results.
+
+**Proof:** the complete all-feature CI Control Plane suite (601 library cases, 22 binary cases, every
+CDC and drill, real gVisor execution, the definition-cutover and terminal-accounting matrices, and
+all durable PostgreSQL/object-store integrations); the three-case sandbox self-hosted-scope CDC;
+the two-case Control Plane regional runner-claim drill; warning-free all-target/all-feature CI
+Control Plane clippy; and the real 99-row contract gate.
+
 ## 2026-08-24 — Storage recovery proof belongs to the real owners
 
 Storage exposed a 533-line test-support module that labelled three arbitrary in-process replay

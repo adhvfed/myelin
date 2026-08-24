@@ -131,8 +131,6 @@ pub mod log_sink_durable;
 pub mod metering;
 pub mod migrations;
 pub mod rebac_fragment;
-#[cfg(any(test, feature = "test-support"))]
-pub mod residency_drill;
 pub mod runner_bind;
 pub mod scheduler;
 pub mod schema;
@@ -389,12 +387,6 @@ pub use migrations::{
 };
 
 pub use surge::{CiDispatchShed, CiSurgeControls, CiSurgeGate, StarvationHistogram};
-
-#[cfg(any(test, feature = "test-support"))]
-pub use residency_drill::{
-    drive_ci_d10_self_hosted_boundary, drive_ci_r3_residency, CellJob, CiD10Report, CiR3Report,
-    CiStoreResidency,
-};
 
 pub const SERVICE_NAME: &str = "ci-controlplane";
 
