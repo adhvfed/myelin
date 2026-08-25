@@ -9,6 +9,7 @@ use myelin_ci_sandbox::{
 };
 #[cfg(test)]
 use myelin_ci_sandbox::{IdemToken, TrustTier};
+#[cfg(test)]
 use myelin_refs::ArtifactRef;
 #[cfg(test)]
 use myelin_storage::MicroUsd;
@@ -48,14 +49,17 @@ use crate::job_queue_store::{
 #[cfg(test)]
 use crate::job_schedule::JobScheduleTerms;
 #[cfg(test)]
+use crate::job_spec_store::ClaimedDispatchIdentity;
+#[cfg(test)]
 use crate::job_spec_store::MAX_JOB_TIMEOUT_SECS;
-use crate::job_spec_store::{CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity};
+use crate::job_spec_store::{CiJobSpecStore, CiJobSpecStoreError};
 #[cfg(test)]
 use crate::metering::Meter;
 #[cfg(test)]
 use crate::scheduler::Lane;
 
 mod accounting;
+mod completion;
 mod runner;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -72,6 +76,14 @@ pub use accounting::{
     MICRO_USD_PER_CPU_SECOND, MICRO_USD_PER_GB_SECOND, TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 #[cfg(test)]
+use completion::completion_receipt;
+pub use completion::ClaimRefusal;
+use completion::{
+    completion_receipts_v4, preparation_completion_receipts, verify_claimed_identity,
+    workload_disposition, CompletionReceiptInput, CompletionReceipts,
+    PreparationCompletionReceiptInput,
+};
+#[cfg(test)]
 use driver::validate_driver_tenant;
 #[cfg(any(test, feature = "test-support"))]
 pub use driver::{fixed_command_spec_builder, CiPipelineDriver, StartRunError};
@@ -83,202 +95,6 @@ fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Out
     match tokio::runtime::Handle::try_current() {
         Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
         Err(_) => rt.block_on(fut),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ClaimRefusal {
-    TenantMismatch { reporter: String, claimed: String },
-    NoDispatchRecord { job_id: String },
-    RunMismatch { durable: String, claimed: String },
-    IdemMismatch { durable: String, claimed: String },
-}
-
-impl std::fmt::Display for ClaimRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClaimRefusal::TenantMismatch { reporter, claimed } => write!(
-                f,
-                "claimed tenant `{claimed}` is not this reporter's tenant `{reporter}`"
-            ),
-            ClaimRefusal::NoDispatchRecord { job_id } => write!(
-                f,
-                "no durable ci_job_spec dispatch record for job `{job_id}` (unclaimed/forged completion)"
-            ),
-            ClaimRefusal::RunMismatch { durable, claimed } => write!(
-                f,
-                "durable dispatch run_id `{durable}` does not match the claimed run `{claimed}`"
-            ),
-            ClaimRefusal::IdemMismatch { durable, claimed } => write!(
-                f,
-                "durable dispatch idem_token `{durable}` does not match the claimed `{claimed}`"
-            ),
-        }
-    }
-}
-
-fn verify_claimed_identity(
-    reporter_tenant: &TenantId,
-    claimed_tenant: &TenantId,
-    presented_run: &str,
-    presented_job_id: &str,
-    presented_idem_token: &str,
-    durable: Option<ClaimedDispatchIdentity>,
-) -> Result<String, ClaimRefusal> {
-    if claimed_tenant != reporter_tenant {
-        return Err(ClaimRefusal::TenantMismatch {
-            reporter: reporter_tenant.0.clone(),
-            claimed: claimed_tenant.0.clone(),
-        });
-    }
-    let Some(identity) = durable else {
-        return Err(ClaimRefusal::NoDispatchRecord {
-            job_id: presented_job_id.to_string(),
-        });
-    };
-    if identity.run_id != presented_run {
-        return Err(ClaimRefusal::RunMismatch {
-            durable: identity.run_id,
-            claimed: presented_run.to_string(),
-        });
-    }
-    if identity.idem_token != presented_idem_token {
-        return Err(ClaimRefusal::IdemMismatch {
-            durable: identity.idem_token,
-            claimed: presented_idem_token.to_string(),
-        });
-    }
-    Ok(identity.stage)
-}
-
-#[derive(Clone, Copy)]
-struct CompletionReceiptInput<'a> {
-    tenant: &'a TenantId,
-    region: &'a str,
-    run: &'a RunId,
-    job_id: &'a str,
-    idem_token: &'a str,
-    stage: &'a str,
-    passed: bool,
-    timed_out: bool,
-    usage: ResourceUsage,
-    result_refs: &'a [ArtifactRef],
-    lease_owner: &'a str,
-    lease_epoch: i64,
-    claim_nonce: &'a str,
-}
-
-fn completion_receipt(input: CompletionReceiptInput<'_>) -> String {
-    let key = blake3::derive_key(
-        "myelin.ci.completion-receipt.v3",
-        input.claim_nonce.as_bytes(),
-    );
-    let mut hasher = blake3::Hasher::new_keyed(&key);
-    for frame in [
-        input.tenant.0.as_bytes(),
-        input.region.as_bytes(),
-        input.run.0.as_bytes(),
-        input.job_id.as_bytes(),
-        input.idem_token.as_bytes(),
-        input.stage.as_bytes(),
-        &[input.passed as u8],
-        &[input.timed_out as u8],
-        &input.usage.cpu_seconds.to_be_bytes(),
-        &input.usage.mem_byte_seconds.to_be_bytes(),
-        input.lease_owner.as_bytes(),
-        &input.lease_epoch.to_be_bytes(),
-        input.claim_nonce.as_bytes(),
-    ] {
-        hasher.update(&(frame.len() as u64).to_be_bytes());
-        hasher.update(frame);
-    }
-    hasher.update(&(input.result_refs.len() as u64).to_be_bytes());
-    for result_ref in input.result_refs {
-        hasher.update(&(result_ref.0.len() as u64).to_be_bytes());
-        hasher.update(result_ref.0.as_bytes());
-    }
-    format!("v3:{}", hasher.finalize().to_hex())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CompletionReceipts {
-    current_v4: String,
-    legacy_v3: String,
-}
-
-fn completion_receipts_v4(
-    input: CompletionReceiptInput<'_>,
-    disposition: CiJobTerminalDisposition,
-) -> CompletionReceipts {
-    let legacy_v3 = completion_receipt(input);
-    CompletionReceipts {
-        current_v4: disposition_receipt_v4(&legacy_v3, disposition),
-        legacy_v3,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PreparationCompletionReceiptInput<'a> {
-    tenant: &'a TenantId,
-    region: &'a str,
-    wf_run_id: &'a str,
-    ci_run_id: &'a str,
-    job_id: &'a str,
-    idem_token: &'a str,
-    stage: &'a str,
-    reserve_handle: &'a str,
-    usage: ResourceUsage,
-    lease_owner: &'a str,
-    lease_epoch: i64,
-    claim_nonce: &'a str,
-    claim_started_at_epoch_secs: i64,
-    claim_expires_at_epoch_secs: i64,
-}
-
-fn preparation_completion_receipts(
-    input: PreparationCompletionReceiptInput<'_>,
-    disposition: PreparationTerminalDisposition,
-) -> CompletionReceipts {
-    let key = blake3::derive_key(
-        "myelin.ci.preparation-completion-receipt.v3",
-        input.claim_nonce.as_bytes(),
-    );
-    let mut hasher = blake3::Hasher::new_keyed(&key);
-    for frame in [
-        input.tenant.as_str().as_bytes(),
-        input.region.as_bytes(),
-        input.wf_run_id.as_bytes(),
-        input.ci_run_id.as_bytes(),
-        input.job_id.as_bytes(),
-        input.idem_token.as_bytes(),
-        input.stage.as_bytes(),
-        input.reserve_handle.as_bytes(),
-        &input.usage.cpu_seconds.to_be_bytes(),
-        &input.usage.mem_byte_seconds.to_be_bytes(),
-        input.lease_owner.as_bytes(),
-        &input.lease_epoch.to_be_bytes(),
-        input.claim_nonce.as_bytes(),
-        &input.claim_started_at_epoch_secs.to_be_bytes(),
-        &input.claim_expires_at_epoch_secs.to_be_bytes(),
-    ] {
-        hasher.update(&(frame.len() as u64).to_be_bytes());
-        hasher.update(frame);
-    }
-    let legacy_v3 = format!("v3:{}", hasher.finalize().to_hex());
-    let disposition = CiJobTerminalDisposition::Preparation(disposition);
-    CompletionReceipts {
-        current_v4: disposition_receipt_v4(&legacy_v3, disposition),
-        legacy_v3,
-    }
-}
-
-fn workload_disposition(report: &TerminalReport) -> CiJobTerminalDisposition {
-    if report.timed_out {
-        CiJobTerminalDisposition::WorkloadTimedOut
-    } else if report.passed {
-        CiJobTerminalDisposition::WorkloadPassed
-    } else {
-        CiJobTerminalDisposition::WorkloadFailed
     }
 }
 
