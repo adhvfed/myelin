@@ -3,7 +3,8 @@ use sqlx::postgres::PgPool;
 use myelin_events::{
     BrokerDeliveryRef, CoCommitError, CoCommitTx, ConsumerName, DeadLetterRecord, DedupError,
     DedupResult, DeliveryQuarantineReason, DurableBusErasure, DurableDeadLetter, DurableDedup,
-    DurableDeliveryQuarantine, ErasedSubject, EventId, PiiKeyRef, Region, TenantId, Timestamp,
+    DurableDeliveryQuarantine, ErasedSubject, ErasureLedgerError, EventId, PiiKeyRef, Region,
+    TenantId, Timestamp,
 };
 
 use crate::migration::{Migration, Migrations};
@@ -332,7 +333,7 @@ impl DurableBusErasure for DurableBusErasureBacking {
         subject: &str,
         key_refs: &[PiiKeyRef],
         erased_at: &Timestamp,
-    ) -> Result<(), String> {
+    ) -> Result<(), ErasureLedgerError> {
         let mut refs: Vec<String> = key_refs.iter().map(|k| k.0.clone()).collect();
         refs.sort();
         refs.dedup();
@@ -356,13 +357,18 @@ impl DurableBusErasure for DurableBusErasureBacking {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|_| ErasureLedgerError::Unavailable)
         })
     }
 
-    fn is_erased(&self, tenant: &TenantId, region: &Region, subject: &str) -> bool {
+    fn is_erased(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        subject: &str,
+    ) -> Result<bool, ErasureLedgerError> {
         self.block(async {
-            let exists: bool = sqlx::query_scalar(
+            sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM bus_erasure_ledger \
                  WHERE tenant = $1 AND region = $2 AND subject = $3)",
             )
@@ -371,21 +377,17 @@ impl DurableBusErasure for DurableBusErasureBacking {
             .bind(subject)
             .fetch_one(&self.pool)
             .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "BUS ERASURE-LEDGER DURABILITY FAILURE (fail-static): is_erased read failed for \
-                     subject={subject} tenant={} - an incomplete read is a silent resurrection path \
-                     (EB-16/BUS-D8): {e}",
-                    tenant.0
-                )
-            });
-            exists
+            .map_err(|_| ErasureLedgerError::Unavailable)
         })
     }
 
-    fn entries(&self, tenant: &TenantId, region: &Region) -> Vec<ErasedSubject> {
+    fn entries(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<Vec<ErasedSubject>, ErasureLedgerError> {
         self.block(async {
-            let rows: Vec<(String, Vec<String>, String)> = sqlx::query_as(
+            sqlx::query_as::<_, (String, Vec<String>, String)>(
                 "SELECT subject, key_refs, erased_at FROM bus_erasure_ledger \
                  WHERE tenant = $1 AND region = $2 ORDER BY subject",
             )
@@ -393,21 +395,16 @@ impl DurableBusErasure for DurableBusErasureBacking {
             .bind(&region.0)
             .fetch_all(&self.pool)
             .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "BUS ERASURE-LEDGER DURABILITY FAILURE (fail-static): entries read failed for \
-                     tenant={} - an incomplete replay set would let a resurrected subject escape the \
-                     post-restore re-erasure pass (EB-16/BUS-D8): {e}",
-                    tenant.0
-                )
-            });
-            rows.into_iter()
-                .map(|(subject, key_refs, erased_at)| ErasedSubject {
-                    subject,
-                    key_refs: key_refs.into_iter().map(PiiKeyRef).collect(),
-                    erased_at: Timestamp(erased_at),
-                })
-                .collect()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(subject, key_refs, erased_at)| ErasedSubject {
+                        subject,
+                        key_refs: key_refs.into_iter().map(PiiKeyRef).collect(),
+                        erased_at: Timestamp(erased_at),
+                    })
+                    .collect()
+            })
+            .map_err(|_| ErasureLedgerError::Unavailable)
         })
     }
 }

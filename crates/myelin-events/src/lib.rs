@@ -89,7 +89,10 @@ pub use holder::{
     degrade_on_tombstone, BusEventLog, BusHolder, EraseReceipt, ExportedEvent, InMemoryShredder,
     InlinePiiShredder, LocateReport, LocatedEvent, ShredError, BUS_ERASED_TYPE, ERASED_EVENT_NAME,
 };
-pub use reerase::{BusErasureLedger, DurableBusErasure, ErasedSubject, ReErasureReceipt};
+pub use reerase::{
+    BusErasureError, BusErasureLedger, DurableBusErasure, ErasedSubject, ErasureLedgerError,
+    ReErasureReceipt,
+};
 
 pub use reindex::{
     reindex, snapshot_event_id, DerivedStore, ReferenceReindexSource, ReindexError, ReindexReceipt,

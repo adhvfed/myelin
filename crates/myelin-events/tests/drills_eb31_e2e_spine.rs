@@ -447,7 +447,9 @@ fn e2e4_dsar_fanout_bus_holder_zero_recoverable_and_zero_resurrected() {
     }
     assert_eq!(recoverable_pii, 0, "E2E-4 RED: the subject's inline-PII is still recoverable in the live log - threshold 0, NOT weakened");
     assert!(
-        ledger.is_erased("u42"),
+        ledger
+            .is_erased("u42")
+            .expect("in-memory erasure ledger is available"),
         "E2E-4: the PII-free ledger durably remembers the erasure (re-erasure can replay)"
     );
 

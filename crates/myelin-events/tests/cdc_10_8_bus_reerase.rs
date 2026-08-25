@@ -100,5 +100,7 @@ fn cdc_10_8_provider_restores_consumer_re_erases_zero_resurrected() {
         !shredder.is_live(&key),
         "the key STAYS destroyed across the restore"
     );
-    assert!(ledger.is_erased("u42"));
+    assert!(ledger
+        .is_erased("u42")
+        .expect("in-memory erasure ledger is available"));
 }

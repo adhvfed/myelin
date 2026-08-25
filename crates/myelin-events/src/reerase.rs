@@ -14,6 +14,50 @@ pub struct ErasedSubject {
     pub erased_at: Timestamp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErasureLedgerError {
+    Unavailable,
+}
+
+impl std::fmt::Display for ErasureLedgerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("bus erasure ledger is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for ErasureLedgerError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BusErasureError {
+    Shred(ShredError),
+    Ledger(ErasureLedgerError),
+}
+
+impl std::fmt::Display for BusErasureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shred(error) => error.fmt(f),
+            Self::Ledger(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for BusErasureError {}
+
+impl From<ShredError> for BusErasureError {
+    fn from(error: ShredError) -> Self {
+        Self::Shred(error)
+    }
+}
+
+impl From<ErasureLedgerError> for BusErasureError {
+    fn from(error: ErasureLedgerError) -> Self {
+        Self::Ledger(error)
+    }
+}
+
 pub trait DurableBusErasure: Send + Sync {
     fn record(
         &self,
@@ -22,9 +66,18 @@ pub trait DurableBusErasure: Send + Sync {
         subject: &str,
         key_refs: &[PiiKeyRef],
         erased_at: &Timestamp,
-    ) -> Result<(), String>;
-    fn is_erased(&self, tenant: &TenantId, region: &Region, subject: &str) -> bool;
-    fn entries(&self, tenant: &TenantId, region: &Region) -> Vec<ErasedSubject>;
+    ) -> Result<(), ErasureLedgerError>;
+    fn is_erased(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        subject: &str,
+    ) -> Result<bool, ErasureLedgerError>;
+    fn entries(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+    ) -> Result<Vec<ErasedSubject>, ErasureLedgerError>;
 }
 
 #[derive(Clone)]
@@ -66,7 +119,12 @@ impl BusErasureLedger {
         &self.region
     }
 
-    pub fn record(&self, subject: &str, key_refs: &[PiiKeyRef], erased_at: Timestamp) {
+    pub fn record(
+        &self,
+        subject: &str,
+        key_refs: &[PiiKeyRef],
+        erased_at: Timestamp,
+    ) -> Result<(), ErasureLedgerError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             BusErasureBackend::Memory(entries) => {
@@ -84,52 +142,44 @@ impl BusErasureLedger {
                     }
                 }
                 entry.key_refs.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok(())
             }
             BusErasureBackend::Durable(d) => {
-                if let Err(e) = d.record(&self.tenant, &self.region, subject, key_refs, &erased_at)
-                {
-                    panic!(
-                        "BUS ERASURE-LEDGER DURABILITY FAILURE (fail-static): the erasure record for \
-                         subject={subject} tenant={} could NOT be persisted - an unrecorded erasure is \
-                         a silent resurrection path across a backup restore (EB-16/BUS-D8); refusing \
-                         to report the erasure as recorded: {e}",
-                        self.tenant.0
-                    );
-                }
+                d.record(&self.tenant, &self.region, subject, key_refs, &erased_at)
             }
         }
     }
 
-    pub fn is_erased(&self, subject: &str) -> bool {
+    pub fn is_erased(&self, subject: &str) -> Result<bool, ErasureLedgerError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            BusErasureBackend::Memory(entries) => entries
+            BusErasureBackend::Memory(entries) => Ok(entries
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains_key(subject),
+                .contains_key(subject)),
             BusErasureBackend::Durable(d) => d.is_erased(&self.tenant, &self.region, subject),
         }
     }
 
-    pub fn entries(&self) -> Vec<ErasedSubject> {
+    pub fn entries(&self) -> Result<Vec<ErasedSubject>, ErasureLedgerError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            BusErasureBackend::Memory(entries) => entries
+            BusErasureBackend::Memory(entries) => Ok(entries
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .values()
                 .cloned()
-                .collect(),
+                .collect()),
             BusErasureBackend::Durable(d) => d.entries(&self.tenant, &self.region),
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.entries().len()
+    pub fn len(&self) -> Result<usize, ErasureLedgerError> {
+        self.entries().map(|entries| entries.len())
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries().is_empty()
+    pub fn is_empty(&self) -> Result<bool, ErasureLedgerError> {
+        self.entries().map(|entries| entries.is_empty())
     }
 }
 
@@ -159,7 +209,7 @@ impl<S: InlinePiiShredder> BusHolder<S> {
         minter: Arc<dyn IdMinter>,
         ledger: &BusErasureLedger,
         now: Timestamp,
-    ) -> Result<EraseReceipt, ShredError> {
+    ) -> Result<EraseReceipt, BusErasureError> {
         let report = self.locate(subject, log);
         let mut distinct: Vec<PiiKeyRef> = Vec::new();
         for ev in &report.inline_pii_events {
@@ -170,7 +220,7 @@ impl<S: InlinePiiShredder> BusHolder<S> {
 
         let receipt = self.erase(subject, log, tx, minter)?;
 
-        ledger.record(subject, &distinct, now);
+        ledger.record(subject, &distinct, now)?;
         Ok(receipt)
     }
 
@@ -181,8 +231,8 @@ impl<S: InlinePiiShredder> BusHolder<S> {
         tx: &mut OutboxStore,
         minter: Arc<dyn IdMinter>,
         now: Timestamp,
-    ) -> Result<ReErasureReceipt, ShredError> {
-        let entries = ledger.entries();
+    ) -> Result<ReErasureReceipt, BusErasureError> {
+        let entries = ledger.entries()?;
 
         let mut keys_resurrected_by_restore = 0usize;
         for entry in &entries {
@@ -231,6 +281,10 @@ mod tests {
         EventType, Visibility,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+
+    fn available<T>(result: Result<T, ErasureLedgerError>) -> T {
+        result.expect("in-memory erasure ledger is available")
+    }
 
     fn tenant() -> TenantId {
         TenantId("acme".into())
@@ -302,11 +356,12 @@ mod tests {
             .expect("erase+record");
 
         assert!(
-            ledger.is_erased("u42"),
+            available(ledger.is_erased("u42")),
             "the ledger remembers u42 was erased"
         );
-        assert_eq!(ledger.len(), 1);
-        let entry = &ledger.entries()[0];
+        assert_eq!(available(ledger.len()), 1);
+        let entries = available(ledger.entries());
+        let entry = &entries[0];
         assert_eq!(entry.subject, "u42");
         assert_eq!(
             entry.key_refs,
@@ -397,7 +452,7 @@ mod tests {
                 .erase_and_record(s, &mut log, &mut outbox, m.clone(), &ledger, now())
                 .expect("erase+record");
         }
-        assert_eq!(ledger.len(), 3);
+        assert_eq!(available(ledger.len()), 3);
 
         let (mut restored, _) = seeded(&["u1", "u2", "u3"]);
         for s in ["u1", "u2", "u3"] {
@@ -433,6 +488,9 @@ mod tests {
         let err = holder
             .re_erase_after_restore(&ledger, &mut restored, &mut ro, minter(), now())
             .expect_err("loud on KMS failure");
-        assert!(matches!(err, ShredError::KmsUnavailable(_)));
+        assert!(matches!(
+            err,
+            BusErasureError::Shred(ShredError::KmsUnavailable(_))
+        ));
     }
 }

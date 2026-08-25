@@ -87,7 +87,9 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
         "precondition: the DEK is dead in the live cell"
     );
     assert!(
-        ledger.is_erased("u42"),
+        ledger
+            .is_erased("u42")
+            .expect("in-memory erasure ledger is available"),
         "the PII-free ledger remembers the erasure"
     );
 
@@ -198,5 +200,8 @@ fn bus_post_restore_re_erasure_is_loud_on_kms_failure() {
     let err = holder
         .re_erase_after_restore(&ledger, &mut restored, &mut ro, minter(), now())
         .expect_err("re-erase is loud on a KMS failure (never assume re-erased)");
-    assert!(matches!(err, myelin_events::ShredError::KmsUnavailable(_)));
+    assert!(matches!(
+        err,
+        myelin_events::BusErasureError::Shred(myelin_events::ShredError::KmsUnavailable(_))
+    ));
 }

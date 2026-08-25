@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — bus erasure survives a ledger outage without panicking
+
+The bus-erasure ledger still panicked on PostgreSQL write, point-read, and replay-set failures. A
+write outage could unwind the request after its key had already been irreversibly destroyed, while
+a read outage could crash the post-restore sweep instead of withholding its green receipt.
+
+The ledger now has one typed availability result across all operations. Live erasure and restore
+re-erasure return a composite error that distinguishes key destruction from ledger availability,
+so callers can retry interrupted work without confusing either failure. An irreversible key step
+may still precede the durable record, but no receipt is minted until that record exists; the same
+request is idempotent and completes it after recovery. An unreadable restore obligation likewise
+produces no success receipt and is re-applied by a fresh worker.
+
+**Proof:** a warning-free workspace all-target/all-feature compile; strict all-target/all-feature
+clippy for Events and Storage; all 231 Events library cases; and all five real-PostgreSQL durable
+bus-erasure journeys, including closed-pool failure of every ledger operation, retry after the
+irreversible live key step, and retry of a restore sweep that finishes with zero resurrected keys
+(0.17 seconds total); restarted affected services; and both live TypeScript privacy-lifecycle
+journeys (5.16 seconds total).
+
 ## 2026-08-26 — event delivery waits for durable dedup storage
 
 The PostgreSQL dedup adapter translated every storage failure into an ordinary boolean. Most

@@ -8,10 +8,11 @@ use myelin_storage::events_durable::{DurableBusErasureBacking, BUS_ERASURE_LEDGE
 use myelin_storage::tenant_tx::connect_pool_with_reset;
 
 use myelin_events::{
-    derive_envelope, Actor, AggregateKey, ArtifactRef, BusErasureLedger, BusEventLog, BusHolder,
-    CausedBy, DataRole, DurableBusErasure, EmitContext, EraseReceipt, EventDraft, EventEnvelope,
-    EventId, EventType, IdMinter, InMemoryShredder, InlinePiiShredder, MonotonicMinter,
-    OutboxStore, PiiKeyRef, Region, TenantId, Timestamp, Visibility,
+    derive_envelope, Actor, AggregateKey, ArtifactRef, BusErasureError, BusErasureLedger,
+    BusEventLog, BusHolder, CausedBy, DataRole, DurableBusErasure, EmitContext, EraseReceipt,
+    ErasureLedgerError, EventDraft, EventEnvelope, EventId, EventType, IdMinter, InMemoryShredder,
+    InlinePiiShredder, MonotonicMinter, OutboxStore, PiiKeyRef, Region, TenantId, Timestamp,
+    Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
@@ -81,6 +82,10 @@ fn durable_ledger(
     )
 }
 
+fn available<T>(result: Result<T, ErasureLedgerError>) -> T {
+    result.expect("bus erasure ledger is available")
+}
+
 fn actor_for(id: &str, tenant: &str) -> Actor {
     Actor(Principal::stub(
         PrincipalId(id.into()),
@@ -148,8 +153,11 @@ async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
 
     {
         let ledger = durable_ledger(&tenant, &pool_write, &rt);
-        ledger.record(&subject, &refs, now());
-        assert!(ledger.is_erased(&subject), "recorded in the writing ledger");
+        available(ledger.record(&subject, &refs, now()));
+        assert!(
+            available(ledger.is_erased(&subject)),
+            "recorded in the writing ledger"
+        );
         pool_write.close().await;
     }
 
@@ -158,10 +166,10 @@ async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
         .expect("connect a FRESH pool");
     let ledger2 = durable_ledger(&tenant, &pool_fresh, &rt);
     assert!(
-        ledger2.is_erased(&subject),
+        available(ledger2.is_erased(&subject)),
         "after a FRESH pool the erasure record SURVIVED (an in-memory BTreeMap would be empty)"
     );
-    let entries = ledger2.entries();
+    let entries = available(ledger2.entries());
     assert_eq!(entries.len(), 1, "exactly one recorded subject");
     assert_eq!(entries[0].subject, subject);
     assert_eq!(
@@ -200,10 +208,10 @@ async fn w6c_idempotent_key_refs_merge_dedups_and_keeps_first_erased_at() {
     let subject = format!("subject:{tag}");
     let ledger = durable_ledger(&tenant, &pool, &rt);
 
-    ledger.record(&subject, &[keyref("a"), keyref("b")], now());
-    ledger.record(&subject, &[keyref("b"), keyref("c")], later());
+    available(ledger.record(&subject, &[keyref("a"), keyref("b")], now()));
+    available(ledger.record(&subject, &[keyref("b"), keyref("c")], later()));
 
-    let entries = ledger.entries();
+    let entries = available(ledger.entries());
     assert_eq!(
         entries.len(),
         1,
@@ -248,23 +256,23 @@ async fn w6c_partition_isolation_tenant_a_invisible_to_tenant_b() {
     let ledger_a = durable_ledger(&tenant_a, &pool, &rt);
     let ledger_b = durable_ledger(&tenant_b, &pool, &rt);
 
-    ledger_a.record(&subject, &[keyref("a")], now());
+    available(ledger_a.record(&subject, &[keyref("a")], now()));
 
     assert!(
-        ledger_a.is_erased(&subject),
+        available(ledger_a.is_erased(&subject)),
         "tenant A sees its own erasure"
     );
     assert!(
-        !ledger_b.is_erased(&subject),
+        !available(ledger_b.is_erased(&subject)),
         "tenant B's scope does NOT see tenant A's erasure (partition isolation)"
     );
     assert_eq!(
-        ledger_a.entries().len(),
+        available(ledger_a.entries()).len(),
         1,
         "A's replay set has the subject"
     );
     assert!(
-        ledger_b.entries().is_empty(),
+        available(ledger_b.entries()).is_empty(),
         "B's replay set is EMPTY (the explicit (tenant, region) predicate isolates it)"
     );
 
@@ -318,7 +326,7 @@ async fn w6c_re_erase_after_restore_drives_off_the_durable_ledger() {
         .expect("connect a FRESH pool");
     let restart_ledger = durable_ledger(&tenant, &pool_fresh, &rt);
     assert!(
-        restart_ledger.is_erased(subject),
+        available(restart_ledger.is_erased(subject)),
         "the fresh durable ledger remembers the erasure (drives the replay)"
     );
 
@@ -360,4 +368,138 @@ async fn w6c_re_erase_after_restore_drives_off_the_durable_ledger() {
     );
 
     cleanup(&pool_fresh, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ledger_outage_withholds_both_erase_receipts_and_each_retry_finishes() {
+    let cfg = MyelinConfig::dev();
+    let rt = tokio::runtime::Handle::current();
+    let tag = uniq();
+    let tenant = format!("acme-w6c-outage-{tag}");
+    let subject = "u42";
+    let key = keyref(subject);
+
+    let unavailable_pool = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 2)
+        .await
+        .expect("connect Postgres");
+    ensure_table(&unavailable_pool).await;
+    cleanup(&unavailable_pool, &tenant).await;
+    let unavailable_ledger = durable_ledger(&tenant, &unavailable_pool, &rt);
+    unavailable_pool.close().await;
+
+    assert_eq!(
+        unavailable_ledger.record(subject, std::slice::from_ref(&key), now()),
+        Err(ErasureLedgerError::Unavailable),
+        "a failed durable write is not reported as an erasure record"
+    );
+    assert_eq!(
+        unavailable_ledger.is_erased(subject),
+        Err(ErasureLedgerError::Unavailable),
+        "a failed point read is not reported as an unerased subject"
+    );
+    assert_eq!(
+        unavailable_ledger.entries(),
+        Err(ErasureLedgerError::Unavailable),
+        "a failed replay-set read is not reported as an empty ledger"
+    );
+    assert_eq!(
+        unavailable_ledger.len(),
+        Err(ErasureLedgerError::Unavailable)
+    );
+    assert_eq!(
+        unavailable_ledger.is_empty(),
+        Err(ErasureLedgerError::Unavailable)
+    );
+
+    let (mut live_log, shredder) = seeded(&[subject], &tenant);
+    let holder = BusHolder::new(TenantId(tenant.clone()), region(), shredder.clone());
+    let mut interrupted_outbox = OutboxStore::new();
+    let interrupted = holder
+        .erase_and_record(
+            subject,
+            &mut live_log,
+            &mut interrupted_outbox,
+            minter(),
+            &unavailable_ledger,
+            now(),
+        )
+        .expect_err("the caller cannot receive an erase receipt without a durable ledger record");
+    assert_eq!(
+        interrupted,
+        BusErasureError::Ledger(ErasureLedgerError::Unavailable)
+    );
+    assert!(
+        !shredder.is_live(&key),
+        "the irreversible key destruction may finish before the ledger outage is observed"
+    );
+
+    let recovered_pool = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 2)
+        .await
+        .expect("reconnect Postgres");
+    let recovered_ledger = durable_ledger(&tenant, &recovered_pool, &rt);
+    let mut retry_outbox = OutboxStore::new();
+    holder
+        .erase_and_record(
+            subject,
+            &mut live_log,
+            &mut retry_outbox,
+            minter(),
+            &recovered_ledger,
+            later(),
+        )
+        .expect("retry completes the missing durable erasure record");
+    assert!(
+        available(recovered_ledger.is_erased(subject)),
+        "the retry leaves the restore obligation durable"
+    );
+
+    let (mut restored_log, _) = seeded(&[subject], &tenant);
+    shredder.seal(&key);
+    recovered_pool.close().await;
+    let mut interrupted_reerase_outbox = OutboxStore::new();
+    let interrupted_reerase = holder
+        .re_erase_after_restore(
+            &recovered_ledger,
+            &mut restored_log,
+            &mut interrupted_reerase_outbox,
+            minter(),
+            later(),
+        )
+        .expect_err("an unreadable replay set cannot produce a green restore receipt");
+    assert_eq!(
+        interrupted_reerase,
+        BusErasureError::Ledger(ErasureLedgerError::Unavailable)
+    );
+    assert!(
+        shredder.is_live(&key),
+        "the resurrected key remains visible until a retry can discover its obligation"
+    );
+
+    let retry_pool = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 2)
+        .await
+        .expect("reconnect Postgres for the restore retry");
+    let retry_ledger = durable_ledger(&tenant, &retry_pool, &rt);
+    let mut retry_reerase_outbox = OutboxStore::new();
+    let receipt = holder
+        .re_erase_after_restore(
+            &retry_ledger,
+            &mut restored_log,
+            &mut retry_reerase_outbox,
+            minter(),
+            later(),
+        )
+        .expect("restore retry reads the obligation and re-destroys the key");
+    assert!(
+        receipt.is_green(),
+        "the completed retry is truthfully green"
+    );
+    assert_eq!(receipt.re_erased_subjects, 1);
+    assert_eq!(receipt.keys_resurrected_by_restore, 1);
+    assert_eq!(receipt.resurrected, 0);
+    assert!(
+        !shredder.is_live(&key),
+        "the recovered sweep leaves no resurrected key"
+    );
+
+    cleanup(&retry_pool, &tenant).await;
 }
