@@ -501,7 +501,6 @@ mod tests {
             operation: "erasure".into(),
             content_hash: format!("blake3:{}", "a".repeat(64)),
             records_erased: 3,
-            already_erased: false,
             key_unrecoverable: true,
         };
         let ordered = PrivacyRequestCertificate::build(

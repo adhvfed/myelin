@@ -1329,7 +1329,12 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         inbox_store.clone(),
         handle.clone(),
     );
-    builder = register_privacy(builder, agent_traces, handle.clone());
+    builder = register_privacy(
+        builder,
+        agent_traces,
+        myelin_storage::DurablePrivacyRequestStore::new(provider.clone()),
+        handle.clone(),
+    );
     let chat_principals = PrincipalStore::with_pg(
         kms.clone(),
         DurablePrincipalBacking::new(provider.clone()),

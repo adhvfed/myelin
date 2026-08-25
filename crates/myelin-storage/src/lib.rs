@@ -89,11 +89,13 @@ pub use agent_tool_effect::{
 };
 pub use agent_trace_durable::{
     agent_trace_durable_migrations, agent_trace_encrypted_only_migrations,
-    agent_trace_erasure_progress_migrations, AgentTraceAvailability, AgentTraceEraseReceipt,
-    AgentTraceError, AgentTraceReceipt, AgentTraceResult, AgentTraceSubjectEraseReceipt,
+    agent_trace_erasure_progress_migrations, agent_trace_erasure_receipt_migrations,
+    AgentTraceAvailability, AgentTraceEraseReceipt, AgentTraceError, AgentTraceReceipt,
+    AgentTraceResult, AgentTraceSubjectEraseReceipt, AgentTraceSubjectErasureProof,
     AgentTraceSubjectState, AgentTraceSubjectSummary, AgentTraceWrite, AgentTraceWriter,
     DurableAgentTraceStore, EraseAgentTraceOutcome, InMemoryAgentTraceStore,
     AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION, AGENT_TRACE_ERASURE_PROGRESS_MIGRATION,
+    AGENT_TRACE_ERASURE_RECEIPT_MIGRATION,
 };
 pub use agent_wallet::{
     agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind, DebitOutcome,
@@ -298,11 +300,11 @@ pub use placement_durable::{
     DurablePlacementBacking, DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
 };
 pub use privacy_request_durable::{
-    privacy_request_durable_migrations, ClaimPrivacyRequestOutcome, CompletePrivacyRequestOutcome,
-    CreatePrivacyRequestOutcome, DurablePrivacyRequest, DurablePrivacyRequestStore,
-    NewPrivacyRequest, PrivacyHolderReceipt, PrivacyRequestCertificate, PrivacyRequestKind,
-    PrivacyRequestLease, PrivacyRequestScope, PrivacyRequestState, MAX_PRIVACY_HOLDER_RECEIPTS,
-    PRIVACY_REQUEST_DEADLINE_DAYS, PRIVACY_REQUEST_MIGRATION,
+    agent_data_holder_receipts, privacy_request_durable_migrations, ClaimPrivacyRequestOutcome,
+    CompletePrivacyRequestOutcome, CreatePrivacyRequestOutcome, DurablePrivacyRequest,
+    DurablePrivacyRequestStore, NewPrivacyRequest, PrivacyHolderReceipt, PrivacyRequestCertificate,
+    PrivacyRequestKind, PrivacyRequestLease, PrivacyRequestScope, PrivacyRequestState,
+    MAX_PRIVACY_HOLDER_RECEIPTS, PRIVACY_REQUEST_DEADLINE_DAYS, PRIVACY_REQUEST_MIGRATION,
 };
 pub use provider::{
     all_durable_migrations, durable_migration_groups, foundation_migrations, BootstrapError,

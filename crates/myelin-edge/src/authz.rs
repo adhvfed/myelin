@@ -37,6 +37,8 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.trigger.firing.reject",
     "privacy.agent_data.read",
     "privacy.agent_data.erase",
+    "privacy.requests.submit",
+    "privacy.request.read",
     "identity.projects.list",
     "identity.project.create",
     "identity.project.view",
@@ -244,6 +246,16 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     },
     ActionRequirement {
         action: "privacy.agent_data.erase",
+        required_capability: None,
+        accepted_purposes: HUMAN_SESSION,
+    },
+    ActionRequirement {
+        action: "privacy.requests.submit",
+        required_capability: None,
+        accepted_purposes: HUMAN_SESSION,
+    },
+    ActionRequirement {
+        action: "privacy.request.read",
         required_capability: None,
         accepted_purposes: HUMAN_SESSION,
     },
@@ -629,7 +641,12 @@ mod tests {
             CredentialAudience::Edge,
             &[],
         );
-        for action in ["privacy.agent_data.read", "privacy.agent_data.erase"] {
+        for action in [
+            "privacy.agent_data.read",
+            "privacy.agent_data.erase",
+            "privacy.requests.submit",
+            "privacy.request.read",
+        ] {
             assert!(authorize_edge_action(&AllowAll, &human, action));
         }
 
@@ -648,11 +665,9 @@ mod tests {
             &[],
         );
         for identity in [&pat, &operator, &agent] {
-            assert!(!authorize_edge_action(
-                &AllowAll,
-                identity,
-                "privacy.agent_data.erase"
-            ));
+            for action in ["privacy.agent_data.erase", "privacy.requests.submit"] {
+                assert!(!authorize_edge_action(&AllowAll, identity, action));
+            }
         }
     }
 

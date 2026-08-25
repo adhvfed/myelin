@@ -567,6 +567,40 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         erased.key_unrecoverable,
         "the subject DEK no longer resolves"
     );
+    let resumed_store = DurableAgentTraceStore::with_runtime(
+        provider.clone(),
+        tokio::runtime::Handle::current(),
+        kms.clone(),
+    );
+    let durable_proof = resumed_store
+        .erasure_proof_for_subject(&tenant.0, "founder")
+        .await
+        .expect("a fresh worker reads the completed holder proof")
+        .expect("the holder proof survives the worker that performed the erasure");
+    assert_eq!(durable_proof.traces_erased, 2);
+    assert_eq!(durable_proof.model_steps_erased, 1);
+    assert_eq!(durable_proof.tool_effects_erased, 1);
+    assert!(durable_proof.key_unrecoverable);
+    let tamper_tenant = tenant.0.clone();
+    let tampering = provider
+        .with_tenant_tx(&tenant.0, move |connection| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE knowledge_agent_trace_subject_erasure \
+                        SET traces_erased = 99 WHERE tenant_id = $1",
+                )
+                .bind(&tamper_tenant)
+                .execute(connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await;
+    assert!(
+        tampering.is_err(),
+        "the database, not a source-text assertion, makes a completed holder proof immutable"
+    );
     assert!(
         kms.resolve_dek(&journal_key_ref, &region).is_err(),
         "captured journal ciphertext is unreadable after the subject key is destroyed",
@@ -611,7 +645,7 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         Err(ToolEffectError::Erased),
         "erasure is checked before a replay journal can admit another tool effect",
     );
-    let replay = store
+    let replay = resumed_store
         .erase_for_subject(&tenant.0, "founder")
         .await
         .expect("subject erasure is idempotent");

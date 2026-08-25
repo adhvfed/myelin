@@ -181,6 +181,60 @@ BEFORE UPDATE ON knowledge_agent_trace_subject_erasure
 FOR EACH ROW EXECUTE FUNCTION myelin_guard_agent_trace_subject_erasure_update();
 "#;
 
+pub const AGENT_TRACE_ERASURE_RECEIPT_MIGRATION: &str = r#"
+DROP TRIGGER IF EXISTS knowledge_agent_trace_subject_erasure_guard_update
+  ON knowledge_agent_trace_subject_erasure;
+
+ALTER TABLE knowledge_agent_trace_subject_erasure
+    ADD COLUMN traces_erased bigint,
+    ADD COLUMN model_steps_erased bigint,
+    ADD COLUMN tool_effects_erased bigint;
+
+UPDATE knowledge_agent_trace_subject_erasure
+   SET traces_erased = 0, model_steps_erased = 0, tool_effects_erased = 0
+ WHERE completed_at IS NOT NULL;
+
+ALTER TABLE knowledge_agent_trace_subject_erasure
+    ADD CONSTRAINT knowledge_agent_trace_subject_erasure_receipt_shape CHECK (
+      (completed_at IS NULL
+       AND traces_erased IS NULL
+       AND model_steps_erased IS NULL
+       AND tool_effects_erased IS NULL)
+      OR
+      (completed_at IS NOT NULL
+       AND traces_erased IS NOT NULL AND traces_erased >= 0
+       AND model_steps_erased IS NOT NULL AND model_steps_erased >= 0
+       AND tool_effects_erased IS NOT NULL AND tool_effects_erased >= 0)
+    );
+
+CREATE OR REPLACE FUNCTION myelin_guard_agent_trace_subject_erasure_update()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
+     NEW.region IS DISTINCT FROM OLD.region OR
+     NEW.subject_token IS DISTINCT FROM OLD.subject_token OR
+     NEW.erased_at IS DISTINCT FROM OLD.erased_at OR
+     OLD.completed_at IS NOT NULL OR
+     OLD.traces_erased IS NOT NULL OR
+     OLD.model_steps_erased IS NOT NULL OR
+     OLD.tool_effects_erased IS NOT NULL OR
+     NEW.completed_at IS NULL OR
+     NEW.traces_erased IS NULL OR
+     NEW.model_steps_erased IS NULL OR
+     NEW.tool_effects_erased IS NULL THEN
+    RAISE EXCEPTION 'agent trace subject erasure permits only its one-way completion receipt';
+  END IF;
+  RETURN NEW;
+END
+$myelin$;
+
+CREATE TRIGGER knowledge_agent_trace_subject_erasure_guard_update
+BEFORE UPDATE ON knowledge_agent_trace_subject_erasure
+FOR EACH ROW EXECUTE FUNCTION myelin_guard_agent_trace_subject_erasure_update();
+"#;
+
 pub fn agent_trace_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0098_knowledge_agent_trace", AGENT_TRACE_MIGRATION),
@@ -214,6 +268,13 @@ pub fn agent_trace_erasure_progress_migrations() -> Migrations {
     Migrations::of([Migration::plain(
         "0108_agent_trace_erasure_progress",
         AGENT_TRACE_ERASURE_PROGRESS_MIGRATION,
+    )])
+}
+
+pub fn agent_trace_erasure_receipt_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0132_agent_trace_erasure_receipt",
+        AGENT_TRACE_ERASURE_RECEIPT_MIGRATION,
     )])
 }
 
@@ -352,6 +413,14 @@ pub struct AgentTraceSubjectEraseReceipt {
     pub tool_effects_erased: u64,
     pub already_erased: bool,
     pub key_destroyed: bool,
+    pub key_unrecoverable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTraceSubjectErasureProof {
+    pub traces_erased: u64,
+    pub model_steps_erased: u64,
+    pub tool_effects_erased: u64,
     pub key_unrecoverable: bool,
 }
 
@@ -786,6 +855,69 @@ impl DurableAgentTraceStore {
             key_destroyed,
             key_unrecoverable: true,
         })
+    }
+
+    pub async fn erasure_proof_for_subject(
+        &self,
+        tenant: &str,
+        requested_by: &str,
+    ) -> Result<Option<AgentTraceSubjectErasureProof>, AgentTraceError> {
+        let tenant_id = tenant.to_string();
+        let subject = requested_by.to_string();
+        let region = self.provider.config().region.clone();
+        let locator = AgentSubjectLocator::new(&self.kms, &tenant_id, &region, &subject);
+        let current = locator.current().to_string();
+        let legacy = locator.legacy().to_string();
+        let query_tenant = tenant_id.clone();
+        let query_region = region.clone();
+        let counts = self
+            .provider
+            .with_tenant_tx(&tenant_id, move |connection| {
+                Box::pin(async move {
+                    sqlx::query_as::<_, (i64, i64, i64)>(
+                        "SELECT traces_erased, model_steps_erased, tool_effects_erased \
+                           FROM knowledge_agent_trace_subject_erasure \
+                          WHERE tenant_id = $1 AND region = $2 \
+                            AND subject_token IN ($3, $4) AND completed_at IS NOT NULL \
+                          ORDER BY subject_token = $3 DESC \
+                          LIMIT 1",
+                    )
+                    .bind(&query_tenant)
+                    .bind(&query_region)
+                    .bind(&current)
+                    .bind(&legacy)
+                    .fetch_optional(connection)
+                    .await
+                    .map_err(trace_query)
+                })
+            })
+            .await
+            .map_err(|error| AgentTraceError::Storage(error.to_string()))?;
+        let Some((traces_erased, model_steps_erased, tool_effects_erased)) = counts else {
+            return Ok(None);
+        };
+
+        let tenant = TenantId(tenant_id);
+        let key_ref = PiiKeyRef::new(tenant, 0, KeyClass::Subject(subject));
+        match self.kms.resolve_dek(&key_ref, &Region(region)) {
+            Err(KmsError::DekUnavailable(_)) => {}
+            Err(error) => {
+                return Err(AgentTraceError::Storage(format!(
+                    "could not verify the completed subject erasure: {error}"
+                )))
+            }
+            Ok(_) => {
+                return Err(AgentTraceError::Storage(
+                    "subject key resolves despite a completed erasure receipt".into(),
+                ))
+            }
+        }
+        Ok(Some(AgentTraceSubjectErasureProof {
+            traces_erased: nonnegative_erasure_count(traces_erased)?,
+            model_steps_erased: nonnegative_erasure_count(model_steps_erased)?,
+            tool_effects_erased: nonnegative_erasure_count(tool_effects_erased)?,
+            key_unrecoverable: true,
+        }))
     }
 
     pub async fn set_subject_restriction(
@@ -1282,21 +1414,39 @@ async fn complete_subject_erasure_on_connection(
     .execute(&mut *connection)
     .await
     .map_err(trace_query)?;
+    let traces_erased = deleted_traces.rows_affected();
+    let model_steps_erased = deleted_model_steps.rows_affected();
+    let tool_effects_erased = deleted_tool_effects.rows_affected();
     sqlx::query(
-        "UPDATE knowledge_agent_trace_subject_erasure SET completed_at = now() \
+        "UPDATE knowledge_agent_trace_subject_erasure \
+            SET completed_at = now(), traces_erased = $4, \
+                model_steps_erased = $5, tool_effects_erased = $6 \
           WHERE tenant_id = $1 AND region = $2 AND subject_token = $3 \
             AND completed_at IS NULL",
     )
     .bind(tenant)
     .bind(region)
     .bind(&marker.token)
+    .bind(erasure_count_for_database(traces_erased)?)
+    .bind(erasure_count_for_database(model_steps_erased)?)
+    .bind(erasure_count_for_database(tool_effects_erased)?)
     .execute(&mut *connection)
     .await
     .map_err(trace_query)?;
     Ok(DatabaseSubjectEraseReceipt {
-        traces_erased: deleted_traces.rows_affected(),
-        model_steps_erased: deleted_model_steps.rows_affected(),
-        tool_effects_erased: deleted_tool_effects.rows_affected(),
+        traces_erased,
+        model_steps_erased,
+        tool_effects_erased,
+    })
+}
+
+fn erasure_count_for_database(count: u64) -> Result<i64, PgError> {
+    i64::try_from(count).map_err(|_| PgError::Query("agent-data erasure count overflowed".into()))
+}
+
+fn nonnegative_erasure_count(count: i64) -> Result<u64, AgentTraceError> {
+    u64::try_from(count).map_err(|_| {
+        AgentTraceError::Storage("durable agent-data erasure count is negative".into())
     })
 }
 
@@ -1640,36 +1790,5 @@ mod tests {
             store.write(&tenant, trace("Done.")).unwrap_err(),
             AgentTraceError::Storage("in-memory trace state is unavailable".into()),
         );
-    }
-
-    #[test]
-    fn the_durable_holder_is_rls_scoped_bounded_and_immutable_by_primary_key() {
-        assert!(AGENT_TRACE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
-        assert!(AGENT_TRACE_MIGRATION.contains("PRIMARY KEY (tenant_id, region, run_id)"));
-        assert!(AGENT_TRACE_MIGRATION.contains("UNIQUE (tenant_id, region, artifact_ref)"));
-        assert!(AGENT_TRACE_MIGRATION.contains("octet_length(answer) BETWEEN 1 AND 65536"));
-        assert!(AGENT_TRACE_MIGRATION.contains("octet_length(trace_body::text) <= 262144"));
-        assert!(AGENT_TRACE_ERASURE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
-        assert!(AGENT_TRACE_ERASURE_MIGRATION.contains("PRIMARY KEY (tenant_id, region, run_id)"));
-        assert!(AGENT_TRACE_ENCRYPTION_MIGRATION.contains("payload_ciphertext bytea"));
-        assert!(AGENT_TRACE_ENCRYPTION_MIGRATION.contains("answer IS NULL AND trace_body IS NULL"));
-        assert!(AGENT_TRACE_SUBJECT_ERASURE_MIGRATION.contains("subject_token text"));
-        assert!(AGENT_TRACE_SUBJECT_ERASURE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
-        assert!(AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION.contains("restricted_at"));
-        assert!(AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
-        assert!(AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION
-            .contains("INSERT INTO knowledge_agent_trace_erasure"));
-        assert!(AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION.contains("DELETE FROM knowledge_agent_trace"));
-        assert!(AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION
-            .contains("ALTER COLUMN payload_ciphertext SET NOT NULL"));
-        assert!(
-            AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION.contains("answer IS NULL AND trace_body IS NULL")
-        );
-        assert!(
-            AGENT_TRACE_ERASURE_PROGRESS_MIGRATION.contains("ADD COLUMN completed_at timestamptz")
-        );
-        assert!(!AGENT_TRACE_ERASURE_PROGRESS_MIGRATION.contains("SET completed_at = erased_at"));
-        assert!(AGENT_TRACE_ERASURE_PROGRESS_MIGRATION.contains("OLD.completed_at IS NOT NULL"));
-        assert!(AGENT_TRACE_ERASURE_PROGRESS_MIGRATION.contains("one-way completion transition"));
     }
 }

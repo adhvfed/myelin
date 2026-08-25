@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Uuid;
 
+use crate::AgentTraceSubjectErasureProof;
+
 pub const PRIVACY_REQUEST_DEADLINE_DAYS: i64 = 30;
 pub const MAX_PRIVACY_HOLDER_RECEIPTS: usize = 64;
 
@@ -90,8 +92,45 @@ pub struct PrivacyHolderReceipt {
     pub operation: String,
     pub content_hash: String,
     pub records_erased: u64,
-    pub already_erased: bool,
     pub key_unrecoverable: bool,
+}
+
+pub fn agent_data_holder_receipts(
+    proof: &AgentTraceSubjectErasureProof,
+) -> Result<Vec<PrivacyHolderReceipt>, &'static str> {
+    if !proof.key_unrecoverable {
+        return Err("agent-data erasure did not prove that its subject key is unrecoverable");
+    }
+
+    Ok([
+        ("agent_traces", proof.traces_erased),
+        ("model_replay", proof.model_steps_erased),
+        ("tool_effects", proof.tool_effects_erased),
+    ]
+    .into_iter()
+    .map(|(holder, records_erased)| agent_data_holder_receipt(holder, records_erased))
+    .collect())
+}
+
+fn agent_data_holder_receipt(holder: &str, records_erased: u64) -> PrivacyHolderReceipt {
+    let operation = PrivacyRequestKind::Erasure.token();
+    let mut digest = blake3::Hasher::new_derive_key("myelin.privacy-holder-receipt.agent-data.v1");
+    for field in [
+        holder.as_bytes(),
+        operation.as_bytes(),
+        &records_erased.to_be_bytes(),
+        &[1],
+    ] {
+        digest.update(&(field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    PrivacyHolderReceipt {
+        holder: holder.into(),
+        operation: operation.into(),
+        content_hash: format!("blake3:{}", digest.finalize().to_hex()),
+        records_erased,
+        key_unrecoverable: true,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +186,6 @@ impl PrivacyRequestCertificate {
                 receipt.operation.as_bytes(),
                 receipt.content_hash.as_bytes(),
                 &receipt.records_erased.to_be_bytes(),
-                &[u8::from(receipt.already_erased)],
                 &[u8::from(receipt.key_unrecoverable)],
             ] {
                 digest.update(&(field.len() as u64).to_be_bytes());
@@ -219,4 +257,53 @@ pub enum ClaimPrivacyRequestOutcome {
 pub enum CompletePrivacyRequestOutcome {
     Completed(DurablePrivacyRequest),
     LeaseLost,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_real_erasure_becomes_three_independently_counted_holder_receipts() {
+        let receipts = agent_data_holder_receipts(&AgentTraceSubjectErasureProof {
+            traces_erased: 2,
+            model_steps_erased: 3,
+            tool_effects_erased: 5,
+            key_unrecoverable: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| (receipt.holder.as_str(), receipt.records_erased))
+                .collect::<Vec<_>>(),
+            [
+                ("agent_traces", 2),
+                ("model_replay", 3),
+                ("tool_effects", 5)
+            ]
+        );
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.key_unrecoverable
+                    && valid_blake3_digest(&receipt.content_hash))
+        );
+    }
+
+    #[test]
+    fn a_holder_receipt_cannot_certify_a_recoverable_key() {
+        let result = agent_data_holder_receipts(&AgentTraceSubjectErasureProof {
+            traces_erased: 0,
+            model_steps_erased: 0,
+            tool_effects_erased: 0,
+            key_unrecoverable: false,
+        });
+
+        assert_eq!(
+            result.unwrap_err(),
+            "agent-data erasure did not prove that its subject key is unrecoverable"
+        );
+    }
 }

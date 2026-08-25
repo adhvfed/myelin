@@ -241,6 +241,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::restore_verify_durable::restore_wal_offset_invariant_migrations(),
         crate::agent_thread_durable::agent_thread_durable_migrations(),
         crate::privacy_request_durable::privacy_request_durable_migrations(),
+        crate::agent_trace_durable::agent_trace_erasure_receipt_migrations(),
     ]
 }
 

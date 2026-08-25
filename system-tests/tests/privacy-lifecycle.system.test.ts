@@ -6,7 +6,7 @@ import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/cont
 import { awaitAuthorizedIssue } from "../src/issues.js";
 import { awaitAutomationFiring } from "../src/journeys/automations.js";
 import { announceIssueChange } from "../src/journeys/issues.js";
-import { integer, record, string, type JsonRecord } from "../src/json.js";
+import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import type { SystemTestClient } from "../src/client.js";
 
 async function createVisibleIssue(
@@ -37,7 +37,7 @@ async function createVisibleIssue(
 }
 
 describe("a person's agent-data privacy lifecycle", () => {
-  test("shows what is held, erases it once, and refuses to quietly rebuild it", async () => {
+  test("shows what is held, completes one resumable request, and refuses to quietly rebuild it", async () => {
     await privacyClient.json("/v1/privacy/me/agent-data", { expectedStatus: 403 });
     const person = await browserApprovedCliClient(privacyClient);
 
@@ -125,25 +125,80 @@ describe("a person's agent-data privacy lifecycle", () => {
     const recoverableBefore = integer(held.recoverable_records, "recoverable agent records");
     expect(recoverableBefore).toBeGreaterThanOrEqual(2);
 
-    const erased = await person.json("/v1/privacy/me/agent-data/erase", {
+    const retryKey = `erase-my-agent-data-${randomUUID()}`;
+    const submitted = await person.json("/v1/privacy/me/requests", {
       method: "POST",
-      body: {},
-      idempotencyKey: false,
+      body: { kind: "erasure", scope: "agent_data" },
+      idempotencyKey: retryKey,
+      expectedStatus: 201,
     });
-    const receipt = record(erased.body.erasure, "agent-data erasure receipt");
-    expect(receipt).toMatchObject({
-      subject: "self",
+    const request = record(submitted.body.request, "completed privacy request");
+    const requestId = string(request.id, "privacy request id");
+    expect(submitted.body.created).toBe(true);
+    expect(request).toMatchObject({
+      kind: "erasure",
       scope: "agent_data",
-      erased: true,
-      already_erased: false,
-      traces_erased: 1,
-      key_destroyed_this_request: true,
-      key_unrecoverable: true,
-      new_processing_blocked: true,
-      irreversible: true,
+      state: "completed",
+      attempt_count: 1,
+      certificate_available: true,
     });
-    expect(integer(receipt.model_steps_erased, "erased model replays")).toBeGreaterThanOrEqual(1);
-    expect(integer(receipt.records_erased, "all erased agent records")).toBe(recoverableBefore);
+    expect(Date.parse(string(request.deadline_at, "privacy request deadline"))).toBeGreaterThan(
+      Date.parse(string(request.submitted_at, "privacy request submission time")),
+    );
+
+    const status = await person.json(
+      `/v1/privacy/me/requests/${encodeURIComponent(requestId)}`,
+    );
+    expect(status.body.request).toEqual(request);
+
+    const certified = await person.json(
+      `/v1/privacy/me/requests/${encodeURIComponent(requestId)}/certificate`,
+    );
+    const certificate = record(certified.body.certificate, "privacy request certificate");
+    expect(certificate).toMatchObject({
+      request_id: requestId,
+      kind: "erasure",
+      scope: "agent_data",
+    });
+    expect(string(certificate.content_hash, "certificate content hash")).toMatch(
+      /^blake3:[0-9a-f]{64}$/,
+    );
+    const holders = array(certificate.holders, "certified privacy holders").map((holder) =>
+      record(holder, "certified privacy holder"),
+    );
+    expect(holders.map((holder) => holder.holder)).toEqual([
+      "agent_traces",
+      "model_replay",
+      "tool_effects",
+    ]);
+    expect(
+      holders.reduce(
+        (total, holder) => total + integer(holder.records_erased, "holder erasure count"),
+        0,
+      ),
+    ).toBe(recoverableBefore);
+    expect(holders).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          holder: "agent_traces",
+          operation: "erasure",
+          records_erased: 1,
+          key_unrecoverable: true,
+        }),
+        expect.objectContaining({ holder: "model_replay", key_unrecoverable: true }),
+        expect.objectContaining({ holder: "tool_effects", key_unrecoverable: true }),
+      ]),
+    );
+
+    const replayed = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "agent_data" },
+      idempotencyKey: retryKey,
+    });
+    expect(replayed.body).toMatchObject({
+      created: false,
+      request: { id: requestId, state: "completed", attempt_count: 1 },
+    });
     await person.json(
       `/v1/triggers/${encodeURIComponent(triggerId)}/runs/${encodeURIComponent(runId)}/result`,
       { expectedStatus: 404 },

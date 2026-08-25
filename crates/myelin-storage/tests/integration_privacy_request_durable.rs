@@ -91,7 +91,6 @@ fn certificate(request_id: Uuid) -> PrivacyRequestCertificate {
             operation: "erasure".into(),
             content_hash: format!("blake3:{}", "a".repeat(64)),
             records_erased: 7,
-            already_erased: false,
             key_unrecoverable: true,
         }],
     )

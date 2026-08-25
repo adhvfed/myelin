@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use myelin_storage::{
     AgentTraceSubjectEraseReceipt, AgentTraceSubjectState, AgentTraceSubjectSummary,
-    DurableAgentTraceStore,
+    DurableAgentTraceStore, DurablePrivacyRequestStore,
 };
 use serde_json::json;
 use tokio::runtime::Handle;
@@ -15,9 +15,12 @@ use crate::{EdgeError, Method};
 
 const MAX_PRIVACY_JSON_BYTES: usize = 1024;
 
+mod request;
+
 #[derive(Clone)]
-struct PrivacyHttpApi {
+pub(super) struct PrivacyHttpApi {
     traces: DurableAgentTraceStore,
+    requests: DurablePrivacyRequestStore,
     runtime: Handle,
 }
 
@@ -46,6 +49,15 @@ impl PrivacyHttpApi {
             "privacy HTTP",
         )?
         .map_err(|error| EdgeError::Internal(error.to_string()))
+    }
+
+    pub(super) fn drive<F, T, E>(&self, future: F) -> Result<T, EdgeError>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        drive_edge_future(&self.runtime, future, "privacy HTTP")?
+            .map_err(|error| EdgeError::Internal(error.to_string()))
     }
 }
 
@@ -95,10 +107,15 @@ impl Handler for AgentDataEraseHandler {
 pub fn register_privacy(
     builder: GatewayBuilder,
     traces: DurableAgentTraceStore,
+    requests: DurablePrivacyRequestStore,
     runtime: Handle,
 ) -> GatewayBuilder {
-    let api = PrivacyHttpApi { traces, runtime };
-    builder
+    let api = PrivacyHttpApi {
+        traces,
+        requests,
+        runtime,
+    };
+    let builder = builder
         .route(
             Method::Get,
             "/v1/privacy/me/agent-data",
@@ -109,8 +126,9 @@ pub fn register_privacy(
             Method::Post,
             "/v1/privacy/me/agent-data/erase",
             "privacy.agent_data.erase",
-            Arc::new(AgentDataEraseHandler { api }),
-        )
+            Arc::new(AgentDataEraseHandler { api: api.clone() }),
+        );
+    request::register(builder, api)
 }
 
 fn require_no_parameters_or_body(ctx: &HandlerCtx<'_>, operation: &str) -> Result<(), EdgeError> {
