@@ -4,7 +4,8 @@ use myelin_events::{derive_envelope, EmitContext, IdMinter};
 use myelin_tenancy::{Region, TenantId};
 
 use super::{
-    AuthoredMessageEraseReceipt, AuthoredMessageErasureState, MessageErasureAttempt, PgMessageStore,
+    AuthoredMessageEraseReceipt, AuthoredMessageErasureState, MessageErasureAttempt,
+    PgMessageStore, VerifiedMessageErasureAttempt,
 };
 use crate::dek::{chat_subject_key_class, decode_encrypted_body};
 use crate::events::CHAT_MESSAGE_ERASED;
@@ -76,17 +77,69 @@ impl PgMessageStore {
         Ok(state)
     }
 
+    /// Proves that every live body is on the independent Chat key before a
+    /// caller destroys that key. The pending marker already fences new writes,
+    /// so this inventory stays valid until the mutation phase.
+    pub async fn verify_author_erasure_ready(
+        &self,
+        tenant: &str,
+        author: &str,
+        operation_id: &str,
+    ) -> Result<u64, StoreError> {
+        validate_erasure_identity(tenant, author, operation_id)?;
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| StoreError::Cold(format!("acquire: {error}")))?;
+        self.set_session_scope(&mut connection, tenant, &self.region)
+            .await?;
+        let mut transaction = connection
+            .begin()
+            .await
+            .map_err(|error| StoreError::Cold(format!("begin Chat erasure check: {error}")))?;
+        lock_author(&mut transaction, tenant, author, AuthorLock::Exclusive).await?;
+        let marker = load_erasure_marker(
+            &mut transaction,
+            &self.erasure_operation_table(),
+            tenant,
+            &self.region,
+            operation_id,
+        )
+        .await?;
+        require_same_author(&marker, author)?;
+        let count = match erasure_state_from_row(&marker)? {
+            AuthoredMessageErasureState::Completed(receipt) => receipt.messages_tombstoned,
+            AuthoredMessageErasureState::Pending => {
+                validate_authored_body_envelopes(
+                    &mut transaction,
+                    &self.table,
+                    tenant,
+                    &self.region,
+                    author,
+                )
+                .await?
+            }
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|error| StoreError::Cold(format!("commit Chat erasure check: {error}")))?;
+        Ok(count)
+    }
+
     /// Tombstones every live message written by one pseudonymous author and
     /// co-commits one durable erasure event per message in the same transaction.
     /// A retry returns the operation's original receipt and emits no duplicate
     /// events. `prepare_author_erasure` must have committed first.
-    pub async fn tombstone_author_co_commit(
+    pub(crate) async fn tombstone_author_co_commit(
         &self,
         tenant: &str,
-        author: &str,
         event_ids: &dyn IdMinter,
-        attempt: MessageErasureAttempt,
+        verified: VerifiedMessageErasureAttempt,
     ) -> Result<AuthoredMessageEraseReceipt, StoreError> {
+        let VerifiedMessageErasureAttempt { author, attempt } = verified;
+        let author = author.as_str();
         let MessageErasureAttempt {
             operation_id,
             actor,
@@ -114,23 +167,14 @@ impl PgMessageStore {
             .map_err(|error| StoreError::Cold(format!("begin Chat erasure: {error}")))?;
         lock_author(&mut transaction, tenant, author, AuthorLock::Exclusive).await?;
 
-        let marker = sqlx::query(&format!(
-            "SELECT author, completed_at IS NOT NULL AS completed, \
-                    messages_erased, events_emitted \
-               FROM {} \
-              WHERE tenant_id = $1 AND region = $2 AND operation_id = $3 \
-              FOR UPDATE",
-            self.erasure_operation_table(),
-        ))
-        .bind(tenant)
-        .bind(&self.region)
-        .bind(operation_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|error| StoreError::Cold(format!("lock Chat erasure marker: {error}")))?
-        .ok_or_else(|| {
-            StoreError::Cold("Chat erasure was not durably prepared before message mutation".into())
-        })?;
+        let marker = load_erasure_marker(
+            &mut transaction,
+            &self.erasure_operation_table(),
+            tenant,
+            &self.region,
+            operation_id,
+        )
+        .await?;
         require_same_author(&marker, author)?;
         if let AuthoredMessageErasureState::Completed(receipt) = erasure_state_from_row(&marker)? {
             transaction
@@ -140,47 +184,14 @@ impl PgMessageStore {
             return Ok(receipt);
         }
 
-        let bodies = sqlx::query(&format!(
-            "SELECT message_id, body_inline, body_nodes \
-               FROM {} \
-              WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3 \
-              ORDER BY message_id FOR UPDATE",
-            self.table,
-        ))
-        .bind(tenant)
-        .bind(&self.region)
-        .bind(author)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(|error| StoreError::Cold(format!("inspect authored Chat encryption: {error}")))?;
-        for row in &bodies {
-            let message_id: String = row.try_get("message_id").map_err(erasure_row_decode)?;
-            for (column, encoded) in [
-                (
-                    "body_inline",
-                    row.try_get::<Vec<u8>, _>("body_inline")
-                        .map_err(erasure_row_decode)?,
-                ),
-                (
-                    "body_nodes",
-                    row.try_get::<Vec<u8>, _>("body_nodes")
-                        .map_err(erasure_row_decode)?,
-                ),
-            ] {
-                let envelope = decode_encrypted_body(&encoded).map_err(|_| {
-                    StoreError::Cold(format!(
-                        "Chat erasure cannot prove the encryption boundary of {message_id} {column}"
-                    ))
-                })?;
-                if envelope.key_ref.tenant.as_str() != tenant
-                    || envelope.key_ref.class != chat_subject_key_class(author)
-                {
-                    return Err(StoreError::Cold(format!(
-                        "Chat erasure refuses legacy or foreign key scope on {message_id} {column}"
-                    )));
-                }
-            }
-        }
+        validate_authored_body_envelopes(
+            &mut transaction,
+            &self.table,
+            tenant,
+            &self.region,
+            author,
+        )
+        .await?;
 
         let rows = sqlx::query(&format!(
             "UPDATE {} \
@@ -312,6 +323,82 @@ impl PgMessageStore {
         }
         Ok(())
     }
+}
+
+async fn load_erasure_marker(
+    connection: &mut sqlx::PgConnection,
+    table: &str,
+    tenant: &str,
+    region: &str,
+    operation_id: &str,
+) -> Result<sqlx::postgres::PgRow, StoreError> {
+    sqlx::query(&format!(
+        "SELECT author, completed_at IS NOT NULL AS completed, \
+                messages_erased, events_emitted \
+           FROM {table} \
+          WHERE tenant_id = $1 AND region = $2 AND operation_id = $3 \
+          FOR UPDATE",
+    ))
+    .bind(tenant)
+    .bind(region)
+    .bind(operation_id)
+    .fetch_optional(connection)
+    .await
+    .map_err(|error| StoreError::Cold(format!("lock Chat erasure marker: {error}")))?
+    .ok_or_else(|| {
+        StoreError::Cold("Chat erasure was not durably prepared before message mutation".into())
+    })
+}
+
+async fn validate_authored_body_envelopes(
+    connection: &mut sqlx::PgConnection,
+    table: &str,
+    tenant: &str,
+    region: &str,
+    author: &str,
+) -> Result<u64, StoreError> {
+    let bodies = sqlx::query(&format!(
+        "SELECT message_id, body_inline, body_nodes \
+           FROM {table} \
+          WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3 \
+          ORDER BY message_id FOR UPDATE",
+    ))
+    .bind(tenant)
+    .bind(region)
+    .bind(author)
+    .fetch_all(connection)
+    .await
+    .map_err(|error| StoreError::Cold(format!("inspect authored Chat encryption: {error}")))?;
+    for row in &bodies {
+        let message_id: String = row.try_get("message_id").map_err(erasure_row_decode)?;
+        for (column, encoded) in [
+            (
+                "body_inline",
+                row.try_get::<Vec<u8>, _>("body_inline")
+                    .map_err(erasure_row_decode)?,
+            ),
+            (
+                "body_nodes",
+                row.try_get::<Vec<u8>, _>("body_nodes")
+                    .map_err(erasure_row_decode)?,
+            ),
+        ] {
+            let envelope = decode_encrypted_body(&encoded).map_err(|_| {
+                StoreError::Cold(format!(
+                    "Chat erasure cannot prove the encryption boundary of {message_id} {column}"
+                ))
+            })?;
+            if envelope.key_ref.tenant.as_str() != tenant
+                || envelope.key_ref.class != chat_subject_key_class(author)
+            {
+                return Err(StoreError::Cold(format!(
+                    "Chat erasure refuses legacy or foreign key scope on {message_id} {column}"
+                )));
+            }
+        }
+    }
+    u64::try_from(bodies.len())
+        .map_err(|_| StoreError::Cold("Chat erasure inventory count overflowed".into()))
 }
 
 #[derive(Clone, Copy)]

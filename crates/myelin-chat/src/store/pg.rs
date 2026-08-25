@@ -133,6 +133,23 @@ pub struct MessageErasureAttempt {
     pub(crate) recorded: myelin_events::Timestamp,
 }
 
+pub(crate) struct VerifiedMessageErasureAttempt {
+    pub(crate) author: String,
+    pub(crate) attempt: MessageErasureAttempt,
+}
+
+impl VerifiedMessageErasureAttempt {
+    pub(crate) fn after_key_destruction(
+        author: impl Into<String>,
+        attempt: MessageErasureAttempt,
+    ) -> Self {
+        Self {
+            author: author.into(),
+            attempt,
+        }
+    }
+}
+
 impl MessageErasureAttempt {
     pub fn new(
         operation_id: impl Into<String>,
@@ -146,6 +163,10 @@ impl MessageErasureAttempt {
             occurred,
             recorded,
         }
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
     }
 }
 

@@ -5,6 +5,7 @@ pub mod content;
 pub mod conversation;
 pub mod cross_org;
 pub mod dek;
+pub mod durable_erase;
 pub mod erase;
 pub mod events;
 pub mod fanout;
@@ -48,6 +49,9 @@ pub use dek::{
     chat_subject_key_class, decode_encrypted_body, decrypt_body, encode_encrypted_body,
     encrypt_body, is_chat_subject_key_class, plaintext_at_rest, subject_dek_erasure,
     ChatBodyEnvelopeError, ChatFreeText,
+};
+pub use durable_erase::{
+    DurableChatMessageEraser, DurableChatMessageErasureError, DurableChatMessageErasureProof,
 };
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseError, ChatEraseReport, ChatErasureCascade,

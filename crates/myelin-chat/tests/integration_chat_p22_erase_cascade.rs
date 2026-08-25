@@ -1,6 +1,7 @@
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use myelin_chat::events::{
     channel_aggregate, event_actor_pseudonym, pseudonymized_event_principal,
@@ -12,13 +13,15 @@ use myelin_chat::store::{
     AuthorKind, ConversationId, MessageState, MonotonicUlidSource, NewMessage, RangeCursor,
 };
 use myelin_chat::{
-    chat_subject_key_class, decode_encrypted_body, decrypt_body, encode_encrypted_body,
-    encrypt_body, subject_dek_erasure, ChatFreeText, CHAT_ERASE_CASCADE_TOKEN,
+    decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, subject_dek_erasure,
+    ChatFreeText, DurableChatMessageEraser, CHAT_ERASE_CASCADE_TOKEN,
 };
+use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, Timestamp, Ulid, UlidMinter};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
-use myelin_storage::kms::{DekId, KekId, KmsEngine};
+use myelin_storage::kms::{KekId, KmsEngine};
+use myelin_storage::{DurablePostPitLedger, PostPitErasureScope, SubstrateProvider};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
@@ -66,7 +69,7 @@ impl IdMinter for ConstantMinter {
     }
 }
 
-async fn fresh_store() -> (sqlx::PgPool, PgMessageStore, String) {
+async fn fresh_store() -> (sqlx::PgPool, PgMessageStore, String, SubstrateProvider) {
     let admin = PgPoolOptions::new()
         .max_connections(4)
         .connect(&admin_url())
@@ -86,13 +89,13 @@ async fn fresh_store() -> (sqlx::PgPool, PgMessageStore, String) {
         .execute(&admin)
         .await
         .expect("the durable outbox schema is available");
-    let app = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&app_url())
+    let mut config = MyelinConfig::dev();
+    config.database_url = app_url();
+    let app = SubstrateProvider::connect(config, 4)
         .await
         .expect("connect to dev Postgres as the production application role");
-    let store = PgMessageStore::new(app, region().as_str(), table.clone());
-    (admin, store, table)
+    let store = PgMessageStore::new(app.db_pool().clone(), region().as_str(), table.clone());
+    (admin, store, table, app)
 }
 
 fn encrypted_message(
@@ -195,8 +198,10 @@ async fn clear_test_rows(admin: &sqlx::PgPool, table: &str, conversations: &[Con
 
 #[tokio::test]
 async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_events() {
-    let (admin, store, table) = fresh_store().await;
-    let kms = KmsEngine::new();
+    let (admin, store, table, provider) = fresh_store().await;
+    let kms = Arc::new(KmsEngine::new());
+    let ledger = DurablePostPitLedger::new(provider);
+    let eraser = DurableChatMessageEraser::new(store.clone(), Arc::clone(&kms), ledger.clone());
     let ids = MonotonicUlidSource::new();
     let event_ids = UlidMinter::new();
     let ada = event_actor_pseudonym(TENANT, ADA);
@@ -266,18 +271,18 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
         .expect_err("a fresh write cannot overtake Ada's in-progress erasure");
     assert!(refused.to_string().contains("erasure is in progress"));
 
-    let receipt = store
-        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_attempt(operation))
+    let proof = eraser
+        .erase_subject_messages(TENANT, ADA, &event_ids, erasure_attempt(operation))
         .await
-        .expect("the production message store completes Ada's erasure atomically");
+        .expect("the durable eraser records, shreds, and tombstones Ada's messages");
     assert_eq!(
-        (
-            receipt.messages_tombstoned,
-            receipt.erasure_events_co_committed,
-        ),
+        (proof.messages_erased, proof.erasure_events_co_committed,),
         (2, 2),
         "both authored messages and both durable consequences move together",
     );
+    assert!(proof.key_destroyed_this_attempt);
+    assert_eq!(proof.destroyed_key_epoch, Some(0));
+    assert!(proof.key_unrecoverable);
 
     let planning_messages = store
         .range(&planning, RangeCursor::Recent, 10)
@@ -314,21 +319,30 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
         row.get::<serde_json::Value, _>("envelope")["type_"] == CHAT_ERASE_CASCADE_TOKEN
     }));
 
-    let retry = store
-        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_attempt(operation))
+    let retry = eraser
+        .erase_subject_messages(TENANT, ADA, &event_ids, erasure_attempt(operation))
         .await
         .expect("a delivery retry returns the durable receipt");
     assert_eq!(
-        (retry.messages_tombstoned, retry.erasure_events_co_committed,),
+        (retry.messages_erased, retry.erasure_events_co_committed,),
         (2, 2),
         "a completed message erasure replays its original proof without another event",
+    );
+    assert!(
+        !retry.key_destroyed_this_attempt && retry.destroyed_key_epoch.is_none(),
+        "replay must not mistake a later Chat key for the key destroyed by the operation",
     );
     assert_eq!(
         store
             .prepare_author_erasure(TENANT, &ada, operation)
             .await
             .expect("the durable marker remains readable after response loss"),
-        AuthoredMessageErasureState::Completed(receipt.clone()),
+        AuthoredMessageErasureState::Completed(
+            myelin_chat::store::pg::AuthoredMessageEraseReceipt {
+                messages_tombstoned: 2,
+                erasure_events_co_committed: 2,
+            },
+        ),
     );
     let event_count_after_retry: i64 =
         sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1 OR aggregate = $2")
@@ -342,24 +356,34 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
         "receipt replay never republishes a completed erasure",
     );
 
-    kms.destroy_dek(&DekId::new(
-        TenantId::from_token(TENANT),
-        chat_subject_key_class(&ada),
-    ))
-    .expect("shred Ada's independent Chat key");
     assert!(
         decrypt_body(&kms, &region(), &first_envelope).is_err()
             && decrypt_body(&kms, &region(), &second_envelope).is_err(),
         "the tombstones and Chat-scoped key together leave no recoverable authored body",
+    );
+    let post_pit = ledger
+        .completed_after(PostPitErasureScope::Chat, 0)
+        .await
+        .expect("the post-restore ledger remains queryable");
+    assert!(
+        post_pit.iter().any(|entry| {
+            entry.tenant == TenantId::from_token(TENANT) && entry.subject == SubjectId::new(ADA)
+        }),
+        "restore recovery can discover and reapply this Chat erasure",
     );
 
     clear_test_rows(&admin, &table, &[planning, incident]).await;
 }
 
 #[tokio::test]
-async fn an_erasure_event_failure_restores_every_message_body() {
-    let (admin, store, table) = fresh_store().await;
-    let kms = KmsEngine::new();
+async fn an_erasure_event_failure_leaves_a_resumable_storage_transaction() {
+    let (admin, store, table, provider) = fresh_store().await;
+    let kms = Arc::new(KmsEngine::new());
+    let eraser = DurableChatMessageEraser::new(
+        store.clone(),
+        Arc::clone(&kms),
+        DurablePostPitLedger::new(provider),
+    );
     let ids = MonotonicUlidSource::new();
     let ada = event_actor_pseudonym(TENANT, ADA);
     let conversation = ConversationId::new(TENANT, region().as_str(), "01J0CHATP411ROLLBACK00000");
@@ -383,10 +407,10 @@ async fn an_erasure_event_failure_restores_every_message_body() {
         AuthoredMessageErasureState::Pending,
     );
     let one_id_for_two_different_events = UlidMinter::new().mint();
-    let error = store
-        .tombstone_author_co_commit(
+    let error = eraser
+        .erase_subject_messages(
             TENANT,
-            &ada,
+            ADA,
             &ConstantMinter(one_id_for_two_different_events),
             erasure_attempt(operation),
         )
@@ -404,6 +428,12 @@ async fn an_erasure_event_failure_restores_every_message_body() {
             && !message.body_inline.is_empty()
             && !message.body_nodes.is_empty()
     }));
+    let stranded_body = decode_encrypted_body(&messages[0].body_inline)
+        .expect("the rolled-back row still contains its encrypted envelope");
+    assert!(
+        decrypt_body(&kms, &region(), &stranded_body).is_err(),
+        "the irreversible key step stays honest even when the database step must resume",
+    );
     let event_count: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
         .bind(channel_aggregate(&conversation.conversation_id).0)
         .fetch_one(&admin)
@@ -421,13 +451,40 @@ async fn an_erasure_event_failure_restores_every_message_body() {
         AuthoredMessageErasureState::Pending,
     );
 
+    let resumed = eraser
+        .erase_subject_messages(TENANT, ADA, &UlidMinter::new(), erasure_attempt(operation))
+        .await
+        .expect("a retry can finish storage after the irreversible key step");
+    assert_eq!(
+        (resumed.messages_erased, resumed.erasure_events_co_committed),
+        (2, 2),
+    );
+    assert!(
+        !resumed.key_destroyed_this_attempt && resumed.destroyed_key_epoch.is_none(),
+        "the retry observes that the old key was already destroyed",
+    );
+    let finished = store
+        .range(&conversation, RangeCursor::Recent, 10)
+        .await
+        .expect("read the room after resuming the operation");
+    assert!(finished.iter().all(|message| {
+        message.state == MessageState::Tombstoned
+            && message.body_inline.is_empty()
+            && message.body_nodes.is_empty()
+    }));
+
     clear_test_rows(&admin, &table, &[conversation]).await;
 }
 
 #[tokio::test]
 async fn a_legacy_cross_product_key_is_never_misreported_as_safely_shredded() {
-    let (admin, store, table) = fresh_store().await;
-    let kms = KmsEngine::new();
+    let (admin, store, table, provider) = fresh_store().await;
+    let kms = Arc::new(KmsEngine::new());
+    let eraser = DurableChatMessageEraser::new(
+        store.clone(),
+        Arc::clone(&kms),
+        DurablePostPitLedger::new(provider),
+    );
     let ids = MonotonicUlidSource::new();
     let event_ids = UlidMinter::new();
     let ada = event_actor_pseudonym(TENANT, ADA);
@@ -445,8 +502,8 @@ async fn a_legacy_cross_product_key_is_never_misreported_as_safely_shredded() {
         .await
         .expect("persist the attempted erasure");
 
-    let error = store
-        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_attempt(operation))
+    let error = eraser
+        .erase_subject_messages(TENANT, ADA, &event_ids, erasure_attempt(operation))
         .await
         .expect_err("a shared legacy key cannot support an honest Chat-only certificate");
     assert!(error
@@ -462,6 +519,11 @@ async fn a_legacy_cross_product_key_is_never_misreported_as_safely_shredded() {
     assert!(
         !message.body_inline.is_empty(),
         "a refusal does not destroy data while claiming success",
+    );
+    let envelope = decode_encrypted_body(&message.body_inline).expect("decode the legacy body");
+    assert_eq!(
+        decrypt_body(&kms, &region(), &envelope).expect("the shared legacy key remains intact"),
+        b"legacy private body",
     );
 
     clear_test_rows(&admin, &table, &[conversation]).await;
