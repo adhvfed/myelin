@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — event delivery waits for durable dedup storage
+
+The PostgreSQL dedup adapter translated every storage failure into an ordinary boolean. Most
+dangerously, failed co-commit acquisition returned a fresh, no-op transaction whose commit always
+succeeded. A consumer could therefore run a handler during a database outage and acknowledge the
+delivery without durably recording either its dedup mark or its transactional effect.
+
+Dedup reads and mutations now return a small typed availability result. Co-commit acquisition has
+no fallback transaction: an outage leaves the delivery pending and returns the standard retry
+outcome before the handler can run. Non-retryable delivery also waits until its post-quarantine
+dedup mark is durable before acknowledging, and full notification rebuilds surface a failed dedup
+reset instead of quietly replaying against stale state.
+
+**Proof:** a warning-free workspace all-target/all-feature compile; strict clippy across Events,
+Storage, and Notifications; all 231 Events library cases; three real-PostgreSQL co-commit journeys,
+including closed-pool failure for every dedup operation followed by a same-delivery recovery that
+commits one mark and one effect (0.17 seconds total); restarted affected services; and both live
+TypeScript private-agent-thread journeys (7.44 seconds total).
+
 ## 2026-08-26 — token mint waits for its durable run grant
 
 Run-token minting recorded the credential lifetime but discarded the result of writing the

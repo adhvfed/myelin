@@ -419,11 +419,15 @@ fn cdc_consumer_dedup_suppresses_a_replayed_reorder() {
     let ledger = DedupLedger::new();
     let consumer = ConsumerName("issues-board-projection".into());
     assert!(
-        ledger.mark_handled(&consumer, &eid),
+        ledger
+            .mark_handled(&consumer, &eid)
+            .expect("in-memory dedup storage is available"),
         "first delivery is newly handled"
     );
     assert!(
-        !ledger.mark_handled(&consumer, &eid),
+        !ledger
+            .mark_handled(&consumer, &eid)
+            .expect("in-memory dedup storage is available"),
         "a replay of the same stable event_id is dedup-suppressed (0 double-apply of the rank)"
     );
 }

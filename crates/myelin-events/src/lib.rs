@@ -42,7 +42,10 @@ pub use dead_letter::{
     bounded_reason, DeadLetterRecord, DeadLetterSink, DurableDeadLetter,
     CONSUMER_DEAD_LETTER_MIGRATION, MAX_REASON_LEN,
 };
-pub use dedup::{CoCommitError, CoCommitTx, DedupLedger, DurableDedup, CONSUMER_DEDUP_MIGRATION};
+pub use dedup::{
+    CoCommitError, CoCommitTx, DedupError, DedupLedger, DedupResult, DurableDedup,
+    CONSUMER_DEDUP_MIGRATION,
+};
 pub use firehose::{
     Firehose, FirehoseError, FirehoseScope, Frame, FrameDraft, FramePayload, RetentionWindow,
     ScopeKind, SubStream, Subscription as FirehoseSubscription, DEFAULT_INFLIGHT_CAP,

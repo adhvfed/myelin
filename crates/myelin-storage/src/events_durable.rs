@@ -1,8 +1,8 @@
 use sqlx::postgres::PgPool;
 
 use myelin_events::{
-    BrokerDeliveryRef, CoCommitError, CoCommitTx, ConsumerName, DeadLetterRecord,
-    DeliveryQuarantineReason, DurableBusErasure, DurableDeadLetter, DurableDedup,
+    BrokerDeliveryRef, CoCommitError, CoCommitTx, ConsumerName, DeadLetterRecord, DedupError,
+    DedupResult, DeliveryQuarantineReason, DurableBusErasure, DurableDeadLetter, DurableDedup,
     DurableDeliveryQuarantine, ErasedSubject, EventId, PiiKeyRef, Region, TenantId, Timestamp,
 };
 
@@ -25,9 +25,9 @@ impl DurableDedupBacking {
 }
 
 impl DurableDedup for DurableDedupBacking {
-    fn mark_handled(&self, consumer: &ConsumerName, event_id: &EventId) -> bool {
+    fn mark_handled(&self, consumer: &ConsumerName, event_id: &EventId) -> DedupResult<bool> {
         self.block(async {
-            match sqlx::query(
+            sqlx::query(
                 "INSERT INTO consumer_dedup (consumer, event_id) VALUES ($1, $2) \
                  ON CONFLICT (consumer, event_id) DO NOTHING",
             )
@@ -35,48 +35,45 @@ impl DurableDedup for DurableDedupBacking {
             .bind(&event_id.0)
             .execute(&self.pool)
             .await
-            {
-                Ok(res) => res.rows_affected() == 1,
-                Err(_) => true,
-            }
+            .map(|res| res.rows_affected() == 1)
+            .map_err(|_| DedupError::Unavailable)
         })
     }
 
-    fn is_handled(&self, consumer: &ConsumerName, event_id: &EventId) -> bool {
+    fn is_handled(&self, consumer: &ConsumerName, event_id: &EventId) -> DedupResult<bool> {
         self.block(async {
-            let exists: bool = sqlx::query_scalar(
+            sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM consumer_dedup WHERE consumer = $1 AND event_id = $2)",
             )
             .bind(&consumer.0)
             .bind(&event_id.0)
             .fetch_one(&self.pool)
             .await
-            .unwrap_or(false);
-            exists
+            .map_err(|_| DedupError::Unavailable)
         })
     }
 
-    fn revert(&self, consumer: &ConsumerName, event_id: &EventId) {
+    fn revert(&self, consumer: &ConsumerName, event_id: &EventId) -> DedupResult<()> {
         self.block(async {
-            let _ = sqlx::query("DELETE FROM consumer_dedup WHERE consumer = $1 AND event_id = $2")
-                .bind(&consumer.0)
-                .bind(&event_id.0)
-                .execute(&self.pool)
-                .await;
-        });
-    }
-
-    fn forget(&self, consumer: &ConsumerName, event_id: &EventId) -> bool {
-        self.block(async {
-            match sqlx::query("DELETE FROM consumer_dedup WHERE consumer = $1 AND event_id = $2")
+            sqlx::query("DELETE FROM consumer_dedup WHERE consumer = $1 AND event_id = $2")
                 .bind(&consumer.0)
                 .bind(&event_id.0)
                 .execute(&self.pool)
                 .await
-            {
-                Ok(res) => res.rows_affected() > 0,
-                Err(_) => false,
-            }
+                .map(|_| ())
+                .map_err(|_| DedupError::Unavailable)
+        })
+    }
+
+    fn forget(&self, consumer: &ConsumerName, event_id: &EventId) -> DedupResult<bool> {
+        self.block(async {
+            sqlx::query("DELETE FROM consumer_dedup WHERE consumer = $1 AND event_id = $2")
+                .bind(&consumer.0)
+                .bind(&event_id.0)
+                .execute(&self.pool)
+                .await
+                .map(|res| res.rows_affected() > 0)
+                .map_err(|_| DedupError::Unavailable)
         })
     }
 
@@ -86,7 +83,7 @@ impl DurableDedup for DurableDedupBacking {
         event_id: &EventId,
         tenant: &TenantId,
         region: &Region,
-    ) -> (Box<dyn CoCommitTx>, bool) {
+    ) -> DedupResult<(Box<dyn CoCommitTx>, bool)> {
         let acquired: Result<(sqlx::Transaction<'static, sqlx::Postgres>, bool), sqlx::Error> =
             self.block(async {
                 let mut tx = self.pool.begin().await?;
@@ -108,16 +105,17 @@ impl DurableDedup for DurableDedupBacking {
                 .await?;
                 Ok((tx, res.rows_affected() == 1))
             });
-        match acquired {
-            Ok((tx, fresh)) => (
-                Box::new(DurableCoCommit {
-                    tx: Some(tx),
-                    rt: self.rt.clone(),
-                }),
-                fresh,
-            ),
-            Err(_) => (Box::new(NoopCoCommit), true),
-        }
+        acquired
+            .map(|(tx, fresh)| {
+                (
+                    Box::new(DurableCoCommit {
+                        tx: Some(tx),
+                        rt: self.rt.clone(),
+                    }) as Box<dyn CoCommitTx>,
+                    fresh,
+                )
+            })
+            .map_err(|_| DedupError::Unavailable)
     }
 }
 
@@ -153,18 +151,6 @@ impl CoCommitTx for DurableCoCommit {
             let _ = self.block(async { tx.rollback().await });
         }
     }
-}
-
-struct NoopCoCommit;
-
-impl CoCommitTx for NoopCoCommit {
-    fn connection(&mut self) -> Option<&mut dyn core::any::Any> {
-        None
-    }
-    fn commit(self: Box<Self>) -> Result<(), CoCommitError> {
-        Ok(())
-    }
-    fn rollback(self: Box<Self>) {}
 }
 
 pub fn consumer_dead_letter_migrations() -> Migrations {

@@ -5,11 +5,15 @@ fn provider_record_handled(
     consumer: &ConsumerName,
     event_id: &EventId,
 ) -> bool {
-    ledger.mark_handled(consumer, event_id)
+    ledger
+        .mark_handled(consumer, event_id)
+        .expect("in-memory dedup storage is available")
 }
 
 fn consumer_should_skip(ledger: &DedupLedger, consumer: &ConsumerName, event_id: &EventId) -> bool {
-    ledger.is_handled(consumer, event_id)
+    ledger
+        .is_handled(consumer, event_id)
+        .expect("in-memory dedup storage is available")
 }
 
 #[test]

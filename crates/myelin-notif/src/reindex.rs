@@ -43,6 +43,7 @@ impl RetentionWindow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReindexError {
     Bus(String),
+    DedupUnavailable,
     MissingSnapshot(String),
 }
 
@@ -50,6 +51,9 @@ impl std::fmt::Display for ReindexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReindexError::Bus(e) => write!(f, "notif reindex: bus re-emit failed: {e}"),
+            ReindexError::DedupUnavailable => {
+                f.write_str("notif reindex: consumer dedup storage is unavailable")
+            }
             ReindexError::MissingSnapshot(id) => {
                 write!(f, "notif reindex: snapshot {id} not found in the outbox (re-emit did not stage it)")
             }
@@ -117,7 +121,8 @@ impl<'a> NotifReindexer<'a> {
                 if full_rebuild {
                     self.consumer
                         .dedup()
-                        .forget(self.consumer.name(), &event_id);
+                        .forget(self.consumer.name(), &event_id)
+                        .map_err(|_| ReindexError::DedupUnavailable)?;
                 }
                 let row = outbox
                     .row(&event_id)

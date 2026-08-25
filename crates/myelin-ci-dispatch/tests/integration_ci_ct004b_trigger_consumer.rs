@@ -487,7 +487,9 @@ async fn h1_crash_window_rolls_back_everything_then_reruns() {
     let run_id = armed.handoff.run_write.run_id.clone();
 
     tokio::task::block_in_place(|| {
-        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        let (mut cotx, fresh) = ledger
+            .begin_co_commit(&cname, &ev.event_id, &tenant, &region)
+            .expect("dedup storage is available");
         assert!(fresh, "first delivery marks the dedup row FRESH");
         {
             let conn = cotx.connection().expect("co-commit exposes a connection");
@@ -525,7 +527,9 @@ async fn h1_crash_window_rolls_back_everything_then_reruns() {
 
     tokio::task::block_in_place(|| {
         let armed = armed_for(&ev, repo, oid);
-        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        let (mut cotx, fresh) = ledger
+            .begin_co_commit(&cname, &ev.event_id, &tenant, &region)
+            .expect("dedup storage is available");
         assert!(
             fresh,
             "after the rollback the redelivery is STILL FRESH (0 lost)"
@@ -565,7 +569,9 @@ async fn h1_crash_window_rolls_back_everything_then_reruns() {
     );
 
     tokio::task::block_in_place(|| {
-        let (cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        let (cotx, fresh) = ledger
+            .begin_co_commit(&cname, &ev.event_id, &tenant, &region)
+            .expect("dedup storage is available");
         assert!(!fresh, "the committed mark makes a redelivery a DUPLICATE");
         cotx.rollback();
     });
@@ -858,7 +864,9 @@ async fn production_crash_rolls_back_run_attempt_events_and_mark_then_reconverge
     let run_id = armed.handoff.run_write.run_id.clone();
 
     tokio::task::block_in_place(|| {
-        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        let (mut cotx, fresh) = ledger
+            .begin_co_commit(&cname, &ev.event_id, &tenant, &region)
+            .expect("dedup storage is available");
         assert!(fresh, "first delivery marks the dedup row FRESH");
         {
             let conn = cotx.connection().expect("co-commit exposes a connection");
@@ -912,7 +920,9 @@ async fn production_crash_rolls_back_run_attempt_events_and_mark_then_reconverge
 
     tokio::task::block_in_place(|| {
         let armed = armed_for(&ev, repo, oid);
-        let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &ev.event_id, &tenant, &region);
+        let (mut cotx, fresh) = ledger
+            .begin_co_commit(&cname, &ev.event_id, &tenant, &region)
+            .expect("dedup storage is available");
         assert!(
             fresh,
             "after the rollback the redelivery is STILL FRESH (0 lost)"
@@ -1021,7 +1031,9 @@ async fn production_reserve_and_replay_need_no_update_grant_on_immutable_attempt
             EventId("ev-runtime-immutable-attempt-replay".into()),
         ] {
             tokio::task::block_in_place(|| {
-                let (mut cotx, fresh) = ledger.begin_co_commit(&cname, &event_id, &tenant, &region);
+                let (mut cotx, fresh) = ledger
+                    .begin_co_commit(&cname, &event_id, &tenant, &region)
+                    .expect("dedup storage is available");
                 assert!(fresh);
                 {
                     let conn = cotx.connection().expect("co-commit connection");

@@ -9,9 +9,9 @@ use myelin_storage::tenant_tx::connect_pool_with_reset;
 
 use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, Backoff, ConsumerName, CorrelationId, DataRole, DedupLedger,
-    DurableDedup, EventEnvelope, EventHandler, EventId, EventType, HandleOutcome, HandlerTx,
-    PrefetchBound, SubjectPattern, Timestamp, Visibility, CONSUMER_DEDUP_MIGRATION,
+    Actor, AggregateKey, ArtifactRef, Backoff, ConsumerName, CorrelationId, DataRole, DedupError,
+    DedupLedger, DurableDedup, EventEnvelope, EventHandler, EventId, EventType, HandleOutcome,
+    HandlerTx, PrefetchBound, SubjectPattern, Timestamp, Visibility, CONSUMER_DEDUP_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
@@ -60,6 +60,15 @@ fn envelope(id: &str) -> EventEnvelope {
         recorded_at: Timestamp("2026-07-16T00:00:01Z".into()),
         payload: serde_json::json!({ "ref": "x" }),
     }
+}
+
+fn subscription(name: &str) -> Subscription {
+    Subscription::bind(
+        ConsumerName(name.into()),
+        &["myelin://acme/issues/"],
+        PrefetchBound::DEFAULT,
+    )
+    .expect("the test subscription is valid")
 }
 
 static SUBJECTS: &[SubjectPattern] = &[];
@@ -153,8 +162,9 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     let region = Region(cfg.region.clone());
 
     tokio::task::block_in_place(|| {
-        let (mut cotx, fresh) =
-            ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
+        let (mut cotx, fresh) = ledger
+            .begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region)
+            .expect("dedup storage is available");
         assert!(fresh, "first delivery marks the dedup row FRESH");
         let conn = cotx
             .connection()
@@ -181,8 +191,9 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     );
 
     tokio::task::block_in_place(|| {
-        let (mut cotx, fresh) =
-            ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
+        let (mut cotx, fresh) = ledger
+            .begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region)
+            .expect("dedup storage is available");
         assert!(
             fresh,
             "after the rollback the redelivery is STILL FRESH (0 lost)"
@@ -212,8 +223,9 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     );
 
     tokio::task::block_in_place(|| {
-        let (cotx, fresh) =
-            ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
+        let (cotx, fresh) = ledger
+            .begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region)
+            .expect("dedup storage is available");
         assert!(
             !fresh,
             "the committed mark makes a redelivery a DUPLICATE (deduped)"
@@ -248,14 +260,6 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
         let backing = DurableDedupBacking::new(pool.clone(), rt.clone());
         DedupLedger::durable(Arc::new(backing) as Arc<dyn DurableDedup>)
     };
-    let sub = |name: &str| {
-        Subscription::bind(
-            ConsumerName(name.into()),
-            &["myelin://acme/issues/"],
-            PrefetchBound::DEFAULT,
-        )
-        .unwrap()
-    };
     let cname = format!("mr023b_rt_{tag}");
     let id = format!("mr023b-rt-evt-{tag}");
     let msg = Message {
@@ -270,7 +274,7 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
             outcome: HandleOutcome::Retry(Backoff { seconds: 1 }),
             ran: AtomicU32::new(0),
         },
-        sub(&cname),
+        subscription(&cname),
         make_ledger(),
     );
     let out = tokio::task::block_in_place(|| retry_consumer.deliver(&msg));
@@ -296,7 +300,7 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
             outcome: HandleOutcome::Done,
             ran: AtomicU32::new(0),
         },
-        sub(&cname),
+        subscription(&cname),
         make_ledger(),
     );
     let out = tokio::task::block_in_place(|| done_consumer.deliver(&msg));
@@ -329,4 +333,124 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
     .await
     .expect("count");
     assert_eq!(effect_count, 1, "exactly ONE effect row - no duplicate");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn database_outage_retries_before_the_handler_and_redelivery_commits_once() {
+    let cfg = MyelinConfig::dev();
+    let unavailable_pool = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 2)
+        .await
+        .expect("connect Postgres");
+    let tag = uniq();
+    let effect = format!("mr023b_outage_effect_{tag}");
+    setup(&unavailable_pool, &effect).await;
+
+    let rt = tokio::runtime::Handle::current();
+    let backing = DurableDedupBacking::new(unavailable_pool.clone(), rt.clone());
+    let consumer_name = ConsumerName(format!("mr023b_outage_{tag}"));
+    let event_id = EventId(format!("mr023b-outage-evt-{tag}"));
+    let tenant = TenantId("acme".into());
+    let region = Region(cfg.region.clone());
+    let message = Message {
+        subject: "myelin://acme/issues/issue/PROJ-1".into(),
+        envelope: envelope(&event_id.0),
+    };
+
+    unavailable_pool.close().await;
+
+    tokio::task::block_in_place(|| {
+        assert_eq!(
+            backing.mark_handled(&consumer_name, &event_id),
+            Err(DedupError::Unavailable),
+            "an unavailable mark is not reported as fresh"
+        );
+        assert_eq!(
+            backing.is_handled(&consumer_name, &event_id),
+            Err(DedupError::Unavailable),
+            "an unavailable read is not reported as unhandled"
+        );
+        assert_eq!(
+            backing.revert(&consumer_name, &event_id),
+            Err(DedupError::Unavailable),
+            "an unavailable revert is not reported as complete"
+        );
+        assert_eq!(
+            backing.forget(&consumer_name, &event_id),
+            Err(DedupError::Unavailable),
+            "an unavailable forget is not reported as absent"
+        );
+        assert!(
+            matches!(
+                backing.begin_co_commit(&consumer_name, &event_id, &tenant, &region),
+                Err(DedupError::Unavailable)
+            ),
+            "an unavailable co-commit never creates a pretend transaction"
+        );
+    });
+
+    let waiting_consumer = Consumer::new(
+        EffectHandler {
+            table: effect.clone(),
+            rt: rt.clone(),
+            outcome: HandleOutcome::Done,
+            ran: AtomicU32::new(0),
+        },
+        subscription(&consumer_name.0),
+        DedupLedger::durable(Arc::new(backing)),
+    );
+
+    let first_delivery = tokio::task::block_in_place(|| waiting_consumer.deliver(&message));
+    assert_eq!(
+        first_delivery,
+        Delivered::Retried(2),
+        "the delivery waits for durable dedup storage instead of running unsafely"
+    );
+    assert_eq!(
+        waiting_consumer.handler().ran.load(Ordering::SeqCst),
+        0,
+        "the handler cannot create an effect before dedup acquisition succeeds"
+    );
+    assert_eq!(waiting_consumer.lag(), 1, "the delivery remains pending");
+
+    let recovered_pool = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 2)
+        .await
+        .expect("reconnect Postgres");
+    let recovered_consumer = Consumer::new(
+        EffectHandler {
+            table: effect.clone(),
+            rt: rt.clone(),
+            outcome: HandleOutcome::Done,
+            ran: AtomicU32::new(0),
+        },
+        subscription(&consumer_name.0),
+        DedupLedger::durable(Arc::new(DurableDedupBacking::new(
+            recovered_pool.clone(),
+            rt,
+        ))),
+    );
+
+    let redelivery = tokio::task::block_in_place(|| recovered_consumer.deliver(&message));
+    assert_eq!(
+        redelivery,
+        Delivered::Acked,
+        "after recovery the same delivery commits its mark and effect together"
+    );
+    assert!(
+        dedup_present(&recovered_pool, &consumer_name.0, &event_id.0).await,
+        "the recovered delivery leaves a durable dedup mark"
+    );
+    assert!(
+        effect_present(&recovered_pool, &effect, &event_id.0).await,
+        "the recovered delivery leaves its intended effect"
+    );
+    assert_eq!(
+        tokio::task::block_in_place(|| recovered_consumer.deliver(&message)),
+        Delivered::Deduplicated,
+        "later broker redelivery observes the committed mark"
+    );
+    assert_eq!(
+        recovered_consumer.handler().ran.load(Ordering::SeqCst),
+        1,
+        "the user-visible effect happens exactly once across outage and recovery"
+    );
 }

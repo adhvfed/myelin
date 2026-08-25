@@ -316,7 +316,9 @@ async fn mr023_durable_dedup_survives_restart() {
             rt.clone(),
         )));
         assert!(
-            backing1.mark_handled(&consumer, &id),
+            backing1
+                .mark_handled(&consumer, &id)
+                .expect("dedup storage is available"),
             "first mark is FRESH (the handler should run)"
         );
     }
@@ -326,11 +328,15 @@ async fn mr023_durable_dedup_survives_restart() {
             rt.clone(),
         )));
         assert!(
-            !backing2.mark_handled(&consumer, &id),
+            !backing2
+                .mark_handled(&consumer, &id)
+                .expect("dedup storage is available"),
             "after a RESTART the mark SURVIVED → DUPLICATE (the in-memory HashSet would re-run → ghost)"
         );
         assert!(
-            backing2.is_handled(&consumer, &id),
+            backing2
+                .is_handled(&consumer, &id)
+                .expect("dedup storage is available"),
             "the durable ledger still reports the pair handled across the restart"
         );
     }

@@ -262,12 +262,14 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     let consumer = ConsumerName("flow.trigger".into());
     let event_id = EventId("event-committed-start".into());
     let committed_run = tokio::task::block_in_place(|| {
-        let (mut co_tx, fresh) = ledger.begin_co_commit(
-            &consumer,
-            &event_id,
-            &TenantId("acme".into()),
-            &Region("fr-par".into()),
-        );
+        let (mut co_tx, fresh) = ledger
+            .begin_co_commit(
+                &consumer,
+                &event_id,
+                &TenantId("acme".into()),
+                &Region("fr-par".into()),
+            )
+            .expect("dedup storage is available");
         assert!(fresh);
         let run = {
             let conn = co_tx.connection().expect("durable co-commit connection");
@@ -328,12 +330,14 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
         "start and dedup mark co-committed"
     );
     tokio::task::block_in_place(|| {
-        let (co_tx, fresh) = ledger.begin_co_commit(
-            &consumer,
-            &event_id,
-            &TenantId("acme".into()),
-            &Region("fr-par".into()),
-        );
+        let (co_tx, fresh) = ledger
+            .begin_co_commit(
+                &consumer,
+                &event_id,
+                &TenantId("acme".into()),
+                &Region("fr-par".into()),
+            )
+            .expect("dedup storage is available");
         assert!(!fresh, "committed delivery is durably deduplicated");
         co_tx.rollback();
     });

@@ -345,13 +345,19 @@ fn cdc_consumer_dedup_suppresses_a_replayed_issue_event() {
     let consumer = ConsumerName("issues-rollup".into());
 
     assert!(
-        ledger.mark_handled(&consumer, &eid),
+        ledger
+            .mark_handled(&consumer, &eid)
+            .expect("in-memory dedup storage is available"),
         "first delivery is newly handled"
     );
-    assert!(ledger.is_handled(&consumer, &eid));
+    assert!(ledger
+        .is_handled(&consumer, &eid)
+        .expect("in-memory dedup storage is available"));
 
     assert!(
-        !ledger.mark_handled(&consumer, &eid),
+        !ledger
+            .mark_handled(&consumer, &eid)
+            .expect("in-memory dedup storage is available"),
         "a replay of the same stable event_id is dedup-suppressed (0 double-handle)"
     );
 }

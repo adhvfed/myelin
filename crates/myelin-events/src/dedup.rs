@@ -23,6 +23,23 @@ impl core::fmt::Display for CoCommitError {
 
 impl std::error::Error for CoCommitError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DedupError {
+    Unavailable,
+}
+
+impl core::fmt::Display for DedupError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("consumer dedup storage is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for DedupError {}
+
+pub type DedupResult<T> = Result<T, DedupError>;
+
 pub trait CoCommitTx: Send {
     fn connection(&mut self) -> Option<&mut dyn core::any::Any>;
     fn commit(self: Box<Self>) -> Result<(), CoCommitError>;
@@ -30,17 +47,18 @@ pub trait CoCommitTx: Send {
 }
 
 pub trait DurableDedup: Send + Sync {
-    fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
-    fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
-    fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId);
-    fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool;
+    fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId)
+        -> DedupResult<bool>;
+    fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> DedupResult<bool>;
+    fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> DedupResult<()>;
+    fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> DedupResult<bool>;
     fn begin_co_commit(
         &self,
         consumer: &ConsumerName,
         event_id: &crate::EventId,
         tenant: &crate::TenantId,
         region: &crate::Region,
-    ) -> (Box<dyn CoCommitTx>, bool);
+    ) -> DedupResult<(Box<dyn CoCommitTx>, bool)>;
 }
 
 #[derive(Clone)]
@@ -108,13 +126,17 @@ impl DedupLedger {
         }
     }
 
-    pub fn mark_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
+    pub fn mark_handled(
+        &self,
+        consumer: &ConsumerName,
+        event_id: &crate::EventId,
+    ) -> DedupResult<bool> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            DedupBackend::Memory(inner) => inner
+            DedupBackend::Memory(inner) => Ok(inner
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert((consumer.clone(), event_id.clone())),
+                .insert((consumer.clone(), event_id.clone()))),
             DedupBackend::Durable(d) => d.mark_handled(consumer, event_id),
         }
     }
@@ -125,7 +147,7 @@ impl DedupLedger {
         event_id: &crate::EventId,
         tenant: &crate::TenantId,
         region: &crate::Region,
-    ) -> (Box<dyn CoCommitTx>, bool) {
+    ) -> DedupResult<(Box<dyn CoCommitTx>, bool)> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => {
@@ -134,31 +156,35 @@ impl DedupLedger {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key.clone());
-                (
+                Ok((
                     Box::new(MemoryCoCommit {
                         set: Arc::clone(inner),
                         key,
                         inserted: fresh,
                     }),
                     fresh,
-                )
+                ))
             }
             DedupBackend::Durable(d) => d.begin_co_commit(consumer, event_id, tenant, region),
         }
     }
 
-    pub fn is_handled(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
+    pub fn is_handled(
+        &self,
+        consumer: &ConsumerName,
+        event_id: &crate::EventId,
+    ) -> DedupResult<bool> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            DedupBackend::Memory(inner) => inner
+            DedupBackend::Memory(inner) => Ok(inner
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .contains(&(consumer.clone(), event_id.clone())),
+                .contains(&(consumer.clone(), event_id.clone()))),
             DedupBackend::Durable(d) => d.is_handled(consumer, event_id),
         }
     }
 
-    pub fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId) {
+    pub fn revert(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> DedupResult<()> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             DedupBackend::Memory(inner) => {
@@ -166,18 +192,19 @@ impl DedupLedger {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&(consumer.clone(), event_id.clone()));
+                Ok(())
             }
             DedupBackend::Durable(d) => d.revert(consumer, event_id),
         }
     }
 
-    pub fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> bool {
+    pub fn forget(&self, consumer: &ConsumerName, event_id: &crate::EventId) -> DedupResult<bool> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            DedupBackend::Memory(inner) => inner
+            DedupBackend::Memory(inner) => Ok(inner
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(&(consumer.clone(), event_id.clone())),
+                .remove(&(consumer.clone(), event_id.clone()))),
             DedupBackend::Durable(d) => d.forget(consumer, event_id),
         }
     }
@@ -200,6 +227,10 @@ mod tests {
         ConsumerName(name.into())
     }
 
+    fn available<T>(result: DedupResult<T>) -> T {
+        result.expect("in-memory dedup storage is available")
+    }
+
     #[test]
     fn same_consumer_event_inserted_twice_is_one_effect() {
         let ledger = DedupLedger::new();
@@ -207,15 +238,15 @@ mod tests {
         let id = EventId("01J-1".into());
 
         assert!(
-            ledger.mark_handled(&c, &id),
+            available(ledger.mark_handled(&c, &id)),
             "first delivery is FRESH → the handler runs"
         );
         assert!(
-            !ledger.mark_handled(&c, &id),
+            !available(ledger.mark_handled(&c, &id)),
             "redelivery is a DUPLICATE → the handler is skipped"
         );
         assert!(
-            !ledger.mark_handled(&c, &id),
+            !available(ledger.mark_handled(&c, &id)),
             "and again - still a duplicate"
         );
         assert_eq!(
@@ -223,7 +254,10 @@ mod tests {
             1,
             "exactly ONE (consumer, event_id) pair recorded"
         );
-        assert!(ledger.is_handled(&c, &id), "the pair is durably handled");
+        assert!(
+            available(ledger.is_handled(&c, &id)),
+            "the pair is durably handled"
+        );
     }
 
     #[test]
@@ -233,23 +267,26 @@ mod tests {
         let b = consumer("notifier");
         let id = EventId("01J-1".into());
 
-        assert!(ledger.mark_handled(&a, &id), "fresh for consumer A");
         assert!(
-            ledger.mark_handled(&b, &id),
+            available(ledger.mark_handled(&a, &id)),
+            "fresh for consumer A"
+        );
+        assert!(
+            available(ledger.mark_handled(&b, &id)),
             "ALSO fresh for consumer B (different PK)"
         );
         assert!(
-            !ledger.mark_handled(&a, &id),
+            !available(ledger.mark_handled(&a, &id)),
             "redelivery to A is a duplicate"
         );
         assert!(
-            !ledger.mark_handled(&b, &id),
+            !available(ledger.mark_handled(&b, &id)),
             "redelivery to B is a duplicate"
         );
         assert_eq!(ledger.len(), 2, "two distinct (consumer, event_id) pairs");
-        assert!(ledger.is_handled(&a, &id) && ledger.is_handled(&b, &id));
+        assert!(available(ledger.is_handled(&a, &id)) && available(ledger.is_handled(&b, &id)));
         assert!(
-            !ledger.is_handled(&consumer("other"), &id),
+            !available(ledger.is_handled(&consumer("other"), &id)),
             "a third consumer has not handled it"
         );
     }
@@ -260,15 +297,24 @@ mod tests {
         let c = consumer("indexer");
         let id = EventId("01J-1".into());
         assert!(ledger.is_empty(), "a fresh ledger is empty");
-        assert!(!ledger.is_handled(&c, &id), "nothing handled yet");
-
-        assert!(ledger.mark_handled(&c, &id), "first mark is fresh");
-        assert!(!ledger.is_empty(), "no longer empty after a mark");
-        assert!(ledger.is_handled(&c, &id), "the exact pair is handled");
-
-        ledger.revert(&c, &id);
         assert!(
-            !ledger.is_handled(&c, &id),
+            !available(ledger.is_handled(&c, &id)),
+            "nothing handled yet"
+        );
+
+        assert!(
+            available(ledger.mark_handled(&c, &id)),
+            "first mark is fresh"
+        );
+        assert!(!ledger.is_empty(), "no longer empty after a mark");
+        assert!(
+            available(ledger.is_handled(&c, &id)),
+            "the exact pair is handled"
+        );
+
+        available(ledger.revert(&c, &id));
+        assert!(
+            !available(ledger.is_handled(&c, &id)),
             "after revert the pair is unhandled (a retry re-runs)"
         );
         assert!(ledger.is_empty(), "revert removed the only pair");
@@ -281,26 +327,29 @@ mod tests {
         let id = EventId("01J-snapshot".into());
 
         assert!(
-            !ledger.forget(&c, &id),
+            !available(ledger.forget(&c, &id)),
             "forgetting a mark that was never present returns false"
         );
 
-        assert!(ledger.mark_handled(&c, &id), "first delivery is fresh");
-        assert!(ledger.is_handled(&c, &id), "the pair is handled");
         assert!(
-            ledger.forget(&c, &id),
+            available(ledger.mark_handled(&c, &id)),
+            "first delivery is fresh"
+        );
+        assert!(available(ledger.is_handled(&c, &id)), "the pair is handled");
+        assert!(
+            available(ledger.forget(&c, &id)),
             "forgetting a present mark returns true"
         );
         assert!(
-            !ledger.is_handled(&c, &id),
+            !available(ledger.is_handled(&c, &id)),
             "after forget the pair is unhandled - the cold rebuild re-applies the snapshot"
         );
         assert!(
-            !ledger.forget(&c, &id),
+            !available(ledger.forget(&c, &id)),
             "a second forget of the now-absent mark returns false"
         );
         assert!(
-            ledger.mark_handled(&c, &id),
+            available(ledger.mark_handled(&c, &id)),
             "redelivery after forget is fresh → the handler re-runs (reindex-after-wipe)"
         );
     }

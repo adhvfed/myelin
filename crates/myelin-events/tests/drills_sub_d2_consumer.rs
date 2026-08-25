@@ -175,7 +175,11 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
     );
     let handled: std::collections::HashSet<_> = ids
         .iter()
-        .filter(|id| ledger.is_handled(c2.name(), id))
+        .filter(|id| {
+            ledger
+                .is_handled(c2.name(), id)
+                .expect("in-memory dedup storage is available")
+        })
         .cloned()
         .collect();
     assert_eq!(

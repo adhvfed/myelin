@@ -1,6 +1,7 @@
 use crate::dead_letter::{DeadLetterRecord, DeadLetterSink};
 use crate::{
-    DedupLedger, EventEnvelope, EventHandler, HandleOutcome, HandlerTx, Reason, SubjectPattern,
+    DedupError, DedupLedger, EventEnvelope, EventHandler, HandleOutcome, HandlerTx, Reason,
+    SubjectPattern,
 };
 use myelin_tenancy::TenantId;
 use std::collections::HashMap;
@@ -217,7 +218,7 @@ impl<H: EventHandler> Consumer<H> {
         self.subscription.matches(subject)
     }
 
-    pub fn is_handled(&self, event_id: &crate::EventId) -> bool {
+    pub fn is_handled(&self, event_id: &crate::EventId) -> Result<bool, DedupError> {
         self.dedup.is_handled(self.name(), event_id)
     }
 
@@ -348,8 +349,16 @@ impl<H: EventHandler> Consumer<H> {
         );
 
         let (mut cotx, fresh) =
-            self.dedup
-                .begin_co_commit(self.name(), &event_id, &tenant, &msg.envelope.region);
+            match self
+                .dedup
+                .begin_co_commit(self.name(), &event_id, &tenant, &msg.envelope.region)
+            {
+                Ok(acquired) => acquired,
+                Err(DedupError::Unavailable) => {
+                    self.bump_pending(&msg.subject, &event_id);
+                    return Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS);
+                }
+            };
         if !fresh {
             cotx.rollback();
             self.clear_pending(&msg.subject, &event_id);
@@ -408,12 +417,17 @@ impl<H: EventHandler> Consumer<H> {
             HandleOutcome::NonRetryable(reason) => {
                 cotx.rollback();
                 match self.push_dead_letter(envelope, reason.clone()) {
-                    Ok(()) => {
-                        self.dedup.mark_handled(self.name(), &event_id);
-                        self.clear_pending(&msg.subject, &event_id);
-                        self.clear_tenant_inflight(&tenant, &event_id);
-                        Delivered::DeadLettered(reason)
-                    }
+                    Ok(()) => match self.dedup.mark_handled(self.name(), &event_id) {
+                        Ok(_) => {
+                            self.clear_pending(&msg.subject, &event_id);
+                            self.clear_tenant_inflight(&tenant, &event_id);
+                            Delivered::DeadLettered(reason)
+                        }
+                        Err(DedupError::Unavailable) => {
+                            self.bump_pending(&msg.subject, &event_id);
+                            Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
+                        }
+                    },
                     Err(_) => {
                         self.bump_pending(&msg.subject, &event_id);
                         Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS)
@@ -519,6 +533,10 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
+
+    fn available<T>(result: Result<T, DedupError>) -> T {
+        result.expect("in-memory dedup storage is available")
+    }
 
     fn principal() -> Principal {
         Principal::stub(
@@ -647,9 +665,9 @@ mod tests {
 
         assert!(consumer.accepts(&message.subject));
         assert!(!consumer.accepts("myelin://acme/chat/message/1"));
-        assert!(!consumer.is_handled(&message.envelope.event_id));
+        assert!(!available(consumer.is_handled(&message.envelope.event_id)));
         assert_eq!(consumer.deliver(&message), Delivered::Acked);
-        assert!(consumer.is_handled(&message.envelope.event_id));
+        assert!(available(consumer.is_handled(&message.envelope.event_id)));
     }
 
     #[test]
@@ -713,20 +731,28 @@ mod tests {
         let consumer = ConsumerName("indexer".into());
         let id = EventId("01J-1".into());
         assert!(ledger.is_empty(), "a fresh ledger is empty");
-        assert!(!ledger.is_handled(&consumer, &id), "nothing handled yet");
+        assert!(
+            !available(ledger.is_handled(&consumer, &id)),
+            "nothing handled yet"
+        );
 
-        assert!(ledger.mark_handled(&consumer, &id), "first mark is fresh");
+        assert!(
+            available(ledger.mark_handled(&consumer, &id)),
+            "first mark is fresh"
+        );
         assert!(
             !ledger.is_empty(),
             "the ledger is no longer empty after a mark"
         );
         assert!(
-            ledger.is_handled(&consumer, &id),
+            available(ledger.is_handled(&consumer, &id)),
             "the exact pair is handled"
         );
-        assert!(!ledger.is_handled(&ConsumerName("other".into()), &id));
+        assert!(!available(
+            ledger.is_handled(&ConsumerName("other".into()), &id)
+        ));
         assert!(
-            !ledger.mark_handled(&consumer, &id),
+            !available(ledger.mark_handled(&consumer, &id)),
             "re-mark is a duplicate, not fresh"
         );
     }
@@ -847,7 +873,9 @@ mod tests {
             Delivered::Retried(DEFAULT_COMMIT_RETRY_BACKOFF_SECS),
             "a failed durable quarantine write is non-terminal"
         );
-        assert!(!ledger.is_handled(c.name(), &poison.envelope.event_id));
+        assert!(!available(
+            ledger.is_handled(c.name(), &poison.envelope.event_id)
+        ));
         assert_eq!(c.lag(), 1, "the unacked poison remains visible as lag");
         assert_eq!(
             c.dead_letters().len(),
@@ -920,7 +948,7 @@ mod tests {
         assert_eq!(c.deliver(&m), Delivered::Retried(2));
         assert_eq!(c.lag(), 1, "an un-acked retry sits in consumer lag");
         assert!(
-            !c.dedup().is_handled(c.name(), &m.envelope.event_id),
+            !available(c.dedup().is_handled(c.name(), &m.envelope.event_id)),
             "a retry leaves NO dedup mark"
         );
 
@@ -938,7 +966,7 @@ mod tests {
             "lag recovers to 0 after the successful redelivery (SUB-D2)"
         );
         assert!(
-            c.dedup().is_handled(c.name(), &m.envelope.event_id),
+            available(c.dedup().is_handled(c.name(), &m.envelope.event_id)),
             "now it is durably handled"
         );
     }
@@ -1045,7 +1073,7 @@ mod tests {
             "the gap is surfaced, not silently dropped"
         );
         assert!(
-            c.dedup().mark_handled(c.name(), &EventId("01J-gap".into())),
+            available(c.dedup().mark_handled(c.name(), &EventId("01J-gap".into()))),
             "the gapped event_id is still FRESH - it was never marked handled"
         );
     }
