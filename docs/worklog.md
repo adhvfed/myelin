@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — privacy holder work keeps its fenced request lease alive
+
+Privacy requests acquired a 120-second lease and then performed all holder work without renewing
+it. Bounded Chat erasure removed the dangerous large transaction, but also made the mismatch plain:
+a sufficiently large history could make correct durable progress past the lease, then lose the
+authority needed to publish its certificate.
+
+The privacy-request store now offers a fenced heartbeat. It extends only a still-live processing
+lease with the same owner and epoch, never shortens an existing expiry, cannot resurrect an expired
+worker, and cannot reopen a completed request. Edge polls holder work alongside that heartbeat every
+40 seconds. A lost lease cancels the current future and returns the current durable request instead
+of allowing stale completion; Chat's already-committed batches remain available to the next owner.
+Transient holder failures and violated proof invariants remain distinct public/internal outcomes.
+
+**Proof:** warning-free all-target/all-feature Storage and Edge clippy; all 508 Storage and 363 Edge
+library cases; all three real-PostgreSQL privacy-request journeys, including a two-second lease kept
+authoritative past its original expiry and terminal completion refusing a later heartbeat; restarted
+Edge; and both live TypeScript privacy lifecycle journeys (5.28 seconds total).
+
 ## 2026-08-26 — authored Chat erasure makes bounded, resumable progress
 
 Authored-message erasure previously loaded, locked, tombstoned, and emitted consequences for a

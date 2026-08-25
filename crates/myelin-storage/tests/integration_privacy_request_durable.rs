@@ -156,6 +156,84 @@ async fn chat_message_erasure_is_a_distinct_durable_request_scope() {
     assert_eq!(completed.certificate, Some(certificate));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_working_holder_keeps_its_lease_without_resurrecting_an_expired_one() {
+    let provider = provider().await;
+    let tenant = unique_tenant();
+    seed_people(&provider, &tenant).await;
+    let submitted_at = Utc.timestamp_opt(1_788_912_000, 0).single().unwrap();
+    let request_id = Uuid::from_u128(0x136);
+    let requests = DurablePrivacyRequestStore::new(provider);
+    requests
+        .create(
+            &tenant,
+            NewPrivacyRequest {
+                request_id,
+                owner_principal_id: "alice".into(),
+                client_nonce: "keep-working-on-my-erasure".into(),
+                kind: PrivacyRequestKind::Erasure,
+                scope: PrivacyRequestScope::AgentData,
+                submitted_at,
+            },
+        )
+        .await
+        .unwrap();
+    let claimed = requests
+        .claim_owned(
+            &tenant,
+            "alice",
+            request_id,
+            "holder-doing-bounded-work",
+            submitted_at,
+            2,
+        )
+        .await
+        .unwrap();
+    let ClaimPrivacyRequestOutcome::Claimed(lease) = claimed else {
+        panic!("the holder should own the request: {claimed:?}");
+    };
+
+    assert!(requests
+        .renew(&tenant, &lease, submitted_at + Duration::seconds(1), 30,)
+        .await
+        .expect("a live holder can heartbeat between bounded steps"));
+    let competing = requests
+        .claim_owned(
+            &tenant,
+            "alice",
+            request_id,
+            "impatient-second-holder",
+            submitted_at + Duration::seconds(3),
+            30,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(competing, ClaimPrivacyRequestOutcome::Busy(_)),
+        "the original two-second lease has passed, but its heartbeat remains authoritative",
+    );
+    let completed = requests
+        .complete(
+            &tenant,
+            &lease,
+            &certificate(request_id),
+            submitted_at + Duration::seconds(20),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        completed,
+        CompletePrivacyRequestOutcome::Completed(_)
+    ));
+    assert!(
+        !requests
+            .renew(&tenant, &lease, submitted_at + Duration::seconds(21), 30,)
+            .await
+            .expect("the completed request remains readable"),
+        "completion is terminal; an old heartbeat cannot reopen the lease",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_request_survives_a_lost_worker_and_returns_one_private_certificate() {
     let provider = provider().await;

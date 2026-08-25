@@ -164,14 +164,7 @@ impl DurablePrivacyRequestStore {
     ) -> Result<ClaimPrivacyRequestOutcome, ProviderError> {
         bounded("privacy request owner", owner_principal_id, MAX_OWNER_BYTES)?;
         bounded("privacy request worker", worker, MAX_WORKER_BYTES)?;
-        if !(MIN_LEASE_SECONDS..=MAX_LEASE_SECONDS).contains(&lease_seconds) {
-            return Err(invalid(
-                "privacy request lease must be between 1 and 300 seconds",
-            ));
-        }
-        let lease_expires = now
-            .checked_add_signed(Duration::seconds(lease_seconds))
-            .ok_or_else(|| invalid("privacy request lease is outside the supported range"))?;
+        let lease_expires = lease_expiry(now, lease_seconds)?;
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         let owner = owner_principal_id.to_string();
@@ -237,6 +230,52 @@ impl DurablePrivacyRequestStore {
                         lease_owner: worker,
                         lease_epoch,
                     }))
+                })
+            })
+            .await
+    }
+
+    /// Extends only the caller's still-live fenced lease. An expired worker
+    /// cannot revive itself, and a worker superseded at a newer epoch cannot
+    /// keep the current owner from making progress.
+    pub async fn renew(
+        &self,
+        tenant: &str,
+        lease: &PrivacyRequestLease,
+        now: DateTime<Utc>,
+        lease_seconds: i64,
+    ) -> Result<bool, ProviderError> {
+        let lease_expires = lease_expiry(now, lease_seconds)?;
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let request_id = lease.request.request_id;
+        let owner = lease.request.owner_principal_id.clone();
+        let lease_owner = lease.lease_owner.clone();
+        let lease_epoch = lease.lease_epoch;
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    let changed = sqlx::query(
+                        "UPDATE privacy_request \
+                            SET lease_expires = GREATEST(lease_expires, $8) \
+                          WHERE tenant_id = $1 AND region = $2 AND request_id = $3 \
+                            AND owner_principal_id = $4 AND state = 'processing' \
+                            AND lease_owner = $5 AND lease_epoch = $6 \
+                            AND lease_expires > $7",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(request_id)
+                    .bind(&owner)
+                    .bind(&lease_owner)
+                    .bind(lease_epoch)
+                    .bind(now)
+                    .bind(lease_expires)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(query_error("renew privacy request lease"))?
+                    .rows_affected();
+                    Ok(changed == 1)
                 })
             })
             .await
@@ -356,6 +395,16 @@ fn validate_new_request(proposal: &NewPrivacyRequest) -> Result<(), ProviderErro
         &proposal.client_nonce,
         MAX_NONCE_BYTES,
     )
+}
+
+fn lease_expiry(now: DateTime<Utc>, lease_seconds: i64) -> Result<DateTime<Utc>, ProviderError> {
+    if !(MIN_LEASE_SECONDS..=MAX_LEASE_SECONDS).contains(&lease_seconds) {
+        return Err(invalid(
+            "privacy request lease must be between 1 and 300 seconds",
+        ));
+    }
+    now.checked_add_signed(Duration::seconds(lease_seconds))
+        .ok_or_else(|| invalid("privacy request lease is outside the supported range"))
 }
 
 fn bounded(label: &str, value: &str, maximum: usize) -> Result<(), ProviderError> {

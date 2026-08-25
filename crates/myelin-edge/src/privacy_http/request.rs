@@ -1,11 +1,14 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use myelin_chat::chat_message_holder_receipts;
+use myelin_identity::Principal;
 use myelin_storage::{
     agent_data_holder_receipts, ClaimPrivacyRequestOutcome, CompletePrivacyRequestOutcome,
     CreatePrivacyRequestOutcome, DurablePrivacyRequest, NewPrivacyRequest, PrivacyHolderReceipt,
-    PrivacyRequestCertificate, PrivacyRequestKind, PrivacyRequestScope, PrivacyRequestState,
+    PrivacyRequestCertificate, PrivacyRequestKind, PrivacyRequestLease, PrivacyRequestScope,
+    PrivacyRequestState,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,6 +22,7 @@ use crate::{EdgeError, Method};
 
 const PRIVACY_REQUEST_WORKER: &str = "edge:privacy-request";
 const PRIVACY_REQUEST_LEASE_SECONDS: i64 = 120;
+const PRIVACY_REQUEST_HEARTBEAT_SECONDS: u64 = 40;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -164,11 +168,22 @@ fn finish_erasure_request(
         }
     };
 
-    let receipts = match erasure_receipts(api, ctx, lease.request()) {
+    let receipts = match api.drive_value(erasure_receipts_while_lease_is_live(
+        api,
+        ctx.principal,
+        &lease,
+    ))? {
         Ok(receipts) => receipts,
-        Err(error) => {
+        Err(HolderWorkError::LeaseLost) => {
+            return owned_request(api, ctx, request.request_id);
+        }
+        Err(HolderWorkError::Retryable) => {
             release_failed_request(api, tenant, &lease)?;
-            return Err(error);
+            return Err(retryable_holder_failure());
+        }
+        Err(HolderWorkError::Invariant(reason)) => {
+            release_failed_request(api, tenant, &lease)?;
+            return Err(EdgeError::Internal(reason.into()));
         }
     };
     let certificate = match PrivacyRequestCertificate::build(
@@ -200,43 +215,85 @@ fn finish_erasure_request(
     }
 }
 
-fn erasure_receipts(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HolderWorkError {
+    Retryable,
+    LeaseLost,
+    Invariant(&'static str),
+}
+
+async fn erasure_receipts_while_lease_is_live(
     api: &PrivacyHttpApi,
-    ctx: &HandlerCtx<'_>,
-    request: &DurablePrivacyRequest,
-) -> Result<Vec<PrivacyHolderReceipt>, EdgeError> {
-    match request.scope {
-        PrivacyRequestScope::AgentData => agent_data_erasure_receipts(api, ctx),
-        PrivacyRequestScope::ChatMessages => {
-            let operation_id = format!("privacy-request:{}", request.request_id);
-            let proof = api
-                .erase_chat_messages(ctx.principal, &operation_id)
-                .map_err(|_| retryable_holder_failure())?;
-            chat_message_holder_receipts(&proof).map_err(|error| EdgeError::Internal(error.into()))
+    principal: &Principal,
+    lease: &PrivacyRequestLease,
+) -> Result<Vec<PrivacyHolderReceipt>, HolderWorkError> {
+    let work = erasure_receipts(api, principal, lease.request());
+    tokio::pin!(work);
+    let heartbeat = tokio::time::sleep(Duration::from_secs(PRIVACY_REQUEST_HEARTBEAT_SECONDS));
+    tokio::pin!(heartbeat);
+
+    loop {
+        tokio::select! {
+            result = &mut work => return result,
+            () = &mut heartbeat => {
+                let renewed = api.requests.renew(
+                    &principal.tenant.0,
+                    lease,
+                    Utc::now(),
+                    PRIVACY_REQUEST_LEASE_SECONDS,
+                )
+                .await
+                .map_err(|_| HolderWorkError::Retryable)?;
+                if !renewed {
+                    return Err(HolderWorkError::LeaseLost);
+                }
+                heartbeat.as_mut().reset(
+                    tokio::time::Instant::now()
+                        + Duration::from_secs(PRIVACY_REQUEST_HEARTBEAT_SECONDS),
+                );
+            }
         }
     }
 }
 
-fn agent_data_erasure_receipts(
+async fn erasure_receipts(
     api: &PrivacyHttpApi,
-    ctx: &HandlerCtx<'_>,
-) -> Result<Vec<PrivacyHolderReceipt>, EdgeError> {
-    let tenant = &ctx.principal.tenant.0;
-    let owner = &ctx.principal.principal_id.0;
-    if api.erase(tenant, owner).is_err() {
-        return Err(retryable_holder_failure());
+    principal: &Principal,
+    request: &DurablePrivacyRequest,
+) -> Result<Vec<PrivacyHolderReceipt>, HolderWorkError> {
+    match request.scope {
+        PrivacyRequestScope::AgentData => agent_data_erasure_receipts(api, principal).await,
+        PrivacyRequestScope::ChatMessages => {
+            let operation_id = format!("privacy-request:{}", request.request_id);
+            let proof = api
+                .erase_chat_messages(principal, &operation_id)
+                .await
+                .map_err(|_| HolderWorkError::Retryable)?;
+            chat_message_holder_receipts(&proof).map_err(HolderWorkError::Invariant)
+        }
     }
-    let proof = match api.drive(api.traces.erasure_proof_for_subject(tenant, owner)) {
+}
+
+async fn agent_data_erasure_receipts(
+    api: &PrivacyHttpApi,
+    principal: &Principal,
+) -> Result<Vec<PrivacyHolderReceipt>, HolderWorkError> {
+    let tenant = &principal.tenant.0;
+    let owner = &principal.principal_id.0;
+    if api.traces.erase_for_subject(tenant, owner).await.is_err() {
+        return Err(HolderWorkError::Retryable);
+    }
+    let proof = match api.traces.erasure_proof_for_subject(tenant, owner).await {
         Ok(Some(proof)) => proof,
         Ok(None) => {
-            return Err(EdgeError::Internal(
-                "agent-data holder did not preserve its erasure proof".into(),
+            return Err(HolderWorkError::Invariant(
+                "agent-data holder did not preserve its erasure proof",
             ));
         }
-        Err(_) => return Err(retryable_holder_failure()),
+        Err(_) => return Err(HolderWorkError::Retryable),
     };
     agent_data_holder_receipts(&proof).map_err(|_| {
-        EdgeError::Internal("agent-data holder returned an incomplete erasure proof".into())
+        HolderWorkError::Invariant("agent-data holder returned an incomplete erasure proof")
     })
 }
 

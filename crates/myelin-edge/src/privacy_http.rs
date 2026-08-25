@@ -57,7 +57,7 @@ impl PrivacyHttpApi {
         .map_err(|error| EdgeError::Internal(error.to_string()))
     }
 
-    fn erase_chat_messages(
+    async fn erase_chat_messages(
         &self,
         principal: &myelin_identity::Principal,
         operation_id: &str,
@@ -72,17 +72,15 @@ impl PrivacyHttpApi {
             now.clone(),
             now,
         );
-        drive_edge_future(
-            &self.runtime,
-            self.chat_messages.erase_subject_messages(
+        self.chat_messages
+            .erase_subject_messages(
                 &principal.tenant.0,
                 &principal.principal_id.0,
                 &UlidMinter::new(),
                 attempt,
-            ),
-            "privacy HTTP",
-        )?
-        .map_err(|error| EdgeError::Internal(error.to_string()))
+            )
+            .await
+            .map_err(|error| EdgeError::Internal(error.to_string()))
     }
 
     pub(super) fn drive<F, T, E>(&self, future: F) -> Result<T, EdgeError>
@@ -90,8 +88,15 @@ impl PrivacyHttpApi {
         F: std::future::Future<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
-        drive_edge_future(&self.runtime, future, "privacy HTTP")?
+        self.drive_value(future)?
             .map_err(|error| EdgeError::Internal(error.to_string()))
+    }
+
+    pub(super) fn drive_value<F, T>(&self, future: F) -> Result<T, EdgeError>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        drive_edge_future(&self.runtime, future, "privacy HTTP")
     }
 }
 
