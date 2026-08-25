@@ -244,6 +244,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_trace_durable::agent_trace_erasure_receipt_migrations(),
         crate::reerase_durable::post_pit_scope_migrations(),
         crate::reerase_durable::post_pit_scope_required_migrations(),
+        crate::privacy_request_durable::privacy_request_chat_messages_scope_migrations(),
     ]
 }
 

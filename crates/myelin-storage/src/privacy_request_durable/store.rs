@@ -249,6 +249,7 @@ impl DurablePrivacyRequestStore {
         certificate: &PrivacyRequestCertificate,
         completed_at: DateTime<Utc>,
     ) -> Result<CompletePrivacyRequestOutcome, ProviderError> {
+        certificate.verify().map_err(invalid)?;
         if certificate.request_id != lease.request.request_id.to_string()
             || certificate.kind != lease.request.kind
             || certificate.scope != lease.request.scope
@@ -424,6 +425,9 @@ async fn by_nonce(
 }
 
 fn decode_request(row: &sqlx::postgres::PgRow) -> Result<DurablePrivacyRequest, PgError> {
+    let request_id: Uuid = row
+        .try_get("request_id")
+        .map_err(decode_error("privacy request id"))?;
     let kind_token: String = row
         .try_get("kind")
         .map_err(decode_error("privacy request kind"))?;
@@ -438,7 +442,11 @@ fn decode_request(row: &sqlx::postgres::PgRow) -> Result<DurablePrivacyRequest, 
         .map_err(decode_error("privacy request attempt count"))?;
     let attempt_count = u32::try_from(attempts)
         .map_err(|_| PgError::Query("privacy request attempt count is negative".into()))?;
-    let certificate = row
+    let kind = PrivacyRequestKind::parse(&kind_token)
+        .ok_or_else(|| PgError::Query(format!("unknown privacy request kind `{kind_token}`")))?;
+    let scope = PrivacyRequestScope::parse(&scope_token)
+        .ok_or_else(|| PgError::Query(format!("unknown privacy request scope `{scope_token}`")))?;
+    let certificate: Option<PrivacyRequestCertificate> = row
         .try_get::<Option<serde_json::Value>, _>("certificate")
         .map_err(decode_error("privacy request certificate"))?
         .map(|value| {
@@ -446,20 +454,27 @@ fn decode_request(row: &sqlx::postgres::PgRow) -> Result<DurablePrivacyRequest, 
                 .map_err(|error| PgError::Query(format!("decode privacy certificate: {error}")))
         })
         .transpose()?;
+    if let Some(certificate) = &certificate {
+        certificate.verify().map_err(|error| {
+            PgError::Query(format!("verify durable privacy certificate: {error}"))
+        })?;
+        if certificate.request_id != request_id.to_string()
+            || certificate.kind != kind
+            || certificate.scope != scope
+        {
+            return Err(PgError::Query(
+                "durable privacy certificate does not match its request row".into(),
+            ));
+        }
+    }
 
     Ok(DurablePrivacyRequest {
-        request_id: row
-            .try_get("request_id")
-            .map_err(decode_error("privacy request id"))?,
+        request_id,
         owner_principal_id: row
             .try_get("owner_principal_id")
             .map_err(decode_error("privacy request owner"))?,
-        kind: PrivacyRequestKind::parse(&kind_token).ok_or_else(|| {
-            PgError::Query(format!("unknown privacy request kind `{kind_token}`"))
-        })?,
-        scope: PrivacyRequestScope::parse(&scope_token).ok_or_else(|| {
-            PgError::Query(format!("unknown privacy request scope `{scope_token}`"))
-        })?,
+        kind,
+        scope,
         state: PrivacyRequestState::parse(&state_token).ok_or_else(|| {
             PgError::Query(format!("unknown privacy request state `{state_token}`"))
         })?,
@@ -496,13 +511,7 @@ mod tests {
     #[test]
     fn certificate_is_order_independent_and_rejects_incomplete_holders() {
         let request_id = Uuid::from_u128(7);
-        let receipt = |holder: &str| PrivacyHolderReceipt {
-            holder: holder.into(),
-            operation: "erasure".into(),
-            content_hash: format!("blake3:{}", "a".repeat(64)),
-            records_erased: 3,
-            key_unrecoverable: true,
-        };
+        let receipt = |holder: &str| PrivacyHolderReceipt::erasure(holder, 3).unwrap();
         let ordered = PrivacyRequestCertificate::build(
             request_id,
             PrivacyRequestKind::Erasure,

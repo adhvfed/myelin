@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-25 — privacy certificates prove their contents, not merely their shape
+
+Privacy-request certificates carried plausible BLAKE3 strings, but durable reads trusted the
+serialized holder counts and request identity without recomputing either digest. A damaged or
+manually altered row could therefore look certified even though its claims no longer matched the
+erasure that produced it.
+
+Every holder receipt now binds its holder, operation, erased-record count, and key-destruction
+claim. The enclosing certificate binds its canonical request identity, kind, scope, ordered unique
+holder set, and each verified receipt. Completion rejects an invalid certificate before writing,
+and every durable read verifies the stored proof and its relationship to the request row. The three
+existing agent-data holders retain their historical digest context so already-issued certificates
+remain readable. The full storage suite also caught that the new Chat scope migration had been
+inserted into an earlier migration group; it now occupies its proper global position after 0134.
+
+**Proof:** warning-free all-target/all-feature clippy for Storage, Chat, and Edge; all 508 Storage
+library cases; two real-PostgreSQL privacy-request journeys, including direct JSONB tampering; and
+the live authored-Chat-erasure system journey against the restarted Edge binary.
+
 ## 2026-08-24 — private Git work becomes useful Chat context without becoming public
 
 A repository or pull-request reference in Chat previously stayed a bare canonical URI even for its

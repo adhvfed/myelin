@@ -65,11 +65,15 @@ ALTER TABLE privacy_request
 "#;
 
 pub fn privacy_request_durable_migrations() -> Migrations {
-    Migrations::of([
-        Migration::plain("0131_privacy_request", PRIVACY_REQUEST_MIGRATION),
-        Migration::plain(
-            "0135_privacy_request_chat_messages_scope",
-            PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION,
-        ),
-    ])
+    Migrations::of([Migration::plain(
+        "0131_privacy_request",
+        PRIVACY_REQUEST_MIGRATION,
+    )])
+}
+
+pub fn privacy_request_chat_messages_scope_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0135_privacy_request_chat_messages_scope",
+        PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION,
+    )])
 }

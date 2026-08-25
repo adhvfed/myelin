@@ -9,7 +9,7 @@ pub use model::{
     PrivacyRequestState, MAX_PRIVACY_HOLDER_RECEIPTS, PRIVACY_REQUEST_DEADLINE_DAYS,
 };
 pub use schema::{
-    privacy_request_durable_migrations, PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION,
-    PRIVACY_REQUEST_MIGRATION,
+    privacy_request_chat_messages_scope_migrations, privacy_request_durable_migrations,
+    PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION, PRIVACY_REQUEST_MIGRATION,
 };
 pub use store::DurablePrivacyRequestStore;

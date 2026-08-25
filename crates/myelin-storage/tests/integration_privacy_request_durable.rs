@@ -86,13 +86,7 @@ fn certificate(request_id: Uuid) -> PrivacyRequestCertificate {
         request_id,
         PrivacyRequestKind::Erasure,
         PrivacyRequestScope::AgentData,
-        vec![PrivacyHolderReceipt {
-            holder: "agent_data".into(),
-            operation: "erasure".into(),
-            content_hash: format!("blake3:{}", "a".repeat(64)),
-            records_erased: 7,
-            key_unrecoverable: true,
-        }],
+        vec![PrivacyHolderReceipt::erasure("agent_data", 7).unwrap()],
     )
     .unwrap()
 }
@@ -337,4 +331,31 @@ async fn a_privacy_request_survives_a_lost_worker_and_returns_one_private_certif
         .unwrap();
     assert!(!certificate_json.contains("alice"));
     assert!(certificate_json.contains(&expected_certificate.content_hash));
+
+    let tenant_for_tamper = tenant.clone();
+    provider
+        .with_tenant_tx(&tenant, move |connection| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE privacy_request SET certificate = jsonb_set(\
+                       certificate, '{holder_receipts,0,records_erased}', '999'::jsonb\
+                     ) WHERE tenant_id = $1 AND request_id = $2",
+                )
+                .bind(&tenant_for_tamper)
+                .bind(Uuid::from_u128(0x131))
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    let corrupt = restarted
+        .get_owned(&tenant, "alice", Uuid::from_u128(0x131))
+        .await
+        .expect_err("a durable certificate with a changed holder count must not be returned");
+    assert!(corrupt
+        .to_string()
+        .contains("privacy holder receipt failed content verification"));
 }

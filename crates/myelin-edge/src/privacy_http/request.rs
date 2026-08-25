@@ -379,13 +379,7 @@ mod tests {
             Uuid::from_u128(23),
             PrivacyRequestKind::Erasure,
             PrivacyRequestScope::AgentData,
-            vec![PrivacyHolderReceipt {
-                holder: "agent_traces".into(),
-                operation: "erasure".into(),
-                content_hash: format!("blake3:{}", "a".repeat(64)),
-                records_erased: 3,
-                key_unrecoverable: true,
-            }],
+            vec![PrivacyHolderReceipt::erasure("agent_traces", 3).unwrap()],
         )
         .unwrap();
 

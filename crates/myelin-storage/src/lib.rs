@@ -304,12 +304,13 @@ pub use post_restore_agent_data::{
     PostRestoreAgentDataError, PostRestoreAgentDataReEraser, PostRestoreAgentDataReport,
 };
 pub use privacy_request_durable::{
-    agent_data_holder_receipts, privacy_request_durable_migrations, ClaimPrivacyRequestOutcome,
-    CompletePrivacyRequestOutcome, CreatePrivacyRequestOutcome, DurablePrivacyRequest,
-    DurablePrivacyRequestStore, NewPrivacyRequest, PrivacyHolderReceipt, PrivacyRequestCertificate,
-    PrivacyRequestKind, PrivacyRequestLease, PrivacyRequestScope, PrivacyRequestState,
-    MAX_PRIVACY_HOLDER_RECEIPTS, PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION,
-    PRIVACY_REQUEST_DEADLINE_DAYS, PRIVACY_REQUEST_MIGRATION,
+    agent_data_holder_receipts, privacy_request_chat_messages_scope_migrations,
+    privacy_request_durable_migrations, ClaimPrivacyRequestOutcome, CompletePrivacyRequestOutcome,
+    CreatePrivacyRequestOutcome, DurablePrivacyRequest, DurablePrivacyRequestStore,
+    NewPrivacyRequest, PrivacyHolderReceipt, PrivacyRequestCertificate, PrivacyRequestKind,
+    PrivacyRequestLease, PrivacyRequestScope, PrivacyRequestState, MAX_PRIVACY_HOLDER_RECEIPTS,
+    PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION, PRIVACY_REQUEST_DEADLINE_DAYS,
+    PRIVACY_REQUEST_MIGRATION,
 };
 pub use provider::{
     all_durable_migrations, durable_migration_groups, foundation_migrations, BootstrapError,
