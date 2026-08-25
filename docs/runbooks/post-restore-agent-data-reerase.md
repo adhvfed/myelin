@@ -5,6 +5,8 @@ agent-data erasures. It replays the preserved live erasure ledger through the
 same durable holder used by the privacy API. A successful pass deletes restored
 trace, model-replay, and tool-effect rows, destroys the scoped agent-data key, and writes
 the absorbing subject marker that prevents future agent processing.
+The ledger query is itself scoped to `agent_data`; erasures belonging to another
+product are never sent through this holder.
 
 The command is intentionally limited to the production agent-data holder. It
 does not claim to re-erase the current in-memory Chat, Issues, or Git holder

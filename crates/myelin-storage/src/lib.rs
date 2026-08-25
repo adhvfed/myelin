@@ -319,7 +319,9 @@ pub use pseudonym_durable::{
     DurablePseudonymBacking, DurablePseudonymRow,
 };
 pub use reerase_durable::{
-    post_pit_durable_migrations, DurablePostPitLedger, POST_PIT_ERASURE_LEDGER_MIGRATION,
+    post_pit_durable_migrations, post_pit_scope_migrations, post_pit_scope_required_migrations,
+    DurablePostPitLedger, PostPitErasureScope, POST_PIT_ERASURE_LEDGER_MIGRATION,
+    POST_PIT_ERASURE_SCOPE_MIGRATION, POST_PIT_ERASURE_SCOPE_REQUIRED_MIGRATION,
 };
 pub use reserve_settle_durable::{
     cost_ledger_value_invariant_migrations, reserve_settle_durable_migrations, DurableCostLedger,

@@ -795,7 +795,12 @@ impl DurableAgentTraceStore {
         // seconds so a restore point can be compared against wall time.
         let erased_at_secs = unix_seconds(std::time::SystemTime::now())?;
         crate::reerase_durable::DurablePostPitLedger::new(self.provider.clone())
-            .record(&tenant, &SubjectId::new(subject.clone()), erased_at_secs)
+            .record(
+                crate::reerase_durable::PostPitErasureScope::AgentData,
+                &tenant,
+                &SubjectId::new(subject.clone()),
+                erased_at_secs,
+            )
             .await
             .map_err(|error| {
                 AgentTraceError::Storage(format!(

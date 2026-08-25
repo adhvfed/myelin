@@ -5,7 +5,10 @@ use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError};
 use myelin_storage::encryption::SubjectId;
 use myelin_storage::migration::HotTables;
 use myelin_storage::reerase::PostRestoreErasureLedger;
-use myelin_storage::reerase_durable::{post_pit_durable_migrations, DurablePostPitLedger};
+use myelin_storage::reerase_durable::{
+    post_pit_durable_migrations, post_pit_scope_migrations, post_pit_scope_required_migrations,
+    DurablePostPitLedger,
+};
 use myelin_storage::reserve_settle::{
     CostLedger, MeteredUnit, MicroUsd, ReservationState, ReserveError, RunId, SettleError,
 };
@@ -83,6 +86,14 @@ async fn migrate_admin() -> SubstrateProvider {
         .await
         .expect("install and validate the restore WAL-offset invariants (0122-0123)");
     admin
+        .migrate(&post_pit_scope_migrations(), &HotTables::none())
+        .await
+        .expect("make post-PIT erasures scope-aware (0133)");
+    admin
+        .migrate(&post_pit_scope_required_migrations(), &HotTables::none())
+        .await
+        .expect("refuse ambiguous post-PIT erasure writes (0134)");
+    admin
 }
 
 async fn app_provider() -> SubstrateProvider {
@@ -124,6 +135,16 @@ async fn mr009b_w6b_storage_ledgers_durable() {
 
     let corrupt_tenant = format!("corrupt-offset-{suffix}");
     sqlx::query(
+        "INSERT INTO post_pit_erasure_ledger \
+           (tenant_id, region, subject, completed_at_offset) VALUES ($1, $2, $3, 1)",
+    )
+    .bind(&corrupt_tenant)
+    .bind(&region)
+    .bind(format!("missing-scope-{suffix}"))
+    .execute(admin.db_pool())
+    .await
+    .expect_err("the database refuses an erasure record without an explicit product scope");
+    sqlx::query(
         "INSERT INTO restore_erasure_ledger \
            (tenant_id, region, completed_at_offset) VALUES ($1, $2, -1)",
     )
@@ -134,7 +155,8 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     .expect_err("the restore ledger rejects a negative WAL offset at the database boundary");
     sqlx::query(
         "INSERT INTO post_pit_erasure_ledger \
-           (tenant_id, region, subject, completed_at_offset) VALUES ($1, $2, $3, -1)",
+           (tenant_id, region, scope, subject, completed_at_offset) \
+         VALUES ($1, $2, 'agent_data', $3, -1)",
     )
     .bind(&corrupt_tenant)
     .bind(&region)
@@ -448,9 +470,11 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     let pp_tenant = TenantId(format!("01J0PP{suffix}"));
     let subj_post = SubjectId::new(format!("subj-post-{suffix}"));
     let subj_pre = SubjectId::new(format!("subj-pre-{suffix}"));
+    let chat_only = SubjectId::new(format!("chat-only-{suffix}"));
     let pp1 = DurablePostPitLedger::new(app.clone());
     assert!(
         pp1.record(
+            myelin_storage::PostPitErasureScope::AgentData,
             &pp_tenant,
             &SubjectId::new(format!("overflow-{suffix}")),
             i64::MAX as u64 + 1,
@@ -459,17 +483,53 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .is_err(),
         "an unsigned WAL offset cannot wrap into a negative PostgreSQL bigint"
     );
-    pp1.record(&pp_tenant, &subj_post, 140)
-        .await
-        .expect("record a post-PIT erasure (offset 140)");
-    pp1.record(&pp_tenant, &subj_post, 60)
-        .await
-        .expect("an older retry is accepted without rewinding the erasure");
-    pp1.record(&pp_tenant, &subj_pre, 60)
-        .await
-        .expect("record a pre-PIT erasure (offset 60)");
+    pp1.record(
+        myelin_storage::PostPitErasureScope::AgentData,
+        &pp_tenant,
+        &subj_post,
+        140,
+    )
+    .await
+    .expect("record a post-PIT erasure (offset 140)");
+    pp1.record(
+        myelin_storage::PostPitErasureScope::AgentData,
+        &pp_tenant,
+        &subj_post,
+        60,
+    )
+    .await
+    .expect("an older retry is accepted without rewinding the erasure");
+    pp1.record(
+        myelin_storage::PostPitErasureScope::AgentData,
+        &pp_tenant,
+        &subj_pre,
+        60,
+    )
+    .await
+    .expect("record a pre-PIT erasure (offset 60)");
+    pp1.record(
+        myelin_storage::PostPitErasureScope::Chat,
+        &pp_tenant,
+        &chat_only,
+        160,
+    )
+    .await
+    .expect("record a later erasure in another product scope");
 
     let pp2 = DurablePostPitLedger::new(app_provider().await);
+    let agent_data_after = pp2
+        .completed_after(myelin_storage::PostPitErasureScope::AgentData, 100)
+        .await
+        .expect("select only the agent-data restore work");
+    let agent_data_ids: Vec<String> = agent_data_after
+        .iter()
+        .map(|record| record.subject.0.clone())
+        .collect();
+    assert_eq!(
+        agent_data_ids,
+        vec![subj_post.0.clone()],
+        "a Chat erasure must never be replayed through the agent-data holder"
+    );
     let after = pp2.erasures_completed_after(100);
     let ids: Vec<String> = after.iter().map(|r| r.subject.0.clone()).collect();
     assert!(
@@ -479,6 +539,10 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     assert!(
         !ids.contains(&subj_pre.0),
         "the pre-PIT erasure is NOT selected: {ids:?}"
+    );
+    assert!(
+        ids.contains(&chat_only.0),
+        "the legacy all-scope reader still sees every product's restore work"
     );
 
     let windowed = TenantId(format!("01J0WIN{suffix}"));

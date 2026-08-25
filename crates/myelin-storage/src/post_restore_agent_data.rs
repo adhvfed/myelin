@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::backup::WalOffset;
-use crate::{DurableAgentTraceStore, DurablePostPitLedger};
+use crate::{DurableAgentTraceStore, DurablePostPitLedger, PostPitErasureScope};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostRestoreAgentDataReport {
@@ -56,7 +56,7 @@ impl PostRestoreAgentDataReEraser {
     ) -> Result<PostRestoreAgentDataReport, PostRestoreAgentDataError> {
         let records = self
             .live_ledger
-            .completed_after(restored_to_offset)
+            .completed_after(PostPitErasureScope::AgentData, restored_to_offset)
             .await
             .map_err(|_| PostRestoreAgentDataError::LedgerUnavailable)?;
         let selected_subjects =

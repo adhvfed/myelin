@@ -1666,14 +1666,16 @@ Edge and Storage Clippy, and the real 35.69-second `pg_dump`/`pg_restore` story.
 The restored database must reject a brand-new trace after replay and a fresh
 operator pass must converge as already erased.
 
-## 2026-08-25 — narrow agent-data erasure no longer erases Chat by accident
+## 2026-08-25 — narrow agent-data erasure has its own cryptographic boundary
 
-The holder audit found a cross-product erasure bug before adding another
-ceremonial holder: agent traces, model replay, tool results, Chat, Issues, and
-Git all selected the same `(tenant, subject)` DEK. The public operation is
-explicitly scoped to `agent_data`, but destroying that key also made existing
-Chat messages by the same person unreadable. The privacy story had never
-created unrelated personal data, so it could not see the collateral damage.
+The holder audit found a cross-product erasure hazard before adding another
+ceremonial holder: the key model offered only one generic `(tenant, subject)`
+DEK. The public operation is explicitly scoped to `agent_data`, so its safety
+must not depend on every other product transforming the person's identifier
+differently before selecting a key. Chat currently uses an author pseudonym,
+for example, but that incidental separation is not a cryptographic domain
+boundary. Any holder using the same raw subject coordinate would have its key
+destroyed by the narrow operation.
 
 The KMS key model now has a typed scoped-subject class. All three durable
 agent-data writers use the `AgentData` scope and readers retain compatibility
@@ -1685,17 +1687,26 @@ lever. Two journal tests that merely searched migration source for expected SQL
 phrases were removed; the surviving tests exercise typed key behavior and the
 actual PostgreSQL constraints.
 
+The post-restore ledger now records a typed product scope as part of its
+primary key. The agent-data operator selects only `agent_data` rows; a future
+Chat erasure for the same person cannot accidentally be replayed through the
+agent holder. Its legacy all-holder adapter still deduplicates subjects across
+scopes for the older full-fanout restore machinery. A real PostgreSQL story
+records agent-data and Chat work side by side and proves both selection modes.
+
 The black-box privacy story now writes and reads a private Chat message as the
 same person before requesting agent-data erasure, verifies that the request and
 certificate complete, reads the original Chat message again, and posts a new
-follow-up. That story would return a 500 on the old implementation. The real
-dump/restore drill likewise provisions an unrelated subject key and requires it
-to remain resolvable after both live erasure and restore replay.
+follow-up. This states the end-user scope contract directly. The regression
+with teeth is in the real dump/restore drill: it provisions an unrelated key at
+the exact same raw subject coordinate and requires that key to remain resolvable
+after both live erasure and restore replay; the old implementation destroys it.
 
 Proof: four KMS grammar tests; the five-case real PostgreSQL agent-trace suite;
 real model-replay and tool-effect journal tests; warning-free all-target,
 all-feature Storage Clippy; TypeScript typechecking; the 34.82-second real
-`pg_dump`/`pg_restore` drill; and the 15.20-second live privacy system story.
+`pg_dump`/`pg_restore` drill; the real scope-aware ledger story; and the
+15.20-second live privacy system story.
 
 ## known gaps (honest list, in priority order)
 
