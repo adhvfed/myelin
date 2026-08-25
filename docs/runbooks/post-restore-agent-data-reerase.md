@@ -1,16 +1,19 @@
-# Reapply agent-data erasures after a database restore
+# Reapply privacy erasures after a database restore
 
 This runbook is for a restored cell that may predate one or more completed
-agent-data erasures. It replays the preserved live erasure ledger through the
-same durable holder used by the privacy API. A successful pass deletes restored
-trace, model-replay, and tool-effect rows, destroys the scoped agent-data key, and writes
-the absorbing subject marker that prevents future agent processing.
-The ledger query is itself scoped to `agent_data`; erasures belonging to another
-product are never sent through this holder.
+agent-data or Chat-message erasures. It reads the preserved live ledger and
+replays each scope through the same durable holder used by the privacy API.
 
-The command is intentionally limited to the production agent-data holder. It
-does not claim to re-erase the current in-memory Chat, Issues, or Git holder
-prototypes.
+For `agent_data`, a successful pass deletes restored trace, model-replay, and
+tool-effect rows, destroys the scoped key, and restores the absorbing marker
+that prevents future agent processing. For `chat_messages`, it destroys the
+restored Chat key, empties the authored message bodies, retains their immutable
+tombstone coordinates, and co-commits the corresponding erasure events. A
+person may write new Chat messages afterward under fresh key material.
+
+The two ledger queries are scope-specific. A Chat record can never be routed to
+the agent-data holder or vice versa. Issues and Git are not included until their
+durable erasure paths write this ledger and can return equally strong proofs.
 
 ## Before running
 
@@ -47,19 +50,29 @@ non-canonical timestamps, a mismatched cell, an unconfirmed maintenance state,
 a missing live-ledger connection, or a live-ledger URL that resolves to the same
 PostgreSQL database as the restored target.
 
-The only success output is a bounded JSON receipt. It contains aggregate counts,
-not subject identifiers:
+The only success output is a bounded JSON receipt. It contains aggregate counts
+for every supported scope, never subject identifiers:
 
 ```json
 {
   "restore_reerase": {
-    "scope": "agent_data",
     "restored_before_unix": 1787687000,
-    "selected_subjects": 3,
-    "newly_re_erased_subjects": 3,
-    "already_erased_subjects": 0,
-    "records_erased": 14,
-    "new_processing_blocked": true,
+    "scopes": {
+      "agent_data": {
+        "selected_subjects": 3,
+        "newly_re_erased_subjects": 3,
+        "already_erased_subjects": 0,
+        "records_erased": 14,
+        "new_processing_blocked": true
+      },
+      "chat_messages": {
+        "selected_subjects": 2,
+        "newly_re_erased_subjects": 2,
+        "already_erased_subjects": 0,
+        "messages_erased": 9,
+        "erasure_events_co_committed": 9
+      }
+    },
     "complete": true
   }
 }
@@ -71,15 +84,17 @@ recovery step, even if earlier subjects were already processed.
 ## Retry and verify
 
 The pass is resumable. Re-run the exact command after repairing a dependency.
-A converged retry selects the same subjects, reports them under
-`already_erased_subjects`, and preserves the original durable deletion counts.
-It does not recreate keys or data.
+A converged retry selects the same subjects in each scope, reports them under
+that scope's `already_erased_subjects`, and preserves the original durable
+deletion counts. It does not recreate keys, data, or erasure events.
 
 Before routing traffic, retain the aggregate receipt with the restore record and
-run the ordinary cell readiness checks. The restore drill in
+run the ordinary cell readiness checks. The agent-data restore drill in
 `integration_erasure_survives_restore.rs` exercises the full sequence against a
 real `pg_dump` and `pg_restore`; it also attempts new agent work after replay and
-requires the restored holder to refuse it.
+requires the restored holder to refuse it. The Chat PostgreSQL restore story in
+`integration_chat_p22_erase_cascade.rs` exercises scoped selection, key
+destruction, message/event co-commit, neighboring-subject isolation, and replay.
 
 ## Failure interpretation
 
@@ -87,6 +102,9 @@ requires the restored holder to refuse it.
   ledger could not be read. Do not substitute the restored database.
 - “restored agent-data holder is unavailable” means one subject did not finish
   its production erasure path. Repair the target database or KMS and retry.
+- “restored Chat re-erasure failed” means one subject did not finish its scoped
+  key destruction and message/event transaction. Repair the target database or
+  KMS and retry with the same restore command.
 - “incomplete erasure proof” means the holder could not prove both durable
   deletion counts and an unrecoverable agent-data key. Treat this as a hard restore
   failure; do not waive it based on manual row inspection.

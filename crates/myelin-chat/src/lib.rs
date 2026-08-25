@@ -14,6 +14,7 @@ pub mod hitl;
 pub mod holder;
 pub mod membership;
 mod mention_signal;
+pub mod post_restore;
 pub mod presence;
 pub mod project;
 pub mod provenance;
@@ -75,6 +76,9 @@ pub use holder::{
     CHAT_OLTP_STORE, CHAT_RESIDUAL_POSTURE_REF,
 };
 pub use membership::{MembershipError, MembershipGate, MembershipService, MembershipTupleWriter};
+pub use post_restore::{
+    PostRestoreChatMessageError, PostRestoreChatMessageReEraser, PostRestoreChatMessageReport,
+};
 pub use presence::{
     ag_d4_attestation_is_green, presence_and_partials_are_firehose_only, resume_view, run_streamed,
     AgD4Attestation, AgentPresence, FabricHealth, MockStreamRuntime, PartialFrame, PartialPush,

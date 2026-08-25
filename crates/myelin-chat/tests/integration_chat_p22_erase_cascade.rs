@@ -14,7 +14,8 @@ use myelin_chat::store::{
 };
 use myelin_chat::{
     decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, subject_dek_erasure,
-    ChatFreeText, DurableChatMessageEraser, CHAT_ERASE_CASCADE_TOKEN,
+    ChatFreeText, DurableChatMessageEraser, PostRestoreChatMessageReEraser,
+    CHAT_ERASE_CASCADE_TOKEN,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, Timestamp, Ulid, UlidMinter};
@@ -70,6 +71,12 @@ impl IdMinter for ConstantMinter {
 }
 
 async fn fresh_store() -> (sqlx::PgPool, PgMessageStore, String, SubstrateProvider) {
+    fresh_store_in(region()).await
+}
+
+async fn fresh_store_in(
+    store_region: Region,
+) -> (sqlx::PgPool, PgMessageStore, String, SubstrateProvider) {
     let admin = PgPoolOptions::new()
         .max_connections(4)
         .connect(&admin_url())
@@ -81,7 +88,7 @@ async fn fresh_store() -> (sqlx::PgPool, PgMessageStore, String, SubstrateProvid
         NEXT_STORE.fetch_add(1, Ordering::Relaxed),
     );
     let table = format!("chat_message_erase_{suffix}");
-    PgMessageStore::new(admin.clone(), region().as_str(), table.clone())
+    PgMessageStore::new(admin.clone(), store_region.as_str(), table.clone())
         .migrate()
         .await
         .expect("create the same tenant-scoped schema used by the production message store");
@@ -91,10 +98,11 @@ async fn fresh_store() -> (sqlx::PgPool, PgMessageStore, String, SubstrateProvid
         .expect("the durable outbox schema is available");
     let mut config = MyelinConfig::dev();
     config.database_url = app_url();
+    config.region = store_region.0.clone();
     let app = SubstrateProvider::connect(config, 4)
         .await
         .expect("connect to dev Postgres as the production application role");
-    let store = PgMessageStore::new(app.db_pool().clone(), region().as_str(), table.clone());
+    let store = PgMessageStore::new(app.db_pool().clone(), store_region.as_str(), table.clone());
     (admin, store, table, app)
 }
 
@@ -105,11 +113,12 @@ fn encrypted_message(
     nonce: &str,
     plaintext: &str,
 ) -> (NewMessage, EncryptedColumn) {
-    let tenant = TenantId::from_token(TENANT);
+    let tenant = TenantId::from_token(&conversation.tenant);
     let author = SubjectId::new(author);
+    let message_region = Region(conversation.region.clone());
     let body = encrypt_body(
         kms,
-        &region(),
+        &message_region,
         &tenant,
         &author,
         ChatFreeText::BodyInline,
@@ -118,7 +127,7 @@ fn encrypted_message(
     .expect("seal the message body under its author's Chat key");
     let nodes = encrypt_body(
         kms,
-        &region(),
+        &message_region,
         &tenant,
         &author,
         ChatFreeText::BodyNodes,
@@ -144,11 +153,12 @@ fn legacy_encrypted_message(
     conversation: ConversationId,
     author: &str,
 ) -> NewMessage {
-    let tenant = TenantId::from_token(TENANT);
+    let tenant = TenantId::from_token(&conversation.tenant);
     let author = SubjectId::new(author);
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+    let message_region = Region(conversation.region.clone());
+    kms.ensure_kek(&KekId::new(tenant.clone(), message_region.clone()))
         .expect("arrange the legacy tenant key");
-    let cryptor = ColumnCryptor::new(kms, region());
+    let cryptor = ColumnCryptor::new(kms, message_region);
     let seal = |plaintext: &[u8]| {
         cryptor
             .encrypt(&tenant, Some(&author), &subject_dek_erasure(), plaintext)
@@ -281,6 +291,7 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
         "both authored messages and both durable consequences move together",
     );
     assert!(proof.key_destroyed_this_attempt);
+    assert!(!proof.already_completed);
     assert_eq!(proof.destroyed_key_epoch, Some(0));
     assert!(proof.key_unrecoverable);
 
@@ -329,7 +340,9 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
         "a completed message erasure replays its original proof without another event",
     );
     assert!(
-        !retry.key_destroyed_this_attempt && retry.destroyed_key_epoch.is_none(),
+        retry.already_completed
+            && !retry.key_destroyed_this_attempt
+            && retry.destroyed_key_epoch.is_none(),
         "replay must not mistake a later Chat key for the key destroyed by the operation",
     );
     assert_eq!(
@@ -460,7 +473,9 @@ async fn an_erasure_event_failure_leaves_a_resumable_storage_transaction() {
         (2, 2),
     );
     assert!(
-        !resumed.key_destroyed_this_attempt && resumed.destroyed_key_epoch.is_none(),
+        !resumed.already_completed
+            && !resumed.key_destroyed_this_attempt
+            && resumed.destroyed_key_epoch.is_none(),
         "the retry observes that the old key was already destroyed",
     );
     let finished = store
@@ -472,6 +487,108 @@ async fn an_erasure_event_failure_leaves_a_resumable_storage_transaction() {
             && message.body_inline.is_empty()
             && message.body_nodes.is_empty()
     }));
+
+    clear_test_rows(&admin, &table, &[conversation]).await;
+}
+
+#[tokio::test]
+async fn a_restored_database_replays_only_chat_erasures_newer_than_its_restore_point() {
+    let restore_region = Region::new(format!("chat-restore-{}", std::process::id()));
+    let (admin, store, table, provider) = fresh_store_in(restore_region.clone()).await;
+    let kms = Arc::new(KmsEngine::new());
+    let ledger = DurablePostPitLedger::new(provider);
+    let ids = MonotonicUlidSource::new();
+    let tenant = format!("chat-restore-{}", std::process::id());
+    let ada = event_actor_pseudonym(&tenant, ADA);
+    let bob = event_actor_pseudonym(&tenant, BOB);
+    let conversation = ConversationId::new(
+        &tenant,
+        restore_region.as_str(),
+        "01J0CHATP411RESTORED00000",
+    );
+    let (erased, erased_envelope) = encrypted_message(
+        &kms,
+        conversation.clone(),
+        &ada,
+        "restored-ada",
+        "Ada's erased message came back with the database",
+    );
+    let (preserved, preserved_envelope) = encrypted_message(
+        &kms,
+        conversation.clone(),
+        &bob,
+        "restored-bob",
+        "Bob's message predates the restore boundary and remains",
+    );
+    store.append_storage_only(&ids, erased).await.unwrap();
+    store.append_storage_only(&ids, preserved).await.unwrap();
+    ledger
+        .record(
+            PostPitErasureScope::Chat,
+            &TenantId::from_token(&tenant),
+            &SubjectId::new(ADA),
+            200,
+        )
+        .await
+        .unwrap();
+    ledger
+        .record(
+            PostPitErasureScope::Chat,
+            &TenantId::from_token(&tenant),
+            &SubjectId::new(BOB),
+            50,
+        )
+        .await
+        .unwrap();
+
+    let reeraser = PostRestoreChatMessageReEraser::new(ledger, store.clone(), Arc::clone(&kms));
+    let first = reeraser
+        .run(100, &UlidMinter::new(), now())
+        .await
+        .expect("reapply post-restore Chat erasures from the preserved live ledger");
+    assert_eq!(first.selected_subjects, 1);
+    assert_eq!(first.newly_re_erased_subjects, 1);
+    assert_eq!(first.already_erased_subjects, 0);
+    assert_eq!(
+        (first.messages_erased, first.erasure_events_co_committed),
+        (1, 1)
+    );
+    assert!(decrypt_body(&kms, &restore_region, &erased_envelope).is_err());
+    assert_eq!(
+        decrypt_body(&kms, &restore_region, &preserved_envelope).unwrap(),
+        b"Bob's message predates the restore boundary and remains",
+    );
+
+    let replay = reeraser
+        .run(100, &UlidMinter::new(), now())
+        .await
+        .expect("the restore operator is safe to resume after response loss");
+    assert_eq!(replay.newly_re_erased_subjects, 0);
+    assert_eq!(replay.already_erased_subjects, 1);
+    assert_eq!(
+        (replay.messages_erased, replay.erasure_events_co_committed),
+        (1, 1)
+    );
+    let messages = store
+        .range(&conversation, RangeCursor::Recent, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .find(|message| message.author == ada)
+            .unwrap()
+            .state,
+        MessageState::Tombstoned,
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .find(|message| message.author == bob)
+            .unwrap()
+            .state,
+        MessageState::Active,
+    );
 
     clear_test_rows(&admin, &table, &[conversation]).await;
 }

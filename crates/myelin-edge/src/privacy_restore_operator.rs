@@ -1,8 +1,13 @@
 use std::{str::FromStr, sync::Arc};
 
+use chrono::{SecondsFormat, Utc};
+use myelin_chat::store::pg::PgMessageStore;
+use myelin_chat::store::pg_conversation::MESSAGE_TABLE;
+use myelin_chat::{PostRestoreChatMessageReEraser, PostRestoreChatMessageReport};
+use myelin_events::{Timestamp, UlidMinter};
 use myelin_storage::{
     DurableAgentTraceStore, DurablePostPitLedger, KmsEngine, PostRestoreAgentDataReEraser,
-    SubstrateProvider,
+    PostRestoreAgentDataReport, SubstrateProvider,
 };
 use serde_json::json;
 use sqlx::postgres::PgConnectOptions;
@@ -102,31 +107,62 @@ pub async fn run(
     let live_provider = SubstrateProvider::connect(live_config, 2)
         .await
         .unwrap_or_else(|_| refuse("the preserved live erasure ledger is unavailable".into(), 1));
-    let restored_holder =
-        DurableAgentTraceStore::with_runtime(restored_provider, runtime, restored_kms);
-    let report = PostRestoreAgentDataReEraser::new(
-        DurablePostPitLedger::new(live_provider),
-        restored_holder,
+    let live_ledger = DurablePostPitLedger::new(live_provider);
+    let restored_holder = DurableAgentTraceStore::with_runtime(
+        restored_provider.clone(),
+        runtime,
+        restored_kms.clone(),
+    );
+    let agent_data = PostRestoreAgentDataReEraser::new(live_ledger.clone(), restored_holder)
+        .run(command.restored_before_unix)
+        .await
+        .unwrap_or_else(|error| refuse(error.to_string(), 1));
+    let chat_messages = PostRestoreChatMessageReEraser::new(
+        live_ledger,
+        PgMessageStore::new(
+            restored_provider.db_pool().clone(),
+            restored_provider.config().region.clone(),
+            MESSAGE_TABLE,
+        ),
+        restored_kms,
     )
-    .run(command.restored_before_unix)
+    .run(
+        command.restored_before_unix,
+        &UlidMinter::new(),
+        Timestamp(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    )
     .await
     .unwrap_or_else(|error| refuse(error.to_string(), 1));
 
-    println!(
-        "{}",
-        json!({
-            "restore_reerase": {
-                "scope": "agent_data",
-                "restored_before_unix": report.restored_to_offset,
-                "selected_subjects": report.selected_subjects,
-                "newly_re_erased_subjects": report.newly_re_erased_subjects,
-                "already_erased_subjects": report.already_erased_subjects,
-                "records_erased": report.records_erased,
-                "new_processing_blocked": true,
-                "complete": true,
-            }
-        })
-    );
+    println!("{}", report_json(&agent_data, &chat_messages));
+}
+
+fn report_json(
+    agent_data: &PostRestoreAgentDataReport,
+    chat_messages: &PostRestoreChatMessageReport,
+) -> serde_json::Value {
+    json!({
+        "restore_reerase": {
+            "restored_before_unix": agent_data.restored_to_offset,
+            "scopes": {
+                "agent_data": {
+                    "selected_subjects": agent_data.selected_subjects,
+                    "newly_re_erased_subjects": agent_data.newly_re_erased_subjects,
+                    "already_erased_subjects": agent_data.already_erased_subjects,
+                    "records_erased": agent_data.records_erased,
+                    "new_processing_blocked": true,
+                },
+                "chat_messages": {
+                    "selected_subjects": chat_messages.selected_subjects,
+                    "newly_re_erased_subjects": chat_messages.newly_re_erased_subjects,
+                    "already_erased_subjects": chat_messages.already_erased_subjects,
+                    "messages_erased": chat_messages.messages_erased,
+                    "erasure_events_co_committed": chat_messages.erasure_events_co_committed,
+                },
+            },
+            "complete": true,
+        }
+    })
 }
 
 fn set_once(slot: &mut Option<String>, value: String, name: &str) -> Result<(), String> {
@@ -229,5 +265,36 @@ mod tests {
             Ok(false)
         );
         assert!(same_database("not a database", "postgres://db/myelin").is_err());
+    }
+
+    #[test]
+    fn completion_reports_every_scope_the_operator_reapplies() {
+        let body = report_json(
+            &PostRestoreAgentDataReport {
+                restored_to_offset: 42,
+                selected_subjects: 2,
+                newly_re_erased_subjects: 1,
+                already_erased_subjects: 1,
+                records_erased: 7,
+            },
+            &PostRestoreChatMessageReport {
+                restored_to_offset: 42,
+                selected_subjects: 1,
+                newly_re_erased_subjects: 1,
+                already_erased_subjects: 0,
+                messages_erased: 3,
+                erasure_events_co_committed: 3,
+            },
+        );
+        assert_eq!(body["restore_reerase"]["restored_before_unix"], 42);
+        assert_eq!(
+            body["restore_reerase"]["scopes"]["agent_data"]["records_erased"],
+            7,
+        );
+        assert_eq!(
+            body["restore_reerase"]["scopes"]["chat_messages"]["messages_erased"],
+            3,
+        );
+        assert_eq!(body["restore_reerase"]["complete"], true);
     }
 }

@@ -10,8 +10,8 @@ use myelin_tenancy::TenantId;
 use crate::chat_subject_key_class;
 use crate::events::event_actor_pseudonym;
 use crate::store::pg::{
-    AuthoredMessageErasureState, MessageErasureAttempt, PgMessageStore,
-    VerifiedMessageErasureAttempt,
+    AuthoredMessageEraseReceipt, AuthoredMessageErasureState, MessageErasureAttempt,
+    PgMessageStore, VerifiedMessageErasureAttempt,
 };
 use crate::store::StoreError;
 
@@ -19,6 +19,7 @@ use crate::store::StoreError;
 pub struct DurableChatMessageErasureProof {
     pub messages_erased: u64,
     pub erasure_events_co_committed: u64,
+    pub already_completed: bool,
     pub key_destroyed_this_attempt: bool,
     pub destroyed_key_epoch: Option<u64>,
     pub key_unrecoverable: bool,
@@ -79,6 +80,11 @@ pub struct DurableChatMessageEraser {
     ledger: DurablePostPitLedger,
 }
 
+enum PreparedMessageErasure {
+    Completed(AuthoredMessageEraseReceipt),
+    Pending { author: String },
+}
+
 impl DurableChatMessageEraser {
     pub fn new(
         messages: PgMessageStore,
@@ -99,21 +105,15 @@ impl DurableChatMessageEraser {
         event_ids: &dyn IdMinter,
         attempt: MessageErasureAttempt,
     ) -> Result<DurableChatMessageErasureProof, DurableChatMessageErasureError> {
-        let author = event_actor_pseudonym(tenant, subject);
-        let operation_id = attempt.operation_id().to_string();
-        let preparation = self
-            .messages
-            .prepare_author_erasure(tenant, &author, &operation_id)
-            .await
-            .map_err(DurableChatMessageErasureError::Store)?;
-        if let AuthoredMessageErasureState::Completed(receipt) = preparation {
-            return Ok(proof_from_receipt(receipt, false, None));
-        }
-
-        self.messages
-            .verify_author_erasure_ready(tenant, &author, &operation_id)
-            .await
-            .map_err(DurableChatMessageErasureError::Store)?;
+        let author = match self
+            .prepare_subject_messages(tenant, subject, &attempt)
+            .await?
+        {
+            PreparedMessageErasure::Completed(receipt) => {
+                return Ok(proof_from_receipt(receipt, true, false, None));
+            }
+            PreparedMessageErasure::Pending { author } => author,
+        };
 
         let tenant_id = TenantId::from_token(tenant);
         self.ledger
@@ -126,7 +126,64 @@ impl DurableChatMessageEraser {
             .await
             .map_err(DurableChatMessageErasureError::Ledger)?;
 
-        let key_id = DekId::new(tenant_id, chat_subject_key_class(&author));
+        self.erase_prepared_subject_messages(tenant, author, event_ids, attempt)
+            .await
+    }
+
+    pub(crate) async fn erase_subject_messages_already_recorded(
+        &self,
+        tenant: &str,
+        subject: &str,
+        event_ids: &dyn IdMinter,
+        attempt: MessageErasureAttempt,
+    ) -> Result<DurableChatMessageErasureProof, DurableChatMessageErasureError> {
+        let author = match self
+            .prepare_subject_messages(tenant, subject, &attempt)
+            .await?
+        {
+            PreparedMessageErasure::Completed(receipt) => {
+                return Ok(proof_from_receipt(receipt, true, false, None));
+            }
+            PreparedMessageErasure::Pending { author } => author,
+        };
+        self.erase_prepared_subject_messages(tenant, author, event_ids, attempt)
+            .await
+    }
+
+    async fn prepare_subject_messages(
+        &self,
+        tenant: &str,
+        subject: &str,
+        attempt: &MessageErasureAttempt,
+    ) -> Result<PreparedMessageErasure, DurableChatMessageErasureError> {
+        let author = event_actor_pseudonym(tenant, subject);
+        let operation_id = attempt.operation_id();
+        let preparation = self
+            .messages
+            .prepare_author_erasure(tenant, &author, operation_id)
+            .await
+            .map_err(DurableChatMessageErasureError::Store)?;
+        if let AuthoredMessageErasureState::Completed(receipt) = preparation {
+            return Ok(PreparedMessageErasure::Completed(receipt));
+        }
+        self.messages
+            .verify_author_erasure_ready(tenant, &author, operation_id)
+            .await
+            .map_err(DurableChatMessageErasureError::Store)?;
+        Ok(PreparedMessageErasure::Pending { author })
+    }
+
+    async fn erase_prepared_subject_messages(
+        &self,
+        tenant: &str,
+        author: String,
+        event_ids: &dyn IdMinter,
+        attempt: MessageErasureAttempt,
+    ) -> Result<DurableChatMessageErasureProof, DurableChatMessageErasureError> {
+        let key_id = DekId::new(
+            TenantId::from_token(tenant),
+            chat_subject_key_class(&author),
+        );
         let destroyed_key_epoch = self
             .kms
             .export_dek(&key_id)
@@ -158,6 +215,7 @@ impl DurableChatMessageEraser {
             .map_err(DurableChatMessageErasureError::Store)?;
         Ok(proof_from_receipt(
             receipt,
+            false,
             key_destroyed_this_attempt,
             destroyed_key_epoch,
         ))
@@ -165,13 +223,15 @@ impl DurableChatMessageEraser {
 }
 
 fn proof_from_receipt(
-    receipt: crate::store::pg::AuthoredMessageEraseReceipt,
+    receipt: AuthoredMessageEraseReceipt,
+    already_completed: bool,
     key_destroyed_this_attempt: bool,
     destroyed_key_epoch: Option<u64>,
 ) -> DurableChatMessageErasureProof {
     DurableChatMessageErasureProof {
         messages_erased: receipt.messages_tombstoned,
         erasure_events_co_committed: receipt.erasure_events_co_committed,
+        already_completed,
         key_destroyed_this_attempt,
         destroyed_key_epoch,
         key_unrecoverable: true,
@@ -193,6 +253,7 @@ mod tests {
         let complete = DurableChatMessageErasureProof {
             messages_erased: 3,
             erasure_events_co_committed: 3,
+            already_completed: false,
             key_destroyed_this_attempt: true,
             destroyed_key_epoch: Some(4),
             key_unrecoverable: true,

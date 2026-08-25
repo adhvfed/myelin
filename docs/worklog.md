@@ -1790,23 +1790,64 @@ successful but false crypto-shred receipt.
 Proof: the three-case PostgreSQL story (0.72 seconds), warning-free strict Chat
 Clippy, and two live Chat delivery journeys (633 ms of test time).
 
+## 2026-08-25 — A privacy request can truthfully erase authored Chat history
+
+The message-store mutation is no longer callable as if its database receipt
+alone proved erasure. A private verification capability now binds storage
+completion to the durable orchestrator that inventories every live envelope,
+records the post-PIT obligation, destroys and rechecks the independent Chat
+key, and only then commits tombstones and events. A failed event transaction is
+resumable after the irreversible key step, while a completed replay returns its
+original counts without touching key material created for later messages.
+
+The privacy request model now admits a separate `chat_messages` scope. Its
+worker dispatches by the request's durable scope, obtains one holder receipt
+only from the complete Chat proof, and feeds the common leased certificate
+path. The browser-facing story writes private thoughts, receives an exact
+Chat-only certificate, sees content-free tombstones, writes again under fresh
+key material, proves that replaying the old request preserves the new message,
+and then erases it with a new request. Agent-data state remains unchanged.
+
+Proof: four real PostgreSQL Chat erasure cases, two real PostgreSQL privacy
+request scope cases, 363 Edge tests, warning-free strict Storage/Chat/Edge
+Clippy, TypeScript typechecking, and two live privacy journeys in 15.96 seconds
+(691 ms for the Chat journey).
+
+## 2026-08-25 — Restore recovery consumes the Chat erasure ledger
+
+The maintenance-only restore command now queries `agent_data` and
+`chat_messages` independently and runs each record through its production
+holder. Chat replay uses a stable, content-free operation identity, a
+pseudonymized service actor, the same scoped-key verification and destruction,
+and the same message/event co-commit as the public request. Its bounded report
+separates newly completed work from response-loss retries and exposes no subject
+identifiers.
+
+The PostgreSQL restore story gives the preserved ledger one erasure after the
+restore point and one before it. Only the newer subject loses its restored key
+and body; the neighbor still decrypts. Replaying the operator returns the
+durable original count without another event. The operator runbook now names
+both scopes and remains explicit that Issues and Git are outside its proof.
+
+Proof: the four-case Chat PostgreSQL suite in 0.75 seconds, four restore-command
+contract tests, and warning-free strict Chat/Edge Clippy.
+
 ## known gaps (honest list, in priority order)
 
-1. **erasure-restore is closed for the wired path, open for the rest.** the
-   agent-data erase now writes the post-PIT ledger and the re-erase pass is
-   drilled against a real dump. the maintenance command and runbook replay it
-   through the production holder and restore the absorbing processing block.
-   remaining: Chat now has a scoped key, ledger vocabulary, and a resumable,
-   write-fenced message tombstone/event transaction, but no orchestration across
-   that transaction, key destruction, read state, and restore replay; Issues and
-   Git crypto-shred likewise do not write the ledger because none is wired to a
-   user surface yet (gap 2).
-2. **DSR has one truthful product slice, not full holder coverage.** durable
-   submit/status/certificate is now wired for the real agent-data holder and
-   exercised through Edge. Chat has one real PostgreSQL mutation seam but not a
-   complete durable holder; Issues and Git erasure remain library-only. They are
-   deliberately absent from the public certificate rather than being
-   represented by ceremonial receipts.
+1. **erasure-restore is closed for two wired scopes, open for the rest.** the
+   agent-data and authored-Chat-message erasers write separate post-PIT ledger
+   scopes. the maintenance command replays both through their production
+   holders before a restored cell can reopen. agent data is drilled against a
+   real dump; Chat is drilled against restored-holder conditions in real
+   PostgreSQL. remaining: add the full dump/restore Chat drill, then bring Issues
+   and Git onto the ledger before exposing either through privacy requests.
+2. **DSR has two truthful product slices, not full holder coverage.** durable
+   submit/status/certificate is wired for `agent_data` and `chat_messages`, with
+   holder-specific proofs and black-box user journeys. the Chat scope means only
+   authored message bodies; it deliberately does not claim drafts, read state,
+   mentions in other people's content, search projections, Issues, or Git.
+   those holders remain absent rather than being represented by ceremonial
+   receipts.
 3. **multi-tenant machine storms can still exhaust the general dispatch
    pool.** the human lane holds per tenant and against well-behaved machine
    traffic; a coordinated cross-tenant storm of requests that lie about
