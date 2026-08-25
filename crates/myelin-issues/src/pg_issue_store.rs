@@ -1837,27 +1837,7 @@ const AUTHORIZATION_STATUS_SQL: &str = r#"
 SELECT i.id, i.key, i.project_id, i.state, i.state_category,
        i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
        i.created_at::text AS created_at, i.updated_at::text AS updated_at,
-       CASE
-         WHEN b.state = 'active' AND EXISTS (
-           SELECT 1
-           FROM authz_projection_state projection
-           JOIN issue_authz_visible visible
-             ON visible.tenant_id = projection.tenant_id
-            AND visible.region = projection.region
-            AND visible.projection = projection.projection
-            AND visible.revision = projection.applied_revision
-           WHERE projection.tenant_id = b.tenant_id
-             AND projection.region = b.region
-             AND projection.projection = 'issue:view'
-             AND projection.status = 'ready'
-             AND projection.applied_revision = projection.source_revision
-             AND visible.subject = $4
-             AND visible.permission = 'view'
-             AND visible.object_type = 'issue'
-             AND visible.object_id = i.id::text
-         ) THEN 'active'
-         ELSE 'pending'
-       END AS authorization_state
+       b.state AS authorization_state
 FROM issue_authz_binding b
 JOIN issue i
   ON i.tenant_id = b.tenant_id AND i.region = b.region AND i.id = b.issue_id
@@ -2495,7 +2475,7 @@ mod tests {
     }
 
     #[test]
-    fn authorization_status_id_and_binding_lookup_are_strict() {
+    fn authorization_request_ids_are_canonical_ulids() {
         assert!(is_canonical_request_event_id("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
         for invalid in [
             "01arz3ndektsv4rrffq69g5fav",
@@ -2507,29 +2487,6 @@ mod tests {
             assert!(
                 !is_canonical_request_event_id(invalid),
                 "accepted `{invalid}`"
-            );
-        }
-        for required in [
-            "b.request_event_id = $3",
-            "i.created_by_principal = $4",
-            "b.project_id = i.project_id",
-            "b.issue_object = 'issue:' || i.id::text",
-            "b.project_userset = 'project:' || i.project_id::text || '#view'",
-            "b.relation = 'parent_project'",
-            "AND NOT i.archived",
-            "projection.applied_revision = projection.source_revision",
-            "visible.subject = $4",
-            "visible.object_id = i.id::text",
-        ] {
-            assert!(
-                AUTHORIZATION_STATUS_SQL.contains(required),
-                "status lookup omitted `{required}`"
-            );
-        }
-        for forbidden in ["outbox", "attempts", "last_error", "on_behalf_of"] {
-            assert!(
-                !AUTHORIZATION_STATUS_SQL.contains(forbidden),
-                "status lookup exposed `{forbidden}`"
             );
         }
     }

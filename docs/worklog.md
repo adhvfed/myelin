@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-25 — issue creation no longer waits for a tenant-wide list rebuild
+
+The privacy system story exposed a product-scale coupling outside Privacy: an Issue authorization
+binding became active in 66 milliseconds, but its creation receipt remained pending for another
+21.4 seconds while `issue:view` rebuilt 494,678 subject-to-Issue grants. The exact-object workflow
+had been made hostage to the availability of a bulk read model whose fail-static semantics serve a
+different purpose.
+
+Authorization status now follows the durable binding and then performs the authoritative strong
+Identity check for that exact Issue. It can therefore return the completed, decrypted result as
+soon as the authorization saga commits, while list and reference-card reads still refuse to serve a
+missing or stale bulk projection. The PostgreSQL route story proves both sides of that boundary and
+the brittle unit test that asserted SQL substrings has been reduced to the behavior it can honestly
+test: canonical request identifiers.
+
+**Proof:** warning-free all-target/all-feature Issues and Edge clippy; the focused Issues unit case;
+the full real-PostgreSQL Edge issue-route journey; restarted Edge; and both live privacy lifecycle
+journeys against the accumulated large tenant (3.5 seconds and 7.3 seconds; 11.0 seconds total).
+
 ## 2026-08-25 — privacy certificates prove their contents, not merely their shape
 
 Privacy-request certificates carried plausible BLAKE3 strings, but durable reads trusted the

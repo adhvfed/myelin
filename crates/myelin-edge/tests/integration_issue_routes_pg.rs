@@ -642,7 +642,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(active_retry.issue.title, title);
     assert_eq!(active_retry.zookie, activated_zookie);
     assert_eq!(active_retry_writer.calls.load(Ordering::SeqCst), 0);
-    let (status, not_yet_projected) = http(
+    let (status, active_before_projection) = http(
         address,
         "GET",
         &authorization_path,
@@ -650,8 +650,22 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         Vec::new(),
     )
     .await;
-    assert_eq!(status, 202);
-    assert_eq!(not_yet_projected["status"], "pending");
+    assert_eq!(status, 200);
+    assert_eq!(active_before_projection["status"], "active");
+    assert_eq!(active_before_projection["issue"]["id"], issue_id);
+    assert_eq!(active_before_projection["issue"]["title"], title);
+    let list_while_projection_is_missing = http(
+        address,
+        "GET",
+        "/v1/issues",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        list_while_projection_is_missing.0, 503,
+        "the point authorization receipt is independent of the fail-static bulk projection",
+    );
     issue_store
         .rebuild_effective_issue_view(&worker)
         .await
