@@ -598,6 +598,32 @@ fn tier_p_v2_reservation_gate_requires_the_same_exact_settlement_policy_as_v1() 
 }
 
 #[test]
+fn tier_p_settlement_refuses_unpriceable_usage_without_panicking() {
+    let usage = ResourceUsage {
+        cpu_seconds: i64::MAX as u64,
+        mem_byte_seconds: 0,
+    };
+    let priced = PricedCiJobUsage {
+        pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
+        memory_gb_seconds: 0,
+        cpu_wholesale: MicroUsd::ZERO,
+        cpu_markup: MicroUsd::ZERO,
+        memory_wholesale: MicroUsd::ZERO,
+        memory_markup: MicroUsd::ZERO,
+    };
+
+    assert_eq!(
+        validate_reservation_pricing_policy(
+            "ci-reserve:v2:run:budget-v1:a5:batch:job:item",
+            usage,
+            &priced,
+        ),
+        Err(CiJobPricingError::InvalidOutput),
+        "usage that cannot be represented by the pinned price must be refused, not overflow"
+    );
+}
+
+#[test]
 fn retry_attempt_accrual_is_fixed_size_and_projects_exact_usage() {
     let accrual = serde_json::json!({
         "version": 1,

@@ -102,11 +102,18 @@ pub(crate) fn validate_reservation_pricing_policy(
         return Ok(());
     }
     let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(PRICING_GIB_BYTES);
+    let cpu_wholesale = usage
+        .cpu_seconds
+        .checked_mul(MICRO_USD_PER_CPU_SECOND)
+        .ok_or(CiJobPricingError::InvalidOutput)?;
+    let memory_wholesale = memory_gb_seconds
+        .checked_mul(MICRO_USD_PER_GB_SECOND)
+        .ok_or(CiJobPricingError::InvalidOutput)?;
     let exact_operational_policy = priced.pricing_revision == TIER_P_OPERATIONAL_PRICING_REVISION
         && priced.memory_gb_seconds == memory_gb_seconds
-        && priced.cpu_wholesale == MicroUsd(usage.cpu_seconds * MICRO_USD_PER_CPU_SECOND)
+        && priced.cpu_wholesale == MicroUsd(cpu_wholesale)
         && priced.cpu_markup == MicroUsd::ZERO
-        && priced.memory_wholesale == MicroUsd(memory_gb_seconds * MICRO_USD_PER_GB_SECOND)
+        && priced.memory_wholesale == MicroUsd(memory_wholesale)
         && priced.memory_markup == MicroUsd::ZERO;
     if exact_operational_policy {
         Ok(())
