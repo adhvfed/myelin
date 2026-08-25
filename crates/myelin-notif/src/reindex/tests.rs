@@ -1,11 +1,45 @@
 use super::*;
 use crate::router::{build_router, InboxProjection, RoutedInboxItem, SignalRouter};
 use myelin_events::{Actor, Region as BusRegion, Timestamp};
-use myelin_events::{Consumer, DedupLedger, EmitContextBase, Message, OutboxStore};
+use myelin_events::{
+    CoCommitTx, Consumer, ConsumerName, DedupError, DedupLedger, DedupResult, DurableDedup,
+    EmitContextBase, EventId, Message, OutboxStore,
+};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::signals::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
+use std::sync::Arc;
+
+struct UnavailableDedup;
+
+impl DurableDedup for UnavailableDedup {
+    fn mark_handled(&self, _consumer: &ConsumerName, _event_id: &EventId) -> DedupResult<bool> {
+        Err(DedupError::Unavailable)
+    }
+
+    fn is_handled(&self, _consumer: &ConsumerName, _event_id: &EventId) -> DedupResult<bool> {
+        Err(DedupError::Unavailable)
+    }
+
+    fn revert(&self, _consumer: &ConsumerName, _event_id: &EventId) -> DedupResult<()> {
+        Err(DedupError::Unavailable)
+    }
+
+    fn forget(&self, _consumer: &ConsumerName, _event_id: &EventId) -> DedupResult<bool> {
+        Err(DedupError::Unavailable)
+    }
+
+    fn begin_co_commit(
+        &self,
+        _consumer: &ConsumerName,
+        _event_id: &EventId,
+        _tenant: &TenantId,
+        _region: &BusRegion,
+    ) -> DedupResult<(Box<dyn CoCommitTx>, bool)> {
+        Err(DedupError::Unavailable)
+    }
+}
 
 fn tenant() -> TenantId {
     TenantId("acme".into())
@@ -518,6 +552,97 @@ fn reindex_of_unknown_owner_is_a_loud_error() {
 }
 
 #[test]
+fn a_quarantined_snapshot_is_not_reported_as_a_rebuilt_inbox_item() {
+    let mut foreign_signal = signal(
+        "ci_run_failed",
+        Severity::Error,
+        "myelin://globex/ci/run/1",
+        "foreign-run",
+    );
+    foreign_signal.tenant = TenantId("globex".into());
+
+    let mut source = SignalReindexSource::new();
+    source.upsert(foreign_signal.clone(), 1);
+    let expected_event_id = signal_snapshot_draft(&foreign_signal, 1).event_id(&tenant());
+
+    let outbox_router = OutboxStore::new();
+    let (consumer, inbox) = live_router(&outbox_router);
+    let reindexer = NotifReindexer::new(&consumer);
+    let mut outbox = OutboxStore::new();
+
+    let error = reindexer
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            &[&source],
+            &mut outbox,
+            ctx_base(),
+        )
+        .expect_err("a quarantined delivery cannot produce a successful rebuild receipt");
+
+    assert_eq!(
+        error,
+        ReindexError::ReplayIncomplete {
+            event_id: expected_event_id.0,
+            state: ReplayFailure::Quarantined,
+        },
+        "the caller learns which snapshot was not applied without exposing its payload"
+    );
+    assert!(
+        inbox.is_empty(),
+        "the failed snapshot created no user-visible inbox item"
+    );
+    assert_eq!(
+        consumer.dead_letters().len(),
+        1,
+        "the malformed snapshot remains visible to an operator"
+    );
+}
+
+#[test]
+fn a_full_rebuild_without_dedup_storage_returns_no_success_receipt() {
+    let mut source = SignalReindexSource::new();
+    source.upsert(
+        signal(
+            "ci_run_failed",
+            Severity::Error,
+            "myelin://acme/ci/run/1",
+            "run-1",
+        ),
+        1,
+    );
+
+    let inbox = InboxProjection::new();
+    let consumer = build_router(
+        &tenant(),
+        inbox.clone(),
+        OutboxStore::new(),
+        DedupLedger::durable(Arc::new(UnavailableDedup)),
+    )
+    .expect("the test router is valid");
+    let reindexer = NotifReindexer::new(&consumer);
+    let mut outbox = OutboxStore::new();
+
+    let error = reindexer
+        .reindex(
+            &tenant(),
+            &notif_scope("inbox:all"),
+            None,
+            &[&source],
+            &mut outbox,
+            ctx_base(),
+        )
+        .expect_err("a full rebuild cannot reset dedup state while storage is unavailable");
+
+    assert_eq!(error, ReindexError::DedupUnavailable);
+    assert!(
+        inbox.is_empty(),
+        "no snapshot is applied against stale or unknown dedup state"
+    );
+}
+
+#[test]
 fn full_reindex_wipe_is_tenant_scoped() {
     let other = TenantId("globex".into());
     let inbox = InboxProjection::new();
@@ -703,6 +828,10 @@ fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
 fn reindex_error_display_is_informative() {
     let bus = ReindexError::Bus("no owner".into());
     let missing = ReindexError::MissingSnapshot("snap-abc".into());
+    let incomplete = ReindexError::ReplayIncomplete {
+        event_id: "snap-def".into(),
+        state: ReplayFailure::RetryScheduled,
+    };
     assert!(
         format!("{bus}").contains("bus re-emit failed"),
         "the Bus error names the bus failure"
@@ -715,6 +844,10 @@ fn reindex_error_display_is_informative() {
         format!("{bus}"),
         format!("{missing}"),
         "distinct variants render distinctly"
+    );
+    assert_eq!(
+        format!("{incomplete}"),
+        "notif reindex: snapshot snap-def was not applied (retry scheduled)"
     );
     assert!(!format!("{bus}").is_empty(), "the Display is not empty");
 }

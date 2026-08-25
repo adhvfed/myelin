@@ -45,6 +45,52 @@ pub enum ReindexError {
     Bus(String),
     DedupUnavailable,
     MissingSnapshot(String),
+    ReplayIncomplete {
+        event_id: String,
+        state: ReplayFailure,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayFailure {
+    Quarantined,
+    RetryScheduled,
+    DependencyUnavailable,
+    Throttled,
+}
+
+enum ReplayDisposition {
+    Applied,
+    Deduplicated,
+    Incomplete(ReplayFailure),
+}
+
+impl From<myelin_events::Delivered> for ReplayDisposition {
+    fn from(delivery: myelin_events::Delivered) -> Self {
+        match delivery {
+            myelin_events::Delivered::Acked => Self::Applied,
+            myelin_events::Delivered::Deduplicated => Self::Deduplicated,
+            myelin_events::Delivered::DeadLettered(_) => {
+                Self::Incomplete(ReplayFailure::Quarantined)
+            }
+            myelin_events::Delivered::Retried(_) => Self::Incomplete(ReplayFailure::RetryScheduled),
+            myelin_events::Delivered::DependencyUnavailable(_, _) => {
+                Self::Incomplete(ReplayFailure::DependencyUnavailable)
+            }
+            myelin_events::Delivered::Throttled(_) => Self::Incomplete(ReplayFailure::Throttled),
+        }
+    }
+}
+
+impl ReplayFailure {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Quarantined => "quarantined",
+            Self::RetryScheduled => "retry scheduled",
+            Self::DependencyUnavailable => "dependency unavailable",
+            Self::Throttled => "throttled",
+        }
+    }
 }
 
 impl std::fmt::Display for ReindexError {
@@ -57,6 +103,11 @@ impl std::fmt::Display for ReindexError {
             ReindexError::MissingSnapshot(id) => {
                 write!(f, "notif reindex: snapshot {id} not found in the outbox (re-emit did not stage it)")
             }
+            ReindexError::ReplayIncomplete { event_id, state } => write!(
+                f,
+                "notif reindex: snapshot {event_id} was not applied ({})",
+                state.name()
+            ),
         }
     }
 }
@@ -131,9 +182,15 @@ impl<'a> NotifReindexer<'a> {
                     subject: row.envelope.subject.0.clone(),
                     envelope: row.envelope.clone(),
                 };
-                match self.consumer.deliver(&msg) {
-                    myelin_events::Delivered::Deduplicated => receipt.signals_deduplicated += 1,
-                    _ => receipt.signals_replayed += 1,
+                match ReplayDisposition::from(self.consumer.deliver(&msg)) {
+                    ReplayDisposition::Applied => receipt.signals_replayed += 1,
+                    ReplayDisposition::Deduplicated => receipt.signals_deduplicated += 1,
+                    ReplayDisposition::Incomplete(state) => {
+                        return Err(ReindexError::ReplayIncomplete {
+                            event_id: event_id.0,
+                            state,
+                        });
+                    }
                 }
             }
         }

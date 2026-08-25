@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — notification rebuild receipts describe applied work
+
+Notification reindexing counted every delivery other than a duplicate as successfully replayed.
+That included quarantined snapshots, scheduled retries, unavailable dependencies, and tenant
+throttling, so an operator could receive a complete-looking receipt while the rebuilt inbox was
+missing rows.
+
+The rebuild now distinguishes applied, deduplicated, and incomplete delivery dispositions. Any
+incomplete snapshot returns a typed, payload-free error naming the deterministic event ID and safe
+state; no replay count or success receipt is produced. A full rebuild also has an explicit test for
+unavailable dedup storage, ensuring it cannot apply snapshots against unknown reset state.
+
+**Proof:** strict all-target/all-feature Notifications clippy; all 17 notification reindex unit
+stories and the notification replay contract/drill cases selected by that suite, including a
+quarantined cross-tenant snapshot that leaves the inbox empty and remains operator-visible;
+restarted Notifications; and all five live TypeScript notification-lifecycle journeys (107.42
+seconds total).
+
 ## 2026-08-26 — bus erasure survives a ledger outage without panicking
 
 The bus-erasure ledger still panicked on PostgreSQL write, point-read, and replay-set failures. A
