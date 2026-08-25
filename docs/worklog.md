@@ -1512,14 +1512,45 @@ no per-member inbox writes.
 
 The TypeScript story now states the product behavior directly: a reviewer joins a
 decision thread, receives no notification for their own reply, and is brought
-back when the founder answers. Explicit mute/unfollow is not yet surfaced; until
-then, participation is the only thread-follow action.
+back when the founder answers. At this checkpoint participation was the only
+thread-follow action; the next seam adds an explicit quiet control without
+discarding that durable participation history.
 
 Proof: all 273 Chat library tests; the real PostgreSQL reply, participant,
 notification, idempotency, false-root, and tombstone integration; warning-free
 Chat/Edge clippy across all targets and features; TypeScript typechecking; the
 focused red-to-green lifecycle story; and all eleven live Chat collaboration
 stories together.
+
+## 2026-08-25 — a followed thread can become quiet without becoming lost
+
+Following is now an explicit, durable property of a Chat participant rather than
+an inference a client has to reconstruct. Replying still follows a thread, but a
+person can mute it idempotently, see that state on the thread, and follow it again
+when the decision matters. Muting changes only notification delivery: it does not
+delete the participant, change their role, or erase how they joined the work. A
+later reply is an intentional act of participation and follows the thread again.
+
+Reply, follow, and mute all lock the same active root before changing participant
+state, so concurrent actions have one database order and the last user action
+wins. The forward-only `chat_0013` migration adds the delivery flag without
+changing the checksum of the participant migration already deployed. Both HTTP
+mutations recheck live room visibility and return the same content-free 404 as a
+private thread read or reply for an outsider.
+
+The end-to-end story exposed a neighboring attention bug: notification collapse
+incremented its counter but left a read or completed card hidden. Fresh activity
+now reopens ordinary finished work, preserves an explicit snooze, and advances
+provenance and recency monotonically so a late event cannot move the card backward.
+The story reads as a person working: join a decision, finish its current nudge,
+quiet it, observe uninterrupted work, return deliberately, and receive the next
+reply on the same durable card.
+
+Proof: all 273 Chat, 349 Notifications, and 360 Edge library tests; strict
+all-target, all-feature Clippy for all three crates; real PostgreSQL Chat
+co-commit and Notifications collapse/reopen integrations; TypeScript typechecking;
+and focused live privacy and mute/follow lifecycle stories after immutable
+migration and service restarts.
 
 ## 2026-08-25 — the CI completion path has names again
 

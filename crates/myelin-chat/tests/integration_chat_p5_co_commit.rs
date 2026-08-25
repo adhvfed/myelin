@@ -629,6 +629,71 @@ async fn a_reply_co_commits_one_addressed_notification_and_refuses_false_roots()
     .await
     .expect("replying starts following the thread durably");
     assert_eq!(follower, "bob");
+    let bob = PrincipalId("bob".into());
+    assert!(store
+        .thread_following(&conversation, &root, &bob)
+        .await
+        .expect("read the participant's initial following state"));
+    store
+        .set_thread_following(&conversation, &root, &bob, false)
+        .await
+        .expect("mute the followed thread");
+    store
+        .set_thread_following(&conversation, &root, &bob, false)
+        .await
+        .expect("repeating a mute is harmless");
+    assert!(!store
+        .thread_following(&conversation, &root, &bob)
+        .await
+        .expect("read the durable muted state"));
+
+    let mut muted_follow_up = new_msg(
+        &conversation,
+        "muted-root-author-follows-up",
+        "root-author",
+        "encrypted-muted-follow-up",
+    );
+    muted_follow_up.thread_root_id = Some(root.clone());
+    let muted_follow_up_id = store
+        .append_structured_co_commit(
+            &source,
+            muted_follow_up,
+            event_ids.mint().into(),
+            &event_ids,
+            &[],
+            attribution_for("alice"),
+            now(),
+            now(),
+        )
+        .await
+        .expect("the root author can keep working without nudging a muted participant");
+    let muted_signal_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox \
+         WHERE envelope ->> 'type_' = 'signal.opened' \
+           AND envelope -> 'payload' ->> 'subject' = $1 \
+           AND envelope -> 'payload' ->> 'notification_reason' = 'thread_watched'",
+    )
+    .bind(&thread_ref)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        muted_signal_count, 0,
+        "a muted participant stays out of the derived notification audience",
+    );
+
+    store
+        .set_thread_following(&conversation, &root, &bob, true)
+        .await
+        .expect("follow the thread deliberately");
+    store
+        .set_thread_following(&conversation, &root, &bob, true)
+        .await
+        .expect("repeating a follow is harmless");
+    assert!(store
+        .thread_following(&conversation, &root, &bob)
+        .await
+        .expect("read the restored following state"));
 
     let mut follow_up = new_msg(
         &conversation,
@@ -675,7 +740,7 @@ async fn a_reply_co_commits_one_addressed_notification_and_refuses_false_roots()
     .fetch_one(&admin)
     .await
     .unwrap();
-    assert_eq!(replied_events, 2, "each real reply has one domain event");
+    assert_eq!(replied_events, 3, "each real reply has one domain event");
 
     let mut nested = new_msg(&conversation, "nested", "bob", "nested");
     nested.thread_root_id = Some(reply_id.clone());
@@ -754,6 +819,7 @@ async fn a_reply_co_commits_one_addressed_notification_and_refuses_false_roots()
     delete_outbox_aggregate(&admin, &watched_signal_aggregate).await;
     delete_message_visibility(&admin, root.as_str()).await;
     delete_message_visibility(&admin, reply_id.as_str()).await;
+    delete_message_visibility(&admin, muted_follow_up_id.as_str()).await;
     delete_message_visibility(&admin, follow_up_id.as_str()).await;
     drop_store(&admin, &table).await;
 }

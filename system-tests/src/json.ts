@@ -17,6 +17,11 @@ export function string(value: unknown, context = "value"): string {
   return value;
 }
 
+export function boolean(value: unknown, context = "value"): boolean {
+  if (typeof value !== "boolean") throw new TypeError(`${context} must be a boolean`);
+  return value;
+}
+
 export function integer(value: unknown, context = "value"): number {
   if (!Number.isSafeInteger(value)) throw new TypeError(`${context} must be an integer`);
   return value as number;

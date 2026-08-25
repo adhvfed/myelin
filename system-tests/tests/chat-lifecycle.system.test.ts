@@ -1293,6 +1293,23 @@ describe("chat collaboration lifecycle", () => {
           expectedStatus: 404,
         },
       ),
+      reviewerClient.json(
+        `/v1/chat/threads/${encodeURIComponent(privateRoot)}/follow`,
+        {
+          method: "PUT",
+          body: {},
+          idempotencyKey: false,
+          expectedStatus: 404,
+        },
+      ),
+      reviewerClient.json(
+        `/v1/chat/threads/${encodeURIComponent(privateRoot)}/follow`,
+        {
+          method: "DELETE",
+          idempotencyKey: false,
+          expectedStatus: 404,
+        },
+      ),
     ]) {
       const denied = await probe;
       expect(denied.body).toMatchObject({ error: { code: "not_found" } });
@@ -1328,6 +1345,98 @@ describe("chat collaboration lifecycle", () => {
     expect(JSON.stringify(reviewersRoom)).not.toContain(privateWords);
     expect(JSON.stringify(reviewersRoom)).not.toContain(privateRoom.topic);
   });
+
+  test("lets a participant quiet a thread and return when the work matters again", async () => {
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("thread-following"),
+      topic: "Keep useful work within reach without making every reply an interruption",
+    });
+    const rootMessageId = await room.post(
+      systemClient,
+      "Should this migration wait for the compatibility window?",
+    );
+    await room.reply(
+      reviewerClient,
+      rootMessageId,
+      "I will follow the decision while we collect evidence.",
+    );
+
+    expect((await room.thread(reviewerClient, rootMessageId)).following).toBe(true);
+
+    await room.reply(systemClient, rootMessageId, "The first customer trace is ready.");
+    const threadRef =
+      `myelin://${systemTestConfig.tenant}/chat/thread/${rootMessageId}` +
+      `#thread-${rootMessageId}`;
+    const firstNudge = await eventually(
+      () => findInboxItem(reviewerClient, threadRef),
+      { description: "participation to make the decision thread followable" },
+    );
+    expect(firstNudge).toMatchObject({
+      reason: "thread_watched",
+      state: "unread",
+      coalesce_count: 1,
+    });
+    const firstNudgeId = string(firstNudge.id, "watched-thread inbox item id");
+    await reviewerClient.json(
+      `/v1/notif/inbox/${encodeURIComponent(firstNudgeId)}/read`,
+      { method: "POST", body: {}, idempotencyKey: false },
+    );
+    await eventually(
+      async () => {
+        const item = await findInboxItem(reviewerClient, threadRef);
+        return item?.state === "read" ? item : undefined;
+      },
+      { description: "the reviewer to finish the current thread notification" },
+    );
+
+    expect(await room.muteThread(reviewerClient, rootMessageId)).toBe(false);
+    expect(await room.muteThread(reviewerClient, rootMessageId)).toBe(false);
+    expect((await room.thread(reviewerClient, rootMessageId)).following).toBe(false);
+
+    await room.reply(
+      systemClient,
+      rootMessageId,
+      "A second trace arrived while the reviewer was focused elsewhere.",
+    );
+
+    // This later reply produces a direct notification after the muted reply in
+    // the same conversation. Seeing it gives the durable relay time to expose
+    // an accidental watched-thread signal before we assert that none exists.
+    const deliveryCheckpointRoot = await room.post(
+      reviewerClient,
+      "Tell me when the delivery checkpoint is visible.",
+    );
+    await room.reply(systemClient, deliveryCheckpointRoot, "The checkpoint is visible.");
+    const checkpointRef =
+      `myelin://${systemTestConfig.tenant}/chat/thread/${deliveryCheckpointRoot}` +
+      `#thread-${deliveryCheckpointRoot}`;
+    await eventually(
+      () => findInboxItem(reviewerClient, checkpointRef),
+      { description: "the post-mute delivery checkpoint to reach the reviewer" },
+    );
+    expect(await findInboxItem(reviewerClient, threadRef)).toMatchObject({
+      state: "read",
+      coalesce_count: 1,
+    });
+
+    expect(await room.followThread(reviewerClient, rootMessageId)).toBe(true);
+    expect(await room.followThread(reviewerClient, rootMessageId)).toBe(true);
+    expect((await room.thread(reviewerClient, rootMessageId)).following).toBe(true);
+    await room.reply(systemClient, rootMessageId, "The compatibility window can close now.");
+    const returnedNudge = await eventually(
+      async () => {
+        const item = await findInboxItem(reviewerClient, threadRef);
+        return item?.state === "unread" && item.coalesce_count === 2 ? item : undefined;
+      },
+      { description: "a deliberately followed thread to return to the reviewer's inbox" },
+    );
+    expect(returnedNudge).toMatchObject({
+      reason: "thread_watched",
+      state: "unread",
+      coalesce_count: 2,
+    });
+  }, 60_000);
 
   test("lets each engineer resume named private agent work without exposing the other workspace", async () => {
     const founder = await browserApprovedCliClient();

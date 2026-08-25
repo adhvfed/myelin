@@ -631,6 +631,7 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
     );
     let thread_root_author_index =
         super::pg::THREAD_ROOT_AUTHOR_INDEX_DDL.replace("{table}", MESSAGE_TABLE);
+    let thread_following = super::pg::THREAD_FOLLOWING_DDL.replace("{table}", MESSAGE_TABLE);
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
@@ -684,6 +685,11 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
             thread_root_author_index,
             THREAD_PARTICIPANT_TABLE,
         ),
+        Migration::plain_on(
+            "chat_0013_thread_following",
+            thread_following,
+            THREAD_PARTICIPANT_TABLE,
+        ),
     ])
 }
 
@@ -694,7 +700,7 @@ mod tests {
     #[test]
     fn migrations_create_and_tenant_scope_both_tables() {
         let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 12);
+        assert_eq!(migrations.0.len(), 13);
         for (migration, table) in migrations.0[..2]
             .iter()
             .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
@@ -742,6 +748,8 @@ mod tests {
             "myelin_make_tenant_scoped('{THREAD_PARTICIPANT_TABLE}')"
         )));
         assert_eq!(migrations.0[11].id, "chat_0012_thread_root_author");
+        assert_eq!(migrations.0[12].id, "chat_0013_thread_following");
+        assert!(migrations.0[12].ddl.contains("notifications_enabled"));
         assert!(migrations.0[11].ddl.contains(&format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {MESSAGE_TABLE}_thread_root_author"
         )));

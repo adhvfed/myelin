@@ -363,7 +363,8 @@ impl PgMessageStore {
             "INSERT INTO {} \
                (tenant_id, region, conversation_id, thread_root_id, principal_id, role) \
              VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT DO NOTHING",
+             ON CONFLICT (tenant_id, region, conversation_id, thread_root_id, principal_id) \
+             DO UPDATE SET notifications_enabled = true",
             self.thread_participant_table(),
         ))
         .bind(&message.conv.tenant)

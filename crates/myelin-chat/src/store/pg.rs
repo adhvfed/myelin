@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS {table}_thread_participant (
       ON DELETE CASCADE
 );";
 
+pub(crate) const THREAD_FOLLOWING_DDL: &str = "\
+ALTER TABLE {table}_thread_participant
+    ADD COLUMN IF NOT EXISTS notifications_enabled boolean NOT NULL DEFAULT true;";
+
 pub(crate) const THREAD_ROOT_AUTHOR_INDEX_DDL: &str = "\
 CREATE UNIQUE INDEX IF NOT EXISTS {table}_thread_root_author
     ON {table}_thread_participant
@@ -111,6 +115,11 @@ impl PgMessageStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("thread participant DDL: {e}")))?;
+        let following_ddl = THREAD_FOLLOWING_DDL.replace("{table}", &self.table);
+        sqlx::raw_sql(&following_ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Cold(format!("thread following DDL: {e}")))?;
         let root_author_index_ddl = THREAD_ROOT_AUTHOR_INDEX_DDL.replace("{table}", &self.table);
         sqlx::raw_sql(&root_author_index_ddl)
             .execute(&self.pool)

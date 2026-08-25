@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { SystemTestClient } from "../client.js";
-import { array, record, string, type JsonRecord } from "../json.js";
+import { array, boolean, record, string, type JsonRecord } from "../json.js";
 
 export type MessageNode =
   | { kind: "mention"; principal_id: string }
@@ -76,7 +76,7 @@ export class Conversation {
     client: SystemTestClient,
     rootMessageId: string,
     limit = 100,
-  ): Promise<{ ref: string; root: JsonRecord; replies: JsonRecord[] }> {
+  ): Promise<{ ref: string; following: boolean; root: JsonRecord; replies: JsonRecord[] }> {
     const response = await client.json(
       `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/messages?limit=${limit}`,
     );
@@ -86,10 +86,27 @@ export class Conversation {
     }
     return {
       ref: string(response.body.ref, "thread reference"),
+      following: boolean(response.body.following, "thread following state"),
       root: record(response.body.root, "thread root message"),
       replies: array(response.body.items, "thread replies")
         .map((item) => record(item, "thread reply")),
     };
+  }
+
+  async followThread(client: SystemTestClient, rootMessageId: string): Promise<boolean> {
+    const response = await client.json(
+      `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/follow`,
+      { method: "PUT", body: {}, idempotencyKey: false },
+    );
+    return boolean(response.body.following, "followed thread state");
+  }
+
+  async muteThread(client: SystemTestClient, rootMessageId: string): Promise<boolean> {
+    const response = await client.json(
+      `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/follow`,
+      { method: "DELETE", idempotencyKey: false },
+    );
+    return boolean(response.body.following, "muted thread state");
   }
 
   async messages(client: SystemTestClient, limit = 100): Promise<JsonRecord[]> {
