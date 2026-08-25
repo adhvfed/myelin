@@ -62,6 +62,7 @@ pub mod pg;
 pub mod pg_migrator;
 pub mod pgrelay;
 pub mod placement_durable;
+pub mod privacy_request_durable;
 pub mod provider;
 pub mod pseudonym_durable;
 pub mod reerase_durable;
@@ -295,6 +296,13 @@ pub use placement_durable::{
     cell_value_invariant_migrations, placement_durable_migrations, DurableCellProvisioningRow,
     DurableCellRow, DurableLocalTenantRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
     DurablePlacementBacking, DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
+};
+pub use privacy_request_durable::{
+    privacy_request_durable_migrations, ClaimPrivacyRequestOutcome, CompletePrivacyRequestOutcome,
+    CreatePrivacyRequestOutcome, DurablePrivacyRequest, DurablePrivacyRequestStore,
+    NewPrivacyRequest, PrivacyHolderReceipt, PrivacyRequestCertificate, PrivacyRequestKind,
+    PrivacyRequestLease, PrivacyRequestScope, PrivacyRequestState, MAX_PRIVACY_HOLDER_RECEIPTS,
+    PRIVACY_REQUEST_DEADLINE_DAYS, PRIVACY_REQUEST_MIGRATION,
 };
 pub use provider::{
     all_durable_migrations, durable_migration_groups, foundation_migrations, BootstrapError,
