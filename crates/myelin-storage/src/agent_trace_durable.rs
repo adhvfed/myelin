@@ -790,10 +790,7 @@ impl DurableAgentTraceStore {
         // restoring any backup taken before this point (the re-erase pass
         // replays this ledger against a restored database). offsets are unix
         // seconds so a restore point can be compared against wall time.
-        let erased_at_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let erased_at_secs = unix_seconds(std::time::SystemTime::now())?;
         crate::reerase_durable::DurablePostPitLedger::new(self.provider.clone())
             .record(&tenant, &SubjectId::new(subject.clone()), erased_at_secs)
             .await
@@ -1450,6 +1447,16 @@ fn nonnegative_erasure_count(count: i64) -> Result<u64, AgentTraceError> {
     })
 }
 
+fn unix_seconds(time: std::time::SystemTime) -> Result<u64, AgentTraceError> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| {
+            AgentTraceError::Storage(
+                "system clock is before the Unix epoch; refusing an unorderable erasure".into(),
+            )
+        })
+}
+
 async fn erase_for_owner_on_connection(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
@@ -1789,6 +1796,19 @@ mod tests {
         assert_eq!(
             store.write(&tenant, trace("Done.")).unwrap_err(),
             AgentTraceError::Storage("in-memory trace state is unavailable".into()),
+        );
+    }
+
+    #[test]
+    fn erasure_refuses_a_clock_value_that_cannot_be_ordered_after_a_restore_point() {
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            unix_seconds(before_epoch).unwrap_err(),
+            AgentTraceError::Storage(
+                "system clock is before the Unix epoch; refusing an unorderable erasure".into()
+            )
         );
     }
 }

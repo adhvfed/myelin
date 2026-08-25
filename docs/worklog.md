@@ -1636,15 +1636,45 @@ creates recoverable agent work, submits and replays one request, reads its
 status and three-holder certificate, then proves both the old result and all
 future processing stay unavailable. It completed in 13.68 seconds.
 
+## 2026-08-25 — restore replay now restores the refusal, not only the key
+
+The old restore drill replayed a post-PIT erasure through a generic KMS pass
+whose other holders were no-ops. It proved the resurrected key was destroyed at
+that instant, but it did not recreate the durable agent-data subject marker. A
+later agent run could therefore treat the restored subject as active and mint a
+replacement key. The drill was green while the user-level promise was still
+broken.
+
+The production restore primitive now selects post-restore subjects from the
+preserved live ledger and sends each one through `DurableAgentTraceStore`, the
+same holder used by the privacy request. That path deletes restored traces,
+model replay, and tool effects; destroys and verifies the key; and commits the
+absorbing marker. A fresh invocation safely replays the same cutoff and returns
+the original durable counts without reopening processing.
+
+Edge now exposes this as the maintenance-only `privacy-reerase` command. It
+requires a canonical restore timestamp, exact cell confirmation, explicit
+confirmation that serving processes are stopped, and a separately preserved
+ledger database. Database identity comparison ignores credentials, so changing
+users cannot disguise the restored target as its own supposed live ledger. The
+success receipt contains aggregate counts only. The complete operator sequence,
+retry rules, and failure interpretation live in
+`docs/runbooks/post-restore-agent-data-reerase.md`.
+
+Proof: three focused command/safety tests, warning-free all-target/all-feature
+Edge and Storage Clippy, and the real 35.69-second `pg_dump`/`pg_restore` story.
+The restored database must reject a brand-new trace after replay and a fresh
+operator pass must converge as already erased.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
    agent-data erase now writes the post-PIT ledger and the re-erase pass is
-   drilled against a real dump. remaining: the restore RUNBOOK (an ops
-   entrypoint that runs the replay after a production restore — today it is
-   a library call + drill), and the library-level erase paths (chat, issues,
-   git crypto-shred) still do not write the ledger because nothing wires
-   them to a user surface yet (gap 2).
+   drilled against a real dump. the maintenance command and runbook replay it
+   through the production holder and restore the absorbing processing block.
+   remaining: the library-level erase paths (chat, issues, git crypto-shred)
+   still do not write the ledger because nothing wires them to a user surface
+   yet (gap 2).
 2. **DSR has one truthful product slice, not full holder coverage.** durable
    submit/status/certificate is now wired for the real agent-data holder and
    exercised through Edge. chat/issues/git erasure flows still exist as

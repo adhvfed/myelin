@@ -1,4 +1,5 @@
 mod agent_thread_operator;
+mod privacy_restore_operator;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Limited};
@@ -893,9 +894,21 @@ async fn main() {
             let core = compose_core(runtime.cell_id).await;
             agent_thread_operator::run(core.provider, &args[1..]).await;
         }
+        Some("privacy-reerase") => {
+            let runtime = runtime_config_or_exit(false);
+            let core = compose_core(runtime.cell_id).await;
+            privacy_restore_operator::run(
+                core.provider,
+                core.kms,
+                core.handle,
+                &core.cell_id,
+                &args[1..],
+            )
+            .await;
+        }
         Some(other) => {
             eprintln!(
-                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke | secret | agent-thread-reconcile)"
+                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke | secret | agent-thread-reconcile | privacy-reerase)"
             );
             std::process::exit(2);
         }
