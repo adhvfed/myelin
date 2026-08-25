@@ -229,7 +229,8 @@ fn cdc_4_7_ci_job_is_reauthorized_immediately_before_launch() {
         }
     );
 
-    svc.tear_down_run_token_in(&s, &token, &ts("2026-06-19T00:02:00Z"));
+    svc.tear_down_run_token_in(&s, &token, &ts("2026-06-19T00:02:00Z"))
+        .expect("record run teardown");
     assert_eq!(
         authorizer.authorize_ci_job(
             &s,
@@ -405,7 +406,8 @@ fn cdc_4_7_teardown_and_auto_expire_refuse_the_token() {
         &ts("2026-06-19T00:01:00Z")
     ));
 
-    svc.tear_down_run_token_in(&s, &token, &ts("2026-06-19T00:01:30Z"));
+    svc.tear_down_run_token_in(&s, &token, &ts("2026-06-19T00:01:30Z"))
+        .expect("record resumed-run teardown");
     assert!(
         !dispatch_under_token_is_honoured(&svc, &s, &token, &ts("2026-06-19T00:01:31Z")),
         "the consumer refuses a torn-down token (the immediate deny)"

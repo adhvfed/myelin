@@ -133,7 +133,7 @@ impl RunTokenRevoker for IdentityRunRevoker {
         let now = timestamp_from_epoch(now_secs)
             .unwrap_or_else(|_| Timestamp("9999-12-31T23:59:59Z".into()));
         self.revocations
-            .try_tear_down_run_token(&self.scope, jti, now)
+            .tear_down_run_token(&self.scope, jti, now)
             .map_err(|error| error.to_string())?;
         Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
     }

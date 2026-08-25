@@ -386,7 +386,8 @@ mod tests {
             &scope,
             &RevokeTarget::Principal(creator.principal_id.clone()),
             Timestamp("2026-07-15T00:00:00Z".into()),
-        );
+        )
+        .expect("record creator revocation");
         let authz = authorizer(sbc);
         assert!(!authz.authorize_repo(&creator, &repo, RepoAccess::Read));
         assert!(!authz.authorize_repo(&creator, &repo, RepoAccess::Write));

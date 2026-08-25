@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — durable revocation failures reach the caller
+
+The revocation store still used process panics for denylist and run-teardown writes, while its
+diagnostic count translated a database outage into an empty denylist. That was especially unsafe
+after irreversible work: pseudonym erasure could destroy a subject key and then panic while
+disabling the principal, and token minting could hand control to an infallible persistence call.
+
+Every revocation mutation now returns its durable result, and the shorter panic wrappers are gone.
+Token minting refuses to return credential material unless its run lifetime was recorded. Erasure
+and restore replay withhold their receipts until principal disablement succeeds. Agent-session,
+agent-host, operator, and MCP shutdown boundaries either propagate the failure or terminate with a
+clear error; failed writes do not increment success telemetry. The diagnostic count is fallible too,
+so unavailable storage can no longer resemble a legitimately empty tenant partition.
+
+**Proof:** all 424 identity library cases; warning-free strict clippy across Identity, Agent Host,
+MCP, Edge, and CI Control Plane; a workspace-wide all-target/all-feature compile; all four
+real-PostgreSQL durable-revocation journeys, including closed-pool failure of every mutation and a
+fresh-provider retry (0.20 seconds total); restarted affected services; and both live TypeScript
+private-agent-thread journeys, including fresh-context resumption and OpenSSH workspace access
+(7.52 seconds total).
+
 ## 2026-08-26 — interrupted pseudonym erasure resumes without a process panic
 
 Pseudonym-map deletion and the restore-replay ledger still treated PostgreSQL failures as reasons to

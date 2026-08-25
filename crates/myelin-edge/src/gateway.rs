@@ -2342,12 +2342,14 @@ mod git_wire_basic_auth_tests {
         }
         let revocations = RevocationStore::new();
         if purpose.is_run_scoped() {
-            revocations.register_run_token_ttl(
-                &scope,
-                jti,
-                myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
-                myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
-            );
+            revocations
+                .register_run_token_ttl(
+                    &scope,
+                    jti,
+                    myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
+                    myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+                )
+                .expect("record seeded run lifetime");
         }
         let authn = Arc::new(CapabilityAuthenticator::with_verifier(
             store,

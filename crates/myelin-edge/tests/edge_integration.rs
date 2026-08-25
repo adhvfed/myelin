@@ -333,11 +333,13 @@ async fn revoked_token_is_401() {
     let h = bearer(&token);
     let (ok, _b) = http(addr, "GET", "/v1/whoami", &hdr(&h), vec![]).await;
     assert_eq!(ok, 200, "live token authenticates before revocation");
-    revocations.revoke(
-        &admin_scope(TENANT),
-        &RevokeTarget::Jti("jti-rev".into()),
-        Timestamp("2026-06-27T00:00:00Z".into()),
-    );
+    revocations
+        .revoke(
+            &admin_scope(TENANT),
+            &RevokeTarget::Jti("jti-rev".into()),
+            Timestamp("2026-06-27T00:00:00Z".into()),
+        )
+        .expect("record revoked token");
     let (status, _body) = http(addr, "GET", "/v1/whoami", &hdr(&h), vec![]).await;
     assert_eq!(status, 401, "a revoked token fails closed at the edge");
 }

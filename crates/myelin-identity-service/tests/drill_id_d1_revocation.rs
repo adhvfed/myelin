@@ -85,7 +85,8 @@ fn id_d1_scim_disable_denies_every_surface_within_bound() {
         &acme,
         &PrincipalId("p:alice".into()),
         Timestamp(disabled_at.into()),
-    );
+    )
+    .expect("record principal disablement");
 
     let mut stale_regrant_count: i64 = 0;
     let mut worst_deny_latency_secs: i64 = 0;
@@ -160,7 +161,8 @@ fn id_d1_revoke_is_idempotent_across_a_crash() {
         &acme,
         &PrincipalId("p:alice".into()),
         Timestamp("2026-06-19T01:00:00Z".into()),
-    );
+    )
+    .expect("record principal disablement after cache recovery");
     assert_eq!(
         svc.check(
             &subject("p:alice"),
@@ -190,9 +192,10 @@ fn id_d1_revoke_is_idempotent_across_a_crash() {
         &acme,
         &PrincipalId("p:alice".into()),
         Timestamp("2026-06-19T09:00:00Z".into()),
-    );
+    )
+    .expect("record idempotent principal disablement");
     assert_eq!(
-        s7.revocation_count(&acme),
+        s7.revocation_count(&acme).expect("count revocations"),
         1,
         "a double-revoke across a crash is a no-op (idempotent even on crash)"
     );

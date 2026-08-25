@@ -181,8 +181,10 @@ impl McpServer {
             Ok(())
         })();
 
-        self.teardown();
-        result
+        let teardown = self
+            .teardown()
+            .map_err(|error| std::io::Error::other(format!("run-token teardown failed: {error}")));
+        result.and(teardown)
     }
 
     fn initialize_result(&self) -> Value {
@@ -295,10 +297,11 @@ impl McpServer {
         Ok(call_result_json(name, &outcome))
     }
 
-    pub fn teardown(&self) {
+    pub fn teardown(&self) -> Result<(), String> {
         if let Some(router) = &self.router {
-            router.teardown(&(self.clock)());
+            router.teardown(&(self.clock)())?;
         }
+        Ok(())
     }
 }
 

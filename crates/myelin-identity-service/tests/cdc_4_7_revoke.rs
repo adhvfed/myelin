@@ -105,7 +105,8 @@ fn cdc_4_7_revoked_principal_refused_across_surfaces() {
         &s,
         &PrincipalId("p:alice".into()),
         ts("2026-06-19T01:00:00Z"),
-    );
+    )
+    .expect("record principal disablement");
 
     assert!(
         !surface_honours_session(&svc, &subject("p:alice"), "view", &obj),
@@ -136,10 +137,14 @@ fn cdc_4_7_revoke_is_idempotent() {
     let s = scope("acme");
     let store = RevocationStore::new();
     let target = RevokeTarget::Principal(PrincipalId("p:alice".into()));
-    store.revoke(&s, &target, ts("2026-06-19T00:00:00Z"));
-    store.revoke(&s, &target, ts("2026-06-19T09:00:00Z"));
+    store
+        .revoke(&s, &target, ts("2026-06-19T00:00:00Z"))
+        .expect("record first revocation");
+    store
+        .revoke(&s, &target, ts("2026-06-19T09:00:00Z"))
+        .expect("record idempotent revocation");
     assert_eq!(
-        store.revocation_count(&s),
+        store.revocation_count(&s).expect("count revocations"),
         1,
         "a double-revoke is a no-op (idempotent - the denylist holds it once)"
     );

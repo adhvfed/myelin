@@ -116,22 +116,32 @@ impl RevocationStore {
         &self.telemetry
     }
 
-    pub fn revoke(&self, scope: &TenantScope, target: &RevokeTarget, now: Timestamp) {
+    pub fn revoke(
+        &self,
+        scope: &TenantScope,
+        target: &RevokeTarget,
+        now: Timestamp,
+    ) -> Result<(), myelin_storage::ProviderError> {
         let (kind, handle) = match target {
             RevokeTarget::Jti(jti) => (RevokedKind::Jti, jti.clone()),
             RevokeTarget::Principal(pid) => (RevokedKind::Principal, pid.0.clone()),
         };
-        self.insert(scope, kind, handle, now, None);
+        self.insert(scope, kind, handle, now, None)
     }
 
-    pub fn disable_principal(&self, scope: &TenantScope, principal: &PrincipalId, now: Timestamp) {
+    pub fn disable_principal(
+        &self,
+        scope: &TenantScope,
+        principal: &PrincipalId,
+        now: Timestamp,
+    ) -> Result<(), myelin_storage::ProviderError> {
         self.insert(
             scope,
             RevokedKind::Principal,
             principal.0.clone(),
             now,
             None,
-        );
+        )
     }
 
     pub fn register_run_token_ttl(
@@ -140,23 +150,17 @@ impl RevocationStore {
         jti: &str,
         now: Timestamp,
         expires_at: Timestamp,
-    ) {
+    ) -> Result<(), myelin_storage::ProviderError> {
         self.insert(
             scope,
             RevokedKind::Jti,
             jti.to_string(),
             now,
             Some(expires_at),
-        );
+        )
     }
 
-    pub fn tear_down_run_token(&self, scope: &TenantScope, jti: &str, now: Timestamp) {
-        self.try_tear_down_run_token(scope, jti, now).expect(
-            "durable run-token teardown must persist (fail-closed: never a silent lost teardown)",
-        );
-    }
-
-    pub fn try_tear_down_run_token(
+    pub fn tear_down_run_token(
         &self,
         scope: &TenantScope,
         jti: &str,
@@ -291,22 +295,24 @@ impl RevocationStore {
         }
     }
 
-    pub fn revocation_count(&self, scope: &TenantScope) -> usize {
+    pub fn revocation_count(
+        &self,
+        scope: &TenantScope,
+    ) -> Result<usize, myelin_storage::ProviderError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
                 let (t, r) = (scope.tenant().0.clone(), scope.region().0.clone());
                 let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                guard
+                Ok(guard
                     .mirror
                     .keys()
                     .filter(|(kt, kr, _, _)| *kt == t && *kr == r)
-                    .count()
+                    .count())
             }
             RevocationBackend::Pg(pg) => pg
                 .block(pg.backing.count(&scope.tenant().0))
-                .map(|n| n as usize)
-                .unwrap_or(0),
+                .map(|n| n as usize),
         }
     }
 
@@ -317,7 +323,7 @@ impl RevocationStore {
         handle: String,
         now: Timestamp,
         expires_at: Option<Timestamp>,
-    ) {
+    ) -> Result<(), myelin_storage::ProviderError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(inner) => {
@@ -342,13 +348,11 @@ impl RevocationStore {
                     &handle,
                     &now.0,
                     expires_at.as_ref().map(|t| t.0.as_str()),
-                ))
-                .expect(
-                    "durable revocation must persist (fail-closed: never a silent lost revoke)",
-                );
+                ))?;
             }
         }
         self.telemetry.observe();
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -430,7 +434,8 @@ mod tests {
         ];
         for (exp, now) in cases {
             let s7 = RevocationStore::new();
-            s7.register_run_token_ttl(&acme, "run-jti", ts("2026-06-19T00:00:00Z"), ts(exp));
+            s7.register_run_token_ttl(&acme, "run-jti", ts("2026-06-19T00:00:00Z"), ts(exp))
+                .expect("in-memory run lifetime is recorded");
             assert!(
                 !s7.is_revoked(&acme, &run, &ts(now)),
                 "is_revoked: now={now} is at/past expires_at={exp} → token expired (not revoked); a \
@@ -449,7 +454,8 @@ mod tests {
             "run-jti",
             ts("2026-06-19T00:00:00Z"),
             ts("2026-06-19T02:05:00+02:00"),
-        );
+        )
+        .expect("in-memory run lifetime is recorded");
         assert!(s7.is_revoked(&acme, &run, &ts("2026-06-19T00:04:00Z")));
         assert_eq!(
             s7.run_token_state(&acme, &run, &ts("2026-06-19T00:04:00Z")),
@@ -462,7 +468,8 @@ mod tests {
             "run-jti",
             ts("2026-06-19T00:00:00Z"),
             ts("not-a-timestamp"),
-        );
+        )
+        .expect("in-memory run lifetime is recorded");
         assert!(
             s7.is_revoked(&acme, &run, &ts("2026-06-19T00:04:00Z")),
             "a malformed expires_at fails CLOSED: the handle stays revoked (deny), never reads not-revoked"
@@ -478,7 +485,8 @@ mod tests {
             "run-jti",
             ts("2026-06-19T00:00:00Z"),
             ts("2026-06-19T00:05:00Z"),
-        );
+        )
+        .expect("in-memory run lifetime is recorded");
         assert!(
             s7.is_revoked(&acme, &run, &ts("garbage-now")),
             "a malformed `now` fails CLOSED (stays revoked)"
@@ -491,7 +499,8 @@ mod tests {
         let acme = scope("acme");
         let jti = RevokeTarget::Jti("jti-1".into());
         assert!(!s7.is_revoked(&acme, &jti, &ts("2026-06-19T00:00:00Z")));
-        s7.revoke(&acme, &jti, ts("2026-06-19T00:00:00Z"));
+        s7.revoke(&acme, &jti, ts("2026-06-19T00:00:00Z"))
+            .expect("in-memory revocation is recorded");
         assert!(
             s7.is_revoked(&acme, &jti, &ts("2026-06-19T00:00:01Z")),
             "a revoked jti is on the denylist (deny-on-denylisted)"
@@ -503,10 +512,12 @@ mod tests {
         let s7 = RevocationStore::new();
         let acme = scope("acme");
         let jti = RevokeTarget::Jti("jti-1".into());
-        s7.revoke(&acme, &jti, ts("2026-06-19T00:00:00Z"));
-        s7.revoke(&acme, &jti, ts("2026-06-19T09:00:00Z"));
+        s7.revoke(&acme, &jti, ts("2026-06-19T00:00:00Z"))
+            .expect("first revocation is recorded");
+        s7.revoke(&acme, &jti, ts("2026-06-19T09:00:00Z"))
+            .expect("idempotent revocation is recorded");
         assert_eq!(
-            s7.revocation_count(&acme),
+            s7.revocation_count(&acme).expect("count revocations"),
             1,
             "a double-revoke does not grow the denylist (idempotent)"
         );
@@ -531,7 +542,8 @@ mod tests {
         let s7 = RevocationStore::new();
         let acme = scope("acme");
         let jti = RevokeTarget::Jti("jti-1".into());
-        s7.revoke(&acme, &jti, ts("2026-06-19T00:00:00Z"));
+        s7.revoke(&acme, &jti, ts("2026-06-19T00:00:00Z"))
+            .expect("in-memory revocation is recorded");
 
         {
             let mut guard = s7.lock();
@@ -550,8 +562,9 @@ mod tests {
             s7.is_revoked(&acme, &jti, &ts("2026-06-19T00:00:01Z")),
             "recovery rebuilds the denylist from the durable mirror (no revoke lost)"
         );
-        s7.revoke(&acme, &jti, ts("2026-06-19T09:00:00Z"));
-        assert_eq!(s7.revocation_count(&acme), 1);
+        s7.revoke(&acme, &jti, ts("2026-06-19T09:00:00Z"))
+            .expect("idempotent revocation is recorded");
+        assert_eq!(s7.revocation_count(&acme).expect("count revocations"), 1);
     }
 
     #[test]
@@ -563,7 +576,8 @@ mod tests {
             "run-jti",
             ts("2026-06-19T00:00:00Z"),
             ts("2026-06-19T00:05:00Z"),
-        );
+        )
+        .expect("in-memory run lifetime is recorded");
         let jti = RevokeTarget::Jti("run-jti".into());
         assert!(s7.is_revoked(&acme, &jti, &ts("2026-06-19T00:02:00Z")));
         assert!(!s7.is_revoked(&acme, &jti, &ts("2026-06-19T00:06:00Z")));
@@ -575,7 +589,8 @@ mod tests {
         let acme = scope("acme");
         let evil = scope("evil-corp");
         let pid = PrincipalId("p:alice".into());
-        s7.disable_principal(&acme, &pid, ts("2026-06-19T00:00:00Z"));
+        s7.disable_principal(&acme, &pid, ts("2026-06-19T00:00:00Z"))
+            .expect("in-memory principal disablement is recorded");
 
         let target = RevokeTarget::Principal(pid.clone());
         assert!(
@@ -606,12 +621,14 @@ mod tests {
             &acme,
             &RevokeTarget::Jti("jti-1".into()),
             ts("2026-06-19T00:00:00Z"),
-        );
+        )
+        .expect("in-memory revocation is recorded");
         s7.disable_principal(
             &acme,
             &PrincipalId("p:bob".into()),
             ts("2026-06-19T00:00:01Z"),
-        );
+        )
+        .expect("in-memory principal disablement is recorded");
         assert_eq!(
             s7.telemetry().revocation_count(),
             2,

@@ -580,9 +580,10 @@ impl GovernedRouter {
         self.state.borrow().fatal
     }
 
-    pub fn teardown(&self, now: &Timestamp) {
+    pub fn teardown(&self, now: &Timestamp) -> Result<(), String> {
         self.minter
-            .teardown(&self.principal.scope, &self.current_token(), now);
+            .teardown(&self.principal.scope, &self.current_token(), now)
+            .map_err(|error| error.to_string())
     }
 
     pub fn audit(&self) -> Vec<AuditEntry> {

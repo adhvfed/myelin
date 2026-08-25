@@ -312,13 +312,17 @@ async fn revocation_family(
     let run_target = RevokeTarget::Jti(format!("run-{run}"));
 
     if writing {
-        store.revoke(&s, &jti, Timestamp("2026-06-26T00:00:00Z".into()));
-        store.register_run_token_ttl(
-            &s,
-            &format!("run-{run}"),
-            Timestamp("2026-06-26T00:00:00Z".into()),
-            Timestamp("2026-06-26T00:05:00Z".into()),
-        );
+        store
+            .revoke(&s, &jti, Timestamp("2026-06-26T00:00:00Z".into()))
+            .map_err(|error| format!("record revocation: {error}"))?;
+        store
+            .register_run_token_ttl(
+                &s,
+                &format!("run-{run}"),
+                Timestamp("2026-06-26T00:00:00Z".into()),
+                Timestamp("2026-06-26T00:05:00Z".into()),
+            )
+            .map_err(|error| format!("record run-token lifetime: {error}"))?;
         return Ok(Outcome::Ready(serde_json::json!({})));
     }
 

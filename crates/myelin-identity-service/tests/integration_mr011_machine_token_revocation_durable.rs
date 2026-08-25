@@ -109,12 +109,14 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
     let store1 =
         RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     let sc = tenant_scope(&tenant, &region);
-    store1.register_run_token_ttl(
-        &sc,
-        "mr011-jti",
-        Timestamp(NOW_RFC3339.into()),
-        Timestamp("2026-06-26T01:00:00Z".into()),
-    );
+    store1
+        .register_run_token_ttl(
+            &sc,
+            "mr011-jti",
+            Timestamp(NOW_RFC3339.into()),
+            Timestamp("2026-06-26T01:00:00Z".into()),
+        )
+        .expect("persist run lifetime");
     let verifier1: Arc<dyn myelin_identity_service::TokenVerifier> =
         Arc::new(PasetoCapabilityVerifier::new(anchor.clone()).with_clock(|| NOW_UNIX));
     let auth1 = CapabilityAuthenticator::with_verifier(
@@ -134,7 +136,9 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
         "tenant from the verified token"
     );
 
-    store1.tear_down_run_token(&sc, "mr011-jti", Timestamp(NOW_RFC3339.into()));
+    store1
+        .tear_down_run_token(&sc, "mr011-jti", Timestamp(NOW_RFC3339.into()))
+        .expect("persist run teardown");
     let denied = auth1.authenticate(&cred, None);
     assert!(
         matches!(denied, Err(myelin_identity::AuthzError::FailClosed(_))),
@@ -166,12 +170,14 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
         scheme: "ci".into(),
         material: fresh,
     };
-    store2.register_run_token_ttl(
-        &sc,
-        "mr011-jti-fresh",
-        Timestamp(NOW_RFC3339.into()),
-        Timestamp("2026-06-26T01:00:00Z".into()),
-    );
+    store2
+        .register_run_token_ttl(
+            &sc,
+            "mr011-jti-fresh",
+            Timestamp(NOW_RFC3339.into()),
+            Timestamp("2026-06-26T01:00:00Z".into()),
+        )
+        .expect("persist fresh run lifetime");
     assert!(
         auth2.authenticate(&fresh_cred, None).is_ok(),
         "an un-revoked token from the same cell still authenticates (the deny is handle-specific)"

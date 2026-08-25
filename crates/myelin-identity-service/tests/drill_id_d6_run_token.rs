@@ -113,7 +113,8 @@ fn id_d6_killed_run_token_revoked_and_auto_expires_within_run_life() {
         );
     }
 
-    svc.tear_down_run_token_in(&acme, &token, &ts(killed_at));
+    svc.tear_down_run_token_in(&acme, &token, &ts(killed_at))
+        .expect("record run teardown");
 
     let mut stale_token_survival: i64 = 0;
     let mut worst_revocation_lag_secs: i64 = 0;

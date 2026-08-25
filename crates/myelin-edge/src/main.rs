@@ -1627,7 +1627,12 @@ async fn operator_revoke(core: ComposedCore, args: &[String]) {
         ),
         Region(region.clone()),
     );
-    revocations.revoke(&scope, &RevokeTarget::Jti(jti.clone()), now_rfc3339());
+    if let Err(error) = revocations.revoke(&scope, &RevokeTarget::Jti(jti.clone()), now_rfc3339()) {
+        eprintln!(
+            "edge revoke: durable denylist write failed for tenant `{tenant}` region `{region}`: {error}"
+        );
+        std::process::exit(1);
+    }
     eprintln!("edge revoke: token jti `{jti}` revoked in tenant `{tenant}` region `{region}` (durable S7 denylist - the deny survives restart)");
 }
 

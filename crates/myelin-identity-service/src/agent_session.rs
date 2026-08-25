@@ -432,7 +432,12 @@ impl AgentSessionIssuer {
             .map_err(|error| AgentSessionError::Policy(error.to_string()))?;
         if run_token.jti != claimed.token_jti {
             self.identity
-                .tear_down_run_token_in(&scope, &run_token, &timestamp(now));
+                .tear_down_run_token_in(&scope, &run_token, &timestamp(now))
+                .map_err(|error| {
+                    AgentSessionError::Storage(format!(
+                        "mismatched token identity could not be revoked: {error}"
+                    ))
+                })?;
             return Err(AgentSessionError::Storage(
                 "replayed agent session minted a different token identity".into(),
             ));

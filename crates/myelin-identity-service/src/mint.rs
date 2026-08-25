@@ -321,6 +321,7 @@ pub enum MintError {
     ResolvedPolicyBindingMismatch,
     InvalidMintAttempt,
     InvalidDelegationCaveat(String),
+    RevocationUnavailable,
 }
 
 impl core::fmt::Display for MintError {
@@ -354,6 +355,9 @@ impl core::fmt::Display for MintError {
             MintError::InvalidDelegationCaveat(reason) => {
                 write!(f, "invalid delegation caveat: {reason} - refused")
             }
+            MintError::RevocationUnavailable => f.write_str(
+                "durable run-token lifetime could not be recorded - credential mint refused",
+            ),
         }
     }
 }
@@ -811,7 +815,8 @@ impl RunTokenMinter {
         };
 
         self.revocations
-            .register_run_token_ttl(scope, &jti, now.clone(), expires_at.clone());
+            .register_run_token_ttl(scope, &jti, now.clone(), expires_at.clone())
+            .map_err(|_| MintError::RevocationUnavailable)?;
 
         if let Some(tuples) = &self.tuples {
             let delta = TupleDelta::Add(RelationTuple {
@@ -867,9 +872,14 @@ impl RunTokenMinter {
         )
     }
 
-    pub fn teardown(&self, scope: &TenantScope, token: &RunToken, now: &Timestamp) {
+    pub fn teardown(
+        &self,
+        scope: &TenantScope,
+        token: &RunToken,
+        now: &Timestamp,
+    ) -> Result<(), myelin_storage::ProviderError> {
         self.revocations
-            .tear_down_run_token(scope, &token.jti, now.clone());
+            .tear_down_run_token(scope, &token.jti, now.clone())
     }
 
     pub fn is_live(&self, scope: &TenantScope, token: &RunToken, now: &Timestamp) -> bool {
@@ -1322,7 +1332,9 @@ mod tests {
             .expect_err("attenuated-away capability must be denied");
         assert!(denied.contains("outside the signed attenuated"));
 
-        minter.teardown(&acme, &token, &ts("2026-06-19T00:02:00Z"));
+        minter
+            .teardown(&acme, &token, &ts("2026-06-19T00:02:00Z"))
+            .expect("record run teardown");
         let denied = authorizer
             .authorize(
                 &acme,
@@ -1749,7 +1761,9 @@ mod tests {
             &["job.launch"],
             300,
         );
-        torn_down_s7.tear_down_run_token(&acme, &torn_down.jti, ts("2026-06-19T00:01:00Z"));
+        torn_down_s7
+            .tear_down_run_token(&acme, &torn_down.jti, ts("2026-06-19T00:01:00Z"))
+            .expect("record run teardown");
         assert_eq!(
             RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), torn_down_s7,)
                 .with_clock(|| ts("2026-06-19T00:01:01Z"))
@@ -1766,11 +1780,13 @@ mod tests {
         );
 
         let revoked_s7 = RevocationStore::new();
-        revoked_s7.revoke(
-            &acme,
-            &RevokeTarget::Jti(ci_token.jti.clone()),
-            ts("2026-06-19T00:00:30Z"),
-        );
+        revoked_s7
+            .revoke(
+                &acme,
+                &RevokeTarget::Jti(ci_token.jti.clone()),
+                ts("2026-06-19T00:00:30Z"),
+            )
+            .expect("record token revocation");
         assert_eq!(
             authorize_with(revoked_s7, "2026-06-19T00:01:00Z"),
             Err(CiJobAuthorizationError::NotLive {
@@ -2117,7 +2133,9 @@ mod tests {
             )
             .expect("mint");
         assert!(minter.is_live(&acme, &token, &ts("2026-06-19T00:01:00Z")));
-        minter.teardown(&acme, &token, &ts("2026-06-19T00:01:30Z"));
+        minter
+            .teardown(&acme, &token, &ts("2026-06-19T00:01:30Z"))
+            .expect("record resumed-run teardown");
         assert!(
             !minter.is_live(&acme, &token, &ts("2026-06-19T00:01:31Z")),
             "after teardown the token is dead immediately (token-revocation-lag = 0)"

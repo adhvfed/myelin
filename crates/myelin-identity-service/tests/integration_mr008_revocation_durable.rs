@@ -3,8 +3,15 @@
 mod common;
 
 use myelin_events::Timestamp;
-use myelin_identity::{Principal, PrincipalId, PrincipalKind, RevokeTarget};
+use myelin_identity::{
+    DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind, RevokeTarget, RunId,
+    RuntimeRef,
+};
 use myelin_identity_service::revocation::{RevocationStore, RunTokenState};
+use myelin_identity_service::{
+    Authority, CellTokenAuthority, DelegationInput, MachineKind, MintError, PasetoCapabilitySigner,
+    RunTokenMinter,
+};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{identity_durable_migrations, DurableRevocationBacking, SubstrateProvider};
 use myelin_tenancy::{Region, TenantId};
@@ -75,13 +82,19 @@ async fn revocation_is_durable_and_idempotent_across_a_fresh_store_instance() {
     let store1 =
         RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     let jti = RevokeTarget::Jti("jti-1".into());
-    store1.revoke(&s, &jti, ts("2026-06-26T00:00:00Z"));
-    store1.disable_principal(
-        &s,
-        &PrincipalId("p:alice".into()),
-        ts("2026-06-26T00:00:00Z"),
-    );
-    store1.revoke(&s, &jti, ts("2026-06-26T09:00:00Z"));
+    store1
+        .revoke(&s, &jti, ts("2026-06-26T00:00:00Z"))
+        .expect("persist revoked token");
+    store1
+        .disable_principal(
+            &s,
+            &PrincipalId("p:alice".into()),
+            ts("2026-06-26T00:00:00Z"),
+        )
+        .expect("persist disabled principal");
+    store1
+        .revoke(&s, &jti, ts("2026-06-26T09:00:00Z"))
+        .expect("repeat revocation remains idempotent");
 
     let store2 =
         RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
@@ -98,7 +111,7 @@ async fn revocation_is_durable_and_idempotent_across_a_fresh_store_instance() {
         "a disabled principal reads back as revoked across surfaces (durable)"
     );
     assert_eq!(
-        store2.revocation_count(&s),
+        store2.revocation_count(&s).expect("count revocations"),
         2,
         "a double-revoke does not grow the durable denylist (idempotent even across a fresh instance)"
     );
@@ -123,19 +136,25 @@ async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
 
     let store1 =
         RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
-    store1.register_run_token_ttl(
-        &s,
-        "run-jti",
-        ts("2026-06-26T00:00:00Z"),
-        ts("2026-06-26T00:05:00Z"),
-    );
-    store1.register_run_token_ttl(
-        &s,
-        "torn-jti",
-        ts("2026-06-26T00:00:00Z"),
-        ts("2026-06-26T00:05:00Z"),
-    );
-    store1.tear_down_run_token(&s, "torn-jti", ts("2026-06-26T00:01:00Z"));
+    store1
+        .register_run_token_ttl(
+            &s,
+            "run-jti",
+            ts("2026-06-26T00:00:00Z"),
+            ts("2026-06-26T00:05:00Z"),
+        )
+        .expect("persist live run lifetime");
+    store1
+        .register_run_token_ttl(
+            &s,
+            "torn-jti",
+            ts("2026-06-26T00:00:00Z"),
+            ts("2026-06-26T00:05:00Z"),
+        )
+        .expect("persist torn-down run lifetime");
+    store1
+        .tear_down_run_token(&s, "torn-jti", ts("2026-06-26T00:01:00Z"))
+        .expect("persist run teardown");
 
     let store2 =
         RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
@@ -179,12 +198,14 @@ async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
         "an unminted jti fails closed (Unknown), never Live"
     );
 
-    store1.register_run_token_ttl(
-        &s,
-        "frac-jti",
-        ts("2026-06-26T00:00:00Z"),
-        ts("2026-06-26T00:05:00Z"),
-    );
+    store1
+        .register_run_token_ttl(
+            &s,
+            "frac-jti",
+            ts("2026-06-26T00:00:00Z"),
+            ts("2026-06-26T00:05:00Z"),
+        )
+        .expect("persist fractional-expiry run lifetime");
     let frac = RevokeTarget::Jti("frac-jti".into());
     assert!(
         !store2.is_revoked(&s, &frac, &ts("2026-06-26T00:05:00.5Z")),
@@ -214,18 +235,22 @@ async fn tenant_a_revocations_invisible_to_b_and_no_guc_bleeds() {
 
     let store = RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle);
     let jti = RevokeTarget::Jti("jti-secret".into());
-    store.revoke(&sa, &jti, ts("2026-06-26T00:00:00Z"));
-    store.disable_principal(
-        &sa,
-        &PrincipalId("p:alice".into()),
-        ts("2026-06-26T00:00:00Z"),
-    );
+    store
+        .revoke(&sa, &jti, ts("2026-06-26T00:00:00Z"))
+        .expect("persist tenant A revocation");
+    store
+        .disable_principal(
+            &sa,
+            &PrincipalId("p:alice".into()),
+            ts("2026-06-26T00:00:00Z"),
+        )
+        .expect("persist tenant A principal disablement");
 
     assert!(
         store.is_revoked(&sa, &jti, &ts("2026-06-26T00:00:01Z")),
         "tenant A sees its revocation"
     );
-    assert_eq!(store.revocation_count(&sa), 2);
+    assert_eq!(store.revocation_count(&sa).expect("count tenant A"), 2);
 
     assert!(
         !store.is_revoked(&sb, &jti, &ts("2026-06-26T00:00:01Z")),
@@ -240,7 +265,7 @@ async fn tenant_a_revocations_invisible_to_b_and_no_guc_bleeds() {
         "tenant B cannot see tenant A's disabled principal"
     );
     assert_eq!(
-        store.revocation_count(&sb),
+        store.revocation_count(&sb).expect("count tenant B"),
         0,
         "tenant B's revocation partition is empty"
     );
@@ -252,4 +277,157 @@ async fn tenant_a_revocations_invisible_to_b_and_no_guc_bleeds() {
 
     cleanup(&admin, &[&tenant_a, &tenant_b]).await;
     println!("OK [c]: tenant A's revocations invisible to tenant B (RLS via with_tenant_tx); no GUC bleed.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
+    let admin = migrate().await;
+    let unavailable = common::app_provider(2).await;
+    let region = unavailable.config().region.clone();
+    let handle = tokio::runtime::Handle::current();
+    let tenant = format!("mr008-outage-{}", uniq());
+    let s = scope(&tenant, &region);
+    let store = RevocationStore::with_pg(
+        DurableRevocationBacking::new(unavailable.clone()),
+        handle.clone(),
+    );
+    let minter = RunTokenMinter::with_signer_and_tuples(
+        store.clone(),
+        None,
+        std::sync::Arc::new(PasetoCapabilitySigner::new(std::sync::Arc::new(
+            CellTokenAuthority::generate(),
+        ))),
+    );
+
+    unavailable.db_pool().close().await;
+
+    let grant = "repo:acme/core#read";
+    let mut agent = Principal::stub(
+        PrincipalId("p:agent".into()),
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("rt:agent".into()),
+            on_behalf_of: Some(PrincipalId("p:human".into())),
+        },
+        s.tenant().clone(),
+    );
+    agent.region = s.region().clone();
+    let mut human = Principal::stub(
+        PrincipalId("p:human".into()),
+        PrincipalKind::Human,
+        s.tenant().clone(),
+    );
+    human.region = s.region().clone();
+    let authority = Authority::of([grant]);
+    assert_eq!(
+        minter.mint_run_token(
+            &s,
+            &agent.principal_id,
+            &RunId("run:during-outage".into()),
+            &agent,
+            &human,
+            &DelegationInput {
+                agent_policy: authority.clone(),
+                delegation: authority.clone(),
+                tenant_policy: authority.clone(),
+                trigger_actor_held: authority,
+            },
+            &DelegationCaveats(vec![grant.into()]),
+            MachineKind::Agent,
+            &FailStaticBound {
+                static_max_secs: 300,
+            },
+            &ts("2026-06-26T00:00:00Z"),
+        ),
+        Err(MintError::RevocationUnavailable),
+        "the caller receives no credential when its durable run lifetime cannot be recorded"
+    );
+
+    assert!(
+        store
+            .revoke(
+                &s,
+                &RevokeTarget::Jti("revoked-during-outage".into()),
+                ts("2026-06-26T00:00:00Z"),
+            )
+            .is_err(),
+        "an operator is told that the denylist write did not happen"
+    );
+    assert!(
+        store
+            .disable_principal(
+                &s,
+                &PrincipalId("p:disabled-during-outage".into()),
+                ts("2026-06-26T00:00:00Z"),
+            )
+            .is_err(),
+        "an erasure or SCIM caller is told that principal disablement did not happen"
+    );
+    assert!(
+        store
+            .register_run_token_ttl(
+                &s,
+                "minted-during-outage",
+                ts("2026-06-26T00:00:00Z"),
+                ts("2026-06-26T00:05:00Z"),
+            )
+            .is_err(),
+        "a mint caller cannot mistake an unrecorded run lifetime for a usable credential"
+    );
+    assert!(
+        store
+            .tear_down_run_token(&s, "torn-down-during-outage", ts("2026-06-26T00:01:00Z"),)
+            .is_err(),
+        "a run owner is told that teardown did not reach durable storage"
+    );
+    assert!(
+        store.revocation_count(&s).is_err(),
+        "an unavailable database is not reported as an empty denylist"
+    );
+    assert_eq!(
+        store.telemetry().revocation_count(),
+        0,
+        "failed writes are not counted as successful revocation observations"
+    );
+
+    let recovered = common::app_provider(4).await;
+    let store = RevocationStore::with_pg(DurableRevocationBacking::new(recovered), handle);
+    store
+        .revoke(
+            &s,
+            &RevokeTarget::Jti("revoked-during-outage".into()),
+            ts("2026-06-26T00:02:00Z"),
+        )
+        .expect("retry denylist write after recovery");
+    store
+        .disable_principal(
+            &s,
+            &PrincipalId("p:disabled-during-outage".into()),
+            ts("2026-06-26T00:02:00Z"),
+        )
+        .expect("retry principal disablement after recovery");
+    store
+        .register_run_token_ttl(
+            &s,
+            "minted-during-outage",
+            ts("2026-06-26T00:02:00Z"),
+            ts("2026-06-26T00:05:00Z"),
+        )
+        .expect("retry run lifetime write after recovery");
+    store
+        .tear_down_run_token(&s, "torn-down-during-outage", ts("2026-06-26T00:02:00Z"))
+        .expect("retry teardown after recovery");
+
+    assert_eq!(
+        store.revocation_count(&s).expect("count after recovery"),
+        3,
+        "the retried token, principal, and run lifetime are now durable"
+    );
+    assert_eq!(
+        store.telemetry().revocation_count(),
+        4,
+        "each successful retry is observed once"
+    );
+
+    cleanup(&admin, &[&tenant]).await;
+    println!("OK [d]: revocation mutations report outages honestly and remain retryable.");
 }

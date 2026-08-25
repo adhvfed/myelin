@@ -56,12 +56,14 @@ fn provider() -> CapabilityAuthenticator {
         .expect("link the per-job token record");
     let revocations = RevocationStore::new();
     for jti in ["jti-1", "jti-2"] {
-        revocations.register_run_token_ttl(
-            &s,
-            jti,
-            myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
-            myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
-        );
+        revocations
+            .register_run_token_ttl(
+                &s,
+                jti,
+                myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
+                myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+            )
+            .expect("record test run lifetime");
     }
     CapabilityAuthenticator::with_verifier(
         store,

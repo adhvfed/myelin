@@ -155,12 +155,14 @@ impl Harness {
         let jti = format!("jti-{subject_key}-{nonce}");
         let purpose = if ci_job {
             let scope = admin_scope();
-            self.revocations.register_run_token_ttl(
-                &scope,
-                &jti,
-                myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
-                myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
-            );
+            self.revocations
+                .register_run_token_ttl(
+                    &scope,
+                    &jti,
+                    myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
+                    myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+                )
+                .expect("record CI run lifetime");
             myelin_identity_service::CredentialPurpose::CiJob {
                 run_id: format!("ci-{subject_key}"),
             }

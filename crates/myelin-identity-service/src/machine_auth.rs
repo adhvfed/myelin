@@ -743,12 +743,14 @@ mod tests {
         let revocations = RevocationStore::new();
         if matches!(scheme, scheme::CI | scheme::PER_JOB) {
             for jti in ["jti-1", "jti-ci", "jti-live", "jti-r1", "jti-r2", "jti-x"] {
-                revocations.register_run_token_ttl(
-                    &sc,
-                    jti,
-                    Timestamp("2020-01-01T00:00:00Z".into()),
-                    Timestamp("2099-01-01T00:00:00Z".into()),
-                );
+                revocations
+                    .register_run_token_ttl(
+                        &sc,
+                        jti,
+                        Timestamp("2020-01-01T00:00:00Z".into()),
+                        Timestamp("2099-01-01T00:00:00Z".into()),
+                    )
+                    .expect("record seeded run lifetime");
             }
         }
         CapabilityAuthenticator::with_verifier(
@@ -867,12 +869,14 @@ mod tests {
         let sc = scope("acme", "eu-west");
 
         let live_s7 = RevocationStore::new();
-        live_s7.register_run_token_ttl(
-            &sc,
-            "jti-live",
-            Timestamp("2026-07-18T10:00:00Z".into()),
-            Timestamp("2026-07-18T10:05:00Z".into()),
-        );
+        live_s7
+            .register_run_token_ttl(
+                &sc,
+                "jti-live",
+                Timestamp("2026-07-18T10:00:00Z".into()),
+                Timestamp("2026-07-18T10:05:00Z".into()),
+            )
+            .expect("record live run lifetime");
         let identity = run_authenticator(live_s7, "2026-07-18T10:01:00Z")
             .authenticate_identity(&cred(scheme::AGENT, run_material("jti-live")), None)
             .expect("a known run token resolves its principal without a second API-key binding");
@@ -887,28 +891,34 @@ mod tests {
         assert!(matches!(unknown, Err(AuthzError::FailClosed(_))));
 
         let expired_s7 = RevocationStore::new();
-        expired_s7.register_run_token_ttl(
-            &sc,
-            "jti-expired",
-            Timestamp("2026-07-18T10:00:00Z".into()),
-            Timestamp("2026-07-18T10:05:00Z".into()),
-        );
+        expired_s7
+            .register_run_token_ttl(
+                &sc,
+                "jti-expired",
+                Timestamp("2026-07-18T10:00:00Z".into()),
+                Timestamp("2026-07-18T10:05:00Z".into()),
+            )
+            .expect("record expired run lifetime");
         let expired = run_authenticator(expired_s7, "2026-07-18T10:05:00Z")
             .authenticate_identity(&cred(scheme::AGENT, run_material("jti-expired")), None);
         assert!(matches!(expired, Err(AuthzError::FailClosed(_))));
 
         let torn_down_s7 = RevocationStore::new();
-        torn_down_s7.register_run_token_ttl(
-            &sc,
-            "jti-torn-down",
-            Timestamp("2026-07-18T10:00:00Z".into()),
-            Timestamp("2026-07-18T10:05:00Z".into()),
-        );
-        torn_down_s7.tear_down_run_token(
-            &sc,
-            "jti-torn-down",
-            Timestamp("2026-07-18T10:01:00Z".into()),
-        );
+        torn_down_s7
+            .register_run_token_ttl(
+                &sc,
+                "jti-torn-down",
+                Timestamp("2026-07-18T10:00:00Z".into()),
+                Timestamp("2026-07-18T10:05:00Z".into()),
+            )
+            .expect("record torn-down run lifetime");
+        torn_down_s7
+            .tear_down_run_token(
+                &sc,
+                "jti-torn-down",
+                Timestamp("2026-07-18T10:01:00Z".into()),
+            )
+            .expect("record run teardown");
         let torn_down = run_authenticator(torn_down_s7, "2026-07-18T10:02:00Z")
             .authenticate_identity(&cred(scheme::AGENT, run_material("jti-torn-down")), None);
         assert!(matches!(torn_down, Err(AuthzError::FailClosed(_))));
@@ -923,7 +933,8 @@ mod tests {
             "jti-legacy",
             Timestamp("2026-07-18T10:00:00Z".into()),
             Timestamp("2026-07-18T10:05:00Z".into()),
-        );
+        )
+        .expect("record legacy run lifetime");
         let auth = run_authenticator(s7, "2026-07-18T10:01:00Z");
         let material = "acme|eu-west|run-subject|jti-legacy|0|repo.pull|agent_run|edge|run-1|";
         let result = auth.authenticate_identity(&cred(scheme::AGENT, material.into()), None);
@@ -942,12 +953,14 @@ mod tests {
             let sc = scope("acme", "eu-west");
 
             let live_s7 = RevocationStore::new();
-            live_s7.register_run_token_ttl(
-                &sc,
-                "jti-live-kind",
-                Timestamp("2026-07-18T10:00:00Z".into()),
-                Timestamp("2026-07-18T10:05:00Z".into()),
-            );
+            live_s7
+                .register_run_token_ttl(
+                    &sc,
+                    "jti-live-kind",
+                    Timestamp("2026-07-18T10:00:00Z".into()),
+                    Timestamp("2026-07-18T10:05:00Z".into()),
+                )
+                .expect("record live credential lifetime");
             scoped_run_authenticator(credential_scheme, subject, live_s7, "2026-07-18T10:01:00Z")
                 .authenticate_identity(&cred(credential_scheme, material("jti-live-kind")), None)
                 .expect("known live run-scoped credential");
@@ -962,12 +975,14 @@ mod tests {
             assert!(matches!(unknown, Err(AuthzError::FailClosed(_))));
 
             let expired_s7 = RevocationStore::new();
-            expired_s7.register_run_token_ttl(
-                &sc,
-                "jti-expired-kind",
-                Timestamp("2026-07-18T10:00:00Z".into()),
-                Timestamp("2026-07-18T10:05:00Z".into()),
-            );
+            expired_s7
+                .register_run_token_ttl(
+                    &sc,
+                    "jti-expired-kind",
+                    Timestamp("2026-07-18T10:00:00Z".into()),
+                    Timestamp("2026-07-18T10:05:00Z".into()),
+                )
+                .expect("record expired credential lifetime");
             let expired = scoped_run_authenticator(
                 credential_scheme,
                 subject,
@@ -978,17 +993,21 @@ mod tests {
             assert!(matches!(expired, Err(AuthzError::FailClosed(_))));
 
             let torn_s7 = RevocationStore::new();
-            torn_s7.register_run_token_ttl(
-                &sc,
-                "jti-torn-kind",
-                Timestamp("2026-07-18T10:00:00Z".into()),
-                Timestamp("2026-07-18T10:05:00Z".into()),
-            );
-            torn_s7.tear_down_run_token(
-                &sc,
-                "jti-torn-kind",
-                Timestamp("2026-07-18T10:01:00Z".into()),
-            );
+            torn_s7
+                .register_run_token_ttl(
+                    &sc,
+                    "jti-torn-kind",
+                    Timestamp("2026-07-18T10:00:00Z".into()),
+                    Timestamp("2026-07-18T10:05:00Z".into()),
+                )
+                .expect("record torn-down credential lifetime");
+            torn_s7
+                .tear_down_run_token(
+                    &sc,
+                    "jti-torn-kind",
+                    Timestamp("2026-07-18T10:01:00Z".into()),
+                )
+                .expect("record credential teardown");
             let torn = scoped_run_authenticator(
                 credential_scheme,
                 subject,
@@ -1320,11 +1339,9 @@ mod tests {
         )
         .unwrap();
         let sc = scope("acme", "eu-west");
-        auth.revocations().tear_down_run_token(
-            &sc,
-            "jti-live",
-            Timestamp("2026-06-26T00:00:00Z".into()),
-        );
+        auth.revocations()
+            .tear_down_run_token(&sc, "jti-live", Timestamp("2026-06-26T00:00:00Z".into()))
+            .expect("record credential teardown");
         let r = auth.authenticate(
             &cred(
                 scheme::CI,

@@ -265,7 +265,8 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
         &s,
         &RevokeTarget::Principal(PrincipalId("p:alice".into())),
         now(),
-    );
+    )
+    .expect("record principal revocation");
     let alice = subject("p:alice", "acme");
     match id.list_objects(&alice, &read, &repo_ty, &at_latest()) {
         Ok(ListObjectsResult::Ids { ids, .. }) => {

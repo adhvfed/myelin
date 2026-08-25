@@ -823,7 +823,8 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
     let token = router.current_token();
     router
         .minter()
-        .teardown(&router.principal().scope, &token, &now());
+        .teardown(&router.principal().scope, &token, &now())
+        .expect("record run teardown");
     let second = drive(
         &revoked,
         &[
@@ -1142,7 +1143,8 @@ fn a_revoked_run_token_is_denied_never_routed() {
     let token = router.current_token();
     router
         .minter()
-        .teardown(&router.principal().scope, &token, &now());
+        .teardown(&router.principal().scope, &token, &now())
+        .expect("record run teardown");
 
     let second = server
         .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":2,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-2"}}}"#)

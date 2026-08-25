@@ -466,7 +466,8 @@ mod tests {
         );
 
         c.revocations()
-            .disable_principal(&acme, &subj, ts("2026-06-19T00:00:00Z"));
+            .disable_principal(&acme, &subj, ts("2026-06-19T00:00:00Z"))
+            .expect("record principal disablement");
 
         let after = c.check_cached(
             &acme,

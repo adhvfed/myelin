@@ -97,12 +97,14 @@ fn build_with(
 
     let revocations = RevocationStore::new();
     for tenant in ["acme", "globex"] {
-        revocations.register_run_token_ttl(
-            &admin_scope(tenant),
-            &format!("jti-ci-{tenant}"),
-            myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
-            myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
-        );
+        revocations
+            .register_run_token_ttl(
+                &admin_scope(tenant),
+                &format!("jti-ci-{tenant}"),
+                myelin_events::Timestamp("2020-01-01T00:00:00Z".into()),
+                myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+            )
+            .expect("record CI run lifetime");
     }
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
         store,

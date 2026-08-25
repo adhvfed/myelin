@@ -156,7 +156,8 @@ fn id_d2_fail_static_survives_hiccup_and_denies_revoked() {
         &acme,
         &PrincipalId("p:alice".into()),
         ts("2026-06-19T00:04:00Z"),
-    );
+    )
+    .expect("record principal disablement");
 
     let mut successful_authz_after_cache_for_revoked: i64 = 0;
     for i in 0..8 {

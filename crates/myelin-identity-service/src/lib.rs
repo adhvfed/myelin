@@ -525,8 +525,8 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         target: &myelin_identity::RevokeTarget,
         now: myelin_events::Timestamp,
-    ) {
-        self.revocations.revoke(scope, target, now);
+    ) -> Result<(), myelin_storage::ProviderError> {
+        self.revocations.revoke(scope, target, now)
     }
 
     pub fn disable_principal_in(
@@ -534,8 +534,8 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         principal: &myelin_identity::PrincipalId,
         now: myelin_events::Timestamp,
-    ) {
-        self.revocations.disable_principal(scope, principal, now);
+    ) -> Result<(), myelin_storage::ProviderError> {
+        self.revocations.disable_principal(scope, principal, now)
     }
 
     pub fn pseudonyms(&self) -> &PseudonymStore {
@@ -594,7 +594,8 @@ impl StoreBackedCheck {
             &dek_class,
         )?;
         self.revocations
-            .disable_principal(scope, subject, now.clone());
+            .disable_principal(scope, subject, now.clone())
+            .map_err(|error| PseudonymError::Storage(error.to_string()))?;
         self.erasure_ledger
             .record(scope, subject, dek_class.clone(), now.clone())?;
         Ok(pseudonym_erase::ErasureReceipt::for_erase(
@@ -633,7 +634,8 @@ impl StoreBackedCheck {
                     &entry.dek_class,
                 )?;
             self.revocations
-                .disable_principal(scope, &entry.subject, now.clone());
+                .disable_principal(scope, &entry.subject, now.clone())
+                .map_err(|error| PseudonymError::Storage(error.to_string()))?;
             per_subject.push(pseudonym_erase::ErasureReceipt::for_erase(
                 entry.subject.clone(),
                 scope.tenant().clone(),
@@ -925,8 +927,8 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         token: &myelin_identity::RunToken,
         now: &myelin_events::Timestamp,
-    ) {
-        self.minter.teardown(scope, token, now);
+    ) -> Result<(), myelin_storage::ProviderError> {
+        self.minter.teardown(scope, token, now)
     }
 
     pub fn list_subjects_in(
