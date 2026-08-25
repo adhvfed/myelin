@@ -13,12 +13,12 @@ use myelin_chat::store::{
 };
 use myelin_chat::{
     chat_subject_key_class, decode_encrypted_body, decrypt_body, encode_encrypted_body,
-    encrypt_body, ChatFreeText, CHAT_ERASE_CASCADE_TOKEN,
+    encrypt_body, subject_dek_erasure, ChatFreeText, CHAT_ERASE_CASCADE_TOKEN,
 };
 use myelin_events::{Actor, IdMinter, Timestamp, Ulid, UlidMinter};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::encryption::{EncryptedColumn, SubjectId};
-use myelin_storage::kms::{DekId, KmsEngine};
+use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
+use myelin_storage::kms::{DekId, KekId, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
@@ -134,6 +134,33 @@ fn encrypted_message(
         },
         body,
     )
+}
+
+fn legacy_encrypted_message(
+    kms: &KmsEngine,
+    conversation: ConversationId,
+    author: &str,
+) -> NewMessage {
+    let tenant = TenantId::from_token(TENANT);
+    let author = SubjectId::new(author);
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("arrange the legacy tenant key");
+    let cryptor = ColumnCryptor::new(kms, region());
+    let seal = |plaintext: &[u8]| {
+        cryptor
+            .encrypt(&tenant, Some(&author), &subject_dek_erasure(), plaintext)
+            .expect("seal a legacy unscoped Chat body")
+    };
+    NewMessage {
+        conv: conversation,
+        thread_root_id: None,
+        author: author.0.clone(),
+        author_kind: AuthorKind::Human,
+        body_inline: encode_encrypted_body(&seal(b"legacy private body"))
+            .expect("encode the legacy body"),
+        body_nodes: encode_encrypted_body(&seal(b"[]")).expect("encode the legacy nodes"),
+        client_nonce: "legacy-message".into(),
+    }
 }
 
 async fn clear_test_rows(admin: &sqlx::PgPool, table: &str, conversations: &[ConversationId]) {
@@ -392,6 +419,49 @@ async fn an_erasure_event_failure_restores_every_message_body() {
             .await
             .expect("the failed operation remains resumable"),
         AuthoredMessageErasureState::Pending,
+    );
+
+    clear_test_rows(&admin, &table, &[conversation]).await;
+}
+
+#[tokio::test]
+async fn a_legacy_cross_product_key_is_never_misreported_as_safely_shredded() {
+    let (admin, store, table) = fresh_store().await;
+    let kms = KmsEngine::new();
+    let ids = MonotonicUlidSource::new();
+    let event_ids = UlidMinter::new();
+    let ada = event_actor_pseudonym(TENANT, ADA);
+    let conversation = ConversationId::new(TENANT, region().as_str(), "01J0CHATP411LEGACY000000");
+    store
+        .append_storage_only(
+            &ids,
+            legacy_encrypted_message(&kms, conversation.clone(), &ada),
+        )
+        .await
+        .expect("arrange one message from before Chat had an independent key scope");
+    let operation = "privacy-request:ada-legacy";
+    store
+        .prepare_author_erasure(TENANT, &ada, operation)
+        .await
+        .expect("persist the attempted erasure");
+
+    let error = store
+        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_attempt(operation))
+        .await
+        .expect_err("a shared legacy key cannot support an honest Chat-only certificate");
+    assert!(error
+        .to_string()
+        .contains("refuses legacy or foreign key scope"));
+    let message = store
+        .range(&conversation, RangeCursor::Recent, 1)
+        .await
+        .expect("inspect the refused mutation")
+        .pop()
+        .expect("the legacy message remains");
+    assert_eq!(message.state, MessageState::Active);
+    assert!(
+        !message.body_inline.is_empty(),
+        "a refusal does not destroy data while claiming success",
     );
 
     clear_test_rows(&admin, &table, &[conversation]).await;

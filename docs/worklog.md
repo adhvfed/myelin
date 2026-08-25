@@ -1778,7 +1778,16 @@ The old unit test that asserted Chat migration correctness by searching DDL
 strings was removed. The schema and its RLS behavior are exercised by the real
 database story instead.
 
-Proof: the two-case PostgreSQL story (0.69 seconds), warning-free strict Chat
+The same story now covers the upgrade boundary explicitly. A message written
+before scoped Chat keys used the generic cross-product subject key. Destroying
+that key for a Chat-only request could erase another product, while preserving
+it would leave the old message recoverable from backups. The production erase
+transaction therefore inspects and locks every live body envelope before
+mutation and refuses a legacy or foreign key class. It leaves the operation
+pending and the body intact for an explicit re-key migration; it never emits a
+successful but false crypto-shred receipt.
+
+Proof: the three-case PostgreSQL story (0.72 seconds), warning-free strict Chat
 Clippy, and two live Chat delivery journeys (633 ms of test time).
 
 ## known gaps (honest list, in priority order)

@@ -6,6 +6,7 @@ use myelin_tenancy::{Region, TenantId};
 use super::{
     AuthoredMessageEraseReceipt, AuthoredMessageErasureState, MessageErasureAttempt, PgMessageStore,
 };
+use crate::dek::{chat_subject_key_class, decode_encrypted_body};
 use crate::events::CHAT_MESSAGE_ERASED;
 use crate::store::{message_event_draft, ConversationId, MessageId, StoreError};
 
@@ -137,6 +138,48 @@ impl PgMessageStore {
                 .await
                 .map_err(|error| StoreError::Cold(format!("commit Chat erasure retry: {error}")))?;
             return Ok(receipt);
+        }
+
+        let bodies = sqlx::query(&format!(
+            "SELECT message_id, body_inline, body_nodes \
+               FROM {} \
+              WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3 \
+              ORDER BY message_id FOR UPDATE",
+            self.table,
+        ))
+        .bind(tenant)
+        .bind(&self.region)
+        .bind(author)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| StoreError::Cold(format!("inspect authored Chat encryption: {error}")))?;
+        for row in &bodies {
+            let message_id: String = row.try_get("message_id").map_err(erasure_row_decode)?;
+            for (column, encoded) in [
+                (
+                    "body_inline",
+                    row.try_get::<Vec<u8>, _>("body_inline")
+                        .map_err(erasure_row_decode)?,
+                ),
+                (
+                    "body_nodes",
+                    row.try_get::<Vec<u8>, _>("body_nodes")
+                        .map_err(erasure_row_decode)?,
+                ),
+            ] {
+                let envelope = decode_encrypted_body(&encoded).map_err(|_| {
+                    StoreError::Cold(format!(
+                        "Chat erasure cannot prove the encryption boundary of {message_id} {column}"
+                    ))
+                })?;
+                if envelope.key_ref.tenant.as_str() != tenant
+                    || envelope.key_ref.class != chat_subject_key_class(author)
+                {
+                    return Err(StoreError::Cold(format!(
+                        "Chat erasure refuses legacy or foreign key scope on {message_id} {column}"
+                    )));
+                }
+            }
         }
 
         let rows = sqlx::query(&format!(
