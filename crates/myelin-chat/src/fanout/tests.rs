@@ -242,6 +242,10 @@ fn write_fanout_reasons_map_to_the_registered_rule_keys_and_activity_reasons() {
         RULE_KEY_REPLIED
     );
     assert_eq!(
+        WriteFanoutReason::ThreadWatched.rule_key(),
+        crate::glue::RULE_KEY_THREAD_WATCHED,
+    );
+    assert_eq!(
         WriteFanoutReason::HitlApprovalForYou.rule_key(),
         RULE_KEY_APPROVAL_REQUESTED
     );
@@ -254,6 +258,7 @@ fn write_fanout_reasons_map_to_the_registered_rule_keys_and_activity_reasons() {
         WriteFanoutReason::Mentioned,
         WriteFanoutReason::DirectMessage,
         WriteFanoutReason::ThreadReplyToYou,
+        WriteFanoutReason::ThreadWatched,
         WriteFanoutReason::HitlApprovalForYou,
         WriteFanoutReason::KeywordMatch,
     ] {

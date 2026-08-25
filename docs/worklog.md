@@ -1481,15 +1481,45 @@ inbox reads still reauthorize that coordinate against live room membership.
 
 Roots written before `chat_0011` remain readable and replyable but cannot acquire an
 author notification retroactively: Chat deliberately stores only an event
-pseudonym in the old row, so there is no safe real identity to reconstruct. Watched
-thread fanout is also still to come; the new participant model gives that work a
-durable foundation without pretending it is implemented.
+pseudonym in the old row, so there is no safe real identity to reconstruct. A
+successful reply now uses the participant model to follow later activity; an
+explicit mute or unfollow control remains a separate user-facing seam.
 
 Proof: all 271 Chat and 360 Edge library tests; the real PostgreSQL co-commit,
 idempotency, false-root, and tombstone integration; warning-free Chat/Edge clippy;
 TypeScript typechecking; and all eleven live Chat collaboration stories after an
 Edge, notifications, and outbox restart through the immutable `chat_0011`
 migration; the single-author index follows in forward-only `chat_0012`.
+
+## 2026-08-25 — participating keeps a thread within reach
+
+A person who replies now follows that exact thread automatically. When someone
+else answers later, prior participants receive one lower-priority
+`thread_watched` inbox item while the root author keeps the more direct `replied`
+item. The current replier never notifies themself, the root author is not sent a
+second lower-priority copy, and neither signal contains message text. Existing
+notification deduplication coalesces later activity by recipient, rule, and
+canonical thread.
+
+Participation is recorded in the same transaction as the reply and all derived
+events. Replies take an update lock on their root, giving concurrent replies a
+real order: the later transaction sees the earlier participant before it derives
+its audience. Exact retries add neither another participant nor another event.
+The producer orders and caps watched recipients at Notifications' 64-recipient
+hot-subject bound, so a large thread cannot turn one reply into an unbounded
+payload or database read. Ordinary channel watchers remain read-fanout and cause
+no per-member inbox writes.
+
+The TypeScript story now states the product behavior directly: a reviewer joins a
+decision thread, receives no notification for their own reply, and is brought
+back when the founder answers. Explicit mute/unfollow is not yet surfaced; until
+then, participation is the only thread-follow action.
+
+Proof: all 273 Chat library tests; the real PostgreSQL reply, participant,
+notification, idempotency, false-root, and tombstone integration; warning-free
+Chat/Edge clippy across all targets and features; TypeScript typechecking; the
+focused red-to-green lifecycle story; and all eleven live Chat collaboration
+stories together.
 
 ## known gaps (honest list, in priority order)
 

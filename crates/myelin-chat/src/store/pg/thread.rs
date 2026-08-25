@@ -1,13 +1,19 @@
 use sqlx::Row;
 
+use myelin_identity::PrincipalId;
+
 use super::{row_to_message, PgMessageStore};
 use crate::store::{
     ConversationId, MessageId, MessageState, RangeCursor, StoreError, TimelineMessage,
 };
 
 pub(super) struct ThreadRoot {
-    pub(super) notification_recipient: Option<String>,
+    pub(super) notification_recipient: Option<PrincipalId>,
+    pub(super) followers: Vec<PrincipalId>,
 }
+
+pub(super) const ROOT_AUTHOR_ROLE: i16 = 0;
+pub(super) const FOLLOWER_ROLE: i16 = 1;
 
 impl PgMessageStore {
     pub(super) async fn require_thread_root_in_tx(
@@ -28,14 +34,14 @@ impl PgMessageStore {
                 AND participant.role = 0 \
               WHERE root.tenant_id = $1 AND root.region = $2 \
                 AND root.conversation_id = $3 AND root.message_id = $4 \
-              FOR SHARE OF root",
+              FOR UPDATE OF root",
             table = self.table,
         ))
         .bind(&conversation.tenant)
         .bind(&conversation.region)
         .bind(&conversation.conversation_id)
         .bind(root.as_str())
-        .fetch_optional(connection)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(|error| StoreError::Cold(format!("thread root select: {error}")))?
         .ok_or_else(|| StoreError::NotFound(root.clone()))?;
@@ -51,8 +57,29 @@ impl PgMessageStore {
                 actual: i32::from(stored_state),
             });
         }
+        let followers = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT principal_id FROM {participant_table} \
+              WHERE tenant_id = $1 AND region = $2 AND conversation_id = $3 \
+                AND thread_root_id = $4 AND role = $5 \
+              ORDER BY principal_id LIMIT $6"
+        ))
+        .bind(&conversation.tenant)
+        .bind(&conversation.region)
+        .bind(&conversation.conversation_id)
+        .bind(root.as_str())
+        .bind(FOLLOWER_ROLE)
+        .bind(i64::from(myelin_notif::DEFAULT_HOT_SUBJECT_WRITE_CAP))
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| StoreError::Cold(format!("thread followers select: {error}")))?
+        .into_iter()
+        .map(PrincipalId)
+        .collect();
         Ok(ThreadRoot {
-            notification_recipient: row.get("principal_id"),
+            notification_recipient: row
+                .get::<Option<String>, _>("principal_id")
+                .map(PrincipalId),
+            followers,
         })
     }
 

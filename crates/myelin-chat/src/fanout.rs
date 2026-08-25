@@ -3,6 +3,7 @@ use myelin_notif::{InboxFilter, Reason};
 
 use crate::glue::{
     fanout_class, FanoutClass, RULE_KEY_APPROVAL_REQUESTED, RULE_KEY_MENTIONED, RULE_KEY_REPLIED,
+    RULE_KEY_THREAD_WATCHED,
 };
 
 pub const WATCHER_RELATION: &str = "watcher";
@@ -19,6 +20,7 @@ pub enum WriteFanoutReason {
     Mentioned,
     DirectMessage,
     ThreadReplyToYou,
+    ThreadWatched,
     HitlApprovalForYou,
     KeywordMatch,
 }
@@ -30,6 +32,7 @@ impl WriteFanoutReason {
             | WriteFanoutReason::DirectMessage
             | WriteFanoutReason::KeywordMatch => RULE_KEY_MENTIONED,
             WriteFanoutReason::ThreadReplyToYou => RULE_KEY_REPLIED,
+            WriteFanoutReason::ThreadWatched => RULE_KEY_THREAD_WATCHED,
             WriteFanoutReason::HitlApprovalForYou => RULE_KEY_APPROVAL_REQUESTED,
         }
     }
@@ -40,6 +43,7 @@ impl WriteFanoutReason {
             | WriteFanoutReason::DirectMessage
             | WriteFanoutReason::KeywordMatch => Reason::Mentioned,
             WriteFanoutReason::ThreadReplyToYou => Reason::Replied,
+            WriteFanoutReason::ThreadWatched => Reason::ThreadWatched,
             WriteFanoutReason::HitlApprovalForYou => Reason::ApprovalRequested,
         }
     }

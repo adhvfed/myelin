@@ -237,40 +237,28 @@ impl PgMessageStore {
             return Ok(MessageId(existing));
         }
 
-        if msg.thread_root_id.is_none() {
-            sqlx::query(&format!(
-                "INSERT INTO {} \
-                   (tenant_id, region, conversation_id, thread_root_id, principal_id, role) \
-                 VALUES ($1, $2, $3, $4, $5, 0) \
-                 ON CONFLICT DO NOTHING",
-                self.thread_participant_table(),
-            ))
-            .bind(&msg.conv.tenant)
-            .bind(&msg.conv.region)
-            .bind(&msg.conv.conversation_id)
-            .bind(message_id.as_str())
-            .bind(&notification_recipient.0)
-            .execute(&mut *dbtx)
-            .await
-            .map_err(|error| {
-                StoreError::Cold(format!("co-commit thread root participant: {error}"))
-            })?;
-        }
+        let (participant_root, participant_role) = match msg.thread_root_id.as_ref() {
+            Some(root) => (root, super::thread::FOLLOWER_ROLE),
+            None => (&message_id, super::thread::ROOT_AUTHOR_ROLE),
+        };
+        self.record_thread_participant_in_tx(
+            &mut dbtx,
+            &msg,
+            participant_root,
+            &notification_recipient,
+            participant_role,
+        )
+        .await?;
 
         let reply_events = match (msg.thread_root_id.as_ref(), thread_root.as_ref()) {
-            (Some(root), Some(thread_root)) => {
-                let root_recipient = thread_root
-                    .notification_recipient
-                    .as_ref()
-                    .map(|recipient| PrincipalId(recipient.clone()));
-                Some(thread_notification::thread_reply_events(
-                    &envelope,
-                    root,
-                    &message_id,
-                    root_recipient.as_ref(),
-                    &notification_recipient,
-                )?)
-            }
+            (Some(root), Some(thread_root)) => Some(thread_notification::thread_reply_events(
+                &envelope,
+                root,
+                &message_id,
+                thread_root.notification_recipient.as_ref(),
+                &thread_root.followers,
+                &notification_recipient,
+            )?),
             _ => None,
         };
 
@@ -328,7 +316,7 @@ impl PgMessageStore {
             )
             .await
             .map_err(|error| StoreError::Cold(format!("co-commit Chat thread reply: {error}")))?;
-            if let Some(notification) = reply_events.notification {
+            for notification in reply_events.notifications {
                 myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
                     &mut dbtx,
                     &notification.aggregate.0,
@@ -336,7 +324,7 @@ impl PgMessageStore {
                 )
                 .await
                 .map_err(|error| {
-                    StoreError::Cold(format!("co-commit Chat reply notification: {error}"))
+                    StoreError::Cold(format!("co-commit Chat thread notification: {error}"))
                 })?;
             }
         }
@@ -361,6 +349,33 @@ impl PgMessageStore {
             .await
             .map_err(|e| StoreError::Cold(format!("co-commit: {e}")))?;
         Ok(message_id)
+    }
+
+    async fn record_thread_participant_in_tx(
+        &self,
+        transaction: &mut sqlx::PgConnection,
+        message: &NewMessage,
+        root: &MessageId,
+        principal: &PrincipalId,
+        role: i16,
+    ) -> Result<(), StoreError> {
+        sqlx::query(&format!(
+            "INSERT INTO {} \
+               (tenant_id, region, conversation_id, thread_root_id, principal_id, role) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT DO NOTHING",
+            self.thread_participant_table(),
+        ))
+        .bind(&message.conv.tenant)
+        .bind(&message.conv.region)
+        .bind(&message.conv.conversation_id)
+        .bind(root.as_str())
+        .bind(&principal.0)
+        .bind(role)
+        .execute(transaction)
+        .await
+        .map_err(|error| StoreError::Cold(format!("co-commit thread participant: {error}")))?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

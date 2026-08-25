@@ -7,19 +7,20 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_notif::{Reason, SIGNAL_MENTIONS_KEY};
 use myelin_query::{DedupKey, RuleId, Severity, Signal, SignalState};
 
-use crate::glue::RULE_KEY_REPLIED;
+use crate::glue::{RULE_KEY_REPLIED, RULE_KEY_THREAD_WATCHED};
 use crate::store::{MessageId, StoreError};
 
 pub(super) struct ThreadReplyEvents {
     pub(super) replied: EventEnvelope,
-    pub(super) notification: Option<EventEnvelope>,
+    pub(super) notifications: Vec<EventEnvelope>,
 }
 
 pub(super) fn thread_reply_events(
     message: &EventEnvelope,
     root: &MessageId,
     reply: &MessageId,
-    recipient: Option<&PrincipalId>,
+    root_recipient: Option<&PrincipalId>,
+    followers: &[PrincipalId],
     replying_principal: &PrincipalId,
 ) -> Result<ThreadReplyEvents, StoreError> {
     let thread = crate::subs::mint_thread(message.tenant.as_str(), root.as_str())
@@ -42,25 +43,94 @@ pub(super) fn thread_reply_events(
         derived_context(message, "thread-replied"),
         Some(message),
     );
-    let notification = recipient
-        .filter(|recipient| *recipient != replying_principal)
-        .map(|recipient| reply_signal(&replied, &thread, root, recipient))
-        .transpose()?;
+    let mut notifications = Vec::with_capacity(2);
+    if let Some(recipient) = root_recipient.filter(|recipient| *recipient != replying_principal) {
+        notifications.push(notification_signal(
+            &replied,
+            &thread,
+            root,
+            std::slice::from_ref(recipient),
+            NotificationKind::Replied,
+        )?);
+    }
+    let mut followers = followers
+        .iter()
+        .filter(|recipient| *recipient != replying_principal && Some(*recipient) != root_recipient)
+        .cloned()
+        .collect::<Vec<_>>();
+    followers.sort_by(|left, right| left.0.cmp(&right.0));
+    followers.dedup_by(|left, right| left.0 == right.0);
+    followers.truncate(myelin_notif::DEFAULT_HOT_SUBJECT_WRITE_CAP as usize);
+    if !followers.is_empty() {
+        notifications.push(notification_signal(
+            &replied,
+            &thread,
+            root,
+            &followers,
+            NotificationKind::ThreadWatched,
+        )?);
+    }
     Ok(ThreadReplyEvents {
         replied,
-        notification,
+        notifications,
     })
 }
 
-fn reply_signal(
+#[derive(Clone, Copy)]
+enum NotificationKind {
+    Replied,
+    ThreadWatched,
+}
+
+impl NotificationKind {
+    fn rule_key(self) -> &'static str {
+        match self {
+            NotificationKind::Replied => RULE_KEY_REPLIED,
+            NotificationKind::ThreadWatched => RULE_KEY_THREAD_WATCHED,
+        }
+    }
+
+    fn reason(self) -> Reason {
+        match self {
+            NotificationKind::Replied => Reason::Replied,
+            NotificationKind::ThreadWatched => Reason::ThreadWatched,
+        }
+    }
+
+    fn dedup_key(self, root: &MessageId) -> String {
+        match self {
+            NotificationKind::Replied => format!("chat-thread:{}", root.as_str()),
+            NotificationKind::ThreadWatched => {
+                format!("chat-thread-watched:{}", root.as_str())
+            }
+        }
+    }
+
+    fn signal_name(self) -> &'static str {
+        match self {
+            NotificationKind::Replied => "chat_thread_replied",
+            NotificationKind::ThreadWatched => "chat_thread_watched",
+        }
+    }
+
+    fn event_purpose(self) -> &'static str {
+        match self {
+            NotificationKind::Replied => "reply-signal",
+            NotificationKind::ThreadWatched => "thread-watched-signal",
+        }
+    }
+}
+
+fn notification_signal(
     replied: &EventEnvelope,
     thread: &myelin_tenancy::ArtifactRef,
     root: &MessageId,
-    recipient: &PrincipalId,
+    recipients: &[PrincipalId],
+    kind: NotificationKind,
 ) -> Result<EventEnvelope, StoreError> {
-    let dedup_key = format!("chat-thread:{}", root.as_str());
+    let dedup_key = kind.dedup_key(root);
     let signal = Signal {
-        rule_id: RuleId(RULE_KEY_REPLIED.into()),
+        rule_id: RuleId(kind.rule_key().into()),
         tenant: replied.tenant.clone(),
         severity: Severity::Notice,
         dedup_key: DedupKey(dedup_key.clone()),
@@ -71,22 +141,30 @@ fn reply_signal(
         last_seen: replied.occurred_at.0.clone(),
     };
     let mut payload = serde_json::to_value(signal).map_err(payload_error)?;
-    payload[SIGNAL_MENTIONS_KEY] = serde_json::to_value([InlineNode::Mention(Principal::stub(
-        recipient.clone(),
-        PrincipalKind::Human,
-        replied.tenant.clone(),
-    ))])
+    payload[SIGNAL_MENTIONS_KEY] = serde_json::to_value(
+        recipients
+            .iter()
+            .cloned()
+            .map(|recipient| {
+                InlineNode::Mention(Principal::stub(
+                    recipient,
+                    PrincipalKind::Human,
+                    replied.tenant.clone(),
+                ))
+            })
+            .collect::<Vec<_>>(),
+    )
     .map_err(payload_error)?;
-    payload["notification_reason"] =
-        serde_json::to_value(Reason::Replied).map_err(payload_error)?;
+    payload["notification_reason"] = serde_json::to_value(kind.reason()).map_err(payload_error)?;
 
     let aggregate_id = &blake3::hash(dedup_key.as_bytes()).to_hex()[..32];
     Ok(derive_envelope(
         EventDraft {
             type_: EventType("signal.opened".into()),
             subject: myelin_tenancy::ArtifactRef(format!(
-                "sig.{}.notice.chat_thread_replied",
-                replied.tenant.0
+                "sig.{}.notice.{}",
+                replied.tenant.0,
+                kind.signal_name(),
             )),
             aggregate: AggregateKey(format!("signal:{aggregate_id}")),
             payload,
@@ -95,7 +173,7 @@ fn reply_signal(
             contains_personal_data: false,
             pii_key_ref: None,
         },
-        derived_context(replied, "reply-signal"),
+        derived_context(replied, kind.event_purpose()),
         Some(replied),
     ))
 }
@@ -172,6 +250,7 @@ mod tests {
             &root,
             &reply,
             Some(&PrincipalId("alice".into())),
+            &[],
             &PrincipalId("bob".into()),
         )
         .unwrap();
@@ -184,7 +263,7 @@ mod tests {
                 root.as_str(),
             )
         );
-        let notification = events.notification.unwrap();
+        let notification = &events.notifications[0];
         assert_eq!(notification.payload["notification_reason"], "replied");
         assert_eq!(notification.payload["subject"], events.replied.subject.0);
         assert!(!notification.payload.to_string().contains("message content"));
@@ -198,9 +277,66 @@ mod tests {
             &root,
             &MessageId("01J00000000000000000000001".into()),
             Some(&PrincipalId("alice".into())),
+            &[],
             &PrincipalId("alice".into()),
         )
         .unwrap();
-        assert!(events.notification.is_none());
+        assert!(events.notifications.is_empty());
+    }
+
+    #[test]
+    fn a_later_reply_reaches_prior_participants_once_without_notifying_the_replier() {
+        let root = MessageId("01J00000000000000000000000".into());
+        let events = thread_reply_events(
+            &message(),
+            &root,
+            &MessageId("01J00000000000000000000001".into()),
+            Some(&PrincipalId("alice".into())),
+            &[
+                PrincipalId("bob".into()),
+                PrincipalId("carol".into()),
+                PrincipalId("carol".into()),
+                PrincipalId("alice".into()),
+            ],
+            &PrincipalId("bob".into()),
+        )
+        .unwrap();
+
+        assert_eq!(events.notifications.len(), 2);
+        let watched = events
+            .notifications
+            .iter()
+            .find(|event| event.payload["notification_reason"] == "thread_watched")
+            .expect("prior participants receive watched-thread activity");
+        let recipients = watched.payload["mentions"].to_string();
+        assert!(recipients.contains("carol"));
+        assert!(!recipients.contains("alice"));
+        assert!(!recipients.contains("bob"));
+    }
+
+    #[test]
+    fn watched_thread_delivery_respects_the_hot_subject_write_bound() {
+        let followers = (0..=myelin_notif::DEFAULT_HOT_SUBJECT_WRITE_CAP)
+            .map(|index| PrincipalId(format!("participant-{index:03}")))
+            .collect::<Vec<_>>();
+        let events = thread_reply_events(
+            &message(),
+            &MessageId("01J00000000000000000000000".into()),
+            &MessageId("01J00000000000000000000001".into()),
+            None,
+            &followers,
+            &PrincipalId("current-replier".into()),
+        )
+        .unwrap();
+
+        let mentions: Vec<InlineNode> =
+            serde_json::from_value(events.notifications[0].payload["mentions"].clone()).unwrap();
+        assert_eq!(
+            mentions.len(),
+            myelin_notif::DEFAULT_HOT_SUBJECT_WRITE_CAP as usize,
+        );
+        let encoded = serde_json::to_string(&mentions).unwrap();
+        assert!(encoded.contains("participant-063"));
+        assert!(!encoded.contains("participant-064"));
     }
 }

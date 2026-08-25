@@ -1178,13 +1178,42 @@ describe("chat collaboration lifecycle", () => {
     expect(conflictingReply.body).toMatchObject({ error: { code: "conflict" } });
     const foundersReply = uniqueName("Agreed; the repair remains the release gate");
     const foundersReplyId = await room.reply(systemClient, rootMessageId, foundersReply);
+    const followedThread = await eventually(
+      () => findInboxItem(reviewerClient, threadRef),
+      { description: "a participant to hear about later activity in the thread they joined" },
+    );
+    expect(followedThread).toMatchObject({
+      subject: threadRef,
+      subsystem: "chat",
+      reason: "thread_watched",
+      state: "unread",
+      coalesce_count: 1,
+    });
+    const reviewersConclusion = uniqueName("Then I will hold the rollout until the repair lands");
+    const reviewersConclusionId = await room.reply(
+      reviewerClient,
+      rootMessageId,
+      reviewersConclusion,
+    );
+    const continuingConversation = await eventually(
+      async () => {
+        const item = await findInboxItem(systemClient, threadRef);
+        return item?.coalesce_count === 2 ? item : undefined;
+      },
+      { description: "later replies to remain one continuing inbox conversation" },
+    );
+    expect(continuingConversation).toMatchObject({
+      reason: "replied",
+      state: "unread",
+      coalesce_count: 2,
+    });
 
     expect(await room.messages(systemClient)).toEqual([
       expect.objectContaining({
         id: rootMessageId,
         content: decision,
         thread_root_id: null,
-        reply_count: 2,
+        reply_count: 3,
       }),
       expect.objectContaining({
         content: "The rest of the room can keep moving.",
@@ -1199,7 +1228,7 @@ describe("chat collaboration lifecycle", () => {
         id: rootMessageId,
         content: decision,
         thread_root_id: null,
-        reply_count: 2,
+        reply_count: 3,
       }),
       expect.objectContaining({
         id: reviewersReplyId,
@@ -1213,21 +1242,36 @@ describe("chat collaboration lifecycle", () => {
         thread_root_id: rootMessageId,
         reply_count: 0,
       }),
+      expect.objectContaining({
+        id: reviewersConclusionId,
+        content: reviewersConclusion,
+        thread_root_id: rootMessageId,
+        reply_count: 0,
+      }),
     ]);
     const latestReplyPage = await systemClient.json(
       `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/messages?limit=1`,
     );
     expect(latestReplyPage.body).toMatchObject({
-      root: { id: rootMessageId, reply_count: 2 },
-      items: [{ id: foundersReplyId, thread_root_id: rootMessageId }],
-      page: { limit: 1, next_cursor: foundersReplyId },
+      root: { id: rootMessageId, reply_count: 3 },
+      items: [{ id: reviewersConclusionId, thread_root_id: rootMessageId }],
+      page: { limit: 1, next_cursor: reviewersConclusionId },
     });
     const earlierReplyPage = await systemClient.json(
       `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/messages?limit=1` +
-      `&before=${encodeURIComponent(foundersReplyId)}`,
+      `&before=${encodeURIComponent(reviewersConclusionId)}`,
     );
     expect(earlierReplyPage.body).toMatchObject({
-      root: { id: rootMessageId, reply_count: 2 },
+      root: { id: rootMessageId, reply_count: 3 },
+      items: [{ id: foundersReplyId, thread_root_id: rootMessageId }],
+      page: { limit: 1, next_cursor: foundersReplyId },
+    });
+    const firstReplyPage = await systemClient.json(
+      `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/messages?limit=1` +
+      `&before=${encodeURIComponent(foundersReplyId)}`,
+    );
+    expect(firstReplyPage.body).toMatchObject({
+      root: { id: rootMessageId, reply_count: 3 },
       items: [{ id: reviewersReplyId, thread_root_id: rootMessageId }],
       page: { limit: 1, next_cursor: null },
     });
