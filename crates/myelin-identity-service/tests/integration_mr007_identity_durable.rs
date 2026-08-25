@@ -17,6 +17,9 @@ use myelin_identity_service::namespace::{FragmentDef, NamespaceEngine, Permissio
 use myelin_identity_service::principal_store::{PrincipalError, PrincipalProfile, PrincipalStore};
 use myelin_identity_service::reverse_index::ReverseIndex;
 use myelin_identity_service::tuple_store::TupleStore;
+use myelin_identity_service::{
+    KeyBindingLookupError, KeyBindingResolver, PrincipalStoreKeyBindings,
+};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     identity_durable_migrations, identity_tuple_revision_migrations, DurablePrincipalBacking,
@@ -267,6 +270,32 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         .await;
     println!(
         "OK [1]: principal row + profile ciphertext + tuple edges durable across a fresh instance."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_key_lookup_reports_a_closed_identity_pool_without_panicking() {
+    let admin = common::admin_provider(2).await;
+    admin
+        .migrate(&identity_durable_migrations(), &HotTables::none())
+        .await
+        .expect("the durable identity directory is migrated before the outage");
+
+    let app = common::app_provider(1).await;
+    let region = app.config().region.clone();
+    let store = PrincipalStore::with_pg(
+        Arc::new(KmsEngine::new()),
+        DurablePrincipalBacking::new(app.clone()),
+        tokio::runtime::Handle::current(),
+    );
+    let bindings = PrincipalStoreKeyBindings::new(store, scope("ssh-outage", &region));
+
+    app.db_pool().close().await;
+
+    assert_eq!(
+        bindings.resolve("SHA256:registered-before-the-outage"),
+        Err(KeyBindingLookupError::Unavailable),
+        "SSH admission receives a typed unavailable result when its identity pool is down"
     );
 }
 

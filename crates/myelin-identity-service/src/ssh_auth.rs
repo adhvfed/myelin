@@ -273,12 +273,37 @@ impl KeyBindingIndex {
 }
 
 pub trait KeyBindingResolver: Send + Sync {
-    fn resolve(&self, fingerprint: &str) -> Option<RegisteredKey>;
+    fn resolve(&self, fingerprint: &str) -> Result<Option<RegisteredKey>, KeyBindingLookupError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyBindingLookupError {
+    Unavailable,
+}
+
+impl core::fmt::Display for KeyBindingLookupError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            KeyBindingLookupError::Unavailable => {
+                formatter.write_str("SSH key binding directory is unavailable")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KeyBindingLookupError {}
+
+type KeyBindingLookup = Result<Option<RegisteredKey>, KeyBindingLookupError>;
+
+impl From<PrincipalError> for KeyBindingLookupError {
+    fn from(_: PrincipalError) -> Self {
+        KeyBindingLookupError::Unavailable
+    }
 }
 
 impl KeyBindingResolver for KeyBindingIndex {
-    fn resolve(&self, fingerprint: &str) -> Option<RegisteredKey> {
-        self.get(fingerprint).cloned()
+    fn resolve(&self, fingerprint: &str) -> KeyBindingLookup {
+        Ok(self.get(fingerprint).cloned())
     }
 }
 
@@ -319,15 +344,15 @@ impl PrincipalStoreKeyBindings {
 }
 
 impl KeyBindingResolver for PrincipalStoreKeyBindings {
-    fn resolve(&self, fingerprint: &str) -> Option<RegisteredKey> {
+    fn resolve(&self, fingerprint: &str) -> KeyBindingLookup {
         let row = self
             .store
-            .resolve_credential(&self.scope, scheme::SSH, fingerprint)?;
-        Some(RegisteredKey {
+            .try_resolve_credential(&self.scope, scheme::SSH, fingerprint)?;
+        Ok(row.map(|row| RegisteredKey {
             tenant: row.tenant,
             region: row.region,
             subject_key: fingerprint.to_string(),
-        })
+        }))
     }
 }
 
@@ -539,12 +564,20 @@ impl CredentialVerifier for SshVerifier {
         let sig = parse_ssh_signature(&signature_blob)?;
 
         let fingerprint = ssh_fingerprint(&public_key_blob);
-        let binding = self.registry.resolve(&fingerprint).ok_or_else(|| {
-            refuse(format!(
-                "unregistered SSH key fingerprint `{fingerprint}` (no S1 binding - fail-closed, \
-                 never a fabricated principal)"
-            ))
-        })?;
+        let binding = self
+            .registry
+            .resolve(&fingerprint)
+            .map_err(|_| {
+                AuthzError::Unavailable(
+                    "SSH key binding directory is unavailable - authentication fails closed".into(),
+                )
+            })?
+            .ok_or_else(|| {
+                refuse(format!(
+                    "unregistered SSH key fingerprint `{fingerprint}` (no S1 binding - \
+                     fail-closed, never a fabricated principal)"
+                ))
+            })?;
 
         let nonce = self.challenges.consume(&env.challenge_id)?;
 
@@ -566,7 +599,7 @@ mod tests {
     use super::*;
     use crate::authenticate::StructuralVerifier;
     use crate::oidc::SchemeDispatchVerifier;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
     fn put_string(out: &mut Vec<u8>, s: &[u8]) {
         out.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -821,6 +854,53 @@ mod tests {
             matches!(&err, AuthzError::FailClosed(m) if m.contains("unregistered SSH key")),
             "an unregistered key must be refused, got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_directory_outage_denies_ssh_without_burning_the_challenge() {
+        struct RecoveringDirectory {
+            available: Arc<AtomicBool>,
+            binding: RegisteredKey,
+        }
+
+        impl KeyBindingResolver for RecoveringDirectory {
+            fn resolve(&self, fingerprint: &str) -> KeyBindingLookup {
+                if !self.available.load(Ordering::SeqCst) {
+                    return Err(KeyBindingLookupError::Unavailable);
+                }
+                Ok((self.binding.subject_key == fingerprint).then(|| self.binding.clone()))
+            }
+        }
+
+        let key = EdKey::generate();
+        let blob = key.pubkey_blob();
+        let fingerprint = ssh_fingerprint(&blob);
+        let available = Arc::new(AtomicBool::new(false));
+        let directory = RecoveringDirectory {
+            available: available.clone(),
+            binding: RegisteredKey {
+                tenant: TenantId(TENANT.into()),
+                region: Region(REGION.into()),
+                subject_key: fingerprint.clone(),
+            },
+        };
+        let verifier = SshVerifier::with_resolver(Arc::new(directory), ChallengeGuard::new(300));
+        let credential = signed_cred(&verifier, &blob, |message| key.sig_blob(message));
+
+        let outage = verifier.verify(&credential).unwrap_err();
+        assert_eq!(
+            outage,
+            AuthzError::Unavailable(
+                "SSH key binding directory is unavailable - authentication fails closed".into()
+            ),
+            "a directory outage is an ordinary fail-closed authentication result, not a panic"
+        );
+
+        available.store(true, Ordering::SeqCst);
+        let assertion = verifier
+            .verify(&credential)
+            .expect("the same signed challenge remains usable after the directory recovers");
+        assert_eq!(assertion.subject_key, fingerprint);
     }
 
     #[test]

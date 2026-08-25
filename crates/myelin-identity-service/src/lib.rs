@@ -140,7 +140,8 @@ pub use revocation::{
 };
 pub use ssh_auth::{
     encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,
-    KeyBindingIndex, KeyBindingResolver, PrincipalStoreKeyBindings, RegisteredKey, SshVerifier,
+    KeyBindingIndex, KeyBindingLookupError, KeyBindingResolver, PrincipalStoreKeyBindings,
+    RegisteredKey, SshVerifier,
 };
 pub use tuple_store::{
     run_grant_expiry, tuple_written_event, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,

@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — SSH authentication fails closed when its identity directory is down
+
+The durable SSH key adapter was the lone identity authenticator still using a legacy convenience
+read that panicked on PostgreSQL errors. A transient directory outage could therefore unwind an SSH
+admission path instead of producing an ordinary denial, despite every later principal lookup being
+fallible.
+
+Key-binding resolution is now explicitly fallible. The in-memory directory remains infallible, the
+durable adapter translates storage and corrupt-row failures into a credential-free typed error, and
+the verifier returns `Unavailable` before consuming the one-shot signed challenge. That ordering
+lets a person retry the exact request after the directory recovers without weakening replay
+protection after a binding has actually been resolved.
+
+**Proof:** all 425 identity library cases; warning-free all-target/all-feature Identity clippy; a
+recovery story in which the first verification is denied and the same challenge subsequently
+succeeds; and all eight real-PostgreSQL durable-identity journeys, including a closed-pool lookup
+returning `Unavailable` without a panic.
+
 ## 2026-08-26 — privacy holder work keeps its fenced request lease alive
 
 Privacy requests acquired a 120-second lease and then performed all holder work without renewing
