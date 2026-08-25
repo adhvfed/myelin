@@ -77,7 +77,8 @@ pub use pg_issue_store::{
     IssueAuthorizationOutcome, IssueAuthorizationState, IssueAuthorizationStatus, IssueAuthorizer,
     IssueCreationOutcome, IssueCreationReceipt, IssuePage, IssuePageRequest, IssuePermission,
     IssueRelationCreationOutcome, IssueStoreError, IssueTupleWriter, IssueViewProjectionRevision,
-    PgIssueStore, StoredIssue, StoredIssueRelation, VisibleIssues, MAX_RELATIONS_PER_ISSUE,
+    IssueViewRebuildOutcome, PgIssueStore, StoredIssue, StoredIssueRelation, VisibleIssues,
+    MAX_RELATIONS_PER_ISSUE,
 };
 pub use pg_issue_store::{ImportIssue, ImportIssueReceipt};
 

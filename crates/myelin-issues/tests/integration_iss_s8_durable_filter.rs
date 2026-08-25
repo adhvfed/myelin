@@ -9,8 +9,8 @@ use myelin_identity::{
 use myelin_identity_service::TupleStore;
 use myelin_issues::{
     issues_hot_tables, issues_migrations, CreateIssue, IssueAuthorizationBinding, IssueAuthorizer,
-    IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore,
-    VisibleIssues,
+    IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter, IssueViewRebuildOutcome,
+    PgIssueStore, VisibleIssues,
 };
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
@@ -305,6 +305,9 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .rebuild_effective_issue_view(&worker)
         .await
         .expect("worker rebuilds pending projection");
+    let IssueViewRebuildOutcome::Published(built) = built else {
+        panic!("an uncontended rebuild publishes its staged revision");
+    };
     assert!(built.effective_grants >= 2);
     assert_eq!(
         store
@@ -467,33 +470,44 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
     )
     .await
     .unwrap();
-    let locked = Arc::new(tokio::sync::Notify::new());
+    let snapshot_staged = Arc::new(tokio::sync::Notify::new());
     let rebuild_store = restarted.clone();
     let rebuild_worker = worker.clone();
-    let rebuild_locked = locked.clone();
+    let rebuild_snapshot = snapshot_staged.clone();
     let rebuilding = tokio::spawn(async move {
         rebuild_store
-            .rebuild_effective_issue_view_paused_for_test(
+            .rebuild_effective_issue_view_paused_before_publish_for_test(
                 &rebuild_worker,
-                Duration::from_millis(300),
-                rebuild_locked,
+                Duration::from_secs(2),
+                rebuild_snapshot,
             )
             .await
     });
-    locked.notified().await;
-    let revoking = write(
-        &tuples,
-        &scope,
-        &alice,
-        vec![tuple(
-            false,
-            &issue_object,
-            "confidential_grant",
-            &alice.principal_id.0,
-        )],
-    );
-    let (_, revoked) = tokio::join!(rebuilding, revoking);
-    assert!(revoked.is_ok());
+    snapshot_staged.notified().await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        write(
+            &tuples,
+            &scope,
+            &alice,
+            vec![tuple(
+                false,
+                &issue_object,
+                "confidential_grant",
+                &alice.principal_id.0,
+            )],
+        ),
+    )
+    .await
+    .expect("a visibility change does not wait behind snapshot computation")
+    .expect("revoke the issue grant");
+    assert!(matches!(
+        rebuilding.await.unwrap().unwrap(),
+        IssueViewRebuildOutcome::Superseded {
+            attempted_revision,
+            current_revision,
+        } if current_revision > attempted_revision
+    ));
     assert!(matches!(
         restarted
             .list(&alice, IssuePageRequest::new(20, None).unwrap())

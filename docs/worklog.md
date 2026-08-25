@@ -1577,6 +1577,35 @@ and race subset. The latter covers exact requeue, router handoff, budget
 exhaustion, unresolved phases, retry-versus-phase races, cancellation usage,
 and retry-versus-supersession ordering.
 
+## 2026-08-25 — rebuilding issue visibility no longer stops issue creation
+
+The complete Chat lifecycle exposed a durable latency defect outside Chat: an
+issue visibility rebuild held the tenant projection revision lock while it
+walked every relevant ReBAC path twice. Issue creation invalidates that same
+revision row, so an ordinary proposal waited behind the full computation. In the
+accumulated system-test tenant, one proposal spent 11.7 seconds inside its HTTP
+request before it could even enter the documented asynchronous authorization
+hold.
+
+The rebuild now takes a revision snapshot and computes one bounded recursive
+walk into transaction-local staging without the publication lock. Validation and
+effective membership share that staged walk instead of repeating it. Only the
+short replacement-and-publication phase locks the revision. If a grant, revoke,
+or issue changes during computation, the worker returns an explicit
+`Superseded` outcome and discards the snapshot; the stale revision is never
+published, and reads remain fail-static until a fresh rebuild wins.
+
+The PostgreSQL race story pauses a fully staged snapshot for two seconds and
+requires a concurrent revoke to commit within one. It then proves the stale
+snapshot was refused and that a fresh rebuild excludes the revoked issue. On the
+same accumulated tenant, live issue proposals returned to roughly 100 ms without
+relaxing the existing authorization or story budgets.
+
+Proof: all 433 Issues library tests and focused Edge reconciliation tests;
+warning-free all-target, all-feature Clippy for Issues and Edge; the real
+PostgreSQL visibility/revocation race, issue saga, and Edge route integrations;
+and all twelve live Chat collaboration stories together after an Edge restart.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the

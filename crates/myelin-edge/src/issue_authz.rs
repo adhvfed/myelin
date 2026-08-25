@@ -8,7 +8,7 @@ use myelin_identity_service::{StoreBackedCheck, TupleStore};
 use myelin_issues::pg_issue_store::MAX_PAGE_SIZE;
 use myelin_issues::{
     IssueAuthorizationBinding, IssueAuthorizationOutcome, IssueAuthorizer, IssuePermission,
-    IssueStoreError, IssueTupleWriter, PgIssueStore, VisibleIssues,
+    IssueStoreError, IssueTupleWriter, IssueViewRebuildOutcome, PgIssueStore, VisibleIssues,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
@@ -203,6 +203,7 @@ pub struct IssueReconciliationReport {
     pub failures: u64,
     pub projections_rebuilt: u64,
     pub projected_grants: u64,
+    pub projection_superseded: u64,
     pub projection_failures: u64,
     pub max_projection_lag: u64,
 }
@@ -260,9 +261,12 @@ impl IssueAuthorizationSweeper for PgIssueAuthorizationSweeper {
                             .max_projection_lag
                             .max(lag.unwrap_or(1).unsigned_abs());
                         match self.store.rebuild_effective_issue_view(worker).await {
-                            Ok(rebuilt) => {
+                            Ok(IssueViewRebuildOutcome::Published(rebuilt)) => {
                                 report.projections_rebuilt += 1;
                                 report.projected_grants += rebuilt.effective_grants;
+                            }
+                            Ok(IssueViewRebuildOutcome::Superseded { .. }) => {
+                                report.projection_superseded += 1;
                             }
                             Err(_) => {
                                 report.projection_failures += 1;
@@ -290,6 +294,7 @@ pub struct IssueReconciliationMetrics {
     failures: AtomicU64,
     projections_rebuilt: AtomicU64,
     projected_grants: AtomicU64,
+    projection_superseded: AtomicU64,
     projection_failures: AtomicU64,
     max_projection_lag: AtomicU64,
 }
@@ -303,6 +308,7 @@ pub struct IssueReconciliationMetricsSnapshot {
     pub failures: u64,
     pub projections_rebuilt: u64,
     pub projected_grants: u64,
+    pub projection_superseded: u64,
     pub projection_failures: u64,
     pub max_projection_lag: u64,
 }
@@ -317,6 +323,7 @@ impl IssueReconciliationMetrics {
             failures: self.failures.load(Ordering::Relaxed),
             projections_rebuilt: self.projections_rebuilt.load(Ordering::Relaxed),
             projected_grants: self.projected_grants.load(Ordering::Relaxed),
+            projection_superseded: self.projection_superseded.load(Ordering::Relaxed),
             projection_failures: self.projection_failures.load(Ordering::Relaxed),
             max_projection_lag: self.max_projection_lag.load(Ordering::Relaxed),
         }
@@ -335,6 +342,8 @@ impl IssueReconciliationMetrics {
             .fetch_add(report.projections_rebuilt, Ordering::Relaxed);
         self.projected_grants
             .fetch_add(report.projected_grants, Ordering::Relaxed);
+        self.projection_superseded
+            .fetch_add(report.projection_superseded, Ordering::Relaxed);
         self.projection_failures
             .fetch_add(report.projection_failures, Ordering::Relaxed);
         self.max_projection_lag
@@ -445,14 +454,15 @@ async fn run_reconciliation_loop(
         }
         let report = sweeper.sweep().await;
         metrics.record(report);
-        if report.pending_seen > 0 || report.failures > 0 {
+        if report.pending_seen > 0 || report.failures > 0 || report.projection_superseded > 0 {
             eprintln!(
-                "issues authz reconciler: pending_seen={} newly_activated={} already_active={} failures={} projections_rebuilt={} projection_failures={} max_projection_lag={} region={}",
+                "issues authz reconciler: pending_seen={} newly_activated={} already_active={} failures={} projections_rebuilt={} projection_superseded={} projection_failures={} max_projection_lag={} region={}",
                 report.pending_seen,
                 report.newly_activated,
                 report.already_active,
                 report.failures,
                 report.projections_rebuilt,
+                report.projection_superseded,
                 report.projection_failures,
                 report.max_projection_lag,
                 config.region.as_str(),

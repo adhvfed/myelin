@@ -78,6 +78,15 @@ pub struct IssueViewProjectionRevision {
     pub effective_grants: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueViewRebuildOutcome {
+    Published(IssueViewProjectionRevision),
+    Superseded {
+        attempted_revision: i64,
+        current_revision: i64,
+    },
+}
+
 pub trait IssueAuthorizer: Send + Sync {
     fn may_create(&self, principal: &Principal, project_id: &str) -> bool;
     fn may_view_project(&self, principal: &Principal, project_id: &str) -> bool {
@@ -1667,26 +1676,26 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     pub async fn rebuild_effective_issue_view(
         &self,
         worker: &Principal,
-    ) -> Result<IssueViewProjectionRevision, IssueStoreError> {
+    ) -> Result<IssueViewRebuildOutcome, IssueStoreError> {
         self.rebuild_effective_issue_view_inner(worker, None).await
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn rebuild_effective_issue_view_paused_for_test(
+    pub async fn rebuild_effective_issue_view_paused_before_publish_for_test(
         &self,
         worker: &Principal,
         pause: std::time::Duration,
-        locked: Arc<tokio::sync::Notify>,
-    ) -> Result<IssueViewProjectionRevision, IssueStoreError> {
-        self.rebuild_effective_issue_view_inner(worker, Some((pause, locked)))
+        snapshot_staged: Arc<tokio::sync::Notify>,
+    ) -> Result<IssueViewRebuildOutcome, IssueStoreError> {
+        self.rebuild_effective_issue_view_inner(worker, Some((pause, snapshot_staged)))
             .await
     }
 
     async fn rebuild_effective_issue_view_inner(
         &self,
         worker: &Principal,
-        pause_after_lock: Option<(std::time::Duration, Arc<tokio::sync::Notify>)>,
-    ) -> Result<IssueViewProjectionRevision, IssueStoreError> {
+        pause_before_publish: Option<(std::time::Duration, Arc<tokio::sync::Notify>)>,
+    ) -> Result<IssueViewRebuildOutcome, IssueStoreError> {
         let scope = self.scope(worker)?;
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
@@ -1707,6 +1716,65 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
 
                     let revision: i64 = sqlx::query_scalar(
                         "SELECT source_revision FROM authz_projection_state \
+                         WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+
+                    let stage_walk_sql = format!(
+                        "CREATE TEMP TABLE issue_view_rebuild_walk ON COMMIT DROP AS \
+                         {ISSUE_VIEW_WALK_CTE} \
+                         SELECT issue_id, arm, object_id, relation, depth, supported \
+                         FROM walk"
+                    );
+                    sqlx::query(&stage_walk_sql)
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+
+                    let unsupported: Option<String> = sqlx::query_scalar(
+                        "SELECT object_id || '#' || relation \
+                           FROM pg_temp.issue_view_rebuild_walk \
+                          WHERE NOT supported OR depth >= 16 \
+                          ORDER BY depth, object_id LIMIT 1",
+                    )
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+                    if let Some(node) = unsupported {
+                        return Err(myelin_storage::PgError::Query(format!(
+                            "unsupported or over-depth userset in issue:view rebuild: {node}"
+                        )));
+                    }
+
+                    let stage_effective_sql = format!(
+                        "CREATE TEMP TABLE issue_view_rebuild_effective ON COMMIT DROP AS \
+                         WITH walk AS MATERIALIZED (\
+                           SELECT issue_id, arm, object_id, relation, supported \
+                           FROM pg_temp.issue_view_rebuild_walk\
+                         ) \
+                         {ISSUE_VIEW_MEMBERS_CTE} \
+                         SELECT issue_id, subject FROM effective"
+                    );
+                    sqlx::query(&stage_effective_sql)
+                        .bind(&tenant_id)
+                        .bind(&region)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
+
+                    if let Some((pause, snapshot_staged)) = pause_before_publish {
+                        snapshot_staged.notify_one();
+                        tokio::time::sleep(pause).await;
+                    }
+
+                    let current_revision: i64 = sqlx::query_scalar(
+                        "SELECT source_revision FROM authz_projection_state \
                          WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view' \
                          FOR UPDATE",
                     )
@@ -1715,10 +1783,11 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
-
-                    if let Some((pause, locked)) = pause_after_lock {
-                        locked.notify_one();
-                        tokio::time::sleep(pause).await;
+                    if current_revision != revision {
+                        return Ok(IssueViewRebuildOutcome::Superseded {
+                            attempted_revision: revision,
+                            current_revision,
+                        });
                     }
 
                     sqlx::query(
@@ -1727,26 +1796,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     )
                     .bind(&tenant_id)
                     .bind(&region)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
-
-                    let unsupported_sql = format!(
-                        "{ISSUE_VIEW_WALK_CTE} \
-                         SELECT object_id || '#' || relation FROM walk \
-                         WHERE NOT supported OR depth >= 16 ORDER BY depth, object_id LIMIT 1"
-                    );
-                    let unsupported: Option<String> = sqlx::query_scalar(&unsupported_sql)
-                        .bind(&tenant_id)
-                        .bind(&region)
-                        .fetch_optional(&mut *conn)
+                        .execute(&mut *conn)
                         .await
                         .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
-                    if let Some(node) = unsupported {
-                        return Err(myelin_storage::PgError::Query(format!(
-                            "unsupported or over-depth userset in issue:view rebuild: {node}"
-                        )));
-                    }
 
                     sqlx::query(
                         "DELETE FROM issue_authz_visible \
@@ -1758,15 +1810,13 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .await
                     .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
 
-                    let insert_sql = format!(
-                        "{ISSUE_VIEW_WALK_CTE} {ISSUE_VIEW_MEMBERS_CTE} \
-                         INSERT INTO issue_authz_visible \
+                    let inserted = sqlx::query(
+                        "INSERT INTO issue_authz_visible \
                            (tenant_id, region, projection, subject, permission, object_type, \
                             object_id, revision) \
                          SELECT $1, $2, 'issue:view', subject, 'view', 'issue', issue_id, $3 \
-                         FROM effective"
-                    );
-                    let inserted = sqlx::query(&insert_sql)
+                         FROM pg_temp.issue_view_rebuild_effective",
+                    )
                         .bind(&tenant_id)
                         .bind(&region)
                         .bind(revision)
@@ -1792,10 +1842,10 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                             "issue:view source revision changed during locked rebuild".into(),
                         ));
                     }
-                    Ok(IssueViewProjectionRevision {
+                    Ok(IssueViewRebuildOutcome::Published(IssueViewProjectionRevision {
                         revision,
                         effective_grants: inserted,
-                    })
+                    }))
                 })
             })
             .await
