@@ -107,6 +107,14 @@ describe("artifact references", () => {
     expect(artifactRefHref(
       "myelin://acme/chat/message/01J00000000000000000000000#message-01J00000000000000000000001",
     )).toBeUndefined();
+    expect(artifactRefLabel("myelin://acme/chat/thread/01J00000000000000000000000"))
+      .toBe("Thread · 00000000");
+    expect(artifactRefHref(
+      "myelin://acme/chat/thread/01J00000000000000000000000#thread-01J00000000000000000000000",
+    )).toBe("/chat?thread=01J00000000000000000000000#thread-01J00000000000000000000000");
+    expect(artifactRefHref(
+      "myelin://acme/chat/thread/01J00000000000000000000000#thread-01J00000000000000000000001",
+    )).toBeUndefined();
     expect(artifactRefHref(
       "myelin://acme/agent/thread/92000000-0000-4000-8000-000000000001",
     )).toBe("/agents?thread=92000000-0000-4000-8000-000000000001");

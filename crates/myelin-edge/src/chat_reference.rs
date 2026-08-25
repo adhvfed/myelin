@@ -19,6 +19,7 @@ pub struct DurableChatReferenceApi {
 pub(crate) struct ChatMessageProjection {
     pub(crate) message_id: String,
     pub(crate) conversation_topic: String,
+    pub(crate) thread_root_id: Option<String>,
     pub(crate) state: MessageState,
 }
 
@@ -103,6 +104,7 @@ impl DurableChatReferenceApi {
                             ChatMessageProjection {
                                 message_id: location.message_id.0,
                                 conversation_topic: topic.clone(),
+                                thread_root_id: location.thread_root_id.map(|id| id.0),
                                 state: location.state,
                             }
                         })

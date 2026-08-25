@@ -14,7 +14,7 @@ pub fn chat_dispatch_with_project(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no chat command (try: list | create <channel> --topic <topic> | history <id> | send <id> <message> | mention <id> <principal> <message> | ref <id> <ArtifactRef>)"
+            "no chat command (try: list | create <channel> --topic <topic> | history <id> | send <id> <message> | thread <root> | reply <root> <message> | mention <id> <principal> <message> | ref <id> <ArtifactRef>)"
                 .into(),
         )
     })?;
@@ -34,10 +34,17 @@ pub fn chat_dispatch_with_project(
             ))
         }
         "send" | "post" => send_message(rest),
+        "thread" => {
+            let (root, flags) = target_and_flags("thread", rest)?;
+            canonical_ulid("thread root id", root)?;
+            let page = PageArgs::parse(flags, "--before")?;
+            Ok(page.call(&format!("/v1/chat/threads/{root}/messages"), "before"))
+        }
+        "reply" => reply_to_message(rest),
         "mention" => mention_principal(rest),
         "ref" => reference_message(rest),
         other => Err(CliError::Usage(format!(
-            "unknown chat command `{other}` (try: list | create | history | send | mention | ref)"
+            "unknown chat command `{other}` (try: list | create | history | send | thread | reply | mention | ref)"
         ))),
     }
 }
@@ -100,6 +107,20 @@ fn send_message(args: &[&str]) -> Result<EdgeCall, CliError> {
     validate_message(content)?;
     Ok(EdgeCall::post_json(
         format!("/v1/chat/conversations/{conversation}/messages"),
+        json!({ "content": content }),
+    ))
+}
+
+fn reply_to_message(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let [root, content] = args else {
+        return Err(CliError::Usage(
+            "`chat reply` needs exactly one <root_message_id> and one quoted <message>".into(),
+        ));
+    };
+    canonical_ulid("thread root id", root)?;
+    validate_message(content)?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/chat/messages/{root}/replies"),
         json!({ "content": content }),
     ))
 }
@@ -268,7 +289,7 @@ mod tests {
     const OTHER_PROJECT: &str = "22222222-2222-2222-2222-222222222222";
 
     #[test]
-    fn list_and_history_map_to_bounded_cursor_routes() {
+    fn list_history_and_threads_map_to_bounded_cursor_routes() {
         let list = chat_dispatch(&["list", "--limit", "25", "--cursor", CONVERSATION]).unwrap();
         assert_eq!(list.method, HttpMethod::Get);
         assert_eq!(list.path, "/v1/chat/conversations");
@@ -294,6 +315,13 @@ mod tests {
             history.query.as_deref(),
             Some("limit=2&before=01J00000000000000000000000")
         );
+
+        let thread = chat_dispatch(&["thread", CONVERSATION, "--limit", "2"]).unwrap();
+        assert_eq!(
+            thread.path,
+            format!("/v1/chat/threads/{CONVERSATION}/messages")
+        );
+        assert_eq!(thread.query.as_deref(), Some("limit=2"));
     }
 
     #[test]
@@ -344,6 +372,16 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(send.payload.as_deref().unwrap()).unwrap(),
             json!({"content": "Ready for review."})
         );
+        let reply =
+            chat_dispatch(&["reply", CONVERSATION, "Keep this with the decision."]).unwrap();
+        assert_eq!(
+            reply.path,
+            format!("/v1/chat/messages/{CONVERSATION}/replies")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(reply.payload.as_deref().unwrap()).unwrap(),
+            json!({"content": "Keep this with the decision."})
+        );
 
         let mention = chat_dispatch(&[
             "mention",
@@ -385,6 +423,9 @@ mod tests {
             vec!["history", "not-an-id"],
             vec!["send", CONVERSATION, ""],
             vec!["send", CONVERSATION],
+            vec!["thread", "not-an-id"],
+            vec!["reply", CONVERSATION, ""],
+            vec!["reply", CONVERSATION],
             vec!["mention", CONVERSATION, "reviewer"],
             vec!["mention", CONVERSATION, " reviewer", "please review"],
             vec!["mention", CONVERSATION, "reviewer", ""],

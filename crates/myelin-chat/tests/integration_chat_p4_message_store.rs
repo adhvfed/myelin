@@ -158,6 +158,51 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
         "one metadata-only query returns canonical unique coordinates"
     );
 
+    let mut first_reply = new_msg(&conv, "thread-20-a", "bob", "first focused reply");
+    first_reply.thread_root_id = Some(pg_ids[20].clone());
+    let first_reply_id = store
+        .append_storage_only(&pg_src, first_reply)
+        .await
+        .expect("append the first focused reply");
+    let mut second_reply = new_msg(&conv, "thread-20-b", "alice", "second focused reply");
+    second_reply.thread_root_id = Some(pg_ids[20].clone());
+    let second_reply_id = store
+        .append_storage_only(&pg_src, second_reply)
+        .await
+        .expect("append the second focused reply");
+    let roots = store
+        .range_roots(&conv, RangeCursor::Recent, 1000)
+        .await
+        .expect("page the calm top-level timeline");
+    assert_eq!(roots.len(), 40, "focused replies do not crowd the room");
+    assert_eq!(
+        roots
+            .iter()
+            .find(|item| item.message.message_id == pg_ids[20])
+            .map(|item| item.reply_count),
+        Some(2),
+        "the root advertises the exact reply count"
+    );
+    let replies = store
+        .range_replies(&conv, &pg_ids[20], RangeCursor::Recent, 1000)
+        .await
+        .expect("page only the root's replies");
+    assert_eq!(
+        replies
+            .iter()
+            .map(|item| item.message.message_id.clone())
+            .collect::<Vec<_>>(),
+        vec![first_reply_id, second_reply_id],
+    );
+    assert!(replies.iter().all(|item| item.reply_count == 0));
+    assert_eq!(
+        store
+            .reply_count(&conv, &pg_ids[20])
+            .await
+            .expect("count replies through the indexed root coordinate"),
+        2,
+    );
+
     let again = store
         .append_storage_only(&pg_src, new_msg(&conv, "n0", "alice", "m0 retry"))
         .await
@@ -169,7 +214,7 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
             .await
             .unwrap()
             .len(),
-        40,
+        42,
         "no second row from the retried send"
     );
 
@@ -230,7 +275,7 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     let after = store.range(&conv, RangeCursor::Recent, 1000).await.unwrap();
     assert_eq!(
         after.len(),
-        40,
+        42,
         "tombstone keeps the record (the fact survives)"
     );
     let tomb = after.iter().find(|m| m.message_id == pg_ids[1]).unwrap();

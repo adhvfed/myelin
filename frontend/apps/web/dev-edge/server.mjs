@@ -825,6 +825,65 @@ const server = createServer((req, res) => {
     return send(res, 200, output, { "cache-control": "no-store" });
   }
 
+  if (method === "GET" && (chatMatch = path.match(/^\/v1\/chat\/messages\/([^/]+)$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const messageId = decodeCiPathSegment(chatMatch[1]);
+    if (!messageId || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(messageId) || url.search) {
+      return send(res, 400, { error: { message: "invalid Chat message", code: "bad_request" } });
+    }
+    const output = chat.getMessage(messageId);
+    return output
+      ? send(res, 200, output, { "cache-control": "no-store" })
+      : send(res, 404, notFoundEnvelope("message"));
+  }
+
+  if (
+    method === "GET" &&
+    (chatMatch = path.match(/^\/v1\/chat\/threads\/([^/]+)\/messages$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const rootMessageId = decodeCiPathSegment(chatMatch[1]);
+    const input = parseChatQuery(url.search.slice(1), "before");
+    if (!rootMessageId || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(rootMessageId) || !input) {
+      return send(res, 400, { error: { message: "invalid Chat thread query", code: "bad_request" } });
+    }
+    const output = chat.listThread(rootMessageId, input);
+    return output
+      ? send(res, 200, output, { "cache-control": "no-store" })
+      : send(res, 404, notFoundEnvelope("thread"));
+  }
+
+  if (
+    method === "POST" &&
+    (chatMatch = path.match(/^\/v1\/chat\/messages\/([^/]+)\/replies$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const rootMessageId = decodeCiPathSegment(chatMatch[1]);
+    if (!rootMessageId || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(rootMessageId) || url.search) {
+      return send(res, 400, { error: { message: "invalid Chat reply request", code: "bad_request" } });
+    }
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return send(res, 400, { error: { message: "invalid Chat reply body", code: "bad_request" } });
+      }
+      const output = chat.postReply(rootMessageId, body, req.headers["idempotency-key"]);
+      if (output.status === 404) return send(res, 404, notFoundEnvelope("thread"));
+      if (output.status === 409) {
+        return send(res, 409, { error: { message: "Chat reply retry conflicts", code: "conflict" } });
+      }
+      if (output.status === 400) {
+        return send(res, 400, { error: { message: "invalid Chat reply body", code: "bad_request" } });
+      }
+      return send(res, output.status, output.json, { "cache-control": "no-store" });
+    });
+    return;
+  }
+
   if (
     method === "POST" &&
     (chatMatch = path.match(/^\/v1\/chat\/conversations\/([^/]+)\/messages$/))
@@ -845,6 +904,9 @@ const server = createServer((req, res) => {
       }
       const output = chat.postMessage(conversationId, body, req.headers["idempotency-key"]);
       if (output.status === 404) return send(res, 404, notFoundEnvelope("conversation"));
+      if (output.status === 409) {
+        return send(res, 409, { error: { message: "Chat message retry conflicts", code: "conflict" } });
+      }
       if (output.status === 400) {
         return send(res, 400, { error: { message: "invalid Chat message body", code: "bad_request" } });
       }

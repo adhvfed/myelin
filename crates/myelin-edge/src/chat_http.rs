@@ -6,32 +6,35 @@ use crate::gateway::{sse_scope_for_resource, GatewayBuilder};
 use crate::request::EdgeResponse;
 use crate::sse::SseHub;
 use crate::Method;
-use crate::{ReferenceCard, ReferenceCardResolver};
+use crate::ReferenceCardResolver;
 use myelin_chat::conversation::{Conversation, ConversationError, ConversationKind};
 use myelin_chat::events::{event_actor_pseudonym, pseudonymized_event_principal};
 use myelin_chat::store::pg::PgMessageStore;
 use myelin_chat::store::pg_conversation::{PgConversationStore, MESSAGE_TABLE};
 use myelin_chat::store::{
-    AuthorKind, ConversationId, Message, MessageId, MessageState, NewMessage, RangeCursor,
-    StoreError, SystemUlidSource, UlidSource,
+    AuthorKind, ConversationId, MessageId, MessageState, NewMessage, RangeCursor, StoreError,
+    SystemUlidSource, TimelineMessage, UlidSource,
 };
-use myelin_chat::{
-    channel_ref, decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body,
-    ChatFreeText,
-};
-use myelin_content::{InlineNode, OBJ};
+use myelin_chat::{channel_ref, ChatFreeText};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{PrincipalStore, StoreBackedCheck};
-use myelin_storage::{KeyClass, KmsEngine, SubjectId, TenantScope};
+use myelin_storage::{KmsEngine, TenantScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
 use crate::runtime::drive_result_on_runtime;
+
+mod render;
+mod thread;
+
+use render::{
+    decode_readable_message, encrypt_message_column, readable_message_json, ReadableMessage,
+};
 
 const MAX_CHAT_JSON_BYTES: usize = 36 * 1024;
 const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -177,7 +180,7 @@ impl DurableChatReadApi {
             .unwrap_or(RangeCursor::Recent);
         let messages = self.drive(async {
             self.messages
-                .range(&conversation.id, range, limit + 1)
+                .range_roots(&conversation.id, range, limit + 1)
                 .await
                 .map_err(map_store_error)
         })?;
@@ -185,24 +188,13 @@ impl DurableChatReadApi {
         let start = messages.len().saturating_sub(limit as usize);
         let visible = &messages[start..];
         let next = has_more
-            .then(|| visible.first().map(|message| message.message_id.0.clone()))
+            .then(|| {
+                visible
+                    .first()
+                    .map(|message| message.message.message_id.0.clone())
+            })
             .flatten();
-        let viewer = event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0);
-        let readable = visible
-            .iter()
-            .map(|message| decode_readable_message(message, self.kms.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let references = readable
-            .iter()
-            .flat_map(|message| message.reference_nodes())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let cards = self.reference_cards.resolve(principal, &references);
-        let items = readable
-            .iter()
-            .map(|message| readable_message_json(message, &viewer, &cards))
-            .collect::<Vec<_>>();
+        let items = self.render_timeline(principal, visible)?;
         Ok(json!({
             "conversation": conversation_json(&conversation),
             "items": items,
@@ -227,14 +219,53 @@ impl DurableChatReadApi {
             .ok_or_else(|| EdgeError::NotFound("message not found".into()))?;
         let conversation =
             self.drive(self.visible_conversation(principal, &message.conv.conversation_id))?;
-        let readable = decode_readable_message(&message, self.kms.as_ref())?;
-        let references = readable.reference_nodes().collect::<Vec<_>>();
-        let cards = self.reference_cards.resolve(principal, &references);
-        let viewer = event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0);
+        let reply_count = if message.thread_root_id.is_none() {
+            self.drive(async {
+                self.messages
+                    .reply_count(&conversation.id, &message.message_id)
+                    .await
+                    .map_err(map_store_error)
+            })?
+        } else {
+            0
+        };
+        let mut rendered = self.render_timeline(
+            principal,
+            &[TimelineMessage {
+                message,
+                reply_count,
+            }],
+        )?;
         Ok(json!({
             "conversation": conversation_json(&conversation),
-            "message": readable_message_json(&readable, &viewer, &cards),
+            "message": rendered.pop().expect("one exact Chat message was rendered"),
         }))
+    }
+
+    fn render_timeline(
+        &self,
+        principal: &Principal,
+        messages: &[TimelineMessage],
+    ) -> Result<Vec<Value>, EdgeError> {
+        let readable = messages
+            .iter()
+            .map(|item| decode_readable_message(&item.message, self.kms.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let references = readable
+            .iter()
+            .flat_map(ReadableMessage::reference_nodes)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let cards = self.reference_cards.resolve(principal, &references);
+        let viewer = event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0);
+        Ok(readable
+            .iter()
+            .zip(messages)
+            .map(|(message, item)| {
+                readable_message_json(message, item.reply_count, &viewer, &cards)
+            })
+            .collect())
     }
 }
 
@@ -468,18 +499,39 @@ impl DurableChatMutationApi {
         input: &MessageInput,
         client_nonce: String,
     ) -> Result<MessageId, EdgeError> {
+        self.validate_message_intent(actor, authorized_viewer, input, &client_nonce)?;
+        validate_ulid(conversation_id)?;
+        let conversation = self.drive(
+            self.reads
+                .postable_conversation(authorized_viewer, conversation_id),
+        )?;
+        self.append_message(actor, conversation, None, input, client_nonce)
+    }
+
+    fn validate_message_intent(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        input: &MessageInput,
+        client_nonce: &str,
+    ) -> Result<(), EdgeError> {
         if actor.tenant != authorized_viewer.tenant || actor.region != authorized_viewer.region {
             return Err(EdgeError::Forbidden(
                 "Chat actor and delegated viewer must share one tenant and region".into(),
             ));
         }
-        validate_ulid(conversation_id)?;
         input.validate_content()?;
-        validate_nonce(&client_nonce)?;
-        let conversation = self.drive(
-            self.reads
-                .postable_conversation(authorized_viewer, conversation_id),
-        )?;
+        validate_nonce(client_nonce)
+    }
+
+    fn append_message(
+        &self,
+        actor: &Principal,
+        conversation: Conversation,
+        thread_root_id: Option<MessageId>,
+        input: &MessageInput,
+        client_nonce: String,
+    ) -> Result<MessageId, EdgeError> {
         let structured_nodes = input.resolve_nodes(actor, |principal_id| {
             self.resolve_mention(actor, &conversation, principal_id)
         })?;
@@ -489,10 +541,14 @@ impl DurableChatMutationApi {
             PrincipalKind::Agent { .. } => AuthorKind::Agent,
             PrincipalKind::Service => AuthorKind::Service,
         };
+        let expected_conversation = conversation.id.clone();
+        let expected_thread_root = thread_root_id.clone();
+        let expected_author = event_principal.principal_id.0.clone();
+        let expected_nonce = client_nonce.clone();
         let new_message = NewMessage {
             conv: conversation.id,
-            thread_root_id: None,
-            author: event_principal.principal_id.0.clone(),
+            thread_root_id,
+            author: expected_author.clone(),
             author_kind,
             body_inline: encrypt_message_column(
                 self.reads.kms.as_ref(),
@@ -515,7 +571,7 @@ impl DurableChatMutationApi {
             client_nonce,
         };
         let now = now_timestamp();
-        self.drive(async {
+        let message_id = self.drive(async {
             self.reads
                 .messages
                 .append_structured_co_commit(
@@ -530,7 +586,39 @@ impl DurableChatMutationApi {
                 )
                 .await
                 .map_err(map_store_error)
-        })
+        })?;
+        let stored = self
+            .drive(async {
+                self.reads
+                    .messages
+                    .get_exact(actor.tenant.as_str(), &message_id)
+                    .await
+                    .map_err(map_store_error)
+            })?
+            .ok_or_else(|| {
+                EdgeError::Internal(
+                    "accepted Chat message is absent from its authoritative store".into(),
+                )
+            })?;
+        if stored.conv != expected_conversation
+            || stored.thread_root_id != expected_thread_root
+            || stored.author != expected_author
+            || stored.author_kind != author_kind
+            || stored.client_nonce != expected_nonce
+        {
+            return Err(EdgeError::Conflict(
+                "that idempotency key was already used for a different Chat message".into(),
+            ));
+        }
+        if stored.state == MessageState::Active {
+            let readable = decode_readable_message(&stored, self.reads.kms.as_ref())?;
+            if readable.content != input.content || readable.nodes != structured_nodes {
+                return Err(EdgeError::Conflict(
+                    "that idempotency key was already used for a different Chat message".into(),
+                ));
+            }
+        }
+        Ok(message_id)
     }
 
     fn resolve_mention(
@@ -739,7 +827,7 @@ pub fn register_chat(
 ) -> GatewayBuilder {
     let api = DurableChatMutationApi::new(reads.clone(), principals);
     let sse = builder.sse_hub();
-    builder
+    let builder = builder
         .route(
             Method::Get,
             "/v1/chat/conversations",
@@ -763,7 +851,9 @@ pub fn register_chat(
             "/v1/chat/messages/{message}",
             "chat.message.view",
             Arc::new(MessageViewHandler { api: reads.clone() }),
-        )
+        );
+    let builder = thread::register_routes(builder, reads.clone(), api.clone());
+    builder
         .route(
             Method::Post,
             "/v1/chat/conversations/{conversation}/messages",
@@ -951,165 +1041,6 @@ fn same_conversation_intent(left: &Conversation, right: &Conversation) -> bool {
         && left.created_by == right.created_by
 }
 
-struct ReadableMessage<'a> {
-    stored: &'a Message,
-    content: String,
-    nodes: Vec<InlineNode>,
-}
-
-impl ReadableMessage<'_> {
-    fn reference_nodes(&self) -> impl Iterator<Item = String> + '_ {
-        self.nodes.iter().filter_map(|node| match node {
-            InlineNode::ArtifactRefNode(reference) | InlineNode::Embed(reference) => {
-                Some(reference.0.clone())
-            }
-            InlineNode::Mention(_) => None,
-        })
-    }
-}
-
-fn decode_readable_message<'a>(
-    message: &'a Message,
-    kms: &KmsEngine,
-) -> Result<ReadableMessage<'a>, EdgeError> {
-    if matches!(
-        message.state,
-        MessageState::Deleted | MessageState::Tombstoned
-    ) {
-        return Ok(ReadableMessage {
-            stored: message,
-            content: String::new(),
-            nodes: Vec::new(),
-        });
-    }
-    let content = decrypt_message_column(message, kms, &message.body_inline, "body_inline")?;
-    let content = std::str::from_utf8(&content)
-        .map_err(|_| EdgeError::Internal("stored Chat message is not valid UTF-8".into()))?
-        .to_string();
-    let nodes = decode_message_nodes(message, kms)?;
-    if content
-        .chars()
-        .filter(|character| *character == OBJ)
-        .count()
-        != nodes.len()
-    {
-        return Err(EdgeError::Internal(
-            "stored Chat content and structured nodes disagree".into(),
-        ));
-    }
-    Ok(ReadableMessage {
-        stored: message,
-        content,
-        nodes,
-    })
-}
-
-fn readable_message_json(
-    message: &ReadableMessage<'_>,
-    viewer: &str,
-    cards: &HashMap<String, ReferenceCard>,
-) -> Value {
-    let stored = message.stored;
-    json!({
-        "id": stored.message_id.as_str(),
-        "author": stored.author,
-        "author_kind": match stored.author_kind {
-            AuthorKind::Human => "human",
-            AuthorKind::Agent => "agent",
-            AuthorKind::Service => "service",
-        },
-        "is_you": stored.author == viewer,
-        "content": message.content,
-        "nodes": message.nodes.iter().map(|node| message_node_json(node, cards)).collect::<Vec<_>>(),
-        "edited": stored.edited_seq > 0,
-        "state": stored.state.token(),
-        "created_at": stored.message_id.timestamp_ms().map(|value| value / 1000),
-    })
-}
-
-fn decode_message_nodes(message: &Message, kms: &KmsEngine) -> Result<Vec<InlineNode>, EdgeError> {
-    // The first public Edge floor wrote only an empty plaintext node array.
-    // It contains no personal data and remains readable during the rolling
-    // transition; every newly written node array is encrypted.
-    if message.body_nodes.is_empty() || message.body_nodes == b"[]" {
-        return Ok(Vec::new());
-    }
-    let node_bytes = decrypt_message_column(message, kms, &message.body_nodes, "body_nodes")?;
-    serde_json::from_slice(&node_bytes)
-        .map_err(|_| EdgeError::Internal("stored Chat structured nodes are not valid".into()))
-}
-
-fn message_node_json(node: &InlineNode, cards: &HashMap<String, ReferenceCard>) -> Value {
-    match node {
-        InlineNode::Mention(principal) => json!({
-            "kind": "mention",
-            "principal_id": principal.principal_id.0,
-        }),
-        InlineNode::ArtifactRefNode(reference) => {
-            reference_node_json("artifact_ref", reference, cards)
-        }
-        InlineNode::Embed(reference) => reference_node_json("embed", reference, cards),
-    }
-}
-
-fn reference_node_json(
-    kind: &str,
-    reference: &myelin_refs::ArtifactRef,
-    cards: &HashMap<String, ReferenceCard>,
-) -> Value {
-    json!({
-        "kind": kind,
-        "ref": reference.0,
-        "card": cards.get(&reference.0).unwrap_or(&ReferenceCard::Tombstone),
-    })
-}
-
-fn decrypt_message_column(
-    message: &Message,
-    kms: &KmsEngine,
-    encoded: &[u8],
-    column: &str,
-) -> Result<Vec<u8>, EdgeError> {
-    let encrypted = decode_encrypted_body(encoded).map_err(|_| {
-        EdgeError::Internal(format!(
-            "stored Chat message has an invalid encrypted {column}"
-        ))
-    })?;
-    if encrypted.key_ref.tenant.as_str() != message.conv.tenant
-        || encrypted.key_ref.class != KeyClass::Subject(message.author.clone())
-    {
-        return Err(EdgeError::Internal(
-            "stored Chat message encryption scope does not match its author".into(),
-        ));
-    }
-    decrypt_body(
-        kms,
-        &myelin_tenancy::Region(message.conv.region.clone()),
-        &encrypted,
-    )
-    .map_err(|_| EdgeError::Internal(format!("stored Chat {column} cannot be decrypted")))
-}
-
-fn encrypt_message_column(
-    kms: &KmsEngine,
-    principal: &Principal,
-    author: &str,
-    kind: ChatFreeText,
-    plaintext: &[u8],
-) -> Result<Vec<u8>, EdgeError> {
-    let column = encrypt_body(
-        kms,
-        &principal.region,
-        &principal.tenant,
-        &SubjectId::new(author),
-        kind,
-        plaintext,
-    )
-    .map_err(|error| EdgeError::Internal(format!("Chat message encryption failed: {error}")))?;
-    encode_encrypted_body(&column)
-        .map_err(|error| EdgeError::Internal(format!("Chat message encoding failed: {error}")))
-}
-
 fn map_conversation_error(error: ConversationError) -> EdgeError {
     match error {
         ConversationError::NotFound(_) => EdgeError::NotFound("conversation not found".into()),
@@ -1142,7 +1073,14 @@ fn no_store(response: EdgeResponse) -> EdgeResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use myelin_chat::store::Message;
+    use myelin_content::InlineNode;
+
+    use super::render::message_node_json;
     use super::*;
+    use crate::ReferenceCard;
 
     fn principal(tenant: &str) -> Principal {
         Principal::stub(
@@ -1239,7 +1177,7 @@ mod tests {
         assert_eq!(readable.content, "");
         assert!(readable.nodes.is_empty());
         assert_eq!(
-            readable_message_json(&readable, message.author.as_str(), &HashMap::new()),
+            readable_message_json(&readable, 0, message.author.as_str(), &HashMap::new()),
             json!({
                 "id": message.message_id.as_str(),
                 "author": message.author,
@@ -1247,6 +1185,8 @@ mod tests {
                 "is_you": true,
                 "content": "",
                 "nodes": [],
+                "thread_root_id": null,
+                "reply_count": 0,
                 "edited": false,
                 "state": "tombstoned",
                 "created_at": message.message_id.timestamp_ms().map(|value| value / 1000),

@@ -28,6 +28,8 @@ const message = (id: string, isYou = false): ChatMessage => ({
   is_you: isYou,
   content: id,
   nodes: [],
+  thread_root_id: null,
+  reply_count: 0,
   edited: false,
   state: "active",
   created_at: 1,

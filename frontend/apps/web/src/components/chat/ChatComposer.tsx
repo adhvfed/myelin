@@ -14,6 +14,7 @@ export interface ChatComposerProps {
   conversationId: string;
   conversationRef: string;
   topic: string;
+  threadRootId?: string;
   onPosted: (conversationId: string) => Promise<void> | void;
 }
 
@@ -72,15 +73,19 @@ export function ChatComposer(props: ChatComposerProps) {
 
   onMount(() => setInteractive(true));
 
+  const draftId = () => props.threadRootId
+    ? `${props.conversationId}:thread:${props.threadRootId}`
+    : props.conversationId;
+
   createEffect(() => {
-    const conversationId = props.conversationId;
+    const conversationId = draftId();
     setDrafts((current) => {
       if (current.has(conversationId)) return current;
       return new Map(current).set(conversationId, newDraft());
     });
   });
 
-  const draft = () => drafts().get(props.conversationId) ?? EMPTY_DRAFT;
+  const draft = () => drafts().get(draftId()) ?? EMPTY_DRAFT;
   const updateDraft = (
     conversationId: string,
     update: (current: ConversationDraft) => ConversationDraft,
@@ -99,7 +104,7 @@ export function ChatComposer(props: ChatComposerProps) {
   };
 
   const send = async () => {
-    const conversationId = props.conversationId;
+    const conversationId = draftId();
     const outgoing = draft();
     if (outgoing.sending) return;
     if (!outgoing.content.trim()) {
@@ -113,13 +118,21 @@ export function ChatComposer(props: ChatComposerProps) {
 
     let result;
     try {
-      result = await mutate({
-        op: "post-message",
-        conversationId,
-        content: outgoing.content,
-        references: outgoing.references,
-        clientNonce: outgoing.clientNonce,
-      });
+      result = props.threadRootId
+        ? await mutate({
+            op: "post-reply",
+            rootMessageId: props.threadRootId,
+            content: outgoing.content,
+            references: outgoing.references,
+            clientNonce: outgoing.clientNonce,
+          })
+        : await mutate({
+            op: "post-message",
+            conversationId: props.conversationId,
+            content: outgoing.content,
+            references: outgoing.references,
+            clientNonce: outgoing.clientNonce,
+          });
     } catch {
       rejectSend(conversationId, outgoing.clientNonce, errorCopy("error"));
       return;
@@ -129,7 +142,8 @@ export function ChatComposer(props: ChatComposerProps) {
       rejectSend(conversationId, outgoing.clientNonce, errorCopy(result.error));
       return;
     }
-    if (result.op !== "post-message") {
+    const expectedOperation = props.threadRootId ? "post-reply" : "post-message";
+    if (result.op !== expectedOperation) {
       rejectSend(conversationId, outgoing.clientNonce, errorCopy("error"));
       return;
     }
@@ -139,7 +153,7 @@ export function ChatComposer(props: ChatComposerProps) {
       ? completed
       : current);
     try {
-      await props.onPosted(conversationId);
+      await props.onPosted(props.conversationId);
     } catch {
       updateDraft(conversationId, (current) => current.clientNonce === completed.clientNonce
         ? { ...current, error: "Message sent, but the timeline couldn’t refresh. Reload to see it." }
@@ -152,7 +166,7 @@ export function ChatComposer(props: ChatComposerProps) {
   };
 
   const addReference = () => {
-    const conversationId = props.conversationId;
+    const conversationId = draftId();
     const current = draft();
     const reference = current.referenceInput.trim();
     const validation = relatedArtifactRefError(
@@ -191,12 +205,12 @@ export function ChatComposer(props: ChatComposerProps) {
         <BlockEditor
           value={editorValue()}
           readOnly={!interactive() || draft().sending}
-          inputLabel={`Message ${props.topic}`}
+          inputLabel={props.threadRootId ? `Reply in ${props.topic}` : `Message ${props.topic}`}
           referenceLabel={artifactRefLabel}
           referenceHref={artifactRefHref}
           onSubmit={() => void send()}
           onChange={(blocks) => {
-            const conversationId = props.conversationId;
+            const conversationId = draftId();
             updateDraft(conversationId, (current) => ({
               ...current,
               content: blocks.map((block) => block.markdown).join("\n"),
@@ -225,7 +239,7 @@ export function ChatComposer(props: ChatComposerProps) {
               placeholder="myelin://workspace/issue/issue/ENG-41"
               aria-invalid={Boolean(draft().referenceError)}
               onInput={(event) => {
-                const conversationId = props.conversationId;
+                const conversationId = draftId();
                 updateDraft(conversationId, (current) => ({
                   ...current,
                   referenceInput: event.currentTarget.value,
@@ -246,7 +260,7 @@ export function ChatComposer(props: ChatComposerProps) {
               type="button"
               class="chat-button chat-button-secondary"
               onClick={() => {
-                const conversationId = props.conversationId;
+                const conversationId = draftId();
                 updateDraft(conversationId, (current) => ({
                   ...current,
                   linking: false,
@@ -276,7 +290,7 @@ export function ChatComposer(props: ChatComposerProps) {
               ? "This message has reached its structured-reference limit"
               : undefined}
             onClick={() => {
-              const conversationId = props.conversationId;
+              const conversationId = draftId();
               updateDraft(conversationId, (current) => ({ ...current, linking: true }));
             }}
           >

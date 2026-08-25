@@ -20,6 +20,7 @@ pub const CONVERSATION_CLIENT_NONCE_INDEX: &str = "chat_conversation_client_nonc
 pub const CONVERSATION_PROJECT_RECENT_INDEX: &str = "chat_conversation_project_recent";
 pub const CONVERSATION_PROJECT_TOPIC_INDEX: &str = "chat_conversation_project_topic_unique";
 pub const MESSAGE_IDENTITY_INDEX: &str = "chat_message_identity";
+pub const MESSAGE_THREAD_RANGE_INDEX: &str = "chat_message_thread_range";
 
 pub const MESSAGE_ENUM_CONSTRAINTS_EXPAND_DDL: &str = r#"
 DO $myelin$
@@ -618,6 +619,11 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
         "CREATE UNIQUE INDEX IF NOT EXISTS {MESSAGE_IDENTITY_INDEX}
                ON {MESSAGE_TABLE} (tenant_id, region, message_id);"
     );
+    let message_thread_range = format!(
+        "CREATE INDEX IF NOT EXISTS {MESSAGE_THREAD_RANGE_INDEX}
+               ON {MESSAGE_TABLE}
+               (tenant_id, region, conversation_id, thread_root_id, message_id);"
+    );
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
@@ -656,6 +662,11 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
             message_identity,
             MESSAGE_TABLE,
         ),
+        Migration::plain_on(
+            "chat_0010_message_thread_range",
+            message_thread_range,
+            MESSAGE_TABLE,
+        ),
     ])
 }
 
@@ -666,7 +677,7 @@ mod tests {
     #[test]
     fn migrations_create_and_tenant_scope_both_tables() {
         let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 9);
+        assert_eq!(migrations.0.len(), 10);
         for (migration, table) in migrations.0[..2]
             .iter()
             .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
@@ -704,6 +715,8 @@ mod tests {
         );
         assert_eq!(migrations.0[8].id, "chat_0009_message_identity");
         assert!(migrations.0[8].ddl.contains(MESSAGE_IDENTITY_INDEX));
+        assert_eq!(migrations.0[9].id, "chat_0010_message_thread_range");
+        assert!(migrations.0[9].ddl.contains(MESSAGE_THREAD_RANGE_INDEX));
     }
 
     #[test]

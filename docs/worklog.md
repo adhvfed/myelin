@@ -1430,6 +1430,37 @@ through `chat_0009`; warning-free Chat/Edge clippy; 643 browser units plus
 TypeScript and ESLint; all ten live Chat lifecycle stories; and both real
 Chromium Chat journeys.
 
+## 2026-08-25 — focused replies stay beside the room
+
+A reply no longer has to become another room or disappear into an undifferentiated
+timeline. A top-level Chat message is now a stable thread root; every reply points
+directly to that root, and a root from another conversation or a reply masquerading
+as a root is rejected. Room pages contain only top-level messages and their exact
+reply counts. Thread pages return the root separately from their pageable replies,
+so a long discussion never pages away the sentence that gave it meaning.
+
+The read and write boundaries recheck the live parent-conversation permission
+before decrypting or appending. Exact retries return the original reply, while the
+same retry key carrying different words is a conflict rather than silent data loss.
+Canonical thread references resolve to useful topic-named cards for current members
+and content-free tombstones for everyone else. The browser can enter a thread from
+its room, reply in place, follow the reference back to the exact anchor, and return
+to current room traffic. The CLI offers the same `chat reply` and `chat thread`
+workflow without asking a person to reconstruct HTTP routes.
+
+The implementation also leaves a calmer shape behind: indexed root/reply reads are
+owned by a focused PostgreSQL module, thread routing is separate from conversation
+orchestration, and encrypted message rendering has one narrow module. The TypeScript
+story reads as a product decision: two replies deepen one decision while an ordinary
+message remains visible in the room, retries are honest, paging keeps the root, and
+a private thread discloses neither topic nor body.
+
+Proof: all 269 Chat, 360 Edge, and 154 CLI library tests; the real PostgreSQL
+root/reply range integration; warning-free clippy across all targets and features of
+all three crates; TypeScript and ESLint; 644 browser units; all twelve rebuilt live
+Chat lifecycle and CLI stories; and both real Chromium Chat journeys after an Edge
+restart through the immutable `chat_0010` migration.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1459,11 +1490,11 @@ Chromium Chat journeys.
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
    content-free tombstones for denied or unavailable artifacts. Git comments
-   now resolve to their exact discussion or diff location, and Chat messages
-   open one exact permission-reconfirmed focused view. Git review decisions,
-   other CI artifacts, plus Chat threads
-   still retain their canonical link rather than a rich card because their durable owner projectors
-   are not composed. Event-driven cache invalidation and live card updates also remain unwired.
+   now resolve to their exact discussion or diff location. Chat messages and
+   their focused reply threads open exact permission-reconfirmed views. Git
+   review decisions and other CI artifacts still retain their canonical link
+   rather than a rich card because their durable owner projectors are not
+   composed. Event-driven cache invalidation and live card updates also remain unwired.
 7. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade

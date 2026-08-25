@@ -47,6 +47,8 @@ export interface ChatMessage {
   is_you: boolean;
   content: string;
   nodes: ChatMessageNode[];
+  thread_root_id: string | null;
+  reply_count: number;
   edited: boolean;
   state: ChatMessageState;
   created_at: number | null;
@@ -61,6 +63,14 @@ export interface ChatMessagePage {
 export interface ChatMessageView {
   conversation: ChatConversation;
   message: ChatMessage;
+}
+
+export interface ChatThreadPage {
+  conversation: ChatConversation;
+  ref: string;
+  root: ChatMessage;
+  items: ChatMessage[];
+  page: { next_cursor: string | null; limit: number };
 }
 
 export interface ChatConversationReceipt {
@@ -82,6 +92,13 @@ export interface ChatConversationDraft {
 
 export interface ChatMessageDraft {
   conversationId: string;
+  content: string;
+  references: string[];
+  clientNonce: string;
+}
+
+export interface ChatReplyDraft {
+  rootMessageId: string;
   content: string;
   references: string[];
   clientNonce: string;
@@ -194,12 +211,16 @@ function referenceCard(value: unknown): ChatReferenceCard | null {
 function message(value: unknown): ChatMessage | null {
   const row = record(value);
   if (!row || !exact(row, [
-    "id", "author", "author_kind", "is_you", "content", "nodes", "edited", "state", "created_at",
+    "id", "author", "author_kind", "is_you", "content", "nodes", "thread_root_id",
+    "reply_count", "edited", "state", "created_at",
   ]) || !isChatUlid(row.id) ||
       (typeof row.author !== "string" || !/^chat-author:[0-9a-f]{32}$/.test(row.author)) ||
       !["human", "agent", "service"].includes(row.author_kind as string) ||
       typeof row.is_you !== "boolean" || !cleanText(row.content, 32 * 1024, true) ||
       !Array.isArray(row.nodes) || row.nodes.length > 32 ||
+      (row.thread_root_id !== null && !isChatUlid(row.thread_root_id)) ||
+      !Number.isSafeInteger(row.reply_count) || (row.reply_count as number) < 0 ||
+      (row.thread_root_id !== null && row.reply_count !== 0) ||
       typeof row.edited !== "boolean" ||
       !["active", "edited", "deleted", "tombstoned"].includes(row.state as string) ||
       (row.created_at !== null &&
@@ -230,6 +251,21 @@ export function parseChatMessage(value: unknown): ChatMessageView | null {
   const item = message(envelope?.message);
   return envelope && exact(envelope, ["conversation", "message"]) && subject && item
     ? { conversation: subject, message: item }
+    : null;
+}
+
+export function parseChatThread(value: unknown): ChatThreadPage | null {
+  const envelope = record(value);
+  const subject = conversation(envelope?.conversation);
+  const root = message(envelope?.root);
+  const paging = page(envelope?.page);
+  if (!envelope || !exact(envelope, ["conversation", "ref", "root", "items", "page"]) ||
+      !subject || !cleanText(envelope.ref, 4 * 1024) || !root || root.thread_root_id !== null ||
+      !Array.isArray(envelope.items) || !paging || envelope.items.length > paging.limit) return null;
+  const items = envelope.items.map(message);
+  return items.every((item): item is ChatMessage =>
+    item !== null && item.thread_root_id === root.id)
+    ? { conversation: subject, ref: envelope.ref, root, items, page: paging }
     : null;
 }
 
@@ -274,6 +310,22 @@ export function parseChatMessageDraft(value: unknown): ChatMessageDraft | null {
       !isClientNonce(draft.clientNonce)) return null;
   return {
     conversationId: draft.conversationId,
+    content: draft.content,
+    references: draft.references,
+    clientNonce: draft.clientNonce,
+  };
+}
+
+export function parseChatReplyDraft(value: unknown): ChatReplyDraft | null {
+  const draft = record(value);
+  if (!draft || !exact(draft, ["rootMessageId", "content", "references", "clientNonce"]) ||
+      !isChatUlid(draft.rootMessageId) || !cleanText(draft.content, 32 * 1024) ||
+      !draft.content.trim() || !Array.isArray(draft.references) || draft.references.length > 32 ||
+      !draft.references.every(isStorableArtifactRef) ||
+      [...draft.content].filter((character) => character === "\uFFFC").length !== draft.references.length ||
+      !isClientNonce(draft.clientNonce)) return null;
+  return {
+    rootMessageId: draft.rootMessageId,
     content: draft.content,
     references: draft.references,
     clientNonce: draft.clientNonce,

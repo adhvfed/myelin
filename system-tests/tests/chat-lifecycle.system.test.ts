@@ -1127,6 +1127,152 @@ describe("chat collaboration lifecycle", () => {
     expect(JSON.stringify(deniedExactMessage.body)).not.toContain(foundersWords);
   });
 
+  test("keeps a focused reply thread beside the room instead of turning it into another room", async () => {
+    const roomTopic = "Keep one decision together while the room moves on";
+    const room = await Conversation.open(systemClient, {
+      projectId: systemTestConfig.issues.projectId,
+      channel: uniqueName("focused-replies"),
+      topic: roomTopic,
+    });
+    const decision = uniqueName("Should the rollout wait for the storage repair?");
+    const rootMessageId = await room.post(systemClient, decision);
+    await room.post(systemClient, "The rest of the room can keep moving.");
+    const replyKey = `reply-${randomUUID()}`;
+    const reviewersReply = uniqueName("Yes, because restored readers must fail closed");
+    const reviewersReplyId = await room.reply(
+      reviewerClient,
+      rootMessageId,
+      reviewersReply,
+      { idempotencyKey: replyKey },
+    );
+    expect(await room.reply(
+      reviewerClient,
+      rootMessageId,
+      reviewersReply,
+      { idempotencyKey: replyKey },
+    )).toBe(reviewersReplyId);
+    const conflictingReply = await reviewerClient.json(
+      `/v1/chat/messages/${encodeURIComponent(rootMessageId)}/replies`,
+      {
+        method: "POST",
+        body: { content: "This is not the reply that key already committed." },
+        idempotencyKey: replyKey,
+        expectedStatus: 409,
+      },
+    );
+    expect(conflictingReply.body).toMatchObject({ error: { code: "conflict" } });
+    const foundersReply = uniqueName("Agreed; the repair remains the release gate");
+    const foundersReplyId = await room.reply(systemClient, rootMessageId, foundersReply);
+
+    expect(await room.messages(systemClient)).toEqual([
+      expect.objectContaining({
+        id: rootMessageId,
+        content: decision,
+        thread_root_id: null,
+        reply_count: 2,
+      }),
+      expect.objectContaining({
+        content: "The rest of the room can keep moving.",
+        thread_root_id: null,
+        reply_count: 0,
+      }),
+    ]);
+    const thread = await room.thread(systemClient, rootMessageId);
+    expect(thread.ref).toBe(
+      `myelin://${systemTestConfig.tenant}/chat/thread/${rootMessageId}` +
+      `#thread-${rootMessageId}`,
+    );
+    expect([thread.root, ...thread.replies]).toEqual([
+      expect.objectContaining({
+        id: rootMessageId,
+        content: decision,
+        thread_root_id: null,
+        reply_count: 2,
+      }),
+      expect.objectContaining({
+        id: reviewersReplyId,
+        content: reviewersReply,
+        thread_root_id: rootMessageId,
+        reply_count: 0,
+      }),
+      expect.objectContaining({
+        id: foundersReplyId,
+        content: foundersReply,
+        thread_root_id: rootMessageId,
+        reply_count: 0,
+      }),
+    ]);
+    const latestReplyPage = await systemClient.json(
+      `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/messages?limit=1`,
+    );
+    expect(latestReplyPage.body).toMatchObject({
+      root: { id: rootMessageId, reply_count: 2 },
+      items: [{ id: foundersReplyId, thread_root_id: rootMessageId }],
+      page: { limit: 1, next_cursor: foundersReplyId },
+    });
+    const earlierReplyPage = await systemClient.json(
+      `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/messages?limit=1` +
+      `&before=${encodeURIComponent(foundersReplyId)}`,
+    );
+    expect(earlierReplyPage.body).toMatchObject({
+      root: { id: rootMessageId, reply_count: 2 },
+      items: [{ id: reviewersReplyId, thread_root_id: rootMessageId }],
+      page: { limit: 1, next_cursor: null },
+    });
+
+    const privateRoom = await createPrivateConversation(systemClient, "private reply thread");
+    const privateWords = uniqueName("Only the founder can see this thread root");
+    const privateRoot = await privateRoom.conversation.post(systemClient, privateWords);
+    for (const probe of [
+      reviewerClient.json(
+        `/v1/chat/threads/${encodeURIComponent(privateRoot)}/messages?limit=10`,
+        { expectedStatus: 404 },
+      ),
+      reviewerClient.json(
+        `/v1/chat/messages/${encodeURIComponent(privateRoot)}/replies`,
+        {
+          method: "POST",
+          body: { content: "I should not discover the private thread." },
+          idempotencyKey: `denied-private-reply-${randomUUID()}`,
+          expectedStatus: 404,
+        },
+      ),
+    ]) {
+      const denied = await probe;
+      expect(denied.body).toMatchObject({ error: { code: "not_found" } });
+      expect(JSON.stringify(denied.body)).not.toContain(privateWords);
+      expect(JSON.stringify(denied.body)).not.toContain(privateRoom.topic);
+    }
+
+    const privateThreadRef =
+      `myelin://${systemTestConfig.tenant}/chat/thread/${privateRoot}` +
+      `#thread-${privateRoot}`;
+    await room.post(
+      systemClient,
+      "Continue the shared discussion in ￼; the private one remains ￼.",
+      { references: [thread.ref, privateThreadRef] },
+    );
+    const reviewersRoom = await room.messages(reviewerClient);
+    expect(reviewersRoom.at(-1)).toMatchObject({
+      nodes: [
+        {
+          ref: thread.ref,
+          card: expect.objectContaining({
+            kind: "projection",
+            title: `Thread in ${roomTopic}`,
+            state: "active",
+            icon: "message",
+            render_hint: "chat_thread",
+            sub_anchor: `thread-${rootMessageId}`,
+          }),
+        },
+        { ref: privateThreadRef, card: { kind: "tombstone" } },
+      ],
+    });
+    expect(JSON.stringify(reviewersRoom)).not.toContain(privateWords);
+    expect(JSON.stringify(reviewersRoom)).not.toContain(privateRoom.topic);
+  });
+
   test("lets each engineer resume named private agent work without exposing the other workspace", async () => {
     const founder = await browserApprovedCliClient();
     const reviewer = await browserApprovedCliClient(reviewerClient);

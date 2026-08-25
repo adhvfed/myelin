@@ -39,7 +39,12 @@ fn render_knowledge_link(value: &Value) -> Option<String> {
 
 pub(super) fn render_collection_header(value: &Value) -> Option<String> {
     let conversation = value.get("conversation")?;
-    render_conversation(conversation).map(|row| format!("{row}\n"))
+    let conversation = render_conversation(conversation)?;
+    let root = value.get("root").and_then(render_message);
+    Some(match root {
+        Some(root) => format!("{conversation}\n{root}\n"),
+        None => format!("{conversation}\n"),
+    })
 }
 
 pub(super) fn render_item(value: &Value) -> Option<String> {
@@ -68,6 +73,14 @@ pub(super) fn page_command(call: &EdgeCall, cursor: &str) -> Option<String> {
             "myelin doc page list --limit {limit} --cursor {cursor}"
         )),
         path => {
+            if let Some(root) = path
+                .strip_prefix("/v1/chat/threads/")
+                .and_then(|path| path.strip_suffix("/messages"))
+            {
+                return canonical_ulid(root).then(|| {
+                    format!("myelin chat thread {root} --limit {limit} --before {cursor}")
+                });
+            }
             if let Some(conversation) = path
                 .strip_prefix("/v1/chat/conversations/")
                 .and_then(|path| path.strip_suffix("/messages"))
@@ -339,6 +352,17 @@ mod tests {
 
         let history = crate::dispatch::chat_dispatch(&["history", ID, "--limit", "2"]).unwrap();
         let hint = page_command(&history, ID).unwrap();
+        let words = hint.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(
+            crate::dispatch::chat_dispatch(&words[2..])
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("limit=2&before=01J00000000000000000000000")
+        );
+
+        let thread = crate::dispatch::chat_dispatch(&["thread", ID, "--limit", "2"]).unwrap();
+        let hint = page_command(&thread, ID).unwrap();
         let words = hint.split_whitespace().collect::<Vec<_>>();
         assert_eq!(
             crate::dispatch::chat_dispatch(&words[2..])

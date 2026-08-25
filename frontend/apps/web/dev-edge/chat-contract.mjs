@@ -86,7 +86,7 @@ function referenceCard(reference) {
     : { kind: "reference" };
 }
 
-function messageJson(row) {
+function messageJson(row, replyCount = 0) {
   return {
     id: row.id,
     author: row.author,
@@ -98,6 +98,8 @@ function messageJson(row) {
         ? { ...node, card: referenceCard(node.ref) }
         : node
     ),
+    thread_root_id: row.thread_root_id ?? null,
+    reply_count: row.thread_root_id ? 0 : replyCount,
     edited: false,
     state: "active",
     created_at: row.created_at,
@@ -219,13 +221,17 @@ export class ChatFixtures {
   listMessages(conversationId, { before, limit }) {
     const conversation = this.conversations.find((row) => row.id === conversationId);
     if (!conversation) return null;
-    const ordered = [...(this.messages.get(conversationId) ?? [])]
+    const rows = this.messages.get(conversationId) ?? [];
+    const ordered = rows
+      .filter((row) => !row.thread_root_id)
       .sort((left, right) => left.id.localeCompare(right.id));
     const eligible = before ? ordered.filter((row) => row.id < before) : ordered;
     const items = eligible.slice(Math.max(0, eligible.length - limit));
     return {
       conversation: conversationJson(conversation),
-      items: items.map(messageJson),
+      items: items.map((row) =>
+        messageJson(row, rows.filter((reply) => reply.thread_root_id === row.id).length)
+      ),
       page: {
         next_cursor: eligible.length > items.length ? items[0]?.id ?? null : null,
         limit,
@@ -234,6 +240,59 @@ export class ChatFixtures {
   }
 
   postMessage(conversationId, body, idempotencyKey) {
+    return this.appendMessage(conversationId, null, body, idempotencyKey);
+  }
+
+  postReply(rootMessageId, body, idempotencyKey) {
+    const found = this.findMessage(rootMessageId);
+    if (!found || found.message.thread_root_id) return { status: 404 };
+    return this.appendMessage(found.conversation.id, rootMessageId, body, idempotencyKey);
+  }
+
+  getMessage(messageId) {
+    const found = this.findMessage(messageId);
+    if (!found) return null;
+    const rows = this.messages.get(found.conversation.id) ?? [];
+    return {
+      conversation: conversationJson(found.conversation),
+      message: messageJson(
+        found.message,
+        rows.filter((reply) => reply.thread_root_id === found.message.id).length,
+      ),
+    };
+  }
+
+  listThread(rootMessageId, { before, limit }) {
+    const found = this.findMessage(rootMessageId);
+    if (!found || found.message.thread_root_id) return null;
+    const rows = this.messages.get(found.conversation.id) ?? [];
+    const replies = rows
+      .filter((row) => row.thread_root_id === rootMessageId)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const eligible = before ? replies.filter((row) => row.id < before) : replies;
+    const items = eligible.slice(Math.max(0, eligible.length - limit));
+    return {
+      conversation: conversationJson(found.conversation),
+      ref: `myelin://${TENANT}/chat/thread/${rootMessageId}#thread-${rootMessageId}`,
+      root: messageJson(found.message, replies.length),
+      items: items.map((row) => messageJson(row)),
+      page: {
+        next_cursor: eligible.length > items.length ? items[0]?.id ?? null : null,
+        limit,
+      },
+    };
+  }
+
+  findMessage(messageId) {
+    for (const conversation of this.conversations) {
+      const message = (this.messages.get(conversation.id) ?? [])
+        .find((row) => row.id === messageId);
+      if (message) return { conversation, message };
+    }
+    return null;
+  }
+
+  appendMessage(conversationId, threadRootId, body, idempotencyKey) {
     const bodyShape = exactObject(body, ["content"]) || exactObject(body, ["content", "references"]);
     const references = body?.references ?? [];
     if (!bodyShape || !cleanMessage(body.content) || !Array.isArray(references) ||
@@ -243,13 +302,19 @@ export class ChatFixtures {
     if (!this.conversations.some((row) => row.id === conversationId)) return { status: 404 };
     const rows = this.messages.get(conversationId) ?? [];
     const existing = rows.find((row) => row.client_nonce === idempotencyKey);
-    if (existing) return { status: 201, json: { message_id: existing.id, durable: true } };
+    if (existing) {
+      const existingReferences = (existing.nodes ?? []).map((node) => node.ref);
+      if (existing.content !== body.content || existing.thread_root_id !== threadRootId ||
+          JSON.stringify(existingReferences) !== JSON.stringify(references)) return { status: 409 };
+      return { status: 201, json: { message_id: existing.id, durable: true } };
+    }
     const row = {
       id: fixtureUlid(++this.sequence),
       author: AUTHOR,
       author_kind: "human",
       content: body.content,
       nodes: references.map((ref) => ({ kind: "artifact_ref", ref })),
+      thread_root_id: threadRootId,
       created_at: 1_750_001_000 + this.sequence,
       client_nonce: idempotencyKey,
     };

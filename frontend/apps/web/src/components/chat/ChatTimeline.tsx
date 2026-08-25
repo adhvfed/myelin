@@ -14,6 +14,7 @@ export interface ChatTimelineProps {
   onLoadEarlier: () => void;
   onPosted: (conversationId: string) => Promise<void> | void;
   focusedMessageId?: string;
+  threadRootId?: string;
 }
 
 export function ChatTimeline(props: ChatTimelineProps) {
@@ -28,7 +29,7 @@ export function ChatTimeline(props: ChatTimelineProps) {
           <p><Icon name="channel" /> {props.conversation.channel}</p>
           <h2 id="chat-topic-heading">{props.conversation.topic}</h2>
         </div>
-        {props.focusedMessageId
+        {props.focusedMessageId || props.threadRootId
           ? <A
               href={`/chat?conversation=${encodeURIComponent(props.conversation.id)}`}
               class="chat-live-cue"
@@ -37,6 +38,7 @@ export function ChatTimeline(props: ChatTimelineProps) {
       </>}
       messages={props.messages}
       focusedMessageId={props.focusedMessageId}
+      threadRootId={props.threadRootId}
       loading={props.loading}
       hasEarlier={props.hasEarlier}
       loadingEarlier={props.loadingEarlier}
@@ -45,6 +47,7 @@ export function ChatTimeline(props: ChatTimelineProps) {
           conversationId={props.conversation.id}
           conversationRef={props.conversation.ref}
           topic={props.conversation.topic}
+          threadRootId={props.threadRootId}
           onPosted={props.onPosted}
         />}
     />

@@ -65,6 +65,8 @@ describe("development Chat contract", () => {
 
     const first = chat.postMessage(conversationId, message, "message-1");
     expect(chat.postMessage(conversationId, message, "message-1")).toEqual(first);
+    expect(chat.postMessage(conversationId, { content: "Different words." }, "message-1").status)
+      .toBe(409);
     expect(chat.listMessages(conversationId, { before: undefined, limit: 50 })?.items)
       .toHaveLength(1);
     expect(chat.postMessage(conversationId, message, undefined).status).toBe(400);
@@ -73,6 +75,30 @@ describe("development Chat contract", () => {
       { ...message, client_nonce: "legacy-body-token" },
       "message-2",
     ).status).toBe(400);
+  });
+
+  it("keeps focused replies out of the room and under one stable root", () => {
+    const chat = new ChatFixtures();
+    chat.reset({ empty: true });
+    const created = chat.createConversation({
+      project_id: FIRST_PROJECT,
+      channel: "engineering",
+      topic: "one focused decision",
+    }, "create-thread-room");
+    if (!created.json) throw new Error("expected a created conversation");
+    const conversationId = created.json.conversation.id;
+    const root = chat.postMessage(conversationId, { content: "Should we wait?" }, "root");
+    if (!root.json) throw new Error("expected a root message");
+    const rootId = root.json.message_id;
+    expect(chat.postReply(rootId, { content: "Wait for storage." }, "reply").status).toBe(201);
+
+    expect(chat.listMessages(conversationId, { before: undefined, limit: 50 })?.items)
+      .toEqual([expect.objectContaining({ id: rootId, reply_count: 1, thread_root_id: null })]);
+    expect(chat.listThread(rootId, { before: undefined, limit: 50 })).toMatchObject({
+      ref: `myelin://acme/chat/thread/${rootId}#thread-${rootId}`,
+      root: { id: rootId, reply_count: 1 },
+      items: [{ thread_root_id: rootId, reply_count: 0 }],
+    });
   });
 
   it("scopes topic retry identities to one exact draft", () => {

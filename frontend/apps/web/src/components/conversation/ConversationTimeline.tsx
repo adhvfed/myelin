@@ -75,6 +75,18 @@ function MessageBody(props: { message: ChatMessage }) {
   </Show>;
 }
 
+function ThreadLink(props: { message: ChatMessage; currentRootId?: string }) {
+  const rootId = () => props.message.thread_root_id ?? props.message.id;
+  const label = () => props.message.thread_root_id
+    ? "View thread"
+    : props.message.reply_count === 0
+      ? "Reply"
+      : `${props.message.reply_count} ${props.message.reply_count === 1 ? "reply" : "replies"}`;
+  return <Show when={rootId() !== props.currentRootId}>
+    <A href={`/chat?thread=${encodeURIComponent(rootId())}#thread-${rootId()}`}>{label()}</A>
+  </Show>;
+}
+
 export interface ConversationTimelineProps {
   headingId: string;
   header: JSX.Element;
@@ -87,6 +99,7 @@ export interface ConversationTimelineProps {
   emptyHeading?: string;
   emptyCopy?: string;
   focusedMessageId?: string;
+  threadRootId?: string;
 }
 
 export function ConversationTimeline(props: ConversationTimelineProps) {
@@ -110,7 +123,11 @@ export function ConversationTimeline(props: ConversationTimelineProps) {
   });
 
   return (
-    <section class="chat-conversation" aria-labelledby={props.headingId}>
+    <section
+      id={props.threadRootId ? `thread-${props.threadRootId}` : undefined}
+      class="chat-conversation"
+      aria-labelledby={props.headingId}
+    >
       <header class="chat-conversation-header">{props.header}</header>
       <div ref={timeline} class="chat-timeline" aria-live="polite" aria-busy={props.loading}>
         <Show when={!props.loading} fallback={
@@ -159,6 +176,7 @@ export function ConversationTimeline(props: ConversationTimelineProps) {
                       <Show when={message.edited}><span>edited</span></Show>
                     </header>
                     <MessageBody message={message} />
+                    <ThreadLink message={message} currentRootId={props.threadRootId} />
                   </article>
                 </li>
               )}</For>

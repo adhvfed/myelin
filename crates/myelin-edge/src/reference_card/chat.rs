@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use myelin_chat::store::MessageId;
 use myelin_identity::Principal;
@@ -19,15 +19,17 @@ impl ChatReferenceCardProjector {
 impl ReferenceCardProjector for ChatReferenceCardProjector {
     fn project(&self, viewer: &Principal, references: &[String]) -> HashMap<String, ReferenceCard> {
         let conversation_roots = root_references(viewer, references, "chat", "channel");
-        let message_roots = message_references(viewer, references);
-        if conversation_roots.is_empty() && message_roots.is_empty() {
+        let message_roots = exact_references(viewer, references, ExactReferenceKind::Message);
+        let thread_roots = exact_references(viewer, references, ExactReferenceKind::Thread);
+        if conversation_roots.is_empty() && message_roots.is_empty() && thread_roots.is_empty() {
             return HashMap::new();
         }
 
         let mut cards = claimed_tombstones(&conversation_roots);
-        cards.extend(claimed_message_tombstones(&message_roots));
+        cards.extend(claimed_exact_tombstones(&message_roots));
+        cards.extend(claimed_exact_tombstones(&thread_roots));
         self.project_conversations(viewer, &conversation_roots, &mut cards);
-        self.project_messages(viewer, &message_roots, &mut cards);
+        self.project_exact_chat(viewer, &message_roots, &thread_roots, &mut cards);
         cards
     }
 }
@@ -64,36 +66,73 @@ impl ChatReferenceCardProjector {
         }
     }
 
-    fn project_messages(
+    fn project_exact_chat(
         &self,
         viewer: &Principal,
-        roots: &BTreeMap<String, Vec<OwnedMessageReference>>,
+        message_roots: &BTreeMap<String, Vec<OwnedExactReference>>,
+        thread_roots: &BTreeMap<String, Vec<OwnedExactReference>>,
         cards: &mut HashMap<String, ReferenceCard>,
     ) {
-        let canonical = canonical_message_references(roots);
-        let message_ids = canonical.keys().cloned().map(MessageId).collect::<Vec<_>>();
+        let messages = canonical_exact_references(message_roots, ExactReferenceKind::Message);
+        let threads = canonical_exact_references(thread_roots, ExactReferenceKind::Thread);
+        let message_ids = messages
+            .keys()
+            .chain(threads.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(MessageId)
+            .collect::<Vec<_>>();
         let Ok(visible) = self.chat.project_messages(viewer, &message_ids) else {
             return;
         };
 
         for message in visible {
-            let Some(references) = canonical.get(&message.message_id) else {
-                continue;
-            };
-            let title = format!("Message in {}", message.conversation_topic);
-            for reference in references {
-                cards.insert(
-                    reference.original.clone(),
-                    ReferenceCard::projection_at(
-                        title.clone(),
-                        message.state.token(),
-                        "message",
-                        "chat_message",
-                        Some(reference.sub_anchor.clone()),
-                    ),
+            if let Some(references) = messages.get(&message.message_id) {
+                insert_exact_cards(
+                    cards,
+                    references,
+                    format!("Message in {}", message.conversation_topic),
+                    message.state.token(),
+                    "message",
+                    "chat_message",
                 );
             }
+            if message.thread_root_id.is_none() {
+                if let Some(references) = threads.get(&message.message_id) {
+                    insert_exact_cards(
+                        cards,
+                        references,
+                        format!("Thread in {}", message.conversation_topic),
+                        message.state.token(),
+                        "message",
+                        "chat_thread",
+                    );
+                }
+            }
         }
+    }
+}
+
+fn insert_exact_cards(
+    cards: &mut HashMap<String, ReferenceCard>,
+    references: &[OwnedExactReference],
+    title: String,
+    state: &str,
+    icon: &str,
+    render_hint: &str,
+) {
+    for reference in references {
+        cards.insert(
+            reference.original.clone(),
+            ReferenceCard::projection_at(
+                title.clone(),
+                state,
+                icon,
+                render_hint,
+                Some(reference.sub_anchor.clone()),
+            ),
+        );
     }
 }
 
@@ -108,33 +147,63 @@ fn insert_card(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct OwnedMessageReference {
+struct OwnedExactReference {
     original: String,
     sub_anchor: String,
 }
 
-fn message_references(
+#[derive(Clone, Copy)]
+enum ExactReferenceKind {
+    Message,
+    Thread,
+}
+
+impl ExactReferenceKind {
+    const fn type_token(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Thread => "thread",
+        }
+    }
+
+    fn anchor(self, id: &str) -> String {
+        format!("{}-{id}", self.type_token())
+    }
+
+    fn sub_anchor(self, sub: Option<myelin_refs::Sub>, id: &str) -> Option<String> {
+        match (self, sub) {
+            (Self::Message, None) => Some(self.anchor(id)),
+            (Self::Message, Some(myelin_refs::Sub::Message(sub_id))) => Some(self.anchor(&sub_id)),
+            (Self::Thread, None) => Some(self.anchor(id)),
+            (Self::Thread, Some(myelin_refs::Sub::Thread(sub_id))) => Some(self.anchor(&sub_id)),
+            _ => None,
+        }
+    }
+}
+
+fn exact_references(
     viewer: &Principal,
     references: &[String],
-) -> BTreeMap<String, Vec<OwnedMessageReference>> {
-    let mut owned = BTreeMap::<String, Vec<OwnedMessageReference>>::new();
+    kind: ExactReferenceKind,
+) -> BTreeMap<String, Vec<OwnedExactReference>> {
+    let mut owned = BTreeMap::<String, Vec<OwnedExactReference>>::new();
     for reference in references {
         let Ok(parsed) = myelin_refs::parse_scoped(reference) else {
             continue;
         };
-        if parsed.tenant != viewer.tenant || parsed.subsystem != "chat" || parsed.type_ != "message"
+        if parsed.tenant != viewer.tenant
+            || parsed.subsystem != "chat"
+            || parsed.type_ != kind.type_token()
         {
             continue;
         }
-        let sub_anchor = match parsed.sub {
-            None => format!("message-{}", parsed.id),
-            Some(myelin_refs::Sub::Message(message_id)) => format!("message-{message_id}"),
-            Some(_) => continue,
+        let Some(sub_anchor) = kind.sub_anchor(parsed.sub, &parsed.id) else {
+            continue;
         };
         owned
             .entry(parsed.id)
             .or_default()
-            .push(OwnedMessageReference {
+            .push(OwnedExactReference {
                 original: reference.clone(),
                 sub_anchor,
             });
@@ -142,16 +211,17 @@ fn message_references(
     owned
 }
 
-fn canonical_message_references(
-    roots: &BTreeMap<String, Vec<OwnedMessageReference>>,
-) -> BTreeMap<String, Vec<OwnedMessageReference>> {
+fn canonical_exact_references(
+    roots: &BTreeMap<String, Vec<OwnedExactReference>>,
+    kind: ExactReferenceKind,
+) -> BTreeMap<String, Vec<OwnedExactReference>> {
     roots
         .iter()
         .filter_map(|(message_id, references)| {
             if !myelin_chat::is_canonical_ulid(message_id) {
                 return None;
             }
-            let expected_anchor = format!("message-{message_id}");
+            let expected_anchor = kind.anchor(message_id);
             let canonical = references
                 .iter()
                 .filter(|reference| reference.sub_anchor == expected_anchor)
@@ -162,8 +232,8 @@ fn canonical_message_references(
         .collect()
 }
 
-fn claimed_message_tombstones(
-    roots: &BTreeMap<String, Vec<OwnedMessageReference>>,
+fn claimed_exact_tombstones(
+    roots: &BTreeMap<String, Vec<OwnedExactReference>>,
 ) -> HashMap<String, ReferenceCard> {
     roots
         .values()
@@ -198,24 +268,54 @@ mod tests {
             format!("myelin://other/chat/message/{id}"),
         ];
 
-        let owned = message_references(&viewer(), &references);
+        let owned = exact_references(&viewer(), &references, ExactReferenceKind::Message);
         assert_eq!(owned.len(), 1);
         assert_eq!(owned.values().next().unwrap().len(), 3);
         assert_eq!(
-            canonical_message_references(&owned),
+            canonical_exact_references(&owned, ExactReferenceKind::Message),
             BTreeMap::from([(
                 id.into(),
                 vec![
-                    OwnedMessageReference {
+                    OwnedExactReference {
                         original: root.clone(),
                         sub_anchor: format!("message-{id}"),
                     },
-                    OwnedMessageReference {
+                    OwnedExactReference {
                         original: format!("{root}#message-{id}"),
                         sub_anchor: format!("message-{id}"),
                     },
                 ]
             )])
+        );
+    }
+
+    #[test]
+    fn thread_roots_accept_only_their_matching_thread_anchor() {
+        let id = "01J00000000000000000000000";
+        let root = format!("myelin://acme/chat/thread/{id}");
+        let references = [
+            root.clone(),
+            format!("{root}#thread-{id}"),
+            format!("{root}#thread-01J00000000000000000000001"),
+            format!("{root}#message-{id}"),
+        ];
+        let owned = exact_references(&viewer(), &references, ExactReferenceKind::Thread);
+        assert_eq!(owned.values().next().unwrap().len(), 3);
+        assert_eq!(
+            canonical_exact_references(&owned, ExactReferenceKind::Thread),
+            BTreeMap::from([(
+                id.into(),
+                vec![
+                    OwnedExactReference {
+                        original: root.clone(),
+                        sub_anchor: format!("thread-{id}"),
+                    },
+                    OwnedExactReference {
+                        original: format!("{root}#thread-{id}"),
+                        sub_anchor: format!("thread-{id}"),
+                    },
+                ],
+            )]),
         );
     }
 }

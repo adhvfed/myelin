@@ -10,6 +10,8 @@ import {
   parseChatMessage,
   parseChatMessageReceipt,
   parseChatMessages,
+  parseChatReplyDraft,
+  parseChatThread,
   type ChatConversationDraft,
   type ChatConversationPage,
   type ChatConversationReceipt,
@@ -17,6 +19,8 @@ import {
   type ChatMessagePage,
   type ChatMessageView,
   type ChatMessageReceipt,
+  type ChatReplyDraft,
+  type ChatThreadPage,
 } from "./chat-response";
 
 export type {
@@ -30,6 +34,7 @@ export type {
   ChatMessageView,
   ChatMessageReceipt,
   ChatMessageState,
+  ChatThreadPage,
 } from "./chat-response";
 
 export type ChatErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
@@ -133,13 +138,46 @@ export const getChatMessage = query(async (messageId: string): Promise<ChatMessa
   });
 }, "chat-message");
 
+/** One focused reply thread, with its root kept outside reply pagination. */
+export const getChatThread = query(async (request: {
+  rootMessageId: string;
+  before?: string;
+  limit?: number;
+}): Promise<ChatThreadPage> => {
+  "use server";
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+      !isChatUlid(request.rootMessageId) ||
+      (request.before !== undefined && !isChatUlid(request.before)) ||
+      (request.limit !== undefined &&
+        (!Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 100)) ||
+      Object.keys(request).some((key) => !["rootMessageId", "before", "limit"].includes(key))) {
+    throw new ChatRouteError("bad-input");
+  }
+  const search = new URLSearchParams();
+  if (request.before) search.set("before", request.before);
+  if (request.limit) search.set("limit", String(request.limit));
+  return chatAuthed(async () => {
+    const decoded = parseChatThread(await edgeGet(
+      `/v1/chat/threads/${segment(request.rootMessageId)}/messages${
+        search.size ? `?${search.toString()}` : ""
+      }`,
+    ));
+    if (!decoded || decoded.root.id !== request.rootMessageId) {
+      throw new ChatRouteError("error");
+    }
+    return decoded;
+  });
+}, "chat-thread");
+
 export type ChatMutation =
   | ({ op: "create-conversation" } & ChatConversationDraft)
-  | ({ op: "post-message" } & ChatMessageDraft);
+  | ({ op: "post-message" } & ChatMessageDraft)
+  | ({ op: "post-reply" } & ChatReplyDraft);
 
 export type ChatMutationResult =
   | { ok: true; op: "create-conversation"; receipt: ChatConversationReceipt }
   | { ok: true; op: "post-message"; receipt: ChatMessageReceipt }
+  | { ok: true; op: "post-reply"; receipt: ChatMessageReceipt }
   | { ok: false; error: ChatErrorKind };
 
 /** Chat writes use one narrow server action; tenant and author always come from the signed session. */
@@ -192,6 +230,28 @@ export const chatMutate = action(async (mutation: ChatMutation) => {
             content: parsed.content,
             references: parsed.references,
           },
+          { idempotencyKey: parsed.clientNonce },
+        ));
+        if (!decoded) throw new ChatRouteError("error");
+        return decoded;
+      });
+      return result({ ok: true, op: mutation.op, receipt });
+    }
+    if (mutation.op === "post-reply") {
+      const parsed = parseChatReplyDraft({
+        rootMessageId: mutation.rootMessageId,
+        content: mutation.content,
+        references: mutation.references,
+        clientNonce: mutation.clientNonce,
+      });
+      if (!parsed || Object.keys(mutation).some((key) =>
+        !["op", "rootMessageId", "content", "references", "clientNonce"].includes(key))) {
+        return result({ ok: false, error: "bad-input" });
+      }
+      const receipt = await chatAuthed(async () => {
+        const decoded = parseChatMessageReceipt(await edgePost(
+          `/v1/chat/messages/${segment(parsed.rootMessageId)}/replies`,
+          { content: parsed.content, references: parsed.references },
           { idempotencyKey: parsed.clientNonce },
         ));
         if (!decoded) throw new ChatRouteError("error");

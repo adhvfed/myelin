@@ -23,6 +23,7 @@ import {
   getChatConversations,
   getChatMessage,
   getChatMessages,
+  getChatThread,
   type ChatConversationPage,
   type ChatErrorKind,
   type ChatMessagePage,
@@ -47,11 +48,15 @@ export default function ChatIndex() {
   const requestedConversationId = () =>
     typeof search.conversation === "string" ? search.conversation : undefined;
   const requestedMessageId = () => typeof search.message === "string" ? search.message : undefined;
+  const requestedThreadId = () => typeof search.thread === "string" ? search.thread : undefined;
   const validConversationId = () =>
     isChatUlid(requestedConversationId()) ? requestedConversationId() : undefined;
   const validFocusedMessageId = () =>
     isChatUlid(requestedMessageId()) ? requestedMessageId() : undefined;
-  const hasSelection = () => Boolean(requestedConversationId() || requestedMessageId());
+  const validThreadRootId = () =>
+    isChatUlid(requestedThreadId()) ? requestedThreadId() : undefined;
+  const hasSelection = () =>
+    Boolean(requestedConversationId() || requestedMessageId() || requestedThreadId());
   const createOpen = () => search.new === "1";
 
   const [conversationPages, setConversationPages] = createSignal<ChatConversationPage[]>([]);
@@ -94,6 +99,24 @@ export default function ChatIndex() {
         return { page: null, error: chatErrorKind(error) };
       }
     }
+    const threadRoot = requestedThreadId();
+    if (threadRoot) {
+      if (!isChatUlid(threadRoot)) return { page: null, error: "bad-input" };
+      try {
+        const thread = await getChatThread({ rootMessageId: threadRoot, limit: 100 });
+        return {
+          page: {
+            conversation: thread.conversation,
+            items: [thread.root, ...thread.items],
+            page: thread.page,
+          },
+          error: null,
+        };
+      } catch (error) {
+        if (error instanceof Response) throw error;
+        return { page: null, error: chatErrorKind(error) };
+      }
+    }
     const raw = requestedConversationId();
     if (!raw) return null;
     if (!isChatUlid(raw)) return { page: null, error: "bad-input" };
@@ -110,7 +133,7 @@ export default function ChatIndex() {
 
   const conversations = createMemo(() =>
     mergeConversationPages(firstConversations()?.page, conversationPages()));
-  const validSelectedId = () => validFocusedMessageId()
+  const validSelectedId = () => validFocusedMessageId() || validThreadRootId()
     ? recentMessages()?.page?.conversation.id
     : validConversationId();
   const selectedConversation = createMemo(() => {
@@ -136,6 +159,7 @@ export default function ChatIndex() {
   createEffect(() => {
     requestedConversationId();
     requestedMessageId();
+    requestedThreadId();
     messageGeneration += 1;
     earlierMessageRequest += 1;
     setEarlierMessagePages([]);
@@ -150,7 +174,7 @@ export default function ChatIndex() {
     const timer = window.setInterval(() => {
       const conversationId = validSelectedId();
       if (!conversationId || validFocusedMessageId() || document.hidden) return;
-      void revalidate(getChatMessages.keyFor({ conversationId, limit: 100 }));
+      void refreshSelection(conversationId);
     }, 30_000);
     onCleanup(() => window.clearInterval(timer));
   });
@@ -166,8 +190,7 @@ export default function ChatIndex() {
       `/api/chat/conversations/${encodeURIComponent(conversationId)}/events`,
     );
     let everOpened = false;
-    const refresh = () =>
-      void revalidate(getChatMessages.keyFor({ conversationId, limit: 100 }));
+    const refresh = () => void refreshSelection(conversationId);
     source.addEventListener("chat.message.posted", refresh);
     source.onopen = () => {
       if (everOpened) refresh();
@@ -222,7 +245,14 @@ export default function ChatIndex() {
     setLoadingEarlier(true);
     setEarlierError(false);
     try {
-      const page = await getChatMessages({ conversationId, before, limit: 100 });
+      const rootMessageId = validThreadRootId();
+      const page = rootMessageId
+        ? await getChatThread({ rootMessageId, before, limit: 100 }).then((thread) => ({
+            conversation: thread.conversation,
+            items: [thread.root, ...thread.items],
+            page: thread.page,
+          }))
+        : await getChatMessages({ conversationId, before, limit: 100 });
       if (generation !== messageGeneration || request !== earlierMessageRequest) return;
       setEarlierMessagePages((pages) => [...pages, page]);
     } catch {
@@ -240,9 +270,21 @@ export default function ChatIndex() {
     await revalidate(getChatMessages.keyFor({ conversationId, limit: 100 }));
   };
 
+  const refreshSelection = async (conversationId: string) => {
+    const rootMessageId = validThreadRootId();
+    if (rootMessageId) {
+      await Promise.all([
+        revalidate(getChatThread.keyFor({ rootMessageId, limit: 100 })),
+        revalidate(getChatMessages.keyFor({ conversationId, limit: 100 })),
+      ]);
+      return;
+    }
+    await refreshMessages(conversationId);
+  };
+
   const messagePosted = async (conversationId: string) => {
     try {
-      await refreshMessages(conversationId);
+      await refreshSelection(conversationId);
       toast.show({ title: "Message sent", variant: "success" });
     } catch {
       toast.show({ title: "Message sent — reload the topic to see it", variant: "warning" });
@@ -289,7 +331,9 @@ export default function ChatIndex() {
                 fallback={
                   <ChatConversationError
                     kind={recentMessages()?.error ??
-                      ((validConversationId() || validFocusedMessageId()) ? "error" : "bad-input")}
+                      ((validConversationId() || validFocusedMessageId() || validThreadRootId())
+                        ? "error"
+                        : "bad-input")}
                   />
                 }
               >
@@ -302,6 +346,7 @@ export default function ChatIndex() {
                   onLoadEarlier={() => void loadEarlier()}
                   onPosted={messagePosted}
                   focusedMessageId={validFocusedMessageId()}
+                  threadRootId={validThreadRootId()}
                 />
               </Show>
             </Show>

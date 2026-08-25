@@ -85,6 +85,8 @@ describe("private agent work wire projection", () => {
         is_you: true,
         content: "The final reader still owns the lease.",
         nodes: [],
+        thread_root_id: null,
+        reply_count: 0,
         edited: false,
         state: "active",
         created_at: 1_700_000_000,

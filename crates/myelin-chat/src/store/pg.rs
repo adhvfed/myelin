@@ -22,6 +22,8 @@ use super::{
     RangeCursor, StoreError,
 };
 
+mod thread;
+
 const EXACT_MESSAGE_BATCH_MAX: usize = 100;
 
 pub const MESSAGE_TABLE_DDL: &str = "\
@@ -83,6 +85,14 @@ impl PgMessageStore {
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Cold(format!("message identity index: {e}")))?;
+        sqlx::raw_sql(&format!(
+            "CREATE INDEX IF NOT EXISTS {table}_thread_range \
+             ON {table} (tenant_id, region, conversation_id, thread_root_id, message_id)",
+            table = self.table,
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Cold(format!("message thread range index: {e}")))?;
         sqlx::raw_sql(&format!(
             "DO $myelin$ \
              BEGIN \

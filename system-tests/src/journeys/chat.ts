@@ -50,6 +50,48 @@ export class Conversation {
     return string(posted.body.message_id, "posted message id");
   }
 
+  async reply(
+    client: SystemTestClient,
+    rootMessageId: string,
+    content: string,
+    options: { references?: string[]; nodes?: MessageNode[]; idempotencyKey?: string } = {},
+  ): Promise<string> {
+    const posted = await client.json(
+      `/v1/chat/messages/${encodeURIComponent(rootMessageId)}/replies`,
+      {
+        method: "POST",
+        body: {
+          content,
+          ...(options.references === undefined ? {} : { references: options.references }),
+          ...(options.nodes === undefined ? {} : { nodes: options.nodes }),
+        },
+        idempotencyKey: options.idempotencyKey ?? `chat-reply-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    return string(posted.body.message_id, "posted reply id");
+  }
+
+  async thread(
+    client: SystemTestClient,
+    rootMessageId: string,
+    limit = 100,
+  ): Promise<{ ref: string; root: JsonRecord; replies: JsonRecord[] }> {
+    const response = await client.json(
+      `/v1/chat/threads/${encodeURIComponent(rootMessageId)}/messages?limit=${limit}`,
+    );
+    const conversation = record(response.body.conversation, "thread conversation");
+    if (string(conversation.id, "thread conversation id") !== this.id) {
+      throw new Error("thread resolved outside its conversation");
+    }
+    return {
+      ref: string(response.body.ref, "thread reference"),
+      root: record(response.body.root, "thread root message"),
+      replies: array(response.body.items, "thread replies")
+        .map((item) => record(item, "thread reply")),
+    };
+  }
+
   async messages(client: SystemTestClient, limit = 100): Promise<JsonRecord[]> {
     const response = await client.json(
       `/v1/chat/conversations/${encodeURIComponent(this.id)}/messages?limit=${limit}`,

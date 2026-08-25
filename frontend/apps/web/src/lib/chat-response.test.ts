@@ -8,6 +8,7 @@ import {
   parseChatMessageDraft,
   parseChatMessageReceipt,
   parseChatMessages,
+  parseChatThread,
 } from "./chat-response";
 
 const ID = "01J00000000000000000000000";
@@ -50,6 +51,8 @@ const message = {
   is_you: true,
   content: "The rollout is green.",
   nodes: [],
+  thread_root_id: null,
+  reply_count: 0,
   edited: false,
   state: "active",
   created_at: 1_700_000_000,
@@ -67,6 +70,13 @@ describe("Chat wire projection", () => {
       page: { next_cursor: null, limit: 50 },
     })?.items).toEqual([message]);
     expect(parseChatMessage({ conversation, message })).toEqual({ conversation, message });
+    expect(parseChatThread({
+      conversation,
+      ref: `myelin://acme/chat/thread/${NEXT}#thread-${NEXT}`,
+      root: { ...message, reply_count: 1 },
+      items: [{ ...message, id: ID, thread_root_id: NEXT }],
+      page: { next_cursor: null, limit: 50 },
+    })?.items).toEqual([{ ...message, id: ID, thread_root_id: NEXT }]);
     expect(parseChatConversationReceipt({ conversation, durable: true })).toEqual({
       conversation,
       durable: true,

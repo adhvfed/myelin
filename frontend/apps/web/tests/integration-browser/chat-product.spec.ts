@@ -211,6 +211,38 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await expect(page.getByText(message)).toBeVisible();
   await expect(page.getByRole("link", { name: `${issueTitle}, ${issue!.state}` })).toBeVisible();
 
+  const rootMessage = page.locator("li.chat-message").filter({ hasText: message });
+  const rootDomId = await rootMessage.getAttribute("id");
+  expect(rootDomId).toMatch(/^message-[0-9A-HJKMNP-TV-Z]{26}$/);
+  const rootMessageId = rootDomId!.slice("message-".length);
+  const threadReply = `Wait for the storage repair, then continue ${suffix}.`;
+  await rootMessage.getByRole("link", { name: "Reply", exact: true }).click();
+  await expect(page).toHaveURL(
+    new RegExp(`/chat\\?thread=${rootMessageId}#thread-${rootMessageId}$`),
+  );
+  await page.getByLabel(`Reply in ${topic}`).fill(threadReply);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByText(threadReply)).toBeVisible();
+  await page.getByRole("link", { name: "View latest messages" }).click();
+  await expect(page).toHaveURL(new RegExp(`/chat\\?conversation=[0-9A-HJKMNP-TV-Z]{26}$`));
+  await expect(page.locator(`#message-${rootMessageId}`).getByRole("link", { name: "1 reply" }))
+    .toBeVisible();
+
+  const threadRef = `myelin://${tenant}/chat/thread/${rootMessageId}#thread-${rootMessageId}`;
+  await page.getByLabel(`Message ${topic}`).fill("Keep the release decision in this thread.");
+  await page.getByRole("button", { name: "Link work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(threadRef);
+  await page.getByRole("button", { name: "Add reference" }).click();
+  await page.getByRole("button", { name: "Send" }).click();
+  const threadCard = page.getByRole("link", { name: `Thread in ${topic}, active`, exact: true });
+  await expect(threadCard).toHaveAttribute(
+    "href",
+    `/chat?thread=${rootMessageId}#thread-${rootMessageId}`,
+  );
+  await threadCard.click();
+  await expect(page.locator(`#thread-${rootMessageId}`)).toContainText(threadReply);
+  await page.getByRole("link", { name: "View latest messages" }).click();
+
   await page.getByLabel(`Message ${topic}`).fill("Resume from this exact revision.");
   await page.getByRole("button", { name: "Link work" }).click();
   await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(commitRef);

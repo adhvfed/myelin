@@ -109,6 +109,14 @@ pub struct MessageLocation {
     pub state: MessageState,
 }
 
+/// A message projected into a conversation or thread timeline.
+/// Replies stay encrypted in storage; only their count accompanies a root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineMessage {
+    pub message: Message,
+    pub reply_count: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RangeCursor {
     Recent,
