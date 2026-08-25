@@ -1,10 +1,10 @@
 use sqlx::postgres::PgPool;
 
 use myelin_events::{
-    BrokerDeliveryRef, CoCommitError, CoCommitTx, ConsumerName, DeadLetterRecord, DedupError,
-    DedupResult, DeliveryQuarantineReason, DurableBusErasure, DurableDeadLetter, DurableDedup,
-    DurableDeliveryQuarantine, ErasedSubject, ErasureLedgerError, EventId, PiiKeyRef, Region,
-    TenantId, Timestamp,
+    BrokerDeliveryRef, CoCommitError, CoCommitTx, ConsumerName, DeadLetterError, DeadLetterRecord,
+    DedupError, DedupResult, DeliveryQuarantineReason, DurableBusErasure, DurableDeadLetter,
+    DurableDedup, DurableDeliveryQuarantine, ErasedSubject, ErasureLedgerError, EventId, PiiKeyRef,
+    Region, TenantId, Timestamp,
 };
 
 use crate::migration::{Migration, Migrations};
@@ -183,7 +183,7 @@ impl DurableDeadLetter for DurableDeadLetterBacking {
         consumer: &ConsumerName,
         event_id: &EventId,
         reason: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), DeadLetterError> {
         self.block(async {
             sqlx::query(
                 "INSERT INTO consumer_dead_letter (consumer, event_id, reason) \
@@ -196,36 +196,32 @@ impl DurableDeadLetter for DurableDeadLetterBacking {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|_| DeadLetterError::Unavailable)
         })
     }
 
-    fn dead_letters(&self, consumer: &ConsumerName) -> Vec<DeadLetterRecord> {
+    fn dead_letters(
+        &self,
+        consumer: &ConsumerName,
+    ) -> Result<Vec<DeadLetterRecord>, DeadLetterError> {
         self.block(async {
-            let rows: Vec<(String, String)> = match sqlx::query_as(
+            sqlx::query_as::<_, (String, String)>(
                 "SELECT event_id, reason FROM consumer_dead_letter \
                  WHERE consumer = $1 ORDER BY occurred_at, event_id",
             )
             .bind(&consumer.0)
             .fetch_all(&self.pool)
             .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    eprintln!(
-                        "[consumer-dlq] LOUD: durable dead_letters read failed for consumer={}: {e}",
-                        consumer.0
-                    );
-                    return Vec::new();
-                }
-            };
-            rows.into_iter()
-                .map(|(event_id, reason)| DeadLetterRecord {
-                    consumer: consumer.clone(),
-                    event_id: EventId(event_id),
-                    reason,
-                })
-                .collect()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(event_id, reason)| DeadLetterRecord {
+                        consumer: consumer.clone(),
+                        event_id: EventId(event_id),
+                        reason,
+                    })
+                    .collect()
+            })
+            .map_err(|_| DeadLetterError::Unavailable)
         })
     }
 }

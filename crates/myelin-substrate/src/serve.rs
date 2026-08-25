@@ -1147,7 +1147,7 @@ mod tests {
             consumer: &ConsumerName,
             event_id: &EventId,
             reason: &str,
-        ) -> Result<(), String> {
+        ) -> Result<(), myelin_events::DeadLetterError> {
             if self
                 .fail_next
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -1159,7 +1159,7 @@ mod tests {
                 })
                 .is_ok()
             {
-                return Err("DLQ unavailable".into());
+                return Err(myelin_events::DeadLetterError::Unavailable);
             }
             self.records
                 .lock()
@@ -1172,14 +1172,18 @@ mod tests {
             Ok(())
         }
 
-        fn dead_letters(&self, consumer: &ConsumerName) -> Vec<myelin_events::DeadLetterRecord> {
-            self.records
+        fn dead_letters(
+            &self,
+            consumer: &ConsumerName,
+        ) -> Result<Vec<myelin_events::DeadLetterRecord>, myelin_events::DeadLetterError> {
+            Ok(self
+                .records
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .iter()
                 .filter(|record| &record.consumer == consumer)
                 .cloned()
-                .collect()
+                .collect())
         }
     }
 

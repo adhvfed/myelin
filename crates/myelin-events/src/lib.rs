@@ -39,7 +39,7 @@ pub use crosscell_propagation::{
     PropagatedPointer,
 };
 pub use dead_letter::{
-    bounded_reason, DeadLetterRecord, DeadLetterSink, DurableDeadLetter,
+    bounded_reason, DeadLetterError, DeadLetterRecord, DeadLetterSink, DurableDeadLetter,
     CONSUMER_DEAD_LETTER_MIGRATION, MAX_REASON_LEN,
 };
 pub use dedup::{

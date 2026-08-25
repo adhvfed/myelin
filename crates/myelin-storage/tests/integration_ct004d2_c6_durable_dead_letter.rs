@@ -9,10 +9,10 @@ use myelin_storage::tenant_tx::connect_pool_with_reset;
 
 use myelin_events::consumer::{Consumer, Delivered, Message, Subscription};
 use myelin_events::{
-    Actor, AggregateKey, ArtifactRef, ConsumerName, CorrelationId, DataRole, DeadLetterSink,
-    DedupLedger, DurableDeadLetter, DurableDedup, EventEnvelope, EventHandler, EventId, EventType,
-    HandleOutcome, HandlerTx, PrefetchBound, SubjectPattern, Timestamp, Visibility,
-    CONSUMER_DEAD_LETTER_MIGRATION, CONSUMER_DEDUP_MIGRATION,
+    Actor, AggregateKey, ArtifactRef, ConsumerName, CorrelationId, DataRole, DeadLetterError,
+    DeadLetterSink, DedupLedger, DurableDeadLetter, DurableDedup, EventEnvelope, EventHandler,
+    EventId, EventType, HandleOutcome, HandlerTx, PrefetchBound, SubjectPattern, Timestamp,
+    Visibility, CONSUMER_DEAD_LETTER_MIGRATION, CONSUMER_DEDUP_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
@@ -136,7 +136,8 @@ async fn record_survives_a_restart_and_is_idempotent() {
         "the dead-letter SURVIVED the restart (durable, not a volatile Vec)"
     );
     let backing2 = DurableDeadLetterBacking::new(pool2.clone(), rt.clone());
-    let rows = tokio::task::block_in_place(|| backing2.dead_letters(&consumer));
+    let rows = tokio::task::block_in_place(|| backing2.dead_letters(&consumer))
+        .expect("the durable quarantine is readable after reconnecting");
     assert_eq!(rows.len(), 1, "the read verb sees the surviving row");
     assert_eq!(rows[0].event_id, event_id);
 
@@ -336,10 +337,10 @@ async fn db_unreachable_record_falls_back_never_silently_drops() {
         "DB-unreachable: the poison fell back to in-memory - NOT silently dropped"
     );
     assert_eq!(surfaced[0].envelope.event_id, EventId(id.clone()));
-    let durable = consumer.durable_dead_letters();
-    assert!(
-        durable.is_empty(),
-        "the durable table got nothing (DB unreachable) - the fallback carried it"
+    assert_eq!(
+        consumer.durable_dead_letters(),
+        Err(DeadLetterError::Unavailable),
+        "an unavailable durable quarantine must not masquerade as an empty one"
     );
     println!(
         "[#7b] PASS (3): a DB-unreachable durable record is LOUD + falls back in-process (0 silent \

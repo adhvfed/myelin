@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — an unreadable dead-letter queue is not an empty queue
+
+The PostgreSQL consumer dead-letter adapter logged read failures and returned an empty list. That
+made a storage outage indistinguishable from a healthy queue with no quarantined events—the exact
+moment an operator most needs an honest answer. Writes also exposed arbitrary database strings
+through an otherwise deliberately small durability boundary.
+
+Dead-letter reads and writes now share a typed, payload-free availability error. Failed writes
+still retain an emergency in-process copy and withhold broker acknowledgement; failed reads now
+reach the caller instead of manufacturing an empty queue. The test vocabulary follows the user
+story directly: after a durable quarantine reconnects, the poison is visible; while its database
+is unreachable, the local copy remains visible and the durable view explicitly says unavailable.
+
+**Proof:** warning-free all-target/all-feature compile and strict clippy across Events, Storage,
+and Substrate; all 216 Events library cases; and all three real-PostgreSQL durable dead-letter
+journeys, including idempotent restart recovery, payload-free panic quarantine, and unavailable
+storage that withholds acknowledgement and never reports a false empty queue; restarted
+Notifications; and all five live TypeScript notification-lifecycle journeys (107.06 seconds
+total).
+
 ## 2026-08-26 — notification rebuild receipts describe applied work
 
 Notification reindexing counted every delivery other than a duplicate as successfully replayed.

@@ -31,15 +31,33 @@ pub struct DeadLetterRecord {
     pub reason: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeadLetterError {
+    Unavailable,
+}
+
+impl std::fmt::Display for DeadLetterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("consumer dead-letter storage is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for DeadLetterError {}
+
 pub trait DurableDeadLetter: Send + Sync {
     fn record(
         &self,
         consumer: &ConsumerName,
         event_id: &crate::EventId,
         reason: &str,
-    ) -> Result<(), String>;
+    ) -> Result<(), DeadLetterError>;
 
-    fn dead_letters(&self, consumer: &ConsumerName) -> Vec<DeadLetterRecord>;
+    fn dead_letters(
+        &self,
+        consumer: &ConsumerName,
+    ) -> Result<Vec<DeadLetterRecord>, DeadLetterError>;
 }
 
 pub enum DeadLetterSink {
@@ -68,7 +86,7 @@ impl DeadLetterSink {
         }
     }
 
-    pub fn push(&self, consumer: &ConsumerName, dead: DeadLetter) -> Result<(), String> {
+    pub fn push(&self, consumer: &ConsumerName, dead: DeadLetter) -> Result<(), DeadLetterError> {
         match self {
             DeadLetterSink::InMemory(v) => {
                 v.lock().unwrap_or_else(|e| e.into_inner()).push(dead);
@@ -105,9 +123,12 @@ impl DeadLetterSink {
         }
     }
 
-    pub fn durable_dead_letters(&self, consumer: &ConsumerName) -> Vec<DeadLetterRecord> {
+    pub fn durable_dead_letters(
+        &self,
+        consumer: &ConsumerName,
+    ) -> Result<Vec<DeadLetterRecord>, DeadLetterError> {
         match self {
-            DeadLetterSink::InMemory(_) => Vec::new(),
+            DeadLetterSink::InMemory(_) => Ok(Vec::new()),
             DeadLetterSink::Durable { backing, .. } => backing.dead_letters(consumer),
         }
     }
@@ -178,7 +199,9 @@ mod tests {
         assert_eq!(surfaced[0].reason, Reason("malformed".into()));
         assert_eq!(surfaced[1].envelope.event_id, EventId("01J-b".into()));
         assert!(
-            sink.durable_dead_letters(&c).is_empty(),
+            sink.durable_dead_letters(&c)
+                .expect("the in-memory sink is always readable")
+                .is_empty(),
             "the in-memory sink has NO durable table"
         );
     }
@@ -195,10 +218,10 @@ mod tests {
             consumer: &ConsumerName,
             event_id: &crate::EventId,
             reason: &str,
-        ) -> Result<(), String> {
+        ) -> Result<(), DeadLetterError> {
             self.record_calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                return Err("DB unreachable (mock)".into());
+                return Err(DeadLetterError::Unavailable);
             }
             let mut rows = self.rows.lock().unwrap();
             let present = rows
@@ -213,14 +236,21 @@ mod tests {
             }
             Ok(())
         }
-        fn dead_letters(&self, consumer: &ConsumerName) -> Vec<DeadLetterRecord> {
-            self.rows
+        fn dead_letters(
+            &self,
+            consumer: &ConsumerName,
+        ) -> Result<Vec<DeadLetterRecord>, DeadLetterError> {
+            if self.fail {
+                return Err(DeadLetterError::Unavailable);
+            }
+            Ok(self
+                .rows
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|r| r.consumer == *consumer)
                 .cloned()
-                .collect()
+                .collect())
         }
     }
 
@@ -237,7 +267,9 @@ mod tests {
             2,
             "record was called twice (both deliveries)"
         );
-        let rows = sink.durable_dead_letters(&c);
+        let rows = sink
+            .durable_dead_letters(&c)
+            .expect("durable quarantine is available");
         assert_eq!(rows.len(), 1, "ON CONFLICT DO NOTHING → exactly ONE row");
         assert_eq!(rows[0].event_id, EventId("01J-a".into()));
         assert_eq!(rows[0].reason, "malformed");
@@ -258,13 +290,14 @@ mod tests {
 
         assert_eq!(
             sink.push(&c, dead("01J-poison", "handler PANICKED")),
-            Err("DB unreachable (mock)".into()),
+            Err(DeadLetterError::Unavailable),
             "durable failure must be non-terminal to the caller"
         );
         assert_eq!(mock.record_calls.load(Ordering::SeqCst), 1, "record tried");
-        assert!(
-            mock.dead_letters(&c).is_empty(),
-            "the durable table got NOTHING (DB was unreachable)"
+        assert_eq!(
+            mock.dead_letters(&c),
+            Err(DeadLetterError::Unavailable),
+            "an unavailable durable table is not reported as empty"
         );
         let fallback = sink.surfaced();
         assert_eq!(

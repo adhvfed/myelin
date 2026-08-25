@@ -1,4 +1,4 @@
-use crate::dead_letter::{DeadLetterRecord, DeadLetterSink};
+use crate::dead_letter::{DeadLetterError, DeadLetterRecord, DeadLetterSink};
 use crate::{
     DedupError, DedupLedger, EventEnvelope, EventHandler, HandleOutcome, HandlerTx, Reason,
     SubjectPattern,
@@ -300,7 +300,7 @@ impl<H: EventHandler> Consumer<H> {
         self.dead_letters.surfaced()
     }
 
-    pub fn durable_dead_letters(&self) -> Vec<DeadLetterRecord> {
+    pub fn durable_dead_letters(&self) -> Result<Vec<DeadLetterRecord>, DeadLetterError> {
         self.dead_letters.durable_dead_letters(self.name())
     }
 
@@ -461,7 +461,11 @@ impl<H: EventHandler> Consumer<H> {
             .collect()
     }
 
-    fn push_dead_letter(&self, envelope: EventEnvelope, reason: Reason) -> Result<(), String> {
+    fn push_dead_letter(
+        &self,
+        envelope: EventEnvelope,
+        reason: Reason,
+    ) -> Result<(), DeadLetterError> {
         self.dead_letters
             .push(self.name(), DeadLetter { envelope, reason })
     }
@@ -845,12 +849,15 @@ mod tests {
                 _consumer: &ConsumerName,
                 _event_id: &crate::EventId,
                 _reason: &str,
-            ) -> Result<(), String> {
-                Err("durable DLQ unavailable".into())
+            ) -> Result<(), crate::DeadLetterError> {
+                Err(crate::DeadLetterError::Unavailable)
             }
 
-            fn dead_letters(&self, _consumer: &ConsumerName) -> Vec<crate::DeadLetterRecord> {
-                Vec::new()
+            fn dead_letters(
+                &self,
+                _consumer: &ConsumerName,
+            ) -> Result<Vec<crate::DeadLetterRecord>, crate::DeadLetterError> {
+                Err(crate::DeadLetterError::Unavailable)
             }
         }
 
@@ -1104,15 +1111,18 @@ mod tests {
                 _consumer: &ConsumerName,
                 _event_id: &crate::EventId,
                 _reason: &str,
-            ) -> Result<(), String> {
+            ) -> Result<(), crate::DeadLetterError> {
                 if self.0.swap(false, Ordering::SeqCst) {
-                    Err("DLQ unavailable".into())
+                    Err(crate::DeadLetterError::Unavailable)
                 } else {
                     Ok(())
                 }
             }
-            fn dead_letters(&self, _consumer: &ConsumerName) -> Vec<crate::DeadLetterRecord> {
-                Vec::new()
+            fn dead_letters(
+                &self,
+                _consumer: &ConsumerName,
+            ) -> Result<Vec<crate::DeadLetterRecord>, crate::DeadLetterError> {
+                Ok(Vec::new())
             }
         }
         let c = Consumer::new(
