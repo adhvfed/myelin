@@ -1751,17 +1751,47 @@ still need one durable orchestration boundary.
 Proof: the two-case real PostgreSQL Chat erasure story (0.53 seconds) and
 warning-free all-target, all-feature Chat Clippy.
 
+## 2026-08-25 — Chat message erasure is resumable across crashes
+
+The message transaction alone was atomic but its retry receipt was not durable:
+after response loss, a second call could only observe zero remaining live rows.
+Worse, a message append could race the interval between selecting authored rows
+and completing the wider key-erasure operation.
+
+Every Chat message erasure now begins with a tenant-scoped operation marker.
+The marker is keyed by the caller's stable operation identity, binds that
+identity to exactly one pseudonymous author, and permits only one transition
+from pending to a completed pair of message/event counts. Retrying either phase
+returns the original receipt. A failed outbox co-commit leaves the operation
+pending and both message bodies intact.
+
+Production appends and erasure share one framed author lifecycle fence. Appends
+hold its shared form through their transaction; erasure holds its exclusive
+form while preparing and completing. Once a pending marker exists, a new
+message by that author is refused. A writer that began first must finish before
+the marker can commit, so the later erase necessarily sees its row. The real
+PostgreSQL story exercises the write refusal, durable receipt replay, and failed
+transaction resumption. The production migration was applied by restarting
+Edge, then the live delivery story proved normal Chat posting still works.
+
+The old unit test that asserted Chat migration correctness by searching DDL
+strings was removed. The schema and its RLS behavior are exercised by the real
+database story instead.
+
+Proof: the two-case PostgreSQL story (0.69 seconds), warning-free strict Chat
+Clippy, and two live Chat delivery journeys (633 ms of test time).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
    agent-data erase now writes the post-PIT ledger and the re-erase pass is
    drilled against a real dump. the maintenance command and runbook replay it
    through the production holder and restore the absorbing processing block.
-   remaining: Chat now has a scoped key, ledger vocabulary, and real message
-   tombstone/event transaction, but no durable orchestration across that
-   transaction, key destruction, read state, and restore replay; Issues and Git
-   crypto-shred likewise do not write the ledger because none is wired to a user
-   surface yet (gap 2).
+   remaining: Chat now has a scoped key, ledger vocabulary, and a resumable,
+   write-fenced message tombstone/event transaction, but no orchestration across
+   that transaction, key destruction, read state, and restore replay; Issues and
+   Git crypto-shred likewise do not write the ledger because none is wired to a
+   user surface yet (gap 2).
 2. **DSR has one truthful product slice, not full holder coverage.** durable
    submit/status/certificate is now wired for the real agent-data holder and
    exercised through Edge. Chat has one real PostgreSQL mutation seam but not a

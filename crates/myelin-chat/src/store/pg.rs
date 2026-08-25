@@ -65,6 +65,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS {table}_thread_root_author
        (tenant_id, region, conversation_id, thread_root_id)
     WHERE role = 0;";
 
+pub const MESSAGE_ERASURE_OPERATION_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS {table}_erasure_operation (
+    tenant_id       text        NOT NULL,
+    region          text        NOT NULL,
+    operation_id    text        NOT NULL CHECK (length(operation_id) BETWEEN 1 AND 255),
+    author          text        NOT NULL CHECK (length(author) BETWEEN 1 AND 255),
+    started_at      timestamptz NOT NULL DEFAULT now(),
+    completed_at    timestamptz,
+    messages_erased bigint,
+    events_emitted  bigint,
+    PRIMARY KEY (tenant_id, region, operation_id),
+    CHECK (
+      (completed_at IS NULL AND messages_erased IS NULL AND events_emitted IS NULL)
+      OR
+      (completed_at IS NOT NULL
+       AND messages_erased IS NOT NULL AND messages_erased >= 0
+       AND events_emitted IS NOT NULL AND events_emitted = messages_erased)
+    )
+);
+CREATE INDEX IF NOT EXISTS {table}_erasure_in_progress
+    ON {table}_erasure_operation (tenant_id, region, author)
+    WHERE completed_at IS NULL;
+CREATE OR REPLACE FUNCTION {table}_guard_erasure_completion()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
+     NEW.region IS DISTINCT FROM OLD.region OR
+     NEW.operation_id IS DISTINCT FROM OLD.operation_id OR
+     NEW.author IS DISTINCT FROM OLD.author OR
+     NEW.started_at IS DISTINCT FROM OLD.started_at OR
+     OLD.completed_at IS NOT NULL OR
+     NEW.completed_at IS NULL THEN
+    RAISE EXCEPTION 'Chat message erasure permits only its one-way completion transition';
+  END IF;
+  RETURN NEW;
+END
+$myelin$;
+DROP TRIGGER IF EXISTS {table}_erasure_guard_update ON {table}_erasure_operation;
+CREATE TRIGGER {table}_erasure_guard_update
+BEFORE UPDATE ON {table}_erasure_operation
+FOR EACH ROW EXECUTE FUNCTION {table}_guard_erasure_completion();
+"#;
+
 #[derive(Clone, Debug)]
 pub struct MessageAttribution {
     event_actor: Actor,
@@ -80,6 +125,30 @@ impl MessageAttribution {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct MessageErasureAttempt {
+    pub(crate) operation_id: String,
+    pub(crate) actor: Actor,
+    pub(crate) occurred: myelin_events::Timestamp,
+    pub(crate) recorded: myelin_events::Timestamp,
+}
+
+impl MessageErasureAttempt {
+    pub fn new(
+        operation_id: impl Into<String>,
+        actor: Actor,
+        occurred: myelin_events::Timestamp,
+        recorded: myelin_events::Timestamp,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.into(),
+            actor,
+            occurred,
+            recorded,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PgMessageStore {
     pool: PgPool,
@@ -91,6 +160,12 @@ pub struct PgMessageStore {
 pub struct AuthoredMessageEraseReceipt {
     pub messages_tombstoned: u64,
     pub erasure_events_co_committed: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthoredMessageErasureState {
+    Pending,
+    Completed(AuthoredMessageEraseReceipt),
 }
 
 impl PgMessageStore {
@@ -122,6 +197,12 @@ impl PgMessageStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("thread participant DDL: {e}")))?;
+        let erasure_table = self.erasure_operation_table();
+        let erasure_ddl = MESSAGE_ERASURE_OPERATION_DDL.replace("{table}", &self.table);
+        sqlx::raw_sql(&erasure_ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Cold(format!("message erasure DDL: {e}")))?;
         let following_ddl = THREAD_FOLLOWING_DDL.replace("{table}", &self.table);
         sqlx::raw_sql(&following_ddl)
             .execute(&self.pool)
@@ -183,6 +264,12 @@ impl PgMessageStore {
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Cold(format!("make thread participants tenant scoped: {e}")))?;
+        sqlx::raw_sql(&format!(
+            "SELECT myelin_make_tenant_scoped('{erasure_table}')"
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Cold(format!("make message erasures tenant scoped: {e}")))?;
         sqlx::raw_sql(&format!("GRANT ALL ON {} TO myelin_app", self.table))
             .execute(&self.pool)
             .await
@@ -191,11 +278,19 @@ impl PgMessageStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("thread participant grant: {e}")))?;
+        sqlx::raw_sql(&format!("GRANT ALL ON {erasure_table} TO myelin_app"))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Cold(format!("message erasure grant: {e}")))?;
         Ok(())
     }
 
     fn thread_participant_table(&self) -> String {
         format!("{}_thread_participant", self.table)
+    }
+
+    fn erasure_operation_table(&self) -> String {
+        format!("{}_erasure_operation", self.table)
     }
 
     async fn set_session_scope(

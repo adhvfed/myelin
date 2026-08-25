@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use myelin_chat::events::{
     channel_aggregate, event_actor_pseudonym, pseudonymized_event_principal,
 };
-use myelin_chat::store::pg::PgMessageStore;
+use myelin_chat::store::pg::{
+    AuthoredMessageErasureState, MessageAttribution, MessageErasureAttempt, PgMessageStore,
+};
 use myelin_chat::store::{
     AuthorKind, ConversationId, MessageState, MonotonicUlidSource, NewMessage, RangeCursor,
 };
@@ -50,6 +52,10 @@ fn erasure_actor(raw_principal: &str) -> Actor {
         TenantId(TENANT.into()),
     );
     Actor(pseudonymized_event_principal(TENANT, &principal))
+}
+
+fn erasure_attempt(operation_id: &str) -> MessageErasureAttempt {
+    MessageErasureAttempt::new(operation_id, erasure_actor(ADA), now(), now())
 }
 
 struct ConstantMinter(Ulid);
@@ -149,6 +155,10 @@ async fn clear_test_rows(admin: &sqlx::PgPool, table: &str, conversations: &[Con
         .execute(&mut *transaction)
         .await
         .expect("drop the isolated thread participant table");
+    sqlx::query(&format!("DROP TABLE IF EXISTS {table}_erasure_operation"))
+        .execute(&mut *transaction)
+        .await
+        .expect("drop the isolated erasure operation table");
     sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
         .execute(&mut *transaction)
         .await
@@ -201,8 +211,36 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
         .await
         .expect("Bob can write beside Ada");
 
+    let operation = "privacy-request:ada-2026-06-21";
+    assert_eq!(
+        store
+            .prepare_author_erasure(TENANT, &ada, operation)
+            .await
+            .expect("persist the operation before irreversible work"),
+        AuthoredMessageErasureState::Pending,
+    );
+    let (late_message, _) = encrypted_message(
+        &kms,
+        planning.clone(),
+        &ada,
+        "late-arrival",
+        "This must not cross an in-progress erasure",
+    );
+    let refused = store
+        .append_co_commit(
+            &ids,
+            late_message,
+            event_ids.mint().into(),
+            MessageAttribution::new(erasure_actor(ADA), PrincipalId(ADA.into())),
+            now(),
+            now(),
+        )
+        .await
+        .expect_err("a fresh write cannot overtake Ada's in-progress erasure");
+    assert!(refused.to_string().contains("erasure is in progress"));
+
     let receipt = store
-        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_actor(ADA), now(), now())
+        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_attempt(operation))
         .await
         .expect("the production message store completes Ada's erasure atomically");
     assert_eq!(
@@ -250,13 +288,31 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
     }));
 
     let retry = store
-        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_actor(ADA), now(), now())
+        .tombstone_author_co_commit(TENANT, &ada, &event_ids, erasure_attempt(operation))
         .await
-        .expect("a delivery retry converges without another event");
+        .expect("a delivery retry returns the durable receipt");
     assert_eq!(
         (retry.messages_tombstoned, retry.erasure_events_co_committed,),
-        (0, 0),
-        "a completed message erasure is a quiet no-op on retry",
+        (2, 2),
+        "a completed message erasure replays its original proof without another event",
+    );
+    assert_eq!(
+        store
+            .prepare_author_erasure(TENANT, &ada, operation)
+            .await
+            .expect("the durable marker remains readable after response loss"),
+        AuthoredMessageErasureState::Completed(receipt.clone()),
+    );
+    let event_count_after_retry: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1 OR aggregate = $2")
+            .bind(channel_aggregate(&planning.conversation_id).0)
+            .bind(channel_aggregate(&incident.conversation_id).0)
+            .fetch_one(&admin)
+            .await
+            .expect("count events after replaying the durable receipt");
+    assert_eq!(
+        event_count_after_retry, 2,
+        "receipt replay never republishes a completed erasure",
     );
 
     kms.destroy_dek(&DekId::new(
@@ -291,15 +347,21 @@ async fn an_erasure_event_failure_restores_every_message_body() {
             .expect("arrange an authored message");
     }
 
+    let operation = "privacy-request:ada-rollback";
+    assert_eq!(
+        store
+            .prepare_author_erasure(TENANT, &ada, operation)
+            .await
+            .expect("persist the operation before attempting the mutation"),
+        AuthoredMessageErasureState::Pending,
+    );
     let one_id_for_two_different_events = UlidMinter::new().mint();
     let error = store
         .tombstone_author_co_commit(
             TENANT,
             &ada,
             &ConstantMinter(one_id_for_two_different_events),
-            erasure_actor(ADA),
-            now(),
-            now(),
+            erasure_attempt(operation),
         )
         .await
         .expect_err("a divergent event identity must abort the whole erasure transaction");
@@ -323,6 +385,13 @@ async fn an_erasure_event_failure_restores_every_message_body() {
     assert_eq!(
         event_count, 0,
         "neither message mutation nor event may escape a failed co-commit",
+    );
+    assert_eq!(
+        store
+            .prepare_author_erasure(TENANT, &ada, operation)
+            .await
+            .expect("the failed operation remains resumable"),
+        AuthoredMessageErasureState::Pending,
     );
 
     clear_test_rows(&admin, &table, &[conversation]).await;

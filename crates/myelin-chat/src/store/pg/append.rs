@@ -182,6 +182,8 @@ impl PgMessageStore {
             .begin()
             .await
             .map_err(|e| StoreError::Cold(format!("begin co-commit tx: {e}")))?;
+        self.refuse_append_during_author_erasure(&mut dbtx, &msg.conv.tenant, &msg.author)
+            .await?;
 
         let thread_root = match msg.thread_root_id.as_ref() {
             Some(root) => Some(

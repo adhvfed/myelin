@@ -16,6 +16,7 @@ const EXACT_CONVERSATION_BATCH_MAX: usize = 10_000;
 pub const CONVERSATION_TABLE: &str = "chat_conversation";
 pub const MESSAGE_TABLE: &str = "chat_message";
 pub const THREAD_PARTICIPANT_TABLE: &str = "chat_message_thread_participant";
+pub const MESSAGE_ERASURE_OPERATION_TABLE: &str = "chat_message_erasure_operation";
 pub const CONVERSATION_RECENT_INDEX: &str = "chat_conversation_recent";
 pub const CONVERSATION_CLIENT_NONCE_INDEX: &str = "chat_conversation_client_nonce";
 pub const CONVERSATION_PROJECT_RECENT_INDEX: &str = "chat_conversation_project_recent";
@@ -632,6 +633,10 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
     let thread_root_author_index =
         super::pg::THREAD_ROOT_AUTHOR_INDEX_DDL.replace("{table}", MESSAGE_TABLE);
     let thread_following = super::pg::THREAD_FOLLOWING_DDL.replace("{table}", MESSAGE_TABLE);
+    let message_erasure = format!(
+        "{}\nSELECT myelin_make_tenant_scoped('{MESSAGE_ERASURE_OPERATION_TABLE}');",
+        super::pg::MESSAGE_ERASURE_OPERATION_DDL.replace("{table}", MESSAGE_TABLE),
+    );
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
@@ -690,70 +695,17 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
             thread_following,
             THREAD_PARTICIPANT_TABLE,
         ),
+        Migration::plain_on(
+            "chat_0014_message_erasure_operation",
+            message_erasure,
+            MESSAGE_ERASURE_OPERATION_TABLE,
+        ),
     ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn migrations_create_and_tenant_scope_both_tables() {
-        let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 13);
-        for (migration, table) in migrations.0[..2]
-            .iter()
-            .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
-        {
-            assert!(migration
-                .ddl
-                .contains(&format!("CREATE TABLE IF NOT EXISTS {table}")));
-            assert!(migration
-                .ddl
-                .contains(&format!("myelin_make_tenant_scoped('{table}')")));
-        }
-        assert!(migrations.0[0].ddl.contains(CONVERSATION_RECENT_INDEX));
-        assert!(migrations.0[2]
-            .ddl
-            .contains(CONVERSATION_CLIENT_NONCE_INDEX));
-        assert!(migrations.0[3]
-            .ddl
-            .contains(CONVERSATION_PROJECT_RECENT_INDEX));
-        assert!(migrations.0[4]
-            .ddl
-            .contains(CONVERSATION_PROJECT_TOPIC_INDEX));
-        assert!(migrations.0[4].ddl.contains(
-            "DROP CONSTRAINT IF EXISTS chat_conversation_tenant_id_region_name_topic_key"
-        ));
-        assert!(migrations.0[5]
-            .ddl
-            .contains("WHERE kind = 'channel_public'"));
-        assert_eq!(
-            migrations.0[6].id,
-            "chat_0007_message_enum_constraints_expand"
-        );
-        assert_eq!(
-            migrations.0[7].id,
-            "chat_0008_message_enum_constraints_validate"
-        );
-        assert_eq!(migrations.0[8].id, "chat_0009_message_identity");
-        assert!(migrations.0[8].ddl.contains(MESSAGE_IDENTITY_INDEX));
-        assert_eq!(migrations.0[9].id, "chat_0010_message_thread_range");
-        assert!(migrations.0[9].ddl.contains(MESSAGE_THREAD_RANGE_INDEX));
-        assert_eq!(migrations.0[10].id, "chat_0011_thread_participant");
-        assert!(migrations.0[10].ddl.contains(&format!(
-            "CREATE TABLE IF NOT EXISTS {THREAD_PARTICIPANT_TABLE}"
-        )));
-        assert!(migrations.0[10].ddl.contains(&format!(
-            "myelin_make_tenant_scoped('{THREAD_PARTICIPANT_TABLE}')"
-        )));
-        assert_eq!(migrations.0[11].id, "chat_0012_thread_root_author");
-        assert_eq!(migrations.0[12].id, "chat_0013_thread_following");
-        assert!(migrations.0[12].ddl.contains("notifications_enabled"));
-        assert!(migrations.0[11].ddl.contains(&format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {MESSAGE_TABLE}_thread_root_author"
-        )));
-    }
 
     #[test]
     fn durable_channel_validation_is_strict() {
