@@ -10,10 +10,12 @@ use myelin_identity::{
 use myelin_identity_service::revocation::{RevocationStore, RunTokenState};
 use myelin_identity_service::{
     Authority, CellTokenAuthority, DelegationInput, MachineKind, MintError, PasetoCapabilitySigner,
-    RunTokenMinter,
+    RunTokenMinter, TupleStore, RUN_GRANT_RELATION,
 };
 use myelin_storage::migration::HotTables;
-use myelin_storage::{identity_durable_migrations, DurableRevocationBacking, SubstrateProvider};
+use myelin_storage::{
+    identity_durable_migrations, DurableRevocationBacking, DurableTupleBacking, SubstrateProvider,
+};
 use myelin_tenancy::{Region, TenantId};
 
 fn uniq() -> String {
@@ -40,6 +42,62 @@ fn ts(s: &str) -> Timestamp {
     Timestamp(s.into())
 }
 
+fn run_participants(s: &myelin_storage::TenantScope) -> (Principal, Principal) {
+    let mut agent = Principal::stub(
+        PrincipalId("p:agent".into()),
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("rt:agent".into()),
+            on_behalf_of: Some(PrincipalId("p:human".into())),
+        },
+        s.tenant().clone(),
+    );
+    agent.region = s.region().clone();
+    let mut human = Principal::stub(
+        PrincipalId("p:human".into()),
+        PrincipalKind::Human,
+        s.tenant().clone(),
+    );
+    human.region = s.region().clone();
+    (agent, human)
+}
+
+fn run_minter(
+    revocations: RevocationStore,
+    tuples: Option<TupleStore>,
+    signer: std::sync::Arc<PasetoCapabilitySigner>,
+) -> RunTokenMinter {
+    RunTokenMinter::with_signer_and_tuples(revocations, tuples, signer)
+}
+
+fn mint_one_run(
+    minter: &RunTokenMinter,
+    s: &myelin_storage::TenantScope,
+    run_id: &str,
+) -> Result<myelin_identity::RunToken, MintError> {
+    let grant = "repo:acme/core#read";
+    let (agent, human) = run_participants(s);
+    let authority = Authority::of([grant]);
+    minter.mint_run_token(
+        s,
+        &agent.principal_id,
+        &RunId(run_id.into()),
+        &agent,
+        &human,
+        &DelegationInput {
+            agent_policy: authority.clone(),
+            delegation: authority.clone(),
+            tenant_policy: authority.clone(),
+            trigger_actor_held: authority,
+        },
+        &DelegationCaveats(vec![grant.into()]),
+        MachineKind::Agent,
+        &FailStaticBound {
+            static_max_secs: 300,
+        },
+        &ts("2099-06-26T00:00:00Z"),
+    )
+}
+
 async fn migrate() -> SubstrateProvider {
     let admin = common::admin_provider(4).await;
     admin
@@ -61,6 +119,8 @@ async fn residual_guc(pool: &sqlx::PgPool) -> String {
 async fn cleanup(admin: &SubstrateProvider, tenants: &[&str]) {
     for t in tenants {
         for sql in [
+            "DELETE FROM outbox WHERE tenant_id = $1",
+            "DELETE FROM rebac_tuple WHERE tenant_id = $1",
             "DELETE FROM revocation WHERE tenant_id = $1",
             "DELETE FROM run_token_teardown WHERE tenant_id = $1",
         ] {
@@ -291,7 +351,7 @@ async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
         DurableRevocationBacking::new(unavailable.clone()),
         handle.clone(),
     );
-    let minter = RunTokenMinter::with_signer_and_tuples(
+    let minter = run_minter(
         store.clone(),
         None,
         std::sync::Arc::new(PasetoCapabilitySigner::new(std::sync::Arc::new(
@@ -301,43 +361,8 @@ async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
 
     unavailable.db_pool().close().await;
 
-    let grant = "repo:acme/core#read";
-    let mut agent = Principal::stub(
-        PrincipalId("p:agent".into()),
-        PrincipalKind::Agent {
-            runtime_ref: RuntimeRef("rt:agent".into()),
-            on_behalf_of: Some(PrincipalId("p:human".into())),
-        },
-        s.tenant().clone(),
-    );
-    agent.region = s.region().clone();
-    let mut human = Principal::stub(
-        PrincipalId("p:human".into()),
-        PrincipalKind::Human,
-        s.tenant().clone(),
-    );
-    human.region = s.region().clone();
-    let authority = Authority::of([grant]);
     assert_eq!(
-        minter.mint_run_token(
-            &s,
-            &agent.principal_id,
-            &RunId("run:during-outage".into()),
-            &agent,
-            &human,
-            &DelegationInput {
-                agent_policy: authority.clone(),
-                delegation: authority.clone(),
-                tenant_policy: authority.clone(),
-                trigger_actor_held: authority,
-            },
-            &DelegationCaveats(vec![grant.into()]),
-            MachineKind::Agent,
-            &FailStaticBound {
-                static_max_secs: 300,
-            },
-            &ts("2026-06-26T00:00:00Z"),
-        ),
+        mint_one_run(&minter, &s, "during-outage"),
         Err(MintError::RevocationUnavailable),
         "the caller receives no credential when its durable run lifetime cannot be recorded"
     );
@@ -430,4 +455,63 @@ async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
 
     cleanup(&admin, &[&tenant]).await;
     println!("OK [d]: revocation mutations report outages honestly and remain retryable.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mint_returns_a_credential_only_after_its_run_grant_is_durable() {
+    let admin = migrate().await;
+    let revocation_app = common::app_provider(4).await;
+    let unavailable_graph = common::app_provider(2).await;
+    let region = revocation_app.config().region.clone();
+    let handle = tokio::runtime::Handle::current();
+    let tenant = format!("mr008-grant-outage-{}", uniq());
+    let s = scope(&tenant, &region);
+    let revocations = RevocationStore::with_pg(
+        DurableRevocationBacking::new(revocation_app.clone()),
+        handle.clone(),
+    );
+    let unavailable_tuples = TupleStore::with_pg(
+        DurableTupleBacking::new(unavailable_graph.clone()),
+        handle.clone(),
+    );
+    let signer = std::sync::Arc::new(PasetoCapabilitySigner::new(std::sync::Arc::new(
+        CellTokenAuthority::generate(),
+    )));
+    let minter = run_minter(
+        revocations.clone(),
+        Some(unavailable_tuples),
+        signer.clone(),
+    );
+
+    unavailable_graph.db_pool().close().await;
+
+    assert_eq!(
+        mint_one_run(&minter, &s, "grant-retry"),
+        Err(MintError::RunGrantUnavailable),
+        "a healthy lifetime store is insufficient: no credential leaves the mint boundary while its authorization graph is down"
+    );
+
+    let recovered_tuples =
+        TupleStore::with_pg(DurableTupleBacking::new(revocation_app.clone()), handle);
+    let recovered_minter = run_minter(revocations, Some(recovered_tuples.clone()), signer);
+    mint_one_run(&recovered_minter, &s, "grant-retry")
+        .expect("the same mint request succeeds after the authorization graph recovers");
+
+    let grants = recovered_tuples
+        .tuples_in(&s)
+        .expect("read the recovered run authorization graph");
+    let grant = grants
+        .iter()
+        .find(|stored| stored.tuple.object.0 == "run:grant-retry")
+        .expect("the run grant is durable before the credential is returned");
+    assert_eq!(grant.tuple.relation.0, RUN_GRANT_RELATION);
+    assert_eq!(grant.tuple.subject.0, "p:agent");
+    assert_eq!(
+        grant.expires_at,
+        Some(ts("2099-06-26T00:05:00.000000Z")),
+        "the recovered grant expires with the run credential"
+    );
+
+    cleanup(&admin, &[&tenant]).await;
+    println!("OK [e]: credential mint waits for both durable lifetime and run grant.");
 }

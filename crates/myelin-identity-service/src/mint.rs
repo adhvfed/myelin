@@ -322,6 +322,7 @@ pub enum MintError {
     InvalidMintAttempt,
     InvalidDelegationCaveat(String),
     RevocationUnavailable,
+    RunGrantUnavailable,
 }
 
 impl core::fmt::Display for MintError {
@@ -357,6 +358,9 @@ impl core::fmt::Display for MintError {
             }
             MintError::RevocationUnavailable => f.write_str(
                 "durable run-token lifetime could not be recorded - credential mint refused",
+            ),
+            MintError::RunGrantUnavailable => f.write_str(
+                "durable run authorization grant could not be recorded - credential mint refused",
             ),
         }
     }
@@ -825,14 +829,16 @@ impl RunTokenMinter {
                 subject: agent_id.clone(),
                 caveat: None,
             });
-            let _ = tuples.write_tuples(
-                scope,
-                agent,
-                &[delta],
-                None::<&Precondition>,
-                Some(expires_at),
-                now.clone(),
-            );
+            tuples
+                .write_tuples(
+                    scope,
+                    agent,
+                    &[delta],
+                    None::<&Precondition>,
+                    Some(expires_at),
+                    now.clone(),
+                )
+                .map_err(|_| MintError::RunGrantUnavailable)?;
         }
 
         Ok((

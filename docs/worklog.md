@@ -4,6 +4,23 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — token mint waits for its durable run grant
+
+Run-token minting recorded the credential lifetime but discarded the result of writing the
+matching expiring relationship into the authorization graph. A graph outage could therefore return
+a signed, live credential whose `run#run_bound` edge never existed, leaving downstream behavior to
+depend on which of the two security records it consulted.
+
+Minting now has two explicit durable prerequisites: its lifetime record and its run grant. Either
+failure withholds the credential and reaches the caller as a storage failure. Both writes remain
+idempotent, so a caller can retry the same deterministic mint request after recovery without
+creating a wider or longer-lived credential.
+
+**Proof:** all 424 identity library cases; warning-free all-target/all-feature Identity clippy; all
+five real-PostgreSQL durable-revocation/mint journeys, including independently healthy lifetime
+storage and unavailable tuple storage followed by a successful same-request retry (0.21 seconds
+total); restarted Edge; and both live TypeScript private-agent-thread journeys (7.21 seconds total).
+
 ## 2026-08-26 — durable revocation failures reach the caller
 
 The revocation store still used process panics for denylist and run-teardown writes, while its

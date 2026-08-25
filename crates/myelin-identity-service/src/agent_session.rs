@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::delegation::authority_of;
 use crate::{
     run_token_jti, AgentRegistration, AgentRegistryError, Authority, DelegationPolicySource,
-    MachineKind, PgAgentRegistry, StoreBackedCheck, EXTERNAL_MCP_RUNTIME,
+    MachineKind, MintError, PgAgentRegistry, StoreBackedCheck, EXTERNAL_MCP_RUNTIME,
 };
 
 pub const MAX_EXTERNAL_AGENT_RUN_TTL_SECS: u64 = 5 * 60;
@@ -429,7 +429,12 @@ impl AgentSessionIssuer {
                 },
                 &issued_at,
             )
-            .map_err(|error| AgentSessionError::Policy(error.to_string()))?;
+            .map_err(|error| match error {
+                MintError::RevocationUnavailable | MintError::RunGrantUnavailable => {
+                    AgentSessionError::Storage(error.to_string())
+                }
+                error => AgentSessionError::Policy(error.to_string()),
+            })?;
         if run_token.jti != claimed.token_jti {
             self.identity
                 .tear_down_run_token_in(&scope, &run_token, &timestamp(now))
