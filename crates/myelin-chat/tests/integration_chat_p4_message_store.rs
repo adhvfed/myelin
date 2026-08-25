@@ -331,6 +331,10 @@ async fn pg_hot_tier_matches_mem_tier_and_pins_residency() {
     let cold = ColdSegments::default();
     let _ = cold;
 
+    sqlx::query(&format!("DROP TABLE IF EXISTS {table}_thread_participant"))
+        .execute(&admin)
+        .await
+        .unwrap();
     sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
         .execute(&admin)
         .await

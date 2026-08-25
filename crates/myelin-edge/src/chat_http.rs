@@ -9,7 +9,7 @@ use crate::Method;
 use crate::ReferenceCardResolver;
 use myelin_chat::conversation::{Conversation, ConversationError, ConversationKind};
 use myelin_chat::events::{event_actor_pseudonym, pseudonymized_event_principal};
-use myelin_chat::store::pg::PgMessageStore;
+use myelin_chat::store::pg::{MessageAttribution, PgMessageStore};
 use myelin_chat::store::pg_conversation::{PgConversationStore, MESSAGE_TABLE};
 use myelin_chat::store::{
     AuthorKind, ConversationId, MessageId, MessageState, NewMessage, RangeCursor, StoreError,
@@ -580,7 +580,7 @@ impl DurableChatMutationApi {
                     EventId(self.event_ids.mint().0),
                     self.event_ids.as_ref(),
                     &structured_nodes,
-                    Actor(event_principal),
+                    MessageAttribution::new(Actor(event_principal), actor.principal_id.clone()),
                     now.clone(),
                     now,
                 )

@@ -15,6 +15,7 @@ const EXACT_CONVERSATION_BATCH_MAX: usize = 10_000;
 
 pub const CONVERSATION_TABLE: &str = "chat_conversation";
 pub const MESSAGE_TABLE: &str = "chat_message";
+pub const THREAD_PARTICIPANT_TABLE: &str = "chat_message_thread_participant";
 pub const CONVERSATION_RECENT_INDEX: &str = "chat_conversation_recent";
 pub const CONVERSATION_CLIENT_NONCE_INDEX: &str = "chat_conversation_client_nonce";
 pub const CONVERSATION_PROJECT_RECENT_INDEX: &str = "chat_conversation_project_recent";
@@ -624,6 +625,12 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
                ON {MESSAGE_TABLE}
                (tenant_id, region, conversation_id, thread_root_id, message_id);"
     );
+    let thread_participant = format!(
+        "{}\nSELECT myelin_make_tenant_scoped('{THREAD_PARTICIPANT_TABLE}');",
+        super::pg::THREAD_PARTICIPANT_TABLE_DDL.replace("{table}", MESSAGE_TABLE),
+    );
+    let thread_root_author_index =
+        super::pg::THREAD_ROOT_AUTHOR_INDEX_DDL.replace("{table}", MESSAGE_TABLE);
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
@@ -667,6 +674,16 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
             message_thread_range,
             MESSAGE_TABLE,
         ),
+        Migration::plain_on(
+            "chat_0011_thread_participant",
+            thread_participant,
+            THREAD_PARTICIPANT_TABLE,
+        ),
+        Migration::plain_on(
+            "chat_0012_thread_root_author",
+            thread_root_author_index,
+            THREAD_PARTICIPANT_TABLE,
+        ),
     ])
 }
 
@@ -677,7 +694,7 @@ mod tests {
     #[test]
     fn migrations_create_and_tenant_scope_both_tables() {
         let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 10);
+        assert_eq!(migrations.0.len(), 12);
         for (migration, table) in migrations.0[..2]
             .iter()
             .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
@@ -717,6 +734,17 @@ mod tests {
         assert!(migrations.0[8].ddl.contains(MESSAGE_IDENTITY_INDEX));
         assert_eq!(migrations.0[9].id, "chat_0010_message_thread_range");
         assert!(migrations.0[9].ddl.contains(MESSAGE_THREAD_RANGE_INDEX));
+        assert_eq!(migrations.0[10].id, "chat_0011_thread_participant");
+        assert!(migrations.0[10].ddl.contains(&format!(
+            "CREATE TABLE IF NOT EXISTS {THREAD_PARTICIPANT_TABLE}"
+        )));
+        assert!(migrations.0[10].ddl.contains(&format!(
+            "myelin_make_tenant_scoped('{THREAD_PARTICIPANT_TABLE}')"
+        )));
+        assert_eq!(migrations.0[11].id, "chat_0012_thread_root_author");
+        assert!(migrations.0[11].ddl.contains(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {MESSAGE_TABLE}_thread_root_author"
+        )));
     }
 
     #[test]

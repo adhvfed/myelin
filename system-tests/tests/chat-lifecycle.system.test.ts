@@ -1151,6 +1151,21 @@ describe("chat collaboration lifecycle", () => {
       reviewersReply,
       { idempotencyKey: replyKey },
     )).toBe(reviewersReplyId);
+    const threadRef =
+      `myelin://${systemTestConfig.tenant}/chat/thread/${rootMessageId}` +
+      `#thread-${rootMessageId}`;
+    const replyNotification = await eventually(
+      () => findInboxItem(systemClient, threadRef),
+      { description: "the reply to reach the root author's one durable inbox" },
+    );
+    expect(replyNotification).toMatchObject({
+      subject: threadRef,
+      subsystem: "chat",
+      reason: "replied",
+      state: "unread",
+      coalesce_count: 1,
+    });
+    expect(await findInboxItem(reviewerClient, threadRef)).toBeUndefined();
     const conflictingReply = await reviewerClient.json(
       `/v1/chat/messages/${encodeURIComponent(rootMessageId)}/replies`,
       {
@@ -1178,10 +1193,7 @@ describe("chat collaboration lifecycle", () => {
       }),
     ]);
     const thread = await room.thread(systemClient, rootMessageId);
-    expect(thread.ref).toBe(
-      `myelin://${systemTestConfig.tenant}/chat/thread/${rootMessageId}` +
-      `#thread-${rootMessageId}`,
-    );
+    expect(thread.ref).toBe(threadRef);
     expect([thread.root, ...thread.replies]).toEqual([
       expect.objectContaining({
         id: rootMessageId,

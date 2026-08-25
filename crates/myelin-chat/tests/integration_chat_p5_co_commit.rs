@@ -1,7 +1,7 @@
 #![cfg(feature = "integration")]
 
-use myelin_chat::store::pg::PgMessageStore;
-use myelin_chat::store::{AuthorKind, ConversationId, NewMessage, SystemUlidSource};
+use myelin_chat::store::pg::{MessageAttribution, PgMessageStore};
+use myelin_chat::store::{AuthorKind, ConversationId, NewMessage, StoreError, SystemUlidSource};
 use myelin_content::InlineNode;
 use myelin_events::{Actor, ArtifactRef, IdMinter, Timestamp, Ulid, UlidMinter};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -27,12 +27,17 @@ fn region() -> &'static str {
     "fr-par"
 }
 
-fn actor() -> Actor {
-    Actor(Principal::stub(
-        PrincipalId("alice".into()),
+fn attribution() -> MessageAttribution {
+    attribution_for("alice")
+}
+
+fn attribution_for(principal_id: &str) -> MessageAttribution {
+    let principal = Principal::stub(
+        PrincipalId(principal_id.into()),
         PrincipalKind::Human,
         TenantId("acmeP399".into()),
-    ))
+    );
+    MessageAttribution::new(Actor(principal), PrincipalId(principal_id.into()))
 }
 
 fn now() -> Timestamp {
@@ -92,6 +97,10 @@ async fn fresh_store() -> (sqlx::PgPool, String, PgMessageStore, String) {
 }
 
 async fn drop_store(admin: &sqlx::PgPool, table: &str) {
+    sqlx::query(&format!("DROP TABLE IF EXISTS {table}_thread_participant"))
+        .execute(admin)
+        .await
+        .expect("drop the isolated thread participant table");
     sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
         .execute(admin)
         .await
@@ -158,7 +167,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
             &src,
             first_message.clone(),
             event_ids.mint().into(),
-            actor(),
+            attribution(),
             now(),
             now(),
         ),
@@ -166,7 +175,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
             &src,
             first_message,
             event_ids.mint().into(),
-            actor(),
+            attribution(),
             now(),
             now(),
         ),
@@ -272,7 +281,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
             &src,
             new_msg(&conv, "n0", "alice", "hello world (retry)"),
             event_ids.mint().into(),
-            actor(),
+            attribution(),
             now(),
             now(),
         )
@@ -320,7 +329,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
                     &src,
                     new_msg(&conv, &format!("n{i}"), "alice", &format!("m{i}")),
                     event_ids.mint().into(),
-                    actor(),
+                    attribution(),
                     now(),
                     now(),
                 )
@@ -374,7 +383,7 @@ async fn a_structured_reference_is_one_atomic_durable_action() {
             event_ids.mint().into(),
             &event_ids,
             &nodes,
-            actor(),
+            attribution(),
             now(),
             now(),
         )
@@ -451,7 +460,7 @@ async fn a_structured_reference_is_one_atomic_durable_action() {
             colliding_id.clone().into(),
             &ConstantMinter(colliding_id.clone()),
             &nodes,
-            actor(),
+            attribution(),
             now(),
             now(),
         )
@@ -505,5 +514,183 @@ async fn a_structured_reference_is_one_atomic_durable_action() {
     delete_outbox_aggregate(&admin, &channel_aggregate).await;
     delete_outbox_aggregate(&admin, &edge_aggregate.0).await;
     delete_message_visibility(&admin, source_message_id.as_str()).await;
+    drop_store(&admin, &table).await;
+}
+
+#[tokio::test]
+async fn a_reply_co_commits_one_addressed_notification_and_refuses_false_roots() {
+    let (admin, table, store, suffix) = fresh_store().await;
+    let source = SystemUlidSource::new();
+    let event_ids = UlidMinter::new();
+    let conversation = ConversationId::new("acmeP399", region(), format!("01J0THREADP399{suffix}"));
+    let channel_aggregate = myelin_chat::events::channel_aggregate(&conversation.conversation_id).0;
+    delete_outbox_aggregate(&admin, &channel_aggregate).await;
+
+    let root = store
+        .append_structured_co_commit(
+            &source,
+            new_msg(&conversation, "root", "root-author", "encrypted-root"),
+            event_ids.mint().into(),
+            &event_ids,
+            &[],
+            attribution_for("alice"),
+            now(),
+            now(),
+        )
+        .await
+        .expect("append a root with its notification recipient");
+    let stored_recipient: String = sqlx::query_scalar(&format!(
+        "SELECT principal_id FROM {table}_thread_participant \
+         WHERE tenant_id = $1 AND region = $2 AND conversation_id = $3 \
+           AND thread_root_id = $4 AND role = 0"
+    ))
+    .bind(&conversation.tenant)
+    .bind(&conversation.region)
+    .bind(&conversation.conversation_id)
+    .bind(root.as_str())
+    .fetch_one(&admin)
+    .await
+    .expect("the root author is durable beside the root");
+    assert_eq!(stored_recipient, "alice");
+
+    let mut reply = new_msg(&conversation, "reply", "reply-author", "encrypted-reply");
+    reply.thread_root_id = Some(root.clone());
+    let reply_id = store
+        .append_structured_co_commit(
+            &source,
+            reply.clone(),
+            event_ids.mint().into(),
+            &event_ids,
+            &[],
+            attribution_for("bob"),
+            now(),
+            now(),
+        )
+        .await
+        .expect("append the reply and its notification");
+    let replayed = store
+        .append_structured_co_commit(
+            &source,
+            reply,
+            event_ids.mint().into(),
+            &event_ids,
+            &[],
+            attribution_for("bob"),
+            now(),
+            now(),
+        )
+        .await
+        .expect("retry the exact reply");
+    assert_eq!(replayed, reply_id);
+
+    let channel_events: Vec<serde_json::Value> =
+        sqlx::query_scalar("SELECT envelope FROM outbox WHERE aggregate = $1 ORDER BY seq")
+            .bind(&channel_aggregate)
+            .fetch_all(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        channel_events
+            .iter()
+            .filter(|event| event["type_"] == myelin_chat::events::CHAT_THREAD_REPLIED)
+            .count(),
+        1,
+        "the retry emits no second thread-domain event",
+    );
+    let thread_ref = format!(
+        "myelin://acmeP399/chat/thread/{}#thread-{}",
+        root.as_str(),
+        root.as_str(),
+    );
+    let signal_rows = sqlx::query(
+        "SELECT aggregate, envelope FROM outbox \
+         WHERE envelope ->> 'type_' = 'signal.opened' \
+           AND envelope -> 'payload' ->> 'subject' = $1",
+    )
+    .bind(&thread_ref)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(signal_rows.len(), 1, "one retry-safe addressed signal");
+    let signal = signal_rows[0].get::<serde_json::Value, _>("envelope");
+    assert_eq!(signal["payload"]["notification_reason"], "replied");
+    assert!(signal["payload"]["mentions"].to_string().contains("alice"));
+    assert!(!signal["payload"].to_string().contains("encrypted-reply"));
+
+    let mut nested = new_msg(&conversation, "nested", "bob", "nested");
+    nested.thread_root_id = Some(reply_id.clone());
+    assert!(matches!(
+        store
+            .append_structured_co_commit(
+                &source,
+                nested,
+                event_ids.mint().into(),
+                &event_ids,
+                &[],
+                attribution_for("bob"),
+                now(),
+                now(),
+            )
+            .await,
+        Err(StoreError::NotFound(id)) if id == reply_id
+    ));
+
+    let mut foreign = new_msg(
+        &ConversationId::new("acmeP399", region(), format!("01J0OTHERP399{suffix}")),
+        "foreign",
+        "bob",
+        "foreign",
+    );
+    foreign.thread_root_id = Some(root.clone());
+    assert!(matches!(
+        store
+            .append_structured_co_commit(
+                &source,
+                foreign,
+                event_ids.mint().into(),
+                &event_ids,
+                &[],
+                attribution_for("bob"),
+                now(),
+                now(),
+            )
+            .await,
+        Err(StoreError::NotFound(id)) if id == root
+    ));
+
+    sqlx::query(&format!(
+        "UPDATE {table} SET state = 3 \
+         WHERE tenant_id = $1 AND region = $2 AND conversation_id = $3 AND message_id = $4"
+    ))
+    .bind(&conversation.tenant)
+    .bind(&conversation.region)
+    .bind(&conversation.conversation_id)
+    .bind(root.as_str())
+    .execute(&admin)
+    .await
+    .unwrap();
+    let mut after_removal = new_msg(&conversation, "after-removal", "bob", "too late");
+    after_removal.thread_root_id = Some(root.clone());
+    assert!(matches!(
+        store
+            .append_structured_co_commit(
+                &source,
+                after_removal,
+                event_ids.mint().into(),
+                &event_ids,
+                &[],
+                attribution_for("bob"),
+                now(),
+                now(),
+            )
+            .await,
+        Err(StoreError::CasConflict { message_id, .. }) if message_id == root
+    ));
+
+    let signal_aggregate = signal_rows[0].get::<String, _>("aggregate");
+    delete_outbox_aggregate(&admin, &channel_aggregate).await;
+    delete_outbox_aggregate(&admin, &signal_aggregate).await;
+    delete_message_visibility(&admin, root.as_str()).await;
+    delete_message_visibility(&admin, reply_id.as_str()).await;
     drop_store(&admin, &table).await;
 }

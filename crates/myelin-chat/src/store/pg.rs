@@ -23,6 +23,7 @@ use super::{
 };
 
 mod thread;
+mod thread_notification;
 
 const EXACT_MESSAGE_BATCH_MAX: usize = 100;
 
@@ -46,6 +47,41 @@ CREATE TABLE IF NOT EXISTS {table} (
 );
 CREATE INDEX IF NOT EXISTS {table}_range
     ON {table} (tenant_id, region, conversation_id, message_id DESC);";
+
+pub(crate) const THREAD_PARTICIPANT_TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS {table}_thread_participant (
+    tenant_id       text NOT NULL,
+    region          text NOT NULL,
+    conversation_id text NOT NULL,
+    thread_root_id  text NOT NULL,
+    principal_id    text NOT NULL,
+    role            smallint NOT NULL CHECK (role BETWEEN 0 AND 1),
+    PRIMARY KEY (tenant_id, region, conversation_id, thread_root_id, principal_id),
+    FOREIGN KEY (tenant_id, region, conversation_id, thread_root_id)
+      REFERENCES {table} (tenant_id, region, conversation_id, message_id)
+      ON DELETE CASCADE
+);";
+
+pub(crate) const THREAD_ROOT_AUTHOR_INDEX_DDL: &str = "\
+CREATE UNIQUE INDEX IF NOT EXISTS {table}_thread_root_author
+    ON {table}_thread_participant
+       (tenant_id, region, conversation_id, thread_root_id)
+    WHERE role = 0;";
+
+#[derive(Clone, Debug)]
+pub struct MessageAttribution {
+    event_actor: Actor,
+    notification_recipient: PrincipalId,
+}
+
+impl MessageAttribution {
+    pub fn new(event_actor: Actor, notification_recipient: PrincipalId) -> Self {
+        Self {
+            event_actor,
+            notification_recipient,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PgMessageStore {
@@ -77,6 +113,17 @@ impl PgMessageStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("message DDL: {e}")))?;
+        let participant_table = self.thread_participant_table();
+        let participant_ddl = THREAD_PARTICIPANT_TABLE_DDL.replace("{table}", &self.table);
+        sqlx::raw_sql(&participant_ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Cold(format!("thread participant DDL: {e}")))?;
+        let root_author_index_ddl = THREAD_ROOT_AUTHOR_INDEX_DDL.replace("{table}", &self.table);
+        sqlx::raw_sql(&root_author_index_ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Cold(format!("thread root author index DDL: {e}")))?;
         sqlx::raw_sql(&format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {table}_identity \
              ON {table} (tenant_id, region, message_id)",
@@ -122,11 +169,25 @@ impl PgMessageStore {
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Cold(format!("make tenant scoped: {e}")))?;
+        sqlx::raw_sql(&format!(
+            "SELECT myelin_make_tenant_scoped('{participant_table}')"
+        ))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Cold(format!("make thread participants tenant scoped: {e}")))?;
         sqlx::raw_sql(&format!("GRANT ALL ON {} TO myelin_app", self.table))
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("grant: {e}")))?;
+        sqlx::raw_sql(&format!("GRANT ALL ON {participant_table} TO myelin_app"))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Cold(format!("thread participant grant: {e}")))?;
         Ok(())
+    }
+
+    fn thread_participant_table(&self) -> String {
+        format!("{}_thread_participant", self.table)
     }
 
     async fn set_session_scope(
@@ -213,12 +274,21 @@ impl PgMessageStore {
         minter: &dyn super::UlidSource,
         msg: NewMessage,
         event_id: EventId,
-        actor: Actor,
+        attribution: MessageAttribution,
         occurred: Timestamp,
         recorded: Timestamp,
     ) -> Result<MessageId, StoreError> {
-        self.append_co_commit_inner(minter, msg, event_id, None, &[], actor, occurred, recorded)
-            .await
+        self.append_co_commit_inner(
+            minter,
+            msg,
+            event_id,
+            None,
+            &[],
+            attribution,
+            occurred,
+            recorded,
+        )
+        .await
     }
 
     /// Appends a message and its structured reference edges atomically. The
@@ -232,7 +302,7 @@ impl PgMessageStore {
         event_id: EventId,
         related_event_ids: &dyn IdMinter,
         structured_nodes: &[InlineNode],
-        actor: Actor,
+        attribution: MessageAttribution,
         occurred: Timestamp,
         recorded: Timestamp,
     ) -> Result<MessageId, StoreError> {
@@ -242,7 +312,7 @@ impl PgMessageStore {
             event_id,
             Some(related_event_ids),
             structured_nodes,
-            actor,
+            attribution,
             occurred,
             recorded,
         )
@@ -257,13 +327,22 @@ impl PgMessageStore {
         event_id: EventId,
         related_event_ids: Option<&dyn IdMinter>,
         structured_nodes: &[InlineNode],
-        actor: Actor,
+        attribution: MessageAttribution,
         occurred: Timestamp,
         recorded: Timestamp,
     ) -> Result<MessageId, StoreError> {
+        let MessageAttribution {
+            event_actor: actor,
+            notification_recipient,
+        } = attribution;
         if actor.0.tenant.0 != msg.conv.tenant {
             return Err(StoreError::Cold(
                 "message actor is outside the conversation tenant".into(),
+            ));
+        }
+        if notification_recipient.0.is_empty() {
+            return Err(StoreError::Cold(
+                "message notification recipient is empty".into(),
             ));
         }
         let mut conn = self
@@ -356,6 +435,14 @@ impl PgMessageStore {
             .await
             .map_err(|e| StoreError::Cold(format!("begin co-commit tx: {e}")))?;
 
+        let thread_root = match msg.thread_root_id.as_ref() {
+            Some(root) => Some(
+                self.require_thread_root_in_tx(&mut dbtx, &msg.conv, root)
+                    .await?,
+            ),
+            None => None,
+        };
+
         let inserted = sqlx::query_scalar::<_, String>(&format!(
             "INSERT INTO {} (tenant_id, region, conversation_id, message_id, thread_root_id, \
              author, author_kind, body_inline, body_nodes, client_nonce, edited_seq, state) \
@@ -401,6 +488,43 @@ impl PgMessageStore {
                 .map_err(|e| StoreError::Cold(format!("rollback duplicate append: {e}")))?;
             return Ok(MessageId(existing));
         }
+
+        if msg.thread_root_id.is_none() {
+            sqlx::query(&format!(
+                "INSERT INTO {} \
+                   (tenant_id, region, conversation_id, thread_root_id, principal_id, role) \
+                 VALUES ($1, $2, $3, $4, $5, 0) \
+                 ON CONFLICT DO NOTHING",
+                self.thread_participant_table(),
+            ))
+            .bind(&msg.conv.tenant)
+            .bind(&msg.conv.region)
+            .bind(&msg.conv.conversation_id)
+            .bind(message_id.as_str())
+            .bind(&notification_recipient.0)
+            .execute(&mut *dbtx)
+            .await
+            .map_err(|error| {
+                StoreError::Cold(format!("co-commit thread root participant: {error}"))
+            })?;
+        }
+
+        let reply_events = match (msg.thread_root_id.as_ref(), thread_root.as_ref()) {
+            (Some(root), Some(thread_root)) => {
+                let root_recipient = thread_root
+                    .notification_recipient
+                    .as_ref()
+                    .map(|recipient| PrincipalId(recipient.clone()));
+                Some(thread_notification::thread_reply_events(
+                    &envelope,
+                    root,
+                    &message_id,
+                    root_recipient.as_ref(),
+                    &notification_recipient,
+                )?)
+            }
+            _ => None,
+        };
 
         let visibility_tuple = message_visibility_tuple(&msg, &message_id);
         let identity_delta = TupleDelta::Add(visibility_tuple.clone());
@@ -448,6 +572,26 @@ impl PgMessageStore {
         )
         .await
         .map_err(|e| StoreError::Cold(format!("co-commit outbox insert: {e}")))?;
+        if let Some(reply_events) = reply_events {
+            myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+                &mut dbtx,
+                &reply_events.replied.aggregate.0,
+                &reply_events.replied,
+            )
+            .await
+            .map_err(|error| StoreError::Cold(format!("co-commit Chat thread reply: {error}")))?;
+            if let Some(notification) = reply_events.notification {
+                myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+                    &mut dbtx,
+                    &notification.aggregate.0,
+                    &notification,
+                )
+                .await
+                .map_err(|error| {
+                    StoreError::Cold(format!("co-commit Chat reply notification: {error}"))
+                })?;
+            }
+        }
         for edge in edge_envelopes {
             myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut dbtx, &edge.aggregate.0, &edge)
                 .await

@@ -1,9 +1,61 @@
 use sqlx::Row;
 
 use super::{row_to_message, PgMessageStore};
-use crate::store::{ConversationId, MessageId, RangeCursor, StoreError, TimelineMessage};
+use crate::store::{
+    ConversationId, MessageId, MessageState, RangeCursor, StoreError, TimelineMessage,
+};
+
+pub(super) struct ThreadRoot {
+    pub(super) notification_recipient: Option<String>,
+}
 
 impl PgMessageStore {
+    pub(super) async fn require_thread_root_in_tx(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        conversation: &ConversationId,
+        root: &MessageId,
+    ) -> Result<ThreadRoot, StoreError> {
+        let participant_table = self.thread_participant_table();
+        let row = sqlx::query(&format!(
+            "SELECT root.thread_root_id, root.state, participant.principal_id \
+               FROM {table} root \
+               LEFT JOIN {participant_table} participant \
+                 ON participant.tenant_id = root.tenant_id \
+                AND participant.region = root.region \
+                AND participant.conversation_id = root.conversation_id \
+                AND participant.thread_root_id = root.message_id \
+                AND participant.role = 0 \
+              WHERE root.tenant_id = $1 AND root.region = $2 \
+                AND root.conversation_id = $3 AND root.message_id = $4 \
+              FOR SHARE OF root",
+            table = self.table,
+        ))
+        .bind(&conversation.tenant)
+        .bind(&conversation.region)
+        .bind(&conversation.conversation_id)
+        .bind(root.as_str())
+        .fetch_optional(connection)
+        .await
+        .map_err(|error| StoreError::Cold(format!("thread root select: {error}")))?
+        .ok_or_else(|| StoreError::NotFound(root.clone()))?;
+        if row.get::<Option<String>, _>("thread_root_id").is_some() {
+            return Err(StoreError::NotFound(root.clone()));
+        }
+        let stored_state: i16 = row.get("state");
+        let state = super::decode_message_state(stored_state)?;
+        if matches!(state, MessageState::Deleted | MessageState::Tombstoned) {
+            return Err(StoreError::CasConflict {
+                message_id: root.clone(),
+                expected: 0,
+                actual: i32::from(stored_state),
+            });
+        }
+        Ok(ThreadRoot {
+            notification_recipient: row.get("principal_id"),
+        })
+    }
+
     /// Pages only roots for the calm, top-level conversation timeline.
     pub async fn range_roots(
         &self,

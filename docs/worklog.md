@@ -1461,6 +1461,36 @@ all three crates; TypeScript and ESLint; 644 browser units; all twelve rebuilt l
 Chat lifecycle and CLI stories; and both real Chromium Chat journeys after an Edge
 restart through the immutable `chat_0010` migration.
 
+## 2026-08-25 — a reply becomes one durable nudge
+
+The author of a thread root now receives one unread `replied` inbox item when a
+teammate answers, linked to the canonical thread rather than to copied message
+content. Replying to one's own root is quiet, and an exact transport retry remains
+the same message and the same notification. The root author's delivery identity is
+recorded beside the root in a tenant-and-region-scoped companion table in the same
+transaction as the message. A partial unique index makes the single-author role a
+database invariant while leaving room for many future thread participants.
+
+The durable append boundary now owns the thread invariant instead of trusting Edge:
+under a row lock it requires an active top-level root from the same conversation.
+The reply, `chat.thread.replied` domain event, addressed `signal.opened`, visibility
+tuple, reference edges, and mention signal then co-commit. A nested reply, a root
+from another room, or a removed root cannot become a false thread. The notification
+contains routing identity and the thread coordinate, never the message body, and
+inbox reads still reauthorize that coordinate against live room membership.
+
+Roots written before `chat_0011` remain readable and replyable but cannot acquire an
+author notification retroactively: Chat deliberately stores only an event
+pseudonym in the old row, so there is no safe real identity to reconstruct. Watched
+thread fanout is also still to come; the new participant model gives that work a
+durable foundation without pretending it is implemented.
+
+Proof: all 271 Chat and 360 Edge library tests; the real PostgreSQL co-commit,
+idempotency, false-root, and tombstone integration; warning-free Chat/Edge clippy;
+TypeScript typechecking; and all eleven live Chat collaboration stories after an
+Edge, notifications, and outbox restart through the immutable `chat_0011`
+migration; the single-author index follows in forward-only `chat_0012`.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
