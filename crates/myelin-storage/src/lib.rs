@@ -308,7 +308,8 @@ pub use privacy_request_durable::{
     CompletePrivacyRequestOutcome, CreatePrivacyRequestOutcome, DurablePrivacyRequest,
     DurablePrivacyRequestStore, NewPrivacyRequest, PrivacyHolderReceipt, PrivacyRequestCertificate,
     PrivacyRequestKind, PrivacyRequestLease, PrivacyRequestScope, PrivacyRequestState,
-    MAX_PRIVACY_HOLDER_RECEIPTS, PRIVACY_REQUEST_DEADLINE_DAYS, PRIVACY_REQUEST_MIGRATION,
+    MAX_PRIVACY_HOLDER_RECEIPTS, PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION,
+    PRIVACY_REQUEST_DEADLINE_DAYS, PRIVACY_REQUEST_MIGRATION,
 };
 pub use provider::{
     all_durable_migrations, durable_migration_groups, foundation_migrations, BootstrapError,

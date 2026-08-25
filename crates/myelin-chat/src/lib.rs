@@ -51,7 +51,8 @@ pub use dek::{
     ChatBodyEnvelopeError, ChatFreeText,
 };
 pub use durable_erase::{
-    DurableChatMessageEraser, DurableChatMessageErasureError, DurableChatMessageErasureProof,
+    chat_message_holder_receipts, DurableChatMessageEraser, DurableChatMessageErasureError,
+    DurableChatMessageErasureProof,
 };
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseError, ChatEraseReport, ChatErasureCascade,

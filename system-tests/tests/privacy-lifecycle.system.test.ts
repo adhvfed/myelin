@@ -37,7 +37,7 @@ async function createVisibleIssue(
   );
 }
 
-describe("a person's agent-data privacy lifecycle", () => {
+describe("a person's privacy lifecycle", () => {
   test("shows what is held, completes one resumable request, and refuses to quietly rebuild it", async () => {
     await privacyClient.json("/v1/privacy/me/agent-data", { expectedStatus: 403 });
     const person = await browserApprovedCliClient(privacyClient);
@@ -275,5 +275,109 @@ describe("a person's agent-data privacy lifecycle", () => {
         expect.objectContaining({ id: followUpId, content: followUp }),
       ]),
     );
+  });
+
+  test("erases authored Chat history without erasing the person's right to speak again", async () => {
+    const person = await browserApprovedCliClient(privacyClient);
+    const agentDataBefore = (await person.json("/v1/privacy/me/agent-data")).body;
+    const prefix = `CM${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    const projectResponse = await person.json("/v1/projects", {
+      method: "POST",
+      body: { name: uniqueName("Chat privacy"), issue_prefix: prefix },
+      expectedStatus: 201,
+    });
+    const project = record(projectResponse.body.project, "Chat privacy project");
+    const conversation = await Conversation.open(person, {
+      projectId: string(project.id, "Chat privacy project id"),
+      channel: uniqueName("erasable-history"),
+      topic: "The person controls their authored Chat history",
+    });
+    const privateThoughts = [
+      uniqueName("A launch concern I want removed"),
+      uniqueName("A follow-up I also want removed"),
+    ];
+    const erasedIds = await Promise.all(
+      privateThoughts.map((thought) => conversation.post(person, thought)),
+    );
+
+    const idempotencyKey = `erase-my-chat-messages-${randomUUID()}`;
+    const submitted = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "chat_messages" },
+      idempotencyKey,
+      expectedStatus: 201,
+    });
+    const request = record(submitted.body.request, "completed Chat erasure request");
+    const requestId = string(request.id, "Chat erasure request id");
+    expect(request).toMatchObject({
+      kind: "erasure",
+      scope: "chat_messages",
+      state: "completed",
+      attempt_count: 1,
+      certificate_available: true,
+    });
+
+    const history = await conversation.messages(person);
+    for (const messageId of erasedIds) {
+      expect(history).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          id: messageId,
+          is_you: true,
+          state: "tombstoned",
+          content: "",
+          nodes: [],
+        }),
+      ]));
+    }
+    expect(JSON.stringify(history)).not.toContain(privateThoughts[0]);
+    expect(JSON.stringify(history)).not.toContain(privateThoughts[1]);
+
+    const certified = await person.json(
+      `/v1/privacy/me/requests/${encodeURIComponent(requestId)}/certificate`,
+    );
+    const certificate = record(certified.body.certificate, "Chat erasure certificate");
+    expect(certificate).toMatchObject({
+      request_id: requestId,
+      kind: "erasure",
+      scope: "chat_messages",
+      holders: [expect.objectContaining({
+        holder: "chat_messages",
+        operation: "erasure",
+        key_unrecoverable: true,
+      })],
+    });
+    const holders = array(certificate.holders, "Chat erasure holders");
+    expect(integer(record(holders[0], "Chat message holder").records_erased, "erased messages"))
+      .toBeGreaterThanOrEqual(erasedIds.length);
+
+    const freshThought = uniqueName("A new thought after clearing my history");
+    const freshId = await conversation.post(person, freshThought);
+    const replay = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "chat_messages" },
+      idempotencyKey,
+    });
+    expect(replay.body).toMatchObject({
+      created: false,
+      request: { id: requestId, state: "completed", attempt_count: 1 },
+    });
+    expect(await conversation.messages(person)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: freshId, state: "active", content: freshThought }),
+    ]));
+    expect((await person.json("/v1/privacy/me/agent-data")).body).toEqual(agentDataBefore);
+
+    const second = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "chat_messages" },
+      idempotencyKey: `erase-my-new-chat-messages-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    expect(second.body).toMatchObject({
+      created: true,
+      request: { scope: "chat_messages", state: "completed" },
+    });
+    expect(await conversation.messages(person)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: freshId, state: "tombstoned", content: "" }),
+    ]));
   });
 });

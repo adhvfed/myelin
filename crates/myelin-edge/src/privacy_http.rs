@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+use chrono::{SecondsFormat, Utc};
+use myelin_chat::events::pseudonymized_event_principal;
+use myelin_chat::store::pg::MessageErasureAttempt;
+use myelin_chat::{DurableChatMessageEraser, DurableChatMessageErasureProof};
+use myelin_events::{Actor, Timestamp, UlidMinter};
 use myelin_storage::{
     AgentTraceSubjectEraseReceipt, AgentTraceSubjectState, AgentTraceSubjectSummary,
     DurableAgentTraceStore, DurablePrivacyRequestStore,
@@ -20,6 +25,7 @@ mod request;
 #[derive(Clone)]
 pub(super) struct PrivacyHttpApi {
     traces: DurableAgentTraceStore,
+    chat_messages: DurableChatMessageEraser,
     requests: DurablePrivacyRequestStore,
     runtime: Handle,
 }
@@ -46,6 +52,34 @@ impl PrivacyHttpApi {
         drive_edge_future(
             &self.runtime,
             self.traces.erase_for_subject(tenant, subject),
+            "privacy HTTP",
+        )?
+        .map_err(|error| EdgeError::Internal(error.to_string()))
+    }
+
+    fn erase_chat_messages(
+        &self,
+        principal: &myelin_identity::Principal,
+        operation_id: &str,
+    ) -> Result<DurableChatMessageErasureProof, EdgeError> {
+        let now = Timestamp(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+        let attempt = MessageErasureAttempt::new(
+            operation_id,
+            Actor(pseudonymized_event_principal(
+                &principal.tenant.0,
+                principal,
+            )),
+            now.clone(),
+            now,
+        );
+        drive_edge_future(
+            &self.runtime,
+            self.chat_messages.erase_subject_messages(
+                &principal.tenant.0,
+                &principal.principal_id.0,
+                &UlidMinter::new(),
+                attempt,
+            ),
             "privacy HTTP",
         )?
         .map_err(|error| EdgeError::Internal(error.to_string()))
@@ -107,11 +141,13 @@ impl Handler for AgentDataEraseHandler {
 pub fn register_privacy(
     builder: GatewayBuilder,
     traces: DurableAgentTraceStore,
+    chat_messages: DurableChatMessageEraser,
     requests: DurablePrivacyRequestStore,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = PrivacyHttpApi {
         traces,
+        chat_messages,
         requests,
         runtime,
     };

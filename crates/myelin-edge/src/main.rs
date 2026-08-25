@@ -1345,6 +1345,15 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     builder = register_privacy(
         builder,
         agent_traces,
+        myelin_chat::DurableChatMessageEraser::new(
+            myelin_chat::store::pg::PgMessageStore::new(
+                provider.db_pool().clone(),
+                provider.config().region.clone(),
+                myelin_chat::store::pg_conversation::MESSAGE_TABLE,
+            ),
+            kms.clone(),
+            myelin_storage::DurablePostPitLedger::new(provider.clone()),
+        ),
         myelin_storage::DurablePrivacyRequestStore::new(provider.clone()),
         handle.clone(),
     );

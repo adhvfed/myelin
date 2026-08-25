@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use myelin_chat::chat_message_holder_receipts;
 use myelin_storage::{
     agent_data_holder_receipts, ClaimPrivacyRequestOutcome, CompletePrivacyRequestOutcome,
-    CreatePrivacyRequestOutcome, DurablePrivacyRequest, NewPrivacyRequest,
+    CreatePrivacyRequestOutcome, DurablePrivacyRequest, NewPrivacyRequest, PrivacyHolderReceipt,
     PrivacyRequestCertificate, PrivacyRequestKind, PrivacyRequestScope, PrivacyRequestState,
 };
 use serde::Deserialize;
@@ -63,7 +64,7 @@ impl Handler for SubmitPrivacyRequestHandler {
                 ))
             }
         };
-        let request = finish_agent_data_erasure(&self.api, ctx, request)?;
+        let request = finish_erasure_request(&self.api, ctx, request)?;
         let status = match (created, request.state) {
             (_, PrivacyRequestState::Pending | PrivacyRequestState::Processing) => 202,
             (true, PrivacyRequestState::Completed) => 201,
@@ -139,7 +140,7 @@ pub(super) fn register(builder: GatewayBuilder, api: PrivacyHttpApi) -> GatewayB
         )
 }
 
-fn finish_agent_data_erasure(
+fn finish_erasure_request(
     api: &PrivacyHttpApi,
     ctx: &HandlerCtx<'_>,
     request: DurablePrivacyRequest,
@@ -163,30 +164,11 @@ fn finish_agent_data_erasure(
         }
     };
 
-    if api.erase(tenant, owner).is_err() {
-        release_failed_request(api, tenant, &lease)?;
-        return Err(retryable_holder_failure());
-    }
-    let proof = match api.drive(api.traces.erasure_proof_for_subject(tenant, owner)) {
-        Ok(Some(proof)) => proof,
-        Ok(None) => {
-            release_failed_request(api, tenant, &lease)?;
-            return Err(EdgeError::Internal(
-                "agent-data holder did not preserve its erasure proof".into(),
-            ));
-        }
-        Err(_) => {
-            release_failed_request(api, tenant, &lease)?;
-            return Err(retryable_holder_failure());
-        }
-    };
-    let receipts = match agent_data_holder_receipts(&proof) {
+    let receipts = match erasure_receipts(api, ctx, lease.request()) {
         Ok(receipts) => receipts,
-        Err(_) => {
+        Err(error) => {
             release_failed_request(api, tenant, &lease)?;
-            return Err(EdgeError::Internal(
-                "agent-data holder returned an incomplete erasure proof".into(),
-            ));
+            return Err(error);
         }
     };
     let certificate = match PrivacyRequestCertificate::build(
@@ -218,6 +200,46 @@ fn finish_agent_data_erasure(
     }
 }
 
+fn erasure_receipts(
+    api: &PrivacyHttpApi,
+    ctx: &HandlerCtx<'_>,
+    request: &DurablePrivacyRequest,
+) -> Result<Vec<PrivacyHolderReceipt>, EdgeError> {
+    match request.scope {
+        PrivacyRequestScope::AgentData => agent_data_erasure_receipts(api, ctx),
+        PrivacyRequestScope::ChatMessages => {
+            let operation_id = format!("privacy-request:{}", request.request_id);
+            let proof = api
+                .erase_chat_messages(ctx.principal, &operation_id)
+                .map_err(|_| retryable_holder_failure())?;
+            chat_message_holder_receipts(&proof).map_err(|error| EdgeError::Internal(error.into()))
+        }
+    }
+}
+
+fn agent_data_erasure_receipts(
+    api: &PrivacyHttpApi,
+    ctx: &HandlerCtx<'_>,
+) -> Result<Vec<PrivacyHolderReceipt>, EdgeError> {
+    let tenant = &ctx.principal.tenant.0;
+    let owner = &ctx.principal.principal_id.0;
+    if api.erase(tenant, owner).is_err() {
+        return Err(retryable_holder_failure());
+    }
+    let proof = match api.drive(api.traces.erasure_proof_for_subject(tenant, owner)) {
+        Ok(Some(proof)) => proof,
+        Ok(None) => {
+            return Err(EdgeError::Internal(
+                "agent-data holder did not preserve its erasure proof".into(),
+            ));
+        }
+        Err(_) => return Err(retryable_holder_failure()),
+    };
+    agent_data_holder_receipts(&proof).map_err(|_| {
+        EdgeError::Internal("agent-data holder returned an incomplete erasure proof".into())
+    })
+}
+
 fn release_failed_request(
     api: &PrivacyHttpApi,
     tenant: &str,
@@ -226,7 +248,7 @@ fn release_failed_request(
     let released = api.drive(api.requests.release_after_failure(
         tenant,
         lease,
-        "agent-data holder temporarily unavailable",
+        "privacy holder temporarily unavailable",
     ))?;
     if !released {
         return Err(EdgeError::Internal(

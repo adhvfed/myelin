@@ -97,6 +97,71 @@ fn certificate(request_id: Uuid) -> PrivacyRequestCertificate {
     .unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_message_erasure_is_a_distinct_durable_request_scope() {
+    let provider = provider().await;
+    let tenant = unique_tenant();
+    seed_people(&provider, &tenant).await;
+    let submitted_at = Utc.timestamp_opt(1_788_912_000, 0).single().unwrap();
+    let request_id = Uuid::from_u128(0x135);
+    let requests = DurablePrivacyRequestStore::new(provider);
+
+    let created = requests
+        .create(
+            &tenant,
+            NewPrivacyRequest {
+                request_id,
+                owner_principal_id: "alice".into(),
+                client_nonce: "erase-my-chat-messages-once".into(),
+                kind: PrivacyRequestKind::Erasure,
+                scope: PrivacyRequestScope::ChatMessages,
+                submitted_at,
+            },
+        )
+        .await
+        .expect("persist the user-visible Chat erasure request");
+    let CreatePrivacyRequestOutcome::Created(created) = created else {
+        panic!("the scoped request should be new: {created:?}");
+    };
+    assert_eq!(created.scope, PrivacyRequestScope::ChatMessages);
+
+    let claimed = requests
+        .claim_owned(
+            &tenant,
+            "alice",
+            request_id,
+            "chat-erasure-worker",
+            submitted_at,
+            30,
+        )
+        .await
+        .expect("claim the Chat erasure request");
+    let ClaimPrivacyRequestOutcome::Claimed(lease) = claimed else {
+        panic!("the Chat erasure request should be claimable: {claimed:?}");
+    };
+    let certificate = PrivacyRequestCertificate::build(
+        request_id,
+        PrivacyRequestKind::Erasure,
+        PrivacyRequestScope::ChatMessages,
+        vec![PrivacyHolderReceipt::erasure("chat_messages", 2).unwrap()],
+    )
+    .unwrap();
+    let completed = requests
+        .complete(
+            &tenant,
+            &lease,
+            &certificate,
+            submitted_at + Duration::seconds(1),
+        )
+        .await
+        .expect("complete the Chat erasure request");
+    let CompletePrivacyRequestOutcome::Completed(completed) = completed else {
+        panic!("the Chat erasure certificate should be durable: {completed:?}");
+    };
+    assert_eq!(completed.scope, PrivacyRequestScope::ChatMessages);
+    assert_eq!(completed.certificate, Some(certificate));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_request_survives_a_lost_worker_and_returns_one_private_certificate() {
     let provider = provider().await;

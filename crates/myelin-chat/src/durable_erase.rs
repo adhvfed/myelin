@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use myelin_events::IdMinter;
 use myelin_storage::{
-    DekId, DurablePostPitLedger, KmsEngine, KmsError, PostPitErasureScope, ProviderError, SubjectId,
+    DekId, DurablePostPitLedger, KmsEngine, KmsError, PostPitErasureScope, PrivacyHolderReceipt,
+    ProviderError, SubjectId,
 };
 use myelin_tenancy::TenantId;
 
@@ -21,6 +22,19 @@ pub struct DurableChatMessageErasureProof {
     pub key_destroyed_this_attempt: bool,
     pub destroyed_key_epoch: Option<u64>,
     pub key_unrecoverable: bool,
+}
+
+pub fn chat_message_holder_receipts(
+    proof: &DurableChatMessageErasureProof,
+) -> Result<Vec<PrivacyHolderReceipt>, &'static str> {
+    if !proof.key_unrecoverable {
+        return Err("Chat message erasure did not prove that its subject key is unrecoverable");
+    }
+    if proof.messages_erased != proof.erasure_events_co_committed {
+        return Err("Chat message erasure did not co-commit one consequence per erased message");
+    }
+    PrivacyHolderReceipt::erasure("chat_messages", proof.messages_erased)
+        .map(|receipt| vec![receipt])
 }
 
 #[derive(Debug)]
@@ -168,4 +182,28 @@ fn unix_seconds(time: std::time::SystemTime) -> Result<u64, DurableChatMessageEr
     time.duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| DurableChatMessageErasureError::ClockBeforeUnixEpoch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chat_certificate_requires_key_and_event_proof() {
+        let complete = DurableChatMessageErasureProof {
+            messages_erased: 3,
+            erasure_events_co_committed: 3,
+            key_destroyed_this_attempt: true,
+            destroyed_key_epoch: Some(4),
+            key_unrecoverable: true,
+        };
+        let receipts = chat_message_holder_receipts(&complete).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].holder, "chat_messages");
+        assert_eq!(receipts[0].records_erased, 3);
+
+        let mut incomplete = complete;
+        incomplete.erasure_events_co_committed = 2;
+        assert!(chat_message_holder_receipts(&incomplete).is_err());
+    }
 }

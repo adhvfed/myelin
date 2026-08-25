@@ -56,9 +56,20 @@ CREATE POLICY myelin_tenant_isolation ON privacy_request
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION: &str = r#"
+ALTER TABLE privacy_request
+  DROP CONSTRAINT privacy_request_scope_check;
+ALTER TABLE privacy_request
+  ADD CONSTRAINT privacy_request_scope_check
+  CHECK (scope IN ('agent_data', 'chat_messages'));
+"#;
+
 pub fn privacy_request_durable_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0131_privacy_request",
-        PRIVACY_REQUEST_MIGRATION,
-    )])
+    Migrations::of([
+        Migration::plain("0131_privacy_request", PRIVACY_REQUEST_MIGRATION),
+        Migration::plain(
+            "0135_privacy_request_chat_messages_scope",
+            PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION,
+        ),
+    ])
 }

@@ -32,18 +32,21 @@ impl PrivacyRequestKind {
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyRequestScope {
     AgentData,
+    ChatMessages,
 }
 
 impl PrivacyRequestScope {
     pub const fn token(self) -> &'static str {
         match self {
             Self::AgentData => "agent_data",
+            Self::ChatMessages => "chat_messages",
         }
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "agent_data" => Some(Self::AgentData),
+            "chat_messages" => Some(Self::ChatMessages),
             _ => None,
         }
     }
@@ -95,6 +98,38 @@ pub struct PrivacyHolderReceipt {
     pub key_unrecoverable: bool,
 }
 
+impl PrivacyHolderReceipt {
+    pub fn erasure(holder: impl Into<String>, records_erased: u64) -> Result<Self, &'static str> {
+        let holder = holder.into();
+        if holder.is_empty()
+            || holder.len() > 128
+            || holder.trim() != holder
+            || holder.chars().any(char::is_control)
+        {
+            return Err("a privacy holder name must be a clean 1-128 byte value");
+        }
+
+        let operation = PrivacyRequestKind::Erasure.token();
+        let mut digest = blake3::Hasher::new_derive_key("myelin.privacy-holder-receipt.erasure.v1");
+        for field in [
+            holder.as_bytes(),
+            operation.as_bytes(),
+            &records_erased.to_be_bytes(),
+            &[1],
+        ] {
+            digest.update(&(field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        Ok(Self {
+            holder,
+            operation: operation.into(),
+            content_hash: format!("blake3:{}", digest.finalize().to_hex()),
+            records_erased,
+            key_unrecoverable: true,
+        })
+    }
+}
+
 pub fn agent_data_holder_receipts(
     proof: &AgentTraceSubjectErasureProof,
 ) -> Result<Vec<PrivacyHolderReceipt>, &'static str> {
@@ -102,35 +137,14 @@ pub fn agent_data_holder_receipts(
         return Err("agent-data erasure did not prove that its subject key is unrecoverable");
     }
 
-    Ok([
+    [
         ("agent_traces", proof.traces_erased),
         ("model_replay", proof.model_steps_erased),
         ("tool_effects", proof.tool_effects_erased),
     ]
     .into_iter()
-    .map(|(holder, records_erased)| agent_data_holder_receipt(holder, records_erased))
-    .collect())
-}
-
-fn agent_data_holder_receipt(holder: &str, records_erased: u64) -> PrivacyHolderReceipt {
-    let operation = PrivacyRequestKind::Erasure.token();
-    let mut digest = blake3::Hasher::new_derive_key("myelin.privacy-holder-receipt.agent-data.v1");
-    for field in [
-        holder.as_bytes(),
-        operation.as_bytes(),
-        &records_erased.to_be_bytes(),
-        &[1],
-    ] {
-        digest.update(&(field.len() as u64).to_be_bytes());
-        digest.update(field);
-    }
-    PrivacyHolderReceipt {
-        holder: holder.into(),
-        operation: operation.into(),
-        content_hash: format!("blake3:{}", digest.finalize().to_hex()),
-        records_erased,
-        key_unrecoverable: true,
-    }
+    .map(|(holder, records_erased)| PrivacyHolderReceipt::erasure(holder, records_erased))
+    .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
