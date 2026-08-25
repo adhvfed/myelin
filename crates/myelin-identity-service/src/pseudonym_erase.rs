@@ -187,7 +187,7 @@ impl PseudonymErasureLedger {
         subject: &PrincipalId,
         dek_class: myelin_storage::KeyClass,
         erased_at: myelin_events::Timestamp,
-    ) {
+    ) -> Result<(), PseudonymError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             ErasureLedgerBackend::Memory(inner_arc) => {
@@ -203,33 +203,20 @@ impl PseudonymErasureLedger {
                     .entry(part)
                     .or_default()
                     .insert(subject.0.clone(), entry);
+                Ok(())
             }
-            ErasureLedgerBackend::Pg(pg) => {
-                if let Err(e) = pg.block(pg.backing.record(
+            ErasureLedgerBackend::Pg(pg) => pg
+                .block(pg.backing.record(
                     &scope.tenant().0,
                     &subject.0,
                     &dek_class.as_token(),
                     &erased_at.0,
-                )) {
-                    panic!(
-                        "ERASURE-LEDGER DURABILITY FAILURE (fail-static): the erasure record for \
-                         subject={} tenant={} could NOT be persisted - an unrecorded erasure is a \
-                         silent resurrection path across PIT restore (P-ID-20/ID-D8); refusing to \
-                         report the erasure as recorded: {e}",
-                        subject.0,
-                        scope.tenant().0
-                    );
-                }
-            }
+                ))
+                .map_err(|error| PseudonymError::Storage(error.to_string())),
         }
     }
 
-    pub fn entries_in(&self, scope: &TenantScope) -> Vec<ErasureLedgerEntry> {
-        self.try_entries_in(scope)
-            .unwrap_or_else(|e| panic!("erasure ledger: replay read failed loud: {e}"))
-    }
-
-    pub fn try_entries_in(
+    pub fn entries_in(
         &self,
         scope: &TenantScope,
     ) -> Result<Vec<ErasureLedgerEntry>, PseudonymError> {
@@ -266,12 +253,7 @@ impl PseudonymErasureLedger {
         })
     }
 
-    pub fn is_erased(&self, scope: &TenantScope, subject: &PrincipalId) -> bool {
-        self.try_is_erased(scope, subject)
-            .unwrap_or_else(|e| panic!("erasure ledger: state read failed loud: {e}"))
-    }
-
-    pub fn try_is_erased(
+    pub fn is_erased(
         &self,
         scope: &TenantScope,
         subject: &PrincipalId,
@@ -317,7 +299,7 @@ impl EraseEngine {
         let dek_destroyed = kms
             .destroy_dek(&dek_id)
             .map_err(|error| PseudonymError::Storage(error.to_string()))?;
-        let row_shredded = store.shred_row(scope, subject);
+        let row_shredded = store.shred_row(scope, subject)?;
         Ok((dek_destroyed, row_shredded, dek_class.as_token()))
     }
 }
@@ -348,23 +330,25 @@ mod tests {
         let subject = PrincipalId("p:alice".into());
         assert!(
             !ledger
-                .try_is_erased(&s, &subject)
+                .is_erased(&s, &subject)
                 .expect("ledger state read succeeds"),
             "not erased before record"
         );
-        ledger.record(
-            &s,
-            &subject,
-            KeyClass::Subject("p:alice".into()),
-            ts("2026-06-19T00:00:00Z"),
-        );
+        ledger
+            .record(
+                &s,
+                &subject,
+                KeyClass::Subject("p:alice".into()),
+                ts("2026-06-19T00:00:00Z"),
+            )
+            .expect("record the erasure");
         assert!(
-            ledger.is_erased(&s, &subject),
+            ledger
+                .is_erased(&s, &subject)
+                .expect("ledger state read succeeds"),
             "the ledger remembers the erasure"
         );
-        let entries = ledger
-            .try_entries_in(&s)
-            .expect("ledger replay read succeeds");
+        let entries = ledger.entries_in(&s).expect("ledger replay read succeeds");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].subject, subject);
         assert_eq!(entries[0].dek_class, KeyClass::Subject("p:alice".into()));
@@ -377,22 +361,33 @@ mod tests {
         let globex = scope("globex", "eu-west");
         let acme_us = scope("acme", "us-east");
         let subject = PrincipalId("p:alice".into());
-        ledger.record(
-            &acme,
-            &subject,
-            KeyClass::Subject("p:alice".into()),
-            ts("t"),
-        );
-        assert!(ledger.is_erased(&acme, &subject));
+        ledger
+            .record(
+                &acme,
+                &subject,
+                KeyClass::Subject("p:alice".into()),
+                ts("t"),
+            )
+            .expect("record acme's erasure");
+        assert!(ledger
+            .is_erased(&acme, &subject)
+            .expect("acme's ledger remains readable"));
         assert!(
-            !ledger.is_erased(&globex, &subject),
+            !ledger
+                .is_erased(&globex, &subject)
+                .expect("globex's ledger remains readable"),
             "no cross-tenant ledger read"
         );
         assert!(
-            !ledger.is_erased(&acme_us, &subject),
+            !ledger
+                .is_erased(&acme_us, &subject)
+                .expect("the us-east ledger remains readable"),
             "no cross-region ledger read"
         );
-        assert!(ledger.entries_in(&globex).is_empty());
+        assert!(ledger
+            .entries_in(&globex)
+            .expect("globex's replay ledger remains readable")
+            .is_empty());
     }
 
     #[test]
@@ -400,9 +395,15 @@ mod tests {
         let ledger = PseudonymErasureLedger::new();
         let s = scope("acme", "eu-west");
         let subject = PrincipalId("p:alice".into());
-        ledger.record(&s, &subject, KeyClass::Subject("p:alice".into()), ts("t1"));
-        ledger.record(&s, &subject, KeyClass::Subject("p:alice".into()), ts("t2"));
-        let entries = ledger.entries_in(&s);
+        ledger
+            .record(&s, &subject, KeyClass::Subject("p:alice".into()), ts("t1"))
+            .expect("record the first erasure");
+        ledger
+            .record(&s, &subject, KeyClass::Subject("p:alice".into()), ts("t2"))
+            .expect("record the same erasure again");
+        let entries = ledger
+            .entries_in(&s)
+            .expect("read the idempotent ledger entry");
         assert_eq!(entries.len(), 1, "a re-record does not duplicate");
         assert_eq!(entries[0].erased_at, ts("t2"), "the timestamp updates");
     }

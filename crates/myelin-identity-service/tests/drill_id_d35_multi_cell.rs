@@ -298,6 +298,7 @@ fn ga_d8_multi_cell_erasure_per_cell_receipt_set() {
             part.engine()
                 .pseudonyms()
                 .resolve_subject(&scope, &subject)
+                .expect("the cell identity directory is readable before erasure")
                 .is_some(),
             "the subject is mapped in cell {c} before the DSR"
         );
@@ -336,6 +337,7 @@ fn ga_d8_multi_cell_erasure_per_cell_receipt_set() {
             part.engine()
                 .pseudonyms()
                 .resolve_subject(&scope, &subject)
+                .expect("the cell identity directory remains readable after erasure")
                 .is_none(),
             "the subject is erased in {} after the DSR",
             cell_id.as_str()

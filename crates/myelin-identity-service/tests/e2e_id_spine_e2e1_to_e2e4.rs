@@ -541,7 +541,10 @@ fn e2e4_dsar_fanout_pseudonym_shred_and_s8_holder_zero_missed() {
         .expect("seed the S2 mapping");
 
     assert!(
-        svc.pseudonyms().resolve_subject(&acme, &erasee).is_some(),
+        svc.pseudonyms()
+            .resolve_subject(&acme, &erasee)
+            .expect("the identity directory is readable before erasure")
+            .is_some(),
         "E2E-4: BEFORE - the subject's real-identity link resolves (S2 holds it)"
     );
     assert!(
@@ -563,7 +566,12 @@ fn e2e4_dsar_fanout_pseudonym_shred_and_s8_holder_zero_missed() {
     holders_visited.insert("S8_reverse_index");
 
     let mut recoverable_pii: i64 = 0;
-    if svc.pseudonyms().resolve_subject(&acme, &erasee).is_some() {
+    if svc
+        .pseudonyms()
+        .resolve_subject(&acme, &erasee)
+        .expect("the identity directory is readable after erasure")
+        .is_some()
+    {
         recoverable_pii += 1;
     }
     assert!(
@@ -585,7 +593,9 @@ fn e2e4_dsar_fanout_pseudonym_shred_and_s8_holder_zero_missed() {
     }
 
     assert!(
-        svc.erasure_ledger().is_erased(&acme, &erasee),
+        svc.erasure_ledger()
+            .is_erased(&acme, &erasee)
+            .expect("the erasure ledger remains readable"),
         "E2E-4: the erasure is durably recorded in the PII-free ledger (re-erasure can replay it)"
     );
 
@@ -702,7 +712,12 @@ fn id_is_the_authz_spine_of_all_four_e2e_scenarios() {
         .erase_in(&acme, &subj, ts("2026-06-24T02:00:00Z"))
         .unwrap();
     assert!(
-        receipt.dek_destroyed && svc.pseudonyms().resolve_subject(&acme, &subj).is_none(),
+        receipt.dek_destroyed
+            && svc
+                .pseudonyms()
+                .resolve_subject(&acme, &subj)
+                .expect("the identity directory remains readable after erasure")
+                .is_none(),
         "spine E2E-4: the pseudonym shred destroys the DEK → the real identity is unrecoverable"
     );
 

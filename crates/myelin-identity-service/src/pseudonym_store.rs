@@ -264,12 +264,7 @@ impl PseudonymStore {
         Ok((key_ref, SealedRealIdentity { nonce, ciphertext }))
     }
 
-    pub fn mapping_of(&self, scope: &TenantScope, subject: &PrincipalId) -> Option<PseudonymRow> {
-        self.try_mapping_of(scope, subject)
-            .unwrap_or_else(|e| panic!("pseudonym store: mapping read failed loud: {e}"))
-    }
-
-    pub fn try_mapping_of(
+    pub fn mapping_of(
         &self,
         scope: &TenantScope,
         subject: &PrincipalId,
@@ -355,15 +350,6 @@ impl PseudonymStore {
         &self,
         scope: &TenantScope,
         subject: &PrincipalId,
-    ) -> Option<PrincipalId> {
-        self.try_resolve_subject(scope, subject)
-            .unwrap_or_else(|e| panic!("pseudonym store: subject resolution failed loud: {e}"))
-    }
-
-    pub fn try_resolve_subject(
-        &self,
-        scope: &TenantScope,
-        subject: &PrincipalId,
     ) -> Result<Option<PrincipalId>, PseudonymError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
         let (key_ref, sealed) = match &self.backend {
@@ -408,11 +394,20 @@ impl PseudonymStore {
         Ok(Some(PrincipalId(subject)))
     }
 
-    pub fn shred_key_for(&self, scope: &TenantScope, subject: &PrincipalId) -> Option<PiiKeyRef> {
-        self.mapping_of(scope, subject).map(|r| r.real_id_key_ref)
+    pub fn shred_key_for(
+        &self,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> Result<Option<PiiKeyRef>, PseudonymError> {
+        self.mapping_of(scope, subject)
+            .map(|row| row.map(|row| row.real_id_key_ref))
     }
 
-    pub fn shred_row(&self, scope: &TenantScope, subject: &PrincipalId) -> bool {
+    pub fn shred_row(
+        &self,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> Result<bool, PseudonymError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -439,35 +434,15 @@ impl PseudonymStore {
                         .get_mut(&part_key)
                         .and_then(|m| m.remove(&rendering));
                 }
-                removed
+                Ok(removed)
             }
-            PseudonymBackend::Pg(pg) => Self::require_durable_shred(
-                pg.block(pg.backing.shred(&scope.tenant().0, &subject.0)),
-                scope,
-                subject,
-            ),
+            PseudonymBackend::Pg(pg) => pg
+                .block(pg.backing.shred(&scope.tenant().0, &subject.0))
+                .map_err(|error| PseudonymError::Storage(error.to_string())),
         }
     }
 
-    fn require_durable_shred<E: core::fmt::Display>(
-        result: Result<bool, E>,
-        scope: &TenantScope,
-        subject: &PrincipalId,
-    ) -> bool {
-        result.unwrap_or_else(|error| {
-            panic!(
-                "PSEUDONYM-SHRED DURABILITY FAILURE (fail-static): subject={} tenant={} row delete \
-                 failed; refusing to report an idempotent erase or mint a receipt: {error}",
-                subject.0,
-                scope.tenant().0
-            )
-        })
-    }
-
-    pub fn try_mappings_in(
-        &self,
-        scope: &TenantScope,
-    ) -> Result<Vec<PseudonymRow>, PseudonymError> {
+    pub fn mappings_in(&self, scope: &TenantScope) -> Result<Vec<PseudonymRow>, PseudonymError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S2_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -486,11 +461,6 @@ impl PseudonymStore {
                 .map(|drow| Self::durable_to_row(scope, drow))
                 .collect(),
         }
-    }
-
-    pub fn mappings_in(&self, scope: &TenantScope) -> Vec<PseudonymRow> {
-        self.try_mappings_in(scope)
-            .unwrap_or_else(|e| panic!("pseudonym store: mapping scan failed loud: {e}"))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -546,7 +516,7 @@ mod tests {
         assert_eq!(written.pseudonym, h, "the public pseudonym is stored");
 
         let read = store
-            .try_mapping_of(&s, &PrincipalId("p:alice".into()))
+            .mapping_of(&s, &PrincipalId("p:alice".into()))
             .expect("mapping directory read succeeds")
             .expect("the row round-trips under the same scope");
         assert_eq!(
@@ -555,7 +525,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .try_mappings_in(&s)
+                .mappings_in(&s)
                 .expect("mapping directory scan succeeds"),
             vec![written]
         );
@@ -591,33 +561,9 @@ mod tests {
         drop(inner);
 
         assert_eq!(
-            store.try_resolve_subject(&s, &subject),
+            store.resolve_subject(&s, &subject),
             Err(PseudonymError::CorruptMapping),
             "corruption must invalidate an erasure proof instead of looking erased"
-        );
-    }
-
-    #[test]
-    fn durable_shred_fault_cannot_masquerade_as_idempotent_absence() {
-        let s = scope("acme");
-        let subject = PrincipalId("p:alice".into());
-        assert!(PseudonymStore::require_durable_shred(
-            Ok::<bool, &str>(true),
-            &s,
-            &subject
-        ));
-        assert!(!PseudonymStore::require_durable_shred(
-            Ok::<bool, &str>(false),
-            &s,
-            &subject
-        ));
-
-        let panic = std::panic::catch_unwind(|| {
-            PseudonymStore::require_durable_shred(Err("database unavailable"), &s, &subject)
-        });
-        assert!(
-            panic.is_err(),
-            "a storage fault must refuse the erase receipt"
         );
     }
 
@@ -634,6 +580,7 @@ mod tests {
         assert!(
             store
                 .mapping_of(&globex, &PrincipalId("p:alice".into()))
+                .expect("globex's mapping partition remains readable")
                 .is_none(),
             "no cross-tenant read path: globex cannot see acme's mapping"
         );
@@ -643,10 +590,19 @@ mod tests {
             "globex cannot resolve acme's pseudonym"
         );
         assert!(
-            store.mappings_in(&globex).is_empty(),
+            store
+                .mappings_in(&globex)
+                .expect("globex's mapping partition remains readable")
+                .is_empty(),
             "globex's partition is empty"
         );
-        assert_eq!(store.mappings_in(&acme).len(), 1);
+        assert_eq!(
+            store
+                .mappings_in(&acme)
+                .expect("acme's mapping partition remains readable")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -664,10 +620,17 @@ mod tests {
         assert!(
             store
                 .mapping_of(&us, &PrincipalId("p:alice".into()))
+                .expect("the us-east mapping partition remains readable")
                 .is_none(),
             "residency partition: the us-east partition cannot see the eu-west mapping"
         );
-        assert_eq!(store.mappings_in(&eu).len(), 1);
+        assert_eq!(
+            store
+                .mappings_in(&eu)
+                .expect("the eu-west mapping partition remains readable")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -683,10 +646,12 @@ mod tests {
 
         let alice_ref = store
             .shred_key_for(&s, &PrincipalId("p:alice".into()))
-            .unwrap();
+            .expect("alice's key lookup succeeds")
+            .expect("alice has a shred key");
         let bob_ref = store
             .shred_key_for(&s, &PrincipalId("p:bob".into()))
-            .unwrap();
+            .expect("bob's key lookup succeeds")
+            .expect("bob has a shred key");
 
         assert_eq!(alice_ref.class, KeyClass::Subject("p:alice".into()));
         assert_ne!(
@@ -712,7 +677,8 @@ mod tests {
             .unwrap();
         let bob_ref = store
             .shred_key_for(&s, &PrincipalId("p:bob".into()))
-            .unwrap();
+            .expect("bob's key lookup succeeds")
+            .expect("bob has a shred key");
 
         let inner = store.lock();
         let part = (s.tenant().0.clone(), s.region().0.clone());
@@ -744,7 +710,8 @@ mod tests {
 
         let key_ref = store
             .shred_key_for(&s, &PrincipalId("p:alice".into()))
-            .unwrap();
+            .expect("alice's key lookup succeeds")
+            .expect("alice has a shred key");
         let dek_id = myelin_storage::DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
         assert!(
             store.kms.destroy_dek(&dek_id).unwrap(),
@@ -759,6 +726,7 @@ mod tests {
         assert!(
             store
                 .mapping_of(&s, &PrincipalId("p:alice".into()))
+                .expect("the public mapping directory remains readable")
                 .is_some(),
             "the public pseudonym row survives the crypto-shred (historic attribution intact)"
         );
@@ -777,6 +745,7 @@ mod tests {
         assert!(
             store
                 .mapping_of(&s, &PrincipalId("p:alice".into()))
+                .expect("the unchanged mapping directory remains readable")
                 .is_none(),
             "nothing was written on rejection (no partial write)"
         );

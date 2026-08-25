@@ -120,6 +120,7 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
     let store2 = pseudonym_store(&kms, &app2);
     let row = store2
         .mapping_of(&s, &alice)
+        .expect("the mapping directory read succeeds after restart")
         .expect("the S2 row survives a fresh engine over a fresh pool (kill-9-equivalent)");
     assert_eq!(row.pseudonym, h, "the public render survived");
     assert_eq!(
@@ -130,6 +131,7 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
 
     let key_ref = store2
         .shred_key_for(&s, &alice)
+        .expect("the shred-key directory read succeeds")
         .expect("the subject has a per-subject shred key");
     let dek_id = DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
     assert!(
@@ -141,7 +143,10 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
     let app3 = common::app_provider(6).await;
     let store3 = pseudonym_store(&kms, &app3);
     assert!(
-        store3.mapping_of(&s, &alice).is_some(),
+        store3
+            .mapping_of(&s, &alice)
+            .expect("the public mapping directory remains readable")
+            .is_some(),
         "the PUBLIC pseudonym row survives the crypto-shred across a restart (attribution intact)"
     );
     assert!(
@@ -149,7 +154,10 @@ async fn s2_row_survives_fresh_pool_and_crypto_shred_stays_loud_while_render_sur
         "a crypto-shredded resolve fails LOUD across restart, never plaintext-without-key"
     );
     assert!(
-        store3.resolve_subject(&s, &alice).is_none(),
+        store3
+            .resolve_subject(&s, &alice)
+            .expect("the sealed identity directory remains readable")
+            .is_none(),
         "the subject is erased (0 recoverable real identity) after the crypto-shred + restart"
     );
 
@@ -194,10 +202,17 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
         .erase_in(&s, &bob, at("2026-06-19T10:00:01Z"))
         .unwrap();
     assert!(
-        engine1.pseudonyms().mapping_of(&s, &alice).is_none(),
+        engine1
+            .pseudonyms()
+            .mapping_of(&s, &alice)
+            .expect("the mapping directory remains readable after erasure")
+            .is_none(),
         "the full erase DELETEd the durable map row (the resolvable mapping is gone)"
     );
-    assert!(engine1.erasure_ledger().is_erased(&s, &alice));
+    assert!(engine1
+        .erasure_ledger()
+        .is_erased(&s, &alice)
+        .expect("the erasure ledger remains readable"));
 
     let app2 = common::app_provider(6).await;
     let engine2 = StoreBackedCheck::with_pg(
@@ -207,12 +222,22 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
         tokio::runtime::Handle::current(),
     );
     assert!(
-        engine2.pseudonyms().mapping_of(&s, &alice).is_none(),
+        engine2
+            .pseudonyms()
+            .mapping_of(&s, &alice)
+            .expect("the restarted mapping directory remains readable")
+            .is_none(),
         "the crypto-shred DELETE stays dead across a restart"
     );
     assert!(
-        engine2.erasure_ledger().is_erased(&s, &alice)
-            && engine2.erasure_ledger().is_erased(&s, &bob),
+        engine2
+            .erasure_ledger()
+            .is_erased(&s, &alice)
+            .expect("alice's restarted erasure ledger is readable")
+            && engine2
+                .erasure_ledger()
+                .is_erased(&s, &bob)
+                .expect("bob's restarted erasure ledger is readable"),
         "the PII-free erasure ledger survived the restart (it must, to drive re-erasure)"
     );
 
@@ -225,7 +250,11 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
         .put_mapping(&s, &bob, handle_b.clone())
         .expect("restore bob");
     assert!(
-        engine2.pseudonyms().resolve_subject(&s, &alice).is_some(),
+        engine2
+            .pseudonyms()
+            .resolve_subject(&s, &alice)
+            .expect("the restored identity directory is readable")
+            .is_some(),
         "the restore resurrected alice"
     );
 
@@ -249,7 +278,11 @@ async fn full_erase_deletes_durably_and_the_ledger_drives_re_erasure_across_rest
         "the ID-D8 re-erasure drill is GREEN across a live-PG restart"
     );
     assert!(
-        engine2.pseudonyms().resolve_subject(&s, &alice).is_none(),
+        engine2
+            .pseudonyms()
+            .resolve_subject(&s, &alice)
+            .expect("the re-erased identity directory is readable")
+            .is_none(),
         "alice re-erased (0 recoverable real identity)"
     );
 
@@ -275,15 +308,20 @@ async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
     store
         .put_mapping(&sa, &alice, handle("anon-a", &tenant_a))
         .expect("acme write");
-    ledger.record(
-        &sa,
-        &alice,
-        KeyClass::Subject("p:alice".into()),
-        at("2026-06-19T10:00:00Z"),
-    );
+    ledger
+        .record(
+            &sa,
+            &alice,
+            KeyClass::Subject("p:alice".into()),
+            at("2026-06-19T10:00:00Z"),
+        )
+        .expect("record tenant A's erasure");
 
     assert!(
-        store.mapping_of(&sb, &alice).is_none(),
+        store
+            .mapping_of(&sb, &alice)
+            .expect("tenant B's mapping directory remains readable")
+            .is_none(),
         "no cross-tenant map read: B cannot see A's mapping"
     );
     assert!(
@@ -294,29 +332,46 @@ async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
         "no cross-tenant resolve"
     );
     assert!(
-        store.mappings_in(&sb).is_empty(),
+        store
+            .mappings_in(&sb)
+            .expect("tenant B's mapping directory remains readable")
+            .is_empty(),
         "B's map partition is empty"
     );
     assert!(
-        !ledger.is_erased(&sb, &alice),
+        !ledger
+            .is_erased(&sb, &alice)
+            .expect("tenant B's erasure ledger remains readable"),
         "no cross-tenant erasure-ledger read"
     );
     assert!(
-        ledger.entries_in(&sb).is_empty(),
+        ledger
+            .entries_in(&sb)
+            .expect("tenant B's replay ledger remains readable")
+            .is_empty(),
         "B's ledger partition is empty"
     );
-    assert!(store.mapping_of(&sa, &alice).is_some());
-    assert!(ledger.is_erased(&sa, &alice));
+    assert!(store
+        .mapping_of(&sa, &alice)
+        .expect("tenant A's mapping directory remains readable")
+        .is_some());
+    assert!(ledger
+        .is_erased(&sa, &alice)
+        .expect("tenant A's erasure ledger remains readable"));
 
-    ledger.record(
-        &sa,
-        &alice,
-        KeyClass::Subject("p:alice".into()),
-        at("2026-06-19T12:00:00Z"),
-    );
+    ledger
+        .record(
+            &sa,
+            &alice,
+            KeyClass::Subject("p:alice".into()),
+            at("2026-06-19T12:00:00Z"),
+        )
+        .expect("record tenant A's erasure again");
     let app2 = common::app_provider(6).await;
     let ledger2 = erasure_ledger(&app2);
-    let entries = ledger2.entries_in(&sa);
+    let entries = ledger2
+        .entries_in(&sa)
+        .expect("the restarted replay ledger remains readable");
     assert_eq!(
         entries.len(),
         1,
@@ -330,4 +385,96 @@ async fn partition_isolation_and_idempotent_ledger_on_live_pg() {
 
     cleanup(&tenant_a, &region).await;
     cleanup(&tenant_b, &region).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupted_erasure_returns_an_error_and_a_fresh_worker_finishes_it() {
+    migrate_admin().await;
+    let first_provider = common::app_provider(2).await;
+    let region = first_provider.config().region.clone();
+    let tenant = format!("mr009b-w6a-retry-{}", uniq());
+    let tenant_scope = scope(&tenant, &region);
+    let alice = PrincipalId("p:alice".into());
+    let kms = Arc::new(KmsEngine::new());
+    let cell = Arc::new(CellTokenAuthority::generate());
+    let first = StoreBackedCheck::with_pg(
+        first_provider.clone(),
+        kms.clone(),
+        cell.clone(),
+        tokio::runtime::Handle::current(),
+    );
+    first
+        .pseudonyms()
+        .put_mapping(&tenant_scope, &alice, handle("anon-alice", &tenant))
+        .expect("alice has a durable pseudonym before requesting erasure");
+
+    first_provider.db_pool().close().await;
+
+    assert!(
+        matches!(
+            first.erase_in(
+                &tenant_scope,
+                &alice,
+                at("2026-08-26T12:00:00Z")
+            ),
+            Err(PseudonymError::Storage(_))
+        ),
+        "an unavailable mapping store refuses the receipt instead of panicking after key destruction"
+    );
+    assert!(
+        matches!(
+            first.pseudonyms().mapping_of(&tenant_scope, &alice),
+            Err(PseudonymError::Storage(_))
+        ),
+        "an outage cannot look like an absent mapping"
+    );
+    assert!(
+        matches!(
+            first.pseudonyms().mappings_in(&tenant_scope),
+            Err(PseudonymError::Storage(_))
+        ),
+        "an outage cannot look like an empty mapping partition"
+    );
+    assert!(
+        matches!(
+            first.erasure_ledger().is_erased(&tenant_scope, &alice),
+            Err(PseudonymError::Storage(_))
+        ),
+        "an outage cannot look like a missing erasure record"
+    );
+    assert!(
+        matches!(
+            first.erasure_ledger().entries_in(&tenant_scope),
+            Err(PseudonymError::Storage(_))
+        ),
+        "an outage cannot look like an empty restore-replay ledger"
+    );
+
+    let recovered_provider = common::app_provider(2).await;
+    let recovered = StoreBackedCheck::with_pg(
+        recovered_provider,
+        kms,
+        cell,
+        tokio::runtime::Handle::current(),
+    );
+    let receipt = recovered
+        .erase_in(&tenant_scope, &alice, at("2026-08-26T12:00:01Z"))
+        .expect("a fresh worker finishes the interrupted erasure");
+    assert!(
+        !receipt.dek_destroyed,
+        "the first attempt already destroyed the per-subject key"
+    );
+    assert!(
+        receipt.row_shredded,
+        "the retry deletes the mapping that the outage left behind"
+    );
+    assert!(
+        recovered
+            .erasure_ledger()
+            .is_erased(&tenant_scope, &alice)
+            .expect("the recovered erasure ledger is readable"),
+        "the retry durably records the erasure before returning its receipt"
+    );
+
+    cleanup(&tenant, &region).await;
 }

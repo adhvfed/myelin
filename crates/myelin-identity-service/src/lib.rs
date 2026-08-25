@@ -557,14 +557,14 @@ impl StoreBackedCheck {
     ) -> Result<myelin_identity::PseudonymHandle, pseudonym_erase::PseudonymEraseError> {
         match self
             .pseudonyms
-            .try_mapping_of(scope, subject)
+            .mapping_of(scope, subject)
             .map_err(pseudonym_erase::PseudonymEraseError::from)?
         {
             Some(row) => Ok(row.pseudonym),
             None => {
                 if self
                     .erasure_ledger
-                    .try_is_erased(scope, subject)
+                    .is_erased(scope, subject)
                     .map_err(pseudonym_erase::PseudonymEraseError::from)?
                 {
                     Err(pseudonym_erase::PseudonymEraseError::Erased {
@@ -596,7 +596,7 @@ impl StoreBackedCheck {
         self.revocations
             .disable_principal(scope, subject, now.clone());
         self.erasure_ledger
-            .record(scope, subject, dek_class.clone(), now.clone());
+            .record(scope, subject, dek_class.clone(), now.clone())?;
         Ok(pseudonym_erase::ErasureReceipt::for_erase(
             subject.clone(),
             scope.tenant().clone(),
@@ -613,13 +613,13 @@ impl StoreBackedCheck {
         scope: &myelin_storage::TenantScope,
         now: myelin_events::Timestamp,
     ) -> Result<pseudonym_erase::ReErasureReceipt, PseudonymError> {
-        let entries = self.erasure_ledger.try_entries_in(scope)?;
+        let entries = self.erasure_ledger.entries_in(scope)?;
         let mut per_subject = Vec::with_capacity(entries.len());
         let mut resurrected = 0usize;
         for entry in &entries {
             let live_before = self
                 .pseudonyms
-                .try_resolve_subject(scope, &entry.subject)?
+                .resolve_subject(scope, &entry.subject)?
                 .is_some();
             if live_before {
                 resurrected += 1;
@@ -648,7 +648,7 @@ impl StoreBackedCheck {
         for entry in &entries {
             if self
                 .pseudonyms
-                .try_resolve_subject(scope, &entry.subject)?
+                .resolve_subject(scope, &entry.subject)?
                 .is_some()
             {
                 still_resolvable += 1;

@@ -72,7 +72,9 @@ fn cdc_4_8_erase_makes_de_pseudonymisation_fail_closed_but_attribution_stands() 
         "after erase, the consumer cannot de-pseudonymise the subject (fails closed): {r:?}"
     );
     assert!(
-        svc.erasure_ledger().is_erased(&s, &alice),
+        svc.erasure_ledger()
+            .is_erased(&s, &alice)
+            .expect("the erasure ledger remains readable"),
         "the provider recorded the erasure in the PII-free ledger (10.8)"
     );
 }

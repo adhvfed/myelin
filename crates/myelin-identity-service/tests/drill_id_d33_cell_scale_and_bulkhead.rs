@@ -122,7 +122,12 @@ impl Cell {
                 svc.pseudonyms()
                     .put_mapping(&s, &subj, handle(&format!("anon-{i}"), tenant))
                     .unwrap();
-                if svc.pseudonyms().resolve_subject(&s, &subj).is_some() {
+                if svc
+                    .pseudonyms()
+                    .resolve_subject(&s, &subj)
+                    .expect("the restored identity directory remains readable")
+                    .is_some()
+                {
                     resurrected += 1;
                 }
             }

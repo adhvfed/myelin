@@ -42,10 +42,24 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
         .unwrap();
     slot.erase_in(&s, &bob, at("2026-06-19T10:00:01Z")).unwrap();
 
-    assert!(slot.pseudonyms().resolve_subject(&s, &alice).is_none());
-    assert!(slot.pseudonyms().resolve_subject(&s, &bob).is_none());
-    assert!(slot.erasure_ledger().is_erased(&s, &alice));
-    assert!(slot.erasure_ledger().is_erased(&s, &bob));
+    assert!(slot
+        .pseudonyms()
+        .resolve_subject(&s, &alice)
+        .expect("alice's identity directory remains readable")
+        .is_none());
+    assert!(slot
+        .pseudonyms()
+        .resolve_subject(&s, &bob)
+        .expect("bob's identity directory remains readable")
+        .is_none());
+    assert!(slot
+        .erasure_ledger()
+        .is_erased(&s, &alice)
+        .expect("alice's erasure ledger remains readable"));
+    assert!(slot
+        .erasure_ledger()
+        .is_erased(&s, &bob)
+        .expect("bob's erasure ledger remains readable"));
 
     slot.pseudonyms()
         .put_mapping(&s, &alice, handle("anon-a", "acme"))
@@ -54,11 +68,17 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
         .put_mapping(&s, &bob, handle("anon-b", "acme"))
         .unwrap();
     assert!(
-        slot.pseudonyms().resolve_subject(&s, &alice).is_some(),
+        slot.pseudonyms()
+            .resolve_subject(&s, &alice)
+            .expect("alice's restored identity directory remains readable")
+            .is_some(),
         "the restore RESURRECTED alice (resolvable again) - the bug ID-D8 catches"
     );
     assert!(
-        slot.pseudonyms().resolve_subject(&s, &bob).is_some(),
+        slot.pseudonyms()
+            .resolve_subject(&s, &bob)
+            .expect("bob's restored identity directory remains readable")
+            .is_some(),
         "the restore resurrected bob"
     );
 
@@ -84,11 +104,17 @@ fn id_d8_restore_resurrects_no_authority_and_emits_a_dated_re_erasure_receipt() 
     assert!(receipt.summary().contains("2026-06-19T11:00:00Z"));
 
     assert!(
-        slot.pseudonyms().resolve_subject(&s, &alice).is_none(),
+        slot.pseudonyms()
+            .resolve_subject(&s, &alice)
+            .expect("alice's re-erased identity directory remains readable")
+            .is_none(),
         "alice re-erased"
     );
     assert!(
-        slot.pseudonyms().resolve_subject(&s, &bob).is_none(),
+        slot.pseudonyms()
+            .resolve_subject(&s, &bob)
+            .expect("bob's re-erased identity directory remains readable")
+            .is_none(),
         "bob re-erased"
     );
     let nowt = at("2026-06-19T11:00:00Z");
@@ -139,7 +165,10 @@ fn id_d8_without_re_erasure_a_restore_resurrects_the_subject() {
         .put_mapping(&s, &alice, handle("anon-a", "acme"))
         .unwrap();
     assert!(
-        slot.pseudonyms().resolve_subject(&s, &alice).is_some(),
+        slot.pseudonyms()
+            .resolve_subject(&s, &alice)
+            .expect("the restored identity directory remains readable")
+            .is_some(),
         "WITHOUT re-erasure, the restore resurrects the subject - the property re_erase_after_restore \
          exists to repair (a mutation skipping the pass leaves this resurrected, reding ID-D8)"
     );

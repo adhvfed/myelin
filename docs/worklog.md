@@ -4,6 +4,23 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — interrupted pseudonym erasure resumes without a process panic
+
+Pseudonym-map deletion and the restore-replay ledger still treated PostgreSQL failures as reasons to
+panic. Their neighboring reads also offered shorter panic wrappers beside fallible methods, making
+an outage easy to mistake for an absent mapping, an empty tenant, or no erasure obligation.
+
+Every pseudonym and ledger operation is now explicitly fallible, including row shredding and ledger
+recording. `erase_in` propagates either failure and cannot mint a receipt until both durable steps
+finish. The irreversible key step remains safely retryable: if key destruction succeeds and the
+database then disappears, a fresh worker observes the already-destroyed key, deletes the surviving
+mapping, records the replay obligation, and only then returns the truthful receipt. The obsolete
+panic-helper test is gone; the production PostgreSQL adapter itself supplies the evidence.
+
+**Proof:** all 424 identity library cases; warning-free all-target/all-feature Identity clippy; and
+all four real-PostgreSQL pseudonym journeys, including a closed-pool interruption followed by a
+fresh-provider retry that completes the row shred and durable ledger record (0.35 seconds total).
+
 ## 2026-08-26 — principal-directory reads cannot panic or masquerade as absence
 
 The principal store exposed fallible `try_*` reads beside convenience methods that panicked on the

@@ -74,15 +74,23 @@ fn erase_destroys_the_dek_and_shreds_the_row_and_records_the_ledger() {
     );
 
     assert!(
-        slot.pseudonyms().mapping_of(&s, &subject).is_none(),
+        slot.pseudonyms()
+            .mapping_of(&s, &subject)
+            .expect("the mapping directory remains readable")
+            .is_none(),
         "the pseudonym-map row is shredded"
     );
     assert!(
-        slot.pseudonyms().resolve_subject(&s, &subject).is_none(),
+        slot.pseudonyms()
+            .resolve_subject(&s, &subject)
+            .expect("the sealed identity directory remains readable")
+            .is_none(),
         "the subject's real identity is unrecoverable (the DEK is crypto-shredded)"
     );
     assert!(
-        slot.erasure_ledger().is_erased(&s, &subject),
+        slot.erasure_ledger()
+            .is_erased(&s, &subject)
+            .expect("the erasure ledger remains readable"),
         "the erasure is written to the PII-free ledger (10.8)"
     );
 }
@@ -97,7 +105,11 @@ fn erased_subject_real_identity_unrecoverable_but_opaque_id_still_attributes() {
         .unwrap();
     slot.erase_in(&s, &subject, now()).unwrap();
 
-    assert!(slot.pseudonyms().resolve_subject(&s, &subject).is_none());
+    assert!(slot
+        .pseudonyms()
+        .resolve_subject(&s, &subject)
+        .expect("the sealed identity directory remains readable")
+        .is_none());
     let receipt = slot.erase_in(&s, &subject, now()).unwrap();
     assert_eq!(
         receipt.subject, subject,
@@ -197,7 +209,9 @@ fn re_erase_of_an_already_shredded_subject_is_a_noop_but_recorded() {
     );
     assert!(!second.row_shredded, "the row was already shredded (no-op)");
     assert!(
-        slot.erasure_ledger().is_erased(&s, &subject),
+        slot.erasure_ledger()
+            .is_erased(&s, &subject)
+            .expect("the erasure ledger remains readable"),
         "the subject is still recorded erased"
     );
 }
@@ -218,16 +232,28 @@ fn erase_is_tenant_scoped() {
     slot.erase_in(&acme, &subject, now()).unwrap();
 
     assert!(
-        slot.pseudonyms().mapping_of(&acme, &subject).is_none(),
+        slot.pseudonyms()
+            .mapping_of(&acme, &subject)
+            .expect("acme's mapping directory remains readable")
+            .is_none(),
         "acme's mapping is erased"
     );
     assert!(
-        slot.pseudonyms().mapping_of(&globex, &subject).is_some(),
+        slot.pseudonyms()
+            .mapping_of(&globex, &subject)
+            .expect("globex's mapping directory remains readable")
+            .is_some(),
         "globex's identically-named subject is untouched (the erase is tenant-scoped)"
     );
-    assert!(slot.erasure_ledger().is_erased(&acme, &subject));
+    assert!(slot
+        .erasure_ledger()
+        .is_erased(&acme, &subject)
+        .expect("acme's erasure ledger remains readable"));
     assert!(
-        !slot.erasure_ledger().is_erased(&globex, &subject),
+        !slot
+            .erasure_ledger()
+            .is_erased(&globex, &subject)
+            .expect("globex's erasure ledger remains readable"),
         "globex's subject is NOT in acme's erasure ledger"
     );
 }
