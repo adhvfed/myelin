@@ -177,9 +177,22 @@ fn emit_message_event(
     author: &str,
     thread_root_id: Option<&MessageId>,
 ) -> Result<()> {
+    let draft = message_event_draft(event_type, conv, message_id, author, thread_root_id)?;
+    tx.emit(draft, None)
+        .map_err(|e| StoreError::Cold(format!("outbox emit {event_type}: {e:?}")))?;
+    Ok(())
+}
+
+pub(crate) fn message_event_draft(
+    event_type: &str,
+    conv: &ConversationId,
+    message_id: &MessageId,
+    author: &str,
+    thread_root_id: Option<&MessageId>,
+) -> Result<EventDraft> {
     let subject = crate::subs::mint_message(&conv.tenant, message_id.as_str())
         .map_err(|e| StoreError::Cold(format!("mint message #sub anchor: {e}")))?;
-    let draft = EventDraft {
+    Ok(EventDraft {
         type_: EventType(event_type.to_string()),
         subject,
         aggregate: crate::events::channel_aggregate(&conv.conversation_id),
@@ -193,10 +206,7 @@ fn emit_message_event(
         visibility: Visibility::Internal,
         contains_personal_data: false,
         pii_key_ref: None,
-    };
-    tx.emit(draft, None)
-        .map_err(|e| StoreError::Cold(format!("outbox emit {event_type}: {e:?}")))?;
-    Ok(())
+    })
 }
 
 pub fn emit_erased_tombstone(

@@ -1720,13 +1720,36 @@ New Chat bodies now select the typed `Chat` subject-key scope. Decryption accept
 both that scope and the legacy unscoped class, but explicitly rejects another
 product's scoped key. The erasure cascade uses the same typed selector. This is
 only a safe cryptographic seam—not a claim that the existing in-memory cascade is
-a production holder. The misleading PostgreSQL-labelled cascade test still needs
-replacement with a real `PgMessageStore` erase story before Chat can join the
-public privacy certificate.
+a production holder.
 
 Proof: the real PostgreSQL subject-key and existing cascade tests; focused Chat
 contracts; warning-free all-target, all-feature Chat, Edge, and Storage Clippy;
 and 13 live Chat/privacy system journeys in 129.31 seconds.
+
+## 2026-08-25 — Chat message erasure reaches its authoritative store
+
+The PostgreSQL-labelled Chat cascade test was not an integration test. It put
+ciphertext in a one-off table, then invoked the cascade against a different
+`MemHotTier`; no production message row was ever mutated. That test is gone.
+
+`PgMessageStore` now owns an async authored-message erasure operation. In one
+tenant-scoped PostgreSQL transaction it empties both encrypted body columns,
+moves every live message by the pseudonymous author to `tombstoned`, and
+co-commits one `chat.message.erased` envelope per message. Its API returns only
+the count it can prove. A retry sees no live authored messages and emits no
+duplicate consequence.
+
+The replacement story writes two encrypted messages for Ada across two rooms
+and a neighbouring message for Bob using the production schema. It proves that
+only Ada's rows become empty tombstones, Bob's body still decrypts, exactly two
+durable erasure events exist, and retry is quiet. A second story deliberately
+gives two different tombstones the same event identity; the outbox rejects it
+and PostgreSQL restores both message bodies. This closes the storage/event
+atomicity seam, but the key, restore ledger, read state, and public DSR request
+still need one durable orchestration boundary.
+
+Proof: the two-case real PostgreSQL Chat erasure story (0.53 seconds) and
+warning-free all-target, all-feature Chat Clippy.
 
 ## known gaps (honest list, in priority order)
 
@@ -1734,15 +1757,17 @@ and 13 live Chat/privacy system journeys in 129.31 seconds.
    agent-data erase now writes the post-PIT ledger and the re-erase pass is
    drilled against a real dump. the maintenance command and runbook replay it
    through the production holder and restore the absorbing processing block.
-   remaining: Chat now has a scoped key and ledger vocabulary, but its cascade
-   still targets memory rather than `PgMessageStore`; Issues and Git crypto-shred
-   likewise do not write the ledger because none is wired to a user surface yet
-   (gap 2).
+   remaining: Chat now has a scoped key, ledger vocabulary, and real message
+   tombstone/event transaction, but no durable orchestration across that
+   transaction, key destruction, read state, and restore replay; Issues and Git
+   crypto-shred likewise do not write the ledger because none is wired to a user
+   surface yet (gap 2).
 2. **DSR has one truthful product slice, not full holder coverage.** durable
    submit/status/certificate is now wired for the real agent-data holder and
-   exercised through Edge. chat/issues/git erasure flows still exist as
-   in-memory tested code only, so they are deliberately absent from the public
-   certificate rather than being represented by ceremonial receipts.
+   exercised through Edge. Chat has one real PostgreSQL mutation seam but not a
+   complete durable holder; Issues and Git erasure remain library-only. They are
+   deliberately absent from the public certificate rather than being
+   represented by ceremonial receipts.
 3. **multi-tenant machine storms can still exhaust the general dispatch
    pool.** the human lane holds per tenant and against well-behaved machine
    traffic; a coordinated cross-tenant storm of requests that lie about

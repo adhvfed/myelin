@@ -14,6 +14,7 @@ use super::{
 use super::{NewMessage, TombstoneReason};
 
 mod append;
+mod erase;
 mod thread;
 mod thread_notification;
 
@@ -84,6 +85,12 @@ pub struct PgMessageStore {
     pool: PgPool,
     region: String,
     table: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoredMessageEraseReceipt {
+    pub messages_tombstoned: u64,
+    pub erasure_events_co_committed: u64,
 }
 
 impl PgMessageStore {
