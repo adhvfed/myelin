@@ -1521,6 +1521,31 @@ Chat/Edge clippy across all targets and features; TypeScript typechecking; the
 focused red-to-green lifecycle story; and all eleven live Chat collaboration
 stories together.
 
+## 2026-08-25 — the CI completion path has names again
+
+The durable CI completion path no longer hides dispatch, legacy test driving,
+pricing, receipt derivation, and retry accrual inside one roughly 3,000-line
+module. Each concern now has a narrow module and the original facade preserves
+the existing API. The production settlement/reporter core has fallen to 1,857
+lines without moving tests into production or weakening any claim fence. A
+reader can inspect how a dispatch is made, how a replay receipt binds a claim,
+or how retry usage is accumulated without first understanding the other two.
+
+The split also found a real refusal-path bug. Tier-P settlement validation
+recomputed the pinned CPU and memory prices with unchecked `u64`
+multiplication. A malformed pricing implementation and large-but-durable usage
+could therefore panic in a debug build or wrap in an optimized one. Expected
+prices are now checked arithmetic; unpriceable usage returns the existing
+`InvalidOutput` refusal. A regression uses `i64::MAX` CPU seconds to pin that
+fail-closed behavior.
+
+Proof: all 603 CI control-plane library tests and warning-free all-target,
+all-feature Clippy; both real PostgreSQL pipeline culmination stories; all 27
+atomic terminal-accounting scenarios; and the focused eight-story live retry
+and race subset. The latter covers exact requeue, router handoff, budget
+exhaustion, unresolved phases, retry-versus-phase races, cancellation usage,
+and retry-versus-supersession ordering.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
