@@ -4,6 +4,23 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — principal-directory reads cannot panic or masquerade as absence
+
+The principal store exposed fallible `try_*` reads beside convenience methods that panicked on the
+same PostgreSQL and corrupt-row failures. That doubled the API, made the unsafe spelling shorter,
+and left every new caller one easy choice away from crashing an authentication or privacy path.
+
+There is now one unsurprising API per read: point lookup, tenant scan, profile-erasure key lookup,
+and credential resolution all return `Result`, with absence represented only inside the successful
+value. Production callers, integration tools, and tests use those same names and must decide how an
+outage reaches their boundary. The obsolete panic wrappers and their `try_` twins are gone.
+
+**Proof:** all 425 identity library cases; warning-free all-target/all-feature Identity and Edge
+clippy; all eight real-PostgreSQL durable-identity journeys, with one closed pool proving that all
+four reads return storage errors rather than absence or a panic; restarted Edge; and the two live
+private-agent-thread journeys, including fresh-context resumption and real OpenSSH workspace access
+(7.82 seconds total).
+
 ## 2026-08-26 — SSH authentication fails closed when its identity directory is down
 
 The durable SSH key adapter was the lone identity authenticator still using a legacy convenience

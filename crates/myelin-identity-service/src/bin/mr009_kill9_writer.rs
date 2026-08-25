@@ -278,6 +278,7 @@ async fn identity_family(
 
     let row = pstore
         .get_principal(&s, &alice)
+        .map_err(|e| format!("get_principal: {e}"))?
         .ok_or_else(|| "principal row not durable across kill-9".to_string())?;
     let profile = pstore
         .get_profile(&s, &alice)

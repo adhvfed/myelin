@@ -219,6 +219,7 @@ mod tests {
         assert!(matches!(result, Err(BootstrapError::BadParam(_))));
         assert!(store
             .get_principal(&scope(), &PrincipalId("founder".into()))
+            .expect("the unchanged in-memory directory remains readable")
             .is_none());
         assert!(tuples
             .tuples_in(&scope())

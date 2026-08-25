@@ -184,6 +184,7 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
 
     let read = pstore2
         .get_principal(&s, &alice)
+        .expect("the principal directory read succeeds")
         .expect("the principal row is durable across a fresh instance");
     assert_eq!(read.principal_id, alice);
     assert_eq!(read.kind, PrincipalKind::Human);
@@ -194,7 +195,10 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         "the erasable profile_ref persists (ciphertext durable)"
     );
     assert_eq!(
-        pstore2.principals_in(&s).len(),
+        pstore2
+            .principals_in(&s)
+            .expect("the principal directory scan succeeds")
+            .len(),
         2,
         "both the human + service principals are durable"
     );
@@ -274,7 +278,7 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ssh_key_lookup_reports_a_closed_identity_pool_without_panicking() {
+async fn every_principal_directory_read_reports_a_closed_pool_without_panicking() {
     let admin = common::admin_provider(2).await;
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
@@ -288,10 +292,39 @@ async fn ssh_key_lookup_reports_a_closed_identity_pool_without_panicking() {
         DurablePrincipalBacking::new(app.clone()),
         tokio::runtime::Handle::current(),
     );
-    let bindings = PrincipalStoreKeyBindings::new(store, scope("ssh-outage", &region));
+    let directory_scope = scope("identity-outage", &region);
+    let bindings = PrincipalStoreKeyBindings::new(store.clone(), directory_scope.clone());
 
     app.db_pool().close().await;
 
+    assert!(
+        matches!(
+            store.get_principal(&directory_scope, &PrincipalId("p:alice".into())),
+            Err(PrincipalError::Storage(_))
+        ),
+        "a point read makes the directory outage explicit"
+    );
+    assert!(
+        matches!(
+            store.principals_in(&directory_scope),
+            Err(PrincipalError::Storage(_))
+        ),
+        "a directory scan cannot mistake the outage for an empty tenant"
+    );
+    assert!(
+        matches!(
+            store.profile_shred_key(&directory_scope, &PrincipalId("p:alice".into())),
+            Err(PrincipalError::Storage(_))
+        ),
+        "an erasure-key lookup cannot mistake the outage for missing key material"
+    );
+    assert!(
+        matches!(
+            store.resolve_credential(&directory_scope, "oidc", "alice"),
+            Err(PrincipalError::Storage(_))
+        ),
+        "credential resolution cannot mistake the outage for an unknown person"
+    );
     assert_eq!(
         bindings.resolve("SHA256:registered-before-the-outage"),
         Err(KeyBindingLookupError::Unavailable),
@@ -351,7 +384,7 @@ async fn corrupt_durable_principal_fields_never_become_identity_authority() {
             .expect("the drill corrupts one durable identity field");
 
         assert_eq!(
-            store.try_resolve_credential(&tenant_scope, "oidc", "alice"),
+            store.resolve_credential(&tenant_scope, "oidc", "alice"),
             Err(PrincipalError::CorruptPrincipal { field: column }),
             "an invalid {column} fails closed at the credential-to-authority boundary"
         );
@@ -378,7 +411,7 @@ async fn corrupt_durable_principal_fields_never_become_identity_authority() {
     .expect("the drill corrupts the encrypted profile reference");
 
     assert_eq!(
-        store.try_resolve_credential(&tenant_scope, "oidc", "alice"),
+        store.resolve_credential(&tenant_scope, "oidc", "alice"),
         Err(PrincipalError::CorruptPrincipal {
             field: "profile_key_ref"
         }),
@@ -533,7 +566,10 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         .expect("tenant A tuple write");
 
     assert_eq!(
-        pstore.principals_in(&sa).len(),
+        pstore
+            .principals_in(&sa)
+            .expect("read tenant A's principal partition")
+            .len(),
         1,
         "tenant A sees its principal"
     );
@@ -547,11 +583,17 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
     );
 
     assert!(
-        pstore.get_principal(&sb, &alice).is_none(),
+        pstore
+            .get_principal(&sb, &alice)
+            .expect("read tenant B's principal partition")
+            .is_none(),
         "tenant B cannot see tenant A's principal (RLS via with_tenant_tx)"
     );
     assert!(
-        pstore.principals_in(&sb).is_empty(),
+        pstore
+            .principals_in(&sb)
+            .expect("scan tenant B's principal partition")
+            .is_empty(),
         "tenant B's principal partition is empty"
     );
     assert!(
@@ -581,11 +623,13 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         .expect("link a verified credential to an existing principal");
     let resolved = pstore
         .resolve_credential(&sa, "oidc", "sub-alice")
+        .expect("the credential directory read succeeds")
         .expect("the credential resolves to its principal");
     assert_eq!(resolved.principal_id, alice);
     assert!(
         pstore
             .resolve_credential(&sb, "oidc", "sub-alice")
+            .expect("tenant B's credential directory remains readable")
             .is_none(),
         "a credential verified for tenant A never resolves into tenant B's directory"
     );

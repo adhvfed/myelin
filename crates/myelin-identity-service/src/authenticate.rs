@@ -274,7 +274,7 @@ impl HumanSsoAuthenticator {
 
         let row = self
             .store
-            .try_resolve_credential(&scope, &assertion.scheme, &assertion.subject_key)
+            .resolve_credential(&scope, &assertion.scheme, &assertion.subject_key)
             .map_err(|e| {
                 AuthzError::FailClosed(format!(
                     "identity directory lookup failed for verified `{}` credential - fail-closed: {e}",

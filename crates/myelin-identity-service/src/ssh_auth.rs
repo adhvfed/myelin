@@ -347,7 +347,7 @@ impl KeyBindingResolver for PrincipalStoreKeyBindings {
     fn resolve(&self, fingerprint: &str) -> KeyBindingLookup {
         let row = self
             .store
-            .try_resolve_credential(&self.scope, scheme::SSH, fingerprint)?;
+            .resolve_credential(&self.scope, scheme::SSH, fingerprint)?;
         Ok(row.map(|row| RegisteredKey {
             tenant: row.tenant,
             region: row.region,

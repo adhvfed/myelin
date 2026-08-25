@@ -78,6 +78,7 @@ async fn principal_store_with_pg_write_succeeds_after_the_aggregate_boot() {
 
     let read = PrincipalStore::with_pg(kms, DurablePrincipalBacking::new(app.clone()), handle)
         .get_principal(&s, &alice)
+        .expect("the principal directory read succeeds")
         .expect("the principal row is durable");
     assert_eq!(read.principal_id, alice);
     assert_eq!(read.kind, PrincipalKind::Human);

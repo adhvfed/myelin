@@ -563,8 +563,8 @@ impl CapabilityAuthenticator {
             // binding would turn either flow back into long-lived API-key provisioning.
             CredentialPurpose::HumanSession | CredentialPurpose::AgentRun { .. } => self
                 .store
-                .try_get_principal(&scope, &PrincipalId(token.subject_key.clone())),
-            _ => self.store.try_resolve_credential(
+                .get_principal(&scope, &PrincipalId(token.subject_key.clone())),
+            _ => self.store.resolve_credential(
                 &scope,
                 credential.scheme.as_str(),
                 &token.subject_key,

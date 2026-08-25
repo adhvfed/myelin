@@ -670,7 +670,7 @@ fn active_delegator(
     id: &PrincipalId,
 ) -> Result<Principal, EdgeError> {
     let row = principals
-        .try_get_principal(scope, id)
+        .get_principal(scope, id)
         .map_err(|_| EdgeError::Unavailable("agent delegator lookup is unavailable".into()))?
         .ok_or_else(|| EdgeError::NotFound("agent run not found".into()))?;
     let principal = Principal::new(
@@ -725,7 +725,7 @@ impl GateApproverPolicy for CreatorApproverPolicy {
             .ok_or_else(|| format!("tool `{tool}` has no registered Edge approval policy"))?;
         let row = self
             .principals
-            .try_get_principal(&self.scope, &self.creator_id)
+            .get_principal(&self.scope, &self.creator_id)
             .map_err(|error| format!("approver lookup unavailable: {error}"))?;
         let Some(row) = row else {
             return Ok(Vec::new());

@@ -398,7 +398,7 @@ impl PrincipalStore {
         Ok((key_ref, EncryptedProfile { nonce, ciphertext }))
     }
 
-    pub fn try_get_principal(
+    pub fn get_principal(
         &self,
         scope: &TenantScope,
         principal_id: &PrincipalId,
@@ -419,15 +419,6 @@ impl PrincipalStore {
                 .map(|drow| Self::durable_to_row(scope, drow))
                 .transpose(),
         }
-    }
-
-    pub fn get_principal(
-        &self,
-        scope: &TenantScope,
-        principal_id: &PrincipalId,
-    ) -> Option<PrincipalRow> {
-        self.try_get_principal(scope, principal_id)
-            .unwrap_or_else(|e| panic!("principal store: principal read failed loud: {e}"))
     }
 
     pub fn get_profile(
@@ -503,24 +494,12 @@ impl PrincipalStore {
         &self,
         scope: &TenantScope,
         principal_id: &PrincipalId,
-    ) -> Option<PiiKeyRef> {
-        self.try_profile_shred_key(scope, principal_id)
-            .unwrap_or_else(|e| panic!("principal store: erasure-key lookup failed loud: {e}"))
-    }
-
-    pub fn try_profile_shred_key(
-        &self,
-        scope: &TenantScope,
-        principal_id: &PrincipalId,
     ) -> Result<Option<PiiKeyRef>, PrincipalError> {
-        self.try_get_principal(scope, principal_id)
+        self.get_principal(scope, principal_id)
             .map(|row| row.and_then(|r| r.profile_ref.map(|pr| pr.key_ref)))
     }
 
-    pub fn try_principals_in(
-        &self,
-        scope: &TenantScope,
-    ) -> Result<Vec<PrincipalRow>, PrincipalError> {
+    pub fn principals_in(&self, scope: &TenantScope) -> Result<Vec<PrincipalRow>, PrincipalError> {
         let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -539,11 +518,6 @@ impl PrincipalStore {
                 .map(|drow| Self::durable_to_row(scope, drow))
                 .collect(),
         }
-    }
-
-    pub fn principals_in(&self, scope: &TenantScope) -> Vec<PrincipalRow> {
-        self.try_principals_in(scope)
-            .unwrap_or_else(|e| panic!("principal store: principal scan failed loud: {e}"))
     }
 
     pub fn link_credential(
@@ -594,7 +568,7 @@ impl PrincipalStore {
         }
     }
 
-    pub fn try_resolve_credential(
+    pub fn resolve_credential(
         &self,
         scope: &TenantScope,
         scheme: &str,
@@ -630,16 +604,6 @@ impl PrincipalStore {
                 .map(|drow| Self::durable_to_row(scope, drow))
                 .transpose(),
         }
-    }
-
-    pub fn resolve_credential(
-        &self,
-        scope: &TenantScope,
-        scheme: &str,
-        subject_key: &str,
-    ) -> Option<PrincipalRow> {
-        self.try_resolve_credential(scope, scheme, subject_key)
-            .unwrap_or_else(|e| panic!("principal store: credential lookup failed loud: {e}"))
     }
 
     fn link_key(scheme: &str, subject_key: &str) -> String {
@@ -790,7 +754,7 @@ mod tests {
         );
 
         let read = store
-            .try_get_principal(&s, &PrincipalId("p:alice".into()))
+            .get_principal(&s, &PrincipalId("p:alice".into()))
             .expect("principal directory read succeeds")
             .expect("the row round-trips under the same scope");
         assert_eq!(
@@ -800,14 +764,12 @@ mod tests {
         assert_eq!(read.kind, PrincipalKind::Human);
         assert_eq!(read.status, PrincipalStatus::Active);
         assert_eq!(
-            store
-                .try_principals_in(&s)
-                .expect("directory scan succeeds"),
+            store.principals_in(&s).expect("directory scan succeeds"),
             vec![written.clone()]
         );
         assert_eq!(
             store
-                .try_profile_shred_key(&s, &PrincipalId("p:alice".into()))
+                .profile_shred_key(&s, &PrincipalId("p:alice".into()))
                 .expect("erasure-key read succeeds"),
             written.profile_ref.map(|profile| profile.key_ref)
         );
@@ -832,14 +794,24 @@ mod tests {
         assert!(
             store
                 .get_principal(&globex, &PrincipalId("p:alice".into()))
+                .expect("globex's principal partition remains readable")
                 .is_none(),
             "no cross-tenant read path: globex cannot see acme's principal"
         );
         assert!(
-            store.principals_in(&globex).is_empty(),
+            store
+                .principals_in(&globex)
+                .expect("globex's principal partition remains readable")
+                .is_empty(),
             "globex's partition is empty"
         );
-        assert_eq!(store.principals_in(&acme).len(), 1);
+        assert_eq!(
+            store
+                .principals_in(&acme)
+                .expect("acme's principal partition remains readable")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -860,10 +832,17 @@ mod tests {
         assert!(
             store
                 .get_principal(&us, &PrincipalId("p:alice".into()))
+                .expect("the us-east principal partition remains readable")
                 .is_none(),
             "residency partition: the us-east partition cannot see the eu-west principal"
         );
-        assert_eq!(store.principals_in(&eu).len(), 1);
+        assert_eq!(
+            store
+                .principals_in(&eu)
+                .expect("the eu-west principal partition remains readable")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -893,6 +872,7 @@ mod tests {
 
         let key_ref = store
             .profile_shred_key(&s, &PrincipalId("p:alice".into()))
+            .expect("the principal directory read succeeds")
             .expect("a profiled principal has a shred key");
         assert_eq!(
             key_ref.class,
@@ -922,7 +902,8 @@ mod tests {
             .unwrap();
         let alice_ref = store
             .profile_shred_key(&s, &PrincipalId("p:alice".into()))
-            .unwrap();
+            .expect("alice's erasure-key lookup succeeds")
+            .expect("alice has a profile key");
         store
             .put_principal(
                 &s,
@@ -935,7 +916,8 @@ mod tests {
             .unwrap();
         let bob_ref = store
             .profile_shred_key(&s, &PrincipalId("p:bob".into()))
-            .unwrap();
+            .expect("bob's erasure-key lookup succeeds")
+            .expect("bob has a profile key");
 
         assert_ne!(
             alice_ref.class, bob_ref.class,
@@ -1044,7 +1026,8 @@ mod tests {
             .unwrap();
         let key_ref = store
             .profile_shred_key(&s, &PrincipalId("p:alice".into()))
-            .unwrap();
+            .expect("the erasure-key lookup succeeds")
+            .expect("alice has a profile key");
         let dek_id = myelin_storage::DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
         assert!(
             store.kms.destroy_dek(&dek_id).unwrap(),
@@ -1059,6 +1042,7 @@ mod tests {
         assert!(
             store
                 .get_principal(&s, &PrincipalId("p:alice".into()))
+                .expect("the principal directory remains readable after profile erasure")
                 .is_some(),
             "the opaque principal_id row survives the profile shred (immutable attribution)"
         );
@@ -1100,7 +1084,9 @@ mod tests {
                 Some(&profile("alice@acme.test", "Alice")),
             )
             .unwrap();
-        let rows = store.principals_in(&s);
+        let rows = store
+            .principals_in(&s)
+            .expect("the principal directory scan succeeds");
         assert_eq!(
             rows.len(),
             2,
@@ -1179,7 +1165,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .try_resolve_credential(&scope, "agent", "human:mcp-operator")
+                .resolve_credential(&scope, "agent", "human:mcp-operator")
                 .expect("credential directory read succeeds")
                 .unwrap()
                 .principal_id,
@@ -1187,7 +1173,7 @@ mod tests {
         );
         assert!(
             store
-                .try_resolve_credential(&scope, "agent", "missing")
+                .resolve_credential(&scope, "agent", "missing")
                 .expect("an absent link is not a read fault")
                 .is_none(),
             "a genuine absence remains distinguishable from storage failure"

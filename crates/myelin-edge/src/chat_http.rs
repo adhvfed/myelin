@@ -638,7 +638,7 @@ impl DurableChatMutationApi {
         let scope = TenantScope::from_verified_token(actor, actor.region.clone());
         let row = self
             .principals
-            .try_get_principal(&scope, principal_id)
+            .get_principal(&scope, principal_id)
             .map_err(|error| {
                 EdgeError::Internal(format!("Chat mention directory lookup failed: {error}"))
             })?
