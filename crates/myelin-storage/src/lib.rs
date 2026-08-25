@@ -62,6 +62,7 @@ pub mod pg;
 pub mod pg_migrator;
 pub mod pgrelay;
 pub mod placement_durable;
+pub mod post_restore_agent_data;
 pub mod privacy_request_durable;
 pub mod provider;
 pub mod pseudonym_durable;
@@ -298,6 +299,9 @@ pub use placement_durable::{
     cell_value_invariant_migrations, placement_durable_migrations, DurableCellProvisioningRow,
     DurableCellRow, DurableLocalTenantRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
     DurablePlacementBacking, DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
+};
+pub use post_restore_agent_data::{
+    PostRestoreAgentDataError, PostRestoreAgentDataReEraser, PostRestoreAgentDataReport,
 };
 pub use privacy_request_durable::{
     agent_data_holder_receipts, privacy_request_durable_migrations, ClaimPrivacyRequestOutcome,

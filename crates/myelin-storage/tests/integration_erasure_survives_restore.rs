@@ -18,13 +18,11 @@ use std::process::Command;
 use std::sync::Arc;
 
 use myelin_config::MyelinConfig;
-use myelin_storage::reerase::ReErasePass;
 use myelin_storage::reerase_durable::DurablePostPitLedger;
-use myelin_storage::restore::{ReindexFromSource, RestoreReport, SourceLog};
 use myelin_storage::{
-    all_durable_migrations, AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore,
-    DurableKmsBacking, EraseError, EraseHolders, HotTables, KeyClass, KmsError, PiiKeyRef, SealKey,
-    SubstrateProvider,
+    all_durable_migrations, AgentTraceError, AgentTraceSubjectState, AgentTraceWrite,
+    AgentTraceWriter, DurableAgentTraceStore, DurableKmsBacking, HotTables, KeyClass, KmsError,
+    PiiKeyRef, PostRestoreAgentDataReEraser, SealKey, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -105,50 +103,6 @@ fn trace(run_id: &str) -> AgentTraceWrite {
             }]
         }),
         charged_micro: 42,
-    }
-}
-
-// The drill's scope is the KMS tier: the per-subject DEK must stay destroyed
-// across a restore. The holder fan-out (search purge, refs tombstones, bus
-// PII) has its own drills; here each holder is a recorded no-op.
-struct NoopHolder;
-
-impl myelin_storage::PseudonymShred for NoopHolder {
-    fn shred_pseudonym(
-        &self,
-        _s: &myelin_storage::SubjectId,
-        _t: &TenantId,
-    ) -> Result<(), EraseError> {
-        Ok(())
-    }
-}
-impl myelin_storage::SearchPurge for NoopHolder {
-    fn purge_and_reindex(
-        &self,
-        _s: &myelin_storage::SubjectId,
-        _t: &TenantId,
-    ) -> Result<(), EraseError> {
-        Ok(())
-    }
-}
-impl myelin_storage::RefsTombstone for NoopHolder {
-    fn tombstone(&self, _s: &myelin_storage::SubjectId, _t: &TenantId) -> Result<(), EraseError> {
-        Ok(())
-    }
-}
-impl myelin_storage::BusErase for NoopHolder {
-    fn erase_inline_pii(
-        &self,
-        _s: &myelin_storage::SubjectId,
-        _t: &TenantId,
-    ) -> Result<(), EraseError> {
-        Ok(())
-    }
-}
-impl myelin_storage::ErasureLedgerSink for NoopHolder {
-    fn record_erasure(&self, _s: &myelin_storage::SubjectId, _t: &TenantId, _at: u64) {}
-    fn is_erased(&self, _s: &myelin_storage::SubjectId, _t: &TenantId) -> bool {
-        false
     }
 }
 
@@ -252,10 +206,12 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
     let scratch_provider = SubstrateProvider::connect(scratch_config, 2)
         .await
         .expect("connect to the restored scratch database");
-    let scratch_kms = DurableKmsBacking::new(scratch_provider.db_pool().clone(), cell.clone())
-        .load_or_generate(&seal_key)
-        .await
-        .expect("the restored KMS state loads under the same seal key");
+    let scratch_kms = Arc::new(
+        DurableKmsBacking::new(scratch_provider.db_pool().clone(), cell.clone())
+            .load_or_generate(&seal_key)
+            .await
+            .expect("the restored KMS state loads under the same seal key"),
+    );
 
     // THE TEETH: the restore genuinely resurrects the erased subject. If this
     // assertion ever starts failing, the drill has gone vacuous - fix the
@@ -265,44 +221,56 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
          exposure the re-erase pass exists to close",
     );
 
-    // 5. replay the live post-PIT erasure ledger against the restored
-    //    database; the subject must be unreadable again.
+    // 5. replay the live post-PIT ledger through the production holder in the
+    //    restored database. This must restore both key destruction and the
+    //    absorbing subject marker that refuses future processing.
     let ledger = DurablePostPitLedger::new(provider.clone());
-    let noop = NoopHolder;
-    let holders = EraseHolders {
-        pseudonym: &noop,
-        search: &noop,
-        refs: &noop,
-        bus: &noop,
-        ledger: &noop,
-        git_reach: None,
-    };
-    let report = RestoreReport {
-        restored_to_offset: pit_secs,
-        oltp_rows: vec![],
-        derived: ReindexFromSource::reindex(&SourceLog::new(), 0),
-        restored_keys: vec![],
-        dangling_ref_count: 0,
-    };
-    let pass = ReErasePass::new(&scratch_kms, region.clone());
-    let re_erase =
-        tokio::task::block_in_place(|| pass.run(&report, &ledger, &holders, now_secs() * 1000))
-            .expect("the re-erase pass completes against the restored database");
-
-    assert!(
-        re_erase.re_erased_subject(&myelin_storage::SubjectId::new("founder"), &tenant),
-        "the ledger replay re-erased the drill subject: {re_erase:?}"
+    let restored_holder = DurableAgentTraceStore::with_runtime(
+        scratch_provider.clone(),
+        tokio::runtime::Handle::current(),
+        scratch_kms.clone(),
     );
-    assert!(
-        re_erase.is_green(),
-        "no subject stays resurrected after the pass: {re_erase:?}"
-    );
+    let re_erase = PostRestoreAgentDataReEraser::new(ledger, restored_holder.clone())
+        .run(pit_secs)
+        .await
+        .expect("the production holder completes the post-restore re-erasure pass");
+    assert_eq!(re_erase.selected_subjects, 1);
+    assert_eq!(re_erase.newly_re_erased_subjects, 1);
+    assert_eq!(re_erase.already_erased_subjects, 0);
+    assert_eq!(re_erase.records_erased, 1);
     match scratch_kms.resolve_dek(&key_ref, &region) {
         Err(KmsError::DekUnavailable(_)) => {}
         other => panic!(
             "the restored subject DEK must be destroyed after the re-erase pass, got {other:?}"
         ),
     }
+    assert_eq!(
+        restored_holder
+            .summarize_subject(&tenant.0, "founder")
+            .await
+            .expect("read the restored holder state")
+            .state,
+        AgentTraceSubjectState::Erased,
+        "the restored database retains the absorbing erasure marker"
+    );
+    assert_eq!(
+        restored_holder
+            .write(&tenant, trace("66666666-6666-4666-8666-666666666666"))
+            .unwrap_err(),
+        AgentTraceError::Erased,
+        "post-restore work cannot silently mint a replacement subject key"
+    );
+    let replay = PostRestoreAgentDataReEraser::new(
+        DurablePostPitLedger::new(provider.clone()),
+        restored_holder,
+    )
+    .run(pit_secs)
+    .await
+    .expect("a fresh operator invocation safely resumes the same restore point");
+    assert_eq!(replay.selected_subjects, 1);
+    assert_eq!(replay.newly_re_erased_subjects, 0);
+    assert_eq!(replay.already_erased_subjects, 1);
+    assert_eq!(replay.records_erased, 1);
     let (leftover,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM kms_wrapped_dek WHERE tenant_id = $1 AND cell_id = $2",
     )

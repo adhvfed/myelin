@@ -76,7 +76,7 @@ impl DurablePostPitLedger {
         Ok(())
     }
 
-    async fn completed_after_async(
+    pub async fn completed_after(
         &self,
         pit: WalOffset,
     ) -> Result<Vec<ErasureRecord>, ProviderError> {
@@ -127,7 +127,7 @@ fn post_pit_row_decode(error: sqlx::Error) -> ProviderError {
 
 impl PostRestoreErasureLedger for DurablePostPitLedger {
     fn erasures_completed_after(&self, pit: WalOffset) -> Vec<ErasureRecord> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.completed_after_async(pit)))
+        tokio::task::block_in_place(|| self.rt.block_on(self.completed_after(pit)))
             .unwrap_or_else(|e| {
                 panic!(
                     "FAIL-STATIC: durable post-PIT erasure ledger read failed (an incomplete \
