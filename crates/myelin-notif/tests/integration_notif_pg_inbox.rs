@@ -195,6 +195,98 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         store.upsert(&critical_a).await.unwrap(),
         InboxUpsertOutcome::Collapsed { coalesce_count: 2 }
     );
+    let critical_scope = InboxReadScope {
+        tenant: tenant.clone(),
+        region: region.clone(),
+        recipient: recipient.into(),
+    };
+    store
+        .mark_read(&critical_scope, "crit-a")
+        .await
+        .expect("finish the first two collapsed events");
+    let mut later_critical = critical_a.clone();
+    later_critical.item.origin_event = ArtifactRef(format!(
+        "myelin://{}/bus/event/event-crit-a-later",
+        tenant.0
+    ));
+    later_critical.occurred_at = "2026-07-22T12:01:00Z".into();
+    assert_eq!(
+        store.upsert(&later_critical).await.unwrap(),
+        InboxUpsertOutcome::Collapsed { coalesce_count: 3 },
+    );
+    let reopened = store.get(&critical_scope, "crit-a").await.unwrap();
+    assert_eq!(
+        reopened.item.state, "unread",
+        "new activity returns a previously finished item to the user's attention",
+    );
+    assert_eq!(reopened.item.origin_event, later_critical.item.origin_event);
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&reopened.occurred_at).unwrap(),
+        chrono::DateTime::parse_from_rfc3339(&later_critical.occurred_at).unwrap(),
+    );
+
+    let critical_snooze_until = Utc::now()
+        .checked_add_signed(Duration::milliseconds(100))
+        .unwrap();
+    store
+        .snooze(&critical_scope, "crit-a", critical_snooze_until)
+        .await
+        .expect("park the collapsed item deliberately");
+    let mut while_snoozed = later_critical.clone();
+    while_snoozed.item.origin_event = ArtifactRef(format!(
+        "myelin://{}/bus/event/event-crit-a-snoozed",
+        tenant.0
+    ));
+    while_snoozed.occurred_at = "2026-07-22T12:02:00Z".into();
+    assert_eq!(
+        store.upsert(&while_snoozed).await.unwrap(),
+        InboxUpsertOutcome::Collapsed { coalesce_count: 4 },
+    );
+    let parked = store.get(&critical_scope, "crit-a").await.unwrap();
+    assert_eq!(parked.item.state, "snoozed");
+    let stored_snooze = chrono::DateTime::parse_from_rfc3339(
+        parked
+            .item
+            .snooze_until
+            .as_deref()
+            .expect("the explicit snooze remains scheduled"),
+    )
+    .unwrap();
+    assert_eq!(
+        stored_snooze.timestamp_micros(),
+        critical_snooze_until.timestamp_micros(),
+        "fresh activity respects an explicit snooze window at PostgreSQL precision",
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        store
+            .get(&critical_scope, "crit-a")
+            .await
+            .unwrap()
+            .item
+            .state,
+        "unread",
+        "the ordinary due-snooze path brings the accumulated activity back",
+    );
+
+    let mut late_critical = while_snoozed.clone();
+    late_critical.item.origin_event =
+        ArtifactRef(format!("myelin://{}/bus/event/event-crit-a-late", tenant.0));
+    late_critical.occurred_at = "2026-07-22T11:59:00Z".into();
+    assert_eq!(
+        store.upsert(&late_critical).await.unwrap(),
+        InboxUpsertOutcome::Collapsed { coalesce_count: 5 },
+    );
+    let after_late_arrival = store.get(&critical_scope, "crit-a").await.unwrap();
+    assert_eq!(
+        after_late_arrival.item.origin_event,
+        while_snoozed.item.origin_event
+    );
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&after_late_arrival.occurred_at).unwrap(),
+        chrono::DateTime::parse_from_rfc3339(&while_snoozed.occurred_at).unwrap(),
+        "late delivery counts as activity without moving the notification backward in time",
+    );
 
     let mut incompatible = critical_a.clone();
     incompatible.template_key = "git.pr.a-different-template".into();
@@ -276,10 +368,10 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
             .iter()
             .map(|item| item.item.item_id.as_str())
             .collect::<Vec<_>>(),
-        ["crit-b", "crit-a"],
+        ["crit-a", "crit-b"],
         "within one priority band the newest work must be visible first"
     );
-    assert_eq!(first.items[1].item.coalesce_count, 2);
+    assert_eq!(first.items[0].item.coalesce_count, 5);
 
     let newest_critical = store
         .list(&InboxReadRequest {
@@ -290,7 +382,7 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         })
         .await
         .unwrap();
-    assert_eq!(newest_critical.items[0].item.item_id, "crit-b");
+    assert_eq!(newest_critical.items[0].item.item_id, "crit-a");
     let older_critical = store
         .list(&InboxReadRequest {
             scope: scope.clone(),
@@ -301,7 +393,7 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         .await
         .unwrap();
     assert_eq!(
-        older_critical.items[0].item.item_id, "crit-a",
+        older_critical.items[0].item.item_id, "crit-b",
         "the recency cursor must neither skip nor repeat work within one priority band"
     );
 
@@ -352,7 +444,7 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
             .iter()
             .map(|item| item.item.item_id.as_str())
             .collect::<Vec<_>>(),
-        ["direct-a", "fyi-a", "crit-b", "crit-a"],
+        ["direct-a", "fyi-a", "crit-a", "crit-b"],
         "completed critical work must not bury lower-priority unread work"
     );
 
@@ -404,7 +496,7 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
             .iter()
             .map(|item| item.item.item_id.as_str())
             .collect::<Vec<_>>(),
-        ["fyi-a", "direct-a", "crit-b", "crit-a"],
+        ["fyi-a", "direct-a", "crit-a", "crit-b"],
         "unread work precedes read work before reason priority is considered"
     );
     assert_eq!(

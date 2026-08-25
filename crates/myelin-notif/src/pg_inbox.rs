@@ -36,7 +36,13 @@ const UPSERT_SQL: &str = "INSERT INTO notif_inbox_item (
  $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, 1, 'unread', NULL, $13, $14
 )
 ON CONFLICT (tenant_id, recipient, dedup_key) DO UPDATE
-SET coalesce_count = notif_inbox_item.coalesce_count + 1
+SET coalesce_count = notif_inbox_item.coalesce_count + 1,
+    state = CASE WHEN notif_inbox_item.state = 'snoozed' THEN 'snoozed' ELSE 'unread' END,
+    snooze_until = CASE WHEN notif_inbox_item.state = 'snoozed'
+                        THEN notif_inbox_item.snooze_until ELSE NULL END,
+    origin_event = CASE WHEN EXCLUDED.occurred_at >= notif_inbox_item.occurred_at
+                        THEN EXCLUDED.origin_event ELSE notif_inbox_item.origin_event END,
+    occurred_at = GREATEST(notif_inbox_item.occurred_at, EXCLUDED.occurred_at)
 WHERE notif_inbox_item.region = EXCLUDED.region
   AND notif_inbox_item.item_id = EXCLUDED.item_id
   AND notif_inbox_item.subject = EXCLUDED.subject

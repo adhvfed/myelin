@@ -80,7 +80,12 @@ impl InboxProjection {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.get_mut(&key) {
             Some(existing) => {
-                existing.coalesce_count += 1;
+                existing.coalesce_count = existing.coalesce_count.saturating_add(1);
+                existing.origin_event = item.origin_event;
+                if existing.state != "snoozed" {
+                    existing.state = "unread".into();
+                    existing.snooze_until = None;
+                }
             }
             None => {
                 item.coalesce_count = 1;
@@ -1024,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn same_key_signals_collapse_to_one_row_coalesce_count_bumps() {
+    fn new_activity_reopens_finished_work_but_respects_an_explicit_snooze() {
         let outbox = OutboxStore::new();
         let (consumer, inbox) = router_over(&outbox);
         let sig = signal(
@@ -1036,6 +1041,19 @@ mod tests {
         assert_eq!(
             consumer.deliver(&signal_msg("evt-a", &sig)),
             Delivered::Acked
+        );
+        let item_id = inbox
+            .get(
+                &tenant(),
+                "psn:watcher:ci_run_failed",
+                "ci_run_failed:run-42",
+            )
+            .expect("the first activity opens one inbox item")
+            .item_id;
+        assert!(
+            inbox.mutate_state(&tenant(), "psn:watcher:ci_run_failed", &item_id, |row| {
+                row.state = "read".into()
+            },)
         );
         assert_eq!(
             consumer.deliver(&signal_msg("evt-b", &sig)),
@@ -1054,9 +1072,62 @@ mod tests {
                 "ci_run_failed:run-42",
             )
             .unwrap();
+        assert_eq!(row.coalesce_count, 2);
         assert_eq!(
-            row.coalesce_count, 2,
-            "the second same-key Signal bumped coalesce_count to 2"
+            row.state, "unread",
+            "new work is not hidden behind read state"
+        );
+        assert_eq!(row.origin_event.0, "myelin://acme/bus/event/evt-b");
+
+        assert!(
+            inbox.mutate_state(&tenant(), "psn:watcher:ci_run_failed", &item_id, |row| {
+                row.state = "done".into()
+            },)
+        );
+        assert_eq!(
+            consumer.deliver(&signal_msg("evt-c", &sig)),
+            Delivered::Acked
+        );
+        let after_done = inbox
+            .get(
+                &tenant(),
+                "psn:watcher:ci_run_failed",
+                "ci_run_failed:run-42",
+            )
+            .unwrap();
+        assert_eq!(after_done.coalesce_count, 3);
+        assert_eq!(
+            after_done.state, "unread",
+            "new work reopens completed work"
+        );
+
+        assert!(
+            inbox.mutate_state(&tenant(), "psn:watcher:ci_run_failed", &item_id, |row| {
+                row.state = "snoozed".into();
+                row.snooze_until = Some("2026-06-21T00:00:00Z".into());
+            },)
+        );
+        assert_eq!(
+            consumer.deliver(&signal_msg("evt-d", &sig)),
+            Delivered::Acked
+        );
+        let snoozed = inbox
+            .get(
+                &tenant(),
+                "psn:watcher:ci_run_failed",
+                "ci_run_failed:run-42",
+            )
+            .unwrap();
+        assert_eq!(snoozed.coalesce_count, 4);
+        assert_eq!(snoozed.state, "snoozed");
+        assert_eq!(
+            snoozed.snooze_until.as_deref(),
+            Some("2026-06-21T00:00:00Z")
+        );
+        assert_eq!(
+            outbox.committed_count(),
+            1,
+            "collapsed activity updates one card without sending another push"
         );
     }
 
