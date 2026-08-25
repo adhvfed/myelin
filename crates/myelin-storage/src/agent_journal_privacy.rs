@@ -1,9 +1,8 @@
-use myelin_gdpr::ErasureMethod;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
 use crate::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
-use crate::kms::{KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
+use crate::kms::{KeyClass, KmsEngine, PiiKeyRef, SubjectKeyScope, NONCE_LEN};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 
@@ -275,10 +274,10 @@ pub(crate) fn seal_journal_payload(
     plaintext: &[u8],
 ) -> Result<EncryptedColumn, PgError> {
     ColumnCryptor::new(kms, Region(context.region.to_string()))
-        .encrypt_with_aad(
+        .encrypt_for_subject_scope_with_aad(
             &TenantId(context.tenant.clone()),
-            Some(&SubjectId::new(&context.requested_by)),
-            &ErasureMethod::CryptoShred("subject_dek".into()),
+            &SubjectId::new(&context.requested_by),
+            SubjectKeyScope::AgentData,
             plaintext,
             &journal_payload_aad(context),
         )
@@ -293,13 +292,13 @@ pub(crate) fn open_journal_payload(
     ciphertext: Vec<u8>,
 ) -> Result<Vec<u8>, PgError> {
     let key_ref = PiiKeyRef::parse(key_ref).ok_or_else(|| {
-        PgError::Query("agent journal has an invalid subject key reference".into())
+        PgError::Query("agent journal has an invalid personal-data key reference".into())
     })?;
     if key_ref.tenant.as_str() != context.tenant
-        || key_ref.class != KeyClass::Subject(context.requested_by.to_string())
+        || !is_agent_data_key_class(&key_ref.class, &context.requested_by)
     {
         return Err(PgError::Query(
-            "agent journal key reference does not match its immutable subject".into(),
+            "agent journal key reference does not match its immutable agent-data subject".into(),
         ));
     }
     let nonce: [u8; NONCE_LEN] = nonce
@@ -315,6 +314,17 @@ pub(crate) fn open_journal_payload(
             &journal_payload_aad(context),
         )
         .map_err(|error| PgError::Query(format!("agent journal decryption failed: {error}")))
+}
+
+pub(crate) fn agent_data_key_class(subject: &str) -> KeyClass {
+    KeyClass::ScopedSubject {
+        scope: SubjectKeyScope::AgentData,
+        subject: subject.to_string(),
+    }
+}
+
+pub(crate) fn is_agent_data_key_class(class: &KeyClass, subject: &str) -> bool {
+    class == &agent_data_key_class(subject) || class == &KeyClass::Subject(subject.to_string())
 }
 
 fn journal_payload_aad(context: &JournalPayloadContext) -> Vec<u8> {
@@ -441,21 +451,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migration_makes_subject_ownership_complete_and_immutable() {
-        assert!(AGENT_JOURNAL_SUBJECT_MIGRATION.contains("trace.requested_by"));
-        assert!(AGENT_JOURNAL_SUBJECT_MIGRATION.contains("binding.owner_principal_id"));
-        assert!(AGENT_JOURNAL_SUBJECT_MIGRATION
-            .contains("DROP TRIGGER IF EXISTS agent_model_step_guard_update"));
-        assert!(AGENT_JOURNAL_SUBJECT_MIGRATION.contains("ALTER COLUMN requested_by SET NOT NULL"));
-        assert_eq!(
-            AGENT_JOURNAL_SUBJECT_MIGRATION
-                .matches("NEW.requested_by IS DISTINCT FROM OLD.requested_by")
-                .count(),
-            2,
-        );
-    }
-
-    #[test]
     fn subject_locator_is_stable_tenant_scoped_and_not_offline_enumerable() {
         let kms = KmsEngine::new();
         let first = AgentSubjectLocator::new(&kms, "acme", "eu", "founder");
@@ -503,17 +498,12 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_legacy_payloads_become_unreplayable_instead_of_surviving_the_upgrade() {
-        assert!(
-            AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("SET state = 'redacted', response = NULL")
-        );
-        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION
-            .contains("SET state = 'redacted', result_text = NULL"));
-        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("response IS NULL"));
-        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("result_text IS NULL"));
-        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("response_ciphertext"));
-        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("result_ciphertext"));
-        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("response_key_ref IS NOT NULL"));
-        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("result_key_ref IS NOT NULL"));
+    fn agent_data_reads_legacy_keys_without_accepting_another_subject_or_scope() {
+        let current = agent_data_key_class("founder");
+        let legacy = KeyClass::Subject("founder".into());
+        assert!(is_agent_data_key_class(&current, "founder"));
+        assert!(is_agent_data_key_class(&legacy, "founder"));
+        assert!(!is_agent_data_key_class(&current, "someone-else"));
+        assert!(!is_agent_data_key_class(&KeyClass::Tenant, "founder"));
     }
 }

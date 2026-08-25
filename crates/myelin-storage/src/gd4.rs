@@ -51,7 +51,7 @@ impl DataClass {
 
 pub fn granularity_of_key_class(class: &KeyClass) -> KeyGranularity {
     match class {
-        KeyClass::Subject(_) => KeyGranularity::PerSubjectDek,
+        KeyClass::Subject(_) | KeyClass::ScopedSubject { .. } => KeyGranularity::PerSubjectDek,
         KeyClass::Tenant | KeyClass::Blob => KeyGranularity::PerTenantDek,
     }
 }

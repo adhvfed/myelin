@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use myelin_gdpr::{
-    DsrError, EraseReceipt, EraseScope, ErasureMethod, LocateReport, Patch, PersonalDataHolder,
-    PortableBundle, Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
+    DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
+    Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
 };
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
@@ -11,9 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 
-use crate::agent_journal_privacy::{agent_subject_status, AgentSubjectLocator, AgentSubjectStatus};
+use crate::agent_journal_privacy::{
+    agent_data_key_class, agent_subject_status, is_agent_data_key_class, AgentSubjectLocator,
+    AgentSubjectStatus,
+};
 use crate::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
-use crate::kms::{DekId, KekId, KeyClass, KmsEngine, KmsError, PiiKeyRef, NONCE_LEN};
+use crate::kms::{DekId, KekId, KmsEngine, KmsError, PiiKeyRef, SubjectKeyScope, NONCE_LEN};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
@@ -783,7 +786,7 @@ impl DurableAgentTraceStore {
             .await
             .map_err(|error| AgentTraceError::Storage(error.to_string()))?;
         let tenant = TenantId(tenant_id.clone());
-        let class = KeyClass::Subject(subject.clone());
+        let class = agent_data_key_class(&subject);
         let dek_id = DekId::new(tenant.clone(), class.clone());
         // record the erasure in the post-PIT ledger BEFORE destroying the key:
         // a destroyed-but-unrecorded erasure would be silently resurrected by
@@ -796,7 +799,7 @@ impl DurableAgentTraceStore {
             .await
             .map_err(|error| {
                 AgentTraceError::Storage(format!(
-                    "refusing to destroy the subject key before its erasure is durably \
+                    "refusing to destroy the agent-data subject key before its erasure is durably \
                      recorded in the post-PIT ledger: {error}"
                 ))
             })?;
@@ -809,12 +812,12 @@ impl DurableAgentTraceStore {
             Err(KmsError::DekUnavailable(_)) => {}
             Err(error) => {
                 return Err(AgentTraceError::Storage(format!(
-                    "could not verify subject key destruction: {error}"
+                    "could not verify agent-data subject key destruction: {error}"
                 )))
             }
             Ok(_) => {
                 return Err(AgentTraceError::Storage(
-                    "subject key still resolves after destruction".into(),
+                    "agent-data subject key still resolves after destruction".into(),
                 ))
             }
         }
@@ -895,7 +898,7 @@ impl DurableAgentTraceStore {
         };
 
         let tenant = TenantId(tenant_id);
-        let key_ref = PiiKeyRef::new(tenant, 0, KeyClass::Subject(subject));
+        let key_ref = PiiKeyRef::new(tenant, 0, agent_data_key_class(&subject));
         match self.kms.resolve_dek(&key_ref, &Region(region)) {
             Err(KmsError::DekUnavailable(_)) => {}
             Err(error) => {
@@ -905,7 +908,7 @@ impl DurableAgentTraceStore {
             }
             Ok(_) => {
                 return Err(AgentTraceError::Storage(
-                    "subject key resolves despite a completed erasure receipt".into(),
+                    "agent-data subject key resolves despite a completed erasure receipt".into(),
                 ))
             }
         }
@@ -1110,7 +1113,7 @@ impl PersonalDataHolder for DurableAgentTraceStore {
                     .map_err(|error| DsrError(error.to_string()))?;
                 if !erased.key_unrecoverable {
                     return Err(DsrError(
-                        "agent trace subject key still resolves after erasure".into(),
+                        "agent-data subject key still resolves after erasure".into(),
                     ));
                 }
                 Ok(EraseReceipt {
@@ -1616,10 +1619,10 @@ fn seal_trace(
     .map_err(|error| AgentTraceError::Storage(error.to_string()))?;
     let aad = trace_aad(&tenant.0, region, &trace.run_id, &artifact_ref.0);
     let encrypted = ColumnCryptor::new(kms, Region(region.to_string()))
-        .encrypt_with_aad(
+        .encrypt_for_subject_scope_with_aad(
             tenant,
-            Some(&SubjectId::new(&trace.requested_by)),
-            &ErasureMethod::CryptoShred("subject_dek".into()),
+            &SubjectId::new(&trace.requested_by),
+            SubjectKeyScope::AgentData,
             &payload,
             &aad,
         )
@@ -1657,7 +1660,7 @@ fn agent_trace_result_from_row(
             PiiKeyRef::parse(&value)
                 .ok_or_else(|| PgError::Query("agent trace has an invalid key reference".into()))
         })?;
-    if key_ref.tenant.as_str() != tenant || key_ref.class != KeyClass::Subject(requested_by.clone())
+    if key_ref.tenant.as_str() != tenant || !is_agent_data_key_class(&key_ref.class, &requested_by)
     {
         return Err(PgError::Query(
             "agent trace encryption scope does not match its attribution".into(),

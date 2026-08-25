@@ -5,7 +5,10 @@ use myelin_storage::agent_model_step::{
     AgentModelStepStore, ModelStepBegin, ModelStepCompletion, ModelStepError,
 };
 use myelin_storage::migration::HotTables;
-use myelin_storage::{all_durable_migrations, DurableKmsBacking, SealKey, SubstrateProvider};
+use myelin_storage::{
+    all_durable_migrations, DurableKmsBacking, KeyClass, PiiKeyRef, SealKey, SubjectKeyScope,
+    SubstrateProvider,
+};
 use myelin_tenancy::TenantId;
 use std::sync::Arc;
 
@@ -139,11 +142,16 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
         plaintext.is_none(),
         "the JSON response never rests in its legacy column"
     );
-    assert!(
+    assert_eq!(
         key_ref
             .as_deref()
-            .is_some_and(|value| value.contains("subject:founder")),
-        "the replay response is wrapped by the requesting human's subject key",
+            .and_then(PiiKeyRef::parse)
+            .map(|key| key.class),
+        Some(KeyClass::ScopedSubject {
+            scope: SubjectKeyScope::AgentData,
+            subject: "founder".into(),
+        }),
+        "the replay response has an independently erasable agent-data key",
     );
     assert_eq!(nonce.expect("the encrypted response has a nonce").len(), 12);
     let ciphertext = ciphertext.expect("the encrypted response has ciphertext");

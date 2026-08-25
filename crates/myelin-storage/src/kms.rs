@@ -18,9 +18,35 @@ pub const NONCE_LEN: usize = 12;
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
+pub enum SubjectKeyScope {
+    AgentData,
+}
+
+impl SubjectKeyScope {
+    pub const fn as_token(&self) -> &'static str {
+        match self {
+            Self::AgentData => "agent-data",
+        }
+    }
+
+    fn parse_token(token: &str) -> Option<Self> {
+        match token {
+            "agent-data" => Some(Self::AgentData),
+            _ => None,
+        }
+    }
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum KeyClass {
     Tenant,
     Subject(String),
+    ScopedSubject {
+        scope: SubjectKeyScope,
+        subject: String,
+    },
     Blob,
 }
 
@@ -29,6 +55,9 @@ impl KeyClass {
         match self {
             KeyClass::Tenant => "tenant".to_string(),
             KeyClass::Subject(id) => format!("subject:{id}"),
+            KeyClass::ScopedSubject { scope, subject } => {
+                format!("scoped-subject:{}:{subject}", scope.as_token())
+            }
             KeyClass::Blob => "blob".to_string(),
         }
     }
@@ -37,6 +66,16 @@ impl KeyClass {
         match s {
             "tenant" => Some(KeyClass::Tenant),
             "blob" => Some(KeyClass::Blob),
+            other if other.starts_with("scoped-subject:") => {
+                let (scope, subject) = other.strip_prefix("scoped-subject:")?.split_once(':')?;
+                if subject.is_empty() {
+                    return None;
+                }
+                Some(KeyClass::ScopedSubject {
+                    scope: SubjectKeyScope::parse_token(scope)?,
+                    subject: subject.to_string(),
+                })
+            }
             other => other.strip_prefix("subject:").and_then(|id| {
                 if id.is_empty() {
                     None
@@ -1186,6 +1225,15 @@ mod tests {
         assert_eq!(kr.to_uri(), "kms://acme/3/subject:u-42");
         let kr = PiiKeyRef::new(t("acme"), 7, KeyClass::Blob);
         assert_eq!(kr.to_uri(), "kms://acme/7/blob");
+        let kr = PiiKeyRef::new(
+            t("acme"),
+            4,
+            KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::AgentData,
+                subject: "u-42".into(),
+            },
+        );
+        assert_eq!(kr.to_uri(), "kms://acme/4/scoped-subject:agent-data:u-42");
     }
 
     #[test]
@@ -1193,6 +1241,7 @@ mod tests {
         for uri in [
             "kms://acme/0/tenant",
             "kms://acme/12/subject:u-99",
+            "kms://acme/4/scoped-subject:agent-data:u-99",
             "kms://acme/5/blob",
         ] {
             let kr = PiiKeyRef::parse(uri).expect("parses the canonical grammar");
@@ -1218,6 +1267,10 @@ mod tests {
         assert!(
             PiiKeyRef::parse("kms://acme/0/bogus").is_none(),
             "unknown class"
+        );
+        assert!(
+            PiiKeyRef::parse("kms://acme/0/scoped-subject:unknown:u-1").is_none(),
+            "unknown subject-key scopes are refused"
         );
         assert!(
             PiiKeyRef::parse("kms://acme/0/subject:").is_none(),

@@ -5,6 +5,7 @@ import { describe, expect, test } from "vitest";
 import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/context.js";
 import { awaitAuthorizedIssue } from "../src/issues.js";
 import { awaitAutomationFiring } from "../src/journeys/automations.js";
+import { Conversation } from "../src/journeys/chat.js";
 import { announceIssueChange } from "../src/journeys/issues.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import type { SystemTestClient } from "../src/client.js";
@@ -61,6 +62,18 @@ describe("a person's agent-data privacy lifecycle", () => {
       expectedStatus: 201,
     });
     const project = record(projectResponse.body.project, "private work project");
+    const conversation = await Conversation.open(person, {
+      projectId: string(project.id, "private work project id"),
+      channel: uniqueName("private-work"),
+      topic: "Work that must survive a narrow agent-data erasure",
+    });
+    const conversationMemory = uniqueName("Keep the migration plan in our private room");
+    const conversationMessageId = await conversation.post(person, conversationMemory);
+    expect(await conversation.messages(person)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: conversationMessageId, content: conversationMemory }),
+      ]),
+    );
     const issue = await createVisibleIssue(
       person,
       uniqueName("Private agent work"),
@@ -248,5 +261,19 @@ describe("a person's agent-data privacy lifecycle", () => {
     expect((await person.json("/v1/privacy/me/agent-data")).body).toMatchObject({
       agent_data: { state: "erased", recoverable_records: 0 },
     });
+
+    // A narrow privacy choice must not erase the person's work in another product.
+    expect(await conversation.messages(person)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: conversationMessageId, content: conversationMemory }),
+      ]),
+    );
+    const followUp = uniqueName("The private room remains useful after the agent forgets");
+    const followUpId = await conversation.post(person, followUp);
+    expect(await conversation.messages(person)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: followUpId, content: followUp }),
+      ]),
+    );
   });
 });

@@ -3,7 +3,7 @@
 This runbook is for a restored cell that may predate one or more completed
 agent-data erasures. It replays the preserved live erasure ledger through the
 same durable holder used by the privacy API. A successful pass deletes restored
-trace, model-replay, and tool-effect rows, destroys the subject key, and writes
+trace, model-replay, and tool-effect rows, destroys the scoped agent-data key, and writes
 the absorbing subject marker that prevents future agent processing.
 
 The command is intentionally limited to the production agent-data holder. It
@@ -86,5 +86,5 @@ requires the restored holder to refuse it.
 - “restored agent-data holder is unavailable” means one subject did not finish
   its production erasure path. Repair the target database or KMS and retry.
 - “incomplete erasure proof” means the holder could not prove both durable
-  deletion counts and an unrecoverable subject key. Treat this as a hard restore
+  deletion counts and an unrecoverable agent-data key. Treat this as a hard restore
   failure; do not waive it based on manual row inspection.

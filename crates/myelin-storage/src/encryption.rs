@@ -2,7 +2,7 @@ use myelin_gdpr::ErasureMethod;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::blob::ContentWrap;
-use crate::kms::{DekHandle, KeyClass, KmsEngine, KmsError, PiiKeyRef, NONCE_LEN};
+use crate::kms::{DekHandle, KeyClass, KmsEngine, KmsError, PiiKeyRef, SubjectKeyScope, NONCE_LEN};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubjectId(pub String);
@@ -133,6 +133,37 @@ impl<'a> ColumnCryptor<'a> {
         let key_ref = self
             .engine
             .ensure_dek(tenant, &self.region, class)
+            .map_err(KeyChoiceError::Kms)?;
+        let dek = self
+            .engine
+            .resolve_dek(&key_ref, &self.region)
+            .map_err(KeyChoiceError::Kms)?;
+        let (nonce, ciphertext) = dek.seal_with_aad(plaintext, aad);
+        Ok(EncryptedColumn {
+            key_ref,
+            nonce,
+            ciphertext,
+        })
+    }
+
+    pub fn encrypt_for_subject_scope_with_aad(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+        scope: SubjectKeyScope,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<EncryptedColumn, KeyChoiceError> {
+        let key_ref = self
+            .engine
+            .ensure_dek(
+                tenant,
+                &self.region,
+                KeyClass::ScopedSubject {
+                    scope,
+                    subject: subject.0.clone(),
+                },
+            )
             .map_err(KeyChoiceError::Kms)?;
         let dek = self
             .engine

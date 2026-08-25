@@ -158,8 +158,8 @@ pub use key_origin::{
 };
 pub use kms::{
     CellRoot, DekHandle, DekId, ExportedKek, KekId, KeyClass, KmsAdapter, KmsDurableSnapshot,
-    KmsEngine, KmsError, PiiKeyRef, SealKey, SealKeyError, SealedRoot, WrappedDek, KEY_LEN,
-    NONCE_LEN,
+    KmsEngine, KmsError, PiiKeyRef, SealKey, SealKeyError, SealedRoot, SubjectKeyScope, WrappedDek,
+    KEY_LEN, NONCE_LEN,
 };
 pub use kms_failstatic::{
     KmsFailStaticSignals, KmsReadError, KmsReadPath, KmsReadResult, KmsReadiness,

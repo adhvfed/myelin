@@ -2,12 +2,12 @@
 
 // The erasure-survives-restore drill, against a REAL pg_dump/pg_restore:
 //
-//   1. a subject's data exists under a per-subject DEK (durable KMS, real pg)
+//   1. agent data exists under its scoped per-subject DEK (durable KMS, real pg)
 //   2. a backup is taken (pg_dump, custom format)
 //   3. the subject is erased through the production path - which now records
 //      the erasure in the post-PIT ledger BEFORE destroying the key
 //   4. the backup is restored into a scratch database - and the drill proves
-//      the wrapped subject DEK is RESURRECTED there (the drill has teeth)
+//      the wrapped agent-data DEK is RESURRECTED there (the drill has teeth)
 //   5. the re-erase pass replays the live ledger against the restored
 //      database and the subject is unreadable again
 //
@@ -22,7 +22,7 @@ use myelin_storage::reerase_durable::DurablePostPitLedger;
 use myelin_storage::{
     all_durable_migrations, AgentTraceError, AgentTraceSubjectState, AgentTraceWrite,
     AgentTraceWriter, DurableAgentTraceStore, DurableKmsBacking, HotTables, KeyClass, KmsError,
-    PiiKeyRef, PostRestoreAgentDataReEraser, SealKey, SubstrateProvider,
+    PiiKeyRef, PostRestoreAgentDataReEraser, SealKey, SubjectKeyScope, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -136,13 +136,23 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
         kms.clone(),
     );
 
-    // 1. the subject's data exists under its per-subject DEK.
+    // 1. Agent data and an unrelated product each have their own erasure lever.
+    let unrelated_key_ref = kms
+        .ensure_dek(&tenant, &region, KeyClass::Subject("founder".to_string()))
+        .expect("represent unrelated personal data under its existing product key");
     store
         .write(&tenant, trace("55555555-5555-4555-8555-555555555555"))
         .expect("one subject-owned trace exists before the backup");
-    let key_ref = PiiKeyRef::new(tenant.clone(), 0, KeyClass::Subject("founder".to_string()));
+    let key_ref = PiiKeyRef::new(
+        tenant.clone(),
+        0,
+        KeyClass::ScopedSubject {
+            scope: SubjectKeyScope::AgentData,
+            subject: "founder".to_string(),
+        },
+    );
     kms.resolve_dek(&key_ref, &region)
-        .expect("the subject DEK resolves before the backup (the data is live)");
+        .expect("the agent-data DEK resolves before the backup (the data is live)");
 
     // 2. a real backup, taken while the subject is still live.
     let admin_url = admin_config().database_url;
@@ -170,8 +180,10 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
     assert!(!receipt.already_erased, "a fresh erasure, not a replay");
     match kms.resolve_dek(&key_ref, &region) {
         Err(KmsError::DekUnavailable(_)) => {}
-        other => panic!("the live subject DEK must be destroyed after erasure, got {other:?}"),
+        other => panic!("the live agent-data DEK must be destroyed after erasure, got {other:?}"),
     }
+    kms.resolve_dek(&unrelated_key_ref, &region)
+        .expect("narrow agent-data erasure preserves another product's subject key");
 
     // 4. restore the pre-erasure backup into a scratch database.
     let scratch = scratch_db_name();
@@ -241,9 +253,12 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
     match scratch_kms.resolve_dek(&key_ref, &region) {
         Err(KmsError::DekUnavailable(_)) => {}
         other => panic!(
-            "the restored subject DEK must be destroyed after the re-erase pass, got {other:?}"
+            "the restored agent-data DEK must be destroyed after the re-erase pass, got {other:?}"
         ),
     }
+    scratch_kms
+        .resolve_dek(&unrelated_key_ref, &region)
+        .expect("post-restore agent-data erasure preserves unrelated personal data");
     assert_eq!(
         restored_holder
             .summarize_subject(&tenant.0, "founder")
@@ -258,7 +273,7 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
             .write(&tenant, trace("66666666-6666-4666-8666-666666666666"))
             .unwrap_err(),
         AgentTraceError::Erased,
-        "post-restore work cannot silently mint a replacement subject key"
+        "post-restore work cannot silently mint a replacement agent-data key"
     );
     let replay = PostRestoreAgentDataReEraser::new(
         DurablePostPitLedger::new(provider.clone()),
@@ -280,8 +295,8 @@ async fn a_subject_erased_after_a_backup_stays_erased_when_that_backup_is_restor
     .await
     .expect("count restored DEK rows");
     assert_eq!(
-        leftover, 0,
-        "no wrapped DEK row for the erased subject survives in the restored database"
+        leftover, 1,
+        "only the deliberately unrelated product key survives in the restored database"
     );
 
     // cleanup: the scratch database and the dump are drill artifacts.

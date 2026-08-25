@@ -246,7 +246,7 @@ workflow, releases unused run budget, rejects still-pending effects, and removes
 cards. Every run that reaches a final agent answer writes it before cost settlement as one
 immutable, content-addressed Knowledge
 trace. Its answer and block-model body rest only as authenticated ciphertext under the
-requesting human's durable subject key. The automation owner can retrieve that work product and
+requesting human's durable agent-data key. The automation owner can retrieve that work product and
 its exact metered cost in the web firing history or with `automation result`; other users cannot
 read it through the run reference. The owner can erase one result from that result view or with
 `automation erase-result`; a durable erasure marker makes the operation idempotent and refuses any
@@ -259,7 +259,7 @@ third-party integration key is created or copied into the agent.
 The durable trace store is also the H17 personal-data holder. A signed-in person can inspect this
 narrow agent-data scope and irreversibly erase their own traces, model replay steps, and tool-effect
 journals through Edge or `myelin privacy agent-data`. Erasure records a durable suppression marker,
-deletes every live record, destroys the subject key so ciphertext in backups remains unrecoverable,
+deletes every live record, destroys the scoped agent-data key so ciphertext in backups remains unrecoverable,
 and permanently blocks later agent processing for that person. This self-service operation is not
 presented as full account or organization erasure; other personal-data holders remain outside its
 explicit scope.

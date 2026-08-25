@@ -5,7 +5,10 @@ use myelin_storage::agent_tool_effect::{
     AgentToolEffectStore, ToolEffectBegin, ToolEffectCompletion, ToolEffectError,
 };
 use myelin_storage::migration::HotTables;
-use myelin_storage::{all_durable_migrations, DurableKmsBacking, SealKey, SubstrateProvider};
+use myelin_storage::{
+    all_durable_migrations, DurableKmsBacking, KeyClass, PiiKeyRef, SealKey, SubjectKeyScope,
+    SubstrateProvider,
+};
 use myelin_tenancy::TenantId;
 use std::sync::Arc;
 
@@ -177,11 +180,16 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
         plaintext.is_none(),
         "the tool result never rests in its legacy column"
     );
-    assert!(
+    assert_eq!(
         key_ref
             .as_deref()
-            .is_some_and(|value| value.contains("subject:founder")),
-        "the replay result is wrapped by the requesting human's subject key",
+            .and_then(PiiKeyRef::parse)
+            .map(|key| key.class),
+        Some(KeyClass::ScopedSubject {
+            scope: SubjectKeyScope::AgentData,
+            subject: "founder".into(),
+        }),
+        "the replay result has an independently erasable agent-data key",
     );
     assert_eq!(nonce.expect("the encrypted result has a nonce").len(), 12);
     let ciphertext = ciphertext.expect("the encrypted result has ciphertext");
