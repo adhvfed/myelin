@@ -19,6 +19,7 @@ mod thread;
 mod thread_notification;
 
 const EXACT_MESSAGE_BATCH_MAX: usize = 100;
+pub const AUTHOR_ERASURE_BATCH_MAX: usize = 100;
 
 pub const MESSAGE_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS {table} (
@@ -104,6 +105,87 @@ BEGIN
   RETURN NEW;
 END
 $myelin$;
+DROP TRIGGER IF EXISTS {table}_erasure_guard_update ON {table}_erasure_operation;
+CREATE TRIGGER {table}_erasure_guard_update
+BEFORE UPDATE ON {table}_erasure_operation
+FOR EACH ROW EXECUTE FUNCTION {table}_guard_erasure_completion();
+"#;
+
+pub(crate) const MESSAGE_ERASURE_PROGRESS_DDL: &str = r#"
+ALTER TABLE {table}_erasure_operation
+    ADD COLUMN IF NOT EXISTS validation_cursor text,
+    ADD COLUMN IF NOT EXISTS validation_completed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS messages_erased_so_far bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS events_emitted_so_far bigint NOT NULL DEFAULT 0;
+
+DROP TRIGGER IF EXISTS {table}_erasure_guard_update ON {table}_erasure_operation;
+
+UPDATE {table}_erasure_operation
+   SET validation_completed_at = completed_at,
+       messages_erased_so_far = messages_erased,
+       events_emitted_so_far = events_emitted
+ WHERE completed_at IS NOT NULL
+   AND validation_completed_at IS NULL;
+
+DO $myelin$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid = '{table}_erasure_operation'::regclass
+       AND conname = '{table}_erasure_progress_valid'
+  ) THEN
+    ALTER TABLE {table}_erasure_operation
+      ADD CONSTRAINT {table}_erasure_progress_valid CHECK (
+        messages_erased_so_far >= 0 AND
+        events_emitted_so_far = messages_erased_so_far AND
+        (validation_completed_at IS NOT NULL OR messages_erased_so_far = 0) AND
+        (completed_at IS NULL OR (
+          validation_completed_at IS NOT NULL AND
+          messages_erased = messages_erased_so_far AND
+          events_emitted = events_emitted_so_far
+        ))
+      );
+  END IF;
+END
+$myelin$;
+
+CREATE INDEX IF NOT EXISTS {table}_author_erasure_batch
+    ON {table} (tenant_id, region, author, message_id)
+    WHERE state <> 3;
+
+CREATE OR REPLACE FUNCTION {table}_guard_erasure_completion()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
+     NEW.region IS DISTINCT FROM OLD.region OR
+     NEW.operation_id IS DISTINCT FROM OLD.operation_id OR
+     NEW.author IS DISTINCT FROM OLD.author OR
+     NEW.started_at IS DISTINCT FROM OLD.started_at OR
+     OLD.completed_at IS NOT NULL OR
+     NEW.messages_erased_so_far < OLD.messages_erased_so_far OR
+     NEW.events_emitted_so_far < OLD.events_emitted_so_far OR
+     NEW.messages_erased_so_far <> NEW.events_emitted_so_far OR
+     (OLD.validation_cursor IS NOT NULL AND
+       NEW.validation_cursor IS DISTINCT FROM OLD.validation_cursor AND
+       (NEW.validation_cursor IS NULL OR NEW.validation_cursor <= OLD.validation_cursor)) OR
+     (OLD.validation_completed_at IS NOT NULL AND
+       (NEW.validation_completed_at IS DISTINCT FROM OLD.validation_completed_at OR
+        NEW.validation_cursor IS DISTINCT FROM OLD.validation_cursor)) OR
+     (NEW.validation_completed_at IS NULL AND NEW.messages_erased_so_far <> 0) OR
+     (NEW.completed_at IS NULL AND
+       (NEW.messages_erased IS NOT NULL OR NEW.events_emitted IS NOT NULL)) OR
+     (NEW.completed_at IS NOT NULL AND
+       (NEW.validation_completed_at IS NULL OR
+        NEW.messages_erased IS DISTINCT FROM NEW.messages_erased_so_far OR
+        NEW.events_emitted IS DISTINCT FROM NEW.events_emitted_so_far)) THEN
+    RAISE EXCEPTION 'Chat message erasure permits only forward validation, progress, and completion';
+  END IF;
+  RETURN NEW;
+END
+$myelin$;
+
 DROP TRIGGER IF EXISTS {table}_erasure_guard_update ON {table}_erasure_operation;
 CREATE TRIGGER {table}_erasure_guard_update
 BEFORE UPDATE ON {table}_erasure_operation
@@ -224,6 +306,11 @@ impl PgMessageStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Cold(format!("message erasure DDL: {e}")))?;
+        let erasure_progress_ddl = MESSAGE_ERASURE_PROGRESS_DDL.replace("{table}", &self.table);
+        sqlx::raw_sql(&erasure_progress_ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Cold(format!("message erasure progress DDL: {e}")))?;
         let following_ddl = THREAD_FOLLOWING_DDL.replace("{table}", &self.table);
         sqlx::raw_sql(&following_ddl)
             .execute(&self.pool)

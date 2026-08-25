@@ -4,6 +4,33 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — authored Chat erasure makes bounded, resumable progress
+
+Authored-message erasure previously loaded, locked, tombstoned, and emitted consequences for a
+person's entire Chat history in one PostgreSQL transaction. The key-destruction boundary was sound,
+but transaction duration and memory grew without bound; a large account could also lose all
+database progress to one late outbox failure.
+
+The durable operation now advances through two bounded phases under the existing author fence.
+Envelope verification records a monotone message cursor before the independent Chat key can be
+destroyed. Mutation then tombstones at most 100 messages at a time, co-commits exactly 100 or fewer
+erasure events, and advances equal cumulative counts in that same transaction. A retry starts with
+the remaining live row, while the final certificate is impossible until no remainder exists and
+the operation's cumulative counts become its immutable receipt. A partial index serves both bounded
+walks. The one-way database guard permits only forward cursor/count transitions and completion.
+
+The upgrade preserves historical evidence: completed pre-batching operations are backfilled from
+their immutable final receipts while their old trigger is deliberately replaced; pending operations
+remain unverified and must traverse the new proof path. The production accumulated database exposed
+that compatibility requirement during restart, and a dedicated real-PostgreSQL story now keeps it
+from regressing.
+
+**Proof:** warning-free all-target/all-feature Chat clippy; all 275 Chat library cases; all six
+real-PostgreSQL Chat erasure journeys, including a second-batch event collision that leaves exactly
+100 message/event pairs committed before a fresh worker completes the remaining five, plus the
+historical-schema upgrade; successful migration and restart of Edge over the accumulated database;
+and both live TypeScript privacy lifecycle journeys (5.28 seconds total).
+
 ## 2026-08-26 — Issue visibility is factored by the scope that grants it
 
 The creation-receipt fix removed one symptom, but the underlying `issue:view` projection still

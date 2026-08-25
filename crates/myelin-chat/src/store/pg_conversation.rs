@@ -637,6 +637,8 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
         "{}\nSELECT myelin_make_tenant_scoped('{MESSAGE_ERASURE_OPERATION_TABLE}');",
         super::pg::MESSAGE_ERASURE_OPERATION_DDL.replace("{table}", MESSAGE_TABLE),
     );
+    let message_erasure_progress =
+        super::pg::MESSAGE_ERASURE_PROGRESS_DDL.replace("{table}", MESSAGE_TABLE);
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
@@ -698,6 +700,11 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
         Migration::plain_on(
             "chat_0014_message_erasure_operation",
             message_erasure,
+            MESSAGE_ERASURE_OPERATION_TABLE,
+        ),
+        Migration::plain_on(
+            "chat_0015_bounded_message_erasure",
+            message_erasure_progress,
             MESSAGE_ERASURE_OPERATION_TABLE,
         ),
     ])

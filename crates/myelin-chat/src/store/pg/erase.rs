@@ -5,7 +5,7 @@ use myelin_tenancy::{Region, TenantId};
 
 use super::{
     AuthoredMessageEraseReceipt, AuthoredMessageErasureState, MessageErasureAttempt,
-    PgMessageStore, VerifiedMessageErasureAttempt,
+    PgMessageStore, VerifiedMessageErasureAttempt, AUTHOR_ERASURE_BATCH_MAX,
 };
 use crate::dek::{chat_subject_key_class, decode_encrypted_body};
 use crate::events::CHAT_MESSAGE_ERASED;
@@ -17,6 +17,21 @@ struct TombstonedMessage {
     message_id: MessageId,
     author: String,
     thread_root_id: Option<MessageId>,
+}
+
+#[derive(Clone, Copy)]
+struct AuthorErasure<'a> {
+    tenant: &'a str,
+    region: &'a str,
+    author: &'a str,
+    operation_id: &'a str,
+}
+
+struct ErasureEvents<'a> {
+    ids: &'a dyn IdMinter,
+    actor: &'a myelin_events::Actor,
+    occurred: &'a myelin_events::Timestamp,
+    recorded: &'a myelin_events::Timestamp,
 }
 
 impl PgMessageStore {
@@ -78,60 +93,73 @@ impl PgMessageStore {
     }
 
     /// Proves that every live body is on the independent Chat key before a
-    /// caller destroys that key. The pending marker already fences new writes,
-    /// so this inventory stays valid until the mutation phase.
-    pub async fn verify_author_erasure_ready(
+    /// caller destroys that key. Each bounded transaction advances a durable
+    /// cursor. The pending marker fences new writes, so an earlier verified
+    /// batch cannot change while a later batch is inspected.
+    pub(crate) async fn verify_author_erasure_ready(
         &self,
         tenant: &str,
         author: &str,
         operation_id: &str,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<(), StoreError> {
         validate_erasure_identity(tenant, author, operation_id)?;
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| StoreError::Cold(format!("acquire: {error}")))?;
-        self.set_session_scope(&mut connection, tenant, &self.region)
+        loop {
+            let mut connection = self
+                .pool
+                .acquire()
+                .await
+                .map_err(|error| StoreError::Cold(format!("acquire: {error}")))?;
+            self.set_session_scope(&mut connection, tenant, &self.region)
+                .await?;
+            let mut transaction = connection
+                .begin()
+                .await
+                .map_err(|error| StoreError::Cold(format!("begin Chat erasure check: {error}")))?;
+            lock_author(&mut transaction, tenant, author, AuthorLock::Exclusive).await?;
+            let marker = load_erasure_marker(
+                &mut transaction,
+                &self.erasure_operation_table(),
+                tenant,
+                &self.region,
+                operation_id,
+            )
             .await?;
-        let mut transaction = connection
-            .begin()
-            .await
-            .map_err(|error| StoreError::Cold(format!("begin Chat erasure check: {error}")))?;
-        lock_author(&mut transaction, tenant, author, AuthorLock::Exclusive).await?;
-        let marker = load_erasure_marker(
-            &mut transaction,
-            &self.erasure_operation_table(),
-            tenant,
-            &self.region,
-            operation_id,
-        )
-        .await?;
-        require_same_author(&marker, author)?;
-        let count = match erasure_state_from_row(&marker)? {
-            AuthoredMessageErasureState::Completed(receipt) => receipt.messages_tombstoned,
-            AuthoredMessageErasureState::Pending => {
-                validate_authored_body_envelopes(
-                    &mut transaction,
-                    &self.table,
-                    tenant,
-                    &self.region,
-                    author,
-                )
-                .await?
+            require_same_author(&marker, author)?;
+            let ready = match erasure_state_from_row(&marker)? {
+                AuthoredMessageErasureState::Completed(_) => true,
+                AuthoredMessageErasureState::Pending => {
+                    let erasure = AuthorErasure {
+                        tenant,
+                        region: &self.region,
+                        author,
+                        operation_id,
+                    };
+                    validate_next_authored_body_batch(
+                        &mut transaction,
+                        &self.table,
+                        &self.erasure_operation_table(),
+                        erasure,
+                        &marker,
+                    )
+                    .await?
+                }
+            };
+            transaction
+                .commit()
+                .await
+                .map_err(|error| StoreError::Cold(format!("commit Chat erasure check: {error}")))?;
+            if ready {
+                return Ok(());
             }
-        };
-        transaction
-            .commit()
-            .await
-            .map_err(|error| StoreError::Cold(format!("commit Chat erasure check: {error}")))?;
-        Ok(count)
+        }
     }
 
-    /// Tombstones every live message written by one pseudonymous author and
-    /// co-commits one durable erasure event per message in the same transaction.
-    /// A retry returns the operation's original receipt and emits no duplicate
-    /// events. `prepare_author_erasure` must have committed first.
+    /// Tombstones every live message written by one pseudonymous author in
+    /// bounded transactions. Every batch co-commits one durable erasure event
+    /// per message and advances the operation's durable counts. A retry resumes
+    /// at the first live message and returns the original cumulative receipt.
+    /// `prepare_author_erasure` and bounded envelope verification must have
+    /// committed before the caller can construct `verified`.
     pub(crate) async fn tombstone_author_co_commit(
         &self,
         tenant: &str,
@@ -154,24 +182,55 @@ impl PgMessageStore {
             ));
         }
 
+        let erasure = AuthorErasure {
+            tenant,
+            region: &self.region,
+            author,
+            operation_id,
+        };
+        let events = ErasureEvents {
+            ids: event_ids,
+            actor: &actor,
+            occurred: &occurred,
+            recorded: &recorded,
+        };
+        loop {
+            if let Some(receipt) = self.tombstone_next_author_batch(erasure, &events).await? {
+                return Ok(receipt);
+            }
+        }
+    }
+
+    async fn tombstone_next_author_batch(
+        &self,
+        erasure: AuthorErasure<'_>,
+        events: &ErasureEvents<'_>,
+    ) -> Result<Option<AuthoredMessageEraseReceipt>, StoreError> {
+        let AuthorErasure {
+            tenant,
+            region,
+            author,
+            operation_id,
+        } = erasure;
         let mut connection = self
             .pool
             .acquire()
             .await
             .map_err(|error| StoreError::Cold(format!("acquire: {error}")))?;
-        self.set_session_scope(&mut connection, tenant, &self.region)
+        self.set_session_scope(&mut connection, tenant, region)
             .await?;
         let mut transaction = connection
             .begin()
             .await
-            .map_err(|error| StoreError::Cold(format!("begin Chat erasure: {error}")))?;
+            .map_err(|error| StoreError::Cold(format!("begin Chat erasure batch: {error}")))?;
         lock_author(&mut transaction, tenant, author, AuthorLock::Exclusive).await?;
 
+        let operation_table = self.erasure_operation_table();
         let marker = load_erasure_marker(
             &mut transaction,
-            &self.erasure_operation_table(),
+            &operation_table,
             tenant,
-            &self.region,
+            region,
             operation_id,
         )
         .await?;
@@ -181,31 +240,45 @@ impl PgMessageStore {
                 .commit()
                 .await
                 .map_err(|error| StoreError::Cold(format!("commit Chat erasure retry: {error}")))?;
-            return Ok(receipt);
+            return Ok(Some(receipt));
+        }
+        if !marker
+            .try_get::<bool, _>("validation_completed")
+            .map_err(erasure_row_decode)?
+        {
+            return Err(StoreError::Cold(
+                "Chat erasure cannot mutate messages before envelope verification".into(),
+            ));
         }
 
-        validate_authored_body_envelopes(
-            &mut transaction,
-            &self.table,
-            tenant,
-            &self.region,
-            author,
-        )
-        .await?;
-
         let rows = sqlx::query(&format!(
-            "UPDATE {} \
+            "WITH batch AS ( \
+                 SELECT tenant_id, region, conversation_id, message_id \
+                   FROM {} \
+                  WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3 \
+                  ORDER BY message_id \
+                  LIMIT $4 FOR UPDATE \
+             ) \
+             UPDATE {} AS message \
                 SET state = 3, body_inline = '\\x', body_nodes = '\\x' \
-              WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3 \
-              RETURNING conversation_id, message_id, thread_root_id, author",
-            self.table,
+               FROM batch \
+              WHERE message.tenant_id = batch.tenant_id \
+                AND message.region = batch.region \
+                AND message.conversation_id = batch.conversation_id \
+                AND message.message_id = batch.message_id \
+              RETURNING message.conversation_id, message.message_id, \
+                        message.thread_root_id, message.author",
+            self.table, self.table,
         ))
         .bind(tenant)
-        .bind(&self.region)
+        .bind(region)
         .bind(author)
+        .bind(i64::try_from(AUTHOR_ERASURE_BATCH_MAX).expect("batch limit fits in i64"))
         .fetch_all(&mut *transaction)
         .await
-        .map_err(|error| StoreError::Cold(format!("tombstone authored Chat messages: {error}")))?;
+        .map_err(|error| {
+            StoreError::Cold(format!("tombstone authored Chat message batch: {error}"))
+        })?;
 
         let mut tombstones = rows
             .into_iter()
@@ -213,7 +286,7 @@ impl PgMessageStore {
                 Ok(TombstonedMessage {
                     conversation: ConversationId::new(
                         tenant,
-                        &self.region,
+                        region,
                         row.try_get::<String, _>("conversation_id")
                             .map_err(erasure_row_decode)?,
                     ),
@@ -239,13 +312,13 @@ impl PgMessageStore {
             let envelope = derive_envelope(
                 draft,
                 EmitContext {
-                    event_id: event_ids.mint().into(),
+                    event_id: events.ids.mint().into(),
                     tenant: TenantId(tenant.to_string()),
-                    region: Region(self.region.clone()),
-                    actor: actor.clone(),
+                    region: Region(region.to_string()),
+                    actor: events.actor.clone(),
                     schema_ver: 1,
-                    occurred_at: occurred.clone(),
-                    recorded_at: recorded.clone(),
+                    occurred_at: events.occurred.clone(),
+                    recorded_at: events.recorded.clone(),
                     caused_by: None,
                 },
                 None,
@@ -261,38 +334,75 @@ impl PgMessageStore {
             })?;
         }
 
-        let count = i64::try_from(tombstones.len())
-            .map_err(|_| StoreError::Cold("Chat erasure count exceeds PostgreSQL bigint".into()))?;
-        let completed = sqlx::query(&format!(
-            "UPDATE {} \
-                SET completed_at = CURRENT_TIMESTAMP, messages_erased = $4, events_emitted = $4 \
+        let batch_count = i64::try_from(tombstones.len())
+            .map_err(|_| StoreError::Cold("Chat erasure batch count overflowed".into()))?;
+        let progress = sqlx::query(&format!(
+            "UPDATE {operation_table} \
+                SET messages_erased_so_far = messages_erased_so_far + $4, \
+                    events_emitted_so_far = events_emitted_so_far + $4 \
               WHERE tenant_id = $1 AND region = $2 AND operation_id = $3 \
-                AND completed_at IS NULL",
-            self.erasure_operation_table(),
+                AND completed_at IS NULL \
+              RETURNING messages_erased_so_far",
         ))
         .bind(tenant)
-        .bind(&self.region)
+        .bind(region)
         .bind(operation_id)
-        .bind(count)
-        .execute(&mut *transaction)
+        .bind(batch_count)
+        .fetch_one(&mut *transaction)
         .await
-        .map_err(|error| StoreError::Cold(format!("complete Chat erasure marker: {error}")))?;
-        if completed.rows_affected() != 1 {
-            return Err(StoreError::Cold(
-                "Chat erasure marker did not complete exactly once".into(),
-            ));
-        }
+        .map_err(|error| StoreError::Cold(format!("advance Chat erasure progress: {error}")))?;
+        let messages_erased: i64 = progress
+            .try_get("messages_erased_so_far")
+            .map_err(erasure_row_decode)?;
+        let more_messages: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM {} \
+                  WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3 \
+             )",
+            self.table,
+        ))
+        .bind(tenant)
+        .bind(region)
+        .bind(author)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| StoreError::Cold(format!("check Chat erasure remainder: {error}")))?;
+
+        let receipt = if more_messages {
+            None
+        } else {
+            let completed = sqlx::query(&format!(
+                "UPDATE {operation_table} \
+                    SET completed_at = CURRENT_TIMESTAMP, \
+                        messages_erased = messages_erased_so_far, \
+                        events_emitted = events_emitted_so_far \
+                  WHERE tenant_id = $1 AND region = $2 AND operation_id = $3 \
+                    AND completed_at IS NULL",
+            ))
+            .bind(tenant)
+            .bind(region)
+            .bind(operation_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| StoreError::Cold(format!("complete Chat erasure marker: {error}")))?;
+            if completed.rows_affected() != 1 {
+                return Err(StoreError::Cold(
+                    "Chat erasure marker did not complete exactly once".into(),
+                ));
+            }
+            let messages_tombstoned = u64::try_from(messages_erased)
+                .map_err(|_| StoreError::Cold("Chat erasure count is negative".into()))?;
+            Some(AuthoredMessageEraseReceipt {
+                messages_tombstoned,
+                erasure_events_co_committed: messages_tombstoned,
+            })
+        };
 
         transaction
             .commit()
             .await
-            .map_err(|error| StoreError::Cold(format!("commit Chat erasure: {error}")))?;
-        let count = u64::try_from(count)
-            .map_err(|_| StoreError::Cold("Chat erasure count is negative".into()))?;
-        Ok(AuthoredMessageEraseReceipt {
-            messages_tombstoned: count,
-            erasure_events_co_committed: count,
-        })
+            .map_err(|error| StoreError::Cold(format!("commit Chat erasure batch: {error}")))?;
+        Ok(receipt)
     }
 
     pub(super) async fn refuse_append_during_author_erasure(
@@ -334,6 +444,7 @@ async fn load_erasure_marker(
 ) -> Result<sqlx::postgres::PgRow, StoreError> {
     sqlx::query(&format!(
         "SELECT author, completed_at IS NOT NULL AS completed, \
+                validation_cursor, validation_completed_at IS NOT NULL AS validation_completed, \
                 messages_erased, events_emitted \
            FROM {table} \
           WHERE tenant_id = $1 AND region = $2 AND operation_id = $3 \
@@ -350,25 +461,45 @@ async fn load_erasure_marker(
     })
 }
 
-async fn validate_authored_body_envelopes(
+async fn validate_next_authored_body_batch(
     connection: &mut sqlx::PgConnection,
     table: &str,
-    tenant: &str,
-    region: &str,
-    author: &str,
-) -> Result<u64, StoreError> {
+    operation_table: &str,
+    erasure: AuthorErasure<'_>,
+    marker: &sqlx::postgres::PgRow,
+) -> Result<bool, StoreError> {
+    let AuthorErasure {
+        tenant,
+        region,
+        author,
+        operation_id,
+    } = erasure;
+    if marker
+        .try_get::<bool, _>("validation_completed")
+        .map_err(erasure_row_decode)?
+    {
+        return Ok(true);
+    }
+    let cursor = marker
+        .try_get::<Option<String>, _>("validation_cursor")
+        .map_err(erasure_row_decode)?;
     let bodies = sqlx::query(&format!(
         "SELECT message_id, body_inline, body_nodes \
            FROM {table} \
           WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3 \
-          ORDER BY message_id FOR UPDATE",
+            AND ($4::text IS NULL OR message_id > $4) \
+          ORDER BY message_id LIMIT $5 FOR UPDATE",
     ))
     .bind(tenant)
     .bind(region)
     .bind(author)
-    .fetch_all(connection)
+    .bind(cursor.as_deref())
+    .bind(i64::try_from(AUTHOR_ERASURE_BATCH_MAX).expect("batch limit fits in i64"))
+    .fetch_all(&mut *connection)
     .await
-    .map_err(|error| StoreError::Cold(format!("inspect authored Chat encryption: {error}")))?;
+    .map_err(|error| {
+        StoreError::Cold(format!("inspect authored Chat encryption batch: {error}"))
+    })?;
     for row in &bodies {
         let message_id: String = row.try_get("message_id").map_err(erasure_row_decode)?;
         for (column, encoded) in [
@@ -397,8 +528,34 @@ async fn validate_authored_body_envelopes(
             }
         }
     }
-    u64::try_from(bodies.len())
-        .map_err(|_| StoreError::Cold("Chat erasure inventory count overflowed".into()))
+    let next_cursor = bodies
+        .last()
+        .map(|row| row.try_get::<String, _>("message_id"))
+        .transpose()
+        .map_err(erasure_row_decode)?
+        .or(cursor);
+    let validation_completed = bodies.len() < AUTHOR_ERASURE_BATCH_MAX;
+    let advanced = sqlx::query(&format!(
+        "UPDATE {operation_table} \
+            SET validation_cursor = $4, \
+                validation_completed_at = CASE WHEN $5 THEN CURRENT_TIMESTAMP ELSE NULL END \
+          WHERE tenant_id = $1 AND region = $2 AND operation_id = $3 \
+            AND completed_at IS NULL",
+    ))
+    .bind(tenant)
+    .bind(region)
+    .bind(operation_id)
+    .bind(next_cursor)
+    .bind(validation_completed)
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| StoreError::Cold(format!("advance Chat erasure validation: {error}")))?;
+    if advanced.rows_affected() != 1 {
+        return Err(StoreError::Cold(
+            "Chat erasure validation marker did not advance exactly once".into(),
+        ));
+    }
+    Ok(validation_completed)
 }
 
 #[derive(Clone, Copy)]

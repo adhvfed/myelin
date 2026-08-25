@@ -1,13 +1,14 @@
 #![cfg(feature = "integration")]
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use myelin_chat::events::{
     channel_aggregate, event_actor_pseudonym, pseudonymized_event_principal,
 };
 use myelin_chat::store::pg::{
     AuthoredMessageErasureState, MessageAttribution, MessageErasureAttempt, PgMessageStore,
+    AUTHOR_ERASURE_BATCH_MAX, MESSAGE_ERASURE_OPERATION_DDL, MESSAGE_TABLE_DDL,
 };
 use myelin_chat::store::{
     AuthorKind, ConversationId, MessageState, MonotonicUlidSource, NewMessage, RangeCursor,
@@ -67,6 +68,44 @@ struct ConstantMinter(Ulid);
 impl IdMinter for ConstantMinter {
     fn mint(&self) -> Ulid {
         self.0.clone()
+    }
+}
+
+struct FailAfterOneCommittedBatch {
+    calls: AtomicUsize,
+    first_id: Mutex<Option<Ulid>>,
+    unique_ids: UlidMinter,
+}
+
+impl FailAfterOneCommittedBatch {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            first_id: Mutex::new(None),
+            unique_ids: UlidMinter::new(),
+        }
+    }
+}
+
+impl IdMinter for FailAfterOneCommittedBatch {
+    fn mint(&self) -> Ulid {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        if call == AUTHOR_ERASURE_BATCH_MAX {
+            return self
+                .first_id
+                .lock()
+                .expect("event-id memory remains available")
+                .clone()
+                .expect("the first batch minted an event id");
+        }
+        let id = self.unique_ids.mint();
+        if call == 0 {
+            *self
+                .first_id
+                .lock()
+                .expect("event-id memory remains available") = Some(id.clone());
+        }
+        id
     }
 }
 
@@ -489,6 +528,179 @@ async fn an_erasure_event_failure_leaves_a_resumable_storage_transaction() {
     }));
 
     clear_test_rows(&admin, &table, &[conversation]).await;
+}
+
+#[tokio::test]
+async fn a_large_erasure_commits_small_steps_and_resumes_from_its_durable_count() {
+    let (admin, store, table, provider) = fresh_store().await;
+    let kms = Arc::new(KmsEngine::new());
+    let eraser = DurableChatMessageEraser::new(
+        store.clone(),
+        Arc::clone(&kms),
+        DurablePostPitLedger::new(provider),
+    );
+    let message_ids = MonotonicUlidSource::new();
+    let ada = event_actor_pseudonym(TENANT, ADA);
+    let conversation = ConversationId::new(TENANT, region().as_str(), "01J0CHATP411BOUNDED000000");
+    let message_count = AUTHOR_ERASURE_BATCH_MAX + 5;
+    for sequence in 0..message_count {
+        let (message, _) = encrypted_message(
+            &kms,
+            conversation.clone(),
+            &ada,
+            &format!("message-{sequence}"),
+            &format!("private thought {sequence}"),
+        );
+        store
+            .append_storage_only(&message_ids, message)
+            .await
+            .expect("Ada can accumulate a long-lived Chat history");
+    }
+
+    let operation = "privacy-request:ada-bounded-resume";
+    let interrupted = eraser
+        .erase_subject_messages(
+            TENANT,
+            ADA,
+            &FailAfterOneCommittedBatch::new(),
+            erasure_attempt(operation),
+        )
+        .await
+        .expect_err("a failure in the second batch interrupts the request");
+    assert!(interrupted
+        .to_string()
+        .contains("co-commit Chat message erasure"));
+
+    let states = sqlx::query(&format!(
+        "SELECT state, count(*) AS messages FROM {table} \
+          WHERE tenant_id = $1 AND region = $2 AND author = $3 \
+          GROUP BY state ORDER BY state",
+    ))
+    .bind(TENANT)
+    .bind(region().as_str())
+    .bind(&ada)
+    .fetch_all(&admin)
+    .await
+    .expect("inspect the durable boundary left by the interruption");
+    assert_eq!(states.len(), 2);
+    assert_eq!(states[0].get::<i16, _>("state"), 0);
+    assert_eq!(states[0].get::<i64, _>("messages"), 5);
+    assert_eq!(states[1].get::<i16, _>("state"), 3);
+    assert_eq!(
+        states[1].get::<i64, _>("messages"),
+        i64::try_from(AUTHOR_ERASURE_BATCH_MAX).unwrap(),
+        "the first bounded step remains committed while the failed step rolls back",
+    );
+    let durable_progress: (i64, i64, bool) = sqlx::query_as(&format!(
+        "SELECT messages_erased_so_far, events_emitted_so_far, completed_at IS NOT NULL \
+           FROM {table}_erasure_operation \
+          WHERE tenant_id = $1 AND region = $2 AND operation_id = $3",
+    ))
+    .bind(TENANT)
+    .bind(region().as_str())
+    .bind(operation)
+    .fetch_one(&admin)
+    .await
+    .expect("the operation remembers exactly what moved together");
+    assert_eq!(
+        durable_progress,
+        (
+            i64::try_from(AUTHOR_ERASURE_BATCH_MAX).unwrap(),
+            i64::try_from(AUTHOR_ERASURE_BATCH_MAX).unwrap(),
+            false,
+        ),
+    );
+
+    let resumed = eraser
+        .erase_subject_messages(TENANT, ADA, &UlidMinter::new(), erasure_attempt(operation))
+        .await
+        .expect("a fresh worker resumes at the five messages still live");
+    assert_eq!(
+        (resumed.messages_erased, resumed.erasure_events_co_committed,),
+        (
+            u64::try_from(message_count).unwrap(),
+            u64::try_from(message_count).unwrap(),
+        ),
+        "the final proof covers every batch, including work committed before the retry",
+    );
+    assert!(!resumed.key_destroyed_this_attempt);
+    let remaining: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} \
+          WHERE tenant_id = $1 AND region = $2 AND author = $3 AND state <> 3",
+    ))
+    .bind(TENANT)
+    .bind(region().as_str())
+    .bind(&ada)
+    .fetch_one(&admin)
+    .await
+    .expect("look for live authored messages after the resumed request");
+    assert_eq!(remaining, 0);
+    let event_count: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox WHERE aggregate = $1")
+        .bind(channel_aggregate(&conversation.conversation_id).0)
+        .fetch_one(&admin)
+        .await
+        .expect("count the cumulative durable consequences");
+    assert_eq!(event_count, i64::try_from(message_count).unwrap());
+
+    clear_test_rows(&admin, &table, &[conversation]).await;
+}
+
+#[tokio::test]
+async fn a_completed_pre_batching_erasure_upgrades_without_reopening_its_proof() {
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url())
+        .await
+        .expect("connect to dev Postgres as the migration owner");
+    let suffix = format!(
+        "{}_{}",
+        std::process::id(),
+        NEXT_STORE.fetch_add(1, Ordering::Relaxed),
+    );
+    let table = format!("chat_message_erase_{suffix}");
+    let legacy_schema = format!(
+        "{}\n{}",
+        MESSAGE_TABLE_DDL.replace("{table}", &table),
+        MESSAGE_ERASURE_OPERATION_DDL.replace("{table}", &table),
+    );
+    sqlx::raw_sql(&legacy_schema)
+        .execute(&admin)
+        .await
+        .expect("arrange the exact schema that preceded bounded erasure");
+    sqlx::query(&format!(
+        "INSERT INTO {table}_erasure_operation ( \
+             tenant_id, region, operation_id, author, completed_at, \
+             messages_erased, events_emitted \
+         ) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, 7, 7)",
+    ))
+    .bind(TENANT)
+    .bind(region().as_str())
+    .bind("privacy-request:historical-complete")
+    .bind(event_actor_pseudonym(TENANT, ADA))
+    .execute(&admin)
+    .await
+    .expect("arrange a certificate-bearing historical operation");
+
+    PgMessageStore::new(admin.clone(), region().as_str(), table.clone())
+        .migrate()
+        .await
+        .expect("upgrade the historical operation without violating its one-way guard");
+    let upgraded: (i64, i64, bool, bool) = sqlx::query_as(&format!(
+        "SELECT messages_erased_so_far, events_emitted_so_far, \
+                validation_completed_at = completed_at, completed_at IS NOT NULL \
+           FROM {table}_erasure_operation \
+          WHERE operation_id = 'privacy-request:historical-complete'",
+    ))
+    .fetch_one(&admin)
+    .await
+    .expect("read the upgraded durable proof");
+    assert_eq!(
+        upgraded,
+        (7, 7, true, true),
+        "the migration backfills progress from the immutable final receipt",
+    );
+
+    clear_test_rows(&admin, &table, &[]).await;
 }
 
 #[tokio::test]
