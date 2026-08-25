@@ -1606,6 +1606,36 @@ warning-free all-target, all-feature Clippy for Issues and Edge; the real
 PostgreSQL visibility/revocation race, issue saga, and Edge route integrations;
 and all twelve live Chat collaboration stories together after an Edge restart.
 
+## 2026-08-25 — an erasure request is a durable user object
+
+Agent-data erasure is no longer only an irreversible button backed by one HTTP
+response. A human can submit one named, idempotent privacy request, recover its
+status by ID, and retrieve a content-addressed certificate. The request is
+tenant- and owner-scoped, survives a worker loss, reclaims an expired lease with
+an epoch fence, and publishes its certificate only after every registered
+holder has supplied a complete proof. Today the deliberately honest holder set
+is the production agent-data path: traces, model replay, and tool effects all
+share the subject key and all three report their own deletion counts.
+
+Review found a crash seam in the first composition: a process could destroy the
+key and delete the rows, then die before storing the request certificate. A
+retry remained safe but could only report zero deletions. The subject-erasure
+marker now records the three counts in the same database transition that
+deletes the rows and marks completion. A fresh holder instance recovers that
+proof, the database trigger makes a completed proof immutable, and the privacy
+request can finish after the original worker disappears. This replaced the
+agent-trace module's broad test that inspected migration source strings with a
+real PostgreSQL attempt to mutate the completed receipt and an assertion that
+the database refuses it.
+
+Proof: TypeScript typechecking; all focused Storage and Edge privacy and
+authorization tests; warning-free all-target, all-feature Clippy for Storage
+and Edge; real PostgreSQL holder-restart/receipt-immutability and request
+lease-loss stories; and the live black-box privacy lifecycle. The live story
+creates recoverable agent work, submits and replays one request, reads its
+status and three-holder certificate, then proves both the old result and all
+future processing stay unavailable. It completed in 13.68 seconds.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
@@ -1615,10 +1645,11 @@ and all twelve live Chat collaboration stories together after an Edge restart.
    a library call + drill), and the library-level erase paths (chat, issues,
    git crypto-shred) still do not write the ledger because nothing wires
    them to a user surface yet (gap 2).
-2. **DSR is a library, not a product surface.** no service registers a
-   PersonalDataHolder; dsr_submit/status/certificate are unwired. the only
-   user-facing privacy surface is `/v1/privacy/me/agent-data*`. chat/issues/
-   git erasure flows exist as in-memory tested code only.
+2. **DSR has one truthful product slice, not full holder coverage.** durable
+   submit/status/certificate is now wired for the real agent-data holder and
+   exercised through Edge. chat/issues/git erasure flows still exist as
+   in-memory tested code only, so they are deliberately absent from the public
+   certificate rather than being represented by ceremonial receipts.
 3. **multi-tenant machine storms can still exhaust the general dispatch
    pool.** the human lane holds per tenant and against well-behaved machine
    traffic; a coordinated cross-tenant storm of requests that lie about
