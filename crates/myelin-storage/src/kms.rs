@@ -20,18 +20,21 @@ pub const NONCE_LEN: usize = 12;
 )]
 pub enum SubjectKeyScope {
     AgentData,
+    Chat,
 }
 
 impl SubjectKeyScope {
     pub const fn as_token(&self) -> &'static str {
         match self {
             Self::AgentData => "agent-data",
+            Self::Chat => "chat",
         }
     }
 
     fn parse_token(token: &str) -> Option<Self> {
         match token {
             "agent-data" => Some(Self::AgentData),
+            "chat" => Some(Self::Chat),
             _ => None,
         }
     }

@@ -177,6 +177,16 @@ impl<'a> ColumnCryptor<'a> {
         })
     }
 
+    pub fn encrypt_for_subject_scope(
+        &self,
+        tenant: &TenantId,
+        subject: &SubjectId,
+        scope: SubjectKeyScope,
+        plaintext: &[u8],
+    ) -> Result<EncryptedColumn, KeyChoiceError> {
+        self.encrypt_for_subject_scope_with_aad(tenant, subject, scope, plaintext, &[])
+    }
+
     pub fn decrypt(&self, column: &EncryptedColumn) -> Result<Vec<u8>, KeyChoiceError> {
         self.decrypt_with_aad(column, &[])
     }

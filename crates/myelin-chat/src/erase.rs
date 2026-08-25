@@ -1,6 +1,6 @@
 use myelin_gdpr::{EraseReceipt, EraseScope, Receipt, SubjectRef, TenantId};
 use myelin_storage::encryption::EncryptedColumn;
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine, KmsError};
+use myelin_storage::kms::{DekId, KmsEngine, KmsError};
 use myelin_tenancy::Region;
 
 use crate::composer::DraftStore;
@@ -124,7 +124,7 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
 
         let destroyed_key_epoch = match &subject_token {
             Some(sid) => {
-                let dek_id = DekId::new(tenant.clone(), KeyClass::Subject(sid.clone()));
+                let dek_id = DekId::new(tenant.clone(), crate::dek::chat_subject_key_class(sid));
                 let epoch = self.dek_epoch(&tenant, sid, &dek_id)?;
                 self.kms.destroy_dek(&dek_id)?;
                 epoch
@@ -188,7 +188,7 @@ impl<'a, S: MessageStore> ChatErasureCascade<'a, S> {
             .ensure_dek(
                 tenant,
                 &self.region,
-                KeyClass::Subject(subject_token.to_string()),
+                crate::dek::chat_subject_key_class(subject_token),
             )
             .ok()
             .map(|key_ref| key_ref.dek_epoch))
@@ -444,7 +444,8 @@ mod tests {
             !kms.backup_snapshot()
                 .unwrap()
                 .into_iter()
-                .any(|(id, _)| id == DekId::new(tenant(), KeyClass::Subject("psn:ada".into()))),
+                .any(|(id, _)| id
+                    == DekId::new(tenant(), crate::dek::chat_subject_key_class("psn:ada"))),
             "the crypto-shredded DEK is EXCLUDED from backups (it stays dead across restore, §7.5)"
         );
         assert!(

@@ -42,8 +42,16 @@ async fn chat_body_per_subject_dek_zero_plaintext_at_rest_in_real_postgres() {
         &plaintext_nodes,
     )
     .expect("seal body_nodes under the per-subject DEK");
-    assert!(inline_col.key_ref.class.as_token().starts_with("subject:"));
-    assert!(nodes_col.key_ref.class.as_token().starts_with("subject:"));
+    assert!(inline_col
+        .key_ref
+        .class
+        .as_token()
+        .starts_with("scoped-subject:chat:"));
+    assert!(nodes_col
+        .key_ref
+        .class
+        .as_token()
+        .starts_with("scoped-subject:chat:"));
 
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)

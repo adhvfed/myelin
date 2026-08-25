@@ -1,6 +1,6 @@
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, KeyChoiceError, SubjectId};
-use myelin_storage::kms::{KekId, KmsEngine, PiiKeyRef, NONCE_LEN};
+use myelin_storage::kms::{KekId, KeyClass, KmsEngine, PiiKeyRef, SubjectKeyScope, NONCE_LEN};
 use myelin_tenancy::{Region, TenantId};
 
 pub fn subject_dek_erasure() -> ErasureMethod {
@@ -44,7 +44,7 @@ pub fn encrypt_body(
 ) -> Result<EncryptedColumn, KeyChoiceError> {
     engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
     let cryptor = ColumnCryptor::new(engine, region.clone());
-    cryptor.encrypt(tenant, Some(author), &subject_dek_erasure(), plaintext)
+    cryptor.encrypt_for_subject_scope(tenant, author, SubjectKeyScope::Chat, plaintext)
 }
 
 pub fn decrypt_body(
@@ -54,6 +54,17 @@ pub fn decrypt_body(
 ) -> Result<Vec<u8>, KeyChoiceError> {
     let cryptor = ColumnCryptor::new(engine, region.clone());
     cryptor.decrypt(column)
+}
+
+pub fn chat_subject_key_class(author: &str) -> KeyClass {
+    KeyClass::ScopedSubject {
+        scope: SubjectKeyScope::Chat,
+        subject: author.to_string(),
+    }
+}
+
+pub fn is_chat_subject_key_class(class: &KeyClass, author: &str) -> bool {
+    class == &chat_subject_key_class(author) || class == &KeyClass::Subject(author.to_string())
 }
 
 pub fn plaintext_at_rest(column: &EncryptedColumn, plaintext: &[u8]) -> bool {
@@ -170,6 +181,21 @@ mod tests {
     }
 
     #[test]
+    fn chat_reads_legacy_author_keys_without_accepting_another_scope() {
+        let current = chat_subject_key_class(author().as_str());
+        let legacy = KeyClass::Subject(author().0);
+        assert!(is_chat_subject_key_class(&current, "8a2f@acme.noreply"));
+        assert!(is_chat_subject_key_class(&legacy, "8a2f@acme.noreply"));
+        assert!(!is_chat_subject_key_class(
+            &KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::AgentData,
+                subject: "8a2f@acme.noreply".into(),
+            },
+            "8a2f@acme.noreply"
+        ));
+    }
+
+    #[test]
     fn encrypted_body_envelope_round_trips_without_plaintext() {
         let eng = engine();
         let plaintext = b"a private release discussion";
@@ -214,7 +240,11 @@ mod tests {
             let column = encrypt_body(&eng, &region(), &tenant(), &author(), kind, &plaintext)
                 .expect("seal");
             assert!(
-                column.key_ref.class.as_token().starts_with("subject:"),
+                column
+                    .key_ref
+                    .class
+                    .as_token()
+                    .starts_with("scoped-subject:chat:"),
                 "the {} column is keyed under the per-subject DEK (GD-4)",
                 kind.label()
             );
@@ -267,7 +297,13 @@ mod tests {
             a.key_ref.class, b.key_ref.class,
             "each author has a DISTINCT per-subject DEK (GD-4 individual granularity)"
         );
-        assert!(matches!(a.key_ref.class, KeyClass::Subject(_)));
+        assert!(matches!(
+            a.key_ref.class,
+            KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::Chat,
+                ..
+            }
+        ));
     }
 
     #[test]

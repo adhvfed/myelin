@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use myelin_chat::store::{AuthorKind, Message, MessageId, MessageState};
 use myelin_chat::{
-    decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, ChatFreeText,
+    decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body,
+    is_chat_subject_key_class, ChatFreeText,
 };
 use myelin_content::{InlineNode, OBJ};
 use myelin_identity::Principal;
-use myelin_storage::{KeyClass, KmsEngine, SubjectId};
+use myelin_storage::{KmsEngine, SubjectId};
 use serde_json::{json, Value};
 
 use crate::{EdgeError, ReferenceCard};
@@ -142,7 +143,7 @@ fn decrypt_message_column(
         ))
     })?;
     if encrypted.key_ref.tenant.as_str() != message.conv.tenant
-        || encrypted.key_ref.class != KeyClass::Subject(message.author.clone())
+        || !is_chat_subject_key_class(&encrypted.key_ref.class, &message.author)
     {
         return Err(EdgeError::Internal(
             "stored Chat message encryption scope does not match its author".into(),

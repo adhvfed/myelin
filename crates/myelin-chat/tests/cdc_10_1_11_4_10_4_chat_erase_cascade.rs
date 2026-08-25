@@ -9,7 +9,7 @@ use myelin_events::{
 use myelin_gdpr::{EraseScope, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::SubjectId;
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
+use myelin_storage::kms::{DekId, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -217,7 +217,7 @@ fn cdc_11_4_10_1_destroyed_epoch_matches_the_excluded_backup_dek() {
         b"body",
     )
     .expect("seal");
-    let dek_id = DekId::new(tenant(), KeyClass::Subject("psn:ada".into()));
+    let dek_id = DekId::new(tenant(), myelin_chat::chat_subject_key_class("psn:ada"));
     assert!(
         kms.backup_snapshot()
             .unwrap()

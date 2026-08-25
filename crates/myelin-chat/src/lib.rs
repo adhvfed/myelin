@@ -45,8 +45,9 @@ pub use cross_org::{
     ChannelProjection, CrossOrgChannel, CrossOrgPointer, FederatedMember,
 };
 pub use dek::{
-    decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, plaintext_at_rest,
-    subject_dek_erasure, ChatBodyEnvelopeError, ChatFreeText,
+    chat_subject_key_class, decode_encrypted_body, decrypt_body, encode_encrypted_body,
+    encrypt_body, is_chat_subject_key_class, plaintext_at_rest, subject_dek_erasure,
+    ChatBodyEnvelopeError, ChatFreeText,
 };
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseError, ChatEraseReport, ChatErasureCascade,

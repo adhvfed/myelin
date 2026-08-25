@@ -1708,15 +1708,36 @@ all-feature Storage Clippy; TypeScript typechecking; the 34.82-second real
 `pg_dump`/`pg_restore` drill; the real scope-aware ledger story; and the
 15.20-second live privacy system story.
 
+## 2026-08-25 — Chat has an independent key boundary
+
+The next holder audit exposed the same coupling on Chat's write path. Message
+bodies still selected the legacy generic subject key, so a future durable Chat
+erase could not safely become one member of a larger privacy request: destroying
+its key could also erase an unrelated holder that happened to use the same
+subject coordinate.
+
+New Chat bodies now select the typed `Chat` subject-key scope. Decryption accepts
+both that scope and the legacy unscoped class, but explicitly rejects another
+product's scoped key. The erasure cascade uses the same typed selector. This is
+only a safe cryptographic seam—not a claim that the existing in-memory cascade is
+a production holder. The misleading PostgreSQL-labelled cascade test still needs
+replacement with a real `PgMessageStore` erase story before Chat can join the
+public privacy certificate.
+
+Proof: the real PostgreSQL subject-key and existing cascade tests; focused Chat
+contracts; warning-free all-target, all-feature Chat, Edge, and Storage Clippy;
+and 13 live Chat/privacy system journeys in 129.31 seconds.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for the wired path, open for the rest.** the
    agent-data erase now writes the post-PIT ledger and the re-erase pass is
    drilled against a real dump. the maintenance command and runbook replay it
    through the production holder and restore the absorbing processing block.
-   remaining: the library-level erase paths (chat, issues, git crypto-shred)
-   still do not write the ledger because nothing wires them to a user surface
-   yet (gap 2).
+   remaining: Chat now has a scoped key and ledger vocabulary, but its cascade
+   still targets memory rather than `PgMessageStore`; Issues and Git crypto-shred
+   likewise do not write the ledger because none is wired to a user surface yet
+   (gap 2).
 2. **DSR has one truthful product slice, not full holder coverage.** durable
    submit/status/certificate is now wired for the real agent-data holder and
    exercised through Edge. chat/issues/git erasure flows still exist as

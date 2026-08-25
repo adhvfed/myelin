@@ -12,7 +12,7 @@ use myelin_events::{
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
+use myelin_storage::kms::{DekId, KmsEngine};
 use myelin_tenancy::{Region, TenantId};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ fn chat_d8_chained_erase_zero_recoverable_pii_complete_receipts() {
     let hot_body = seal_body(&kms, b"my private chat in the hot tier");
     let cold_body = seal_body(&kms, b"my private chat archived in the cold segment");
     let backup_before = kms.backup_snapshot().unwrap();
-    let dek_id = DekId::new(tenant(), KeyClass::Subject(SUBJECT.into()));
+    let dek_id = DekId::new(tenant(), myelin_chat::chat_subject_key_class(SUBJECT));
     assert!(
         backup_before.iter().any(|(id, _)| id == &dek_id),
         "the backup carries the subject's per-subject DEK BEFORE the erase"

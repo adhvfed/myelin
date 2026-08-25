@@ -264,6 +264,11 @@ and permanently blocks later agent processing for that person. This self-service
 presented as full account or organization erasure; other personal-data holders remain outside its
 explicit scope.
 
+New Chat messages likewise use a Chat-specific subject key. Existing messages encrypted with the
+former unscoped subject key remain readable, while another product's erasure can no longer destroy
+the key for a newly written Chat message. This is the cryptographic boundary required for a real
+Chat holder; it does not yet make Chat part of the public privacy request or certificate.
+
 Sensitive effects such as `git.merge` have a second, narrower approval boundary. The agent may
 reason up to the effect, but Myelin withholds the mutation, parks the durable workflow without
 holding a model runtime, and places the exact pull request in every eligible human approver's

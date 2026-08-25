@@ -5,7 +5,7 @@ use myelin_chat::{
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::encryption::SubjectId;
-use myelin_storage::kms::{DekId, KeyClass, KmsEngine};
+use myelin_storage::kms::{DekId, KeyClass, KmsEngine, SubjectKeyScope};
 use myelin_substrate::{
     assert_holder_completeness, classify_store, Holder, HolderRegistry, StoreKind,
 };
@@ -29,11 +29,21 @@ fn provider_chat_body_seals_under_the_authors_per_subject_dek() {
         let column =
             encrypt_body(&eng, &region(), &tenant(), &author(), kind, &plaintext).expect("seal");
         assert!(
-            matches!(column.key_ref.class, KeyClass::Subject(_)),
+            matches!(
+                column.key_ref.class,
+                KeyClass::ScopedSubject {
+                    scope: SubjectKeyScope::Chat,
+                    ..
+                }
+            ),
             "the {} body is keyed under the per-subject DEK",
             kind.label()
         );
-        assert!(column.key_ref.class.as_token().starts_with("subject:"));
+        assert!(column
+            .key_ref
+            .class
+            .as_token()
+            .starts_with("scoped-subject:chat:"));
         assert!(
             !plaintext_at_rest(&column, &plaintext),
             "0 plaintext body bytes at rest for {}",

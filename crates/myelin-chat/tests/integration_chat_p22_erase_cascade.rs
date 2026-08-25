@@ -56,7 +56,11 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
         &plaintext,
     )
     .expect("seal body_inline under the per-subject DEK");
-    assert!(col.key_ref.class.as_token().starts_with("subject:"));
+    assert!(col
+        .key_ref
+        .class
+        .as_token()
+        .starts_with("scoped-subject:chat:"));
 
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
