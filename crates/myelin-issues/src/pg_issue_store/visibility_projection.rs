@@ -4,10 +4,12 @@ use myelin_storage::PgError;
 use sqlx::{PgConnection, Row};
 use std::sync::Arc;
 
+const FACTORED_ISSUE_VIEW_FORMAT: i32 = 2;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueViewProjectionRevision {
     pub revision: i64,
-    pub effective_grants: u64,
+    pub projected_memberships: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,7 +79,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .with_tenant_tx(&tenant_id.clone(), move |connection| {
                 Box::pin(async move {
                     let row = sqlx::query(
-                        "SELECT source_revision, applied_revision, status \
+                        "SELECT source_revision, applied_revision, status, format_version \
                          FROM authz_projection_state \
                          WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'",
                     )
@@ -90,7 +92,11 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         let source: i64 = row.get("source_revision");
                         let applied: i64 = row.get("applied_revision");
                         let status: String = row.get("status");
-                        if status == "ready" && source == applied {
+                        let format_version: i32 = row.get("format_version");
+                        if status == "ready"
+                            && source == applied
+                            && format_version == FACTORED_ISSUE_VIEW_FORMAT
+                        {
                             0
                         } else {
                             source.saturating_sub(applied).max(1)
@@ -101,6 +107,23 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .await
             .map_err(|error| IssueStoreError::Storage(error.to_string()))
     }
+}
+
+pub async fn visible_issue_keys_in_tx(
+    connection: &mut PgConnection,
+    tenant_id: &str,
+    region: &str,
+    subject: &str,
+    issue_keys: &[String],
+) -> Result<Vec<String>, PgError> {
+    sqlx::query_scalar::<_, String>(visible_issue_keys_sql())
+        .bind(tenant_id)
+        .bind(region)
+        .bind(subject)
+        .bind(issue_keys)
+        .fetch_all(connection)
+        .await
+        .map_err(query_error)
 }
 
 async fn stage_visibility_snapshot(
@@ -123,7 +146,7 @@ async fn stage_visibility_snapshot(
     let stage_walk_sql = format!(
         "CREATE TEMP TABLE issue_view_rebuild_walk ON COMMIT DROP AS \
          {ISSUE_VIEW_WALK_CTE} \
-         SELECT issue_id, arm, object_id, relation, depth, supported \
+         SELECT scope_kind, scope_id, object_id, relation, depth, supported \
          FROM walk"
     );
     sqlx::query(&stage_walk_sql)
@@ -135,16 +158,16 @@ async fn stage_visibility_snapshot(
 
     reject_unsupported_usersets(connection).await?;
 
-    let stage_effective_sql = format!(
-        "CREATE TEMP TABLE issue_view_rebuild_effective ON COMMIT DROP AS \
+    let stage_subjects_sql = format!(
+        "CREATE TEMP TABLE issue_view_rebuild_subjects ON COMMIT DROP AS \
          WITH walk AS MATERIALIZED (\
-           SELECT issue_id, arm, object_id, relation, supported \
+           SELECT scope_kind, scope_id, object_id, relation, supported \
            FROM pg_temp.issue_view_rebuild_walk\
          ) \
          {ISSUE_VIEW_MEMBERS_CTE} \
-         SELECT issue_id, subject FROM effective"
+         SELECT DISTINCT scope_kind, scope_id, subject FROM members"
     );
-    sqlx::query(&stage_effective_sql)
+    sqlx::query(&stage_subjects_sql)
         .bind(tenant_id)
         .bind(region)
         .execute(&mut *connection)
@@ -217,7 +240,7 @@ async fn publish_visibility_snapshot(
     }
 
     mark_projection_rebuilding(connection, tenant_id, region).await?;
-    replace_visible_grants(connection, tenant_id, region, snapshot_revision).await
+    replace_projected_memberships(connection, tenant_id, region, snapshot_revision).await
 }
 
 async fn mark_projection_rebuilding(
@@ -237,14 +260,14 @@ async fn mark_projection_rebuilding(
     Ok(())
 }
 
-async fn replace_visible_grants(
+async fn replace_projected_memberships(
     connection: &mut PgConnection,
     tenant_id: &str,
     region: &str,
     revision: i64,
 ) -> Result<IssueViewRebuildOutcome, PgError> {
     sqlx::query(
-        "DELETE FROM issue_authz_visible \
+        "DELETE FROM issue_view_subject \
          WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'",
     )
     .bind(tenant_id)
@@ -253,12 +276,11 @@ async fn replace_visible_grants(
     .await
     .map_err(query_error)?;
 
-    let effective_grants = sqlx::query(
-        "INSERT INTO issue_authz_visible \
-           (tenant_id, region, projection, subject, permission, object_type, \
-            object_id, revision) \
-         SELECT $1, $2, 'issue:view', subject, 'view', 'issue', issue_id, $3 \
-         FROM pg_temp.issue_view_rebuild_effective",
+    let projected_memberships = sqlx::query(
+        "INSERT INTO issue_view_subject \
+           (tenant_id, region, projection, subject, scope_kind, scope_id, revision) \
+         SELECT $1, $2, 'issue:view', subject, scope_kind, scope_id, $3 \
+         FROM pg_temp.issue_view_rebuild_subjects",
     )
     .bind(tenant_id)
     .bind(region)
@@ -270,13 +292,15 @@ async fn replace_visible_grants(
 
     let published = sqlx::query(
         "UPDATE authz_projection_state \
-         SET applied_revision = $3, status = 'ready', rebuilt_at = now() \
+         SET applied_revision = $3, status = 'ready', rebuilt_at = now(), \
+             format_version = $4 \
          WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view' \
            AND source_revision = $3",
     )
     .bind(tenant_id)
     .bind(region)
     .bind(revision)
+    .bind(FACTORED_ISSUE_VIEW_FORMAT)
     .execute(&mut *connection)
     .await
     .map_err(query_error)?;
@@ -290,7 +314,7 @@ async fn replace_visible_grants(
     Ok(IssueViewRebuildOutcome::Published(
         IssueViewProjectionRevision {
             revision,
-            effective_grants,
+            projected_memberships,
         },
     ))
 }
@@ -307,32 +331,75 @@ fn projection_error(reason: String) -> IssueStoreError {
     }
 }
 
+const VISIBLE_ISSUE_KEYS_BEFORE_VISIBILITY: &str = r#"
+WITH projection AS MATERIALIZED (
+  SELECT applied_revision AS revision
+    FROM authz_projection_state
+   WHERE tenant_id = $1 AND region = $2
+     AND projection = 'issue:view' AND status = 'ready'
+     AND applied_revision = source_revision AND format_version = 2
+)
+SELECT i.key
+  FROM projection
+  JOIN issue i
+    ON i.tenant_id = $1 AND i.region = $2
+  JOIN issue_authz_binding binding
+    ON binding.tenant_id = i.tenant_id AND binding.region = i.region
+   AND binding.issue_id = i.id AND binding.state = 'active'
+   AND binding.project_id = i.project_id
+   AND binding.issue_object = 'issue:' || i.id::text
+   AND binding.project_userset = 'project:' || i.project_id::text || '#view'
+   AND binding.relation = 'parent_project'
+ WHERE i.key = ANY($4)
+   AND i.deleted_at IS NULL AND NOT i.archived
+   AND
+"#;
+
+fn visible_issue_keys_sql() -> &'static str {
+    static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SQL.get_or_init(|| {
+        [
+            VISIBLE_ISSUE_KEYS_BEFORE_VISIBILITY,
+            super::ISSUE_VIEW_SUBJECT_PREDICATE,
+        ]
+        .concat()
+    })
+}
+
 const ISSUE_VIEW_WALK_CTE: &str = r#"
-WITH RECURSIVE roots(issue_id, arm, object_id, relation, depth, path, supported) AS (
-  SELECT i.id::text, root.arm,
-         CASE WHEN root.arm = 'base'
-              THEN split_part(b.project_userset, '#', 1)
-              ELSE b.issue_object END,
-         root.relation, 0,
-         ARRAY[(CASE WHEN root.arm = 'base'
-                     THEN split_part(b.project_userset, '#', 1)
-                     ELSE b.issue_object END) || '#' || root.relation]::text[],
-         true
+WITH RECURSIVE active_binding AS (
+  SELECT i.id AS issue_id, i.project_id, b.issue_object, b.project_userset
   FROM issue i
   JOIN issue_authz_binding b
     ON b.tenant_id = i.tenant_id AND b.region = i.region
    AND b.issue_id = i.id AND b.state = 'active'
-  CROSS JOIN (VALUES
-      ('base'::text, 'view'::text),
-      ('confidential'::text, 'confidential'::text),
-      ('grant'::text, 'confidential_grant'::text)
-  ) AS root(arm, relation)
-  WHERE i.tenant_id = $1 AND i.region = $2 AND i.deleted_at IS NULL
+   AND b.project_id = i.project_id
+   AND b.issue_object = 'issue:' || i.id::text
+   AND b.project_userset = 'project:' || i.project_id::text || '#view'
+   AND b.relation = 'parent_project'
+  WHERE i.tenant_id = $1 AND i.region = $2
+    AND i.deleted_at IS NULL AND NOT i.archived
 ),
-walk(issue_id, arm, object_id, relation, depth, path, supported) AS (
-  SELECT issue_id, arm, object_id, relation, depth, path, supported FROM roots
+roots(scope_kind, scope_id, object_id, relation, depth, path, supported) AS (
+  SELECT DISTINCT 'project'::text, project_id,
+         split_part(project_userset, '#', 1), 'view'::text, 0,
+         ARRAY[project_userset]::text[], true
+  FROM active_binding
+
   UNION ALL
-  SELECT w.issue_id, w.arm, child.object_id, child.relation, w.depth + 1,
+
+  SELECT scope_kind, issue_id, issue_object, relation, 0,
+         ARRAY[issue_object || '#' || relation]::text[], true
+  FROM active_binding
+  CROSS JOIN (VALUES
+      ('confidential'::text, 'confidential'::text),
+      ('confidential_grant'::text, 'confidential_grant'::text)
+  ) AS issue_scope(scope_kind, relation)
+),
+walk(scope_kind, scope_id, object_id, relation, depth, path, supported) AS (
+  SELECT scope_kind, scope_id, object_id, relation, depth, path, supported FROM roots
+  UNION ALL
+  SELECT w.scope_kind, w.scope_id, child.object_id, child.relation, w.depth + 1,
          w.path || (child.object_id || '#' || child.relation), child.supported
   FROM walk w
   CROSS JOIN LATERAL (
@@ -385,8 +452,8 @@ walk(issue_id, arm, object_id, relation, depth, path, supported) AS (
 "#;
 
 const ISSUE_VIEW_MEMBERS_CTE: &str = r#"
-, members(issue_id, arm, subject) AS (
-  SELECT w.issue_id, w.arm, t.subject
+, members(scope_kind, scope_id, subject) AS (
+  SELECT w.scope_kind, w.scope_id, t.subject
   FROM walk w
   JOIN rebac_tuple t
     ON t.tenant_id = $1 AND t.region = $2
@@ -395,12 +462,5 @@ const ISSUE_VIEW_MEMBERS_CTE: &str = r#"
   WHERE w.supported AND position('#' IN t.subject) = 0
     AND NOT (w.relation = 'view'
              AND split_part(w.object_id, ':', 1) IN ('org', 'team', 'project'))
-),
-effective(issue_id, subject) AS (
-  (SELECT issue_id, subject FROM members WHERE arm = 'base'
-   EXCEPT
-   SELECT issue_id, subject FROM members WHERE arm = 'confidential')
-  UNION
-  SELECT issue_id, subject FROM members WHERE arm = 'grant'
 )
 "#;

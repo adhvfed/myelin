@@ -88,6 +88,52 @@ END;
 $$;
 "#;
 
+pub const AUTHZ_PROJECTION_FORMAT_MIGRATION: &str = r#"
+ALTER TABLE authz_projection_state
+  ADD COLUMN IF NOT EXISTS format_version integer NOT NULL DEFAULT 0
+    CHECK (format_version >= 0);
+
+CREATE OR REPLACE FUNCTION myelin_invalidate_issue_view_projection()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+AS $$
+DECLARE
+    scoped_tenant text;
+    scoped_region text;
+BEGIN
+    IF TG_TABLE_NAME = 'rebac_tuple' THEN
+        IF split_part(COALESCE(NEW.object_id, ''), ':', 1)
+               NOT IN ('issue', 'project', 'team', 'org')
+           AND split_part(COALESCE(OLD.object_id, ''), ':', 1)
+               NOT IN ('issue', 'project', 'team', 'org') THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+    END IF;
+
+    scoped_tenant := COALESCE(NEW.tenant_id, OLD.tenant_id);
+    scoped_region := COALESCE(NEW.region, OLD.region);
+    INSERT INTO authz_projection_state
+        (tenant_id, region, projection, source_revision, applied_revision, status,
+         rebuilt_at, format_version)
+    VALUES (scoped_tenant, scoped_region, 'issue:view', 1, 0, 'pending', NULL, 0)
+    ON CONFLICT (tenant_id, region, projection) DO UPDATE
+       SET source_revision = authz_projection_state.source_revision + 1,
+           status = 'pending',
+           rebuilt_at = NULL,
+           format_version = 0;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+UPDATE authz_projection_state
+   SET source_revision = source_revision + 1,
+       status = 'pending',
+       rebuilt_at = NULL,
+       format_version = 0
+ WHERE projection = 'issue:view';
+"#;
+
 pub fn authz_projection_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain(
@@ -107,6 +153,13 @@ pub fn authz_projection_durable_migrations() -> Migrations {
             AUTHZ_PROJECTION_SCOPED_INVALIDATOR_MIGRATION,
         ),
     ])
+}
+
+pub fn authz_projection_format_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0136_authz_projection_format",
+        AUTHZ_PROJECTION_FORMAT_MIGRATION,
+    )])
 }
 
 #[cfg(test)]

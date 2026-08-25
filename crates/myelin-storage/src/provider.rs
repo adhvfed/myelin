@@ -245,6 +245,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::reerase_durable::post_pit_scope_migrations(),
         crate::reerase_durable::post_pit_scope_required_migrations(),
         crate::privacy_request_durable::privacy_request_chat_messages_scope_migrations(),
+        crate::authz_projection_durable::authz_projection_format_migrations(),
     ]
 }
 

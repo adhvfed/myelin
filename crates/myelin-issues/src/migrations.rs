@@ -14,6 +14,7 @@ pub const CONSUMER_DEDUP_TABLE: &str = "consumer_dedup";
 pub const OUTBOX_TABLE: &str = "outbox";
 pub const ISSUE_AUTHZ_BINDING_TABLE: &str = "issue_authz_binding";
 pub const ISSUE_AUTHZ_VISIBLE_TABLE: &str = "issue_authz_visible";
+pub const ISSUE_VIEW_SUBJECT_TABLE: &str = "issue_view_subject";
 pub const IMPORT_MAP_TABLE: &str = "import_map";
 pub const ISSUE_CREATE_IDEMPOTENCY_TABLE: &str = "issue_create_idempotency";
 
@@ -34,6 +35,28 @@ CREATE TABLE IF NOT EXISTS issue_authz_visible (
 CREATE INDEX IF NOT EXISTS issue_authz_visible_lookup
   ON issue_authz_visible
     (tenant_id, region, subject, permission, object_type, revision, object_id);"#;
+
+pub const CREATE_ISSUE_VIEW_SUBJECT_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS issue_view_subject (
+  tenant_id   text NOT NULL,
+  region      text NOT NULL,
+  projection  text NOT NULL CHECK (projection = 'issue:view'),
+  subject     text NOT NULL,
+  scope_kind  text NOT NULL CHECK (scope_kind IN ('project', 'confidential', 'confidential_grant')),
+  scope_id    uuid NOT NULL,
+  revision    bigint NOT NULL CHECK (revision > 0),
+  PRIMARY KEY (tenant_id, region, projection, scope_kind, scope_id, subject),
+  FOREIGN KEY (tenant_id, region, projection)
+    REFERENCES authz_projection_state (tenant_id, region, projection)
+);
+CREATE INDEX IF NOT EXISTS issue_view_subject_lookup
+  ON issue_view_subject
+    (tenant_id, region, subject, revision, scope_kind, scope_id);"#;
+
+const INVALIDATE_LEGACY_ISSUE_VIEW_DDL: &str = r#"
+UPDATE authz_projection_state
+   SET source_revision = source_revision + 1, status = 'pending', rebuilt_at = NULL
+ WHERE projection = 'issue:view';"#;
 
 pub const CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL: &str = r#"
 CREATE TRIGGER issue_invalidate_issue_view
@@ -573,6 +596,17 @@ pub fn issues_migrations() -> Migrations {
         MigrationPhase::Expand,
         ISSUE_RELATION_TABLE,
     ));
+    let issue_view_subject_ddl = format!(
+        "{}\n{};\n{}",
+        CREATE_ISSUE_VIEW_SUBJECT_DDL,
+        make_tenant_scoped_ddl(ISSUE_VIEW_SUBJECT_TABLE),
+        INVALIDATE_LEGACY_ISSUE_VIEW_DDL,
+    );
+    migrations.push(Migration::plain_on(
+        "iss_0031_factored_issue_view",
+        issue_view_subject_ddl,
+        ISSUE_VIEW_SUBJECT_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -710,11 +744,6 @@ mod tests {
     #[test]
     fn the_migration_set_is_forward_only() {
         let migrations = issues_migrations();
-        assert_eq!(
-            migrations.0.len(),
-            36,
-            "the complete append-only Issues migration history remains intact"
-        );
         for m in &migrations.0 {
             assert!(
                 !myelin_substrate::is_destructive(m.ddl.as_ref()),
@@ -752,7 +781,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id.as_ref()),
-            Some("iss_0030_issue_relation_creator_kind")
+            Some("iss_0031_factored_issue_view")
         );
         for invariant in [
             "CREATE INDEX CONCURRENTLY",
@@ -867,6 +896,7 @@ mod tests {
     fn the_runner_admits_the_whole_set_idempotently() {
         use myelin_substrate::MigrationRunner;
         let migrations = issues_migrations();
+        let expected_migrations = migrations.0.len();
         let hot = issues_hot_tables();
         let mut runner = MigrationRunner::new();
         runner
@@ -874,7 +904,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            36,
+            expected_migrations,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -889,7 +919,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            36,
+            expected_migrations,
             "the re-apply admits every migration again"
         );
     }

@@ -146,6 +146,15 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .await
         .expect("Issues projection table and strict triggers");
     let provider = bootstrap.into_runtime().await.expect("runtime provider");
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(
+            &std::env::var("DATABASE_MIGRATION_URL").unwrap_or_else(|_| {
+                "postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin".into()
+            }),
+        )
+        .await
+        .unwrap();
 
     let suffix = format!("{}_{}", std::process::id(), now_nanos());
     let tenant = format!("iss_s8_{suffix}");
@@ -308,7 +317,29 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
     let IssueViewRebuildOutcome::Published(built) = built else {
         panic!("an uncontended rebuild publishes its staged revision");
     };
-    assert!(built.effective_grants >= 2);
+    assert!(built.projected_memberships >= 2);
+    sqlx::query(
+        "UPDATE authz_projection_state SET format_version = 0 \
+         WHERE tenant_id = $1 AND region = 'fr-par' AND projection = 'issue:view'",
+    )
+    .bind(&tenant)
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        store.effective_issue_view_lag(&worker).await.unwrap(),
+        Some(1)
+    );
+    assert!(matches!(
+        store
+            .list(&alice, IssuePageRequest::new(20, None).unwrap())
+            .await,
+        Err(IssueStoreError::AuthorizationUnavailable(_))
+    ));
+    store
+        .rebuild_effective_issue_view(&worker)
+        .await
+        .expect("a current worker replaces a legacy-format projection");
     assert_eq!(
         store
             .list(&alice, IssuePageRequest::new(20, None).unwrap())
@@ -545,16 +576,8 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         Err(IssueStoreError::NotFound)
     );
 
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(
-            &std::env::var("DATABASE_MIGRATION_URL").unwrap_or_else(|_| {
-                "postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin".into()
-            }),
-        )
-        .await
-        .unwrap();
     for statement in [
+        "DELETE FROM issue_view_subject WHERE tenant_id = ANY($1)",
         "DELETE FROM issue_authz_visible WHERE tenant_id = ANY($1)",
         "DELETE FROM issue_authz_binding WHERE tenant_id = ANY($1)",
         "DELETE FROM issue WHERE tenant_id = ANY($1)",

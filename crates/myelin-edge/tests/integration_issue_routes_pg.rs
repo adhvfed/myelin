@@ -1062,10 +1062,12 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO issue_authz_visible (tenant_id, region, projection, subject, permission, \
-                                           object_type, object_id, revision) \
-         SELECT tenant_id, region, 'issue:view', $3, 'view', 'issue', id::text, $4 \
-         FROM issue WHERE tenant_id = $1 AND region = $2 AND key LIKE 'SKW-%'",
+        "INSERT INTO issue_view_subject \
+           (tenant_id, region, projection, subject, scope_kind, scope_id, revision) \
+         SELECT DISTINCT tenant_id, region, 'issue:view', $3, 'project', project_id, $4 \
+         FROM issue WHERE tenant_id = $1 AND region = $2 AND key LIKE 'SKW-%' \
+         ON CONFLICT (tenant_id, region, projection, scope_kind, scope_id, subject) \
+         DO UPDATE SET revision = EXCLUDED.revision",
     )
     .bind(&tenant)
     .bind(REGION)
@@ -1074,7 +1076,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .execute(&admin)
     .await
     .unwrap();
-    for table in ["issue", "issue_authz_binding", "issue_authz_visible"] {
+    for table in ["issue", "issue_authz_binding", "issue_view_subject"] {
         sqlx::query(&format!("ANALYZE {table}"))
             .execute(&admin)
             .await
@@ -1179,6 +1181,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         "DELETE FROM issue WHERE tenant_id = $1",
         "DELETE FROM prefix_counter WHERE tenant_id = $1",
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM issue_view_subject WHERE tenant_id = $1",
         "DELETE FROM issue_authz_visible WHERE tenant_id = $1",
         "DELETE FROM authz_projection_state WHERE tenant_id = $1",
     ] {

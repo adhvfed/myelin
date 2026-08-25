@@ -60,25 +60,25 @@ pub use migrations::{
     CREATE_ISSUE_AUTHZ_VISIBLE_DDL, CREATE_ISSUE_CHANGE_LOG_DDL,
     CREATE_ISSUE_CREATE_IDEMPOTENCY_DDL, CREATE_ISSUE_DDL, CREATE_ISSUE_INDEXES_DDL,
     CREATE_ISSUE_KEY_PREFIX_LIST_INDEX_DDL, CREATE_ISSUE_RECENT_LIST_INDEX_DDL,
-    CREATE_ISSUE_RELATION_DDL, CREATE_ISSUE_RELATION_INDEXES_DDL, CREATE_MILESTONE_DDL,
-    CREATE_PREFIX_COUNTER_DDL, CREATE_SCHEME_ASSIGNMENT_DDL, CREATE_SCHEME_DDL,
-    CYCLE_MEMBERSHIP_TABLE, CYCLE_TABLE, EXPAND_ISSUE_AUTHZ_CREATED_EVENT_DDL,
+    CREATE_ISSUE_RELATION_DDL, CREATE_ISSUE_RELATION_INDEXES_DDL, CREATE_ISSUE_VIEW_SUBJECT_DDL,
+    CREATE_MILESTONE_DDL, CREATE_PREFIX_COUNTER_DDL, CREATE_SCHEME_ASSIGNMENT_DDL,
+    CREATE_SCHEME_DDL, CYCLE_MEMBERSHIP_TABLE, CYCLE_TABLE, EXPAND_ISSUE_AUTHZ_CREATED_EVENT_DDL,
     EXPAND_ISSUE_CREATOR_KIND_DDL, EXPAND_ISSUE_RELATION_ACTOR_DDL,
     EXPAND_ISSUE_RELATION_CREATOR_KIND_DDL, ISSUE_ASSIGNEE_INDEX, ISSUE_AUTHZ_BINDING_TABLE,
     ISSUE_AUTHZ_VISIBLE_TABLE, ISSUE_BOARD_INDEX, ISSUE_CHANGE_LOG_TABLE,
     ISSUE_CREATE_IDEMPOTENCY_TABLE, ISSUE_CYCLE_INDEX, ISSUE_KEY_PREFIX_LIST_INDEX,
     ISSUE_PARENT_INDEX, ISSUE_PROPS_GIN_INDEX, ISSUE_RECENT_LIST_INDEX, ISSUE_RELATION_TABLE,
-    ISSUE_ROADMAP_INDEX, ISSUE_TABLE, MILESTONE_TABLE, OUTBOX_TABLE, PREFIX_COUNTER_TABLE,
-    SCHEME_ASSIGNMENT_TABLE, SCHEME_TABLE,
+    ISSUE_ROADMAP_INDEX, ISSUE_TABLE, ISSUE_VIEW_SUBJECT_TABLE, MILESTONE_TABLE, OUTBOX_TABLE,
+    PREFIX_COUNTER_TABLE, SCHEME_ASSIGNMENT_TABLE, SCHEME_TABLE,
 };
 pub use migrations::{CREATE_IMPORT_MAP_DDL, IMPORT_MAP_TABLE};
 pub use pg_issue_store::{
-    is_canonical_request_event_id, CreateIssue, CreateIssueIntent, IssueAuthorizationBinding,
-    IssueAuthorizationOutcome, IssueAuthorizationState, IssueAuthorizationStatus, IssueAuthorizer,
-    IssueCreationOutcome, IssueCreationReceipt, IssuePage, IssuePageRequest, IssuePermission,
-    IssueRelationCreationOutcome, IssueStoreError, IssueTupleWriter, IssueViewProjectionRevision,
-    IssueViewRebuildOutcome, PgIssueStore, StoredIssue, StoredIssueRelation, VisibleIssues,
-    MAX_RELATIONS_PER_ISSUE,
+    is_canonical_request_event_id, visible_issue_keys_in_tx, CreateIssue, CreateIssueIntent,
+    IssueAuthorizationBinding, IssueAuthorizationOutcome, IssueAuthorizationState,
+    IssueAuthorizationStatus, IssueAuthorizer, IssueCreationOutcome, IssueCreationReceipt,
+    IssuePage, IssuePageRequest, IssuePermission, IssueRelationCreationOutcome, IssueStoreError,
+    IssueTupleWriter, IssueViewProjectionRevision, IssueViewRebuildOutcome, PgIssueStore,
+    StoredIssue, StoredIssueRelation, VisibleIssues, MAX_RELATIONS_PER_ISSUE,
 };
 pub use pg_issue_store::{ImportIssue, ImportIssueReceipt};
 

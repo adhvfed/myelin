@@ -4,6 +4,34 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Issue visibility is factored by the scope that grants it
+
+The creation-receipt fix removed one symptom, but the underlying `issue:view` projection still
+walked the same project/team/organization graph once per Issue and persisted the resulting
+subject-to-Issue Cartesian product. The long-lived system tenant demonstrated the consequence:
+1,678 Issues and 426 subjects occupied 494,678 projection rows, and an ordinary change could spend
+more than twenty seconds rebuilding all of them.
+
+The projection now models the policy it serves. Project visibility is resolved and stored once per
+project and subject; only Issue-specific confidential membership and explicit confidential grants
+are stored per Issue. Reads compose those three sets as `(project AND NOT confidential) OR grant`.
+Issues owns that predicate and the bounded key resolver used by References, replacing an Edge-owned
+copy of security-sensitive SQL. Reconciliation metrics now count projected memberships rather than
+mislabeling confidential exclusions as grants.
+
+The migration is safe under mixed-version workers. Every relevant database mutation resets an
+explicit projection format generation, only the factored publisher can mark generation 2 ready,
+and all new reads reject any older generation. A durable test simulates a legacy worker publishing
+generation 0, proves reads remain fail-static, and proves a current worker repairs it. On the real
+accumulated tenant the ready projection fell from 494,678 rows to 727, a 680-fold reduction; the
+next complete privacy Vitest phase fell from 11.0 seconds to 5.3 seconds.
+
+**Proof:** warning-free all-target/all-feature Storage, Issues, and Edge clippy; 508 Storage, 433
+Issues, and 363 Edge library cases through the real backend harness; the durable inheritance,
+expiry, confidentiality, restart, revocation, legacy-format, and rebuild-race story; the complete
+PostgreSQL Edge Issue route and its 2,000-row query-plan bound; the R44 authorization saga; restarted
+Edge; and both live privacy lifecycle journeys against the large tenant.
+
 ## 2026-08-25 — issue creation no longer waits for a tenant-wide list rebuild
 
 The privacy system story exposed a product-scale coupling outside Privacy: an Issue authorization

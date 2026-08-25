@@ -202,7 +202,7 @@ pub struct IssueReconciliationReport {
     pub already_active: u64,
     pub failures: u64,
     pub projections_rebuilt: u64,
-    pub projected_grants: u64,
+    pub projected_memberships: u64,
     pub projection_superseded: u64,
     pub projection_failures: u64,
     pub max_projection_lag: u64,
@@ -263,7 +263,7 @@ impl IssueAuthorizationSweeper for PgIssueAuthorizationSweeper {
                         match self.store.rebuild_effective_issue_view(worker).await {
                             Ok(IssueViewRebuildOutcome::Published(rebuilt)) => {
                                 report.projections_rebuilt += 1;
-                                report.projected_grants += rebuilt.effective_grants;
+                                report.projected_memberships += rebuilt.projected_memberships;
                             }
                             Ok(IssueViewRebuildOutcome::Superseded { .. }) => {
                                 report.projection_superseded += 1;
@@ -293,7 +293,7 @@ pub struct IssueReconciliationMetrics {
     already_active: AtomicU64,
     failures: AtomicU64,
     projections_rebuilt: AtomicU64,
-    projected_grants: AtomicU64,
+    projected_memberships: AtomicU64,
     projection_superseded: AtomicU64,
     projection_failures: AtomicU64,
     max_projection_lag: AtomicU64,
@@ -307,7 +307,7 @@ pub struct IssueReconciliationMetricsSnapshot {
     pub already_active: u64,
     pub failures: u64,
     pub projections_rebuilt: u64,
-    pub projected_grants: u64,
+    pub projected_memberships: u64,
     pub projection_superseded: u64,
     pub projection_failures: u64,
     pub max_projection_lag: u64,
@@ -322,7 +322,7 @@ impl IssueReconciliationMetrics {
             already_active: self.already_active.load(Ordering::Relaxed),
             failures: self.failures.load(Ordering::Relaxed),
             projections_rebuilt: self.projections_rebuilt.load(Ordering::Relaxed),
-            projected_grants: self.projected_grants.load(Ordering::Relaxed),
+            projected_memberships: self.projected_memberships.load(Ordering::Relaxed),
             projection_superseded: self.projection_superseded.load(Ordering::Relaxed),
             projection_failures: self.projection_failures.load(Ordering::Relaxed),
             max_projection_lag: self.max_projection_lag.load(Ordering::Relaxed),
@@ -340,8 +340,8 @@ impl IssueReconciliationMetrics {
         self.failures.fetch_add(report.failures, Ordering::Relaxed);
         self.projections_rebuilt
             .fetch_add(report.projections_rebuilt, Ordering::Relaxed);
-        self.projected_grants
-            .fetch_add(report.projected_grants, Ordering::Relaxed);
+        self.projected_memberships
+            .fetch_add(report.projected_memberships, Ordering::Relaxed);
         self.projection_superseded
             .fetch_add(report.projection_superseded, Ordering::Relaxed);
         self.projection_failures

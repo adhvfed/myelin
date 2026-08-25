@@ -30,7 +30,9 @@ mod visibility_projection;
 use create_idempotency::{CreateClaim, CreateIdentity};
 use import_creation::{ImportClaim, ImportIdentity};
 pub use import_creation::{ImportIssue, ImportIssueReceipt};
-pub use visibility_projection::{IssueViewProjectionRevision, IssueViewRebuildOutcome};
+pub use visibility_projection::{
+    visible_issue_keys_in_tx, IssueViewProjectionRevision, IssueViewRebuildOutcome,
+};
 
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_PAGE_SIZE: u32 = 100;
@@ -1848,31 +1850,55 @@ JOIN issue i
 WHERE b.tenant_id = $1 AND b.region = $2 AND b.request_event_id = $3
   AND i.created_by_principal = $4 AND i.deleted_at IS NULL AND NOT i.archived
 "#;
-const EFFECTIVE_ISSUE_VIEW_PREFIX: &str = r#"
+pub(super) const ISSUE_VIEW_SUBJECT_PREDICATE: &str = r#"(
+  EXISTS (
+    SELECT 1 FROM issue_view_subject grant_subject
+    WHERE grant_subject.tenant_id = $1 AND grant_subject.region = $2
+      AND grant_subject.projection = 'issue:view'
+      AND grant_subject.subject = $3 AND grant_subject.revision = projection.revision
+      AND grant_subject.scope_kind = 'confidential_grant'
+      AND grant_subject.scope_id = i.id
+  )
+  OR (
+    EXISTS (
+      SELECT 1 FROM issue_view_subject project_subject
+      WHERE project_subject.tenant_id = $1 AND project_subject.region = $2
+        AND project_subject.projection = 'issue:view'
+        AND project_subject.subject = $3 AND project_subject.revision = projection.revision
+        AND project_subject.scope_kind = 'project'
+        AND project_subject.scope_id = i.project_id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM issue_view_subject confidential_subject
+      WHERE confidential_subject.tenant_id = $1 AND confidential_subject.region = $2
+        AND confidential_subject.projection = 'issue:view'
+        AND confidential_subject.subject = $3
+        AND confidential_subject.revision = projection.revision
+        AND confidential_subject.scope_kind = 'confidential'
+        AND confidential_subject.scope_id = i.id
+    )
+  )
+)"#;
+
+const EFFECTIVE_ISSUE_VIEW_PREFIX_BEFORE_VISIBILITY: &str = r#"
 WITH projection AS MATERIALIZED (
-  SELECT source_revision, applied_revision, status
+  SELECT source_revision, applied_revision, status, format_version
   FROM authz_projection_state
   WHERE tenant_id = $1 AND region = $2 AND projection = 'issue:view'
 ),
 gate AS MATERIALIZED (
   SELECT source_revision AS revision
   FROM projection
-  WHERE status = 'ready' AND applied_revision = source_revision
+  WHERE status = 'ready' AND applied_revision = source_revision AND format_version = 2
 ),
 authorized AS (
   SELECT i.id, i.key, i.project_id, i.state, i.state_category,
          i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
          i.created_at::text AS created_at, i.updated_at::text AS updated_at,
          floor(extract(epoch from i.updated_at) * 1000000)::bigint AS updated_at_micros
-  FROM gate g
-  JOIN issue_authz_visible av
-    ON av.tenant_id = $1 AND av.region = $2
-   AND av.projection = 'issue:view' AND av.subject = $3
-   AND av.permission = 'view' AND av.object_type = 'issue'
-   AND av.revision = g.revision
+  FROM gate projection
   JOIN issue i
-    ON i.tenant_id = av.tenant_id AND i.region = av.region
-   AND i.id::text = av.object_id
+    ON i.tenant_id = $1 AND i.region = $2
   JOIN issue_authz_binding b
     ON b.tenant_id = i.tenant_id AND b.region = i.region
    AND b.issue_id = i.id AND b.state = 'active'
@@ -1882,7 +1908,19 @@ authorized AS (
    AND b.relation = 'parent_project'
   WHERE i.tenant_id = $1 AND i.region = $2
     AND i.deleted_at IS NULL AND NOT i.archived
+    AND
 "#;
+
+fn effective_issue_view_prefix() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| {
+        [
+            EFFECTIVE_ISSUE_VIEW_PREFIX_BEFORE_VISIBILITY,
+            ISSUE_VIEW_SUBJECT_PREDICATE,
+        ]
+        .concat()
+    })
+}
 
 const EFFECTIVE_ISSUE_VIEW_RESULT: &str = r#"
 )
@@ -1925,7 +1963,7 @@ const EFFECTIVE_ISSUE_KEYS_FILTER: &str = r#"
 
 fn effective_issue_view_sql(filter: &str) -> String {
     [
-        EFFECTIVE_ISSUE_VIEW_PREFIX,
+        effective_issue_view_prefix(),
         filter,
         EFFECTIVE_ISSUE_VIEW_RESULT,
     ]

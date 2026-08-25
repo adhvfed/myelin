@@ -882,6 +882,7 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         "DELETE FROM issue WHERE tenant_id = $1",
         "DELETE FROM prefix_counter WHERE tenant_id = $1",
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
+        "DELETE FROM issue_view_subject WHERE tenant_id = $1",
         "DELETE FROM issue_authz_visible WHERE tenant_id = $1",
         "DELETE FROM authz_projection_state WHERE tenant_id = $1",
         "DELETE FROM outbox_quarantine WHERE event_id IN (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",

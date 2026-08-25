@@ -353,31 +353,14 @@ async fn read_database_visibility(
         run_ids,
     } = query;
     let mut result = DatabaseVisibility::default();
-    let visible_issues = sqlx::query_scalar::<_, String>(
-        "SELECT i.key
-           FROM authz_projection_state projection
-           JOIN issue_authz_visible visible
-             ON visible.tenant_id = projection.tenant_id
-            AND visible.region = projection.region
-            AND visible.projection = projection.projection
-            AND visible.revision = projection.applied_revision
-           JOIN issue i
-             ON i.tenant_id = visible.tenant_id AND i.region = visible.region
-            AND i.id::text = visible.object_id
-          WHERE projection.tenant_id = $1 AND projection.region = $2
-            AND projection.projection = 'issue:view' AND projection.status = 'ready'
-            AND projection.applied_revision = projection.source_revision
-            AND visible.subject = $3 AND visible.permission = 'view'
-            AND visible.object_type = 'issue' AND i.key = ANY($4)
-            AND i.deleted_at IS NULL AND NOT i.archived",
+    let visible_issues = myelin_issues::visible_issue_keys_in_tx(
+        connection,
+        &tenant,
+        &region,
+        &subject,
+        &issue_keys,
     )
-    .bind(&tenant)
-    .bind(&region)
-    .bind(&subject)
-    .bind(&issue_keys)
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(database_error("authorize referenced issues"))?;
+    .await?;
     result.roots.extend(
         visible_issues
             .into_iter()
