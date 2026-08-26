@@ -1,4 +1,5 @@
 pub mod check_seam;
+pub mod clock;
 pub mod consumer;
 pub mod crosscell;
 pub mod crosscell_propagation;

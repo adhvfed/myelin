@@ -13,6 +13,7 @@ use crate::request::{EdgeRequest, EdgeResponse};
 use crate::session::{SessionStore, SESSION_COOKIE};
 use crate::shed_governor::{run_class_header, EdgeShed, RUN_CLASS_HEADER};
 use crate::sse::{SseEvent, SseHub};
+use myelin_events::clock::ClockError;
 use myelin_events::{IdMinter, UlidMinter};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
 use myelin_identity_service::{
@@ -35,18 +36,22 @@ const HUMAN_SESSION_TTL_SECS: i64 = 8 * 60 * 60;
 struct HumanSessionIssuer {
     cell: Arc<CellTokenAuthority>,
     jtis: Arc<UlidMinter>,
+    now: Arc<dyn Fn() -> Result<i64, ClockError> + Send + Sync>,
 }
 
 impl HumanSessionIssuer {
+    fn now_unix(&self) -> Result<i64, EdgeError> {
+        (self.now)().map_err(|error| {
+            EdgeError::Unavailable(format!("authentication clock unavailable: {error}"))
+        })
+    }
+
     fn mint(
         &self,
         principal: &Principal,
         assertion: &VerifiedAssertion,
     ) -> Result<(String, i64), EdgeError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let now = self.now_unix()?;
         let expiry = assertion
             .expires_at_unix
             .unwrap_or_else(|| now.saturating_add(HUMAN_SESSION_TTL_SECS))
@@ -76,10 +81,7 @@ impl HumanSessionIssuer {
         session_jti: &str,
         authorization_expires_at_unix: i64,
     ) -> Result<(String, i64), EdgeError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
+        let now = self.now_unix()?;
         let authorization_started_at_unix = authorization_expires_at_unix
             .checked_sub(DEVICE_AUTHORIZATION_TTL_SECS)
             .ok_or_else(|| EdgeError::Unauthorized("the CLI login request is invalid".into()))?;
@@ -381,6 +383,9 @@ impl GatewayBuilder {
         self.human_session_issuer = Some(HumanSessionIssuer {
             cell,
             jtis: Arc::new(UlidMinter::new()),
+            now: Arc::new(|| {
+                myelin_events::clock::system_clock_reading().map(|reading| reading.unix_seconds())
+            }),
         });
         self
     }
@@ -447,6 +452,9 @@ fn map_device_authorization_error(error: DeviceAuthorizationError) -> EdgeError 
         DeviceAuthorizationError::InvalidInput(message) => EdgeError::BadRequest(message.into()),
         DeviceAuthorizationError::RateLimited { .. } => {
             EdgeError::TooManyRequests(DEVICE_AUTHORIZATION_LIMIT_MESSAGE.into())
+        }
+        DeviceAuthorizationError::Clock(_) => {
+            EdgeError::Unavailable("interactive CLI login clock is temporarily unavailable".into())
         }
         DeviceAuthorizationError::Store(_) => {
             EdgeError::Unavailable("interactive CLI login state is temporarily unavailable".into())
@@ -1115,6 +1123,32 @@ mod tests {
         PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
     };
     use myelin_storage::KmsEngine;
+
+    #[test]
+    fn a_broken_clock_cannot_mint_a_human_session() {
+        let issuer = HumanSessionIssuer {
+            cell: Arc::new(CellTokenAuthority::from_seed(&[7_u8; 32], &[9_u8; 32]).unwrap()),
+            jtis: Arc::new(UlidMinter::new()),
+            now: Arc::new(|| Err(ClockError::BeforeUnixEpoch)),
+        };
+        let principal = Principal::stub(
+            myelin_identity::PrincipalId("person:alice".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
+        let assertion = VerifiedAssertion {
+            tenant: TenantId("acme".into()),
+            region: Region("fr-par".into()),
+            scheme: myelin_identity_service::scheme::OIDC.into(),
+            subject_key: "alice".into(),
+            expires_at_unix: None,
+        };
+
+        assert!(matches!(
+            issuer.mint(&principal, &assertion),
+            Err(EdgeError::Unavailable(message)) if message.contains("clock unavailable")
+        ));
+    }
 
     #[test]
     fn public_base_url_validation_returns_errors_instead_of_panicking() {

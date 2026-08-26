@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use myelin_agent::{ToolCall, ToolDef, ToolName, ToolResult, ToolSchema};
 use myelin_agent_model::{LunaClient, ModelClient, ModelError};
@@ -60,11 +59,9 @@ pub struct SystemDeadlineClock;
 
 impl DeadlineClock for SystemDeadlineClock {
     fn now_unix_secs(&self) -> Result<i64, String> {
-        let seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "system clock is before the Unix epoch".to_string())?
-            .as_secs();
-        i64::try_from(seconds).map_err(|_| "system clock exceeds the supported range".to_string())
+        myelin_events::clock::system_clock_reading()
+            .map(|reading| reading.unix_seconds())
+            .map_err(|error| error.to_string())
     }
 }
 

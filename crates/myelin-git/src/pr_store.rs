@@ -1101,6 +1101,9 @@ pub fn merge_pr<P: RepoPathResolver>(
     merger_pseudonym: &str,
     provenance: PushProvenance,
 ) -> Result<MergeAttempt, DurableError> {
+    let merged_at_unix = myelin_events::clock::system_clock_reading()
+        .map_err(|error| DurableError::Io(format!("Git merge clock unavailable: {error}")))?
+        .unix_seconds();
     let mut rec = store
         .get(repo_loc, number)?
         .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
@@ -1155,12 +1158,7 @@ pub fn merge_pr<P: RepoPathResolver>(
             pr.transition(PrTransition::Merge, true)
                 .map_err(|e| DurableError::Git(format!("PR merge transition: {e}")))?;
             rec.state = pr.state;
-            rec.updated_at = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or_default(),
-            );
+            rec.updated_at = Some(merged_at_unix);
             store.put(repo_loc, &rec)?;
             Ok(MergeAttempt::Merged {
                 base_ref: rec.base_ref,

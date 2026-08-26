@@ -13,6 +13,7 @@ use crate::protocol::{
 use crate::registry::ToolRegistry;
 use myelin_agent::EffectKind;
 use myelin_agent_service::validate_tool_arguments;
+use myelin_events::clock::{system_clock_reading, ClockError};
 use myelin_events::Timestamp;
 use myelin_identity::Principal;
 
@@ -20,7 +21,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
+pub type Clock = Arc<dyn Fn() -> Result<Timestamp, ClockError> + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectReadError {
@@ -205,8 +206,9 @@ impl McpServer {
                 "governed session is terminal after an indeterminate mutation outcome",
             ));
         }
+        let now = self.clock_now()?;
         let permitted = router
-            .permitted_tool_names(&self.registry, &(self.clock)())
+            .permitted_tool_names(&self.registry, &now)
             .map_err(|reason| RpcError::new(AUTHORIZATION_REFUSED, reason))?;
         Ok(self.registry.list_result_for(&permitted))
     }
@@ -252,7 +254,8 @@ impl McpServer {
                         "direct read routing is not wired into this server instance",
                     )
                 })?;
-                let authorization = match router.authorize_read(&tool, &args, &(self.clock)()) {
+                let now = self.clock_now()?;
+                let authorization = match router.authorize_read(&tool, &args, &now) {
                     Ok(authorization) => authorization,
                     Err(outcome) => return Ok(call_result_json(name, &outcome)),
                 };
@@ -260,7 +263,7 @@ impl McpServer {
                     executor.execute(&router.principal().agent, &authorization, name, &args);
                 let audit_outcome = read_audit_outcome(&result);
                 if router
-                    .complete_read(&authorization, audit_outcome, &(self.clock)())
+                    .complete_read(&authorization, audit_outcome, &now)
                     .is_err()
                 {
                     result = Err(DirectReadError::Unavailable);
@@ -276,7 +279,7 @@ impl McpServer {
             EffectKind::Mutate | EffectKind::External => {}
         }
 
-        let now = (self.clock)();
+        let now = self.clock_now()?;
         let idempotency_key = params
             .get("_meta")
             .and_then(|meta| meta.get("com.myelin/idempotencyKey"))
@@ -299,9 +302,19 @@ impl McpServer {
 
     pub fn teardown(&self) -> Result<(), String> {
         if let Some(router) = &self.router {
-            router.teardown(&(self.clock)())?;
+            let now = (self.clock)().map_err(|_| "MCP clock is unavailable".to_string())?;
+            router.teardown(&now)?;
         }
         Ok(())
+    }
+
+    fn clock_now(&self) -> Result<Timestamp, RpcError> {
+        (self.clock)().map_err(|_| {
+            RpcError::new(
+                AUTHORIZATION_REFUSED,
+                "MCP clock is unavailable; governed work was not attempted",
+            )
+        })
     }
 }
 
@@ -528,13 +541,8 @@ fn write_value(v: &Value) -> String {
     })
 }
 
-fn system_now() -> Timestamp {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    let now = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
-    Timestamp(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+fn system_now() -> Result<Timestamp, ClockError> {
+    system_clock_reading().map(|reading| reading.timestamp())
 }
 
 #[cfg(test)]

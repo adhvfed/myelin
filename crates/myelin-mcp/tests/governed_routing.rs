@@ -49,6 +49,10 @@ fn now() -> Timestamp {
     Timestamp("2026-06-26T00:00:00Z".into())
 }
 
+fn test_clock() -> Result<Timestamp, myelin_events::clock::ClockError> {
+    Ok(now())
+}
+
 fn git_registry() -> ToolRegistry {
     registry_for_subsystems(&["git"])
 }
@@ -231,7 +235,7 @@ fn governed_router_with_caveats_and_verdicts(
 }
 
 fn governed_server() -> McpServer {
-    McpServer::with_router_and_clock(git_registry(), governed_router(), Arc::new(now))
+    McpServer::with_router_and_clock(git_registry(), governed_router(), Arc::new(test_clock))
 }
 
 struct RecordingReadExecutor {
@@ -366,7 +370,7 @@ fn a_repository_caveat_denies_a_merge_before_asking_a_human_to_approve_it() {
             &["pull_request.merge"],
             &["pull_request.merge", "repo:acme/web"],
         ),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let response = drive(
@@ -400,7 +404,7 @@ fn a_repository_caveat_denies_a_read_before_the_storage_adapter_sees_it() {
         ToolRegistry::for_cursors(&["git.read_file.v1".into()]).unwrap(),
         caveated_router(&["repo.pull"], &["repo.pull", "repo:acme/web"]),
         recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let response = drive(
@@ -471,7 +475,7 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
         Arc::new(RecordingReadExecutor {
             calls: AtomicUsize::new(0),
         }),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let listed = drive(
@@ -537,7 +541,7 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
         Arc::new(RecordingReadExecutor {
             calls: AtomicUsize::new(0),
         }),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
     let listed = drive(
         &server,
@@ -584,7 +588,7 @@ fn ci_read_projects_shared_schema_and_routes_directly_without_idempotency() {
         registry,
         ci_read_router(&["run.view"]),
         recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let listed = drive(
@@ -653,7 +657,7 @@ fn an_agent_read_leaves_a_durable_trace_around_the_exact_resource() {
             )),
         ),
         recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let response = drive(
@@ -699,7 +703,7 @@ fn a_refused_read_is_audited_without_touching_the_resource_adapter() {
             )),
         ),
         recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let response = drive(
@@ -733,7 +737,7 @@ fn no_durable_attempt_means_no_resource_read() {
         ToolRegistry::for_cursors(&["ci.read_run.v1".into()]).unwrap(),
         ci_read_router_with_audit(&["run.view"], Arc::new(FailAttemptAudit)),
         recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let response = drive(
@@ -760,7 +764,7 @@ fn an_unaudited_read_result_never_leaves_the_server() {
         ToolRegistry::for_cursors(&["ci.read_run.v1".into()]).unwrap(),
         ci_read_router_with_audit(&["run.view"], Arc::new(FailOutcomeAudit)),
         recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
 
     let response = drive(
@@ -788,7 +792,7 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
         git_and_ci_registry(),
         ci_read_router(&["repo.push"]),
         denied_recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
     let response = drive(
         &denied,
@@ -810,7 +814,7 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
         git_and_ci_registry(),
         ci_read_router(&["run.view"]),
         revoked_recorder.clone(),
-        Arc::new(now),
+        Arc::new(test_clock),
     );
     let first = drive(
         &revoked,
@@ -1223,7 +1227,7 @@ fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
         },
         Arc::new(FailOutcomeAudit),
     );
-    let server = McpServer::with_router_and_clock(git_registry(), router, Arc::new(now));
+    let server = McpServer::with_router_and_clock(git_registry(), router, Arc::new(test_clock));
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha","title":"Open alpha"},"_meta":{"com.myelin/idempotencyKey":"open-alpha"}}}"#;
     let mut output = Vec::new();
     let error = server
@@ -1407,11 +1411,11 @@ fn governed_calls_read_the_clock_afresh() {
     let reads = Arc::new(AtomicUsize::new(0));
     let clock_reads = Arc::clone(&reads);
     let clock = Arc::new(move || {
-        if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+        Ok(if clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
             Timestamp("2026-06-26T00:00:00Z".into())
         } else {
             Timestamp("2026-06-26T00:05:01Z".into())
-        }
+        })
     });
     let server = McpServer::with_router_and_clock(git_registry(), governed_router(), clock);
     let call = |id| {
@@ -1432,4 +1436,24 @@ fn governed_calls_read_the_clock_afresh() {
         .unwrap()
         .contains("expired"));
     assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_broken_clock_refuses_governed_work_before_routing_it() {
+    let server = McpServer::with_router_and_clock(
+        git_registry(),
+        governed_router(),
+        Arc::new(|| Err(myelin_events::clock::ClockError::BeforeUnixEpoch)),
+    );
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":1,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"broken-clock-review"}}}"#;
+
+    let response: serde_json::Value =
+        serde_json::from_str(&server.handle_line(request).unwrap()).unwrap();
+
+    assert_eq!(response["error"]["code"], -32001);
+    assert_eq!(
+        response["error"]["message"],
+        "MCP clock is unavailable; governed work was not attempted"
+    );
+    assert!(response.get("result").is_none());
 }

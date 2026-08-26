@@ -105,10 +105,12 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_secs(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0)
+        u64::try_from(
+            myelin_events::clock::system_clock_reading()
+                .expect("fail-static security requires a representable system clock")
+                .unix_seconds(),
+        )
+        .expect("the shared clock never returns a negative Unix time")
     }
 }
 

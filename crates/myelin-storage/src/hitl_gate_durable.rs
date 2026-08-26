@@ -769,10 +769,9 @@ fn consume_rules(
 }
 
 fn system_unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .expect("system clock must be after the Unix epoch")
+    myelin_events::clock::system_clock_reading()
+        .expect("HITL security requires a representable system clock")
+        .unix_seconds()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

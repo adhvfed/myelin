@@ -85,6 +85,7 @@ pub enum CiRunnerHostFailure {
     RunnerExitedEarly,
     DrainTimedOut,
     SandboxBackendInitializationFailed,
+    ClockUnavailable,
 }
 
 impl std::fmt::Display for CiRunnerHostFailure {
@@ -110,6 +111,9 @@ impl std::fmt::Display for CiRunnerHostFailure {
             Self::DrainTimedOut => "runner host exceeded its process-fatal graceful-drain deadline",
             Self::SandboxBackendInitializationFailed => {
                 "sandbox backend initialization refused the preflighted workspace configuration"
+            }
+            Self::ClockUnavailable => {
+                "sandbox runner stopped before claiming work because its security clock is unavailable"
             }
         };
         f.write_str(message)
@@ -465,6 +469,7 @@ fn classify_runner_lane(
         Ok(Ok(CiRunnerLoopExit::SandboxBackendInitializationFailed)) => {
             Some(CiRunnerHostFailure::SandboxBackendInitializationFailed)
         }
+        Ok(Ok(CiRunnerLoopExit::ClockUnavailable)) => Some(CiRunnerHostFailure::ClockUnavailable),
         Ok(Err(_)) => Some(CiRunnerHostFailure::RunnerThreadPanicked),
         Err(_) => Some(CiRunnerHostFailure::RunnerJoinTaskPanicked),
     }
@@ -636,6 +641,14 @@ mod tests {
         assert_eq!(
             classify_runner_lane(Ok(Ok(CiRunnerLoopExit::TerminalReportFailed)), false),
             Some(CiRunnerHostFailure::TerminalReportFailed)
+        );
+    }
+
+    #[test]
+    fn an_unavailable_security_clock_stops_the_runner_host() {
+        assert_eq!(
+            classify_runner_lane(Ok(Ok(CiRunnerLoopExit::ClockUnavailable)), false),
+            Some(CiRunnerHostFailure::ClockUnavailable)
         );
     }
 

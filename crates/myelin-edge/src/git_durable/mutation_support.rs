@@ -51,8 +51,8 @@ pub(super) fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()
 }
 
-pub(super) fn clock_reading() -> Result<myelin_git::clock::ClockReading, DurableError> {
-    myelin_git::clock::system_clock_reading()
+pub(super) fn clock_reading() -> Result<myelin_events::clock::ClockReading, DurableError> {
+    myelin_events::clock::system_clock_reading()
         .map_err(|error| DurableError::Io(format!("Git clock unavailable: {error}")))
 }
 

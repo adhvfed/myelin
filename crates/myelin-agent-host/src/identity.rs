@@ -1,5 +1,5 @@
-use chrono::{DateTime, SecondsFormat, Utc};
 use myelin_agent_service::RunTokenRevoker;
+use myelin_events::clock::clock_reading_from_unix;
 use myelin_events::Timestamp;
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter};
 use myelin_identity::{
@@ -30,9 +30,9 @@ impl core::fmt::Display for TimestampOutOfRange {
 impl std::error::Error for TimestampOutOfRange {}
 
 pub fn timestamp_from_epoch(secs: i64) -> Result<Timestamp, TimestampOutOfRange> {
-    DateTime::<Utc>::from_timestamp(secs, 0)
-        .map(|instant| Timestamp(instant.to_rfc3339_opts(SecondsFormat::Secs, true)))
-        .ok_or(TimestampOutOfRange { seconds: secs })
+    clock_reading_from_unix(secs)
+        .map(|reading| reading.timestamp())
+        .map_err(|_| TimestampOutOfRange { seconds: secs })
 }
 
 pub struct IdentityRunMinter {
@@ -130,8 +130,7 @@ impl IdentityRunRevoker {
 
 impl RunTokenRevoker for IdentityRunRevoker {
     fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
-        let now = timestamp_from_epoch(now_secs)
-            .unwrap_or_else(|_| Timestamp("9999-12-31T23:59:59Z".into()));
+        let now = timestamp_from_epoch(now_secs).map_err(|error| error.to_string())?;
         self.revocations
             .tear_down_run_token(&self.scope, jti, now)
             .map_err(|error| error.to_string())?;

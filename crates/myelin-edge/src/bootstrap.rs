@@ -1,4 +1,4 @@
-use myelin_events::Timestamp;
+use myelin_events::clock::clock_reading_from_unix;
 use myelin_identity::{
     DataRole, ObjectId, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RelName,
     RelationTuple, TupleDelta,
@@ -76,6 +76,9 @@ pub fn bootstrap_principal_and_mint(
             "--issues-project must be a canonical lowercase UUID".into(),
         ));
     }
+    let observed_at = clock_reading_from_unix(now_unix)
+        .map_err(|error| BootstrapError::Store(format!("bootstrap clock unavailable: {error}")))?
+        .timestamp();
 
     let operator = Principal::new(
         TenantId(params.tenant.to_string()),
@@ -119,14 +122,7 @@ pub fn bootstrap_principal_and_mint(
         caveat: None,
     });
     tuples
-        .write_tuples(
-            &scope,
-            &operator,
-            &[grant],
-            None,
-            None,
-            timestamp_from_unix(now_unix),
-        )
+        .write_tuples(&scope, &operator, &[grant], None, None, observed_at)
         .map_err(|e| BootstrapError::Store(format!("Issues project reader grant failed: {e}")))?;
 
     let jti = fresh_jti(params.principal);
@@ -152,13 +148,6 @@ pub fn bootstrap_principal_and_mint(
         jti,
         expiry_unix,
     })
-}
-
-fn timestamp_from_unix(unix: i64) -> Timestamp {
-    let value = chrono::DateTime::from_timestamp(unix, 0)
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    Timestamp(value)
 }
 
 fn fresh_jti(principal: &str) -> String {
@@ -217,6 +206,27 @@ mod tests {
             1_700_000_000,
         );
         assert!(matches!(result, Err(BootstrapError::BadParam(_))));
+        assert!(store
+            .get_principal(&scope(), &PrincipalId("founder".into()))
+            .expect("the unchanged in-memory directory remains readable")
+            .is_none());
+        assert!(tuples
+            .tuples_in(&scope())
+            .expect("read tuples after rejected bootstrap")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_broken_clock_is_rejected_before_any_durable_shape_changes() {
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let tuples = TupleStore::new(OutboxStore::new());
+        let cell = CellTokenAuthority::from_seed(&[7; 32], &[9; 32]).unwrap();
+
+        let result = bootstrap_principal_and_mint(&store, &tuples, &cell, &params(PROJECT), -1);
+
+        assert!(
+            matches!(result, Err(BootstrapError::Store(message)) if message.contains("clock unavailable"))
+        );
         assert!(store
             .get_principal(&scope(), &PrincipalId("founder".into()))
             .expect("the unchanged in-memory directory remains readable")

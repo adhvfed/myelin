@@ -1,4 +1,5 @@
 use base64::Engine as _;
+use myelin_events::clock::{system_clock_reading, ClockError};
 use myelin_identity::Principal;
 use myelin_storage::migration::{Migration, Migrations};
 use rand::{rngs::OsRng, RngCore};
@@ -226,6 +227,7 @@ impl std::error::Error for DeviceAuthorizationStoreError {}
 pub(crate) enum DeviceAuthorizationError {
     InvalidInput(&'static str),
     RateLimited { retry_after_secs: u64 },
+    Clock(ClockError),
     Store(DeviceAuthorizationStoreError),
 }
 
@@ -237,6 +239,9 @@ impl core::fmt::Display for DeviceAuthorizationError {
                 formatter,
                 "device authorization start limit reached; retry after {retry_after_secs} seconds"
             ),
+            Self::Clock(error) => {
+                write!(formatter, "device authorization clock unavailable: {error}")
+            }
             Self::Store(error) => error.fmt(formatter),
         }
     }
@@ -755,7 +760,7 @@ fn seconds_until(deadline_unix: i64, floor_unix: i64) -> u64 {
 pub struct DeviceAuthorizationBroker {
     store: Arc<dyn DeviceAuthorizationStore>,
     verification_uri: String,
-    now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    now: Arc<dyn Fn() -> Result<i64, ClockError> + Send + Sync>,
     start_policy: StartPolicy,
 }
 
@@ -794,6 +799,15 @@ impl DeviceAuthorizationBroker {
 
     #[cfg(test)]
     pub(crate) fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.now = Arc::new(move || Ok(now()));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fallible_clock(
+        mut self,
+        now: impl Fn() -> Result<i64, ClockError> + Send + Sync + 'static,
+    ) -> Self {
         self.now = Arc::new(now);
         self
     }
@@ -824,7 +838,7 @@ impl DeviceAuthorizationBroker {
             decode_secret(verifier_challenge).ok_or(DeviceAuthorizationError::InvalidInput(
                 "the verifier challenge is not a canonical S256 value",
             ))?;
-        let now_unix = (self.now)();
+        let now_unix = (self.now)().map_err(DeviceAuthorizationError::Clock)?;
         for _ in 0..4 {
             let device_code = random_secret();
             let user_code = random_user_code();
@@ -875,7 +889,11 @@ impl DeviceAuthorizationBroker {
         )?;
         validate_approval(&approval).map_err(DeviceAuthorizationError::Store)?;
         self.store
-            .approve(digest("user", &user_code), approval, (self.now)())
+            .approve(
+                digest("user", &user_code),
+                approval,
+                (self.now)().map_err(DeviceAuthorizationError::Clock)?,
+            )
             .map_err(DeviceAuthorizationError::Store)
     }
 
@@ -892,7 +910,7 @@ impl DeviceAuthorizationBroker {
             .claim(
                 digest("device", device_code),
                 verifier_challenge,
-                (self.now)(),
+                (self.now)().map_err(DeviceAuthorizationError::Clock)?,
             )
             .map_err(DeviceAuthorizationError::Store)
     }
@@ -919,11 +937,8 @@ fn validate_verification_uri(value: &str) -> Result<String, String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
-fn system_now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+fn system_now_unix() -> Result<i64, ClockError> {
+    system_clock_reading().map(|reading| reading.unix_seconds())
 }
 
 fn random_secret() -> String {
@@ -1024,6 +1039,18 @@ mod tests {
 
     fn challenge(verifier: &str) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha256(verifier.as_bytes()))
+    }
+
+    #[test]
+    fn a_broken_clock_cannot_open_a_device_login_window() {
+        let broker = DeviceAuthorizationBroker::memory("https://myelin.example/cli/auth")
+            .unwrap()
+            .with_fallible_clock(|| Err(ClockError::BeforeUnixEpoch));
+
+        assert_eq!(
+            broker.begin(&challenge(&verifier())),
+            Err(DeviceAuthorizationError::Clock(ClockError::BeforeUnixEpoch))
+        );
     }
 
     #[test]
@@ -1132,7 +1159,7 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect to the Edge runtime database");
-        let now_unix = system_now_unix();
+        let now_unix = system_now_unix().expect("the integration clock is available");
         let mut transaction = pool.begin().await.unwrap();
         sqlx::query(
             "SELECT pg_advisory_xact_lock(\

@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — One wall clock cannot become several security truths
+
+Authentication, governed MCP work, Git wire credentials, repository grants, agent teardown, CI
+leases, and fail-static authorization each had their own wall-clock conversion. Several copies
+turned rollback into epoch zero; others silently selected an extreme date or used unchecked
+integer casts. Those defaults were individually plausible but collectively dangerous: the same
+broken host clock could expire one authority, extend another, and write misleading audit time.
+
+Events now owns one checked wall-clock reading with mutually consistent Unix-second and RFC 3339
+forms. Security-sensitive callers either receive that reading or stop before minting a session,
+opening a device-login window, issuing Git credentials, routing governed work, changing durable
+bootstrap state, claiming a CI lease, or advancing an in-memory merge. One MCP request also reuses
+one instant for authorization and completion audit, so a call cannot straddle two contradictory
+security truths. Diagnostic-only entropy and display timestamps remain deliberately independent;
+they do not grant authority or order durable user work.
+
+**Proof:** rollback and range-boundary stories in Events, Edge, Identity, MCP, Agent Host, and CI;
+all library stories in the nine affected crates, including 587 CI control-plane, 365 Edge, 419
+Identity, 417 Storage, 177 Substrate, and 34 Agent Host stories; all 30 governed-routing integration
+stories; strict all-target/all-feature Clippy; and the complete seventeen-story TypeScript browser
+and CLI authentication journey against the rebuilt PostgreSQL-backed system (78.16 seconds).
+
 ## 2026-08-26 — One checked Git clock stamps a pull request operation
 
 The durable pull-request store and Edge's in-memory fallback each treated a clock before the Unix

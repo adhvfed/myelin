@@ -12,7 +12,6 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
-use crate::clock::system_clock_reading;
 use crate::core::{Oid as CoreOid, RepoLoc};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
@@ -31,6 +30,7 @@ use crate::receive_pack::{
     CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushProvenance,
     PushSession, Pusher, RefName, RefStore,
 };
+use myelin_events::clock::system_clock_reading;
 
 mod check_admission;
 use check_admission::overlay_projected_checks;

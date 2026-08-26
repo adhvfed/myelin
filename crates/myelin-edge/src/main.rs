@@ -25,7 +25,7 @@ use myelin_edge::{
     ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
     WorkspaceSshEndpoint,
 };
-use myelin_events::{OutboxStore, Timestamp};
+use myelin_events::OutboxStore;
 use myelin_identity::{
     AuthzError, Credential, DataRole, FragmentAdmit, Principal, PrincipalId, PrincipalKind,
     PrincipalStatus, RevokeTarget,
@@ -1544,7 +1544,7 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
         handle.clone(),
     );
     let tuples = TupleStore::with_pg(DurableTupleBacking::new(provider.clone()), handle.clone());
-    let now_unix = now_unix();
+    let now_unix = system_clock_reading_or_exit("bootstrap").unix_seconds();
     let outcome = bootstrap_principal_and_mint(
         &store,
         &tuples,
@@ -1627,7 +1627,8 @@ async fn operator_revoke(core: ComposedCore, args: &[String]) {
         ),
         Region(region.clone()),
     );
-    if let Err(error) = revocations.revoke(&scope, &RevokeTarget::Jti(jti.clone()), now_rfc3339()) {
+    let revoked_at = system_clock_reading_or_exit("revoke").timestamp();
+    if let Err(error) = revocations.revoke(&scope, &RevokeTarget::Jti(jti.clone()), revoked_at) {
         eprintln!(
             "edge revoke: durable denylist write failed for tenant `{tenant}` region `{region}`: {error}"
         );
@@ -1869,16 +1870,11 @@ fn default_region() -> String {
     std::env::var("MYELIN_REGION").unwrap_or_else(|_| "fr-par".to_string())
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn now_rfc3339() -> Timestamp {
-    let dt = chrono::DateTime::from_timestamp(now_unix(), 0).unwrap_or_default();
-    Timestamp(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+fn system_clock_reading_or_exit(operation: &str) -> myelin_events::clock::ClockReading {
+    myelin_events::clock::system_clock_reading().unwrap_or_else(|error| {
+        eprintln!("edge {operation}: system clock unavailable: {error}");
+        std::process::exit(1);
+    })
 }
 
 #[cfg(test)]

@@ -249,7 +249,7 @@ fn server(
         registry_for_subsystems(&["git", "ci"]),
         router,
         reads,
-        Arc::new(|| Timestamp(NOW.into())),
+        Arc::new(|| Ok(Timestamp(NOW.into()))),
     )
 }
 

@@ -187,7 +187,7 @@ fn governed_git_server_with_grants_scoped_at(
     McpServer::with_router_and_clock(
         registry_for_subsystems(&["git"]),
         router,
-        Arc::new(move || current.clone()),
+        Arc::new(move || Ok(current.clone())),
     )
 }
 

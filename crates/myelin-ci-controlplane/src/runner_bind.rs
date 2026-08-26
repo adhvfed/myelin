@@ -291,6 +291,7 @@ pub enum CiRunnerLoopExit {
     SettlementOwnerMismatch,
     TerminalReportFailed,
     SandboxBackendInitializationFailed,
+    ClockUnavailable,
 }
 
 impl CiRunnerLoop {
@@ -435,7 +436,16 @@ impl CiRunnerLoop {
             if runner_shutdown_requested(&mut shutdown) {
                 return CiRunnerLoopExit::Shutdown;
             }
-            match agent.run_one_cycle(now_secs()) {
+            let now = match now_secs() {
+                Ok(now) => now,
+                Err(error) => {
+                    eprintln!(
+                        "ci-runner[{worker_id}]: security clock unavailable; stopping before a lease claim: {error}"
+                    );
+                    return CiRunnerLoopExit::ClockUnavailable;
+                }
+            };
+            match agent.run_one_cycle(now) {
                 Ok(myelin_ci_sandbox::RunnerCycleOutcome::Workload(o)) => {
                     eprintln!(
                         "ci-runner[{worker_id}]: ran job {} for run {} (passed={}, job.done={:?})",
@@ -546,11 +556,8 @@ fn runner_sleep_until_shutdown(
     }
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+fn now_secs() -> Result<i64, myelin_events::clock::ClockError> {
+    myelin_events::clock::system_clock_reading().map(|reading| reading.unix_seconds())
 }
 
 pub fn spec_store_unavailable_resolver() -> JobSpecResolver {

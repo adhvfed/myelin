@@ -203,7 +203,7 @@ impl GitWireCredentialIssuer for IdentityGitWireCredentialIssuer {
                 &FailStaticBound {
                     static_max_secs: request.ttl_secs,
                 },
-                &system_now_timestamp(),
+                &system_now_timestamp()?,
             )
             .map_err(|_| "Identity refused the Git-wire run-token mint".to_string())?;
         let (bearer, jti) = minted.into_parts();
@@ -250,7 +250,7 @@ impl GitWireCredentialIssuer for IdentityGitWireCredentialIssuer {
         if !self
             .identity
             .run_token_minter()
-            .is_live(&scope, &token, &system_now_timestamp())
+            .is_live(&scope, &token, &system_now_timestamp()?)
         {
             return Err("Identity rejected the Git-wire credential lifecycle".into());
         }
@@ -258,13 +258,10 @@ impl GitWireCredentialIssuer for IdentityGitWireCredentialIssuer {
     }
 }
 
-fn system_now_timestamp() -> myelin_events::Timestamp {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    let instant = chrono::DateTime::from_timestamp(seconds, 0).unwrap_or_default();
-    myelin_events::Timestamp(instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+fn system_now_timestamp() -> Result<myelin_events::Timestamp, String> {
+    myelin_events::clock::system_clock_reading()
+        .map(|reading| reading.timestamp())
+        .map_err(|error| format!("Git-wire credential clock unavailable: {error}"))
 }
 
 pub struct GitWireExecutor {
