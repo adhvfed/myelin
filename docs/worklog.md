@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — An issue title no longer shares another product's erasure key
+
+The shipped PostgreSQL Issues path encrypted each title, but selected the old unscoped subject key.
+Destroying that key for an Issues request would also make legacy Chat or agent data for the same
+person unreadable; preserving it would leave the issue recoverable. That made a truthful Issues
+privacy holder impossible even though the ciphertext itself was sound.
+
+Subject keys now admit an explicit Issues class. Every new Issue free-text envelope uses
+`scoped-subject:issues:<person>`, while decryption continues to understand legacy references so an
+upgrade does not discard data. The Issues module owns the exact current and legacy class predicate
+that its future eraser will use. Tests prove the same human's Issues, Chat, and agent-data keys are
+distinct, and the live PostgreSQL saga inspects the authoritative row rather than inferring its key
+from an in-memory encryption result.
+
+This is deliberately a foundation, not an erasure claim. Existing unscoped issue rows still need an
+explicit re-key or fail-loud migration path; authored-title tombstoning, holder receipts, post-PIT
+ledger replay, and the public request scope remain open until they can be proved together.
+
+**Proof:** the focused Storage key grammar and Issues encryption suites; the external Issues
+pseudonym/DEK contract; strict all-target/all-feature Storage and Issues Clippy; and the live
+PostgreSQL issue saga, which verifies the actual stored key class while retaining rollback,
+authorization, restart, retry, and concurrency behavior (1.44 seconds). `target` is 89 GB with
+624 GB free, so no cache clean was warranted.
+
 ## 2026-08-26 — Teardown measures the write that ended authority
 
 The hosted-agent loop reported token revocation lag by subtracting two copies of the same frozen
@@ -2925,8 +2949,10 @@ unavailable, and is deliberately not counted as green.
    scopes. the maintenance command replays both through their production
    holders before a restored cell can reopen. agent data is drilled against a
    real dump; Chat now has the same real `pg_dump`/`pg_restore` proof, including
-   a deliberately resurrected decryptable body. remaining: bring Issues and Git
-   onto the ledger before exposing either through privacy requests.
+   a deliberately resurrected decryptable body. New issue titles have an
+   independent Issues subject-key class, but authored-title tombstoning, holder
+   proof, ledger replay, and legacy-row handling remain open. Git has not yet
+   begun that path. Neither may be exposed through privacy requests first.
 2. **DSR has two truthful product slices, not full holder coverage.** durable
    submit/status/certificate is wired for `agent_data` and `chat_messages`, with
    holder-specific proofs and black-box user journeys. the Chat scope means only

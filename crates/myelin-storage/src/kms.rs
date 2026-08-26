@@ -21,6 +21,7 @@ pub const NONCE_LEN: usize = 12;
 pub enum SubjectKeyScope {
     AgentData,
     Chat,
+    Issues,
 }
 
 impl SubjectKeyScope {
@@ -28,6 +29,7 @@ impl SubjectKeyScope {
         match self {
             Self::AgentData => "agent-data",
             Self::Chat => "chat",
+            Self::Issues => "issues",
         }
     }
 
@@ -35,6 +37,7 @@ impl SubjectKeyScope {
         match token {
             "agent-data" => Some(Self::AgentData),
             "chat" => Some(Self::Chat),
+            "issues" => Some(Self::Issues),
             _ => None,
         }
     }
@@ -1162,6 +1165,16 @@ mod tests {
             },
         );
         assert_eq!(kr.to_uri(), "kms://acme/4/scoped-subject:agent-data:u-42");
+
+        let kr = PiiKeyRef::new(
+            t("acme"),
+            5,
+            KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::Issues,
+                subject: "u-42".into(),
+            },
+        );
+        assert_eq!(kr.to_uri(), "kms://acme/5/scoped-subject:issues:u-42");
     }
 
     #[test]
@@ -1170,6 +1183,7 @@ mod tests {
             "kms://acme/0/tenant",
             "kms://acme/12/subject:u-99",
             "kms://acme/4/scoped-subject:agent-data:u-99",
+            "kms://acme/4/scoped-subject:issues:u-99",
             "kms://acme/5/blob",
         ] {
             let kr = PiiKeyRef::parse(uri).expect("parses the canonical grammar");

@@ -210,7 +210,7 @@ fn cdc_11_4_free_text_is_subject_dek_sealed_and_decrypts_zero_plaintext_at_rest(
             .key_ref
             .class
             .as_token()
-            .starts_with("subject:"),
+            .starts_with("scoped-subject:issues:"),
         "title is keyed under the per-subject DEK"
     );
     assert!(
@@ -219,7 +219,7 @@ fn cdc_11_4_free_text_is_subject_dek_sealed_and_decrypts_zero_plaintext_at_rest(
             .key_ref
             .class
             .as_token()
-            .starts_with("subject:"),
+            .starts_with("scoped-subject:issues:"),
         "props is keyed under the per-subject DEK"
     );
 
@@ -246,7 +246,7 @@ fn cdc_11_4_free_text_is_subject_dek_sealed_and_decrypts_zero_plaintext_at_rest(
         .as_ref()
         .expect("a PII-bearing event carries a key ref");
     assert!(
-        key_ref.0.starts_with("kms://acme/") && key_ref.0.contains("/subject:"),
+        key_ref.0.starts_with("kms://acme/") && key_ref.0.contains("/scoped-subject:issues:"),
         "the event carries the REAL per-subject-DEK key ref, got {}",
         key_ref.0
     );

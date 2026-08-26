@@ -1,6 +1,6 @@
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, KeyChoiceError, SubjectId};
-use myelin_storage::kms::{KekId, KmsEngine};
+use myelin_storage::kms::{KekId, KeyClass, KmsEngine, SubjectKeyScope};
 use myelin_tenancy::{Region, TenantId};
 
 pub fn subject_dek_erasure() -> ErasureMethod {
@@ -47,7 +47,7 @@ pub fn encrypt_free_text(
 ) -> Result<EncryptedColumn, KeyChoiceError> {
     engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
     let cryptor = ColumnCryptor::new(engine, region.clone());
-    cryptor.encrypt(tenant, Some(subject), &subject_dek_erasure(), plaintext)
+    cryptor.encrypt_for_subject_scope(tenant, subject, SubjectKeyScope::Issues, plaintext)
 }
 
 pub fn decrypt_free_text(
@@ -61,6 +61,17 @@ pub fn decrypt_free_text(
 
 pub fn plaintext_at_rest(column: &EncryptedColumn, plaintext: &[u8]) -> bool {
     column.contains_plaintext(plaintext)
+}
+
+pub fn issue_subject_key_class(subject: &str) -> KeyClass {
+    KeyClass::ScopedSubject {
+        scope: SubjectKeyScope::Issues,
+        subject: subject.to_string(),
+    }
+}
+
+pub fn is_issue_subject_key_class(class: &KeyClass, subject: &str) -> bool {
+    class == &issue_subject_key_class(subject) || class == &KeyClass::Subject(subject.to_string())
 }
 
 #[cfg(test)]
@@ -106,7 +117,11 @@ mod tests {
                 encrypt_free_text(&eng, &region(), &tenant(), &subject(), kind, &plaintext)
                     .expect("seal");
             assert!(
-                column.key_ref.class.as_token().starts_with("subject:"),
+                column
+                    .key_ref
+                    .class
+                    .as_token()
+                    .starts_with("scoped-subject:issues:"),
                 "the {} column is keyed under the per-subject DEK (GD-4)",
                 kind.label()
             );
@@ -159,6 +174,38 @@ mod tests {
             a.key_ref.class, b.key_ref.class,
             "each subject has a DISTINCT per-subject DEK (GD-4 individual granularity)"
         );
+    }
+
+    #[test]
+    fn issue_keys_are_distinct_from_chat_and_agent_data_for_the_same_person() {
+        let subject = "human:ada";
+        let issues = issue_subject_key_class(subject);
+        assert_ne!(
+            issues,
+            KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::Chat,
+                subject: subject.into(),
+            }
+        );
+        assert_ne!(
+            issues,
+            KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::AgentData,
+                subject: subject.into(),
+            }
+        );
+        assert!(is_issue_subject_key_class(&issues, subject));
+        assert!(is_issue_subject_key_class(
+            &KeyClass::Subject(subject.into()),
+            subject
+        ));
+        assert!(!is_issue_subject_key_class(
+            &KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::Issues,
+                subject: "human:grace".into(),
+            },
+            subject
+        ));
     }
 
     #[test]

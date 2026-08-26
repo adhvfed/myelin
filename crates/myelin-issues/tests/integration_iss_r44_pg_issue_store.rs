@@ -19,7 +19,8 @@ use myelin_issues::{
     SourceSystem, VisibleIssues,
 };
 use myelin_storage::{
-    all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
+    all_durable_migrations, DurableTupleBacking, KeyClass, KmsEngine, PgBootstrap, PiiKeyRef,
+    SubjectKeyScope, TenantScope,
 };
 use myelin_substrate::HotTables;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
@@ -641,6 +642,22 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .create(&creator, proposal("ENG", "private staged title"))
         .await
         .expect("stage invisible issue");
+    let title_key_ref: String = sqlx::query_scalar(
+        "SELECT pii_key_ref FROM issue WHERE tenant_id = $1 AND region = 'fr-par' AND id = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&staged.id)
+    .fetch_one(&admin)
+    .await
+    .expect("inspect the title key boundary");
+    assert_eq!(
+        PiiKeyRef::parse(&title_key_ref).map(|key_ref| key_ref.class),
+        Some(KeyClass::ScopedSubject {
+            scope: SubjectKeyScope::Issues,
+            subject: creator.principal_id.0.clone(),
+        }),
+        "an authored issue title has its own Issues key, never the creator's cross-product key",
+    );
     assert_eq!(
         store.view(&creator, &staged.id).await,
         Err(IssueStoreError::NotFound),
