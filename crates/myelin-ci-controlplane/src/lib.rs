@@ -94,7 +94,6 @@ pub mod ci_run_store;
 pub mod ci_run_supersession;
 pub mod ci_scheduler_db;
 pub mod cost_store;
-pub mod crypto_shred_erase;
 pub mod deployment;
 pub mod events;
 pub mod fairness;
@@ -122,7 +121,6 @@ pub use pg_pipeline_starter::{
 pub mod ci_pipeline_driver;
 pub mod ci_pipeline_reporter_router;
 pub mod ci_secret_store;
-pub mod holder;
 pub mod job_queue_region;
 pub mod live_tail;
 pub mod log_pipeline;
@@ -188,17 +186,6 @@ pub use job_accounting_store::{
     CiJobAccountingError, CiJobAccountingRecord, CiJobAccountingStore, CiJobAccountingWrite,
     CiJobAccountingWriteVersion, CiJobTerminalDisposition, INSERT_CI_JOB_ACCOUNTING_QUERY,
     SELECT_CI_JOB_ACCOUNTING_QUERY,
-};
-
-pub use holder::{
-    ci_store_classifier, register_ci_holders, CiHolder, CiHolderRegistration, CiStoreClass,
-    RestrictionFlag, CI_OLTP_STORE, CI_RESIDUAL_POSTURE_REF, ERASED_OUTCOME_NONE_REMAIN,
-};
-
-pub use crypto_shred_erase::{
-    drive_ci_d3_erasure_reaches_every_holder, subject_dek_ref, tenant_dek_ref, CiD3Report,
-    CiEraseFanOut, CiEraseReceipt, CiErasedTombstone, CiSealedRow, CiShredError,
-    CiSubjectFootprint, CI_ERASED_VERB, ERASED_PSEUDONYM,
 };
 
 pub use log_pipeline::{
@@ -279,7 +266,7 @@ pub use ci_run_starter_poller::{
 pub use ci_run_store::{
     CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationOutcome, CiRunFinalizationWrite,
     CiRunFinalizer, CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, CiRunTerminalState,
-    DurableCiRunFinalizer, FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY,
+    DurableCiRunFinalizer, ERASED_PSEUDONYM, FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY,
     LOCK_CI_RUN_FOR_FINALIZE_QUERY, LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY,
     SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };

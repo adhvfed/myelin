@@ -21,6 +21,8 @@ use crate::job_accounting_store::{
 const PR_RUN_SUPERSESSION_LOCK_DOMAIN: &str = "myelin.ci.pr-run-supersession.v1";
 const CI_RUN_IDEMPOTENCY_LOCK_DOMAIN: &str = "myelin.ci.run-idempotency.v1";
 
+pub const ERASED_PSEUDONYM: &str = "psn:erased";
+
 const LOCK_CI_RUN_IDEMPOTENCY_QUERY: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1073,7 +1075,7 @@ async fn verify_existing_replay_on_conn(
         .bind(&row.trust_tier)
         .bind(&row.correlation_id)
         .bind(&row.triggered_by)
-        .bind(crate::ERASED_PSEUDONYM)
+        .bind(ERASED_PSEUDONYM)
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| CiRunStoreError::Db(e.to_string()))?;

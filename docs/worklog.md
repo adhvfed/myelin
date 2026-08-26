@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — CI no longer reports an erasure it did not perform
+
+CI exposed a `PersonalDataHolder` whose ordinary `erase` returned success without calling its
+destructive fan-out. The separate fan-out destroyed keys and tombstoned artifacts only in local
+memory. Its PostgreSQL integration test then manually issued an `UPDATE` to pseudonymise the real
+row after the model had already reported green, so the test made the database resemble the receipt
+instead of proving that the receipt's operation changed the database.
+
+The holder, in-memory fan-out, public exports, and both endorsing suites are gone. The erased-actor
+marker was the one production dependency hidden in that model; it now lives beside the durable CI
+run store that accepts pre-erasure replays after an actor edge has actually been pseudonymised. CI
+remains honestly absent from privacy-request scopes until one durable operation can discover its
+PostgreSQL rows and object-store logs, destroy the right keys, pseudonymise the rows, record a
+post-restore obligation, and prove the complete result.
+
+**Proof:** all-target/all-feature CI Control Plane compile and strict clippy; all 586 remaining
+library stories; the complete all-feature suite against PostgreSQL and real sandbox execution,
+including the 118.19-second definition-cutover and 135.66-second terminal-accounting race suites;
+rebuilt CI Control Plane and Edge; and all six live TypeScript CI delivery journeys, including exact
+commit execution, persisted sandbox output, failure inspection, and repository visibility
+(11.71 seconds). Net removal: 1,502 lines of unshipped privacy models and self-certifying tests.
+
 ## 2026-08-26 — Search privacy reaches the index it describes
 
 Search exported a zero-sized `SearchIndexHolder` beside its working `SearchEraseHolder`. The former
