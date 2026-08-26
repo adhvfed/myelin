@@ -28,42 +28,84 @@ pub(super) const CARGO_VENDOR_SOURCE_NAME: &str = "vendored";
 
 pub const SERVER_CARGO_CONFIG_TOML: &str = "[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = \"/opt/myelin/cargo-vendor\"\n";
 
-fn is_admitted_structured_cargo_argv(command: &[String]) -> bool {
-    let r = CARGO_SOURCE_REPLACE_CONFIG;
-    let v = CARGO_VENDOR_DIRECTORY_CONFIG;
-    let admitted: [Vec<&str>; 4] = [
-        vec!["cargo", "build", "--locked", "--config", r, "--config", v],
-        vec![
-            "cargo", "test", "--locked", "--lib", "--config", r, "--config", v,
-        ],
-        vec![
-            "cargo",
-            "test",
-            "--locked",
-            "--lib",
-            "--workspace",
-            "--config",
-            r,
-            "--config",
-            v,
-        ],
-        vec![
-            "cargo",
-            "clippy",
-            "--locked",
-            "--all-targets",
-            "--config",
-            r,
-            "--config",
-            v,
-            "--",
-            "-D",
-            "warnings",
-        ],
+pub fn is_admitted_structured_cargo_recipe(args: &[String]) -> bool {
+    let recipe: Vec<&str> = args.iter().map(String::as_str).collect();
+    match recipe.as_slice() {
+        ["build", "--locked"]
+        | ["test", "--locked", "--lib"]
+        | ["test", "--locked", "--lib", "--workspace"]
+        | ["test", "--locked", "--workspace", "--all-targets"]
+        | ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"]
+        | ["clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"] => true,
+        ["test", "--locked", "-p", package] => valid_cargo_package_name(package),
+        _ => false,
+    }
+}
+
+pub fn platform_cargo_argv(args: &[String]) -> Vec<String> {
+    let vendor = [
+        "--config".to_owned(),
+        CARGO_SOURCE_REPLACE_CONFIG.to_owned(),
+        "--config".to_owned(),
+        CARGO_VENDOR_DIRECTORY_CONFIG.to_owned(),
     ];
-    admitted
-        .iter()
-        .any(|argv| command.iter().map(String::as_str).eq(argv.iter().copied()))
+    let mut argv = Vec::with_capacity(1 + args.len() + vendor.len());
+    argv.push("cargo".to_owned());
+    match args.iter().position(|argument| argument == "--") {
+        Some(split) => {
+            argv.extend(args[..split].iter().cloned());
+            argv.extend(vendor);
+            argv.extend(args[split..].iter().cloned());
+        }
+        None => {
+            argv.extend(args.iter().cloned());
+            argv.extend(vendor);
+        }
+    }
+    argv
+}
+
+fn is_admitted_structured_cargo_argv(command: &[String]) -> bool {
+    let Some(recipe) = recipe_from_platform_argv(command) else {
+        return false;
+    };
+    is_admitted_structured_cargo_recipe(&recipe) && platform_cargo_argv(&recipe) == command
+}
+
+fn recipe_from_platform_argv(command: &[String]) -> Option<Vec<String>> {
+    if command.first().map(String::as_str) != Some("cargo") {
+        return None;
+    }
+    let vendor = [
+        "--config",
+        CARGO_SOURCE_REPLACE_CONFIG,
+        "--config",
+        CARGO_VENDOR_DIRECTORY_CONFIG,
+    ];
+    let starts: Vec<usize> = command
+        .windows(vendor.len())
+        .enumerate()
+        .filter_map(|(index, window)| {
+            window
+                .iter()
+                .map(String::as_str)
+                .eq(vendor.iter().copied())
+                .then_some(index)
+        })
+        .collect();
+    let [start] = starts.as_slice() else {
+        return None;
+    };
+    let mut recipe = command[1..*start].to_vec();
+    recipe.extend_from_slice(&command[*start + vendor.len()..]);
+    Some(recipe)
+}
+
+fn valid_cargo_package_name(package: &str) -> bool {
+    let mut bytes = package.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && package.len() <= 256
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(super) fn validated_cargo_vendor_reference(spec: &JobSpec) -> Result<Option<ImageRef>, String> {
@@ -80,7 +122,7 @@ pub(super) fn validated_cargo_vendor_reference(spec: &JobSpec) -> Result<Option<
     }
     if spec.kind != JobKind::Ci || !is_admitted_structured_cargo_argv(&spec.command) {
         return Err(
-            "a Cargo vendor asset may be selected only for a platform-owned structured CI Cargo recipe (build / test --lib / clippy)"
+            "a Cargo vendor asset may be selected only for a platform-owned structured CI Cargo recipe"
                 .to_string(),
         );
     }
@@ -963,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_cargo_argv_allowlist_admits_build_test_clippy_and_rejects_others() {
+    fn structured_cargo_argv_allowlist_is_shared_by_every_supported_offline_recipe() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
         let r = CARGO_SOURCE_REPLACE_CONFIG;
         let v = CARGO_VENDOR_DIRECTORY_CONFIG;
@@ -985,8 +1027,44 @@ mod tests {
             ],
             vec![
                 "cargo",
+                "test",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--config",
+                r,
+                "--config",
+                v,
+            ],
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "myelin-lints",
+                "--config",
+                r,
+                "--config",
+                v,
+            ],
+            vec![
+                "cargo",
                 "clippy",
                 "--locked",
+                "--all-targets",
+                "--config",
+                r,
+                "--config",
+                v,
+                "--",
+                "-D",
+                "warnings",
+            ],
+            vec![
+                "cargo",
+                "clippy",
+                "--locked",
+                "--workspace",
                 "--all-targets",
                 "--config",
                 r,
@@ -1006,6 +1084,32 @@ mod tests {
             vec!["cargo", "build"],
             vec!["cargo", "run", "--locked", "--config", r, "--config", v],
             vec!["cargo", "test", "--config", r, "--config", v],
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "--workspace",
+                "--config",
+                r,
+                "--config",
+                v,
+            ],
+            vec![
+                "cargo",
+                "test",
+                "--locked",
+                "--workspace",
+                "--all-targets",
+                "--config",
+                r,
+                "--config",
+                v,
+                "--config",
+                r,
+                "--config",
+                v,
+            ],
             vec![
                 "cargo",
                 "clippy",

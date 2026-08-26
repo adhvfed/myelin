@@ -2980,9 +2980,34 @@ PostgreSQL title lifecycle from a freshly rebuilt migration in 0.77 seconds,
 four restore-command contract
 tests, the real Issue-title backup/restore drill in 35.94 seconds, and all three
 black-box privacy journeys in 10.92 seconds. A broader
-backend run compiled the workspace and then stopped on three pre-existing Chat
-HITL drill failures whose test contexts lack the now-required durable timer
-wheel; they are not counted as green.
+initial backend run compiled the workspace and then stopped on three Chat HITL
+drill contexts that lacked the now-required durable timer wheel. Those fixtures
+now share one story harness that supplies and asserts the exact durable timeout;
+all three are green, and the resumed broad run progressed to the self-CI gap
+below.
+
+## 2026-08-26 — self-hosted CI restores its full quality gates
+
+The checked-in Myelin pipeline again runs four first-class jobs: build, complete
+workspace tests, warning-free workspace Clippy, and the `myelin-lints`
+architecture gate. A broad backend run caught that the file had been reduced to
+three weaker jobs even though its self-hosting contract still described four.
+
+The underlying gap was a split authority. The control plane already admitted
+the full structured recipes, while the gVisor launch boundary carried an older
+four-command copy of the allowlist. The earlier operational workaround weakened
+the pipeline to what that copy recognized. The sandbox now owns both structured
+Cargo recipe recognition and deterministic offline argv lowering; the control
+plane consumes those functions. At launch, the sandbox removes exactly one
+platform-owned vendor configuration frame, validates the recovered recipe, and
+reconstructs the command byte-for-byte, so duplicate or misplaced configuration
+arguments still fail closed. Package-scoped tests also require a bounded Cargo
+package name beginning with an alphanumeric byte.
+
+Proof: the checked-in pipeline parses, resolves, persists, and decodes with all
+four jobs; 33 run-plan tests are green; and the sandbox boundary admits every
+supported offline recipe while rejecting unknown commands, option-shaped
+package names, duplicate vendor frames, and misplaced compiler arguments.
 
 ## known gaps (honest list, in priority order)
 

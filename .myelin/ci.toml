@@ -1,10 +1,8 @@
 # Myelin's pipeline runs in the pinned offline runner image from runner-assets.toml.
 #
-# jobs must use the platform-owned structured cargo recipes (the vendored-cargo
-# boundary admits exactly: build --locked / test --locked --lib /
-# clippy --locked --all-targets -- -D warnings). integration tests and the
-# myelin-lints architecture gate need recipes the boundary does not admit yet -
-# extending the structured recipe set is the named follow-on in docs/worklog.md.
+# Jobs use platform-owned structured Cargo recipes. The resolver and sandbox
+# share one allowlist, so a recipe accepted into the plan is also executable at
+# the offline vendored-Cargo boundary.
 schema_version = 2
 on = "push"
 
@@ -19,11 +17,17 @@ build = { tool = "cargo", args = ["build", "--locked"] }
 [[jobs]]
 name = "test"
 image = "myelin.local/linux-rust-v1-rootfs@sha256:e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
-build = { tool = "cargo", args = ["test", "--locked", "--lib"] }
+build = { tool = "cargo", args = ["test", "--locked", "--workspace", "--all-targets"] }
 needs = ["build"]
 
 [[jobs]]
 name = "clippy"
 image = "myelin.local/linux-rust-v1-rootfs@sha256:e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
-build = { tool = "cargo", args = ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"] }
+build = { tool = "cargo", args = ["clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"] }
+needs = ["build"]
+
+[[jobs]]
+name = "architecture"
+image = "myelin.local/linux-rust-v1-rootfs@sha256:e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60"
+build = { tool = "cargo", args = ["test", "--locked", "-p", "myelin-lints"] }
 needs = ["build"]

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use myelin_ci_sandbox::gvisor::{CARGO_SOURCE_REPLACE_CONFIG, CARGO_VENDOR_DIRECTORY_CONFIG};
+use myelin_ci_sandbox::gvisor::{is_admitted_structured_cargo_recipe, platform_cargo_argv};
 use myelin_ci_sandbox::ImageRef;
 use myelin_storage::{BlobError, BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
@@ -112,28 +112,7 @@ impl StructuredBuildV1 {
 
     pub fn platform_argv(&self) -> Vec<String> {
         match self.tool {
-            StructuredBuildToolV1::Cargo => {
-                let vendor = [
-                    "--config".to_owned(),
-                    CARGO_SOURCE_REPLACE_CONFIG.to_owned(),
-                    "--config".to_owned(),
-                    CARGO_VENDOR_DIRECTORY_CONFIG.to_owned(),
-                ];
-                let mut argv = Vec::with_capacity(1 + self.args.len() + vendor.len());
-                argv.push("cargo".to_owned());
-                match self.args.iter().position(|arg| arg == "--") {
-                    Some(split) => {
-                        argv.extend(self.args[..split].iter().cloned());
-                        argv.extend(vendor);
-                        argv.extend(self.args[split..].iter().cloned());
-                    }
-                    None => {
-                        argv.extend(self.args.iter().cloned());
-                        argv.extend(vendor);
-                    }
-                }
-                argv
-            }
+            StructuredBuildToolV1::Cargo => platform_cargo_argv(&self.args),
         }
     }
 }
@@ -853,10 +832,7 @@ fn validate_structured_build(
     }
     match build.tool {
         StructuredBuildToolV1::Cargo => {
-            let recipe: Vec<&str> = build.args.iter().map(String::as_str).collect();
-            if CARGO_RECIPE_ALLOWLIST.contains(&recipe.as_slice())
-                || is_package_scoped_test_recipe(&recipe)
-            {
+            if is_admitted_structured_cargo_recipe(&build.args) {
                 Ok(())
             } else {
                 invalid(format!(
@@ -868,36 +844,6 @@ fn validate_structured_build(
         }
     }
 }
-
-// `test --locked -p <package>`: package names are already constrained to the
-// structured-build argument charset, and the sandbox runs tests either way.
-fn is_package_scoped_test_recipe(recipe: &[&str]) -> bool {
-    matches!(recipe, ["test", "--locked", "-p", package] if !package.starts_with('-'))
-}
-
-const CARGO_RECIPE_ALLOWLIST: &[&[&str]] = &[
-    &["build", "--locked"],
-    &["test", "--locked", "--lib"],
-    &["test", "--locked", "--lib", "--workspace"],
-    &["test", "--locked", "--workspace", "--all-targets"],
-    &[
-        "clippy",
-        "--locked",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ],
-    &[
-        "clippy",
-        "--locked",
-        "--workspace",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ],
-];
 
 fn validate_matrix(job: &ResolvedJobV1) -> Result<(), RunPlanError> {
     if job.matrix_key.len() > MAX_MATRIX_AXES {
