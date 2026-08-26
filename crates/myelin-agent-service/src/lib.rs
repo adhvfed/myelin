@@ -140,9 +140,9 @@ pub use dry_run::{
 };
 
 pub use hitl::{
-    derive_approver_set, gate_id_of, live_cost_estimate, persist_gate_decision, persist_gate_open,
-    run_hitl_loop, surface_card, ApprovedTools, ApproverSet, Halted, HitlCard, HitlGate,
-    HitlGateState, HitlOutcome, HitlWait, InvalidTransition, RiskSummary, WaitDecision,
+    derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card,
+    ApprovedTools, ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait,
+    InvalidTransition, RiskSummary, WaitDecision,
 };
 
 pub use card_text::{

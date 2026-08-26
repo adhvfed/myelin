@@ -4,6 +4,23 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — One durable HITL path owns governance
+
+Agent Service exported a second adapter from its in-memory approval model into Storage's durable
+gate records. No production caller used it: live governed tool calls enter through MCP's
+PostgreSQL-backed verdict store. Its two tests therefore exercised a parallel in-memory assembly,
+not the product path, while the adapter itself could panic on clock rollback and silently replace
+a serialization failure with an empty risk summary.
+
+The unused persistence adapter, public exports, and self-contained tests are removed. Agent
+Service retains the planning and approval vocabulary its callers use; MCP and Storage remain the
+single durable implementation for opening, deciding, consuming, and expiring gates. This makes a
+green approval test less ambiguous and removes a tempting place to fix the wrong implementation.
+
+**Proof:** no remaining workspace reference to the removed persistence surface; all Agent Service
+library stories; strict all-target/all-feature Agent Service Clippy; and workspace-wide all-target
+compilation. Net removal: 269 lines.
+
 ## 2026-08-26 — The CLI never turns a broken clock into a live credential
 
 Three user-facing authentication checks independently converted a clock before the Unix epoch
