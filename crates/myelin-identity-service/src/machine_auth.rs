@@ -392,7 +392,7 @@ impl TokenVerifier for StructuralTokenVerifier {
             dpop_bound,
             purpose,
             audience,
-            exp_unix: i64::MAX,
+            exp_unix: myelin_events::clock::MAX_RFC3339_UNIX_SECONDS,
         })
     }
 
@@ -491,6 +491,7 @@ impl CapabilityAuthenticator {
             Some(binding) => self.verifier.verify_for_request(credential, binding)?,
             None => self.verifier.verify(credential)?,
         };
+        validate_capability_expiry(token.exp_unix)?;
 
         let scope = self.scope_for(&token);
 
@@ -674,6 +675,16 @@ impl CapabilityAuthenticator {
     }
 }
 
+fn validate_capability_expiry(exp_unix: i64) -> myelin_identity::Result<()> {
+    myelin_events::clock::clock_reading_from_unix(exp_unix)
+        .map(|_| ())
+        .map_err(|_| {
+            AuthzError::FailClosed(
+                "capability expiry is outside the supported RFC 3339 range".into(),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,6 +767,18 @@ mod tests {
             scheme: scheme.into(),
             material,
         }
+    }
+
+    #[test]
+    fn capability_expiry_must_be_a_durable_timestamp() {
+        for invalid in [-1, i64::MAX] {
+            assert!(matches!(
+                validate_capability_expiry(invalid),
+                Err(AuthzError::FailClosed(_))
+            ));
+        }
+        validate_capability_expiry(myelin_events::clock::MAX_RFC3339_UNIX_SECONDS)
+            .expect("the last supported RFC 3339 second remains a valid bound");
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
+use myelin_events::clock::system_clock_reading;
 use myelin_identity::Principal;
 use myelin_identity_service::workspace_ssh_public_key_fingerprint;
 use myelin_storage::{
@@ -172,26 +173,23 @@ impl Handler for WorkspaceSshAccessCreateHandler {
             })?;
         let thread_id = thread_param(ctx)?;
         let thread = self.api.owner_thread(ctx.principal, thread_id)?;
-        let now = Utc::now()
-            .with_nanosecond(0)
-            .expect("zero nanoseconds is a valid timestamp");
+        let now_reading = system_clock_reading().map_err(|_| {
+            EdgeError::Unavailable("workspace SSH clock is temporarily unavailable".into())
+        })?;
+        let now = DateTime::from_timestamp(now_reading.unix_seconds(), 0).ok_or_else(|| {
+            EdgeError::Unavailable("workspace SSH clock is temporarily unavailable".into())
+        })?;
         let workspace_expires_at = parse_stored_timestamp(&thread.expires_at)?;
         if thread.state != AgentThreadState::Ready || workspace_expires_at <= now {
             return Err(EdgeError::Conflict(
                 "agent thread workspace is not available for SSH access".into(),
             ));
         }
-        let browser_expires_at =
-            DateTime::from_timestamp(ctx.identity.capability().expires_at_unix, 0)
-                .unwrap_or(DateTime::<Utc>::MAX_UTC);
-        let expires_at = (now + Duration::seconds(MAX_WORKSPACE_SSH_GRANT_SECONDS))
-            .min(workspace_expires_at)
-            .min(browser_expires_at);
-        if expires_at <= now {
-            return Err(EdgeError::Conflict(
-                "browser-approved session expires before SSH access can begin".into(),
-            ));
-        }
+        let expires_at = workspace_ssh_grant_expiry(
+            now,
+            workspace_expires_at,
+            ctx.identity.capability().expires_at_unix,
+        )?;
 
         let grant_id = Uuid::new_v4();
         let route_username = self
@@ -237,6 +235,24 @@ impl Handler for WorkspaceSshAccessCreateHandler {
             &access_json(&self.api.endpoint, &grant, created),
         )))
     }
+}
+
+fn workspace_ssh_grant_expiry(
+    now: DateTime<Utc>,
+    workspace_expires_at: DateTime<Utc>,
+    capability_expires_at_unix: i64,
+) -> Result<DateTime<Utc>, EdgeError> {
+    let capability_expires_at = DateTime::from_timestamp(capability_expires_at_unix, 0)
+        .ok_or_else(|| EdgeError::Unauthorized("browser session has an invalid expiry".into()))?;
+    let expires_at = (now + Duration::seconds(MAX_WORKSPACE_SSH_GRANT_SECONDS))
+        .min(workspace_expires_at)
+        .min(capability_expires_at);
+    if expires_at <= now {
+        return Err(EdgeError::Conflict(
+            "browser-approved session expires before SSH access can begin".into(),
+        ));
+    }
+    Ok(expires_at)
 }
 
 pub(crate) fn register_workspace_ssh_access(
@@ -333,6 +349,31 @@ mod tests {
     use super::*;
     use myelin_identity_service::WorkspaceSshHostIdentity;
     use myelin_storage::SealKey;
+
+    #[test]
+    fn ssh_access_never_outlives_or_repairs_its_authority() {
+        let now = DateTime::parse_from_rfc3339("2026-08-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let workspace_expires_at = now + Duration::days(3);
+
+        let bounded = workspace_ssh_grant_expiry(
+            now,
+            workspace_expires_at,
+            (now + Duration::seconds(90)).timestamp(),
+        )
+        .unwrap();
+        assert_eq!(bounded, now + Duration::seconds(90));
+
+        assert!(matches!(
+            workspace_ssh_grant_expiry(now, workspace_expires_at, i64::MAX),
+            Err(EdgeError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            workspace_ssh_grant_expiry(now, workspace_expires_at, now.timestamp()),
+            Err(EdgeError::Conflict(_))
+        ));
+    }
 
     #[test]
     fn response_projects_only_connection_material_for_the_exact_workspace() {

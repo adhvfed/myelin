@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Timestamp;
 
-const LAST_RFC3339_SECOND: i64 = 253_402_300_799;
+pub const MAX_RFC3339_UNIX_SECONDS: i64 = 253_402_300_799;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClockReading {
@@ -53,7 +53,7 @@ pub fn clock_reading_at(time: SystemTime) -> Result<ClockReading, ClockError> {
 }
 
 pub fn clock_reading_from_unix(unix_seconds: i64) -> Result<ClockReading, ClockError> {
-    if !(0..=LAST_RFC3339_SECOND).contains(&unix_seconds) {
+    if !(0..=MAX_RFC3339_UNIX_SECONDS).contains(&unix_seconds) {
         return Err(if unix_seconds < 0 {
             ClockError::BeforeUnixEpoch
         } else {
@@ -108,7 +108,7 @@ mod tests {
             Err(ClockError::BeforeUnixEpoch)
         );
         assert_eq!(
-            clock_reading_from_unix(LAST_RFC3339_SECOND + 1),
+            clock_reading_from_unix(MAX_RFC3339_UNIX_SECONDS + 1),
             Err(ClockError::OutsideRfc3339)
         );
     }
@@ -120,7 +120,7 @@ mod tests {
             "1970-01-01T00:00:00Z"
         );
         assert_eq!(
-            clock_reading_from_unix(LAST_RFC3339_SECOND)
+            clock_reading_from_unix(MAX_RFC3339_UNIX_SECONDS)
                 .unwrap()
                 .timestamp()
                 .0,

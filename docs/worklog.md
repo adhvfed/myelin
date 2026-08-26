@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — SSH authority has a representable end
+
+Workspace SSH bounded a new grant by the browser capability's signed expiry, but converted an
+unrepresentable Unix value to Chrono's maximum date. An unusually large signed expiry could
+therefore stop constraining the SSH grant instead of being refused. The handler also read wall time
+directly even though the other security boundaries had moved to the shared checked clock.
+
+Capability authentication now rejects every expiry outside the platform's exact RFC 3339 range,
+before constructing a request identity. The range ceiling is named once in Events and reused by
+structural fixtures instead of representing "long lived" with `i64::MAX`. Workspace SSH retains an
+independent defensive conversion, obtains its issuance time from the same checked clock, and
+computes one grant deadline as the minimum of five minutes, workspace life, and browser authority.
+An invalid or already-ended authority can never be repaired into a live SSH grant.
+
+**Proof:** the exact capability-range and SSH-lifetime stories; all 420 Identity and 365 Edge
+library stories; strict all-target/all-feature Clippy for Events, Identity, and Edge; and the live
+TypeScript private-work journey, which keeps another human out, grants and replays ephemeral SSH
+access, connects through the pinned host key, resumes work from fresh agent context, records the
+workspace session, and makes the workspace inaccessible at expiry (8.41 seconds).
+
 ## 2026-08-26 — The browser has one session boundary
 
 Edge still carried an older browser-cookie implementation beside the deployed web boundary. It

@@ -1181,7 +1181,7 @@ mod tests {
                 dpop_bound: true,
                 purpose: myelin_identity_service::CredentialPurpose::Pat,
                 audience: myelin_identity_service::CredentialAudience::Edge,
-                exp_unix: i64::MAX,
+                exp_unix: myelin_events::clock::MAX_RFC3339_UNIX_SECONDS,
             })
         }
     }
@@ -1333,7 +1333,7 @@ mod tests {
                 dpop_bound: true,
                 purpose: myelin_identity_service::CredentialPurpose::Pat,
                 audience: myelin_identity_service::CredentialAudience::Edge,
-                exp_unix: i64::MAX,
+                exp_unix: myelin_events::clock::MAX_RFC3339_UNIX_SECONDS,
             })
         }
     }
