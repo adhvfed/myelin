@@ -20,8 +20,8 @@ use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     resolved_gvisor_rootfs, EgressPolicy, FirehoseSink, IdemToken, ImageRef, JobKind, JobSpec,
-    LeaseStore, MeterTarget, ResourceLimits, RunTokenCredential, RunnerAgent, RunnerError,
-    RunnerHooks, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
+    LeaseStore, MeterTarget, ResourceLimits, RunTokenCredential, RunnerAgent, RunnerHooks,
+    TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::OUTBOX_MIGRATION;
@@ -927,20 +927,4 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     );
     })
     .await;
-}
-
-#[allow(dead_code)]
-fn _runner_error_shapes(e: &RunnerError) -> bool {
-    matches!(
-        e,
-        RunnerError::NoWork
-            | RunnerError::LaunchFailed(_)
-            | RunnerError::LeaseLost { .. }
-            | RunnerError::ReportFailed(_)
-    )
-}
-
-#[allow(dead_code)]
-fn _adapter_is_a_lease_store(a: &DurableLeaseAdapter) -> &dyn LeaseStore {
-    a
 }
