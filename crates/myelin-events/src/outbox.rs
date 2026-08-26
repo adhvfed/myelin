@@ -380,17 +380,32 @@ pub trait DurableOutboxBacking: Send + Sync {
     }
 
     fn outbox_depth(&self) -> usize;
+    fn try_outbox_depth(&self) -> Result<usize> {
+        Ok(self.outbox_depth())
+    }
     fn dead_letter_count(&self) -> usize;
+    fn try_dead_letter_count(&self) -> Result<usize> {
+        Ok(self.dead_letter_count())
+    }
     fn oldest_unsent_recorded_at(&self) -> Option<crate::Timestamp>;
+    fn try_oldest_unsent_recorded_at(&self) -> Result<Option<crate::Timestamp>> {
+        Ok(self.oldest_unsent_recorded_at())
+    }
     fn committed_count(&self) -> usize;
+    fn try_committed_count(&self) -> Result<usize> {
+        Ok(self.committed_count())
+    }
     fn row(&self, id: &EventId) -> Option<OutboxRow>;
+    fn try_row(&self, id: &EventId) -> Result<Option<OutboxRow>> {
+        Ok(self.row(id))
+    }
     fn committed_rows(&self) -> Vec<OutboxRow>;
     fn try_committed_rows(&self) -> Result<Vec<OutboxRow>> {
         Ok(self.committed_rows())
     }
     fn try_retained_rows(&self) -> Result<Vec<OutboxRow>> {
         let mut rows = self.try_committed_rows()?;
-        rows.extend(self.dead_letters());
+        rows.extend(self.try_dead_letters()?);
         rows.sort_by(|left, right| {
             (&left.aggregate.0, left.seq).cmp(&(&right.aggregate.0, right.seq))
         });
@@ -408,6 +423,9 @@ pub trait DurableOutboxBacking: Send + Sync {
         )
     }
     fn dead_letters(&self) -> Vec<OutboxRow>;
+    fn try_dead_letters(&self) -> Result<Vec<OutboxRow>> {
+        Ok(self.dead_letters())
+    }
 
     fn drain_once(&self, transport: &dyn BusTransport, batch: usize) -> Result<DrainReport>;
 }
@@ -484,11 +502,27 @@ impl OutboxStore {
         }
     }
 
+    pub fn try_outbox_depth(&self) -> Result<usize> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_outbox_depth(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => Ok(self.outbox_depth()),
+        }
+    }
+
     pub fn dead_letter_count(&self) -> usize {
         match &self.backend {
             OutboxBackend::Durable(b) => b.dead_letter_count(),
             #[cfg(any(test, feature = "test-support"))]
             OutboxBackend::Memory(_) => self.mem().expect("memory backend").dead_letters.len(),
+        }
+    }
+
+    pub fn try_dead_letter_count(&self) -> Result<usize> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_dead_letter_count(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => Ok(self.dead_letter_count()),
         }
     }
 
@@ -509,11 +543,27 @@ impl OutboxStore {
         }
     }
 
+    pub fn try_oldest_unsent_recorded_at(&self) -> Result<Option<crate::Timestamp>> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_oldest_unsent_recorded_at(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => Ok(self.oldest_unsent_recorded_at()),
+        }
+    }
+
     pub fn committed_count(&self) -> usize {
         match &self.backend {
             OutboxBackend::Durable(b) => b.committed_count(),
             #[cfg(any(test, feature = "test-support"))]
             OutboxBackend::Memory(_) => self.mem().expect("memory backend").order.len(),
+        }
+    }
+
+    pub fn try_committed_count(&self) -> Result<usize> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_committed_count(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => Ok(self.committed_count()),
         }
     }
 
@@ -525,11 +575,27 @@ impl OutboxStore {
         }
     }
 
+    pub fn try_row(&self, id: &EventId) -> Result<Option<OutboxRow>> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_row(id),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => Ok(self.row(id)),
+        }
+    }
+
     pub fn dead_letters(&self) -> Vec<OutboxRow> {
         match &self.backend {
             OutboxBackend::Durable(b) => b.dead_letters(),
             #[cfg(any(test, feature = "test-support"))]
             OutboxBackend::Memory(_) => self.mem().expect("memory backend").dead_letters.clone(),
+        }
+    }
+
+    pub fn try_dead_letters(&self) -> Result<Vec<OutboxRow>> {
+        match &self.backend {
+            OutboxBackend::Durable(b) => b.try_dead_letters(),
+            #[cfg(any(test, feature = "test-support"))]
+            OutboxBackend::Memory(_) => Ok(self.dead_letters()),
         }
     }
 

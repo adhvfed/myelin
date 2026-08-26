@@ -189,7 +189,8 @@ fn bus_d9_per_aggregate_publish_latency_is_measured_and_emitted() {
     let publish_latency_millis = 1_000;
 
     let obs = BusObservations::default();
-    let sig = BusSignals::snapshot(&store, &drain, &obs, &clock(), publish_latency_millis);
+    let sig = BusSignals::snapshot(&store, &drain, &obs, &clock(), publish_latency_millis)
+        .expect("outbox telemetry is readable");
     assert_eq!(sig.outbox_depth, 0, "the outbox drained at QPS");
     assert_eq!(sig.dead_letter_count, 0, "0 dead-lettered (0 lost)");
     assert_eq!(sig.relay_published as u64, N, "every push published");

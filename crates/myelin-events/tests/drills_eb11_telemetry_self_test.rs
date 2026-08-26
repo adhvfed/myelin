@@ -96,7 +96,8 @@ fn eb11_self_test_inject_producer_kill_read_outbox_depth_and_dedup_assertion() {
 
     let obs = BusObservations::default();
     let now_severed = Timestamp("2026-06-19T00:00:30Z".into());
-    let sig = BusSignals::snapshot(&store, &drain_severed, &obs, &now_severed, 0);
+    let sig = BusSignals::snapshot(&store, &drain_severed, &obs, &now_severed, 0)
+        .expect("outbox telemetry is readable");
     let mut rec = MetricRecorder::new();
     sig.emit_to(&mut rec);
 
@@ -141,7 +142,8 @@ fn eb11_self_test_inject_producer_kill_read_outbox_depth_and_dedup_assertion() {
         ..BusObservations::default()
     };
     let now_drained = Timestamp("2026-06-19T00:01:00Z".into());
-    let sig_after = BusSignals::snapshot(&store, &drain_healed, &obs_after, &now_drained, 0);
+    let sig_after = BusSignals::snapshot(&store, &drain_healed, &obs_after, &now_drained, 0)
+        .expect("outbox telemetry is readable");
     let mut rec_after = MetricRecorder::new();
     sig_after.emit_to(&mut rec_after);
 
@@ -200,7 +202,8 @@ fn eb11_full_4_11_signal_set_is_emitted_to_the_port() {
         &obs,
         &Timestamp("2026-06-19T00:00:00Z".into()),
         7,
-    );
+    )
+    .expect("outbox telemetry is readable");
     let mut rec = MetricRecorder::new();
     sig.emit_to(&mut rec);
 
@@ -277,7 +280,8 @@ fn eb11_self_test_registers_into_the_permanent_drill_suite() {
             &BusObservations::default(),
             &Timestamp("2026-06-19T00:01:00Z".into()),
             0,
-        );
+        )
+        .expect("outbox telemetry is readable");
         let mut rec = MetricRecorder::new();
         sig.emit_to(&mut rec);
         ctx.signals.set_scalar(

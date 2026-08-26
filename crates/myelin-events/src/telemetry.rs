@@ -181,17 +181,17 @@ impl BusSignals {
         obs: &BusObservations,
         now: &Timestamp,
         publish_latency_millis: i64,
-    ) -> BusSignals {
+    ) -> crate::Result<BusSignals> {
         let outbox_age_secs = store
-            .oldest_unsent_recorded_at()
+            .try_oldest_unsent_recorded_at()?
             .map(|recorded| age_seconds(&recorded, now))
             .unwrap_or(0);
 
-        BusSignals {
-            outbox_depth: store.outbox_depth() as i64,
+        Ok(BusSignals {
+            outbox_depth: store.try_outbox_depth()? as i64,
             outbox_age_secs,
             relay_published: drain.published as i64,
-            dead_letter_count: store.dead_letter_count() as i64,
+            dead_letter_count: store.try_dead_letter_count()? as i64,
             publish_latency_millis,
             dedup_hits: obs.dedup_hits as i64,
             dedup_deliveries: obs.dedup_deliveries as i64,
@@ -207,7 +207,7 @@ impl BusSignals {
                 .collect(),
             causal_depth_max: obs.causal_depth_max as i64,
             shared_root_tripwire_firings: obs.shared_root_tripwire_firings as i64,
-        }
+        })
     }
 
     pub fn emit_to<S: MetricsSink>(&self, sink: &mut S) {
@@ -382,7 +382,8 @@ mod tests {
         let obs = BusObservations::default();
         let drain = DrainReport::default();
         let now = Timestamp("2026-06-19T00:01:30Z".into());
-        let sig = BusSignals::snapshot(&store, &drain, &obs, &now, 0);
+        let sig = BusSignals::snapshot(&store, &drain, &obs, &now, 0)
+            .expect("outbox telemetry is readable");
         assert_eq!(sig.outbox_depth, 3, "3 committed-but-unsent rows");
         assert_eq!(sig.outbox_age_secs, 90, "oldest unsent row waited 90s");
 
@@ -413,7 +414,8 @@ mod tests {
             &obs,
             &Timestamp("2026-06-19T00:00:00Z".into()),
             12,
-        );
+        )
+        .expect("outbox telemetry is readable");
         let mut rec = MetricRecorder::new();
         sig.emit_to(&mut rec);
 

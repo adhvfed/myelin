@@ -22,6 +22,12 @@ pub struct RelayBatchProgress {
     pub quarantined: usize,
 }
 
+pub(crate) enum RetainedRowsError {
+    Storage,
+    TooManyRows,
+    TooManyEnvelopeBytes,
+}
+
 impl RelayBatchProgress {
     pub fn made_progress(self) -> bool {
         self.published > 0 || self.quarantined > 0
@@ -1115,11 +1121,11 @@ impl PgRelay {
         rows.iter().map(row_from_pg).collect()
     }
 
-    pub async fn retained_rows_bounded(
+    pub(crate) async fn retained_rows_bounded(
         &self,
         maximum_rows: usize,
         maximum_envelope_bytes: usize,
-    ) -> Result<Vec<OutboxRow>, PgError> {
+    ) -> Result<Vec<OutboxRow>, RetainedRowsError> {
         let fetch_limit = i64::try_from(maximum_rows.saturating_add(1)).unwrap_or(i64::MAX);
         let byte_limit = i64::try_from(maximum_envelope_bytes).unwrap_or(i64::MAX);
         let rows = sqlx::query(
@@ -1146,23 +1152,19 @@ impl PgRelay {
         .bind(byte_limit)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| PgError::Query(e.to_string()))?;
+        .map_err(|_| RetainedRowsError::Storage)?;
         if rows.len() > maximum_rows {
-            return Err(PgError::Query(
-                "retained outbox snapshot exceeds its row limit".into(),
-            ));
+            return Err(RetainedRowsError::TooManyRows);
         }
         let mut decoded = Vec::with_capacity(rows.len());
         for row in &rows {
             let aggregate_bytes: i64 = row
                 .try_get("aggregate_bytes")
-                .map_err(|e| PgError::Query(e.to_string()))?;
+                .map_err(|_| RetainedRowsError::Storage)?;
             if aggregate_bytes > byte_limit {
-                return Err(PgError::Query(
-                    "retained outbox snapshot exceeds its envelope byte limit".into(),
-                ));
+                return Err(RetainedRowsError::TooManyEnvelopeBytes);
             }
-            decoded.push(row_from_pg(row)?);
+            decoded.push(row_from_pg(row).map_err(|_| RetainedRowsError::Storage)?);
         }
         Ok(decoded)
     }

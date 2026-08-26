@@ -444,6 +444,83 @@ async fn eb03_seq_gap_free_under_concurrent_committers_both_backends() {
     eprintln!("EB-03 OK (DURABLE) - gap-free per-aggregate seq under 32 concurrent PG committers");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outbox_outage_is_retryable_state_not_a_process_panic() {
+    let pool = connect().await;
+    let _guard = db_lock().lock().await;
+    let store = fresh_durable_store(&pool).await;
+
+    let mut tx = store.begin(minter(), ctx_base());
+    let event_id = tx
+        .emit(draft("issues.issue.created", "issue:OUTAGE"), None)
+        .expect("stage the event");
+    tx.commit().expect("the event is durable before the outage");
+    assert_eq!(store.try_outbox_depth().unwrap(), 1);
+    assert!(store
+        .try_retained_rows_bounded(0, 10_000)
+        .expect_err("the row ceiling is enforced in storage")
+        .0
+        .contains("row limit"));
+    assert!(store
+        .try_retained_rows_bounded(1, 0)
+        .expect_err("the envelope ceiling is enforced in storage")
+        .0
+        .contains("envelope byte limit"));
+
+    pool.close().await;
+
+    let unavailable = [
+        store.try_outbox_depth().map(|_| ()),
+        store.try_dead_letter_count().map(|_| ()),
+        store.try_oldest_unsent_recorded_at().map(|_| ()),
+        store.try_committed_count().map(|_| ()),
+        store.try_row(&event_id).map(|_| ()),
+        store.try_committed_rows().map(|_| ()),
+        store.try_retained_rows().map(|_| ()),
+        store.try_retained_rows_bounded(10, 10_000).map(|_| ()),
+        store.try_dead_letters().map(|_| ()),
+    ];
+    for read in unavailable {
+        let error = read.expect_err("a closed pool leaves outbox state unknown");
+        assert!(error.0.contains("unavailable"));
+        assert!(error.0.contains("state is unknown"));
+        assert!(
+            !error.0.contains("pool") && !error.0.contains("database"),
+            "storage diagnostics stay payload-free: {}",
+            error.0
+        );
+    }
+
+    let bus = InProcessBus::new();
+    let relay = Relay::new(store, bus.clone(), || {
+        Timestamp("2026-06-19T00:00:09Z".into())
+    });
+    let interrupted = relay.drain_to_empty();
+    assert_eq!(interrupted.published, 0);
+    assert_eq!(interrupted.drain_errors, 1);
+    assert_eq!(bus.delivered_count(), 0, "unknown work is never invented");
+
+    let recovered_pool = connect().await;
+    let recovered = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
+        recovered_pool,
+        tokio::runtime::Handle::current(),
+    )));
+    assert_eq!(
+        recovered.try_outbox_depth().unwrap(),
+        1,
+        "a fresh worker sees the pending event after storage recovers"
+    );
+    let recovered_bus = InProcessBus::new();
+    let recovered_relay = Relay::new(recovered.clone(), recovered_bus.clone(), || {
+        Timestamp("2026-06-19T00:00:10Z".into())
+    });
+    let completed = recovered_relay.drain_to_empty();
+    assert_eq!(completed.published, 1);
+    assert_eq!(completed.drain_errors, 0);
+    assert_eq!(recovered_bus.delivered_count(), 1);
+    assert_eq!(recovered.try_outbox_depth().unwrap(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn domain_batch_and_ordinary_staged_writer_share_the_same_aggregate_lock() {
     let pool = connect().await;

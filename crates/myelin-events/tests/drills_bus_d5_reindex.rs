@@ -136,7 +136,8 @@ fn bus_d5_reindex_from_cold_is_byte_identical_to_live() {
     );
 
     let obs = BusObservations::default();
-    let sig = BusSignals::snapshot(&outbox, &drain, &obs, &now(), 0);
+    let sig = BusSignals::snapshot(&outbox, &drain, &obs, &now(), 0)
+        .expect("outbox telemetry is readable");
     let mut rec = myelin_events::MetricRecorder::new();
     sig.emit_to(&mut rec);
     let mut signals = SignalSource::new();

@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — an outbox outage sheds readiness without killing the service
+
+Every service tick refreshed outbox telemetry through infallible PostgreSQL reads. Losing the
+database could therefore panic a healthy process while it was merely measuring queue depth; relay
+drain and projection rebuilds carried the same false assumption. The fallback was especially
+misleading at an operational boundary: either the process disappeared or unknown state looked
+like ordinary state.
+
+Durable outbox reads now have an explicit fallible vocabulary used throughout service telemetry,
+relay drain, bus signals, and the Events, Notifications, Refs, and Search rebuilders. A failed
+telemetry refresh preserves the last trustworthy measurements, marks a distinct critical outbox
+dependency down, and lets the service loop live so readiness can recover when storage returns.
+Boot and graceful drain still fail loudly because they cannot honestly complete without reading
+the queue. Snapshot size failures remain typed and distinct from storage unavailability.
+
+**Proof:** warning-free workspace all-target/all-feature compile and strict clippy across Events,
+Storage, Substrate, Notifications, Search, and Refs; all 216 Events and 192 Substrate library
+stories; the relevant Notifications, Search, and Refs rebuild suites; all nine real-PostgreSQL
+durable-outbox journeys, including a closed-pool outage, non-panicking relay, bounded snapshot
+errors, and exactly-once recovery (1.45 seconds); restarted Edge, Agent Service, Hosted Agent
+Worker, and Workspace Gateway; and both live TypeScript private-agent-thread journeys, including
+fresh-context continuation in its persistent workspace (7.55 seconds).
+
 ## 2026-08-26 — an unreadable dead-letter queue is not an empty queue
 
 The PostgreSQL consumer dead-letter adapter logged read failures and returned an empty list. That

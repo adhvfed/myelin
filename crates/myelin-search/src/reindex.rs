@@ -329,12 +329,15 @@ impl SearchReindexer {
                     progress.docs_skipped_applied += 1;
                     continue;
                 }
-                let row = outbox.row(&event_id).ok_or_else(|| {
-                    ReindexError::Bus(format!(
-                        "snapshot {} not found in the outbox (the bus re-emit did not stage it)",
-                        event_id.0
-                    ))
-                })?;
+                let row = outbox
+                    .try_row(&event_id)
+                    .map_err(|error| ReindexError::Bus(error.0))?
+                    .ok_or_else(|| {
+                        ReindexError::Bus(format!(
+                            "snapshot {} not found in the outbox (the bus re-emit did not stage it)",
+                            event_id.0
+                        ))
+                    })?;
                 self.indexer.index(&row.envelope).map_err(map_index_err)?;
                 progress.docs_indexed += 1;
                 highest_applied = highest_applied.max(draft.version);

@@ -158,7 +158,11 @@ pub fn reindex(
     let mut skipped_duplicate = 0usize;
     for draft in drafts {
         let id = draft.event_id(tenant);
-        if outbox.row(&id).is_some() {
+        if outbox
+            .try_row(&id)
+            .map_err(|error| ReindexError::OutboxFailed(error.0))?
+            .is_some()
+        {
             skipped_duplicate += 1;
         } else {
             to_emit.push(draft);

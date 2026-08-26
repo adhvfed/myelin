@@ -475,8 +475,13 @@ impl<T: BusTransport> Relay<T> {
     pub fn drain_to_empty(&self) -> DrainReport {
         let mut total = DrainReport::default();
         loop {
-            if self.store.outbox_depth() == 0 {
-                break;
+            match self.store.try_outbox_depth() {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    total.add_drain_errors(1);
+                    break;
+                }
             }
             let r = self.drain_once();
             let made_progress = r.published > 0 || r.deduplicated > 0;

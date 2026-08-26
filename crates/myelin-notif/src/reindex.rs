@@ -176,7 +176,8 @@ impl<'a> NotifReindexer<'a> {
                         .map_err(|_| ReindexError::DedupUnavailable)?;
                 }
                 let row = outbox
-                    .row(&event_id)
+                    .try_row(&event_id)
+                    .map_err(|error| ReindexError::Bus(error.0))?
                     .ok_or_else(|| ReindexError::MissingSnapshot(event_id.0.clone()))?;
                 let msg = Message {
                     subject: row.envelope.subject.0.clone(),

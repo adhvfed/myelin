@@ -9,7 +9,7 @@ use myelin_events::relay::InProcessBus;
 use myelin_events::relay::{BusTransport, EventConsumer};
 use myelin_events::{
     BrokerDeliveryBody, Consumer, ConsumerName, Delivered, DeliveryQuarantineReason, DeliveryToken,
-    DurableDeliveryQuarantine, EventHandler, Message, OutboxStore, Relay, Timestamp,
+    DurableDeliveryQuarantine, EventHandler, Message, OutboxError, OutboxStore, Relay, Timestamp,
 };
 use myelin_storage::{OltpConfig, OltpPool, OltpStoreHolder};
 use std::collections::BTreeMap;
@@ -232,14 +232,19 @@ impl Telemetry {
         Telemetry::default()
     }
 
-    fn observe(&self, outbox: &OutboxStore, consumers: &[ConsumerReg]) {
+    fn observe(&self, outbox: &OutboxStore, consumers: &[ConsumerReg]) -> Result<(), OutboxError> {
+        let outbox_depth = outbox.try_outbox_depth()? as i64;
+        let dead_letter_count = outbox.try_dead_letter_count()? as i64;
+        let consumer_lag = consumers
+            .iter()
+            .map(|consumer| (consumer.name().0, consumer.lag() as i64))
+            .collect();
+
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.outbox_depth = outbox.outbox_depth() as i64;
-        inner.dead_letter_count = outbox.dead_letter_count() as i64;
-        inner.consumer_lag.clear();
-        for c in consumers {
-            inner.consumer_lag.insert(c.name().0, c.lag() as i64);
-        }
+        inner.outbox_depth = outbox_depth;
+        inner.dead_letter_count = dead_letter_count;
+        inner.consumer_lag = consumer_lag;
+        Ok(())
     }
 
     pub fn outbox_depth(&self) -> i64 {
@@ -451,8 +456,20 @@ impl ServeHandle {
     }
 
     pub fn telemetry(&self) -> &Telemetry {
-        self.telemetry.observe(&self.outbox, &self.consumers);
         &self.telemetry
+    }
+
+    fn refresh_telemetry(&self) -> bool {
+        match self.telemetry.observe(&self.outbox, &self.consumers) {
+            Ok(()) => {
+                self.health_probe().mark_up("outbox");
+                true
+            }
+            Err(_) => {
+                self.health_probe().mark_down("outbox");
+                false
+            }
+        }
     }
 
     pub fn tick(&self) -> Vec<(ConsumerName, usize)> {
@@ -461,7 +478,7 @@ impl ServeHandle {
         }
 
         if self.is_draining() && self.consumer_transport.is_some() {
-            self.telemetry.observe(&self.outbox, &self.consumers);
+            self.refresh_telemetry();
             return Vec::new();
         }
 
@@ -471,7 +488,7 @@ impl ServeHandle {
                 Ok(None) => {}
                 Err(dependency) => {
                     self.health_probe().mark_down(dependency.name());
-                    self.telemetry.observe(&self.outbox, &self.consumers);
+                    self.refresh_telemetry();
                     return Vec::new();
                 }
             }
@@ -483,7 +500,7 @@ impl ServeHandle {
                 Err(error) => {
                     eprintln!("[{}] broker pull failed: {}", self.name, error.0);
                     self.health_probe().mark_down("broker");
-                    self.telemetry.observe(&self.outbox, &self.consumers);
+                    self.refresh_telemetry();
                     return Vec::new();
                 }
             }
@@ -500,7 +517,7 @@ impl ServeHandle {
                 })
                 .collect()
         } else {
-            self.telemetry.observe(&self.outbox, &self.consumers);
+            self.refresh_telemetry();
             return Vec::new();
         };
 
@@ -654,7 +671,7 @@ impl ServeHandle {
                 }
             }
         }
-        self.telemetry.observe(&self.outbox, &self.consumers);
+        self.refresh_telemetry();
         delivered
     }
 
@@ -678,7 +695,11 @@ impl ServeHandle {
             self.health_probe().mark_up("broker");
         }
         self.tick();
-        self.telemetry.observe(&self.outbox, &self.consumers);
+        if !self.refresh_telemetry() {
+            return Err(ServeError(
+                "graceful drain could not read durable outbox state".into(),
+            ));
+        }
         Ok(self.telemetry)
     }
 
@@ -783,7 +804,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         })
     });
 
-    let mut full_critical = vec!["oltp".to_string()];
+    let mut full_critical = vec!["oltp".to_string(), "outbox".to_string()];
     full_critical.extend(critical.deps().iter().map(|d| d.0.clone()));
     let mut ports = PortOpener::default();
     ports.open_all(CriticalDependencies::new(full_critical));
@@ -797,7 +818,9 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     }
 
     let telemetry = Telemetry::new();
-    telemetry.observe(&outbox_store, &consumers);
+    telemetry
+        .observe(&outbox_store, &consumers)
+        .map_err(|_| ServeError("durable outbox state is unavailable at boot".into()))?;
 
     ports.mark_metrics_health_started();
 
@@ -1428,6 +1451,97 @@ mod tests {
     fn serve_runs_lifecycle_and_returns_ok() {
         let spec = AppSpec::minimal("svc", Config::default(), OutboxSpec::default_inproc());
         assert_eq!(serve(spec), Ok(()), "serve boots → … → drains cleanly");
+    }
+
+    #[derive(Default)]
+    struct SwitchingOutbox {
+        unavailable: AtomicBool,
+    }
+
+    impl myelin_events::DurableOutboxBacking for SwitchingOutbox {
+        fn commit_staged(&self, _rows: Vec<myelin_events::OutboxRow>) -> myelin_events::Result<()> {
+            Ok(())
+        }
+
+        fn outbox_depth(&self) -> usize {
+            0
+        }
+
+        fn try_outbox_depth(&self) -> myelin_events::Result<usize> {
+            if self.unavailable.load(Ordering::SeqCst) {
+                Err(OutboxError("outbox unavailable".into()))
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn dead_letter_count(&self) -> usize {
+            0
+        }
+
+        fn try_dead_letter_count(&self) -> myelin_events::Result<usize> {
+            self.try_outbox_depth()
+        }
+
+        fn oldest_unsent_recorded_at(&self) -> Option<Timestamp> {
+            None
+        }
+
+        fn committed_count(&self) -> usize {
+            0
+        }
+
+        fn row(&self, _id: &EventId) -> Option<myelin_events::OutboxRow> {
+            None
+        }
+
+        fn committed_rows(&self) -> Vec<myelin_events::OutboxRow> {
+            Vec::new()
+        }
+
+        fn dead_letters(&self) -> Vec<myelin_events::OutboxRow> {
+            Vec::new()
+        }
+
+        fn drain_once(
+            &self,
+            _transport: &dyn BusTransport,
+            _batch: usize,
+        ) -> myelin_events::Result<myelin_events::DrainReport> {
+            Ok(myelin_events::DrainReport::default())
+        }
+    }
+
+    #[test]
+    fn an_outbox_read_outage_sheds_readiness_without_killing_the_service_loop() {
+        let backing = Arc::new(SwitchingOutbox::default());
+        let store = OutboxStore::durable(backing.clone());
+        let handle = boot(AppSpec::minimal(
+            "outbox-outage",
+            Config::default(),
+            OutboxSpec::new(store, InProcessBus::new()),
+        ))
+        .expect("the outbox is readable at boot");
+        assert!(handle.metrics_health().readiness().is_ready());
+
+        backing.unavailable.store(true, Ordering::SeqCst);
+        assert_eq!(handle.tick(), Vec::new(), "the process remains live");
+        assert!(
+            handle.metrics_health().readiness().sheds(),
+            "unknown durable state sheds traffic instead of panicking"
+        );
+        assert_eq!(
+            handle.telemetry().outbox_depth(),
+            0,
+            "the last trustworthy measurement is retained"
+        );
+
+        backing.unavailable.store(false, Ordering::SeqCst);
+        assert_eq!(handle.tick(), Vec::new());
+        assert!(
+            handle.metrics_health().readiness().is_ready(),
+            "the next successful tick recovers without a restart"
+        );
     }
 
     #[test]

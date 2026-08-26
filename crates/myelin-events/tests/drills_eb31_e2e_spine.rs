@@ -496,7 +496,8 @@ fn e2e4_dsar_fanout_bus_holder_zero_recoverable_and_zero_resurrected() {
     );
 
     let obs = BusObservations::default();
-    let sig = BusSignals::snapshot(&reerase_outbox, &drain, &obs, &now(), 0);
+    let sig = BusSignals::snapshot(&reerase_outbox, &drain, &obs, &now(), 0)
+        .expect("outbox telemetry is readable");
     let mut rec = MetricRecorder::new();
     sig.emit_to(&mut rec);
 

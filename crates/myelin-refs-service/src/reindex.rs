@@ -181,9 +181,12 @@ impl RefsReindexer {
         let mut ingested = 0usize;
         for draft in &drafts {
             let id = snapshot_event_id(tenant, &draft.aggregate, draft.version);
-            let row = outbox.row(&id).ok_or_else(|| {
-                ReindexError::Bus(format!("snapshot row {} absent after emit", id.0))
-            })?;
+            let row = outbox
+                .try_row(&id)
+                .map_err(|error| ReindexError::Bus(error.0))?
+                .ok_or_else(|| {
+                    ReindexError::Bus(format!("snapshot row {} absent after emit", id.0))
+                })?;
             match self
                 .builder
                 .handle(&row.envelope, &mut myelin_events::HandlerTx::none())

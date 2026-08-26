@@ -144,7 +144,8 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
     );
 
     let obs = BusObservations::default();
-    let sig = BusSignals::snapshot(&reerase_outbox, &drain, &obs, &now(), 0);
+    let sig = BusSignals::snapshot(&reerase_outbox, &drain, &obs, &now(), 0)
+        .expect("outbox telemetry is readable");
     let mut rec = myelin_events::MetricRecorder::new();
     sig.emit_to(&mut rec);
 
