@@ -3,14 +3,13 @@ use myelin_agent_service::{
     comment_required_caps, comment_tool_def, draft_required_caps, draft_tool_def,
     edit_confidential_required_caps, edit_confidential_tool_def, gate_id_of,
     is_content_addressed_kn_document, knowledge_tool_defs, publish_required_caps, publish_tool_def,
-    register_knowledge_tools, run_hitl_loop, trace_ref_of, AgentTraceHolder, ApplyError,
-    ApprovedTools, CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, HitlGate,
-    HitlOutcome, HitlWait, PipelineSignals, PlanThenApply, PlannedEffect, RiskSummary,
-    SubsystemApply, TenantGuard, TraceDocument, WaitDecision, COMMENT_TOOL, DRAFT_TOOL,
-    EDIT_CONFIDENTIAL_TOOL, KNOWLEDGE_SUBSYSTEM, PUBLISH_TOOL,
+    register_knowledge_tools, run_hitl_loop, trace_ref_of, ApplyError, ApprovedTools,
+    CapabilityCheck, DelegationLookup, EffectBudget, EffectCost, HitlGate, HitlOutcome, HitlWait,
+    PipelineSignals, PlanThenApply, PlannedEffect, RiskSummary, SubsystemApply, TenantGuard,
+    TraceDocument, WaitDecision, COMMENT_TOOL, DRAFT_TOOL, EDIT_CONFIDENTIAL_TOOL,
+    KNOWLEDGE_SUBSYSTEM, PUBLISH_TOOL,
 };
 use myelin_content::{Block, Inline, Span};
-use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{
     CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
     PrincipalKind, RuntimeRef, Zookie,
@@ -480,14 +479,6 @@ fn pii_trace(run_id: u128) -> TraceDocument {
     )
 }
 
-fn gdpr_subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(
-        PrincipalId(id.into()),
-        PrincipalKind::Human,
-        GdprTenantId::from_token("acme"),
-    ))
-}
-
 #[test]
 fn cdc_8_8_trace_ref_resolves_to_a_content_addressed_13_1_document() {
     let doc = pii_trace(7);
@@ -503,53 +494,6 @@ fn cdc_8_8_trace_ref_resolves_to_a_content_addressed_13_1_document() {
     assert!(
         is_content_addressed_kn_document(&doc),
         "the trace is the content-addressed KN document (8.8)"
-    );
-}
-
-#[test]
-fn knd12_erase_subject_crypto_shreds_the_trace_pseudonym_survives() {
-    let holder = AgentTraceHolder;
-    let subject = gdpr_subject("psn:agent-subject-7");
-
-    let doc = pii_trace(7);
-    let body = doc.canonical_bytes();
-    assert!(
-        String::from_utf8_lossy(&body).contains("alice@example.com"),
-        "the trace body contains PII before erasure (the reasoning the brain authored)"
-    );
-
-    let scope = EraseScope::Subject {
-        subject: subject.clone(),
-        tenant: GdprTenantId::from_token("acme"),
-    };
-    let receipt = holder
-        .erase(scope)
-        .expect("the trace holder erase succeeds (the M3 seam)");
-    assert_eq!(receipt.receipt.operation, "erase");
-    assert!(
-        receipt.receipt.content_hash.starts_with("blake3:"),
-        "the erase receipt is content-addressed"
-    );
-
-    let subject_id = &subject.principal.principal_id.0;
-    assert_eq!(
-        subject_id, "psn:agent-subject-7",
-        "the subject is the opaque pseudonym, not PII"
-    );
-    assert!(
-        !subject_id.contains('@') && !subject_id.contains("alice"),
-        "0 recoverable PII in the attribution key - it is the opaque pseudonym (EI-04 §1)"
-    );
-
-    let receipt2 = holder
-        .erase(EraseScope::Subject {
-            subject,
-            tenant: GdprTenantId::from_token("acme"),
-        })
-        .expect("idempotent");
-    assert_eq!(
-        receipt, receipt2,
-        "erase is idempotent (the same scope → the identical receipt)"
     );
 }
 

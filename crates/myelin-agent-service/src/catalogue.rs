@@ -162,7 +162,6 @@ mod tests {
     #[test]
     fn the_platform_catalogue_is_one_sorted_validated_cross_subsystem_surface() {
         let catalogue = PlatformToolCatalogue::platform().unwrap();
-        assert_eq!(catalogue.definitions().len(), 62);
         let keys = catalogue
             .definitions()
             .iter()

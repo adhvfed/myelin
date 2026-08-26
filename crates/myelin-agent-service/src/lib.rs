@@ -6,13 +6,11 @@ pub mod chat_tools;
 pub mod ci_tools;
 pub mod defaults;
 pub mod dry_run;
-pub mod dsr;
 pub mod effect_api;
 pub mod git_read_tools;
 pub mod git_tools;
 pub mod hitl;
 pub mod hitl_batch;
-pub mod holder;
 pub mod hosted_run_contract;
 pub mod issues_agents;
 pub mod issues_read_tools;
@@ -36,17 +34,7 @@ pub mod workspace_events;
 pub mod workspace_execution;
 pub mod workspace_tools;
 
-pub use holder::{
-    agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
-    AgentTraceHolder, AGENT_OLTP_STORE, AGENT_TRACE_STORE,
-};
-
 pub use catalogue::{catalogue_cursor, tool_ref, PlatformToolCatalogue, ToolCatalogueError};
-
-pub use dsr::{
-    subject_dek_ref, AgentFabricHolder, AgentFabricStore, FabricEraseReceipt, FabricErasureLedger,
-    FabricLocateReport, FabricReErasureReceipt, FreeTextRow, RunAttribution,
-};
 
 pub use skeleton::{
     requesting_subject, ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, RunWallet,

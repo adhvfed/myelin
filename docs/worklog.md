@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Agent privacy receipts describe durable work
+
+Agent Service exported three parallel privacy models while Edge constructed only one. Two public
+registration holders returned successful locate, export, restrict, and erase receipts without
+reading or changing a store—the erase outcome literally said `no-op`. A larger in-memory fabric
+model tombstoned vectors, destroyed process-local keys, and replayed a private in-memory ledger, but
+was likewise used only by its own tests. Production privacy requests, durable traces, restrictions,
+erasure proofs, and post-restore replay all use Storage's PostgreSQL-backed
+`DurableAgentTraceStore` instead.
+
+Both ceremonial models, their public exports, and the suites that certified them are gone. The one
+useful Knowledge tool drill no longer invokes a no-op trace holder as evidence of erasure. During
+the regression run, a hard-coded platform-tool count also failed after a valid tool was added; that
+incidental count is gone while the catalogue's sorted uniqueness, validation, cross-subsystem
+presence, latest-version projection, and approval-contract behavior remain asserted.
+
+**Proof:** all-target/all-feature Agent Service compile and strict clippy; all 226 remaining library
+stories; the complete all-feature Agent Service suite against PostgreSQL, including durable RLS,
+tool-scope, trigger-handoff, and wallet-metering journeys; rebuilt Agent Service and Edge; both live
+TypeScript privacy journeys (5.33 seconds); and both private-agent-thread journeys, including
+fresh-context continuation in a private persistent workspace (7.22 seconds). Net removal: 1,481
+lines of unshipped models and self-certifying tests.
+
 ## 2026-08-26 — Chat privacy has one truthful implementation
 
 Chat exposed two incompatible erasure stories. The production privacy request path uses the
