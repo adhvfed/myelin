@@ -4,6 +4,23 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — a poison batch cannot strand healthy events
+
+`drain_to_empty` stopped whenever a pass published or deduplicated nothing. Moving a poison event
+to the dead-letter queue was real forward progress, but the aggregate receipt both discarded that
+count and treated the pass as stalled. A full bounded batch reaching its retry ceiling could
+therefore hide every healthy event ordered behind it while reporting an incomplete quarantine.
+
+Drain aggregation now has one small seam that owns both progress and receipt accounting. Dead-
+lettering frees queue capacity, continues the drain, and remains visible to the operator. The
+durable story stages 257 ordered events, exhausts all 256 rows in the first batch, then proves the
+healthy final event is delivered exactly once and the live queue is genuinely empty.
+
+**Proof:** strict all-target/all-feature clippy for Events and Storage; all 217 Events library
+stories; the real-PostgreSQL full-poison-batch regression (0.41 seconds); restarted the outbox
+publisher; and the live TypeScript first-hour organization journey from browser approval through
+project, repository, issue, CI, and governed-agent work (18.98 seconds).
+
 ## 2026-08-26 — an outbox outage sheds readiness without killing the service
 
 Every service tick refreshed outbox telemetry through infallible PostgreSQL reads. Losing the

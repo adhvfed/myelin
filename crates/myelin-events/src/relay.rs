@@ -364,6 +364,16 @@ impl DrainReport {
     fn add_drain_errors(&mut self, errors: usize) {
         self.drain_errors += errors;
     }
+
+    fn absorb_pass(&mut self, pass: DrainReport) -> bool {
+        let made_progress = pass.published > 0 || pass.deduplicated > 0 || pass.dead_lettered > 0;
+        self.published += pass.published;
+        self.deduplicated += pass.deduplicated;
+        self.failed += pass.failed;
+        self.dead_lettered += pass.dead_lettered;
+        self.drain_errors += pass.drain_errors;
+        made_progress
+    }
 }
 
 pub struct Relay<T: BusTransport> {
@@ -484,11 +494,7 @@ impl<T: BusTransport> Relay<T> {
                 }
             }
             let r = self.drain_once();
-            let made_progress = r.published > 0 || r.deduplicated > 0;
-            total.published += r.published;
-            total.deduplicated += r.deduplicated;
-            total.failed += r.failed;
-            total.add_drain_errors(r.drain_errors);
+            let made_progress = total.absorb_pass(r);
             if !made_progress {
                 break;
             }
@@ -681,6 +687,25 @@ mod tests {
         };
         total.add_drain_errors(4);
         assert_eq!(total.drain_errors, 7);
+    }
+
+    #[test]
+    fn a_dead_letter_is_progress_and_is_never_lost_from_the_drain_receipt() {
+        let mut total = DrainReport::default();
+        let progressed = total.absorb_pass(DrainReport {
+            dead_lettered: 2,
+            failed: 1,
+            drain_errors: 3,
+            ..DrainReport::default()
+        });
+
+        assert!(
+            progressed,
+            "quarantining poison frees room for the next batch"
+        );
+        assert_eq!(total.dead_lettered, 2, "the operator sees every quarantine");
+        assert_eq!(total.failed, 1);
+        assert_eq!(total.drain_errors, 3);
     }
 
     fn commit_n(

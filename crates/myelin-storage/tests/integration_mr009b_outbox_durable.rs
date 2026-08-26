@@ -7,7 +7,7 @@ use myelin_config::MyelinConfig;
 use myelin_storage::outbox_durable::PgOutboxBacking;
 use myelin_storage::pgrelay::PgRelay;
 
-use myelin_events::relay::{InProcessBus, Relay};
+use myelin_events::relay::{InProcessBus, Relay, DEFAULT_DRAIN_BATCH};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
     EventDraft, EventEnvelope, EventId, EventType, IdMinter, MonotonicMinter, OutboxRow,
@@ -403,6 +403,58 @@ async fn cdc_parity_dead_letter_at_max_attempts() {
     let store = fresh_durable_store(&pool).await;
     dead_letter_scenario(&store);
     eprintln!("PARITY OK - dead-letter at MAX_PUBLISH_ATTEMPTS identical across backends");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_full_poison_batch_does_not_hide_the_healthy_work_behind_it() {
+    let pool = connect().await;
+    let _guard = db_lock().lock().await;
+    let store = fresh_durable_store(&pool).await;
+    let mut tx = store.begin(minter(), ctx_base());
+    for index in 0..=DEFAULT_DRAIN_BATCH {
+        tx.emit(
+            draft("issues.issue.updated", &format!("issue:BATCH-{index:03}")),
+            None,
+        )
+        .expect("stage one event in the ordered relay backlog");
+    }
+    tx.commit().expect("commit the whole relay backlog");
+
+    let bus = InProcessBus::new();
+    bus.sever();
+    let relay = Relay::new(store.clone(), bus.clone(), || {
+        Timestamp("2026-06-19T00:00:09Z".into())
+    });
+    for attempt in 1..MAX_PUBLISH_ATTEMPTS {
+        let report = relay.drain_once();
+        assert_eq!(
+            report.failed, DEFAULT_DRAIN_BATCH,
+            "attempt {attempt} parks exactly the first bounded batch"
+        );
+        assert_eq!(report.dead_lettered, 0);
+    }
+
+    bus.heal();
+    bus.fail_next(
+        u32::try_from(DEFAULT_DRAIN_BATCH).expect("the relay batch fits the fault counter"),
+    );
+    let report = relay.drain_to_empty();
+
+    assert_eq!(
+        report.dead_lettered, DEFAULT_DRAIN_BATCH,
+        "the receipt accounts for every poison row removed from the live queue"
+    );
+    assert_eq!(
+        report.published, 1,
+        "the healthy event behind a full poison batch is still delivered"
+    );
+    assert_eq!(store.try_outbox_depth().unwrap(), 0, "drain means empty");
+    assert_eq!(
+        store.try_dead_letter_count().unwrap(),
+        DEFAULT_DRAIN_BATCH,
+        "all poison rows remain available for operator recovery"
+    );
+    assert_eq!(bus.delivered_count(), 1, "the healthy event arrives once");
 }
 
 async fn concurrent_seq_scenario(store: &OutboxStore, n: u64) {
