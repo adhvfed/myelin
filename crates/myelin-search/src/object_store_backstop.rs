@@ -1,7 +1,7 @@
 use myelin_storage::{BlobError, BlobStore, ContentHash};
 use myelin_tenancy::{Region, TenantId};
 
-use crate::hyok_scale::{BackupScaleEraseVerdict, SealedBackupSegment};
+use crate::backup_erasure::{BackupScaleEraseVerdict, SealedBackupSegment};
 
 pub struct SegmentBackstop<B: BlobStore> {
     blobs: B,
@@ -245,7 +245,7 @@ impl ObjectStoreBackstopGate {
         let recoverable_after_shred = match srch_d4 {
             BackupScaleEraseVerdict::Green(a) => a.backup_segments_recoverable_after_shred,
             BackupScaleEraseVerdict::Red(f) => {
-                use crate::hyok_scale::BackupScaleEraseFailure as F;
+                use crate::backup_erasure::BackupScaleEraseFailure as F;
                 return match f {
                     F::BackupRecoverableAfterShred(n) => ObjectStoreBackstopVerdict::Red(
                         ObjectStoreBackstopFailure::RecoverableAfterShred(*n),
@@ -444,7 +444,7 @@ mod tests {
     }
 
     fn green_d4(recoverable_after: usize) -> BackupScaleEraseVerdict {
-        BackupScaleEraseVerdict::Green(crate::hyok_scale::BackupScaleEraseArtifact {
+        BackupScaleEraseVerdict::Green(crate::backup_erasure::BackupScaleEraseArtifact {
             tenant: tenant(),
             region: region(),
             live_docs_purged: 1,

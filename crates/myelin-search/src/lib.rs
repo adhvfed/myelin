@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod backup_erasure;
 pub mod cache;
 pub mod chat_projection;
 pub mod ci_log_projection;
@@ -12,7 +13,6 @@ pub mod filtered_ann;
 pub mod freshness;
 pub mod fusion;
 pub mod git_code_projection;
-pub mod hyok_scale;
 pub mod indexer;
 pub mod issues_projection;
 pub mod kn_projection;
@@ -31,6 +31,11 @@ pub mod telemetry;
 pub mod tier3_valve;
 pub mod vector;
 
+pub use backup_erasure::{
+    backup_scale_page_spec, build_live_corpus, subject_matcher, BackupScaleEraseArtifact,
+    BackupScaleEraseFailure, BackupScaleEraseGate, BackupScaleEraseInputs, BackupScaleEraseVerdict,
+    MapFetcher, SealedBackupSegment,
+};
 pub use cache::{
     should_bypass, zookie_bucket, CacheStats, CacheTtl, FilterCache, ResultCache,
     TtlExceedsRevocationSla,
@@ -79,12 +84,6 @@ pub use git_code_projection::{
     FACET_BLOB_OID as GIT_FACET_BLOB_OID, FACET_LANGUAGE as GIT_FACET_LANGUAGE,
     FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_TYPE, GIT_SUBSYSTEM,
     TRIGRAM_N,
-};
-pub use hyok_scale::{
-    backup_scale_page_spec, build_live_corpus, subject_matcher, BackupScaleEraseArtifact,
-    BackupScaleEraseFailure, BackupScaleEraseGate, BackupScaleEraseInputs, BackupScaleEraseVerdict,
-    DerivedStore, HyokCrossStoreArtifact, HyokCrossStoreFailure, HyokCrossStoreGate,
-    HyokCrossStoreInputs, HyokCrossStoreVerdict, MapFetcher, SealedBackupSegment,
 };
 pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,

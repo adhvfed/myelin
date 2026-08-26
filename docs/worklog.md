@@ -2625,6 +2625,33 @@ both scopes and remains explicit that Issues and Git are outside its proof.
 Proof: the four-case Chat PostgreSQL suite in 0.75 seconds, four restore-command
 contract tests, and warning-free strict Chat/Edge Clippy.
 
+## 2026-08-26 — delete the HYOK proof that could not observe HYOK data
+
+The Search quality audit found a green security drill whose central observation
+was hard-coded. `HyokCrossStoreInputs::hyok_class_present_in` returned `false`
+for index segments, vectors, caches, and backups without reading any of them.
+The tests populated only a platform-managed control class, then reported that
+all four stores had been walked and that no HYOK plaintext existed. They could
+not turn red if a HYOK document were indexed.
+
+The false SRCH-D10 artifact, verdict, gate, five unit tests, and external drill
+have been removed. The remaining file and drill are named for the behavior they
+actually exercise: backup-scale erasure. That path still seals recoverable
+ciphertext, purges live documents and vectors through the holder, destroys the
+key, and proves the retained backup no longer opens. The public Search exports
+no longer offer callers an assurance object that the system cannot calculate.
+
+This does not declare HYOK safe by absence. The honest gap is that origin
+selection is not wired into production projection/index admission at all; the
+`KeyOrigin` types are currently exercised only by Rust fixtures. A future
+SRCH-D10 must begin with a configured customer-key origin and drive the same
+consumer and stores used by live search.
+
+Proof: 335 Search library tests and the two-case renamed backup-erasure drill.
+The feature-enabled object-store story reached the live adapter but could not
+run because that dependency was unavailable, and is deliberately not counted
+as green.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for two wired scopes, open for the rest.** the
@@ -2674,3 +2701,11 @@ contract tests, and warning-free strict Chat/Edge Clippy.
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.
+10. **HYOK/BYOK is a model, not a production Search boundary yet.** Storage's
+    `KeyOrigin` vocabulary exists, but no running configuration selects an
+    origin for a product data class and Search projections do not carry that
+    decision into index admission. BYOK also records a customer key path
+    without invoking a customer-key adapter. The former SRCH-D10 drill was
+    removed because its supposed HYOK inspection returned `false`
+    unconditionally. A replacement must configure a real origin, attempt the
+    ordinary indexing path, and inspect every actual derived store.

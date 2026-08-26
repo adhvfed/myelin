@@ -2,13 +2,12 @@ use std::sync::Arc;
 
 use myelin_gdpr::{PersonalDataHolder, SubjectRef};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::{Dek, Hyok, HyokKeyService, HyokServiceDenied, KmsEngine, PlatformManaged};
-use myelin_storage::{DekHandle, WrappedDek};
+use myelin_storage::KmsEngine;
 use myelin_tenancy::{Region, TenantId};
 
 use myelin_search::{
     build_live_corpus, subject_matcher, AclFilter, BackupScaleEraseGate, BackupScaleEraseInputs,
-    HyokCrossStoreGate, HyokCrossStoreInputs, SealedBackupSegment, SearchDekPin, SearchEraseHolder,
+    SealedBackupSegment, SearchDekPin, SearchEraseHolder,
 };
 
 const NOW: &str = "2026-06-24T00:00:00Z";
@@ -25,56 +24,6 @@ fn subject(id: &str) -> SubjectRef {
         PrincipalKind::Human,
         tenant(),
     ))
-}
-
-struct DenyAllHyok;
-impl HyokKeyService for DenyAllHyok {
-    fn wrap(&self, _dek: &Dek) -> Result<WrappedDek, HyokServiceDenied> {
-        Err(HyokServiceDenied)
-    }
-    fn unwrap(&self, _w: &WrappedDek) -> Result<DekHandle, HyokServiceDenied> {
-        Err(HyokServiceDenied)
-    }
-    fn destroy(&self) {}
-}
-
-#[test]
-fn srch_d10_hyok_cross_store_zero_plaintext_anywhere() {
-    let (ix, ids) = build_live_corpus(&tenant(), &region(), "u-ctrl", &["c1", "c2"], &["o1", "o2"]);
-    let engine = KmsEngine::new();
-    let platform = PlatformManaged::new(&engine, region());
-    let hyok = Hyok::new(DenyAllHyok);
-
-    let inputs = HyokCrossStoreInputs {
-        indexer: &ix,
-        tenant: tenant(),
-        region: region(),
-        platform_cache_present: true,
-        platform_backup_present: true,
-        platform_doc_id: ids[0].clone(),
-        platform_probe_text: "raft leadership".into(),
-        now: NOW.into(),
-    };
-
-    let artifact = HyokCrossStoreGate::new()
-        .run_or_fail_ci(&inputs, &hyok, &platform)
-        .expect("SRCH-D10 green: 0 HYOK plaintext in any derived store");
-
-    assert_eq!(
-        artifact.stores_with_hyok_plaintext, 0,
-        "0 HYOK plaintext in any derived store (index/vectors/caches/backups) - the SRCH-D10 gate"
-    );
-    assert_eq!(
-        artifact.stores_walked.len(),
-        4,
-        "all four derived stores walked"
-    );
-    assert_eq!(
-        artifact.stores_with_platform_class, 4,
-        "the platform-managed control class IS present in all four stores (the walk is real)"
-    );
-    println!("[P-422 GATE GREEN 2026-06-24] {}", artifact.summary());
-    assert!(artifact.is_green());
 }
 
 #[test]
