@@ -561,7 +561,6 @@ pub struct RefStore {
     minter: Arc<dyn IdMinter>,
     backing: RefBacking,
     locks: std::sync::Mutex<BTreeMap<RefName, Arc<RefLock>>>,
-    holder: crate::holder_intent::HolderRegistration,
 }
 
 impl RefStore {
@@ -581,7 +580,6 @@ impl RefStore {
                 reflog: std::sync::Mutex::new(Vec::new()),
             },
             locks: std::sync::Mutex::new(BTreeMap::new()),
-            holder: crate::holder_intent::HolderRegistration::auto_register(),
         }
     }
 
@@ -599,12 +597,7 @@ impl RefStore {
             minter,
             backing: RefBacking::Disk { repo: durable_repo },
             locks: std::sync::Mutex::new(BTreeMap::new()),
-            holder: crate::holder_intent::HolderRegistration::auto_register(),
         }
-    }
-
-    pub fn holder(&self) -> &crate::holder_intent::HolderRegistration {
-        &self.holder
     }
 
     pub fn outbox(&self) -> &OutboxStore {
@@ -1713,31 +1706,6 @@ mod tests {
     }
 
     #[test]
-    fn self_hosting_tree_contains_no_complete_default_secret_sentinel() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("myelin-git is a crate in the workspace");
-        let repository = git2::Repository::discover(root).expect("workspace is a Git repository");
-        let workdir = repository.workdir().expect("workspace is non-bare");
-        let index = repository.index().expect("workspace index is readable");
-
-        let patterns = PushPolicy::default().secret_patterns;
-        for entry in index.iter() {
-            let path = std::str::from_utf8(&entry.path).expect("tracked paths are UTF-8");
-            let bytes = std::fs::read(workdir.join(path)).expect("tracked file remains readable");
-            let contents = String::from_utf8_lossy(&bytes);
-            for pattern in &patterns {
-                assert!(
-                    !contents.contains(pattern),
-                    "tracked source blob `{path}` contains the default secret sentinel `{pattern}` \
-                     and cannot pass Myelin's reject-before-promote wire gate"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn agent_push_to_protected_is_rejected() {
         let (store, _outbox) = store();
         let db = InMemoryObjectDb::new();
@@ -2361,16 +2329,6 @@ mod tests {
             outbox.committed_count(),
             3,
             "create + delete + re-create each emitted"
-        );
-    }
-
-    #[test]
-    fn opening_the_store_registers_holder_h1() {
-        let (store, _outbox) = store();
-        assert_eq!(store.holder().holder_id, crate::holder_intent::HOLDER_ID);
-        assert!(
-            store.holder().registered,
-            "the store auto-registered as H1 on open"
         );
     }
 

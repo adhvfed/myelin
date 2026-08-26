@@ -21,8 +21,6 @@ pub mod fork_gate;
 pub mod front_door;
 pub mod git_resolve;
 pub mod gix_backend;
-pub mod holder;
-pub mod holder_intent;
 pub mod lifecycle;
 pub mod list_filter;
 pub mod live_check;

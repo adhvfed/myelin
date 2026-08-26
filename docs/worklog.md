@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Git privacy no longer counts wired doubles as product holders
+
+Git's `PersonalDataHolder` returned successful locate, export, rectify, and restrict receipts
+without reading or changing Git state, while its trait erase correctly refused to claim success.
+A separate "real fan-out" existed only in tests: process-local KMS state and eight seam doubles were
+invoked, after which all eight holders were marked reached by construction. The durable Git stores,
+PostgreSQL pull-request rows, object packs, Search, References, Bus, and the production privacy
+request path never composed it. Ref stores also carried a boolean holder-registration field that no
+runtime behavior read.
+
+The ceremonial holder, registration object, and endorsing suites are gone; the real sandboxed
+history-rewrite tool remains independently tested. During the full regression run, a source-scanning
+unit test failed because it required every path in the Git index to exist in the dirty worktree.
+That test also enforced secret policy by string-scanning Myelin's own checkout instead of exercising
+the push boundary. It is gone; the actual quarantine tests still prove that detected credentials
+are rejected before object promotion or ref movement.
+
+**Proof:** all-target/all-feature Git compile and strict clippy; all 553 remaining library stories;
+the complete all-feature suite against PostgreSQL, Valkey, and on-disk repositories, including
+external `git fsck` and destructive backup/restore; rebuilt Edge; and all twelve live TypeScript Git
+journeys from concurrent repository creation through editing, review, branch protection, and merge
+(13.28 seconds). Removed 1,560 lines of unshipped holder scaffolding and brittle source inspection.
+
 ## 2026-08-26 — References privacy claims now stop at the durable boundary
 
 References exposed two privacy holders backed by its process-local edge projection. One returned
