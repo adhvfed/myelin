@@ -6,7 +6,23 @@ use crate::backup::{wal_offset_from_bigint, wal_offset_to_bigint, WalOffset};
 use crate::encryption::SubjectId;
 use crate::migration::{Migration, Migrations};
 use crate::provider::{ProviderError, SubstrateProvider};
-use crate::reerase::{ErasureRecord, PostRestoreErasureLedger};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErasureRecord {
+    pub subject: SubjectId,
+    pub tenant: TenantId,
+    pub completed_at_offset: WalOffset,
+}
+
+impl ErasureRecord {
+    pub fn new(subject: SubjectId, tenant: TenantId, completed_at_offset: WalOffset) -> Self {
+        Self {
+            subject,
+            tenant,
+            completed_at_offset,
+        }
+    }
+}
 
 pub const POST_PIT_ERASURE_LEDGER_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS post_pit_erasure_ledger (
@@ -71,15 +87,11 @@ impl PostPitErasureScope {
 #[derive(Clone)]
 pub struct DurablePostPitLedger {
     provider: SubstrateProvider,
-    rt: tokio::runtime::Handle,
 }
 
 impl DurablePostPitLedger {
     pub fn new(provider: SubstrateProvider) -> DurablePostPitLedger {
-        DurablePostPitLedger {
-            provider,
-            rt: tokio::runtime::Handle::current(),
-        }
+        DurablePostPitLedger { provider }
     }
 
     fn region(&self) -> String {
@@ -147,31 +159,6 @@ impl DurablePostPitLedger {
         .map_err(|e| ProviderError::from(crate::pg::PgError::Query(e.to_string())))?;
         decode_erasure_records(&rows)
     }
-
-    async fn completed_after_any_scope(
-        &self,
-        pit: WalOffset,
-    ) -> Result<Vec<ErasureRecord>, ProviderError> {
-        let region = self.region();
-        let pit_i = wal_offset_to_bigint(pit).ok_or_else(|| {
-            ProviderError::from(crate::pg::PgError::Query(
-                "post-PIT restore target exceeds the PostgreSQL bigint range".into(),
-            ))
-        })?;
-        let rows = sqlx::query(
-            "SELECT tenant_id, subject, MAX(completed_at_offset) AS completed_at_offset \
-             FROM post_pit_erasure_ledger \
-             WHERE region = $1 AND completed_at_offset > $2 \
-             GROUP BY tenant_id, subject \
-             ORDER BY tenant_id, subject",
-        )
-        .bind(&region)
-        .bind(pit_i)
-        .fetch_all(self.provider.db_pool())
-        .await
-        .map_err(|e| ProviderError::from(crate::pg::PgError::Query(e.to_string())))?;
-        decode_erasure_records(&rows)
-    }
 }
 
 fn decode_erasure_records(
@@ -202,17 +189,4 @@ fn post_pit_row_decode(error: sqlx::Error) -> ProviderError {
     ProviderError::from(crate::pg::PgError::Query(format!(
         "post-PIT erasure ledger row decode failed: {error}"
     )))
-}
-
-impl PostRestoreErasureLedger for DurablePostPitLedger {
-    fn erasures_completed_after(&self, pit: WalOffset) -> Vec<ErasureRecord> {
-        tokio::task::block_in_place(|| self.rt.block_on(self.completed_after_any_scope(pit)))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "FAIL-STATIC: durable post-PIT erasure ledger read failed (an incomplete \
-                     post-PIT set would let a post-backup-erased subject escape the §7.5 re-erasure \
-                     pass - a silent resurrection): {e}"
-                )
-            })
-    }
 }

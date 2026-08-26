@@ -4,7 +4,6 @@ use myelin_config::MyelinConfig;
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError};
 use myelin_storage::encryption::SubjectId;
 use myelin_storage::migration::HotTables;
-use myelin_storage::reerase::PostRestoreErasureLedger;
 use myelin_storage::reerase_durable::{
     post_pit_durable_migrations, post_pit_scope_migrations, post_pit_scope_required_migrations,
     DurablePostPitLedger,
@@ -530,21 +529,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         vec![subj_post.0.clone()],
         "a Chat erasure must never be replayed through the agent-data holder"
     );
-    let after = pp2.erasures_completed_after(100);
-    let ids: Vec<String> = after.iter().map(|r| r.subject.0.clone()).collect();
-    assert!(
-        ids.contains(&subj_post.0),
-        "the post-PIT erasure survived + is selected on the fresh instance: {ids:?}"
-    );
-    assert!(
-        !ids.contains(&subj_pre.0),
-        "the pre-PIT erasure is NOT selected: {ids:?}"
-    );
-    assert!(
-        ids.contains(&chat_only.0),
-        "the legacy all-scope reader still sees every product's restore work"
-    );
-
     let windowed = TenantId(format!("01J0WIN{suffix}"));
     assert!(
         DurableRestoreErasureLedger::new(app.clone())

@@ -247,10 +247,10 @@ impl RestoreVerifyGate {
     }
 
     pub fn run(&self, inputs: &GateInputs<'_>) -> GateVerdict {
-        self.run_inner(inputs, false)
+        self.run_inner(inputs)
     }
 
-    fn run_inner(&self, inputs: &GateInputs<'_>, reerase_will_run: bool) -> GateVerdict {
+    fn run_inner(&self, inputs: &GateInputs<'_>) -> GateVerdict {
         let presence = build_presence(inputs.objects);
         let report = match restore_to_offset(
             inputs.archiver,
@@ -301,9 +301,6 @@ impl RestoreVerifyGate {
 
         for (tenant, completed_at_offset) in inputs.erasure_ledger.records() {
             if completed_at_offset > report.restored_to_offset {
-                if reerase_will_run {
-                    continue;
-                }
                 return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
             }
             if report.restored_key_for_tenant(&tenant) {
@@ -325,71 +322,6 @@ impl RestoreVerifyGate {
             cross_seam_mismatches: 0,
             resurrected_subjects: 0,
         })
-    }
-
-    pub fn run_with_reerase(
-        &self,
-        inputs: &GateInputs<'_>,
-        post_pit_ledger: &dyn crate::reerase::PostRestoreErasureLedger,
-        holders: &crate::erase::EraseHolders<'_>,
-        region: myelin_tenancy::Region,
-        now: crate::erase::EpochMillis,
-    ) -> GateVerdict {
-        let base = self.run_inner(inputs, true);
-        let mut artifact = match base {
-            GateVerdict::Green(a) => a,
-            red @ GateVerdict::Red(_) => return red,
-        };
-
-        let presence = build_presence(inputs.objects);
-        let report = match restore_to_offset(
-            inputs.archiver,
-            inputs.target,
-            inputs.rows,
-            &presence,
-            inputs.source,
-            inputs.kms,
-        ) {
-            Ok(report) => report,
-            Err(e) => return GateVerdict::Red(GateFailure::RestoreFailed(e)),
-        };
-
-        let post_pit_tenants: std::collections::BTreeSet<TenantId> = post_pit_ledger
-            .erasures_completed_after(report.restored_to_offset)
-            .into_iter()
-            .map(|r| r.tenant)
-            .collect();
-        for (tenant, completed_at_offset) in inputs.erasure_ledger.records() {
-            if completed_at_offset > report.restored_to_offset
-                && !post_pit_tenants.contains(&tenant)
-            {
-                return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
-            }
-        }
-
-        let pass = crate::reerase::ReErasePass::new(inputs.kms, region);
-        let reerase = match pass.run(&report, post_pit_ledger, holders, now) {
-            Ok(r) => r,
-            Err(e) => {
-                return GateVerdict::Red(GateFailure::CrossSeamMismatch {
-                    count: 1,
-                    detail: format!("post-restore re-erasure step failed: {e}"),
-                })
-            }
-        };
-
-        if !reerase.is_green() {
-            let tenant = reerase
-                .re_erased
-                .iter()
-                .find(|s| s.was_resurrected_before_reapply)
-                .map(|s| s.tenant.clone())
-                .unwrap_or_else(|| TenantId("<unknown>".into()));
-            return GateVerdict::Red(GateFailure::ErasureResurrected { tenant });
-        }
-
-        artifact.resurrected_subjects = reerase.resurrected_count;
-        GateVerdict::Green(artifact)
     }
 
     pub fn run_or_fail_ci(&self, inputs: &GateInputs<'_>) -> Result<GreenArtifact, GateFailure> {

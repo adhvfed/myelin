@@ -9,7 +9,9 @@ use myelin_events::{
     InProcessBus, PiiKeyRef, Timestamp, Visibility, OUTBOX_MIGRATION, OUTBOX_QUARANTINE_MIGRATION,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::elected_relay::{ElectedDrainOutcome, ElectedPgRelay};
+use myelin_storage::elected_relay::{
+    ElectedDrainOutcome, ElectedPgRelay, SHARED_OUTBOX_PUBLISHER_LOCK_ID,
+};
 use myelin_storage::pgrelay::{PgRelay, RelayValidationConfig};
 use myelin_tenancy::{Region, TenantId};
 
@@ -126,6 +128,7 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
         serde_json::json!({"ok": true}),
     );
     let raw = PgRelay::new(pool.clone());
+    let lock_id = SHARED_OUTBOX_PUBLISHER_LOCK_ID ^ i64::from(std::process::id());
     raw.enqueue("issue:good", 0, &good)
         .await
         .expect("enqueue good row");
@@ -344,7 +347,8 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
     let validation =
         RelayValidationConfig::new(Region("no-osl".into()), 1024).expect("valid strict scope");
     let publisher = Arc::new(RecordingPublisher::default());
-    let elected = ElectedPgRelay::new(pool.clone(), validation.clone()).expect("strict relay");
+    let elected = ElectedPgRelay::with_lock_id(pool.clone(), validation.clone(), lock_id)
+        .expect("strict relay");
     assert_eq!(
         elected
             .drain_once(publisher.as_ref(), 64)
@@ -397,7 +401,8 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
     .expect("read blocked tail");
     assert_eq!(blocked, (true, 0));
 
-    let restarted = ElectedPgRelay::new(pool.clone(), validation).expect("restarted strict relay");
+    let restarted = ElectedPgRelay::with_lock_id(pool.clone(), validation, lock_id)
+        .expect("restarted strict relay");
     assert_eq!(
         restarted
             .drain_once(publisher.as_ref(), 64)

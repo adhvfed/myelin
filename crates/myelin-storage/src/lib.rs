@@ -16,13 +16,9 @@ pub mod cell_migration;
 pub mod ci_log_index;
 pub mod coloc;
 pub mod encryption;
-pub mod erase;
 #[cfg(any(test, feature = "test-support"))]
 pub mod firehose_archive;
-pub mod gd4;
-pub mod git_shred;
 pub mod gitpack;
-pub mod holder_fanout;
 pub mod key_origin;
 pub mod kms;
 pub mod kms_failstatic;
@@ -30,13 +26,11 @@ pub mod migration;
 pub mod migration_under_load;
 pub mod mirror;
 pub mod money;
-pub mod multi_cell_erase;
 pub mod object_packs;
 pub mod olap;
 pub mod olap_feed;
 pub mod olap_restrict;
 pub mod oltp;
-pub mod reerase;
 pub mod replicated_blob;
 pub mod reserve_settle;
 pub mod residency;
@@ -126,29 +120,15 @@ pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATI
 pub use encryption::{
     key_class_for, ColumnCryptor, DekContentWrap, EncryptedColumn, KeyChoiceError, SubjectId,
 };
-pub use erase::{
-    BlobShredReach, BusErase, CryptoShredErase, EpochMillis, EraseError, EraseHolders,
-    ErasureLedgerSink, ErasureReceipt, PseudonymShred, RefsTombstone, SearchPurge,
-};
 #[cfg(any(test, feature = "test-support"))]
 pub use firehose_archive::{
     segment_pointer_draft, ArchiveError, ArchiveTelemetry, FirehoseArchiver, SealedSegment,
     SegmentBytes,
 };
-pub use gd4::{
-    assert_gd4_table_complete, assert_no_local_residual_statement, granularity_of_key_class,
-    key_choice_granularity, structural_reach_uses_erase_seams, DataClass, Gd4TableReport,
-    KeyGranularity, StructuralErasureFloor, StructuralFloorReport, RESIDUAL_POSTURE_REF,
-};
-pub use git_shred::{GitCryptoShredReach, GitResidual, GitShredReceipt, GitShreddable};
 pub use gitpack::{
     git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
     RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup, GIT_PACKFILE_MAX_STORED_BYTES,
     GIT_PACK_OBJECT_MAX_STORED_BYTES,
-};
-pub use holder_fanout::{
-    holder_ids_not_covered, FullHolderFanOut, HolderClass, HolderCoverage,
-    HolderCoverageCertificate, HolderCoverageReceiptSet, HolderErasure, ResidualPosture,
 };
 pub use key_origin::{
     Byok, Dek, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, KeyId, KeyOrigin,
@@ -172,9 +152,6 @@ pub use migration_under_load::{
 };
 pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
 pub use money::MicroUsd;
-pub use multi_cell_erase::{
-    CellEraseContext, CellEraseReceipt, MultiCellEraseFanOut, MultiCellEraseReceiptSet,
-};
 pub use object_packs::{
     cdn_over_object_backing, object_backed_pack_tier, place_repo_object_backed,
     served_from_object_tier, CloneStormLoad, GitD4Ceiling, GitD4Report, ObjectBackedServe,
@@ -189,12 +166,6 @@ pub use olap_restrict::{
     RestrictionLeakAudit,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
-#[cfg(any(test, feature = "test-support"))]
-pub use reerase::InMemoryPostPitLedger;
-pub use reerase::{
-    CellKillRestore, CellKillRtoReport, ErasureRecord, PostRestoreErasureLedger, ReErasePass,
-    ReEraseReport, ReErasedSubject, RtoGrain,
-};
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
 pub use reserve_settle::{
     CostEvent, CostLedger, LedgerUnavailable, MeteredUnit, Reservation, ReservationState,
@@ -318,7 +289,7 @@ pub use pseudonym_durable::{
 };
 pub use reerase_durable::{
     post_pit_durable_migrations, post_pit_scope_migrations, post_pit_scope_required_migrations,
-    DurablePostPitLedger, PostPitErasureScope, POST_PIT_ERASURE_LEDGER_MIGRATION,
+    DurablePostPitLedger, ErasureRecord, PostPitErasureScope, POST_PIT_ERASURE_LEDGER_MIGRATION,
     POST_PIT_ERASURE_SCOPE_MIGRATION, POST_PIT_ERASURE_SCOPE_REQUIRED_MIGRATION,
 };
 pub use reserve_settle_durable::{

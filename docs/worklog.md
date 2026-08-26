@@ -4,6 +4,36 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Restore erasure is proven against the database it protects
+
+Storage still contained a second privacy stack after the legacy service was removed. A generic
+eraser accepted caller-supplied pseudonym, Search, References, Bus, Git, and ledger doubles; an
+eighteen-entry holder list then marked every remaining store reached by iterating that same list.
+The Git leg destroyed a blob key in the in-memory KMS and claimed reflogs, bitmaps, and backups were
+covered by returning their enum variants. Multi-cell fan-out silently omitted failed cells, while
+post-restore tests rebuilt hand-authored vectors and replayed through the same process-local state.
+None of these types had a caller outside their own unit and drill suites.
+
+That parallel eraser, declared holder inventory, Git reach model, multi-cell twin, granularity
+posture, synchronous re-erasure bridge, and their endorsing tests are gone. The durable post-PIT
+ledger now owns its record type and exposes only explicit asynchronous product scopes. Edge still
+wires independent agent-data and Chat post-restore operators, while the restore gate refuses a
+post-backup erasure unless that real operator path has dealt with it. The retained integration
+story uses `pg_dump` and `pg_restore`, first proves the erased key was genuinely resurrected, then
+proves the durable holder destroys it and restores its absorbing erasure marker.
+
+The full run also exposed relay-test contention with the live product: schema-isolated tests shared
+PostgreSQL's database-global production election key and could nondeterministically become standby.
+Production construction still uses the one shared key; test-support construction can now provide
+an isolated election key, so the concurrency, outage, quarantine, and recovery stories test their
+own relay rather than racing Edge.
+
+**Proof:** all-target/all-feature Storage compile and strict Clippy; the 99-row contract gate; all
+436 remaining Storage library stories and the complete PostgreSQL, Valkey, object-store, sandbox,
+relay, durable privacy, and real backup/restore suite; rebuilt Edge; and both public TypeScript
+privacy journeys (5.34 seconds). Net removal before this entry: 5,953 lines of in-memory privacy
+twins and self-certifying drills.
+
 ## 2026-08-26 — Privacy compliance is a product path, not a parallel simulation
 
 `myelin-gdpr-service` looked like the system's privacy control plane, but it had no binary and no

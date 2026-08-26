@@ -772,7 +772,6 @@ status = "covered"
 cdc = [
     "crates/myelin-storage/tests/cdc_11_2_blobstore.rs",
     "crates/myelin-storage/tests/cdc_11_2_git_pack_tier.rs",
-    "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-storage/tests/cdc_11_2_c3_cdn_clone_class.rs",
     "crates/myelin-git/tests/cdc_11_2_git_pack_tier_consumer.rs",
     "crates/myelin-git/tests/cdc_11_2_c3_git_bundle_uri.rs",
@@ -796,8 +795,6 @@ title = "crypto-shred + GD-4 granularity"
 status = "covered"
 cdc = [
     "crates/myelin-storage/tests/cdc_11_4_classify_key_choice.rs",
-    "crates/myelin-storage/tests/cdc_11_4_erase_algorithm.rs",
-    "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs",
     "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
     "crates/myelin-chat/tests/integration_chat_p22_erase_cascade.rs",

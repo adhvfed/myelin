@@ -56,6 +56,10 @@ fn validation() -> RelayValidationConfig {
     RelayValidationConfig::new(Region("no-osl".into()), 256 * 1024).expect("valid relay scope")
 }
 
+fn isolated_lock_id() -> i64 {
+    SHARED_OUTBOX_PUBLISHER_LOCK_ID ^ i64::from(std::process::id())
+}
+
 #[derive(Default)]
 struct SlowRecordingPublisher {
     active: AtomicUsize,
@@ -126,6 +130,7 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
         .expect("clean outbox");
 
     let raw = PgRelay::new(pool.clone());
+    let lock_id = isolated_lock_id();
     for (aggregate, seq) in [
         ("issue:A", 0),
         ("issue:B", 0),
@@ -137,8 +142,10 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
             .expect("enqueue");
     }
 
-    let first = ElectedPgRelay::new(pool.clone(), validation()).expect("first contender");
-    let second = ElectedPgRelay::new(pool.clone(), validation()).expect("second contender");
+    let first =
+        ElectedPgRelay::with_lock_id(pool.clone(), validation(), lock_id).expect("first contender");
+    let second = ElectedPgRelay::with_lock_id(pool.clone(), validation(), lock_id)
+        .expect("second contender");
     let publisher = Arc::new(SlowRecordingPublisher::default());
     let start = Arc::new(tokio::sync::Barrier::new(3));
 
@@ -196,19 +203,19 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
     let mut lock_holder = pool.acquire().await.expect("lock-holder connection");
     lock_holder.close_on_drop();
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
+        .bind(lock_id)
         .fetch_one(&mut *lock_holder)
         .await
         .expect("hold election lock");
     assert!(locked);
-    let standby = ElectedPgRelay::new(pool.clone(), validation())
+    let standby = ElectedPgRelay::with_lock_id(pool.clone(), validation(), lock_id)
         .expect("standby relay")
         .drain_once(publisher.as_ref(), 32)
         .await
         .expect("standby outcome");
     assert_eq!(standby, ElectedDrainOutcome::Standby);
     let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-        .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
+        .bind(lock_id)
         .fetch_one(&mut *lock_holder)
         .await
         .expect("release election lock");
@@ -224,7 +231,8 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
         .expect("enqueue outage row");
     let severed = InProcessBus::new();
     severed.sever();
-    let elected = ElectedPgRelay::new(pool.clone(), validation()).expect("outage relay");
+    let elected =
+        ElectedPgRelay::with_lock_id(pool.clone(), validation(), lock_id).expect("outage relay");
     let error = elected
         .drain_once(&severed, 32)
         .await
@@ -261,11 +269,12 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
             .await
             .expect("connect one-session pool")
     };
-    let recovered = ElectedPgRelay::new(one_connection_pool.clone(), validation())
-        .expect("one connection is sufficient")
-        .drain_once(publisher.as_ref(), 32)
-        .await
-        .expect("one-connection elected pass");
+    let recovered =
+        ElectedPgRelay::with_lock_id(one_connection_pool.clone(), validation(), lock_id)
+            .expect("one connection is sufficient")
+            .drain_once(publisher.as_ref(), 32)
+            .await
+            .expect("one-connection elected pass");
     assert_eq!(recovered, ElectedDrainOutcome::Published(1));
     one_connection_pool.close().await;
 

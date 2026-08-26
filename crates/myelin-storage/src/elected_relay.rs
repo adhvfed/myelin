@@ -44,11 +44,29 @@ impl std::error::Error for ElectedRelayError {}
 pub struct ElectedPgRelay {
     pool: PgPool,
     validation: RelayValidationConfig,
+    lock_id: i64,
 }
 
 impl ElectedPgRelay {
     pub fn new(pool: PgPool, validation: RelayValidationConfig) -> Result<Self, ElectedRelayError> {
-        Ok(Self { pool, validation })
+        Ok(Self {
+            pool,
+            validation,
+            lock_id: SHARED_OUTBOX_PUBLISHER_LOCK_ID,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_lock_id(
+        pool: PgPool,
+        validation: RelayValidationConfig,
+        lock_id: i64,
+    ) -> Result<Self, ElectedRelayError> {
+        Ok(Self {
+            pool,
+            validation,
+            lock_id,
+        })
     }
 
     pub async fn drain_once<P: EventPublisher + ?Sized>(
@@ -70,7 +88,7 @@ impl ElectedPgRelay {
 
         // @tenant-cross-scope: the cell-local publisher election lock protects the shared outbox.
         let elected: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-            .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
+            .bind(self.lock_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| ElectedRelayError::Election(PgError::Query(e.to_string())))?;
@@ -105,6 +123,8 @@ mod tests {
             .expect("lazy pool");
         let validation = RelayValidationConfig::new(myelin_events::Region("no-osl".into()), 1024)
             .expect("valid scope");
-        ElectedPgRelay::new(pool, validation).expect("election and relay share one transaction");
+        let relay = ElectedPgRelay::new(pool, validation)
+            .expect("election and relay share one transaction");
+        assert_eq!(relay.lock_id, SHARED_OUTBOX_PUBLISHER_LOCK_ID);
     }
 }
