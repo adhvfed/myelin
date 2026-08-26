@@ -1008,18 +1008,6 @@ impl DurableKms {
             .map_err(|error| KmsError::Durability(error.to_string()))?;
         Ok(self.core.destroy_dek(id)? || durable_removed)
     }
-
-    pub(crate) fn wrap_dek_material(
-        &self,
-        tenant: &TenantId,
-        region: &Region,
-        material: &[u8; KEY_LEN],
-    ) -> Result<WrappedDek, KmsError> {
-        let _cache = self.synchronize_cache()?;
-        let kek_id = KekId::new(tenant.clone(), region.clone());
-        self.ensure_kek_while_synchronized(&kek_id)?;
-        self.core.wrap_dek_material(tenant, region, material)
-    }
 }
 
 const WRAPPED_KEY_CIPHERTEXT_LEN: usize = KEY_LEN + 16;

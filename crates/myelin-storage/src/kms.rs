@@ -862,60 +862,9 @@ impl KmsCore {
         })
     }
 
-    pub fn wrap_dek_material(
-        &self,
-        tenant: &TenantId,
-        region: &Region,
-        material: &[u8; KEY_LEN],
-    ) -> Result<WrappedDek, KmsError> {
-        let kek_id = KekId::new(tenant.clone(), region.clone());
-        let mut state = self.state()?;
-        if !state.keks.contains_key(&kek_id) {
-            let wrapped = self.root.wrap_kek(&RawKey::generate())?;
-            state
-                .keks
-                .insert(kek_id.clone(), StoredKek { wrapped, epoch: 0 });
-        }
-        let stored_kek = state
-            .keks
-            .get(&kek_id)
-            .ok_or_else(|| KmsError::KekUnavailable(kek_id.clone()))?;
-        let kek = self
-            .root
-            .unwrap_kek(&stored_kek.wrapped)
-            .ok_or(KmsError::KekUnavailable(kek_id))?;
-        wrap_dek(&kek, stored_kek.epoch, &RawKey(*material))
-    }
-
     pub fn counts(&self) -> Result<(usize, usize), KmsError> {
         let state = self.state()?;
         Ok((state.keks.len(), state.deks.len()))
-    }
-
-    pub fn unwrap_dek_material(
-        &self,
-        tenant: &TenantId,
-        region: &Region,
-        w: &WrappedDek,
-    ) -> Result<DekHandle, KmsError> {
-        let kek_id = KekId::new(tenant.clone(), region.clone());
-        let kek = self.open_kek(&kek_id)?;
-        let plain = Zeroizing::new(
-            kek.cipher()
-                .decrypt(Nonce::from_slice(&w.nonce), w.wrapped.as_slice())
-                .map_err(|_| {
-                    KmsError::UnwrapFailed(DekId::new(tenant.clone(), KeyClass::Tenant))
-                })?,
-        );
-        if plain.len() != KEY_LEN {
-            return Err(KmsError::UnwrapFailed(DekId::new(
-                tenant.clone(),
-                KeyClass::Tenant,
-            )));
-        }
-        let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(plain.as_slice());
-        Ok(DekHandle { key: RawKey(bytes) })
     }
 
     fn state(&self) -> Result<MutexGuard<'_, KmsState>, KmsError> {
@@ -1157,28 +1106,6 @@ impl KmsEngine {
             KmsBackend::Memory(core) => core.backup_snapshot_durable(_seal_key),
             KmsBackend::Durable(durable) => durable.backup_snapshot_durable(),
         }
-    }
-
-    pub fn wrap_dek_material(
-        &self,
-        tenant: &TenantId,
-        region: &Region,
-        material: &[u8; KEY_LEN],
-    ) -> Result<WrappedDek, KmsError> {
-        match &self.backend {
-            #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => core.wrap_dek_material(tenant, region, material),
-            KmsBackend::Durable(d) => d.wrap_dek_material(tenant, region, material),
-        }
-    }
-
-    pub fn unwrap_dek_material(
-        &self,
-        tenant: &TenantId,
-        region: &Region,
-        w: &WrappedDek,
-    ) -> Result<DekHandle, KmsError> {
-        self.core().unwrap_dek_material(tenant, region, w)
     }
 }
 

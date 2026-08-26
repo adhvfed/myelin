@@ -19,7 +19,6 @@ pub mod encryption;
 #[cfg(any(test, feature = "test-support"))]
 pub mod firehose_archive;
 pub mod gitpack;
-pub mod key_origin;
 pub mod kms;
 pub mod migration;
 pub mod migration_under_load;
@@ -128,10 +127,6 @@ pub use gitpack::{
     git_object_address, GitObjectKind, GitPackError, GitPackTier, PackManifest, PlacementError,
     RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup, GIT_PACKFILE_MAX_STORED_BYTES,
     GIT_PACK_OBJECT_MAX_STORED_BYTES,
-};
-pub use key_origin::{
-    Byok, Dek, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, KeyId, KeyOrigin,
-    KeyOriginError, KeyOriginKind, KeyOriginTelemetry, PlatformManaged,
 };
 pub use kms::{
     CellRoot, DekHandle, DekId, ExportedKek, KekId, KeyClass, KmsAdapter, KmsDurableSnapshot,

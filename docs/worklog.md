@@ -2646,16 +2646,21 @@ key, and proves the retained backup no longer opens. The public Search and Chat
 exports no longer offer callers an assurance object that the system cannot
 calculate.
 
-This does not declare HYOK safe by absence. The honest gap is that origin
-selection is not wired into production projection/index admission at all; the
-`KeyOrigin` types are currently exercised only by Rust fixtures. A future
-SRCH-D10 must begin with a configured customer-key origin and drive the same
-consumer and stores used by live search.
+This does not declare HYOK safe by absence. Tracing the origin model after the
+downstream deletion showed that it had no production caller anywhere. Its
+`Byok` implementation retained a customer-key path but wrapped with Myelin's
+ordinary platform KEK; no customer-key adapter was called. The isolated
+`KeyOrigin` model, its contract test, and its now-private arbitrary-envelope KMS
+helpers have therefore been removed too. Contract 11.3 now distinguishes the
+shipped durable platform KMS from open BYOK/HYOK work. A future SRCH-D10 must
+begin with a configured customer-key origin and drive the same consumer and
+stores used by live search.
 
-Proof: 333 Search library tests, 261 Chat library tests, the two-case renamed
-backup-erasure drill, the two real Chat ACL-search stories, and warning-free
-all-target/all-feature Search and Chat Clippy. The feature-enabled object-store
-story reached the live adapter but could not run because that dependency was
+Proof: 333 Search library tests, 261 Chat library tests, 417 Storage library
+tests, the two-case renamed backup-erasure drill, the two real Chat ACL-search
+stories, warning-free all-target/all-feature Search, Chat, and Storage Clippy,
+and a workspace-wide all-target compile. The feature-enabled object-store story
+reached the live adapter but could not run because that dependency was
 unavailable, and is deliberately not counted as green.
 
 ## known gaps (honest list, in priority order)
@@ -2707,11 +2712,12 @@ unavailable, and is deliberately not counted as green.
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.
-10. **HYOK/BYOK is a model, not a production Search boundary yet.** Storage's
-    `KeyOrigin` vocabulary exists, but no running configuration selects an
-    origin for a product data class and Search projections do not carry that
-    decision into index admission. BYOK also records a customer key path
-    without invoking a customer-key adapter. The former SRCH-D10 drill was
+10. **HYOK/BYOK has no production boundary yet.** The unwired `KeyOrigin`
+    model was removed after its BYOK path proved to be ordinary platform-key
+    wrapping with an unused customer-path string. No running configuration
+    selects an origin for a product data class and Search projections do not
+    carry that decision into index admission. The former SRCH-D10 drill was
     removed because its supposed HYOK inspection returned `false`
-    unconditionally. A replacement must configure a real origin, attempt the
-    ordinary indexing path, and inspect every actual derived store.
+    unconditionally. A replacement must start with a real customer-key
+    adapter, attempt the ordinary indexing path, and inspect every actual
+    derived store.
