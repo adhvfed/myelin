@@ -279,7 +279,7 @@ fn e2e2_triage_agent_runs_under_delegation_and_mint_exactly_once_merge() {
         "E2E-2: the per-run token is live mid-run"
     );
 
-    svc.tear_down_run_token_in(&acme, &token, &ts("2026-06-24T00:02:00Z"))
+    svc.tear_down_run_token_in(&acme, &token)
         .expect("record run teardown");
     assert!(
         !svc.run_token_minter()

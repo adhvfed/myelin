@@ -33,12 +33,12 @@ struct ProviderRevoker {
     revoked: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 impl RunTokenRevoker for ProviderRevoker {
-    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
+    fn revoke(&self, jti: &str) -> Result<u64, String> {
         let mut g = self.revoked.lock().unwrap();
         if !g.insert(jti.to_string()) {
             return Ok(0);
         }
-        Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
+        Ok(0)
     }
     fn is_dead(&self, jti: &str, _now: i64) -> bool {
         self.revoked.lock().unwrap().contains(jti)

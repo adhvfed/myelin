@@ -164,7 +164,6 @@ impl RevocationStore {
         &self,
         scope: &TenantScope,
         jti: &str,
-        now: Timestamp,
     ) -> Result<(), myelin_storage::ProviderError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -180,7 +179,6 @@ impl RevocationStore {
                 pg.block(pg.backing.insert_teardown(&scope.tenant().0, jti))?;
             }
         }
-        let _ = now;
         self.telemetry.observe();
         Ok(())
     }

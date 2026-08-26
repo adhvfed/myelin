@@ -827,7 +827,7 @@ fn ci_read_capability_and_revocation_deny_before_the_adapter() {
     let token = router.current_token();
     router
         .minter()
-        .teardown(&router.principal().scope, &token, &now())
+        .teardown(&router.principal().scope, &token)
         .expect("record run teardown");
     let second = drive(
         &revoked,
@@ -1147,7 +1147,7 @@ fn a_revoked_run_token_is_denied_never_routed() {
     let token = router.current_token();
     router
         .minter()
-        .teardown(&router.principal().scope, &token, &now())
+        .teardown(&router.principal().scope, &token)
         .expect("record run teardown");
 
     let second = server
@@ -1456,4 +1456,23 @@ fn a_broken_clock_refuses_governed_work_before_routing_it() {
         "MCP clock is unavailable; governed work was not attempted"
     );
     assert!(response.get("result").is_none());
+}
+
+#[test]
+fn a_broken_clock_cannot_keep_a_run_token_alive_during_teardown() {
+    let router = governed_router();
+    let token = router.current_token();
+    let scope = router.principal().scope.clone();
+    let minter = router.minter().clone();
+    let server = McpServer::with_router_and_clock(
+        git_registry(),
+        router,
+        Arc::new(|| Err(myelin_events::clock::ClockError::BeforeUnixEpoch)),
+    );
+
+    assert!(minter.is_live(&scope, &token, &now()));
+    server
+        .teardown()
+        .expect("revocation does not depend on the wall clock");
+    assert!(!minter.is_live(&scope, &token, &now()));
 }

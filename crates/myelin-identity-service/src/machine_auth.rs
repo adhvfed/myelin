@@ -927,11 +927,7 @@ mod tests {
             )
             .expect("record torn-down run lifetime");
         torn_down_s7
-            .tear_down_run_token(
-                &sc,
-                "jti-torn-down",
-                Timestamp("2026-07-18T10:01:00Z".into()),
-            )
+            .tear_down_run_token(&sc, "jti-torn-down")
             .expect("record run teardown");
         let torn_down = run_authenticator(torn_down_s7, "2026-07-18T10:02:00Z")
             .authenticate_identity(&cred(scheme::AGENT, run_material("jti-torn-down")), None);
@@ -1016,11 +1012,7 @@ mod tests {
                 )
                 .expect("record torn-down credential lifetime");
             torn_s7
-                .tear_down_run_token(
-                    &sc,
-                    "jti-torn-kind",
-                    Timestamp("2026-07-18T10:01:00Z".into()),
-                )
+                .tear_down_run_token(&sc, "jti-torn-kind")
                 .expect("record credential teardown");
             let torn = scoped_run_authenticator(
                 credential_scheme,
@@ -1354,7 +1346,7 @@ mod tests {
         .unwrap();
         let sc = scope("acme", "eu-west");
         auth.revocations()
-            .tear_down_run_token(&sc, "jti-live", Timestamp("2026-06-26T00:00:00Z".into()))
+            .tear_down_run_token(&sc, "jti-live")
             .expect("record credential teardown");
         let r = auth.authenticate(
             &cred(

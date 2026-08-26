@@ -22,6 +22,8 @@ import {
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
+const MULTI_STAGE_COLLABORATION_TIMEOUT_MS = 60_000;
+
 describe("collaboration lifecycle", () => {
   test("reads red mainline CI and opens one governed issue without an integration API key", async () => {
     const founder = await browserApprovedCliClient();
@@ -646,5 +648,5 @@ command = ["true"]
       automation_id: triggerId,
       event_id: eventId,
     });
-  });
+  }, MULTI_STAGE_COLLABORATION_TIMEOUT_MS);
 });

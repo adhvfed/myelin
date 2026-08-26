@@ -873,10 +873,8 @@ impl RunTokenMinter {
         &self,
         scope: &TenantScope,
         token: &RunToken,
-        now: &Timestamp,
     ) -> Result<(), myelin_storage::ProviderError> {
-        self.revocations
-            .tear_down_run_token(scope, &token.jti, now.clone())
+        self.revocations.tear_down_run_token(scope, &token.jti)
     }
 
     pub fn is_live(&self, scope: &TenantScope, token: &RunToken, now: &Timestamp) -> bool {
@@ -1329,9 +1327,7 @@ mod tests {
             .expect_err("attenuated-away capability must be denied");
         assert!(denied.contains("outside the signed attenuated"));
 
-        minter
-            .teardown(&acme, &token, &ts("2026-06-19T00:02:00Z"))
-            .expect("record run teardown");
+        minter.teardown(&acme, &token).expect("record run teardown");
         let denied = authorizer
             .authorize(
                 &acme,
@@ -1759,7 +1755,7 @@ mod tests {
             300,
         );
         torn_down_s7
-            .tear_down_run_token(&acme, &torn_down.jti, ts("2026-06-19T00:01:00Z"))
+            .tear_down_run_token(&acme, &torn_down.jti)
             .expect("record run teardown");
         assert_eq!(
             RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), torn_down_s7,)
@@ -2131,7 +2127,7 @@ mod tests {
             .expect("mint");
         assert!(minter.is_live(&acme, &token, &ts("2026-06-19T00:01:00Z")));
         minter
-            .teardown(&acme, &token, &ts("2026-06-19T00:01:30Z"))
+            .teardown(&acme, &token)
             .expect("record resumed-run teardown");
         assert!(
             !minter.is_live(&acme, &token, &ts("2026-06-19T00:01:31Z")),

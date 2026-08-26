@@ -129,12 +129,12 @@ impl IdentityRunRevoker {
 }
 
 impl RunTokenRevoker for IdentityRunRevoker {
-    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
-        let now = timestamp_from_epoch(now_secs).map_err(|error| error.to_string())?;
+    fn revoke(&self, jti: &str) -> Result<u64, String> {
+        let started = std::time::Instant::now();
         self.revocations
-            .tear_down_run_token(&self.scope, jti, now)
+            .tear_down_run_token(&self.scope, jti)
             .map_err(|error| error.to_string())?;
-        Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
+        Ok(revocation_lag_seconds(started.elapsed()))
     }
 
     fn is_dead(&self, jti: &str, now_secs: i64) -> bool {
@@ -148,6 +148,12 @@ impl RunTokenRevoker for IdentityRunRevoker {
         );
         state != RunTokenState::LiveWithinRunLife
     }
+}
+
+fn revocation_lag_seconds(elapsed: std::time::Duration) -> u64 {
+    elapsed
+        .as_secs()
+        .saturating_add(u64::from(elapsed.subsec_nanos() != 0))
 }
 
 #[cfg(test)]
@@ -167,6 +173,22 @@ mod tests {
         assert_eq!(
             timestamp_from_epoch(i64::MIN),
             Err(TimestampOutOfRange { seconds: i64::MIN })
+        );
+    }
+
+    #[test]
+    fn revocation_lag_rounds_up_so_a_completed_write_never_disappears_as_zero() {
+        assert_eq!(revocation_lag_seconds(std::time::Duration::ZERO), 0);
+        assert_eq!(
+            revocation_lag_seconds(std::time::Duration::from_nanos(1)),
+            1
+        );
+        assert_eq!(revocation_lag_seconds(std::time::Duration::from_secs(1)), 1);
+        assert_eq!(
+            revocation_lag_seconds(
+                std::time::Duration::from_secs(1) + std::time::Duration::from_nanos(1)
+            ),
+            2
         );
     }
 }

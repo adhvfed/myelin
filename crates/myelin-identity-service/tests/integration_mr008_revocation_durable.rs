@@ -213,7 +213,7 @@ async fn run_token_expiry_and_teardown_are_durable_across_a_fresh_instance() {
         )
         .expect("persist torn-down run lifetime");
     store1
-        .tear_down_run_token(&s, "torn-jti", ts("2026-06-26T00:01:00Z"))
+        .tear_down_run_token(&s, "torn-jti")
         .expect("persist run teardown");
 
     let store2 =
@@ -400,7 +400,7 @@ async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
     );
     assert!(
         store
-            .tear_down_run_token(&s, "torn-down-during-outage", ts("2026-06-26T00:01:00Z"),)
+            .tear_down_run_token(&s, "torn-down-during-outage")
             .is_err(),
         "a run owner is told that teardown did not reach durable storage"
     );
@@ -439,7 +439,7 @@ async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
         )
         .expect("retry run lifetime write after recovery");
     store
-        .tear_down_run_token(&s, "torn-down-during-outage", ts("2026-06-26T00:02:00Z"))
+        .tear_down_run_token(&s, "torn-down-during-outage")
         .expect("retry teardown after recovery");
 
     assert_eq!(

@@ -198,7 +198,7 @@ impl AgentSessionIssuer {
             .claim(actor, &registration, agent_id, &request, lifetime)
             .await?;
         let minted = self
-            .mint_claimed(actor, &registration, &claimed.run, now)
+            .mint_claimed(actor, &registration, &claimed.run)
             .await?;
         let ready = self
             .runs
@@ -373,7 +373,6 @@ impl AgentSessionIssuer {
         actor: &Principal,
         registration: &AgentRegistration,
         claimed: &DurableExternalAgentRun,
-        now: DateTime<Utc>,
     ) -> Result<MintedAgentRun, AgentSessionError> {
         let agent_principal_id = PrincipalId(registration.principal_id.clone());
         let run_id = RunId(claimed.run_id.clone());
@@ -437,7 +436,7 @@ impl AgentSessionIssuer {
             })?;
         if run_token.jti != claimed.token_jti {
             self.identity
-                .tear_down_run_token_in(&scope, &run_token, &timestamp(now))
+                .tear_down_run_token_in(&scope, &run_token)
                 .map_err(|error| {
                     AgentSessionError::Storage(format!(
                         "mismatched token identity could not be revoked: {error}"

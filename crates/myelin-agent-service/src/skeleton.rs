@@ -100,7 +100,8 @@ impl AgentRuntime for SkeletonAgentRuntime {
 impl MeteredRuntime for SkeletonAgentRuntime {}
 
 pub trait RunTokenRevoker {
-    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String>;
+    /// Tears down the run credential and returns the observed durable revocation lag in seconds.
+    fn revoke(&self, jti: &str) -> Result<u64, String>;
 
     fn is_dead(&self, jti: &str, now_secs: i64) -> bool;
 }
@@ -394,9 +395,8 @@ impl SkeletonAgent {
             .minter_token
             .mint_run_token(&sub.agent_id, &sub.run_id, &caveats, sub.token_ttl_secs)
             .map_err(SkeletonError::from)?;
-        let teardown_at = sub.now_secs;
         let result = self.handle_minted_run(runtime, sub, telemetry, kill, &token);
-        match sub.revoker.revoke(&token.jti, sub.now_secs, teardown_at) {
+        match sub.revoker.revoke(&token.jti) {
             Ok(lag) => {
                 telemetry.record_revoke(lag);
                 if result.is_ok() {
@@ -743,13 +743,13 @@ mod tests {
         minted_at: i64,
     }
     impl RunTokenRevoker for FakeRevoker {
-        fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
+        fn revoke(&self, jti: &str) -> Result<u64, String> {
             let mut g = self.revoked.lock().unwrap();
             if g.contains_key(jti) {
                 return Ok(0);
             }
-            g.insert(jti.to_string(), now_secs);
-            Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
+            g.insert(jti.to_string(), self.minted_at);
+            Ok(0)
         }
         fn is_dead(&self, jti: &str, now_secs: i64) -> bool {
             self.revoked.lock().unwrap().contains_key(jti)
@@ -2297,8 +2297,54 @@ mod tests {
 
     struct FailingRevoker;
 
+    struct LagReportingRevoker;
+
+    impl RunTokenRevoker for LagReportingRevoker {
+        fn revoke(&self, _jti: &str) -> Result<u64, String> {
+            Ok(7)
+        }
+
+        fn is_dead(&self, _jti: &str, _now_secs: i64) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_run_reports_the_lag_observed_by_its_revocation_provider() {
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut telemetry = SkeletonTelemetry::new();
+        let catalogue = MockToolSurface::new();
+        let executor = MockToolExecutor::new();
+        let mut sub = substrate(
+            "R-observed-revoke-lag",
+            &LagReportingRevoker,
+            &catalogue,
+            &executor,
+            &mut gate,
+            &mut ledger,
+            &outbox,
+            100,
+            10,
+            1_000,
+        );
+
+        SkeletonAgent::new()
+            .handle_run(
+                &SkeletonAgentRuntime::new(),
+                &mut sub,
+                &mut telemetry,
+                RunOutcomeKind::Completed,
+            )
+            .expect("the run completes after durable teardown");
+
+        assert_eq!(telemetry.tokens_revoked(), 1);
+        assert_eq!(telemetry.max_revocation_lag(), 7);
+    }
+
     impl RunTokenRevoker for FailingRevoker {
-        fn revoke(&self, _jti: &str, _now_secs: i64, _teardown_secs: i64) -> Result<u64, String> {
+        fn revoke(&self, _jti: &str) -> Result<u64, String> {
             Err("revocation store unavailable".into())
         }
 

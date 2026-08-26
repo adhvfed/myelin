@@ -137,7 +137,7 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
     );
 
     store1
-        .tear_down_run_token(&sc, "mr011-jti", Timestamp(NOW_RFC3339.into()))
+        .tear_down_run_token(&sc, "mr011-jti")
         .expect("persist run teardown");
     let denied = auth1.authenticate(&cred, None);
     assert!(

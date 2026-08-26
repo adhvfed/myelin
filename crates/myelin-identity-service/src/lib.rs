@@ -924,9 +924,8 @@ impl StoreBackedCheck {
         &self,
         scope: &myelin_storage::TenantScope,
         token: &myelin_identity::RunToken,
-        now: &myelin_events::Timestamp,
     ) -> Result<(), myelin_storage::ProviderError> {
-        self.minter.teardown(scope, token, now)
+        self.minter.teardown(scope, token)
     }
 
     pub fn list_subjects_in(

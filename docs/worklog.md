@@ -4,6 +4,32 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Teardown measures the write that ended authority
+
+The hosted-agent loop reported token revocation lag by subtracting two copies of the same frozen
+task timestamp. Durable teardown happened, but its measured lag was therefore forced to zero and
+the bound asserted by the drills could never fail. The revocation store made the contract still
+more misleading by accepting and discarding a caller-supplied time. MCP shutdown depended on that
+unused time, so a broken wall clock could prevent it from revoking an otherwise live run token.
+
+The revocation provider now owns the whole teardown observation. The production identity adapter
+measures the durable store operation with a monotonic clock and reports a conservative whole-second
+upper bound; the agent loop records that observed value instead of manufacturing one from workflow
+time. The unused timestamp has been removed through the durable store, minter, identity facade,
+agent-session cleanup, and MCP router. Governed work still refuses a broken clock, while shutdown
+needs only the durable revocation boundary. A regression provider that reports seven seconds proves
+the agent telemetry carries a real observation rather than recomputing zero.
+
+**Proof:** all 622 Agent Host, Agent Service, and Identity library stories; all 31 governed MCP
+routing stories, including teardown under a failed clock; the focused external run-token, skeleton,
+identity spine, and revocation drills; compilation of every Identity test target; strict
+all-target/all-feature Clippy for Agent Host, Agent Service, Identity, and MCP; the live PostgreSQL
+hosted-agent journey using durable identity, wallet, cost, replay, and teardown state (0.54 seconds);
+and both live TypeScript collaboration journeys (36.74 seconds). The latter also exposed a test
+whose three bounded asynchronous stages could outlive Vitest's 30-second whole-test ceiling: its
+named 60-second story budget now lets the existing 15-second stage bounds produce useful failures.
+`target` is 88 GB with 625 GB free, so no cache clean was warranted.
+
 ## 2026-08-26 — A timeout exists before its side effect
 
 Flow allowed callers to request timed signal waits and jobs without giving the workflow a durable

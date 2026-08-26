@@ -29,12 +29,12 @@ struct IdentityRevokeProvider {
     ttl_w: i64,
 }
 impl RunTokenRevoker for IdentityRevokeProvider {
-    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
+    fn revoke(&self, jti: &str) -> Result<u64, String> {
         let mut g = self.revoked.lock().unwrap();
         if !g.insert(jti.to_string()) {
             return Ok(0);
         }
-        Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
+        Ok(0)
     }
     fn is_dead(&self, jti: &str, now_secs: i64) -> bool {
         self.revoked.lock().unwrap().contains(jti) || now_secs >= self.minted_at + self.ttl_w
@@ -78,7 +78,7 @@ fn revoke_is_idempotent_even_on_crash_and_token_auto_expires() {
     let jti = "jti:psn:agent-7:R1";
 
     assert_eq!(
-        provider.revoke(jti, minted_at, minted_at),
+        provider.revoke(jti),
         Ok(0),
         "first revoke records the jti (lag 0)"
     );
@@ -88,7 +88,7 @@ fn revoke_is_idempotent_even_on_crash_and_token_auto_expires() {
     );
 
     assert_eq!(
-        provider.revoke(jti, minted_at + 5, minted_at),
+        provider.revoke(jti),
         Ok(0),
         "a re-revoke is a no-op (idempotent)"
     );

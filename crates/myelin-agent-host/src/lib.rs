@@ -316,12 +316,12 @@ struct SyntheticRunRevoker {
 }
 
 impl RunTokenRevoker for SyntheticRunRevoker {
-    fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> Result<u64, String> {
+    fn revoke(&self, jti: &str) -> Result<u64, String> {
         let mut g = self.revoked.lock().expect("revoker lock");
         if !g.insert(jti.to_string()) {
             return Ok(0);
         }
-        Ok(now_secs.saturating_sub(teardown_secs).max(0) as u64)
+        Ok(0)
     }
     fn is_dead(&self, jti: &str, _now_secs: i64) -> bool {
         self.revoked.lock().expect("revoker lock").contains(jti)
@@ -890,8 +890,8 @@ mod tests {
     fn revoker_is_idempotent() {
         let r = SyntheticRunRevoker::default();
         assert!(!r.is_dead("j1", 10));
-        let _ = r.revoke("j1", 10, 5);
+        let _ = r.revoke("j1");
         assert!(r.is_dead("j1", 10));
-        assert_eq!(r.revoke("j1", 10, 5), Ok(0));
+        assert_eq!(r.revoke("j1"), Ok(0));
     }
 }

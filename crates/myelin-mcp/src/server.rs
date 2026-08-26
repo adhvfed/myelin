@@ -302,8 +302,7 @@ impl McpServer {
 
     pub fn teardown(&self) -> Result<(), String> {
         if let Some(router) = &self.router {
-            let now = (self.clock)().map_err(|_| "MCP clock is unavailable".to_string())?;
-            router.teardown(&now)?;
+            router.teardown()?;
         }
         Ok(())
     }

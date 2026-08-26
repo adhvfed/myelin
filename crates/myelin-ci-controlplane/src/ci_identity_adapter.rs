@@ -1570,12 +1570,8 @@ mod tests {
         let scope = checkout_scope();
         let principal = ci_principal(&claim.tenant_id, &claim.region);
         let tenant_scope = TenantScope::from_verified_token(&principal, principal.region.clone());
-        s7.tear_down_run_token(
-            &tenant_scope,
-            &credential.jti,
-            timestamp_from_epoch(NOW).unwrap(),
-        )
-        .expect("record CI credential teardown");
+        s7.tear_down_run_token(&tenant_scope, &credential.jti)
+            .expect("record CI credential teardown");
         let spec = checkout_job(credential, &claim, checkout_workspace(), Some(&scope));
         assert!(boundary.authorize_checkout(&spec, &scope).is_err());
     }
@@ -1723,7 +1719,7 @@ mod tests {
 
         let principal = ci_principal(&claim.tenant_id, &claim.region);
         let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
-        s7.tear_down_run_token(&scope, &credential.jti, timestamp_from_epoch(NOW).unwrap())
+        s7.tear_down_run_token(&scope, &credential.jti)
             .expect("record CI credential teardown");
         let retry_after_teardown = adapter
             .mint_verified(claim.clone(), authority())
