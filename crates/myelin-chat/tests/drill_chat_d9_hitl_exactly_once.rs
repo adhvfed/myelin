@@ -9,7 +9,7 @@ use myelin_events::{
 use myelin_flow::{
     approval_wait_name, drive_full, request_approval_and_wait, run_state, DriveOutcome,
     DurableExecutor, FlowExecutor, RetryPolicy, RunBudget, RunId as FlowRunId, SignalOutcome,
-    SignalSpec, StartSpec, WaitOutcome, WfCtx, WfJournal, WorkflowBody,
+    SignalSpec, StartSpec, TimerStore, WaitOutcome, WfCtx, WfJournal, WorkflowBody,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RunId as IdRunId};
 use myelin_tenancy::{Region, TenantId};
@@ -131,37 +131,6 @@ fn start_run(ex: &FlowExecutor) -> FlowRunId {
     .expect("start")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn drive(
-    ex: &FlowExecutor,
-    outbox: &OutboxStore,
-    journal: &WfJournal,
-    tele: &myelin_flow::FlowTelemetry,
-    run_row: &myelin_flow::RunRow,
-    body: &WorkflowBody,
-    now_secs: i64,
-) -> DriveOutcome {
-    drive_full(
-        ex.runs(),
-        outbox,
-        journal,
-        tele,
-        minter(),
-        ctx_base(),
-        run_row,
-        "2026-06-21T00:00:00Z",
-        7,
-        body,
-        1,
-        1,
-        None,
-        Some(ex.signals().clone()),
-        now_secs,
-        None,
-        None,
-    )
-}
-
 fn card(run: &FlowRunId) -> ChatApprovalCard {
     ChatApprovalCard {
         run_id: IdRunId(run.0.clone()),
@@ -176,73 +145,139 @@ fn card(run: &FlowRunId) -> ChatApprovalCard {
     }
 }
 
+struct ChatHitlStory {
+    executor: FlowExecutor,
+    run: FlowRunId,
+    outbox: OutboxStore,
+    journal: WfJournal,
+    timers: TimerStore,
+    telemetry: myelin_flow::FlowTelemetry,
+    body: Box<WorkflowBody>,
+}
+
+impl ChatHitlStory {
+    const APPROVAL_REQUESTED_AT: i64 = 1_000;
+    const APPROVAL_DEADLINE: i64 = Self::APPROVAL_REQUESTED_AT + 86_400;
+
+    fn begin() -> Self {
+        let executor = executor();
+        let run = start_run(&executor);
+        executor.runs().put(myelin_flow::RunRow::new_runnable(
+            tenant(),
+            region(),
+            run.0.clone(),
+            "agent.run",
+            0,
+        ));
+        Self {
+            executor,
+            run,
+            outbox: OutboxStore::new(),
+            journal: WfJournal::new(),
+            timers: TimerStore::new(),
+            telemetry: myelin_flow::FlowTelemetry::new(),
+            body: gated_tool_body(),
+        }
+    }
+
+    fn drive(&self, now_secs: i64) -> DriveOutcome {
+        let run = self
+            .executor
+            .runs()
+            .get(&tenant(), &self.run.0)
+            .expect("the durable workflow run exists");
+        drive_full(
+            self.executor.runs(),
+            &self.outbox,
+            &self.journal,
+            &self.telemetry,
+            minter(),
+            ctx_base(),
+            &run,
+            "2026-06-21T00:00:00Z",
+            7,
+            self.body.as_ref(),
+            1,
+            1,
+            Some(self.timers.clone()),
+            Some(self.executor.signals().clone()),
+            now_secs,
+            None,
+            None,
+        )
+    }
+
+    fn request_approval(&self) -> usize {
+        assert_eq!(
+            self.drive(Self::APPROVAL_REQUESTED_AT),
+            DriveOutcome::Waiting,
+            "the first drive parks on the approval wait",
+        );
+        assert_eq!(
+            self.executor
+                .runs()
+                .get(&tenant(), &self.run.0)
+                .expect("the waiting run remains durable")
+                .state,
+            run_state::WAITING,
+            "the run holds no runtime while a person decides",
+        );
+        let timers = self.timers.rows_for_run(&tenant(), &region(), &self.run.0);
+        assert_eq!(timers.len(), 1, "the approval owns one durable timeout");
+        assert_eq!(
+            timers[0].fire_at,
+            Self::APPROVAL_DEADLINE,
+            "the timeout survives a multi-day worker restart",
+        );
+        let emitted = self.outbox.committed_count();
+        assert_eq!(emitted, 1, "the card request emitted exactly once");
+        emitted
+    }
+
+    fn signal(&self, click: &CardClick) -> CardSignal {
+        let mut signal = build_card_signal(&card(&self.run), click);
+        signal.signal_name = approval_wait_name("card-1");
+        signal
+    }
+
+    fn post(&self, signal: &CardSignal) -> SignalDelivery {
+        FlowSignalPort {
+            ex: self.executor.clone(),
+        }
+        .post_signal(signal)
+        .expect("the Chat decision reaches the workflow signal store")
+    }
+
+    fn resume(&self, now_secs: i64) -> DriveOutcome {
+        self.executor.runs().wake(&tenant(), &self.run.0);
+        self.drive(now_secs)
+    }
+}
+
 #[test]
 fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
-    let ex = executor();
-    let run = start_run(&ex);
-    let outbox = OutboxStore::new();
-    let journal = WfJournal::new();
-    let run_row =
-        myelin_flow::RunRow::new_runnable(tenant(), region(), run.0.clone(), "agent.run", 0);
-    ex.runs().put(run_row.clone());
-    let body = gated_tool_body();
-    let tele = myelin_flow::FlowTelemetry::new();
-
-    let o1 = drive(
-        &ex,
-        &outbox,
-        &journal,
-        &tele,
-        &run_row,
-        body.as_ref(),
-        1_000,
-    );
-    assert_eq!(
-        o1,
-        DriveOutcome::Waiting,
-        "drive 1 parks on the approval wait"
-    );
-    let emits_after_request = outbox.committed_count();
-    assert_eq!(emits_after_request, 1, "the card request emitted ONCE");
-    assert_eq!(
-        ex.runs().get(&tenant(), &run.0).unwrap().state,
-        run_state::WAITING,
-        "the run holds NO runtime while it waits (the multi-day kill window)"
-    );
-
-    let port = FlowSignalPort { ex: ex.clone() };
+    let story = ChatHitlStory::begin();
+    story.request_approval();
     let approve = CardClick {
         effect_idx: 0,
         decision: CardDecision::Approve,
         decline_reason: String::new(),
     };
-    let mut sig = build_card_signal(&card(&run), &approve);
-    sig.signal_name = approval_wait_name("card-1");
-    let d1 = port.post_signal(&sig).unwrap();
+    let signal = story.signal(&approve);
+    let d1 = story.post(&signal);
     assert_eq!(
         d1,
         SignalDelivery::Buffered,
         "the approval buffered (first click)"
     );
-    let d2 = port.post_signal(&sig).unwrap();
+    let d2 = story.post(&signal);
     assert_eq!(
         d2,
         SignalDelivery::Duplicate,
         "a double-click is ONE approval (0 double-apply)"
     );
 
-    ex.runs().wake(&tenant(), &run.0);
-    let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
-    let o2 = drive(
-        &ex,
-        &outbox,
-        &journal,
-        &tele,
-        &run_row2,
-        body.as_ref(),
-        200_000,
-    );
-    match o2 {
+    match story.resume(200_000) {
         DriveOutcome::Completed(refs) => assert_eq!(
             refs,
             vec![ArtifactRef("myelin://acme/agent/effect/merged".into())],
@@ -251,12 +286,12 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
         other => panic!("expected Completed, got {other:?}"),
     }
     assert_eq!(
-        outbox.committed_count(),
+        story.outbox.committed_count(),
         1,
         "card request emitted exactly once across the kill"
     );
     assert_eq!(
-        ex.signals().buffered_depth(),
+        story.executor.signals().buffered_depth(),
         0,
         "the approval was consumed EXACTLY once"
     );
@@ -264,55 +299,22 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
 
 #[test]
 fn chat_d9_deny_withholds_zero_mutation() {
-    let ex = executor();
-    let run = start_run(&ex);
-    let outbox = OutboxStore::new();
-    let journal = WfJournal::new();
-    let run_row =
-        myelin_flow::RunRow::new_runnable(tenant(), region(), run.0.clone(), "agent.run", 0);
-    ex.runs().put(run_row.clone());
-    let body = gated_tool_body();
-    let tele = myelin_flow::FlowTelemetry::new();
-
-    drive(
-        &ex,
-        &outbox,
-        &journal,
-        &tele,
-        &run_row,
-        body.as_ref(),
-        1_000,
-    );
-    let emits_after_park = outbox.committed_count();
-
-    let port = FlowSignalPort { ex: ex.clone() };
+    let story = ChatHitlStory::begin();
+    let emits_after_park = story.request_approval();
     let decline = CardClick {
         effect_idx: 0,
         decision: CardDecision::Decline,
         decline_reason: DECLINE_MARKER.into(),
     };
-    let mut sig = build_card_signal(&card(&run), &decline);
-    sig.signal_name = approval_wait_name("card-1");
-    port.post_signal(&sig).unwrap();
+    story.post(&story.signal(&decline));
 
-    ex.runs().wake(&tenant(), &run.0);
-    let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
-    let o2 = drive(
-        &ex,
-        &outbox,
-        &journal,
-        &tele,
-        &run_row2,
-        body.as_ref(),
-        2_000,
-    );
     assert_eq!(
-        o2,
+        story.resume(2_000),
         DriveOutcome::Completed(vec![]),
         "a DENY completes with NO effect (withheld)"
     );
     assert_eq!(
-        outbox.committed_count(),
+        story.outbox.committed_count(),
         emits_after_park,
         "the declined tool made 0 mutation - the pre-approval-mutation signal = 0 (AG-8)"
     );
@@ -320,52 +322,20 @@ fn chat_d9_deny_withholds_zero_mutation() {
 
 #[test]
 fn chat_d9_timeout_auto_denies_zero_mutation() {
-    let ex = executor();
-    let run = start_run(&ex);
-    let outbox = OutboxStore::new();
-    let journal = WfJournal::new();
-    let run_row =
-        myelin_flow::RunRow::new_runnable(tenant(), region(), run.0.clone(), "agent.run", 0);
-    ex.runs().put(run_row.clone());
-    let body = gated_tool_body();
-    let tele = myelin_flow::FlowTelemetry::new();
-
-    drive(
-        &ex,
-        &outbox,
-        &journal,
-        &tele,
-        &run_row,
-        body.as_ref(),
-        1_000,
-    );
-    let emits_after_park = outbox.committed_count();
-
-    let port = FlowSignalPort { ex: ex.clone() };
+    let story = ChatHitlStory::begin();
+    let emits_after_park = story.request_approval();
     let click = myelin_chat::hitl::auto_deny_on_timeout(0);
-    let mut sig = build_card_signal(&card(&run), &click);
-    sig.signal_name = approval_wait_name("card-1");
-    assert_eq!(sig.payload_key_ref.as_deref(), Some(TIMEOUT_REASON));
-    port.post_signal(&sig).unwrap();
+    let signal = story.signal(&click);
+    assert_eq!(signal.payload_key_ref.as_deref(), Some(TIMEOUT_REASON));
+    story.post(&signal);
 
-    ex.runs().wake(&tenant(), &run.0);
-    let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
-    let o2 = drive(
-        &ex,
-        &outbox,
-        &journal,
-        &tele,
-        &run_row2,
-        body.as_ref(),
-        2_000,
-    );
     assert_eq!(
-        o2,
+        story.resume(2_000),
         DriveOutcome::Completed(vec![]),
         "a TIMEOUT auto-deny withholds the tool"
     );
     assert_eq!(
-        outbox.committed_count(),
+        story.outbox.committed_count(),
         emits_after_park,
         "the timed-out tool made 0 mutation (AG-8)"
     );
