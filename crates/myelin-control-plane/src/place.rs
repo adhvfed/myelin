@@ -299,10 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn place_leg_writes_zero_personal_columns() {
-        crate::holder::assert_no_personal_columns()
-            .expect("CP-D1 place leg: the place write path has 0 is_personal=true columns");
-
+    fn placement_persists_the_requested_tenant_slug() {
         let mut reg = registry_with([cell(
             "cell-w-1",
             "eu-west",

@@ -4,7 +4,6 @@ pub mod cross_cell_bridge;
 pub mod cross_cell_bridge_durable;
 pub mod discover;
 pub mod four_layer;
-pub mod holder;
 pub mod isolation;
 pub mod migration;
 pub mod mirror_allowed;
@@ -35,10 +34,6 @@ pub use cross_cell_bridge_durable::{ProjectionError, ResolverFactory};
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use four_layer::{
     CrossRegionPathError, FourLayerEnforcement, ResidencyWriteBoundary, ResidencyWriteRejected,
-};
-pub use holder::{
-    assert_no_personal_columns, control_plane_data_map, ColumnClassification, ControlPlaneHolder,
-    CONTROL_PLANE_STORE,
 };
 pub use isolation::{partition_key, IsolationTier, PartitionKey, PoolStore};
 pub use migration::{

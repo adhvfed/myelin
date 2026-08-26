@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Control Plane privacy inventory follows the schema, not a second list
+
+Control Plane exported a zero-sized privacy holder whose locate and export operations returned
+fixed successful receipts without consulting the registry, while its destructive operations only
+explained that the registry should contain no personal data. Its supporting inventory was a
+handwritten list of columns, tested only against itself; adding a real schema column could not make
+the test fail. No running privacy request constructed the holder.
+
+That ceremonial holder, the independently maintained column list, and the production GDPR
+dependency used only by them are gone. The durable registry schema remains the source of truth,
+while the real cross-cell DSR fan-out and storage re-erasure boundary retain their behavioral
+tests. If personal data enters the registry, it must arrive with a durable operation over that data
+rather than a receipt generator that says the intended architecture is safe.
+
+**Proof:** all-target/all-feature Control Plane compile and strict Clippy; all 191 remaining
+library stories and the complete PostgreSQL-backed crate suite; rebuilt Edge; and the live
+TypeScript first-hour journey from one browser approval through project, repository, issue, CI,
+and governed-agent setup (26.93 seconds). Net removal: 183 lines of ceremonial inventory and tests.
+
 ## 2026-08-26 — Git privacy no longer counts wired doubles as product holders
 
 Git's `PersonalDataHolder` returned successful locate, export, rectify, and restrict receipts
