@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::thresholds::FailStaticThreshold;
 use crate::{Seconds, ServeError};
@@ -106,8 +107,27 @@ impl Clock for SystemClock {
     fn now_secs(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|duration| duration.as_secs())
             .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MonotonicClock {
+    origin: Instant,
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now_secs(&self) -> u64 {
+        self.origin.elapsed().as_secs()
     }
 }
 
@@ -125,6 +145,10 @@ impl TestClock {
 
     pub fn advance(&self, secs: u64) {
         self.now.fetch_add(secs, Ordering::SeqCst);
+    }
+
+    pub fn set(&self, secs: u64) {
+        self.now.store(secs, Ordering::SeqCst);
     }
 }
 
@@ -157,7 +181,7 @@ impl FailStaticSignals {
     }
 }
 
-pub struct FailStatic<K, T, C: Clock = SystemClock> {
+pub struct FailStatic<K, T, C: Clock = MonotonicClock> {
     fresh_ttl: Seconds,
     static_max: Seconds,
     clock: C,
@@ -180,13 +204,13 @@ impl<K, T, C: Clock> std::fmt::Debug for FailStatic<K, T, C> {
     }
 }
 
-impl<K: Hash + Eq, T: Clone> FailStatic<K, T, SystemClock> {
+impl<K: Hash + Eq, T: Clone> FailStatic<K, T, MonotonicClock> {
     pub fn try_new(
         fresh_ttl: Seconds,
         static_max: Seconds,
         bound: StalenessBound,
     ) -> Result<Self, FailStaticError> {
-        Self::try_new_with_clock(fresh_ttl, static_max, bound, SystemClock)
+        Self::try_new_with_clock(fresh_ttl, static_max, bound, MonotonicClock::default())
     }
 }
 
@@ -269,7 +293,11 @@ impl<K: Hash + Eq, T: Clone, C: Clock> FailStatic<K, T, C> {
             self.closed_count.fetch_add(1, Ordering::SeqCst);
             return Answer::Closed;
         };
-        let age = now.saturating_sub(entry.cached_at_secs);
+        let Some(age) = now.checked_sub(entry.cached_at_secs) else {
+            drop(cache);
+            self.closed_count.fetch_add(1, Ordering::SeqCst);
+            return Answer::Closed;
+        };
         if age <= self.fresh_ttl {
             let value = entry.value.clone();
             drop(cache);
@@ -666,15 +694,32 @@ mod tests {
     }
 
     #[test]
-    fn system_clock_returns_real_wall_seconds() {
-        let c = SystemClock;
+    fn production_clock_is_monotonic_and_process_local() {
+        let c = MonotonicClock::default();
         let a = c.now_secs();
-        assert!(
-            a > 1_577_836_800,
-            "SystemClock reads real wall time, got {a}"
-        );
         let b = c.now_secs();
-        assert!(b >= a, "wall time does not run backwards across two reads");
+        assert!(b >= a, "monotonic time does not run backwards");
+        assert!(
+            b < 60,
+            "a new process-local clock starts near zero, got {b}"
+        );
+    }
+
+    #[test]
+    fn clock_rollback_closes_the_cache_instead_of_extending_an_allow() {
+        let clock = TestClock::at(1_000);
+        let fs = FailStatic::<&str, u32, _>::try_new_with_clock(30, 300, drill_bound(), clock)
+            .expect("valid bound");
+
+        assert_eq!(fs.get("actor:alice", || Ok(7)), Answer::Fresh(7));
+        fs_clock(&fs).set(999);
+
+        assert_eq!(
+            fs.get("actor:alice", fail_once()),
+            Answer::Closed,
+            "time moving backwards must never make an old allow look freshly cached"
+        );
+        assert_eq!(fs.signals().closed, 1, "the closure remains observable");
     }
 
     fn fs_clock<K, T: Clone>(fs: &FailStatic<K, T, TestClock>) -> &TestClock {

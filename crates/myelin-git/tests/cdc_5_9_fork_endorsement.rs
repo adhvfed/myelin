@@ -10,7 +10,7 @@ use myelin_identity::{
     ListObjectsResult, ObjectId, ObjectType, Permission, Precondition, Principal, PrincipalId,
     PrincipalKind, Result as IdResult, RewriteTrace, SubjectTree, TupleDelta, Zookie,
 };
-use myelin_substrate::{FailStaticThreshold, SystemClock};
+use myelin_substrate::{FailStaticThreshold, MonotonicClock};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use std::collections::{BTreeMap, HashMap};
 
@@ -152,7 +152,7 @@ fn threshold() -> FailStaticThreshold {
     }
 }
 
-fn gate(id: StubId) -> GitCheckGate<StubId, SystemClock> {
+fn gate(id: StubId) -> GitCheckGate<StubId, MonotonicClock> {
     GitCheckGate::try_new(id, 300, &threshold()).expect("gate constructs")
 }
 

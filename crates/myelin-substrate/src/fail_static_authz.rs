@@ -1,6 +1,6 @@
 use myelin_identity::{Consistency, ConsistencyMode, Decision};
 
-use crate::fail_static::{Answer, Clock, FailStatic, FailStaticSignals, SystemClock};
+use crate::fail_static::{Answer, Clock, FailStatic, FailStaticSignals, MonotonicClock};
 use crate::thresholds::FailStaticThreshold;
 use crate::{FailStaticError, Seconds, ServeError, StalenessBound};
 
@@ -57,7 +57,7 @@ impl AuthzDecision {
     }
 }
 
-pub struct FailStaticAuthz<C: Clock = SystemClock> {
+pub struct FailStaticAuthz<C: Clock = MonotonicClock> {
     inner: FailStatic<String, CoarseAuthz, C>,
 }
 
@@ -69,12 +69,16 @@ impl<C: Clock> std::fmt::Debug for FailStaticAuthz<C> {
     }
 }
 
-impl FailStaticAuthz<SystemClock> {
+impl FailStaticAuthz<MonotonicClock> {
     pub fn try_new(
         revocation_sla_secs: Seconds,
         threshold: &FailStaticThreshold,
-    ) -> Result<FailStaticAuthz<SystemClock>, FailStaticError> {
-        FailStaticAuthz::try_new_with_clock(revocation_sla_secs, threshold, SystemClock)
+    ) -> Result<FailStaticAuthz<MonotonicClock>, FailStaticError> {
+        FailStaticAuthz::try_new_with_clock(
+            revocation_sla_secs,
+            threshold,
+            MonotonicClock::default(),
+        )
     }
 }
 

@@ -8,7 +8,7 @@ use myelin_identity::{
 };
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
 use myelin_storage::TenantScope;
-use myelin_substrate::{FailStaticError, FailStaticThreshold, Seconds, SystemClock};
+use myelin_substrate::{FailStaticError, FailStaticThreshold, MonotonicClock, Seconds};
 use myelin_tenancy::ArtifactRef;
 
 pub const REPO_ADMIN_RELATION: &str = "admin";
@@ -22,7 +22,7 @@ pub fn repo_object_ref(slug: &str) -> ArtifactRef {
 }
 
 pub struct CheckBackedRepoAuthorizer {
-    gate: GitCheckGate<StoreBackedCheck, SystemClock>,
+    gate: GitCheckGate<StoreBackedCheck, MonotonicClock>,
 }
 
 impl CheckBackedRepoAuthorizer {

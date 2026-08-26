@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Cached authority ages only while the process moves forward
+
+Fail-static authorization measured cache age with Unix wall time and `saturating_sub`. If the
+host clock moved backwards, an old allow acquired age zero and could remain usable beyond its
+bounded revocation window. Git and Identity authorization, plus control-plane discovery, all
+inherited that default through wrappers which advertised a wall clock even though they needed
+elapsed time.
+
+The fail-static default is now a process-local monotonic clock. A deliberately injected clock
+that moves backwards closes the cache and increments the existing closed signal; it never serves
+fresh or stale data from an impossible timeline. The cache-bearing wrappers now state the same
+monotonic type, while the separate wall clock remains available to placement and other callers
+that produce real timestamps. This keeps elapsed-age policy distinct from timestamp issuance.
+
+**Proof:** the rollback regression and all 177 Substrate library stories; all 190 control-plane
+stories; 552 deterministic Git stories; all 419 Identity stories; strict all-target/all-feature
+Clippy across Substrate, Control Plane, Git, Identity, and Edge; rebuilt healthy Edge; and the live
+TypeScript browser-approved CLI authentication journey against PostgreSQL (133 milliseconds).
+The remaining live-Postgres Git library case was not counted: its raw admin login did not match
+the database credential after the environment restart.
+
 ## 2026-08-26 — Identity never interprets a broken clock as 1970
 
 Seven identity boundaries independently read wall time: OIDC, SAML, WebAuthn, SSH challenges,

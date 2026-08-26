@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use myelin_substrate::{Answer, Clock, ServeError, StalenessBound, SystemClock};
+use myelin_substrate::{Answer, Clock, MonotonicClock, ServeError, StalenessBound, SystemClock};
 use myelin_tenancy::TenantId;
 
 use crate::discover::{DiscoverKey, DiscoveryCache, RouteTuple};
@@ -84,7 +84,7 @@ impl core::fmt::Debug for ControlPlane {
     }
 }
 
-pub struct DataPlane<C: Clock = SystemClock> {
+pub struct DataPlane<C: Clock = MonotonicClock> {
     gateway: CellGateway,
     cache: DiscoveryCache<C>,
     ttl_seconds: myelin_substrate::Seconds,

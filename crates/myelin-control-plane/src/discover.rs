@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use myelin_substrate::{
-    Answer, Clock, FailStatic, FailStaticError, Seconds, ServeError, StalenessBound, SystemClock,
+    Answer, Clock, FailStatic, FailStaticError, MonotonicClock, Seconds, ServeError, StalenessBound,
 };
 use myelin_tenancy::{CellId, Region, TenantId};
 
@@ -52,7 +52,7 @@ impl Registry {
     }
 }
 
-pub struct DiscoveryCache<C: Clock = SystemClock> {
+pub struct DiscoveryCache<C: Clock = MonotonicClock> {
     inner: FailStatic<DiscoverKey, RouteTuple, C>,
     discovery_cache_hit: AtomicU64,
     misroute_count: AtomicU64,
@@ -74,7 +74,7 @@ impl<C: Clock> std::fmt::Debug for DiscoveryCache<C> {
     }
 }
 
-impl DiscoveryCache<SystemClock> {
+impl DiscoveryCache<MonotonicClock> {
     pub fn try_new(
         fresh_ttl: Seconds,
         static_max: Seconds,

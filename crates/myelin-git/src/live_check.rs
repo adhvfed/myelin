@@ -4,7 +4,7 @@ use myelin_identity::{
 };
 use myelin_substrate::{
     AuthzDecision, AuthzServed, Clock, FailStaticAuthz, FailStaticError, FailStaticSignals,
-    FailStaticThreshold, Seconds, ServeError, SystemClock,
+    FailStaticThreshold, MonotonicClock, Seconds, ServeError,
 };
 use myelin_tenancy::ArtifactRef;
 
@@ -31,12 +31,12 @@ pub fn bounded_stale_at(zookie: Zookie) -> Consistency {
     }
 }
 
-pub struct GitCheckGate<I: IdentityService, C: Clock = SystemClock> {
+pub struct GitCheckGate<I: IdentityService, C: Clock = MonotonicClock> {
     id: I,
     failstatic: FailStaticAuthz<C>,
 }
 
-impl<I: IdentityService> GitCheckGate<I, SystemClock> {
+impl<I: IdentityService> GitCheckGate<I, MonotonicClock> {
     pub fn try_new(
         id: I,
         revocation_sla_secs: Seconds,

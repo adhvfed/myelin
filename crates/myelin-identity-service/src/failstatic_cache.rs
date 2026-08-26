@@ -3,8 +3,8 @@ use myelin_identity::{Consistency, ConsistencyMode, Decision, PrincipalId, Revok
 use myelin_storage::TenantScope;
 use myelin_substrate::thresholds::FailStaticThreshold;
 use myelin_substrate::{
-    Answer, Clock, FailStatic, FailStaticError, FailStaticSignals, Seconds, ServeError,
-    StalenessBound, SystemClock,
+    Answer, Clock, FailStatic, FailStaticError, FailStaticSignals, MonotonicClock, Seconds,
+    ServeError, StalenessBound,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -39,23 +39,23 @@ struct S6Key {
 }
 
 #[derive(Clone)]
-pub struct FailStaticCache<C: Clock = SystemClock> {
+pub struct FailStaticCache<C: Clock = MonotonicClock> {
     inner: Arc<FailStatic<S6Key, CoarseGrant, C>>,
     revocations: RevocationStore,
     telemetry: Arc<CacheTelemetry>,
 }
 
-impl FailStaticCache<SystemClock> {
+impl FailStaticCache<MonotonicClock> {
     pub fn try_new(
         revocation_sla_secs: Seconds,
         threshold: &FailStaticThreshold,
         revocations: RevocationStore,
-    ) -> Result<FailStaticCache<SystemClock>, FailStaticError> {
+    ) -> Result<FailStaticCache<MonotonicClock>, FailStaticError> {
         FailStaticCache::try_new_with_clock(
             revocation_sla_secs,
             threshold,
             revocations,
-            SystemClock,
+            MonotonicClock::default(),
         )
     }
 }

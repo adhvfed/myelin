@@ -21,8 +21,8 @@ pub use agent_load::{
     SharedRootTripwire, TripwireVerdict,
 };
 pub use fail_static::{
-    Answer, Clock, FailStatic, FailStaticError, FailStaticSignals, StalenessBound, SystemClock,
-    TestClock,
+    Answer, Clock, FailStatic, FailStaticError, FailStaticSignals, MonotonicClock, StalenessBound,
+    SystemClock, TestClock,
 };
 pub use fail_static_authz::{
     encode_authz_key, AuthzDecision, AuthzServed, CoarseAuthz, FailStaticAuthz,

@@ -185,7 +185,7 @@ mod tests {
         TupleDelta, Zookie,
     };
     use myelin_storage::InMemoryCache;
-    use myelin_substrate::{FailStaticThreshold, SystemClock};
+    use myelin_substrate::{FailStaticThreshold, MonotonicClock};
     use myelin_tenancy::{Region, TenantId};
     use std::collections::{BTreeMap, HashMap};
 
@@ -340,7 +340,7 @@ mod tests {
         }
     }
 
-    fn gate(id: StubId) -> GitCheckGate<StubId, SystemClock> {
+    fn gate(id: StubId) -> GitCheckGate<StubId, MonotonicClock> {
         GitCheckGate::try_new(id, 300, &threshold()).expect("gate constructs")
     }
 
