@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — References privacy claims now stop at the durable boundary
+
+References exposed two privacy holders backed by its process-local edge projection. One returned
+successful structural-erasure receipts while preserving every edge; the other could evict a real
+Valkey entry, but discovered affected keys from that in-memory twin rather than the production
+`PgEdgeStore`. Neither holder was constructed by a running privacy request. A public restore driver
+then simulated backup recovery by manually repopulating local maps and an in-memory KMS, and called
+its own second pass restore-safe. A constants-only posture test completed the appearance of shipped
+coverage without observing any product state.
+
+The holders, suppression set, simulated erasure ledger and restore driver, posture declaration,
+and endorsing suites are gone. The edge and cache store names now live in a neutral three-line
+module used by residency metadata. The real reference graph remains: PostgreSQL ingestion and
+tombstoning, encrypted Valkey caching and invalidation, leak-free resolution, and reindex parity
+all retain their own direct tests. References remains absent from privacy-request scopes until a
+durable operation locates actor edges in PostgreSQL, purges derived cache entries, records its
+obligation, and proves re-erasure after an actual backend restore.
+
+**Proof:** all-target/all-feature References compile and strict clippy; all 275 remaining library
+stories; the complete all-feature suite against PostgreSQL and Valkey; rebuilt References and Edge;
+and all three live TypeScript graph journeys covering lossless paged backlinks, outbound traversal,
+and indistinguishable 404s for a private artifact (14.59 seconds). Removed 2,039 lines of simulated
+privacy machinery and self-certifying tests.
+
 ## 2026-08-26 — Workflow privacy no longer presents a process-local prototype as durable
 
 Workflow exposed an optional `PersonalDataHolder` whose ordinary construction returned successful

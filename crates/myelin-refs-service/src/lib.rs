@@ -15,9 +15,7 @@ pub mod cross_cell;
 pub mod dek;
 pub mod edge_builder;
 pub mod emit;
-pub mod erasure_posture;
 pub mod git_producer;
-pub mod holder;
 pub mod invalidator;
 pub mod issues_producer;
 pub mod kn_producer;
@@ -33,8 +31,7 @@ pub mod reindex;
 pub mod reindex_at_scale;
 pub mod residency;
 pub mod resolve;
-pub mod restore_reerase;
-pub mod restrict;
+mod store;
 pub mod surge;
 pub mod traverse;
 
@@ -61,13 +58,8 @@ pub use edge_builder::{
 pub use emit::{
     edge_aggregate_key, emit_edges, extract_edges, EdgeDraft, EdgeRel, REFS_EDGE_CREATED,
 };
-pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use git_producer::{
     git_replay_scope, CommentState, GitEdgeProducer, GitOwner, GitReplayGrain, GIT_OWNER_TOKEN,
-};
-pub use holder::{
-    refs_store_classifier, register_refs_holders, EdgeBacking, RefsCacheHolder, RefsEdgeHolder,
-    RefsHolderRegistration, REFS_CACHE_STORE, REFS_EDGE_STORE,
 };
 pub use invalidator::{
     InvalidateError, InvalidationCall, NoOpCacheShim, ProjectionCache, RefsProjectionInvalidator,
@@ -125,12 +117,7 @@ pub use resolve::{
     Resolution, ResolveMode, ResolveService, Tombstone, TombstoneReason,
     RESOLVE_CACHE_HIT_RATIO_SIGNAL, VIEW_PERMISSION,
 };
-pub use restore_reerase::{
-    build_backup_scale_corpus, re_erase_at_backup_scale, BackupScaleErasureCorpus,
-    BackupScaleReEraseReport, CorpusEdge, RefsErasedSubject, RefsErasureLedger,
-    REERASE_RECOVERABLE_PII_SIGNAL,
-};
-pub use restrict::RestrictSet;
+pub use store::{REFS_CACHE_STORE, REFS_EDGE_STORE};
 pub use surge::{
     run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, REFS_SURGE_MULTIPLIER,
 };

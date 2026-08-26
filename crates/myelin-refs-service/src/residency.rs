@@ -1,7 +1,7 @@
 use myelin_substrate::StoreKind;
 use myelin_tenancy::{Region, ResidencyTag, TenantId};
 
-use crate::holder::{REFS_CACHE_STORE, REFS_EDGE_STORE};
+use crate::store::{REFS_CACHE_STORE, REFS_EDGE_STORE};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefsStoreDescriptor {
