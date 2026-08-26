@@ -2,14 +2,12 @@ use chrono::{DateTime, Utc};
 use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, SubjectPattern};
 use myelin_identity::iam_events::{signals, IDENTITY_TUPLE_WRITTEN};
 use myelin_identity::{ObjectId, ObjectType, PrincipalId, RelName, Zookie};
-use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
+use myelin_storage::{TenantQuery, TenantScope, TenantTable};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const S8_TABLE: &str = "authz_visible";
-
-pub const S8_HOLDER: &str = "identity_authz_reverse_index";
 
 pub const S8_CONSUMER: &str = "s8_reverse_index";
 
@@ -57,7 +55,6 @@ struct Inner {
 #[derive(Clone)]
 pub struct ReverseIndex {
     inner: Arc<Mutex<Inner>>,
-    holder: OltpStoreHolder,
 }
 
 impl Default for ReverseIndex {
@@ -68,16 +65,9 @@ impl Default for ReverseIndex {
 
 impl ReverseIndex {
     pub fn new() -> ReverseIndex {
-        let holder = OltpStoreHolder::new(S8_HOLDER);
-        let _receipt = holder.register();
         ReverseIndex {
             inner: Arc::new(Mutex::new(Inner::default())),
-            holder,
         }
-    }
-
-    pub fn holder(&self) -> &OltpStoreHolder {
-        &self.holder
     }
 
     pub fn dek_class(&self, scope: &TenantScope) -> String {
@@ -822,18 +812,6 @@ mod tests {
         );
         assert_eq!(index.row_count(&acme, &ObjectType("repo".into())), 1);
         assert_eq!(index.watermark(&globex), Zookie(String::new()));
-    }
-
-    #[test]
-    fn s8_auto_registers_as_a_personal_data_holder() {
-        let index = ReverseIndex::new();
-        assert_eq!(
-            index.holder().store,
-            S8_HOLDER,
-            "S8 registered under its holder name"
-        );
-        let receipt = index.holder().register();
-        assert_eq!(receipt.store, S8_HOLDER);
     }
 
     #[test]

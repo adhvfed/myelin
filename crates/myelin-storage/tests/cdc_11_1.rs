@@ -1,7 +1,5 @@
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::{
-    register_holder, OltpConfig, OltpPool, OltpStoreHolder, TenantQuery, TenantScope, TenantTable,
-};
+use myelin_storage::{OltpConfig, OltpPool, TenantQuery, TenantScope, TenantTable};
 use myelin_tenancy::{Region, TenantId};
 
 struct IssuesService {
@@ -16,9 +14,6 @@ impl IssuesService {
             per_tenant_in_flight_cap: 4,
         };
         let pool = OltpPool::open(config).expect("issues OLTP pool opens through the harness");
-        let receipt = register_holder("issue_oltp");
-        assert_eq!(receipt.store, "issue_oltp");
-        let _holder = OltpStoreHolder::new("issue_oltp");
         IssuesService { pool }
     }
 

@@ -1,13 +1,11 @@
 use myelin_identity::{Consistency, ConsistencyMode};
-use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
+use myelin_storage::{TenantQuery, TenantScope, TenantTable};
 use myelin_substrate::Seconds;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const S5_TABLE: &str = "authz_read_replica";
-
-pub const S5_HOLDER: &str = "identity_authz_read_replica";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaRow {
@@ -35,7 +33,6 @@ struct Inner {
 #[derive(Clone)]
 pub struct AuthzReadReplica {
     inner: Arc<Mutex<Inner>>,
-    holder: OltpStoreHolder,
     telemetry: Arc<ReplicaTelemetry>,
 }
 
@@ -49,17 +46,10 @@ impl AuthzReadReplica {
     pub const DEFAULT_MAX_REPLICATION_LAG_SECS: Seconds = 30;
 
     pub fn new() -> AuthzReadReplica {
-        let holder = OltpStoreHolder::new(S5_HOLDER);
-        let _receipt = holder.register();
         AuthzReadReplica {
             inner: Arc::new(Mutex::new(Inner::default())),
-            holder,
             telemetry: Arc::new(ReplicaTelemetry::default()),
         }
-    }
-
-    pub fn holder(&self) -> &OltpStoreHolder {
-        &self.holder
     }
 
     pub fn telemetry(&self) -> &ReplicaTelemetry {
@@ -346,18 +336,6 @@ mod tests {
             "globex's offset is untouched by acme's replication"
         );
         assert_eq!(s5.row_count(&acme), 1);
-    }
-
-    #[test]
-    fn s5_auto_registers_as_a_personal_data_holder() {
-        let s5 = AuthzReadReplica::new();
-        assert_eq!(
-            s5.holder().store,
-            S5_HOLDER,
-            "S5 registered under its holder name"
-        );
-        let receipt = s5.holder().register();
-        assert_eq!(receipt.store, S5_HOLDER);
     }
 
     #[test]

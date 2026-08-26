@@ -11,7 +11,7 @@ use myelin_events::{
     BrokerDeliveryBody, Consumer, ConsumerName, Delivered, DeliveryQuarantineReason, DeliveryToken,
     DurableDeliveryQuarantine, EventHandler, Message, OutboxError, OutboxStore, Relay, Timestamp,
 };
-use myelin_storage::{OltpConfig, OltpPool, OltpStoreHolder};
+use myelin_storage::{OltpConfig, OltpPool};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -767,8 +767,6 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
 
     let HoldersSpec::Auto = holders;
     let mut holder_registry = HolderRegistry::new();
-    let oltp_holder = OltpStoreHolder::new(name);
-    let _oltp_receipt = oltp_holder.register();
     holder_registry.open(StoreKind::Oltp, name);
     for store in stores.stores() {
         holder_registry.open(store.kind, store.name);

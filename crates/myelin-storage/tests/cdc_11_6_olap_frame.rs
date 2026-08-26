@@ -3,7 +3,7 @@ use myelin_events::{
     PiiKeyRef, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::{OlapApply, OlapEvent, OlapReadStore, OlapStoreHolder, SourceLog};
+use myelin_storage::{OlapApply, OlapEvent, OlapReadStore, SourceLog};
 use myelin_tenancy::{Region, TenantId};
 
 fn region() -> Region {
@@ -112,13 +112,6 @@ fn cdc_11_6_reindex_from_source_is_the_only_rebuild_path() {
         0,
         "the cold rebuild is reindex-from-source - never an OLTP scan"
     );
-}
-
-#[test]
-fn cdc_11_6_olap_store_is_a_registered_holder() {
-    let holder = OlapStoreHolder::new("issue_analytics_olap");
-    let receipt = holder.register();
-    assert_eq!(receipt.store, "issue_analytics_olap");
 }
 
 #[test]

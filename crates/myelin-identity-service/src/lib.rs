@@ -115,7 +115,7 @@ pub use oidc::{
 };
 pub use principal_store::{
     PrincipalCredentialProvision, PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore,
-    ProfileRef, S1_HOLDER, S1_TABLE,
+    ProfileRef, S1_TABLE,
 };
 pub use project_store::{
     project_ref, validate_new_project, NewProject, PgProjectStore, Project, ProjectCreation,
@@ -126,14 +126,11 @@ pub use pseudonym_erase::{
     ErasureLedgerEntry, ErasureReceipt, PseudonymEraseError, PseudonymErasureLedger,
     ReErasureReceipt, ERASURE_LEDGER,
 };
-pub use pseudonym_store::{PseudonymError, PseudonymRow, PseudonymStore, S2_HOLDER, S2_TABLE};
+pub use pseudonym_store::{PseudonymError, PseudonymRow, PseudonymStore, S2_TABLE};
 pub use read_replica::{
-    AuthzReadReplica, ReadRoute, ReplicaRow, ReplicaTelemetry, ReplicaWriteRejected, S5_HOLDER,
-    S5_TABLE,
+    AuthzReadReplica, ReadRoute, ReplicaRow, ReplicaTelemetry, ReplicaWriteRejected, S5_TABLE,
 };
-pub use reverse_index::{
-    ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
-};
+pub use reverse_index::{ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_TABLE};
 pub use revocation::{
     RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, RunTokenState,
     REVOCATION_SLA_SECS, S7_TABLE,
@@ -144,7 +141,7 @@ pub use ssh_auth::{
     RegisteredKey, SshVerifier,
 };
 pub use tuple_store::{
-    run_grant_expiry, tuple_written_event, StoredTuple, TupleStore, WriteError, S3_HOLDER, S3_TABLE,
+    run_grant_expiry, tuple_written_event, StoredTuple, TupleStore, WriteError, S3_TABLE,
 };
 pub use webauthn::{
     encode_assertion_material, encode_registration_material,

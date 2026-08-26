@@ -1,13 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_events::EventEnvelope;
-use myelin_gdpr::{
-    DsrError, EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle,
-    RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId as GdprTenantId,
-};
 use myelin_tenancy::{Region, TenantId};
 
-use crate::holder::{register_holder, OltpHolderRegistration};
 use crate::restore::{ReindexFromSource, SourceLog};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,76 +171,25 @@ impl OlapReadStore {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct OlapStoreHolder {
-    pub store: &'static str,
-}
-
-impl OlapStoreHolder {
-    pub fn new(store: &'static str) -> OlapStoreHolder {
-        OlapStoreHolder { store }
-    }
-
-    pub fn register(&self) -> OltpHolderRegistration {
-        register_holder(self.store)
-    }
-}
-
-fn olap_dsr_floor(method: &str) -> DsrError {
-    DsrError(format!(
-        "OLAP {method} body lands in P-GA-25 (global P-152, the per-derivative erasure fan-out: \
-         OLAP purge + restrict suppression / crypto-shred); P-ST-17 ships the holder registration \
-         + the CQRS frame only"
-    ))
-}
-
-impl PersonalDataHolder for OlapStoreHolder {
-    fn locate(&self, _subject: &SubjectRef, _tenant: GdprTenantId) -> DsrResult<LocateReport> {
-        Err(olap_dsr_floor("locate"))
-    }
-    fn export(&self, _subject: &SubjectRef, _tenant: GdprTenantId) -> DsrResult<PortableBundle> {
-        Err(olap_dsr_floor("export"))
-    }
-    fn rectify(&self, _subject: &SubjectRef, _patch: Patch) -> DsrResult<RectifyReceipt> {
-        Err(olap_dsr_floor("rectify"))
-    }
-    fn restrict(&self, _subject: &SubjectRef, _on: bool) -> DsrResult<RestrictReceipt> {
-        Err(olap_dsr_floor("restrict (C5 analytics suppression)"))
-    }
-    fn erase(&self, _scope: EraseScope) -> DsrResult<EraseReceipt> {
-        Err(olap_dsr_floor("erase (crypto-shred / purge)"))
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OlapFrameSignal {
     pub store: &'static str,
     pub oltp_scan_path_count: u64,
-    pub holder_registered: bool,
     pub reindex_matches_live: bool,
 }
 
 impl OlapFrameSignal {
     pub fn is_green(&self) -> bool {
-        self.oltp_scan_path_count == 0 && self.holder_registered && self.reindex_matches_live
+        self.oltp_scan_path_count == 0 && self.reindex_matches_live
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
     fn region() -> Region {
         Region("fr-par".into())
-    }
-
-    fn subject_ref() -> SubjectRef {
-        SubjectRef::new(Principal::stub(
-            PrincipalId("p".into()),
-            PrincipalKind::Human,
-            GdprTenantId::from_token("acme"),
-        ))
     }
 
     fn event(id: &str, row: &str) -> OlapEvent {
@@ -337,42 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn olap_holder_registers() {
-        let holder = OlapStoreHolder::new("issue_analytics_olap");
-        assert_eq!(
-            holder.register(),
-            OltpHolderRegistration {
-                store: "issue_analytics_olap"
-            }
-        );
-    }
-
-    #[test]
-    fn olap_dsr_bodies_are_the_named_pga25_floor() {
-        let holder = OlapStoreHolder::new("issue_analytics_olap");
-        let s = subject_ref();
-        match holder.export(&s, GdprTenantId::from_token("acme")) {
-            Err(DsrError(msg)) => {
-                assert!(msg.contains("P-GA-25"), "floor names its follow-on: {msg}")
-            }
-            Ok(_) => panic!("export body must be the named P-GA-25 floor on P-ST-17"),
-        }
-        match holder.erase(EraseScope::Tenant(GdprTenantId::from_token("acme"))) {
-            Err(DsrError(msg)) => {
-                assert!(msg.contains("crypto-shred"), "erase = crypto-shred: {msg}")
-            }
-            Ok(_) => panic!("erase body must be the crypto-shred floor"),
-        }
-        match holder.restrict(&s, true) {
-            Err(DsrError(msg)) => assert!(
-                msg.contains("C5"),
-                "restrict = the C5 suppression seam: {msg}"
-            ),
-            Ok(_) => panic!("restrict body must be the C5 floor"),
-        }
-    }
-
-    #[test]
     fn c5_restriction_flag_is_carried_for_m4() {
         let mut store = OlapReadStore::pinned_to(region());
         assert!(
@@ -407,13 +315,9 @@ mod tests {
         }
         let reindex_matches_live = cold.doc_count() == live.doc_count();
 
-        let holder = OlapStoreHolder::new("issue_analytics_olap");
-        let _ = holder.register();
-
         let signal = OlapFrameSignal {
             store: "issue_analytics_olap",
             oltp_scan_path_count: cold.oltp_scan_path_count(),
-            holder_registered: true,
             reindex_matches_live,
         };
         assert!(
@@ -431,7 +335,6 @@ mod tests {
         let green = OlapFrameSignal {
             store: "issue_analytics_olap",
             oltp_scan_path_count: 0,
-            holder_registered: true,
             reindex_matches_live: true,
         };
         assert!(green.is_green(), "the all-green baseline is green");
@@ -443,15 +346,6 @@ mod tests {
         assert!(
             !red_backdoor.is_green(),
             "an OLTP-scan backdoor must read RED"
-        );
-
-        let red_holder = OlapFrameSignal {
-            holder_registered: false,
-            ..green.clone()
-        };
-        assert!(
-            !red_holder.is_green(),
-            "an unregistered holder must read RED"
         );
 
         let red_reindex = OlapFrameSignal {

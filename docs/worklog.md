@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Opening a store no longer creates a pretend DSR capability
+
+Storage supplied generic OLTP, blob, and OLAP "holders" whose registration method merely returned
+their name and changed no registry. Every privacy method failed with a note pointing at future
+work. Identity then carried one of these objects in five stores solely so unit tests could call
+that no-op registration, while Substrate independently maintained the real boot-time store
+manifest. OLAP combined its placeholder with a green signal whose `holder_registered` input was a
+literal `true` in the same test.
+
+The generic holders and their failing DSR surfaces are gone, as are the unused Identity fields,
+constructors, accessors, and self-certifying tests. Substrate's actual store manifest and registry
+remain the one boot inventory for OLTP, blob, cache, and search stores. The OLAP projection keeps
+its event ingestion, regional boundary, restriction behavior, and source-reindex parity without
+claiming a privacy capability it does not have.
+
+**Proof:** all-target/all-feature compile and strict Clippy across Storage, Substrate, and Identity;
+all 502 Storage, 192 Substrate, and 419 Identity library stories plus their complete PostgreSQL,
+Valkey, object-store, restore, and sandbox-backed suites; rebuilt Edge; and the live TypeScript
+browser-to-CLI authentication journey (253 ms). Net removal: 404 lines of placeholder holder
+objects and self-certifying tests.
+
 ## 2026-08-26 — Knowledge privacy has one durable agent-trace implementation
 
 Knowledge exposed a privacy holder backed by a process-local restriction set. Its locate,

@@ -8,7 +8,7 @@ use myelin_events::{
 use myelin_events::{EmitContextBase, OutboxStore, OutboxTransaction, OutboxTx};
 use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
-use myelin_storage::{OltpStoreHolder, TenantQuery, TenantScope, TenantTable};
+use myelin_storage::{TenantQuery, TenantScope, TenantTable};
 use myelin_tenancy::{Region, TenantId};
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
@@ -18,8 +18,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 pub const S3_TABLE: &str = "rebac_tuple";
-
-pub const S3_HOLDER: &str = "identity_rebac_tuples";
 
 /// Derives the canonical event for a relationship write performed inside another aggregate's
 /// transaction. Callers own the transaction and event id; Identity owns the event contract.
@@ -173,7 +171,6 @@ pub struct TupleStore {
     #[cfg(any(test, feature = "test-support"))]
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
-    holder: OltpStoreHolder,
 }
 
 #[derive(Clone)]
@@ -197,8 +194,6 @@ impl TupleStore {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_minter(outbox: OutboxStore, minter: Arc<dyn IdMinter>) -> TupleStore {
-        let holder = OltpStoreHolder::new(S3_HOLDER);
-        let _receipt = holder.register();
         TupleStore {
             backend: TupleBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
             revision: Arc::new(AtomicU64::new(0)),
@@ -206,7 +201,6 @@ impl TupleStore {
             read_failure: None,
             outbox,
             minter,
-            holder,
         }
     }
 
@@ -222,8 +216,6 @@ impl TupleStore {
         backing: myelin_storage::DurableTupleBacking,
         rt: tokio::runtime::Handle,
     ) -> TupleStore {
-        let holder = OltpStoreHolder::new(S3_HOLDER);
-        let _receipt = holder.register();
         TupleStore {
             backend: TupleBackend::Pg(PgTupleBacking {
                 backing: Arc::new(backing),
@@ -235,16 +227,11 @@ impl TupleStore {
             #[cfg(any(test, feature = "test-support"))]
             outbox: OutboxStore::new(),
             minter,
-            holder,
         }
     }
 
     pub fn dek_class(&self, scope: &TenantScope) -> String {
         format!("kms://{}/tenant", scope.tenant().0)
-    }
-
-    pub fn holder(&self) -> &OltpStoreHolder {
-        &self.holder
     }
 
     pub fn current_zookie(&self) -> Zookie {
@@ -1197,18 +1184,6 @@ mod tests {
             0,
             "a rejected relationship emits no poisoned projection event"
         );
-    }
-
-    #[test]
-    fn s3_store_registers_as_a_personal_data_holder() {
-        let store = TupleStore::new(OutboxStore::new());
-        assert_eq!(
-            store.holder().store,
-            S3_HOLDER,
-            "the S3 store registered under its holder name"
-        );
-        let receipt = store.holder().register();
-        assert_eq!(receipt.store, S3_HOLDER);
     }
 
     #[test]

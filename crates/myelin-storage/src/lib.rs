@@ -22,7 +22,6 @@ pub mod firehose_archive;
 pub mod gd4;
 pub mod git_shred;
 pub mod gitpack;
-pub mod holder;
 pub mod holder_fanout;
 pub mod key_origin;
 pub mod kms;
@@ -147,7 +146,6 @@ pub use gitpack::{
     RepoGitPlacement, RepoId, RepoPlacementStatus, StorageGroup, GIT_PACKFILE_MAX_STORED_BYTES,
     GIT_PACK_OBJECT_MAX_STORED_BYTES,
 };
-pub use holder::{register_holder, BlobStoreHolder, OltpHolderRegistration, OltpStoreHolder};
 pub use holder_fanout::{
     holder_ids_not_covered, FullHolderFanOut, HolderClass, HolderCoverage,
     HolderCoverageCertificate, HolderCoverageReceiptSet, HolderErasure, ResidualPosture,
@@ -182,9 +180,7 @@ pub use object_packs::{
     served_from_object_tier, CloneStormLoad, GitD4Ceiling, GitD4Report, ObjectBackedServe,
     SingleNodeServe,
 };
-pub use olap::{
-    OlapApply, OlapDoc, OlapEvent, OlapFrameSignal, OlapIngestError, OlapReadStore, OlapStoreHolder,
-};
+pub use olap::{OlapApply, OlapDoc, OlapEvent, OlapFrameSignal, OlapIngestError, OlapReadStore};
 pub use olap_feed::{
     reindex_olap_from_bus, OlapAnalyticsSource, OlapBusConsumer, OlapReindexParitySignal,
 };

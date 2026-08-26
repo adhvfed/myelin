@@ -1,8 +1,7 @@
 use myelin_gdpr::PersonalData;
 use myelin_identity::{PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{
-    KeyClass, KmsEngine, KmsError, OltpHolderRegistration, OltpStoreHolder, PiiKeyRef, TenantQuery,
-    TenantScope, TenantTable,
+    KeyClass, KmsEngine, KmsError, PiiKeyRef, TenantQuery, TenantScope, TenantTable,
 };
 use myelin_tenancy::{Region, TenantId};
 #[cfg(any(test, feature = "test-support"))]
@@ -12,8 +11,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 pub const S1_TABLE: &str = "principal";
-
-pub const S1_HOLDER: &str = "identity_principal";
 
 #[derive(PersonalData, Clone, Debug, PartialEq, Eq)]
 pub struct PrincipalProfile {
@@ -183,7 +180,6 @@ struct Inner {
 pub struct PrincipalStore {
     backend: PrincipalBackend,
     kms: Arc<KmsEngine>,
-    holder: OltpStoreHolder,
 }
 
 #[derive(Clone)]
@@ -202,12 +198,9 @@ struct PgPrincipalBacking {
 impl PrincipalStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn new(kms: Arc<KmsEngine>) -> PrincipalStore {
-        let holder = OltpStoreHolder::new(S1_HOLDER);
-        let _receipt = holder.register();
         PrincipalStore {
             backend: PrincipalBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
             kms,
-            holder,
         }
     }
 
@@ -216,24 +209,13 @@ impl PrincipalStore {
         backing: myelin_storage::DurablePrincipalBacking,
         rt: tokio::runtime::Handle,
     ) -> PrincipalStore {
-        let holder = OltpStoreHolder::new(S1_HOLDER);
-        let _receipt = holder.register();
         PrincipalStore {
             backend: PrincipalBackend::Pg(PgPrincipalBacking {
                 backing: Arc::new(backing),
                 rt,
             }),
             kms,
-            holder,
         }
-    }
-
-    pub fn holder(&self) -> &OltpStoreHolder {
-        &self.holder
-    }
-
-    pub fn register_holder(&self) -> OltpHolderRegistration {
-        self.holder.register()
     }
 
     pub fn subject_dek_class(principal_id: &PrincipalId) -> KeyClass {
@@ -1046,18 +1028,6 @@ mod tests {
                 .is_some(),
             "the opaque principal_id row survives the profile shred (immutable attribution)"
         );
-    }
-
-    #[test]
-    fn s1_store_registers_as_a_personal_data_holder() {
-        let store = PrincipalStore::new(kms());
-        assert_eq!(
-            store.holder().store,
-            S1_HOLDER,
-            "the S1 store registered under its holder name"
-        );
-        let receipt = store.register_holder();
-        assert_eq!(receipt.store, S1_HOLDER);
     }
 
     #[test]

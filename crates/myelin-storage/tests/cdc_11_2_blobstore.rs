@@ -1,6 +1,4 @@
-use myelin_storage::{
-    BlobStore, BlobStoreHolder, ContentHash, FsBlobStore, OltpHolderRegistration,
-};
+use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::TenantId;
 
 struct AttachmentsService<B: BlobStore> {
@@ -10,8 +8,6 @@ struct AttachmentsService<B: BlobStore> {
 
 impl<B: BlobStore> AttachmentsService<B> {
     fn boot(blobs: B, tenant: TenantId) -> AttachmentsService<B> {
-        let receipt: OltpHolderRegistration = BlobStoreHolder::new("attachments").register();
-        assert_eq!(receipt.store, "attachments");
         AttachmentsService { blobs, tenant }
     }
 
