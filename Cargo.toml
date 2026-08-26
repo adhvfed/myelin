@@ -14,7 +14,6 @@ members = [
     "crates/myelin-agent-service",
     "crates/myelin-agent-model",
     "crates/myelin-gdpr",
-    "crates/myelin-gdpr-service",
     "crates/myelin-gdpr-macros",
     "crates/myelin-client",
     "crates/myelin-git",

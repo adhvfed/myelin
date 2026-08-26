@@ -8,7 +8,6 @@ pub mod cross_cell;
 pub mod dek;
 pub mod engine;
 pub mod erase;
-pub mod erasure_posture;
 pub mod filtered_ann;
 pub mod freshness;
 pub mod fusion;
@@ -65,7 +64,6 @@ pub use erase::{
     EraseOutcome, ErasureEventClock, SearchEraseHolder, SystemErasureEventClock,
     SEARCH_ERASE_EVENT_TYPE,
 };
-pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use filtered_ann::{
     measure_recall_at_k, FilteredAnnArtifact, FilteredAnnFailure, FilteredAnnGate,
     FilteredAnnStrategy, FilteredAnnVerdict, RecallMeasurement,

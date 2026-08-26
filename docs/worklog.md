@@ -4,6 +4,35 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Privacy compliance is a product path, not a parallel simulation
+
+`myelin-gdpr-service` looked like the system's privacy control plane, but it had no binary and no
+production consumer. Its only dependants were dev-dependencies used by tests. Behind the broad API
+were process-local holder inventories, erasure ledgers, retention state, audit logs, eDiscovery
+exports, agent traces, and service-specific doubles. Their tests assembled those models directly,
+then certified the state they had just arranged; a running privacy request could reach none of it.
+Search also published a constants-only posture whose complete conjunction was true by declaration.
+
+The legacy service, its external endorsing tests, and Search's declared-green posture are gone.
+The small `myelin-gdpr` contract crate remains, as do the paths that change durable product state:
+Storage's leased privacy requests and encrypted agent traces, Chat's authored-message erasure,
+Search's real eraser, cross-cell fan-out, and restore re-erasure. Removing the workspace member
+changed the lockfile, so the full offline Cargo vendor asset was deliberately rebuilt and repinned
+by both lockfile and canonical-tree digests.
+
+The contract manifest now distinguishes proof from aspiration. All 99 rows reconcile to existing
+tests or a named landing prompt: 75 are covered and 24 are explicitly deferred, with zero invented
+files. Durable holder inventory, data mapping, notification erasure, audit, eDiscovery, policy
+controls, and a system-wide immutable-content posture remain visible gaps rather than capabilities
+implied by an unwired crate.
+
+**Proof:** workspace all-target/all-feature compile and strict Clippy; the contract-coverage gate;
+all five vendored-runner asset guards; the complete Control Plane, Issues, Search, and Storage
+suites against PostgreSQL, Valkey, object storage, and sandbox drills; rebuilt Edge; and both live
+TypeScript privacy journeys (5.07 seconds), covering a resumable request, reconstruction refusal,
+Chat erasure, and the person's right to speak again. Net removal: 25,570 lines of parallel privacy
+simulation and self-certifying tests before this worklog entry.
+
 ## 2026-08-26 — Opening a store no longer creates a pretend DSR capability
 
 Storage supplied generic OLTP, blob, and OLAP "holders" whose registration method merely returned

@@ -15,17 +15,6 @@ const CORE_LAYERS: &[(&str, u8)] = &[
     ("myelin-substrate", 6),
 ];
 
-const FORBIDDEN_PRODUCTION_EDGES: &[(&str, &[&str])] = &[(
-    "myelin-gdpr-service",
-    &[
-        "myelin-storage",
-        "myelin-search",
-        "myelin-refs",
-        "myelin-refs-service",
-        "myelin-notif",
-    ],
-)];
-
 fn production_dependencies(root: &Path, owner: &str) -> Result<Vec<(String, String)>, String> {
     let path = root.join("crates").join(owner).join("Cargo.toml");
     let source = std::fs::read_to_string(&path)
@@ -70,20 +59,6 @@ pub fn scan_dependency_directions(root: &Path) -> Vec<String> {
             }
         }
     }
-    for (owner, forbidden) in FORBIDDEN_PRODUCTION_EDGES {
-        match production_dependencies(root, owner) {
-            Ok(dependencies) => {
-                for (alias, dependency) in dependencies {
-                    if forbidden.contains(&dependency.as_str()) {
-                        errors.push(format!(
-                            "L2: `{owner}` depends on forbidden production crate `{dependency}` via `{alias}`; cross-store reads must use the personal-data-holder seam"
-                        ));
-                    }
-                }
-            }
-            Err(error) => errors.push(error),
-        }
-    }
     errors
 }
 
@@ -106,13 +81,6 @@ mod tests {
             )
             .unwrap();
         }
-        let service = root.join("crates/myelin-gdpr-service");
-        std::fs::create_dir_all(&service).unwrap();
-        std::fs::write(
-            service.join("Cargo.toml"),
-            "[package]\nname = \"myelin-gdpr-service\"\nversion = \"0.0.0\"\n",
-        )
-        .unwrap();
         root
     }
 
@@ -145,28 +113,6 @@ mod tests {
         assert!(scan_dependency_directions(&root)
             .iter()
             .any(|error| error.contains("myelin-content")));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn gdpr_service_can_test_store_crates_but_cannot_read_them_in_production() {
-        let root = fixture_root("gdpr-service");
-        let manifest = root.join("crates/myelin-gdpr-service/Cargo.toml");
-        std::fs::write(
-            &manifest,
-            "[package]\nname = \"myelin-gdpr-service\"\nversion = \"0.0.0\"\n\n[dev-dependencies]\nmyelin-search = \"0\"\n",
-        )
-        .unwrap();
-        assert!(scan_dependency_directions(&root).is_empty());
-
-        std::fs::write(
-            &manifest,
-            "[package]\nname = \"myelin-gdpr-service\"\nversion = \"0.0.0\"\n\n[dependencies]\nsearch_alias = { package = \"myelin-search\", version = \"0\" }\n",
-        )
-        .unwrap();
-        assert!(scan_dependency_directions(&root)
-            .iter()
-            .any(|error| error.contains("forbidden production crate `myelin-search`")));
         std::fs::remove_dir_all(root).ok();
     }
 }

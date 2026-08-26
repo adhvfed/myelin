@@ -22,11 +22,8 @@ cdc = ["crates/myelin-substrate/tests/cdc_1_3_liveness_readiness.rs"]
 [[contract]]
 row = "1.4"
 title = "PersonalDataHolder auto-registration"
-status = "covered"
-cdc = [
-    "crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs",
-    "crates/myelin-agent-service/tests/cdc_10_1_agent_holder.rs",
-]
+status = "deferred"
+landing = "P-GDPR-DURABLE-HOLDER-INVENTORY"
 
 [[contract]]
 row = "1.5"
@@ -159,7 +156,7 @@ status = "covered"
 cdc = [
     "crates/myelin-events/tests/cdc_2_7_bus_holder.rs",
     "crates/myelin-chat/tests/cdc_5_9_2_7_chat_unfurl_invalidation.rs",
-    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
+    "crates/myelin-chat/tests/integration_chat_p22_erase_cascade.rs",
 ]
 
 [[contract]]
@@ -570,10 +567,8 @@ cdc = [
 [[contract]]
 row = "7.7"
 title = "PersonalDataHolder (Notif history) + replay"
-status = "covered"
-cdc = [
-    "crates/myelin-notif/tests/cdc_7_7_notif_holder.rs",
-]
+status = "deferred"
+landing = "P-GDPR-DURABLE-NOTIFICATION-HOLDER"
 
 [[contract]]
 row = "7.8"
@@ -647,9 +642,7 @@ row = "8.8"
 title = "AG-7 agent trace"
 status = "covered"
 cdc = [
-    "crates/myelin-gdpr-service/tests/cdc_8_8_agent_trace_seam.rs",
     "crates/myelin-agent-service/tests/drills_ag_p19_knowledge_tools.rs",
-    "crates/myelin-knowledge/tests/cdc_8_8_knowledge_agent_trace.rs",
     "crates/myelin-agent-host/tests/integration_agent_host_activity.rs",
     "crates/myelin-storage/tests/integration_agent_trace_erasure.rs",
 ]
@@ -699,17 +692,10 @@ row = "10.1"
 title = "PersonalDataHolder{locate, export, rectify, restrict, erase}"
 status = "covered"
 cdc = [
-    "crates/myelin-gdpr-service/tests/cdc_10_1_holder_bodies.rs",
-    "crates/myelin-refs-service/tests/cdc_10_1_refs_holder.rs",
-    "crates/myelin-agent-service/tests/cdc_10_1_agent_holder.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_1_producer_holders.rs",
-    "crates/myelin-git/tests/cdc_10_1_10_4_git_holder.rs",
     "crates/myelin-knowledge/tests/cdc_13_2_10_1_knowledge_export_import.rs",
-    "crates/myelin-ci-controlplane/tests/cdc_10_1_ci_holder.rs",
-    "crates/myelin-issues/tests/cdc_10_1_issues_holder_erase.rs",
     "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
     "crates/myelin-chat/tests/cdc_7_2_10_1_chat_read_state.rs",
-    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
+    "crates/myelin-chat/tests/integration_chat_p22_erase_cascade.rs",
     "crates/myelin-chat/tests/cdc_4_8_10_1_chat_mention_shred_restrict.rs",
     "crates/myelin-storage/tests/integration_agent_trace_erasure.rs",
 ]
@@ -726,48 +712,36 @@ cdc = [
 [[contract]]
 row = "10.3"
 title = "data_map() / ropa(tenant)"
-status = "covered"
-cdc = ["crates/myelin-gdpr-service/tests/cdc_10_3_data_map.rs"]
+status = "deferred"
+landing = "P-GDPR-DURABLE-DATA-MAP"
 
 [[contract]]
 row = "10.4"
 title = "dsr_submit / dsr_status / dsr_certificate"
 status = "covered"
 cdc = [
-    "crates/myelin-gdpr-service/tests/cdc_10_4_dsr_orchestrator.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_4_fanout.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_4_tenant_ops.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_4_deadline_timer.rs",
-    "crates/myelin-git/tests/cdc_10_1_10_4_git_holder.rs",
-    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
+    "crates/myelin-storage/tests/integration_privacy_request_durable.rs",
+    "crates/myelin-chat/tests/integration_chat_p22_erase_cascade.rs",
     "crates/myelin-control-plane/tests/cdc_10_4_cross_cell_dsr_fanout.rs",
 ]
 
 [[contract]]
 row = "10.5"
 title = "retention / consent / sub-processor / legal-hold / transfer gate / outbound-mirror (C-4)"
-status = "covered"
-cdc = [
-    "crates/myelin-gdpr-service/tests/cdc_10_5_retention_engine.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_5_consent_transfer_gate.rs",
-    "crates/myelin-control-plane/tests/cdc_10_5_mirror_gate.rs",
-    "crates/myelin-storage/tests/cdc_10_5_mirror_crossing_flag.rs",
-]
+status = "deferred"
+landing = "P-GDPR-DURABLE-POLICY-CONTROLS"
 
 [[contract]]
 row = "10.6"
 title = "tamper-evident audit log"
-status = "covered"
-cdc = [
-    "crates/myelin-gdpr-service/tests/cdc_10_6_audit_log.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_6_audit_proofs.rs",
-]
+status = "deferred"
+landing = "P-GDPR-DURABLE-AUDIT"
 
 [[contract]]
 row = "10.7"
 title = "eDiscovery / legal-hold export"
-status = "covered"
-cdc = ["crates/myelin-gdpr-service/tests/cdc_10_7_ediscovery_export.rs"]
+status = "deferred"
+landing = "P-GDPR-DURABLE-EDISCOVERY"
 
 [[contract]]
 row = "10.8"
@@ -778,12 +752,8 @@ landing = "P-115"
 [[contract]]
 row = "10.9"
 title = "the ONE free-text / immutable-content erasure posture"
-status = "covered"
-cdc = [
-    "crates/myelin-gdpr-service/tests/cdc_10_9_erasure_posture.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_9_structural_floor.rs",
-    "crates/myelin-gdpr-service/tests/cdc_10_9_commit_prerequisite.rs",
-]
+status = "deferred"
+landing = "P-GDPR-COMPLETE-ERASURE-POSTURE"
 
 [[contract]]
 row = "11.1"
@@ -830,7 +800,7 @@ cdc = [
     "crates/myelin-storage/tests/cdc_11_2_11_4_git_crypto_shred_reach.rs",
     "crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs",
     "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
-    "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
+    "crates/myelin-chat/tests/integration_chat_p22_erase_cascade.rs",
     "crates/myelin-storage/tests/integration_agent_trace_erasure.rs",
 ]
 

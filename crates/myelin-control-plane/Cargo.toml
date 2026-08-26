@@ -34,7 +34,5 @@ myelin-config = { path = "../myelin-config" }
 futures = { workspace = true }
 sqlx = { workspace = true }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-myelin-gdpr-service = { path = "../myelin-gdpr-service" }
-myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-harness = { path = "../myelin-harness" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
