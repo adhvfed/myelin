@@ -1,16 +1,12 @@
 pub mod app;
-pub mod card_text;
 pub mod catalogue;
 pub mod chat_read_tools;
 pub mod chat_tools;
 pub mod ci_tools;
 pub mod defaults;
-pub mod dry_run;
 pub mod effect_api;
 pub mod git_read_tools;
 pub mod git_tools;
-pub mod hitl;
-pub mod hitl_batch;
 pub mod hosted_run_contract;
 pub mod issues_agents;
 pub mod issues_read_tools;
@@ -53,12 +49,7 @@ pub use mock::{
     MockAgentRuntime, MockScript, ReplayRecord, RuntimeFlag, TraceHistory, MOCK_MAX_STEPS,
 };
 
-pub use effect_api::{
-    decode_proposed, effect_gate_key, effect_gate_key_str, encode_proposed, validate_call,
-    validate_schema, validate_tool_arguments, ApplyError, CapabilityCheck, DelegationLookup,
-    EffectApiBridge, EffectBudget, EffectCost, PipelineSignals, PipelineStep, PlanThenApply,
-    PlanVerdict, PlannedEffect, SubsystemApply, TenantGuard,
-};
+pub use effect_api::{validate_call, validate_schema, validate_tool_arguments};
 
 pub use defaults::{
     assert_no_silent_loosening, default_for_tool, requires_approval_default,
@@ -89,10 +80,8 @@ pub use issues_tools::{
 
 pub use issues_agents::{
     assign_required_caps, assign_tool_def, close_tool_def, create_required_caps, create_tool_def,
-    estimate_tool_def, full_issues_tool_defs, link_tool_def, mock_forecast_agent,
-    mock_triage_agent, register_full_issues_tools, reorder_tool_def, replay_forecast_agent,
-    triage_effect_for, triage_suggestion_strip, update_required_caps, update_tool_def,
-    ForecastInput, ForecastOutput, LinearForecast, ASSIGN_TOOL, CLOSE_TOOL, CREATE_TOOL,
+    estimate_tool_def, full_issues_tool_defs, link_tool_def, register_full_issues_tools,
+    reorder_tool_def, update_required_caps, update_tool_def, ASSIGN_TOOL, CLOSE_TOOL, CREATE_TOOL,
     CREATE_TOOL_VERSION, ESTIMATE_TOOL, LINK_TOOL, REORDER_TOOL, UPDATE_TOOL,
 };
 
@@ -134,27 +123,6 @@ pub use ci_tools::{
 };
 
 pub use trace_seam::{is_content_addressed_kn_document, trace_ref_of, TraceDocument};
-
-pub use dry_run::{
-    dry_run_plan, proposed_effect_sequence, DryRunBridge, DryRunEntry, DryRunPlanner,
-};
-
-pub use hitl::{
-    derive_approver_set, gate_id_of, live_cost_estimate, run_hitl_loop, surface_card,
-    ApprovedTools, ApproverSet, Halted, HitlCard, HitlGate, HitlGateState, HitlOutcome, HitlWait,
-    InvalidTransition, RiskSummary, WaitDecision,
-};
-
-pub use card_text::{
-    assert_no_raw_agent_surface, humanise_agent_message, humanise_card, humanise_risk_summary,
-    register_agent_templates, AgentMessage, RawAgentString, RenderCtx, RenderedCard,
-    AGENT_PLATFORM_DEFAULT_TEMPLATES,
-};
-
-pub use hitl_batch::{
-    per_effect_idem_key, run_batch_hitl_loop, ApplyLedger, BatchApprovalCard, BatchGatedEffect,
-    BatchHitlWait, BatchOutcome, DecisionScript, EffectOutcome,
-};
 
 pub use tool_scope::{
     apply_scope_to_conversation, assert_apply_rechecks_revoked, build_scoped_tool_list,

@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod authority;
 pub mod block_tree;
 pub mod collab;

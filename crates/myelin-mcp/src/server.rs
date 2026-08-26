@@ -669,10 +669,9 @@ mod tests {
             .unwrap();
         let response: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["error"]["code"], json!(INVALID_PARAMS));
-        assert!(response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("field `number` must be of type `integer`"));
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("do not match input schema"), "{message}");
+        assert!(message.contains("/number"), "{message}");
     }
 
     #[test]

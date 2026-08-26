@@ -1,14 +1,8 @@
-use myelin_agent::{
-    BudgetView, ProposedEffect, StepOutcome, Submission, SystemContext, ToolCall, ToolCallId,
-    ToolDef, ToolName, ToolSchema, ToolSurface,
-};
+use myelin_agent::{ToolDef, ToolSurface};
 use myelin_issues::rebac_fragment::object_types as issue_objects;
 
 use crate::defaults::{cap, mutate_tool_def, register_tool_defs, LooseningViolation};
-use crate::dry_run::proposed_effect_sequence;
-use crate::effect_api::{EffectCost, PlannedEffect};
 use crate::issues_tools::{issues_tool_defs, ISSUES_SUBSYSTEM, ISSUES_TOOL_VERSION};
-use crate::mock::{MockAgentRuntime, MockScript};
 
 pub const CREATE_TOOL: &str = "create";
 pub const UPDATE_TOOL: &str = "update";
@@ -148,122 +142,11 @@ pub fn register_full_issues_tools<S: ToolSurface>(
     register_tool_defs(surface, full_issues_tool_defs())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ForecastInput {
-    pub remaining: u64,
-    pub velocity_per_period: u64,
-    pub at_risk_threshold_periods: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ForecastOutput {
-    pub periods_to_completion: Option<u64>,
-    pub at_risk: bool,
-}
-
-pub struct LinearForecast;
-
-impl LinearForecast {
-    pub fn forecast(input: &ForecastInput) -> ForecastOutput {
-        let periods = if input.velocity_per_period == 0 {
-            None
-        } else {
-            Some(input.remaining.div_ceil(input.velocity_per_period))
-        };
-        let at_risk = match periods {
-            Some(p) => p > input.at_risk_threshold_periods,
-            None => true,
-        };
-        ForecastOutput {
-            periods_to_completion: periods,
-            at_risk,
-        }
-    }
-}
-
-pub fn mock_forecast_agent(input: &ForecastInput) -> MockAgentRuntime {
-    let out = LinearForecast::forecast(input);
-    let summary = match out.periods_to_completion {
-        Some(p) => format!(
-            "forecast(linear): ~{p} period(s) to completion (remaining={}, velocity={}/period); at_risk={}",
-            input.remaining, input.velocity_per_period, out.at_risk
-        ),
-        None => format!(
-            "forecast(linear): no defensible date (velocity=0, remaining={}); at_risk=true",
-            input.remaining
-        ),
-    };
-    MockAgentRuntime::new(MockScript::submit_only(
-        "issues.forecast agent (mock, linear; labelled as an agent)",
-        summary,
-    ))
-}
-
-pub fn mock_triage_agent(issue_ref: &str) -> MockAgentRuntime {
-    let triage_tool = crate::issues_tools::TRIAGE_TOOL;
-    let script = MockScript::new(
-        SystemContext("issues.triage agent (mock; labelled as an agent)".into()),
-        vec![ToolSchema {
-            name: ToolName(triage_tool.to_string()),
-            description: String::new(),
-            input_schema: "{}".into(),
-        }],
-        BudgetView(0),
-        vec![
-            StepOutcome::UseTools(vec![ToolCall {
-                id: ToolCallId(format!("call:{triage_tool}")),
-                name: ToolName(triage_tool.to_string()),
-                arguments: serde_json::Value::Null,
-            }]),
-            StepOutcome::Submit(Submission(format!(
-                "triage(suggestion strip): proposed triage for {issue_ref} (S9 - the human accepts)"
-            ))),
-        ],
-    );
-    MockAgentRuntime::new(script)
-}
-
-pub fn triage_effect_for(name: &ToolName, issue_ref: &str) -> Option<PlannedEffect> {
-    if name.0 == crate::issues_tools::TRIAGE_TOOL {
-        Some(PlannedEffect {
-            tool: name.clone(),
-            object: myelin_tenancy::ArtifactRef(format!("myelin://acme/issue/issue/{issue_ref}")),
-            input_json: format!(r#"{{"issue":"{issue_ref}","priority":"high"}}"#),
-            field: None,
-            transition: None,
-            cost: EffectCost {
-                unit: "issue.transition",
-                wholesale: 1,
-                markup: 0,
-            },
-        })
-    } else {
-        None
-    }
-}
-
-pub fn triage_suggestion_strip(issue_ref: &str) -> Vec<ProposedEffect> {
-    let brain = mock_triage_agent(issue_ref);
-    let script = brain.script().clone();
-    proposed_effect_sequence(
-        &brain,
-        &script,
-        &|name: &ToolName| triage_effect_for(name, issue_ref),
-        crate::mock::MOCK_MAX_STEPS,
-    )
-}
-
-pub fn replay_forecast_agent(input: &ForecastInput) -> crate::mock::ReplayRecord {
-    let brain = mock_forecast_agent(input);
-    let script = brain.script().clone();
-    crate::mock::replay_bounded(&brain, &script, crate::mock::MOCK_MAX_STEPS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::defaults::{assert_no_silent_loosening, requires_approval_default};
-    use myelin_agent::EffectKind;
+    use myelin_agent::{EffectKind, ToolName};
 
     struct Catalogue {
         defs: Vec<ToolDef>,
@@ -423,78 +306,5 @@ mod tests {
         assert_eq!(err.subsystem, "issues");
         assert_eq!(err.tool, "close");
         assert!(err.to_string().contains("WITHOUT a written deviation"));
-    }
-
-    #[test]
-    fn linear_forecast_is_ceil_remaining_over_velocity() {
-        let f = LinearForecast::forecast(&ForecastInput {
-            remaining: 100,
-            velocity_per_period: 10,
-            at_risk_threshold_periods: 12,
-        });
-        assert_eq!(f.periods_to_completion, Some(10));
-        assert!(!f.at_risk, "10 ≤ 12 → not at-risk");
-
-        let f2 = LinearForecast::forecast(&ForecastInput {
-            remaining: 101,
-            velocity_per_period: 10,
-            at_risk_threshold_periods: 10,
-        });
-        assert_eq!(
-            f2.periods_to_completion,
-            Some(11),
-            "a partial period rounds up"
-        );
-        assert!(f2.at_risk, "11 > 10 → at-risk");
-
-        let f3 = LinearForecast::forecast(&ForecastInput {
-            remaining: 50,
-            velocity_per_period: 0,
-            at_risk_threshold_periods: 5,
-        });
-        assert_eq!(
-            f3.periods_to_completion, None,
-            "velocity 0 → no defensible date"
-        );
-        assert!(f3.at_risk, "no velocity → at-risk (the worst case)");
-    }
-
-    #[test]
-    fn ag_d9_forecast_agent_replay_is_byte_identical() {
-        let input = ForecastInput {
-            remaining: 100,
-            velocity_per_period: 10,
-            at_risk_threshold_periods: 12,
-        };
-        let a = replay_forecast_agent(&input);
-        let b = replay_forecast_agent(&input);
-        assert_eq!(a, b, "AG-D9: two forecast-agent replays are byte-identical");
-        assert!(
-            a.terminated,
-            "the forecast agent terminates (a single Submit)"
-        );
-        let s = a.submission.expect("the forecast agent submits");
-        assert!(
-            s.0.contains("forecast(linear): ~10 period(s)"),
-            "the submission carries the linear forecast: {}",
-            s.0
-        );
-    }
-
-    #[test]
-    fn ag_d9_triage_suggestion_strip_is_byte_identical_and_proposes_one_effect() {
-        let a = triage_suggestion_strip("ENG-42");
-        let b = triage_suggestion_strip("ENG-42");
-        assert_eq!(
-            a, b,
-            "AG-D9: two triage dry-run strips are byte-identical (effect-sequence determinism)"
-        );
-        assert_eq!(a.len(), 1, "the triage agent proposes one advisory effect");
-        let carrier = &a[0].0;
-        assert!(
-            carrier.contains("tool=triage"),
-            "the proposed effect is triage: {carrier}"
-        );
-        assert!(carrier.contains("ENG-42"), "for the named issue: {carrier}");
     }
 }

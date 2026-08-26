@@ -4,6 +4,39 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — An advertised tool schema is an enforced product boundary
+
+A caller-graph audit of Agent Service's old plan/apply and HITL surfaces found a complete parallel
+product: bespoke effect carriers, capability and delegation traits, in-memory budgets, single and
+batch approval loops, card rendering, dry runs, and a second Knowledge agent/gate model. Production
+called none of it. Eleven Agent Service drills and two Knowledge contract tests assembled those
+copies themselves, while real agent work already flows from Agent Host through MCP governance into
+PostgreSQL-backed Storage. Cross-copy parity tests made the duplication look intentional without
+testing a user path.
+
+The parallel implementation and its tests are gone. Agent Service's 1,845-line `effect_api` module
+is now the small argument-validation boundary production actually calls, and the coverage registry
+points only at surviving artifacts. Tool definitions and the shared catalogue remain; durable MCP
+governance remains the one place that authorizes, gates, applies, audits, and consumes approval.
+
+That smaller boundary exposed a real bug: MCP advertised closed objects, regex patterns, string
+lengths, numeric ranges, and enums but enforced only required fields and primitive types. It now
+executes the complete Draft 2020-12 schema with a linear-time regex engine and no HTTP or file
+resolver features. The live CLI journey proves unknown fields, empty titles, malformed canonical
+references, and over-limit pages are all JSON-RPC invalid-parameter errors before authorization or
+mutation.
+
+The new standards validator changed the workspace lockfile, so the offline gVisor Cargo vendor
+asset was rebuilt and its lock and canonical-tree identities were intentionally repinned. No
+verify-to-use boundary was weakened for the dependency change.
+
+**Proof:** all 160 Agent Service library stories and its surviving integration suite; all 347
+Knowledge library stories; all 32 MCP library stories; strict all-target/all-feature Clippy across
+the three affected crates; the real 99-row coverage registry; all 18 runner-asset verification
+stories; workspace-wide all-target compilation; TypeScript type checking; and the complete
+sixteen-stage CLI organization journey against the running PostgreSQL-backed stack (48.13 seconds).
+Net removal: 9,179 lines.
+
 ## 2026-08-26 — One durable HITL path owns governance
 
 Agent Service exported a second adapter from its in-memory approval model into Storage's durable

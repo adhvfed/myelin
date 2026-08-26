@@ -582,10 +582,8 @@ title = "ToolSurface::register_tool(ToolDef)"
 status = "covered"
 cdc = [
     "crates/myelin-agent/tests/cdc_8_1_tool_surface.rs",
-    "crates/myelin-knowledge/tests/cdc_8_1_knowledge_agent_tools.rs",
     "crates/myelin-agent-service/tests/cdc_8_1_ci_x6_tooldefs.rs",
     "crates/myelin-mcp/tests/cdc_8_1_ci_read_projection.rs",
-    "crates/myelin-agent-service/tests/drills_iss_p23_issues_tools_and_agents.rs",
     "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
 ]
 
@@ -595,7 +593,6 @@ title = "EffectApi::apply (plan-then-apply)"
 status = "covered"
 cdc = [
     "crates/myelin-agent/tests/cdc_8_2_effect_api.rs",
-    "crates/myelin-knowledge/tests/cdc_8_2_knowledge_agent_governance.rs",
     "crates/myelin-chat/tests/cdc_8_1_8_2_8_7_11_7_chat_tools.rs",
 ]
 
@@ -642,7 +639,6 @@ row = "8.8"
 title = "AG-7 agent trace"
 status = "covered"
 cdc = [
-    "crates/myelin-agent-service/tests/drills_ag_p19_knowledge_tools.rs",
     "crates/myelin-agent-host/tests/integration_agent_host_activity.rs",
     "crates/myelin-storage/tests/integration_agent_trace_erasure.rs",
 ]

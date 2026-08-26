@@ -979,6 +979,41 @@ describe.sequential("the CLI authentication journey", () => {
       additionalProperties: false,
     });
 
+    // Discovery is a promise, not documentation theatre. Calls that violate the advertised
+    // closed-object, length, pattern, or numeric-bound rules stop at MCP validation and never
+    // reach authorization, approval, or a product mutation.
+    const schemaFixtureProjectRef =
+      `myelin://${systemTestConfig.tenant}/identity/project/00000000-0000-4000-8000-000000000000`;
+    for (const [id, name, arguments_] of [
+      [3, "issues.create", { project_ref: schemaFixtureProjectRef, title: "Valid", surprise: true }],
+      [4, "issues.create", { project_ref: schemaFixtureProjectRef, title: "" }],
+      [5, "issues.create", { project_ref: "project-id-instead-of-a-ref", title: "Valid" }],
+      [6, "issues.list", { limit: 101 }],
+    ] as const) {
+      const refused = await systemClient.json(`/v1/agent-runs/${running.run.id}/mcp`, {
+        method: "POST",
+        body: {
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name, arguments: arguments_ },
+        },
+        token: running.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 200,
+      });
+      expect(refused.body).toMatchObject({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: -32602,
+        },
+      });
+      expect(string(record(refused.body.error, "MCP schema error").message, "schema error")).toContain(
+        "do not match input schema",
+      );
+    }
+
     // Finishing work destroys that transient identity as one durable operation. The run can be
     // inspected as closed, while its bearer material becomes useless immediately.
     const closeRun = await systemClient.json(`/v1/agent-runs/${running.run.id}/close`, {
