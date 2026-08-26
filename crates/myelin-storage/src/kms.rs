@@ -1207,8 +1207,6 @@ impl KmsAdapter for KmsEngine {
     }
 }
 
-pub use crate::kms_failstatic::{KmsReadError, KmsReadPath, KmsReadResult, KmsReadiness};
-
 #[cfg(test)]
 mod tests {
     use super::*;

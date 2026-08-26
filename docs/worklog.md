@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — An unwired KMS model no longer certifies production resilience
+
+Storage exported a second KMS read path with its own clock, resolved-key cache, fail-static
+ladder, signals, and outage drill. No production caller constructed it. Every real encryption
+boundary continued to use `KmsEngine` directly, while the drill injected failure into a private
+adapter and declared sixteen synthetic reads resilient. The model even contained the same
+wall-clock rollback defect fixed in the live authorization caches, but repairing it would only
+have strengthened a claim the running product did not earn.
+
+The unused read path, duplicate clock vocabulary, public re-exports, and self-contained outage
+drill are removed. The actual KMS engine, durable key hierarchy, encryption boundaries, erasure
+paths, and their tests remain. Future remote-KMS resilience must wrap the `KmsAdapter` used by
+real product reads and be proven through Edge, not through a parallel test-only stack.
+
+**Proof:** no remaining workspace reference to the removed surface; all 424 Storage library
+stories; strict all-target/all-feature Storage Clippy; rebuilt healthy Edge; and both live
+TypeScript privacy journeys against PostgreSQL, covering certified agent-data erasure, blocked
+reprocessing, private-room preservation, authored Chat erasure, and the retained right to speak
+again (5.69 seconds). Net removal: 662 lines.
+
 ## 2026-08-26 — Search cache failures neither extend visibility nor retain queries
 
 Search's authorization-filter and ranked-result caches measured age with wall time and

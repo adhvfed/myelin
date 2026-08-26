@@ -21,7 +21,6 @@ pub mod firehose_archive;
 pub mod gitpack;
 pub mod key_origin;
 pub mod kms;
-pub mod kms_failstatic;
 pub mod migration;
 pub mod migration_under_load;
 pub mod mirror;
@@ -138,9 +137,6 @@ pub use kms::{
     CellRoot, DekHandle, DekId, ExportedKek, KekId, KeyClass, KmsAdapter, KmsDurableSnapshot,
     KmsEngine, KmsError, PiiKeyRef, SealKey, SealKeyError, SealedRoot, SubjectKeyScope, WrappedDek,
     KEY_LEN, NONCE_LEN,
-};
-pub use kms_failstatic::{
-    KmsFailStaticSignals, KmsReadError, KmsReadPath, KmsReadResult, KmsReadiness,
 };
 pub use migration::{
     is_blocking_alter, is_destructive, HotTables, Migration, MigrationError, MigrationPhase,
