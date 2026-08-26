@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — authored Chat erasure survives a real database restore
+
+Chat re-erasure was production-wired but its restore test rebuilt the expected rows by hand. That
+proved holder selection and idempotency, not that a real PostgreSQL backup could resurrect the
+encrypted body and key material or that the shipped restore path would remove them again.
+
+The new integration story takes a custom-format backup containing two people's encrypted messages,
+erases one person through the production holder, and restores the pre-erasure database. It first
+proves the old private body is decryptable again—the drill has teeth—then drives the live ledger
+through the production restore holder. The old body becomes unrecoverable and its row a tombstone,
+the neighboring person's message remains readable, and a response-lost replay preserves new Chat
+history the erased person deliberately authored after recovery. This keeps Chat-history erasure
+narrow without weakening restore safety.
+
+**Proof:** strict all-target/all-feature Chat clippy; all 275 Chat library stories; all six existing
+real-PostgreSQL durable Chat erasure cases (1.91 seconds); the new real `pg_dump`/`pg_restore` story
+(37.82 seconds); and both live TypeScript privacy journeys, including the right to speak again after
+authored-history erasure (5.09 seconds).
+
 ## 2026-08-26 — a poison batch cannot strand healthy events
 
 `drain_to_empty` stopped whenever a pass published or deduplicated nothing. Moving a poison event
@@ -2157,9 +2176,9 @@ contract tests, and warning-free strict Chat/Edge Clippy.
    agent-data and authored-Chat-message erasers write separate post-PIT ledger
    scopes. the maintenance command replays both through their production
    holders before a restored cell can reopen. agent data is drilled against a
-   real dump; Chat is drilled against restored-holder conditions in real
-   PostgreSQL. remaining: add the full dump/restore Chat drill, then bring Issues
-   and Git onto the ledger before exposing either through privacy requests.
+   real dump; Chat now has the same real `pg_dump`/`pg_restore` proof, including
+   a deliberately resurrected decryptable body. remaining: bring Issues and Git
+   onto the ledger before exposing either through privacy requests.
 2. **DSR has two truthful product slices, not full holder coverage.** durable
    submit/status/certificate is wired for `agent_data` and `chat_messages`, with
    holder-specific proofs and black-box user journeys. the Chat scope means only
