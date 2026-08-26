@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use myelin_identity::{Consistency, ListObjectsResult, ObjectType, Principal};
 use myelin_storage::{DekHandle, KmsError, PiiKeyRef};
-use myelin_substrate::{Clock, Seconds, SystemClock};
+use myelin_substrate::{Clock, MonotonicClock, Seconds};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::consistency::fail_static_bypass;
@@ -84,6 +84,14 @@ struct SealedEntry {
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
     cached_at_secs: u64,
+}
+
+impl SealedEntry {
+    fn is_fresh_at(&self, now_secs: u64, ttl_secs: Seconds) -> bool {
+        now_secs
+            .checked_sub(self.cached_at_secs)
+            .is_some_and(|age| age <= ttl_secs)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -175,7 +183,7 @@ pub struct FilterCache {
 
 impl FilterCache {
     pub fn new(ttl: CacheTtl, dek: SearchDekPin) -> FilterCache {
-        FilterCache::with_clock(ttl, dek, Box::new(SystemClock))
+        FilterCache::with_clock(ttl, dek, Box::new(MonotonicClock::default()))
     }
 
     pub fn with_clock(ttl: CacheTtl, dek: SearchDekPin, clock: Box<dyn Clock>) -> FilterCache {
@@ -262,8 +270,7 @@ impl FilterCache {
         let Some(entry) = entries.get(key) else {
             return Ok(None);
         };
-        let age = self.clock.now_secs().saturating_sub(entry.cached_at_secs);
-        if age > self.ttl.secs() {
+        if !entry.is_fresh_at(self.clock.now_secs(), self.ttl.secs()) {
             entries.remove(key);
             self.stats.record_expired();
             return Ok(None);
@@ -296,8 +303,7 @@ impl FilterCache {
         let Some(entry) = entries.get(&key) else {
             return Ok(false);
         };
-        let age = self.clock.now_secs().saturating_sub(entry.cached_at_secs);
-        if age > self.ttl.secs() {
+        if !entry.is_fresh_at(self.clock.now_secs(), self.ttl.secs()) {
             return Ok(false);
         }
         Ok(open_under_dek(&self.dek, key_ref, region, entry)?.is_some())
@@ -319,13 +325,13 @@ pub struct ResultCache {
     dek: SearchDekPin,
     clock: Box<dyn Clock>,
     entries: Mutex<HashMap<ResultKey, SealedEntry>>,
-    inflight: Mutex<HashMap<ResultKey, std::sync::Arc<Mutex<()>>>>,
+    inflight: Mutex<HashMap<ResultKey, Arc<Mutex<()>>>>,
     stats: CacheStats,
 }
 
 impl ResultCache {
     pub fn new(ttl: CacheTtl, dek: SearchDekPin) -> ResultCache {
-        ResultCache::with_clock(ttl, dek, Box::new(SystemClock))
+        ResultCache::with_clock(ttl, dek, Box::new(MonotonicClock::default()))
     }
 
     pub fn with_clock(ttl: CacheTtl, dek: SearchDekPin, clock: Box<dyn Clock>) -> ResultCache {
@@ -382,17 +388,8 @@ impl ResultCache {
             return Ok(decode_results(&plaintext));
         }
 
-        let gate = {
-            let mut inflight = self
-                .inflight
-                .lock()
-                .expect("result cache inflight poisoned");
-            inflight
-                .entry(key.clone())
-                .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _held = gate.lock().expect("result cache coalesce gate poisoned");
+        let computation = CoalescedComputation::join(&self.inflight, key.clone());
+        let _held = computation.wait();
 
         if let Some(plaintext) = self.try_read(&key, region, key_ref)? {
             self.stats.record_coalesced();
@@ -414,10 +411,6 @@ impl ResultCache {
             },
         );
 
-        self.inflight
-            .lock()
-            .expect("result cache inflight poisoned")
-            .remove(&key);
         Ok(results)
     }
 
@@ -431,8 +424,7 @@ impl ResultCache {
         let Some(entry) = entries.get(key) else {
             return Ok(None);
         };
-        let age = self.clock.now_secs().saturating_sub(entry.cached_at_secs);
-        if age > self.ttl.secs() {
+        if !entry.is_fresh_at(self.clock.now_secs(), self.ttl.secs()) {
             entries.remove(key);
             self.stats.record_expired();
             return Ok(None);
@@ -465,11 +457,53 @@ impl ResultCache {
         let Some(entry) = entries.get(&key) else {
             return Ok(false);
         };
-        let age = self.clock.now_secs().saturating_sub(entry.cached_at_secs);
-        if age > self.ttl.secs() {
+        if !entry.is_fresh_at(self.clock.now_secs(), self.ttl.secs()) {
             return Ok(false);
         }
         Ok(open_under_dek(&self.dek, key_ref, region, entry)?.is_some())
+    }
+}
+
+struct CoalescedComputation<'a> {
+    registry: &'a Mutex<HashMap<ResultKey, Arc<Mutex<()>>>>,
+    key: ResultKey,
+    gate: Arc<Mutex<()>>,
+}
+
+impl<'a> CoalescedComputation<'a> {
+    fn join(registry: &'a Mutex<HashMap<ResultKey, Arc<Mutex<()>>>>, key: ResultKey) -> Self {
+        let gate = registry
+            .lock()
+            .expect("result cache inflight poisoned")
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        Self {
+            registry,
+            key,
+            gate,
+        }
+    }
+
+    fn wait(&self) -> MutexGuard<'_, ()> {
+        self.gate
+            .lock()
+            .expect("result cache coalesce gate poisoned")
+    }
+}
+
+impl Drop for CoalescedComputation<'_> {
+    fn drop(&mut self) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let joined_gate_is_current = registry
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.gate));
+        if joined_gate_is_current {
+            registry.remove(&self.key);
+        }
     }
 }
 
@@ -810,6 +844,50 @@ mod tests {
     }
 
     #[test]
+    fn s5_clock_rollback_expires_visibility_instead_of_extending_it() {
+        let (pin, key_ref) = pin_with_dek();
+        let clock = Arc::new(TestClock::at(1_000));
+        let cache = FilterCache::with_clock(
+            CacheTtl::bounded(60, 300).unwrap(),
+            pin,
+            Box::new(SharedClock(clock.clone())),
+        );
+        let at = bounded("z@5");
+
+        cache
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &at,
+                &key_ref,
+                || ids_result(&["previously-visible"], "z@5"),
+            )
+            .unwrap();
+        clock.set(999);
+
+        let refreshed = cache
+            .get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                &ty(),
+                &at,
+                &key_ref,
+                || ids_result(&["visible-now"], "z@5"),
+            )
+            .unwrap();
+
+        assert_eq!(refreshed, ids_result(&["visible-now"], "z@5"));
+        assert_eq!(
+            cache.stats().expired(),
+            1,
+            "an impossible cache timeline is observable as expiry"
+        );
+    }
+
+    #[test]
     fn s5_dek_destroy_renders_cache_unrecoverable() {
         let (pin, key_ref) = pin_with_dek();
         let cache = FilterCache::new(CacheTtl::bounded(60, 300).unwrap(), pin.clone());
@@ -928,6 +1006,63 @@ mod tests {
         assert_eq!(r1, r2);
         assert_eq!(computed.load(Ordering::SeqCst), 1, "the engine ran once");
         assert_eq!(cache.stats().hits(), 1);
+    }
+
+    #[test]
+    fn result_clock_rollback_recomputes_instead_of_serving_old_hits() {
+        let (pin, key_ref) = pin_with_dek();
+        let clock = Arc::new(TestClock::at(1_000));
+        let cache = ResultCache::with_clock(
+            CacheTtl::bounded(60, 300).unwrap(),
+            pin,
+            Box::new(SharedClock(clock.clone())),
+        );
+        let at = bounded("z@5");
+
+        cache
+            .get_or_compute(&tenant(), &region(), &subject(), 7, &at, &key_ref, || {
+                ranked(&[("previously-visible", 1.0)], "z@5")
+            })
+            .unwrap();
+        clock.set(999);
+
+        let refreshed = cache
+            .get_or_compute(&tenant(), &region(), &subject(), 7, &at, &key_ref, || {
+                ranked(&[("visible-now", 1.0)], "z@5")
+            })
+            .unwrap();
+
+        assert_eq!(refreshed, ranked(&[("visible-now", 1.0)], "z@5"));
+        assert_eq!(cache.stats().expired(), 1);
+    }
+
+    #[test]
+    fn failed_result_seals_release_every_inflight_query() {
+        let (pin, key_ref) = pin_with_dek();
+        let cache = ResultCache::new(CacheTtl::bounded(60, 300).unwrap(), pin.clone());
+        assert!(pin.destroy_tenant_index_dek(&tenant(), &region()).unwrap());
+
+        for query_hash in 0..32 {
+            let result = cache.get_or_compute(
+                &tenant(),
+                &region(),
+                &subject(),
+                query_hash,
+                &bounded("z@5"),
+                &key_ref,
+                || ranked(&[("cannot-be-sealed", 1.0)], "z@5"),
+            );
+            assert!(result.is_err(), "a shredded cache DEK fails loudly");
+        }
+
+        assert!(
+            cache
+                .inflight
+                .lock()
+                .expect("result cache inflight poisoned")
+                .is_empty(),
+            "failed user queries must not accumulate permanent coalescing entries"
+        );
     }
 
     #[test]

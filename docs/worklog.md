@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Search cache failures neither extend visibility nor retain queries
+
+Search's authorization-filter and ranked-result caches measured age with wall time and
+`saturating_sub`. A clock rollback therefore made an old visibility decision or result page look
+new again. The result cache had a second failure-path leak: it removed per-query coalescing state
+only after a successful DEK seal. During KMS failure or crypto-shred, each distinct user query left
+a permanent map entry.
+
+Both caches now use the process-local monotonic clock and one checked freshness rule; an injected
+rollback expires and recomputes rather than extending old visibility. Result coalescing is owned
+by a scoped guard which removes only its own gate on every exit path, including sealing errors and
+unwind, while preserving the successful single-computation behavior for concurrent readers.
+
+**Proof:** rollback stories for both filter and result caches; 32 distinct failed-seal queries
+leaving zero in-flight entries; all 17 focused cache stories and all 340 Search library stories;
+strict all-target/all-feature Search Clippy; rebuilt healthy Edge; and six live TypeScript code
+search journeys against PostgreSQL and stock Git covering exact coordinates, unauthorized
+viewers, default-branch movement, feature isolation, merge visibility, and deletion (4.42 seconds).
+
 ## 2026-08-26 — Cached authority ages only while the process moves forward
 
 Fail-static authorization measured cache age with Unix wall time and `saturating_sub`. If the
