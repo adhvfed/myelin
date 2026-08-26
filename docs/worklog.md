@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — A runner identity is either unpredictable or unavailable
+
+The user-namespace allocator used kernel randomness for its lease nonce but treated its
+runner-instance identity differently: if `/dev/urandom` could not be opened or read, it silently
+fell back to a process ID and process-local counter. That value participates in deciding whether
+an existing namespace lease belongs to this runner. The fallback was predictable, could repeat
+after a process restart and PID reuse, and made an entropy failure look like a valid security
+identity.
+
+Runner identity creation now has the same fail-closed boundary as lease nonce creation. A complete
+128-bit kernel entropy read is required before allocator construction; an unavailable or short
+source produces a named `EntropyUnavailable` allocator error, and that result is retained for the
+life of the process rather than recovering later under a different identity. The entropy reader is
+small and injectable, so the regression story proves both a complete read and refusal of a
+15-byte source without inspecting implementation text.
+
+**Proof:** the focused entropy regression; 593 ordinary sandbox stories with 49 explicitly
+privileged-host cases skipped; strict all-target/all-feature sandbox Clippy; and the live
+TypeScript private-agent workspace journey, which bounded timed-out and overproducing commands,
+rejected a conflicting idempotent retry, and then read durable workspace state successfully (4.32
+seconds). The all-feature privileged-host lane also refused to pretend this desktop is suitable:
+its cgroup delegates memory and process controllers but not CPU.
+
 ## 2026-08-26 — A store name is not a privacy capability
 
 Substrate's `HolderRegistry` appeared to implement the deferred automatic

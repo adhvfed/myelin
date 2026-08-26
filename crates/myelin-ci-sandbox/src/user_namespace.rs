@@ -5,7 +5,6 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -220,22 +219,29 @@ pub struct RunnerInstanceId(u128);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseNonce(u128);
 
-fn random_u128() -> io::Result<u128> {
+fn random_u128_from(mut entropy: impl io::Read) -> io::Result<u128> {
     let mut bytes = [0u8; 16];
-    let mut file = std::fs::File::open("/dev/urandom")?;
-    io::Read::read_exact(&mut file, &mut bytes)?;
+    entropy.read_exact(&mut bytes)?;
     Ok(u128::from_le_bytes(bytes))
 }
 
-fn runner_instance_id() -> RunnerInstanceId {
-    static CACHED: OnceLock<RunnerInstanceId> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        RunnerInstanceId(random_u128().unwrap_or_else(|_| {
-            static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
-            (std::process::id() as u128) << 64
-                | FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed) as u128
-        }))
-    })
+fn random_u128() -> io::Result<u128> {
+    random_u128_from(std::fs::File::open("/dev/urandom")?)
+}
+
+fn runner_instance_id_from(entropy: impl io::Read) -> io::Result<RunnerInstanceId> {
+    random_u128_from(entropy).map(RunnerInstanceId)
+}
+
+fn runner_instance_id() -> Result<RunnerInstanceId, String> {
+    static CACHED: OnceLock<Result<RunnerInstanceId, String>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let entropy = std::fs::File::open("/dev/urandom")
+                .map_err(|error| format!("open /dev/urandom: {error}"))?;
+            runner_instance_id_from(entropy).map_err(|error| format!("read /dev/urandom: {error}"))
+        })
+        .clone()
 }
 
 const LEASE_MARKER_SCHEMA_V1: u32 = 1;
@@ -355,6 +361,7 @@ pub enum UserNamespaceAllocatorError {
     UnsafeLeasesDir { leases_dir: PathBuf, reason: String },
     CorruptLeaseMarker { path: PathBuf, reason: String },
     PrivilegedRunner { euid: u32, egid: u32 },
+    EntropyUnavailable { reason: String },
     PoolTooSmall { pool_size: u32, required: u32 },
 }
 
@@ -393,6 +400,10 @@ impl std::fmt::Display for UserNamespaceAllocatorError {
                 "this process's own euid={euid}/egid={egid} must not be 0 (root) - refusing to \
                  start an allocator whose container-namespace-root mapping would resolve to host \
                  root"
+            ),
+            UserNamespaceAllocatorError::EntropyUnavailable { reason } => write!(
+                f,
+                "kernel entropy is unavailable for the runner-instance identity: {reason}"
             ),
             UserNamespaceAllocatorError::PoolTooSmall {
                 pool_size,
@@ -1812,6 +1823,8 @@ impl UserNamespaceAllocator {
                 egid: runner_gid,
             });
         }
+        let runner_instance_id = runner_instance_id()
+            .map_err(|reason| UserNamespaceAllocatorError::EntropyUnavailable { reason })?;
         let username = effective_username();
         let uid_range = parse_subordinate_range(
             subuid_path,
@@ -2105,7 +2118,7 @@ impl UserNamespaceAllocator {
             gid_start: gid_range.start,
             runner_uid,
             runner_gid,
-            runner_instance_id: runner_instance_id(),
+            runner_instance_id,
             shared,
         })
     }
@@ -2304,6 +2317,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn runner_instance_identity_requires_a_complete_entropy_read() {
+        let bytes: Vec<u8> = (0..16).collect();
+        let identity = runner_instance_id_from(std::io::Cursor::new(bytes.clone()))
+            .expect("sixteen entropy bytes mint an instance identity");
+        assert_eq!(
+            identity,
+            RunnerInstanceId(u128::from_le_bytes(bytes.try_into().unwrap()))
+        );
+
+        let error = runner_instance_id_from(std::io::Cursor::new([0_u8; 15]))
+            .expect_err("a short entropy read must never mint a predictable identity");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
 
     fn unique_suffix() -> u64 {
         static NEXT: AtomicU64 = AtomicU64::new(0);
