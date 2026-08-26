@@ -509,6 +509,9 @@ fn map_store_error(error: IssueStoreError) -> EdgeError {
         IssueStoreError::AuthorizationUnavailable(_) => {
             EdgeError::Unavailable("issue authorization is temporarily unavailable".into())
         }
+        IssueStoreError::Clock(_) => {
+            EdgeError::Unavailable("issue clock is temporarily unavailable".into())
+        }
         IssueStoreError::Storage(reason) | IssueStoreError::Crypto(reason) => {
             EdgeError::Internal(reason)
         }
@@ -1078,6 +1081,13 @@ mod tests {
             "issue authorization is temporarily unavailable"
         );
         assert!(!unavailable.envelope().to_string().contains("revision"));
+        let clock = map_store_error(IssueStoreError::Clock(
+            myelin_events::clock::ClockError::BeforeUnixEpoch,
+        ));
+        assert_eq!(
+            clock.client_message(),
+            "issue clock is temporarily unavailable"
+        );
         let internal = map_store_error(IssueStoreError::Storage(
             "postgres secret relation customer@example.test".into(),
         ));

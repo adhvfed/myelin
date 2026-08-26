@@ -2,21 +2,16 @@ use crate::api::{
     decode_issue_page_cursor, encode_issue_page_cursor, normalize_issue_key_prefix, IssueListState,
 };
 use crate::dek::{decrypt_free_text, encrypt_free_text, IssueFreeText};
-use crate::events::{
-    ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED, RELATION_CREATED, RELATION_REMOVED,
-};
+use crate::events::{RELATION_CREATED, RELATION_REMOVED};
 use crate::pseudonym::IssueActorKind;
 use crate::refs_glue::{issue_root_ref, IssueLifecycleRel, REFS_EDGE_CREATED};
-use myelin_events::{
-    derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
-    EventId, EventType, IdMinter, Timestamp, UlidMinter, Visibility,
-};
+use myelin_events::clock::{system_clock_reading, ClockError, ClockReading};
+use myelin_events::{EventEnvelope, EventId, IdMinter, UlidMinter};
 use myelin_identity::{ColRef, Principal, PrincipalKind, RelName, SetExpr, Zookie};
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
 use myelin_storage::kms::{KmsEngine, PiiKeyRef, NONCE_LEN};
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{SubstrateProvider, TenantScope};
-use myelin_tenancy::ArtifactRef;
 use sqlx::types::Uuid;
 use sqlx::Row;
 use std::future::Future;
@@ -24,10 +19,16 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 mod create_idempotency;
+mod event_envelopes;
 mod import_creation;
 mod visibility_projection;
 
 use create_idempotency::{CreateClaim, CreateIdentity};
+use event_envelopes::{
+    authorization_requested as authorization_request_envelope,
+    issue_closed as issue_closed_envelope, issue_created as issue_created_envelope,
+    issue_relation as issue_relation_envelope, validate_authorization_request,
+};
 use import_creation::{ImportClaim, ImportIdentity};
 pub use import_creation::{ImportIssue, ImportIssueReceipt};
 pub use visibility_projection::{
@@ -332,6 +333,7 @@ pub enum IssueStoreError {
     Conflict(String),
     NotFound,
     AuthorizationUnavailable(String),
+    Clock(ClockError),
     Storage(String),
     Crypto(String),
 }
@@ -345,6 +347,7 @@ impl core::fmt::Display for IssueStoreError {
             IssueStoreError::AuthorizationUnavailable(reason) => {
                 write!(f, "issue authorization unavailable: {reason}")
             }
+            IssueStoreError::Clock(error) => write!(f, "issue clock unavailable: {error}"),
             IssueStoreError::Storage(reason) => write!(f, "durable issue store fault: {reason}"),
             IssueStoreError::Crypto(reason) => write!(f, "issue encryption fault: {reason}"),
         }
@@ -353,12 +356,15 @@ impl core::fmt::Display for IssueStoreError {
 
 impl std::error::Error for IssueStoreError {}
 
+type Clock = Arc<dyn Fn() -> Result<ClockReading, ClockError> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct PgIssueStore<A: IssueAuthorizer> {
     provider: SubstrateProvider,
     kms: Arc<KmsEngine>,
     authorizer: A,
     minter: Arc<dyn IdMinter>,
+    clock: Clock,
 }
 
 impl<A: IssueAuthorizer> PgIssueStore<A> {
@@ -377,7 +383,21 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             kms,
             authorizer,
             minter,
+            clock: Arc::new(system_clock_reading),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_clock(
+        mut self,
+        clock: impl Fn() -> Result<ClockReading, ClockError> + Send + Sync + 'static,
+    ) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    fn observed_time(&self) -> Result<ClockReading, IssueStoreError> {
+        (self.clock)().map_err(IssueStoreError::Clock)
     }
 
     fn scope(&self, principal: &Principal) -> Result<TenantScope, IssueStoreError> {
@@ -578,6 +598,8 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         {
             return Err(IssueStoreError::NotFound);
         }
+        let observed = self.observed_time()?;
+        let observed_unix = observed.unix_seconds();
 
         let tenant = actor.tenant.clone();
         let subject = SubjectId::new(title_dek_subject(actor));
@@ -613,6 +635,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             &issue_object,
             &project_userset,
             request_event_id.clone(),
+            observed.timestamp(),
         );
         let aggregate = request_envelope.aggregate.0.clone();
         let request_event_id_text = request_event_id.0.clone();
@@ -673,12 +696,12 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                            tenant_id, region, id, key, prefix, type_id, type_rank, state, \
                            state_category, reporter, project_id, rank, title, title_nonce, \
                            title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, \
-                           contains_personal_data, version\
+                           contains_personal_data, version, created_at, updated_at, state_changed_at\
                          ) \
                          SELECT $1, $2, $11, $3 || '-' || high_water::text, $3, $4, \
                            0, 'Todo', 'unstarted', NULL, $5, \
                            '0|' || lpad(high_water::text, 20, '0'), '<encrypted>', $6, $7, $8, $9, $10, \
-                           true, 1 \
+                           true, 1, to_timestamp($12), to_timestamp($12), to_timestamp($12) \
                          FROM allocated \
                          RETURNING id, key, project_id, state, state_category, title_nonce, \
                            title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, version, \
@@ -695,6 +718,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(created_by_kind)
                     .bind(key_ref)
                     .bind(issue_id)
+                    .bind(observed_unix)
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
@@ -702,8 +726,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     sqlx::query(
                         "INSERT INTO issue_authz_binding (\
                            tenant_id, region, issue_id, project_id, issue_object, project_userset, \
-                           relation, request_event_id, created_event_id, state\
-                         ) VALUES ($1, $2, $3, $4, $5, $6, 'parent_project', $7, $8, 'pending')",
+                           relation, request_event_id, created_event_id, state, created_at\
+                         ) VALUES ($1, $2, $3, $4, $5, $6, 'parent_project', $7, $8, 'pending', \
+                                   to_timestamp($9))",
                     )
                     .bind(&tenant_id)
                     .bind(&region)
@@ -713,6 +738,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(&project_userset)
                     .bind(&request_event_id_text)
                     .bind(&created_event_id_text)
+                    .bind(observed_unix)
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
@@ -858,6 +884,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                 newly_activated: false,
             });
         }
+        let observed = self.observed_time()?;
+        let activated_at_unix = observed.unix_seconds();
+        let activated_at = observed.timestamp();
 
         let zookie = match writer.ensure_parent_project(&scope, worker, &binding).await {
             Ok(zookie) if !zookie.0.trim().is_empty() => zookie,
@@ -946,12 +975,13 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         })?,
                         &zookie_for_tx,
                         &request,
+                        activated_at,
                     );
 
                     let changed = sqlx::query(
                         "UPDATE issue_authz_binding \
                          SET state = 'active', zookie = $4, attempts = attempts + 1, \
-                             last_error = NULL, activated_at = now() \
+                             last_error = NULL, activated_at = to_timestamp($5) \
                          WHERE tenant_id = $1 AND region = $2 AND issue_id = $3 \
                            AND state = 'pending'",
                     )
@@ -959,6 +989,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(&region)
                     .bind(id)
                     .bind(&zookie_for_tx.0)
+                    .bind(activated_at_unix)
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
@@ -1234,6 +1265,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         {
             return Err(IssueStoreError::NotFound);
         }
+        let observed = self.observed_time()?;
+        let observed_unix = observed.unix_seconds();
+        let observed_at = observed.timestamp();
 
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
@@ -1301,8 +1335,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let row = sqlx::query(
                         "INSERT INTO issue_relation
                             (tenant_id, region, relation_id, src_issue, dst_ref, rel,
-                             created_by, created_by_principal, created_by_kind)
-                         VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7, $8)
+                             created_by, created_by_principal, created_by_kind, created_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7, $8,
+                                 to_timestamp($9))
                          RETURNING relation_id, dst_ref, rel, created_by_kind,
                                    COALESCE(created_by_principal, created_by::text) AS created_by,
                                    created_at::text AS created_at",
@@ -1315,6 +1350,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(&relation_token)
                     .bind(&actor.principal_id.0)
                     .bind(IssueActorKind::from_principal(&actor).as_str())
+                    .bind(observed_unix)
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
@@ -1324,6 +1360,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         &record,
                         RELATION_CREATED,
                         minter.mint().into(),
+                        observed_at.clone(),
                     );
                     PgRelay::co_commit_in_tx(&mut *conn, &typed.aggregate.0, &typed).await?;
                     let projected = issue_relation_envelope(
@@ -1331,6 +1368,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         &record,
                         REFS_EDGE_CREATED,
                         minter.mint().into(),
+                        observed_at,
                     );
                     PgRelay::co_commit_in_tx(&mut *conn, &projected.aggregate.0, &projected)
                         .await?;
@@ -1425,6 +1463,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         {
             return Err(IssueStoreError::NotFound);
         }
+        let observed_at = self.observed_time()?.timestamp();
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
         let actor = principal.clone();
@@ -1478,6 +1517,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         &record,
                         RELATION_REMOVED,
                         minter.mint().into(),
+                        observed_at.clone(),
                     );
                     PgRelay::co_commit_in_tx(&mut *conn, &typed.aggregate.0, &typed).await?;
                     let projected = issue_relation_envelope(
@@ -1485,6 +1525,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         &record,
                         REFS_EDGE_REMOVED,
                         minter.mint().into(),
+                        observed_at,
                     );
                     PgRelay::co_commit_in_tx(&mut *conn, &projected.aggregate.0, &projected)
                         .await?;
@@ -1689,6 +1730,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         {
             return Err(IssueStoreError::NotFound);
         }
+        let observed = self.observed_time()?;
+        let observed_unix = observed.unix_seconds();
+        let observed_at = observed.timestamp();
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
         let actor = actor.clone();
@@ -1709,7 +1753,8 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let previous_state = current.get::<String, _>("state");
                     let row = sqlx::query(&format!(
                         "UPDATE issue SET state = 'Done', state_category = 'completed', \
-                         state_changed_at = now(), updated_at = now(), version = version + 1 \
+                         state_changed_at = to_timestamp($4), updated_at = to_timestamp($4), \
+                         version = version + 1 \
                          WHERE tenant_id = $1 AND region = $2 AND id = $3 \
                            AND EXISTS (SELECT 1 FROM issue_authz_binding b \
                                        WHERE b.tenant_id = $1 AND b.region = $2 AND b.issue_id = $3 \
@@ -1720,6 +1765,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(&tenant_id)
                     .bind(&region)
                     .bind(id)
+                    .bind(observed_unix)
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
@@ -1732,6 +1778,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         row.get::<String, _>("key").as_str(),
                         previous_state.as_str(),
                         closed_event_id,
+                        observed_at,
                     );
                     let aggregate = envelope.aggregate.0.clone();
                     PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &envelope).await?;
@@ -1788,46 +1835,6 @@ impl From<RelationRecord> for StoredIssueRelation {
             created_at: record.created_at,
         }
     }
-}
-
-fn issue_relation_envelope(
-    actor: &Principal,
-    record: &RelationRecord,
-    event_type: &str,
-    event_id: EventId,
-) -> EventEnvelope {
-    let timestamp = now_rfc3339();
-    let source = ArtifactRef(record.source_ref.clone());
-    let target = ArtifactRef(record.target_ref.clone());
-    derive_envelope(
-        EventDraft {
-            type_: EventType(event_type.into()),
-            subject: source.clone(),
-            aggregate: myelin_refs::edge_aggregate_key(&source, &target),
-            payload: serde_json::json!({
-                "relation_id": record.relation_id.to_string(),
-                "source": source.0,
-                "target": target.0,
-                "rel": record.relation,
-                "rel_class": "lifecycle",
-            }),
-            data_role: DataRole::Controller,
-            visibility: Visibility::Internal,
-            contains_personal_data: false,
-            pii_key_ref: None,
-        },
-        EmitContext {
-            event_id,
-            tenant: actor.tenant.clone(),
-            region: actor.region.clone(),
-            actor: Actor(actor.clone()),
-            schema_ver: 1,
-            occurred_at: timestamp.clone(),
-            recorded_at: timestamp,
-            caused_by: None,
-        },
-        None,
-    )
 }
 
 const SELECT_COLUMNS: &str = "id, key, project_id, state, state_category, title_nonce, \
@@ -2130,199 +2137,6 @@ fn project_userset(project_id: Uuid) -> String {
     format!("project:{project_id}#view")
 }
 
-fn issue_subject(tenant: &str, issue_id: Uuid) -> ArtifactRef {
-    ArtifactRef(format!("myelin://{tenant}/issue/issue/{issue_id}"))
-}
-
-fn authorization_request_envelope(
-    actor: &Principal,
-    issue_id: Uuid,
-    project_id: Uuid,
-    issue_object: &str,
-    project_userset: &str,
-    event_id: EventId,
-) -> EventEnvelope {
-    let timestamp = now_rfc3339();
-    derive_envelope(
-        EventDraft {
-            type_: EventType(ISSUE_AUTHORIZATION_REQUESTED.into()),
-            subject: issue_subject(actor.tenant.as_str(), issue_id),
-            aggregate: AggregateKey(format!("issue:{issue_id}")),
-            payload: serde_json::json!({
-                "issue_id": issue_id.to_string(),
-                "project_id": project_id.to_string(),
-                "issue_object": issue_object,
-                "relation": "parent_project",
-                "project_userset": project_userset,
-            }),
-            data_role: DataRole::Controller,
-            visibility: Visibility::Internal,
-            contains_personal_data: false,
-            pii_key_ref: None,
-        },
-        EmitContext {
-            event_id,
-            tenant: actor.tenant.clone(),
-            region: actor.region.clone(),
-            actor: Actor(actor.clone()),
-            schema_ver: 1,
-            occurred_at: timestamp.clone(),
-            recorded_at: timestamp,
-            caused_by: None,
-        },
-        None,
-    )
-}
-
-fn issue_created_envelope(
-    event_id: EventId,
-    issue_id: Uuid,
-    key: &str,
-    project_id: Uuid,
-    zookie: &Zookie,
-    request: &EventEnvelope,
-) -> EventEnvelope {
-    derive_envelope(
-        EventDraft {
-            type_: EventType(ISSUE_CREATED.into()),
-            subject: issue_subject(request.tenant.as_str(), issue_id),
-            aggregate: AggregateKey(format!("issue:{issue_id}")),
-            payload: serde_json::json!({
-                "issue_id": issue_id.to_string(),
-                "issue_key": key,
-                "project_id": project_id.to_string(),
-                "authorization_zookie": zookie.0,
-            }),
-            data_role: DataRole::Controller,
-            visibility: Visibility::Internal,
-            contains_personal_data: false,
-            pii_key_ref: None,
-        },
-        EmitContext {
-            event_id,
-            tenant: request.tenant.clone(),
-            region: request.region.clone(),
-            actor: request.actor.clone(),
-            schema_ver: 1,
-            occurred_at: request.occurred_at.clone(),
-            recorded_at: now_rfc3339(),
-            caused_by: request.caused_by.clone(),
-        },
-        Some(request),
-    )
-}
-
-fn issue_closed_envelope(
-    actor: &Principal,
-    issue_id: Uuid,
-    key: &str,
-    previous_state: &str,
-    event_id: EventId,
-) -> EventEnvelope {
-    let timestamp = now_rfc3339();
-    derive_envelope(
-        EventDraft {
-            type_: EventType(ISSUE_CLOSED.into()),
-            subject: issue_subject(actor.tenant.as_str(), issue_id),
-            aggregate: AggregateKey(format!("issue:{issue_id}")),
-            payload: serde_json::json!({
-                "issue_id": issue_id.to_string(),
-                "issue_key": key,
-                "from": previous_state,
-                "to": "Done",
-                "category": "completed",
-            }),
-            data_role: DataRole::Controller,
-            visibility: Visibility::Internal,
-            contains_personal_data: false,
-            pii_key_ref: None,
-        },
-        EmitContext {
-            event_id,
-            tenant: actor.tenant.clone(),
-            region: actor.region.clone(),
-            actor: Actor(actor.clone()),
-            schema_ver: 1,
-            occurred_at: timestamp.clone(),
-            recorded_at: timestamp,
-            caused_by: None,
-        },
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_authorization_request(
-    request: &EventEnvelope,
-    tenant: &str,
-    region: &str,
-    issue_id: Uuid,
-    project_id: Uuid,
-    issue_object: &str,
-    project_userset: &str,
-    relation: &str,
-    request_event_id: &str,
-    created_by_principal: &str,
-) -> Result<(), String> {
-    let expected_subject = issue_subject(tenant, issue_id);
-    let expected_aggregate = AggregateKey(format!("issue:{issue_id}"));
-    let expected_issue_id = issue_id.to_string();
-    let expected_project_id = project_id.to_string();
-    let payload = &request.payload;
-    let valid = request.type_.0 == ISSUE_AUTHORIZATION_REQUESTED
-        && request.event_id.0 == request_event_id
-        && request.tenant.as_str() == tenant
-        && request.region.as_str() == region
-        && request.actor.0.tenant.as_str() == tenant
-        && request.actor.0.region.as_str() == region
-        && request.actor.0.principal_id.0 == created_by_principal
-        && request.subject == expected_subject
-        && request.aggregate == expected_aggregate
-        && !request.contains_personal_data
-        && request.pii_key_ref.is_none()
-        && payload.get("issue_id").and_then(serde_json::Value::as_str)
-            == Some(expected_issue_id.as_str())
-        && payload
-            .get("project_id")
-            .and_then(serde_json::Value::as_str)
-            == Some(expected_project_id.as_str())
-        && payload
-            .get("issue_object")
-            .and_then(serde_json::Value::as_str)
-            == Some(issue_object)
-        && payload
-            .get("project_userset")
-            .and_then(serde_json::Value::as_str)
-            == Some(project_userset)
-        && payload.get("relation").and_then(serde_json::Value::as_str) == Some(relation);
-    if valid {
-        Ok(())
-    } else {
-        Err("authorization request envelope does not match staged issue binding".into())
-    }
-}
-
-fn now_rfc3339() -> Timestamp {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    Timestamp(format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z"))
-}
-
 fn decode_row(
     kms: &KmsEngine,
     region: &myelin_tenancy::Region,
@@ -2472,8 +2286,14 @@ pub fn is_canonical_request_event_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::ISSUE_CLOSED;
+    use myelin_events::{Actor, Timestamp};
     use myelin_identity::{DataRole, PrincipalId, PrincipalStatus, RuntimeRef};
     use myelin_tenancy::{Region, TenantId};
+
+    fn fixed_time() -> Timestamp {
+        Timestamp("2026-07-18T00:00:00Z".into())
+    }
 
     #[test]
     fn pagination_is_bounded_and_cursor_is_typed() {
@@ -2632,6 +2452,7 @@ mod tests {
             &issue_object,
             &userset,
             request_id.clone(),
+            fixed_time(),
         );
 
         validate_authorization_request(
@@ -2654,6 +2475,7 @@ mod tests {
             project_id,
             &Zookie("zookie:1".into()),
             &request,
+            fixed_time(),
         );
 
         assert_eq!(request.event_id.0.len(), 26);
@@ -2663,6 +2485,8 @@ mod tests {
         assert_eq!(created.tenant, request.tenant);
         assert_eq!(created.region, request.region);
         assert_eq!(created.occurred_at, request.occurred_at);
+        assert_eq!(request.recorded_at, fixed_time());
+        assert_eq!(created.recorded_at, fixed_time());
         assert_eq!(created.causation_id, Some(request_id));
         assert!(!created.contains_personal_data);
         assert_eq!(created.pii_key_ref, None);
@@ -2689,6 +2513,7 @@ mod tests {
             &object,
             &userset,
             UlidMinter::new().mint().into(),
+            fixed_time(),
         );
         let request_event_id = request.event_id.0.clone();
         let validate = |candidate: &EventEnvelope| {
@@ -2729,8 +2554,14 @@ mod tests {
         );
         let issue_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
         let event_id: EventId = UlidMinter::new().mint().into();
-        let closed =
-            issue_closed_envelope(&actor, issue_id, "ENG-7", "In Review", event_id.clone());
+        let closed = issue_closed_envelope(
+            &actor,
+            issue_id,
+            "ENG-7",
+            "In Review",
+            event_id.clone(),
+            fixed_time(),
+        );
 
         assert_eq!(closed.event_id, event_id);
         assert_eq!(closed.type_.0, ISSUE_CLOSED);
@@ -2741,6 +2572,8 @@ mod tests {
         assert_eq!(closed.payload["issue_key"], "ENG-7");
         assert_eq!(closed.payload["from"], "In Review");
         assert_eq!(closed.payload["category"], "completed");
+        assert_eq!(closed.occurred_at, fixed_time());
+        assert_eq!(closed.recorded_at, fixed_time());
         assert!(!closed.contains_personal_data);
         assert!(closed.pii_key_ref.is_none());
         assert!(!closed.payload.to_string().contains("title"));

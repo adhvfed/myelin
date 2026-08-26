@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — An issue action has one durable time
+
+The PostgreSQL Issues store let the database timestamp a row while application code independently
+timestamped its event. Relation changes were worse: the issue event and reference-graph event each
+read the clock separately. Clock rollback became 1970, and an ordinary user action could therefore
+leave three different accounts of when it happened.
+
+The store now acquires one checked clock reading before each state-changing boundary and binds its
+Unix form into PostgreSQL while carrying its RFC 3339 form into every co-committed event. Creation
+aligns the issue row, pending authorization binding, and request event; activation aligns the
+binding and created event; relation changes align the row and both graph projections; closing
+aligns the issue state and close event. A clock failure is a typed unavailable response and leaves
+neither a row nor an event. The envelope construction and provenance validation also moved into a
+small dedicated module, removing that policy from the already-large transaction store.
+
+**Proof:** all 414 Issues library stories; the Edge leak-safe error-mapping story; strict
+all-target/all-feature Clippy for Issues and Edge; the live PostgreSQL authorization saga proving
+rollback leaves zero state, every row/event timestamp agrees, concurrent retries converge, and
+events remain exactly-once (1.41 seconds); and all three TypeScript issue-lifecycle journeys against
+the rebuilt system, covering founder defaults, authorization/discovery/close, and dependency
+create/retry/remove (11.20 seconds). `target` is 80 GB with 632 GB free, so the useful cache remains.
+
 ## 2026-08-26 — One wall clock cannot become several security truths
 
 Authentication, governed MCP work, Git wire credentials, repository grants, agent teardown, CI

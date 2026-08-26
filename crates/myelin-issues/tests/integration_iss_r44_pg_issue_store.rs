@@ -1,6 +1,7 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::{Mode, MyelinConfig};
+use myelin_events::clock::{clock_reading_from_unix, ClockError};
 use myelin_events::{EventEnvelope, Timestamp};
 use myelin_identity::{
     Consistency, ConsistencyMode, DataRole, Decision, FragmentAdmit, IdentityService, ObjectId,
@@ -9,7 +10,7 @@ use myelin_identity::{
 };
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
 use myelin_issues::events::{
-    ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CREATED, RELATION_CREATED, RELATION_REMOVED,
+    ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED, RELATION_CREATED, RELATION_REMOVED,
 };
 use myelin_issues::{
     issues_hot_tables, issues_migrations, CreateIssue, CreateIssueIntent, ImportIssue,
@@ -243,6 +244,49 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .connect(&admin_url())
         .await
         .expect("admin inspection connection");
+
+    let rows_before_clock_failure: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issue WHERE tenant_id = $1")
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    let events_before_clock_failure: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE envelope->>'tenant' = $1")
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    let broken_clock = store
+        .clone()
+        .with_clock(|| Err(ClockError::BeforeUnixEpoch));
+    assert_eq!(
+        broken_clock
+            .create(
+                &creator,
+                proposal("CLK", "a clock must exist before an issue does")
+            )
+            .await,
+        Err(IssueStoreError::Clock(ClockError::BeforeUnixEpoch))
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM issue WHERE tenant_id = $1")
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        rows_before_clock_failure,
+        "clock failure left no issue row"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM outbox WHERE envelope->>'tenant' = $1",)
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        events_before_clock_failure,
+        "clock failure left no event"
+    );
 
     let import_job_id = sqlx::types::Uuid::new_v4().to_string();
     let imported = ImportIssue {
@@ -693,6 +737,32 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     assert!(!created.contains_personal_data);
     assert!(created.pii_key_ref.is_none());
     assert_eq!(created.causation_id, Some(request.event_id));
+    assert_eq!(request.occurred_at, request.recorded_at);
+    let durable_times = sqlx::query(
+        "SELECT i.created_at = $3::timestamptz AS issue_matches_request,
+                i.updated_at = $3::timestamptz AS update_matches_request,
+                b.created_at = $3::timestamptz AS binding_matches_request,
+                b.activated_at = $4::timestamptz AS activation_matches_created
+           FROM issue i
+           JOIN issue_authz_binding b
+             ON b.tenant_id = i.tenant_id AND b.region = i.region AND b.issue_id = i.id
+          WHERE i.tenant_id = $1 AND i.id = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&staged.id)
+    .bind(&request.recorded_at.0)
+    .bind(&created.recorded_at.0)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    for column in [
+        "issue_matches_request",
+        "update_matches_request",
+        "binding_matches_request",
+        "activation_matches_created",
+    ] {
+        assert!(durable_times.get::<bool, _>(column), "{column}");
+    }
     let created_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM outbox WHERE envelope->>'tenant' = $1 \
          AND envelope->>'type_' = $2 AND aggregate = $3",
@@ -756,8 +826,14 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     .unwrap();
     assert_eq!(race_created, 1);
 
+    const OPERATION_TIME_UNIX: i64 = 1_787_834_096;
+    const OPERATION_TIME: &str = "2026-08-27T12:34:56Z";
+    let timebound = restarted.clone().with_clock(|| {
+        Ok(clock_reading_from_unix(OPERATION_TIME_UNIX)
+            .expect("the fixed operation clock is representable"))
+    });
     let target_ref = myelin_issues::issue_root_ref(&tenant, &raced.key).0;
-    let relation = restarted
+    let relation = timebound
         .create_relation(&creator, &staged.id, &target_ref, IssueLifecycleRel::Blocks)
         .await
         .expect("a manager relates two visible issues");
@@ -771,14 +847,14 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     assert_eq!(relation.relation.created_by, creator.principal_id.0);
     assert_eq!(relation.relation.creator_kind, IssueActorKind::Service);
 
-    let retry = restarted
+    let retry = timebound
         .create_relation(&creator, &staged.id, &target_ref, IssueLifecycleRel::Blocks)
         .await
         .expect("retrying the same relation returns its durable identity");
     assert!(!retry.created);
     assert_eq!(retry.relation, relation.relation);
     assert_eq!(
-        restarted
+        timebound
             .list_relations(&creator, &staged.id)
             .await
             .unwrap(),
@@ -786,58 +862,100 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     );
 
     for event_type in [RELATION_CREATED, "refs.edge.created"] {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM outbox
+        let events: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT envelope FROM outbox
               WHERE envelope->>'tenant' = $1 AND envelope->>'type_' = $2
                 AND envelope->'payload'->>'relation_id' = $3",
         )
         .bind(&tenant)
         .bind(event_type)
         .bind(&relation.relation.id)
-        .fetch_one(&admin)
+        .fetch_all(&admin)
         .await
         .unwrap();
-        assert_eq!(
-            count, 1,
-            "the idempotent source-of-truth write emits `{event_type}` once"
-        );
+        assert_eq!(events.len(), 1, "`{event_type}` is emitted exactly once");
+        let event = &events[0];
+        assert_eq!(event["occurred_at"], OPERATION_TIME);
+        assert_eq!(event["recorded_at"], OPERATION_TIME);
     }
+    let relation_created_at: i64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM created_at)::bigint FROM issue_relation
+          WHERE tenant_id = $1 AND relation_id = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&relation.relation.id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(relation_created_at, OPERATION_TIME_UNIX);
 
-    let removed = restarted
+    let removed = timebound
         .remove_relation(&creator, &staged.id, &relation.relation.id)
         .await
         .expect("remove the dependency")
         .expect("the dependency existed");
     assert_eq!(removed, relation.relation);
-    assert!(restarted
+    assert!(timebound
         .list_relations(&creator, &staged.id)
         .await
         .unwrap()
         .is_empty());
     assert_eq!(
-        restarted
+        timebound
             .remove_relation(&creator, &staged.id, &relation.relation.id)
             .await
             .expect("removal retries are safe"),
         None
     );
     for event_type in [RELATION_REMOVED, "refs.edge.removed"] {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM outbox
+        let events: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT envelope FROM outbox
               WHERE envelope->>'tenant' = $1 AND envelope->>'type_' = $2
                 AND envelope->'payload'->>'relation_id' = $3",
         )
         .bind(&tenant)
         .bind(event_type)
         .bind(&relation.relation.id)
-        .fetch_one(&admin)
+        .fetch_all(&admin)
         .await
         .unwrap();
-        assert_eq!(
-            count, 1,
-            "the idempotent source-of-truth removal emits `{event_type}` once"
-        );
+        assert_eq!(events.len(), 1, "`{event_type}` is emitted exactly once");
+        let event = &events[0];
+        assert_eq!(event["occurred_at"], OPERATION_TIME);
+        assert_eq!(event["recorded_at"], OPERATION_TIME);
     }
+
+    timebound
+        .close(&creator, &staged.id)
+        .await
+        .expect("closing an issue stamps its row and event once");
+    let closed_times = sqlx::query(
+        "SELECT extract(epoch FROM updated_at)::bigint AS updated,
+                extract(epoch FROM state_changed_at)::bigint AS state_changed
+           FROM issue WHERE tenant_id = $1 AND id = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&staged.id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(closed_times.get::<i64, _>("updated"), OPERATION_TIME_UNIX);
+    assert_eq!(
+        closed_times.get::<i64, _>("state_changed"),
+        OPERATION_TIME_UNIX
+    );
+    let closed_event: serde_json::Value = sqlx::query_scalar(
+        "SELECT envelope FROM outbox
+          WHERE envelope->>'tenant' = $1 AND envelope->>'type_' = $2 AND aggregate = $3",
+    )
+    .bind(&tenant)
+    .bind(ISSUE_CLOSED)
+    .bind(format!("issue:{}", staged.id))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(closed_event["occurred_at"], OPERATION_TIME);
+    assert_eq!(closed_event["recorded_at"], OPERATION_TIME);
 
     let legacy_id = sqlx::types::Uuid::new_v4();
     sqlx::query(
