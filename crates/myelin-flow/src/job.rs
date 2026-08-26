@@ -101,8 +101,9 @@ impl WfCtx {
         let dispatch_command_id = self.peek_next_command_id();
         let replaying_dispatch = self.is_replaying_command(&dispatch_command_id);
         let idem_token = job_idem_token(self.run_id(), &dispatch_command_id);
-        let deadline_unix_secs =
-            timeout_secs.map(|timeout| self.drive_now_unix_secs().saturating_add(timeout));
+        let deadline_unix_secs = timeout_secs
+            .map(|timeout| self.timer_deadline_after(timeout, "timed job dispatch"))
+            .transpose()?;
         let dispatched = JobSpec {
             idem_token: idem_token.clone(),
             ..spec
@@ -757,6 +758,52 @@ mod tests {
             .expect("an unrelated completion is not a protocol error");
         assert_eq!(outcome, JobOutcome::Parked);
         assert_eq!(signals.buffered_depth(), 1);
+    }
+
+    #[test]
+    fn a_timed_job_without_a_timer_fails_before_dispatch() {
+        let outbox = OutboxStore::new();
+        let runner = RecordingRunner::default();
+        let mut ctx = begin(&outbox, WfJournal::new(), SignalStore::new());
+
+        let error = ctx
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/never-started"),
+                &runner,
+                Some(60),
+            )
+            .expect_err("a timeout without a durable clock must be refused");
+
+        assert!(matches!(error, WfError::CoCommit(_)));
+        assert_eq!(
+            runner.calls.load(Ordering::SeqCst),
+            0,
+            "configuration is validated before the external job can observe a dispatch"
+        );
+        assert_eq!(ctx.side_effects_executed(), 0);
+    }
+
+    #[test]
+    fn an_unrepresentable_job_deadline_fails_before_dispatch() {
+        let outbox = OutboxStore::new();
+        let runner = RecordingRunner::default();
+        let mut ctx = begin(&outbox, WfJournal::new(), SignalStore::new()).with_timers(
+            crate::timer::TimerStore::new(),
+            0,
+            i64::MAX,
+        );
+
+        let error = ctx
+            .dispatch_job(
+                JobSpec::new(JobKind::Ci, "pipeline://acme/ci/never-started"),
+                &runner,
+                Some(1),
+            )
+            .expect_err("a deadline that overflows Unix time must be refused");
+
+        assert!(matches!(error, WfError::CoCommit(_)));
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ctx.side_effects_executed(), 0);
     }
 
     #[test]

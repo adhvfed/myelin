@@ -164,6 +164,7 @@ struct Substrate {
     runs: RunStore,
     journal: WfJournal,
     signals: SignalStore,
+    timers: myelin_flow::TimerStore,
     outbox: OutboxStore,
     tele: FlowTelemetry,
 }
@@ -187,7 +188,8 @@ fn fresh_worker(
         worker,
         30,
     )
-    .with_signals(sub.signals.clone());
+    .with_signals(sub.signals.clone())
+    .with_timers(sub.timers.clone());
     disp.register(
         "agent.run",
         gated_multi_effect_body(ledger, apply_count, sub.signals.clone()),
@@ -249,6 +251,7 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
         runs: ex.runs().clone(),
         journal: WfJournal::new(),
         signals: ex.signals().clone(),
+        timers: myelin_flow::TimerStore::new(),
         outbox: OutboxStore::new(),
         tele: FlowTelemetry::new(),
     };

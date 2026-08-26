@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — A timeout exists before its side effect
+
+Flow allowed callers to request timed signal waits and jobs without giving the workflow a durable
+timer. A timed wait then computed its deadline from epoch zero and could park forever. A timed job
+was more dangerous: it dispatched the external work first and discovered the missing timer only
+while arming its deadline. Deadline addition also saturated on overflow, and replay could quietly
+turn a timed wait into an untimed one (or the reverse). Two multi-day approval tests omitted timers,
+so their prose described durable waiting while their fixtures exercised the broken shortcut.
+
+Workflow timing is now a named context containing the wheel, partition, and current Unix time.
+Relative deadlines share one checked calculation. A timed job validates that context and its
+deadline before the runner can observe anything; a timed wait validates before journaling or
+parking. Signal receipt comparison uses wide arithmetic rather than saturating milliseconds, and
+the journaled presence and value of a deadline are replay invariants. Approval and token-remint
+stories now advance real durable timers across days instead of relying on an epoch-zero default.
+
+**Proof:** all 242 Flow library stories; the focused multi-day approval and remint drills; strict
+all-target/all-feature Flow Clippy; the live PostgreSQL dispatcher story persisting two competing
+deadlines and replaying the fired frontier without reopening work (1.14 seconds); and all six live
+TypeScript CI lifecycle journeys, covering push and pull-request dispatch, exact-commit sandbox
+execution and archived output, failure settlement, and repository isolation (14.94 seconds).
+`target` is 82 GB with 630 GB free, so no cache clean was warranted.
+
 ## 2026-08-26 — SSH authority has a representable end
 
 Workspace SSH bounded a new grant by the browser capability's signed expiry, but converted an

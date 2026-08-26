@@ -498,6 +498,7 @@ mod tests {
         let run = start_a_run(&ex);
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
+        let timers = crate::timer::TimerStore::new();
         let part = 0i16;
         let run_row = RunRow::new_runnable(tenant(), region(), run.0.clone(), "agent.run", part);
         ex.runs().put(run_row.clone());
@@ -517,7 +518,7 @@ mod tests {
             body.as_ref(),
             1,
             1,
-            None,
+            Some(timers.clone()),
             Some(ex.signals().clone()),
             1_000,
             None,
@@ -563,7 +564,7 @@ mod tests {
             body.as_ref(),
             1,
             1,
-            None,
+            Some(timers),
             Some(ex.signals().clone()),
             200_000,
             None,
@@ -595,6 +596,7 @@ mod tests {
         let run = start_a_run(&ex);
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
+        let timers = crate::timer::TimerStore::new();
         let run_row = RunRow::new_runnable(tenant(), region(), run.0.clone(), "agent.run", 0);
         ex.runs().put(run_row.clone());
         let body = gated_tool_body();
@@ -613,7 +615,7 @@ mod tests {
             body.as_ref(),
             1,
             1,
-            None,
+            Some(timers.clone()),
             Some(ex.signals().clone()),
             1_000,
             None,
@@ -645,7 +647,7 @@ mod tests {
             body.as_ref(),
             1,
             1,
-            None,
+            Some(timers),
             Some(ex.signals().clone()),
             2_000,
             None,

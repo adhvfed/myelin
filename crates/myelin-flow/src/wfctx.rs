@@ -286,7 +286,7 @@ pub struct WfCtx {
     double_effects: u64,
     divergence: Option<String>,
     pinned_wf_version: Option<i32>,
-    timers: Option<(crate::timer::TimerStore, i16, i64)>,
+    timers: Option<TimerContext>,
     parked_on_timer: bool,
     signals: Option<crate::engine::SignalStore>,
     parked_on_signal: bool,
@@ -299,6 +299,13 @@ pub struct WfCtx {
     pub(crate) job_dispatches: std::collections::HashMap<String, (String, Option<i64>, String)>,
     pub(crate) joined_job_dispatches: std::collections::HashSet<String>,
     pub(crate) disarmed_timer_ids: Vec<String>,
+}
+
+#[derive(Clone)]
+struct TimerContext {
+    store: crate::timer::TimerStore,
+    partition: i16,
+    now_unix_secs: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -397,7 +404,11 @@ impl WfCtx {
         partition: i16,
         now_secs: i64,
     ) -> Self {
-        self.timers = Some((timers, partition, now_secs));
+        self.timers = Some(TimerContext {
+            store: timers,
+            partition,
+            now_unix_secs: now_secs,
+        });
         self
     }
 
@@ -796,12 +807,12 @@ impl WfCtx {
                 }
             }
         }
-        let (timers, partition, now_secs) = self.timers.clone().ok_or_else(|| {
+        let timer = self.timers.clone().ok_or_else(|| {
             WfError::CoCommit("sleep_until requires a timer wheel (WfCtx::with_timers)".into())
         })?;
         let timer_id = format!("{}/{}", self.run_id, command_id);
         let bucket = crate::timer::epoch_minute(fire_at_secs);
-        timers.arm(crate::timer::TimerRow {
+        timer.store.arm(crate::timer::TimerRow {
             tenant: self.tenant.clone(),
             region: self.region.clone(),
             timer_id: timer_id.clone(),
@@ -810,10 +821,10 @@ impl WfCtx {
             fire_at: fire_at_secs,
             bucket,
             fired: false,
-            partition,
+            partition: timer.partition,
         });
         self.stage_history(crate::timer::history_kind::TIMER_SET, command_id, None);
-        if fire_at_secs > now_secs {
+        if fire_at_secs > timer.now_unix_secs {
             self.parked_on_timer = true;
             self.park_condition = Some(ParkCondition::Timer { timer_id });
         }
@@ -821,13 +832,33 @@ impl WfCtx {
     }
 
     pub fn sleep_for(&mut self, duration_secs: i64) -> WfResult<()> {
-        let now_secs = self.timers.as_ref().map(|(_, _, n)| *n).unwrap_or(0);
-        let fire_at = now_secs.saturating_add(duration_secs.max(0));
+        let fire_at = self.timer_deadline_after(duration_secs.max(0), "sleep_for")?;
         self.sleep_until(fire_at)
     }
 
-    pub(crate) fn drive_now_unix_secs(&self) -> i64 {
-        self.timers.as_ref().map(|(_, _, now)| *now).unwrap_or(0)
+    pub(crate) fn timer_now_unix_secs(&self, operation: &str) -> WfResult<i64> {
+        self.timers
+            .as_ref()
+            .map(|timer| timer.now_unix_secs)
+            .ok_or_else(|| {
+                WfError::CoCommit(format!(
+                    "{operation} requires a durable timer wheel (WfCtx::with_timers)"
+                ))
+            })
+    }
+
+    pub(crate) fn timer_deadline_after(
+        &self,
+        duration_secs: i64,
+        operation: &str,
+    ) -> WfResult<i64> {
+        self.timer_now_unix_secs(operation)?
+            .checked_add(duration_secs)
+            .ok_or_else(|| {
+                WfError::CoCommit(format!(
+                    "{operation} deadline is outside the Unix time range"
+                ))
+            })
     }
 
     pub fn wait_for_signal(
@@ -946,21 +977,47 @@ impl WfCtx {
             }
         }
 
-        let now_secs = self.timers.as_ref().map(|(_, _, n)| *n).unwrap_or(0);
-        let effective_deadline =
-            (timeout_secs.is_some() || absolute_deadline.is_some()).then(|| {
-                if already_waited {
-                    self.replayed_wait_deadline(&command_id).unwrap_or_else(|| {
-                        absolute_deadline.unwrap_or_else(|| {
-                            now_secs.saturating_add(timeout_secs.unwrap_or_default())
-                        })
-                    })
-                } else {
-                    absolute_deadline.unwrap_or_else(|| {
-                        now_secs.saturating_add(timeout_secs.unwrap_or_default())
-                    })
+        let timer = if timeout_secs.is_some() || absolute_deadline.is_some() {
+            Some(self.timers.clone().ok_or_else(|| {
+                WfError::CoCommit(
+                    "a timed signal wait requires a durable timer wheel (WfCtx::with_timers)"
+                        .into(),
+                )
+            })?)
+        } else {
+            None
+        };
+        let requested_timed_wait = timer.is_some();
+        let effective_deadline = if already_waited {
+            let recorded_deadline = match self.replayed_wait_deadline(&command_id) {
+                Ok(deadline) => deadline,
+                Err(detail) => return Err(self.diverge(detail)),
+            };
+            match (requested_timed_wait, recorded_deadline) {
+                (true, Some(deadline)) => Some(deadline),
+                (false, None) => None,
+                (true, None) => {
+                    return Err(self.diverge(format!(
+                        "replay divergence at {command_id}: body issued a timed signal wait but \
+                         the journal records an untimed wait"
+                    )));
                 }
-            });
+                (false, Some(_)) => {
+                    return Err(self.diverge(format!(
+                        "replay divergence at {command_id}: body issued an untimed signal wait but \
+                         the journal records a timed wait"
+                    )));
+                }
+            }
+        } else {
+            match (absolute_deadline, timeout_secs) {
+                (Some(deadline), _) => Some(deadline),
+                (None, Some(timeout)) => {
+                    Some(self.timer_deadline_after(timeout, "timed signal wait")?)
+                }
+                (None, None) => None,
+            }
+        };
 
         let candidate = match expected_idem_key {
             Some(idem_key) => signals
@@ -969,9 +1026,9 @@ impl WfCtx {
             None => signals.first_unconsumed_for(&self.tenant, &self.run_id, name),
         };
         if let Some((idem_key, row)) = candidate {
-            if effective_deadline
-                .is_some_and(|deadline| row.received_unix_ms > deadline.saturating_mul(1000))
-            {
+            if effective_deadline.is_some_and(|deadline| {
+                i128::from(row.received_unix_ms) > i128::from(deadline) * 1_000
+            }) {
                 self.stage_received(
                     command_id,
                     Some(name),
@@ -1016,7 +1073,10 @@ impl WfCtx {
         }
 
         if let Some(deadline) = effective_deadline {
-            if now_secs >= deadline {
+            let timer = timer
+                .as_ref()
+                .ok_or_else(|| WfError::CoCommit("timed signal wait lost its timer".into()))?;
+            if timer.now_unix_secs >= deadline {
                 self.stage_received(
                     command_id,
                     Some(name),
@@ -1030,21 +1090,19 @@ impl WfCtx {
                 return Ok(WaitOutcome::TimedOut);
             }
             if arm_timeout {
-                if let Some((timers, partition, _)) = self.timers.clone() {
-                    let timer_id = format!("{}/{}/timeout", self.run_id, command_id);
-                    let bucket = crate::timer::epoch_minute(deadline);
-                    timers.arm(crate::timer::TimerRow {
-                        tenant: self.tenant.clone(),
-                        region: self.region.clone(),
-                        timer_id,
-                        run_id: Some(self.run_id.clone()),
-                        command_id: command_id.clone(),
-                        fire_at: deadline,
-                        bucket,
-                        fired: false,
-                        partition,
-                    });
-                }
+                let timer_id = format!("{}/{}/timeout", self.run_id, command_id);
+                let bucket = crate::timer::epoch_minute(deadline);
+                timer.store.arm(crate::timer::TimerRow {
+                    tenant: self.tenant.clone(),
+                    region: self.region.clone(),
+                    timer_id,
+                    run_id: Some(self.run_id.clone()),
+                    command_id: command_id.clone(),
+                    fire_at: deadline,
+                    bucket,
+                    fired: false,
+                    partition: timer.partition,
+                });
             }
             if !already_waited {
                 self.stage_waited(
@@ -1075,13 +1133,13 @@ impl WfCtx {
         dispatch_command_id: &str,
         deadline: i64,
     ) -> WfResult<()> {
-        let (timers, partition, _) = self.timers.clone().ok_or_else(|| {
+        let timer = self.timers.clone().ok_or_else(|| {
             WfError::CoCommit(
                 "a timed job dispatch requires a durable timer wheel (WfCtx::with_timers)".into(),
             )
         })?;
         let command_id = format!("{dispatch_command_id}/job-timeout");
-        timers.arm(crate::timer::TimerRow {
+        timer.store.arm(crate::timer::TimerRow {
             tenant: self.tenant.clone(),
             region: self.region.clone(),
             timer_id: format!("{}/{command_id}", self.run_id),
@@ -1090,38 +1148,44 @@ impl WfCtx {
             fire_at: deadline,
             bucket: crate::timer::epoch_minute(deadline),
             fired: false,
-            partition,
+            partition: timer.partition,
         });
         Ok(())
     }
 
     pub(crate) fn disarm_job_deadline(&mut self, dispatch_command_id: &str) -> WfResult<()> {
-        let (timers, _, _) = self.timers.clone().ok_or_else(|| {
+        let timer = self.timers.clone().ok_or_else(|| {
             WfError::CoCommit(
                 "a timed job join requires a durable timer wheel (WfCtx::with_timers)".into(),
             )
         })?;
         let timer_id = format!("{}/{dispatch_command_id}/job-timeout", self.run_id);
-        timers.disarm(&self.tenant, &timer_id);
+        timer.store.disarm(&self.tenant, &timer_id);
         if !self.disarmed_timer_ids.contains(&timer_id) {
             self.disarmed_timer_ids.push(timer_id);
         }
         Ok(())
     }
 
-    fn replayed_wait_deadline(&self, command_id: &str) -> Option<i64> {
-        let replayed = self.replay_history.get(command_id)?;
+    fn replayed_wait_deadline(&self, command_id: &str) -> Result<Option<i64>, String> {
+        let Some(replayed) = self.replay_history.get(command_id) else {
+            return Ok(None);
+        };
         if replayed.kind != crate::wfctx::history_kind::SIGNAL_WAITED {
-            return None;
+            return Ok(None);
         }
-        replayed
-            .result
-            .as_ref()
-            .and_then(|refs| {
-                refs.iter()
-                    .find_map(|r| r.0.strip_prefix(WAIT_DEADLINE_PREFIX))
-            })
-            .and_then(|s| s.parse::<i64>().ok())
+        let Some(encoded) = replayed.result.as_ref().and_then(|refs| {
+            refs.iter()
+                .find_map(|r| r.0.strip_prefix(WAIT_DEADLINE_PREFIX))
+        }) else {
+            return Ok(None);
+        };
+        encoded.parse::<i64>().map(Some).map_err(|_| {
+            format!(
+                "replay divergence at {command_id}: journaled signal deadline `{encoded}` is not \
+                 a Unix timestamp"
+            )
+        })
     }
 
     fn replayed_wait_expected_idem(&self, command_id: &str) -> Option<String> {
@@ -1261,7 +1325,11 @@ impl WfCtx {
         let timers = self
             .timers
             .as_ref()
-            .map(|(store, _, _)| store.rows_for_run(&self.tenant, &self.region, &self.run_id))
+            .map(|timer| {
+                timer
+                    .store
+                    .rows_for_run(&self.tenant, &self.region, &self.run_id)
+            })
             .unwrap_or_default();
         let WfCtx {
             tx,
@@ -2103,6 +2171,21 @@ mod tests {
     }
 
     #[test]
+    fn sleep_for_refuses_a_deadline_outside_unix_time() {
+        let outbox = OutboxStore::new();
+        let timers = crate::timer::TimerStore::new();
+        let mut ctx = begin(&outbox, WfJournal::new()).with_timers(timers.clone(), 0, i64::MAX);
+
+        let error = ctx
+            .sleep_for(1)
+            .expect_err("an overflowing relative sleep must be refused");
+
+        assert!(matches!(error, WfError::CoCommit(_)));
+        assert_eq!(timers.armed_count(), 0);
+        assert_eq!(ctx.staged_history_len(), 0);
+    }
+
+    #[test]
     fn sleep_with_no_timer_wheel_errors_loudly() {
         let outbox = OutboxStore::new();
         let mut ctx = begin(&outbox, WfJournal::new());
@@ -2745,6 +2828,104 @@ mod tests {
             matches!(err, WfError::CoCommit(ref m) if m.contains("signal store")),
             "the missing-store wait is a loud CoCommit error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_timed_wait_without_a_timer_refuses_instead_of_parking_forever() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let mut ctx = begin(&outbox, journal.clone()).with_signals(SignalStore::new());
+
+        let error = ctx
+            .wait_for_signal("approval:call-1", Some(60))
+            .expect_err("a timed wait needs a durable way to wake itself");
+
+        assert!(matches!(error, WfError::CoCommit(_)));
+        assert!(journal.history_for(&tenant(), "R1").is_empty());
+        assert_eq!(ctx.park_condition(), None);
+    }
+
+    #[test]
+    fn an_unrepresentable_signal_deadline_is_refused_before_it_is_journaled() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let timers = crate::timer::TimerStore::new();
+        let mut ctx = begin(&outbox, journal.clone())
+            .with_signals(SignalStore::new())
+            .with_timers(timers.clone(), 0, i64::MAX);
+
+        let error = ctx
+            .wait_for_signal("approval:call-1", Some(1))
+            .expect_err("a deadline beyond Unix time must be refused");
+
+        assert!(matches!(error, WfError::CoCommit(_)));
+        assert!(journal.history_for(&tenant(), "R1").is_empty());
+        assert_eq!(timers.armed_count(), 0);
+    }
+
+    #[test]
+    fn a_timed_wait_cannot_replay_as_an_untimed_wait() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let mut first = begin(&outbox, journal.clone())
+            .with_signals(signals.clone())
+            .with_timers(crate::timer::TimerStore::new(), 0, 1_000);
+        assert_eq!(
+            first.wait_for_signal("approval:call-1", Some(60)).unwrap(),
+            WaitOutcome::Parked
+        );
+        first.commit().unwrap();
+
+        let mut replay = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        )
+        .with_signals(signals);
+
+        let error = replay
+            .wait_for_signal("approval:call-1", None)
+            .expect_err("changing a durable wait's timing is nondeterministic");
+        assert!(error.is_nondeterministic());
+    }
+
+    #[test]
+    fn an_untimed_wait_cannot_gain_a_timeout_during_replay() {
+        let outbox = OutboxStore::new();
+        let journal = WfJournal::new();
+        let signals = SignalStore::new();
+        let mut first = begin(&outbox, journal.clone()).with_signals(signals.clone());
+        assert_eq!(
+            first.wait_for_signal("approval:call-1", None).unwrap(),
+            WaitOutcome::Parked
+        );
+        first.commit().unwrap();
+
+        let mut replay = WfCtx::resume(
+            &outbox,
+            minter(),
+            journal.clone(),
+            ctx_base(),
+            "R1",
+            "agent.run",
+            "2026-06-21T00:00:00Z",
+            42,
+            journal.history_for(&tenant(), "R1"),
+        )
+        .with_signals(signals)
+        .with_timers(crate::timer::TimerStore::new(), 0, 1_000);
+
+        let error = replay
+            .wait_for_signal("approval:call-1", Some(60))
+            .expect_err("adding a timeout during replay is nondeterministic");
+        assert!(error.is_nondeterministic());
     }
 
     #[test]

@@ -183,7 +183,7 @@ fn deliver_approval(signals: &SignalStore, call_id: &str, payload: Vec<ArtifactR
         idem_key: format!("card:{call_id}"),
         payload,
         payload_key_ref: None,
-        received_unix_ms: 0,
+        received_unix_ms: 3 * 86_400 * 1_000,
         consumed_seq: None,
     });
 }
@@ -193,6 +193,7 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
     let outbox = OutboxStore::new();
     let journal = WfJournal::new();
     let signals = SignalStore::new();
+    let timers = myelin_flow::TimerStore::new();
     let id = Arc::new(MintingIdentity::default());
 
     let mut c1 = WfCtx::begin(
@@ -206,9 +207,10 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
         42,
     )
     .with_signals(signals.clone())
+    .with_timers(timers.clone(), 0, 1_000)
     .with_run_identity(lease(id.clone()));
     let out1 = c1
-        .wait_for_signal(&approval_wait_name("call-7"), Some(3600))
+        .wait_for_signal(&approval_wait_name("call-7"), Some(7 * 86_400))
         .expect("park on the approval wait");
     assert_eq!(
         out1,
@@ -246,9 +248,10 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
         history,
     )
     .with_signals(signals.clone())
+    .with_timers(timers, 0, 3 * 86_400 + 1_000)
     .with_run_identity(lease(id.clone()));
     let out2 = c2
-        .wait_for_signal(&approval_wait_name("call-7"), Some(3600))
+        .wait_for_signal(&approval_wait_name("call-7"), Some(7 * 86_400))
         .expect("resume + consume");
     assert!(
         matches!(out2, WaitOutcome::Signalled { .. }),
