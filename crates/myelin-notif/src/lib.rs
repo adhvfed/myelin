@@ -16,10 +16,8 @@ pub mod cli;
 pub mod cross_cell;
 pub mod define_rule;
 pub mod delivery;
-pub mod erasure_residual;
 pub mod escalation;
 pub mod eu_provider;
-pub mod holder;
 pub mod humanise;
 pub mod list_inbox;
 pub mod migrations;
@@ -64,11 +62,6 @@ pub use delivery::{
     build_idem_key, channel_from_token, effective_delivery_count, is_eu_region, redact_for_offcell,
     DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
 };
-pub use erasure_residual::{
-    erase_residual, DeliveryShredError, ErasedNotifSubject, InMemoryDeliveryShredder,
-    InlineDeliveryShredder, NotifErasureLedger, OffCellResidual, ResidualEraseError,
-    ResidualEraseReceipt, ERASURE_RESIDUAL_PROMPT,
-};
 pub use escalation::{
     notify_for, oncall_now, render_oncall, render_page, DurableWheel, EscalationEngine,
     EscalationError, EscalationPolicy, EscalationRun, EscalationStep, EscalationTarget,
@@ -77,10 +70,6 @@ pub use escalation::{
 pub use eu_provider::{
     EuProviderError, EuSovereignAdapter, EuTransport, OpenLegalFlag, ProviderErasureOutcome,
     RecordingEuTransport, TransportReceipt, OPEN_LEGAL_PROVIDER_DPA,
-};
-pub use holder::{
-    notif_history_holder, notif_store_classifier, register_notif_holder, NotifBacking,
-    NotifHistoryHolder, NotifHolderRegistration, RestrictSet, NOTIF_OLTP_STORE,
 };
 pub use humanise::{
     humanise, humanise_item, parse_markdown, reason_template_key, render_html, render_markdown,

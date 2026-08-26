@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Notifications no longer certify an in-memory erasure
+
+Notifications exported a privacy holder whose default instance returned successful locate,
+export, rectify, restrict, and erase receipts without any backing store. Its backed variant counted
+rows in the process-local inbox projection but called leaving every row unchanged a successful
+"structural erase." The accompanying PostgreSQL test did not invoke an eraser at all: it selected
+the same rows twice and treated their equality as proof. A second test-only eraser destroyed keys,
+recorded restrictions, and wrote an erasure ledger only in local maps while its tests described the
+result as durable and restore-safe.
+
+Those two simulated privacy paths, their public exports, and their self-certifying suites are gone.
+The useful behavior hidden in the broad drill remains as a narrow story: once Identity resolution
+reports an actor erased, every notification appearance renders as an unlinkable erased-user
+tombstone. The real inbox, preference, delivery, provider, and replay paths remain intact.
+Notifications now stays honestly absent from privacy-request scopes until one durable operation can
+discover inbox and off-cell delivery residuals, apply a durable routing restriction, destroy real
+keys, request provider erasure, record the proof, and resume after interruption or restore.
+
+**Proof:** all-target/all-feature Notification compile and strict clippy; all 330 remaining library
+stories; the complete all-feature suite against PostgreSQL; rebuilt Notifications and Edge; and all
+five live TypeScript notification journeys covering durable delivery, deduplication, coalescing,
+tenant visibility, read/snooze/resurface state, completion, self-suppression, and cursor traversal
+(109.41 seconds). Net removal: 1,751 lines of in-memory compliance models and endorsing tests.
+
 ## 2026-08-26 — CI no longer reports an erasure it did not perform
 
 CI exposed a `PersonalDataHolder` whose ordinary `erase` returned success without calling its
