@@ -1,11 +1,8 @@
 use myelin_events::OutboxStore;
 use myelin_substrate::{
-    boot, serve, AppSpec, Config, CriticalDependencies, DeclaredStore, HotTables, InternalRpc,
-    Migration, Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreKind,
-    StoreManifest,
+    boot, serve, AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migration,
+    Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle,
 };
-
-use crate::store::SEARCH_INDEX_STORE;
 
 pub const SERVICE_NAME: &str = "search";
 
@@ -25,13 +22,6 @@ pub fn search_service_migrations() -> Migrations {
     )])
 }
 
-fn search_stores() -> StoreManifest {
-    StoreManifest::of([DeclaredStore::new(
-        StoreKind::SearchIndex,
-        SEARCH_INDEX_STORE,
-    )])
-}
-
 fn search_critical() -> CriticalDependencies {
     CriticalDependencies::new(["identity"])
 }
@@ -45,8 +35,6 @@ pub fn search_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: search_stores(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: search_critical(),
         intake_scope: None,
@@ -75,7 +63,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_substrate::{HolderRegistration, Liveness, Surface};
+    use myelin_substrate::{Liveness, Surface};
 
     #[test]
     fn search_boots_from_serve_appspec_with_three_ports() {
@@ -98,24 +86,6 @@ mod tests {
         assert!(
             mh.readiness().is_ready(),
             "readiness = can-serve-now (all critical deps healthy at boot) - distinct from liveness"
-        );
-
-        assert!(
-            handle
-                .holder_registry()
-                .is_registered(StoreKind::SearchIndex, SEARCH_INDEX_STORE),
-            "the per-tenant search index auto-registered as a holder (§3.4, GD-3)"
-        );
-        assert!(
-            handle.registered_holders().contains(&HolderRegistration {
-                kind: StoreKind::SearchIndex,
-                name: SEARCH_INDEX_STORE,
-            }),
-            "the search-index holder registration receipt is present"
-        );
-        assert!(
-            handle.holder_registered().is_ok(),
-            "every declared store registered"
         );
     }
 
@@ -182,22 +152,6 @@ mod tests {
                 .iter()
                 .any(|m| m.id == "0010_search_index_directory"),
             "the index-directory migration is in the Search AppSpec's forward-only set"
-        );
-    }
-
-    #[test]
-    fn the_shell_declares_the_index_store_and_no_engine() {
-        let spec = search_app_spec(Config::default(), OutboxStore::new());
-        assert!(
-            spec.stores
-                .stores()
-                .iter()
-                .any(|s| s.kind == StoreKind::SearchIndex),
-            "the per-tenant search index store is declared (auto-registered as H7)"
-        );
-        assert!(
-            spec.consumers.is_empty(),
-            "no indexer consumer at the shell (SRCH-P06 floor)"
         );
     }
 }

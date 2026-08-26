@@ -9,8 +9,7 @@ use myelin_harness::{Predicate, SignalName, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_substrate::serve::{boot, AppSpec, ConsumerReg, OutboxSpec, Surface};
 use myelin_substrate::{
-    Config, CriticalDependencies, HolderRegistration, HotTables, InternalRpc, Migrations,
-    PublicRoutes, StoreKind, StoreManifest,
+    Config, CriticalDependencies, HotTables, InternalRpc, Migrations, PublicRoutes,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -79,8 +78,6 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: vec![ConsumerReg::new(consumer)],
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
         critical: CriticalDependencies::default(),
         intake_scope: None,
@@ -92,15 +89,6 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         &[Surface::Public, Surface::Internal, Surface::MetricsHealth],
         "the three-surface topology opened in the lifecycle (1.2 seam, SUB-D7/D9 are P-S13/P-S14)"
     );
-    assert_eq!(
-        handle.registered_holders(),
-        &[HolderRegistration {
-            kind: StoreKind::Oltp,
-            name: "hello"
-        }],
-        "the opened store auto-registered as a holder (§3.4)"
-    );
-
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
     let mut tx = outbox.begin(minter, ctx_base());
     tx.stage_state_change("hello created");

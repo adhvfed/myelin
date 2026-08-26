@@ -4,7 +4,7 @@ use myelin_events::{DedupLedger, InProcessBus};
 use myelin_refs::ArtifactRef;
 use myelin_substrate::{
     AppSpec, Config, ConsumerReg, CriticalDependencies, HotTables, InternalRpc, Migrations,
-    OutboxSpec, PublicRoutes, ServeError, StoreManifest,
+    OutboxSpec, PublicRoutes, ServeError,
 };
 #[cfg(test)]
 use myelin_tenancy::TenantId;
@@ -219,8 +219,6 @@ fn notif_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
         intake_scope: None,

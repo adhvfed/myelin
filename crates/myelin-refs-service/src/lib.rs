@@ -5,7 +5,6 @@ use myelin_events::OutboxStore;
 #[cfg(feature = "integration")]
 use myelin_substrate::{
     AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
-    StoreManifest,
 };
 
 pub mod backlinks;
@@ -155,8 +154,6 @@ where
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers,
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay_with_consumer(outbox, intake, delivery_quarantine),
         critical: CriticalDependencies::default(),
         intake_scope: None,

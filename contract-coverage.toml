@@ -30,7 +30,7 @@ row = "1.5"
 title = "forward-only online migrations"
 status = "covered"
 cdc = [
-    "crates/myelin-substrate/tests/cdc_1_4_1_5_holders_and_migrations.rs",
+    "crates/myelin-substrate/tests/cdc_1_5_migrations.rs",
     "crates/myelin-knowledge/tests/cdc_1_1_1_5_knowledge_boot_and_hot_tables.rs",
     "crates/myelin-issues/tests/e2e_iss_p11_scheme_precedence.rs",
 ]

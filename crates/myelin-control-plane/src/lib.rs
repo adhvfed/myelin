@@ -73,9 +73,7 @@ pub use schema::{
 };
 pub use self_host::DegenerateControlPlane;
 
-use myelin_substrate::{
-    AppSpec, Config, Migration, Migrations, OutboxSpec, StoreKind, StoreManifest,
-};
+use myelin_substrate::{AppSpec, Config, Migration, Migrations, OutboxSpec};
 
 pub const SERVICE_NAME: &str = "control-plane";
 
@@ -141,19 +139,9 @@ pub fn control_plane_migrations() -> Migrations {
     ])
 }
 
-pub fn control_plane_store_manifest() -> StoreManifest {
-    StoreManifest::of([myelin_substrate::DeclaredStore::new(
-        StoreKind::Oltp,
-        CONTROL_PLANE_STORE_NAME,
-    )])
-}
-
-pub const CONTROL_PLANE_STORE_NAME: &str = "control_plane_registry";
-
 pub fn control_plane_app_spec(config: Config, outbox: OutboxSpec) -> AppSpec {
     let mut spec = AppSpec::minimal(SERVICE_NAME, config, outbox);
     spec.migrations = control_plane_migrations();
-    spec.stores = control_plane_store_manifest();
     spec
 }
 
@@ -173,7 +161,7 @@ pub fn cell_utilisation_signal(cell: &Cell) -> CellUtilisationSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_substrate::{is_destructive, HolderRegistry, HotTables};
+    use myelin_substrate::{is_destructive, HotTables};
 
     #[test]
     fn migrations_are_forward_only_and_pii_free() {
@@ -216,34 +204,14 @@ mod tests {
     }
 
     #[test]
-    fn app_spec_carries_registry_and_store_manifest() {
+    fn app_spec_carries_the_registry_migrations() {
         let spec = control_plane_app_spec(Config::default(), OutboxSpec::default_inproc());
         assert_eq!(spec.name, SERVICE_NAME);
         assert_eq!(spec.migrations.0.len(), 5);
-        let ids = spec.stores.holder_ids();
-        assert!(
-            ids.contains("oltp:control_plane_registry"),
-            "registry store declared: {ids:?}"
-        );
         let mut runner = myelin_substrate::MigrationRunner::new();
         runner
             .run(&spec.migrations, &HotTables::none())
             .expect("registry migrations are admitted (forward-only, PII-free)");
-    }
-
-    #[test]
-    fn registry_store_auto_registers_as_a_holder() {
-        let manifest = control_plane_store_manifest();
-        let mut registry = HolderRegistry::new();
-        for store in manifest.stores() {
-            registry.open(store.kind, store.name);
-        }
-        let violations = myelin_substrate::holder_registered(&manifest, &registry);
-        assert!(
-            violations.is_empty(),
-            "every declared store auto-registers: {violations:?}"
-        );
-        assert!(registry.is_registered(StoreKind::Oltp, CONTROL_PLANE_STORE_NAME));
     }
 
     #[test]

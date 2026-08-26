@@ -139,7 +139,7 @@ use myelin_identity::{
 use myelin_substrate::ConsumerReg;
 use myelin_substrate::{
     boot, AppSpec, Authorizer, Config, CriticalDependencies, HotTables, InternalRpc, Migration,
-    Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    Migrations, OutboxSpec, PublicRoutes, ServeError, ServeHandle,
 };
 use myelin_tenancy::ArtifactRef;
 
@@ -323,8 +323,6 @@ pub fn knowledge_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
         intake_scope: None,
@@ -538,17 +536,6 @@ mod tests {
                 Err(AuthzError::NotYetImplemented(_))
             ),
             "list_objects errors loudly until KN-P16 (never a permissive set)"
-        );
-    }
-
-    #[test]
-    fn knowledge_store_auto_registers_as_holder() {
-        let handle = boot_knowledge(Config::default(), OutboxStore::new()).expect("boot");
-        assert!(
-            handle
-                .holder_registry()
-                .is_registered(myelin_substrate::StoreKind::Oltp, "knowledge"),
-            "the knowledge OLTP store auto-registered as a PersonalDataHolder"
         );
     }
 

@@ -2,7 +2,7 @@ use crate::migrations::{issues_hot_tables, issues_migrations};
 use myelin_events::OutboxStore;
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
-    ServeError, ServeHandle, StoreManifest,
+    ServeError, ServeHandle,
 };
 
 pub const SERVICE_NAME: &str = "issues";
@@ -20,8 +20,6 @@ pub fn issues_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: issues_critical(),
         intake_scope: None,

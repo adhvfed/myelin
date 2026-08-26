@@ -390,8 +390,6 @@ pub fn controlplane_app_spec(config: Config, outbox: myelin_events::OutboxStore)
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: myelin_substrate::StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: controlplane_critical(),
         intake_scope: None,

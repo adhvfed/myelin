@@ -2,7 +2,7 @@ use myelin_events::relay::InProcessBus;
 use myelin_substrate::serve::{boot, AppSpec, OutboxSpec, Surface};
 use myelin_substrate::{
     Config, CriticalDependencies, HotTables, InternalRpc, Liveness, Migrations, PublicRoutes,
-    Readiness, StoreManifest,
+    Readiness,
 };
 
 #[test]
@@ -15,8 +15,6 @@ fn cdc_1_3_lifecycle_metrics_health_is_liveness_ne_readiness() {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: vec![],
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::new(myelin_events::OutboxStore::new(), InProcessBus::new()),
         critical: CriticalDependencies::new(["identity"]),
         intake_scope: None,

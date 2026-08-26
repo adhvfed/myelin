@@ -7,7 +7,6 @@ use myelin_git::check_status_store::{
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::{
     AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
-    StoreManifest,
 };
 use std::sync::Arc;
 
@@ -106,8 +105,6 @@ async fn main() {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: vec![ConsumerReg::new(consumer)],
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay_with_consumer(outbox, Box::new(intake), quarantine),
         critical: CriticalDependencies::default(),
         intake_scope: None,

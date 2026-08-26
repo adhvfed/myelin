@@ -6,14 +6,12 @@ pub mod fail_static;
 pub mod fail_static_authz;
 pub mod firehose;
 pub mod firehose_selector;
-pub mod holder_catalog;
-pub mod holder_registered;
-pub mod holders;
 pub mod metrics_health;
 pub mod migrations;
 pub mod overlay;
 pub mod serve;
 pub mod shed;
+pub mod store_kind;
 pub mod thresholds;
 pub mod topology;
 
@@ -37,14 +35,6 @@ pub use firehose_selector::{
     BoundedSelector, FrameBudgetVerdict, FrameOutcome, FrameSelector, FrameShedBudget, ScopeWindow,
     SelectorError, SelectorKind, WindowVerdict,
 };
-pub use holder_catalog::{
-    assert_holder_completeness, classify_store, holder_completeness, Holder, OrphanStore,
-    StoreClassifier, StoreHolder,
-};
-pub use holder_registered::{
-    assert_all_holders_registered, holder_registered, DeclaredStore, HolderViolation, StoreManifest,
-};
-pub use holders::{HolderRegistration, HolderRegistry, StoreKind};
 pub use metrics_health::{
     CriticalDependencies, CriticalDependency, DependencyHealth, HealthTable, Liveness,
     LivenessState, MetricsHealthSurface, Readiness, ReadinessReport, Startup,
@@ -58,13 +48,14 @@ pub use overlay::{
     Rect, Side,
 };
 pub use serve::{
-    boot, serve, serve_until_shutdown, AppSpec, ConsumerReg, HoldersSpec, IntakeScope, InternalRpc,
-    OutboxSpec, PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
+    boot, serve, serve_until_shutdown, AppSpec, ConsumerReg, IntakeScope, InternalRpc, OutboxSpec,
+    PortOpener, PublicRoutes, ServeHandle, Surface, Telemetry,
 };
 pub use shed::{
     BoundedQueue, RunClass, RunClassHeader, ShedBudgetError, ShedBudgetTable, ShedDecision,
     ShedLane, Surface as ShedSurface, SurfaceBudget,
 };
+pub use store_kind::StoreKind;
 pub use thresholds::{
     CellSizing, DepthCeilings, DsrDeadline, FailStaticThreshold, FlexDb, Revocation, RpoRto,
     ShedBudgetRow, Surge, ThresholdError, Thresholds, THRESHOLDS_FILENAME,
@@ -108,14 +99,11 @@ mod tests {
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![],
-            holders: HoldersSpec::Auto,
-            stores: StoreManifest::new(),
             outbox: OutboxSpec::default(),
             critical: CriticalDependencies::default(),
             intake_scope: None,
         };
         assert_eq!(spec.name, "hello");
-        assert_eq!(spec.holders, HoldersSpec::Auto);
         let _f: fn(AppSpec) -> Result<(), ServeError> = serve;
     }
 

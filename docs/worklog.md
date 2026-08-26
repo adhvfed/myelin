@@ -4,6 +4,33 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — A store name is not a privacy capability
+
+Substrate's `HolderRegistry` appeared to implement the deferred automatic
+`PersonalDataHolder` contract, but boot only copied `AppSpec.stores` into a second in-memory list.
+The architecture check compared those two copies, while a separate H1–H18 enum classified the
+same declarations and called the result exhaustive. None of it provided locate, export, rectify,
+restrict, or erase, and no product operation consumed the registry. The fixed
+`HoldersSpec::Auto` field had no alternative behavior. Service tests therefore certified privacy
+coverage by repeating that each service had a datastore.
+
+The registry, duplicate manifest, classifier, inert application fields, and self-certifying tests
+are gone. The neutral `StoreKind` taxonomy remains because real Search and References residency
+descriptors use it. The cross-language contract name and coverage row also remain: contract 1.4
+is still explicitly deferred to `P-GDPR-DURABLE-HOLDER-INVENTORY`, where a future implementation
+must register executable durable holders rather than metadata. The workspace check also found a
+stale Identity cell-scale drill importing Storage's deleted process-local restore model; its
+hand-written RPO/RTO durations and signals are gone, while the actual authority-resurrection and
+cell-bulkhead cases and the restore harness's timing drills remain.
+
+**Proof:** workspace all-target/all-feature compile and strict Clippy; the 99-row contract gate;
+all 176 Substrate library stories and every lifecycle, topology, migration, firehose, load, IDOR,
+and restore drill; all three full-stack Identity cell-scale cases; the Agent, Control Plane, Flow,
+Knowledge, and Search library suites (including Search's two independent 3,000-event freshness
+measurements); rebuilt healthy Edge; and the public browser-to-CLI authentication journey (398
+milliseconds). Net removal before this entry: 1,334 lines of declarative privacy simulation and
+fabricated recovery evidence.
+
 ## 2026-08-26 — Restore erasure is proven against the database it protects
 
 Storage still contained a second privacy stack after the legacy service was removed. A generic

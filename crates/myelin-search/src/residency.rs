@@ -82,12 +82,12 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_name_matches_the_registered_holder_store() {
+    fn descriptor_names_the_search_index_store() {
         let descriptors = search_store_descriptors(TenantId::from_token("acme"), fr_par());
         let names: Vec<&str> = descriptors.iter().map(|d| d.name).collect();
         assert!(
             names.contains(&SEARCH_INDEX_STORE),
-            "the index is described + registered"
+            "the residency descriptor names the index used by Search"
         );
     }
 }

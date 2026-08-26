@@ -1,5 +1,3 @@
-use crate::holder_registered::{assert_all_holders_registered, HolderViolation, StoreManifest};
-use crate::holders::{HolderRegistration, HolderRegistry, StoreKind};
 use crate::metrics_health::{CriticalDependencies, HealthTable, MetricsHealthSurface};
 use crate::migrations::{HotTables, Migration, MigrationRunner, Migrations};
 use crate::topology::PublicSurface;
@@ -151,12 +149,6 @@ pub struct PublicRoutes(pub ());
 #[derive(Clone, Debug, Default)]
 pub struct InternalRpc(pub ());
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum HoldersSpec {
-    #[default]
-    Auto,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
     Public,
@@ -287,18 +279,12 @@ pub struct AppSpec {
     pub public: PublicRoutes,
     pub internal: InternalRpc,
     pub consumers: Vec<ConsumerReg>,
-    pub holders: HoldersSpec,
-    pub stores: StoreManifest,
     pub outbox: OutboxSpec,
     pub critical: CriticalDependencies,
     pub intake_scope: Option<IntakeScope>,
 }
 
 impl AppSpec {
-    pub const fn auto() -> HoldersSpec {
-        HoldersSpec::Auto
-    }
-
     pub fn minimal(name: &'static str, config: Config, outbox: OutboxSpec) -> AppSpec {
         AppSpec {
             name,
@@ -308,8 +294,6 @@ impl AppSpec {
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: Vec::new(),
-            holders: HoldersSpec::Auto,
-            stores: StoreManifest::new(),
             outbox,
             critical: CriticalDependencies::default(),
             intake_scope: None,
@@ -342,8 +326,6 @@ pub struct ServeHandle {
     consumer_transport: Option<Box<dyn EventConsumer>>,
     delivery_quarantine: Option<Arc<dyn DurableDeliveryQuarantine>>,
     consumers: Vec<ConsumerReg>,
-    holders: HolderRegistry,
-    manifest: StoreManifest,
     ports: PortOpener,
     telemetry: Telemetry,
     draining: Arc<AtomicBool>,
@@ -421,22 +403,6 @@ impl ServeHandle {
 
     pub fn outbox(&self) -> &OutboxStore {
         &self.outbox
-    }
-
-    pub fn registered_holders(&self) -> &[HolderRegistration] {
-        self.holders.registrations()
-    }
-
-    pub fn holder_registry(&self) -> &HolderRegistry {
-        &self.holders
-    }
-
-    pub fn store_manifest(&self) -> &StoreManifest {
-        &self.manifest
-    }
-
-    pub fn holder_registered(&self) -> Result<(), Vec<HolderViolation>> {
-        assert_all_holders_registered(&self.manifest, &self.holders)
     }
 
     pub fn surfaces(&self) -> &[Surface] {
@@ -722,8 +688,6 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         public: _public,
         internal: _internal,
         consumers,
-        holders,
-        stores,
         outbox,
         critical,
         intake_scope,
@@ -764,20 +728,6 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     ]);
     full_migrations.0.extend(migrations.0);
     runner.run(&full_migrations, &hot_tables)?;
-
-    let HoldersSpec::Auto = holders;
-    let mut holder_registry = HolderRegistry::new();
-    holder_registry.open(StoreKind::Oltp, name);
-    for store in stores.stores() {
-        holder_registry.open(store.kind, store.name);
-    }
-    let mut full_manifest = StoreManifest::of([crate::holder_registered::DeclaredStore::new(
-        StoreKind::Oltp,
-        name,
-    )]);
-    for store in stores.stores() {
-        full_manifest.declare(store.kind, store.name);
-    }
 
     let OutboxSpec {
         store: outbox_store,
@@ -830,8 +780,6 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
         consumer_transport,
         delivery_quarantine,
         consumers,
-        holders: holder_registry,
-        manifest: full_manifest,
         ports,
         telemetry,
         draining: Arc::new(AtomicBool::new(false)),
@@ -1374,8 +1322,6 @@ mod tests {
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![consumer],
-            holders: AppSpec::auto(),
-            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
             intake_scope: None,
@@ -1388,21 +1334,6 @@ mod tests {
             &[Surface::Public, Surface::Internal, Surface::MetricsHealth],
             "the three ports opened in the lifecycle"
         );
-        assert_eq!(
-            handle.registered_holders(),
-            &[HolderRegistration {
-                kind: StoreKind::Oltp,
-                name: "hello"
-            }],
-            "the OLTP store auto-registered as a holder (§3.4)"
-        );
-        assert!(
-            handle
-                .holder_registry()
-                .is_registered(StoreKind::Oltp, "hello"),
-            "no store escaped registration (opening IS registering)"
-        );
-
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
         let mut tx = outbox.begin(minter, ctx_base());
         tx.stage_state_change("hello created");
@@ -1994,8 +1925,6 @@ mod tests {
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![consumer],
-            holders: AppSpec::auto(),
-            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
             intake_scope: None,
@@ -2041,8 +1970,6 @@ mod tests {
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![consumer],
-            holders: AppSpec::auto(),
-            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
             intake_scope: None,
@@ -2074,8 +2001,6 @@ mod tests {
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![],
-            holders: AppSpec::auto(),
-            stores: StoreManifest::new(),
             outbox: OutboxSpec::default(),
             critical: CriticalDependencies::default(),
             intake_scope: None,
@@ -2142,8 +2067,6 @@ mod tests {
             public: PublicRoutes::default(),
             internal: InternalRpc::default(),
             consumers: vec![ConsumerReg::new(consumer)],
-            holders: AppSpec::auto(),
-            stores: StoreManifest::new(),
             outbox: OutboxSpec::new(outbox.clone(), InProcessBus::new()),
             critical: CriticalDependencies::default(),
             intake_scope: None,

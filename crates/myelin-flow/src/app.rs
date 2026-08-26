@@ -2,7 +2,7 @@ use crate::migrations::migrations as flow_migrations;
 use myelin_events::OutboxStore;
 use myelin_substrate::{
     boot, serve, AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations,
-    OutboxSpec, PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    OutboxSpec, PublicRoutes, ServeError, ServeHandle,
 };
 
 pub const SERVICE_NAME: &str = "myelin-flow";
@@ -20,8 +20,6 @@ pub fn flow_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
         intake_scope: None,
@@ -190,22 +188,6 @@ mod tests {
             spec.consumers.len(),
             1,
             "the inbound-signal consumer occupies the consumer slot (P-FLOW-09)"
-        );
-    }
-
-    #[test]
-    fn flow_oltp_store_auto_registers_as_a_holder_at_boot() {
-        use myelin_substrate::StoreKind;
-        let handle = boot_flow(Config::default(), OutboxStore::new()).expect("boot");
-        assert!(
-            handle
-                .holder_registry()
-                .is_registered(StoreKind::Oltp, SERVICE_NAME),
-            "the flow OLTP store auto-registered as a holder at boot (opening IS registering)"
-        );
-        assert!(
-            handle.holder_registered().is_ok(),
-            "no store the service declares escaped registration (the holder-registered architecture test)"
         );
     }
 

@@ -2,7 +2,7 @@ use myelin_events::OutboxStore;
 use myelin_knowledge::{boot_knowledge, knowledge_app_spec, HOT_TABLES, SERVICE_NAME};
 use myelin_substrate::{
     is_destructive, serve, Config, HotTables, Migration, MigrationPhase, MigrationRunner,
-    Migrations, Readiness, Startup, StoreKind, Surface,
+    Migrations, Readiness, Startup, Surface,
 };
 
 #[test]
@@ -20,12 +20,6 @@ fn consumer_knowledge_appspec_boots_three_ports_over_harness_provider() {
         handle.metrics_health().readiness().verdict,
         Readiness::Ready,
         "a booted knowledge instance is ready once the provider's migrate-gate lifts"
-    );
-    assert!(
-        handle
-            .holder_registry()
-            .is_registered(StoreKind::Oltp, SERVICE_NAME),
-        "the knowledge OLTP store auto-registered as a PersonalDataHolder"
     );
 }
 

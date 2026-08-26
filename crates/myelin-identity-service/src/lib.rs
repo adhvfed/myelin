@@ -157,7 +157,7 @@ use myelin_identity::{
 };
 use myelin_substrate::{
     boot, AppSpec, Authorizer, Config, CriticalDependencies, InternalRpc, Migration, Migrations,
-    PublicRoutes, ServeError, ServeHandle, StoreManifest,
+    PublicRoutes, ServeError, ServeHandle,
 };
 use myelin_tenancy::ArtifactRef;
 
@@ -1183,8 +1183,6 @@ pub fn identity_app_spec(config: Config, outbox: OutboxStore) -> AppSpec {
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: myelin_substrate::OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
         intake_scope: None,
@@ -1426,17 +1424,6 @@ mod tests {
         assert!(
             matches!(r, Err(AuthzError::NotYetImplemented(_))),
             "list_objects errors loudly until P-ID-11/12 (never a permissive set)"
-        );
-    }
-
-    #[test]
-    fn identity_store_auto_registers_as_holder() {
-        let handle = boot_identity(Config::default(), OutboxStore::new()).expect("boot");
-        assert!(
-            handle
-                .holder_registry()
-                .is_registered(myelin_substrate::StoreKind::Oltp, "identity"),
-            "the identity OLTP store auto-registered as a PersonalDataHolder"
         );
     }
 

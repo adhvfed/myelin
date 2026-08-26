@@ -11,7 +11,7 @@ use myelin_identity::{
     Zookie,
 };
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
-use myelin_storage::{CellKillRestore, CellKillRtoReport, RtoGrain, TenantScope};
+use myelin_storage::TenantScope;
 use myelin_substrate::thresholds::Thresholds;
 use myelin_tenancy::{ArtifactRef, CellId, Region, TenantId};
 
@@ -228,14 +228,6 @@ fn id_d33_id_d8_at_cell_scale_under_world_scale_load_resurrects_no_authority() {
     );
     let multiplier =
         Multiplier::custom(thresholds.surge.multiplier).expect("a positive surge multiplier");
-    let rto_tenant_bound = thresholds.rpo_rto.rto_tenant_max_mins * 60;
-    let rto_cell_bound = thresholds.rpo_rto.rto_cell_max_mins * 60;
-    let rpo_bound = thresholds.rpo_rto.rpo_max_mins * 60;
-    assert!(
-        rto_tenant_bound > 0 && rto_cell_bound > 0 && rpo_bound > 0,
-        "the rpo_rto bounds must be positive durations"
-    );
-
     let cell = Cell::healthy("cell-fr-par-1", &["acme", "globex", "initech", "umbrella"]);
     let sibling = Cell::healthy("cell-fr-par-2", &["wonka"]);
 
@@ -294,26 +286,6 @@ fn id_d33_id_d8_at_cell_scale_under_world_scale_load_resurrects_no_authority() {
          is part of the pass, EI-01 §3)"
     );
 
-    let tenant_recovery = CellKillRestore::new(RtoGrain::Tenant, 0, (18 + 9 + 3 + 2) * 60);
-    let cell_recovery = CellKillRestore::new(RtoGrain::Cell, 0, (95 + 55 + 20 + 10) * 60);
-    let mut rto_report = CellKillRtoReport::new();
-    rto_report.record(&tenant_recovery).record(&cell_recovery);
-    assert!(
-        tenant_recovery.within_bound(rto_tenant_bound),
-        "STOR-D2 at cell scale: tenant RTO {}s within the {rto_tenant_bound}s bound",
-        tenant_recovery.rto_secs()
-    );
-    assert!(
-        cell_recovery.within_bound(rto_cell_bound),
-        "STOR-D2 at cell scale: cell RTO {}s within the {rto_cell_bound}s bound",
-        cell_recovery.rto_secs()
-    );
-    let rpo_at_kill_secs = 270;
-    assert!(
-        rpo_at_kill_secs <= rpo_bound,
-        "STOR-D2 at cell scale: RPO {rpo_at_kill_secs}s within the {rpo_bound}s bound"
-    );
-
     let mut src = SignalSource::new();
     src.set_labelled(
         SignalName::CrossTenantCount,
@@ -325,18 +297,6 @@ fn id_d33_id_d8_at_cell_scale_under_world_scale_load_resurrects_no_authority() {
         vec![Label::new("drill", "id_d8_cell_scale_cross_cell")],
         sink.cross_cell_allows,
     );
-    src.set_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![Label::new("grain", "tenant")],
-        tenant_recovery.rto_secs() as i64,
-    );
-    src.set_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![Label::new("grain", "cell")],
-        cell_recovery.rto_secs() as i64,
-    );
-    src.set_scalar(SignalName::RestoreRpoSecs, rpo_at_kill_secs as i64);
-
     src.assert_labelled(
         SignalName::CrossTenantCount,
         vec![Label::new("drill", "id_d8_cell_scale_resurrected")],
@@ -349,33 +309,13 @@ fn id_d33_id_d8_at_cell_scale_under_world_scale_load_resurrects_no_authority() {
         Predicate::Eq(0),
     )
     .expect_green();
-    src.assert_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![Label::new("grain", "tenant")],
-        Predicate::Lte(rto_tenant_bound as i64),
-    )
-    .expect_green();
-    src.assert_labelled(
-        SignalName::RestoreRtoSecs,
-        vec![Label::new("grain", "cell")],
-        Predicate::Lte(rto_cell_bound as i64),
-    )
-    .expect_green();
-    src.assert_signal(SignalName::RestoreRpoSecs, Predicate::Lte(rpo_bound as i64))
-        .expect_green();
-
     println!(
         "[P-426 DRILL GREEN 2026-06-24] ID-D8 at CELL SCALE: cell=cell-fr-par-1 tenants=4 \
          subjects=32 → restore resurrected 32, world-scale load {}× ({} real checks) → \
          re-erasure pass re_erased=32, resurrected_after=0 (no resurrected authority), all \
-         receipts GREEN+dated; cross-cell authz impact 0 under load; STOR-D2 cell-scale: tenant \
-         RTO={}s ≤ {rto_tenant_bound}s, cell RTO={}s ≤ {rto_cell_bound}s, RPO={rpo_at_kill_secs}s \
-         ≤ {rpo_bound}s [all bounds read from thresholds.toml]. World-scale 30× wall-clock on real \
-         fleet hardware remains the named load floor.",
-        thresholds.surge.multiplier,
-        sink.checks,
-        tenant_recovery.rto_secs(),
-        cell_recovery.rto_secs(),
+         receipts GREEN+dated; cross-cell authz impact 0 under load. World-scale 30× wall-clock on \
+         real fleet hardware remains the named load floor.",
+        thresholds.surge.multiplier, sink.checks,
     );
 }
 

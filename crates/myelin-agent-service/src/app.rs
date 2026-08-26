@@ -2,7 +2,7 @@
 use myelin_substrate::{boot, serve, ServeHandle};
 use myelin_substrate::{
     AppSpec, Config, CriticalDependencies, HotTables, InternalRpc, Migrations, OutboxSpec,
-    PublicRoutes, ServeError, StoreManifest,
+    PublicRoutes, ServeError,
 };
 
 pub const SERVICE_NAME: &str = "myelin-agent";
@@ -55,8 +55,6 @@ fn agent_app_spec(config: Config, outbox: myelin_events::OutboxStore) -> AppSpec
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers: Vec::new(),
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: CriticalDependencies::default(),
         intake_scope: None,
@@ -250,23 +248,6 @@ mod tests {
                 "0005_create_agent_trace",
             ],
             "the substrate migrate set carries the SAME five AG-P2 migrations (one schema)"
-        );
-    }
-
-    #[test]
-    fn agent_stores_auto_register_as_holders_at_boot() {
-        use myelin_substrate::StoreKind;
-        let handle =
-            boot_agent(Config::default(), myelin_events::OutboxStore::new()).expect("boot");
-        assert!(
-            handle
-                .holder_registry()
-                .is_registered(StoreKind::Oltp, SERVICE_NAME),
-            "the agent OLTP store auto-registered as a holder at boot"
-        );
-        assert!(
-            handle.holder_registered().is_ok(),
-            "no store the service declares escaped registration (the holder-registered architecture test)"
         );
     }
 

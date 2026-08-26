@@ -32,7 +32,7 @@ pub use resolve::{
 
 use myelin_substrate::{
     AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
-    ServeError, StoreManifest,
+    ServeError,
 };
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -250,8 +250,6 @@ fn dispatch_app_spec(
         public: PublicRoutes::default(),
         internal: InternalRpc::default(),
         consumers,
-        holders: AppSpec::auto(),
-        stores: StoreManifest::new(),
         outbox: OutboxSpec::external_relay(outbox),
         critical: dispatch_critical(),
         intake_scope: None,
