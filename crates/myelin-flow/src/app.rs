@@ -210,22 +210,6 @@ mod tests {
     }
 
     #[test]
-    fn boot_registered_flow_store_classifies_and_completeness_is_green() {
-        use crate::holder::{flow_history_holder, flow_store_classifier};
-        use myelin_substrate::{assert_holder_completeness, Holder};
-        let handle = boot_flow(Config::default(), OutboxStore::new()).expect("boot");
-        assert_eq!(flow_history_holder(), Some(Holder::H8EventBus));
-        assert_eq!(
-            assert_holder_completeness(
-                handle.holder_registry().registrations(),
-                &flow_store_classifier(),
-            ),
-            Ok(()),
-            "every store the flow harness opens is in the exhaustive H1–H18 list - 0 orphan"
-        );
-    }
-
-    #[test]
     fn run_flow_boots_serves_and_drains_cleanly() {
         assert_eq!(
             run_flow(Config::default(), OutboxStore::new()),

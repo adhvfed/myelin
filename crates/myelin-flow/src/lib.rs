@@ -2,10 +2,8 @@ pub mod app;
 pub mod approval;
 pub mod budget;
 pub mod ci_pipeline;
-pub mod crypto_shred;
 pub mod engine;
 pub mod executor;
-pub mod holder;
 pub mod job;
 pub mod loopsafety;
 pub mod maintenance;
@@ -37,11 +35,6 @@ pub use ci_pipeline::{
     read_stage_verdict, stage_verdict_marker, CiPipelineSpec, CiStage, PipelineOutcome,
     CI_PIPELINE_WF_TYPE,
 };
-pub use crypto_shred::{
-    aggregate_receipt as crypto_shred_receipt, history_row_has_inline_pii,
-    is_inline_pii_unrecoverable, open_inline_pii, seal_inline_pii, signal_row_has_inline_pii,
-    subject_dek_erasure, subject_dek_id, WfCryptoShred, WfShredReport,
-};
 pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,
     FlowTelemetry, RunRow, RunStore, SignalRow, SignalStore, WorkflowBody,
@@ -50,10 +43,6 @@ pub use executor::partition_for_run_id;
 pub use executor::{
     DurableExecutor, ExecutorError, FlowExecutor, RunBudget, RunId, RunStatus, SignalOutcome,
     SignalPayload, SignalSpec, StartSpec, TypedSignalSpec, PARTITION_COUNT,
-};
-pub use holder::{
-    flow_history_holder, flow_store_classifier, register_flow_holder, FlowBacking,
-    FlowHolderRegistration, RestrictSet, WfHistoryHolder, FLOW_OLTP_STORE,
 };
 pub use job::{
     job_dispatch_marker, job_idem_token, DispatchedJob, JobKind, JobOutcome, JobRunner, JobSpec,

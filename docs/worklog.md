@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Workflow privacy no longer presents a process-local prototype as durable
+
+Workflow exposed an optional `PersonalDataHolder` whose ordinary construction returned successful
+no-op privacy receipts and whose "backed" construction read only the process-local workflow
+journal. A special constructor made the story look stronger by encrypting synthetic history under
+Storage's in-memory KMS, destroying that in-memory key, and inspecting the same process's snapshot.
+No running service constructed any variant, no PostgreSQL workflow row was read or changed, and no
+privacy request could reach it. Its restore-safety claims therefore certified the prototype rather
+than the product.
+
+The holder, crypto-shred prototype, public exports, classification endorsement, and both dedicated
+suites are gone. Workflow's real service inventory remains automatically registered at boot, and
+the durable PostgreSQL engine, replay journal, signal buffer, timer wheel, and lease-fenced worker
+are unchanged. Workflow remains honestly absent from privacy-request scopes until its durable
+history can be located and erased through the same production path, with persistent key state and
+post-restore replay evidence.
+
+**Proof:** all-target/all-feature Workflow compile and strict clippy; all 236 remaining library
+stories; the complete all-feature suite against PostgreSQL, including 100k timers, durable replay,
+lease fencing, exact-once signals, and CI wake-ups; rebuilt Hosted Agent Worker, CI Dispatch, and
+Edge; and both live TypeScript private-agent journeys, including a named private problem and
+workspace resumed from fresh agent context (6.63 seconds). Net removal: 1,475 lines of unshipped
+privacy prototype and endorsing tests.
+
 ## 2026-08-26 — Notifications no longer certify an in-memory erasure
 
 Notifications exported a privacy holder whose default instance returned successful locate,
