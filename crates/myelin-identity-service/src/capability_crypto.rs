@@ -520,13 +520,6 @@ fn verify_dpop_proof(
 
 type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-fn system_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[derive(Clone)]
 pub struct PasetoCapabilityVerifier {
     anchor: CellTrustAnchor,
@@ -540,7 +533,7 @@ impl PasetoCapabilityVerifier {
     pub fn new(anchor: CellTrustAnchor) -> PasetoCapabilityVerifier {
         PasetoCapabilityVerifier {
             anchor,
-            now: Arc::new(system_now),
+            now: Arc::new(crate::clock::unix_seconds),
             binding: None,
             dpop_window_secs: 60,
             replay: DpopReplayGuard::new(),
@@ -865,7 +858,7 @@ impl PasetoCapabilitySigner {
     pub fn new(authority: Arc<CellTokenAuthority>) -> PasetoCapabilitySigner {
         PasetoCapabilitySigner {
             authority,
-            now: Arc::new(system_now),
+            now: Arc::new(crate::clock::unix_seconds),
         }
     }
 

@@ -323,13 +323,6 @@ impl ClientData {
 
 type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-fn system_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[derive(Clone, Debug)]
 struct StoredChallenge {
     expires_at: i64,
@@ -348,7 +341,7 @@ impl ChallengeGuard {
         ChallengeGuard {
             inner: Arc::new(Mutex::new(BTreeMap::new())),
             ttl_secs,
-            now: Arc::new(system_now),
+            now: Arc::new(crate::clock::unix_seconds),
         }
     }
 

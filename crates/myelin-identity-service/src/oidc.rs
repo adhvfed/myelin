@@ -506,13 +506,6 @@ impl OidcConfig {
 
 type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-fn system_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[derive(Clone)]
 pub struct OidcVerifier {
     config: OidcConfig,
@@ -527,7 +520,7 @@ impl OidcVerifier {
             config,
             jwks: JwksSource::fixed(jwks),
             replay: ReplayGuard::new(),
-            now: Arc::new(system_now),
+            now: Arc::new(crate::clock::unix_seconds),
         }
     }
 

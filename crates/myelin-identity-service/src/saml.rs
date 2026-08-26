@@ -485,13 +485,6 @@ fn algorithm(el: &Element) -> Option<&str> {
 
 type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-fn system_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[derive(Clone)]
 pub struct SamlConfig {
     pub issuer: String,
@@ -619,7 +612,7 @@ impl SamlVerifier {
             config,
             replay,
             request_binding: None,
-            now: Arc::new(system_now),
+            now: Arc::new(crate::clock::unix_seconds),
         }
     }
 

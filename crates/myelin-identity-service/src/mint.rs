@@ -120,7 +120,7 @@ impl RunTokenAuthorizer {
         Self {
             verifier,
             revocations,
-            now: Arc::new(system_now_timestamp),
+            now: Arc::new(crate::clock::timestamp),
         }
     }
 
@@ -301,15 +301,6 @@ impl RunTokenAuthorizer {
         }
         Ok(())
     }
-}
-
-fn system_now_timestamp() -> Timestamp {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let dt = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
-    Timestamp(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

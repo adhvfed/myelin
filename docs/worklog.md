@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Identity never interprets a broken clock as 1970
+
+Seven identity boundaries independently read wall time: OIDC, SAML, WebAuthn, SSH challenges,
+PASETO capability verification, machine authentication, and run-token minting. Each converted a
+system clock before the Unix epoch into zero; the two timestamp-producing copies then converted
+that zero into `1970-01-01T00:00:00Z`. A verifier under that failure could compare credentials
+against the distant past, while an issuer could create a lifetime unrelated to real time. The
+fallback made a broken security dependency look valid.
+
+Identity now owns one private clock boundary. It checks both the Unix-epoch lower bound and signed
+timestamp range, refuses to continue if either invariant is unavailable, and produces RFC 3339
+timestamps through the same checked value. All seven production callers use that boundary; their
+existing injected test clocks remain unchanged, so protocol tests stay deterministic without a
+second production interpretation of time.
+
+**Proof:** the pre-epoch clock regression; all 419 Identity library stories, including OIDC, SAML,
+WebAuthn, SSH, capability, revocation, and minting cases; strict all-target/all-feature Identity
+Clippy; rebuilt healthy Edge and Workspace Gateway; and the live TypeScript browser-approved CLI
+authentication journey against PostgreSQL (121 milliseconds).
+
 ## 2026-08-26 — A runner identity is either unpredictable or unavailable
 
 The user-namespace allocator used kernel randomness for its lease nonce but treated its
