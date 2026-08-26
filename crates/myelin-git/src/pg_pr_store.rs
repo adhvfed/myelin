@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, Timestamp, UlidMinter};
+use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, UlidMinter};
 use myelin_gdpr::ErasureMethod;
 use myelin_identity::Principal;
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
@@ -12,6 +12,7 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
+use crate::clock::system_clock_reading;
 use crate::core::{Oid as CoreOid, RepoLoc};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
@@ -349,7 +350,7 @@ pub struct PendingMerge {
 struct MergeAdmission {
     intent: MergeIntent,
     command_hash: String,
-    ctx: EmitContextBase,
+    ctx: PrOperationContext,
     ruleset: BranchProtectionRuleset,
     project_checks: bool,
 }
@@ -411,7 +412,7 @@ impl PrMutation {
         }
     }
 
-    pub fn apply_to(self, record: &mut PrRecord) {
+    pub fn apply_to_at(self, record: &mut PrRecord, updated_at_unix: i64) {
         match self {
             Self::ReportChecks {
                 green_contexts,
@@ -442,15 +443,21 @@ impl PrMutation {
             }
             Self::Touch => {}
         }
-        record.updated_at = Some(now_unix());
+        record.updated_at = Some(updated_at_unix);
     }
+}
+
+#[derive(Clone)]
+struct PrOperationContext {
+    emit: EmitContextBase,
+    unix_seconds: i64,
 }
 
 struct PrMutationCommand {
     operation_id: PrOperationId,
     actor_subject_id: String,
     payload_hash: String,
-    emit_context: EmitContextBase,
+    context: PrOperationContext,
 }
 
 struct PrCommandIdentity<'a> {
@@ -603,27 +610,32 @@ impl PgPrStore {
         VerifiedCellScope::new(scope, &self.provider.config().region)
     }
 
-    fn emit_context(
+    fn operation_context(
         &self,
         scope: &TenantScope,
         principal: &Principal,
-    ) -> Result<EmitContextBase, DurableError> {
+    ) -> Result<PrOperationContext, DurableError> {
         if principal.tenant != *scope.tenant() || principal.region != *scope.region() {
             return Err(DurableError::NotFound("repository partition".into()));
         }
         if scope.region().0 != self.provider.config().region {
             return Err(DurableError::NotFound("repository partition".into()));
         }
-        let timestamp = now_rfc3339();
+        let clock = system_clock_reading()
+            .map_err(|error| DurableError::Io(format!("Git PR clock unavailable: {error}")))?;
+        let timestamp = clock.timestamp();
         let event_principal = pseudonymized_event_principal(scope.tenant().as_str(), principal);
-        Ok(EmitContextBase {
-            tenant: scope.tenant().clone(),
-            region: scope.region().clone(),
-            actor: Actor(event_principal),
-            schema_ver: 1,
-            occurred_at: timestamp.clone(),
-            recorded_at: timestamp,
-            caused_by: None,
+        Ok(PrOperationContext {
+            emit: EmitContextBase {
+                tenant: scope.tenant().clone(),
+                region: scope.region().clone(),
+                actor: Actor(event_principal),
+                schema_ver: 1,
+                occurred_at: timestamp.clone(),
+                recorded_at: timestamp,
+                caused_by: None,
+            },
+            unix_seconds: clock.unix_seconds(),
         })
     }
 
@@ -1022,7 +1034,9 @@ impl PgPrStore {
         let actor_subject_id = record.author_subject_id.clone();
         record.number = 0;
         let payload_hash = open_payload_hash(&record)?;
-        let ctx = self.emit_context(scope, principal)?;
+        let ctx = self.operation_context(scope, principal)?;
+        record.created_at = Some(ctx.unix_seconds);
+        record.updated_at = Some(ctx.unix_seconds);
         self.open_inner(
             scope,
             repo,
@@ -1048,7 +1062,9 @@ impl PgPrStore {
         let actor_subject_id = record.author_subject_id.clone();
         record.number = 0;
         let payload_hash = open_payload_hash(&record)?;
-        let ctx = self.emit_context(scope, principal)?;
+        let ctx = self.operation_context(scope, principal)?;
+        record.created_at = Some(ctx.unix_seconds);
+        record.updated_at = Some(ctx.unix_seconds);
         self.open_inner(
             scope,
             repo,
@@ -1070,7 +1086,7 @@ impl PgPrStore {
         operation_id: PrOperationId,
         actor_subject_id: String,
         payload_hash: String,
-        ctx: EmitContextBase,
+        ctx: PrOperationContext,
         abort_after_event: bool,
     ) -> Result<PrRecord, DurableError> {
         let loc = self.scoped_loc(scope, repo)?;
@@ -1142,7 +1158,7 @@ impl PgPrStore {
                         .execute(&mut *conn)
                         .await
                         .map_err(|_| pg_query("insert PR"))?;
-                        co_commit_event(conn, minter, ctx, &loc, &record, GIT_PR_OPENED, None).await?;
+                        co_commit_event(conn, minter, ctx.emit, &loc, &record, GIT_PR_OPENED, None).await?;
                         record_command(conn, &loc, &command, &record).await?;
                         if abort_after_event {
                             return Err(myelin_storage::PgError::Query(
@@ -1173,7 +1189,7 @@ impl PgPrStore {
             operation_id,
             actor_subject_id,
             payload_hash,
-            emit_context,
+            context,
         } = command;
         let provider = self.provider.clone();
         let minter = self.minter.clone();
@@ -1218,7 +1234,7 @@ impl PgPrStore {
                         }
                         let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode PR"))?;
-                        mutation.apply_to(&mut record);
+                        mutation.apply_to_at(&mut record, context.unix_seconds);
                         let sealed = seal_pr_record(
                             &kms,
                             crypto_region.clone(),
@@ -1250,7 +1266,7 @@ impl PgPrStore {
                         co_commit_event(
                             conn,
                             minter,
-                            emit_context,
+                            context.emit,
                             &loc,
                             &record,
                             event_type,
@@ -1277,7 +1293,7 @@ impl PgPrStore {
     ) -> Result<PrRecord, DurableError> {
         let actor_subject_id = normalized_subject_id(principal)?;
         let payload_hash = payload_hash(&(number, &mutation))?;
-        let emit_context = self.emit_context(scope, principal)?;
+        let context = self.operation_context(scope, principal)?;
         self.mutate(
             scope,
             repo,
@@ -1286,7 +1302,7 @@ impl PgPrStore {
                 operation_id: operation_id.clone(),
                 actor_subject_id,
                 payload_hash,
-                emit_context,
+                context,
             },
             mutation,
         )
@@ -1440,7 +1456,7 @@ impl PgPrStore {
                     DurableError::Io("pending merge disappeared during recovery".into())
                 });
         }
-        let ctx = self.emit_context(scope, principal)?;
+        let ctx = self.operation_context(scope, principal)?;
         let record = self
             .get(scope, repo, number)?
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
@@ -1626,8 +1642,8 @@ impl PgPrStore {
             }
         }
 
-        let mut ctx = self.emit_context(scope, recovery_principal)?;
-        ctx.caused_by = Some(CausedBy(format!(
+        let mut ctx = self.operation_context(scope, recovery_principal)?;
+        ctx.emit.caused_by = Some(CausedBy(format!(
             "git-pr-operation:{}",
             intent.operation_id
         )));
@@ -1670,7 +1686,7 @@ impl PgPrStore {
         number: u64,
         intent: &MergeIntent,
         command_hash: &str,
-        ctx: EmitContextBase,
+        ctx: PrOperationContext,
         target_repo: &DurableGitRepo,
         ref_store: &RefStore,
         merger_pseudonym: &str,
@@ -1880,7 +1896,7 @@ impl PgPrStore {
         intent: &MergeIntent,
         command_hash: &str,
         actual: Option<PushOid>,
-        ctx: EmitContextBase,
+        ctx: PrOperationContext,
     ) -> Result<MergeAttempt, DurableError> {
         let expected = serde_json::to_value(intent)
             .map_err(|_| DurableError::Git("encode merge intent failed".into()))?;
@@ -1973,7 +1989,7 @@ impl PgPrStore {
                         co_commit_event(
                             conn,
                             minter,
-                            ctx,
+                            ctx.emit,
                             &loc,
                             &record,
                             GIT_PR_UPDATED,
@@ -2157,7 +2173,7 @@ impl PgPrStore {
                         co_commit_event(
                             conn,
                             minter,
-                            ctx,
+                            ctx.emit,
                             &loc,
                             &record,
                             GIT_PR_UPDATED,
@@ -2181,7 +2197,7 @@ impl PgPrStore {
         intent: &MergeIntent,
         command_hash: &str,
         update_seq: u64,
-        ctx: EmitContextBase,
+        ctx: PrOperationContext,
     ) -> Result<MergeAttempt, DurableError> {
         validate_merge_intent(intent)?;
         let operation_id = PrOperationId::from_stored_digest(&intent.operation_id)?;
@@ -2222,7 +2238,7 @@ impl PgPrStore {
                 }
                 let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row).map_err(|_| pg_query("decode merge PR"))?;
                 record.state = PrState::Merged;
-                record.updated_at = Some(now_unix());
+                record.updated_at = Some(ctx.unix_seconds);
                 let sealed = seal_pr_record(&kms, crypto_region.clone(), &TenantId(loc.tenant.clone()), &record)
                     .map_err(|_| pg_query("seal merge PR"))?;
                 sqlx::query("UPDATE git_pr SET record=$5, version=version+1, merge_intent=$6, \
@@ -2236,7 +2252,7 @@ impl PgPrStore {
                     .bind(sealed.body.as_ref().map(|column| column.ciphertext.clone()))
                     .bind(sealed.body.as_ref().map(|column| column.key_ref.to_uri()))
                     .execute(&mut *conn).await.map_err(|_| pg_query("update merge PR"))?;
-                co_commit_event(conn, minter, ctx, &loc, &record, GIT_PR_MERGED, Some(&expected)).await?;
+                co_commit_event(conn, minter, ctx.emit, &loc, &record, GIT_PR_MERGED, Some(&expected)).await?;
                 let result = MergeCommandResult::Merged {
                     base_ref: record.base_ref.clone(),
                     new_oid: record.head_oid.clone(),
@@ -2807,38 +2823,6 @@ fn normalized_subject_id(principal: &Principal) -> Result<String, DurableError> 
     Ok(subject.to_owned())
 }
 
-fn now_rfc3339() -> Timestamp {
-    let seconds = now_unix().max(0) as u64;
-    let days = (seconds / 86_400) as i64;
-    let remainder = seconds % 86_400;
-    let (hour, minute, second) = (remainder / 3_600, (remainder % 3_600) / 60, remainder % 60);
-    let shifted_days = days + 719_468;
-    let era = shifted_days.div_euclid(146_097);
-    let day_of_era = shifted_days.rem_euclid(146_097) as u64;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    let year = if month <= 2 { year + 1 } else { year };
-    Timestamp(format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    ))
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3028,6 +3012,22 @@ mod tests {
         assert!(validate_merge_intent(&intent).is_ok());
         intent.operation_id.clear();
         assert!(validate_merge_intent(&intent).is_err());
+    }
+
+    #[test]
+    fn a_pr_mutation_uses_the_operations_exact_clock_reading() {
+        let pull_request = crate::lifecycle::PullRequest::open(
+            1,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pull_request, "a".repeat(40));
+
+        PrMutation::Touch.apply_to_at(&mut record, 1_722_470_400);
+
+        assert_eq!(record.updated_at, Some(1_722_470_400));
     }
 
     #[test]
@@ -3283,7 +3283,11 @@ mod tests {
             .await
             .expect("admin assertions pool");
 
-        let suffix = format!("{}-{}", std::process::id(), now_unix());
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            system_clock_reading().unwrap().unix_seconds()
+        );
         let tenant_a = format!("git-pr-a-{suffix}");
         let tenant_b = format!("git-pr-b-{suffix}");
         let region = cfg.region.clone();
@@ -3370,7 +3374,7 @@ mod tests {
             head_repo_slug: projection_slug.clone(),
         };
         let projection_hash = merge_payload_hash(projected_pr.number, &projection_intent).unwrap();
-        let projection_ctx = store.emit_context(&scope_a, &actor).unwrap();
+        let projection_ctx = store.operation_context(&scope_a, &actor).unwrap();
         assert!(matches!(
             store
                 .begin_merge(
@@ -3422,6 +3426,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(opened, replayed);
+        let opened_at = crate::clock::clock_reading_from_unix(
+            opened
+                .created_at
+                .expect("an open records its observation time"),
+        )
+        .unwrap()
+        .timestamp()
+        .0;
+        assert_eq!(
+            opened.updated_at, opened.created_at,
+            "an open has one record observation time"
+        );
+        let event_times: (String, String) = sqlx::query_as(
+            "SELECT envelope->>'occurred_at',envelope->>'recorded_at'
+               FROM outbox
+              WHERE aggregate=$1 AND envelope->>'tenant'=$2 AND envelope->>'type_'=$3",
+        )
+        .bind(format!("git/pr/{repo}:{}", opened.number))
+        .bind(&tenant_a)
+        .bind(GIT_PR_OPENED)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            event_times,
+            (opened_at.clone(), opened_at),
+            "one observation stamps the opened record and its event"
+        );
         assert!(store
             .open(
                 &scope_a,
@@ -3814,8 +3846,8 @@ mod tests {
                 scope_a.tenant().clone(),
             );
             event_agent.region = scope_a.region().clone();
-            let privacy_ctx = store.emit_context(&scope_a, &event_agent).unwrap();
-            let serialized_actor = serde_json::to_string(&privacy_ctx.actor).unwrap();
+            let privacy_ctx = store.operation_context(&scope_a, &event_agent).unwrap();
+            let serialized_actor = serde_json::to_string(&privacy_ctx.emit.actor).unwrap();
             for raw in [
                 "agent:raw-event-subject",
                 "runtime://raw-pg-worker/session",
@@ -3826,7 +3858,7 @@ mod tests {
                     "PG event actor leaked {raw}"
                 );
             }
-            let ctx = store.emit_context(&scope_a, &actor).unwrap();
+            let ctx = store.operation_context(&scope_a, &actor).unwrap();
             assert!(store
                 .begin_merge(
                     &scope_a,
@@ -3891,7 +3923,7 @@ mod tests {
                 .iter()
                 .any(|pending| pending.repo_slug == slug && pending.number == opened.number));
 
-            let ref_store = open_ref_store(target.clone(), slug, ctx);
+            let ref_store = open_ref_store(target.clone(), slug, ctx.emit);
             if slug == "merge-before" {
                 policy_store
                     .put_protection(&loc, &crate::pr_store::BranchProtectionConfig::default())

@@ -163,7 +163,7 @@ impl DurableGitBackend {
                     tenant,
                     region,
                     recovery_principal,
-                );
+                )?;
                 if store
                     .recover_pending_merge_target(
                         scope,

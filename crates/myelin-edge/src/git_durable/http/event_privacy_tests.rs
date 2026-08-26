@@ -15,8 +15,10 @@ fn production_refstore_context_scrubs_all_raw_agent_identifiers() {
         DataRole::Controller,
         PrincipalStatus::Active,
     );
-    let first = DurableGitBackend::emit_ctx("acme", "fr-par", &principal);
-    let second = DurableGitBackend::emit_ctx("acme", "fr-par", &principal);
+    let first = DurableGitBackend::emit_ctx("acme", "fr-par", &principal)
+        .expect("the test clock is available");
+    let second = DurableGitBackend::emit_ctx("acme", "fr-par", &principal)
+        .expect("the test clock is available");
     assert_eq!(first.actor, second.actor, "the tenant pseudonym is stable");
     assert_ne!(first.actor.0.principal_id, principal.principal_id);
     let serialized = serde_json::to_string(&first.actor).unwrap();

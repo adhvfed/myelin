@@ -51,11 +51,13 @@ pub(super) fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()
 }
 
-pub(super) fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+pub(super) fn clock_reading() -> Result<myelin_git::clock::ClockReading, DurableError> {
+    myelin_git::clock::system_clock_reading()
+        .map_err(|error| DurableError::Io(format!("Git clock unavailable: {error}")))
+}
+
+pub(super) fn now_unix() -> Result<i64, DurableError> {
+    Ok(clock_reading()?.unix_seconds())
 }
 
 pub(super) fn branch_ref(gitref: &str) -> String {

@@ -104,7 +104,7 @@ impl DurableGitBackend {
             .map(|anchor| self.resolve_thread_anchor(&loc, &rec, anchor))
             .transpose()?;
         let author = Self::thread_principal(tenant, principal);
-        let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix())?;
+        let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix()?)?;
         let outcome = self.threads.create_thread(&loc, &key, anchor, comment)?;
         self.reconcile_conversation_projection(
             &loc,
@@ -135,7 +135,7 @@ impl DurableGitBackend {
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
         let author = Self::thread_principal(tenant, principal);
-        let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix())?;
+        let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix()?)?;
         let outcome = self.threads.add_comment(&loc, &key, thread_id, comment)?;
         self.reconcile_conversation_projection(
             &loc,
@@ -225,7 +225,7 @@ impl DurableGitBackend {
             .map(|anchor| self.resolve_thread_anchor(&loc, &rec, anchor))
             .transpose()?;
         let author = Self::thread_principal(tenant, principal);
-        let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix())?;
+        let comment = CommentWrite::new(author, body_md, operation_nonce, now_unix()?)?;
         let request = PendingCommentRequest::new(loc, key, review_id, anchor, comment)?;
         let comment = self.threads.add_pending_comment(request)?;
         Ok(comment_json(&comment))
@@ -274,7 +274,7 @@ impl DurableGitBackend {
             actor,
             decision,
             operation_nonce,
-            now_unix(),
+            now_unix()?,
         )?;
         let submitted = self.threads.submit_review(request)?;
         // Production PR mutations have their own command ledger, so replaying this projection is

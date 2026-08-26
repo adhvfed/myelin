@@ -7,6 +7,7 @@ pub mod blob_coordinate;
 pub mod body;
 pub mod check_status;
 pub mod check_status_store;
+pub mod clock;
 pub mod code_projection;
 pub mod code_tools;
 pub mod commit;

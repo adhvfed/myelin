@@ -11,7 +11,7 @@ use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::{decode_form_query_component, EdgeRequest, EdgeResponse};
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::MonotonicMinter;
-use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
+use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId};
 use myelin_git::api::{
     http_catalogue, valid_code_search_query, valid_code_search_repo, Method as GitMethod,
     Operation as GitOperation,
@@ -566,16 +566,19 @@ impl DurableGitBackend {
             );
         }
         self.prs.update(loc, number, |record| {
-            mutation.apply_to(record);
+            mutation.apply_to_at(record, now_unix()?);
             Ok(record.clone())
         })
     }
 
-    fn emit_ctx(tenant: &str, region: &str, principal: &Principal) -> EmitContextBase {
-        let now = chrono::DateTime::from_timestamp(now_unix(), 0).unwrap_or_default();
-        let now = Timestamp(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    fn emit_ctx(
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+    ) -> Result<EmitContextBase, DurableError> {
+        let now = clock_reading()?.timestamp();
         let event_principal = pseudonymized_event_principal(tenant, principal);
-        EmitContextBase {
+        Ok(EmitContextBase {
             tenant: TenantId(tenant.into()),
             region: Region(region.into()),
             actor: Actor(event_principal),
@@ -583,7 +586,7 @@ impl DurableGitBackend {
             occurred_at: now.clone(),
             recorded_at: now,
             caused_by: None,
-        }
+        })
     }
 
     fn fresh_operation_id(&self) -> Result<PrOperationId, DurableError> {
@@ -629,14 +632,14 @@ impl DurableGitBackend {
         tenant: &str,
         region: &str,
         principal: &Principal,
-    ) -> RefStore {
-        RefStore::open_durable(
+    ) -> Result<RefStore, DurableError> {
+        Ok(RefStore::open_durable(
             repo,
             slug.to_string(),
-            Self::emit_ctx(tenant, region, principal),
+            Self::emit_ctx(tenant, region, principal)?,
             self.outbox.clone(),
             self.minter.clone(),
-        )
+        ))
     }
 
     pub(super) fn repo_policy(
@@ -1595,7 +1598,8 @@ impl DurableGitBackend {
             &prepared.commit,
         )?;
 
-        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
+        let ref_store =
+            self.open_durable_refstore(repo.clone(), slug, tenant, region, principal)?;
         let expected_old = prior_target
             .map(|p| PushOid::new(p.0))
             .unwrap_or_else(PushOid::zero);
@@ -1906,7 +1910,7 @@ impl DurableGitBackend {
                     }),
             );
         }
-        let now = now_unix();
+        let now = now_unix()?;
         rec.created_at = Some(now);
         rec.updated_at = Some(now);
         self.pr_open(&loc, rec, operation_id, actor)
@@ -2515,7 +2519,7 @@ impl DurableGitBackend {
         }
         let loc = Self::loc(tenant, region, slug);
         let repo = Arc::new(self.store.open_repo(&loc)?);
-        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, actor);
+        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, actor)?;
         if let Some(store) = &self.pg_prs {
             let scope = Self::verified_pr_scope(actor, &loc)?;
             if let Some(intent) = store.pending_merge_intent(&scope, slug, number)? {
@@ -2800,7 +2804,8 @@ impl DurableGitBackend {
             }
         }
 
-        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
+        let ref_store =
+            self.open_durable_refstore(repo.clone(), slug, tenant, region, principal)?;
         let push = PushSession {
             updates,
             quarantine,

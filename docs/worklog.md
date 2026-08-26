@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — One checked Git clock stamps a pull request operation
+
+The durable pull-request store and Edge's in-memory fallback each treated a clock before the Unix
+epoch as epoch zero. The PostgreSQL path also cast an unsigned duration to `i64` without checking
+the range, formatted its event timestamp through a separate helper, and sometimes read the clock
+again while applying the mutation. A broken clock could therefore backdate user-visible Git work
+to 1970, while a second boundary could make the record and its event disagree.
+
+Git now exposes one checked clock reading with exact Unix-second and RFC 3339 forms. It rejects
+rollback and dates outside the supported year-9999 envelope. Opening, mutating, and finalizing a
+durable pull request carry that reading as one operation context, so the record and co-committed
+event cannot observe different seconds. Merge and crash-recovery paths acquire the context before
+advancing a ref, which keeps a clock failure on the safe side of the irreversible boundary. Edge's
+repository edits, review conversations, and ref-event contexts use the same checked source instead
+of manufacturing epoch-zero values.
+
+**Proof:** exact clock-boundary and supplied-mutation-time unit stories; the live PostgreSQL PR
+boundary, including equal open-record/event timestamps, atomic abort, idempotent commands, merge
+finalization, crash recovery, ref-refusal cancellation, and deterministic retry; strict
+all-target/all-feature Clippy for Git and Edge; and all twelve stages of the running TypeScript Git
+engineering lifecycle against PostgreSQL and the rebuilt Edge (16.85 seconds).
+
 ## 2026-08-26 — An advertised tool schema is an enforced product boundary
 
 A caller-graph audit of Agent Service's old plan/apply and HITL surfaces found a complete parallel
