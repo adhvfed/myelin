@@ -107,9 +107,12 @@ real `pg_dump` and `pg_restore`; it also attempts new agent work after replay an
 requires the restored holder to refuse it. The Chat PostgreSQL restore story in
 `integration_chat_p22_erase_cascade.rs` exercises scoped selection, key
 destruction, message/event co-commit, neighboring-subject isolation, and replay.
-The Issues holder has real PostgreSQL lifecycle coverage and is composed into
-this operator, but its full dump/restore disaster story remains required before
-calling that scope restore-drilled.
+The Issues disaster story in
+`integration_issue_title_erasure_survives_restore.rs` uses the same real
+`pg_dump`/`pg_restore` boundary. It proves the backup resurrects the exact
+decryptable title, the live ledger selects only the Issue-title obligation,
+replay destroys the resurrected key and tombstones the title, neighboring work
+survives, and replaying the recovery receipt does not erase later work.
 
 ## Failure interpretation
 

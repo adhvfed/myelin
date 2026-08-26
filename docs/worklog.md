@@ -2968,33 +2968,34 @@ Issue-title erasures now have their own post-PIT ledger scope. The maintenance
 operator selects it independently, uses stable content-free restore operation
 identities, runs the same validation/key/tombstone path against the restored
 cell, and includes bounded Issue counts in its aggregate report. This is wired
-production recovery behavior; unlike agent data and Chat, it does not yet have
-a complete real `pg_dump`/`pg_restore` disaster drill and is not represented as
-having one.
+production recovery behavior. A real `pg_dump`/`pg_restore` drill proves an old
+backup resurrects the exact decryptable title, then the live ledger selects
+only the Issue-title obligation, destroys the resurrected key, tombstones the
+title, preserves a colleague's work, and leaves later work intact on replay.
 
 Proof: 418 Issues and 417 Storage library tests, warning-free strict
 Storage/Issues/Edge all-target Clippy, TypeScript typechecking, the existing
 real PostgreSQL Issues authorization saga in 1.41 seconds, the new real
 PostgreSQL title lifecycle from a freshly rebuilt migration in 0.77 seconds,
 four restore-command contract
-tests, and all three black-box privacy journeys in 10.92 seconds. A broader
+tests, the real Issue-title backup/restore drill in 35.94 seconds, and all three
+black-box privacy journeys in 10.92 seconds. A broader
 backend run compiled the workspace and then stopped on three pre-existing Chat
 HITL drill failures whose test contexts lack the now-required durable timer
 wheel; they are not counted as green.
 
 ## known gaps (honest list, in priority order)
 
-1. **erasure-restore is closed for two drilled scopes and wired for a third.** the
+1. **erasure-restore is closed for three drilled scopes.** the
    agent-data and authored-Chat-message erasers write separate post-PIT ledger
    scopes. the maintenance command replays both through their production
    holders before a restored cell can reopen. agent data is drilled against a
    real dump; Chat now has the same real `pg_dump`/`pg_restore` proof, including
-   a deliberately resurrected decryptable body. authored Issue titles now have
-   independent keys, bounded tombstoning, holder proof, public requests,
-   ledger replay, and fail-closed legacy-row handling. Their production restore
-   path still needs the equivalent real dump/restore drill. Git has not yet
-   begun a truthful holder path and must not be exposed through privacy
-   requests first.
+   a deliberately resurrected decryptable body. authored Issue titles have the
+   equivalent real restore proof around their independent keys, bounded
+   tombstoning, holder receipt, public requests, ledger replay, and fail-closed
+   legacy-row handling. Git has not yet begun a truthful holder path and must
+   not be exposed through privacy requests first.
 2. **DSR has three truthful product slices, not full holder coverage.** durable
    submit/status/certificate is wired for `agent_data`, `chat_messages`, and
    `issue_titles`, with holder-specific proofs and black-box user journeys. the
