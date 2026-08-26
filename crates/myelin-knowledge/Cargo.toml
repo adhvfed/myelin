@@ -47,4 +47,3 @@ myelin-harness = { path = "../myelin-harness" }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-agent-service = { path = "../myelin-agent-service" }
 myelin-agent = { path = "../myelin-agent" }
-myelin-gdpr-service = { path = "../myelin-gdpr-service" }

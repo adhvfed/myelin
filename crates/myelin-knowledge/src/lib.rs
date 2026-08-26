@@ -9,7 +9,6 @@ pub mod database;
 pub mod editor;
 pub mod emit;
 pub mod export;
-pub mod gdpr;
 pub mod list_filter;
 pub mod materialise;
 pub mod merge;
@@ -62,11 +61,6 @@ pub use emit::{
 pub use export::{
     export_rows_to_csv, import_adf, AdfImportResult, ExportBlock, ExportDoc, ExportError,
     ExportFormat, ParsedAdfNode, EXPORT_SCHEMA_VERSION,
-};
-pub use gdpr::{
-    KnowledgeLocateReport, KnowledgePersonRecord, KnowledgePersonalDataHolder, LocatedKind,
-    LocatedLocus, RectifyOutcome, RestrictSuppressor, RestrictionRegistry, RestrictionSink,
-    SinkVerdict, HOLDER_ID as KNOWLEDGE_HOLDER_ID,
 };
 pub use list_filter::{
     compose_db_count_query, compose_db_view_query, db_row_id_colref, lower_over,

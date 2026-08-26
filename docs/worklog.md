@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Knowledge privacy has one durable agent-trace implementation
+
+Knowledge exposed a privacy holder backed by a process-local restriction set. Its locate,
+rectify, and ordinary export methods made content-addressed receipts without reading or changing
+Knowledge rows; its erase method made another receipt without invoking the separate eraser. That
+eraser destroyed keys in Storage's in-memory KMS and purged caller-supplied IDs from in-memory
+Search and References models. An adjacent agent-trace holder stored traces in a local map and
+claimed backup-safe erasure through the same model.
+
+Those duplicate holders, synthetic personal-data schema, in-memory erasure floor, and endorsing
+suites are gone. Knowledge page encryption, the PostgreSQL page store, collaboration transport,
+and Search feed remain. Agent traces have one product implementation: Storage's PostgreSQL-backed
+`DurableAgentTraceStore`, composed by Edge for trigger history, privacy requests, and restore
+re-erasure. Knowledge itself remains absent from privacy-request scopes until its durable pages,
+blocks, comments, references, and search projections can be handled as one resumable operation.
+
+**Proof:** all-target/all-feature Knowledge compile and strict Clippy; all 365 remaining library
+stories and the complete PostgreSQL/object-store-backed crate suite; rebuilt Edge; and both live
+TypeScript Knowledge journeys covering durable create/edit/conflict handling and a living document
+that adds then forgets an Issue reference (3.89 seconds). Net removal: 2,252 lines of duplicate
+privacy models and self-certifying tests.
+
 ## 2026-08-26 — Control Plane privacy inventory follows the schema, not a second list
 
 Control Plane exported a zero-sized privacy holder whose locate and export operations returned

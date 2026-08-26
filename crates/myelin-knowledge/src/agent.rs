@@ -1,9 +1,3 @@
-pub mod trace;
-pub use trace::{
-    write_agent_trace, AgentTrace, AgentTraceHolder, TraceEraseReceipt, AUDIT_LOG_ERASABLE,
-    AUDIT_LOG_STORE_ID, TRACE_ERASABLE, TRACE_HOLDER_ID,
-};
-
 use myelin_content::rebac_fragment::object_types as kn_objects;
 use myelin_content::rebac_fragment::{COMMENT, DRAFT, EDIT, PUBLISH};
 
