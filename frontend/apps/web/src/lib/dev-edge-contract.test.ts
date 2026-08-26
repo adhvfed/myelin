@@ -23,7 +23,6 @@ import {
 const LIST_FILTER_BLOB = "c3d4e5f60718293a4b5c6d7e8f90011223344556";
 const HEAD_COMMIT = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
 
-// FRONTEND-CONTRACT: git-read-dev-edge-parity
 // Both this consumer and the Rust provider integration load this exact committed artifact.
 const GIT_READ_GOLDEN_PATH = "contracts/git-read-dev-edge.golden.json";
 const gitReadGolden = JSON.parse(readFileSync(

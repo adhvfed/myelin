@@ -1,5 +1,4 @@
-# RED fixture: 1.1 CLAIMS coverage via a file that does not exist (a falsely-claimed pair);
-# 4.3 is deferred but names NO landing prompt (an un-named floor). The scanner MUST reject loudly.
+# RED fixture: 1.1 registers a file that does not exist; 4.3 is deferred without a landing prompt.
 [[contract]]
 row = "1.1"
 title = "serve"

@@ -11,7 +11,6 @@ import {
   parseCiRunsQuery,
 } from "../../dev-edge/ci-contract.mjs";
 
-// FRONTEND-CONTRACT: ci-read-dev-edge-parity
 // The production Rust handler and this dev-edge consumer execute this exact committed artifact.
 const CI_READ_GOLDEN_PATH = "contracts/ci-read-dev-edge.golden.json";
 const golden = JSON.parse(readFileSync(

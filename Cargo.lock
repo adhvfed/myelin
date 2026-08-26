@@ -3512,6 +3512,7 @@ dependencies = [
  "myelin-ci-sandbox",
  "proc-macro2",
  "serde",
+ "serde_json",
  "syn",
  "toml",
 ]

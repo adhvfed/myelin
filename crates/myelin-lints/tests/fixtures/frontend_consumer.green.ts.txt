@@ -1,2 +1,1 @@
-// FRONTEND-CONTRACT: fixture-frontend-parity
-const golden = "crates/myelin-lints/tests/fixtures/frontend_contract.green.json";
+this file is registered as the frontend contract test artifact

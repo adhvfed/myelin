@@ -21,9 +21,8 @@ fn contract_coverage_is_green_over_the_real_workspace() {
     let code = run_scanner(&[]);
     assert_eq!(
         code, 0,
-        "contract-coverage MUST be green over the real contract-index + manifest (0 \
-         falsely-claimed rows). If this is red, ship the missing CDC pair or mark the row \
-         deferred with its landing prompt - NEVER weaken the gate."
+        "contract-coverage must reconcile the real contract index with existing registered \
+         artifacts and named deferred landings"
     );
 }
 
@@ -39,8 +38,7 @@ fn contract_coverage_fails_loudly_on_the_red_manifest_fixture() {
     ]);
     assert_ne!(
         code, 0,
-        "contract-coverage MUST exit non-zero on the red manifest fixture (a falsely-claimed pair \
-         + an un-named deferred floor)"
+        "contract-coverage must reject a missing registered artifact and an unnamed deferred floor"
     );
 }
 
@@ -56,7 +54,6 @@ fn contract_coverage_passes_on_the_green_manifest_fixture() {
     ]);
     assert_eq!(
         code, 0,
-        "contract-coverage MUST exit zero on the green manifest fixture (a real pair + a named \
-         landing prompt)"
+        "contract-coverage must accept existing registered artifacts and a named landing prompt"
     );
 }

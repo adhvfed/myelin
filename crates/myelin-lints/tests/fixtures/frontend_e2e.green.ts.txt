@@ -1,1 +1,1 @@
-// FRONTEND-CONTRACT: fixture-frontend-parity
+this file is registered as the browser journey artifact

@@ -1,7 +1,6 @@
 import { test, expect, request as pwRequest, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 
-// FRONTEND-CONTRACT: git-read-dev-edge-parity
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
 async function resetPrFixtures() {

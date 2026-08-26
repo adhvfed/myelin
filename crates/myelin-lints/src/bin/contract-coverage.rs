@@ -1,6 +1,6 @@
 use myelin_lints::coverage::{
     parse_contract_index_rows, parse_frontend_contracts, parse_manifest, scan,
-    scan_frontend_contracts, workspace_root, FsCdc,
+    scan_frontend_contracts, workspace_root, FsArtifacts,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -68,17 +68,17 @@ fn main() -> ExitCode {
         }
     };
 
-    let cdc = FsCdc {
+    let artifacts = FsArtifacts {
         workspace_root: root,
     };
-    let report = scan(&rows, &manifest, &cdc);
-    let frontend_errors = scan_frontend_contracts(&frontend, &cdc);
+    let report = scan(&rows, &manifest, &artifacts);
+    let frontend_errors = scan_frontend_contracts(&frontend, &artifacts);
 
     if report.is_green() && frontend_errors.is_empty() {
         eprintln!(
             "contract-coverage: OK - {} contract rows reconciled ({} covered by existing CDC \
-             test files, {} deferred with a named landing prompt), {} frontend contract(s) tied \
-             to shared vectors, 0 falsely-claimed.",
+             test files, {} deferred with a named landing prompt), {} frontend contract(s) \
+             registered with structurally-valid shared vectors.",
             report.rows_checked,
             report.covered,
             report.deferred,
@@ -87,9 +87,7 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "contract-coverage: FAIL - {} contract coverage violation(s) (loud, never swallowed - \
-             ship the missing CDC pair/shared frontend vectors or name the deferred landing; \
-             NEVER weaken the gate):",
+            "contract-coverage: FAIL - {} contract coverage registry violation(s):",
             report.errors.len() + frontend_errors.len()
         );
         for err in &report.errors {

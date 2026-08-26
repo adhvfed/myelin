@@ -592,7 +592,6 @@ fn get_query_headers(
     gateway.handle(EdgeRequest::new("GET", path, query, headers, Vec::new()))
 }
 
-/// FRONTEND-CONTRACT: ci-read-dev-edge-parity
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
     let schema = schema_name();

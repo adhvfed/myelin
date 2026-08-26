@@ -1,4 +1,4 @@
-# GREEN fixture: 1.1 covered by a real test file; 4.3 deferred with a landing prompt.
+# GREEN fixture: 1.1 registers an existing artifact; 4.3 has a named deferred landing.
 [[contract]]
 row = "1.1"
 title = "serve"

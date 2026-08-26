@@ -242,7 +242,6 @@ fn hdr<'a>(b: &'a [(&'static str, String); 2]) -> Vec<(&'a str, &'a str)> {
     b.iter().map(|(k, v)| (*k, v.as_str())).collect()
 }
 
-/// FRONTEND-CONTRACT: git-read-dev-edge-parity
 #[tokio::test]
 async fn writes_persist_across_a_fresh_backend_restart() {
     let root = temp_root("persist");

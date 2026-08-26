@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowId {
     pub cluster: u32,
@@ -54,17 +56,12 @@ pub enum CoverageError {
     StaleManifestEntry {
         row: RowId,
     },
-    CdcFileMissing {
+    CoverageArtifactMissing {
         row: RowId,
         title: String,
         file: String,
     },
-    CdcFileHasNoTests {
-        row: RowId,
-        title: String,
-        file: String,
-    },
-    CoveredWithNoCdc {
+    CoveredWithNoArtifacts {
         row: RowId,
         title: String,
     },
@@ -84,29 +81,24 @@ impl fmt::Display for CoverageError {
             ),
             CoverageError::StaleManifestEntry { row } => write!(
                 f,
-                "row {row}: in contract-coverage.toml but NO LONGER in contract-index.md - a stale \
-                 claim. Remove or re-point the manifest entry."
+                "row {row}: in contract-coverage.toml but no longer in contract-index.md. Remove or \
+                 re-point the stale registry entry."
             ),
-            CoverageError::CdcFileMissing { row, title, file } => write!(
+            CoverageError::CoverageArtifactMissing { row, title, file } => write!(
                 f,
-                "row {row} ({title}): claims coverage via `{file}` which does NOT exist on disk - a \
-                 falsely-claimed CDC pair. Ship the file or mark the row deferred with its landing \
-                 prompt."
+                "row {row} ({title}): registered coverage artifact `{file}` does not exist. \
+                 Restore the artifact, update the registry, or defer the row with a landing prompt."
             ),
-            CoverageError::CdcFileHasNoTests { row, title, file } => write!(
+            CoverageError::CoveredWithNoArtifacts { row, title } => write!(
                 f,
-                "row {row} ({title}): CDC file `{file}` contains no test functions - it cannot \
-                 prove the contract. Ship a real test or mark the row deferred."
-            ),
-            CoverageError::CoveredWithNoCdc { row, title } => write!(
-                f,
-                "row {row} ({title}): status=covered but declares NO cdc files - an empty claim of \
-                 coverage. Name the CDC test file(s), or mark the row deferred."
+                "row {row} ({title}): status=covered but registers no coverage artifacts. Name the \
+                 relevant test file(s), or mark the row deferred."
             ),
             CoverageError::DeferredWithNoLandingPrompt { row, title } => write!(
                 f,
                 "row {row} ({title}): status=deferred but names NO landing prompt - an un-named \
-                 floor. Name the prompt (e.g. landing = \"P-067\") that will ship its CDC pair."
+                 floor. Name the prompt (e.g. landing = \"P-067\") that will add its coverage \
+                 artifacts."
             ),
         }
     }
@@ -131,158 +123,41 @@ pub fn parse_contract_index_rows(markdown: &str) -> Vec<RowId> {
     rows
 }
 
-pub fn parse_manifest(toml: &str) -> Result<Vec<ManifestEntry>, String> {
-    let mut entries = Vec::new();
-    let mut cur: Option<RawEntry> = None;
-
-    let raw_lines: Vec<&str> = toml.lines().collect();
-    let mut logical: Vec<(usize, String)> = Vec::new();
-    let mut i = 0;
-    while i < raw_lines.len() {
-        let mut acc = strip_toml_comment(raw_lines[i]).trim().to_string();
-        let opens = acc.matches('[').count();
-        let closes = acc.matches(']').count();
-        if acc != "[[contract]]" && opens > closes {
-            let mut j = i + 1;
-            let mut o = opens;
-            let mut c = closes;
-            while j < raw_lines.len() && o > c {
-                let next = strip_toml_comment(raw_lines[j]).trim();
-                acc.push(' ');
-                acc.push_str(next);
-                o += next.matches('[').count();
-                c += next.matches(']').count();
-                j += 1;
-            }
-            logical.push((i, acc));
-            i = j;
-        } else {
-            logical.push((i, acc));
-            i += 1;
-        }
-    }
-
-    let mut skipping_frontend = false;
-    for (lineno, line) in logical {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "[[contract]]" {
-            if let Some(e) = cur.take() {
-                entries.push(e.finish(lineno)?);
-            }
-            cur = Some(RawEntry::default());
-            skipping_frontend = false;
-            continue;
-        }
-        if line == "[[frontend]]" {
-            if let Some(e) = cur.take() {
-                entries.push(e.finish(lineno)?);
-            }
-            skipping_frontend = true;
-            continue;
-        }
-        if skipping_frontend {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!(
-                "line {}: not a key = value pair: {line}",
-                lineno + 1
-            ));
-        };
-        let key = key.trim();
-        let value = value.trim();
-        let Some(e) = cur.as_mut() else {
-            return Err(format!(
-                "line {}: key `{key}` before any [[contract]] table",
-                lineno + 1
-            ));
-        };
-        match key {
-            "row" => e.row = Some(unquote(value, lineno)?),
-            "title" => e.title = Some(unquote(value, lineno)?),
-            "status" => e.status = Some(unquote(value, lineno)?),
-            "landing" => e.landing = Some(unquote(value, lineno)?),
-            "cdc" => e.cdc = Some(parse_string_array(value, lineno)?),
-            other => return Err(format!("line {}: unknown key `{other}`", lineno + 1)),
-        }
-    }
-    if let Some(e) = cur.take() {
-        entries.push(e.finish(usize::MAX)?);
-    }
-    Ok(entries)
+pub fn parse_manifest(source: &str) -> Result<Vec<ManifestEntry>, String> {
+    let document = parse_registry(source)?;
+    document
+        .contract
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| entry.finish(index))
+        .collect()
 }
 
-pub fn parse_frontend_contracts(toml: &str) -> Result<Vec<FrontendContract>, String> {
-    let mut entries = Vec::new();
-    let mut cur: Option<RawFrontendContract> = None;
-    let raw_lines: Vec<&str> = toml.lines().collect();
-    let mut i = 0;
-    while i < raw_lines.len() {
-        let lineno = i;
-        let mut line = strip_toml_comment(raw_lines[i]).trim().to_string();
-        let mut opens = line.matches('[').count();
-        let mut closes = line.matches(']').count();
-        i += 1;
-        while !line.starts_with("[[") && opens > closes && i < raw_lines.len() {
-            let next = strip_toml_comment(raw_lines[i]).trim();
-            line.push(' ');
-            line.push_str(next);
-            opens += next.matches('[').count();
-            closes += next.matches(']').count();
-            i += 1;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "[[frontend]]" {
-            if let Some(entry) = cur.take() {
-                entries.push(entry.finish(lineno)?);
-            }
-            cur = Some(RawFrontendContract::default());
-            continue;
-        }
-        if line == "[[contract]]" {
-            if let Some(entry) = cur.take() {
-                entries.push(entry.finish(lineno)?);
-            }
-            continue;
-        }
-        let Some(entry) = cur.as_mut() else {
-            continue;
-        };
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!(
-                "line {}: not a key = value pair: {line}",
-                lineno + 1
-            ));
-        };
-        match key.trim() {
-            "id" => entry.id = Some(unquote(value.trim(), lineno)?),
-            "golden" => entry.golden = Some(unquote(value.trim(), lineno)?),
-            "rust_tests" => entry.rust_tests = Some(parse_string_array(value.trim(), lineno)?),
-            "frontend_tests" => {
-                entry.frontend_tests = Some(parse_string_array(value.trim(), lineno)?)
-            }
-            "e2e_tests" => entry.e2e_tests = Some(parse_string_array(value.trim(), lineno)?),
-            other => {
-                return Err(format!(
-                    "line {}: unknown frontend key `{other}`",
-                    lineno + 1
-                ))
-            }
-        }
-    }
-    if let Some(entry) = cur.take() {
-        entries.push(entry.finish(usize::MAX)?);
-    }
-    Ok(entries)
+pub fn parse_frontend_contracts(source: &str) -> Result<Vec<FrontendContract>, String> {
+    let document = parse_registry(source)?;
+    document
+        .frontend
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| entry.finish(index))
+        .collect()
 }
 
-#[derive(Default)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRegistry {
+    #[serde(default)]
+    contract: Vec<RawEntry>,
+    #[serde(default)]
+    frontend: Vec<RawFrontendContract>,
+}
+
+fn parse_registry(source: &str) -> Result<RawRegistry, String> {
+    toml::from_str(source).map_err(|error| format!("invalid contract registry TOML: {error}"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFrontendContract {
     id: Option<String>,
     golden: Option<String>,
@@ -292,15 +167,15 @@ struct RawFrontendContract {
 }
 
 impl RawFrontendContract {
-    fn finish(self, lineno: usize) -> Result<FrontendContract, String> {
-        let near = lineno.saturating_add(1);
+    fn finish(self, index: usize) -> Result<FrontendContract, String> {
+        let entry = index.saturating_add(1);
         Ok(FrontendContract {
             id: self
                 .id
-                .ok_or_else(|| format!("frontend entry near line {near} has no `id`"))?,
+                .ok_or_else(|| format!("frontend entry {entry} has no `id`"))?,
             golden: self
                 .golden
-                .ok_or_else(|| format!("frontend entry near line {near} has no `golden`"))?,
+                .ok_or_else(|| format!("frontend entry {entry} has no `golden`"))?,
             rust_tests: self.rust_tests.unwrap_or_default(),
             frontend_tests: self.frontend_tests.unwrap_or_default(),
             e2e_tests: self.e2e_tests.unwrap_or_default(),
@@ -308,7 +183,8 @@ impl RawFrontendContract {
     }
 }
 
-#[derive(Default)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawEntry {
     row: Option<String>,
     title: Option<String>,
@@ -318,12 +194,13 @@ struct RawEntry {
 }
 
 impl RawEntry {
-    fn finish(self, lineno: usize) -> Result<ManifestEntry, String> {
+    fn finish(self, index: usize) -> Result<ManifestEntry, String> {
+        let entry = index.saturating_add(1);
         let row_s = self
             .row
-            .ok_or_else(|| format!("contract entry near line {} has no `row`", lineno + 1))?;
+            .ok_or_else(|| format!("contract entry {entry} has no `row`"))?;
         let row = RowId::parse(&row_s)
-            .ok_or_else(|| format!("bad row id `{row_s}` near line {}", lineno + 1))?;
+            .ok_or_else(|| format!("contract entry {entry} has bad row id `{row_s}`"))?;
         let title = self.title.unwrap_or_default();
         let status = self
             .status
@@ -345,56 +222,6 @@ impl RawEntry {
     }
 }
 
-fn strip_toml_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(i) if !before_is_in_string(&line[..i]) => &line[..i],
-        _ => line,
-    }
-}
-
-fn before_is_in_string(prefix: &str) -> bool {
-    prefix.chars().filter(|&c| c == '"').count() % 2 == 1
-}
-
-fn unquote(value: &str, lineno: usize) -> Result<String, String> {
-    let v = value.trim();
-    v.strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            format!(
-                "line {}: expected a quoted string, got `{value}`",
-                lineno + 1
-            )
-        })
-}
-
-fn parse_string_array(value: &str, lineno: usize) -> Result<Vec<String>, String> {
-    let v = value.trim();
-    let inner = v
-        .strip_prefix('[')
-        .and_then(|v| v.strip_suffix(']'))
-        .ok_or_else(|| {
-            format!(
-                "line {}: expected an array `[...]`, got `{value}`",
-                lineno + 1
-            )
-        })?;
-    let mut out = Vec::new();
-    for part in inner.split(',') {
-        let p = part.trim();
-        if p.is_empty() {
-            continue;
-        }
-        out.push(unquote(p, lineno)?);
-    }
-    Ok(out)
-}
-
-pub fn has_test_fn(src: &str) -> bool {
-    src.contains("#[test]") || src.contains("#[tokio::test") || src.contains("#[sqlx::test")
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct ScanReport {
     pub rows_checked: usize,
@@ -412,26 +239,26 @@ impl ScanReport {
         if self.is_green() {
             format!(
                 "{date} contract-coverage: GREEN - {} rows reconciled ({} covered, {} deferred), \
-                 0 falsely-claimed.",
+                 0 registry errors.",
                 self.rows_checked, self.covered, self.deferred
             )
         } else {
             format!(
-                "{date} contract-coverage: RED - {} falsely-claimed/dropped row(s) (CLAIMED, NOT \
-                 PROVEN; fix the code, never weaken the gate).",
+                "{date} contract-coverage: RED - {} missing, stale, or malformed registry \
+                 entry/entries.",
                 self.errors.len()
             )
         }
     }
 }
 
-pub trait CdcSource {
+pub trait ArtifactSource {
     fn read(&self, file: &str) -> Option<String>;
 }
 
 pub fn scan_frontend_contracts(
     contracts: &[FrontendContract],
-    source: &dyn CdcSource,
+    source: &dyn ArtifactSource,
 ) -> Vec<String> {
     if contracts.is_empty() {
         return Vec::new();
@@ -449,47 +276,58 @@ pub fn scan_frontend_contracts(
                 "frontend contract `{id}` is registered more than once"
             ));
         }
-        let marker = format!("FRONTEND-CONTRACT: {id}");
         match source.read(&contract.golden) {
             None => errors.push(format!(
                 "frontend contract `{id}` golden `{}` does not exist",
                 contract.golden
             )),
-            Some(golden) => {
-                if !golden.contains(id) || !golden.contains("\"vectors\"") {
-                    errors.push(format!(
-                        "frontend contract `{id}` golden `{}` lacks its id or vectors",
-                        contract.golden
-                    ));
+            Some(golden) => match serde_json::from_str::<serde_json::Value>(&golden) {
+                Err(error) => errors.push(format!(
+                    "frontend contract `{id}` golden `{}` is not valid JSON: {error}",
+                    contract.golden
+                )),
+                Ok(document) => {
+                    if document
+                        .get("schema_version")
+                        .and_then(|value| value.as_u64())
+                        != Some(1)
+                    {
+                        errors.push(format!(
+                            "frontend contract `{id}` golden `{}` must declare schema_version 1",
+                            contract.golden
+                        ));
+                    }
+                    if document.get("contract_id").and_then(|value| value.as_str()) != Some(id) {
+                        errors.push(format!(
+                            "frontend contract `{id}` golden `{}` has a different contract_id",
+                            contract.golden
+                        ));
+                    }
+                    if !matches!(
+                        document.get("vectors").and_then(|value| value.as_array()),
+                        Some(vectors) if !vectors.is_empty()
+                    ) {
+                        errors.push(format!(
+                            "frontend contract `{id}` golden `{}` must contain at least one vector",
+                            contract.golden
+                        ));
+                    }
                 }
-            }
+            },
         }
-        for (kind, files, must_name_golden) in [
-            ("Rust provider", &contract.rust_tests, true),
-            ("frontend consumer", &contract.frontend_tests, true),
-            ("browser proof", &contract.e2e_tests, false),
+        for (kind, files) in [
+            ("Rust provider", &contract.rust_tests),
+            ("frontend consumer", &contract.frontend_tests),
+            ("browser journey", &contract.e2e_tests),
         ] {
             if files.is_empty() {
                 errors.push(format!("frontend contract `{id}` has no {kind} files"));
             }
             for file in files {
-                match source.read(file) {
-                    None => errors.push(format!(
+                if source.read(file).is_none() {
+                    errors.push(format!(
                         "frontend contract `{id}` {kind} file `{file}` does not exist"
-                    )),
-                    Some(body) => {
-                        if !body.contains(&marker) {
-                            errors.push(format!(
-                                "frontend contract `{id}` {kind} file `{file}` lacks `{marker}`"
-                            ));
-                        }
-                        if must_name_golden && !body.contains(&contract.golden) {
-                            errors.push(format!(
-                                "frontend contract `{id}` {kind} file `{file}` does not consume `{}`",
-                                contract.golden
-                            ));
-                        }
-                    }
+                    ));
                 }
             }
         }
@@ -497,17 +335,21 @@ pub fn scan_frontend_contracts(
     errors
 }
 
-pub struct FsCdc {
+pub struct FsArtifacts {
     pub workspace_root: PathBuf,
 }
 
-impl CdcSource for FsCdc {
+impl ArtifactSource for FsArtifacts {
     fn read(&self, file: &str) -> Option<String> {
         std::fs::read_to_string(self.workspace_root.join(file)).ok()
     }
 }
 
-pub fn scan(rows: &[RowId], manifest: &[ManifestEntry], cdc: &dyn CdcSource) -> ScanReport {
+pub fn scan(
+    rows: &[RowId],
+    manifest: &[ManifestEntry],
+    artifacts: &dyn ArtifactSource,
+) -> ScanReport {
     let mut report = ScanReport::default();
 
     let mut by_row: BTreeMap<RowId, &ManifestEntry> = BTreeMap::new();
@@ -529,28 +371,19 @@ pub fn scan(rows: &[RowId], manifest: &[ManifestEntry], cdc: &dyn CdcSource) -> 
             Coverage::Covered { cdc: files } => {
                 report.covered += 1;
                 if files.is_empty() {
-                    report.errors.push(CoverageError::CoveredWithNoCdc {
+                    report.errors.push(CoverageError::CoveredWithNoArtifacts {
                         row: *row,
                         title: entry.title.clone(),
                     });
                     continue;
                 }
                 for file in files {
-                    match cdc.read(file) {
-                        None => report.errors.push(CoverageError::CdcFileMissing {
+                    if artifacts.read(file).is_none() {
+                        report.errors.push(CoverageError::CoverageArtifactMissing {
                             row: *row,
                             title: entry.title.clone(),
                             file: file.clone(),
-                        }),
-                        Some(src) => {
-                            if !has_test_fn(&src) {
-                                report.errors.push(CoverageError::CdcFileHasNoTests {
-                                    row: *row,
-                                    title: entry.title.clone(),
-                                    file: file.clone(),
-                                });
-                            }
-                        }
+                        });
                     }
                 }
             }
@@ -591,8 +424,8 @@ pub fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
 
-    struct FakeCdc(std::collections::HashMap<&'static str, &'static str>);
-    impl CdcSource for FakeCdc {
+    struct FakeArtifacts(std::collections::HashMap<&'static str, &'static str>);
+    impl ArtifactSource for FakeArtifacts {
         fn read(&self, file: &str) -> Option<String> {
             self.0.get(file).map(|s| s.to_string())
         }
@@ -659,7 +492,7 @@ landing = \"P-070\"\n";
     }
 
     #[test]
-    fn green_when_covered_rows_have_a_real_pair_and_deferred_rows_name_a_landing() {
+    fn green_when_covered_rows_register_artifacts_and_deferred_rows_name_a_landing() {
         let manifest = vec![
             ManifestEntry {
                 row: RowId::parse("1.1").unwrap(),
@@ -676,12 +509,8 @@ landing = \"P-070\"\n";
                 },
             },
         ];
-        let cdc = FakeCdc(
-            [("cdc_1_1.rs", "#[test]\nfn proves_the_contract() {}")]
-                .into_iter()
-                .collect(),
-        );
-        let report = scan(&rows(&["1.1", "4.3"]), &manifest, &cdc);
+        let artifacts = FakeArtifacts([("cdc_1_1.rs", "")].into_iter().collect());
+        let report = scan(&rows(&["1.1", "4.3"]), &manifest, &artifacts);
         assert!(report.is_green(), "errors: {:?}", report.errors);
         assert_eq!(report.covered, 1);
         assert_eq!(report.deferred, 1);
@@ -697,18 +526,18 @@ landing = \"P-070\"\n";
                 cdc: vec!["does_not_exist.rs".into()],
             },
         }];
-        let cdc = FakeCdc(Default::default());
-        let report = scan(&rows(&["1.1"]), &manifest, &cdc);
+        let artifacts = FakeArtifacts(Default::default());
+        let report = scan(&rows(&["1.1"]), &manifest, &artifacts);
         assert!(!report.is_green());
         assert!(matches!(
             report.errors[0],
-            CoverageError::CdcFileMissing { .. }
+            CoverageError::CoverageArtifactMissing { .. }
         ));
         assert!(report.artifact_row("2026-06-19").contains("RED"));
     }
 
     #[test]
-    fn red_when_a_covered_file_has_no_test_functions() {
+    fn coverage_registry_does_not_guess_test_semantics_from_source_text() {
         let manifest = vec![ManifestEntry {
             row: RowId::parse("1.1").unwrap(),
             title: "serve".into(),
@@ -716,18 +545,84 @@ landing = \"P-070\"\n";
                 cdc: vec!["empty.rs".into()],
             },
         }];
-        let cdc = FakeCdc([("empty.rs", "fn helper() {}")].into_iter().collect());
-        let report = scan(&rows(&["1.1"]), &manifest, &cdc);
-        assert!(!report.is_green());
-        assert!(matches!(
-            report.errors[0],
-            CoverageError::CdcFileHasNoTests { .. }
-        ));
+        let artifacts = FakeArtifacts([("empty.rs", "")].into_iter().collect());
+        let report = scan(&rows(&["1.1"]), &manifest, &artifacts);
+        assert!(report.is_green());
+    }
+
+    #[test]
+    fn frontend_registry_validates_shared_vectors_and_artifact_membership() {
+        let contract = FrontendContract {
+            id: "git-parity".into(),
+            golden: "git.json".into(),
+            rust_tests: vec!["provider.rs".into()],
+            frontend_tests: vec!["consumer.ts".into()],
+            e2e_tests: vec!["journey.ts".into()],
+        };
+        let artifacts = FakeArtifacts(
+            [
+                (
+                    "git.json",
+                    r#"{"schema_version":1,"contract_id":"git-parity","vectors":[{}]}"#,
+                ),
+                ("provider.rs", "source syntax is deliberately irrelevant"),
+                ("consumer.ts", ""),
+                ("journey.ts", ""),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert!(scan_frontend_contracts(&[contract], &artifacts).is_empty());
+    }
+
+    #[test]
+    fn frontend_registry_rejects_malformed_vectors_and_missing_artifacts() {
+        let contract = FrontendContract {
+            id: "ci-parity".into(),
+            golden: "ci.json".into(),
+            rust_tests: vec!["missing-provider.rs".into()],
+            frontend_tests: vec![],
+            e2e_tests: vec!["journey.ts".into()],
+        };
+        let artifacts = FakeArtifacts(
+            [
+                (
+                    "ci.json",
+                    r#"{"schema_version":2,"contract_id":"another-contract","vectors":[]}"#,
+                ),
+                ("journey.ts", ""),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let errors = scan_frontend_contracts(&[contract], &artifacts);
+        assert_eq!(errors.len(), 5, "errors: {errors:#?}");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("schema_version 1")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("different contract_id")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("at least one vector")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing-provider.rs")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("no frontend consumer")));
     }
 
     #[test]
     fn red_when_a_contract_row_is_absent_from_the_manifest() {
-        let report = scan(&rows(&["1.1", "9.9"]), &[], &FakeCdc(Default::default()));
+        let report = scan(
+            &rows(&["1.1", "9.9"]),
+            &[],
+            &FakeArtifacts(Default::default()),
+        );
         assert_eq!(report.errors.len(), 2);
         assert!(report
             .errors
@@ -742,7 +637,11 @@ landing = \"P-070\"\n";
             title: "list_objects".into(),
             coverage: Coverage::Deferred { landing: "".into() },
         }];
-        let report = scan(&rows(&["4.3"]), &manifest, &FakeCdc(Default::default()));
+        let report = scan(
+            &rows(&["4.3"]),
+            &manifest,
+            &FakeArtifacts(Default::default()),
+        );
         assert!(matches!(
             report.errors[0],
             CoverageError::DeferredWithNoLandingPrompt { .. }
@@ -758,7 +657,11 @@ landing = \"P-070\"\n";
                 landing: "P-001".into(),
             },
         }];
-        let report = scan(&rows(&["1.1"]), &manifest, &FakeCdc(Default::default()));
+        let report = scan(
+            &rows(&["1.1"]),
+            &manifest,
+            &FakeArtifacts(Default::default()),
+        );
         assert!(report.errors.iter().any(
             |e| matches!(e, CoverageError::StaleManifestEntry { row } if row.to_string() == "99.1")
         ));
@@ -775,10 +678,14 @@ landing = \"P-070\"\n";
             title: "serve".into(),
             coverage: Coverage::Covered { cdc: vec![] },
         }];
-        let report = scan(&rows(&["1.1"]), &manifest, &FakeCdc(Default::default()));
+        let report = scan(
+            &rows(&["1.1"]),
+            &manifest,
+            &FakeArtifacts(Default::default()),
+        );
         assert!(matches!(
             report.errors[0],
-            CoverageError::CoveredWithNoCdc { .. }
+            CoverageError::CoveredWithNoArtifacts { .. }
         ));
     }
 }

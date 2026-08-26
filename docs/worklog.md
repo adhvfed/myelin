@@ -4,6 +4,35 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Contract coverage is a registry, not a source-text oracle
+
+The contract-coverage gate inferred test meaning by searching source files for test attributes,
+marker comments, contract identifiers, and golden-file path strings. Those checks broke on
+semantics-preserving edits and could be satisfied by inert text. Its frontend branch was weaker
+still: no real frontend contract was registered, so the green workspace run exercised only a
+synthetic fixture.
+
+The gate now does the job it can honestly perform. It reconciles every product-contract row with
+an existing coverage artifact or a named deferred landing. Frontend entries require a valid
+versioned JSON document with the exact contract identity and at least one vector, plus existing
+Rust-provider, frontend-consumer, and browser-journey artifacts. It does not inspect those files
+and pretend to know whether they test anything; Cargo, Vitest, Playwright, and the TypeScript
+system suite own behavioral execution. The Git and CI read-parity contracts are now registered
+against their real shared vectors and all three consumers. The hand-written TOML parser and its
+bracket-counting approximation were replaced by the repository's existing Serde/TOML boundary.
+
+The direct JSON dependency changed the workspace lockfile, so the offline gVisor Cargo vendor
+asset was rebuilt and both its lock identity and canonical tree digest were intentionally
+repinned. This preserves the production verify-to-use boundary rather than bypassing the asset
+gate for a development convenience.
+
+**Proof:** 18 lint library stories; the three-case contract-registry executable suite against
+both fixtures and the real 99-row manifest; strict all-target/all-feature lint Clippy; all 27 Git
+and CI frontend shared-vector stories; the real durable Git Edge shared-vector integration; and
+the five-case runner-asset digest suite over the rebuilt 6.4 GB offline vendor tree. The matching
+CI Edge integration reached PostgreSQL but its hard-coded development admin credential no longer
+matches the running stack, so it is not counted as green.
+
 ## 2026-08-26 — An unwired KMS model no longer certifies production resilience
 
 Storage exported a second KMS read path with its own clock, resolved-key cache, fail-static

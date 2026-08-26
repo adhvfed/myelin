@@ -3,8 +3,6 @@ import AxeBuilder from "@axe-core/playwright";
 
 // Browser coverage for repository browsing and the PR overview, including accessibility, keyboard
 // navigation, blocked merge details, and authentication redirects.
-// FRONTEND-CONTRACT: git-read-dev-edge-parity
-
 const C2 = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
