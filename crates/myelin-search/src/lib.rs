@@ -60,7 +60,7 @@ pub use consistency::{
     disposition, fail_static_bypass, stale_candidates, BoundedCheckPort, CandidateDisposition,
     ConsistencyStats,
 };
-pub use dek::{hyok_skips_index, srch_p03_inherited_gates, InheritedGate, SearchDekPin};
+pub use dek::{srch_p03_inherited_gates, InheritedGate, SearchDekPin};
 pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, SubjectMatcher, TantivyBackend,
     DEFAULT_SUBJECT_LOCATOR_FACETS, ORDER_KEY_FIELD,

@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use myelin_storage::{
-    DekId, IndexAdmission, KekId, KeyClass, KeyOrigin, KmsEngine, KmsError, PiiKeyRef,
-};
+use myelin_storage::{DekId, KekId, KeyClass, KmsEngine, KmsError, PiiKeyRef};
 use myelin_tenancy::{Region, TenantId};
 
 #[derive(Clone)]
@@ -83,10 +81,6 @@ impl std::fmt::Debug for SearchDekPin {
     }
 }
 
-pub fn hyok_skips_index(origin: &dyn KeyOrigin) -> bool {
-    matches!(IndexAdmission::for_origin(origin), IndexAdmission::SkipHyok)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InheritedGate {
     pub id: &'static str,
@@ -140,9 +134,6 @@ pub fn srch_p03_inherited_gates() -> Vec<InheritedGate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_storage::{
-        Byok, Dek, DekHandle, Hyok, HyokKeyService, HyokServiceDenied, PlatformManaged, WrappedDek,
-    };
 
     fn kms() -> Arc<KmsEngine> {
         Arc::new(KmsEngine::new())
@@ -336,41 +327,6 @@ mod tests {
         assert!(
             Arc::ptr_eq(pin.engine(), &kms),
             "the pin holds the very same cell engine"
-        );
-    }
-
-    #[test]
-    fn hyok_class_is_structurally_skipped_no_index_no_dek() {
-        struct DenyAllHyok;
-        impl HyokKeyService for DenyAllHyok {
-            fn wrap(&self, _dek: &Dek) -> Result<WrappedDek, HyokServiceDenied> {
-                Err(HyokServiceDenied)
-            }
-            fn unwrap(&self, _w: &WrappedDek) -> Result<DekHandle, HyokServiceDenied> {
-                Err(HyokServiceDenied)
-            }
-            fn destroy(&self) {}
-        }
-
-        let engine = KmsEngine::new();
-        engine
-            .ensure_kek(&KekId::new(t(), r()))
-            .expect("seed the in-memory KEK");
-        let platform = PlatformManaged::new(&engine, r());
-        let byok = Byok::new(&engine, r(), "kms-customer://acme/k1");
-        let hyok = Hyok::new(DenyAllHyok);
-
-        assert!(
-            !hyok_skips_index(&platform),
-            "platform-managed class IS indexed (full search)"
-        );
-        assert!(
-            !hyok_skips_index(&byok),
-            "BYOK class IS indexed (plaintext reachable while live)"
-        );
-        assert!(
-            hyok_skips_index(&hyok),
-            "a HYOK class is structurally SKIPPED - no plaintext index"
         );
     }
 

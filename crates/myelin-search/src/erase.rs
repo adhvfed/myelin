@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use crate::dek::SearchDekPin;
+use crate::engine::SubjectMatcher;
+use crate::indexer::IncrementalIndexer;
+use crate::store::SEARCH_INDEX_STORE;
 use chrono::{SecondsFormat, Utc};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
@@ -11,12 +15,6 @@ use myelin_gdpr::{
     Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
 };
 use myelin_identity::Principal;
-use myelin_storage::KeyOrigin;
-
-use crate::dek::{hyok_skips_index, SearchDekPin};
-use crate::engine::SubjectMatcher;
-use crate::indexer::IncrementalIndexer;
-use crate::store::SEARCH_INDEX_STORE;
 
 pub const SEARCH_ERASE_EVENT_TYPE: &str = "search.subject.erased";
 
@@ -119,10 +117,6 @@ impl SearchEraseHolder {
             })
             .map(|(doc, _)| doc.to_string())
             .collect()
-    }
-
-    pub fn erase_class(&self, origin: &dyn KeyOrigin) -> bool {
-        hyok_skips_index(origin)
     }
 
     pub fn erase_subject(
@@ -315,10 +309,7 @@ mod tests {
     };
     use myelin_identity::{PrincipalId, PrincipalKind};
     use myelin_query::{FieldType, FieldValue};
-    use myelin_storage::{
-        Byok, Dek, DekHandle, Hyok, HyokKeyService, HyokServiceDenied, KekId, KmsEngine,
-        PlatformManaged, WrappedDek,
-    };
+    use myelin_storage::KmsEngine;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex as StdMutex;
 
@@ -683,41 +674,6 @@ mod tests {
             surviving.len(),
             2,
             "both docs surface once the restriction is cleared"
-        );
-    }
-
-    #[test]
-    fn hyok_class_has_nothing_to_erase() {
-        struct DenyAllHyok;
-        impl HyokKeyService for DenyAllHyok {
-            fn wrap(&self, _d: &Dek) -> Result<WrappedDek, HyokServiceDenied> {
-                Err(HyokServiceDenied)
-            }
-            fn unwrap(&self, _w: &WrappedDek) -> Result<DekHandle, HyokServiceDenied> {
-                Err(HyokServiceDenied)
-            }
-            fn destroy(&self) {}
-        }
-        let engine = KmsEngine::new();
-        engine
-            .ensure_kek(&KekId::new(tenant(), region()))
-            .expect("seed the in-memory KEK");
-        let platform = PlatformManaged::new(&engine, region());
-        let byok = Byok::new(&engine, region(), "kms-customer://acme/k1");
-        let hyok = Hyok::new(DenyAllHyok);
-
-        let holder = holder_over(indexer_with(&[]));
-        assert!(
-            !holder.erase_class(&platform),
-            "a platform-managed class IS indexed (erase = purge)"
-        );
-        assert!(
-            !holder.erase_class(&byok),
-            "a BYOK class IS indexed (plaintext reachable while live)"
-        );
-        assert!(
-            holder.erase_class(&hyok),
-            "a HYOK class is structurally skipped - nothing to erase"
         );
     }
 

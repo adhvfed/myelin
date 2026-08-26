@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::content::MessageBody;
 use myelin_content::{Block, InlineNode};
 use myelin_identity::{Consistency, ListObjectsResult, ObjectType, Permission, Principal};
 use myelin_query::{FieldType, FieldValue};
@@ -7,9 +8,6 @@ use myelin_search::{
     query as search_query, IndexBackend, IndexSpec, ListObjectsPort, Page, QueryStats,
     RankedResults, ScopedEngine, SearchProjection,
 };
-use myelin_storage::{IndexAdmission, KeyOrigin};
-
-use crate::content::MessageBody;
 
 pub const CHAT_SUBSYSTEM: &str = "chat";
 
@@ -202,14 +200,6 @@ pub fn non_member_filter(zookie: &str) -> ListObjectsResult {
     }
 }
 
-pub fn admit_message_indexing(origin: &dyn KeyOrigin) -> IndexAdmission {
-    IndexAdmission::for_origin(origin)
-}
-
-pub fn may_index_messages(origin: &dyn KeyOrigin) -> bool {
-    admit_message_indexing(origin).may_index()
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct EmbeddingsArePersonalData;
 
@@ -232,11 +222,7 @@ mod tests {
         FieldDecl, FieldSchema, IncrementalIndexer, IndexDocument, MockEmbeddingAdapter,
         TantivyBackend,
     };
-    use myelin_storage::{
-        kms::{DekHandle, KekId, KmsEngine, KEY_LEN},
-        Byok, Dek, Hyok, HyokKeyService, HyokServiceDenied, PlatformManaged, WrappedDek,
-    };
-    use myelin_tenancy::{Region, TenantId};
+    use myelin_tenancy::TenantId;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -513,75 +499,6 @@ mod tests {
             ty.0,
             message_index_spec().acl_object_type,
             "the feeder conjoins on the SAME object type the spec declares (message.id)"
-        );
-    }
-
-    struct MockHyok {
-        revoked: std::cell::Cell<bool>,
-        key: [u8; KEY_LEN],
-    }
-    impl MockHyok {
-        fn new() -> MockHyok {
-            MockHyok {
-                revoked: std::cell::Cell::new(false),
-                key: [7u8; KEY_LEN],
-            }
-        }
-    }
-    impl HyokKeyService for MockHyok {
-        fn wrap(&self, _dek: &Dek) -> Result<WrappedDek, HyokServiceDenied> {
-            if self.revoked.get() {
-                return Err(HyokServiceDenied);
-            }
-            Ok(WrappedDek {
-                nonce: [0u8; 12],
-                wrapped: self.key.to_vec(),
-                kek_epoch: 0,
-            })
-        }
-        fn unwrap(&self, _w: &WrappedDek) -> Result<DekHandle, HyokServiceDenied> {
-            if self.revoked.get() {
-                return Err(HyokServiceDenied);
-            }
-            Ok(DekHandle::from_raw(self.key))
-        }
-        fn destroy(&self) {
-            self.revoked.set(true);
-        }
-    }
-
-    #[test]
-    fn hyok_class_skips_message_indexing() {
-        let eng = KmsEngine::new();
-        eng.ensure_kek(&KekId::new(
-            TenantId("acme".into()),
-            Region("fr-par".into()),
-        ))
-        .expect("seed the in-memory KEK");
-        let region = Region("fr-par".into());
-
-        let platform = PlatformManaged::new(&eng, region.clone());
-        assert_eq!(admit_message_indexing(&platform), IndexAdmission::Admit);
-        assert!(
-            may_index_messages(&platform),
-            "platform-managed: full search/RAG"
-        );
-
-        let byok = Byok::new(&eng, region.clone(), "kms-customer://acme/k");
-        assert!(
-            may_index_messages(&byok),
-            "BYOK: the key is live in-engine → can index"
-        );
-
-        let hyok = Hyok::new(MockHyok::new());
-        assert_eq!(
-            admit_message_indexing(&hyok),
-            IndexAdmission::SkipHyok,
-            "a HYOK class is refused - you cannot index what you cannot decrypt"
-        );
-        assert!(
-            !may_index_messages(&hyok),
-            "0 indexed message bodies for a HYOK tenant (the structural skip)"
         );
     }
 

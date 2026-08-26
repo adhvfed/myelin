@@ -2635,11 +2635,16 @@ all four stores had been walked and that no HYOK plaintext existed. They could
 not turn red if a HYOK document were indexed.
 
 The false SRCH-D10 artifact, verdict, gate, five unit tests, and external drill
-have been removed. The remaining file and drill are named for the behavior they
-actually exercise: backup-scale erasure. That path still seals recoverable
+have been removed. Three more downstream facades were equally unwired:
+Search's `hyok_skips_index`, its erasure holder's `erase_class`, and Chat's
+`admit_message_indexing` were called only by tests that interpreted a returned
+boolean as proof that no data reached an index. Those APIs and their three
+tests are gone too. The remaining file and drill are named for the behavior
+they actually exercise: backup-scale erasure. That path still seals recoverable
 ciphertext, purges live documents and vectors through the holder, destroys the
-key, and proves the retained backup no longer opens. The public Search exports
-no longer offer callers an assurance object that the system cannot calculate.
+key, and proves the retained backup no longer opens. The public Search and Chat
+exports no longer offer callers an assurance object that the system cannot
+calculate.
 
 This does not declare HYOK safe by absence. The honest gap is that origin
 selection is not wired into production projection/index admission at all; the
@@ -2647,10 +2652,11 @@ selection is not wired into production projection/index admission at all; the
 SRCH-D10 must begin with a configured customer-key origin and drive the same
 consumer and stores used by live search.
 
-Proof: 335 Search library tests and the two-case renamed backup-erasure drill.
-The feature-enabled object-store story reached the live adapter but could not
-run because that dependency was unavailable, and is deliberately not counted
-as green.
+Proof: 333 Search library tests, 261 Chat library tests, the two-case renamed
+backup-erasure drill, the two real Chat ACL-search stories, and warning-free
+all-target/all-feature Search and Chat Clippy. The feature-enabled object-store
+story reached the live adapter but could not run because that dependency was
+unavailable, and is deliberately not counted as green.
 
 ## known gaps (honest list, in priority order)
 

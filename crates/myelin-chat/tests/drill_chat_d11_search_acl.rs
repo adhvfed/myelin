@@ -1,6 +1,4 @@
-use myelin_chat::{
-    admit_message_indexing, may_index_messages, AclConjoinedSearchFeeder, FT_BODY_FIELD,
-};
+use myelin_chat::{AclConjoinedSearchFeeder, FT_BODY_FIELD};
 use myelin_identity::{
     Consistency, ConsistencyMode, ListObjectsResult, Literal, ObjectId, ObjectType, Permission,
     Principal, PrincipalId, PrincipalKind, Result as AuthzResult, SetExpr, Zookie,
@@ -10,12 +8,7 @@ use myelin_search::{
     FieldDecl, FieldSchema, IndexBackend, IndexDocument, ListObjectsPort, Page, QueryStats,
     ScopedEngine, TantivyBackend,
 };
-use myelin_storage::{
-    kms::{DekHandle, KekId, KmsEngine, KEY_LEN},
-    Byok, Dek, Hyok, HyokKeyService, HyokServiceDenied, IndexAdmission, PlatformManaged,
-    WrappedDek,
-};
-use myelin_tenancy::{Region, TenantId};
+use myelin_tenancy::TenantId;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -190,63 +183,4 @@ fn partial_membership_sees_only_granted_messages() {
         1,
         "the count reveals only the visible message"
     );
-}
-
-#[test]
-fn hyok_tenant_indexes_zero_message_bodies() {
-    let engine = KmsEngine::new();
-    let region = Region("fr-par".into());
-    engine
-        .ensure_kek(&KekId::new(TenantId("acme".into()), region.clone()))
-        .expect("seed the in-memory KEK");
-
-    let platform = PlatformManaged::new(&engine, region.clone());
-    assert!(
-        may_index_messages(&platform),
-        "platform-managed: full search/RAG"
-    );
-
-    let byok = Byok::new(&engine, region.clone(), "kms-customer://acme/k");
-    assert!(
-        may_index_messages(&byok),
-        "BYOK: key live in-engine → can index"
-    );
-
-    assert_eq!(admit_message_indexing(&platform), IndexAdmission::Admit);
-    assert_eq!(admit_message_indexing(&byok), IndexAdmission::Admit);
-
-    let hyok = Hyok::new(MockHyok::new());
-    assert_eq!(
-        admit_message_indexing(&hyok),
-        IndexAdmission::SkipHyok,
-        "a HYOK class is refused by construction (you cannot index what you cannot decrypt)"
-    );
-    assert!(
-        !may_index_messages(&hyok),
-        "0 indexed message bodies for a HYOK tenant → nothing to leak (11.3)"
-    );
-}
-
-struct MockHyok {
-    key: [u8; KEY_LEN],
-}
-impl MockHyok {
-    fn new() -> MockHyok {
-        MockHyok {
-            key: [7u8; KEY_LEN],
-        }
-    }
-}
-impl HyokKeyService for MockHyok {
-    fn wrap(&self, _dek: &Dek) -> Result<WrappedDek, HyokServiceDenied> {
-        Ok(WrappedDek {
-            nonce: [0u8; 12],
-            wrapped: self.key.to_vec(),
-            kek_epoch: 0,
-        })
-    }
-    fn unwrap(&self, _w: &WrappedDek) -> Result<DekHandle, HyokServiceDenied> {
-        Ok(DekHandle::from_raw(self.key))
-    }
-    fn destroy(&self) {}
 }
