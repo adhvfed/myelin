@@ -1,5 +1,6 @@
 pub mod ci_watch;
 pub mod client;
+mod clock;
 pub mod config;
 pub mod context;
 mod credential_store;

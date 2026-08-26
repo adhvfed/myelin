@@ -7,7 +7,7 @@ use hyper::Uri;
 use rand::{rngs::OsRng, RngCore};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const SECRET_BYTES: usize = 32;
 const SECRET_LENGTH: usize = 43;
@@ -172,11 +172,12 @@ fn parse_claim(value: Value) -> Result<Claim, CliError> {
         .get("expires_at")
         .and_then(Value::as_i64)
         .ok_or_else(|| malformed_error("device token expiry is missing"))?;
+    let now = crate::clock::unix_seconds()?;
     if token_type != "Bearer"
         || scheme != SESSION_SCHEME
         || token.is_empty()
         || !token.as_bytes().iter().all(u8::is_ascii_graphic)
-        || expires_at <= now_unix()
+        || expires_at <= now
     {
         return malformed("authorized credential has an invalid shape");
     }
@@ -269,13 +270,6 @@ fn validate_verification_uri(value: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 fn malformed<T>(message: impl Into<String>) -> Result<T, CliError> {
     Err(malformed_error(message))
 }
@@ -290,6 +284,10 @@ fn malformed_error(message: impl Into<String>) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn future_expiry() -> i64 {
+        crate::clock::unix_seconds().expect("test clock") + 600
+    }
 
     #[test]
     fn verifier_and_challenge_are_canonical_independent_secrets() {
@@ -344,7 +342,7 @@ mod tests {
             "access_token": "SIGNED_SESSION",
             "token_type": "Bearer",
             "scheme": "session",
-            "expires_at": now_unix() + 600,
+            "expires_at": future_expiry(),
         }))
         .unwrap();
         assert!(matches!(accepted, Claim::Authorized(_)));
@@ -355,13 +353,13 @@ mod tests {
                 "access_token": "SIGNED_SESSION",
                 "token_type": "Bearer",
                 "scheme": "agent",
-                "expires_at": now_unix() + 600,
+                "expires_at": future_expiry(),
             }),
             json!({
                 "access_token": "SIGNED_SESSION",
                 "token_type": "Bearer",
                 "scheme": "session",
-                "expires_at": now_unix() - 1,
+                "expires_at": crate::clock::unix_seconds().expect("test clock") - 1,
             }),
         ] {
             assert!(parse_claim(malformed).is_err());

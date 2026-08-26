@@ -52,7 +52,7 @@ impl WorkspaceSshGrant {
         validate_username(&grant.access.username)?;
         let expires_at = DateTime::parse_from_rfc3339(&grant.access.expires_at)
             .map_err(|_| unsafe_access("expiry is not RFC 3339"))?;
-        if expires_at.timestamp() <= unix_now() {
+        if expires_at.timestamp() <= crate::clock::unix_seconds()? {
             return Err(unsafe_access("grant is already expired"));
         }
         if grant.access.public_key_fingerprint != key.fingerprint {
@@ -149,13 +149,6 @@ pub(super) fn unsafe_access(detail: &str) -> CliError {
     CliError::Transport(format!(
         "Edge returned unsafe workspace SSH access: {detail}"
     ))
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

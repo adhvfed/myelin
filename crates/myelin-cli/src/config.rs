@@ -77,10 +77,11 @@ impl core::fmt::Debug for Credential {
 
 impl Credential {
     pub fn ensure_not_expired(&self) -> Result<(), CliError> {
-        if self
-            .expires_at_unix
-            .is_some_and(|expires_at| expires_at <= unix_now())
-        {
+        let Some(expires_at) = self.expires_at_unix else {
+            return Ok(());
+        };
+        let now = crate::clock::unix_seconds()?;
+        if expires_at <= now {
             return Err(CliError::NotAuthenticated(
                 "the saved CLI session has expired".into(),
             ));
@@ -616,15 +617,6 @@ fn credential(
         edge_url: edge_url.map(normalize_stored_edge_url).transpose()?,
         expires_at_unix,
     })
-}
-
-fn unix_now() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 fn normalize_stored_edge_url(edge_url: &str) -> Result<String, CliError> {

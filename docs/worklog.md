@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — The CLI never turns a broken clock into a live credential
+
+Three user-facing authentication checks independently converted a clock before the Unix epoch
+into zero: saved browser sessions, device-login responses, and temporary SSH access to an agent
+workspace. A broken local clock could therefore make an already-expired credential appear live.
+The copies also disagreed about timestamp overflow and made future fixes easy to miss.
+
+The CLI now has one checked wall-clock boundary. Expiring credentials require a representable Unix
+timestamp and fail locally when the clock is unavailable; non-expiring externally supplied
+credentials do not acquire a new clock dependency. Device login and workspace SSH use the same
+rule, and the rollback regression proves that one second before the epoch is an error rather than
+1970.
+
+**Proof:** all 155 CLI library stories, strict all-target/all-feature CLI Clippy, the live
+browser-approved authentication and private-thread/SSH TypeScript journeys (2 stories in 4.13
+seconds), and the full sixteen-story CLI organization journey against the running PostgreSQL,
+Git, identity, agent, Chat, Knowledge, Issues, refs, and workspace stack (48.20 seconds), including
+saved-session expiry, Git credential refusal, logout, named contexts, governed agent work, and
+workspace entry.
+
 ## 2026-08-26 — Contract coverage is a registry, not a source-text oracle
 
 The contract-coverage gate inferred test meaning by searching source files for test attributes,
