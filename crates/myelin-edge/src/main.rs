@@ -1354,6 +1354,11 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             kms.clone(),
             myelin_storage::DurablePostPitLedger::new(provider.clone()),
         ),
+        myelin_issues::DurableIssueTitleEraser::new(
+            issue_store.as_ref().clone(),
+            kms.clone(),
+            myelin_storage::DurablePostPitLedger::new(provider.clone()),
+        ),
         myelin_storage::DurablePrivacyRequestStore::new(provider.clone()),
         handle.clone(),
     );

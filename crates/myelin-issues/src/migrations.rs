@@ -17,6 +17,7 @@ pub const ISSUE_AUTHZ_VISIBLE_TABLE: &str = "issue_authz_visible";
 pub const ISSUE_VIEW_SUBJECT_TABLE: &str = "issue_view_subject";
 pub const IMPORT_MAP_TABLE: &str = "import_map";
 pub const ISSUE_CREATE_IDEMPOTENCY_TABLE: &str = "issue_create_idempotency";
+pub const ISSUE_TITLE_ERASURE_OPERATION_TABLE: &str = "issue_title_erasure_operation";
 
 pub const CREATE_ISSUE_AUTHZ_VISIBLE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS issue_authz_visible (
@@ -186,6 +187,102 @@ UPDATE issue AS i
    AND i.id = historic_kind.issue_id
    AND i.created_by_kind = 'unknown';
 "#;
+
+pub const EXPAND_ISSUE_TITLE_ERASURE_DDL: &str = r#"
+ALTER TABLE issue
+  ADD COLUMN IF NOT EXISTS title_erased boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS title_subject text;
+"#;
+
+pub const BACKFILL_ISSUE_TITLE_ERASURE_DDL: &str = r#"
+UPDATE issue
+   SET title_subject = CASE
+         WHEN pii_key_ref LIKE '%/scoped-subject:issues:%'
+           THEN substring(pii_key_ref from '/scoped-subject:issues:(.+)$')
+         WHEN pii_key_ref LIKE '%/subject:%'
+           THEN substring(pii_key_ref from '/subject:(.+)$')
+         ELSE created_by_principal
+       END
+ WHERE title_subject IS NULL AND NOT title_erased;
+"#;
+
+pub const CREATE_ISSUE_TITLE_ERASURE_OPERATION_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS issue_title_erasure_operation (
+  tenant_id                  text        NOT NULL,
+  region                     text        NOT NULL,
+  operation_id               text        NOT NULL
+    CHECK (length(operation_id) BETWEEN 1 AND 255),
+  subject                    text        NOT NULL
+    CHECK (length(subject) BETWEEN 1 AND 255),
+  started_at                 timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  validation_cursor          uuid,
+  validation_completed_at    timestamptz,
+  titles_erased_so_far       bigint      NOT NULL DEFAULT 0,
+  events_emitted_so_far      bigint      NOT NULL DEFAULT 0,
+  completed_at               timestamptz,
+  titles_erased              bigint,
+  events_emitted             bigint,
+  PRIMARY KEY (tenant_id, region, operation_id),
+  CHECK (
+    titles_erased_so_far >= 0 AND
+    events_emitted_so_far = titles_erased_so_far AND
+    (validation_completed_at IS NOT NULL OR titles_erased_so_far = 0) AND
+    (
+      completed_at IS NULL AND titles_erased IS NULL AND events_emitted IS NULL
+      OR completed_at IS NOT NULL
+         AND validation_completed_at IS NOT NULL
+         AND titles_erased = titles_erased_so_far
+         AND events_emitted = events_emitted_so_far
+    )
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS issue_title_erasure_in_progress
+  ON issue_title_erasure_operation (tenant_id, region, subject)
+  WHERE completed_at IS NULL;
+
+CREATE OR REPLACE FUNCTION myelin_guard_issue_title_erasure_progress()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR
+     NEW.region IS DISTINCT FROM OLD.region OR
+     NEW.operation_id IS DISTINCT FROM OLD.operation_id OR
+     NEW.subject IS DISTINCT FROM OLD.subject OR
+     NEW.started_at IS DISTINCT FROM OLD.started_at OR
+     OLD.completed_at IS NOT NULL OR
+     NEW.titles_erased_so_far < OLD.titles_erased_so_far OR
+     NEW.events_emitted_so_far < OLD.events_emitted_so_far OR
+     NEW.titles_erased_so_far <> NEW.events_emitted_so_far OR
+     (OLD.validation_cursor IS NOT NULL AND
+       NEW.validation_cursor IS DISTINCT FROM OLD.validation_cursor AND
+       (NEW.validation_cursor IS NULL OR NEW.validation_cursor <= OLD.validation_cursor)) OR
+     (OLD.validation_completed_at IS NOT NULL AND
+       (NEW.validation_completed_at IS DISTINCT FROM OLD.validation_completed_at OR
+        NEW.validation_cursor IS DISTINCT FROM OLD.validation_cursor)) OR
+     (NEW.validation_completed_at IS NULL AND NEW.titles_erased_so_far <> 0) OR
+     (NEW.completed_at IS NULL AND
+       (NEW.titles_erased IS NOT NULL OR NEW.events_emitted IS NOT NULL)) OR
+     (NEW.completed_at IS NOT NULL AND
+       (NEW.validation_completed_at IS NULL OR
+        NEW.titles_erased IS DISTINCT FROM NEW.titles_erased_so_far OR
+        NEW.events_emitted IS DISTINCT FROM NEW.events_emitted_so_far)) THEN
+    RAISE EXCEPTION 'Issue-title erasure permits only forward validation, progress, and completion';
+  END IF;
+  RETURN NEW;
+END
+$myelin$;
+
+CREATE OR REPLACE TRIGGER issue_title_erasure_guard_update
+BEFORE UPDATE ON issue_title_erasure_operation
+FOR EACH ROW EXECUTE FUNCTION myelin_guard_issue_title_erasure_progress();
+"#;
+
+pub const CREATE_ISSUE_TITLE_ERASURE_BATCH_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_title_erasure_batch \
+     ON issue (tenant_id, region, title_subject, id) \
+     WHERE NOT title_erased AND title_subject IS NOT NULL";
 
 pub const EXPAND_ISSUE_RELATION_CREATOR_KIND_DDL: &str = r#"
 ALTER TABLE issue_relation
@@ -607,6 +704,34 @@ pub fn issues_migrations() -> Migrations {
         issue_view_subject_ddl,
         ISSUE_VIEW_SUBJECT_TABLE,
     ));
+    migrations.push(Migration::phased(
+        "iss_0032_issue_title_erasure_expand",
+        EXPAND_ISSUE_TITLE_ERASURE_DDL,
+        MigrationPhase::Expand,
+        ISSUE_TABLE,
+    ));
+    let issue_title_erasure_operation_ddl = format!(
+        "{}\n{};",
+        CREATE_ISSUE_TITLE_ERASURE_OPERATION_DDL,
+        make_tenant_scoped_ddl(ISSUE_TITLE_ERASURE_OPERATION_TABLE),
+    );
+    migrations.push(Migration::plain_on(
+        "iss_0033_issue_title_erasure_operation",
+        issue_title_erasure_operation_ddl,
+        ISSUE_TITLE_ERASURE_OPERATION_TABLE,
+    ));
+    migrations.push(Migration::phased(
+        "iss_0034_issue_title_erasure_backfill",
+        BACKFILL_ISSUE_TITLE_ERASURE_DDL,
+        MigrationPhase::Backfill,
+        ISSUE_TABLE,
+    ));
+    migrations.push(Migration::phased(
+        "iss_0035_issue_title_erasure_contract",
+        CREATE_ISSUE_TITLE_ERASURE_BATCH_INDEX_DDL,
+        MigrationPhase::Contract,
+        ISSUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -617,6 +742,7 @@ pub fn issues_hot_tables() -> HotTables {
         ISSUE_CHANGE_LOG_TABLE,
         IMPORT_MAP_TABLE,
         ISSUE_CREATE_IDEMPOTENCY_TABLE,
+        ISSUE_TITLE_ERASURE_OPERATION_TABLE,
     ])
 }
 
@@ -781,7 +907,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id.as_ref()),
-            Some("iss_0031_factored_issue_view")
+            Some("iss_0035_issue_title_erasure_contract")
         );
         for invariant in [
             "CREATE INDEX CONCURRENTLY",
@@ -922,6 +1048,43 @@ mod tests {
             expected_migrations,
             "the re-apply admits every migration again"
         );
+    }
+
+    #[test]
+    fn issue_title_erasure_rolls_out_online_before_it_serves_traffic() {
+        let migrations = issues_migrations();
+        let title_rollout: Vec<_> = migrations
+            .0
+            .iter()
+            .filter(|migration| migration.id.contains("issue_title_erasure"))
+            .collect();
+
+        assert_eq!(
+            title_rollout
+                .iter()
+                .map(|migration| (migration.phase, migration.table.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (MigrationPhase::Expand, Some(ISSUE_TABLE)),
+                (
+                    MigrationPhase::Plain,
+                    Some(ISSUE_TITLE_ERASURE_OPERATION_TABLE),
+                ),
+                (MigrationPhase::Backfill, Some(ISSUE_TABLE)),
+                (MigrationPhase::Contract, Some(ISSUE_TABLE)),
+            ],
+            "Issue-title privacy expands storage, installs its operation ledger, backfills legacy ownership, then enables the serving index"
+        );
+        assert!(EXPAND_ISSUE_TITLE_ERASURE_DDL.contains("ADD COLUMN IF NOT EXISTS"));
+        assert!(!EXPAND_ISSUE_TITLE_ERASURE_DDL.contains("UPDATE issue"));
+        assert_eq!(
+            BACKFILL_ISSUE_TITLE_ERASURE_DDL
+                .matches("UPDATE issue")
+                .count(),
+            1,
+            "the hot-table rewrite is isolated in the declared backfill phase"
+        );
+        assert!(CREATE_ISSUE_TITLE_ERASURE_BATCH_INDEX_DDL.contains("CONCURRENTLY"));
     }
 
     #[test]

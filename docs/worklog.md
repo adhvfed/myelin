@@ -2942,24 +2942,66 @@ and a workspace-wide all-target compile. The feature-enabled object-store story
 reached the live adapter but could not run because that dependency was
 unavailable, and is deliberately not counted as green.
 
+## 2026-08-26 — a person can erase authored Issue titles without erasing shared work
+
+The privacy request surface now admits an exact `issue_titles` scope. It keeps
+the shared Issue coordinate, project, state, and authorization binding alive,
+but replaces every title encrypted for the requesting subject with an explicit
+erased placeholder and removes its ciphertext, nonce, key reference, title
+subject, and direct creator identifier. A colleague's Issues and every other
+privacy scope remain untouched. The certificate is issued only after the
+Issues-scoped subject key is gone and one content-free `issue.updated`
+consequence has co-committed per title.
+
+The implementation closes the create/erase race instead of layering erasure on
+top of it. Title encryption now happens inside the create transaction after a
+shared subject-lifecycle lock and after idempotency replay has resolved. An
+erasure owns the exclusive form of that lock, persists its operation before
+key destruction, verifies every live title's exact Issues key class in bounded
+batches, and refuses legacy generic or foreign key rows before touching the
+key. `title_subject` is distinct from visible creator attribution, so work an
+agent authors on a person's behalf follows that person's title-key lifecycle.
+A completed operation can be replayed without erasing titles written later;
+new work receives fresh key material and needs a new request.
+
+Issue-title erasures now have their own post-PIT ledger scope. The maintenance
+operator selects it independently, uses stable content-free restore operation
+identities, runs the same validation/key/tombstone path against the restored
+cell, and includes bounded Issue counts in its aggregate report. This is wired
+production recovery behavior; unlike agent data and Chat, it does not yet have
+a complete real `pg_dump`/`pg_restore` disaster drill and is not represented as
+having one.
+
+Proof: 418 Issues and 417 Storage library tests, warning-free strict
+Storage/Issues/Edge all-target Clippy, TypeScript typechecking, the existing
+real PostgreSQL Issues authorization saga in 1.41 seconds, the new real
+PostgreSQL title lifecycle from a freshly rebuilt migration in 0.77 seconds,
+four restore-command contract
+tests, and all three black-box privacy journeys in 10.92 seconds. A broader
+backend run compiled the workspace and then stopped on three pre-existing Chat
+HITL drill failures whose test contexts lack the now-required durable timer
+wheel; they are not counted as green.
+
 ## known gaps (honest list, in priority order)
 
-1. **erasure-restore is closed for two wired scopes, open for the rest.** the
+1. **erasure-restore is closed for two drilled scopes and wired for a third.** the
    agent-data and authored-Chat-message erasers write separate post-PIT ledger
    scopes. the maintenance command replays both through their production
    holders before a restored cell can reopen. agent data is drilled against a
    real dump; Chat now has the same real `pg_dump`/`pg_restore` proof, including
-   a deliberately resurrected decryptable body. New issue titles have an
-   independent Issues subject-key class, but authored-title tombstoning, holder
-   proof, ledger replay, and legacy-row handling remain open. Git has not yet
-   begun that path. Neither may be exposed through privacy requests first.
-2. **DSR has two truthful product slices, not full holder coverage.** durable
-   submit/status/certificate is wired for `agent_data` and `chat_messages`, with
-   holder-specific proofs and black-box user journeys. the Chat scope means only
-   authored message bodies; it deliberately does not claim drafts, read state,
-   mentions in other people's content, search projections, Issues, or Git.
-   those holders remain absent rather than being represented by ceremonial
-   receipts.
+   a deliberately resurrected decryptable body. authored Issue titles now have
+   independent keys, bounded tombstoning, holder proof, public requests,
+   ledger replay, and fail-closed legacy-row handling. Their production restore
+   path still needs the equivalent real dump/restore drill. Git has not yet
+   begun a truthful holder path and must not be exposed through privacy
+   requests first.
+2. **DSR has three truthful product slices, not full holder coverage.** durable
+   submit/status/certificate is wired for `agent_data`, `chat_messages`, and
+   `issue_titles`, with holder-specific proofs and black-box user journeys. the
+   narrow scopes deliberately do not claim Chat drafts, read state, mentions in
+   other people's content, Issue bodies/comments/custom fields, search
+   projections, or Git. those holders remain absent rather than being
+   represented by ceremonial receipts.
 3. **multi-tenant machine storms can still exhaust the general dispatch
    pool.** the human lane holds per tenant and against well-behaved machine
    traffic; a coordinated cross-tenant storm of requests that lie about

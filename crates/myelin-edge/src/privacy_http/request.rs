@@ -4,6 +4,7 @@ use std::time::Duration;
 use chrono::Utc;
 use myelin_chat::chat_message_holder_receipts;
 use myelin_identity::Principal;
+use myelin_issues::issue_title_holder_receipts;
 use myelin_storage::{
     agent_data_holder_receipts, ClaimPrivacyRequestOutcome, CompletePrivacyRequestOutcome,
     CreatePrivacyRequestOutcome, DurablePrivacyRequest, NewPrivacyRequest, PrivacyHolderReceipt,
@@ -270,6 +271,14 @@ async fn erasure_receipts(
                 .await
                 .map_err(|_| HolderWorkError::Retryable)?;
             chat_message_holder_receipts(&proof).map_err(HolderWorkError::Invariant)
+        }
+        PrivacyRequestScope::IssueTitles => {
+            let operation_id = format!("privacy-request:{}", request.request_id);
+            let proof = api
+                .erase_issue_titles(principal, &operation_id)
+                .await
+                .map_err(|_| HolderWorkError::Retryable)?;
+            issue_title_holder_receipts(&proof).map_err(HolderWorkError::Invariant)
         }
     }
 }

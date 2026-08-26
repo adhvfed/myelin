@@ -1,8 +1,9 @@
 # Reapply privacy erasures after a database restore
 
 This runbook is for a restored cell that may predate one or more completed
-agent-data or Chat-message erasures. It reads the preserved live ledger and
-replays each scope through the same durable holder used by the privacy API.
+agent-data, Chat-message, or Issue-title erasures. It reads the preserved live
+ledger and replays each scope through the same durable holder used by the
+privacy API.
 
 For `agent_data`, a successful pass deletes restored trace, model-replay, and
 tool-effect rows, destroys the scoped key, and restores the absorbing marker
@@ -10,10 +11,14 @@ that prevents future agent processing. For `chat_messages`, it destroys the
 restored Chat key, empties the authored message bodies, retains their immutable
 tombstone coordinates, and co-commits the corresponding erasure events. A
 person may write new Chat messages afterward under fresh key material.
+For `issue_titles`, it destroys the restored Issues-scoped key, replaces each
+authored title with the explicit erased placeholder, removes its encrypted
+material and direct creator identity, and co-commits one content-free update
+event. The Issue itself and a colleague's work remain.
 
-The two ledger queries are scope-specific. A Chat record can never be routed to
-the agent-data holder or vice versa. Issues and Git are not included until their
-durable erasure paths write this ledger and can return equally strong proofs.
+The three ledger queries are scope-specific. No record can be routed to another
+holder. Git is not included until its durable erasure path writes this ledger
+and can return an equally strong proof.
 
 ## Before running
 
@@ -71,6 +76,13 @@ for every supported scope, never subject identifiers:
         "already_erased_subjects": 0,
         "messages_erased": 9,
         "erasure_events_co_committed": 9
+      },
+      "issue_titles": {
+        "selected_subjects": 2,
+        "newly_re_erased_subjects": 2,
+        "already_erased_subjects": 0,
+        "titles_erased": 4,
+        "erasure_events_co_committed": 4
       }
     },
     "complete": true
@@ -95,6 +107,9 @@ real `pg_dump` and `pg_restore`; it also attempts new agent work after replay an
 requires the restored holder to refuse it. The Chat PostgreSQL restore story in
 `integration_chat_p22_erase_cascade.rs` exercises scoped selection, key
 destruction, message/event co-commit, neighboring-subject isolation, and replay.
+The Issues holder has real PostgreSQL lifecycle coverage and is composed into
+this operator, but its full dump/restore disaster story remains required before
+calling that scope restore-drilled.
 
 ## Failure interpretation
 
@@ -105,6 +120,9 @@ destruction, message/event co-commit, neighboring-subject isolation, and replay.
 - “restored Chat re-erasure failed” means one subject did not finish its scoped
   key destruction and message/event transaction. Repair the target database or
   KMS and retry with the same restore command.
+- “restored Issue re-erasure failed” means one subject did not finish its
+  scoped title-key destruction and title/event transaction. Repair the target
+  database or KMS and retry with the same restore command.
 - “incomplete erasure proof” means the holder could not prove both durable
   deletion counts and an unrecoverable agent-data key. Treat this as a hard restore
   failure; do not waive it based on manual row inspection.

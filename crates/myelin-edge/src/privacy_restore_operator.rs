@@ -1,10 +1,11 @@
 use std::{str::FromStr, sync::Arc};
 
-use chrono::{SecondsFormat, Utc};
 use myelin_chat::store::pg::PgMessageStore;
 use myelin_chat::store::pg_conversation::MESSAGE_TABLE;
 use myelin_chat::{PostRestoreChatMessageReEraser, PostRestoreChatMessageReport};
-use myelin_events::{Timestamp, UlidMinter};
+use myelin_events::clock::system_clock_reading;
+use myelin_events::UlidMinter;
+use myelin_issues::{PostRestoreIssueTitleReEraser, PostRestoreIssueTitleReport};
 use myelin_storage::{
     DurableAgentTraceStore, DurablePostPitLedger, KmsEngine, PostRestoreAgentDataReEraser,
     PostRestoreAgentDataReport, SubstrateProvider,
@@ -117,29 +118,40 @@ pub async fn run(
         .run(command.restored_before_unix)
         .await
         .unwrap_or_else(|error| refuse(error.to_string(), 1));
+    let observed = system_clock_reading()
+        .unwrap_or_else(|error| refuse(format!("the privacy clock is unavailable: {error}"), 1));
     let chat_messages = PostRestoreChatMessageReEraser::new(
-        live_ledger,
+        live_ledger.clone(),
         PgMessageStore::new(
             restored_provider.db_pool().clone(),
             restored_provider.config().region.clone(),
             MESSAGE_TABLE,
         ),
-        restored_kms,
+        restored_kms.clone(),
     )
     .run(
         command.restored_before_unix,
         &UlidMinter::new(),
-        Timestamp(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+        observed.timestamp(),
     )
     .await
     .unwrap_or_else(|error| refuse(error.to_string(), 1));
+    let issue_titles =
+        PostRestoreIssueTitleReEraser::new(live_ledger, restored_provider, restored_kms)
+            .run(command.restored_before_unix, observed)
+            .await
+            .unwrap_or_else(|error| refuse(error.to_string(), 1));
 
-    println!("{}", report_json(&agent_data, &chat_messages));
+    println!(
+        "{}",
+        report_json(&agent_data, &chat_messages, &issue_titles)
+    );
 }
 
 fn report_json(
     agent_data: &PostRestoreAgentDataReport,
     chat_messages: &PostRestoreChatMessageReport,
+    issue_titles: &PostRestoreIssueTitleReport,
 ) -> serde_json::Value {
     json!({
         "restore_reerase": {
@@ -158,6 +170,13 @@ fn report_json(
                     "already_erased_subjects": chat_messages.already_erased_subjects,
                     "messages_erased": chat_messages.messages_erased,
                     "erasure_events_co_committed": chat_messages.erasure_events_co_committed,
+                },
+                "issue_titles": {
+                    "selected_subjects": issue_titles.selected_subjects,
+                    "newly_re_erased_subjects": issue_titles.newly_re_erased_subjects,
+                    "already_erased_subjects": issue_titles.already_erased_subjects,
+                    "titles_erased": issue_titles.titles_erased,
+                    "erasure_events_co_committed": issue_titles.erasure_events_co_committed,
                 },
             },
             "complete": true,
@@ -285,6 +304,14 @@ mod tests {
                 messages_erased: 3,
                 erasure_events_co_committed: 3,
             },
+            &PostRestoreIssueTitleReport {
+                restored_to_offset: 42,
+                selected_subjects: 2,
+                newly_re_erased_subjects: 1,
+                already_erased_subjects: 1,
+                titles_erased: 4,
+                erasure_events_co_committed: 4,
+            },
         );
         assert_eq!(body["restore_reerase"]["restored_before_unix"], 42);
         assert_eq!(
@@ -294,6 +321,10 @@ mod tests {
         assert_eq!(
             body["restore_reerase"]["scopes"]["chat_messages"]["messages_erased"],
             3,
+        );
+        assert_eq!(
+            body["restore_reerase"]["scopes"]["issue_titles"]["titles_erased"],
+            4,
         );
         assert_eq!(body["restore_reerase"]["complete"], true);
     }

@@ -5,6 +5,9 @@ use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::pg::MessageErasureAttempt;
 use myelin_chat::{DurableChatMessageEraser, DurableChatMessageErasureProof};
 use myelin_events::{Actor, Timestamp, UlidMinter};
+use myelin_issues::{
+    DurableIssueTitleEraser, DurableIssueTitleErasureProof, IssueTitleErasureAttempt,
+};
 use myelin_storage::{
     AgentTraceSubjectEraseReceipt, AgentTraceSubjectState, AgentTraceSubjectSummary,
     DurableAgentTraceStore, DurablePrivacyRequestStore,
@@ -26,6 +29,7 @@ mod request;
 pub(super) struct PrivacyHttpApi {
     traces: DurableAgentTraceStore,
     chat_messages: DurableChatMessageEraser,
+    issue_titles: DurableIssueTitleEraser<crate::StoreBackedIssueAuthorizer>,
     requests: DurablePrivacyRequestStore,
     runtime: Handle,
 }
@@ -79,6 +83,29 @@ impl PrivacyHttpApi {
                 &UlidMinter::new(),
                 attempt,
             )
+            .await
+            .map_err(|error| EdgeError::Internal(error.to_string()))
+    }
+
+    async fn erase_issue_titles(
+        &self,
+        principal: &myelin_identity::Principal,
+        operation_id: &str,
+    ) -> Result<DurableIssueTitleErasureProof, EdgeError> {
+        let observed = myelin_events::clock::system_clock_reading().map_err(|error| {
+            EdgeError::Unavailable(format!("privacy clock unavailable: {error}"))
+        })?;
+        let attempt = IssueTitleErasureAttempt::new(
+            operation_id,
+            Actor(pseudonymized_event_principal(
+                &principal.tenant.0,
+                principal,
+            )),
+            observed,
+        )
+        .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+        self.issue_titles
+            .erase_subject_titles(&principal.tenant.0, &principal.principal_id.0, attempt)
             .await
             .map_err(|error| EdgeError::Internal(error.to_string()))
     }
@@ -147,12 +174,14 @@ pub fn register_privacy(
     builder: GatewayBuilder,
     traces: DurableAgentTraceStore,
     chat_messages: DurableChatMessageEraser,
+    issue_titles: DurableIssueTitleEraser<crate::StoreBackedIssueAuthorizer>,
     requests: DurablePrivacyRequestStore,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = PrivacyHttpApi {
         traces,
         chat_messages,
+        issue_titles,
         requests,
         runtime,
     };

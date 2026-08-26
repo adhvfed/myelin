@@ -35,6 +35,7 @@ impl PrivacyRequestKind {
 pub enum PrivacyRequestScope {
     AgentData,
     ChatMessages,
+    IssueTitles,
 }
 
 impl PrivacyRequestScope {
@@ -42,6 +43,7 @@ impl PrivacyRequestScope {
         match self {
             Self::AgentData => "agent_data",
             Self::ChatMessages => "chat_messages",
+            Self::IssueTitles => "issue_titles",
         }
     }
 
@@ -49,6 +51,7 @@ impl PrivacyRequestScope {
         match value {
             "agent_data" => Some(Self::AgentData),
             "chat_messages" => Some(Self::ChatMessages),
+            "issue_titles" => Some(Self::IssueTitles),
             _ => None,
         }
     }

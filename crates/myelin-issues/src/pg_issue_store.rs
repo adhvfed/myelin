@@ -21,6 +21,7 @@ use std::sync::{Arc, OnceLock};
 mod create_idempotency;
 mod event_envelopes;
 mod import_creation;
+mod title_erasure;
 mod visibility_projection;
 
 use create_idempotency::{CreateClaim, CreateIdentity};
@@ -31,6 +32,10 @@ use event_envelopes::{
 };
 use import_creation::{ImportClaim, ImportIdentity};
 pub use import_creation::{ImportIssue, ImportIssueReceipt};
+pub(crate) use title_erasure::VerifiedIssueTitleErasureAttempt;
+pub use title_erasure::{
+    AuthoredIssueTitleEraseReceipt, AuthoredIssueTitleErasureState, IssueTitleErasureAttempt,
+};
 pub use visibility_projection::{
     visible_issue_keys_in_tx, IssueViewProjectionRevision, IssueViewRebuildOutcome,
 };
@@ -277,6 +282,7 @@ pub struct StoredIssue {
     pub state: String,
     pub state_category: String,
     pub title: String,
+    pub title_erased: bool,
     pub created_by_principal: String,
     pub creator_kind: IssueActorKind,
     pub version: i64,
@@ -355,6 +361,12 @@ impl core::fmt::Display for IssueStoreError {
 }
 
 impl std::error::Error for IssueStoreError {}
+
+impl From<myelin_storage::PgError> for IssueStoreError {
+    fn from(error: myelin_storage::PgError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
 
 type Clock = Arc<dyn Fn() -> Result<ClockReading, ClockError> + Send + Sync>;
 
@@ -602,28 +614,18 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let observed_unix = observed.unix_seconds();
 
         let tenant = actor.tenant.clone();
-        let subject = SubjectId::new(title_dek_subject(actor));
-        let sealed = encrypt_free_text(
-            &self.kms,
-            &actor.region,
-            &tenant,
-            &subject,
-            IssueFreeText::Title,
-            proposal.title.as_bytes(),
-        )
-        .map_err(|e| IssueStoreError::Crypto(e.to_string()))?;
-
+        let title_subject = title_dek_subject(actor);
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
         let project_id = parse_uuid("project_id", &proposal.project_id)?;
         let type_id = parse_uuid("type_id", &proposal.type_id)?;
         let issue_id = Uuid::new_v4();
         let prefix = proposal.prefix;
+        let title = proposal.title;
         let created_by = actor.principal_id.0.clone();
         let created_by_kind = IssueActorKind::from_principal(actor).as_str().to_owned();
-        let nonce = sealed.nonce.to_vec();
-        let ciphertext = sealed.ciphertext;
-        let key_ref = sealed.key_ref.to_uri();
+        let title_region = actor.region.clone();
+        let kms = self.kms.clone();
         let issue_object = issue_object(issue_id);
         let project_userset = project_userset(project_id);
         let request_event_id: EventId = self.minter.mint().into();
@@ -641,9 +643,11 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let request_event_id_text = request_event_id.0.clone();
         let created_event_id_text = created_event_id.0.clone();
 
-        let result = self
-            .provider
-            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+        let result = myelin_storage::with_tenant_tx_error(
+            self.provider.db_pool(),
+            &tenant_id.clone(),
+            &region.clone(),
+            move |conn| {
                 Box::pin(async move {
                     if let CreationOrigin::Interactive(Some(identity)) = &origin {
                         match create_idempotency::claim(
@@ -684,6 +688,22 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                             ImportClaim::Conflict => return Ok(CreationTxResult::Conflict),
                         }
                     }
+                    title_erasure::refuse_title_creation_during_erasure(
+                        &mut *conn,
+                        &tenant_id,
+                        &region,
+                        &title_subject,
+                    )
+                    .await?;
+                    let sealed = encrypt_free_text(
+                        &kms,
+                        &title_region,
+                        &tenant,
+                        &SubjectId::new(title_subject.clone()),
+                        IssueFreeText::Title,
+                        title.as_bytes(),
+                    )
+                    .map_err(|error| IssueStoreError::Crypto(error.to_string()))?;
                     let row = sqlx::query(
                         "WITH allocated AS (\
                            INSERT INTO prefix_counter (tenant_id, region, prefix, high_water, block_size) \
@@ -696,12 +716,12 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                            tenant_id, region, id, key, prefix, type_id, type_rank, state, \
                            state_category, reporter, project_id, rank, title, title_nonce, \
                            title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, \
-                           contains_personal_data, version, created_at, updated_at, state_changed_at\
+                           title_subject, contains_personal_data, version, created_at, updated_at, state_changed_at\
                          ) \
-                         SELECT $1, $2, $11, $3 || '-' || high_water::text, $3, $4, \
+                         SELECT $1, $2, $12, $3 || '-' || high_water::text, $3, $4, \
                            0, 'Todo', 'unstarted', NULL, $5, \
-                           '0|' || lpad(high_water::text, 20, '0'), '<encrypted>', $6, $7, $8, $9, $10, \
-                           true, 1, to_timestamp($12), to_timestamp($12), to_timestamp($12) \
+                           '0|' || lpad(high_water::text, 20, '0'), '<encrypted>', $6, $7, $8, $9, $10, $11, \
+                           true, 1, to_timestamp($13), to_timestamp($13), to_timestamp($13) \
                          FROM allocated \
                          RETURNING id, key, project_id, state, state_category, title_nonce, \
                            title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, version, \
@@ -712,11 +732,12 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(&prefix)
                     .bind(type_id)
                     .bind(project_id)
-                    .bind(nonce)
-                    .bind(ciphertext)
+                    .bind(sealed.nonce.to_vec())
+                    .bind(sealed.ciphertext)
                     .bind(created_by)
                     .bind(created_by_kind)
-                    .bind(key_ref)
+                    .bind(sealed.key_ref.to_uri())
+                    .bind(title_subject)
                     .bind(issue_id)
                     .bind(observed_unix)
                     .fetch_one(&mut *conn)
@@ -766,7 +787,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
 
                     PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &request_envelope).await?;
                     if abort_after_outbox {
-                        return Err(myelin_storage::PgError::Query(
+                        return Err(IssueStoreError::Storage(
                             "injected crash after authorization-request outbox stage".into(),
                         ));
                     }
@@ -778,9 +799,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         created: true,
                     })
                 })
-            })
-            .await
-            .map_err(|e| IssueStoreError::Storage(e.to_string()))?;
+            },
+        )
+        .await?;
         match result {
             CreationTxResult::Stored {
                 id,
@@ -1838,13 +1859,13 @@ impl From<RelationRecord> for StoredIssueRelation {
 }
 
 const SELECT_COLUMNS: &str = "id, key, project_id, state, state_category, title_nonce, \
-title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, version, created_at::text, updated_at::text";
+title_ciphertext, title_erased, created_by_principal, created_by_kind, pii_key_ref, version, created_at::text, updated_at::text";
 const SELECT_COLUMNS_QUALIFIED: &str = "i.id, i.key, i.project_id, i.state, i.state_category, \
-i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version, \
+i.title_nonce, i.title_ciphertext, i.title_erased, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version, \
 i.created_at::text, i.updated_at::text";
 const AUTHORIZATION_STATUS_SQL: &str = r#"
 SELECT i.id, i.key, i.project_id, i.state, i.state_category,
-       i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
+       i.title_nonce, i.title_ciphertext, i.title_erased, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
        i.created_at::text AS created_at, i.updated_at::text AS updated_at,
        b.state AS authorization_state
 FROM issue_authz_binding b
@@ -1900,7 +1921,7 @@ gate AS MATERIALIZED (
 ),
 authorized AS (
   SELECT i.id, i.key, i.project_id, i.state, i.state_category,
-         i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
+         i.title_nonce, i.title_ciphertext, i.title_erased, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
          i.created_at::text AS created_at, i.updated_at::text AS updated_at,
          floor(extract(epoch from i.updated_at) * 1000000)::bigint AS updated_at_micros
   FROM gate projection
@@ -1941,13 +1962,14 @@ SELECT 0::int AS sort_key,
        NULL::uuid AS id, NULL::text AS key, NULL::uuid AS project_id,
        NULL::text AS state, NULL::text AS state_category,
        NULL::bytea AS title_nonce, NULL::bytea AS title_ciphertext,
+       NULL::boolean AS title_erased,
        NULL::text AS created_by_principal, NULL::text AS created_by_kind,
        NULL::text AS pii_key_ref, NULL::bigint AS version,
        NULL::text AS created_at, NULL::text AS updated_at,
        NULL::bigint AS updated_at_micros
 UNION ALL
 SELECT 1, 'ready', id, key, project_id, state, state_category,
-       title_nonce, title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, version, created_at, updated_at,
+       title_nonce, title_ciphertext, title_erased, created_by_principal, created_by_kind, pii_key_ref, version, created_at, updated_at,
        updated_at_micros
 FROM authorized
 ORDER BY sort_key ASC, updated_at_micros DESC NULLS FIRST, id DESC NULLS FIRST
@@ -2142,32 +2164,37 @@ fn decode_row(
     region: &myelin_tenancy::Region,
     row: sqlx::postgres::PgRow,
 ) -> Result<StoredIssue, IssueStoreError> {
-    let nonce: Vec<u8> = row
-        .try_get("title_nonce")
-        .map_err(|_| IssueStoreError::Crypto("title nonce is absent".into()))?;
-    let nonce: [u8; NONCE_LEN] = nonce
-        .try_into()
-        .map_err(|_| IssueStoreError::Crypto("title nonce has invalid length".into()))?;
-    let ciphertext: Vec<u8> = row
-        .try_get("title_ciphertext")
-        .map_err(|_| IssueStoreError::Crypto("title ciphertext is absent".into()))?;
-    let key_ref: String = row
-        .try_get("pii_key_ref")
-        .map_err(|_| IssueStoreError::Crypto("title key reference is absent".into()))?;
-    let key_ref = PiiKeyRef::parse(&key_ref)
-        .ok_or_else(|| IssueStoreError::Crypto("title key reference is malformed".into()))?;
-    let opened = decrypt_free_text(
-        kms,
-        region,
-        &EncryptedColumn {
-            key_ref,
-            nonce,
-            ciphertext,
-        },
-    )
-    .map_err(|e| IssueStoreError::Crypto(e.to_string()))?;
-    let title = String::from_utf8(opened)
-        .map_err(|_| IssueStoreError::Crypto("decrypted title is not UTF-8".into()))?;
+    let title_erased: bool = row.get("title_erased");
+    let title = if title_erased {
+        "[erased issue title]".to_string()
+    } else {
+        let nonce: Vec<u8> = row
+            .try_get("title_nonce")
+            .map_err(|_| IssueStoreError::Crypto("title nonce is absent".into()))?;
+        let nonce: [u8; NONCE_LEN] = nonce
+            .try_into()
+            .map_err(|_| IssueStoreError::Crypto("title nonce has invalid length".into()))?;
+        let ciphertext: Vec<u8> = row
+            .try_get("title_ciphertext")
+            .map_err(|_| IssueStoreError::Crypto("title ciphertext is absent".into()))?;
+        let key_ref: String = row
+            .try_get("pii_key_ref")
+            .map_err(|_| IssueStoreError::Crypto("title key reference is absent".into()))?;
+        let key_ref = PiiKeyRef::parse(&key_ref)
+            .ok_or_else(|| IssueStoreError::Crypto("title key reference is malformed".into()))?;
+        let opened = decrypt_free_text(
+            kms,
+            region,
+            &EncryptedColumn {
+                key_ref,
+                nonce,
+                ciphertext,
+            },
+        )
+        .map_err(|e| IssueStoreError::Crypto(e.to_string()))?;
+        String::from_utf8(opened)
+            .map_err(|_| IssueStoreError::Crypto("decrypted title is not UTF-8".into()))?
+    };
     Ok(StoredIssue {
         id: row.get::<Uuid, _>("id").to_string(),
         key: row.get("key"),
@@ -2175,7 +2202,10 @@ fn decode_row(
         state: row.get("state"),
         state_category: row.get("state_category"),
         title,
-        created_by_principal: row.get("created_by_principal"),
+        title_erased,
+        created_by_principal: row
+            .get::<Option<String>, _>("created_by_principal")
+            .unwrap_or_default(),
         creator_kind: IssueActorKind::from_stored(&row.get::<String, _>("created_by_kind"))
             .ok_or_else(|| {
                 IssueStoreError::Storage("stored issue creator kind is invalid".into())

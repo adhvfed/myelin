@@ -2,11 +2,17 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, test } from "vitest";
 
-import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/context.js";
+import {
+  browserApprovedCliClient,
+  privacyClient,
+  reviewerClient,
+  uniqueName,
+} from "../src/context.js";
 import { awaitAuthorizedIssue } from "../src/issues.js";
 import { awaitAutomationFiring } from "../src/journeys/automations.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { announceIssueChange } from "../src/journeys/issues.js";
+import { createProject } from "../src/journeys/projects.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import type { SystemTestClient } from "../src/client.js";
 
@@ -380,4 +386,117 @@ describe("a person's privacy lifecycle", () => {
       expect.objectContaining({ id: freshId, state: "tombstoned", content: "" }),
     ]));
   });
+
+  test("erases authored issue titles without erasing the shared issue or a colleague's work", async () => {
+    const person = await browserApprovedCliClient(privacyClient);
+    const colleague = await browserApprovedCliClient(reviewerClient);
+    const personalProject = await createProject(person, uniqueName("Issue privacy"));
+    const colleagueProject = await createProject(colleague, uniqueName("Neighbouring issues"));
+    const personalIssue = await createVisibleIssue(
+      person,
+      uniqueName("A title the author wants removed"),
+      personalProject.id,
+      string(personalProject.project.default_issue_type_id, "personal issue type"),
+      string(personalProject.project.issue_prefix, "personal issue prefix"),
+    );
+    const colleagueTitle = uniqueName("A colleague's title remains intact");
+    const colleagueIssue = await createVisibleIssue(
+      colleague,
+      colleagueTitle,
+      colleagueProject.id,
+      string(colleagueProject.project.default_issue_type_id, "colleague issue type"),
+      string(colleagueProject.project.issue_prefix, "colleague issue prefix"),
+    );
+
+    const idempotencyKey = `erase-my-issue-titles-${randomUUID()}`;
+    const submitted = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "issue_titles" },
+      idempotencyKey,
+      expectedStatus: 201,
+    });
+    const request = record(submitted.body.request, "completed issue-title erasure request");
+    const requestId = string(request.id, "issue-title erasure request id");
+    expect(request).toMatchObject({
+      kind: "erasure",
+      scope: "issue_titles",
+      state: "completed",
+      attempt_count: 1,
+      certificate_available: true,
+    });
+
+    const erasedIssue = await person.json(
+      `/v1/issues/${encodeURIComponent(string(personalIssue.key, "personal issue key"))}`,
+    );
+    expect(erasedIssue.body).toMatchObject({
+      id: personalIssue.id,
+      key: personalIssue.key,
+      title: "[erased issue title]",
+      title_erased: true,
+    });
+    expect((await colleague.json(
+      `/v1/issues/${encodeURIComponent(string(colleagueIssue.key, "colleague issue key"))}`,
+    )).body).toMatchObject({
+      id: colleagueIssue.id,
+      title: colleagueTitle,
+      title_erased: false,
+    });
+
+    const certified = await person.json(
+      `/v1/privacy/me/requests/${encodeURIComponent(requestId)}/certificate`,
+    );
+    const issueCertificate = record(
+      certified.body.certificate,
+      "Issue-title erasure certificate",
+    );
+    expect(issueCertificate).toMatchObject({
+      request_id: requestId,
+      kind: "erasure",
+      scope: "issue_titles",
+      holders: [expect.objectContaining({
+        holder: "issue_titles",
+        operation: "erasure",
+        key_unrecoverable: true,
+      })],
+    });
+    const issueHolders = array(issueCertificate.holders, "Issue-title erasure holders");
+    expect(integer(
+      record(issueHolders[0], "Issue-title holder").records_erased,
+      "erased issue titles",
+    )).toBeGreaterThanOrEqual(1);
+
+    const freshTitle = uniqueName("Useful work written after the first request");
+    const freshIssue = await createVisibleIssue(
+      person,
+      freshTitle,
+      personalProject.id,
+      string(personalProject.project.default_issue_type_id, "personal issue type"),
+      string(personalProject.project.issue_prefix, "personal issue prefix"),
+    );
+    const replay = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "issue_titles" },
+      idempotencyKey,
+    });
+    expect(replay.body).toMatchObject({
+      created: false,
+      request: { id: requestId, state: "completed", attempt_count: 1 },
+    });
+    expect((await person.json(
+      `/v1/issues/${encodeURIComponent(string(freshIssue.key, "fresh issue key"))}`,
+    )).body).toMatchObject({ title: freshTitle, title_erased: false });
+
+    await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "issue_titles" },
+      idempotencyKey: `erase-my-new-issue-titles-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    expect((await person.json(
+      `/v1/issues/${encodeURIComponent(string(freshIssue.key, "fresh issue key"))}`,
+    )).body).toMatchObject({
+      title: "[erased issue title]",
+      title_erased: true,
+    });
+  }, 60_000);
 });
