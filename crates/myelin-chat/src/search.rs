@@ -214,7 +214,7 @@ pub fn may_index_messages(origin: &dyn KeyOrigin) -> bool {
 pub struct EmbeddingsArePersonalData;
 
 impl EmbeddingsArePersonalData {
-    pub const ERASE_CASCADE_TOKEN: &'static str = crate::erase::CHAT_ERASE_CASCADE_TOKEN;
+    pub const ERASE_CASCADE_TOKEN: &'static str = crate::events::CHAT_MESSAGE_ERASED;
     pub const SPEC_IS_SEMANTIC: bool = true;
 }
 
@@ -594,7 +594,7 @@ mod tests {
         );
         assert_eq!(
             EmbeddingsArePersonalData::ERASE_CASCADE_TOKEN,
-            crate::erase::CHAT_ERASE_CASCADE_TOKEN,
+            crate::events::CHAT_MESSAGE_ERASED,
             "the embeddings purge rides the chat erase cascade (the OUTBOX fan-out)"
         );
     }

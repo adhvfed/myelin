@@ -1,14 +1,6 @@
-use myelin_chat::{
-    chat_store_classifier, decrypt_body, encrypt_body, plaintext_at_rest, register_chat_holders,
-    ChatFreeText, ChatHolder, CHAT_OLTP_STORE,
-};
-use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
-use myelin_identity::{Principal, PrincipalId, PrincipalKind};
+use myelin_chat::{decrypt_body, encrypt_body, plaintext_at_rest, ChatFreeText};
 use myelin_storage::encryption::SubjectId;
 use myelin_storage::kms::{DekId, KeyClass, KmsEngine, SubjectKeyScope};
-use myelin_substrate::{
-    assert_holder_completeness, classify_store, Holder, HolderRegistry, StoreKind,
-};
 use myelin_tenancy::{Region, TenantId};
 
 fn tenant() -> TenantId {
@@ -114,63 +106,4 @@ fn consumer_distinct_authors_get_distinct_deks() {
         phrase,
         "erasing A leaves B's body intact (individual granularity)"
     );
-}
-
-fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(
-        PrincipalId(id.into()),
-        PrincipalKind::Human,
-        TenantId::from_token("acme"),
-    ))
-}
-
-#[test]
-fn provider_chat_store_registers_and_classifies_to_h5_no_orphan() {
-    let registry = register_chat_holders();
-    assert!(registry.is_registered(StoreKind::Oltp, CHAT_OLTP_STORE));
-    let classifier = chat_store_classifier();
-    assert_eq!(
-        classify_store(StoreKind::Oltp, CHAT_OLTP_STORE, &classifier),
-        Some(Holder::H5Chat),
-        "the Chat OLTP store is holder H5"
-    );
-    assert_eq!(
-        assert_holder_completeness(registry.registrations(), &classifier),
-        Ok(()),
-        "0 orphan Chat stores - every store maps to an H-holder"
-    );
-}
-
-#[test]
-fn consumer_chat_holder_surface_is_callable_typed() {
-    let mut registry = HolderRegistry::new();
-    let holder = ChatHolder::new();
-    holder.register(&mut registry);
-    assert!(registry.is_registered(StoreKind::Oltp, CHAT_OLTP_STORE));
-
-    let subj = subject("psn:chat-7");
-    let t = GdprTenantId::from_token("acme");
-
-    let locate = holder.locate(&subj, t.clone()).expect("locate");
-    assert_eq!(locate.receipt.operation, "locate");
-    assert!(locate.receipt.content_hash.starts_with("blake3:"));
-
-    let export = holder.export(&subj, t.clone()).expect("export");
-    assert_eq!(export.receipt.operation, "export");
-
-    let restrict = holder.restrict(&subj, true).expect("restrict");
-    assert_eq!(restrict.receipt.operation, "restrict");
-    assert!(
-        holder.restriction().is_restricted("psn:chat-7"),
-        "restrict flips the real flag the seams read"
-    );
-
-    let erase = holder
-        .erase(EraseScope::Subject {
-            subject: subj,
-            tenant: t,
-        })
-        .expect("erase returns a typed crypto-shred receipt");
-    assert_eq!(erase.receipt.operation, "erase");
-    assert!(erase.receipt.content_hash.starts_with("blake3:"));
 }

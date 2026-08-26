@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use myelin_chat::events::{
-    channel_aggregate, event_actor_pseudonym, pseudonymized_event_principal,
+    channel_aggregate, event_actor_pseudonym, pseudonymized_event_principal, CHAT_MESSAGE_ERASED,
 };
 use myelin_chat::store::pg::{
     AuthoredMessageErasureState, MessageAttribution, MessageErasureAttempt, PgMessageStore,
@@ -16,7 +16,6 @@ use myelin_chat::store::{
 use myelin_chat::{
     decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, subject_dek_erasure,
     ChatFreeText, DurableChatMessageEraser, PostRestoreChatMessageReEraser,
-    CHAT_ERASE_CASCADE_TOKEN,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, Timestamp, Ulid, UlidMinter};
@@ -366,7 +365,7 @@ async fn erasing_one_person_tombstones_only_their_real_postgres_messages_and_eve
     .expect("inspect the durable erasure events");
     assert_eq!(erased_events.len(), 2);
     assert!(erased_events.iter().all(|row| {
-        row.get::<serde_json::Value, _>("envelope")["type_"] == CHAT_ERASE_CASCADE_TOKEN
+        row.get::<serde_json::Value, _>("envelope")["type_"] == CHAT_MESSAGE_ERASED
     }));
 
     let retry = eraser

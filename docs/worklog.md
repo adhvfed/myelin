@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Chat privacy has one truthful implementation
+
+Chat exposed two incompatible erasure stories. The production privacy request path uses the
+PostgreSQL-backed message holder, durable key hierarchy, durable erasure ledger, and restore
+re-erasure worker. Beside it, an unconstructed in-memory cascade claimed to erase messages, drafts,
+Identity, read state, Search, Notifications, and analytics by changing local maps, flags, and
+counters. Its receipt declared complete coverage even though none of those product stores had been
+reached. Two suites then certified the simulation rather than a user-visible operation.
+
+The ceremonial cascade, holder, public exports, and self-certifying suites are gone. The real
+durable holder remains the sole Chat participant in privacy requests. The analytics restriction
+flag now lives beside its gate, and Search and the durable eraser share the canonical
+`chat.message.erased` event directly rather than reaching through the deleted model. Existing
+message encryption, read-state, restriction, and search stories now test their own behavior without
+borrowing credibility from a fictional all-holders receipt.
+
+**Proof:** all-target/all-feature Chat compile and strict clippy; all 262 remaining Chat library
+stories; the complete all-feature Chat suite against PostgreSQL, including the 37.07-second real
+backup/restore re-erasure story; rebuilt Edge; both live TypeScript privacy journeys (5.34 seconds);
+and all twelve live Chat collaboration journeys, including private rooms, reply threads, private
+agent work, and persistent workspace resumption (80.79 seconds). Net removal: 1,808 lines of
+simulated product code and endorsing tests.
+
 ## 2026-08-26 — Issues privacy coverage no longer certifies a simulation
 
 Issues exported a public-looking privacy holder and erase fan-out that no service constructed. It

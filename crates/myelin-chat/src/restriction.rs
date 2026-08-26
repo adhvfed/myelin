@@ -1,6 +1,38 @@
-use crate::holder::RestrictionFlag;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
 use myelin_content::InlineNode;
 use myelin_identity::Principal;
+
+#[derive(Clone, Default)]
+pub struct RestrictionFlag {
+    restricted: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl RestrictionFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, subject: &str, on: bool) {
+        let mut restricted = self
+            .restricted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if on {
+            restricted.insert(subject.to_string());
+        } else {
+            restricted.remove(subject);
+        }
+    }
+
+    pub fn is_restricted(&self, subject: &str) -> bool {
+        self.restricted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(subject)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MentionRender {

@@ -1,14 +1,10 @@
 use myelin_chat::{
-    chat_store_classifier, register_chat_holders, AuthorKind, ConversationId, MemHotTier,
-    MessageId, MessageStore, NewMessage, ReadMarker, ReadStateService, CHAT_OLTP_STORE,
-    CHAT_READ_STATE_STORE,
+    AuthorKind, ConversationId, MemHotTier, MessageId, MessageStore, NewMessage, ReadMarker,
+    ReadStateService,
 };
 use myelin_events::{Actor, CausedBy, EmitContextBase, OutboxStore, OutboxTransaction, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::cache::InMemoryCache;
-use myelin_substrate::{
-    assert_holder_completeness, classify_store, Holder, HolderRegistry, StoreKind,
-};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -96,30 +92,6 @@ fn consumer_unread_is_a_bounded_range_read_over_the_one_truth() {
 }
 
 #[test]
-fn provider_read_state_store_registers_and_classifies_to_h5() {
-    let registry = register_chat_holders();
-    assert!(
-        registry.is_registered(StoreKind::Oltp, CHAT_READ_STATE_STORE),
-        "the read-state store registered as a holder"
-    );
-    let classifier = chat_store_classifier();
-    assert_eq!(
-        classify_store(StoreKind::Oltp, CHAT_READ_STATE_STORE, &classifier),
-        Some(Holder::H5Chat),
-        "10.1: the Chat read-state store is holder H5"
-    );
-    assert_eq!(
-        classify_store(StoreKind::Oltp, CHAT_OLTP_STORE, &classifier),
-        Some(Holder::H5Chat)
-    );
-    assert_eq!(
-        assert_holder_completeness(registry.registrations(), &classifier),
-        Ok(()),
-        "10.1: every Chat store (incl. read-state) is in the exhaustive H1–H18 list - 0 orphans"
-    );
-}
-
-#[test]
 fn consumer_erasure_purges_the_read_state_markers() {
     let store = MemHotTier::new();
     let ids = seed(&store, 4);
@@ -141,5 +113,4 @@ fn consumer_erasure_purges_the_read_state_markers() {
         Some(ids[2].clone()),
         "another principal's read-state is untouched (scoped erasure)"
     );
-    let _ = HolderRegistry::new();
 }

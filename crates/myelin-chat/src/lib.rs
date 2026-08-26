@@ -6,12 +6,10 @@ pub mod conversation;
 pub mod cross_org;
 pub mod dek;
 pub mod durable_erase;
-pub mod erase;
 pub mod events;
 pub mod fanout;
 pub mod glue;
 pub mod hitl;
-pub mod holder;
 pub mod membership;
 mod mention_signal;
 pub mod post_restore;
@@ -55,10 +53,6 @@ pub use durable_erase::{
     chat_message_holder_receipts, DurableChatMessageEraser, DurableChatMessageErasureError,
     DurableChatMessageErasureProof,
 };
-pub use erase::{
-    aggregate_receipt, is_body_unrecoverable, ChatEraseError, ChatEraseReport, ChatErasureCascade,
-    StoreReceipt, CHAT_ERASE_CASCADE_TOKEN,
-};
 pub use fanout::{
     activity, activity_filter, ambient_post_inbox_writes, fanout_behaviour,
     no_second_activity_store, resolve_watchers, write_fanout, AddressedRecipient, FanoutBehaviour,
@@ -70,10 +64,6 @@ pub use hitl::{
     CardSignal, ChatApprovalCard, ClickDenied, ClickGate, PostDecisionError, RenderedCardEffect,
     ResumeTokenMinter, SignalDelivery, SignalPort, SignalPostError, APPROVAL_SIGNAL_PREFIX,
     APPROVE_PERMISSION, DECLINE_MARKER, TIMEOUT_REASON,
-};
-pub use holder::{
-    chat_store_classifier, register_chat_holders, ChatHolder, ChatStoreClass, RestrictionFlag,
-    CHAT_OLTP_STORE, CHAT_RESIDUAL_POSTURE_REF,
 };
 pub use membership::{MembershipError, MembershipGate, MembershipService, MembershipTupleWriter};
 pub use post_restore::{
@@ -102,7 +92,7 @@ pub use replay::{
 pub use restriction::{
     agent_may_read, analytics_eligible, index_projection_if_allowed, notif_may_route,
     render_body_mentions, render_mention, MentionRender, MentionResolver, ReadPath,
-    RestrictionGate, ERASED_USER,
+    RestrictionFlag, RestrictionGate, ERASED_USER,
 };
 pub use search::{
     admit_message_indexing, may_index_messages, message_doc_ref, message_index_spec,

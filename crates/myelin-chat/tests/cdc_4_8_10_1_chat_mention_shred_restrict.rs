@@ -1,9 +1,8 @@
 use myelin_chat::{
     agent_may_read, analytics_eligible, index_projection_if_allowed, notif_may_route,
-    paragraph_body, render_mention, ChatHolder, MentionRender, MentionResolver, ReadPath,
+    paragraph_body, render_mention, MentionRender, MentionResolver, ReadPath, RestrictionFlag,
     RestrictionGate, ERASED_USER,
 };
-use myelin_gdpr::{PersonalDataHolder, SubjectRef, TenantId as GdprTenantId};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::TenantId;
 use std::collections::BTreeSet;
@@ -15,14 +14,6 @@ fn principal(id: &str) -> Principal {
         TenantId("acme".into()),
     )
 }
-fn subject(id: &str) -> SubjectRef {
-    SubjectRef::new(Principal::stub(
-        PrincipalId(id.into()),
-        PrincipalKind::Human,
-        GdprTenantId::from_token("acme"),
-    ))
-}
-
 struct PseudonymMap {
     live: BTreeSet<String>,
 }
@@ -78,8 +69,8 @@ fn cdc_4_8_mention_shred_is_free_body_never_rewritten() {
 
 #[test]
 fn cdc_10_1_provider_consumer_restrict_suppresses_every_read_path() {
-    let holder = ChatHolder::new();
-    let gate = RestrictionGate::new(holder.restriction().clone());
+    let restrictions = RestrictionFlag::new();
+    let gate = RestrictionGate::new(restrictions.clone());
     let body = paragraph_body("a message", vec![]);
 
     assert!(index_projection_if_allowed(&gate, "psn:ada", &body, None).is_some());
@@ -87,9 +78,7 @@ fn cdc_10_1_provider_consumer_restrict_suppresses_every_read_path() {
     assert!(notif_may_route(&gate, "psn:ada"));
     assert!(analytics_eligible(&gate, "psn:ada"));
 
-    holder
-        .restrict(&subject("psn:ada"), true)
-        .expect("restrict on");
+    restrictions.set("psn:ada", true);
 
     assert!(
         index_projection_if_allowed(&gate, "psn:ada", &body, None).is_none(),
@@ -109,20 +98,16 @@ fn cdc_10_1_provider_consumer_restrict_suppresses_every_read_path() {
         "the restricted subject is suppressed across ALL read paths (Art. 18 totality)"
     );
 
-    holder
-        .restrict(&subject("psn:ada"), false)
-        .expect("restrict off");
+    restrictions.set("psn:ada", false);
     assert!(index_projection_if_allowed(&gate, "psn:ada", &body, None).is_some());
     assert!(!gate.suppressed_everywhere("psn:ada"));
 }
 
 #[test]
 fn cdc_10_1_restriction_is_per_subject() {
-    let holder = ChatHolder::new();
-    let gate = RestrictionGate::new(holder.restriction().clone());
-    holder
-        .restrict(&subject("psn:ada"), true)
-        .expect("restrict ada");
+    let restrictions = RestrictionFlag::new();
+    let gate = RestrictionGate::new(restrictions.clone());
+    restrictions.set("psn:ada", true);
     assert!(gate.suppressed_everywhere("psn:ada"));
     for path in ReadPath::ALL {
         assert!(
