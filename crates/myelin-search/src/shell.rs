@@ -5,7 +5,7 @@ use myelin_substrate::{
     StoreManifest,
 };
 
-use crate::holder::SEARCH_INDEX_STORE;
+use crate::store::SEARCH_INDEX_STORE;
 
 pub const SERVICE_NAME: &str = "search";
 

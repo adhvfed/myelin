@@ -2,7 +2,7 @@ use myelin_storage::{KmsError, PiiKeyRef, NONCE_LEN};
 use myelin_tenancy::{Region, ResidencyTag, TenantId};
 
 use crate::dek::SearchDekPin;
-use crate::holder::SEARCH_INDEX_STORE;
+use crate::store::SEARCH_INDEX_STORE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StatefulComponent {

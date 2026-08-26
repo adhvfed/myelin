@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Search privacy reaches the index it describes
+
+Search exported a zero-sized `SearchIndexHolder` beside its working `SearchEraseHolder`. The former
+returned successful locate, restrict, and erase receipts whose outcomes said `stub` and `no-op`;
+the latter locates subject facets, sends removal events through the live indexer, compacts vectors,
+and participates in restore verification. Only the stub and its own contract test used the false
+type, while the deployable shell already inventories its index through `AppSpec`.
+
+The stub holder and its self-certifying suite are gone. The index store identity now lives in a
+small neutral module shared by layout, residency, the service shell, and the real eraser. The same
+audit found that real erasure events carried hard-coded epoch-zero timestamps. Their clock is now
+an explicit dependency with a production UTC implementation and a deterministic test clock, so an
+erasure records when it happened without making the rest of the holder harder to test.
+
+**Proof:** all-target/all-feature Search compile and strict clippy; all 339 Search library stories;
+the complete all-feature Search suite, including PostgreSQL bootstrap, live-consumer erasure,
+restore re-erasure, object-store backstop, cross-tenant isolation, and the 43.58-second freshness-at-
+scale drill; rebuilt Edge; and all six live TypeScript code-search journeys from default-branch
+indexing through stale-match and deletion cleanup (3.45 seconds). Removed 341 lines of no-op holder
+code and endorsing tests.
+
 ## 2026-08-26 — Agent privacy receipts describe durable work
 
 Agent Service exported three parallel privacy models while Edge constructed only one. Two public

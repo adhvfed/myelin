@@ -13,7 +13,6 @@ pub mod filtered_ann;
 pub mod freshness;
 pub mod fusion;
 pub mod git_code_projection;
-pub mod holder;
 pub mod hyok_scale;
 pub mod indexer;
 pub mod issues_projection;
@@ -26,6 +25,7 @@ pub mod reindex;
 pub mod residency;
 pub mod restore_verify;
 pub mod shell;
+mod store;
 pub mod subartifact;
 pub mod surge;
 pub mod telemetry;
@@ -61,7 +61,10 @@ pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, SubjectMatcher, TantivyBackend,
     DEFAULT_SUBJECT_LOCATOR_FACETS, ORDER_KEY_FIELD,
 };
-pub use erase::{EraseOutcome, SearchEraseHolder, SEARCH_ERASE_EVENT_TYPE};
+pub use erase::{
+    EraseOutcome, ErasureEventClock, SearchEraseHolder, SystemErasureEventClock,
+    SEARCH_ERASE_EVENT_TYPE,
+};
 pub use erasure_posture::{erasure_posture, ErasurePosture};
 pub use filtered_ann::{
     measure_recall_at_k, FilteredAnnArtifact, FilteredAnnFailure, FilteredAnnGate,
@@ -78,10 +81,6 @@ pub use git_code_projection::{
     FACET_BLOB_OID as GIT_FACET_BLOB_OID, FACET_LANGUAGE as GIT_FACET_LANGUAGE,
     FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_TYPE, GIT_SUBSYSTEM,
     TRIGRAM_N,
-};
-pub use holder::{
-    register_search_holder, search_index_holder, SearchHolderRegistration, SearchIndexHolder,
-    SEARCH_INDEX_STORE,
 };
 pub use hyok_scale::{
     backup_scale_page_spec, build_live_corpus, subject_matcher, BackupScaleEraseArtifact,
@@ -136,6 +135,7 @@ pub use shell::{
     boot_search, run_search, run_search_until_shutdown, search_app_spec, search_service_migrations,
     SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
 };
+pub use store::SEARCH_INDEX_STORE;
 pub use subartifact::{
     block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
     line_range_subdoc_facets, line_range_subdoc_projection, AnchorState, ContentAnchoredSpan,

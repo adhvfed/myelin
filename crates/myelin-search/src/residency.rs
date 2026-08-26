@@ -1,7 +1,7 @@
 use myelin_substrate::StoreKind;
 use myelin_tenancy::{Region, ResidencyTag, TenantId};
 
-use crate::holder::SEARCH_INDEX_STORE;
+use crate::store::SEARCH_INDEX_STORE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchStoreDescriptor {

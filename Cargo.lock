@@ -3675,6 +3675,7 @@ dependencies = [
 name = "myelin-search"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "myelin-config",
  "myelin-content",
  "myelin-events",

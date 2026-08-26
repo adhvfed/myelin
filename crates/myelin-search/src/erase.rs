@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use chrono::{SecondsFormat, Utc};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
     Region, TenantId, Timestamp, Visibility,
@@ -14,10 +15,23 @@ use myelin_storage::KeyOrigin;
 
 use crate::dek::{hyok_skips_index, SearchDekPin};
 use crate::engine::SubjectMatcher;
-use crate::holder::SEARCH_INDEX_STORE;
 use crate::indexer::IncrementalIndexer;
+use crate::store::SEARCH_INDEX_STORE;
 
 pub const SEARCH_ERASE_EVENT_TYPE: &str = "search.subject.erased";
+
+pub trait ErasureEventClock: Send + Sync {
+    fn now(&self) -> Timestamp;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemErasureEventClock;
+
+impl ErasureEventClock for SystemErasureEventClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
+    }
+}
 
 #[derive(Clone)]
 pub struct SearchEraseHolder {
@@ -25,6 +39,7 @@ pub struct SearchEraseHolder {
     dek: SearchDekPin,
     region: Region,
     restricted: Arc<Mutex<BTreeSet<(String, String)>>>,
+    clock: Arc<dyn ErasureEventClock>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,11 +55,21 @@ impl SearchEraseHolder {
         dek: SearchDekPin,
         region: Region,
     ) -> SearchEraseHolder {
+        Self::with_clock(indexer, dek, region, Arc::new(SystemErasureEventClock))
+    }
+
+    pub fn with_clock(
+        indexer: Arc<IncrementalIndexer>,
+        dek: SearchDekPin,
+        region: Region,
+        clock: Arc<dyn ErasureEventClock>,
+    ) -> SearchEraseHolder {
         SearchEraseHolder {
             indexer,
             dek,
             region,
             restricted: Arc::new(Mutex::new(BTreeSet::new())),
+            clock,
         }
     }
 
@@ -111,7 +136,7 @@ impl SearchEraseHolder {
         let docs_purged = located.len();
 
         for doc_id in &located {
-            let ev = Self::erased_event(tenant, &region, &subject.principal, doc_id);
+            let ev = self.erased_event(tenant, &region, &subject.principal, doc_id);
             self.indexer.index(&ev).map_err(|e| {
                 crate::engine::IndexError::Engine(format!("erase purge failed: {e:?}"))
             })?;
@@ -143,11 +168,13 @@ impl SearchEraseHolder {
     }
 
     fn erased_event(
+        &self,
         tenant: &TenantId,
         region: &Region,
         actor: &Principal,
         doc_id: &str,
     ) -> EventEnvelope {
+        let now = self.clock.now();
         EventEnvelope {
             event_id: EventId(format!("erase:{}:{doc_id}", tenant.0)),
             type_: EventType(SEARCH_ERASE_EVENT_TYPE.into()),
@@ -165,8 +192,8 @@ impl SearchEraseHolder {
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,
             pii_key_ref: None,
-            occurred_at: Timestamp("1970-01-01T00:00:00Z".into()),
-            recorded_at: Timestamp("1970-01-01T00:00:00Z".into()),
+            occurred_at: now.clone(),
+            recorded_at: now,
             payload: serde_json::json!({ "ref": doc_id }),
         }
     }
@@ -401,6 +428,22 @@ mod tests {
         SearchEraseHolder::new(ix, pin, region())
     }
 
+    #[derive(Clone, Copy)]
+    struct FixedErasureEventClock;
+
+    impl ErasureEventClock for FixedErasureEventClock {
+        fn now(&self) -> Timestamp {
+            Timestamp("2026-08-26T02:48:00Z".into())
+        }
+    }
+
+    fn holder_over_at_fixed_time(ix: Arc<IncrementalIndexer>) -> SearchEraseHolder {
+        let pin = SearchDekPin::new(Arc::new(KmsEngine::new()));
+        pin.reserve(&tenant(), &region())
+            .expect("reserve the per-tenant index DEK");
+        SearchEraseHolder::with_clock(ix, pin, region(), Arc::new(FixedErasureEventClock))
+    }
+
     fn with_actor(id: &str) -> BTreeMap<String, FieldValue> {
         let mut f = BTreeMap::new();
         f.insert("actor".to_string(), FieldValue::Principal(id.into()));
@@ -587,8 +630,17 @@ mod tests {
         let r = "myelin://acme/knowledge/page/p1";
         let ix = indexer_with(&[(r, proj("body", BTreeMap::new()))]);
         assert_eq!(ix.live_count(&tenant(), &region()), 1);
-        let erase_ev =
-            SearchEraseHolder::erased_event(&tenant(), &region(), &subject("u-1").principal, r);
+        let holder = holder_over_at_fixed_time(ix.clone());
+        let erase_ev = holder.erased_event(&tenant(), &region(), &subject("u-1").principal, r);
+        assert_eq!(
+            erase_ev.occurred_at,
+            Timestamp("2026-08-26T02:48:00Z".into()),
+            "an erasure event records when the privacy operation actually happened"
+        );
+        assert_eq!(
+            erase_ev.recorded_at, erase_ev.occurred_at,
+            "the synchronous local projection records the erasure at the observed operation time"
+        );
         ix.index(&erase_ev)
             .expect("the erase event flows through the live index() path");
         assert_eq!(
