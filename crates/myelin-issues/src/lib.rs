@@ -11,8 +11,6 @@ pub mod declares;
 pub mod dek;
 pub mod events;
 pub mod governance;
-pub mod holder;
-pub mod holder_erase;
 pub mod holder_intent;
 pub mod import;
 pub mod keys;
@@ -49,10 +47,6 @@ pub use surge::{
 };
 
 pub use app::{boot_issues, issues_app_spec, run_issues, run_issues_until_shutdown, SERVICE_NAME};
-pub use holder::{
-    issue_store_classifier, register_issue_holders, IssueHolder, IssueHolderRegistration,
-    IssueStoreClass, RestrictionFlag, ISSUE_OLTP_STORE, ISSUE_RESIDUAL_POSTURE_REF,
-};
 pub use migrations::{
     issues_hot_tables, issues_migrations, make_tenant_scoped_ddl, CONSUMER_DEDUP_TABLE,
     CREATE_CONSUMER_DEDUP_DDL, CREATE_CYCLE_DDL, CREATE_CYCLE_MEMBERSHIP_DDL,
@@ -165,15 +159,9 @@ pub use rollup::{
     RollupStore,
 };
 
-pub use holder_erase::{
-    store_classes_reached_by_free_text_shred, EraseFanoutError, HolderReceipt, HolderTarget,
-    IssueEraseFanout, IssueEraseOutcome, IssueErasedSubject, IssueErasureLedger,
-    IssueReErasureReceipt, ERASED_TOMBSTONE_TOKENS,
-};
-
 pub use olap_feed::{
     issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer, IssueOlapFeedSignal,
-    IssueRestrictionLeakAudit, ReindexCtx, ISSUE_ANALYTICS_OLAP,
+    IssueRestrictionLeakAudit, ReindexCtx, RestrictionFlag, ISSUE_ANALYTICS_OLAP,
 };
 
 pub use import::{

@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — Issues privacy coverage no longer certifies a simulation
+
+Issues exported a public-looking privacy holder and erase fan-out that no service constructed. It
+used a private in-memory ledger, destroyed keys in a process-local KMS, represented Identity,
+Search, Refs, and OLAP effects by counters or flags, and still returned a receipt claiming every
+holder had been reached. Two Rust suites exercised and endorsed only that twin. This made an honest
+missing product slice look shipped and made the future durable design harder to see.
+
+The ceremonial holder, simulated fan-out, private ledger, public exports, and endorsing suites are
+gone. The real Issues personal-data inventory remains, and the analytics restriction primitive now
+lives beside the projection that consumes it. Issues deliberately remains absent from privacy
+request scopes until its PostgreSQL records, durable key hierarchy, derivative services, and
+post-restore obligation can participate in one truthful operation.
+
+**Proof:** all-target/all-feature Issues compile and strict clippy; all 414 remaining Issues library
+stories; the complete all-feature Issues suite against the configured PostgreSQL backend, including
+the million-row bounded-query and durable authorization/restart stories; rebuilt Edge; and all three
+live TypeScript Issues lifecycle journeys (10.21 seconds). Net removal: 1,632 lines of simulated
+product code and self-certifying tests.
+
 ## 2026-08-26 — authored Chat erasure survives a real database restore
 
 Chat re-erasure was production-wired but its restore test rebuilt the expected rows by hand. That

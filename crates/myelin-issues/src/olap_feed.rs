@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use myelin_events::{
     EventEnvelope, EventHandler, HandleOutcome, Reason, ReindexSource, SubjectPattern,
@@ -7,11 +8,40 @@ use myelin_storage::olap::{OlapApply, OlapEvent, OlapIngestError, OlapReadStore}
 use myelin_storage::olap_restrict::{AnalyticsAggregate, OlapAnalytics, RestrictionLeakAudit};
 
 use crate::events;
-use crate::holder::RestrictionFlag;
 use crate::replay::IssueReindexSource;
 use crate::workflow::StateCategory;
 
 pub const ISSUE_ANALYTICS_OLAP: &str = "issue_analytics_olap";
+
+#[derive(Clone, Default)]
+pub struct RestrictionFlag {
+    restricted: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl RestrictionFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, subject: &str, on: bool) {
+        let mut restricted = self
+            .restricted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if on {
+            restricted.insert(subject.to_string());
+        } else {
+            restricted.remove(subject);
+        }
+    }
+
+    pub fn is_restricted(&self, subject: &str) -> bool {
+        self.restricted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(subject)
+    }
+}
 
 fn issue_olap_subjects() -> &'static [SubjectPattern] {
     use std::sync::OnceLock;
