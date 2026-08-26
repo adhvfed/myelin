@@ -10,7 +10,6 @@ use crate::device_auth::{
 };
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
-use crate::session::{SessionStore, SESSION_COOKIE};
 use crate::shed_governor::{run_class_header, EdgeShed, RUN_CLASS_HEADER};
 use crate::sse::{SseEvent, SseHub};
 use myelin_events::clock::ClockError;
@@ -260,7 +259,6 @@ pub struct GatewayBuilder {
     routes: Vec<Route>,
     default_scheme: String,
     sse: SseHub,
-    sessions: SessionStore,
     public_surface: PublicSurface,
     auth_config: AuthPublicConfig,
     public_base_url: Option<String>,
@@ -415,7 +413,6 @@ impl GatewayBuilder {
             routes: self.routes,
             default_scheme: self.default_scheme,
             sse: self.sse,
-            sessions: self.sessions,
             public_surface: self.public_surface,
             auth_config: self.auth_config,
             public_base_url: self.public_base_url,
@@ -486,7 +483,6 @@ pub struct Gateway {
     routes: Vec<Route>,
     default_scheme: String,
     sse: SseHub,
-    sessions: SessionStore,
     public_surface: PublicSurface,
     auth_config: AuthPublicConfig,
     public_base_url: Option<String>,
@@ -508,7 +504,6 @@ impl Gateway {
             routes: Vec::new(),
             default_scheme: DEFAULT_TOKEN_SCHEME.to_string(),
             sse: SseHub::new(),
-            sessions: SessionStore::new(),
             public_surface: PublicSurface::default(),
             auth_config: AuthPublicConfig::default(),
             public_base_url: None,
@@ -520,10 +515,6 @@ impl Gateway {
 
     pub fn sse_hub(&self) -> &SseHub {
         &self.sse
-    }
-
-    pub fn sessions(&self) -> &SessionStore {
-        &self.sessions
     }
 
     pub fn public_surface(&self) -> &PublicSurface {
@@ -567,8 +558,6 @@ impl Gateway {
                 return self.approve_device_authorization(req)
             }
             (Method::Post, "/v1/auth/device/token") => return self.claim_device_authorization(req),
-            (Method::Post, "/v1/auth/logout") => return Ok(self.logout(req)),
-            (Method::Post, "/v1/auth/refresh") => return self.refresh(req),
             _ => {}
         }
 
@@ -707,21 +696,8 @@ impl Gateway {
                     .map_err(|_| EdgeError::Unauthorized("authentication failed".into()));
             }
         }
-        if let Some(sid) = req.cookie(SESSION_COOKIE) {
-            if let Some(rec) = self.sessions.get(&sid) {
-                let cred = Credential {
-                    scheme: rec.scheme,
-                    material: rec.material,
-                };
-                return authenticate(&cred)
-                    .map_err(|_| EdgeError::Unauthorized("authentication failed".into()));
-            }
-            return Err(EdgeError::Unauthorized(
-                "session cookie does not resolve a live session".into(),
-            ));
-        }
         Err(EdgeError::Unauthorized(
-            "no credential presented (Bearer token or session cookie required)".into(),
+            "no credential presented (Bearer token required)".into(),
         ))
     }
 
@@ -981,31 +957,6 @@ impl Gateway {
             }
             Err(_) => Err(EdgeError::Unauthorized("login failed".into())),
         }
-    }
-
-    fn logout(&self, req: &EdgeRequest) -> EdgeResponse {
-        if let Some(sid) = req.cookie(SESSION_COOKIE) {
-            self.sessions.remove(&sid);
-        }
-        EdgeResponse::json(200, &json!({ "ok": true }))
-            .with_header("set-cookie", SessionStore::clear_cookie_header())
-    }
-
-    fn refresh(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
-        let sid = req
-            .cookie(SESSION_COOKIE)
-            .ok_or_else(|| EdgeError::Unauthorized("no session cookie to refresh".into()))?;
-        let rec = self.sessions.get(&sid).ok_or_else(|| {
-            EdgeError::Unauthorized("session cookie does not resolve a live session".into())
-        })?;
-        let cred = Credential {
-            scheme: rec.scheme,
-            material: rec.material,
-        };
-        self.authn
-            .authenticate_identity(&cred, None)
-            .map_err(|_| EdgeError::Unauthorized("session refresh failed".into()))?;
-        Ok(EdgeResponse::json(200, &json!({ "refreshed": true })))
     }
 
     fn match_route(&self, method: Method, path: &str) -> Result<Option<RouteMatch>, EdgeError> {
@@ -1571,6 +1522,33 @@ mod tests {
         let b = resp.json_body().unwrap();
         assert_eq!(b["error"]["message"], "authentication required");
         assert_eq!(b["error"]["code"], "unauthorized");
+    }
+
+    #[test]
+    fn edge_accepts_browser_credentials_only_as_bounded_capabilities() {
+        let gateway = gw();
+        let cookie = gateway.handle(EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![("cookie".into(), "myelin_session=obsolete".into())],
+            vec![],
+        ));
+        assert_eq!(
+            cookie.status(),
+            401,
+            "the web BFF's opaque cookie is meaningful only to the BFF; Edge requires its bounded capability"
+        );
+
+        for obsolete_path in ["/v1/auth/refresh", "/v1/auth/logout"] {
+            let response =
+                gateway.handle(EdgeRequest::new("POST", obsolete_path, "", vec![], vec![]));
+            assert_eq!(
+                response.status(),
+                404,
+                "Edge must not advertise a parallel cookie lifecycle at {obsolete_path}"
+            );
+        }
     }
 
     fn www_authenticate(resp: &EdgeResponse) -> Option<String> {

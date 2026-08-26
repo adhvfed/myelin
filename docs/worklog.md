@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-26 — The browser has one session boundary
+
+Edge still carried an older browser-cookie implementation beside the deployed web boundary. It
+accepted an in-memory cookie as a credential, exposed refresh and logout routes over that store,
+and generated its cookie identifiers from wall-clock nanoseconds plus a process-local counter. No
+production path issued those cookies: the web BFF owns the opaque, random, HTTP-only cookie and
+presents only a bounded Myelin capability to Edge. Edge login already returned that capability.
+The parallel surface was therefore both predictable in isolation and impossible to use as a
+coherent lifecycle.
+
+The unused store, cookie parser, public exports, cookie authentication branch, and misleading
+refresh/logout routes are gone. Edge now has one human-session boundary: OIDC or browser-approved
+device login mints a bounded capability; the web BFF keeps it behind its independently durable
+opaque cookie; Edge accepts that capability as Bearer (or stock-Git Basic) and nothing else. A
+cookie copied from the browser cannot become an Edge credential.
+
+**Proof:** all 364 Edge library stories; strict all-target/all-feature Edge Clippy; the focused
+negative boundary story for copied cookies and retired lifecycle routes; and the live PostgreSQL
+TypeScript journey in which a browser approves one short-lived CLI session without transferring
+its credential (124 milliseconds).
+
 ## 2026-08-26 — An issue action has one durable time
 
 The PostgreSQL Issues store let the database timestamp a row while application code independently

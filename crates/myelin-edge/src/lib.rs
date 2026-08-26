@@ -44,7 +44,6 @@ pub mod request;
 mod runtime;
 pub mod secret_admin_cmd;
 pub mod server;
-pub mod session;
 pub mod shed_governor;
 pub mod sse;
 pub mod tool_http;
@@ -139,7 +138,6 @@ pub use server::{
     serve_edge, serve_edge_until_shutdown, serve_edge_until_shutdown_with_probe, ReadinessCheck,
     ReadinessProbe, ShutdownOutcome,
 };
-pub use session::{SessionRecord, SessionStore, SESSION_COOKIE};
 pub use sse::{SseEvent, SseHub, SseSubscription};
 pub use tool_http::register_tools;
 pub use trigger_http::register_triggers;

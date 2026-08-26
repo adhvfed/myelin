@@ -115,19 +115,6 @@ impl EdgeRequest {
         Some((user.to_string(), pass.to_string()))
     }
 
-    pub fn cookie(&self, name: &str) -> Option<String> {
-        let raw = self.header("cookie")?;
-        for pair in raw.split(';') {
-            let pair = pair.trim();
-            if let Some((k, v)) = pair.split_once('=') {
-                if k.trim() == name {
-                    return Some(v.trim().to_string());
-                }
-            }
-        }
-        None
-    }
-
     pub fn query_param(&self, key: &str) -> Option<String> {
         for pair in self.query.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
@@ -289,26 +276,11 @@ mod tests {
     }
 
     #[test]
-    fn cookie_and_query_parsing_is_total() {
-        let req = EdgeRequest::new(
-            "GET",
-            "/v1/x",
-            "limit=10&cursor=zz",
-            vec![("cookie".into(), "a=1; myelin_session=SID; b=2".into())],
-            Vec::new(),
-        );
-        assert_eq!(req.cookie("myelin_session"), Some("SID".to_string()));
-        assert_eq!(req.cookie("missing"), None);
+    fn query_parsing_is_total() {
+        let req = EdgeRequest::new("GET", "/v1/x", "limit=10&cursor=zz", vec![], Vec::new());
         assert_eq!(req.query_param("limit"), Some("10".to_string()));
         assert_eq!(req.query_param("cursor"), Some("zz".to_string()));
-        let bad = EdgeRequest::new(
-            "GET",
-            "/",
-            "&&=&x",
-            vec![("cookie".into(), ";;= ;".into())],
-            vec![],
-        );
-        assert_eq!(bad.cookie("x"), None);
+        let bad = EdgeRequest::new("GET", "/", "&&=&x", vec![], vec![]);
         assert_eq!(bad.query_param("x"), None);
     }
 
