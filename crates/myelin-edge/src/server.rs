@@ -1,5 +1,5 @@
 use crate::error::EdgeError;
-use crate::gateway::{Gateway, PreparedGatewayRequest};
+use crate::gateway::{CredentialAdmissionClass, Gateway, PreparedGatewayRequest};
 use crate::request::{EdgeRequest, EdgeResponse};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -28,19 +28,26 @@ const MAX_REQUEST_BODY_BYTES: usize = myelin_ci_sandbox::gvisor::WIRE_STDIN_BOUN
 const MAX_JSON_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
+const MAX_CONCURRENT_MACHINE_GIT_WIRE_OPERATIONS: usize = 3;
 const MAX_CONCURRENT_REQUEST_BODIES: usize = 64;
+const MAX_CONCURRENT_MACHINE_REQUEST_BODIES: usize = 40;
+const MAX_CONCURRENT_PUBLIC_REQUEST_BODIES: usize = 8;
 const MAX_CONCURRENT_GIT_PUSH_BODIES: usize = 2;
+const MAX_CONCURRENT_MACHINE_GIT_PUSH_BODIES: usize = 1;
 const MAX_CONCURRENT_GATEWAY_DISPATCHES: usize = 64;
 // Identity preparation is independently bounded because it runs before the
 // general dispatch pool and may consult durable principal and revocation state.
 // Its ceiling matches the configured identity-authz bulkhead.
 const MAX_CONCURRENT_REQUEST_PREPARATIONS: usize = 256;
+const MAX_CONCURRENT_MACHINE_REQUEST_PREPARATIONS: usize = 224;
+const MAX_CONCURRENT_PUBLIC_REQUEST_PREPARATIONS: usize = 16;
 // Requests whose verified principal is a service or agent draw from this
 // smaller pool FIRST, so the remaining dispatch slots stay available to
 // interactive humans during a cross-tenant machine storm. No caller-provided
 // header participates in this process-wide classification.
 const MAX_CONCURRENT_MACHINE_DISPATCHES: usize = 48;
 const MAX_CONCURRENT_LARGE_RESPONSES: usize = 2;
+const MAX_CONCURRENT_MACHINE_LARGE_RESPONSES: usize = 1;
 const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
@@ -55,12 +62,250 @@ static CONNECTIONS_SHED: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 struct AdmissionSlots {
     git_wire: Arc<Semaphore>,
+    machine_git_wire: Arc<Semaphore>,
     request_body: Arc<Semaphore>,
+    machine_request_body: Arc<Semaphore>,
+    public_request_body: Arc<Semaphore>,
     git_push_body: Arc<Semaphore>,
+    machine_git_push_body: Arc<Semaphore>,
     request_preparation: Arc<Semaphore>,
+    machine_request_preparation: Arc<Semaphore>,
+    public_request_preparation: Arc<Semaphore>,
     gateway_dispatch: Arc<Semaphore>,
     machine_dispatch: Arc<Semaphore>,
     large_response: Arc<Semaphore>,
+    machine_large_response: Arc<Semaphore>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportClass {
+    Human,
+    Machine,
+    Public,
+}
+
+struct ClassedTransportPermits {
+    _general: OwnedSemaphorePermit,
+    _class: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone, Copy)]
+enum TransportAdmissionKind {
+    Machine,
+    Unavailable,
+}
+
+#[derive(Clone, Copy)]
+struct TransportAdmissionError {
+    kind: TransportAdmissionKind,
+    message: &'static str,
+    unread_body: bool,
+}
+
+impl TransportAdmissionError {
+    fn machine(message: &'static str, unread_body: bool) -> Self {
+        Self {
+            kind: TransportAdmissionKind::Machine,
+            message,
+            unread_body,
+        }
+    }
+
+    fn unavailable(message: &'static str, unread_body: bool) -> Self {
+        Self {
+            kind: TransportAdmissionKind::Unavailable,
+            message,
+            unread_body,
+        }
+    }
+
+    fn into_response(self) -> Response<EdgeBody> {
+        match self.kind {
+            TransportAdmissionKind::Machine => {
+                machine_transport_shed(self.message, self.unread_body)
+            }
+            TransportAdmissionKind::Unavailable if self.unread_body => {
+                unread_body_overloaded(self.message)
+            }
+            TransportAdmissionKind::Unavailable => overloaded(self.message),
+        }
+    }
+}
+
+impl AdmissionSlots {
+    fn admit_preparation(
+        &self,
+        class: CredentialAdmissionClass,
+        has_body: bool,
+    ) -> Result<ClassedTransportPermits, TransportAdmissionError> {
+        let class_permit = match class {
+            CredentialAdmissionClass::HumanSession => None,
+            CredentialAdmissionClass::Machine => Some(acquire_machine_transport(
+                &self.machine_request_preparation,
+                "the machine identity preparation pool is at capacity; retry later",
+                has_body,
+            )?),
+            CredentialAdmissionClass::Public => Some(
+                self.public_request_preparation
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        TransportAdmissionError::unavailable(
+                            "the public identity preparation service is at capacity; retry later",
+                            has_body,
+                        )
+                    })?,
+            ),
+        };
+        let general = self
+            .request_preparation
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TransportAdmissionError::unavailable(
+                    "the edge identity service is at capacity; retry later",
+                    has_body,
+                )
+            })?;
+        Ok(ClassedTransportPermits {
+            _general: general,
+            _class: class_permit,
+        })
+    }
+
+    fn admit_request_body(
+        &self,
+        class: TransportClass,
+        has_body: bool,
+    ) -> Result<Option<ClassedTransportPermits>, TransportAdmissionError> {
+        if !has_body {
+            return Ok(None);
+        }
+        let class_permit = match class {
+            TransportClass::Human => None,
+            TransportClass::Machine => Some(acquire_machine_transport(
+                &self.machine_request_body,
+                "the machine request-body pool is at capacity; retry later",
+                true,
+            )?),
+            TransportClass::Public => Some(
+                self.public_request_body
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        TransportAdmissionError::unavailable(
+                            "the public authentication body service is at capacity; retry later",
+                            true,
+                        )
+                    })?,
+            ),
+        };
+        let general = self.request_body.clone().try_acquire_owned().map_err(|_| {
+            TransportAdmissionError::unavailable(
+                "the edge request-body service is at capacity; retry later",
+                true,
+            )
+        })?;
+        Ok(Some(ClassedTransportPermits {
+            _general: general,
+            _class: class_permit,
+        }))
+    }
+
+    fn admit_git_push_body(
+        &self,
+        class: TransportClass,
+        is_git_push: bool,
+    ) -> Result<Option<ClassedTransportPermits>, TransportAdmissionError> {
+        if !is_git_push {
+            return Ok(None);
+        }
+        let class_permit = if class == TransportClass::Machine {
+            Some(acquire_machine_transport(
+                &self.machine_git_push_body,
+                "the machine Git push upload pool is at capacity; retry later",
+                true,
+            )?)
+        } else {
+            None
+        };
+        let general = self
+            .git_push_body
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TransportAdmissionError::unavailable(
+                    "the Git push upload service is at capacity; retry later",
+                    true,
+                )
+            })?;
+        Ok(Some(ClassedTransportPermits {
+            _general: general,
+            _class: class_permit,
+        }))
+    }
+
+    fn admit_large_response(
+        &self,
+        class: TransportClass,
+        required: bool,
+    ) -> Result<Option<ClassedTransportPermits>, TransportAdmissionError> {
+        if !required {
+            return Ok(None);
+        }
+        let class_permit = if class == TransportClass::Machine {
+            Some(acquire_machine_transport(
+                &self.machine_large_response,
+                "the machine large-response pool is at capacity; retry later",
+                false,
+            )?)
+        } else {
+            None
+        };
+        let general = self
+            .large_response
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TransportAdmissionError::unavailable(
+                    "the large response service is at capacity; retry later",
+                    false,
+                )
+            })?;
+        Ok(Some(ClassedTransportPermits {
+            _general: general,
+            _class: class_permit,
+        }))
+    }
+
+    fn admit_git_wire(
+        &self,
+        class: TransportClass,
+        is_git_wire: bool,
+    ) -> Result<Option<ClassedTransportPermits>, TransportAdmissionError> {
+        if !is_git_wire {
+            return Ok(None);
+        }
+        let class_permit = if class == TransportClass::Machine {
+            Some(acquire_machine_transport(
+                &self.machine_git_wire,
+                "the machine Git wire pool is at capacity; retry later",
+                false,
+            )?)
+        } else {
+            None
+        };
+        let general = self.git_wire.clone().try_acquire_owned().map_err(|_| {
+            TransportAdmissionError::unavailable(
+                "the Git wire service is at capacity; retry later",
+                false,
+            )
+        })?;
+        Ok(Some(ClassedTransportPermits {
+            _general: general,
+            _class: class_permit,
+        }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,12 +401,23 @@ where
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let admission = AdmissionSlots {
         git_wire: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS)),
+        machine_git_wire: Arc::new(Semaphore::new(MAX_CONCURRENT_MACHINE_GIT_WIRE_OPERATIONS)),
         request_body: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_BODIES)),
+        machine_request_body: Arc::new(Semaphore::new(MAX_CONCURRENT_MACHINE_REQUEST_BODIES)),
+        public_request_body: Arc::new(Semaphore::new(MAX_CONCURRENT_PUBLIC_REQUEST_BODIES)),
         git_push_body: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSH_BODIES)),
+        machine_git_push_body: Arc::new(Semaphore::new(MAX_CONCURRENT_MACHINE_GIT_PUSH_BODIES)),
         request_preparation: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_PREPARATIONS)),
+        machine_request_preparation: Arc::new(Semaphore::new(
+            MAX_CONCURRENT_MACHINE_REQUEST_PREPARATIONS,
+        )),
+        public_request_preparation: Arc::new(Semaphore::new(
+            MAX_CONCURRENT_PUBLIC_REQUEST_PREPARATIONS,
+        )),
         gateway_dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT_GATEWAY_DISPATCHES)),
         machine_dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT_MACHINE_DISPATCHES)),
         large_response: Arc::new(Semaphore::new(MAX_CONCURRENT_LARGE_RESPONSES)),
+        machine_large_response: Arc::new(Semaphore::new(MAX_CONCURRENT_MACHINE_LARGE_RESPONSES)),
     };
     let mut accept_error = None;
 
@@ -320,6 +576,8 @@ async fn handle_connection_inner(
     let is_git_push = path.ends_with("/git-receive-pack");
     let body_cap = request_body_cap(&path);
     let body_deadline = request_body_deadline(&path);
+    let requires_large_response = requires_large_response_budget(&method, &path);
+    let has_body = request_has_body(&parts.headers);
     let query = parts.uri.query().unwrap_or("").to_string();
     let headers = parts
         .headers
@@ -329,29 +587,47 @@ async fn handle_connection_inner(
     if content_length_over_cap(&parts.headers, body_cap) {
         return payload_too_large(body_cap);
     }
-    let request_body_permit = if request_has_body(&parts.headers) {
-        match admission.request_body.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                return unread_body_overloaded(
-                    "the edge request-body service is at capacity; retry later",
-                )
-            }
-        }
-    } else {
-        None
+    // Authentication, exact-action authorization, and tenant admission depend
+    // only on the method, path, query, and headers. Prepare that bounded view
+    // before accepting a potentially slow or large body, then attach the bytes
+    // exactly once after collection.
+    let edge_req = EdgeRequest::new(method, path, query, headers, Vec::new());
+    let credential_class = gw.credential_admission_class(&edge_req);
+    let preparation_permits = match admission.admit_preparation(credential_class, has_body) {
+        Ok(permits) => permits,
+        Err(error) => return error.into_response(),
     };
-    let git_push_body_permit = if is_git_push {
-        match admission.git_push_body.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                return unread_body_overloaded(
-                    "the Git push upload service is at capacity; retry later",
-                )
-            }
+    let prepare_gateway = gw.clone();
+    let mut prepared = match tokio::task::spawn_blocking(move || {
+        let _preparation_permits = preparation_permits;
+        prepare_gateway_safely(&prepare_gateway, edge_req)
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(response)) => return unread_if_body(to_hyper(response), has_body),
+        Err(_) => {
+            return unread_if_body(
+                to_hyper(EdgeResponse::error(&EdgeError::Internal(
+                    "gateway preparation task did not complete".into(),
+                ))),
+                has_body,
+            )
         }
-    } else {
-        None
+    };
+    let transport_class = match prepared.run_class() {
+        Some(RunClass::Human) => TransportClass::Human,
+        Some(_) => TransportClass::Machine,
+        None => TransportClass::Public,
+    };
+
+    let request_body_permits = match admission.admit_request_body(transport_class, has_body) {
+        Ok(permits) => permits,
+        Err(error) => return error.into_response(),
+    };
+    let git_push_body_permits = match admission.admit_git_push_body(transport_class, is_git_push) {
+        Ok(permits) => permits,
+        Err(error) => return error.into_response(),
     };
     let bytes = match collect_bounded(body, body_cap, body_deadline).await {
         Ok(b) => b,
@@ -359,42 +635,16 @@ async fn handle_connection_inner(
         Err(BoundedCollectError::Read) => return request_body_read_error(),
         Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
-    let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
-    let large_response_permit = if requires_large_response_budget(&edge_req.method, &edge_req.path)
-    {
-        match admission.large_response.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => return overloaded("the large response service is at capacity; retry later"),
-        }
-    } else {
-        None
-    };
-    let git_wire_permit = if is_git_wire {
-        match admission.git_wire.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => return overloaded("the Git wire service is at capacity; retry later"),
-        }
-    } else {
-        None
-    };
-    let preparation_permit = match admission.request_preparation.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return overloaded("the edge identity service is at capacity; retry later"),
-    };
-    let prepare_gateway = gw.clone();
-    let prepared = match tokio::task::spawn_blocking(move || {
-        let _preparation_permit = preparation_permit;
-        prepare_gateway_safely(&prepare_gateway, edge_req)
-    })
-    .await
-    {
-        Ok(Ok(prepared)) => prepared,
-        Ok(Err(response)) => return to_hyper_with_permit(response, large_response_permit),
-        Err(_) => {
-            return to_hyper(EdgeResponse::error(&EdgeError::Internal(
-                "gateway preparation task did not complete".into(),
-            )))
-        }
+    prepared = prepared.with_collected_body(bytes);
+
+    let large_response_permits =
+        match admission.admit_large_response(transport_class, requires_large_response) {
+            Ok(permits) => permits,
+            Err(error) => return error.into_response(),
+        };
+    let git_wire_permits = match admission.admit_git_wire(transport_class, is_git_wire) {
+        Ok(permits) => permits,
+        Err(error) => return error.into_response(),
     };
     let machine_permit = if matches!(
         prepared.run_class(),
@@ -412,15 +662,15 @@ async fn handle_connection_inner(
         Err(_) => return overloaded("the edge request service is at capacity; retry later"),
     };
 
-    let (edge_response, large_response_permit) = match tokio::task::spawn_blocking(move || {
+    let (edge_response, large_response_permits) = match tokio::task::spawn_blocking(move || {
         let _machine_permit = machine_permit;
         let _gateway_permit = gateway_permit;
-        let _git_wire_permit = git_wire_permit;
-        let _request_body_permit = request_body_permit;
-        let _git_push_body_permit = git_push_body_permit;
+        let _git_wire_permits = git_wire_permits;
+        let _request_body_permits = request_body_permits;
+        let _git_push_body_permits = git_push_body_permits;
         (
             dispatch_gateway_safely(&gw, prepared),
-            large_response_permit,
+            large_response_permits,
         )
     })
     .await
@@ -433,7 +683,7 @@ async fn handle_connection_inner(
             None,
         ),
     };
-    to_hyper_with_permit(edge_response, large_response_permit)
+    to_hyper_with_permit(edge_response, large_response_permits)
 }
 
 fn next_request_id() -> String {
@@ -583,13 +833,46 @@ fn overloaded(message: &str) -> Response<EdgeBody> {
 }
 
 fn machine_dispatch_shed() -> Response<EdgeBody> {
-    let err =
-        EdgeError::TooManyRequests("the machine dispatch pool is at capacity; retry later".into());
+    machine_transport_shed(
+        "the machine dispatch pool is at capacity; retry later",
+        false,
+    )
+}
+
+fn acquire_machine_transport(
+    slots: &Arc<Semaphore>,
+    message: &'static str,
+    unread_body: bool,
+) -> Result<OwnedSemaphorePermit, TransportAdmissionError> {
+    slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| TransportAdmissionError::machine(message, unread_body))
+}
+
+fn machine_transport_shed(message: &str, unread_body: bool) -> Response<EdgeBody> {
+    let err = EdgeError::TooManyRequests(message.into());
     let mut response = to_hyper(EdgeResponse::error(&err));
     response.headers_mut().insert(
         hyper::header::RETRY_AFTER,
         hyper::header::HeaderValue::from_static(GIT_WIRE_RETRY_AFTER_SECONDS),
     );
+    if unread_body {
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
+fn unread_if_body(mut response: Response<EdgeBody>, has_body: bool) -> Response<EdgeBody> {
+    if has_body {
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
     response
 }
 
@@ -674,7 +957,7 @@ fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
 
 fn to_hyper_with_permit(
     resp: EdgeResponse,
-    large_response_permit: Option<OwnedSemaphorePermit>,
+    large_response_permit: Option<ClassedTransportPermits>,
 ) -> Response<EdgeBody> {
     match resp {
         EdgeResponse::Bytes {
@@ -695,7 +978,7 @@ fn to_hyper_with_permit(
                 builder = builder.header(k, v);
             }
             let body = match large_response_permit {
-                Some(permit) => budgeted_bytes_body(body, permit),
+                Some(permits) => budgeted_bytes_body_with_permits(body, permits),
                 None => full_body(body),
             };
             builder
@@ -781,11 +1064,22 @@ fn full_body(bytes: Vec<u8>) -> EdgeBody {
         .boxed()
 }
 
+#[cfg(test)]
 fn budgeted_bytes_body(bytes: Vec<u8>, permit: OwnedSemaphorePermit) -> EdgeBody {
+    budgeted_bytes_body_with_permits(
+        bytes,
+        ClassedTransportPermits {
+            _general: permit,
+            _class: None,
+        },
+    )
+}
+
+fn budgeted_bytes_body_with_permits(bytes: Vec<u8>, permits: ClassedTransportPermits) -> EdgeBody {
     BudgetedBytesBody {
         bytes: Bytes::from(bytes),
         offset: 0,
-        _permit: permit,
+        _permits: permits,
     }
     .boxed()
 }
@@ -793,7 +1087,7 @@ fn budgeted_bytes_body(bytes: Vec<u8>, permit: OwnedSemaphorePermit) -> EdgeBody
 struct BudgetedBytesBody {
     bytes: Bytes,
     offset: usize,
-    _permit: OwnedSemaphorePermit,
+    _permits: ClassedTransportPermits,
 }
 
 impl Body for BudgetedBytesBody {

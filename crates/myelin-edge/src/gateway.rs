@@ -535,12 +535,28 @@ pub(crate) struct PreparedGatewayRequest {
     kind: PreparedKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CredentialAdmissionClass {
+    HumanSession,
+    Machine,
+    Public,
+}
+
 impl PreparedGatewayRequest {
     pub(crate) fn run_class(&self) -> Option<RunClass> {
         match &self.kind {
             PreparedKind::Public(_) => None,
             PreparedKind::Authorized(prepared) => Some(prepared.run_class),
         }
+    }
+
+    /// Install the bytes collected by the HTTP transport after header-only
+    /// identity preparation. Keeping this mutation private to the prepared
+    /// request lets the server classify body admission from verified identity
+    /// without parsing or authenticating the request a second time.
+    pub(crate) fn with_collected_body(mut self, body: Vec<u8>) -> Self {
+        self.request.body = body;
+        self
     }
 }
 
@@ -579,6 +595,36 @@ impl Gateway {
             Ok(prepared) => self.dispatch(prepared),
             Err(response) => response,
         }
+    }
+
+    /// Classify the credential selector for the bounded work needed to verify
+    /// it. This is deliberately narrower than request run class: the signed
+    /// token verifier requires the `session` scheme iff the token carries the
+    /// human-session purpose, so a valid agent credential cannot select this
+    /// lane. Principal kind is still derived only after full preparation.
+    pub(crate) fn credential_admission_class(&self, req: &EdgeRequest) -> CredentialAdmissionClass {
+        let selected = || {
+            req.header("x-myelin-token-scheme")
+                .unwrap_or(&self.default_scheme)
+        };
+        let class = |scheme: &str| {
+            if scheme == machine_scheme::SESSION {
+                CredentialAdmissionClass::HumanSession
+            } else {
+                CredentialAdmissionClass::Machine
+            }
+        };
+        if req.bearer().is_some() {
+            return class(selected());
+        }
+        if let Some((username, _)) = req.basic_credentials() {
+            return match username.strip_prefix("myelin-") {
+                Some(scheme) if machine_scheme::is_machine(scheme) => class(scheme),
+                Some(_) => CredentialAdmissionClass::Machine,
+                None => class(selected()),
+            };
+        }
+        CredentialAdmissionClass::Public
     }
 
     fn is_git_wire_route(&self, req: &EdgeRequest) -> bool {
@@ -1570,6 +1616,51 @@ mod tests {
             prepared.run_class(),
             Some(RunClass::BatchCi),
             "a service principal cannot enter a human process lane by omitting classification headers"
+        );
+    }
+
+    #[test]
+    fn credential_admission_uses_only_the_cryptographically_bound_scheme() {
+        let gateway = machine_gateway(crate::shed_governor::EdgeShed::with_budgets(
+            shed_budget(4, 1),
+            shed_budget(4, 1),
+        ));
+        let mut machine = machine_request();
+        machine
+            .headers
+            .push((RUN_CLASS_HEADER.into(), "interactive".into()));
+        assert_eq!(
+            gateway.credential_admission_class(&machine),
+            CredentialAdmissionClass::Machine,
+            "a run-class claim cannot select identity preparation capacity"
+        );
+
+        let session = EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![
+                ("authorization".into(), "Bearer opaque-proof".into()),
+                (
+                    "x-myelin-token-scheme".into(),
+                    machine_scheme::SESSION.into(),
+                ),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            gateway.credential_admission_class(&session),
+            CredentialAdmissionClass::HumanSession
+        );
+        assert_eq!(
+            gateway.credential_admission_class(&EdgeRequest::new(
+                "POST",
+                "/v1/auth/login",
+                "",
+                vec![],
+                vec![],
+            )),
+            CredentialAdmissionClass::Public
         );
     }
 

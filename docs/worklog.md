@@ -3009,6 +3009,41 @@ four jobs; 33 run-plan tests are green; and the sandbox boundary admits every
 supported offline recipe while rejecting unknown commands, option-shaped
 package names, duplicate vendor frames, and misplaced compiler arguments.
 
+## 2026-08-28 — transport capacity follows credential and principal class
+
+Verified dispatch admission still began too late for four bounded resources.
+Identity preparation, request-body collection, Git push and wire execution, and
+large response materialization all had flat process caps. A burst of 300 valid
+agent MCP posts proved the remaining problem: agents filled the 256-operation
+identity backstop before principal resolution, and a browser-approved human
+briefly received 503 even though the later dispatch lane was reserved.
+
+Edge now prepares the method, path, query, headers, exact action, identity, and
+tenant lane before it reads a body, then attaches the bounded bytes to that same
+prepared request. It never parses or authenticates twice. Preparation reserves
+capacity from the credential selector: the signed-token verifier requires the
+`session` scheme exactly when the token carries the human-session purpose, so a
+valid agent credential cannot select it and the caller-controlled run-class
+header is irrelevant. Public and machine preparation have smaller caps inside
+the general ceiling.
+
+After preparation, verified principal kind owns classed request-body, Git push,
+Git wire, and large-response permits. Machine and unauthenticated slow bodies
+cannot consume the human reserve. Machine response permits live until the
+client finishes or drops the body, not merely until the handler returns, and
+every refusal before body collection closes the HTTP/1 connection explicitly.
+
+The black-box overload journey now reruns against the same durable organization
+with a unique agent name and observes concurrent probes through one immediately
+handled promise. Its 300 real one-minute agent MCP posts all omit class hints;
+the browser session stays strict-200 throughout and the machine lane recovers.
+
+Proof: all 367 Edge library stories; all 21 real HTTP transport stories twice,
+including forty incomplete machine uploads across four tenants, eight incomplete
+public login bodies, and concurrent machine/human Git responses; strict
+all-target/all-feature Edge Clippy; TypeScript typechecking; and the rebuilt
+PostgreSQL-backed full-system overload journey.
+
 ## 2026-08-28 — every focused approval story carries its timer
 
 The broad backend run found one Flow approval drill left behind by the durable
@@ -3081,22 +3116,14 @@ running TypeScript overload journey against the rebuilt PostgreSQL-backed Edge.
    other people's content, Issue bodies/comments/custom fields, search
    projections, or Git. those holders remain absent rather than being
    represented by ceremonial receipts.
-3. **pre-auth transport resources still use flat process caps.** verified
-   identity now owns general dispatch admission, but request-body collection,
-   Git-wire execution, and large-response materialization acquire their global
-   semaphores before Gateway preparation. They are bounded, but a coordinated
-   cross-tenant machine storm can still make a human retry at those narrower
-   front doors. Protecting them requires carrying a verified header-only
-   request context across bounded body collection, then reserving classed Git
-   and response capacity without parsing or authenticating twice.
-4. **asynchronous worker admission is not explicit yet.** search, refs,
+3. **asynchronous worker admission is not explicit yet.** search, refs,
    notification, and automation work arrives through durable NATS/SQL queues;
    queue bounds and worker concurrency provide backpressure, but the matching
    thresholds.toml shed rows are targets rather than production enforcement.
-5. **cross-product search is not surfaced yet.** the running product has bounded,
+4. **cross-product search is not surfaced yet.** the running product has bounded,
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.
-6. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
+5. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
    content-free tombstones for denied or unavailable artifacts. Git comments
@@ -3105,19 +3132,19 @@ running TypeScript overload journey against the rebuilt PostgreSQL-backed Edge.
    review decisions and other CI artifacts still retain their canonical link
    rather than a rich card because their durable owner projectors are not
    composed. Event-driven cache invalidation and live card updates also remain unwired.
-7. **Issues has no production live-board transport yet.** the browser offers durable,
+6. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade
    was removed rather than counted as shipped behavior.
-8. **CI has no user-visible cache yet.** the old process-local namespace is gone;
+7. **CI has no user-visible cache yet.** the old process-local namespace is gone;
    the historical `cache_entry` table has no store, pipeline syntax, runner
    restore/save operation, retention policy, or full-system journey. the eventual
    design must derive its namespace from the durable run trust stamp.
-9. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+8. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.
-10. **HYOK/BYOK has no production boundary yet.** The unwired `KeyOrigin`
+9. **HYOK/BYOK has no production boundary yet.** The unwired `KeyOrigin`
     model was removed after its BYOK path proved to be ordinary platform-key
     wrapping with an unused customer-path string. No running configuration
     selects an origin for a product data class and Search projections do not

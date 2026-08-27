@@ -1,6 +1,6 @@
 import { describe, expect, onTestFinished, test } from "vitest";
 
-import { browserApprovedCliClient, systemClient } from "../src/context.js";
+import { browserApprovedCliClient, systemClient, uniqueName } from "../src/context.js";
 import {
   activateExternalAgent,
   beginAgentRun,
@@ -22,7 +22,9 @@ describe("overload shedding", () => {
       // requests intentionally omit both x-myelin-token-scheme and
       // x-myelin-run-class: Edge must classify the signed, durable agent
       // identity rather than trusting a caller to volunteer its traffic class.
-      const agent = await activateExternalAgent(human, "overload probe", ["projects.list"]);
+      const agent = await activateExternalAgent(human, uniqueName("overload probe"), [
+        "projects.list",
+      ]);
       const run = await beginAgentRun(human, agent.agent.id);
       onTestFinished(() => closeAgentRun(run));
       const agentPath = `/v1/agent-runs/${encodeURIComponent(run.run.id)}/mcp`;
@@ -41,14 +43,14 @@ describe("overload shedding", () => {
 
       // interactive probes while the storm is in flight: strict 200s, no
       // shed status is ever acceptable on the human lane.
-      const humanProbes: Array<Promise<unknown>> = [];
-      for (let i = 0; i < 10; i += 1) {
-        humanProbes.push(human.json("/v1/whoami"));
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
+      const humanProbes = (async () => {
+        for (let i = 0; i < 10; i += 1) {
+          await human.json("/v1/whoami");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      })();
 
-      const results = await storm;
-      await Promise.all(humanProbes);
+      const [results] = await Promise.all([storm, humanProbes]);
 
       const admitted = results.filter((r) => r.status === 200);
       const shed = results.filter((r) => r.status === 429);

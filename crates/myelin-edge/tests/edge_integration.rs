@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use myelin_edge::{
@@ -20,8 +20,10 @@ use myelin_identity_service::{
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -30,6 +32,7 @@ const REGION: &str = "eu-west";
 const OTHER_TENANT: &str = "globex";
 const SCHEME: &str = "agent";
 static SLOW_GIT_STARTED: AtomicUsize = AtomicUsize::new(0);
+static SLOW_GIT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static SLOW_JSON_STARTED: AtomicUsize = AtomicUsize::new(0);
 static MACHINE_STORM_STARTED: AtomicUsize = AtomicUsize::new(0);
 
@@ -134,6 +137,13 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
     store
         .link_credential(&scope, SCHEME, "subj-1", &PrincipalId("svc:agent".into()))
         .expect("link credential");
+    seed_principal(
+        &store,
+        TENANT,
+        "human-subject",
+        "person:human",
+        PrincipalKind::Human,
+    );
 
     let revocations = RevocationStore::new();
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
@@ -256,6 +266,12 @@ fn build_cross_tenant_storm_gateway() -> (Arc<Gateway>, CellTokenAuthority) {
                 Arc::new(MachineStormHandler),
             )
             .route(
+                Method::Post,
+                "/v1/body-storm",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .route(
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
@@ -311,6 +327,60 @@ async fn request_without_class_hints(addr: SocketAddr, path: &str, token: &str) 
         vec![],
     )
     .await
+}
+
+struct StalledRequestBody {
+    emitted: bool,
+    started: Arc<AtomicUsize>,
+}
+
+impl Body for StalledRequestBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.emitted {
+            return Poll::Pending;
+        }
+        self.emitted = true;
+        self.started.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{")))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+}
+
+async fn open_stalled_body(
+    addr: SocketAddr,
+    path: &str,
+    token: Option<&str>,
+    started: Arc<AtomicUsize>,
+) -> Response<Incoming> {
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", "edge.test");
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let request = request
+        .body(StalledRequestBody {
+            emitted: false,
+            started,
+        })
+        .unwrap();
+    sender.send_request(request).await.unwrap()
 }
 
 async fn spawn(gateway: Arc<Gateway>) -> SocketAddr {
@@ -766,6 +836,7 @@ async fn responses_are_non_cacheable_and_disable_content_sniffing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn blocking_git_wire_dispatch_does_not_stall_liveness() {
+    let _guard = SLOW_GIT_TEST_LOCK.lock().await;
     SLOW_GIT_STARTED.store(0, Ordering::SeqCst);
     let (gateway, cell, _revocations) = build_gateway();
     let token = mint_with_authority(
@@ -928,54 +999,208 @@ async fn verified_machine_storm_keeps_process_dispatch_capacity_for_a_human() {
 }
 
 #[tokio::test]
-async fn saturated_git_wire_pool_returns_bounded_retry_guidance() {
+async fn verified_machine_slow_bodies_keep_collection_capacity_for_a_human() {
+    let (gateway, cell) = build_cross_tenant_storm_gateway();
+    let addr = spawn(gateway).await;
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut active = tokio::task::JoinSet::new();
+
+    // Forty authenticated service requests stay below every tenant lane while
+    // filling the process machine-body pool. They omit both class hints and
+    // never finish their chunked body, modelling slow uploads from several
+    // organizations rather than blocking a handler after collection.
+    for tenant_index in 0..4 {
+        for request_index in 0..10 {
+            let tenant = format!("machine-{tenant_index}");
+            let token = mint_for_subject(
+                &cell,
+                &tenant,
+                &format!("machine-subject-{tenant_index}"),
+                &format!("body-storm-{tenant_index}-{request_index}"),
+                now() + 3600,
+                vec!["edge.operator".into()],
+            );
+            let started = started.clone();
+            active.spawn(async move {
+                open_stalled_body(addr, "/v1/body-storm", Some(&token), started).await
+            });
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) < 40 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all forty clients start their deliberately incomplete bodies");
+
+    let overflow = mint_for_subject(
+        &cell,
+        "machine-0",
+        "machine-subject-0",
+        "body-storm-overflow",
+        now() + 3600,
+        vec!["edge.operator".into()],
+    );
+    let overflow_authorization = format!("Bearer {overflow}");
+    let (overflow_status, overflow_body) = http(
+        addr,
+        "POST",
+        "/v1/body-storm",
+        &[("authorization", overflow_authorization.as_str())],
+        br#"{}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        overflow_status, 429,
+        "verified identity sheds the extra machine before reading it: {overflow_body}"
+    );
+
+    let human = mint_for_subject(
+        &cell,
+        "interactive",
+        "human-subject",
+        "body-storm-human",
+        now() + 3600,
+        vec!["edge.operator".into()],
+    );
+    let authorization = format!("Bearer {human}");
+    let (human_status, human_body) = http(
+        addr,
+        "POST",
+        "/v1/body-storm",
+        &[("authorization", authorization.as_str())],
+        br#"{}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        human_status, 200,
+        "the authenticated human still collects and dispatches a body: {human_body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&human_body).unwrap()["kind"],
+        "human"
+    );
+
+    active.abort_all();
+}
+
+#[tokio::test]
+async fn unauthenticated_slow_login_bodies_cannot_take_human_capacity() {
+    let (gateway, cell) = build_cross_tenant_storm_gateway();
+    let addr = spawn(gateway).await;
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut active = tokio::task::JoinSet::new();
+
+    for _ in 0..8 {
+        let started = started.clone();
+        active.spawn(async move { open_stalled_body(addr, "/v1/auth/login", None, started).await });
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all bounded public login bodies start");
+
+    let overflow = open(addr, "POST", "/v1/auth/login", &[], br#"{}"#.to_vec()).await;
+    assert_eq!(overflow.status(), 503);
+    assert_eq!(overflow.headers()["retry-after"], "1");
+    assert_eq!(overflow.headers()["connection"], "close");
+
+    let human = mint_for_subject(
+        &cell,
+        "interactive",
+        "human-subject",
+        "public-body-storm-human",
+        now() + 3600,
+        vec!["edge.operator".into()],
+    );
+    let authorization = format!("Bearer {human}");
+    let (human_status, human_body) = http(
+        addr,
+        "POST",
+        "/v1/body-storm",
+        &[("authorization", authorization.as_str())],
+        br#"{}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        human_status, 200,
+        "unauthenticated slow bodies cannot consume the human reserve: {human_body}"
+    );
+
+    active.abort_all();
+}
+
+#[tokio::test]
+async fn verified_machine_git_response_keeps_capacity_for_a_human() {
+    let _guard = SLOW_GIT_TEST_LOCK.lock().await;
     SLOW_GIT_STARTED.store(0, Ordering::SeqCst);
     let (gateway, cell, _revocations) = build_gateway();
-    let token = mint_with_authority(
+    let machine = mint_with_authority(
         &cell,
         TENANT,
         "jti-git-overload",
         now() + 3600,
         vec!["edge.operator".into(), "git.wire.upload_pack".into()],
     );
-    let headers = bearer(&token);
+    let machine_headers = bearer(&machine);
     let addr = spawn(gateway).await;
-    let mut active = Vec::new();
-    for _ in 0..2 {
-        let request_headers = headers.clone();
-        active.push(tokio::spawn(async move {
-            open(
-                addr,
-                "GET",
-                "/acme/eu-west/widgets.git/info/refs",
-                &hdr(&request_headers),
-                vec![],
-            )
-            .await
-        }));
-    }
+    let active_machine_headers = machine_headers.clone();
+    let active_machine = tokio::spawn(async move {
+        open(
+            addr,
+            "GET",
+            "/acme/eu-west/widgets.git/info/refs",
+            &hdr(&active_machine_headers),
+            vec![],
+        )
+        .await
+    });
     tokio::time::timeout(Duration::from_secs(1), async {
-        while SLOW_GIT_STARTED.load(Ordering::SeqCst) < 2 {
+        while SLOW_GIT_STARTED.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("both effective Git wire response slots must be occupied");
+    .expect("the machine Git wire request starts");
 
     let shed = open(
         addr,
         "GET",
         "/acme/eu-west/widgets.git/info/refs",
-        &hdr(&headers),
+        &hdr(&machine_headers),
         vec![],
     )
     .await;
-    assert_eq!(shed.status(), 503);
+    assert_eq!(shed.status(), 429);
     assert_eq!(shed.headers()["retry-after"], "1");
 
-    for request in active {
-        assert_eq!(request.await.unwrap().status(), 200);
-    }
+    let human = mint_for_subject(
+        &cell,
+        TENANT,
+        "human-subject",
+        "jti-git-human",
+        now() + 3600,
+        vec!["edge.operator".into(), "git.wire.upload_pack".into()],
+    );
+    let human_authorization = format!("Bearer {human}");
+    let human_response = open(
+        addr,
+        "GET",
+        "/acme/eu-west/widgets.git/info/refs",
+        &[("authorization", human_authorization.as_str())],
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        human_response.status(),
+        200,
+        "a verified human retains one Git/large-response slot"
+    );
+    assert_eq!(active_machine.await.unwrap().status(), 200);
 }
 
 #[tokio::test]
