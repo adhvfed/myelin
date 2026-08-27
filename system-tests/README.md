@@ -29,6 +29,8 @@ is intentionally unsupported because it would bypass Fed's allocated environment
 The suite is intentionally organized around externally visible contracts:
 
 - `platform` verifies health, readiness, capability authentication, and bounded routing errors.
+- `overload-shed` creates a real short-lived agent identity, omits every caller-supplied traffic
+  class hint, and verifies its live MCP storm sheds while a browser-approved human keeps working.
 - `git-lifecycle` follows repository creation through browsing, delivery of a real review request
   to a second principal, reviewer-scoped PR access, review and inbox completion, merge, and
   base-branch readback.

@@ -3009,6 +3009,39 @@ four jobs; 33 run-plan tests are green; and the sandbox boundary admits every
 supported offline recipe while rejecting unknown commands, option-shaped
 package names, duplicate vendor frames, and misplaced compiler arguments.
 
+## 2026-08-28 — verified identity owns process dispatch admission
+
+Edge's tenant lanes already derived traffic class from an authenticated
+principal, but the process-wide machine pool ran first and trusted only two
+optional request headers. Production defaults an omitted token-scheme header to
+`agent`; a valid service request could therefore omit both headers, bypass the
+48-slot machine pool, and enter the 64-slot general dispatch pool before Edge
+discovered its real class. Coordinated traffic from several tenants could fill
+that pool even though no individual tenant crossed its own bound.
+
+Gateway request handling is now split at a real product boundary. Preparation
+matches the route, verifies the capability and durable principal state,
+resolves tenant and region, authorizes the exact action, and acquires the
+per-tenant lane once. Only that prepared request reaches transport dispatch.
+The transport admits service and agent principals to the machine pool from the
+verified run class, then admits all prepared work to the general pool; neither
+header participates in that process decision. Preparation has its own bounded
+256-operation backstop, matching the configured identity-authz bulkhead, and
+the handler never authenticates a request twice.
+
+The former black-box overload story had a human bootstrap credential volunteer
+`x-myelin-run-class: batch-ci`, so it could stay green while an actual agent
+omitting the header bypassed the process pool. It now creates an external agent
+through Myelin, starts a one-minute durable run, sends its governed MCP reads
+with only the bearer, keeps a separately browser-approved human responsive,
+and closes the run afterward. The transport regression drives 48 headerless
+service requests across four tenants through real HTTP handling: the next
+machine request gets 429 while an authenticated human still gets 200.
+
+Proof: all 366 Edge library stories; all 19 HTTP transport integration stories;
+strict all-target/all-feature Edge Clippy; TypeScript typechecking; and the
+running TypeScript overload journey against the rebuilt PostgreSQL-backed Edge.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3028,11 +3061,14 @@ package names, duplicate vendor frames, and misplaced compiler arguments.
    other people's content, Issue bodies/comments/custom fields, search
    projections, or Git. those holders remain absent rather than being
    represented by ceremonial receipts.
-3. **multi-tenant machine storms can still exhaust the general dispatch
-   pool.** the human lane holds per tenant and against well-behaved machine
-   traffic; a coordinated cross-tenant storm of requests that lie about
-   their class is bounded only by the flat caps. fixing this properly means
-   authenticating before dispatch admission (an edge refactor).
+3. **pre-auth transport resources still use flat process caps.** verified
+   identity now owns general dispatch admission, but request-body collection,
+   Git-wire execution, and large-response materialization acquire their global
+   semaphores before Gateway preparation. They are bounded, but a coordinated
+   cross-tenant machine storm can still make a human retry at those narrower
+   front doors. Protecting them requires carrying a verified header-only
+   request context across bounded body collection, then reserving classed Git
+   and response capacity without parsing or authenticating twice.
 4. **asynchronous worker admission is not explicit yet.** search, refs,
    notification, and automation work arrives through durable NATS/SQL queues;
    queue bounds and worker concurrency provide backpressure, but the matching

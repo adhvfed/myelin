@@ -31,6 +31,7 @@ const OTHER_TENANT: &str = "globex";
 const SCHEME: &str = "agent";
 static SLOW_GIT_STARTED: AtomicUsize = AtomicUsize::new(0);
 static SLOW_JSON_STARTED: AtomicUsize = AtomicUsize::new(0);
+static MACHINE_STORM_STARTED: AtomicUsize = AtomicUsize::new(0);
 
 struct SlowGitWireHandler;
 
@@ -51,6 +52,19 @@ impl Handler for SlowJsonHandler {
     fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         SLOW_JSON_STARTED.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(500));
+        Ok(EdgeResponse::json(
+            200,
+            &serde_json::json!({ "status": "ok" }),
+        ))
+    }
+}
+
+struct MachineStormHandler;
+
+impl Handler for MachineStormHandler {
+    fn handle(&self, _ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        MACHINE_STORM_STARTED.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(2));
         Ok(EdgeResponse::json(
             200,
             &serde_json::json!({ "status": "ok" }),
@@ -133,6 +147,7 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
 
     let gateway = Arc::new(
         Gateway::builder(authn, human_login, Arc::new(AllowAll))
+            .default_token_scheme(SCHEME)
             .route(
                 Method::Get,
                 "/v1/whoami",
@@ -181,6 +196,76 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
     (gateway, cell, revocations)
 }
 
+fn seed_principal(
+    store: &PrincipalStore,
+    tenant: &str,
+    subject: &str,
+    principal_id: &str,
+    kind: PrincipalKind,
+) {
+    let scope = admin_scope(tenant);
+    store
+        .put_principal(
+            &scope,
+            PrincipalId(principal_id.into()),
+            kind,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            None,
+        )
+        .expect("seed storm principal");
+    store
+        .link_credential(&scope, SCHEME, subject, &PrincipalId(principal_id.into()))
+        .expect("link storm credential");
+}
+
+fn build_cross_tenant_storm_gateway() -> (Arc<Gateway>, CellTokenAuthority) {
+    let cell = CellTokenAuthority::from_seed(&[17u8; 32], &[19u8; 32]).expect("cell authority");
+    let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+    for index in 0..4 {
+        seed_principal(
+            &store,
+            &format!("machine-{index}"),
+            &format!("machine-subject-{index}"),
+            &format!("service:machine-{index}"),
+            PrincipalKind::Service,
+        );
+    }
+    seed_principal(
+        &store,
+        "interactive",
+        "human-subject",
+        "person:human",
+        PrincipalKind::Human,
+    );
+    let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+        store,
+        Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+        RevocationStore::new(),
+    ));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
+    let gateway = Arc::new(
+        Gateway::builder(authn, human_login, Arc::new(AllowAll))
+            .default_token_scheme(SCHEME)
+            .route(
+                Method::Get,
+                "/v1/machine-storm",
+                "edge.whoami",
+                Arc::new(MachineStormHandler),
+            )
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .build(),
+    );
+    (gateway, cell)
+}
+
 fn mint(cell: &CellTokenAuthority, tenant: &str, jti: &str, exp_unix: i64) -> String {
     mint_with_authority(cell, tenant, jti, exp_unix, vec!["edge.operator".into()])
 }
@@ -192,10 +277,21 @@ fn mint_with_authority(
     exp_unix: i64,
     authority: Vec<String>,
 ) -> String {
+    mint_for_subject(cell, tenant, "subj-1", jti, exp_unix, authority)
+}
+
+fn mint_for_subject(
+    cell: &CellTokenAuthority,
+    tenant: &str,
+    subject: &str,
+    jti: &str,
+    exp_unix: i64,
+    authority: Vec<String>,
+) -> String {
     cell.mint(&CapabilityMintSpec {
         tenant: tenant.into(),
         region: REGION.into(),
-        subject_key: "subj-1".into(),
+        subject_key: subject.into(),
         jti: jti.into(),
         exp_unix,
         authority,
@@ -203,6 +299,18 @@ fn mint_with_authority(
         purpose: myelin_identity_service::CredentialPurpose::OperatorBootstrap,
         audience: myelin_identity_service::CredentialAudience::Edge,
     })
+}
+
+async fn request_without_class_hints(addr: SocketAddr, path: &str, token: &str) -> (u16, String) {
+    let authorization = format!("Bearer {token}");
+    http(
+        addr,
+        "GET",
+        path,
+        &[("authorization", authorization.as_str())],
+        vec![],
+    )
+    .await
 }
 
 async fn spawn(gateway: Arc<Gateway>) -> SocketAddr {
@@ -743,6 +851,80 @@ async fn blocking_json_dispatch_does_not_stall_liveness() {
     );
     let (slow_status, _) = slow.await.unwrap();
     assert_eq!(slow_status, 200);
+}
+
+#[tokio::test]
+async fn verified_machine_storm_keeps_process_dispatch_capacity_for_a_human() {
+    MACHINE_STORM_STARTED.store(0, Ordering::SeqCst);
+    let (gateway, cell) = build_cross_tenant_storm_gateway();
+    let addr = spawn(gateway).await;
+    let mut active = Vec::new();
+
+    // Each tenant stays below its own machine-lane cap. Together they fill the
+    // process machine pool. The bearer requests deliberately omit both
+    // x-myelin-token-scheme and x-myelin-run-class, as production permits via
+    // the default signed agent-token scheme.
+    for tenant_index in 0..4 {
+        for request_index in 0..12 {
+            let tenant = format!("machine-{tenant_index}");
+            let token = mint_for_subject(
+                &cell,
+                &tenant,
+                &format!("machine-subject-{tenant_index}"),
+                &format!("storm-{tenant_index}-{request_index}"),
+                now() + 3600,
+                vec!["edge.operator".into()],
+            );
+            active.push(tokio::spawn(async move {
+                request_without_class_hints(addr, "/v1/machine-storm", &token).await
+            }));
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while MACHINE_STORM_STARTED.load(Ordering::SeqCst) < 48 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all 48 verified machine requests occupy the machine dispatch pool");
+
+    let overflow = mint_for_subject(
+        &cell,
+        "machine-0",
+        "machine-subject-0",
+        "storm-overflow",
+        now() + 3600,
+        vec!["edge.operator".into()],
+    );
+    let (overflow_status, overflow_body) =
+        request_without_class_hints(addr, "/v1/machine-storm", &overflow).await;
+    assert_eq!(
+        overflow_status, 429,
+        "the verified machine pool sheds before the general pool: {overflow_body}"
+    );
+
+    let human = mint_for_subject(
+        &cell,
+        "interactive",
+        "human-subject",
+        "interactive-human",
+        now() + 3600,
+        vec!["edge.operator".into()],
+    );
+    let (human_status, human_body) = request_without_class_hints(addr, "/v1/whoami", &human).await;
+    assert_eq!(
+        human_status, 200,
+        "the authenticated human still reaches general dispatch: {human_body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&human_body).unwrap()["kind"],
+        "human"
+    );
+
+    for request in active {
+        let (status, body) = request.await.expect("storm request task");
+        assert_eq!(status, 200, "an admitted machine request completes: {body}");
+    }
 }
 
 #[tokio::test]

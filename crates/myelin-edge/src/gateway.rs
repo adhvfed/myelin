@@ -491,6 +491,59 @@ pub struct Gateway {
     shed: EdgeShed,
 }
 
+enum PublicEndpoint {
+    AuthConfig,
+    Login,
+    BeginDeviceAuthorization,
+    ApproveDeviceAuthorization,
+    ClaimDeviceAuthorization,
+}
+
+enum PreparedKind {
+    Public(PublicEndpoint),
+    Authorized(Box<AuthorizedPreparation>),
+}
+
+struct AuthorizedPreparation {
+    route_index: usize,
+    params: BTreeMap<String, String>,
+    identity: RequestIdentity,
+    scope: TenantScope,
+    run_class: RunClass,
+    _shed_permit: crate::shed_governor::ShedPermit,
+}
+
+struct PreparationFailure {
+    error: EdgeError,
+    retry_after_secs: Option<u64>,
+}
+
+impl From<EdgeError> for PreparationFailure {
+    fn from(error: EdgeError) -> Self {
+        Self {
+            error,
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// A request whose route, identity, authority, and per-tenant capacity have
+/// already been resolved. The transport uses its verified run class before it
+/// admits the request to the process-wide dispatch pools.
+pub(crate) struct PreparedGatewayRequest {
+    request: EdgeRequest,
+    kind: PreparedKind,
+}
+
+impl PreparedGatewayRequest {
+    pub(crate) fn run_class(&self) -> Option<RunClass> {
+        match &self.kind {
+            PreparedKind::Public(_) => None,
+            PreparedKind::Authorized(prepared) => Some(prepared.run_class),
+        }
+    }
+}
+
 impl Gateway {
     pub fn builder(
         authn: Arc<CapabilityAuthenticator>,
@@ -522,15 +575,9 @@ impl Gateway {
     }
 
     pub fn handle(&self, req: EdgeRequest) -> EdgeResponse {
-        match self.handle_inner(&req) {
-            Ok(resp) => resp,
-            Err(e) => {
-                let mut resp = EdgeResponse::error(&e);
-                if e.status() == 401 && self.is_git_wire_route(&req) {
-                    resp = resp.with_header("WWW-Authenticate", r#"Basic realm="Myelin""#);
-                }
-                resp
-            }
+        match self.prepare(req) {
+            Ok(prepared) => self.dispatch(prepared),
+            Err(response) => response,
         }
     }
 
@@ -544,20 +591,39 @@ impl Gateway {
         }
     }
 
-    fn handle_inner(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
+    pub(crate) fn prepare(&self, req: EdgeRequest) -> Result<PreparedGatewayRequest, EdgeResponse> {
+        match self.prepare_inner(&req) {
+            Ok(kind) => Ok(PreparedGatewayRequest { request: req, kind }),
+            Err(failure) => Err(self.error_response(&req, failure.error, failure.retry_after_secs)),
+        }
+    }
+
+    fn prepare_inner(&self, req: &EdgeRequest) -> Result<PreparedKind, PreparationFailure> {
         let method = Method::parse(&req.method)
             .ok_or_else(|| EdgeError::BadRequest(format!("unsupported method `{}`", req.method)))?;
 
         match (method, req.path.as_str()) {
-            (Method::Get, "/v1/auth/config") => return Ok(self.auth_config_response()),
-            (Method::Post, "/v1/auth/login") => return self.login(req),
+            (Method::Get, "/v1/auth/config") => {
+                return Ok(PreparedKind::Public(PublicEndpoint::AuthConfig))
+            }
+            (Method::Post, "/v1/auth/login") => {
+                return Ok(PreparedKind::Public(PublicEndpoint::Login))
+            }
             (Method::Post, "/v1/auth/device/authorization") => {
-                return self.begin_device_authorization(req)
+                return Ok(PreparedKind::Public(
+                    PublicEndpoint::BeginDeviceAuthorization,
+                ))
             }
             (Method::Post, "/v1/auth/device/approval") => {
-                return self.approve_device_authorization(req)
+                return Ok(PreparedKind::Public(
+                    PublicEndpoint::ApproveDeviceAuthorization,
+                ))
             }
-            (Method::Post, "/v1/auth/device/token") => return self.claim_device_authorization(req),
+            (Method::Post, "/v1/auth/device/token") => {
+                return Ok(PreparedKind::Public(
+                    PublicEndpoint::ClaimDeviceAuthorization,
+                ))
+            }
             _ => {}
         }
 
@@ -589,7 +655,8 @@ impl Gateway {
             return Err(EdgeError::Forbidden(format!(
                 "authorization denied for action `{}`",
                 authorization_action
-            )));
+            ))
+            .into());
         }
         let run_class = RunClass::derive(
             &identity.principal.kind,
@@ -600,28 +667,74 @@ impl Gateway {
         } else {
             Surface::HttpIntake
         };
-        let _shed_permit = match self.shed.admit(surface, scope.tenant(), run_class) {
+        let shed_permit = match self.shed.admit(surface, scope.tenant(), run_class) {
             Ok(permit) => permit,
             Err(retry_after_secs) => {
-                return Ok(EdgeResponse::error(&EdgeError::TooManyRequests(format!(
-                    "the {} lane for this tenant is at capacity; retry in {retry_after_secs}s",
-                    run_class.lane()
-                )))
-                .with_header("Retry-After", retry_after_secs.to_string()));
+                return Err(PreparationFailure {
+                    error: EdgeError::TooManyRequests(format!(
+                        "the {} lane for this tenant is at capacity; retry in {retry_after_secs}s",
+                        run_class.lane()
+                    )),
+                    retry_after_secs: Some(retry_after_secs),
+                })
             }
         };
+        Ok(PreparedKind::Authorized(Box::new(AuthorizedPreparation {
+            route_index: idx,
+            params,
+            identity,
+            scope,
+            run_class,
+            _shed_permit: shed_permit,
+        })))
+    }
+
+    pub(crate) fn dispatch(&self, prepared: PreparedGatewayRequest) -> EdgeResponse {
+        match self.dispatch_inner(&prepared) {
+            Ok(response) => response,
+            Err(error) => self.error_response(&prepared.request, error, None),
+        }
+    }
+
+    fn dispatch_inner(&self, prepared: &PreparedGatewayRequest) -> Result<EdgeResponse, EdgeError> {
+        let req = &prepared.request;
+        let PreparedKind::Authorized(authorized) = &prepared.kind else {
+            let PreparedKind::Public(endpoint) = &prepared.kind else {
+                unreachable!("the prepared request kind is exhaustive")
+            };
+            return match endpoint {
+                PublicEndpoint::AuthConfig => Ok(self.auth_config_response()),
+                PublicEndpoint::Login => self.login(req),
+                PublicEndpoint::BeginDeviceAuthorization => self.begin_device_authorization(req),
+                PublicEndpoint::ApproveDeviceAuthorization => {
+                    self.approve_device_authorization(req)
+                }
+                PublicEndpoint::ClaimDeviceAuthorization => self.claim_device_authorization(req),
+            };
+        };
+        let route = &self.routes[authorized.route_index];
         match &route.kind {
             RouteKind::Normal(handler) => {
                 let ctx = HandlerCtx {
-                    identity: &identity,
-                    principal: &identity.principal,
-                    scope: &scope,
-                    params: &params,
+                    identity: &authorized.identity,
+                    principal: &authorized.identity.principal,
+                    scope: &authorized.scope,
+                    params: &authorized.params,
                     request: req,
                 };
                 let resp = handler.handle(&ctx)?;
-                self.broadcast_repo_lifecycle(&route.action, &params, &scope, &resp);
-                self.broadcast_chat_lifecycle(&route.action, &params, &scope, &resp);
+                self.broadcast_repo_lifecycle(
+                    &route.action,
+                    &authorized.params,
+                    &authorized.scope,
+                    &resp,
+                );
+                self.broadcast_chat_lifecycle(
+                    &route.action,
+                    &authorized.params,
+                    &authorized.scope,
+                    &resp,
+                );
                 Ok(resp)
             }
             RouteKind::Sse {
@@ -629,9 +742,9 @@ impl Gateway {
                 resource_param,
             } => {
                 let sse_scope = match resource_param {
-                    None => sse_scope_for_tenant(&scope.tenant().0),
+                    None => sse_scope_for_tenant(&authorized.scope.tenant().0),
                     Some(param) => {
-                        let id = params.get(param).ok_or_else(|| {
+                        let id = authorized.params.get(param).ok_or_else(|| {
                             EdgeError::BadRequest(format!(
                                 "SSE route is scoped by `{{{param}}}` but the match bound no \
                                  such parameter"
@@ -642,16 +755,32 @@ impl Gateway {
                                 "SSE resource id for `{{{param}}}` is not a bounded id"
                             )));
                         }
-                        sse_scope_for_resource(&scope.tenant().0, param, id)
+                        sse_scope_for_resource(&authorized.scope.tenant().0, param, id)
                     }
                 };
                 let sub = self.sse.subscribe(stream, &sse_scope);
                 Ok(EdgeResponse::sse(
                     sub,
-                    identity.capability().expires_at_unix,
+                    authorized.identity.capability().expires_at_unix,
                 ))
             }
         }
+    }
+
+    fn error_response(
+        &self,
+        req: &EdgeRequest,
+        error: EdgeError,
+        retry_after_secs: Option<u64>,
+    ) -> EdgeResponse {
+        let mut response = EdgeResponse::error(&error);
+        if let Some(retry_after_secs) = retry_after_secs {
+            response = response.with_header("Retry-After", retry_after_secs.to_string());
+        }
+        if error.status() == 401 && self.is_git_wire_route(req) {
+            response = response.with_header("WWW-Authenticate", r#"Basic realm="Myelin""#);
+        }
+        response
     }
 
     fn authenticate(
@@ -1418,6 +1547,30 @@ mod tests {
             }
             EdgeResponse::Sse { .. } => panic!("a shed is a plain response"),
         }
+    }
+
+    #[test]
+    fn preparation_classifies_from_the_verified_principal_without_request_hints() {
+        let gateway = machine_gateway(crate::shed_governor::EdgeShed::with_budgets(
+            shed_budget(4, 1),
+            shed_budget(4, 1),
+        ));
+        let request = machine_request();
+        assert!(request.header(RUN_CLASS_HEADER).is_none());
+        assert!(request.header("x-myelin-token-scheme").is_none());
+
+        let prepared = match gateway.prepare(request) {
+            Ok(prepared) => prepared,
+            Err(response) => panic!(
+                "the valid service principal did not prepare (status {})",
+                response.status()
+            ),
+        };
+        assert_eq!(
+            prepared.run_class(),
+            Some(RunClass::BatchCi),
+            "a service principal cannot enter a human process lane by omitting classification headers"
+        );
     }
 
     #[test]

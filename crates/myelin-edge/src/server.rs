@@ -1,5 +1,5 @@
 use crate::error::EdgeError;
-use crate::gateway::Gateway;
+use crate::gateway::{Gateway, PreparedGatewayRequest};
 use crate::request::{EdgeRequest, EdgeResponse};
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -8,6 +8,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
+use myelin_substrate::shed::RunClass;
 use std::convert::Infallible;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -30,11 +31,14 @@ const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
 const MAX_CONCURRENT_REQUEST_BODIES: usize = 64;
 const MAX_CONCURRENT_GIT_PUSH_BODIES: usize = 2;
 const MAX_CONCURRENT_GATEWAY_DISPATCHES: usize = 64;
-// machine-classified requests (CI, agents, deploy keys, or anything carrying
-// x-myelin-run-class) draw from this smaller pool FIRST, so the remaining
-// dispatch slots stay available to interactive humans during a machine storm.
-// a caller that lies about its class gets past this pool but is then held to
-// its verified principal class by the per-tenant shed lane in the gateway.
+// Identity preparation is independently bounded because it runs before the
+// general dispatch pool and may consult durable principal and revocation state.
+// Its ceiling matches the configured identity-authz bulkhead.
+const MAX_CONCURRENT_REQUEST_PREPARATIONS: usize = 256;
+// Requests whose verified principal is a service or agent draw from this
+// smaller pool FIRST, so the remaining dispatch slots stay available to
+// interactive humans during a cross-tenant machine storm. No caller-provided
+// header participates in this process-wide classification.
 const MAX_CONCURRENT_MACHINE_DISPATCHES: usize = 48;
 const MAX_CONCURRENT_LARGE_RESPONSES: usize = 2;
 const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024;
@@ -53,6 +57,7 @@ struct AdmissionSlots {
     git_wire: Arc<Semaphore>,
     request_body: Arc<Semaphore>,
     git_push_body: Arc<Semaphore>,
+    request_preparation: Arc<Semaphore>,
     gateway_dispatch: Arc<Semaphore>,
     machine_dispatch: Arc<Semaphore>,
     large_response: Arc<Semaphore>,
@@ -153,6 +158,7 @@ where
         git_wire: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_WIRE_OPERATIONS)),
         request_body: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_BODIES)),
         git_push_body: Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PUSH_BODIES)),
+        request_preparation: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUEST_PREPARATIONS)),
         gateway_dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT_GATEWAY_DISPATCHES)),
         machine_dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT_MACHINE_DISPATCHES)),
         large_response: Arc::new(Semaphore::new(MAX_CONCURRENT_LARGE_RESPONSES)),
@@ -371,7 +377,29 @@ async fn handle_connection_inner(
     } else {
         None
     };
-    let machine_permit = if is_machine_classified(&edge_req) {
+    let preparation_permit = match admission.request_preparation.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return overloaded("the edge identity service is at capacity; retry later"),
+    };
+    let prepare_gateway = gw.clone();
+    let prepared = match tokio::task::spawn_blocking(move || {
+        let _preparation_permit = preparation_permit;
+        prepare_gateway_safely(&prepare_gateway, edge_req)
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(response)) => return to_hyper_with_permit(response, large_response_permit),
+        Err(_) => {
+            return to_hyper(EdgeResponse::error(&EdgeError::Internal(
+                "gateway preparation task did not complete".into(),
+            )))
+        }
+    };
+    let machine_permit = if matches!(
+        prepared.run_class(),
+        Some(run_class) if run_class != RunClass::Human
+    ) {
         match admission.machine_dispatch.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => return machine_dispatch_shed(),
@@ -390,7 +418,10 @@ async fn handle_connection_inner(
         let _git_wire_permit = git_wire_permit;
         let _request_body_permit = request_body_permit;
         let _git_push_body_permit = git_push_body_permit;
-        (handle_gateway_safely(&gw, edge_req), large_response_permit)
+        (
+            dispatch_gateway_safely(&gw, prepared),
+            large_response_permit,
+        )
     })
     .await
     {
@@ -472,8 +503,19 @@ fn log_connection_shed() {
     }
 }
 
-fn handle_gateway_safely(gw: &Gateway, request: EdgeRequest) -> EdgeResponse {
-    catch_unwind(AssertUnwindSafe(|| gw.handle(request))).unwrap_or_else(|_| {
+fn prepare_gateway_safely(
+    gw: &Gateway,
+    request: EdgeRequest,
+) -> Result<PreparedGatewayRequest, EdgeResponse> {
+    catch_unwind(AssertUnwindSafe(|| gw.prepare(request))).unwrap_or_else(|_| {
+        Err(EdgeResponse::error(&EdgeError::Internal(
+            "gateway preparation panicked".into(),
+        )))
+    })
+}
+
+fn dispatch_gateway_safely(gw: &Gateway, prepared: PreparedGatewayRequest) -> EdgeResponse {
+    catch_unwind(AssertUnwindSafe(|| gw.dispatch(prepared))).unwrap_or_else(|_| {
         EdgeResponse::error(&EdgeError::Internal("gateway handler panicked".into()))
     })
 }
@@ -538,19 +580,6 @@ fn overloaded(message: &str) -> Response<EdgeBody> {
         hyper::header::HeaderValue::from_static(GIT_WIRE_RETRY_AFTER_SECONDS),
     );
     response
-}
-
-// pre-auth classification for the machine dispatch pool: an explicit
-// x-myelin-run-class header, or one of the machine-only credential schemes.
-// "session" and "pat" stay in the general pool - they are human-operated.
-fn is_machine_classified(req: &EdgeRequest) -> bool {
-    if req.header(crate::shed_governor::RUN_CLASS_HEADER).is_some() {
-        return true;
-    }
-    matches!(
-        req.header("x-myelin-token-scheme").map(str::trim),
-        Some("ci" | "agent" | "deploy_key" | "per_job")
-    )
 }
 
 fn machine_dispatch_shed() -> Response<EdgeBody> {

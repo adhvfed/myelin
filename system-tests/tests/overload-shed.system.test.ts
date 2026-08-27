@@ -1,6 +1,11 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, onTestFinished, test } from "vitest";
 
 import { browserApprovedCliClient, systemClient } from "../src/context.js";
+import {
+  activateExternalAgent,
+  beginAgentRun,
+  closeAgentRun,
+} from "../src/journeys/agents.js";
 
 // The product promise under test: machine traffic (CI, agents) saturating the
 // edge is shed with 429 + Retry-After, while an interactive human keeps
@@ -13,13 +18,22 @@ describe("overload shedding", () => {
       const human = await browserApprovedCliClient();
       await human.json("/v1/whoami");
 
-      // the storm self-identifies as machine work the way a well-behaved
-      // runner does: the run-class header demotes it to the batch lane.
+      // Myelin creates the other actor and its one-minute credential. These
+      // requests intentionally omit both x-myelin-token-scheme and
+      // x-myelin-run-class: Edge must classify the signed, durable agent
+      // identity rather than trusting a caller to volunteer its traffic class.
+      const agent = await activateExternalAgent(human, "overload probe", ["projects.list"]);
+      const run = await beginAgentRun(human, agent.agent.id);
+      onTestFinished(() => closeAgentRun(run));
+      const agentPath = `/v1/agent-runs/${encodeURIComponent(run.run.id)}/mcp`;
       const stormSize = 300;
       const storm = Promise.all(
-        Array.from({ length: stormSize }, () =>
-          systemClient.request("/v1/whoami", {
-            headers: { "x-myelin-run-class": "batch-ci" },
+        Array.from({ length: stormSize }, (_, index) =>
+          systemClient.request(agentPath, {
+            method: "POST",
+            authenticated: false,
+            headers: { authorization: `Bearer ${run.credential.token}` },
+            body: { jsonrpc: "2.0", id: index + 1, method: "tools/list" },
             expectedStatus: [200, 429, 503],
           }),
         ),
@@ -45,8 +59,11 @@ describe("overload shedding", () => {
       }
 
       // the lane recovers as soon as the storm drains.
-      await systemClient.json("/v1/whoami", {
-        headers: { "x-myelin-run-class": "batch-ci" },
+      await systemClient.json(agentPath, {
+        method: "POST",
+        authenticated: false,
+        headers: { authorization: `Bearer ${run.credential.token}` },
+        body: { jsonrpc: "2.0", id: stormSize + 1, method: "tools/list" },
       });
     },
     120_000,
