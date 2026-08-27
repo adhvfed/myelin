@@ -3009,6 +3009,26 @@ four jobs; 33 run-plan tests are green; and the sandbox boundary admits every
 supported offline recipe while rejecting unknown commands, option-shaped
 package names, duplicate vendor frames, and misplaced compiler arguments.
 
+## 2026-08-28 — every focused approval story carries its timer
+
+The broad backend run found one Flow approval drill left behind by the durable
+timer hardening. Its two stories asked for a seven-day signal wait without
+supplying a timer wheel, so the production workflow context correctly failed
+instead of parking. This was a fixture gap rather than a product shortcut: the
+neighboring restart/remint stories already carry timers, and the PostgreSQL
+dispatcher persists and fairly fires real deadlines.
+
+The focused approval harness now carries the same timer store through each
+fresh worker. Both approval and denial paths assert that exactly one unfired
+timer exists on the run's partition at the precise first-drive time plus seven
+days. The drill therefore cannot regain a misleading green result by merely
+attaching an arbitrary timer context.
+
+Proof: both focused multi-day approval cases; all five neighboring per-effect
+and restart/remint cases; strict Clippy for the repaired all-feature test
+target; and the live PostgreSQL dispatcher fairness story, which persisted and
+fired five competing deadlines amid ordinary runnable work.
+
 ## 2026-08-28 — verified identity owns process dispatch admission
 
 Edge's tenant lanes already derived traffic class from an authenticated

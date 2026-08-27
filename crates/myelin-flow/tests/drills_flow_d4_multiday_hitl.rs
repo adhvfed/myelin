@@ -2,7 +2,8 @@ use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxSto
 use myelin_flow::{
     approval_wait_name, partition_for_run_id, request_approval_and_wait, run_state,
     DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, RetryPolicy, RunStore,
-    SignalSpec, SignalStore, WaitOutcome, WfCtx, WfJournal, WorkflowBody, DECLINE_MARKER,
+    SignalSpec, SignalStore, TimerStore, WaitOutcome, WfCtx, WfJournal, WorkflowBody,
+    DECLINE_MARKER,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
@@ -77,6 +78,7 @@ struct Substrate {
     runs: RunStore,
     journal: WfJournal,
     signals: SignalStore,
+    timers: TimerStore,
     outbox: OutboxStore,
     tele: FlowTelemetry,
 }
@@ -93,9 +95,22 @@ fn fresh_worker(sub: &Substrate, worker: &str, partition: i16) -> FlowDispatcher
         worker,
         30,
     )
-    .with_signals(sub.signals.clone());
+    .with_signals(sub.signals.clone())
+    .with_timers(sub.timers.clone());
     disp.register("agent.run", gated_merge_body());
     disp
+}
+
+fn assert_approval_deadline(sub: &Substrate, run_id: &str, partition: i16) {
+    let timers = sub.timers.rows_for_run(&tenant(), &region(), run_id);
+    assert_eq!(timers.len(), 1, "the approval wait arms one durable timer");
+    assert_eq!(
+        timers[0].fire_at,
+        1_000 + 7 * 86_400,
+        "the timer stores the exact seven-day deadline from the first drive"
+    );
+    assert_eq!(timers[0].partition, partition);
+    assert!(!timers[0].fired, "the approval deadline remains pending");
 }
 
 #[test]
@@ -115,6 +130,7 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         runs: ex.runs().clone(),
         journal: WfJournal::new(),
         signals: ex.signals().clone(),
+        timers: TimerStore::new(),
         outbox: OutboxStore::new(),
         tele: FlowTelemetry::new(),
     };
@@ -139,6 +155,7 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         1,
         "the agent.approval.requested card was emitted once"
     );
+    assert_approval_deadline(&sub, &run.0, part);
 
     drop(w1);
 
@@ -220,6 +237,7 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
         runs: ex.runs().clone(),
         journal: WfJournal::new(),
         signals: ex.signals().clone(),
+        timers: TimerStore::new(),
         outbox: OutboxStore::new(),
         tele: FlowTelemetry::new(),
     };
@@ -231,6 +249,7 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
         myelin_flow::DriveOutcome::Waiting,
         "the run parks on the approval wait"
     );
+    assert_approval_deadline(&sub, &run.0, part);
     let emits_after_card = sub.outbox.committed_count();
     drop(w1);
 
