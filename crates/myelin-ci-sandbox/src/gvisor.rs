@@ -30,15 +30,15 @@ mod oci_config;
 pub(crate) use oci_config::OciWorkspaceMount;
 #[cfg(test)]
 use oci_config::CARGO_VENDOR_SOURCE_NAME;
-use oci_config::{
-    selected_cargo_vendor, validated_cargo_vendor_reference, FdBoundCargoVendor,
-    OciExecutionLayout, WorkspaceProcessIdentity,
-};
 pub use oci_config::{
     is_admitted_structured_cargo_recipe, platform_cargo_argv, OciConfig,
     CARGO_SOURCE_REPLACE_CONFIG, CARGO_SOURCE_REPLACE_ENV, CARGO_VENDOR_DIRECTORY_CONFIG,
     CARGO_VENDOR_DIRECTORY_ENV, ENV_CARGO_VENDOR_ASSET, OCI_CARGO_VENDOR_MOUNT,
     SERVER_CARGO_CONFIG_TOML, STRUCTURED_CARGO_HOME,
+};
+use oci_config::{
+    selected_cargo_vendor, validated_cargo_vendor_reference, FdBoundCargoVendor,
+    OciExecutionLayout, WorkspaceProcessIdentity,
 };
 
 mod rootfs;

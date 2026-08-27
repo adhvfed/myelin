@@ -103,7 +103,9 @@ fn recipe_from_platform_argv(command: &[String]) -> Option<Vec<String>> {
 
 fn valid_cargo_package_name(package: &str) -> bool {
     let mut bytes = package.bytes();
-    bytes.next().is_some_and(|byte| byte.is_ascii_alphanumeric())
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
         && package.len() <= 256
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
