@@ -96,7 +96,7 @@ describe("private agent work wire projection", () => {
     expect(parseWorkspaceSessions({
       items: [{
         id: SESSION,
-        ref: `myelin://acme/agent/workspace/${WORKSPACE}#ssh-session-${SESSION}`,
+        ref: `myelin://acme/agent/session/${SESSION}`,
         method: "ssh",
         mode: "command",
         terminal: true,
@@ -146,6 +146,24 @@ describe("private agent work wire projection", () => {
       }],
       page: { next_cursor: null, limit: 100 },
     })).toBeNull();
+    const sessionPage = (ref: string) => ({
+      items: [{
+        id: SESSION,
+        ref,
+        method: "ssh",
+        mode: "shell",
+        terminal: true,
+        workspace: { id: WORKSPACE, generation: 1 },
+        started_at: "2026-08-22T12:02:00Z",
+      }],
+      page: { next_cursor: null, limit: 100 },
+    });
+    expect(parseWorkspaceSessions(sessionPage(
+      `myelin://acme/agent/workspace/${WORKSPACE}#ssh-session-${SESSION}`,
+    ))).toBeNull();
+    expect(parseWorkspaceSessions(sessionPage(
+      "myelin://acme/agent/session/01J00000000000000000000003",
+    ))).toBeNull();
     expect(parseAgentThreadMessageReceipt({
       message_id: MESSAGE,
       thread_id: AGENT,

@@ -96,8 +96,8 @@ async fn main() {
         .with_admission(admission),
         runtime.clone(),
     )
-    .unwrap_or_else(|_| {
-        eprintln!("{SERVICE_NAME}: cannot bind durable check intake");
+    .unwrap_or_else(|error| {
+        eprintln!("{SERVICE_NAME}: cannot bind durable check intake: {error:?}");
         std::process::exit(1);
     });
     let quarantine: Arc<dyn myelin_events::DurableDeliveryQuarantine> = Arc::new(

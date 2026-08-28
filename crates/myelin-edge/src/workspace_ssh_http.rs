@@ -284,8 +284,8 @@ fn workspace_session_json(tenant: &str, session: &DurableWorkspaceSession) -> Va
     json!({
         "id": session.session_id,
         "ref": format!(
-            "myelin://{tenant}/agent/workspace/{}#ssh-session-{}",
-            session.workspace_id, session.session_id
+            "myelin://{tenant}/agent/session/{}",
+            session.session_id
         ),
         "method": session.access_method,
         "mode": session.mode.token(),
@@ -457,8 +457,8 @@ mod tests {
             json!({
                 "id": session.session_id,
                 "ref": format!(
-                    "myelin://acme/agent/workspace/{}#ssh-session-{}",
-                    session.workspace_id, session.session_id
+                    "myelin://acme/agent/session/{}",
+                    session.session_id
                 ),
                 "method": "ssh",
                 "mode": "command",
@@ -467,6 +467,8 @@ mod tests {
                 "started_at": session.started_at,
             })
         );
+        myelin_refs::parse_scoped(projected["ref"].as_str().unwrap())
+            .expect("workspace session history emits a canonical ArtifactRef");
         let body = projected.to_string();
         for sensitive_name in [
             "fingerprint",

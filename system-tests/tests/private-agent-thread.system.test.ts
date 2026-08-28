@@ -8,6 +8,7 @@ import {
   systemClient,
   uniqueName,
 } from "../src/context.js";
+import { systemTestConfig } from "../src/config.js";
 import {
   activateExternalAgent,
   askAgent,
@@ -366,6 +367,12 @@ describe("private work with an agent", () => {
       workspaceHistory.body.items,
       "private workspace access history",
     );
+    for (const candidate of workspaceSessions) {
+      const session = record(candidate, "private workspace session");
+      expect(session.ref).toBe(
+        `myelin://${systemTestConfig.tenant}/agent/session/${string(session.id, "workspace session id")}`,
+      );
+    }
     expect(workspaceSessions).toEqual(
       expect.arrayContaining([
         expect.objectContaining({

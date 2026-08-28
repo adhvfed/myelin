@@ -138,8 +138,8 @@ async fn main() {
         .with_admission(admission),
         runtime.clone(),
     )
-    .unwrap_or_else(|_error| {
-        eprintln!("notif: cannot bind durable signal intake");
+    .unwrap_or_else(|error| {
+        eprintln!("notif: cannot bind durable signal intake: {error:?}");
         std::process::exit(1);
     });
     let delivery_quarantine: Arc<dyn myelin_events::DurableDeliveryQuarantine> = Arc::new(

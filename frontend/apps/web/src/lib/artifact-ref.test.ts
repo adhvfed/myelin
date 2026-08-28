@@ -24,6 +24,15 @@ describe("artifact references", () => {
       });
   });
 
+  it("recognizes durable agent work and workspace-session roots", () => {
+    expect(parseArtifactRef(
+      "myelin://acme/agent/session/01J00000000000000000000000",
+    )).toMatchObject({ subsystem: "agent", type: "session", sub: null });
+    expect(parseArtifactRef(
+      "myelin://acme/agent/workspace/91000000-0000-4000-8000-000000000001",
+    )).toMatchObject({ subsystem: "agent", type: "workspace", sub: null });
+  });
+
   it.each([
     "https://example.invalid/issue/7",
     "myelin://acme/issue/issue",

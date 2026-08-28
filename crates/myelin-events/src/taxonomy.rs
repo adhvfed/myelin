@@ -52,6 +52,10 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     "tuple",
     "agent",
     "workspace",
+    // A durable workspace access session has its own stable ULID and is not a
+    // sub-anchor of the workspace. Keeping it as a root artifact lets every
+    // consumer validate and retain the accountability reference.
+    "session",
 ];
 
 /// Artifact subjects whose live read boundary is implemented for governed automations.

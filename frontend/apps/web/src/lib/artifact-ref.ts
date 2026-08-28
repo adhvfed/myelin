@@ -17,6 +17,7 @@ const TYPES = new Set([
   "pr", "ref", "review", "comment", "repo", "commit", "blob", "run", "check", "log", "artifact",
   "deployment", "pipeline", "runner", "issue", "initiative", "relation", "page", "doc", "row",
   "channel", "message", "thread", "read_state", "permission", "member", "project", "edge",
+  "database", "tuple", "agent", "workspace", "session",
 ]);
 
 export interface ArtifactRefParts {

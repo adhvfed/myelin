@@ -3237,6 +3237,30 @@ Proof: all 366 Edge library stories; all 19 HTTP transport integration stories;
 strict all-target/all-feature Edge Clippy; TypeScript typechecking; and the
 running TypeScript overload journey against the rebuilt PostgreSQL-backed Edge.
 
+## 2026-08-28 — SSH history carries canonical session identity
+
+The owner-only workspace history returned each durable SSH session with a
+reference shaped like `agent/workspace/<id>#ssh-session-<id>`. `ssh-session`
+is not in the shared sub-reference vocabulary, so the API emitted a value that
+the Rust reference codec and browser reference parser both rejected. The
+history looked accountable while its claimed durable identity could not travel
+through any reference-aware product seam.
+
+Workspace sessions are now first-class `agent/session/<ULID>` artifacts. The
+Bus type table and browser codec recognize the root, Edge proves its projection
+round-trips through the canonical parser, and the browser history decoder
+requires the reference to identify the exact row rather than accepting any
+bounded string. The TypeScript full-system journey checks every session
+reference after real host-key-pinned OpenSSH command and shell access. Consumer
+startup failures also retain their bounded transport reason, so a broker-policy
+or restart mismatch is diagnosable instead of collapsing to “cannot bind”.
+
+Proof: the focused Events taxonomy and Edge SSH projection stories; 28 browser
+reference/agent-thread contract stories; strict all-target/all-feature Events
+and Edge Clippy; browser and system-test TypeScript typechecking; and both
+private-agent-thread journeys against PostgreSQL, the workspace gateway, and
+real OpenSSH (6.88 seconds).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

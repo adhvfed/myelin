@@ -1,4 +1,5 @@
 import { parseChatMessages, type ChatMessagePage } from "./chat-response";
+import { parseArtifactRef } from "./artifact-ref";
 
 const utf8 = new TextEncoder();
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -237,9 +238,11 @@ export function parseAgentThreadMessages(value: unknown, threadId: string): Chat
 function workspaceSession(value: unknown): WorkspaceSession | null {
   const row = record(value);
   const workspace = record(row?.workspace);
+  const reference = parseArtifactRef(row?.ref);
   if (!row || !exact(row, ["id", "ref", "method", "mode", "terminal", "workspace", "started_at"]) ||
       !workspace || !exact(workspace, ["id", "generation"]) || !isUlid(row.id) ||
-      !cleanText(row.ref, 4_096) || row.method !== "ssh" ||
+      !reference || reference.subsystem !== "agent" || reference.type !== "session" ||
+      reference.id !== row.id || reference.sub !== null || row.method !== "ssh" ||
       !["shell", "command"].includes(row.mode as string) || typeof row.terminal !== "boolean" ||
       !isAgentThreadId(workspace.id) || !positiveInteger(workspace.generation, 4_294_967_295) ||
       !timestamp(row.started_at)) return null;
