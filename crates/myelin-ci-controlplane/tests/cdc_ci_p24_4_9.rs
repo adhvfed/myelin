@@ -1,26 +1,19 @@
-use myelin_ci_controlplane::deployment::{
-    deploy_outcome_of, resolve_approvers, DeployGate, DeployGateOutcome,
-    ENVIRONMENT_APPROVE_PERMISSION,
-};
 use myelin_ci_controlplane::secret_broker::{
     SecretBroker, SecretCapability, SecretOutcome, WithholdReason, SECRET_READ_PERMISSION,
 };
 use myelin_ci_sandbox::{SecretRef, TrustTier};
-use myelin_flow::{per_effect_idem_key, ApprovalDecision, EffectOutcome};
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, ConsistencyMode, Credential, Decision,
     DelegationCaveats, EffectivePolicy, FailStaticBound, FragmentAdmit, IdentityService,
     ListObjectsResult, NamespaceFragment, ObjectId, ObjectType, Permission, Precondition,
-    Principal, PrincipalId, PrincipalKind, RelName, Result as IdResult, RevokeTarget, RewriteTrace,
-    RunId, RunToken, SubjectTree, TupleDelta, Zookie,
+    Principal, PrincipalId, PrincipalKind, Result as IdResult, RevokeTarget, RewriteTrace, RunId,
+    RunToken, SubjectTree, TupleDelta, Zookie,
 };
 use myelin_tenancy::{ArtifactRef, TenantId};
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 struct RecordingId {
     last: RefCell<Option<(String, String)>>,
-    approvers: Vec<String>,
 }
 impl IdentityService for RecordingId {
     fn authenticate(&self, _c: &Credential) -> IdResult<Principal> {
@@ -52,21 +45,11 @@ impl IdentityService for RecordingId {
     }
     fn list_subjects(
         &self,
-        o: &ObjectId,
-        p: &Permission,
+        _o: &ObjectId,
+        _p: &Permission,
         _at: &Consistency,
     ) -> IdResult<SubjectTree> {
-        *self.last.borrow_mut() = Some((o.0.clone(), p.0.clone()));
-        Ok(SubjectTree {
-            object: o.clone(),
-            relation: RelName(p.0.clone()),
-            members: self
-                .approvers
-                .iter()
-                .map(|a| PrincipalId(a.clone()))
-                .collect(),
-            zookie: Zookie("z0".into()),
-        })
+        Err(AuthzError::NotYetImplemented("cdc stub"))
     }
     fn explain(
         &self,
@@ -113,29 +96,6 @@ fn at() -> Consistency {
     }
 }
 
-#[test]
-fn cdc_4_4_consumer_resolves_approvers_via_list_subjects_environment_approve() {
-    let id = RecordingId {
-        last: RefCell::new(None),
-        approvers: vec!["u:alice".into(), "u:bob".into()],
-    };
-    let env = ObjectId("environment:prod".into());
-    let approvers = resolve_approvers(&id, &env, &at()).expect("resolves");
-
-    assert_eq!(approvers, vec!["u:alice".to_string(), "u:bob".to_string()]);
-    let (obj, perm) = id
-        .last
-        .borrow()
-        .clone()
-        .expect("a list_subjects call was made");
-    assert_eq!(obj, "environment:prod");
-    assert_eq!(perm, ENVIRONMENT_APPROVE_PERMISSION);
-    assert_eq!(
-        ENVIRONMENT_APPROVE_PERMISSION, "approve",
-        "the FROZEN §5.2 approve permission (4.4)"
-    );
-}
-
 struct ResolvingCap;
 impl SecretCapability for ResolvingCap {
     fn resolve_handle(
@@ -174,7 +134,6 @@ fn cdc_4_9_broker_gates_secret_read_and_fork_short_circuits() {
     let cap = ResolvingCap;
     let id = RecordingId {
         last: RefCell::new(None),
-        approvers: vec![],
     };
     let broker = SecretBroker::new(&cap, &id);
 
@@ -231,40 +190,4 @@ fn cdc_4_9_broker_gates_secret_read_and_fork_short_circuits() {
             ..
         }
     )));
-}
-
-#[test]
-fn cdc_9_4_deploy_gate_keys_on_the_frozen_per_effect_idem_key() {
-    assert_eq!(per_effect_idem_key("dep-card", 0, 1), "dep-card");
-    assert_eq!(per_effect_idem_key("dep-card", 0, 3), "dep-card:0");
-    assert_eq!(per_effect_idem_key("dep-card", 2, 3), "dep-card:2");
-
-    assert_eq!(
-        deploy_outcome_of(&EffectOutcome::Applied("dep-7".into())),
-        DeployGateOutcome::Approved("dep-7".into())
-    );
-    assert_eq!(
-        deploy_outcome_of(&EffectOutcome::Withheld("decline".into())),
-        DeployGateOutcome::Withheld("decline".into())
-    );
-
-    let mut applied: HashMap<String, String> = HashMap::new();
-    let mut applies = 0;
-    for _ in 0..3 {
-        DeployGate::gate_deploy(
-            "dep-card",
-            0,
-            1,
-            ApprovalDecision::Approve,
-            &mut applied,
-            || {
-                applies += 1;
-                "dep-7".to_string()
-            },
-        );
-    }
-    assert_eq!(
-        applies, 1,
-        "three deliveries of the SAME per-effect key = ONE apply (9.4 / OQ-F)"
-    );
 }

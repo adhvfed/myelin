@@ -3608,6 +3608,30 @@ mapped login, queue store, reaper, and connection reset path; strict
 all-target/all-feature Clippy across CI control-plane and Edge. Net removal:
 793 lines.
 
+## 2026-08-28 — CI surfacing has one real owner
+
+CI still exported a second, in-memory product beside its PostgreSQL run surface.
+That façade stored runs, deployments, pipelines, erasure flags, and restrictions
+in maps, projected titles through a stub Identity implementation, and called the
+result a surfacing contract. Its list-filter proof built an ad hoc authorization
+table and interpolated generated SQL; neither the Edge run API nor the durable
+store called that lowering path. The adjacent deployment gate deduplicated into
+a caller-provided `HashMap`, event constructors had no publisher, and generic
+personal-data row structs had no repository.
+
+The CI surface module now owns only its canonical reference codec, which is
+used by durable pipeline startup, manifests, check details, and reference cards.
+The existing `CiRunStore` remains the sole user-facing run owner: it queries the
+real `ci_run`, `ci_job`, and log tables under tenant and repository visibility.
+The parallel projector, query simulator, deployment façade, fake row schema,
+and their copied CDC/drill claims are gone. The fork secret CDC remains under a
+name that describes the actual contract it exercises.
+
+Proof: all 519 CI control-plane library stories and the complete normal suite;
+the live PostgreSQL run-list/detail journey proving visibility-scoped keyset
+paging and RLS through the durable store; and strict all-target/all-feature
+Clippy across CI control-plane and Edge. Net removal: 2,649 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3727,3 +3751,9 @@ all-target/all-feature Clippy across CI control-plane and Edge. Net removal:
     lane shedding, and plan-sensitive backpressure are not connected to a
     service or durable controller. The former process-local surge model was
     removed rather than represented as deployed capacity management.
+20. **CI environments and deployments have no product boundary.** Historical
+    tables, reference tokens, event vocabulary, and ReBAC fragments remain, and
+    the workflow can gate a following job, but there is no durable deployment
+    command/store, environment administration API, publisher, authenticated
+    browser journey, or rollback executor. The former in-memory approval map
+    and draft constructors were removed rather than counted as that product.

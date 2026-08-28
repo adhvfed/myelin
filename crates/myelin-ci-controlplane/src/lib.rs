@@ -93,7 +93,6 @@ pub mod ci_run_store;
 pub mod ci_run_supersession;
 pub mod ci_scheduler_db;
 pub mod cost_store;
-pub mod deployment;
 pub mod events;
 pub mod fleet;
 pub mod job_accounting_store;
@@ -129,7 +128,6 @@ pub mod migrations;
 pub mod rebac_fragment;
 pub mod runner_bind;
 pub mod scheduler;
-pub mod schema;
 pub mod secret_admin;
 pub mod secret_broker;
 pub mod surfacing;
@@ -158,14 +156,6 @@ pub use secret_admin::{
 pub use secret_broker::{
     OidcCredential, ResolvedSecret, SecretBroker, SecretCapability, SecretLaunchError,
     SecretOutcome, SecretResolution, WithheldSecret, WithholdReason, SECRET_READ_PERMISSION,
-};
-
-pub use deployment::{
-    deploy_outcome_of, deploy_requires_approval, deployment_approval_required_draft,
-    deployment_approved_draft, deployment_failed_draft, deployment_rejected_draft,
-    deployment_requested_draft, deployment_rolled_back_draft, deployment_started_draft,
-    deployment_succeeded_draft, resolve_approvers, DeployGate, DeployGateOutcome, DeployState,
-    ENVIRONMENT_APPROVE_PERMISSION,
 };
 
 pub use job_schedule::JobScheduleTerms;
@@ -214,13 +204,8 @@ use myelin_substrate::{
 };
 
 pub use surfacing::{
-    ci_artifact_ref, ci_deployment_ref, ci_pipeline_ref, ci_run_id_colref, ci_run_ref,
-    ci_runner_ref, commit_check_ref, compose_run_list_query, lower_over_run_id,
-    run_search_pre_filter, run_step_line_ref, run_step_ref, ArtifactStore, AuthzJoin,
-    AuthzVisibleIndex, BoundParam, CiArtifactType, CiRefError, CiSearchPreFilter,
-    ComposedRunListQuery, DeploymentMeta, LoweredFilter, PipelineMeta, ProjectError, Projected,
-    Projection, Projector, RenderHint, RunMeta, SubAnchor, Tombstone, TombstoneReason,
-    AUTHZ_VISIBLE_TABLE, CI_SUBSYSTEM, RUN_LIST_PERMISSION, VIEW,
+    ci_artifact_ref, ci_deployment_ref, ci_pipeline_ref, ci_run_ref, ci_runner_ref,
+    commit_check_ref, run_step_line_ref, run_step_ref, CiArtifactType, CiRefError, CI_SUBSYSTEM,
 };
 
 pub use surfacing_index::{
