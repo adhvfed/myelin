@@ -9,8 +9,7 @@ use myelin_events::{derive_envelope, Actor, EmitContext, EventId, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_search::{
     ci_log_index_specs, ci_log_search_projection, AclFilter, CiLogProjectionInput,
-    IncrementalIndexer, MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher,
-    SearchProjection,
+    IncrementalIndexer, MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher, SearchProjection,
 };
 use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
