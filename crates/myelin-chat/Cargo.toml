@@ -42,4 +42,3 @@ myelin-chat = { path = ".", features = ["test-support"] }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-flow = { path = "../myelin-flow" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
-myelin-search = { path = "../myelin-search" }

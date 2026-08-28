@@ -3804,6 +3804,25 @@ standalone strict all-target/all-feature Clippy across Search and Edge; and a
 repository-wide search finding no owner-specific Search projection module. Net
 removal: 2,693 lines.
 
+## 2026-08-28 — Orphaned Search adapters no longer masquerade as journeys
+
+The last external Search dependency was a Chat autocomplete CDC that directly
+wired the generic engine to a test adapter. Production Chat exposes an
+`AutocompletePort` but composes no Search implementation. Search also retained
+an Issues board escalation valve after the in-memory board/query facades and
+all owner projections had been removed; no runtime caller remained.
+
+The fake autocomplete journey, orphaned board valve, and their parity/CDC
+suites are removed. Chat no longer depends on Search even for tests. The
+generic engine remains independently tested, and the worklog continues to
+describe autocomplete/cross-product Search composition as absent rather than
+green by fixture.
+
+Proof: all 220 Chat and 153 Search library stories plus both normal suites;
+strict all-target/all-feature Clippy across Chat and Search; and a
+repository-wide search finding no external Search dependency. Net removal:
+1,145 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

@@ -6,7 +6,6 @@ pub mod fusion;
 pub mod indexer;
 pub mod pipeline;
 pub mod reindex;
-pub mod tier3_valve;
 pub mod vector;
 
 pub use compiler::{
@@ -36,10 +35,6 @@ pub use pipeline::{
 pub use reindex::{
     ReindexCursorStore, ReindexError, ReindexJob, ReindexProgress, SearchReindexer,
     DEFAULT_BATCH_CAP, DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
-};
-pub use tier3_valve::{
-    board_acl_filter, escalate_to_search, oltp_board_admits, BoardEscalationAuthz, BoardQuery,
-    OltpBudget, ReverseResolver,
 };
 pub use vector::{Embedding, HnswVectorIndex, ModelRef, VectorHit, VectorRecord};
 
