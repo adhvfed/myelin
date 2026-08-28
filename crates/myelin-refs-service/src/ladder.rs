@@ -134,51 +134,6 @@ fn find_subsequence(haystack: &[String], needle: &[String]) -> Option<usize> {
         .find(|&start| haystack[start..start + needle.len()] == *needle)
 }
 
-#[derive(Default)]
-pub struct SyntheticSubResolver {
-    states: std::sync::Mutex<Vec<(String, SubState)>>,
-}
-
-impl SyntheticSubResolver {
-    pub fn new() -> SyntheticSubResolver {
-        SyntheticSubResolver::default()
-    }
-
-    pub fn set_state(&self, ref_: &str, state: SubState) {
-        self.states.lock().unwrap().push((ref_.to_string(), state));
-    }
-
-    pub fn default_projection() -> OwnerProjection {
-        OwnerProjection {
-            title: "an embedded artifact".into(),
-            state: "live".into(),
-            icon: "doc".into(),
-            render_hint: "embed".into(),
-            sub_anchor: None,
-            flag: None,
-        }
-    }
-}
-
-impl SubAnchorResolver for SyntheticSubResolver {
-    fn resolve_sub(&self, ref_: &ArtifactRef, sub: Option<&Sub>) -> SubState {
-        if sub.is_none() {
-            return SubState::Live(Self::default_projection());
-        }
-        self.states
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(k, _)| k == &ref_.0)
-            .map(|(_, s)| s.clone())
-            .unwrap_or_else(|| {
-                let mut p = Self::default_projection();
-                p.sub_anchor = Some(ref_.0.clone());
-                SubState::Live(p)
-            })
-    }
-}
-
 pub fn resolve_sub_outcome(resolver: &dyn SubAnchorResolver, ref_: &ArtifactRef) -> ProjectOutcome {
     let sub = sub_kind(ref_);
     resolver.resolve_sub(ref_, sub.as_ref()).into_outcome()
@@ -187,6 +142,3 @@ pub fn resolve_sub_outcome(resolver: &dyn SubAnchorResolver, ref_: &ArtifactRef)
 pub fn ladder_root(ref_: &ArtifactRef) -> ArtifactRef {
     strip_sub(ref_)
 }
-
-#[cfg(test)]
-mod tests;

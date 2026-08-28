@@ -13,7 +13,6 @@ pub mod hitl;
 pub mod membership;
 mod mention_signal;
 pub mod post_restore;
-pub mod presence;
 pub mod project;
 pub mod provenance;
 pub mod read_state;
@@ -65,12 +64,6 @@ pub use hitl::{
 pub use membership::{MembershipError, MembershipGate, MembershipService, MembershipTupleWriter};
 pub use post_restore::{
     PostRestoreChatMessageError, PostRestoreChatMessageReEraser, PostRestoreChatMessageReport,
-};
-pub use presence::{
-    ag_d4_attestation_is_green, presence_and_partials_are_firehose_only, resume_view, run_streamed,
-    AgD4Attestation, AgentPresence, FabricHealth, MockStreamRuntime, PartialFrame, PartialPush,
-    PresencePush, ResumeView, StreamSession, StreamSessions, StreamState, AGENT_MESSAGE_PARTIAL,
-    AGENT_STATUS_CHANGED,
 };
 pub use project::{
     densest_edge_producer, ChannelMeta, ChatProjectionSource, MessageMeta, ProjectError, Projected,

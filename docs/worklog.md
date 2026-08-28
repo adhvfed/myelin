@@ -3935,6 +3935,25 @@ Proof: all-target/all-feature Query and Flow compilation before the strict
 workspace verification; repository-wide search finding no remaining caller or
 removed type. Net removal: 2,211 code/test lines.
 
+## 2026-08-28 — Synthetic collaboration runtimes leave owner crates
+
+Two more public test doubles had no running composition. Refs exported a
+mutex-backed sub-anchor resolver and a copied ladder suite even though its real
+Git, Chat, Issue, and Knowledge owners implement the resolver contract
+directly. Chat exported a streamed-agent runtime that split a prewritten answer
+into partials and then used its own output as the streaming proof; no Edge or
+gateway path called it.
+
+The synthetic Refs resolver, duplicate ladder tests, mock Chat streaming
+runtime, and its CDC/drill suites are removed. Refs keeps the production owner
+adapters and anchor-state mapping. Chat keeps its durable messages and the
+separate gateway's live-frame boundary; a future agent-answer stream must begin
+at the hosted run and reach an authenticated client through that boundary.
+
+Proof: complete normal Chat and Refs-service suites plus strict
+all-target/all-feature Clippy and workspace compilation. Net removal: 1,672
+code/test lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -4042,7 +4061,9 @@ removed type. Net removal: 2,211 code/test lines.
     durable Chat product, but reply, reaction, direct-message, channel creation,
     invitation, and archival have no governed agent effect carrier. They remain
     absent from discovery until each action has exact authorization, audit,
-    idempotency, and a full-system agent journey.
+    idempotency, and a full-system agent journey. Hosted agent answer
+    presence/partial streaming also has no end-to-end Edge/gateway carrier; the
+    former prewritten-answer mock was removed.
 18. **Several Git collaboration and maintenance actions are not agent effects.**
     Agents can durably write files, open pull requests, submit review verdicts,
     endorse fork CI, and merge with human approval. Inline comment authoring,

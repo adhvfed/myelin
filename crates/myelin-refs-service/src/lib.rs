@@ -72,7 +72,7 @@ pub use kn_producer::{
 };
 pub use ladder::{
     ladder_root, resolve_line_range, resolve_sub_outcome, LineRangeState, MintedLineRange,
-    SubAnchorResolver, SubState, SyntheticSubResolver, TOMBSTONE_COUNT_SIGNAL,
+    SubAnchorResolver, SubState, TOMBSTONE_COUNT_SIGNAL,
 };
 pub use loop_guard::{
     is_retrigger_source, stamped_depth, target_is_structured_node, would_exceed_ceiling,
