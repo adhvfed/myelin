@@ -3673,6 +3673,28 @@ strict all-target/all-feature Clippy across those five crates and Edge; and a
 repository-wide search finding no discarded projection registration or null
 project fetcher. Net removal: 486 lines.
 
+## 2026-08-28 — Chat search claims match the running product again
+
+Chat and Search each declared a different authoritative message index. They
+disagreed about the authorization object, permission, semantic indexing, and
+facets, and neither was composed by Edge or a worker. Chat's companion reindex
+source stored its owner truth in a process-local map and projected into three
+more maps; its privacy restriction gate wrapped another process-local set.
+Every caller was a unit, CDC, or drill fixture, so their green results could not
+prove message search, restart recovery, notification projection, or durable
+restriction behavior.
+
+The duplicate schemas, in-memory replay/read models, restriction simulation,
+and their self-certifying suites are removed. Chat no longer has a production
+dependency on Search. Its real durable message store, authorization-gated
+reference surface, notification path, and cryptographic erasure/restore path
+remain. The generic Search engine is unchanged, and Chat autocomplete's direct
+engine exercise remains test-only until it has a real product composition.
+
+Proof: all 220 Chat library stories and the normal non-integration suites, plus
+the Search library and normal suites; strict all-target/all-feature Clippy for
+Chat, Search, and Edge. Net removal: 3,285 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

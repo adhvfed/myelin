@@ -1,5 +1,4 @@
 pub mod analysis;
-pub mod chat_projection;
 pub mod ci_log_projection;
 pub mod compiler;
 pub mod consistency;
@@ -15,10 +14,6 @@ pub mod subartifact;
 pub mod tier3_valve;
 pub mod vector;
 
-pub use chat_projection::{
-    message_doc_ref, message_index_spec, message_index_specs, message_search_projection,
-    CHAT_SUBSYSTEM, MESSAGE_ACL_OBJECT_TYPE, MESSAGE_TYPE,
-};
 pub use ci_log_projection::{
     ci_log_details_ref, ci_log_doc_ref, ci_log_index_spec, ci_log_index_specs,
     ci_log_search_projection, parse_step_anchor, CiLogProjectionInput, CiLogStepAnchor,

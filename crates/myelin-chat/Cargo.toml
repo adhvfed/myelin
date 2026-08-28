@@ -20,7 +20,6 @@ myelin-storage = { path = "../myelin-storage" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-substrate = { path = "../myelin-substrate" }
-myelin-search = { path = "../myelin-search" }
 myelin-query = { path = "../myelin-query" }
 sqlx = { workspace = true }
 tokio = { workspace = true, optional = true }
@@ -43,3 +42,4 @@ myelin-chat = { path = ".", features = ["test-support"] }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-flow = { path = "../myelin-flow" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
+myelin-search = { path = "../myelin-search" }

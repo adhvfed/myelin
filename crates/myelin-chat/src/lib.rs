@@ -18,10 +18,7 @@ pub mod project;
 pub mod provenance;
 pub mod read_state;
 pub mod rebac_fragment;
-pub mod replay;
-pub mod restriction;
 pub mod schema;
-pub mod search;
 pub mod store;
 pub mod subs;
 pub mod tools;
@@ -84,22 +81,6 @@ pub use provenance::{agent_provenance, AgentProvenance, PROVENANCE_AUDIT_LINK_KI
 pub use read_state::{
     ReadMarker, ReadStatePush, ReadStateRecord, ReadStateService, CHAT_READ_STATE_STORE,
     DEFAULT_FLUSH_CADENCE, HOT_MARKER_TTL, READ_STATE_UPDATED,
-};
-pub use replay::{
-    reindex_parity_hash, ChatReadModelConsumer, ChatReindexSource, ChatReplayKind,
-    MessageProjectFetcher, MessageProjection, NOTIF_REASON_MENTIONED,
-};
-pub use restriction::{
-    agent_may_read, analytics_eligible, index_projection_if_allowed, notif_may_route,
-    render_body_mentions, render_mention, MentionRender, MentionResolver, ReadPath,
-    RestrictionFlag, RestrictionGate, ERASED_USER,
-};
-pub use search::{
-    message_doc_ref, message_index_spec, message_index_specs, message_search_acl_anchor,
-    message_search_projection, non_member_filter, AclConjoinedSearchFeeder,
-    EmbeddingsArePersonalData, CHAT_SUBSYSTEM, FACET_ARTIFACT_REF, FACET_AUTHOR, FACET_CHANNEL,
-    FACET_CREATED_AT, FACET_EMBED, FACET_KIND, FACET_MENTION, FACET_THREAD_ROOT, FT_BODY_FIELD,
-    MESSAGE_ACL_OBJECT_TYPE, MESSAGE_READ_PERMISSION, MESSAGE_TYPE,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemHotTier;
