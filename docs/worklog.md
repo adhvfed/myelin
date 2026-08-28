@@ -3773,6 +3773,17 @@ all-target/all-feature Clippy across Git and Edge; repository-wide search
 finding no Git Search dependency or code-projection module. Net removal: 2,353
 lines.
 
+## 2026-08-28 — Privacy JSON builds without accidental feature unification
+
+Edge serialized SQLx UUID values directly in privacy-request status and
+certificate JSON. That compiled only when another selected workspace package
+happened to enable UUID's Serde feature; a standalone all-feature Edge build
+failed. Both public identifiers now cross the HTTP boundary as canonical
+lowercase UUID strings, which also makes the wire representation explicit.
+
+Proof: focused status/certificate JSON tests and standalone strict
+all-target/all-feature Edge Clippy.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

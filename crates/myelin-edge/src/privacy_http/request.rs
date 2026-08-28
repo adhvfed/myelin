@@ -385,7 +385,7 @@ fn request_id(ctx: &HandlerCtx<'_>) -> Result<Uuid, EdgeError> {
 
 fn privacy_request_json(tenant: &str, request: &DurablePrivacyRequest) -> Value {
     json!({
-        "id": request.request_id,
+        "id": request.request_id.to_string(),
         "ref": format!("myelin://{tenant}/privacy/request/{}", request.request_id),
         "kind": request.kind,
         "scope": request.scope,
@@ -401,7 +401,7 @@ fn privacy_request_json(tenant: &str, request: &DurablePrivacyRequest) -> Value 
 
 fn certificate_json(certificate: &PrivacyRequestCertificate) -> Value {
     json!({
-        "request_id": certificate.request_id,
+        "request_id": certificate.request_id.to_string(),
         "kind": certificate.kind,
         "scope": certificate.scope,
         "holders": certificate.holder_receipts,
@@ -433,6 +433,7 @@ mod tests {
         };
 
         let body = privacy_request_json("acme", &request);
+        assert_eq!(body["id"], Uuid::from_u128(19).to_string());
         myelin_refs::parse_scoped(body["ref"].as_str().unwrap())
             .expect("privacy requests expose a canonical ArtifactRef");
         assert_eq!(body["last_attempt_failed"], true);
@@ -452,6 +453,7 @@ mod tests {
         .unwrap();
 
         let body = certificate_json(&certificate);
+        assert_eq!(body["request_id"], Uuid::from_u128(23).to_string());
         assert_eq!(body["holders"][0]["holder"], "agent_traces");
         assert!(body.get("holder_receipts").is_none());
     }
