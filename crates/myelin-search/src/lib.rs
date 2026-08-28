@@ -23,7 +23,6 @@ pub mod projection_feeder;
 pub mod reindex;
 pub mod residency;
 pub mod restore_verify;
-pub mod shell;
 mod store;
 pub mod subartifact;
 pub mod surge;
@@ -127,10 +126,6 @@ pub use residency::{search_store_descriptors, SearchStoreDescriptor};
 pub use restore_verify::{
     ErasedSubjectEntry, SearchErasureLedger, SearchRestoreArtifact, SearchRestoreFailure,
     SearchRestoreInputs, SearchRestoreVerdict, SearchRestoreVerifyGate,
-};
-pub use shell::{
-    boot_search, run_search, run_search_until_shutdown, search_app_spec, search_service_migrations,
-    SEARCH_INDEX_DIR_MIGRATION, SERVICE_NAME,
 };
 pub use store::SEARCH_INDEX_STORE;
 pub use subartifact::{

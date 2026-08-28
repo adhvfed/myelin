@@ -3700,7 +3700,6 @@ dependencies = [
  "myelin-issues",
  "myelin-knowledge",
  "myelin-notif",
- "myelin-search",
  "myelin-storage",
  "sqlx",
  "tokio",

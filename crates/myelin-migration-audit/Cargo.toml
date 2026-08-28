@@ -11,7 +11,6 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-issues = { path = "../myelin-issues" }
 myelin-flow = { path = "../myelin-flow" }
 myelin-notif = { path = "../myelin-notif" }
-myelin-search = { path = "../myelin-search" }
 myelin-knowledge = { path = "../myelin-knowledge" }
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-ci-dispatch = { path = "../myelin-ci-dispatch" }

@@ -17,7 +17,6 @@ pub fn production_migration_sets() -> Vec<(&'static str, Migrations)> {
         ("issues.service", myelin_issues::issues_migrations()),
         ("flow.service", myelin_flow::migrations::migrations()),
         ("notif.service", myelin_notif::migrations::migrations()),
-        ("search.service", myelin_search::search_service_migrations()),
         (
             "knowledge.service",
             myelin_knowledge::knowledge_service_migrations(),

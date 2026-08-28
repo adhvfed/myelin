@@ -3068,6 +3068,30 @@ real JetStream/PostgreSQL/object-store CI dispatch journey; and both
 PostgreSQL Git-check projection journeys, including constrained runtime-role
 RLS and lossless redelivery.
 
+## 2026-08-28 — Search no longer reports healthy while doing nothing
+
+The `search` executable migrated a `search_index_directory` table, registered
+zero event consumers, owned only in-memory Tantivy indexes, and exposed no
+query handler. Its production bootstrap test called that useful merely because
+the process stayed alive without a migration credential. The process was not
+present in the running Fed topology, but its shell tests and migration-catalog
+entry made the repository describe it as a deployable service.
+
+That executable, its empty Substrate shell, its credential-liveness test, and
+the isolated table-shape test are removed. The migration audit no longer calls
+the unused directory table an authoritative production migration. Historical
+applied rows remain harmlessly auditable; no destructive migration was added.
+The Search crate remains the shared query/indexing library, and the running
+bounded Git code-search product remains unchanged. A future Search service
+must begin with a durable encrypted index, a real owner fetcher, durable event
+intake, and a query surface before it can acquire a health endpoint.
+
+Proof: all 327 Search library stories and every remaining all-feature Search
+test target against the Fed durable dependencies; warning-free
+all-target/all-feature Search and migration-audit compile and strict Clippy;
+no remaining `search` binary, service-shell, migration-set, or fake
+production-bootstrap reference.
+
 ## 2026-08-28 — transport capacity follows credential and principal class
 
 Verified dispatch admission still began too late for four bounded resources.
@@ -3177,9 +3201,10 @@ running TypeScript overload journey against the rebuilt PostgreSQL-backed Edge.
    represented by ceremonial receipts.
 3. **Search indexing is not a deployed durable worker yet.** Refs,
    Notification, governed-agent, CI-dispatch, and Git-check NATS consumers now
-   enforce named broker/batch/per-tenant admission rows. Search's deployable
-   shell still registers no production index consumer, fetcher, or durable
-   index backing, so there is deliberately no worker-admission row to bless.
+   enforce named broker/batch/per-tenant admission rows. The former no-op
+   Search shell is gone: there is no production index consumer, fetcher, or
+   durable encrypted index backing, so there is deliberately no
+   worker-admission row to bless.
    The existing `SearchQuery` shed row remains an interactive-surface target,
    not evidence that indexing is running.
 4. **cross-product search is not surfaced yet.** the running product has bounded,
