@@ -41,8 +41,7 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
         ("git", "open_pr", true),
         ("issues", "create", true),
         ("issues", "close", false),
-        ("knowledge", "publish", false),
-        ("knowledge", "draft", true),
+        ("knowledge", "link_work", true),
         ("chat", "post_message", true),
     ];
     for (sub, name, wrong) in raws {
@@ -62,15 +61,18 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
     expect("open_pr", false);
     expect("create", false);
     expect("close", true);
-    expect("publish", true);
-    expect("draft", false);
+    expect("link_work", false);
     expect("post_message", false);
 }
 
 #[test]
 fn cdc_8_1_cross_subsystem_effect_inherits_the_landing_default() {
     assert!(requires_approval_for_landing("chat", "git", "merge"));
-    assert!(!requires_approval_for_landing("chat", "knowledge", "draft"));
+    assert!(!requires_approval_for_landing(
+        "chat",
+        "knowledge",
+        "link_work"
+    ));
     assert_eq!(
         requires_approval_for_landing("chat", "ci", "deploy"),
         requires_approval_default("ci", "deploy")

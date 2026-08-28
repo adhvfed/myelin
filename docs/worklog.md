@@ -3498,6 +3498,24 @@ and the complete running CLI collaboration journey (16/16), including shared
 catalogue pagination and MCP description through one browser-approved session.
 Net removal: 450 lines.
 
+## 2026-08-28 — Knowledge discovery matches its effect carrier
+
+Knowledge repeated the hidden-catalogue mismatch: its durable effect carrier
+implements `knowledge.link_work`, but internal agents could resolve publish,
+confidential edit, draft, and comment definitions with no executor. Human page
+editing and the working list/read/link routes are separate durable product
+paths; the extra agent schemas did not connect to them.
+
+The phantom provider and its self-certifying policy tests are gone. Knowledge's
+working reads and both compatibility versions of link-work now own the
+subsystem/version vocabulary directly. The platform catalogue asserts that the
+unimplemented mutations cannot resolve, and unknown future effects remain
+approval-gated by default.
+
+Proof: all 144 remaining Agent Service library stories and the complete normal
+suite; strict all-target/all-feature Clippy across Agent Service, Edge, CLI, and
+MCP; and the platform-catalogue provider test. Net removal: 264 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3587,3 +3605,8 @@ Net removal: 450 lines.
     rollup store, or cross-cell portfolio worker. Agent discovery now exposes
     only the working create/close mutations; each additional effect needs an
     authorized executor and restart-safe full-system journey before registration.
+15. **Agents cannot author general Knowledge content yet.** Humans have the
+    durable page surface and agents can list/read pages and link related work,
+    but publish, draft, confidential edit, and comment have no governed effect
+    executor. They remain absent from discovery until backed by the page store,
+    authorization, audit, and a full-system agent journey.

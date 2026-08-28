@@ -1,6 +1,7 @@
 use myelin_agent::{EffectKind, ToolDef, ToolName};
 
-use crate::knowledge_tools::{KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION};
+pub const KNOWLEDGE_SUBSYSTEM: &str = "knowledge";
+pub const KNOWLEDGE_TOOL_VERSION: u32 = 1;
 
 pub const LIST_PAGES_TOOL: &str = "list_pages";
 pub const READ_PAGE_TOOL: &str = "read_page";

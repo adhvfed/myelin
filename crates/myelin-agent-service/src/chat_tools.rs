@@ -113,8 +113,8 @@ mod tests {
             "a chat-invoked git.merge is governed where it LANDS (git → gated)"
         );
         assert!(
-            landing_requires_approval("knowledge", "publish"),
-            "a chat-invoked knowledge.publish lands in knowledge → gated"
+            !landing_requires_approval("knowledge", "link_work"),
+            "a chat-invoked knowledge.link_work lands in its implemented reversible effect"
         );
         assert!(
             landing_requires_approval("issues", "close"),

@@ -34,10 +34,6 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("issues", "create") => false,
         ("issues", "close") => true,
 
-        ("knowledge", "publish") => true,
-        ("knowledge", "edit_confidential") => true,
-        ("knowledge", "draft") => false,
-        ("knowledge", "comment") => false,
         ("knowledge", "list_pages") => false,
         ("knowledge", "read_page") => false,
         ("knowledge", "link_work") => false,
@@ -267,21 +263,12 @@ mod tests {
             "an unimplemented future effect remains gated by the fail-closed fallback"
         );
 
+        assert!(!requires_approval_default("knowledge", "list_pages"));
+        assert!(!requires_approval_default("knowledge", "read_page"));
+        assert!(!requires_approval_default("knowledge", "link_work"));
         assert!(
             requires_approval_default("knowledge", "publish"),
-            "publish is gated (consequential)"
-        );
-        assert!(
-            requires_approval_default("knowledge", "edit_confidential"),
-            "confidential edit is gated"
-        );
-        assert!(
-            !requires_approval_default("knowledge", "draft"),
-            "draft is reversible → NOT gated"
-        );
-        assert!(
-            !requires_approval_default("knowledge", "comment"),
-            "comment is reversible → NOT gated"
+            "an unimplemented future effect remains gated by the fail-closed fallback"
         );
         for read in ["list_pages", "read_page"] {
             assert!(

@@ -11,7 +11,6 @@ pub mod hosted_run_contract;
 pub mod issues_agents;
 pub mod issues_read_tools;
 pub mod knowledge_mcp_tools;
-pub mod knowledge_tools;
 pub mod metering;
 pub mod migrations;
 pub mod mock;
@@ -63,13 +62,6 @@ pub use git_tools::{
     GIT_SUBSYSTEM, GIT_TOOL_VERSION, OPEN_PR_TOOL,
 };
 
-pub use knowledge_tools::{
-    comment_required_caps, comment_tool_def, draft_required_caps, draft_tool_def,
-    edit_confidential_required_caps, edit_confidential_tool_def, knowledge_tool_defs,
-    publish_required_caps, publish_tool_def, register_knowledge_tools, COMMENT_TOOL, DRAFT_TOOL,
-    EDIT_CONFIDENTIAL_TOOL, KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION, PUBLISH_TOOL,
-};
-
 pub use issues_agents::{
     close_tool_def, create_required_caps, create_tool_def, issues_mutation_tool_defs,
     register_issues_mutation_tools, CLOSE_TOOL, CREATE_TOOL, CREATE_TOOL_VERSION, ISSUES_SUBSYSTEM,
@@ -81,8 +73,9 @@ pub use issues_read_tools::{
 };
 
 pub use knowledge_mcp_tools::{
-    knowledge_mcp_tool_defs, link_work_tool_def, LINK_WORK_TOOL, LINK_WORK_TOOL_VERSION,
-    LIST_PAGES_TOOL, READ_PAGE_TOOL, READ_PAGE_TOOL_VERSION,
+    knowledge_mcp_tool_defs, link_work_tool_def, KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION,
+    LINK_WORK_TOOL, LINK_WORK_TOOL_VERSION, LIST_PAGES_TOOL, READ_PAGE_TOOL,
+    READ_PAGE_TOOL_VERSION,
 };
 
 pub use project_read_tools::{

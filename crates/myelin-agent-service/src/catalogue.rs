@@ -62,7 +62,6 @@ impl PlatformToolCatalogue {
         definitions.extend(crate::issues_read_tool_defs());
         definitions.extend(crate::issues_mutation_tool_defs());
         definitions.extend(crate::knowledge_mcp_tool_defs());
-        definitions.extend(crate::knowledge_tool_defs());
         definitions.extend(crate::chat_read_tool_defs());
         definitions.extend(myelin_chat::tools::chat_tool_defs());
         definitions.extend(crate::project_read_tool_defs());
@@ -234,6 +233,17 @@ mod tests {
         let create = catalogue.resolve("issues.create").unwrap();
         assert_eq!(create.version, crate::CREATE_TOOL_VERSION);
         assert!(create.input_schema.contains("project_ref"));
+        for unimplemented in [
+            "issues.reorder",
+            "issues.transition",
+            "knowledge.publish",
+            "knowledge.draft",
+        ] {
+            assert!(
+                catalogue.resolve(unimplemented).is_none(),
+                "the shared agent catalogue must not resolve unimplemented effect `{unimplemented}`"
+            );
+        }
         assert!(!names.contains("knowledge.publish"));
     }
 
