@@ -1,7 +1,6 @@
 pub mod app;
 pub mod catalogue;
 pub mod chat_read_tools;
-pub mod chat_tools;
 pub mod ci_tools;
 pub mod defaults;
 pub mod effect_api;
@@ -91,12 +90,6 @@ pub use git_read_tools::{
 pub use workspace_tools::{
     workspace_tool_defs, EXEC_WORKSPACE_COMMAND_TOOL, READ_WORKSPACE_FILE_TOOL,
     WORKSPACE_SUBSYSTEM, WORKSPACE_TOOL_VERSION, WRITE_WORKSPACE_FILE_TOOL,
-};
-
-pub use chat_tools::{
-    chat_tool_defs, landing_requires_approval, post_message_tool_def, post_required_caps,
-    react_tool_def, register_chat_tools, CHAT_SUBSYSTEM, CHAT_TOOL_VERSION, POST_MESSAGE_TOOL,
-    REACT_TOOL,
 };
 
 pub use ci_tools::{

@@ -42,7 +42,7 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
         ("issues", "create", true),
         ("issues", "close", false),
         ("knowledge", "link_work", true),
-        ("chat", "post_message", true),
+        ("chat", "post", true),
     ];
     for (sub, name, wrong) in raws {
         cat.register_tool(seed_requires_approval(raw(sub, name, wrong)));
@@ -62,7 +62,7 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
     expect("create", false);
     expect("close", true);
     expect("link_work", false);
-    expect("post_message", false);
+    expect("post", false);
 }
 
 #[test]

@@ -38,16 +38,9 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("knowledge", "read_page") => false,
         ("knowledge", "link_work") => false,
 
-        ("chat", "post_message") => false,
         ("chat", "post") => false,
-        ("chat", "reply_in_thread") => false,
-        ("chat", "react") => false,
         ("chat", "list_conversations") => false,
         ("chat", "read_messages") => false,
-        ("chat", "start_dm") => false,
-        ("chat", "create_channel") => true,
-        ("chat", "invite") => true,
-        ("chat", "archive_channel") => true,
 
         ("projects", "list") => false,
 
@@ -284,12 +277,8 @@ mod tests {
         }
 
         assert!(
-            !requires_approval_default("chat", "post_message"),
-            "post_message is reversible → NOT gated"
-        );
-        assert!(
-            !requires_approval_default("chat", "react"),
-            "react is reversible → NOT gated"
+            !requires_approval_default("chat", "post"),
+            "the executable post effect is reversible → NOT gated"
         );
         assert!(
             !requires_approval_default("workspace", "exec"),
@@ -383,7 +372,7 @@ mod tests {
             assert_no_silent_loosening(&tightened, &[]).is_ok(),
             "tightening (no → yes) needs no deviation"
         );
-        let chat_tight = tool_def("chat", "post_message", true);
+        let chat_tight = tool_def("chat", "post", true);
         assert!(assert_no_silent_loosening(&chat_tight, &[]).is_ok());
     }
 

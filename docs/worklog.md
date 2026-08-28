@@ -3516,6 +3516,28 @@ Proof: all 144 remaining Agent Service library stories and the complete normal
 suite; strict all-target/all-feature Clippy across Agent Service, Edge, CLI, and
 MCP; and the platform-catalogue provider test. Net removal: 264 lines.
 
+## 2026-08-28 — Chat discovery matches its effect carrier
+
+Chat advertised reply, reaction, direct-message, channel-creation, invitation,
+and archival mutations to internal agents even though the Edge effect carrier
+implements only `chat.post`. A second Agent Service provider also described an
+older `post_message` action and a reaction action; neither provider was used to
+build the platform catalogue or execute an effect. Chat's isolated dry-run and
+spend-reservation helpers were likewise exercised only by tests over local
+fakes, not by the hosted run, durable wallet, or PostgreSQL Chat path.
+
+The Chat owner now publishes exactly the executable post definition, while the
+working conversation/message reads remain alongside it. The duplicate provider,
+phantom definitions, local simulators, and their self-certifying CDC suite are
+gone. The shared catalogue explicitly proves unavailable Chat effects cannot
+resolve, and unknown future actions remain approval-gated until they acquire a
+real carrier and policy.
+
+Proof: all 139 Agent Service, 248 Chat, and 367 Edge library stories plus their
+complete normal suites; strict all-target/all-feature Clippy across Chat, Agent
+Service, Edge, CLI, and MCP; and repository-wide symbol search finding no stale
+phantom provider or simulator caller.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3610,3 +3632,9 @@ MCP; and the platform-catalogue provider test. Net removal: 264 lines.
     but publish, draft, confidential edit, and comment have no governed effect
     executor. They remain absent from discovery until backed by the page store,
     authorization, audit, and a full-system agent journey.
+16. **Agents have only the general Chat post effect.** Humans can create and
+    manage conversations and use richer thread/reaction behavior through the
+    durable Chat product, but reply, reaction, direct-message, channel creation,
+    invitation, and archival have no governed agent effect carrier. They remain
+    absent from discovery until each action has exact authorization, audit,
+    idempotency, and a full-system agent journey.

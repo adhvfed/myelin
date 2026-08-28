@@ -1,6 +1,6 @@
 use myelin_agent::{EffectKind, ToolDef, ToolName};
 
-use crate::chat_tools::{CHAT_SUBSYSTEM, CHAT_TOOL_VERSION};
+use myelin_chat::tools::{CHAT_SUBSYSTEM, CHAT_TOOL_VERSION};
 
 pub const LIST_CONVERSATIONS_TOOL: &str = "list_conversations";
 pub const READ_MESSAGES_TOOL: &str = "read_messages";

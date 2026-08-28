@@ -192,8 +192,12 @@ mod tests {
             McpApprovalContract::for_tool(&merge.canonical_name()),
             Some(McpApprovalContract::GitMerge)
         );
-        let chat_archive = catalogue.resolve("chat.archive_channel").unwrap();
-        assert!(chat_archive.requires_approval);
+        for unavailable in ["chat.react", "chat.create_channel", "chat.archive_channel"] {
+            assert!(
+                catalogue.resolve(unavailable).is_none(),
+                "catalogue must not advertise unavailable effect {unavailable}"
+            );
+        }
         let ci_read = catalogue.resolve("ci.read_run").unwrap();
         assert_eq!(ci_read, &myelin_ci_controlplane::ci_tool_def("read_run"));
 

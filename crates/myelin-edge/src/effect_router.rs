@@ -106,7 +106,7 @@ mod tests {
         let run = RunCtx("run".into());
         let effect = ProposedEffect("opaque".into());
         assert_eq!(
-            router.apply_authorized(&run, &authority("chat.post_message"), effect.clone()),
+            router.apply_authorized(&run, &authority("chat.post"), effect.clone()),
             EffectResult::Applied(EventId("chat".into()))
         );
         assert_eq!(
@@ -129,7 +129,7 @@ mod tests {
         assert!(matches!(
             router.apply_authorized(
                 &RunCtx("run".into()),
-                &authority("chat.post_message"),
+                &authority("chat.post"),
                 ProposedEffect("opaque".into())
             ),
             EffectResult::Denied(reason) if reason.contains("not wired")
