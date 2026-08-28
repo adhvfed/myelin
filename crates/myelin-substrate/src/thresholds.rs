@@ -49,6 +49,8 @@ pub struct Thresholds {
     #[serde(default)]
     pub shed_budgets: Vec<ShedBudgetRow>,
     #[serde(default)]
+    pub worker_admission: Vec<WorkerAdmissionRow>,
+    #[serde(default)]
     pub dsr: DsrDeadline,
     #[serde(default)]
     pub refs_traverse: RefsTraverse,
@@ -475,6 +477,14 @@ pub struct ShedBudgetRow {
     pub retry_after_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerAdmissionRow {
+    pub worker: String,
+    pub max_ack_pending: u32,
+    pub max_batch: u32,
+    pub per_tenant_inflight: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResilientTargetRow {
     pub target: String,
@@ -633,6 +643,35 @@ impl Thresholds {
             .map_err(|e| ThresholdError::Parse(e.to_string()))?;
         let map = self.shed_budget_table()?;
         Ok(ShedBudgetTable::from_rows(map))
+    }
+
+    pub fn worker_admission(
+        &self,
+        worker: &str,
+    ) -> Result<myelin_events::DurableWorkerAdmission, ThresholdError> {
+        let mut rows = self
+            .worker_admission
+            .iter()
+            .filter(|row| row.worker == worker);
+        let row = rows
+            .next()
+            .ok_or_else(|| ThresholdError::Missing(format!("worker_admission.{worker}")))?;
+        if rows.next().is_some() {
+            return Err(ThresholdError::Parse(format!(
+                "worker_admission.{worker} is declared more than once"
+            )));
+        }
+        myelin_events::DurableWorkerAdmission::new(
+            row.max_ack_pending,
+            row.max_batch,
+            row.per_tenant_inflight,
+        )
+        .ok_or_else(|| {
+            ThresholdError::Parse(format!(
+                "worker_admission.{worker} must have positive bounds with max_batch and \
+                 per_tenant_inflight no greater than max_ack_pending"
+            ))
+        })
     }
 
     pub fn resilient_config(
@@ -851,6 +890,33 @@ mod tests {
             .expect("the tuned shed budgets in the canonical file must validate (P-S33)");
         t.shed_budget_table_validated()
             .expect("the validated tuned table builds from the file");
+    }
+
+    #[test]
+    fn canonical_durable_workers_have_coherent_explicit_admission() {
+        let thresholds = Thresholds::load_canonical().expect("load");
+        for (worker, ack_pending, batch, per_tenant) in [
+            ("refs-edge-builder", 96, 32, 24),
+            ("notification-signal-router", 96, 32, 24),
+            ("agent-governed-trigger", 96, 32, 24),
+            ("ci-dispatch-trigger", 64, 32, 64),
+            ("git-check-projection", 64, 32, 16),
+        ] {
+            let admission = thresholds
+                .worker_admission(worker)
+                .unwrap_or_else(|error| panic!("{worker}: {error}"));
+            assert_eq!(admission.max_ack_pending().get(), ack_pending, "{worker}");
+            assert_eq!(admission.max_batch(), batch, "{worker}");
+            assert_eq!(
+                admission.per_tenant_inflight().get(),
+                per_tenant,
+                "{worker}"
+            );
+        }
+        assert!(matches!(
+            thresholds.worker_admission("missing-worker"),
+            Err(ThresholdError::Missing(_))
+        ));
     }
 
     #[test]

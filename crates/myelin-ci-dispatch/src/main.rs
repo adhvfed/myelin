@@ -6,7 +6,7 @@ use myelin_config::Mode;
 use myelin_events::nats::JetStreamConsumerConfig;
 use myelin_events::OutboxStore;
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
-use myelin_substrate::Config;
+use myelin_substrate::{Config, Thresholds};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -111,6 +111,12 @@ async fn main() {
             eprintln!("ci-dispatch: object-store dependency is temporarily unavailable; starting not-ready");
         }
     }
+    let admission = Thresholds::load_canonical()
+        .and_then(|thresholds| thresholds.worker_admission("ci-dispatch-trigger"))
+        .unwrap_or_else(|error| {
+            eprintln!("ci-dispatch: worker admission refused to start: {error}");
+            std::process::exit(1);
+        });
     let consumers = myelin_ci_dispatch::build_dispatch_consumers(
         git_root,
         blobs.clone(),
@@ -120,6 +126,7 @@ async fn main() {
         provider.config().region.clone(),
         minter,
         tokio::runtime::Handle::current(),
+        admission,
     )
     .unwrap_or_else(|e| {
         eprintln!("ci-dispatch: cannot register the ci-dispatch.trigger consumer: {e:?}");
@@ -133,7 +140,8 @@ async fn main() {
             EVENT_SUBJECT_ROOT,
             git_intake_filter(),
             EVENT_DURABLE_CONSUMER,
-        ),
+        )
+        .with_admission(admission),
         blobs,
         tokio::runtime::Handle::current(),
     );

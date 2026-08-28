@@ -190,6 +190,7 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
         "fr-par",
         Arc::new(UlidMinter::new()),
         rt.clone(),
+        myelin_events::DurableWorkerAdmission::new(64, 32, 64).unwrap(),
     )
     .unwrap();
 

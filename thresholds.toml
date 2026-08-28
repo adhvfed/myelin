@@ -5,7 +5,8 @@ as_of = "2026-08-18"
 # honesty note: values historically labelled "MEASURED" came from in-repo
 # simulations of the mechanisms, not from production measurement. every value
 # here is a tuning seed unless its comment names the production enforcement
-# point (today: the edge gateway rows marked ENFORCED).
+# point (today: the edge gateway shed rows and durable worker-admission rows
+# marked ENFORCED).
 
 [revocation]
 sla_mins = 5
@@ -143,6 +144,42 @@ surface = "HttpIntake"        # the generic /v1 API surface; ENFORCED at the edg
 per_tenant_in_flight_cap = 48 # sized under the edge's 64 global dispatch slots (server.rs): one
 human_lane_reservation = 12   # tenant's machine lanes hold at most 36, humans keep 12 reserved.
 retry_after_secs = 5
+
+# Durable worker bounds are a separate contract from request shedding: queued
+# events no longer have a waiting caller or a meaningful human reservation.
+# These values are ENFORCED together at each named service's JetStream pull
+# consumer and handler retry ledger. max_ack_pending bounds broker-owned work,
+# max_batch bounds one service tick, and per_tenant_inflight prevents one
+# tenant's unresolved retries from filling that whole window.
+[[worker_admission]]
+worker = "refs-edge-builder"
+max_ack_pending = 96
+max_batch = 32
+per_tenant_inflight = 24
+
+[[worker_admission]]
+worker = "notification-signal-router"
+max_ack_pending = 96
+max_batch = 32
+per_tenant_inflight = 24
+
+[[worker_admission]]
+worker = "agent-governed-trigger"
+max_ack_pending = 96
+max_batch = 32
+per_tenant_inflight = 24
+
+[[worker_admission]]
+worker = "ci-dispatch-trigger"
+max_ack_pending = 64
+max_batch = 32
+per_tenant_inflight = 64
+
+[[worker_admission]]
+worker = "git-check-projection"
+max_ack_pending = 64
+max_batch = 32
+per_tenant_inflight = 16
 
 [[resilient_client]]
 target = "identity-authz"        # the auth HOT PATH: `check`/`list_objects` (the authz spine, the

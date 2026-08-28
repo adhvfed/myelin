@@ -11,6 +11,13 @@ pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
 pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
 pub const EVENT_DURABLE_CONSUMER: &str = "agent-governed-trigger-intake";
 
+#[derive(Clone)]
+pub struct TriggerConsumerDurability {
+    pub dedup: myelin_events::DedupLedger,
+    pub dead_letters: std::sync::Arc<dyn myelin_events::DurableDeadLetter>,
+    pub admission: myelin_events::DurableWorkerAdmission,
+}
+
 pub fn trigger_intake_filter() -> String {
     format!("{EVENT_SUBJECT_ROOT}.evt.>")
 }
@@ -67,8 +74,7 @@ pub fn governed_trigger_consumer_reg(
     store: std::sync::Arc<dyn crate::trigger_consumer::TriggerBindingStore>,
     visibility: std::sync::Arc<dyn crate::trigger_consumer::TriggerOwnerVisibility>,
     approvals: std::sync::Arc<dyn crate::trigger_consumer::TriggerApprovalInbox>,
-    dedup: myelin_events::DedupLedger,
-    dead_letters: std::sync::Arc<dyn myelin_events::DurableDeadLetter>,
+    durability: TriggerConsumerDurability,
 ) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
     let subject = format!("myelin://{}/", tenant.0);
     let handler = crate::trigger_consumer::GovernedTriggerConsumer::new(
@@ -85,11 +91,14 @@ pub fn governed_trigger_consumer_reg(
             tenant.0
         )),
         &[subject.as_str()],
-        myelin_events::PrefetchBound::DEFAULT,
+        durability.admission.max_ack_pending(),
     )?;
     Ok(myelin_substrate::ConsumerReg::new(
-        myelin_events::Consumer::new(handler, subscription, dedup)
-            .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(dead_letters)),
+        myelin_events::Consumer::new(handler, subscription, durability.dedup)
+            .with_per_tenant_inflight(durability.admission.per_tenant_inflight())
+            .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(
+                durability.dead_letters,
+            )),
     ))
 }
 

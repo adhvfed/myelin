@@ -799,6 +799,7 @@ impl CiTriggerHandler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_trigger_consumer(
     reader: Arc<dyn GitConfigReader>,
     blobs: Arc<dyn BlobStore + Send + Sync>,
@@ -806,15 +807,17 @@ pub fn build_trigger_consumer(
     dedup: myelin_events::DedupLedger,
     expected_region: impl Into<String>,
     dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
+    admission: myelin_events::DurableWorkerAdmission,
 ) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
     let handler = CiTriggerHandler::for_region(reader, blobs, reserve, expected_region);
     let subscription = myelin_events::consumer::Subscription::bind(
         myelin_events::ConsumerName(TRIGGER_CONSUMER.into()),
         CI_TRIGGER_SUBJECT_STRS,
-        myelin_events::PrefetchBound::DEFAULT,
+        admission.max_ack_pending(),
     )?;
     Ok(myelin_substrate::ConsumerReg::new(
         myelin_events::Consumer::new(handler, subscription, dedup)
+            .with_per_tenant_inflight(admission.per_tenant_inflight())
             .with_upcaster(pr_trigger_upcasters().into_hook())
             .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(dead_letters)),
     ))

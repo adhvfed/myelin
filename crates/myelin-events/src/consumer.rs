@@ -77,6 +77,49 @@ impl Default for PerTenantInflight {
     }
 }
 
+/// Production bounds for one durable asynchronous worker.
+///
+/// `max_ack_pending` and `max_batch` are enforced by the broker pull consumer;
+/// `per_tenant_inflight` is enforced by [`Consumer`] while deliveries remain
+/// unresolved across retries. Keeping the three values together prevents a
+/// service from tuning the broker and handler halves independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableWorkerAdmission {
+    max_ack_pending: PrefetchBound,
+    max_batch: u32,
+    per_tenant_inflight: PerTenantInflight,
+}
+
+impl DurableWorkerAdmission {
+    pub fn new(max_ack_pending: u32, max_batch: u32, per_tenant_inflight: u32) -> Option<Self> {
+        let max_ack_pending = PrefetchBound::new(max_ack_pending)?;
+        let per_tenant_inflight = PerTenantInflight::new(per_tenant_inflight)?;
+        if max_batch == 0
+            || max_batch > max_ack_pending.get()
+            || per_tenant_inflight.get() > max_ack_pending.get()
+        {
+            return None;
+        }
+        Some(Self {
+            max_ack_pending,
+            max_batch,
+            per_tenant_inflight,
+        })
+    }
+
+    pub fn max_ack_pending(self) -> PrefetchBound {
+        self.max_ack_pending
+    }
+
+    pub fn max_batch(self) -> u32 {
+        self.max_batch
+    }
+
+    pub fn per_tenant_inflight(self) -> PerTenantInflight {
+        self.per_tenant_inflight
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerSpec {
     pub durable: ConsumerName,
@@ -93,6 +136,12 @@ impl ConsumerSpec {
             max_ack_pending: PrefetchBound::DEFAULT,
             per_tenant_inflight: PerTenantInflight::DEFAULT,
         }
+    }
+
+    pub fn with_admission(mut self, admission: DurableWorkerAdmission) -> Self {
+        self.max_ack_pending = admission.max_ack_pending();
+        self.per_tenant_inflight = admission.per_tenant_inflight();
+        self
     }
 }
 
@@ -987,6 +1036,19 @@ mod tests {
         );
         assert_eq!(PrefetchBound::new(8).unwrap().get(), 8);
         assert_eq!(PrefetchBound::DEFAULT.get(), 64);
+    }
+
+    #[test]
+    fn durable_worker_admission_rejects_incoherent_broker_and_tenant_bounds() {
+        let admission = DurableWorkerAdmission::new(96, 32, 24).expect("coherent bounds");
+        assert_eq!(admission.max_ack_pending().get(), 96);
+        assert_eq!(admission.max_batch(), 32);
+        assert_eq!(admission.per_tenant_inflight().get(), 24);
+
+        assert_eq!(DurableWorkerAdmission::new(0, 1, 1), None);
+        assert_eq!(DurableWorkerAdmission::new(96, 0, 24), None);
+        assert_eq!(DurableWorkerAdmission::new(96, 97, 24), None);
+        assert_eq!(DurableWorkerAdmission::new(96, 32, 97), None);
     }
 
     #[test]

@@ -58,7 +58,7 @@ pub use shed::{
 pub use store_kind::StoreKind;
 pub use thresholds::{
     CellSizing, DepthCeilings, DsrDeadline, FailStaticThreshold, FlexDb, Revocation, RpoRto,
-    ShedBudgetRow, Surge, ThresholdError, Thresholds, THRESHOLDS_FILENAME,
+    ShedBudgetRow, Surge, ThresholdError, Thresholds, WorkerAdmissionRow, THRESHOLDS_FILENAME,
 };
 pub use topology::{
     AllowPrincipal, AuditSink, Authorizer, DenyAll, IdorAuditRecord, InjectedIdentity,

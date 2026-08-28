@@ -3040,6 +3040,34 @@ Proof: all 159 CLI library tests; strict all-target/all-feature CLI Clippy;
 TypeScript typechecking; the rebuilt one-test CLI privacy journey; and all
 three rebuilt privacy lifecycle journeys against the running platform.
 
+## 2026-08-28 — durable workers own one explicit admission contract
+
+Five deployed JetStream consumers previously combined a finite broker default
+with an unrelated generic handler default. A service could tune its pull
+window without tuning per-tenant unresolved retries, or vice versa, and the
+canonical thresholds file described only request-shedding targets with human
+reservations that make no sense after work has entered a durable queue.
+
+`DurableWorkerAdmission` now validates one inseparable broker and handler
+contract: maximum unacknowledged deliveries, maximum pull batch, and maximum
+unresolved retries for one tenant. Refs projection, Notification routing,
+governed agent triggers, CI dispatch triggers, and Git check projection each
+load a named canonical row at startup, refuse missing or incoherent tuning,
+apply it to the real JetStream consumer, and pass the same value into the only
+production consumer builder. No builder retains an implicit production
+default. The request-shedding table remains separate because a queued event
+has neither a waiting caller nor a meaningful human lane to reserve.
+
+Proof: all 221 Events library stories; all 30 threshold stories; all 161 Agent
+Service and 96 CI Dispatch library stories; strict all-target/all-feature
+Clippy across Events, Substrate, Refs, Notifications, Agent Service, CI
+Dispatch, CI Control Plane, and Git; and the real PostgreSQL Refs and
+Notification consumer suites, which assert the canonical per-tenant cap at
+the live co-committing projector/router before applying durable effects; the
+real JetStream/PostgreSQL/object-store CI dispatch journey; and both
+PostgreSQL Git-check projection journeys, including constrained runtime-role
+RLS and lossless redelivery.
+
 ## 2026-08-28 — transport capacity follows credential and principal class
 
 Verified dispatch admission still began too late for four bounded resources.
@@ -3147,10 +3175,13 @@ running TypeScript overload journey against the rebuilt PostgreSQL-backed Edge.
    other people's content, Issue bodies/comments/custom fields, search
    projections, or Git. those holders remain absent rather than being
    represented by ceremonial receipts.
-3. **asynchronous worker admission is not explicit yet.** search, refs,
-   notification, and automation work arrives through durable NATS/SQL queues;
-   queue bounds and worker concurrency provide backpressure, but the matching
-   thresholds.toml shed rows are targets rather than production enforcement.
+3. **Search indexing is not a deployed durable worker yet.** Refs,
+   Notification, governed-agent, CI-dispatch, and Git-check NATS consumers now
+   enforce named broker/batch/per-tenant admission rows. Search's deployable
+   shell still registers no production index consumer, fetcher, or durable
+   index backing, so there is deliberately no worker-admission row to bless.
+   The existing `SearchQuery` shed row remains an interactive-surface target,
+   not evidence that indexing is running.
 4. **cross-product search is not surfaced yet.** the running product has bounded,
    authorization-filtered repository code search, but no Edge/CLI/browser surface over the
    Search service's issue, Knowledge, Chat, and CI projections.

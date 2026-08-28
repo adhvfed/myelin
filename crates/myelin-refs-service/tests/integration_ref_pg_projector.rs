@@ -20,6 +20,12 @@ use tokio::sync::OnceCell;
 
 static MIGRATED: OnceCell<()> = OnceCell::const_new();
 
+fn worker_admission() -> myelin_events::DurableWorkerAdmission {
+    myelin_substrate::Thresholds::load_canonical()
+        .and_then(|thresholds| thresholds.worker_admission("refs-edge-builder"))
+        .expect("canonical Refs worker admission")
+}
+
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
@@ -192,8 +198,14 @@ impl ProjectorHarness {
             dedup,
             dead_letters,
             runtime,
+            worker_admission(),
         )
         .expect("build the tenant-bound projector");
+        assert_eq!(
+            consumer.per_tenant_inflight_cap().get(),
+            24,
+            "the canonical Refs admission is applied at the live projector"
+        );
         Self {
             admin,
             app,
@@ -233,6 +245,7 @@ impl ProjectorHarness {
                 runtime.clone(),
             )),
             runtime,
+            worker_admission(),
         )
         .expect("build another region-bound projector")
     }
@@ -672,6 +685,7 @@ async fn a_new_tenant_can_start_linking_work_without_restarting_refs() {
         ))),
         Arc::new(DurableDeadLetterBacking::new(app.clone(), runtime.clone())),
         runtime,
+        worker_admission(),
     )
     .expect("build one cell-bound projector before the tenant exists");
     let source = ArtifactRef(format!("myelin://{}/chat/message/M1", tenant.0));

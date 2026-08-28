@@ -22,6 +22,12 @@ use myelin_tenancy::{Region, TenantId};
 
 static DATABASE_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn worker_admission() -> myelin_events::DurableWorkerAdmission {
+    myelin_substrate::Thresholds::load_canonical()
+        .and_then(|thresholds| thresholds.worker_admission("notification-signal-router"))
+        .expect("canonical Notification worker admission")
+}
+
 fn upsert(
     tenant: &TenantId,
     region: &Region,
@@ -734,8 +740,14 @@ async fn durable_router_co_commits_dedup_inbox_and_outbox() {
         dead_letters.clone(),
         std::sync::Arc::new(UlidMinter::new()),
         runtime,
+        worker_admission(),
     )
     .expect("build durable router");
+    assert_eq!(
+        consumer.per_tenant_inflight_cap().get(),
+        24,
+        "the canonical Notification admission is applied at the live router"
+    );
 
     let first = signal_envelope(&tenant, &region, &first_id);
     assert_eq!(
@@ -810,6 +822,7 @@ async fn durable_router_co_commits_dedup_inbox_and_outbox() {
         dead_letters,
         std::sync::Arc::new(UlidMinter::new()),
         tokio::runtime::Handle::current(),
+        worker_admission(),
     )
     .expect("build missing-transaction probe router");
     let no_tx = signal_envelope(&tenant, &region, &format!("router-no-tx-{nonce}"));

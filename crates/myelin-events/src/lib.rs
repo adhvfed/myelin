@@ -29,7 +29,8 @@ pub use check_seam::{
 };
 pub use consumer::{
     consume, install_payload_free_panic_hook, Consumer, ConsumerName, ConsumerSpec, DeadLetter,
-    Delivered, Message, PerTenantInflight, PrefetchBound, SubscribeError, Subscription,
+    Delivered, DurableWorkerAdmission, Message, PerTenantInflight, PrefetchBound, SubscribeError,
+    Subscription,
 };
 pub use crosscell::{
     assert_cell_agnostic, pointer_correlation, ArtifactType, CellId, CrossCellPointer,

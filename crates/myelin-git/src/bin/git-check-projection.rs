@@ -7,6 +7,7 @@ use myelin_git::check_status_store::{
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::{
     AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
+    Thresholds,
 };
 use std::sync::Arc;
 
@@ -67,11 +68,18 @@ async fn main() {
             runtime.clone(),
         ),
     );
+    let admission = Thresholds::load_canonical()
+        .and_then(|thresholds| thresholds.worker_admission("git-check-projection"))
+        .unwrap_or_else(|error| {
+            eprintln!("{SERVICE_NAME}: worker admission refused: {error}");
+            std::process::exit(1);
+        });
     let consumer = build_durable_check_consumer(
         runtime.clone(),
         provider.config().region.clone(),
         dedup,
         dead_letters,
+        admission,
     )
     .unwrap_or_else(|error| {
         eprintln!("{SERVICE_NAME}: cannot register check consumer: {error:?}");
@@ -84,7 +92,8 @@ async fn main() {
             EVENT_SUBJECT_ROOT,
             check_intake_filter(),
             EVENT_DURABLE_CONSUMER,
-        ),
+        )
+        .with_admission(admission),
         runtime.clone(),
     )
     .unwrap_or_else(|_| {

@@ -11,7 +11,7 @@ use myelin_refs_service::{
 use myelin_storage::{
     all_durable_migrations, DurablePlacementBacking, HotTables, PgBootstrap, PgOutboxBacking,
 };
-use myelin_substrate::{Config, ConsumerReg};
+use myelin_substrate::{Config, ConsumerReg, Thresholds};
 
 #[tokio::main]
 async fn main() {
@@ -83,6 +83,9 @@ async fn main() {
     );
     let store = PgEdgeStore::new(provider.db_pool().clone());
     let region = myelin_tenancy::Region(provider.config().region.clone());
+    let admission = Thresholds::load_canonical()
+        .and_then(|thresholds| thresholds.worker_admission("refs-edge-builder"))
+        .unwrap_or_else(|error| refuse_start("worker admission", error));
     let consumers = vec![build_pg_cell_edge_consumer(
         &cell_id,
         &region,
@@ -90,6 +93,7 @@ async fn main() {
         dedup,
         dead_letters,
         runtime.clone(),
+        admission,
     )
     .map(ConsumerReg::new)
     .unwrap_or_else(|error| refuse_start("cell-bound edge consumer", format!("{error:?}")))];
@@ -100,7 +104,8 @@ async fn main() {
             EVENT_SUBJECT_ROOT,
             refs_intake_filter(),
             EVENT_DURABLE_CONSUMER,
-        ),
+        )
+        .with_admission(admission),
         runtime.clone(),
     )
     .unwrap_or_else(|error| refuse_start("durable event intake", format!("{error:?}")));

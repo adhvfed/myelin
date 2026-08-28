@@ -672,12 +672,14 @@ pub fn build_durable_check_consumer(
     expected_region: impl Into<String>,
     dedup: DedupLedger,
     dead_letters: std::sync::Arc<dyn myelin_events::DurableDeadLetter>,
+    admission: myelin_events::DurableWorkerAdmission,
 ) -> Result<Consumer<DurableCheckStatusConsumer>, SubscribeError> {
     consume(
         ConsumerSpec::new(
             ConsumerName(CHECK_STATUS_CONSUMER.into()),
             &[CHECK_STATUS_SUBJECT_PREFIX],
-        ),
+        )
+        .with_admission(admission),
         DurableCheckStatusConsumer::new(runtime, expected_region),
         dedup,
     )

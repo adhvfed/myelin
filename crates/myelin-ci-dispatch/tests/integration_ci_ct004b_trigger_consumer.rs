@@ -1097,6 +1097,7 @@ async fn finding6_build_dispatch_consumers_registers_the_live_trigger_consumer()
         "fr-par",
         Arc::new(UlidMinter::new()),
         rt.clone(),
+        myelin_events::DurableWorkerAdmission::new(64, 32, 64).unwrap(),
     )
     .expect("build_dispatch_consumers registers the trigger consumer");
 

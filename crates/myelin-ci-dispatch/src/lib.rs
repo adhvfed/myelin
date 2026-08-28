@@ -215,6 +215,7 @@ pub fn build_dispatch_consumers(
     expected_region: impl Into<String>,
     minter: std::sync::Arc<dyn myelin_events::IdMinter>,
     rt: tokio::runtime::Handle,
+    admission: myelin_events::DurableWorkerAdmission,
 ) -> Result<Vec<ConsumerReg>, myelin_events::SubscribeError> {
     use std::sync::Arc;
     let reader: Arc<dyn consumer::GitConfigReader> =
@@ -223,13 +224,14 @@ pub fn build_dispatch_consumers(
         ));
     let reserve: Arc<dyn consumer::ReserveStore> =
         Arc::new(consumer::CoCommitReserveStore::new(ci_run, minter, rt));
-    Ok(vec![build_trigger_consumer(
+    Ok(vec![consumer::build_trigger_consumer(
         reader,
         blobs,
         reserve,
         dedup,
         expected_region,
         dead_letters,
+        admission,
     )?])
 }
 

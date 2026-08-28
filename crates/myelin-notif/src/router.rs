@@ -664,6 +664,7 @@ pub fn build_durable_router(
     dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
     minter: Arc<dyn IdMinter>,
     runtime: tokio::runtime::Handle,
+    admission: myelin_events::DurableWorkerAdmission,
 ) -> Result<Consumer<SignalRouter>, SubscribeError> {
     let prefix = signal_subject_prefix(tenant)
         .ok_or_else(|| SubscribeError::WildcardSubject(format!("sig.{}.", tenant.0)))?;
@@ -681,7 +682,8 @@ pub fn build_durable_router(
         ConsumerSpec::new(
             ConsumerName(ROUTER_CONSUMER_NAME.into()),
             &[prefix.as_str()],
-        ),
+        )
+        .with_admission(admission),
         router,
         dedup,
     )

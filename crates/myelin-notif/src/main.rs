@@ -10,7 +10,7 @@ use myelin_notif::{
 use myelin_storage::{
     all_durable_migrations, DurablePlacementBacking, HotTables, PgBootstrap, PgOutboxBacking,
 };
-use myelin_substrate::Config;
+use myelin_substrate::{Config, Thresholds};
 use myelin_tenancy::TenantId;
 use std::sync::Arc;
 
@@ -98,6 +98,12 @@ async fn main() {
     );
     let minter: Arc<dyn myelin_events::IdMinter> = Arc::new(UlidMinter::new());
     let inbox = PgInboxStore::new(provider.db_pool().clone());
+    let admission = Thresholds::load_canonical()
+        .and_then(|thresholds| thresholds.worker_admission("notification-signal-router"))
+        .unwrap_or_else(|error| {
+            eprintln!("notif: worker admission refused to start: {error}");
+            std::process::exit(1);
+        });
     let mut consumers = Vec::with_capacity(local_tenants.len());
     for tenant in &local_tenants {
         let consumer = build_durable_router(
@@ -109,6 +115,7 @@ async fn main() {
             dead_letters.clone(),
             minter.clone(),
             runtime.clone(),
+            admission,
         )
         .unwrap_or_else(|error| {
             eprintln!(
@@ -127,7 +134,8 @@ async fn main() {
             EVENT_SUBJECT_ROOT,
             signal_intake_filter(),
             EVENT_DURABLE_CONSUMER,
-        ),
+        )
+        .with_admission(admission),
         runtime.clone(),
     )
     .unwrap_or_else(|_error| {

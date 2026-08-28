@@ -135,8 +135,14 @@ async fn real_ci_draft_cocommits_into_git_projection_and_redelivers_without_loss
         runtime.clone(),
     )));
     let dead_letters = Arc::new(DurableDeadLetterBacking::new(pool.clone(), runtime.clone()));
-    let consumer =
-        build_durable_check_consumer(runtime, REGION, dedup, dead_letters).expect("bind consumer");
+    let consumer = build_durable_check_consumer(
+        runtime,
+        REGION,
+        dedup,
+        dead_letters,
+        myelin_events::DurableWorkerAdmission::new(64, 32, 16).unwrap(),
+    )
+    .expect("bind consumer");
 
     let first = check_event(
         "ci-git-check-failure-1",
@@ -327,6 +333,7 @@ async fn production_migration_and_app_role_consumer_enforce_tenant_region_rls() 
             runtime.clone(),
         ))),
         Arc::new(DurableDeadLetterBacking::new(app.clone(), runtime)),
+        myelin_events::DurableWorkerAdmission::new(64, 32, 16).unwrap(),
     )
     .unwrap();
     let event = check_event(

@@ -107,6 +107,12 @@ impl JetStreamConsumerConfig {
         }
     }
 
+    pub fn with_admission(mut self, admission: crate::DurableWorkerAdmission) -> Self {
+        self.max_ack_pending = i64::from(admission.max_ack_pending().get());
+        self.max_batch = admission.max_batch() as usize;
+        self
+    }
+
     fn validate(&self) -> Result<(), TransportError> {
         if self.nats_url.trim().is_empty()
             || self.stream_name.trim().is_empty()
@@ -1147,6 +1153,26 @@ mod publisher_tests {
         let mut escaped = config;
         escaped.filter_subject = "other.events.>".into();
         assert!(escaped.validate().is_err());
+    }
+
+    #[test]
+    fn durable_worker_admission_controls_the_actual_pull_window() {
+        let admission = crate::DurableWorkerAdmission::new(96, 32, 24).unwrap();
+        let config = JetStreamConsumerConfig::bounded(
+            "nats://127.0.0.1:4222",
+            "MYELIN_EVENTS",
+            "myelin.events",
+            "myelin.events.evt.*.refs.>",
+            "refs-edge-builder-intake",
+        )
+        .with_admission(admission);
+
+        config.validate().unwrap();
+        assert_eq!(config.max_ack_pending, 96);
+        assert_eq!(config.max_batch, 32);
+        let pull = config.pull_config();
+        assert_eq!(pull.max_ack_pending, 96);
+        assert_eq!(pull.max_batch, 32);
     }
 
     #[test]

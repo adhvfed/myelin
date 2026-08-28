@@ -5,7 +5,7 @@ use myelin_agent_service::trigger_consumer::durable::{
 };
 use myelin_agent_service::{
     governed_trigger_consumer_reg, run_agent_ingestion_until_shutdown, trigger_intake_filter,
-    EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT,
+    TriggerConsumerDurability, EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT,
 };
 use myelin_config::Mode;
 use myelin_events::nats::{JetStreamConsumerConfig, NatsJetStreamBus};
@@ -16,7 +16,7 @@ use myelin_storage::{
     all_durable_migrations, seal_key_from_env, DurableAgentTriggerBacking, DurableCellRootBacking,
     DurableKmsBacking, DurablePlacementBacking, HotTables, PgBootstrap, PgOutboxBacking,
 };
-use myelin_substrate::Config;
+use myelin_substrate::{Config, Thresholds};
 use myelin_tenancy::{Region, TenantId};
 
 #[tokio::main]
@@ -117,6 +117,9 @@ async fn main() {
         ),
     );
     let region = Region(provider.config().region.clone());
+    let admission = Thresholds::load_canonical()
+        .and_then(|thresholds| thresholds.worker_admission("agent-governed-trigger"))
+        .unwrap_or_else(|error| refuse_start("worker admission", error));
     let consumers = tenants
         .iter()
         .map(|tenant| {
@@ -126,8 +129,11 @@ async fn main() {
                 trigger_store.clone(),
                 visibility.clone(),
                 approvals.clone(),
-                dedup.clone(),
-                dead_letters.clone(),
+                TriggerConsumerDurability {
+                    dedup: dedup.clone(),
+                    dead_letters: dead_letters.clone(),
+                    admission,
+                },
             )
             .unwrap_or_else(|error| {
                 refuse_start(
@@ -144,7 +150,8 @@ async fn main() {
             EVENT_SUBJECT_ROOT,
             trigger_intake_filter(),
             EVENT_DURABLE_CONSUMER,
-        ),
+        )
+        .with_admission(admission),
         runtime.clone(),
     )
     .unwrap_or_else(|error| refuse_start("durable event intake", format!("{error:?}")));

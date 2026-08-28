@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use myelin_events::{
-    consume, Backoff, Consumer, ConsumerName, ConsumerSpec, DedupLedger, EventEnvelope,
-    EventHandler, HandleOutcome, HandlerTx, Reason, SubjectPattern, SubscribeError,
+    consume, Backoff, Consumer, ConsumerName, ConsumerSpec, DedupLedger, DurableWorkerAdmission,
+    EventEnvelope, EventHandler, HandleOutcome, HandlerTx, Reason, SubjectPattern, SubscribeError,
 };
 use myelin_storage::PiiKeyRef;
 use myelin_tenancy::{Region, TenantId};
@@ -301,6 +301,7 @@ pub fn build_pg_edge_consumer(
     dedup: DedupLedger,
     dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
     runtime: tokio::runtime::Handle,
+    admission: DurableWorkerAdmission,
 ) -> Result<Consumer<PgEdgeProjector>, SubscribeError> {
     let artifact_prefix = format!("myelin://{}/", tenant.0);
     let subjects = vec![SubjectPattern(artifact_prefix.clone())];
@@ -311,7 +312,7 @@ pub fn build_pg_edge_consumer(
         runtime,
         subjects,
     );
-    build_consumer(projector, artifact_prefix, dedup, dead_letters)
+    build_consumer(projector, artifact_prefix, dedup, dead_letters, admission)
 }
 
 pub fn build_pg_cell_edge_consumer(
@@ -321,6 +322,7 @@ pub fn build_pg_cell_edge_consumer(
     dedup: DedupLedger,
     dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
     runtime: tokio::runtime::Handle,
+    admission: DurableWorkerAdmission,
 ) -> Result<Consumer<PgEdgeProjector>, SubscribeError> {
     let artifact_prefix = "myelin://".to_string();
     let subjects = vec![SubjectPattern(artifact_prefix.clone())];
@@ -331,7 +333,7 @@ pub fn build_pg_cell_edge_consumer(
         runtime,
         subjects,
     );
-    build_consumer(projector, artifact_prefix, dedup, dead_letters)
+    build_consumer(projector, artifact_prefix, dedup, dead_letters, admission)
 }
 
 fn build_consumer(
@@ -339,12 +341,14 @@ fn build_consumer(
     artifact_prefix: String,
     dedup: DedupLedger,
     dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
+    admission: DurableWorkerAdmission,
 ) -> Result<Consumer<PgEdgeProjector>, SubscribeError> {
     consume(
         ConsumerSpec::new(
             ConsumerName(crate::edge_builder::EDGE_BUILDER_CONSUMER.into()),
             &[artifact_prefix.as_str()],
-        ),
+        )
+        .with_admission(admission),
         projector,
         dedup,
     )
