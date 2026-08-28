@@ -3602,9 +3602,7 @@ dependencies = [
  "myelin-config",
  "myelin-content",
  "myelin-events",
- "myelin-flow",
  "myelin-gdpr",
- "myelin-harness",
  "myelin-identity",
  "myelin-identity-service",
  "myelin-issues",
@@ -3619,7 +3617,6 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
- "yrs",
 ]
 
 [[package]]

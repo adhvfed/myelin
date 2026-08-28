@@ -3454,6 +3454,29 @@ test suite; strict all-target/all-feature Issues Clippy; and repository-wide
 symbol search finds no surviving caller or export from the removed query chain.
 Net removal: 4,977 lines.
 
+## 2026-08-28 — Issues stops claiming workers it never starts
+
+The Issues process explicitly starts zero consumers, and Edge's durable issue
+mutations do not call the exported workflow, CI guard, reflex, trigger, SLA,
+rollup, reorder, or CRDT engines. Those modules nevertheless carried extensive
+unit/CDC/drill/“E2E” suites over in-memory timers, maps, outboxes, notification
+routers, and Yjs documents. The cross-cell drills similarly assembled local
+resolvers and receipts without control-plane routing or durable member-cell
+work. None started the Issues service, delivered through its broker topology,
+or committed to `PgIssueStore`.
+
+The isolated automation cluster and its copied tests are gone. Shared Query,
+Notification, Flow, and order-key primitives remain at their actual owners;
+Issues retains its durable create/list/close/import, authorization projection,
+reference, outbox, notification-declaration, and privacy paths. Workflow,
+automation, SLA, hierarchy/rollup, and collaborative reorder now remain honest
+product gaps until they are built at those durable boundaries.
+
+Proof: all 167 remaining Issues library stories and the complete normal Issues
+test suite; strict all-target/all-feature Issues Clippy; and repository-wide
+symbol search finds no caller for the removed engines. Net removal: 9,516
+lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3498,8 +3521,8 @@ Net removal: 4,977 lines.
    composed. Event-driven cache invalidation and live card updates also remain unwired.
 6. **Issues has no production live-board transport yet.** the browser offers durable,
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
-   resume/snapshot boundary, or reconnecting board client. the former in-memory facade
-   was removed rather than counted as shipped behavior.
+   resume/snapshot boundary, reconnecting board client, or durable collaborative reorder.
+   the former in-memory and Yjs facades were removed rather than counted as shipped behavior.
 7. **CI has no user-visible cache yet.** the old process-local namespace is gone;
    the later unused `artifact_cache` facade and its fabricated event are also gone.
    the historical `cache_entry` table has no store, pipeline syntax, runner
@@ -3523,12 +3546,12 @@ Net removal: 4,977 lines.
     consumer, durable regional analytics store, authenticated API, or user
     journey; the remaining backup tier token is policy vocabulary, not proof
     that an analytics product is running.
-11. **Issues governance configuration is not surfaced.** Workflow, SLA, trigger,
-    and Identity primitives exist, but the removed scheme resolver and static
-    screen catalogue were not durable configuration or an authenticated admin
-    API/browser UI. A truthful replacement needs stored schemes and assignments,
-    permission inspection at the Identity boundary, validation responses, and
-    full-system admin journeys.
+11. **Issues governance configuration is not surfaced.** Identity primitives
+    exist, but the removed scheme resolver, workflow/SLA/trigger engines, and
+    static screen catalogue were not durable configuration or an authenticated
+    admin API/browser UI. A truthful replacement needs stored schemes and
+    assignments, permission inspection at the Identity boundary, validation
+    responses, and full-system admin journeys.
 12. **Issue cycles, milestones, and attachments have no product boundary.** The
     former time-axis helper wrote only to an in-process outbox and generic blob
     adapter. There is no durable owner store, authenticated API, issue mutation,
@@ -3538,3 +3561,8 @@ Net removal: 4,977 lines.
     planner and facet feeder never reached it. Dynamic fields need a durable
     definition/usage store, safe SQL lowering integrated into `PgIssueStore`,
     online index lifecycle ownership, and a live Edge/browser journey.
+14. **Issue automation and hierarchy processing are not shipped.** There is no
+    durable workflow transition command, CI/reflex/trigger/SLA consumer, parent
+    rollup store, or cross-cell portfolio worker. Agent tool discovery must not
+    advertise these as runnable effects until each has an authorized executor
+    and a restart-safe full-system journey.

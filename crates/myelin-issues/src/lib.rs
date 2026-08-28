@@ -3,9 +3,7 @@
 pub mod agent_spend;
 pub mod api;
 pub mod app;
-pub mod ci_guard;
 pub mod content;
-pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
 pub mod durable_erase;
@@ -13,23 +11,15 @@ pub mod events;
 mod import_source;
 pub mod keys;
 pub mod migrations;
-pub mod move_crdt;
 pub mod my_work;
 pub mod pg_issue_store;
 pub mod post_restore;
 pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
-pub mod reflexes;
 pub mod refs_glue;
-pub mod reorder;
 pub mod replay;
-pub mod rollup;
 pub mod schema;
-pub mod sla_calendar;
-pub mod sla_escalation;
-pub mod trigger;
-pub mod workflow;
 pub mod write_path;
 
 pub use app::{boot_issues, issues_app_spec, run_issues, run_issues_until_shutdown, SERVICE_NAME};
@@ -94,39 +84,9 @@ pub use keys::{
 };
 pub use write_path::create_issue;
 
-pub use reorder::{
-    cmp_ranked, rebalance, reorder, same_displayed_sequence, BoardRanking, RankedIssue,
-    ReorderError, ReorderOutcome, ReorderRequest,
-};
-
-pub use move_crdt::{MoveCrdtBoard, MoveCrdtError, ReorderPressure};
-
-pub use cross_cell_rollup::{
-    CellLocalRollupResolver, CrossCellDsrFanout, CrossCellPortfolioRollup, CrossCellRollupPointer,
-    DsrCellReceipt, PortfolioProjection,
-};
-
 pub use content::{
     emit_content_event, is_issue_block, paragraph_body, roundtrips_md, validate_subtree,
     CasConflict, ContentError, ContentKind, IssueContent, SubsetError, ISSUES_EXCLUDED_BLOCKS,
-};
-
-pub use workflow::{
-    arm_trigger_body, blocked_by_guard, example_arm_trigger, linked_pr_ci_green_guard,
-    ArmedTrigger, GuardVar, IssueContext, PostAction, StateCategory, TransitionBlocked,
-    TransitionPlan, Workflow, WorkflowError, WorkflowGuard, WorkflowState, WorkflowTransition,
-};
-
-pub use ci_guard::{
-    bind_linked_pr_ctx, ci_done_guard, plan_agent_ci_gated_transition, plan_ci_gated_transition,
-    AgentTransitionOutcome, LinkedPrCheck, CHECK_STATE_NEUTRAL, CHECK_STATE_SUCCESS,
-    TRUST_TIER_TRUSTED, TRUST_TIER_UNTRUSTED_FORK,
-};
-
-pub use rollup::{
-    aggregate_snapshot, recompute_incremental, rollup_recomputed_draft, walk_parent_edges,
-    DebounceCoalescer, DebounceWindow, LeafFact, RecomputeOutcome, RollupAggregate, RollupConsumer,
-    RollupStore,
 };
 
 pub use import_source::SourceSystem;
@@ -135,14 +95,6 @@ pub use my_work::{
     issue_humanise_templates, list_my_work, list_my_work_default, my_work_filter,
     register_issue_humanise_templates, wire_issues_my_work, ISSUE_HUMANISE_TEMPLATES,
     TPL_APPROVAL_REQUESTED, TPL_SLA_AT_RISK, TPL_UNBLOCKED,
-};
-
-pub use reflexes::{
-    linked_pr_from_payload, plan_branch_created, plan_chat_message_created, plan_check_updated,
-    plan_member_event, plan_pr_merged, plan_pr_opened, plan_reflex, reflex_subjects,
-    ReflexConsumer, ReflexEffect, AUTO_STATE_DONE, AUTO_STATE_IN_PROGRESS, CHAT_MESSAGE_CREATED,
-    CI_CHECK_UPDATED, GIT_BRANCH_CREATED, GIT_PR_MERGED, GIT_PR_OPENED, IDENTITY_MEMBER_ADDED,
-    IDENTITY_MEMBER_DEACTIVATED, IDENTITY_MEMBER_ERASED, REFLEX_SUBJECTS,
 };
 
 pub use refs_glue::{
@@ -156,10 +108,4 @@ pub use refs_glue::{
 pub use agent_spend::{
     per_effect_idem_key, spend_bearing_run, BalancedRunSignal, DispatchedRun, IssueRunKind,
     IssueSpendGate, SpendError,
-};
-
-pub use trigger::{
-    default_stale_after, ArmRequest, ArmableCondition, IssueTriggerEngine, TriggerInboxItem,
-    TriggerInboxKind, TriggerSnapshot, DEFAULT_STALE_AFTER_DAYS, VAR_ASSIGNEE,
-    VAR_BLOCKED_BY_UNRESOLVED, VAR_STATE_CATEGORY,
 };
