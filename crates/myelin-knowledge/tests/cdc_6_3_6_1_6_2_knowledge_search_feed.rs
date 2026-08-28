@@ -4,13 +4,13 @@ use myelin_identity::{
 };
 use myelin_knowledge::search_feed::{
     feed_project, kn_declared_index_specs, kn_read_permission, kn_search_query, kn_search_semantic,
-    register_kn_index_specs, FeedGrain, KN_SEARCH_OBJECT_TYPE,
+    FeedGrain, KN_SEARCH_OBJECT_TYPE,
 };
 use myelin_query::{CmpOp, Expr, FieldType, FieldValue, OrderKey, Predicate, QueryAst};
 use myelin_search::{
-    ConsistencyStats, EmbeddingAdapter, FieldDecl, FieldSchema, IncrementalIndexer, IndexBackend,
-    IndexDocument, IndexSpec, ListObjectsPort, MockEmbeddingAdapter, Page, QueryStats,
-    ScopedEngine, TantivyBackend, VectorQuery, FT_BODY_FIELD, ORDER_KEY_FIELD, SEMANTIC_FIELD,
+    ConsistencyStats, EmbeddingAdapter, FieldDecl, FieldSchema, IndexBackend, IndexDocument,
+    IndexSpec, ListObjectsPort, MockEmbeddingAdapter, Page, QueryStats, ScopedEngine,
+    TantivyBackend, VectorQuery, FT_BODY_FIELD, ORDER_KEY_FIELD, SEMANTIC_FIELD,
 };
 use myelin_tenancy::TenantId;
 use std::collections::BTreeMap;
@@ -106,33 +106,6 @@ fn provider_knowledge_declares_its_index_specs() {
             s.subsystem, "knowledge",
             "owned under the knowledge subsystem token"
         );
-    }
-}
-
-#[test]
-fn consumer_search_admits_the_declared_specs() {
-    let accepted = register_kn_index_specs();
-    assert_eq!(
-        accepted,
-        kn_declared_index_specs(),
-        "Search admits exactly the declared KN specs"
-    );
-    let _ix = IncrementalIndexer::new(
-        kn_declared_index_specs(),
-        std::sync::Arc::new(NullFetcher),
-        std::sync::Arc::new(MockEmbeddingAdapter::new(16)),
-    );
-}
-
-struct NullFetcher;
-impl myelin_search::ProjectFetcher for NullFetcher {
-    fn project(
-        &self,
-        _t: &myelin_tenancy::TenantId,
-        _r: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<myelin_search::SearchProjection, myelin_search::ProjectFetchError> {
-        Err(myelin_search::ProjectFetchError::Gone)
     }
 }
 

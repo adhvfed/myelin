@@ -30,29 +30,6 @@ pub fn ci_log_index_specs() -> Vec<IndexSpec> {
     vec![ci_log_index_spec()]
 }
 
-pub fn register_ci_log_index_specs() -> Vec<IndexSpec> {
-    let specs = ci_log_index_specs();
-    let _accepted = crate::indexer::IncrementalIndexer::new(
-        specs.clone(),
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
-    );
-    specs
-}
-
-struct NullProjectFetcher;
-
-impl crate::indexer::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<SearchProjection, crate::indexer::ProjectFetchError> {
-        Err(crate::indexer::ProjectFetchError::Gone)
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CiLogProjectionInput {
     pub run_id: String,
@@ -125,8 +102,6 @@ pub fn parse_step_anchor(anchor: &str) -> Option<CiLogStepAnchor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::IncrementalIndexer;
-
     #[test]
     fn ci_log_spec_is_the_consumed_11_8_shape() {
         let s = ci_log_index_spec();
@@ -172,21 +147,6 @@ mod tests {
                 "`{absent}` is full-text projection body, not a structured facet"
             );
         }
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_ci_log_index_specs();
-        assert_eq!(
-            accepted,
-            ci_log_index_specs(),
-            "Search accepts the declared CI-log spec verbatim"
-        );
-        let _ix = IncrementalIndexer::new(
-            ci_log_index_specs(),
-            std::sync::Arc::new(NullProjectFetcher),
-            std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
-        );
     }
 
     #[test]

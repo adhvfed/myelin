@@ -1,21 +1,8 @@
 use myelin_query::FieldType;
 use myelin_search::{
-    kn_index_specs, kn_page_index_spec, kn_row_index_spec, register_kn_index_specs,
-    IncrementalIndexer, IndexSpec, MockEmbeddingAdapter, ProjectFetcher, FACET_ARTIFACT_REF,
-    FACET_EMBED, FACET_MENTION,
+    kn_index_specs, kn_page_index_spec, kn_row_index_spec, FACET_ARTIFACT_REF, FACET_EMBED,
+    FACET_MENTION,
 };
-
-struct NullFetcher;
-impl ProjectFetcher for NullFetcher {
-    fn project(
-        &self,
-        _t: &myelin_tenancy::TenantId,
-        _r: &myelin_tenancy::Region,
-        _a: &myelin_tenancy::ArtifactRef,
-    ) -> Result<myelin_search::SearchProjection, myelin_search::ProjectFetchError> {
-        Err(myelin_search::ProjectFetchError::Gone)
-    }
-}
 
 #[test]
 fn producer_kn_page_spec_is_the_frozen_6_3_shape() {
@@ -92,34 +79,5 @@ fn producer_kn_specs_serialize_to_the_6_3_wire_shape() {
         page_json["struct_fields"],
         serde_json::json!({ "mention": "Relation", "artifact_ref": "Relation", "embed": "Relation" }),
         "the structured inline-node facets serialize to the typed columnar shape"
-    );
-}
-
-#[test]
-fn consumer_search_admits_the_kn_specs() {
-    let _indexer = IncrementalIndexer::new(
-        kn_index_specs(),
-        std::sync::Arc::new(NullFetcher),
-        std::sync::Arc::new(MockEmbeddingAdapter::new(16)),
-    );
-    let accepted: Vec<IndexSpec> = register_kn_index_specs();
-    assert_eq!(
-        accepted,
-        kn_index_specs(),
-        "Search accepts the declared KN specs verbatim"
-    );
-}
-
-#[test]
-fn consumer_kn_specs_coexist_with_another_producer() {
-    let mut issue_fields = std::collections::BTreeMap::new();
-    issue_fields.insert("status".to_string(), FieldType::Select);
-    let issue = IndexSpec::new("issue", "issue", issue_fields);
-    let mut specs = kn_index_specs();
-    specs.push(issue);
-    let _indexer = IncrementalIndexer::new(
-        specs,
-        std::sync::Arc::new(NullFetcher),
-        std::sync::Arc::new(MockEmbeddingAdapter::new(16)),
     );
 }

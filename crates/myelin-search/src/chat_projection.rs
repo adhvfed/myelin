@@ -22,29 +22,6 @@ pub fn message_index_specs() -> Vec<IndexSpec> {
     vec![message_index_spec()]
 }
 
-pub fn register_message_index_specs() -> Vec<IndexSpec> {
-    let specs = message_index_specs();
-    let _accepted = crate::indexer::IncrementalIndexer::new(
-        specs.clone(),
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
-    );
-    specs
-}
-
-struct NullProjectFetcher;
-
-impl crate::indexer::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<SearchProjection, crate::indexer::ProjectFetchError> {
-        Err(crate::indexer::ProjectFetchError::Gone)
-    }
-}
-
 pub fn message_search_projection(body: &[Block], lang: Option<&str>) -> SearchProjection {
     crate::kn_projection::page_search_projection(body, lang)
 }
@@ -56,7 +33,6 @@ pub fn message_doc_ref(tenant: &str, message_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::IncrementalIndexer;
     use myelin_content::{parse_inline, Block, HeadingLevel, InlineNode};
     use myelin_events::ArtifactRef;
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -130,21 +106,6 @@ mod tests {
                 "`{absent}` is full-text projection body, not a structured facet"
             );
         }
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_message_index_specs();
-        assert_eq!(
-            accepted,
-            message_index_specs(),
-            "Search accepts the declared Chat spec verbatim"
-        );
-        let _ix = IncrementalIndexer::new(
-            message_index_specs(),
-            std::sync::Arc::new(NullProjectFetcher),
-            std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
-        );
     }
 
     #[test]

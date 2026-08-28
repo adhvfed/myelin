@@ -32,29 +32,6 @@ pub fn issue_facets_projection_spec() -> IndexSpec {
         .with_acl_object_type(object_types::ISSUE)
 }
 
-pub fn register_issue_facets_projection_spec() -> IndexSpec {
-    let spec = issue_facets_projection_spec();
-    let _accepted = myelin_search::IncrementalIndexer::new(
-        vec![spec.clone()],
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(myelin_search::MockEmbeddingAdapter::new(8)),
-    );
-    spec
-}
-
-struct NullProjectFetcher;
-
-impl myelin_search::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<myelin_search::SearchProjection, myelin_search::ProjectFetchError> {
-        Err(myelin_search::ProjectFetchError::Gone)
-    }
-}
-
 pub const RULE_KEY_SLA_AT_RISK: &str = "issue.sla.at_risk";
 pub const RULE_KEY_UNBLOCKED: &str = "issue.trigger.unblocked";
 pub const RULE_KEY_APPROVAL_REQUESTED: &str = "issue.approval.requested";
@@ -210,16 +187,6 @@ mod tests {
                 "rank": "OrderKey",
             }),
             "the structured facets serialize to the typed columnar shape (13.3)"
-        );
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_issue_facets_projection_spec();
-        assert_eq!(
-            accepted,
-            issue_facets_projection_spec(),
-            "Search accepts the declared spec verbatim"
         );
     }
 

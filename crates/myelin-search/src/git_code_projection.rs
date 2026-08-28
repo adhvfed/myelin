@@ -30,29 +30,6 @@ pub fn git_index_specs() -> Vec<IndexSpec> {
     vec![git_code_projection_spec()]
 }
 
-pub fn register_git_index_specs() -> Vec<IndexSpec> {
-    let specs = git_index_specs();
-    let _accepted = crate::indexer::IncrementalIndexer::new(
-        specs.clone(),
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
-    );
-    specs
-}
-
-struct NullProjectFetcher;
-
-impl crate::indexer::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<SearchProjection, crate::indexer::ProjectFetchError> {
-        Err(crate::indexer::ProjectFetchError::Gone)
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitBlobProjectionInput {
     pub path: String,
@@ -158,8 +135,6 @@ fn normalize_for_trigrams(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::IncrementalIndexer;
-
     #[test]
     fn spec_is_gits_owned_6_5_shape() {
         let s = git_code_projection_spec();
@@ -213,21 +188,6 @@ mod tests {
             obj["struct_fields"],
             serde_json::json!({ "path": "Text", "language": "Text", "blob_oid": "Text" }),
             "the structured facets serialize to the typed columnar shape (13.3)"
-        );
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_git_index_specs();
-        assert_eq!(
-            accepted,
-            git_index_specs(),
-            "Search accepts the declared git spec verbatim"
-        );
-        let _ix = IncrementalIndexer::new(
-            git_index_specs(),
-            std::sync::Arc::new(NullProjectFetcher),
-            std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
         );
     }
 

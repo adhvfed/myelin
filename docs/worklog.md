@@ -3653,6 +3653,26 @@ complete normal suites; strict all-target/all-feature Clippy across CI sandbox,
 CI control-plane, and Edge; and repository-wide search finding no remaining CI
 reindex source or discarded index registration. Net removal: 786 lines.
 
+## 2026-08-28 — Index declarations no longer impersonate registration
+
+Chat, Knowledge, Issues, Git, CI-log, and Search-side projection modules each
+offered a `register_*` function. Every implementation constructed an indexer
+with a null project fetcher and mock embedding adapter, immediately discarded
+it, and returned the caller's specs unchanged. Their CDC tests repeated the
+same ceremony or proved unrelated spec vectors could coexist in a fresh local
+object. None registered with a service, worker, consumer, or durable index.
+
+Those registration APIs, null fetchers, and acceptance tests are removed across
+all owners. Projection builders and engine-level indexing/query tests remain as
+lower-level code, but no public name now implies they are connected to the
+running platform. The eventual indexing service must own a durable backend and
+compose real owner fetchers rather than inheriting these no-op shims.
+
+Proof: the complete normal suites for Search, Chat, Knowledge, Git, and Issues;
+strict all-target/all-feature Clippy across those five crates and Edge; and a
+repository-wide search finding no discarded projection registration or null
+project fetcher. Net removal: 486 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

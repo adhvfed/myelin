@@ -9,8 +9,7 @@ use myelin_search::{
 pub use myelin_search::block_subdoc_projection;
 pub use myelin_search::{
     kn_index_specs, kn_page_index_spec, kn_row_index_spec, page_search_projection,
-    register_kn_index_specs, FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_ROW_TYPE,
-    KN_SUBSYSTEM,
+    FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_ROW_TYPE, KN_SUBSYSTEM,
 };
 
 pub const KN_SEARCH_OBJECT_TYPE: &str = KN_PAGE_TYPE;
@@ -263,16 +262,6 @@ mod tests {
             "a db row is a structured record, not vector-embedded prose"
         );
         assert_eq!(specs.len(), 2);
-    }
-
-    #[test]
-    fn search_admits_the_declared_specs() {
-        let accepted = register_kn_index_specs();
-        assert_eq!(
-            accepted,
-            kn_declared_index_specs(),
-            "Search admits the declared KN specs verbatim"
-        );
     }
 
     #[test]

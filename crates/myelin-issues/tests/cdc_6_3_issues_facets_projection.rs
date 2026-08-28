@@ -1,21 +1,5 @@
-use myelin_issues::declares::{
-    issue_facets_projection_spec, register_issue_facets_projection_spec, ISSUE_SUBSYSTEM,
-    ISSUE_TYPE,
-};
+use myelin_issues::declares::{issue_facets_projection_spec, ISSUE_SUBSYSTEM, ISSUE_TYPE};
 use myelin_query::FieldType;
-use myelin_search::{IncrementalIndexer, IndexSpec, MockEmbeddingAdapter, ProjectFetcher};
-
-struct NullFetcher;
-impl ProjectFetcher for NullFetcher {
-    fn project(
-        &self,
-        _t: &myelin_tenancy::TenantId,
-        _r: &myelin_tenancy::Region,
-        _a: &myelin_tenancy::ArtifactRef,
-    ) -> Result<myelin_search::SearchProjection, myelin_search::ProjectFetchError> {
-        Err(myelin_search::ProjectFetchError::Gone)
-    }
-}
 
 #[test]
 fn producer_issues_declares_the_frozen_6_3_shape() {
@@ -90,33 +74,5 @@ fn producer_spec_serializes_to_the_6_3_wire_shape() {
             "cycle_id": "Relation",
             "rank": "OrderKey",
         })
-    );
-}
-
-#[test]
-fn consumer_search_admits_the_spec() {
-    let spec = issue_facets_projection_spec();
-    let _indexer = IncrementalIndexer::new(
-        vec![spec.clone()],
-        std::sync::Arc::new(NullFetcher),
-        std::sync::Arc::new(MockEmbeddingAdapter::new(8)),
-    );
-    let accepted: IndexSpec = register_issue_facets_projection_spec();
-    assert_eq!(
-        accepted, spec,
-        "Search accepts the declared spec verbatim (no mutation/rejection)"
-    );
-}
-
-#[test]
-fn consumer_issue_spec_coexists_with_another_producer() {
-    let issue = issue_facets_projection_spec();
-    let mut blob_fields = std::collections::BTreeMap::new();
-    blob_fields.insert("path".to_string(), FieldType::Text);
-    let blob = IndexSpec::new("git", "blob", blob_fields).with_acl_object_type("repo");
-    let _indexer = IncrementalIndexer::new(
-        vec![issue, blob],
-        std::sync::Arc::new(NullFetcher),
-        std::sync::Arc::new(MockEmbeddingAdapter::new(8)),
     );
 }

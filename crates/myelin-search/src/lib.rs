@@ -17,14 +17,13 @@ pub mod vector;
 
 pub use chat_projection::{
     message_doc_ref, message_index_spec, message_index_specs, message_search_projection,
-    register_message_index_specs, CHAT_SUBSYSTEM, MESSAGE_ACL_OBJECT_TYPE, MESSAGE_TYPE,
+    CHAT_SUBSYSTEM, MESSAGE_ACL_OBJECT_TYPE, MESSAGE_TYPE,
 };
 pub use ci_log_projection::{
     ci_log_details_ref, ci_log_doc_ref, ci_log_index_spec, ci_log_index_specs,
-    ci_log_search_projection, parse_step_anchor, register_ci_log_index_specs, CiLogProjectionInput,
-    CiLogStepAnchor, CI_LOG_ACL_OBJECT_TYPE, CI_LOG_TYPE, CI_SUBSYSTEM,
-    FACET_JOB_ID as CI_LOG_FACET_JOB_ID, FACET_RUN_ID as CI_LOG_FACET_RUN_ID,
-    FACET_STEP_NO as CI_LOG_FACET_STEP_NO,
+    ci_log_search_projection, parse_step_anchor, CiLogProjectionInput, CiLogStepAnchor,
+    CI_LOG_ACL_OBJECT_TYPE, CI_LOG_TYPE, CI_SUBSYSTEM, FACET_JOB_ID as CI_LOG_FACET_JOB_ID,
+    FACET_RUN_ID as CI_LOG_FACET_RUN_ID, FACET_STEP_NO as CI_LOG_FACET_STEP_NO,
 };
 pub use compiler::{
     compile, render, CompileError, CompiledPlan, ConjoinedPlan, FieldDecl, FieldKind, FieldSchema,
@@ -41,11 +40,10 @@ pub use engine::{
 };
 pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_K};
 pub use git_code_projection::{
-    git_blob_search_projection, git_code_projection_spec, git_index_specs,
-    register_git_index_specs, trigram_query, trigrams, GitBlobProjectionInput,
-    FACET_BLOB_OID as GIT_FACET_BLOB_OID, FACET_LANGUAGE as GIT_FACET_LANGUAGE,
-    FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_TYPE, GIT_SUBSYSTEM,
-    TRIGRAM_N,
+    git_blob_search_projection, git_code_projection_spec, git_index_specs, trigram_query, trigrams,
+    GitBlobProjectionInput, FACET_BLOB_OID as GIT_FACET_BLOB_OID,
+    FACET_LANGUAGE as GIT_FACET_LANGUAGE, FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE,
+    GIT_BLOB_TYPE, GIT_SUBSYSTEM, TRIGRAM_N,
 };
 pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
@@ -53,17 +51,15 @@ pub use indexer::{
     INDEXER_SUBJECT_PREFIXES,
 };
 pub use issues_projection::{
-    issue_index_spec, issue_index_specs, issue_search_projection, register_issue_index_specs,
-    IssueProjectionInput, FACET_ASSIGNEE as ISSUE_FACET_ASSIGNEE,
-    FACET_CYCLE_ID as ISSUE_FACET_CYCLE_ID, FACET_PRIORITY as ISSUE_FACET_PRIORITY,
-    FACET_PROJECT_ID as ISSUE_FACET_PROJECT_ID, FACET_STATE_CATEGORY as ISSUE_FACET_STATE_CATEGORY,
-    FACET_TYPE_RANK as ISSUE_FACET_TYPE_RANK, ISSUE_ACL_OBJECT_TYPE, ISSUE_PRODUCER_RANK_FACET,
-    ISSUE_SUBSYSTEM, ISSUE_TYPE,
+    issue_index_spec, issue_index_specs, issue_search_projection, IssueProjectionInput,
+    FACET_ASSIGNEE as ISSUE_FACET_ASSIGNEE, FACET_CYCLE_ID as ISSUE_FACET_CYCLE_ID,
+    FACET_PRIORITY as ISSUE_FACET_PRIORITY, FACET_PROJECT_ID as ISSUE_FACET_PROJECT_ID,
+    FACET_STATE_CATEGORY as ISSUE_FACET_STATE_CATEGORY, FACET_TYPE_RANK as ISSUE_FACET_TYPE_RANK,
+    ISSUE_ACL_OBJECT_TYPE, ISSUE_PRODUCER_RANK_FACET, ISSUE_SUBSYSTEM, ISSUE_TYPE,
 };
 pub use kn_projection::{
     kn_index_specs, kn_page_index_spec, kn_row_index_spec, page_search_projection,
-    register_kn_index_specs, FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_PAGE_TYPE,
-    KN_ROW_TYPE, KN_SUBSYSTEM,
+    FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_PAGE_TYPE, KN_ROW_TYPE, KN_SUBSYSTEM,
 };
 pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,

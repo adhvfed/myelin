@@ -23,29 +23,6 @@ pub fn git_code_projection_spec() -> IndexSpec {
         .with_parent_acl_object_type(GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_ACL_OBJECT_TYPE)
 }
 
-pub fn register_git_code_projection_spec() -> IndexSpec {
-    let spec = git_code_projection_spec();
-    let _accepted = myelin_search::IncrementalIndexer::new(
-        vec![spec.clone()],
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(myelin_search::MockEmbeddingAdapter::new(8)),
-    );
-    spec
-}
-
-struct NullProjectFetcher;
-
-impl myelin_search::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<myelin_search::SearchProjection, myelin_search::ProjectFetchError> {
-        Err(myelin_search::ProjectFetchError::Gone)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,16 +97,6 @@ mod tests {
             obj["struct_fields"],
             serde_json::json!({ "path": "Text", "language": "Text", "blob_oid": "Text" }),
             "the structured facets serialize to the typed columnar shape (13.3)"
-        );
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_git_code_projection_spec();
-        assert_eq!(
-            accepted,
-            git_code_projection_spec(),
-            "Search accepts the declared spec verbatim"
         );
     }
 }

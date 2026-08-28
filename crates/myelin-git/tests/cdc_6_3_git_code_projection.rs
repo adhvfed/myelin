@@ -1,21 +1,7 @@
 use myelin_git::search_projection::{
-    git_code_projection_spec, register_git_code_projection_spec, GIT_BLOB_ACL_OBJECT_TYPE,
-    GIT_BLOB_TYPE, GIT_SUBSYSTEM,
+    git_code_projection_spec, GIT_BLOB_ACL_OBJECT_TYPE, GIT_BLOB_TYPE, GIT_SUBSYSTEM,
 };
 use myelin_query::FieldType;
-use myelin_search::{IncrementalIndexer, IndexSpec, MockEmbeddingAdapter, ProjectFetcher};
-
-struct NullFetcher;
-impl ProjectFetcher for NullFetcher {
-    fn project(
-        &self,
-        _t: &myelin_tenancy::TenantId,
-        _r: &myelin_tenancy::Region,
-        _a: &myelin_tenancy::ArtifactRef,
-    ) -> Result<myelin_search::SearchProjection, myelin_search::ProjectFetchError> {
-        Err(myelin_search::ProjectFetchError::Gone)
-    }
-}
 
 #[test]
 fn producer_git_declares_the_frozen_6_3_shape() {
@@ -67,33 +53,5 @@ fn producer_spec_serializes_to_the_6_3_wire_shape() {
     assert_eq!(
         obj["struct_fields"],
         serde_json::json!({ "path": "Text", "language": "Text", "blob_oid": "Text" })
-    );
-}
-
-#[test]
-fn consumer_search_admits_the_spec() {
-    let spec = git_code_projection_spec();
-    let _indexer = IncrementalIndexer::new(
-        vec![spec.clone()],
-        std::sync::Arc::new(NullFetcher),
-        std::sync::Arc::new(MockEmbeddingAdapter::new(8)),
-    );
-    let accepted: IndexSpec = register_git_code_projection_spec();
-    assert_eq!(
-        accepted, spec,
-        "Search accepts the declared spec verbatim (no mutation/rejection)"
-    );
-}
-
-#[test]
-fn consumer_git_spec_coexists_with_another_producer() {
-    let git = git_code_projection_spec();
-    let mut issue_fields = std::collections::BTreeMap::new();
-    issue_fields.insert("status".to_string(), FieldType::Select);
-    let issue = IndexSpec::new("issue", "issue", issue_fields);
-    let _indexer = IncrementalIndexer::new(
-        vec![git, issue],
-        std::sync::Arc::new(NullFetcher),
-        std::sync::Arc::new(MockEmbeddingAdapter::new(8)),
     );
 }

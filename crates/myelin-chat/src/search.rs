@@ -48,29 +48,6 @@ pub fn message_index_specs() -> Vec<IndexSpec> {
     vec![message_index_spec()]
 }
 
-pub fn register_message_index_specs() -> Vec<IndexSpec> {
-    let specs = message_index_specs();
-    let _accepted = myelin_search::IncrementalIndexer::new(
-        specs.clone(),
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(myelin_search::MockEmbeddingAdapter::new(8)),
-    );
-    specs
-}
-
-struct NullProjectFetcher;
-
-impl myelin_search::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<SearchProjection, myelin_search::ProjectFetchError> {
-        Err(myelin_search::ProjectFetchError::Gone)
-    }
-}
-
 pub fn message_search_projection(body: &MessageBody, lang: Option<&str>) -> SearchProjection {
     let text = render_body_text(&body.blocks);
     let mut fields: BTreeMap<String, FieldValue> = BTreeMap::new();
@@ -218,10 +195,7 @@ mod tests {
         Permission as IdPerm, Principal, PrincipalId, PrincipalKind, Result as AuthzRes, Zookie,
     };
     use myelin_query::{CmpOp, Expr, Predicate, QueryAst};
-    use myelin_search::{
-        FieldDecl, FieldSchema, IncrementalIndexer, IndexDocument, MockEmbeddingAdapter,
-        TantivyBackend,
-    };
+    use myelin_search::{FieldDecl, FieldSchema, IndexDocument, TantivyBackend};
     use myelin_tenancy::TenantId;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -292,21 +266,6 @@ mod tests {
                 "`{absent}` is the full-text projection body, not a structured facet"
             );
         }
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_message_index_specs();
-        assert_eq!(
-            accepted,
-            message_index_specs(),
-            "Search accepts the declared chat spec verbatim"
-        );
-        let _ix = IncrementalIndexer::new(
-            message_index_specs(),
-            std::sync::Arc::new(NullProjectFetcher),
-            std::sync::Arc::new(MockEmbeddingAdapter::new(8)),
-        );
     }
 
     #[test]

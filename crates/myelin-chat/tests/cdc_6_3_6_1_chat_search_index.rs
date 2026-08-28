@@ -1,7 +1,7 @@
 use myelin_chat::{
-    message_index_spec, message_search_acl_anchor, register_message_index_specs,
-    AclConjoinedSearchFeeder, FACET_ARTIFACT_REF, FACET_AUTHOR, FACET_CHANNEL, FACET_CREATED_AT,
-    FACET_EMBED, FACET_KIND, FACET_MENTION, FACET_THREAD_ROOT, FT_BODY_FIELD,
+    message_index_spec, message_search_acl_anchor, AclConjoinedSearchFeeder, FACET_ARTIFACT_REF,
+    FACET_AUTHOR, FACET_CHANNEL, FACET_CREATED_AT, FACET_EMBED, FACET_KIND, FACET_MENTION,
+    FACET_THREAD_ROOT, FT_BODY_FIELD,
 };
 use myelin_identity::{
     Consistency, ConsistencyMode, ListObjectsResult, Literal, ObjectId, ObjectType, Permission,
@@ -67,16 +67,6 @@ fn chat_message_spec_is_the_frozen_6_3_shape() {
     assert!(
         !s.struct_fields.contains_key(FT_BODY_FIELD),
         "the markdown body is the ft_fields projection, not a structured facet"
-    );
-}
-
-#[test]
-fn search_accepts_the_chat_message_spec() {
-    let accepted = register_message_index_specs();
-    assert_eq!(
-        accepted,
-        vec![message_index_spec()],
-        "Search accepts the chat spec verbatim"
     );
 }
 

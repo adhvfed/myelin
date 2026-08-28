@@ -38,29 +38,6 @@ pub fn issue_index_specs() -> Vec<IndexSpec> {
     vec![issue_index_spec()]
 }
 
-pub fn register_issue_index_specs() -> Vec<IndexSpec> {
-    let specs = issue_index_specs();
-    let _accepted = crate::indexer::IncrementalIndexer::new(
-        specs.clone(),
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
-    );
-    specs
-}
-
-struct NullProjectFetcher;
-
-impl crate::indexer::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<SearchProjection, crate::indexer::ProjectFetchError> {
-        Err(crate::indexer::ProjectFetchError::Gone)
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct IssueProjectionInput {
     pub body: String,
@@ -121,8 +98,6 @@ pub fn issue_search_projection(input: &IssueProjectionInput) -> SearchProjection
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::IncrementalIndexer;
-
     #[test]
     fn issue_spec_is_the_consumed_6_3_shape() {
         let s = issue_index_spec();
@@ -196,21 +171,6 @@ mod tests {
             s.struct_fields.get(ORDER_KEY_FIELD),
             Some(&FieldType::OrderKey),
             "the order_key facet is byte-identical LexoRank (13.3), only the index-doc key is the convention"
-        );
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_issue_index_specs();
-        assert_eq!(
-            accepted,
-            issue_index_specs(),
-            "Search accepts the declared Issues spec verbatim"
-        );
-        let _ix = IncrementalIndexer::new(
-            issue_index_specs(),
-            std::sync::Arc::new(NullProjectFetcher),
-            std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(8)),
         );
     }
 

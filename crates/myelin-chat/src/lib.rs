@@ -96,11 +96,10 @@ pub use restriction::{
 };
 pub use search::{
     message_doc_ref, message_index_spec, message_index_specs, message_search_acl_anchor,
-    message_search_projection, non_member_filter, register_message_index_specs,
-    AclConjoinedSearchFeeder, EmbeddingsArePersonalData, CHAT_SUBSYSTEM, FACET_ARTIFACT_REF,
-    FACET_AUTHOR, FACET_CHANNEL, FACET_CREATED_AT, FACET_EMBED, FACET_KIND, FACET_MENTION,
-    FACET_THREAD_ROOT, FT_BODY_FIELD, MESSAGE_ACL_OBJECT_TYPE, MESSAGE_READ_PERMISSION,
-    MESSAGE_TYPE,
+    message_search_projection, non_member_filter, AclConjoinedSearchFeeder,
+    EmbeddingsArePersonalData, CHAT_SUBSYSTEM, FACET_ARTIFACT_REF, FACET_AUTHOR, FACET_CHANNEL,
+    FACET_CREATED_AT, FACET_EMBED, FACET_KIND, FACET_MENTION, FACET_THREAD_ROOT, FT_BODY_FIELD,
+    MESSAGE_ACL_OBJECT_TYPE, MESSAGE_READ_PERMISSION, MESSAGE_TYPE,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemHotTier;

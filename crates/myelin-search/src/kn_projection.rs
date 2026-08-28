@@ -39,29 +39,6 @@ pub fn kn_index_specs() -> Vec<IndexSpec> {
     vec![kn_page_index_spec(), kn_row_index_spec()]
 }
 
-pub fn register_kn_index_specs() -> Vec<IndexSpec> {
-    let specs = kn_index_specs();
-    let _accepted = crate::indexer::IncrementalIndexer::new(
-        specs.clone(),
-        std::sync::Arc::new(NullProjectFetcher),
-        std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(16)),
-    );
-    specs
-}
-
-struct NullProjectFetcher;
-
-impl crate::indexer::ProjectFetcher for NullProjectFetcher {
-    fn project(
-        &self,
-        _tenant: &myelin_tenancy::TenantId,
-        _region: &myelin_tenancy::Region,
-        _ref_: &myelin_tenancy::ArtifactRef,
-    ) -> Result<SearchProjection, crate::indexer::ProjectFetchError> {
-        Err(crate::indexer::ProjectFetchError::Gone)
-    }
-}
-
 pub fn page_search_projection(blocks: &[Block], lang: Option<&str>) -> SearchProjection {
     let mut text = String::new();
     let mut mentions: Vec<String> = Vec::new();
@@ -192,7 +169,6 @@ fn push_text(text: &mut String, run: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::IncrementalIndexer;
     use myelin_content::{parse_inline, Block, HeadingLevel};
     use myelin_events::ArtifactRef;
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -247,21 +223,6 @@ mod tests {
         );
         assert!(!s.struct_fields.contains_key("rollup"));
         assert!(!s.struct_fields.contains_key("formula"));
-    }
-
-    #[test]
-    fn registration_is_accepted_by_search() {
-        let accepted = register_kn_index_specs();
-        assert_eq!(
-            accepted,
-            kn_index_specs(),
-            "Search accepts the declared KN specs verbatim"
-        );
-        let _ix = IncrementalIndexer::new(
-            kn_index_specs(),
-            std::sync::Arc::new(NullProjectFetcher),
-            std::sync::Arc::new(crate::indexer::MockEmbeddingAdapter::new(16)),
-        );
     }
 
     #[test]
