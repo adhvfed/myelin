@@ -228,6 +228,8 @@ struct SchedulerProbe {
     job_update_claim_window: bool,
     job_update_reservation_write_version: bool,
     fair_select: bool,
+    fair_insert: bool,
+    fair_update: bool,
     run_select_tenant: bool,
     run_select_region: bool,
     run_select_state: bool,
@@ -337,6 +339,8 @@ fn validate_probe_before_mapping(
         && scheduler.job_update_claim_started_at
         && scheduler.job_update_claim_expires_at
         && scheduler.fair_select
+        && scheduler.fair_insert
+        && scheduler.fair_update
         && scheduler.run_select_tenant
         && scheduler.run_select_region
         && scheduler.run_select_state
@@ -465,6 +469,16 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'claim_window_secs', 'UPDATE') AS job_update_claim_window,
                 pg_catalog.has_column_privilege(session_user, 'public.job_queue', 'reservation_write_version', 'UPDATE') AS job_update_reservation_write_version,
                 pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'SELECT') AS fair_select,
+                (
+                  pg_catalog.has_column_privilege(session_user, 'public.fair_deficit', 'tenant_id', 'INSERT')
+                  AND pg_catalog.has_column_privilege(session_user, 'public.fair_deficit', 'region', 'INSERT')
+                  AND pg_catalog.has_column_privilege(session_user, 'public.fair_deficit', 'fair_key', 'INSERT')
+                  AND pg_catalog.has_column_privilege(session_user, 'public.fair_deficit', 'deficit', 'INSERT')
+                ) AS fair_insert,
+                (
+                  pg_catalog.has_column_privilege(session_user, 'public.fair_deficit', 'deficit', 'UPDATE')
+                  AND pg_catalog.has_column_privilege(session_user, 'public.fair_deficit', 'last_served', 'UPDATE')
+                ) AS fair_update,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'tenant_id', 'SELECT') AS run_select_tenant,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'region', 'SELECT') AS run_select_region,
                 pg_catalog.has_column_privilege(session_user, 'public.ci_run', 'state', 'SELECT') AS run_select_state,
@@ -555,6 +569,27 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
                   OR pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'TRUNCATE')
                   OR pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'REFERENCES')
                   OR pg_catalog.has_table_privilege(session_user, 'public.fair_deficit', 'TRIGGER')
+                  OR EXISTS (
+                    SELECT 1
+                      FROM pg_catalog.pg_attribute AS fair_column
+                     WHERE fair_column.attrelid = 'public.fair_deficit'::regclass
+                       AND fair_column.attnum > 0
+                       AND NOT fair_column.attisdropped
+                       AND (
+                         (
+                           fair_column.attname NOT IN ('tenant_id', 'region', 'fair_key', 'deficit')
+                           AND pg_catalog.has_column_privilege(
+                             session_user, fair_column.attrelid, fair_column.attnum, 'INSERT'
+                           )
+                         )
+                         OR (
+                           fair_column.attname NOT IN ('deficit', 'last_served')
+                           AND pg_catalog.has_column_privilege(
+                             session_user, fair_column.attrelid, fair_column.attnum, 'UPDATE'
+                           )
+                         )
+                       )
+                  )
                   OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'INSERT')
                   OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'UPDATE')
                   OR pg_catalog.has_table_privilege(session_user, 'public.ci_run', 'DELETE')
@@ -750,6 +785,8 @@ async fn scheduler_probe(pool: &PgPool) -> Result<SchedulerProbe, CiSchedulerDbE
         job_update_claim_window: row.get("job_update_claim_window"),
         job_update_reservation_write_version: row.get("job_update_reservation_write_version"),
         fair_select: row.get("fair_select"),
+        fair_insert: row.get("fair_insert"),
+        fair_update: row.get("fair_update"),
         run_select_tenant: row.get("run_select_tenant"),
         run_select_region: row.get("run_select_region"),
         run_select_state: row.get("run_select_state"),

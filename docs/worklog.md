@@ -3582,6 +3582,32 @@ across CI control-plane, Agent Service, MCP, Edge, and CLI; and the governed MCP
 suite proving the two reads retain byte-identical schemas and durable routing.
 Net removal: 492 lines.
 
+## 2026-08-28 — CI fairness advances with the lease
+
+The region scheduler ordered claims by `fair_deficit`, but no production path
+ever changed that table. Every tenant therefore remained at zero and queue age
+won forever. The apparent fairness proof created its own tables and rewrote SQL
+instead of calling the running queue store. Adjacent fair-share, backpressure,
+histogram, and prewarming models were process-local objects with no service
+caller, durable state, or dispatch effect.
+
+A successful claim now advances its tenant and fair key in the same PostgreSQL
+statement that creates the lease. A forward-only migration gives the mapped
+region scheduler only the exact fairness columns required for that upsert, with
+the same server-owned region boundary and restrictive RLS guard as queue
+claims. Startup validates those capabilities and rejects broader authority.
+The existing real-schema scheduler journey now proves an older second job from
+tenant A loses to tenant B after A receives a lease, inspects both durable
+frontiers, and proves the scheduler cannot rewrite their identity columns. The
+parallel in-memory fairness and surge products and their self-certifying test
+are removed.
+
+Proof: all 555 CI control-plane library stories and the complete normal suite;
+both live PostgreSQL scheduler boundary journeys through the real migrations,
+mapped login, queue store, reaper, and connection reset path; strict
+all-target/all-feature Clippy across CI control-plane and Edge. Net removal:
+793 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3696,3 +3722,8 @@ Net removal: 492 lines.
     event pipeline and human secret administration do not substitute for a
     governed, idempotent agent command with authorization, audit, and a
     full-system journey.
+19. **CI has no production elasticity controller.** Durable queue ordering and
+    per-tenant launch admission exist, but runner demand histograms, prewarming,
+    lane shedding, and plan-sensitive backpressure are not connected to a
+    service or durable controller. The former process-local surge model was
+    removed rather than represented as deployed capacity management.

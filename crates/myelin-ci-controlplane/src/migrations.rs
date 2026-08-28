@@ -131,6 +131,7 @@ pub const CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0027_ci_pipeline_v5_cutover_fence_row";
 pub const CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0028_ci_pipeline_v6_cutover_fence_row";
+pub const CI_SCHEDULER_FAIRNESS_WRITE_MIGRATION_ID: &str = "ci_0029_scheduler_fairness_write";
 
 pub const CREATE_CI_RUN_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -1662,6 +1663,50 @@ GRANT SELECT ON job_queue TO myelin_ci_region_scheduler;
 GRANT UPDATE (state, lease_owner, lease_expires) ON job_queue TO myelin_ci_region_scheduler;
 GRANT SELECT ON fair_deficit TO myelin_ci_region_scheduler";
 
+pub const GRANT_SCHEDULER_FAIRNESS_WRITE_DDL: &str = "\
+CREATE POLICY myelin_ci_scheduler_fair_deficit_insert_access ON fair_deficit
+  AS PERMISSIVE FOR INSERT TO myelin_ci_region_scheduler
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_fair_deficit_insert_guard ON fair_deficit
+  AS RESTRICTIVE FOR INSERT TO myelin_ci_region_scheduler
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_fair_deficit_update_access ON fair_deficit
+  AS PERMISSIVE FOR UPDATE TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  )
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+CREATE POLICY myelin_ci_scheduler_fair_deficit_update_guard ON fair_deficit
+  AS RESTRICTIVE FOR UPDATE TO myelin_ci_region_scheduler
+  USING (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  )
+  WITH CHECK (
+    current_setting('myelin.tenant_id', true) = ''
+    AND region = public.myelin_ci_scheduler_region()
+    AND region = current_setting('myelin.region', true)
+  );
+GRANT INSERT (tenant_id, region, fair_key, deficit)
+  ON fair_deficit TO myelin_ci_region_scheduler;
+GRANT UPDATE (deficit, last_served)
+  ON fair_deficit TO myelin_ci_region_scheduler";
+
 pub const GRANT_SCHEDULER_CI_RUN_DISCOVERY_DDL: &str = "\
 CREATE POLICY myelin_ci_scheduler_ci_run_discovery_access ON ci_run
   AS PERMISSIVE FOR SELECT TO myelin_ci_region_scheduler
@@ -2042,6 +2087,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
     migrations.push(Migration::plain(
         CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID,
         SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_SCHEDULER_FAIRNESS_WRITE_MIGRATION_ID,
+        GRANT_SCHEDULER_FAIRNESS_WRITE_DDL,
+        FAIR_DEFICIT_TABLE,
     ));
     Migrations::of(migrations)
 }
@@ -2814,6 +2864,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID,
                 CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID,
                 CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID,
+                CI_SCHEDULER_FAIRNESS_WRITE_MIGRATION_ID,
             ],
             "the append-only tail retains every expand → validate → contract dependency"
         );
@@ -2880,8 +2931,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            79,
-            "the complete append-only schema includes the current predecessor fence seed"
+            80,
+            "the complete append-only schema includes durable scheduler fairness"
         );
         fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
             upper_ddl
@@ -3051,6 +3102,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL);
             } else if m.id == CI_REGION_SCHEDULER_RLS_MIGRATION_ID {
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
+            } else if m.id == CI_SCHEDULER_FAIRNESS_WRITE_MIGRATION_ID {
+                assert_eq!(m.ddl, GRANT_SCHEDULER_FAIRNESS_WRITE_DDL);
             } else {
                 assert!(
                     m.ddl.starts_with("CREATE INDEX CONCURRENTLY")
@@ -3078,7 +3131,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            79,
+            80,
             "the runner applied the complete schema plus every additive follow-on"
         );
         assert_eq!(

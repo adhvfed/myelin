@@ -2,7 +2,6 @@
 
 mod common;
 
-use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::FutureExt;
@@ -420,6 +419,7 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
                 let tenant_store = ci_job_queue_store(app.clone());
                 for (fixture, ordinal) in [
                     (job(&tenant_a, FR_PAR, &proof_label, 101), 101),
+                    (job(&tenant_a, FR_PAR, &proof_label, 106), 106),
                     (job(&tenant_b, FR_PAR, &proof_label, 102), 102),
                     (job(&tenant_other_region, DE_FRA, &proof_label, 103), 103),
                 ] {
@@ -432,6 +432,22 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
                     );
                     insert_active_job_owner(&admin, &fixture.tenant_id, &fixture.region, ordinal)
                         .await;
+                }
+                for (ordinal, enqueued_at) in [
+                    (101, "2000-01-01T00:00:00Z"),
+                    (106, "2000-01-02T00:00:00Z"),
+                    (102, "2000-01-03T00:00:00Z"),
+                ] {
+                    sqlx::query(
+                        "UPDATE job_queue
+                            SET enqueued_at = $2::timestamptz
+                          WHERE job_id = $1::uuid",
+                    )
+                    .bind(format!("00000000-0000-0000-0000-{ordinal:012}"))
+                    .bind(enqueued_at)
+                    .execute(&admin)
+                    .await
+                    .expect("set deterministic fairness proof order");
                 }
                 insert_ci_run_fixture(
                     &admin,
@@ -631,10 +647,26 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
                     .await
                     .expect("second cross-tenant claim")
                     .expect("second same-region row");
+                assert_eq!(first.tenant_id, tenant_a);
                 assert_eq!(
-                    BTreeSet::from([first.tenant_id.clone(), second.tenant_id.clone()]),
-                    BTreeSet::from([tenant_a.clone(), tenant_b.clone()]),
-                    "one region scheduler claims across tenants, but only in its mapped region"
+                    second.tenant_id, tenant_b,
+                    "after tenant A's oldest lease advances its durable deficit, tenant B wins over \
+                     tenant A's older remaining job"
+                );
+                let fair_rows: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT tenant_id, deficit
+                       FROM fair_deficit
+                      WHERE tenant_id = ANY($1)
+                      ORDER BY tenant_id",
+                )
+                .bind(&tenants[..2])
+                .fetch_all(&admin)
+                .await
+                .expect("read the durable fairness frontier");
+                assert_eq!(
+                    fair_rows,
+                    vec![(tenant_a.clone(), -1), (tenant_b.clone(), -1)],
+                    "each committed lease advances exactly its own durable fair key"
                 );
                 assert!(
                     region_store
@@ -662,9 +694,13 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
     );
                 let recovered: i64 = sqlx::query_scalar(
                     "SELECT count(*) FROM job_queue
-          WHERE tenant_id = ANY($1) AND state = 'queued' AND lease_owner IS NULL",
+          WHERE tenant_id = ANY($1)
+            AND job_id::text = ANY($2)
+            AND state = 'queued'
+            AND lease_owner IS NULL",
                 )
                 .bind(&tenants[..2])
+                .bind([first.job_id.to_string(), second.job_id.to_string()])
                 .fetch_one(&admin)
                 .await
                 .expect("verify both proof leases recovered");
@@ -841,6 +877,12 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
                 assert!(
                     !scheduler_can_update_reservation_marker,
                     "the scheduler must never hold UPDATE on the reservation write-version marker"
+                );
+                assert_permission_denied(
+                    sqlx::query("UPDATE fair_deficit SET tenant_id = 'forged' WHERE true")
+                        .execute(&raw_scheduler)
+                        .await,
+                    "scheduler fairness key mutation must be denied",
                 );
 
                 let stranded_run = format!("stranded-{suffix}");

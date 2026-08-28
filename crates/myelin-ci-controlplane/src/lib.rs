@@ -95,7 +95,6 @@ pub mod ci_scheduler_db;
 pub mod cost_store;
 pub mod deployment;
 pub mod events;
-pub mod fairness;
 pub mod fleet;
 pub mod job_accounting_store;
 pub mod job_queue_store;
@@ -137,7 +136,6 @@ pub mod surfacing;
 pub mod surfacing_index;
 pub mod surfacing_store;
 pub mod surfacing_tools;
-pub mod surge;
 
 pub use ci_pipeline::{CheckFacts, PipelineRun, PipelineStage, RunVerdict, CI_PIPELINE_WF_TYPE};
 
@@ -309,11 +307,6 @@ pub use fleet::{
     INSERT_RUNNER_QUERY,
 };
 
-pub use fairness::{
-    shed_order, Backpressure, FairShare, PlanTier, ADVANCE_DEFICIT_QUERY, BASE_QUANTUM,
-    DEFAULT_TENANT_IN_FLIGHT_CAP, DEFICIT_CEILING, IN_FLIGHT_COUNT_QUERY, REPLENISH_DEFICIT_QUERY,
-};
-
 pub use migrations::CI_RUN_SURFACE_INDEX_READINESS;
 pub use migrations::{
     ci_controlplane_hot_tables, ci_controlplane_migrations, ci_durable_hot_tables,
@@ -368,8 +361,6 @@ pub use migrations::{
     SEED_CI_PIPELINE_V5_CUTOVER_FENCE_ROW_DDL, SEED_CI_PIPELINE_V6_CUTOVER_FENCE_ROW_DDL,
     VALIDATE_CI_JOB_RUN_LEDGER_INDEX_DDL, VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL,
 };
-
-pub use surge::{CiDispatchShed, CiSurgeControls, CiSurgeGate, StarvationHistogram};
 
 pub const SERVICE_NAME: &str = "ci-controlplane";
 

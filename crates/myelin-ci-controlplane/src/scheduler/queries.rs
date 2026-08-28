@@ -38,7 +38,8 @@ WITH eligible AS (
     q.enqueued_at ASC
   FOR UPDATE OF q SKIP LOCKED
   LIMIT 1
-)
+),
+claimed AS (
 UPDATE job_queue j
 SET state = 'leased',
     lease_owner = $4,
@@ -53,7 +54,24 @@ WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
 RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_key, j.trust_tier,
           j.lease_epoch, j.claim_nonce::text AS claim_nonce, j.claim_window_secs,
           FLOOR(EXTRACT(EPOCH FROM j.claim_started_at))::bigint AS claim_started_at_epoch_secs,
-          FLOOR(EXTRACT(EPOCH FROM j.claim_expires_at))::bigint AS claim_expires_at_epoch_secs";
+          FLOOR(EXTRACT(EPOCH FROM j.claim_expires_at))::bigint AS claim_expires_at_epoch_secs,
+          j.region
+),
+fair_advanced AS (
+  INSERT INTO fair_deficit (tenant_id, region, fair_key, deficit)
+  SELECT tenant_id, region, fair_key, -1
+  FROM claimed
+  ON CONFLICT (tenant_id, region, fair_key) DO UPDATE
+  SET deficit = GREATEST(fair_deficit.deficit, -9223372036854775807) - 1,
+      last_served = statement_timestamp()
+  RETURNING tenant_id, region, fair_key
+)
+SELECT claimed.tenant_id, claimed.job_id, claimed.run_id, claimed.lane,
+       claimed.concurrency_group, claimed.fair_key, claimed.trust_tier,
+       claimed.lease_epoch, claimed.claim_nonce, claimed.claim_window_secs,
+       claimed.claim_started_at_epoch_secs, claimed.claim_expires_at_epoch_secs
+FROM claimed
+JOIN fair_advanced USING (tenant_id, region, fair_key)";
 
 pub const CANCEL_SUPERSEDED_QUERY: &str = "\
 UPDATE job_queue
