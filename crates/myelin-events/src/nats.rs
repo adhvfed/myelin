@@ -291,10 +291,10 @@ fn validate_stream_config(
     }
 }
 
-fn validate_consumer_config(
+fn consumer_config_drift(
     actual: &jetstream::consumer::Config,
     expected: &jetstream::consumer::pull::Config,
-) -> Result<(), TransportError> {
+) -> Vec<&'static str> {
     let mut drift = Vec::new();
     macro_rules! pin {
         ($field:ident) => {
@@ -340,6 +340,21 @@ fn validate_consumer_config(
         drift.push("idle_heartbeat");
     }
 
+    drift
+}
+
+fn admission_limits_are_the_only_consumer_drift(drift: &[&str]) -> bool {
+    !drift.is_empty()
+        && drift
+            .iter()
+            .all(|field| matches!(*field, "max_ack_pending" | "max_batch"))
+}
+
+fn validate_consumer_config(
+    actual: &jetstream::consumer::Config,
+    expected: &jetstream::consumer::pull::Config,
+) -> Result<(), TransportError> {
+    let drift = consumer_config_drift(actual, expected);
     if drift.is_empty() {
         Ok(())
     } else {
@@ -813,6 +828,22 @@ impl NatsJetStreamBus {
                     .await
                     .map_err(|e| TransportError(format!("inspect consumer {consumer_name}: {e}")))?
                     .config;
+                let drift = consumer_config_drift(actual, &expected);
+                if admission_limits_are_the_only_consumer_drift(&drift) {
+                    consumer = stream
+                        .update_consumer(expected.clone())
+                        .await
+                        .map_err(|e| {
+                            TransportError(format!(
+                                "reconcile consumer {consumer_name} admission limits: {e}"
+                            ))
+                        })?;
+                }
+                let actual = &consumer
+                    .info()
+                    .await
+                    .map_err(|e| TransportError(format!("inspect consumer {consumer_name}: {e}")))?
+                    .config;
                 validate_consumer_config(actual, &expected).map_err(|error| {
                     TransportError(format!("durable consumer {consumer_name}: {}", error.0))
                 })?;
@@ -1232,6 +1263,30 @@ mod publisher_tests {
         metadata.insert("owner".into(), "other".into());
         drift!(metadata, metadata);
         drift!(backoff, vec![std::time::Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn only_bounded_admission_limits_are_safe_to_reconcile() {
+        let expected = JetStreamConsumerConfig::bounded(
+            "nats://127.0.0.1:4222",
+            "MYELIN_EVENTS",
+            "myelin.events",
+            "myelin.events.evt.*.notif.>",
+            "notif-signal-router",
+        )
+        .with_admission(crate::DurableWorkerAdmission::new(24, 8, 6).unwrap())
+        .pull_config();
+        let mut actual = expected.clone().into_consumer_config();
+        actual.max_ack_pending = 256;
+        actual.max_batch = 256;
+
+        let drift = consumer_config_drift(&actual, &expected);
+        assert_eq!(drift, ["max_ack_pending", "max_batch"]);
+        assert!(admission_limits_are_the_only_consumer_drift(&drift));
+
+        actual.ack_policy = jetstream::consumer::AckPolicy::None;
+        let drift = consumer_config_drift(&actual, &expected);
+        assert!(!admission_limits_are_the_only_consumer_drift(&drift));
     }
 }
 

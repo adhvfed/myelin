@@ -3261,6 +3261,26 @@ and Edge Clippy; browser and system-test TypeScript typechecking; and both
 private-agent-thread journeys against PostgreSQL, the workspace gateway, and
 real OpenSSH (6.88 seconds).
 
+## 2026-08-28 — bounded durable consumers survive policy upgrades
+
+Tightening a worker's `max_ack_pending` and `max_batch` limits made every
+existing JetStream durable consumer incompatible with its new process. A clean
+deployment worked, but the next restart found the broker's older values and
+failed before Notification, Refs, CI dispatch, Git checks, or hosted agents
+could bind intake. The admission contract was durable, but had no upgrade path.
+
+Consumer startup now classifies the complete broker-policy difference. It uses
+JetStream's explicit durable update only when the two bounded admission limits
+are the entire difference, then re-inspects the broker and applies the original
+exact validator. Subject filters, acknowledgement semantics, delivery policy,
+storage, replicas, backoff, and every other pinned field remain immutable and
+fail closed.
+
+Proof: the complete pinned-field drift matrix; a focused classifier regression;
+strict all-target NATS-enabled Events Clippy; and a live NATS restart test that
+creates one durable at `96/32`, reconnects it at `24/8`, and inspects the
+authoritative broker configuration (2/2 integration stories).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
