@@ -3973,6 +3973,22 @@ Proof: complete normal Flow, Git, and CI-control-plane suites plus strict
 all-target/all-feature Clippy and workspace compilation; repository-wide search
 finding no removed bridge or merge body. Net removal: 4,568 code/test lines.
 
+## 2026-08-28 — Agent service has no production mock selector
+
+Agent service publicly exported a `--use-mock` selector, scripted runtime,
+in-memory trace history, and replay helper, but neither service binary nor the
+hosted worker called them. The only caller was a CDC file that selected the
+mock and asserted the scripted answer it had supplied.
+
+That mock runtime surface and its self-certifying CDC are removed. Controlled
+model and tool doubles remain feature-gated test support for exercising the
+real hosted run, wallet, durable model-step/effect stores, and revocation path;
+there is no longer a product-looking runtime switch beside those paths.
+
+Proof: complete normal Agent-service suite, strict all-target/all-feature
+Clippy, and workspace compilation; repository-wide search finding no mock
+selector or scripted runtime. Net removal: 791 code/test lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

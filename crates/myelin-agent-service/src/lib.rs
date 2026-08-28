@@ -10,7 +10,6 @@ pub mod issues_read_tools;
 pub mod knowledge_mcp_tools;
 pub mod metering;
 pub mod migrations;
-pub mod mock;
 pub mod project_read_tools;
 pub mod schema;
 pub mod skeleton;
@@ -38,11 +37,6 @@ pub use metering::{price, ModelRates, PriceError, Priced, LUNA_RATES};
 #[cfg(any(test, feature = "test-support"))]
 pub use tool_exec::{MockToolExecutor, MockToolSurface};
 pub use tool_exec::{ToolExecError, ToolExecutionContext, ToolExecutor};
-
-pub use mock::{
-    build_conversation, model_turns_taken, replay, replay_bounded, select_runtime, HistoryEntry,
-    MockAgentRuntime, MockScript, ReplayRecord, RuntimeFlag, TraceHistory, MOCK_MAX_STEPS,
-};
 
 pub use effect_api::{validate_call, validate_schema, validate_tool_arguments};
 
