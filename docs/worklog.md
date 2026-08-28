@@ -3345,6 +3345,28 @@ Proof: all 328 remaining Knowledge library stories; strict all-target/all-featur
 Knowledge Clippy; and repository-wide symbol search finds no orphaned export
 types, import entrypoints, or fabricated `myelin://import/blob` identifiers.
 
+## 2026-08-28 — Issues analytics no longer self-certifies an in-process warehouse
+
+Issues exported an “OLAP consumer” backed by a mutex and Storage `BTreeMap`.
+No service started it, no broker delivered to it, no durable store retained its
+projection, and no Edge, CLI, or browser surface read it. Its unit, CDC, drill,
+and “E2E” suites all constructed that same process-local consumer directly,
+then compared cold and live maps populated from their own fixtures. The generic
+Storage feed also minted the non-canonical `olap_src` subsystem. An earlier
+worklog entry called this a real bus rebuild; the running topology disproves
+that claim.
+
+The unused Issues and Storage projection cluster and its copied tests are gone.
+Storage retains the backup policy distinction that derived analytics tiers are
+rebuilt rather than backed up, but Myelin no longer presents a transient map as
+the tier itself. A replacement must start with a deployed consumer, durable
+regional store, authenticated product query, and a full-system story.
+
+Proof: all 393 remaining Storage and 402 remaining Issues library stories;
+strict all-target/all-feature Clippy for both crates; and repository-wide symbol
+search finds no remaining constructor or consumer for the removed projection.
+Net removal: 3,497 lines of non-product code and self-certifying tests.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3409,3 +3431,8 @@ types, import entrypoints, or fabricated `myelin://import/blob` identifiers.
     unconditionally. A replacement must start with a real customer-key
     adapter, attempt the ordinary indexing path, and inspect every actual
     derived store.
+10. **Issues analytics has no production boundary.** The former process-local
+    OLAP projection and its copied green drills are gone. There is no deployed
+    consumer, durable regional analytics store, authenticated API, or user
+    journey; the remaining backup tier token is policy vocabulary, not proof
+    that an analytics product is running.

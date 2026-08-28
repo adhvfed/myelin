@@ -18,7 +18,6 @@ pub mod keys;
 pub mod migrations;
 pub mod move_crdt;
 pub mod my_work;
-pub mod olap_feed;
 pub mod pg_issue_store;
 pub mod planner;
 pub mod post_restore;
@@ -170,11 +169,6 @@ pub use rollup::{
     aggregate_snapshot, recompute_incremental, rollup_recomputed_draft, walk_parent_edges,
     DebounceCoalescer, DebounceWindow, LeafFact, RecomputeOutcome, RollupAggregate, RollupConsumer,
     RollupStore,
-};
-
-pub use olap_feed::{
-    issue_analytics_aggregate_names, IssueOlapAnalytics, IssueOlapConsumer, IssueOlapFeedSignal,
-    IssueRestrictionLeakAudit, ReindexCtx, RestrictionFlag, ISSUE_ANALYTICS_OLAP,
 };
 
 pub use import::{

@@ -25,9 +25,6 @@ pub mod migration_under_load;
 pub mod mirror;
 pub mod money;
 pub mod object_packs;
-pub mod olap;
-pub mod olap_feed;
-pub mod olap_restrict;
 pub mod oltp;
 pub mod replicated_blob;
 pub mod reserve_settle;
@@ -147,14 +144,6 @@ pub use object_packs::{
     cdn_over_object_backing, object_backed_pack_tier, place_repo_object_backed,
     served_from_object_tier, CloneStormLoad, GitD4Ceiling, GitD4Report, ObjectBackedServe,
     SingleNodeServe,
-};
-pub use olap::{OlapApply, OlapDoc, OlapEvent, OlapFrameSignal, OlapIngestError, OlapReadStore};
-pub use olap_feed::{
-    reindex_olap_from_bus, OlapAnalyticsSource, OlapBusConsumer, OlapReindexParitySignal,
-};
-pub use olap_restrict::{
-    AnalyticsAggregate, AnalyticsEligibility, OlapAnalytics, RestrictionGateSignal,
-    RestrictionLeakAudit,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
