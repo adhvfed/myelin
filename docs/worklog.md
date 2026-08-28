@@ -3857,6 +3857,25 @@ Proof: all 44 Content, 498 Git, and 134 Issues library stories plus their
 complete normal suites; strict all-target/all-feature Clippy across all three;
 repository-wide search finding no removed replay owner. Net removal: 997 lines.
 
+## 2026-08-28 — Refs and Notification rebuild claims start at durable stores
+
+Refs and Notification each exposed a reindex product whose authoritative
+source was a map populated by tests. Refs' “full scale” corpus generated five
+synthetic producers into the same process; Notification rebuilt an in-memory
+inbox from an in-memory signal source. Neither API was composed by a running
+service, and neither read the PostgreSQL edge or inbox truth.
+
+Those owner sources, reindexer facades, scale/parity simulations, and copied
+CDC/drill suites are removed. The production PostgreSQL Refs consumer and
+durable Notification router/inbox paths remain. The shared Events snapshot
+contract remains available for a future implementation that begins with a
+durable owner query.
+
+Proof: all 313 Notification and 259 Refs-service library stories plus both
+complete normal suites; strict all-target/all-feature Clippy across both
+services; repository-wide search finding no removed map-backed reindexer. Net
+removal: 3,523 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

@@ -26,7 +26,6 @@ pub mod prefs;
 pub mod ranking;
 pub mod read_fanout;
 pub mod read_state;
-pub mod reindex;
 pub mod router;
 pub mod schema;
 pub mod snooze_resurface;
@@ -98,12 +97,6 @@ pub use read_fanout::{
     WatcherResolvePort, SUBJECT_ROOT_TYPE, WATCHER_RELATION, WATCH_PERMISSION,
 };
 pub use read_state::{active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError};
-pub use reindex::{
-    inbox_parity_hash, notif_scope, signal_snapshot_draft, signal_snapshot_subject, NotifReindexer,
-    ReindexError as NotifReindexError, ReindexReceipt as NotifReindexReceipt, ReplayFailure,
-    RetentionWindow, SignalReindexSource, DEFAULT_RETENTION_DAYS, NOTIF_OWNER_TOKEN,
-    NOTIF_SNAPSHOT_TYPE,
-};
 pub use router::{
     build_durable_router, build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem,
     SignalRouter, NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME,

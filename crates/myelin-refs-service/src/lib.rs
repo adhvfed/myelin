@@ -25,9 +25,7 @@ pub mod mirror;
 #[cfg(feature = "integration")]
 pub mod pg_edge;
 pub mod reach_index;
-pub mod reindex;
 #[cfg(any(test, feature = "test-support"))]
-pub mod reindex_at_scale;
 pub mod residency;
 pub mod resolve;
 mod store;
@@ -100,15 +98,6 @@ pub use pg_edge::{
     build_pg_cell_edge_consumer, build_pg_edge_consumer, PgEdgeProjector, PgEdgeStore, StoredEdge,
 };
 pub use reach_index::{R4ReachIndex, R4Verdict, R4_READ_BUDGET_FANOUT};
-pub use reindex::{
-    RefsReindexSource, RefsReindexer, ReindexError, ReindexReceipt, SourceEdge,
-    REFS_EDGE_SNAPSHOT_TYPE, REFS_OWNER_TOKEN,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use reindex_at_scale::{
-    build_full_scale_corpus, run_full_scale_reindex_parity, FiveProducerCorpus,
-    FullScaleParityReport, FIVE_PRODUCERS,
-};
 pub use residency::{refs_store_descriptors, RefsStoreDescriptor};
 pub use resolve::{
     bounded_stale, strong_read, AuthzServed, CrossCellDisposition, NoOpCacheRead, OwnerProjection,
