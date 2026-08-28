@@ -3754,6 +3754,25 @@ suites; strict all-target/all-feature Clippy across CI, Search, and Edge; and a
 repository-wide search finding no CI/Search projection seam. Net removal: 730
 lines.
 
+## 2026-08-28 — Git code search has one running implementation
+
+Git contained a second code-search pipeline that diffed process-local trees,
+extracted symbols and literals, emitted snapshots to an in-memory outbox, and
+fed Search through fixtures. No receive-pack service or worker constructed its
+cursor/emitter. Its reindex drill rebuilt from another map. Meanwhile the
+running Edge path already performs bounded, authorization-filtered traversal
+against the durable repository backend.
+
+The unused projector, Git-owned Search schema, map-backed reindex drill, and
+their CDC/E2E fixtures are removed. Git no longer depends on Search. Repository
+code search through Edge is unchanged, as are durable ref updates, object
+storage, and authorization.
+
+Proof: all 509 Git library stories and the complete normal suite; strict
+all-target/all-feature Clippy across Git and Edge; repository-wide search
+finding no Git Search dependency or code-projection module. Net removal: 2,353
+lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

@@ -7,7 +7,6 @@ pub mod body;
 pub mod check_status;
 pub mod check_status_store;
 pub mod clock;
-pub mod code_projection;
 pub mod commit;
 pub mod coordinate {
     pub use myelin_refs::git_coordinate::*;
@@ -43,7 +42,6 @@ pub mod refs_pagination;
 pub mod replay;
 pub mod schema;
 pub mod scip;
-pub mod search_projection;
 pub mod shed_clone;
 pub mod speculative_queue;
 pub mod subs;

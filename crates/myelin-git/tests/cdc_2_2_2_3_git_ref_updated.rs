@@ -126,7 +126,7 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
         env.aggregate.0, "ref:core:refs%2Fheads%2Fmain",
         "the per-ref aggregate (2.3) - `ref:` prefix + percent-encoded ref name, matching \
          `GitRefEventKey::aggregate` (receive_pack.rs) and the format every other aggregate-key \
-         test in this crate already expects (gt003_reconcile.rs, code_projection.rs)"
+         test in this crate already expects (gt003_reconcile.rs)"
     );
     assert!(
         !env.contains_personal_data,

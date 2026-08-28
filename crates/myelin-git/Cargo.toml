@@ -13,7 +13,6 @@ myelin-agent = { path = "../myelin-agent" }
 myelin-events = { path = "../myelin-events" }
 myelin-refs = { path = "../myelin-refs" }
 myelin-flow = { path = "../myelin-flow" }
-myelin-search = { path = "../myelin-search" }
 myelin-query = { path = "../myelin-query" }
 myelin-content = { path = "../myelin-content" }
 myelin-notif = { path = "../myelin-notif" }

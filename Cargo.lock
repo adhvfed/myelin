@@ -3524,7 +3524,6 @@ dependencies = [
  "myelin-notif",
  "myelin-query",
  "myelin-refs",
- "myelin-search",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",
