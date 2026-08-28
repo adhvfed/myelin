@@ -13,7 +13,7 @@ pub mod durable_erase;
 pub mod events;
 pub mod governance;
 pub mod holder_intent;
-pub mod import;
+mod import_source;
 pub mod keys;
 pub mod migrations;
 pub mod move_crdt;
@@ -171,12 +171,7 @@ pub use rollup::{
     RollupStore,
 };
 
-pub use import::{
-    adapter_for, AdfBodyNode, CanonicalImport, CanonicalIssue, CanonicalRelation, CsvAdapter,
-    DryRun, GitHubAdapter, IdMapEntry, ImportEngine, ImportError, ImportLaneBudget,
-    InMemorySourceIdMap, JiraAdapter, LinearAdapter, ProviderRecord, ReconciliationReport,
-    SourceAdapter, SourceIdMap, SourceSystem, Unresolved, UNSUPPORTED_PERMISSION_SCHEME,
-};
+pub use import_source::SourceSystem;
 
 pub use my_work::{
     issue_humanise_templates, list_my_work, list_my_work_default, my_work_filter,

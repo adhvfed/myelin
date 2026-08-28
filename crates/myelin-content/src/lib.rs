@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-pub mod adf;
 pub mod block;
 pub mod corpus;
 pub mod editor;
@@ -9,7 +8,6 @@ pub mod inline;
 pub mod rebac_fragment;
 pub mod replay;
 
-pub use adf::{AdfMapping, AdfNode, AdfTarget, ImportReport, Loss, LossyConversion, MAP};
 pub use block::{Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel, ListItem, TaskItem};
 pub use editor::{
     canonicalize, caret_count, dom_to_offset, offset_to_dom, segments, split_at, BlockSplit,

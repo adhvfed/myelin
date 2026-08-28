@@ -1,5 +1,5 @@
 use super::{parse_uuid, CreateIssue, IssueCreationReceipt, IssueStoreError};
-use crate::import::SourceSystem;
+use crate::import_source::SourceSystem;
 use myelin_storage::{ContentHash, PgError};
 use sqlx::types::Uuid;
 use sqlx::{PgConnection, Row};

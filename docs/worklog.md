@@ -3367,6 +3367,28 @@ strict all-target/all-feature Clippy for both crates; and repository-wide symbol
 search finds no remaining constructor or consumer for the removed projection.
 Net removal: 3,497 lines of non-product code and self-certifying tests.
 
+## 2026-08-28 — issue migration has one implementation
+
+The shipped issue-import route already writes PostgreSQL through
+`PgIssueStore`, with a durable `(tenant, source, source_id)` identity for
+crash-safe replay. Beside it, Issues exported a second `ImportEngine` with a
+mutex source map, an in-memory outbox, private key allocator, adapter models,
+and unit/CDC/drill/“E2E” suites that never reached Edge or PostgreSQL. That
+parallel engine was the only remaining consumer of the generic ADF contract
+table after the unshipped Knowledge facade was removed.
+
+The duplicate engine, its copied tests, and the orphaned ADF simulation are
+gone. The four-value `SourceSystem` parser now stands alone beside the running
+route and durable import identity; its focused test checks exactly the tokens
+accepted at the external boundary.
+
+Proof: all 49 Content and 388 Issues library stories; strict
+all-target/all-feature Clippy for Content, Issues, Edge, and CLI; no remaining
+symbol reference to the in-memory import engine or ADF simulation; and the live
+TypeScript import journey, which previews, writes durable issues, resumes the
+same job, and observes zero duplicate creations through Edge and PostgreSQL
+(1.02 seconds). Net removal: 2,123 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

@@ -1,4 +1,4 @@
-use crate::import::SourceSystem;
+use crate::import_source::SourceSystem;
 use crate::pg_issue_store::{is_valid_issue_title, MAX_TITLE_BYTES};
 use crate::refs_glue::IssueLifecycleRel;
 
