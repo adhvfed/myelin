@@ -1,10 +1,97 @@
 use serde_json::Value;
 
 pub(super) fn render_response(value: &Value) -> Option<String> {
+    if let Some(request) = value.get("request") {
+        return render_request(request);
+    }
+    if let Some(certificate) = value.get("certificate") {
+        return render_certificate(certificate);
+    }
     if let Some(agent_data) = value.get("agent_data") {
         return render_status(agent_data);
     }
     value.get("erasure").and_then(render_erasure)
+}
+
+fn render_request(request: &Value) -> Option<String> {
+    let id = canonical_request_id(request.get("id")?.as_str()?)?;
+    if request.get("kind")?.as_str()? != "erasure" {
+        return None;
+    }
+    let scope = scope_label(request.get("scope")?.as_str()?)?;
+    let state = match request.get("state")?.as_str()? {
+        "pending" => "pending",
+        "processing" => "processing",
+        "completed" => "completed",
+        _ => return None,
+    };
+    let attempts = request.get("attempt_count")?.as_u64()?;
+    let certificate_available = request.get("certificate_available")?.as_bool()?;
+    let next = if certificate_available {
+        format!("myelin privacy request certificate {id}")
+    } else {
+        format!("myelin privacy request status {id}")
+    };
+    Some(format!(
+        "Privacy erasure request {id}: {state}.\nScope: {scope}. Attempts: {attempts}.\nNext: `{next}`.\n"
+    ))
+}
+
+fn render_certificate(certificate: &Value) -> Option<String> {
+    let request_id = canonical_request_id(certificate.get("request_id")?.as_str()?)?;
+    if certificate.get("kind")?.as_str()? != "erasure" {
+        return None;
+    }
+    let scope = scope_label(certificate.get("scope")?.as_str()?)?;
+    let content_hash = certificate.get("content_hash")?.as_str()?;
+    if !is_blake3_hash(content_hash) {
+        return None;
+    }
+    let holders = certificate.get("holders")?.as_array()?;
+    if holders.is_empty() || holders.len() > 64 {
+        return None;
+    }
+    let mut rendered = format!("Privacy erasure certificate {request_id}.\nScope: {scope}.\n");
+    for holder in holders {
+        let name = holder.get("holder")?.as_str()?;
+        if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+            return None;
+        }
+        if holder.get("operation")?.as_str()? != "erasure"
+            || !holder.get("key_unrecoverable")?.as_bool()?
+        {
+            return None;
+        }
+        let records = holder.get("records_erased")?.as_u64()?;
+        rendered.push_str(&format!(
+            "- {}: {}; key unrecoverable.\n",
+            super::terminal_safe_single_line(name),
+            labelled_records(records, "record erased", "records erased")
+        ));
+    }
+    rendered.push_str(&format!("Certificate hash: {content_hash}\n"));
+    Some(rendered)
+}
+
+fn canonical_request_id(value: &str) -> Option<&str> {
+    crate::dispatch::is_canonical_uuid(value).then_some(value)
+}
+
+fn scope_label(scope: &str) -> Option<&'static str> {
+    match scope {
+        "agent_data" => Some("agent traces and replay journals"),
+        "chat_messages" => Some("messages you authored in Chat"),
+        "issue_titles" => Some("Issue titles you authored"),
+        _ => None,
+    }
+}
+
+fn is_blake3_hash(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("blake3:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn render_status(agent_data: &Value) -> Option<String> {
@@ -143,5 +230,55 @@ mod tests {
         assert!(rendered.contains("subject key is unrecoverable"));
         assert!(rendered.contains("permanently blocked"));
         assert!(rendered.contains("not full account erasure"));
+    }
+
+    #[test]
+    fn durable_request_output_points_to_its_owned_certificate() {
+        let rendered = render_response(&json!({
+            "request": {
+                "id": "01234567-89ab-cdef-0123-456789abcdef",
+                "kind": "erasure",
+                "scope": "chat_messages",
+                "state": "completed",
+                "attempt_count": 1,
+                "certificate_available": true
+            }
+        }))
+        .unwrap();
+        assert!(rendered.contains("messages you authored in Chat"));
+        assert!(rendered.contains("completed"));
+        assert!(rendered
+            .contains("myelin privacy request certificate 01234567-89ab-cdef-0123-456789abcdef"));
+    }
+
+    #[test]
+    fn certificate_output_names_each_verified_holder_without_overclaiming() {
+        let rendered = render_response(&json!({
+            "certificate": {
+                "request_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "kind": "erasure",
+                "scope": "agent_data",
+                "holders": [
+                    {
+                        "holder": "agent_traces",
+                        "operation": "erasure",
+                        "records_erased": 2,
+                        "key_unrecoverable": true
+                    },
+                    {
+                        "holder": "tool_effects",
+                        "operation": "erasure",
+                        "records_erased": 1,
+                        "key_unrecoverable": true
+                    }
+                ],
+                "content_hash": format!("blake3:{}", "a".repeat(64))
+            }
+        }))
+        .unwrap();
+        assert!(rendered.contains("agent_traces: 2 records erased"));
+        assert!(rendered.contains("tool_effects: 1 record erased"));
+        assert!(rendered.contains("key unrecoverable"));
+        assert!(!rendered.contains("full account"));
     }
 }

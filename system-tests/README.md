@@ -63,6 +63,11 @@ The suite is intentionally organized around externally visible contracts:
 - `automation-delegation` proves automation caveats are enforceable authority and that a
   short-lived agent can use its founder's repository visibility only through an audited MCP read,
   never by impersonating the founder at an ordinary product endpoint.
+- `privacy-lifecycle` creates real agent work, authored Chat history, and authored Issue titles,
+  erases each independently through a durable browser-approved request, verifies the affected
+  product view and isolation from other holders and authors, then reads the exact holder
+  certificate and replays the request without duplicating work. `privacy-cli` drives the same
+  confirmed, retry-safe request, status, and certificate journey through the shipped CLI.
 - `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary exactly once,
   executes the pushed commit in the pinned gVisor sandbox, settles successfully, and preserves the
   exact archived output while repository visibility still governs both list and detail reads.

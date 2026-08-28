@@ -132,7 +132,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Inspect or erase your own agent traces and replay journals.
+    /// Inspect or erase your data through holder-scoped requests and certificates.
     Privacy {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

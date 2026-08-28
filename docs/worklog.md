@@ -3009,6 +3009,37 @@ four jobs; 33 run-plan tests are green; and the sandbox boundary admits every
 supported offline recipe while rejecting unknown commands, option-shaped
 package names, duplicate vendor frames, and misplaced compiler arguments.
 
+## 2026-08-28 — truthful privacy holders reach the CLI
+
+The durable privacy-request API and its full-system journeys already covered
+agent data, authored Chat messages, and authored Issue titles, but the shipped
+CLI exposed only the older agent-data status and direct-erasure shortcut. The
+README was further behind: it still claimed Chat was absent from public privacy
+requests and certificates. People therefore had to construct HTTP requests to
+use two proven holders or retain any holder certificate.
+
+`myelin privacy request erase <scope> --confirm` now projects the one durable
+request contract for all three truthful scopes. Submission requires the
+ordinary retry-stable idempotency key; status and certificate commands accept
+only one canonical lowercase request UUID. Human output names the exact holder
+scope, durable state, retry count, next command, per-holder erased record count,
+key-unrecoverability proof, and certificate hash. JSON mode preserves the
+complete server response. Unknown scopes, malformed identifiers, missing
+confirmation, incomplete receipts, and unrecognised certificate shapes fail
+locally or fall back to unmodified JSON instead of being optimistically
+rendered.
+
+The new TypeScript journey obtains a browser-approved session, proves an
+unconfirmed command never reaches Edge, runs the real CLI binary to erase the
+Chat holder, replays the same request identity, reads human status, and reads
+both machine and human certificate forms. The existing three-scope privacy
+lifecycle was rebuilt and rerun alongside it, so the CLI seam rests on the
+same PostgreSQL-backed holder effects rather than a command-only fixture.
+
+Proof: all 159 CLI library tests; strict all-target/all-feature CLI Clippy;
+TypeScript typechecking; the rebuilt one-test CLI privacy journey; and all
+three rebuilt privacy lifecycle journeys against the running platform.
+
 ## 2026-08-28 — transport capacity follows credential and principal class
 
 Verified dispatch admission still began too late for four bounded resources.

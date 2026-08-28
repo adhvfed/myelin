@@ -156,6 +156,11 @@ myelin agent reject gate:fedcba9876543210fedcba9876543210 \
 # Inspect the agent data held for the signed-in person, then erase that narrow scope:
 myelin privacy agent-data status
 myelin privacy agent-data erase --confirm
+# Or submit a durable holder-scoped request and retain its certificate:
+myelin privacy request erase chat-messages --confirm \
+  --idempotency-key erase-my-chat-history
+myelin privacy request status 55555555-5555-4555-8555-555555555555
+myelin privacy request certificate 55555555-5555-4555-8555-555555555555
 
 myelin repo list
 myelin repo pr list
@@ -259,15 +264,17 @@ third-party integration key is created or copied into the agent.
 The durable trace store is also the H17 personal-data holder. A signed-in person can inspect this
 narrow agent-data scope and irreversibly erase their own traces, model replay steps, and tool-effect
 journals through Edge or `myelin privacy agent-data`. Erasure records a durable suppression marker,
-deletes every live record, destroys the scoped agent-data key so ciphertext in backups remains unrecoverable,
-and permanently blocks later agent processing for that person. This self-service operation is not
-presented as full account or organization erasure; other personal-data holders remain outside its
-explicit scope.
+deletes every live record, destroys the scoped agent-data key so ciphertext in backups remains
+unrecoverable, and permanently blocks later agent processing for that person.
 
-New Chat messages likewise use a Chat-specific subject key. Existing messages encrypted with the
-former unscoped subject key remain readable, while another product's erasure can no longer destroy
-the key for a newly written Chat message. This is the cryptographic boundary required for a real
-Chat holder; it does not yet make Chat part of the public privacy request or certificate.
+The durable privacy-request surface covers the three holder slices Myelin can currently prove:
+agent data, authored Chat messages, and authored Issue titles. `myelin privacy request erase`
+requires an explicit scope, confirmation, and retry-stable idempotency key; its returned request ID
+addresses durable status and a content-addressed holder certificate. Chat and Issue erasure
+tombstone only the requesting person's authored content, destroy that holder-specific subject key,
+and leave other products and other authors untouched. Each scope has real post-restore re-erasure
+proof. These operations are deliberately not presented as full account or organization erasure;
+unlisted holders remain outside the certificate rather than receiving ceremonial receipts.
 
 Sensitive effects such as `git.merge` have a second, narrower approval boundary. The agent may
 reason up to the effect, but Myelin withholds the mutation, parks the durable workflow without
