@@ -22,7 +22,6 @@ myelin-query = { path = "../myelin-query" }
 myelin-refs = { path = "../myelin-refs" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-storage = { path = "../myelin-storage" }
-myelin-search = { path = "../myelin-search" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 serde = { workspace = true }
 serde_json = { workspace = true }

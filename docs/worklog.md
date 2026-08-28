@@ -3695,6 +3695,26 @@ Proof: all 220 Chat library stories and the normal non-integration suites, plus
 the Search library and normal suites; strict all-target/all-feature Clippy for
 Chat, Search, and Edge. Net removal: 3,285 lines.
 
+## 2026-08-28 — Knowledge projections no longer fork durable truth
+
+Knowledge exposed a reindex owner backed by maps populated through public test
+helpers. It synthesized page, row, block, and reference-edge snapshots without
+reading the PostgreSQL page store or the durable Refs store. It even declared a
+second owner for `refs.edge.snapshot`, alongside the real Refs service. The
+Knowledge search feeder similarly wrapped Search's in-process engine and was
+called only by fixtures with fake authorization answers.
+
+The map-backed replay owner, owner-side Search façade, and their CDC/drill
+suites are removed. Knowledge no longer depends on Search. Its durable page
+store and outbox events, content-edge emission, owner-scoped Refs projection,
+and collaboration transport remain the production seams from which a future
+index worker can rebuild truthfully.
+
+Proof: the complete normal Knowledge suite and strict all-target/all-feature
+Clippy across Knowledge, Search, and Edge; repository-wide search finding no
+Knowledge Search dependency or duplicate Knowledge reindex owner. Net removal:
+1,751 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

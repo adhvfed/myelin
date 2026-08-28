@@ -14,9 +14,7 @@ pub mod notif_resolve;
 pub mod pg_page;
 pub mod rebac_fragment;
 pub mod refs_glue;
-pub mod replay;
 pub mod rollup;
-pub mod search_feed;
 pub mod store;
 pub mod subs;
 pub mod surge;
@@ -92,16 +90,10 @@ pub use refs_glue::{
     Projected, Projector, SubAnchor, SubState, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE,
     REL_CLASS_REFERENCE,
 };
-pub use replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 pub use rollup::{
     compute_row, CellValue, FormulaExpr, FormulaField, FormulaSchema, FormulaSchemaError,
     MaterialisationHint, RollupFn, RollupLatencyTelemetry, RollupResolver, MAX_DEPENDENCY_DEPTH,
     MAX_FORMULA_DEPTH, MAX_FORMULA_NODES,
-};
-pub use search_feed::{
-    feed_project, kn_declared_index_specs, kn_index_specs, kn_page_index_spec, kn_read_permission,
-    kn_row_index_spec, kn_search_query, kn_search_semantic, page_search_projection, FeedGrain,
-    SearchAclFilter, KN_READ_PERMISSION, KN_SEARCH_OBJECT_TYPE,
 };
 pub use store::{knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable};
 pub use subs::{
