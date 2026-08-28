@@ -11,8 +11,6 @@ pub mod declares;
 pub mod dek;
 pub mod durable_erase;
 pub mod events;
-pub mod governance;
-pub mod holder_intent;
 mod import_source;
 pub mod keys;
 pub mod migrations;
@@ -37,7 +35,6 @@ pub mod sla_escalation;
 pub mod surge;
 pub mod time_axis;
 pub mod trigger;
-pub mod views;
 pub mod workflow;
 pub mod write_path;
 
@@ -152,17 +149,6 @@ pub use planner::{
 pub use cost_bounder::{
     classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery, CostBudget,
     FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier, TIER3_FIELDS, TYPED_CORE_FIELDS,
-};
-
-pub use views::{
-    board_and_roadmap_share_row, edit_on_board_reflects_on_roadmap, type_rank_split_is_partition,
-    IssueView, RowProjection, BOARD_TYPE_RANK_MAX, CYCLE_FIELD, ORDER_KEY_FIELD,
-    ROADMAP_TYPE_RANK_MIN, STATE_CATEGORY_FIELD, TYPE_RANK_FIELD,
-};
-
-pub use governance::{
-    simulate_breach, workflow_unreachable_states, BreachSimulation, GovernanceView,
-    GovernanceViewModel, GuardLanguage, InspectorAnswer, PermissionInspector, PermissionResolver,
 };
 
 pub use rollup::{

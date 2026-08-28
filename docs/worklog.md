@@ -3389,6 +3389,29 @@ TypeScript import journey, which previews, writes durable issues, resumes the
 same job, and observes zero duplicate creations through Edge and PostgreSQL
 (1.02 seconds). Net removal: 2,123 lines.
 
+## 2026-08-28 — Issues stops presenting library fixtures as product screens
+
+Three exported Issues modules described product surfaces without serving one.
+The governance “catalogue” was a list of screen ids and backing-engine strings;
+its permission inspector only copied Identity answers through a test adapter.
+The co-equal view “E2E” mutated a local `RowProjection` and asserted that its id
+did not change; its nominal integration test created an ad-hoc table unrelated
+to the product schema and issued raw SQL against it. The holder inventory
+asserted the length and contents of its own hard-coded vector. None was called
+by Edge, CLI, browser, a running worker, or a durable product store.
+
+Those facades and their self-certifying unit/CDC/“E2E” suites are gone. The real
+Identity expansion and explanation APIs, bounded authorization-aware query
+planner, issue write path, workflow and SLA engines, and GDPR schema/erasure
+code remain. Future governance screens must be backed by authenticated durable
+commands and browser journeys; actual board/roadmap behavior belongs at the
+existing product query and mutation boundary.
+
+Proof: all 368 remaining Issues library stories and the complete normal Issues
+test suite; strict all-target/all-feature Issues Clippy; and repository-wide
+symbol search finds no remaining caller for the removed types. Net removal:
+1,496 lines of non-product code and self-certifying tests.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3458,3 +3481,8 @@ same job, and observes zero duplicate creations through Edge and PostgreSQL
     consumer, durable regional analytics store, authenticated API, or user
     journey; the remaining backup tier token is policy vocabulary, not proof
     that an analytics product is running.
+11. **Issues governance configuration is not surfaced.** Workflow, scheme, SLA,
+    trigger, and Identity primitives exist, but the removed static screen
+    catalogue was not an authenticated admin API or browser UI. A truthful
+    replacement needs durable configuration commands, permission inspection at
+    the Identity boundary, validation responses, and full-system admin journeys.
