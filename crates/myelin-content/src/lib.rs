@@ -6,7 +6,6 @@ pub mod editor;
 pub mod events;
 pub mod inline;
 pub mod rebac_fragment;
-pub mod replay;
 
 pub use block::{Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel, ListItem, TaskItem};
 pub use editor::{

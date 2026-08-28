@@ -39,7 +39,6 @@ pub mod rebac_fragment;
 pub mod receive_pack;
 pub mod reconcile;
 pub mod refs_pagination;
-pub mod replay;
 pub mod schema;
 pub mod scip;
 pub mod shed_clone;

@@ -3840,6 +3840,23 @@ Proof: the complete normal Search suite and strict all-target/all-feature
 Search Clippy; repository-wide search finding no `SearchReindexer` or process-
 local reindex cursor store. Net removal: 973 lines.
 
+## 2026-08-28 — Owner replay sources no longer invent durable truth
+
+Git, Issues, and Content each exposed a `ReindexSource` backed by maps filled
+through test helpers. They synthesized repo/blob/PR, issue/relation/comment, and
+Knowledge page/block snapshots without reading their authoritative object or
+PostgreSQL stores. No service composed them, so their cold-equals-live results
+only compared data produced from the same fixture.
+
+The three map-backed replay owners and their replay-only tests are removed.
+Content's mixed CDC still validates Knowledge's real durable/firehose token
+registry. A future owner replay must query the durable owner store and prove a
+restart through the real outbox and consumer.
+
+Proof: all 44 Content, 498 Git, and 134 Issues library stories plus their
+complete normal suites; strict all-target/all-feature Clippy across all three;
+repository-wide search finding no removed replay owner. Net removal: 997 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

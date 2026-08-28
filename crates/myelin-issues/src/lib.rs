@@ -18,7 +18,6 @@ pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
 pub mod refs_glue;
-pub mod replay;
 pub mod schema;
 pub mod write_path;
 
@@ -62,7 +61,6 @@ pub use pg_issue_store::{ImportIssue, ImportIssueReceipt};
 pub use post_restore::{
     PostRestoreIssueTitleError, PostRestoreIssueTitleReEraser, PostRestoreIssueTitleReport,
 };
-pub use replay::{IssueReindexSource, IssueReplayKind};
 
 pub use write_path::{
     apply_mutation, issue_aggregate_key, issue_ref, IssueDraft, IssueUpdate, MutationKind,
