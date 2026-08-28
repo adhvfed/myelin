@@ -7,7 +7,6 @@ pub mod crypto;
 pub mod database;
 pub mod editor;
 pub mod emit;
-pub mod export;
 pub mod list_filter;
 pub mod materialise;
 pub mod merge;
@@ -56,10 +55,6 @@ pub use emit::{
     block_ref, database_ref, emit_change, event_actor_pseudonym, page_ref,
     pseudonymized_event_principal, row_ref, KnowledgeChange, KnowledgeLivingDocHandler,
     KNOWLEDGE_LIVING_DOC_TRIGGERS,
-};
-pub use export::{
-    export_rows_to_csv, import_adf, AdfImportResult, ExportBlock, ExportDoc, ExportError,
-    ExportFormat, ParsedAdfNode, EXPORT_SCHEMA_VERSION,
 };
 pub use list_filter::{
     compose_db_count_query, compose_db_view_query, db_row_id_colref, lower_over,

@@ -3326,6 +3326,25 @@ Proof: all 581 remaining CI control-plane library stories and strict
 all-target/all-feature CI control-plane Clippy; repository-wide symbol search
 finds no remaining code dependency on the removed module.
 
+## 2026-08-28 — Knowledge stops certifying an import/export product it does not expose
+
+Knowledge exported a 1,469-line import/export facade with no Edge route, CLI
+command, browser journey, durable store, or production caller. Its tests called
+the library directly and labelled media conversion lossless even though the
+converter stored no attachment: it manufactured a malformed blob reference
+from arbitrary display text. A copied cross-crate drill then certified the same
+in-process model as an Article 20 mechanism without exercising a user boundary.
+
+That facade and its synthetic tests are gone. The shared ADF mapping remains
+because the running Issues import uses it through the shipped Edge and CLI
+journey. A future Knowledge portability surface must begin with durable page
+and attachment ownership, authorization, and an external system story rather
+than an exported Rust helper.
+
+Proof: all 328 remaining Knowledge library stories; strict all-target/all-feature
+Knowledge Clippy; and repository-wide symbol search finds no orphaned export
+types, import entrypoints, or fabricated `myelin://import/blob` identifiers.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
