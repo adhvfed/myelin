@@ -3632,6 +3632,27 @@ the live PostgreSQL run-list/detail journey proving visibility-scoped keyset
 paging and RLS through the durable store; and strict all-target/all-feature
 Clippy across CI control-plane and Edge. Net removal: 2,649 lines.
 
+## 2026-08-28 — CI search no longer has a pretend worker
+
+CI's search registration constructed an `IncrementalIndexer` with a null
+project fetcher and mock embedding adapter, then immediately discarded it. Its
+reindex source replayed rows from a process-local map populated only by tests.
+No CI service composed either object, no consumer fetched authoritative run
+state, and no durable index received the resulting snapshots. The CDC therefore
+proved agreement between two fixtures, not searchable CI data.
+
+The unused index-spec wrapper, in-memory replay source, and their duplicated
+unit and CDC suites are removed. CI notification summaries remain with their
+actual producer/consumer contracts, and the PostgreSQL run and log surfaces
+remain the authoritative readable product. A future Search worker must begin at
+that durable owner boundary and prove ingestion, restart, authorization, and
+erasure against its real index.
+
+Proof: all 507 CI control-plane and 586 CI sandbox library stories plus both
+complete normal suites; strict all-target/all-feature Clippy across CI sandbox,
+CI control-plane, and Edge; and repository-wide search finding no remaining CI
+reindex source or discarded index registration. Net removal: 786 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

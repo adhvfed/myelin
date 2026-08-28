@@ -131,7 +131,6 @@ pub mod scheduler;
 pub mod secret_admin;
 pub mod secret_broker;
 pub mod surfacing;
-pub mod surfacing_index;
 pub mod surfacing_store;
 pub mod surfacing_tools;
 
@@ -208,11 +207,6 @@ pub use surfacing::{
     commit_check_ref, run_step_line_ref, run_step_ref, CiArtifactType, CiRefError, CI_SUBSYSTEM,
 };
 
-pub use surfacing_index::{
-    ci_run_index_spec, ci_summary, register_ci_run_index_spec, register_ci_summary_templates,
-    run_doc_is_indexable, summary_template_key, CheckVerdict, CiReindexSource, CiReplayKind,
-    CiSummary, CI_RUN_ACL_OBJECT_TYPE, CI_RUN_TYPE, CI_SUMMARY_TEMPLATES,
-};
 pub use surfacing_tools::{ci_tool_def, ci_tool_defs, CI_TOOL_NAMES};
 
 pub use scheduler::{

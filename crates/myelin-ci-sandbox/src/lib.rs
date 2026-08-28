@@ -29,7 +29,6 @@ mod launch_gate;
 pub mod notif_rules;
 pub mod redaction;
 pub use redaction::{ResolvedJobSecrets, ResolvedSecretEnv, SecretInjectionError};
-pub mod replay;
 pub mod rootfs_overlay;
 pub mod runner;
 pub mod self_hosted;
@@ -46,8 +45,6 @@ pub use events::{
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use launch_gate::launch_gate_parent_death_probe;
-pub use replay::CiReindexSource;
-
 pub use notif_rules::{
     ci_notif_rules, ci_summary, register_ci_notif_rules, register_ci_summary_templates,
     summary_template_key, CheckVerdict, CiSummary, CI_CHECK_STATUS_RULE, CI_SUMMARY_TEMPLATES,
