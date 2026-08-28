@@ -272,8 +272,7 @@ impl GitEffectApi {
                 }
             }
             other => EffectResult::Denied(format!(
-                "git tool `{other}` is registered but not yet wired through GitEffectApi (GT-005b) \
-                 - denied, never a silent no-op"
+                "git tool `{other}` has no executable GitEffectApi carrier - denied"
             )),
         }
     }

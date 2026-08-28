@@ -18,13 +18,8 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "merge") => true,
         ("git", "open_pr") => false,
         ("git", "write_file") => false,
-        ("git", "comment") => false,
         ("git", "submit_review") => false,
         ("git", "endorse_fork_ci") => false,
-        ("git", "suggest_change") => false,
-        ("git", "resolve_thread") => false,
-        ("git", "history_rewrite") => true,
-        ("git", "scip_index") => false,
         ("git", "list_repositories") => false,
         ("git", "read_file") => false,
         ("git", "search_code") => false,
@@ -216,29 +211,8 @@ mod tests {
             "open_pr is reversible → NOT gated"
         );
         assert!(
-            requires_approval_default("git", "history_rewrite"),
-            "history-rewrite is gated (changes every downstream hash - consequential)"
-        );
-        assert!(
-            !requires_approval_default("git", "scip_index"),
-            "SCIP indexing is a read-only index build → NOT gated (governed by AG-D4, not HITL)"
-        );
-
-        assert!(
-            !requires_approval_default("git", "comment"),
-            "git.comment is reversible → NOT gated"
-        );
-        assert!(
             !requires_approval_default("git", "submit_review"),
             "git.submit_review is reversible → NOT gated"
-        );
-        assert!(
-            !requires_approval_default("git", "suggest_change"),
-            "git.suggest_change is reversible → NOT gated"
-        );
-        assert!(
-            !requires_approval_default("git", "resolve_thread"),
-            "git.resolve_thread is reversible → NOT gated"
         );
         for read in ["list_repositories", "read_file", "search_code"] {
             assert!(

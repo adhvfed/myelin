@@ -1,6 +1,7 @@
 use myelin_agent::{EffectKind, ToolDef, ToolName};
 
-use crate::git_tools::{GIT_SUBSYSTEM, GIT_TOOL_VERSION};
+const GIT_SUBSYSTEM: &str = "git";
+const GIT_TOOL_VERSION: u32 = 1;
 
 pub const LIST_REPOSITORIES_TOOL: &str = "list_repositories";
 pub const READ_FILE_TOOL: &str = "read_file";

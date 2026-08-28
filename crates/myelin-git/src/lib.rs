@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-pub mod agent_author;
 pub mod anchor;
 pub mod backup;
 pub mod blob_coordinate;
@@ -9,7 +8,6 @@ pub mod check_status;
 pub mod check_status_store;
 pub mod clock;
 pub mod code_projection;
-pub mod code_tools;
 pub mod commit;
 pub mod coordinate {
     pub use myelin_refs::git_coordinate::*;

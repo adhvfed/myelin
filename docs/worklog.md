@@ -3538,6 +3538,28 @@ complete normal suites; strict all-target/all-feature Clippy across Chat, Agent
 Service, Edge, CLI, and MCP; and repository-wide symbol search finding no stale
 phantom provider or simulator caller.
 
+## 2026-08-28 — Git has one agent-effect catalogue
+
+The platform merged Git's five executable MCP definitions with an older
+eight-definition Agent Service provider. Name deduplication concealed merge,
+open-PR, and review duplicates, but left comment, suggested-change,
+thread-resolution, history-rewrite, and SCIP-index definitions visible to
+internal agents even though `GitEffectApi` had no execution arm for them.
+
+Git now owns one five-effect definition set—write file, open pull request,
+submit review, endorse fork CI, and human-approved merge—and Edge implements
+that exact set. The duplicate provider and policy rows are gone. The adjacent
+agent-author vocabulary and history-rewrite/index module were also isolated
+test products: the latter invoked an injected wire fake, invalidated injected
+cache fakes, and minted a receipt without a durable command, store, worker, or
+service caller. Those modules and their copied CDC are removed rather than
+counted as Git functionality.
+
+Proof: all 129 Agent Service, 534 Git, and 367 Edge library stories plus their
+complete normal suites; strict all-target/all-feature Clippy across Git, Agent
+Service, Edge, CLI, and MCP; and repository-wide symbol search finding no
+remaining legacy provider or code-tool caller. Net removal: 1,390 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3638,3 +3660,10 @@ phantom provider or simulator caller.
     invitation, and archival have no governed agent effect carrier. They remain
     absent from discovery until each action has exact authorization, audit,
     idempotency, and a full-system agent journey.
+17. **Several Git collaboration and maintenance actions are not agent effects.**
+    Agents can durably write files, open pull requests, submit review verdicts,
+    endorse fork CI, and merge with human approval. Inline comment authoring,
+    suggested changes, thread resolution, SCIP indexing, and audited history
+    rewrite have no governed carrier; the former injected-fake rewrite/index
+    module was removed. Each future action needs a durable owner boundary and a
+    full-system agent journey before discovery.

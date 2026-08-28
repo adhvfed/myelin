@@ -46,17 +46,7 @@ impl PlatformToolCatalogue {
     }
 
     fn build_platform() -> Result<Self, ToolCatalogueError> {
-        let git_mcp = myelin_git::api::agent_tool_defs();
-        let mcp_names = git_mcp
-            .iter()
-            .map(ToolDef::canonical_name)
-            .collect::<BTreeSet<_>>();
-
-        let mut definitions = crate::git_tool_defs()
-            .into_iter()
-            .filter(|definition| !mcp_names.contains(&definition.canonical_name()))
-            .collect::<Vec<_>>();
-        definitions.extend(git_mcp);
+        let mut definitions = myelin_git::api::agent_tool_defs();
         definitions.extend(crate::git_read_tool_defs());
         definitions.extend(myelin_ci_controlplane::ci_tool_defs());
         definitions.extend(crate::issues_read_tool_defs());
@@ -193,6 +183,18 @@ mod tests {
             Some(McpApprovalContract::GitMerge)
         );
         for unavailable in ["chat.react", "chat.create_channel", "chat.archive_channel"] {
+            assert!(
+                catalogue.resolve(unavailable).is_none(),
+                "catalogue must not advertise unavailable effect {unavailable}"
+            );
+        }
+        for unavailable in [
+            "git.comment",
+            "git.history_rewrite",
+            "git.scip_index",
+            "git.suggest_change",
+            "git.resolve_thread",
+        ] {
             assert!(
                 catalogue.resolve(unavailable).is_none(),
                 "catalogue must not advertise unavailable effect {unavailable}"

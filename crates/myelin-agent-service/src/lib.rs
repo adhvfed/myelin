@@ -5,7 +5,6 @@ pub mod ci_tools;
 pub mod defaults;
 pub mod effect_api;
 pub mod git_read_tools;
-pub mod git_tools;
 pub mod hosted_run_contract;
 pub mod issues_agents;
 pub mod issues_read_tools;
@@ -51,14 +50,6 @@ pub use effect_api::{validate_call, validate_schema, validate_tool_arguments};
 pub use defaults::{
     assert_no_silent_loosening, default_for_tool, requires_approval_default,
     requires_approval_for_landing, seed_requires_approval, LooseningViolation, WrittenDeviation,
-};
-
-pub use git_tools::{
-    git_author_tool_defs, git_comment_tool_def, git_history_rewrite_tool_def,
-    git_merge_required_caps, git_merge_tool_def, git_resolve_thread_tool_def,
-    git_scip_index_tool_def, git_submit_review_tool_def, git_suggest_change_tool_def,
-    git_tool_defs, open_pr_required_caps, open_pr_tool_def, register_git_tools, GIT_MERGE_TOOL,
-    GIT_SUBSYSTEM, GIT_TOOL_VERSION, OPEN_PR_TOOL,
 };
 
 pub use issues_agents::{
