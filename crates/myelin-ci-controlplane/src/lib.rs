@@ -1,4 +1,3 @@
-pub mod artifact_cache;
 pub mod check_emitter;
 pub mod ci_checkout_composition;
 pub mod ci_claim_token_issuer;

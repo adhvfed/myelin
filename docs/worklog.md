@@ -3308,6 +3308,24 @@ live CLI collaboration journeys, including catalogue discovery, governed Git,
 approval, resume, retirement, migration, native Git, expiry, and logout (45.95
 seconds).
 
+## 2026-08-28 — CI no longer exports a cache it does not run
+
+`myelin-ci-controlplane` publicly exported an `artifact_cache` module with no
+production caller or durable backing. Its six tests exercised only local key
+selection, a duplicate residency counter, and a fabricated published event;
+that event's supposed reference had an extra path segment and could not pass
+the platform reference codec. The module made the absent product capability
+look implemented without providing cache restore, save, retention, or a runner
+journey.
+
+The unused module and its self-certifying tests are gone. CI's real log,
+artifact surfacing, secret, manifest, and runner paths remain intact, and the
+known cache gap stays explicit until it begins at a durable runner/store seam.
+
+Proof: all 581 remaining CI control-plane library stories and strict
+all-target/all-feature CI control-plane Clippy; repository-wide symbol search
+finds no remaining code dependency on the removed module.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3355,6 +3373,7 @@ seconds).
    resume/snapshot boundary, or reconnecting board client. the former in-memory facade
    was removed rather than counted as shipped behavior.
 7. **CI has no user-visible cache yet.** the old process-local namespace is gone;
+   the later unused `artifact_cache` facade and its fabricated event are also gone.
    the historical `cache_entry` table has no store, pipeline syntax, runner
    restore/save operation, retention policy, or full-system journey. the eventual
    design must derive its namespace from the durable run trust stamp.
