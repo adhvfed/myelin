@@ -577,8 +577,7 @@ mod tests {
     use super::*;
     use crate::keys::{HiLoKeyAllocator, InMemoryPrefixCounter};
     use myelin_events::{
-        Actor, CausedBy, EventEnvelope, EventHandler, HandleOutcome, MonotonicMinter, Region,
-        TenantId, Timestamp,
+        Actor, CausedBy, EventEnvelope, MonotonicMinter, Region, TenantId, Timestamp,
     };
     use myelin_identity::{
         AuthzError, Credential, EffectivePolicy, FragmentAdmit, ListObjectsResult,
@@ -921,54 +920,6 @@ mod tests {
             IssueUpdate::new(b"delta".to_vec(), BUG_TYPE_ID, ["not a field"]),
             Err(WriteError::Invalid(_))
         ));
-    }
-
-    #[test]
-    fn a_written_update_drives_its_hot_facet_projection_end_to_end() {
-        use crate::projection_feeder::{CollectionKey, FacetKey, ProjectionFeeder};
-
-        let store = OutboxStore::new();
-        let object = issue_ref("acme", "ENG-8");
-        let id = StubId::new().allowing(PERM_MANAGE, &object);
-        let update = IssueUpdate::new(b"severity: 2 -> 1".to_vec(), BUG_TYPE_ID, ["severity"])
-            .expect("valid update metadata");
-
-        let outcome = apply_mutation(
-            &store,
-            minter(),
-            ctx_base(),
-            &id,
-            &actor(),
-            "ENG-8",
-            &MutationKind::Update(update),
-            None,
-        )
-        .expect("the issue update commits");
-        let row = store
-            .row(&outcome.event_id.expect("an update emits"))
-            .expect("the event co-committed");
-        assert_eq!(row.envelope.subject, object);
-        assert_eq!(row.envelope.payload["issue"], object.0);
-        assert_eq!(row.envelope.payload["issue_local_id"], "ENG-8");
-        assert_eq!(row.envelope.payload["type_id"], BUG_TYPE_ID);
-        assert_eq!(
-            row.envelope.payload["changed_facets"],
-            serde_json::json!(["severity"])
-        );
-
-        let feeder = ProjectionFeeder::new();
-        let collection = CollectionKey::new("acme", BUG_TYPE_ID);
-        for _ in 0..20 {
-            feeder.record_view_execution(&collection, &["severity"]);
-        }
-        for _ in 0..80 {
-            feeder.record_view_execution(&collection, &[]);
-        }
-        assert_eq!(
-            feeder.handle(&row.envelope, &mut myelin_events::HandlerTx::none()),
-            HandleOutcome::Done
-        );
-        assert!(feeder.is_promoted(&FacetKey::new("acme", BUG_TYPE_ID, "severity")));
     }
 
     #[test]

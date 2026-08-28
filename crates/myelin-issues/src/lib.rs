@@ -5,7 +5,6 @@ pub mod api;
 pub mod app;
 pub mod ci_guard;
 pub mod content;
-pub mod cost_bounder;
 pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
@@ -17,9 +16,7 @@ pub mod migrations;
 pub mod move_crdt;
 pub mod my_work;
 pub mod pg_issue_store;
-pub mod planner;
 pub mod post_restore;
-pub mod projection_feeder;
 pub mod pseudonym;
 pub mod query_coown;
 pub mod rebac_fragment;
@@ -31,25 +28,15 @@ pub mod rollup;
 pub mod schema;
 pub mod sla_calendar;
 pub mod sla_escalation;
-pub mod surge;
 pub mod trigger;
 pub mod workflow;
 pub mod write_path;
 
+pub use app::{boot_issues, issues_app_spec, run_issues, run_issues_until_shutdown, SERVICE_NAME};
 pub use durable_erase::{
     issue_title_holder_receipts, DurableIssueTitleEraser, DurableIssueTitleErasureError,
     DurableIssueTitleErasureProof,
 };
-pub use post_restore::{
-    PostRestoreIssueTitleError, PostRestoreIssueTitleReEraser, PostRestoreIssueTitleReport,
-};
-pub use replay::{IssueReindexSource, IssueReplayKind};
-pub use surge::{
-    open_surge_gate_from_thresholds, run_iss_d2_cell_scale, run_issues_owner_surge,
-    IssD2CellScaleReport, IssuesOwnerShed, IssuesOwnerSurgeReport, ISSUES_SURGE_MULTIPLIER,
-};
-
-pub use app::{boot_issues, issues_app_spec, run_issues, run_issues_until_shutdown, SERVICE_NAME};
 pub use migrations::{
     issues_hot_tables, issues_migrations, make_tenant_scoped_ddl, CONSUMER_DEDUP_TABLE,
     CREATE_CONSUMER_DEDUP_DDL, CREATE_CYCLE_DDL, CREATE_CYCLE_MEMBERSHIP_DDL,
@@ -82,6 +69,10 @@ pub use pg_issue_store::{
     StoredIssueRelation, VisibleIssues, MAX_RELATIONS_PER_ISSUE,
 };
 pub use pg_issue_store::{ImportIssue, ImportIssueReceipt};
+pub use post_restore::{
+    PostRestoreIssueTitleError, PostRestoreIssueTitleReEraser, PostRestoreIssueTitleReport,
+};
+pub use replay::{IssueReindexSource, IssueReplayKind};
 
 pub use write_path::{
     apply_mutation, issue_aggregate_key, issue_ref, IssueDraft, IssueUpdate, MutationKind,
@@ -130,18 +121,6 @@ pub use ci_guard::{
     bind_linked_pr_ctx, ci_done_guard, plan_agent_ci_gated_transition, plan_ci_gated_transition,
     AgentTransitionOutcome, LinkedPrCheck, CHECK_STATE_NEUTRAL, CHECK_STATE_SUCCESS,
     TRUST_TIER_TRUSTED, TRUST_TIER_UNTRUSTED_FORK,
-};
-
-pub use planner::{
-    compose_board_query, issue_id_colref, lower_over_issue_id, AuthzJoin, AuthzVisibleIndex,
-    BoundParam, ComposedBoardQuery, FilterMode, LoweredFilter, AUTHZ_VISIBLE_TABLE,
-    ISSUE_VIEW_PERMISSION,
-};
-
-pub use cost_bounder::{
-    classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery, CostBudget,
-    FacetCatalog, IndexPosture, PlanOutcome, RefineHint, SearchEscalation, Tier, TIER3_FIELDS,
-    TYPED_CORE_FIELDS,
 };
 
 pub use rollup::{

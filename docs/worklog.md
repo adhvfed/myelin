@@ -3432,6 +3432,28 @@ test suite; strict all-target/all-feature Issues Clippy; and repository-wide
 symbol search finds no surviving scheme or time-axis caller. Removed 1,605
 lines of facade modules and self-certifying tests.
 
+## 2026-08-28 — issue reads have one authorization and query path
+
+Edge serves issue pages from `PgIssueStore` and its durable visibility
+projection. Alongside that running path, Issues exported a second planner,
+cost-bounder, facet-frequency map, generated-index builder, and load-report
+facade. Nothing in Edge or the Issues process called them. Their nominal
+PostgreSQL integrations created unrelated tables at test time, rewrote emitted
+SQL strings to point at those tables, and bypassed the product schema, RLS,
+routes, and visibility reconciliation. The cell-scale suite drove only
+in-memory load gates and restore objects.
+
+That parallel query/projection system, its synthetic surge reports, copied
+unit/CDC/drill/“E2E” suites, and the one write-path test that manually invoked
+the fake feeder are gone. The durable PostgreSQL issue list, authorization
+projection, Edge surface, and their live integration/full-system journeys
+remain the product truth.
+
+Proof: all 284 remaining Issues library stories and the complete normal Issues
+test suite; strict all-target/all-feature Issues Clippy; and repository-wide
+symbol search finds no surviving caller or export from the removed query chain.
+Net removal: 4,977 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3511,3 +3533,8 @@ lines of facade modules and self-certifying tests.
     former time-axis helper wrote only to an in-process outbox and generic blob
     adapter. There is no durable owner store, authenticated API, issue mutation,
     download authorization, retention/erasure handling, or full-system journey.
+13. **Issue custom-field querying and index promotion are not shipped.** The
+    running list path is bounded and authorization-filtered, but the removed
+    planner and facet feeder never reached it. Dynamic fields need a durable
+    definition/usage store, safe SQL lowering integrated into `PgIssueStore`,
+    online index lifecycle ownership, and a live Edge/browser journey.
