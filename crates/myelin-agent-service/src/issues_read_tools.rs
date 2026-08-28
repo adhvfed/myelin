@@ -1,6 +1,6 @@
 use myelin_agent::{EffectKind, ToolDef, ToolName};
 
-use crate::issues_tools::{ISSUES_SUBSYSTEM, ISSUES_TOOL_VERSION};
+use crate::issues_agents::{ISSUES_SUBSYSTEM, ISSUES_TOOL_VERSION};
 
 pub const LIST_ISSUES_TOOL: &str = "list";
 pub const VIEW_ISSUE_TOOL: &str = "view";

@@ -39,8 +39,8 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
         ("ci", "run_pipeline", true),
         ("git", "merge", false),
         ("git", "open_pr", true),
-        ("issues", "forecast", true),
-        ("issues", "transition", false),
+        ("issues", "create", true),
+        ("issues", "close", false),
         ("knowledge", "publish", false),
         ("knowledge", "draft", true),
         ("chat", "post_message", true),
@@ -60,8 +60,8 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
     expect("run_pipeline", false);
     expect("merge", true);
     expect("open_pr", false);
-    expect("forecast", false);
-    expect("transition", true);
+    expect("create", false);
+    expect("close", true);
     expect("publish", true);
     expect("draft", false);
     expect("post_message", false);

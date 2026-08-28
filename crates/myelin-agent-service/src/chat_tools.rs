@@ -117,8 +117,8 @@ mod tests {
             "a chat-invoked knowledge.publish lands in knowledge → gated"
         );
         assert!(
-            !landing_requires_approval("issues", "forecast"),
-            "a chat-invoked issues.forecast lands in issues → advisory (NOT gated)"
+            landing_requires_approval("issues", "close"),
+            "a chat-invoked issues.close lands in issues → gated"
         );
         assert!(
             !landing_requires_approval(CHAT_SUBSYSTEM, POST_MESSAGE_TOOL),

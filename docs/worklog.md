@@ -3477,6 +3477,27 @@ test suite; strict all-target/all-feature Issues Clippy; and repository-wide
 symbol search finds no caller for the removed engines. Net removal: 9,516
 lines.
 
+## 2026-08-28 — agents discover only executable issue effects
+
+The Edge effect carrier implements `issues.create` and `issues.close`, but the
+shared platform catalogue also resolved update, comment, link, estimate,
+reorder, assign, forecast, triage, SLA draft, and workflow transition tool
+definitions. MCP happened to hide those entries; internal agent discovery did
+not. A definition and JSON schema therefore looked like runnable capability
+even though no executor could apply it.
+
+The Issues mutation provider now contains exactly the two executable effects,
+retaining create v1 only for version compatibility. Read-only list/view remain
+in their working provider. The unused advisory/transition module and special
+approval defaults are gone; an unknown future effect uses the fail-closed
+approval fallback until it has a real executor and explicit policy.
+
+Proof: all 150 Agent Service library stories and its complete normal test suite;
+strict all-target/all-feature Clippy across Agent Service, Edge, CLI, and MCP;
+and the complete running CLI collaboration journey (16/16), including shared
+catalogue pagination and MCP description through one browser-approved session.
+Net removal: 450 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3563,6 +3584,6 @@ lines.
     online index lifecycle ownership, and a live Edge/browser journey.
 14. **Issue automation and hierarchy processing are not shipped.** There is no
     durable workflow transition command, CI/reflex/trigger/SLA consumer, parent
-    rollup store, or cross-cell portfolio worker. Agent tool discovery must not
-    advertise these as runnable effects until each has an authorized executor
-    and a restart-safe full-system journey.
+    rollup store, or cross-cell portfolio worker. Agent discovery now exposes
+    only the working create/close mutations; each additional effect needs an
+    authorized executor and restart-safe full-system journey before registration.

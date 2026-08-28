@@ -29,19 +29,9 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "read_file") => false,
         ("git", "search_code") => false,
 
-        ("issues", "forecast") => false,
         ("issues", "list") => false,
         ("issues", "view") => false,
-        ("issues", "triage") => false,
-        ("issues", "sla_draft") => false,
         ("issues", "create") => false,
-        ("issues", "update") => false,
-        ("issues", "comment") => false,
-        ("issues", "link") => false,
-        ("issues", "estimate") => false,
-        ("issues", "reorder") => false,
-        ("issues", "assign") => false,
-        ("issues", "transition") => true,
         ("issues", "close") => true,
 
         ("knowledge", "publish") => true,
@@ -268,21 +258,13 @@ mod tests {
             );
         }
 
-        assert!(
-            !requires_approval_default("issues", "forecast"),
-            "forecast is advisory → NOT gated"
-        );
-        assert!(
-            !requires_approval_default("issues", "triage"),
-            "triage is advisory → NOT gated"
-        );
-        assert!(
-            !requires_approval_default("issues", "sla_draft"),
-            "sla_draft is advisory → NOT gated"
-        );
+        assert!(!requires_approval_default("issues", "create"));
+        assert!(!requires_approval_default("issues", "list"));
+        assert!(!requires_approval_default("issues", "view"));
+        assert!(requires_approval_default("issues", "close"));
         assert!(
             requires_approval_default("issues", "transition"),
-            "SLA transition is caveat-gated (floor)"
+            "an unimplemented future effect remains gated by the fail-closed fallback"
         );
 
         assert!(
@@ -347,8 +329,8 @@ mod tests {
             "a chat-invoked git.merge is governed where it LANDS (git → gated)"
         );
         assert!(
-            !requires_approval_for_landing("chat", "issues", "forecast"),
-            "a chat-invoked issues.forecast lands in issues → advisory (NOT gated)"
+            requires_approval_for_landing("chat", "issues", "close"),
+            "a chat-invoked issues.close lands in issues → gated"
         );
         assert_eq!(
             requires_approval_for_landing("git", "git", "merge"),

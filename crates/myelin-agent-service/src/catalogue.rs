@@ -60,7 +60,7 @@ impl PlatformToolCatalogue {
         definitions.extend(crate::git_read_tool_defs());
         definitions.extend(myelin_ci_controlplane::ci_tool_defs());
         definitions.extend(crate::issues_read_tool_defs());
-        definitions.extend(crate::full_issues_tool_defs());
+        definitions.extend(crate::issues_mutation_tool_defs());
         definitions.extend(crate::knowledge_mcp_tool_defs());
         definitions.extend(crate::knowledge_tool_defs());
         definitions.extend(crate::chat_read_tool_defs());

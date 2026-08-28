@@ -10,7 +10,6 @@ pub mod git_tools;
 pub mod hosted_run_contract;
 pub mod issues_agents;
 pub mod issues_read_tools;
-pub mod issues_tools;
 pub mod knowledge_mcp_tools;
 pub mod knowledge_tools;
 pub mod metering;
@@ -71,18 +70,10 @@ pub use knowledge_tools::{
     EDIT_CONFIDENTIAL_TOOL, KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION, PUBLISH_TOOL,
 };
 
-pub use issues_tools::{
-    advisory_required_caps, forecast_tool_def, issues_tool_defs, register_issues_tools,
-    sla_draft_tool_def, transition_caveat, transition_required_caps, transition_tool_def,
-    triage_tool_def, FORECAST_TOOL, ISSUES_SUBSYSTEM, ISSUES_TOOL_VERSION, SLA_DRAFT_TOOL,
-    TRANSITION_TOOL, TRIAGE_TOOL,
-};
-
 pub use issues_agents::{
-    assign_required_caps, assign_tool_def, close_tool_def, create_required_caps, create_tool_def,
-    estimate_tool_def, full_issues_tool_defs, link_tool_def, register_full_issues_tools,
-    reorder_tool_def, update_required_caps, update_tool_def, ASSIGN_TOOL, CLOSE_TOOL, CREATE_TOOL,
-    CREATE_TOOL_VERSION, ESTIMATE_TOOL, LINK_TOOL, REORDER_TOOL, UPDATE_TOOL,
+    close_tool_def, create_required_caps, create_tool_def, issues_mutation_tool_defs,
+    register_issues_mutation_tools, CLOSE_TOOL, CREATE_TOOL, CREATE_TOOL_VERSION, ISSUES_SUBSYSTEM,
+    ISSUES_TOOL_VERSION,
 };
 
 pub use issues_read_tools::{
