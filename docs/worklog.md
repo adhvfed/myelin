@@ -3916,6 +3916,25 @@ Identity service before the workspace-wide verification; repository-wide
 search finding no removed facade or owner index. Net removal: 6,387 code/test
 lines.
 
+## 2026-08-28 — Query stops certifying process-local automations
+
+`myelin-query` exported an automation engine whose rules, firing ledger,
+budgets, and supposedly durable workflow handles lived in collections, plus a
+trigger engine whose `DurableTimer` was another mutex map. No running service
+composed either engine. A Flow test adapter made the query executor look
+durable by translating it into Flow only inside the test process.
+
+Those two engines, their public exports, copied CDC suites, and the test-only
+Flow adapter are removed. Query retains the bounded predicate, matcher, view,
+and signal primitives used by running owners. The separate agent-trigger
+product remains durable in PostgreSQL and covered through its authenticated
+full-system journey. The contract index now marks the removed generic Bus
+automation and trigger contracts as unshipped instead of confirmed.
+
+Proof: all-target/all-feature Query and Flow compilation before the strict
+workspace verification; repository-wide search finding no remaining caller or
+removed type. Net removal: 2,211 code/test lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

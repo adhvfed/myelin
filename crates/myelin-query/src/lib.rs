@@ -28,19 +28,6 @@ pub use signals::{
     Severity, Signal, SignalEngine, SignalRule, SignalState,
 };
 
-pub mod automations;
-pub use automations::{
-    register_automation, Action, ActionKind, AutomationEngine, AutomationId, AutomationRule,
-    Budget, Delegation, DurableExecutor, DurableHandle, ExecutorError, Gate, InMemoryExecutor,
-    Outcome, RunAs, StartedRun, WorkflowRef,
-};
-
-pub mod triggers;
-pub use triggers::{
-    arm_trigger, disarm_trigger, ArmingId, DurableTimer, InMemoryTimer, OnResolve, Resolution,
-    StaleAfter, TimerError, Trigger, TriggerArming, TriggerEngine, TriggerId, TriggerState,
-};
-
 pub const MAX_PREDICATE_NODES: usize = 256;
 
 pub const MAX_PREDICATE_DEPTH: usize = 32;
