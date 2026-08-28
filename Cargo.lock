@@ -3513,7 +3513,6 @@ dependencies = [
  "myelin-config",
  "myelin-content",
  "myelin-events",
- "myelin-flow",
  "myelin-gdpr",
  "myelin-git",
  "myelin-harness",

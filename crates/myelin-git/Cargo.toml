@@ -12,7 +12,6 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-agent = { path = "../myelin-agent" }
 myelin-events = { path = "../myelin-events" }
 myelin-refs = { path = "../myelin-refs" }
-myelin-flow = { path = "../myelin-flow" }
 myelin-query = { path = "../myelin-query" }
 myelin-content = { path = "../myelin-content" }
 myelin-notif = { path = "../myelin-notif" }

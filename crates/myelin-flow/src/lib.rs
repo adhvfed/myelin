@@ -7,7 +7,6 @@ pub mod executor;
 pub mod job;
 pub mod loopsafety;
 pub mod maintenance;
-pub mod merge_queue;
 pub mod migrations;
 pub mod pg_dispatcher;
 pub mod pg_drive_store;
@@ -54,12 +53,6 @@ pub use loopsafety::{
 pub use maintenance::{
     invalidation_marker, maintenance_step_marker, CacheNamespace, MaintenanceOp,
     MaintenancePerformer,
-};
-pub use merge_queue::{
-    ci_dispatch_marker, decode_ci_result, encode_ci_result, git_pr_merged_draft,
-    humanise_dequeue_reason, merge_attempt_id, CheckFact, CiDispatch, CiDispatcher, DequeueCause,
-    MergeOutcome, MergePerformer, MergeRequest, MockCiResultProducer, RealCiResultProducer,
-    CI_RESULT_SIGNAL, GIT_PR_MERGED_EVENT,
 };
 pub use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd};
 pub use pg_dispatcher::{

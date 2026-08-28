@@ -3954,6 +3954,25 @@ Proof: complete normal Chat and Refs-service suites plus strict
 all-target/all-feature Clippy and workspace compilation. Net removal: 1,672
 code/test lines.
 
+## 2026-08-28 — Merge queue claims wait for a production workflow
+
+The documented durable merge queue was implemented only on Flow's in-process
+`RunStore`, `SignalStore`, and `WfJournal`. Its “real” CI result producer still
+wrote to that process-local signal map, Git's merge performer was called only
+by tests, and the production PostgreSQL Flow worker explicitly rejects merge
+bodies because no subsystem adapter is compiled. Larger seam drills merely
+joined those fixtures and labelled the producer real.
+
+The orphan Flow merge body, Git adapter, CI map-backed signal bridge, and their
+CDC/E2E/drill suites are removed. Git's durable direct merge command, CI's
+durable check projection and branch-protection gate, and Flow's PostgreSQL
+signal substrate remain. The contract index now marks checks/gating as the
+shipped portion and the merge queue as a future durable workflow.
+
+Proof: complete normal Flow, Git, and CI-control-plane suites plus strict
+all-target/all-feature Clippy and workspace compilation; repository-wide search
+finding no removed bridge or merge body. Net removal: 4,568 code/test lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -4070,7 +4089,9 @@ code/test lines.
     suggested changes, thread resolution, SCIP indexing, and audited history
     rewrite have no governed carrier; the former injected-fake rewrite/index
     module was removed. Each future action needs a durable owner boundary and a
-    full-system agent journey before discovery.
+    full-system agent journey before discovery. Git also has no production
+    merge queue: durable checks and direct merges ship, but no PostgreSQL Flow
+    merge body consumes `ci.result` and survives restart.
 19. **Agents can inspect CI, but cannot command it directly.** They can read
     durable runs and bounded logs. Pipeline trigger/retry/cancel, validation,
     planning, deploy/approve/rollback, and secret administration have no CI

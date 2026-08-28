@@ -23,7 +23,6 @@ pub mod lifecycle;
 pub mod list_filter;
 pub mod live_check;
 pub mod merge_gate;
-pub mod merge_queue;
 pub mod notif_rules;
 pub mod object_format;
 pub mod object_packs;

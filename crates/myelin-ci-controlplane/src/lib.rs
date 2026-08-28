@@ -12,7 +12,6 @@ pub mod ci_manifest_pipeline;
 pub mod ci_pipeline;
 pub mod ci_pipeline_protocol;
 pub mod ci_prelaunch_usage_journal;
-pub mod ci_result_signal;
 pub mod ci_runner_composition;
 pub mod ci_runner_host;
 pub mod ci_runtime_composition;
@@ -141,8 +140,6 @@ pub use check_emitter::{
     CheckEmitContext, CheckProvider, CheckState, CheckStatusUpdate, CostPosture, TrustTier,
     BUMP_CHECK_ATTEMPT_SQL,
 };
-
-pub use ci_result_signal::{CiResultSignal, RollupDelivery};
 
 pub use ci_secret_store::{
     durable_ci_job_secret_resolver, CiSecretStoreError, DurableCiSecretStore,
