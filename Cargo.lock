@@ -3790,7 +3790,6 @@ dependencies = [
 name = "myelin-search"
 version = "0.0.0"
 dependencies = [
- "myelin-content",
  "myelin-events",
  "myelin-harness",
  "myelin-identity",

@@ -3784,6 +3784,26 @@ lowercase UUID strings, which also makes the wire representation explicit.
 Proof: focused status/certificate JSON tests and standalone strict
 all-target/all-feature Edge Clippy.
 
+## 2026-08-28 — Search no longer owns product-shaped fixture generators
+
+After removing every producer-side façade, Search still carried its own Git,
+Knowledge, and subartifact schemas/projection builders. Their integration tests
+invented owner content and authorization in maps, then queried fresh in-memory
+indexes. No owner service imported the modules and no durable worker could
+produce their inputs, so these suites described a hypothetical product while
+the worklog correctly said cross-product search was absent.
+
+Those owner-shaped generators and tests are removed. Search now contains only
+its generic analyzer/compiler, authorization-conjoined query pipeline, backend,
+indexer/reindex mechanics, fusion, vector, consistency, and admission helpers.
+Its unnecessary Content dependency is gone. The running Git code search remains
+the separate bounded Edge path.
+
+Proof: all 158 remaining Search library stories and the complete normal suite;
+standalone strict all-target/all-feature Clippy across Search and Edge; and a
+repository-wide search finding no owner-specific Search projection module. Net
+removal: 2,693 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

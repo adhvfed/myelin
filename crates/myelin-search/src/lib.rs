@@ -3,12 +3,9 @@ pub mod compiler;
 pub mod consistency;
 pub mod engine;
 pub mod fusion;
-pub mod git_code_projection;
 pub mod indexer;
-pub mod kn_projection;
 pub mod pipeline;
 pub mod reindex;
-pub mod subartifact;
 pub mod tier3_valve;
 pub mod vector;
 
@@ -26,20 +23,10 @@ pub use engine::{
     DEFAULT_SUBJECT_LOCATOR_FACETS, ORDER_KEY_FIELD,
 };
 pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_K};
-pub use git_code_projection::{
-    git_blob_search_projection, git_code_projection_spec, git_index_specs, trigram_query, trigrams,
-    GitBlobProjectionInput, FACET_BLOB_OID as GIT_FACET_BLOB_OID,
-    FACET_LANGUAGE as GIT_FACET_LANGUAGE, FACET_PATH as GIT_FACET_PATH, GIT_BLOB_ACL_OBJECT_TYPE,
-    GIT_BLOB_TYPE, GIT_SUBSYSTEM, TRIGRAM_N,
-};
 pub use indexer::{
     EmbeddingAdapter, IncrementalIndexer, IndexEventError, IndexSpec, MockEmbeddingAdapter,
     ProjectFetchError, ProjectFetcher, SearchProjection, INDEXER_CONSUMER,
     INDEXER_SUBJECT_PREFIXES,
-};
-pub use kn_projection::{
-    kn_index_specs, kn_page_index_spec, kn_row_index_spec, page_search_projection,
-    FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_PAGE_TYPE, KN_ROW_TYPE, KN_SUBSYSTEM,
 };
 pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
@@ -49,11 +36,6 @@ pub use pipeline::{
 pub use reindex::{
     ReindexCursorStore, ReindexError, ReindexJob, ReindexProgress, SearchReindexer,
     DEFAULT_BATCH_CAP, DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
-};
-pub use subartifact::{
-    block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
-    line_range_subdoc_facets, line_range_subdoc_projection, AnchorState, ContentAnchoredSpan,
-    SubGrain, FACET_ANCHOR_STATE, FACET_LINE_END, FACET_LINE_START,
 };
 pub use tier3_valve::{
     board_acl_filter, escalate_to_search, oltp_board_admits, BoardEscalationAuthz, BoardQuery,
