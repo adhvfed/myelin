@@ -3,7 +3,12 @@ use myelin_query::{Expr, Predicate, QueryAst};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::planner::{compose_board_query, lower_over_issue_id, BoundParam, ComposedBoardQuery};
-use crate::schemes::IndexPosture;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexPosture {
+    Gin,
+    GeneratedIndex,
+}
 
 pub const TYPED_CORE_FIELDS: &[&str] = &[
     "state",

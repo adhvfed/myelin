@@ -109,7 +109,7 @@ fn below_threshold_facet_stays_on_gin() {
     assert!(!feeder.is_promoted(&facet));
     assert_eq!(
         feeder.catalog_snapshot().posture("severity"),
-        crate::schemes::IndexPosture::Gin
+        crate::cost_bounder::IndexPosture::Gin
     );
 }
 
@@ -164,7 +164,7 @@ fn above_threshold_facet_provisions_a_generated_index() {
     assert!(feeder.is_promoted(&facet));
     assert_eq!(
         feeder.catalog_snapshot().posture("severity"),
-        crate::schemes::IndexPosture::GeneratedIndex
+        crate::cost_bounder::IndexPosture::GeneratedIndex
     );
 }
 
@@ -271,7 +271,7 @@ fn handle_promotes_a_hot_facet_off_the_bus() {
     );
     assert_eq!(
         feeder.catalog_snapshot().posture("severity"),
-        crate::schemes::IndexPosture::GeneratedIndex
+        crate::cost_bounder::IndexPosture::GeneratedIndex
     );
 }
 

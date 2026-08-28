@@ -3412,6 +3412,26 @@ test suite; strict all-target/all-feature Issues Clippy; and repository-wide
 symbol search finds no remaining caller for the removed types. Net removal:
 1,496 lines of non-product code and self-certifying tests.
 
+## 2026-08-28 — Issues configuration and planning fixtures stop posing as stores
+
+The exported scheme resolver kept assignments and cache entries in process and
+was reached only by tests. Its “E2E” wrapped it in another vector, then inferred
+that no issue rows changed because its fake store never implemented a write.
+Only the two-value index posture was used outside that module, so it now lives
+with the query cost catalogue that owns the decision.
+
+The adjacent time-axis module had the same problem. It emitted cycle membership
+events to a local outbox and returned attachment pointers over a generic blob
+adapter, but had no cycle/milestone or attachment row store, no authenticated
+command or read boundary, and no Edge, CLI, or browser caller. Its tests did not
+start Issues or touch its product schema. Those facades and their copied
+unit/CDC/“E2E” suites are gone; real query-cost classification remains.
+
+Proof: all 344 remaining Issues library stories and the complete normal Issues
+test suite; strict all-target/all-feature Issues Clippy; and repository-wide
+symbol search finds no surviving scheme or time-axis caller. Removed 1,605
+lines of facade modules and self-certifying tests.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3481,8 +3501,13 @@ symbol search finds no remaining caller for the removed types. Net removal:
     consumer, durable regional analytics store, authenticated API, or user
     journey; the remaining backup tier token is policy vocabulary, not proof
     that an analytics product is running.
-11. **Issues governance configuration is not surfaced.** Workflow, scheme, SLA,
-    trigger, and Identity primitives exist, but the removed static screen
-    catalogue was not an authenticated admin API or browser UI. A truthful
-    replacement needs durable configuration commands, permission inspection at
-    the Identity boundary, validation responses, and full-system admin journeys.
+11. **Issues governance configuration is not surfaced.** Workflow, SLA, trigger,
+    and Identity primitives exist, but the removed scheme resolver and static
+    screen catalogue were not durable configuration or an authenticated admin
+    API/browser UI. A truthful replacement needs stored schemes and assignments,
+    permission inspection at the Identity boundary, validation responses, and
+    full-system admin journeys.
+12. **Issue cycles, milestones, and attachments have no product boundary.** The
+    former time-axis helper wrote only to an in-process outbox and generic blob
+    adapter. There is no durable owner store, authenticated API, issue mutation,
+    download authorization, retention/erasure handling, or full-system journey.

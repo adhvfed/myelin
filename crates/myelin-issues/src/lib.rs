@@ -29,11 +29,9 @@ pub mod reorder;
 pub mod replay;
 pub mod rollup;
 pub mod schema;
-pub mod schemes;
 pub mod sla_calendar;
 pub mod sla_escalation;
 pub mod surge;
-pub mod time_axis;
 pub mod trigger;
 pub mod workflow;
 pub mod write_path;
@@ -122,12 +120,6 @@ pub use content::{
     CasConflict, ContentError, ContentKind, IssueContent, SubsetError, ISSUES_EXCLUDED_BLOCKS,
 };
 
-pub use schemes::{
-    add_flexible_field, org_default_scheme_id, resolve, specificity_rank, FlexibleField,
-    FlexibleFieldWrite, IndexPosture, Reassignment, ResolveContext, ResolveKey, Scheme,
-    SchemeAssignment, SchemeKind, SchemeResolver, TypeDef, TypeSchemeBody,
-};
-
 pub use workflow::{
     arm_trigger_body, blocked_by_guard, example_arm_trigger, linked_pr_ci_green_guard,
     ArmedTrigger, GuardVar, IssueContext, PostAction, StateCategory, TransitionBlocked,
@@ -148,7 +140,8 @@ pub use planner::{
 
 pub use cost_bounder::{
     classify_field, estimate_cost, lower_acl, plan_board_query, BoundedBoardQuery, CostBudget,
-    FacetCatalog, PlanOutcome, RefineHint, SearchEscalation, Tier, TIER3_FIELDS, TYPED_CORE_FIELDS,
+    FacetCatalog, IndexPosture, PlanOutcome, RefineHint, SearchEscalation, Tier, TIER3_FIELDS,
+    TYPED_CORE_FIELDS,
 };
 
 pub use rollup::{

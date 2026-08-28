@@ -117,7 +117,7 @@ fn consumer_drives_the_measured_promotion_through_the_runtime() {
     );
     assert_eq!(
         consumer.handler().catalog_snapshot().posture("severity"),
-        myelin_issues::schemes::IndexPosture::GeneratedIndex
+        myelin_issues::IndexPosture::GeneratedIndex
     );
 }
 
