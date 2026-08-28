@@ -452,8 +452,9 @@ fn agent_file_write_creates_a_branch_and_replays_from_git_provenance() {
     .unwrap();
     assert_eq!(conflicting["result"]["isError"], true);
     assert_eq!(
-        conflicting["result"]["_meta"]["reason"], "internal error",
-        "the MCP boundary does not disclose durable Git conflict details"
+        conflicting["result"]["_meta"]["reason"],
+        "idempotency key is already bound to a different file write",
+        "the MCP boundary reports the same safe public conflict as the HTTP boundary"
     );
     assert!(
         matches!(
