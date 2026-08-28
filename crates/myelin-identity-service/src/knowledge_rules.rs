@@ -1,15 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
-
-use myelin_identity::{
-    AuthzError, Consistency, ListObjectsResult, ObjectType, Permission, Principal, RelName,
-    Result as AuthzResult, SetExpr, Zookie,
-};
-use myelin_notif::{
-    define_notif_rule, Class, DedupTpl, NotifRule, NotifRuleRegistry, Reason, RelationalLeaf,
-    ReverseIndexAnswer, RevisionWatermark, WatcherResolvePort,
-};
-use myelin_tenancy::TenantId;
+use myelin_notif::{define_notif_rule, Class, DedupTpl, NotifRule, NotifRuleRegistry, Reason};
 
 use crate::knowledge_fragment::object_types;
 
@@ -78,122 +67,10 @@ pub fn knowledge_watchable_object_types() -> [&'static str; 3] {
     ]
 }
 
-#[derive(Clone, Default)]
-pub struct KnowledgeWatcherIndex {
-    inner: Arc<Mutex<KnowledgeWatcherState>>,
-}
-
-#[derive(Default)]
-struct KnowledgeWatcherState {
-    watches: BTreeMap<(String, String), BTreeSet<String>>,
-    revision: u64,
-    unavailable: bool,
-}
-
-impl KnowledgeWatcherIndex {
-    pub fn new() -> KnowledgeWatcherIndex {
-        KnowledgeWatcherIndex::default()
-    }
-
-    pub fn watch(&self, tenant: &TenantId, principal: &str, subject_root: &str) -> Zookie {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.revision += 1;
-        g.watches
-            .entry((tenant.0.clone(), principal.to_string()))
-            .or_default()
-            .insert(subject_root.to_string());
-        Zookie(format!("zk-{}", g.revision))
-    }
-
-    pub fn unwatch(&self, tenant: &TenantId, principal: &str, subject_root: &str) -> Zookie {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.revision += 1;
-        if let Some(set) = g
-            .watches
-            .get_mut(&(tenant.0.clone(), principal.to_string()))
-        {
-            set.remove(subject_root);
-        }
-        Zookie(format!("zk-{}", g.revision))
-    }
-
-    pub fn current_zookie(&self) -> Zookie {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Zookie(format!("zk-{}", g.revision))
-    }
-
-    pub fn set_unavailable(&self, on: bool) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .unavailable = on;
-    }
-}
-
-impl WatcherResolvePort for KnowledgeWatcherIndex {
-    fn list_objects(
-        &self,
-        _subject: &Principal,
-        _permission: &Permission,
-        _ty: &ObjectType,
-        _at: &Consistency,
-    ) -> AuthzResult<ListObjectsResult> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.unavailable {
-            return Err(AuthzError::Unavailable(
-                "knowledge watcher reverse index unavailable (held, not leaked)".into(),
-            ));
-        }
-        Ok(ListObjectsResult::Filter {
-            set_expr: SetExpr::InRelation {
-                relation: RelName(KN_WATCHER_RELATION.into()),
-                via_column: myelin_notif::subject_root_col(),
-            },
-            zookie: Zookie(format!("zk-{}", g.revision)),
-        })
-    }
-
-    fn resolve_relation(
-        &self,
-        subject: &Principal,
-        leaf: &RelationalLeaf,
-        _required: RevisionWatermark,
-    ) -> AuthzResult<ReverseIndexAnswer> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.unavailable {
-            return Err(AuthzError::Unavailable(
-                "knowledge watcher reverse index unavailable (held, not leaked)".into(),
-            ));
-        }
-        let watched = match leaf {
-            RelationalLeaf::InRelation { relation, .. } if relation.0 == KN_WATCHER_RELATION => g
-                .watches
-                .get(&(subject.tenant.0.clone(), subject.principal_id.0.clone()))
-                .cloned()
-                .unwrap_or_default(),
-            RelationalLeaf::TupleSet { .. } => g
-                .watches
-                .get(&(subject.tenant.0.clone(), subject.principal_id.0.clone()))
-                .cloned()
-                .unwrap_or_default(),
-            _ => BTreeSet::new(),
-        };
-        Ok(ReverseIndexAnswer {
-            subject_roots: watched,
-            revision: RevisionWatermark(g.revision),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_identity::{PrincipalId, PrincipalKind};
     use myelin_notif::reason_base_class;
-
-    fn tenant() -> TenantId {
-        TenantId("acme".into())
-    }
 
     #[test]
     fn knowledge_rules_are_table_correct_mention_comments_shared_watched() {
@@ -295,79 +172,5 @@ mod tests {
             !crate::knowledge_fragment::block_fragment().is_watchable(),
             "block is NOT independently watchable (it inherits its page's ACL)"
         );
-    }
-
-    fn viewer(id: &str) -> Principal {
-        Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
-    }
-
-    #[test]
-    fn knowledge_watcher_index_resolves_real_watched_pages() {
-        let idx = KnowledgeWatcherIndex::new();
-        let page = "myelin://acme/knowledge/page/9";
-        idx.watch(&tenant(), "psn:alice", page);
-
-        let result = idx
-            .list_objects(
-                &viewer("psn:alice"),
-                &Permission(myelin_notif::WATCH_PERMISSION.into()),
-                &ObjectType(myelin_notif::SUBJECT_ROOT_TYPE.into()),
-                &strong("zk-1"),
-            )
-            .expect("the index is available");
-        match result {
-            ListObjectsResult::Filter { set_expr, .. } => assert_eq!(
-                set_expr,
-                SetExpr::InRelation {
-                    relation: RelName("watcher".into()),
-                    via_column: myelin_notif::subject_root_col(),
-                }
-            ),
-            other => panic!("expected the pushed-down Filter, got {other:?}"),
-        }
-
-        let leaf = RelationalLeaf::InRelation {
-            relation: RelName("watcher".into()),
-            via_column: myelin_notif::subject_root_col(),
-        };
-        let answer = idx
-            .resolve_relation(&viewer("psn:alice"), &leaf, RevisionWatermark(0))
-            .expect("available");
-        assert!(
-            answer.subject_roots.contains(page),
-            "alice watches the page"
-        );
-
-        let none = idx
-            .resolve_relation(&viewer("psn:nobody"), &leaf, RevisionWatermark(0))
-            .expect("available");
-        assert!(
-            none.subject_roots.is_empty(),
-            "a non-watcher reaches nothing"
-        );
-    }
-
-    #[test]
-    fn knowledge_watcher_index_only_serves_the_watcher_relation() {
-        let idx = KnowledgeWatcherIndex::new();
-        idx.watch(&tenant(), "psn:alice", "myelin://acme/knowledge/page/9");
-        let other = RelationalLeaf::InRelation {
-            relation: RelName("direct_reader".into()),
-            via_column: myelin_notif::subject_root_col(),
-        };
-        let answer = idx
-            .resolve_relation(&viewer("psn:alice"), &other, RevisionWatermark(0))
-            .expect("available");
-        assert!(
-            answer.subject_roots.is_empty(),
-            "a non-watcher relation reaches nothing (no widen)"
-        );
-    }
-
-    fn strong(zk: &str) -> Consistency {
-        Consistency {
-            at_least: Zookie(zk.into()),
-            mode: myelin_identity::ConsistencyMode::Strong,
-        }
     }
 }

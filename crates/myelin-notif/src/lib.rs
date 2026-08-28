@@ -15,20 +15,15 @@ pub mod automation_approval;
 pub mod cli;
 pub mod cross_cell;
 pub mod define_rule;
-pub mod delivery;
-pub mod escalation;
-pub mod eu_provider;
 pub mod humanise;
 pub mod list_inbox;
 pub mod migrations;
 pub mod pg_inbox;
 pub mod prefs;
 pub mod ranking;
-pub mod read_fanout;
 pub mod read_state;
 pub mod router;
 pub mod schema;
-pub mod snooze_resurface;
 pub mod storm_control;
 pub mod surge;
 pub mod watch;
@@ -57,19 +52,6 @@ pub use define_rule::{
     define_notif_rule, platform_default_reason, platform_default_rules, Classification, DedupTpl,
     DefineRuleError, NotifRule, NotifRuleRegistry,
 };
-pub use delivery::{
-    build_idem_key, channel_from_token, effective_delivery_count, is_eu_region, redact_for_offcell,
-    DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
-};
-pub use escalation::{
-    notify_for, oncall_now, render_oncall, render_page, DurableWheel, EscalationEngine,
-    EscalationError, EscalationPolicy, EscalationRun, EscalationStep, EscalationTarget,
-    InMemoryWheel, OncallSchedule, PageOutcome, RotationWindow, RunState, ESCALATION_REASON,
-};
-pub use eu_provider::{
-    EuProviderError, EuSovereignAdapter, EuTransport, OpenLegalFlag, ProviderErasureOutcome,
-    RecordingEuTransport, TransportReceipt, OPEN_LEGAL_PROVIDER_DPA,
-};
 pub use humanise::{
     humanise, humanise_item, parse_markdown, reason_template_key, render_html, render_markdown,
     render_message, render_plain, shared_platform_templates, tombstone_display, Channel,
@@ -91,19 +73,11 @@ pub use ranking::{
     AffinitySource, DeterministicV1, ExplainTrace, NeutralAffinity, RankStrategy, RankedItem,
     PRIORITY_MAX, PRIORITY_MIN,
 };
-pub use read_fanout::{
-    read_fanout, subject_root_col, AmbientMarkerStore, ReadFanoutError, ReadFanoutMarker,
-    RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, SyntheticReverseIndex,
-    WatcherResolvePort, SUBJECT_ROOT_TYPE, WATCHER_RELATION, WATCH_PERMISSION,
-};
 pub use read_state::{active_inbox, mark, mark_all_read, snooze, ReadState, ReadStateError};
 pub use router::{
     build_durable_router, build_router, signal_subject_prefix, InboxProjection, RoutedInboxItem,
     SignalRouter, NOTIF_ESCALATION_ACKED, NOTIF_ITEM_CREATED, ROUTER_CONSUMER_NAME,
     SIGNAL_MENTIONS_KEY,
-};
-pub use snooze_resurface::{
-    snooze_and_arm, snooze_timer_key, ResurfaceOutcome, SnoozeResurfacer, SNOOZE_TIMER_NS,
 };
 pub use storm_control::{
     dedup_collapse_ratio_bps, is_self_notification, subject_root_of, Coalescer, RateConfig,
@@ -123,6 +97,9 @@ pub use write_fanout::{
 
 pub const SERVICE_NAME: &str = "notif";
 pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
+
+/// Canonical relationship name used by product owners that support watched artifacts.
+pub const WATCHER_RELATION: &str = "watcher";
 pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
 pub const EVENT_DURABLE_CONSUMER: &str = "notif-signal-router";
 
@@ -177,26 +154,6 @@ pub enum Class {
     Participating,
     Watching,
     Fyi,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RedactedMessage {
-    pub rendered: HumanisedString,
-    pub class: Class,
-}
-
-pub trait DeliveryAdapter {
-    fn channel(&self) -> &str;
-
-    fn region(&self) -> &myelin_tenancy::Region;
-
-    fn send(&self, message: &RedactedMessage, idem_key: &str) -> Receipt;
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Receipt {
-    pub idem_key: String,
-    pub accepted: bool,
 }
 
 fn notif_migrations() -> Migrations {
@@ -445,43 +402,6 @@ mod carrier_conformance {
         assert_eq!(h.text, "you were mentioned");
         assert_eq!(h.links.len(), 1);
         assert_eq!(h.icon, "mention");
-    }
-
-    #[test]
-    fn delivery_adapter_shape_is_implementable() {
-        struct InAppAdapter {
-            region: myelin_tenancy::Region,
-        }
-        impl DeliveryAdapter for InAppAdapter {
-            fn channel(&self) -> &str {
-                "in_app"
-            }
-            fn region(&self) -> &myelin_tenancy::Region {
-                &self.region
-            }
-            fn send(&self, _message: &RedactedMessage, idem_key: &str) -> Receipt {
-                Receipt {
-                    idem_key: idem_key.to_string(),
-                    accepted: true,
-                }
-            }
-        }
-        let adapter = InAppAdapter {
-            region: myelin_tenancy::Region("fr-par".into()),
-        };
-        let msg = RedactedMessage {
-            rendered: HumanisedString {
-                text: "redacted".into(),
-                links: vec![],
-                icon: "fyi".into(),
-            },
-            class: Class::Fyi,
-        };
-        let r = adapter.send(&msg, "idem-1");
-        assert_eq!(adapter.channel(), "in_app");
-        assert_eq!(adapter.region().0, "fr-par");
-        assert!(r.accepted);
-        assert_eq!(r.idem_key, "idem-1");
     }
 
     #[test]

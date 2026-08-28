@@ -3895,6 +3895,27 @@ repository-wide search finding no removed snapshot API. Net removal: 1,666
 lines from the reindex fixtures and 25 additional lines of unused exports and a
 stale duplicate taxonomy assertion (1,691 code/test lines net).
 
+## 2026-08-28 — Notification keeps one durable product truth
+
+Notification still exposed a second, non-running architecture beside its
+PostgreSQL inbox: a mutex-backed ambient read-fanout projection, map-backed
+owner watcher indexes, an in-memory timer wheel labelled `DurableWheel`, a
+process-local delivery ledger, recording provider transports, and copied
+CDC/drill suites. The durable router even populated the ambient map although no
+Edge route ever read it. Those tests certified their own fixtures rather than
+the inbox people use.
+
+The ambient projection, synthetic watcher indexes, delivery/provider facade,
+escalation wheel, snooze timer facade, and their tests are removed. The running
+router, co-committed PostgreSQL inbox, automatic database-backed snooze
+resurfacing, authenticated Edge/CLI/browser surfaces, notification rules, and
+canonical `watcher` relationship vocabulary remain.
+
+Proof: all-target/all-feature compilation across Notification, Git, and
+Identity service before the workspace-wide verification; repository-wide
+search finding no removed facade or owner index. Net removal: 6,387 code/test
+lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3926,8 +3947,9 @@ stale duplicate taxonomy assertion (1,691 code/test lines net).
    The existing `SearchQuery` shed row remains an interactive-surface target,
    not evidence that indexing is running.
 4. **cross-product search is not surfaced yet.** the running product has bounded,
-   authorization-filtered repository code search, but no Edge/CLI/browser surface over the
-   Search service's issue, Knowledge, Chat, and CI projections.
+   authorization-filtered repository code search. The generic Search engine
+   remains a dormant foundation: no owner projection, deployed index worker,
+   durable index, or Edge/CLI/browser cross-product query surface exists.
 5. **Chat reference cards do not cover every owner yet.** Edge, CLI, and browser now surface
    viewer-scoped Issue, Knowledge page, Git repository, Git pull-request, CI run, and Chat
    conversation cards, plus named private agent threads, through bounded owner queries, with
@@ -3941,16 +3963,23 @@ stale duplicate taxonomy assertion (1,691 code/test lines net).
    paged issue views and mutations, but there is no Edge board-op stream, authenticated
    resume/snapshot boundary, reconnecting board client, or durable collaborative reorder.
    the former in-memory and Yjs facades were removed rather than counted as shipped behavior.
-7. **CI has no user-visible cache yet.** the old process-local namespace is gone;
+7. **Notification has no outbound delivery or escalation product yet.** the
+   durable inbox and automatic database-backed snooze resurfacing are running,
+   but email/push delivery, provider administration, delivery idempotency,
+   on-call schedules, escalation timers, and acknowledgement workflows have no
+   durable store, worker, authenticated configuration surface, or full-system
+   journey. The former process-local ledger, recording provider, and mutex timer
+   were removed rather than counted as shipped behavior.
+8. **CI has no user-visible cache yet.** the old process-local namespace is gone;
    the later unused `artifact_cache` facade and its fabricated event are also gone.
    the historical `cache_entry` table has no store, pipeline syntax, runner
    restore/save operation, retention policy, or full-system journey. the eventual
    design must derive its namespace from the durable run trust stamp.
-8. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
+9. **stale branch archaeology:** `codex/*`, `claude/*`, `wip/2*`–`wip/35*`
    (CT-007 sandbox slices) sit on a disjoint history root ("founder source
    snapshot") with no common ancestor with main. any useful content must be
    mined as diffs. left in place, treated as archive.
-9. **HYOK/BYOK has no production boundary yet.** The unwired `KeyOrigin`
+10. **HYOK/BYOK has no production boundary yet.** The unwired `KeyOrigin`
     model was removed after its BYOK path proved to be ordinary platform-key
     wrapping with an unused customer-path string. No running configuration
     selects an origin for a product data class and Search projections do not
@@ -3959,62 +3988,62 @@ stale duplicate taxonomy assertion (1,691 code/test lines net).
     unconditionally. A replacement must start with a real customer-key
     adapter, attempt the ordinary indexing path, and inspect every actual
     derived store.
-10. **Issues analytics has no production boundary.** The former process-local
+11. **Issues analytics has no production boundary.** The former process-local
     OLAP projection and its copied green drills are gone. There is no deployed
     consumer, durable regional analytics store, authenticated API, or user
     journey; the remaining backup tier token is policy vocabulary, not proof
     that an analytics product is running.
-11. **Issues governance configuration is not surfaced.** Identity primitives
+12. **Issues governance configuration is not surfaced.** Identity primitives
     exist, but the removed scheme resolver, workflow/SLA/trigger engines, and
     static screen catalogue were not durable configuration or an authenticated
     admin API/browser UI. A truthful replacement needs stored schemes and
     assignments, permission inspection at the Identity boundary, validation
     responses, and full-system admin journeys.
-12. **Issue cycles, milestones, and attachments have no product boundary.** The
+13. **Issue cycles, milestones, and attachments have no product boundary.** The
     former time-axis helper wrote only to an in-process outbox and generic blob
     adapter. There is no durable owner store, authenticated API, issue mutation,
     download authorization, retention/erasure handling, or full-system journey.
-13. **Issue custom-field querying and index promotion are not shipped.** The
+14. **Issue custom-field querying and index promotion are not shipped.** The
     running list path is bounded and authorization-filtered, but the removed
     planner and facet feeder never reached it. Dynamic fields need a durable
     definition/usage store, safe SQL lowering integrated into `PgIssueStore`,
     online index lifecycle ownership, and a live Edge/browser journey.
-14. **Issue automation and hierarchy processing are not shipped.** There is no
+15. **Issue automation and hierarchy processing are not shipped.** There is no
     durable workflow transition command, CI/reflex/trigger/SLA consumer, parent
     rollup store, or cross-cell portfolio worker. Agent discovery now exposes
     only the working create/close mutations; each additional effect needs an
     authorized executor and restart-safe full-system journey before registration.
-15. **Agents cannot author general Knowledge content yet.** Humans have the
+16. **Agents cannot author general Knowledge content yet.** Humans have the
     durable page surface and agents can list/read pages and link related work,
     but publish, draft, confidential edit, and comment have no governed effect
     executor. They remain absent from discovery until backed by the page store,
     authorization, audit, and a full-system agent journey.
-16. **Agents have only the general Chat post effect.** Humans can create and
+17. **Agents have only the general Chat post effect.** Humans can create and
     manage conversations and use richer thread/reaction behavior through the
     durable Chat product, but reply, reaction, direct-message, channel creation,
     invitation, and archival have no governed agent effect carrier. They remain
     absent from discovery until each action has exact authorization, audit,
     idempotency, and a full-system agent journey.
-17. **Several Git collaboration and maintenance actions are not agent effects.**
+18. **Several Git collaboration and maintenance actions are not agent effects.**
     Agents can durably write files, open pull requests, submit review verdicts,
     endorse fork CI, and merge with human approval. Inline comment authoring,
     suggested changes, thread resolution, SCIP indexing, and audited history
     rewrite have no governed carrier; the former injected-fake rewrite/index
     module was removed. Each future action needs a durable owner boundary and a
     full-system agent journey before discovery.
-18. **Agents can inspect CI, but cannot command it directly.** They can read
+19. **Agents can inspect CI, but cannot command it directly.** They can read
     durable runs and bounded logs. Pipeline trigger/retry/cancel, validation,
     planning, deploy/approve/rollback, and secret administration have no CI
     effect carrier and remain absent from discovery. The existing repository
     event pipeline and human secret administration do not substitute for a
     governed, idempotent agent command with authorization, audit, and a
     full-system journey.
-19. **CI has no production elasticity controller.** Durable queue ordering and
+20. **CI has no production elasticity controller.** Durable queue ordering and
     per-tenant launch admission exist, but runner demand histograms, prewarming,
     lane shedding, and plan-sensitive backpressure are not connected to a
     service or durable controller. The former process-local surge model was
     removed rather than represented as deployed capacity management.
-20. **CI environments and deployments have no product boundary.** Historical
+21. **CI environments and deployments have no product boundary.** Historical
     tables, reference tokens, event vocabulary, and ReBAC fragments remain, and
     the workflow can gate a following job, but there is no durable deployment
     command/store, environment administration API, publisher, authenticated

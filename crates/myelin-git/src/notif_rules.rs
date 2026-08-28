@@ -1,16 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
-
 use myelin_events::{AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_identity::{
-    AuthzError, Consistency, DataRole as IdentityDataRole, ListObjectsResult, ObjectType,
-    Permission, Principal, PrincipalId, PrincipalKind, PrincipalStatus, PseudonymHandle, RelName,
-    Result as AuthzResult, SetExpr, Zookie,
+    DataRole as IdentityDataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus,
+    PseudonymHandle,
 };
-use myelin_notif::{
-    define_notif_rule, Class, DedupTpl, NotifRule, NotifRuleRegistry, Reason, RelationalLeaf,
-    ReverseIndexAnswer, RevisionWatermark, WatcherResolvePort,
-};
+use myelin_notif::{define_notif_rule, Class, DedupTpl, NotifRule, NotifRuleRegistry, Reason};
 use myelin_query::{DedupKey, RuleId, Severity, Signal, SignalState};
 use myelin_tenancy::{Region, TenantId};
 
@@ -223,117 +216,9 @@ pub fn git_watchable_object_types() -> [&'static str; 2] {
     [object_types::REPO, object_types::PULL_REQUEST]
 }
 
-#[derive(Clone, Default)]
-pub struct GitWatcherIndex {
-    inner: Arc<Mutex<GitWatcherState>>,
-}
-
-#[derive(Default)]
-struct GitWatcherState {
-    watches: BTreeMap<(String, String), BTreeSet<String>>,
-    revision: u64,
-    unavailable: bool,
-}
-
-impl GitWatcherIndex {
-    pub fn new() -> GitWatcherIndex {
-        GitWatcherIndex::default()
-    }
-
-    pub fn watch(&self, tenant: &TenantId, principal: &str, subject_root: &str) -> Zookie {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.revision += 1;
-        g.watches
-            .entry((tenant.0.clone(), principal.to_string()))
-            .or_default()
-            .insert(subject_root.to_string());
-        Zookie(format!("zk-{}", g.revision))
-    }
-
-    pub fn unwatch(&self, tenant: &TenantId, principal: &str, subject_root: &str) -> Zookie {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.revision += 1;
-        if let Some(set) = g
-            .watches
-            .get_mut(&(tenant.0.clone(), principal.to_string()))
-        {
-            set.remove(subject_root);
-        }
-        Zookie(format!("zk-{}", g.revision))
-    }
-
-    pub fn current_zookie(&self) -> Zookie {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Zookie(format!("zk-{}", g.revision))
-    }
-
-    pub fn set_unavailable(&self, on: bool) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .unavailable = on;
-    }
-}
-
-impl WatcherResolvePort for GitWatcherIndex {
-    fn list_objects(
-        &self,
-        _subject: &Principal,
-        _permission: &Permission,
-        _ty: &ObjectType,
-        _at: &Consistency,
-    ) -> AuthzResult<ListObjectsResult> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.unavailable {
-            return Err(AuthzError::Unavailable(
-                "git watcher reverse index unavailable (held, not leaked)".into(),
-            ));
-        }
-        Ok(ListObjectsResult::Filter {
-            set_expr: SetExpr::InRelation {
-                relation: RelName(GIT_WATCHER_RELATION.into()),
-                via_column: myelin_notif::subject_root_col(),
-            },
-            zookie: Zookie(format!("zk-{}", g.revision)),
-        })
-    }
-
-    fn resolve_relation(
-        &self,
-        subject: &Principal,
-        leaf: &RelationalLeaf,
-        _required: RevisionWatermark,
-    ) -> AuthzResult<ReverseIndexAnswer> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.unavailable {
-            return Err(AuthzError::Unavailable(
-                "git watcher reverse index unavailable (held, not leaked)".into(),
-            ));
-        }
-        let watched = match leaf {
-            RelationalLeaf::InRelation { relation, .. } if relation.0 == GIT_WATCHER_RELATION => g
-                .watches
-                .get(&(subject.tenant.0.clone(), subject.principal_id.0.clone()))
-                .cloned()
-                .unwrap_or_default(),
-            RelationalLeaf::TupleSet { .. } => g
-                .watches
-                .get(&(subject.tenant.0.clone(), subject.principal_id.0.clone()))
-                .cloned()
-                .unwrap_or_default(),
-            _ => BTreeSet::new(),
-        };
-        Ok(ReverseIndexAnswer {
-            subject_roots: watched,
-            revision: RevisionWatermark(g.revision),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_identity::{PrincipalId, PrincipalKind};
     use myelin_notif::reason_base_class;
     use myelin_query::Signal;
 
@@ -504,76 +389,5 @@ mod tests {
             .map(|r| r.0.clone())
             .collect();
         assert!(pr_rels.contains(&"watcher".to_string()));
-    }
-
-    fn viewer(id: &str) -> Principal {
-        Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
-    }
-
-    #[test]
-    fn git_watcher_index_resolves_real_watched_prs() {
-        let idx = GitWatcherIndex::new();
-        let pr = "myelin://acme/git/pr/9";
-        idx.watch(&tenant(), "psn:alice", pr);
-
-        let result = idx
-            .list_objects(
-                &viewer("psn:alice"),
-                &Permission(myelin_notif::WATCH_PERMISSION.into()),
-                &ObjectType(myelin_notif::SUBJECT_ROOT_TYPE.into()),
-                &strong("zk-1"),
-            )
-            .expect("the index is available");
-        match result {
-            ListObjectsResult::Filter { set_expr, .. } => assert_eq!(
-                set_expr,
-                SetExpr::InRelation {
-                    relation: RelName("watcher".into()),
-                    via_column: myelin_notif::subject_root_col(),
-                }
-            ),
-            other => panic!("expected the pushed-down Filter, got {other:?}"),
-        }
-
-        let leaf = RelationalLeaf::InRelation {
-            relation: RelName("watcher".into()),
-            via_column: myelin_notif::subject_root_col(),
-        };
-        let answer = idx
-            .resolve_relation(&viewer("psn:alice"), &leaf, RevisionWatermark(0))
-            .expect("available");
-        assert!(answer.subject_roots.contains(pr), "alice watches the PR");
-
-        let none = idx
-            .resolve_relation(&viewer("psn:nobody"), &leaf, RevisionWatermark(0))
-            .expect("available");
-        assert!(
-            none.subject_roots.is_empty(),
-            "a non-watcher reaches nothing"
-        );
-    }
-
-    #[test]
-    fn git_watcher_index_only_serves_the_watcher_relation() {
-        let idx = GitWatcherIndex::new();
-        idx.watch(&tenant(), "psn:alice", "myelin://acme/git/pr/9");
-        let other = RelationalLeaf::InRelation {
-            relation: RelName("reviewer".into()),
-            via_column: myelin_notif::subject_root_col(),
-        };
-        let answer = idx
-            .resolve_relation(&viewer("psn:alice"), &other, RevisionWatermark(0))
-            .expect("available");
-        assert!(
-            answer.subject_roots.is_empty(),
-            "a non-watcher relation reaches nothing (no widen)"
-        );
-    }
-
-    fn strong(zk: &str) -> Consistency {
-        Consistency {
-            at_least: Zookie(zk.into()),
-            mode: myelin_identity::ConsistencyMode::Strong,
-        }
     }
 }

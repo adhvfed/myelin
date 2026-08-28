@@ -215,7 +215,6 @@ pub struct SignalRouter {
     durable: Option<DurableRouting>,
     storm: StormControl,
     hot_cap: HotSubjectCap,
-    ambient: crate::read_fanout::AmbientMarkerStore,
     subjects: Vec<SubjectPattern>,
 }
 
@@ -248,7 +247,6 @@ impl SignalRouter {
             durable: None,
             storm: StormControl::new(),
             hot_cap: HotSubjectCap::new(),
-            ambient: crate::read_fanout::AmbientMarkerStore::new(),
             subjects: subjects.as_ref().to_vec(),
         }
     }
@@ -278,10 +276,6 @@ impl SignalRouter {
         &self.inbox
     }
 
-    pub fn ambient(&self) -> &crate::read_fanout::AmbientMarkerStore {
-        &self.ambient
-    }
-
     pub fn storm(&self) -> &StormControl {
         &self.storm
     }
@@ -308,16 +302,6 @@ impl SignalRouter {
         }
 
         self.write_fanout(signal_event, &signal, handler_tx)?;
-
-        self.ambient.record(
-            &signal.tenant,
-            &signal.subject,
-            Reason::Watched,
-            &ArtifactRef(format!(
-                "myelin://{}/bus/event/{}",
-                signal_event.tenant.0, signal_event.event_id.0
-            )),
-        );
 
         let item = self.derive_item(signal_event, &signal);
         let subject_root = subject_root_of(&item.subject.0);
