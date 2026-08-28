@@ -95,7 +95,6 @@ pub use reerase::{
     ReErasureReceipt,
 };
 
-
 use serde::{Deserialize, Serialize};
 
 pub use envelope::{

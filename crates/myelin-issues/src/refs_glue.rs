@@ -3,10 +3,8 @@ use myelin_events::ArtifactRef;
 pub const ISSUE_SUBSYSTEM: &str = "issue";
 
 pub fn issue_root_ref(tenant: &str, key: &str) -> ArtifactRef {
-    myelin_refs::parse(&format!(
-        "myelin://{tenant}/{ISSUE_SUBSYSTEM}/issue/{key}"
-    ))
-    .expect("Issues mints a grammatical canonical ArtifactRef")
+    myelin_refs::parse(&format!("myelin://{tenant}/{ISSUE_SUBSYSTEM}/issue/{key}"))
+        .expect("Issues mints a grammatical canonical ArtifactRef")
 }
 
 pub use myelin_refs::{REFS_EDGE_CREATED, REL_CLASS_REFERENCE};
@@ -62,7 +60,10 @@ mod tests {
             IssueLifecycleRel::DependsOn,
             IssueLifecycleRel::Relates,
         ] {
-            assert_eq!(IssueLifecycleRel::from_token(relation.as_str()), Some(relation));
+            assert_eq!(
+                IssueLifecycleRel::from_token(relation.as_str()),
+                Some(relation)
+            );
         }
         assert_eq!(IssueLifecycleRel::from_token("unknown"), None);
     }

@@ -1,7 +1,5 @@
 use myelin_events::taxonomy::{self, new_tokens};
-use myelin_events::{
-    validate_event_type, ArtifactRef, EventDraft, EventType, SEED_EVENT_NAMES,
-};
+use myelin_events::{validate_event_type, ArtifactRef, EventDraft, EventType, SEED_EVENT_NAMES};
 use myelin_events::{AggregateKey, DataRole, Visibility};
 
 fn provider_emits_typed_draft(type_name: &str) -> EventDraft {

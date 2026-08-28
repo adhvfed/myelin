@@ -96,8 +96,7 @@ pub use my_work::{
 };
 
 pub use refs_glue::{
-    issue_root_ref, IssueLifecycleRel, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE,
-    REL_CLASS_REFERENCE,
+    issue_root_ref, IssueLifecycleRel, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE,
 };
 
 pub use agent_spend::{
