@@ -260,10 +260,7 @@ impl<E: DurableExecutor> LiveMigration<E> {
             .executor
             .start(StartSpec {
                 wf_type: WF_DURABLE_PROVISION.into(),
-                input: vec![ArtifactRef(format!(
-                    "myelin://control-plane/provision/{}",
-                    cell.as_str()
-                ))],
+                input: vec![provision_input_ref(cell)],
                 budget: None,
                 idem_key: idem_key.into(),
             })
@@ -307,10 +304,17 @@ impl<E: DurableExecutor> LiveMigration<E> {
 
 fn migration_input_ref(tenant: &TenantId, source: &CellId, target: &CellId) -> ArtifactRef {
     ArtifactRef(format!(
-        "myelin://{}/control-plane/migration/{}→{}",
+        "myelin://{}/control_plane/migration/{}→{}",
         tenant.as_str(),
         source.as_str(),
         target.as_str()
+    ))
+}
+
+fn provision_input_ref(cell: &CellId) -> ArtifactRef {
+    ArtifactRef(format!(
+        "myelin://control-plane/control_plane/provision/{}",
+        cell.as_str()
     ))
 }
 
@@ -729,6 +733,21 @@ mod tests {
             r1.run_id, r2,
             "a redelivered migration trigger is ONE durable run (effectively-once)"
         );
+    }
+
+    #[test]
+    fn durable_control_plane_workflow_inputs_are_canonical_refs() {
+        let tenant = TenantId::from_token("acme");
+        let source = CellId::from_token("cell-w-1");
+        let target = CellId::from_token("cell-w-2");
+
+        for input in [
+            migration_input_ref(&tenant, &source, &target),
+            provision_input_ref(&source),
+        ] {
+            myelin_refs::parse_scoped(&input.0)
+                .unwrap_or_else(|error| panic!("workflow input `{}`: {error}", input.0));
+        }
     }
 
     #[test]

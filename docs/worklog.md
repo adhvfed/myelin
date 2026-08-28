@@ -3281,6 +3281,33 @@ strict all-target NATS-enabled Events Clippy; and a live NATS restart test that
 creates one durable at `96/32`, reconnects it at `24/8`, and inspects the
 authoritative broker configuration (2/2 integration stories).
 
+## 2026-08-28 — owner-produced references share one vocabulary
+
+Several running owners emitted roots that the shared Rust and browser codecs
+could not represent: privacy requests, automation triggers, tool catalogue
+entries, Notification items, bus events, CI secrets and snapshots, Knowledge
+blocks, identity objects, Flow runs, and control-plane workflow inputs. Tool
+versions were especially misleading: the extra `/v1` segment was permitted
+only for Git coordinates, so every catalogue ref was structurally invalid.
+Control-plane provisioning omitted the tenant segment entirely, while live
+migrations used a hyphenated subsystem the event grammar forbids.
+
+The Bus-owned subsystem and artifact-type tables now cover those durable roots
+and the browser mirrors the same vocabulary. Tool identity is one opaque
+`name@version` id. Privacy and catalogue responses are parsed at their actual
+owners, and the public TypeScript journeys assert their exact refs. Durable
+control-plane migration and provisioning inputs now use total, parseable
+tenant/subsystem/type/id coordinates; their producer test parses the values
+returned by the real helper rather than a copied fixture.
+
+Proof: all 221 Events, 36 Refs, 161 Agent Service, and 191 control-plane library
+stories; all 658 browser stories; strict all-target/all-feature Clippy across
+Events, Refs, Agent Service, Edge, CLI, and control-plane; both TypeScript
+typechecks; all three live privacy holder journeys (9.57 seconds); and all 16
+live CLI collaboration journeys, including catalogue discovery, governed Git,
+approval, resume, retirement, migration, native Git, expiry, and logout (45.95
+seconds).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

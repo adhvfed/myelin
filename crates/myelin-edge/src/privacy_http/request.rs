@@ -433,6 +433,8 @@ mod tests {
         };
 
         let body = privacy_request_json("acme", &request);
+        myelin_refs::parse_scoped(body["ref"].as_str().unwrap())
+            .expect("privacy requests expose a canonical ArtifactRef");
         assert_eq!(body["last_attempt_failed"], true);
         assert_eq!(body["certificate_available"], false);
         assert!(!body.to_string().contains("person-private"));

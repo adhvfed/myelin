@@ -304,7 +304,7 @@ describe.sequential("the CLI authentication journey", () => {
     for (const tool of catalogue.items) {
       expect(tool.name).toMatch(/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/);
       expect(tool.ref).toBe(
-        `myelin://${systemTestConfig.tenant}/agent/tool/${tool.name}/v${tool.version}`,
+        `myelin://${systemTestConfig.tenant}/agent/tool/${tool.name}@${tool.version}`,
       );
       expect(tool.input_schema.type).toBe("object");
       expect(tool.required_capabilities.length).toBeGreaterThan(0);
@@ -493,7 +493,7 @@ describe.sequential("the CLI authentication journey", () => {
     );
     for (const tool of activated.agent.selected_tools) {
       expect(tool.ref).toBe(
-        `myelin://${systemTestConfig.tenant}/agent/tool/${tool.name}/v${tool.version}`,
+        `myelin://${systemTestConfig.tenant}/agent/tool/${tool.name}@${tool.version}`,
       );
     }
     expect(createAgent.stdout).not.toContain(systemTestConfig.token);

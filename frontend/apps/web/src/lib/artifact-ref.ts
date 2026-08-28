@@ -11,13 +11,17 @@ const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_ARTIFACT_REF_BYTES = 4 * 1024;
 const MAX_SUBJECT_COMPONENT_BYTES = 1024;
 const SUBSYSTEMS = new Set([
-  "git", "ci", "issue", "knowledge", "chat", "notif", "signal", "identity", "agent", "refs",
+  "bus", "git", "ci", "issue", "knowledge", "chat", "notif", "signal", "identity", "agent",
+  "flow", "privacy", "control_plane", "workspace", "refs",
 ]);
 const TYPES = new Set([
   "pr", "ref", "review", "comment", "repo", "commit", "blob", "run", "check", "log", "artifact",
   "deployment", "pipeline", "runner", "issue", "initiative", "relation", "page", "doc", "row",
   "channel", "message", "thread", "read_state", "permission", "member", "project", "edge",
   "database", "tuple", "agent", "workspace", "session",
+  "block", "decision", "effect", "event", "item", "job", "principal", "pseudonym", "request",
+  "result", "secret", "snapshot", "step", "tool", "trigger",
+  "action", "ci_project", "migration", "provision",
 ]);
 
 export interface ArtifactRefParts {

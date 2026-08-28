@@ -125,7 +125,7 @@ mod tests {
     fn tool() -> Value {
         json!({
             "name": "git.merge",
-            "ref": "myelin://acme/agent/tool/git.merge/v1",
+            "ref": "myelin://acme/agent/tool/git.merge@1",
             "subsystem": "git",
             "version": 1,
             "input_schema": {"type": "object", "required": ["repo"]},
@@ -141,7 +141,7 @@ mod tests {
     fn tool_rows_and_details_are_addressable_legible_and_terminal_safe() {
         assert_eq!(
             render_item(&tool()).unwrap(),
-            "git.merge v1  [mutate, approval]  myelin://acme/agent/tool/git.merge/v1"
+            "git.merge v1  [mutate, approval]  myelin://acme/agent/tool/git.merge@1"
         );
         let mut unsafe_tool = tool();
         unsafe_tool["required_capabilities"] = json!(["pull_request.merge\nforged"]);

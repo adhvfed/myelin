@@ -8,6 +8,7 @@ import {
   reviewerClient,
   uniqueName,
 } from "../src/context.js";
+import { systemTestConfig } from "../src/config.js";
 import { awaitAuthorizedIssue } from "../src/issues.js";
 import { awaitAutomationFiring } from "../src/journeys/automations.js";
 import { Conversation } from "../src/journeys/chat.js";
@@ -153,6 +154,9 @@ describe("a person's privacy lifecycle", () => {
     });
     const request = record(submitted.body.request, "completed privacy request");
     const requestId = string(request.id, "privacy request id");
+    expect(request.ref).toBe(
+      `myelin://${systemTestConfig.tenant}/privacy/request/${requestId}`,
+    );
     expect(submitted.body.created).toBe(true);
     expect(request).toMatchObject({
       kind: "erasure",

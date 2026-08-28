@@ -209,7 +209,7 @@ mod tests {
             "selected_tools": [{
                 "name": "ci.read_run",
                 "version": 1,
-                "ref": "myelin://acme/agent/tool/ci.read_run/v1",
+                "ref": "myelin://acme/agent/tool/ci.read_run@1",
             }],
             "effective_tools": [],
             "grants": ["run.view"],

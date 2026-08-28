@@ -1,4 +1,5 @@
 pub const SUBSYSTEM_TOKENS: &[&str] = &[
+    "bus",
     "git",
     "ci",
     "issue",
@@ -8,6 +9,9 @@ pub const SUBSYSTEM_TOKENS: &[&str] = &[
     "signal",
     "identity",
     "agent",
+    "flow",
+    "privacy",
+    "control_plane",
     "workspace",
     "refs",
 ];
@@ -56,6 +60,28 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     // sub-anchor of the workspace. Keeping it as a root artifact lets every
     // consumer validate and retain the accountability reference.
     "session",
+    // Root artifacts already emitted by the running product. These are
+    // addresses, not event verbs; omitting them makes owner-produced refs
+    // impossible to validate at Refs and browser boundaries.
+    "block",
+    "decision",
+    "effect",
+    "event",
+    "item",
+    "job",
+    "principal",
+    "pseudonym",
+    "request",
+    "result",
+    "secret",
+    "snapshot",
+    "step",
+    "tool",
+    "trigger",
+    "action",
+    "ci_project",
+    "migration",
+    "provision",
 ];
 
 /// Artifact subjects whose live read boundary is implemented for governed automations.
@@ -219,7 +245,7 @@ impl std::fmt::Display for TaxonomyError {
             TaxonomyError::UnknownSubsystem { name, token } => write!(
                 f,
                 "`{name}`: `{token}` is not a canonical subsystem token \
-                 (git/ci/issue/knowledge/chat/notif/signal/identity/agent/workspace/refs)"
+                 (bus/git/ci/issue/knowledge/chat/notif/signal/identity/agent/flow/privacy/control_plane/workspace/refs)"
             ),
             TaxonomyError::PresentTenseVerb { name, token } => write!(
                 f,
@@ -482,6 +508,7 @@ mod tests {
         assert_eq!(
             SUBSYSTEM_TOKENS,
             &[
+                "bus",
                 "git",
                 "ci",
                 "issue",
@@ -491,6 +518,9 @@ mod tests {
                 "signal",
                 "identity",
                 "agent",
+                "flow",
+                "privacy",
+                "control_plane",
                 "workspace",
                 "refs"
             ]

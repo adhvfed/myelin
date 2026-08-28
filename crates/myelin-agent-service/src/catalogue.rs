@@ -148,7 +148,7 @@ pub fn catalogue_cursor(definition: &ToolDef) -> String {
 
 pub fn tool_ref(tenant: &TenantId, definition: &ToolDef) -> ArtifactRef {
     ArtifactRef(format!(
-        "myelin://{}/agent/tool/{}/v{}",
+        "myelin://{}/agent/tool/{}@{}",
         tenant.0,
         definition.canonical_name(),
         definition.version
@@ -314,7 +314,9 @@ mod tests {
         assert_eq!(catalogue_cursor(merge), "git.merge.v1");
         assert_eq!(
             tool_ref(&TenantId("acme".into()), merge).0,
-            "myelin://acme/agent/tool/git.merge/v1"
+            "myelin://acme/agent/tool/git.merge@1"
         );
+        myelin_refs::parse_scoped(&tool_ref(&TenantId("acme".into()), merge).0)
+            .expect("catalogue tool roots are canonical ArtifactRefs");
     }
 }

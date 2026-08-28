@@ -34,6 +34,24 @@ describe("artifact references", () => {
   });
 
   it.each([
+    "myelin://acme/agent/tool/git.merge@1",
+    "myelin://acme/bus/event/01J00000000000000000000000",
+    "myelin://acme/ci/secret/deploy",
+    "myelin://acme/ci/snapshot/blake3:0123456789abcdef",
+    "myelin://acme/ci/ci_project/build-platform",
+    "myelin://acme/identity/trigger/11111111-1111-4111-8111-111111111111",
+    "myelin://acme/identity/action/project.read",
+    "myelin://acme/knowledge/block/block-1",
+    "myelin://acme/knowledge/action/page.edit",
+    "myelin://acme/notif/item/item-1",
+    "myelin://acme/privacy/request/22222222-2222-4222-8222-222222222222",
+    "myelin://acme/control_plane/migration/cell-a→cell-b",
+    "myelin://control-plane/control_plane/provision/cell-a",
+  ])("recognizes a root minted by a running owner: %s", (reference) => {
+    expect(parseArtifactRef(reference)).not.toBeNull();
+  });
+
+  it.each([
     "https://example.invalid/issue/7",
     "myelin://acme/issue/issue",
     "myelin://acme/invented/issue/MYL-7",

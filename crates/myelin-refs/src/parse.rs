@@ -430,6 +430,35 @@ mod tests {
     }
 
     #[test]
+    fn running_product_root_names_share_one_parseable_vocabulary() {
+        for reference in [
+            "myelin://acme/agent/effect/e-1",
+            "myelin://acme/agent/run/run-1",
+            "myelin://acme/agent/session/01J00000000000000000000000",
+            "myelin://acme/agent/tool/git.merge@1",
+            "myelin://acme/bus/event/01J00000000000000000000000",
+            "myelin://acme/ci/secret/deploy",
+            "myelin://acme/ci/snapshot/blake3:0123456789abcdef",
+            "myelin://acme/ci/ci_project/build-platform",
+            "myelin://acme/flow/run/run-1",
+            "myelin://acme/identity/action/project.read",
+            "myelin://acme/identity/principal/p-1",
+            "myelin://acme/identity/pseudonym/psn-1",
+            "myelin://acme/identity/trigger/11111111-1111-4111-8111-111111111111",
+            "myelin://acme/knowledge/block/block-1",
+            "myelin://acme/knowledge/action/page.edit",
+            "myelin://acme/notif/item/item-1",
+            "myelin://acme/privacy/request/22222222-2222-4222-8222-222222222222",
+            "myelin://acme/control_plane/migration/cell-a→cell-b",
+            "myelin://control-plane/control_plane/provision/cell-a",
+        ] {
+            let parsed = parse_scoped(reference)
+                .unwrap_or_else(|error| panic!("owner-produced ref `{reference}`: {error}"));
+            assert_eq!(format(&parsed.artifact_ref), reference);
+        }
+    }
+
+    #[test]
     fn every_sub_kind_parses_classifies_and_round_trips() {
         let cases: &[(&str, Sub)] = &[
             (
