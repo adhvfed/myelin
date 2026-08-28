@@ -1,6 +1,6 @@
 use myelin_events::taxonomy::{self, new_tokens};
 use myelin_events::{
-    validate_event_type, ArtifactRef, EventDraft, EventType, SEED_EVENT_NAMES, SUBSYSTEM_TOKENS,
+    validate_event_type, ArtifactRef, EventDraft, EventType, SEED_EVENT_NAMES,
 };
 use myelin_events::{AggregateKey, DataRole, Visibility};
 
@@ -66,24 +66,4 @@ fn cdc_2_9_consumer_rejects_a_malformed_type_loudly() {
         validate_event_type(&unknown.type_.0),
         Err(taxonomy::TaxonomyError::UnknownSubsystem { .. })
     ));
-}
-
-#[test]
-fn cdc_2_9_subsystem_token_set_is_the_shared_anchor() {
-    assert_eq!(
-        SUBSYSTEM_TOKENS,
-        &[
-            "git",
-            "ci",
-            "issue",
-            "knowledge",
-            "chat",
-            "notif",
-            "signal",
-            "identity",
-            "agent",
-            "workspace",
-            "refs"
-        ]
-    );
 }

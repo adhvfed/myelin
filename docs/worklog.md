@@ -3876,6 +3876,25 @@ complete normal suites; strict all-target/all-feature Clippy across both
 services; repository-wide search finding no removed map-backed reindexer. Net
 removal: 3,523 lines.
 
+## 2026-08-28 — Events no longer exposes an ownerless reindex architecture
+
+Once the synthetic owner implementations were removed, Events' generic
+snapshot/reindex API had no caller outside its own fixtures. Its reference
+source and derived store were maps, and the “E2E spine” drill combined several
+in-memory helpers into a larger self-certifying scenario.
+
+The unused snapshot/reindex contract and its CDC/drill suites are removed.
+Durable restore and cell migration continue through the separate storage WAL
+reindex path. A future event replay contract should be introduced by a running
+owner with a durable source and full-system restart proof, rather than as an
+ownerless abstraction.
+
+Proof: the complete normal Events suite and strict all-target/all-feature
+Events Clippy; workspace-wide all-target/all-feature compilation; and a
+repository-wide search finding no removed snapshot API. Net removal: 1,666
+lines from the reindex fixtures and 25 additional lines of unused exports and a
+stale duplicate taxonomy assertion (1,691 code/test lines net).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

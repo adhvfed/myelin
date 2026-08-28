@@ -14,7 +14,6 @@ pub mod nats;
 pub mod outbox;
 pub mod partition;
 pub mod reerase;
-pub mod reindex;
 pub mod relay;
 pub mod residency;
 pub mod retention;
@@ -96,10 +95,6 @@ pub use reerase::{
     ReErasureReceipt,
 };
 
-pub use reindex::{
-    reindex, snapshot_event_id, DerivedStore, ReferenceReindexSource, ReindexError, ReindexReceipt,
-    ReindexSource, SnapshotDraft, SnapshotScope, SNAPSHOT_EVENT_NAME,
-};
 
 use serde::{Deserialize, Serialize};
 
