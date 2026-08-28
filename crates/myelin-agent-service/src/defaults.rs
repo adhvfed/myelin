@@ -2,18 +2,8 @@ use myelin_agent::{EffectKind, ToolDef, ToolName, ToolSurface};
 
 pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
     match (subsystem, tool) {
-        ("ci", "deploy") => true,
-        ("ci", "approve_deploy") => true,
-        ("ci", "rollback") => true,
-        ("ci", "write_secret") => true,
-        ("ci", "run") => false,
-        ("ci", "run_pipeline") => false,
-        ("ci", "cancel_run") => false,
-        ("ci", "retry_run") => false,
         ("ci", "read_log") => false,
         ("ci", "read_run") => false,
-        ("ci", "validate") => false,
-        ("ci", "plan") => false,
 
         ("git", "merge") => true,
         ("git", "open_pr") => false,
@@ -185,22 +175,18 @@ mod tests {
 
     #[test]
     fn the_frozen_6_3_defaults_table_is_seeded_verbatim() {
-        assert!(
-            requires_approval_default("ci", "deploy"),
-            "CI deploy is gated (consequential)"
-        );
-        assert!(
-            requires_approval_default("ci", "approve_deploy"),
-            "CI approve_deploy is gated"
-        );
-        assert!(
-            requires_approval_default("ci", "write_secret"),
-            "CI write_secret is gated"
-        );
-        assert!(
-            !requires_approval_default("ci", "run_pipeline"),
-            "CI non-prod pipeline is NOT gated"
-        );
+        for read in ["read_log", "read_run"] {
+            assert!(
+                !requires_approval_default("ci", read),
+                "the executable ci.{read} action is read-only"
+            );
+        }
+        for unavailable in ["run_pipeline", "deploy", "approve_deploy", "write_secret"] {
+            assert!(
+                requires_approval_default("ci", unavailable),
+                "unavailable ci.{unavailable} remains gated by the fail-closed fallback"
+            );
+        }
 
         assert!(
             requires_approval_default("git", "merge"),

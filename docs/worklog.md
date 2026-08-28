@@ -3560,6 +3560,28 @@ complete normal suites; strict all-target/all-feature Clippy across Git, Agent
 Service, Edge, CLI, and MCP; and repository-wide symbol search finding no
 remaining legacy provider or code-tool caller. Net removal: 1,390 lines.
 
+## 2026-08-28 — CI discovery contains only routed reads
+
+CI registered twelve agent definitions, but the governed runtime composes no CI
+mutation effect route. Only `ci.read_run` and `ci.read_log` reach the durable,
+permission-checked MCP read adapter. Run, retry, cancellation, validation,
+planning, deployment, rollback, approval, and secret-write definitions carried
+generic empty schemas and could never execute. Agent Service also maintained a
+second four-mutation CI provider used only by its own policy tests.
+
+The CI owner now exposes an option-returning constructor for exactly the two
+executable reads; asking it to define any unavailable action returns no
+definition. The shared catalogue asserts every former phantom is absent. The
+duplicate Agent Service provider, copied twelve-row CDC matrix, and special
+ungated defaults are gone; unknown future mutations use the fail-closed policy
+until a real effect carrier exists.
+
+Proof: all 123 Agent Service, 577 CI control-plane, 32 MCP, and 367 Edge library
+stories plus their complete normal suites; strict all-target/all-feature Clippy
+across CI control-plane, Agent Service, MCP, Edge, and CLI; and the governed MCP
+suite proving the two reads retain byte-identical schemas and durable routing.
+Net removal: 492 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -3667,3 +3689,10 @@ remaining legacy provider or code-tool caller. Net removal: 1,390 lines.
     rewrite have no governed carrier; the former injected-fake rewrite/index
     module was removed. Each future action needs a durable owner boundary and a
     full-system agent journey before discovery.
+18. **Agents can inspect CI, but cannot command it directly.** They can read
+    durable runs and bounded logs. Pipeline trigger/retry/cancel, validation,
+    planning, deploy/approve/rollback, and secret administration have no CI
+    effect carrier and remain absent from discovery. The existing repository
+    event pipeline and human secret administration do not substitute for a
+    governed, idempotent agent command with authorization, audit, and a
+    full-system journey.

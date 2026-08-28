@@ -201,7 +201,27 @@ mod tests {
             );
         }
         let ci_read = catalogue.resolve("ci.read_run").unwrap();
-        assert_eq!(ci_read, &myelin_ci_controlplane::ci_tool_def("read_run"));
+        assert_eq!(
+            ci_read,
+            &myelin_ci_controlplane::ci_tool_def("read_run").unwrap()
+        );
+        for unavailable in [
+            "ci.run",
+            "ci.run_pipeline",
+            "ci.cancel_run",
+            "ci.retry_run",
+            "ci.validate",
+            "ci.plan",
+            "ci.deploy",
+            "ci.approve_deploy",
+            "ci.rollback",
+            "ci.write_secret",
+        ] {
+            assert!(
+                catalogue.resolve(unavailable).is_none(),
+                "catalogue must not advertise unavailable effect {unavailable}"
+            );
+        }
 
         let manifest = catalogue.mcp_manifest();
         let names = manifest["tools"]

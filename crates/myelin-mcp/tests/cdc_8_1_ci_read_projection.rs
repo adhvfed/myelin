@@ -10,7 +10,7 @@ use serde_json::Value;
 fn cdc_8_1_ci_provider_and_mcp_consumer_are_byte_aligned() {
     let registry = registry_for_subsystems(&["git", "ci"]);
     for name in ["read_run", "read_log"] {
-        let provider = ci_tool_def(name);
+        let provider = ci_tool_def(name).unwrap();
         let consumer = registry
             .resolve(&format!("ci.{name}"))
             .expect("exposed CI definition");

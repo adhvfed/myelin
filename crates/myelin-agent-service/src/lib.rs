@@ -1,7 +1,6 @@
 pub mod app;
 pub mod catalogue;
 pub mod chat_read_tools;
-pub mod ci_tools;
 pub mod defaults;
 pub mod effect_api;
 pub mod git_read_tools;
@@ -81,13 +80,6 @@ pub use git_read_tools::{
 pub use workspace_tools::{
     workspace_tool_defs, EXEC_WORKSPACE_COMMAND_TOOL, READ_WORKSPACE_FILE_TOOL,
     WORKSPACE_SUBSYSTEM, WORKSPACE_TOOL_VERSION, WRITE_WORKSPACE_FILE_TOOL,
-};
-
-pub use ci_tools::{
-    approve_deploy_tool_def, ci_tool_defs, deploy_required_caps, deploy_tool_def,
-    register_ci_tools, run_pipeline_required_caps, run_pipeline_tool_def,
-    write_secret_required_caps, write_secret_tool_def, APPROVE_DEPLOY_TOOL, CI_SUBSYSTEM,
-    CI_TOOL_VERSION, DEPLOY_TOOL, RUN_PIPELINE_TOOL, WRITE_SECRET_TOOL,
 };
 
 pub use trace_seam::{is_content_addressed_kn_document, trace_ref_of, TraceDocument};

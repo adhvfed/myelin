@@ -35,8 +35,8 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
     let mut cat = Catalogue { defs: vec![] };
 
     let raws = [
-        ("ci", "deploy", true),
-        ("ci", "run_pipeline", true),
+        ("ci", "read_run", true),
+        ("ci", "read_log", true),
         ("git", "merge", false),
         ("git", "open_pr", true),
         ("issues", "create", true),
@@ -55,8 +55,8 @@ fn cdc_8_1_register_seeds_the_frozen_6_3_default_for_every_subsystem() {
             "{name} requires_approval seeded to the frozen §6.3 default ({gated})"
         );
     };
-    expect("deploy", true);
-    expect("run_pipeline", false);
+    expect("read_run", false);
+    expect("read_log", false);
     expect("merge", true);
     expect("open_pr", false);
     expect("create", false);

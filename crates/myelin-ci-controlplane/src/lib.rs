@@ -230,10 +230,7 @@ pub use surfacing_index::{
     run_doc_is_indexable, summary_template_key, CheckVerdict, CiReindexSource, CiReplayKind,
     CiSummary, CI_RUN_ACL_OBJECT_TYPE, CI_RUN_TYPE, CI_SUMMARY_TEMPLATES,
 };
-pub use surfacing_tools::{
-    ci_effect_kind, ci_required_caps, ci_requires_approval_default, ci_side_effecting, ci_tool_def,
-    ci_tool_defs, register_ci_tools, CI_TOOL_NAMES,
-};
+pub use surfacing_tools::{ci_tool_def, ci_tool_defs, CI_TOOL_NAMES};
 
 pub use scheduler::{
     EnqueueOutcome, Lane, AUTHORIZE_JOB_LAUNCH_QUERY, AUTHORIZE_JOB_LAUNCH_V2_QUERY,

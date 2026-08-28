@@ -605,7 +605,9 @@ fn ci_read_projects_shared_schema_and_routes_directly_without_idempotency() {
     assert_eq!(
         read_run["inputSchema"],
         serde_json::from_str::<serde_json::Value>(
-            &myelin_ci_controlplane::ci_tool_def("read_run").input_schema
+            &myelin_ci_controlplane::ci_tool_def("read_run")
+                .unwrap()
+                .input_schema
         )
         .unwrap()
     );
