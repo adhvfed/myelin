@@ -5,7 +5,6 @@ pub mod engine;
 pub mod fusion;
 pub mod indexer;
 pub mod pipeline;
-pub mod reindex;
 pub mod vector;
 
 pub use compiler::{
@@ -31,10 +30,6 @@ pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
     RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine,
     VectorQuery, READ_PERMISSION,
-};
-pub use reindex::{
-    ReindexCursorStore, ReindexError, ReindexJob, ReindexProgress, SearchReindexer,
-    DEFAULT_BATCH_CAP, DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
 };
 pub use vector::{Embedding, HnswVectorIndex, ModelRef, VectorHit, VectorRecord};
 

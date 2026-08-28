@@ -3823,6 +3823,23 @@ strict all-target/all-feature Clippy across Chat and Search; and a
 repository-wide search finding no external Search dependency. Net removal:
 1,145 lines.
 
+## 2026-08-28 — Search has no pretend resumable reindex job
+
+`SearchReindexer` advertised resumable, throttled rebuilds, but stored cursors
+and per-tenant in-flight counts in mutex-protected process maps. Its only owner
+sources were fixture maps and its only outbox was in memory. With no Search
+service or durable owner fetchers, restarting lost the very progress the API
+claimed was resumable.
+
+The reindex job façade and its CDC are removed. The incremental event indexer
+and query engine remain as generic foundations; a future product reindex must
+start from durable owner snapshots, a durable job/cursor store, worker
+admission, and a restart journey.
+
+Proof: the complete normal Search suite and strict all-target/all-feature
+Search Clippy; repository-wide search finding no `SearchReindexer` or process-
+local reindex cursor store. Net removal: 973 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
