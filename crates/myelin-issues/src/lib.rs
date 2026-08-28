@@ -98,11 +98,8 @@ pub use my_work::{
 };
 
 pub use refs_glue::{
-    block_sub_ref, comment_sub_ref, edge_aggregate_key, emit_content_edges, emit_relation_edge,
-    field_sub_ref, issue_root_ref, row_sub_ref, IssueLifecycleRel, IssueMeta, IssueProjectFetcher,
-    IssueProjectionStore, IssueRelationGraph, LadderRung, ProjectError, Projected, Projection,
-    Projector, RelationEdge, SubAnchor, SubState, Tombstone, TombstoneReason, TraversedNode,
-    REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE, REL_CLASS_REFERENCE, TRAVERSE_MAX_DEPTH,
+    issue_root_ref, IssueLifecycleRel, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE,
+    REL_CLASS_REFERENCE,
 };
 
 pub use agent_spend::{

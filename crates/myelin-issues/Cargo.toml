@@ -20,7 +20,6 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-query = { path = "../myelin-query" }
 myelin-content = { path = "../myelin-content" }
 myelin-events = { path = "../myelin-events" }
-myelin-search = { path = "../myelin-search" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-refs = { path = "../myelin-refs" }

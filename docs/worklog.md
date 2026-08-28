@@ -3715,6 +3715,26 @@ Clippy across Knowledge, Search, and Edge; repository-wide search finding no
 Knowledge Search dependency or duplicate Knowledge reindex owner. Net removal:
 1,751 lines.
 
+## 2026-08-28 — Issues projections use the durable owner or do not exist
+
+Issues still had two index schemas plus a public Search fetcher over a private
+`HashMap`. The same file also exported an authorization-aware reference-card
+projector and bounded relation graph whose stores were populated only by tests.
+Edge does not use them: it resolves Issue cards through visibility-filtered
+queries against `PgIssueStore`, and durable issue relations already live in
+PostgreSQL.
+
+The duplicate Search schemas/fetcher, map-backed card projector, graph
+simulator, and their copied unit/CDC/integration suites are removed. The mixed
+module now retains only the canonical Issue root-ref codec and lifecycle
+relation vocabulary used by the durable API/store. Notification declarations
+remain independent of Search, and Issues no longer depends on Search.
+
+Proof: all 138 Issues and 191 Search library stories plus both normal suites;
+strict all-target/all-feature Clippy across Issues, Search, and Edge; and a
+repository-wide search finding no Issues Search dependency or in-memory Issue
+projection store. Net removal: 2,794 lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
