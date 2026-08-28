@@ -3797,11 +3797,8 @@ dependencies = [
 name = "myelin-search"
 version = "0.0.0"
 dependencies = [
- "chrono",
- "myelin-config",
  "myelin-content",
  "myelin-events",
- "myelin-gdpr",
  "myelin-harness",
  "myelin-identity",
  "myelin-query",
@@ -3812,9 +3809,7 @@ dependencies = [
  "myelin-tenancy",
  "serde",
  "serde_json",
- "sqlx",
  "tantivy",
- "tokio",
 ]
 
 [[package]]

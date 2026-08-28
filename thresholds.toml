@@ -253,19 +253,6 @@ promote_events_per_sec_per_stream = 50000  # promotion criterion: a single-strea
 degraded_publish_latency_p99_ms = 100      # promotion criterion: the per-aggregate publish-latency p99
 promotion_owed = false                     # NO measured volume outgrows JetStream → seam stays NAMED.
 
-[search_freshness]
-freshness_p99_ms = 2000          # simulated under load: the §4.10 seconds-grade event→searchable
-index_lag_alarm_margin_ms = 500  # the index-lag alarm fires at 2000−500 = 1500 ms — BELOW the budget,
-
-[filtered_ann]
-recall_at_k_bps = 10000               # simulated + held: exact recall@k (100.00 %) under a selective
-brute_force_fallback_visible_bps = 2000 # the TUNED very-selective trigger: ≤ 20 % visible ⇒ fall back to
-ivf_pq_promotion_live_vectors = 1000000 # the §3.3 HNSW→IVF-PQ promotion point (per-cell live vectors);
-
-[projection_feeder]
-promotion_ratio = 0.05  # contract 6.3 / OQ-C: the FROZEN > 5 % trigger Search consumes from Issues/KN
-min_executions = 20     # the rolling-window floor: fewer executions is too noisy to promote on.
-
 [timer_wheel_promotion]
 promote_due_now_per_sec_per_cell = 100000 # §7.3 / OQ #5: the per-cell sustained due-now fire rate above
 degraded_wheel_lag_budget = 0             # the `timer_wheel_lag` budget: any due timer left unfired past

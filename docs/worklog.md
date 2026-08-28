@@ -3112,6 +3112,43 @@ selects the rebuilt workspace vendor asset for every job; the staged tree and
 its embedded lockfile match the committed pins; and the runner-asset digest
 contract checks the registry against the manifest.
 
+## 2026-08-28 — Search stops certifying stores it does not run
+
+Removing the no-op Search executable exposed a larger self-certifying cluster
+inside the library. Process-local cache maps, an in-memory KMS, a constant
+`search_index` store descriptor, sealed byte vectors, and an in-memory Tantivy
+registry were composed into “real erase,” backup, object-store, restore, and
+telemetry gates. Every caller was another Search unit or drill; no deployed
+worker, query process, privacy-request holder, durable index, or restore
+maintenance command could reach any of them. Those tests could remain green
+while the product held no Search projection at all.
+
+The imaginary store boundary and its cache, key pin, layout, eraser, backup,
+restore, residency, object-store, and telemetry models are removed together
+with the tests that endorsed them. The reusable search core remains: typed
+producer projections, canonical event indexing, ACL-conjoined full-text and
+semantic query planning, consistency checks, Tantivy/vector algorithms, and
+reindex mechanics. Search event envelopes still preserve personal-data
+metadata, but the library no longer claims that metadata reaches a holder that
+does not exist. A real holder now has one prerequisite: the same deployed,
+durable encrypted index required by the product gap.
+
+The same rule removes Search-only surge, freshness, filtered-ANN, projection-
+promotion, and cross-cell simulators. They measured their own in-memory inputs
+and then labelled the result production readiness. Their three canonical
+threshold sections are gone too; operational tuning will return with the
+deployed component that can actually observe it. The interactive
+`SearchQuery` shed target remains because it describes a future request surface
+rather than asserting that a worker exists.
+
+Proof: all 207 remaining Search library stories and every remaining Search
+test target against Fed's durable dependencies; all 27 focused threshold
+stories; all-target/all-feature Search compile; no Search cache, KMS pin, store
+descriptor, holder, backup, restore, synthetic load/freshness gate, or orphaned
+threshold symbol remains; and the reduced workspace lockfile has a freshly
+rebuilt, content-addressed offline Cargo vendor asset selected by self-hosted
+CI.
+
 ## 2026-08-28 — transport capacity follows credential and principal class
 
 Verified dispatch admission still began too late for four bounded resources.
@@ -3225,6 +3262,9 @@ running TypeScript overload journey against the rebuilt PostgreSQL-backed Edge.
    Search shell is gone: there is no production index consumer, fetcher, or
    durable encrypted index backing, so there is deliberately no
    worker-admission row to bless.
+   The former in-memory cache, KMS pin, store descriptor, eraser, and
+   backup/restore drills are also gone; they cannot be mistaken for that
+   production boundary.
    The existing `SearchQuery` shed row remains an interactive-surface target,
    not evidence that indexing is running.
 4. **cross-product search is not surfaced yet.** the running product has bounded,

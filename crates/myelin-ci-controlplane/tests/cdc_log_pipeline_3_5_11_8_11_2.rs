@@ -9,7 +9,8 @@ use myelin_events::{derive_envelope, Actor, EmitContext, EventId, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_search::{
     ci_log_index_specs, ci_log_search_projection, AclFilter, CiLogProjectionInput,
-    IncrementalIndexer, MapFetcher, MockEmbeddingAdapter,
+    IncrementalIndexer, MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher,
+    SearchProjection,
 };
 use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
@@ -20,6 +21,26 @@ fn tenant() -> TenantId {
 
 fn region() -> Region {
     Region("fr-par".into())
+}
+
+struct OneProjection {
+    reference: String,
+    projection: SearchProjection,
+}
+
+impl ProjectFetcher for OneProjection {
+    fn project(
+        &self,
+        _tenant: &TenantId,
+        _region: &Region,
+        reference: &myelin_tenancy::ArtifactRef,
+    ) -> Result<SearchProjection, ProjectFetchError> {
+        if reference.0 == self.reference {
+            Ok(self.projection.clone())
+        } else {
+            Err(ProjectFetchError::Gone)
+        }
+    }
 }
 
 #[test]
@@ -240,7 +261,10 @@ fn ci_log_available_from_the_real_producer_is_searchable_under_its_parent_run_gr
         log_text: "compile failed in scheduler".into(),
         lang: None,
     });
-    let fetcher = Arc::new(MapFetcher::new([(draft.subject.0.clone(), projection)]));
+    let fetcher = Arc::new(OneProjection {
+        reference: draft.subject.0.clone(),
+        projection,
+    });
     let indexer = IncrementalIndexer::new(
         ci_log_index_specs(),
         fetcher,

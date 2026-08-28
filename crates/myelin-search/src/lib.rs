@@ -1,44 +1,20 @@
 pub mod analysis;
-pub mod backup_erasure;
-pub mod cache;
 pub mod chat_projection;
 pub mod ci_log_projection;
 pub mod compiler;
 pub mod consistency;
-pub mod cross_cell;
-pub mod dek;
 pub mod engine;
-pub mod erase;
-pub mod filtered_ann;
-pub mod freshness;
 pub mod fusion;
 pub mod git_code_projection;
 pub mod indexer;
 pub mod issues_projection;
 pub mod kn_projection;
-pub mod layout;
-pub mod object_store_backstop;
 pub mod pipeline;
-pub mod projection_feeder;
 pub mod reindex;
-pub mod residency;
-pub mod restore_verify;
-mod store;
 pub mod subartifact;
-pub mod surge;
-pub mod telemetry;
 pub mod tier3_valve;
 pub mod vector;
 
-pub use backup_erasure::{
-    backup_scale_page_spec, build_live_corpus, subject_matcher, BackupScaleEraseArtifact,
-    BackupScaleEraseFailure, BackupScaleEraseGate, BackupScaleEraseInputs, BackupScaleEraseVerdict,
-    MapFetcher, SealedBackupSegment,
-};
-pub use cache::{
-    should_bypass, zookie_bucket, CacheStats, CacheTtl, FilterCache, ResultCache,
-    TtlExceedsRevocationSla,
-};
 pub use chat_projection::{
     message_doc_ref, message_index_spec, message_index_specs, message_search_projection,
     register_message_index_specs, CHAT_SUBSYSTEM, MESSAGE_ACL_OBJECT_TYPE, MESSAGE_TYPE,
@@ -59,22 +35,9 @@ pub use consistency::{
     disposition, fail_static_bypass, stale_candidates, BoundedCheckPort, CandidateDisposition,
     ConsistencyStats,
 };
-pub use dek::{srch_p03_inherited_gates, InheritedGate, SearchDekPin};
 pub use engine::{
     AclFilter, Hit, IndexBackend, IndexDocument, IndexError, SubjectMatcher, TantivyBackend,
     DEFAULT_SUBJECT_LOCATOR_FACETS, ORDER_KEY_FIELD,
-};
-pub use erase::{
-    EraseOutcome, ErasureEventClock, SearchEraseHolder, SystemErasureEventClock,
-    SEARCH_ERASE_EVENT_TYPE,
-};
-pub use filtered_ann::{
-    measure_recall_at_k, FilteredAnnArtifact, FilteredAnnFailure, FilteredAnnGate,
-    FilteredAnnStrategy, FilteredAnnVerdict, RecallMeasurement,
-};
-pub use freshness::{
-    fresh_indexer, measure_event_to_searchable, p99_ms, FreshnessArtifact, FreshnessFailure,
-    FreshnessGate, FreshnessVerdict, FRESHNESS_P99_SEED_MS,
 };
 pub use fusion::{fuse_with_k, reciprocal_rank_fusion, FusedHit, RankedList, RRF_K};
 pub use git_code_projection::{
@@ -102,43 +65,19 @@ pub use kn_projection::{
     register_kn_index_specs, FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_PAGE_TYPE,
     KN_ROW_TYPE, KN_SUBSYSTEM,
 };
-pub use layout::{
-    derived_state_invariant_holds, LayoutError, PerTenantIndexLayout, StatefulComponent,
-};
-pub use object_store_backstop::{
-    ObjectStoreBackstopArtifact, ObjectStoreBackstopFailure, ObjectStoreBackstopGate,
-    ObjectStoreBackstopVerdict, SegmentBackstop, StoredSegment, SwappedSegments,
-};
 pub use pipeline::{
     query, query_consistent, semantic, ListObjectsPort, Page, QueryError, QueryStats, RankedResult,
     RankedResults, RelationalLeaf, ReverseIndexAnswer, RevisionWatermark, ScopedEngine,
     VectorQuery, READ_PERMISSION,
 };
-pub use projection_feeder::{
-    FacetCollection, FacetDoc, FacetServingPath, ProjectionFeederArtifact, ProjectionFeederFailure,
-    ProjectionFeederGate, ProjectionFeederVerdict, ViewExecutionTelemetry,
-};
 pub use reindex::{
     ReindexCursorStore, ReindexError, ReindexJob, ReindexProgress, SearchReindexer,
     DEFAULT_BATCH_CAP, DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
 };
-pub use residency::{search_store_descriptors, SearchStoreDescriptor};
-pub use restore_verify::{
-    ErasedSubjectEntry, SearchErasureLedger, SearchRestoreArtifact, SearchRestoreFailure,
-    SearchRestoreInputs, SearchRestoreVerdict, SearchRestoreVerifyGate,
-};
-pub use store::SEARCH_INDEX_STORE;
 pub use subartifact::{
     block_subdoc_projection, db_field_subdoc_projection, db_row_subdoc_projection,
     line_range_subdoc_facets, line_range_subdoc_projection, AnchorState, ContentAnchoredSpan,
     SubGrain, FACET_ANCHOR_STATE, FACET_LINE_END, FACET_LINE_START,
-};
-pub use surge::{
-    run_search_surge, SearchShedGate, SearchShedRejection, SearchSurgeReport,
-    SEARCH_SURGE_MULTIPLIER,
-};
-pub use telemetry::{
-    signal as telemetry_signal, LabelledSignal, RedLabels, SearchTelemetry, CACHE_RATIO_ABSENT,
 };
 pub use tier3_valve::{
     board_acl_filter, escalate_to_search, oltp_board_admits, BoardEscalationAuthz, BoardQuery,
@@ -256,8 +195,8 @@ mod tests {
         for gdpr in [CONTAINS_PERSONAL_DATA, DATA_ROLE, VISIBILITY, PII_KEY_REF] {
             assert!(
                 obj.contains_key(gdpr),
-                "GDPR routing anchor `{gdpr}` must match a frozen EventEnvelope field (so \
-                 Search-as-a-holder erase + the RoPA fan-out reach the index, SRCH-P02/P15)"
+                "personal-data routing anchor `{gdpr}` must match a frozen EventEnvelope field so \
+                 any future durable index can preserve the source event's handling metadata"
             );
         }
     }
