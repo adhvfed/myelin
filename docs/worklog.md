@@ -3092,6 +3092,26 @@ all-target/all-feature Search and migration-audit compile and strict Clippy;
 no remaining `search` binary, service-shell, migration-set, or fake
 production-bootstrap reference.
 
+## 2026-08-28 — self-hosted CI follows the workspace lockfile
+
+Removing Search's unused executable changed the workspace package graph and
+therefore the exact root `Cargo.lock` bytes, but the checked-in self-hosted CI
+registry still selected the previous vendored dependency tree. The broad
+backend run caught the mismatch at the real dispatch resolver: Myelin's own
+push refused to arm because no trusted offline asset matched the new lockfile.
+
+The complete workspace vendor tree has been rebuilt from `cargo vendor
+--locked`, promoted through the existing content-addressed staging flow, and
+repinned as one coherent identity in both `runner-assets.toml` and the sandbox
+registry. The source and selection key are the exact root lockfile digest; the
+runtime image reference is the canonical tree digest. No resolver fallback or
+networked runner path was introduced.
+
+Proof: the checked-in four-job pipeline now parses, resolves, snapshots, and
+selects the rebuilt workspace vendor asset for every job; the staged tree and
+its embedded lockfile match the committed pins; and the runner-asset digest
+contract checks the registry against the manifest.
+
 ## 2026-08-28 — transport capacity follows credential and principal class
 
 Verified dispatch admission still began too late for four bounded resources.

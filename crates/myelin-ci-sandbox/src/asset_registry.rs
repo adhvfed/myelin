@@ -25,9 +25,9 @@ pub const CARGO_VENDOR_SMOKE_LOCK_SHA256: &str =
 pub const ENV_GVISOR_CARGO_VENDOR: &str = "MYELIN_GVISOR_CARGO_VENDOR";
 
 pub const CARGO_VENDOR_WORKSPACE_TREE_SHA256: &str =
-    "536a099a454f7e4c0280b9b2c05de1a1700de7b7ccb603b9c52b90818da38bb0";
+    "d426addbc8e7d9acf17fca42629ed0deccfc1facabd840a4e30abbb5c9973927";
 pub const CARGO_VENDOR_WORKSPACE_LOCK_SHA256: &str =
-    "a9849274387a77bfeaefc95fd14877a216d0dba2c088f74f8d2da9204c1a7eac";
+    "1c5f4ac614739b821178b8c7acda3ba1ee1bf2d4ddb6d548ee34e1075c30992f";
 pub const ENV_GVISOR_CARGO_VENDOR_WORKSPACE: &str = "MYELIN_GVISOR_CARGO_VENDOR_WORKSPACE";
 
 pub fn cargo_vendor_smoke_reference() -> String {
