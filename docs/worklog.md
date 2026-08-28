@@ -3735,6 +3735,25 @@ strict all-target/all-feature Clippy across Issues, Search, and Edge; and a
 repository-wide search finding no Issues Search dependency or in-memory Issue
 projection store. Net removal: 2,794 lines.
 
+## 2026-08-28 — CI log tests stop claiming an absent search product
+
+The durable CI log pipeline writes redacted segments, content-addressed blobs,
+byte-range anchors, resumable live-tail frames, and coalesced availability
+events. A final CDC test then left that production path: it supplied log text
+through a one-row fake fetcher to a fresh in-memory Search index. Search also
+owned a parallel CI-log ref codec and schema unused by the pipeline, Edge, or a
+worker.
+
+The Search-owned CI-log projection and fake indexing portion are removed. The
+CDC now covers only the blob, range-index, live-tail, and coalescing surfaces it
+actually drives. CI control-plane no longer depends on Search; durable bounded
+log reads and live tail remain available through Edge.
+
+Proof: all 507 CI control-plane and 183 Search library stories plus both normal
+suites; strict all-target/all-feature Clippy across CI, Search, and Edge; and a
+repository-wide search finding no CI/Search projection seam. Net removal: 730
+lines.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

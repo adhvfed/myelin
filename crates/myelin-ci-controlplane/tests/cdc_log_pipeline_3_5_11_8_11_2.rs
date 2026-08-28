@@ -1,16 +1,8 @@
-use std::sync::Arc;
-
 use myelin_ci_controlplane::{
-    AnchorStatus, CoalesceBudget, LogAvailablePointer, LogCoord, LogPipeline, SealThreshold,
-    SecretRedactor, CI_LOG_STREAM,
+    AnchorStatus, CoalesceBudget, LogCoord, LogPipeline, SealThreshold, SecretRedactor,
+    CI_LOG_STREAM,
 };
 use myelin_events::firehose::Firehose;
-use myelin_events::{derive_envelope, Actor, EmitContext, EventId, Timestamp};
-use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_search::{
-    ci_log_index_specs, ci_log_search_projection, AclFilter, CiLogProjectionInput,
-    IncrementalIndexer, MockEmbeddingAdapter, ProjectFetchError, ProjectFetcher, SearchProjection,
-};
 use myelin_storage::{BlobStore, ContentHash, FsBlobStore};
 use myelin_tenancy::{Region, TenantId};
 
@@ -20,26 +12,6 @@ fn tenant() -> TenantId {
 
 fn region() -> Region {
     Region("fr-par".into())
-}
-
-struct OneProjection {
-    reference: String,
-    projection: SearchProjection,
-}
-
-impl ProjectFetcher for OneProjection {
-    fn project(
-        &self,
-        _tenant: &TenantId,
-        _region: &Region,
-        reference: &myelin_tenancy::ArtifactRef,
-    ) -> Result<SearchProjection, ProjectFetchError> {
-        if reference.0 == self.reference {
-            Ok(self.projection.clone())
-        } else {
-            Err(ProjectFetchError::Gone)
-        }
-    }
 }
 
 #[test]
@@ -230,76 +202,4 @@ fn cdc_producer_end_to_end_rides_all_three_consumed_surfaces() {
         p.admitted_log_writes() > 0,
         "the residency-pin admitted only in-region writes"
     );
-}
-
-#[test]
-fn ci_log_available_from_the_real_producer_is_searchable_under_its_parent_run_grant() {
-    let pointer = LogAvailablePointer::new(
-        LogCoord::new("01J0RUN", "01J0JOB", 7),
-        0,
-        21,
-        Some(ContentHash::blake3(b"sealed searchable segment")),
-    )
-    .expect("the pointer has one canonical non-empty byte range");
-    let draft = pointer
-        .to_draft(&tenant())
-        .expect("the producer mints one canonical tenant-bound event");
-    assert_eq!(
-        draft.subject.0, "myelin://01J0ACME/ci/log/01J0RUN:01J0JOB:7",
-        "the event subject is the searchable log document, not a scope-less deep link"
-    );
-    assert_eq!(
-        draft.payload["details_ref"], "myelin://01J0ACME/ci/run/01J0RUN#step-7",
-        "the payload separately carries the human jump-to-step link"
-    );
-
-    let projection = ci_log_search_projection(&CiLogProjectionInput {
-        run_id: "myelin://01J0ACME/ci/run/01J0RUN".into(),
-        job_id: "01J0JOB".into(),
-        step_no: 7,
-        log_text: "compile failed in scheduler".into(),
-        lang: None,
-    });
-    let fetcher = Arc::new(OneProjection {
-        reference: draft.subject.0.clone(),
-        projection,
-    });
-    let indexer = IncrementalIndexer::new(
-        ci_log_index_specs(),
-        fetcher,
-        Arc::new(MockEmbeddingAdapter::new(8)),
-    );
-    let event = derive_envelope(
-        draft,
-        EmitContext {
-            event_id: EventId("ci-log-available-7".into()),
-            tenant: tenant(),
-            region: region(),
-            actor: Actor(Principal::stub(
-                PrincipalId("ci-controlplane".into()),
-                PrincipalKind::Service,
-                tenant(),
-            )),
-            schema_ver: 1,
-            occurred_at: Timestamp("2026-08-15T00:00:00Z".into()),
-            recorded_at: Timestamp("2026-08-15T00:00:00Z".into()),
-            caused_by: None,
-        },
-        None,
-    );
-
-    indexer
-        .index(&event)
-        .expect("Search accepts the exact event CI persists");
-    let hits = indexer
-        .search_ft(
-            &tenant(),
-            &region(),
-            &AclFilter::ids(["myelin://01J0ACME/ci/run/01J0RUN"]),
-            "scheduler",
-            10,
-        )
-        .expect("the parent-authorized query succeeds");
-    assert_eq!(hits.len(), 1, "one run grant reveals its failing log step");
-    assert_eq!(hits[0].doc_id, event.subject.0);
 }

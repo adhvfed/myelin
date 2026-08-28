@@ -1,5 +1,4 @@
 pub mod analysis;
-pub mod ci_log_projection;
 pub mod compiler;
 pub mod consistency;
 pub mod engine;
@@ -13,12 +12,6 @@ pub mod subartifact;
 pub mod tier3_valve;
 pub mod vector;
 
-pub use ci_log_projection::{
-    ci_log_details_ref, ci_log_doc_ref, ci_log_index_spec, ci_log_index_specs,
-    ci_log_search_projection, parse_step_anchor, CiLogProjectionInput, CiLogStepAnchor,
-    CI_LOG_ACL_OBJECT_TYPE, CI_LOG_TYPE, CI_SUBSYSTEM, FACET_JOB_ID as CI_LOG_FACET_JOB_ID,
-    FACET_RUN_ID as CI_LOG_FACET_RUN_ID, FACET_STEP_NO as CI_LOG_FACET_STEP_NO,
-};
 pub use compiler::{
     compile, render, CompileError, CompiledPlan, ConjoinedPlan, FieldDecl, FieldKind, FieldSchema,
     FtClause, PostFetchPredicate, Sort, StructuredClause, VectorBranch, FT_BODY_FIELD,

@@ -23,7 +23,6 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-flow = { path = "../myelin-flow" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-refs = { path = "../myelin-refs" }
-myelin-search = { path = "../myelin-search" }
 myelin-query = { path = "../myelin-query" }
 myelin-agent = { path = "../myelin-agent" }
 serde_json = { workspace = true }
