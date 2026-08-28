@@ -292,11 +292,21 @@ async fn dedicated_capability_publishes_and_quarantines_but_cannot_mutate_outbox
     )
     .bind(&valid_id).bind(&valid.aggregate.0).bind(&valid.subject.0)
     .bind(serde_json::to_value(&valid).unwrap()).execute(&admin).await.unwrap();
+    let invalid_aggregate = format!("invalid:publisher:{suffix}");
+    let invalid = envelope(&invalid_id, &invalid_aggregate);
+    let mut invalid_json = serde_json::to_value(&invalid).unwrap();
+    invalid_json["schema_ver"] = serde_json::json!("not-an-integer");
     sqlx::query(
-        "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) VALUES ($1, $2, 0, $3, '{}'::jsonb)",
+        "INSERT INTO outbox (event_id, aggregate, seq, subject, envelope) \
+         VALUES ($1, $2, 0, $3, $4)",
     )
-    .bind(&invalid_id).bind(format!("invalid:publisher:{suffix}"))
-    .bind("myelin://publisher-live/issue/issue/invalid").execute(&admin).await.unwrap();
+    .bind(&invalid_id)
+    .bind(&invalid.aggregate.0)
+    .bind(&invalid.subject.0)
+    .bind(invalid_json)
+    .execute(&admin)
+    .await
+    .unwrap();
 
     let mut foreign_rows = admin.begin().await.unwrap();
     sqlx::query(
@@ -325,7 +335,8 @@ async fn dedicated_capability_publishes_and_quarantines_but_cannot_mutate_outbox
     assert_eq!(*publisher.0.lock().unwrap(), vec![valid_id.clone()]);
     let row = sqlx::query(
         "SELECT published_at IS NOT NULL AS published,
-                EXISTS (SELECT 1 FROM outbox_quarantine WHERE event_id = $2) AS quarantined
+                (SELECT reason_code FROM outbox_quarantine WHERE event_id = $2)
+                    AS quarantine_reason
            FROM outbox WHERE event_id = $1",
     )
     .bind(&valid_id)
@@ -334,7 +345,10 @@ async fn dedicated_capability_publishes_and_quarantines_but_cannot_mutate_outbox
     .await
     .unwrap();
     assert!(row.get::<bool, _>("published"));
-    assert!(row.get::<bool, _>("quarantined"));
+    assert_eq!(
+        row.get::<String, _>("quarantine_reason"),
+        "invalid_envelope_json"
+    );
     foreign_rows.rollback().await.unwrap();
 
     let publisher_url = std::env::var("MYELIN_OUTBOX_PUBLISHER_DATABASE_URL").unwrap();
