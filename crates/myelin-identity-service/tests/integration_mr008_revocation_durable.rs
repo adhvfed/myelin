@@ -408,12 +408,6 @@ async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
         store.revocation_count(&s).is_err(),
         "an unavailable database is not reported as an empty denylist"
     );
-    assert_eq!(
-        store.telemetry().revocation_count(),
-        0,
-        "failed writes are not counted as successful revocation observations"
-    );
-
     let recovered = common::app_provider(4).await;
     let store = RevocationStore::with_pg(DurableRevocationBacking::new(recovered), handle);
     store
@@ -447,12 +441,6 @@ async fn every_durable_revocation_write_reports_an_outage_and_can_be_retried() {
         3,
         "the retried token, principal, and run lifetime are now durable"
     );
-    assert_eq!(
-        store.telemetry().revocation_count(),
-        4,
-        "each successful retry is observed once"
-    );
-
     cleanup(&admin, &[&tenant]).await;
     println!("OK [d]: revocation mutations report outages honestly and remain retryable.");
 }

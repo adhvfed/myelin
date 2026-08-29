@@ -4249,6 +4249,24 @@ claim. Zero observed writer errors and continued progress are the evidence for
 availability in this journey; the test does not manufacture a literal downtime
 measurement or extrapolate 50,000 rows into 50 million.
 
+## 2026-08-29 — Revocation counts no longer impersonate lag measurements
+
+Identity's `RevocationTelemetry` is gone. It incremented an in-process counter
+after a denylist mutation and exposed that count under the
+`revocation_lag` name; it never observed a revocation timestamp, authorization
+decision, elapsed duration, or metrics exporter. The ID-D1 and ID-D6 drills
+then assigned successful checks a hard-coded zero-second lag and represented
+UI, API, Git wire, and agent coverage by calling the same in-memory method four
+times.
+
+The durable behavior remains covered where it actually exists: PostgreSQL
+revocations and run-token teardown survive fresh store instances, fail loudly
+during database outages, retry after recovery, and are exercised by durable
+agent-session lifecycle tests. Those integrations no longer assert that a
+mutation counter is latency telemetry. A real SLA claim needs a SCIM or admin
+deprovisioning entry point, independently timestamped authorization attempts at
+the running service boundaries, and an exported latency distribution.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the
@@ -4403,3 +4421,10 @@ measurement or extrapolate 50,000 rows into 50 million.
     publisher, protocol-v2 advertisement, regional CDN distribution, or clone
     fallback path is composed. The former helper merely round-tripped bytes
     through an in-memory blob adapter and was removed with its drills.
+24. **Principal deprovisioning is not a surfaced administration journey.** The
+    durable revocation store and request-time checks exist, but there is no
+    authenticated SCIM/admin endpoint or browser workflow and no exported
+    end-to-end revocation-lag distribution. The former counter named
+    `revocation_lag` counted successful mutations, while its drills assigned
+    zero seconds and repeated one in-process check under four surface labels;
+    those claims have been removed.

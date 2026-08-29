@@ -133,8 +133,7 @@ pub use read_replica::{
 };
 pub use reverse_index::{ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_TABLE};
 pub use revocation::{
-    RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, RunTokenState,
-    REVOCATION_SLA_SECS, S7_TABLE,
+    RevocationEntry, RevocationStore, RevokedKind, RunTokenState, REVOCATION_SLA_SECS, S7_TABLE,
 };
 pub use ssh_auth::{
     encode_ssh_credential_material, signed_payload, ssh_fingerprint, Challenge, ChallengeGuard,

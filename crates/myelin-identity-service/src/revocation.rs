@@ -3,7 +3,6 @@ use myelin_identity::{PrincipalId, RevokeTarget};
 use myelin_storage::TenantScope;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
@@ -67,7 +66,6 @@ struct Inner {
 #[derive(Clone)]
 pub struct RevocationStore {
     backend: RevocationBackend,
-    telemetry: Arc<RevocationTelemetry>,
 }
 
 #[derive(Clone)]
@@ -95,7 +93,6 @@ impl RevocationStore {
     pub fn new() -> RevocationStore {
         RevocationStore {
             backend: RevocationBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
-            telemetry: Arc::new(RevocationTelemetry::new()),
         }
     }
 
@@ -108,12 +105,7 @@ impl RevocationStore {
                 backing: Arc::new(backing),
                 rt,
             }),
-            telemetry: Arc::new(RevocationTelemetry::new()),
         }
-    }
-
-    pub fn telemetry(&self) -> &RevocationTelemetry {
-        &self.telemetry
     }
 
     pub fn revoke(
@@ -179,7 +171,6 @@ impl RevocationStore {
                 pg.block(pg.backing.insert_teardown(&scope.tenant().0, jti))?;
             }
         }
-        self.telemetry.observe();
         Ok(())
     }
 
@@ -349,7 +340,6 @@ impl RevocationStore {
                 ))?;
             }
         }
-        self.telemetry.observe();
         Ok(())
     }
 
@@ -377,27 +367,6 @@ impl RevocationStore {
 impl PgRevocationBacking {
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
         tokio::task::block_in_place(|| self.rt.block_on(fut))
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct RevocationTelemetry {
-    count: AtomicU64,
-}
-
-impl RevocationTelemetry {
-    pub fn new() -> RevocationTelemetry {
-        RevocationTelemetry::default()
-    }
-
-    pub const SIGNAL: &'static str = myelin_identity::iam_events::signals::REVOCATION_LAG;
-
-    fn observe(&self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn revocation_count(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
     }
 }
 
@@ -604,33 +573,5 @@ mod tests {
             &RevokeTarget::Jti("p:alice".into()),
             &ts("2026-06-19T00:01:00Z")
         ));
-    }
-
-    #[test]
-    fn revoke_emits_revocation_lag_telemetry() {
-        assert_eq!(RevocationTelemetry::SIGNAL, "revocation_lag");
-        assert_eq!(
-            RevocationTelemetry::SIGNAL,
-            myelin_identity::iam_events::signals::REVOCATION_LAG
-        );
-        let s7 = RevocationStore::new();
-        let acme = scope("acme");
-        s7.revoke(
-            &acme,
-            &RevokeTarget::Jti("jti-1".into()),
-            ts("2026-06-19T00:00:00Z"),
-        )
-        .expect("in-memory revocation is recorded");
-        s7.disable_principal(
-            &acme,
-            &PrincipalId("p:bob".into()),
-            ts("2026-06-19T00:00:01Z"),
-        )
-        .expect("in-memory principal disablement is recorded");
-        assert_eq!(
-            s7.telemetry().revocation_count(),
-            2,
-            "each revoke emits one revocation_lag observation"
-        );
     }
 }
