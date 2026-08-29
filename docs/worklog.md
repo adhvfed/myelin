@@ -4190,6 +4190,23 @@ blob round-tripping rather than bundle-URI clone acceleration.
 Proof: the complete Git library suite and strict all-target/all-feature Git
 compilation pass with the duplicate gate and unadvertised clone facade removed.
 
+## 2026-08-29 — A local blob wrapper no longer impersonates a CDN
+
+Storage's `CdnCloneClass` is gone. It wrapped the same caller-supplied
+`BlobStore`, filtered a caller-supplied list of imaginary POPs, and reported the
+tenant's home region regardless of any delivery location. No CDN provider,
+edge inventory, publishing worker, cache policy, signed URL, routing decision,
+or clone negotiation consumed it. The object-tier helper and three layers of
+copied tests therefore certified local blob put/get behavior as a CDN product.
+
+The real content-addressed object tier and its integrity, replication, and
+placement behavior remain. CDN residency will be attestable only when reports
+come from deployed edge inventory and actual bundle delivery, not constructed
+values.
+
+Proof: the complete Storage library suite and strict all-target/all-feature
+Storage compilation pass after removing the wrapper and its drills.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

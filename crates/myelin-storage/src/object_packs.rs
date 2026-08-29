@@ -1,7 +1,6 @@
-use myelin_tenancy::{Region, TenantId};
+use myelin_tenancy::TenantId;
 
 use crate::blob::BlobStore;
-use crate::cdn::CdnCloneClass;
 use crate::gitpack::{GitObjectKind, GitPackError, GitPackTier, RepoGitPlacement, RepoId};
 use crate::replicated_blob::ReplicatedBlobStore;
 
@@ -21,14 +20,6 @@ pub fn served_from_object_tier<B: BlobStore>(
 ) -> Result<Vec<u8>, GitPackError> {
     let address = tier.put_object(repo, kind, content)?;
     tier.get_object(repo, &address)
-}
-
-pub fn cdn_over_object_backing<'a, B: BlobStore>(
-    tier: &'a GitPackTier<ReplicatedBlobStore<B>>,
-    region: Region,
-    tenant_is_eu: bool,
-) -> CdnCloneClass<'a> {
-    CdnCloneClass::over(tier.tenant().clone(), region, tenant_is_eu, tier.blobs())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,8 +138,9 @@ pub fn place_repo_object_backed<B: BlobStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::{BlobError, ContentHash, FsBlobStore, HashAlgo};
+    use crate::blob::{BlobError, FsBlobStore, HashAlgo};
     use crate::gitpack::{RepoPlacementStatus, StorageGroup};
+    use myelin_tenancy::Region;
 
     fn tenant() -> TenantId {
         TenantId("acme".into())
@@ -251,36 +243,6 @@ mod tests {
             1,
             "every object copy corrupt → the read is refused (0 silent serve)"
         );
-    }
-
-    #[test]
-    fn the_c3_cdn_class_is_wired_against_the_object_backing() {
-        let (tier, _repo) = placed_object_tier();
-        let cdn = cdn_over_object_backing(&tier, Region::new("fr-par"), true);
-
-        let bundle_bytes = b"PACK\0clone-bundle-on-the-object-tier";
-        let addr = cdn
-            .publish_bundle(bundle_bytes)
-            .expect("publish to object tier");
-        assert_eq!(addr, ContentHash::blake3(bundle_bytes));
-        assert_eq!(
-            cdn.bundle(&addr).expect("serve bundle from object tier"),
-            bundle_bytes
-        );
-    }
-
-    #[test]
-    fn the_object_backed_cdn_keeps_the_within_eu_edge_filter() {
-        use crate::cdn::CdnEdgePop;
-        let (tier, _repo) = placed_object_tier();
-        let cdn = cdn_over_object_backing(&tier, Region::new("fr-par"), true);
-        let candidates = vec![
-            CdnEdgePop::new("par-1", Region::new("fr-par"), true),
-            CdnEdgePop::new("iad-1", Region::new("us-east"), false),
-        ];
-        let eligible = cdn.eligible_edges(&candidates);
-        assert_eq!(eligible.len(), 1, "the extra-EU POP is excluded");
-        assert!(eligible.iter().all(|p| p.within_eu));
     }
 
     #[test]

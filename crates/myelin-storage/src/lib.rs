@@ -10,7 +10,6 @@ pub mod backup;
 pub mod blob;
 pub mod bus_shred;
 pub mod cache;
-pub mod cdn;
 pub mod cell_migration;
 #[cfg(any(test, feature = "test-support"))]
 pub mod ci_log_index;
@@ -100,7 +99,6 @@ pub use blob::{
 };
 pub use bus_shred::KmsBusShredder;
 pub use cache::{Cache, CacheError, InMemoryCache};
-pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
 pub use cell_migration::{
     is_cell_local, migrate_cell_to_cell, storage_resolves_locally, CellMigrationError,
     CellMigrationReceipt, CellMigrationRequest, CellTenantTiers,
@@ -140,9 +138,8 @@ pub use migration_under_load::{
 pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
 pub use money::MicroUsd;
 pub use object_packs::{
-    cdn_over_object_backing, object_backed_pack_tier, place_repo_object_backed,
-    served_from_object_tier, CloneStormLoad, GitD4Ceiling, GitD4Report, ObjectBackedServe,
-    SingleNodeServe,
+    object_backed_pack_tier, place_repo_object_backed, served_from_object_tier, CloneStormLoad,
+    GitD4Ceiling, GitD4Report, ObjectBackedServe, SingleNodeServe,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
