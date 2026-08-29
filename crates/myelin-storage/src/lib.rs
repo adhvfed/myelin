@@ -32,7 +32,6 @@ pub mod residency;
 pub mod restore;
 pub mod restore_verify;
 pub mod rls;
-pub mod storage_surge;
 
 pub mod authz_projection_durable;
 pub mod backend;
@@ -164,10 +163,6 @@ pub use restore_verify::{
     RestoreVerifyGate, RestoredObject,
 };
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
-pub use storage_surge::{
-    run_storage_lane_surge, StorageAdmission, StorageLaneBudget, StorageLaneClass, StorageLaneGate,
-    StorageSurgeReport, STORAGE_SURGE_MULTIPLIER,
-};
 
 pub use agent_thread_durable::{
     agent_thread_durable_migrations, ActivateAgentThreadOutcome, AgentThreadExpiry,

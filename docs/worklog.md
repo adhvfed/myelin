@@ -4136,6 +4136,24 @@ directly.
 Proof: the complete Storage library suite and strict all-target/all-feature
 Storage compilation pass without the unused public facade.
 
+## 2026-08-29 — Storage surge claims start at a running admission boundary
+
+The process-local `StorageLaneGate`, its report builder, and the duplicated F6
+drill are gone. No service constructed the gate or passed real storage work
+through it: the drill generated requests into a recording sink, replayed their
+count against its own in-memory model, and printed GREEN. That did not prove
+that a PostgreSQL query, blob operation, or owner-store request would be shed,
+that a human request would retain capacity, or that limits survived multiple
+service processes.
+
+The composed OLTP pool and its real global/per-tenant permit checks remain.
+Priority-aware storage admission will count as shipped only when real handlers
+and workers acquire a shared bounded permit and a full-system load journey
+observes actual `429`/retry behavior while human work continues.
+
+Proof: the complete Storage library suite and strict all-target/all-feature
+Storage compilation pass after deleting the uncomposed module and drill.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the
@@ -4278,3 +4296,10 @@ Storage compilation pass without the unused public facade.
     command/store, environment administration API, publisher, authenticated
     browser journey, or rollback executor. The former in-memory approval map
     and draft constructors were removed rather than counted as that product.
+22. **Storage has no product-wide priority admission boundary.** The composed
+    OLTP pool enforces global and per-tenant connection permits, but PostgreSQL,
+    blob, and owner-store operations do not share a human/agent/CI/speculative
+    priority gate. The former process-local storage surge model and its
+    self-driven GREEN drill were removed. A replacement needs to wrap real
+    request and worker paths, coordinate across service processes, emit usable
+    retry responses, and be exercised under full-system load.
