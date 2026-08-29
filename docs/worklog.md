@@ -4294,6 +4294,28 @@ unused pre-expiry grant to prove workspace expiry revokes it. Proof also include
 the live PostgreSQL lifecycle race, the complete Storage library suite, and the
 workspace-gateway suite.
 
+## 2026-08-29 — An old agent write retry cannot overwrite newer human work
+
+`workspace.write_file` accepted an idempotency key and returned the same-looking
+receipt on a retry, but it rewrote the filesystem every time. If an owner edited
+that file over SSH after the first successful agent write, replaying the old
+agent request silently replaced the newer human content. The command tool
+already had a durable at-most-once journal; file writes did not.
+
+File writes now validate their bounded path and content before admission, then
+use the encrypted PostgreSQL tool-effect journal with an identity that binds the
+run, caller, idempotency key, path, and exact bytes. A completed retry returns
+the original minimized write receipt without touching the workspace. A crash
+after admission but before durable completion is reported as indeterminate and
+is never guessed safe to repeat. Both file writes and commands now also report
+an indeterminate outcome if their journal completion fails after the mutation,
+instead of mislabeling a possibly-applied effect as ordinary unavailability.
+
+The private-thread TypeScript journey now writes a notebook as the agent, edits
+that same file through a fresh owner-authorized OpenSSH connection, replays the
+old agent request, and proves both that its receipt is stable and that the newer
+owner content survives into a fresh agent context.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

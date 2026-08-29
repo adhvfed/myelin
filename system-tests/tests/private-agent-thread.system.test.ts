@@ -86,6 +86,7 @@ describe("private work with an agent", () => {
     const retryKey = `private-agent-thread-${randomUUID()}`;
     const notebookPath = "notes/continuity.md";
     const notebook = `${uniqueName("Checkout investigation")}\n\nThe final reader still owns the lease.`;
+    const ownerRevisedNotebook = `${notebook}\nOwner note: preserve this newer diagnosis.`;
     const ownerNotePath = "notes/from-owner.md";
     const ownerNote = `${uniqueName("Owner observation")}: cleanup waits for the final reader.`;
     const executionLogPath = "notes/agent-command.log";
@@ -380,6 +381,27 @@ describe("private work with an agent", () => {
     expect(await useFreshWorkspace((workspace) => workspace.readText(executionLogPath)))
       .toBe(`${executionMarker}\n`);
     await useFreshWorkspace((workspace) => workspace.writeText(ownerNotePath, ownerNote));
+    await useFreshWorkspace((workspace) => workspace.writeText(notebookPath, ownerRevisedNotebook));
+    const replayAfterOwnerEdit = await askAgentToAct(
+      firstContext,
+      6,
+      "workspace.write_file",
+      { path: notebookPath, content: notebook },
+      notebookWriteKey,
+    );
+    expect(replayAfterOwnerEdit).toEqual(writtenNotebook);
+    const conflictingWriteRetry = await askAgentToBeDenied(
+      firstContext,
+      7,
+      "workspace.write_file",
+      { path: notebookPath, content: `${notebook}\nstale retry` },
+      notebookWriteKey,
+    );
+    expect(conflictingWriteRetry).toContain(
+      "idempotency key was already used for another workspace mutation",
+    );
+    expect(await useFreshWorkspace((workspace) => workspace.readText(notebookPath)))
+      .toBe(ownerRevisedNotebook);
     const workspaceHistory = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
     );
@@ -442,11 +464,13 @@ describe("private work with an agent", () => {
     );
     expect(resumedNotebook).toMatchObject({
       path: notebookPath,
-      content: notebook,
-      byte_len: Buffer.byteLength(notebook),
-      content_digest: string(writtenFile.content_digest, "workspace write digest"),
+      content: ownerRevisedNotebook,
+      byte_len: Buffer.byteLength(ownerRevisedNotebook),
       workspace_generation: first.thread.workspace.generation,
     });
+    expect(resumedNotebook.content_digest).not.toBe(
+      string(writtenFile.content_digest, "workspace write digest"),
+    );
     const executionLog = await askAgent(
       freshContext,
       3,
@@ -518,7 +542,7 @@ describe("private work with an agent", () => {
       );
       const workspaceBeforeExpiry = await connectToWorkspace(expiryKey, accessBeforeExpiry.access);
       expect(await useFreshWorkspace((workspace) => workspace.readText(notebookPath)))
-        .toBe(notebook);
+        .toBe(ownerRevisedNotebook);
 
       const runningCommandPath = "notes/running-command.txt";
       const runningCommand = askAgentToAct(

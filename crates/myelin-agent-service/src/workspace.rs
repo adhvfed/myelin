@@ -7,6 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -88,11 +89,15 @@ pub struct WorkspaceFile {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct WrittenWorkspaceFile {
     pub path: String,
     pub byte_len: usize,
     pub content_digest: String,
+}
+
+pub fn validate_workspace_file_path(path: &str) -> Result<(), WorkspaceAccessError> {
+    WorkspaceRelativePath::parse(path).map(|_| ())
 }
 
 pub struct VerifiedWorkspaceDirectory {

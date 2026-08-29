@@ -96,7 +96,12 @@ impl WorkspaceEffectApi {
         let Some(content) = arguments.get("content").and_then(serde_json::Value::as_str) else {
             return EffectResult::Denied("workspace write requires `content`".into());
         };
-        match self.access.write_file(path, content.as_bytes()) {
+        match self.access.write_file(
+            path,
+            content.as_bytes(),
+            &authority.idempotency_key,
+            &self.requested_by,
+        ) {
             Ok(outcome) => {
                 let event_id = workspace_write_event_id(
                     &outcome.binding.thread_id,
@@ -238,7 +243,7 @@ fn public_error(error: WorkspaceRunAccessError) -> String {
         WorkspaceRunAccessError::InvalidPath(reason) => reason,
         WorkspaceRunAccessError::InvalidCommand(reason) => reason,
         WorkspaceRunAccessError::Indeterminate => {
-            "the workspace command was admitted but its result is indeterminate; it will not be repeated"
+            "the workspace mutation was admitted but its result is indeterminate; it will not be repeated"
                 .into()
         }
         WorkspaceRunAccessError::NotFound => {

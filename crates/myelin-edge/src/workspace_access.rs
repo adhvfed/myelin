@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use myelin_agent_service::workspace::{
-    AgentWorkspaceStore, WorkspaceAccessError, WorkspaceFile, WrittenWorkspaceFile,
+    validate_workspace_file_path, AgentWorkspaceStore, WorkspaceAccessError, WorkspaceFile,
+    WrittenWorkspaceFile, MAX_WORKSPACE_FILE_BYTES,
 };
 use myelin_agent_service::workspace_execution::{
     AgentWorkspaceExecutor, WorkspaceCommandRequest, WorkspaceCommandResult,
@@ -111,14 +112,57 @@ impl WorkspaceRunAccess {
         &self,
         path: &str,
         bytes: &[u8],
+        idempotency_key: &str,
+        requested_by: &str,
     ) -> Result<WrittenWorkspaceFileOutcome, WorkspaceRunAccessError> {
+        validate_workspace_file_path(path).map_err(map_file_error)?;
+        if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+            return Err(WorkspaceRunAccessError::TooLarge);
+        }
         let (binding, workspace_id) = self.live_workspace()?;
+        let effect_key = workspace_write_effect_key(idempotency_key);
+        let request_hash = workspace_write_request_hash(path, bytes);
+        match self
+            .service
+            .effects
+            .begin_at_most_once(
+                &TenantId(self.tenant.clone()),
+                &self.run_id.to_string(),
+                &effect_key,
+                &request_hash,
+                requested_by,
+            )
+            .map_err(map_effect_error)?
+        {
+            ToolEffectBegin::Completed(result) => return decode_write_replay(binding, &result),
+            ToolEffectBegin::Indeterminate | ToolEffectBegin::Unreplayable => {
+                return Err(WorkspaceRunAccessError::Indeterminate)
+            }
+            ToolEffectBegin::Execute => {}
+        }
         let file = self
             .service
             .files
             .write_file(&self.tenant, workspace_id, path, bytes)
             .map_err(map_file_error)?;
-        Ok(WrittenWorkspaceFileOutcome { binding, file })
+        let encoded =
+            serde_json::to_string(&file).map_err(|_| WorkspaceRunAccessError::Indeterminate)?;
+        match self
+            .service
+            .effects
+            .complete(
+                &TenantId(self.tenant.clone()),
+                &self.run_id.to_string(),
+                &effect_key,
+                &request_hash,
+                requested_by,
+                &encoded,
+            )
+            .map_err(|_| WorkspaceRunAccessError::Indeterminate)?
+        {
+            ToolEffectCompletion::Applied => Ok(WrittenWorkspaceFileOutcome { binding, file }),
+            ToolEffectCompletion::Replayed(result) => decode_write_replay(binding, &result),
+        }
     }
 
     pub fn execute(
@@ -159,7 +203,7 @@ impl WorkspaceRunAccess {
         })
         .map_err(map_execution_error)?;
         let encoded =
-            serde_json::to_string(&command).map_err(|_| WorkspaceRunAccessError::Unavailable)?;
+            serde_json::to_string(&command).map_err(|_| WorkspaceRunAccessError::Indeterminate)?;
         match self
             .service
             .effects
@@ -171,7 +215,7 @@ impl WorkspaceRunAccess {
                 requested_by,
                 &encoded,
             )
-            .map_err(map_effect_error)?
+            .map_err(|_| WorkspaceRunAccessError::Indeterminate)?
         {
             ToolEffectCompletion::Applied => {
                 Ok(ExecutedWorkspaceCommandOutcome { binding, command })
@@ -211,6 +255,32 @@ fn workspace_exec_effect_key(idempotency_key: &str) -> String {
     format!("workspace.exec:{}", digest.finalize().to_hex())
 }
 
+fn workspace_write_effect_key(idempotency_key: &str) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"myelin.workspace-write.effect.v1\0");
+    digest.update(&(idempotency_key.len() as u64).to_be_bytes());
+    digest.update(idempotency_key.as_bytes());
+    format!("workspace.write_file:{}", digest.finalize().to_hex())
+}
+
+fn workspace_write_request_hash(path: &str, bytes: &[u8]) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"myelin.workspace-write.request.v1\0");
+    digest.update(&(path.len() as u64).to_be_bytes());
+    digest.update(path.as_bytes());
+    digest.update(&(bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    digest.finalize().to_hex().to_string()
+}
+
+fn decode_write_replay(
+    binding: AgentThreadRunBinding,
+    encoded: &str,
+) -> Result<WrittenWorkspaceFileOutcome, WorkspaceRunAccessError> {
+    let file = serde_json::from_str(encoded).map_err(|_| WorkspaceRunAccessError::Unavailable)?;
+    Ok(WrittenWorkspaceFileOutcome { binding, file })
+}
+
 fn decode_execution_replay(
     binding: AgentThreadRunBinding,
     encoded: &str,
@@ -223,7 +293,7 @@ fn decode_execution_replay(
 fn map_effect_error(error: ToolEffectError) -> WorkspaceRunAccessError {
     match error {
         ToolEffectError::Conflict => WorkspaceRunAccessError::InvalidCommand(
-            "the idempotency key was already used for another workspace command".into(),
+            "the idempotency key was already used for another workspace mutation".into(),
         ),
         ToolEffectError::Unreplayable => WorkspaceRunAccessError::Indeterminate,
         ToolEffectError::InvalidInput(_)
@@ -297,6 +367,32 @@ mod tests {
                 map_execution_error(error),
                 WorkspaceRunAccessError::Unavailable
             );
+        }
+    }
+
+    #[test]
+    fn file_write_journal_identity_is_retry_stable_bound_and_opaque() {
+        let key = workspace_write_effect_key("retry-sensitive");
+        assert_eq!(key, workspace_write_effect_key("retry-sensitive"));
+        assert_ne!(key, workspace_write_effect_key("another-retry"));
+        assert_ne!(key, workspace_exec_effect_key("retry-sensitive"));
+        assert!(!key.contains("retry-sensitive"));
+
+        let request = workspace_write_request_hash("notes/continuity.md", b"diagnosis");
+        assert_eq!(
+            request,
+            workspace_write_request_hash("notes/continuity.md", b"diagnosis")
+        );
+        assert_ne!(
+            request,
+            workspace_write_request_hash("notes/other.md", b"diagnosis")
+        );
+        assert_ne!(
+            request,
+            workspace_write_request_hash("notes/continuity.md", b"new diagnosis")
+        );
+        for secret in ["notes/continuity.md", "diagnosis"] {
+            assert!(!request.contains(secret));
         }
     }
 }
