@@ -13,6 +13,7 @@ pub mod coordinate {
 }
 pub mod core;
 pub mod cross_cell;
+pub mod dek;
 pub mod durable;
 pub mod events;
 pub mod fork_gate;

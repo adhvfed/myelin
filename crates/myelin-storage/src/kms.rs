@@ -21,6 +21,7 @@ pub const NONCE_LEN: usize = 12;
 pub enum SubjectKeyScope {
     AgentData,
     Chat,
+    Git,
     Issues,
 }
 
@@ -29,6 +30,7 @@ impl SubjectKeyScope {
         match self {
             Self::AgentData => "agent-data",
             Self::Chat => "chat",
+            Self::Git => "git",
             Self::Issues => "issues",
         }
     }
@@ -37,6 +39,7 @@ impl SubjectKeyScope {
         match token {
             "agent-data" => Some(Self::AgentData),
             "chat" => Some(Self::Chat),
+            "git" => Some(Self::Git),
             "issues" => Some(Self::Issues),
             _ => None,
         }
@@ -1175,6 +1178,16 @@ mod tests {
             },
         );
         assert_eq!(kr.to_uri(), "kms://acme/5/scoped-subject:issues:u-42");
+
+        let kr = PiiKeyRef::new(
+            t("acme"),
+            6,
+            KeyClass::ScopedSubject {
+                scope: SubjectKeyScope::Git,
+                subject: "u-42".into(),
+            },
+        );
+        assert_eq!(kr.to_uri(), "kms://acme/6/scoped-subject:git:u-42");
     }
 
     #[test]
@@ -1183,6 +1196,7 @@ mod tests {
             "kms://acme/0/tenant",
             "kms://acme/12/subject:u-99",
             "kms://acme/4/scoped-subject:agent-data:u-99",
+            "kms://acme/4/scoped-subject:git:u-99",
             "kms://acme/4/scoped-subject:issues:u-99",
             "kms://acme/5/blob",
         ] {

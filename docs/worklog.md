@@ -4043,6 +4043,33 @@ durable selected and effective tool projections, creates the private thread,
 persists its message across reload, and links back to it from Chat (9.9
 seconds).
 
+## 2026-08-29 — Pull-request text has a Git-specific subject key
+
+Durable pull-request titles and bodies were encrypted, but new rows still used
+the legacy generic per-subject key. That coupled Git erasure reach to every
+other product that had once used the same key class: shredding one person's Git
+text could also make unrelated legacy Chat, Issue, or agent data unreadable.
+
+New pull-request free text now uses a Git-scoped per-subject key. The canonical
+key-reference grammar carries the scope, the PostgreSQL reader requires the
+row's tenant and Git author key to agree, and it admits the old generic subject
+class only as an explicit legacy compatibility case. Keys for the same person
+in Git, Chat, Issues, and agent data are independently addressable.
+
+The live PostgreSQL story opens a private pull request through the production
+store, inspects both authoritative key-reference columns, proves they carry the
+Git scope, and then destroys that exact Git key and verifies the pull request
+can no longer be read. This is the cryptographic foundation for a future Git
+holder, not a claim that Git erasure is shipped: there is not yet a durable
+operation ledger, bounded tombstoning pass, holder receipt, restore replay, or
+legacy-row migration policy.
+
+Proof: all 494 Git library stories and the complete normal Git suite; all 393
+Storage library stories; strict all-target/all-feature Git and Storage Clippy;
+and the real PostgreSQL pull-request boundary, including isolation, atomicity,
+idempotency, recovery, authoritative key inspection, and key destruction (0.98
+seconds).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the
@@ -4053,8 +4080,10 @@ seconds).
    a deliberately resurrected decryptable body. authored Issue titles have the
    equivalent real restore proof around their independent keys, bounded
    tombstoning, holder receipt, public requests, ledger replay, and fail-closed
-   legacy-row handling. Git has not yet begun a truthful holder path and must
-   not be exposed through privacy requests first.
+   legacy-row handling. Git pull-request text now has an isolated key
+   foundation, but no durable erasure operation, tombstoning pass, holder
+   receipt, restore replay, or migration for generic-key rows; it must not be
+   exposed through privacy requests first.
 2. **DSR has three truthful product slices, not full holder coverage.** durable
    submit/status/certificate is wired for `agent_data`, `chat_messages`, and
    `issue_titles`, with holder-specific proofs and black-box user journeys. the

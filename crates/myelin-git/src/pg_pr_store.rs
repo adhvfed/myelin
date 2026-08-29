@@ -2,10 +2,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, UlidMinter};
-use myelin_gdpr::ErasureMethod;
 use myelin_identity::Principal;
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
-use myelin_storage::kms::{KekId, KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
+use myelin_storage::kms::{KmsEngine, PiiKeyRef, NONCE_LEN};
 use myelin_storage::{
     HotTables, Migration, MigrationPhase, Migrations, SubstrateProvider, TenantScope,
 };
@@ -13,6 +12,7 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
 use crate::core::{Oid as CoreOid, RepoLoc};
+use crate::dek::{encrypt_free_text, is_git_subject_key_class, GitFreeText};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
     event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_MERGED, GIT_PR_OPENED,
@@ -2549,21 +2549,29 @@ fn seal_pr_record(
     let encoded = serde_json::to_vec(record)
         .map_err(|_| DurableError::Io("encode PR record failed".into()))?;
     ensure_pr_record_size(encoded.len())?;
-    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
-        .map_err(|_| DurableError::Io("PR free-text encryption failed".into()))?;
-    let cryptor = ColumnCryptor::new(kms, region);
     let subject = SubjectId::new(record.author_subject_id.clone());
-    let erasure = ErasureMethod::CryptoShred("subject_dek".into());
-    let title = cryptor
-        .encrypt(tenant, Some(&subject), &erasure, record.title.as_bytes())
-        .map_err(|_| DurableError::Io("PR free-text encryption failed".into()))?;
+    let title = encrypt_free_text(
+        kms,
+        &region,
+        tenant,
+        &subject,
+        GitFreeText::PullRequestTitle,
+        record.title.as_bytes(),
+    )
+    .map_err(|_| DurableError::Io("PR free-text encryption failed".into()))?;
     let body = record
         .body_md
         .as_ref()
         .map(|body| {
-            cryptor
-                .encrypt(tenant, Some(&subject), &erasure, body.as_bytes())
-                .map_err(|_| DurableError::Io("PR free-text encryption failed".into()))
+            encrypt_free_text(
+                kms,
+                &region,
+                tenant,
+                &subject,
+                GitFreeText::PullRequestBody,
+                body.as_bytes(),
+            )
+            .map_err(|_| DurableError::Io("PR free-text encryption failed".into()))
         })
         .transpose()?;
     let mut projection = record.clone();
@@ -2711,7 +2719,7 @@ fn encrypted_column(
             let key_ref = PiiKeyRef::parse(&key_ref)
                 .ok_or_else(|| DurableError::Io(format!("{key_name} is malformed")))?;
             if key_ref.tenant.as_str() != expected_tenant
-                || key_ref.class != KeyClass::Subject(expected_subject.to_owned())
+                || !is_git_subject_key_class(&key_ref.class, expected_subject)
             {
                 return Err(DurableError::Io(format!(
                     "{key_name} does not match the PR tenant and author subject"
@@ -2960,11 +2968,19 @@ mod tests {
         assert!(!encoded.contains("private launch"));
         assert!(!encoded.contains("principal-123"));
         assert!(!sealed.title.contains_plaintext(record.title.as_bytes()));
+        assert_eq!(
+            sealed.title.key_ref.class,
+            crate::dek::git_subject_key_class(&record.author_subject_id)
+        );
         assert!(!sealed
             .body
             .as_ref()
             .unwrap()
             .contains_plaintext(record.body_md.as_ref().unwrap().as_bytes()));
+        assert_eq!(
+            sealed.body.as_ref().unwrap().key_ref.class,
+            crate::dek::git_subject_key_class(&record.author_subject_id)
+        );
         let command = serde_json::to_string(&command_projection(&record).unwrap()).unwrap();
         assert!(!command.contains("private launch"));
         assert!(!command.contains("principal-123"));
@@ -3733,7 +3749,8 @@ mod tests {
         ));
 
         let row = sqlx::query(
-            "SELECT record::text AS record,title_ciphertext,author_subject_id FROM git_pr
+            "SELECT record::text AS record,title_ciphertext,title_pii_key_ref,
+                    body_pii_key_ref,author_subject_id FROM git_pr
               WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
         )
         .bind(&tenant_a)
@@ -3745,12 +3762,22 @@ mod tests {
         .unwrap();
         let projection: String = row.try_get("record").unwrap();
         let ciphertext: Vec<u8> = row.try_get("title_ciphertext").unwrap();
+        let title_key_ref: String = row.try_get("title_pii_key_ref").unwrap();
+        let body_key_ref: String = row.try_get("body_pii_key_ref").unwrap();
         let subject: String = row.try_get("author_subject_id").unwrap();
         assert!(!projection.contains("private-title"));
         assert!(!projection.contains(&subject));
         assert!(!ciphertext
             .windows("private-title".len())
             .any(|w| w == b"private-title"));
+        for key_ref in [title_key_ref, body_key_ref] {
+            let key_ref = PiiKeyRef::parse(&key_ref).expect("stored PR key reference is canonical");
+            assert_eq!(key_ref.tenant.as_str(), tenant_a);
+            assert_eq!(
+                key_ref.class,
+                crate::dek::git_subject_key_class(actor.principal_id.0.as_str())
+            );
+        }
         let command_result: String = sqlx::query_scalar(
             "SELECT result::text FROM git_pr_command
               WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND operation_id=$4",
@@ -4138,7 +4165,7 @@ mod tests {
         assert!(kms
             .destroy_dek(&DekId::new(
                 TenantId(tenant_a.clone()),
-                KeyClass::Subject(actor.principal_id.0.clone()),
+                crate::dek::git_subject_key_class(actor.principal_id.0.as_str()),
             ))
             .expect("destroy the pull-request actor's durable DEK"));
         assert!(store.get(&scope_a, repo, opened.number).is_err());
