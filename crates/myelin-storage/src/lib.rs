@@ -252,12 +252,13 @@ pub use post_restore_agent_data::{
 };
 pub use privacy_request_durable::{
     agent_data_holder_receipts, privacy_request_chat_messages_scope_migrations,
-    privacy_request_durable_migrations, privacy_request_issue_titles_scope_migrations,
-    ClaimPrivacyRequestOutcome, CompletePrivacyRequestOutcome, CreatePrivacyRequestOutcome,
-    DurablePrivacyRequest, DurablePrivacyRequestStore, NewPrivacyRequest, PrivacyHolderReceipt,
-    PrivacyRequestCertificate, PrivacyRequestKind, PrivacyRequestLease, PrivacyRequestScope,
-    PrivacyRequestState, MAX_PRIVACY_HOLDER_RECEIPTS,
-    PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION, PRIVACY_REQUEST_DEADLINE_DAYS,
+    privacy_request_durable_migrations, privacy_request_git_pull_request_text_scope_migrations,
+    privacy_request_issue_titles_scope_migrations, ClaimPrivacyRequestOutcome,
+    CompletePrivacyRequestOutcome, CreatePrivacyRequestOutcome, DurablePrivacyRequest,
+    DurablePrivacyRequestStore, NewPrivacyRequest, PrivacyHolderReceipt, PrivacyRequestCertificate,
+    PrivacyRequestKind, PrivacyRequestLease, PrivacyRequestScope, PrivacyRequestState,
+    MAX_PRIVACY_HOLDER_RECEIPTS, PRIVACY_REQUEST_CHAT_MESSAGES_SCOPE_MIGRATION,
+    PRIVACY_REQUEST_DEADLINE_DAYS, PRIVACY_REQUEST_GIT_PULL_REQUEST_TEXT_SCOPE_MIGRATION,
     PRIVACY_REQUEST_ISSUE_TITLES_SCOPE_MIGRATION, PRIVACY_REQUEST_MIGRATION,
 };
 pub use provider::{

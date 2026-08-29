@@ -4097,6 +4097,31 @@ live PostgreSQL boundary proves pending-writer fencing, recovery after key
 destruction, bounded tombstoning, consequence co-commit, stable addressability,
 and retry; and the real backup/restore drill passes end to end (34.72 seconds).
 
+## 2026-08-29 — Git erasure is a public, certified user journey
+
+People can now submit the durable `git_pull_request_text` privacy scope through
+the authenticated API or the explicit
+`myelin privacy request erase git-pull-request-text --confirm` command. Edge
+composes the request lease with the production Git holder, and the stored
+certificate names the exact holder, record count, and unrecoverable-key proof.
+A forward-only request-schema migration admits the new scope; retries keep the
+same request and certificate identity.
+
+The readable TypeScript full-system journey creates private pull-request titles
+and bodies through the production Git API, completes the privacy request, reads
+the retained PR tombstone, verifies repository content still exists, verifies a
+colleague's PR remains intact, and inspects the durable certificate. It then
+authors a fresh PR, proves replaying the original request leaves that work
+untouched, and proves a new request erases it. This runs against assembled Edge,
+Git, Identity, PostgreSQL, durable KMS, and browser-approved authentication—not
+an in-process holder double.
+
+Proof: Storage privacy-request, CLI privacy, and Edge privacy unit slices;
+system-test TypeScript typecheck; strict all-target/all-feature compilation;
+the focused live data journey (1.56 seconds after service startup); and the
+black-box CLI confirmation, submission, retry, status, JSON certificate, and
+human certificate journey (38.74 seconds).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the
@@ -4113,15 +4138,14 @@ and retry; and the real backup/restore drill passes end to end (34.72 seconds).
    encounters a legacy generic-key row rather than overstating erasure; a
    deliberate legacy rekey migration remains required before old rows can be
    erased through this holder.
-2. **DSR has three truthful product slices, not full holder coverage.** durable
+2. **DSR has four truthful product slices, not full holder coverage.** durable
    submit/status/certificate is wired for `agent_data`, `chat_messages`, and
-   `issue_titles`, with holder-specific proofs and black-box user journeys. the
+   `issue_titles`, and `git_pull_request_text`, with holder-specific proofs and
+   black-box user journeys. the
    narrow scopes deliberately do not claim Chat drafts, read state, mentions in
    other people's content, Issue bodies/comments/custom fields, search
-   projections. Git pull-request text now has a production holder and restore
-   proof, but is not yet composed into public request submission, certificates,
-   CLI, or the browser. Other absent holders remain absent rather than being
-   represented by ceremonial receipts.
+   projections, or Git commit metadata and review comments. Those absent
+   holders remain absent rather than being represented by ceremonial receipts.
 3. **Search indexing is not a deployed durable worker yet.** Refs,
    Notification, governed-agent, CI-dispatch, and Git-check NATS consumers now
    enforce named broker/batch/per-tenant admission rows. The former no-op

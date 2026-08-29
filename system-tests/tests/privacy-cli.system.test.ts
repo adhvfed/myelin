@@ -26,7 +26,7 @@ describe("a person's privacy request from the CLI", () => {
     );
 
     try {
-      const unconfirmed = await runPrivacy("request", "erase", "chat-messages");
+      const unconfirmed = await runPrivacy("request", "erase", "git-pull-request-text");
       expect(unconfirmed.exitCode).toBe(2);
       expect(unconfirmed.stderr).toContain("privacy erasure is irreversible");
 
@@ -35,7 +35,7 @@ describe("a person's privacy request from the CLI", () => {
         "--json",
         "request",
         "erase",
-        "chat-messages",
+        "git-pull-request-text",
         "--confirm",
         "--idempotency-key",
         retryKey,
@@ -47,7 +47,7 @@ describe("a person's privacy request from the CLI", () => {
       expect(submittedBody.created).toBe(true);
       expect(request).toMatchObject({
         kind: "erasure",
-        scope: "chat_messages",
+        scope: "git_pull_request_text",
         state: "completed",
         certificate_available: true,
       });
@@ -56,7 +56,7 @@ describe("a person's privacy request from the CLI", () => {
         "--json",
         "request",
         "erase",
-        "chat-messages",
+        "git-pull-request-text",
         "--confirm",
         "--idempotency-key",
         retryKey,
@@ -70,7 +70,9 @@ describe("a person's privacy request from the CLI", () => {
       const status = await runPrivacy("request", "status", requestId);
       expect(status.exitCode, status.stderr).toBe(0);
       expect(status.stdout).toContain(`Privacy erasure request ${requestId}: completed.`);
-      expect(status.stdout).toContain("Scope: messages you authored in Chat.");
+      expect(status.stdout).toContain(
+        "Scope: pull-request titles and bodies you authored in Git.",
+      );
       expect(status.stdout).toContain(`myelin privacy request certificate ${requestId}`);
 
       const certified = await runPrivacy(
@@ -87,11 +89,11 @@ describe("a person's privacy request from the CLI", () => {
       expect(certificate).toMatchObject({
         request_id: requestId,
         kind: "erasure",
-        scope: "chat_messages",
+        scope: "git_pull_request_text",
       });
       expect(array(certificate.holders, "CLI certificate holders")).toEqual([
         expect.objectContaining({
-          holder: "chat_messages",
+          holder: "git_pull_request_text",
           operation: "erasure",
           key_unrecoverable: true,
         }),
@@ -100,7 +102,7 @@ describe("a person's privacy request from the CLI", () => {
       const humanCertificate = await runPrivacy("request", "certificate", requestId);
       expect(humanCertificate.exitCode, humanCertificate.stderr).toBe(0);
       expect(humanCertificate.stdout).toContain(`Privacy erasure certificate ${requestId}.`);
-      expect(humanCertificate.stdout).toContain("chat_messages:");
+      expect(humanCertificate.stdout).toContain("git_pull_request_text:");
       expect(humanCertificate.stdout).toContain("key unrecoverable");
     } finally {
       await rm(configDirectory, { recursive: true, force: true });

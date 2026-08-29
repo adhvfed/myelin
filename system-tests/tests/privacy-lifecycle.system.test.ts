@@ -14,6 +14,7 @@ import { awaitAutomationFiring } from "../src/journeys/automations.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { announceIssueChange } from "../src/journeys/issues.js";
 import { createProject } from "../src/journeys/projects.js";
+import { GitProject } from "../src/git-project.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import type { SystemTestClient } from "../src/client.js";
 
@@ -503,4 +504,149 @@ describe("a person's privacy lifecycle", () => {
       title_erased: true,
     });
   }, 60_000);
+
+  test("erases authored pull-request text without erasing shared Git history or a colleague's work", async () => {
+    const person = await browserApprovedCliClient(privacyClient);
+    const colleague = await browserApprovedCliClient(reviewerClient);
+
+    async function openPullRequest(
+      owner: SystemTestClient,
+      label: string,
+      title: string,
+      body: string,
+    ): Promise<{ project: GitProject; number: number }> {
+      const project = new GitProject(uniqueName(label), owner);
+      await project.create();
+      await project.writeFile("main", "README.md", `# ${label}\n`);
+      const head = await project.writeFile(
+        "privacy-change",
+        "private.txt",
+        `Durable repository content for ${label}.\n`,
+        { startRef: "main" },
+      );
+      const opened = await owner.json(`${project.path}/prs`, {
+        method: "POST",
+        body: {
+          title,
+          body_md: body,
+          base_ref: "refs/heads/main",
+          head_ref: "refs/heads/privacy-change",
+          head_oid: head.commitOid,
+          reviewers: [],
+        },
+        expectedStatus: 201,
+      });
+      const pullRequest = record(
+        record(opened.body.applied, `${label} open receipt`).pr,
+        `${label} pull request`,
+      );
+      return {
+        project,
+        number: integer(pullRequest.number, `${label} pull request number`),
+      };
+    }
+
+    const privateTitle = uniqueName("A private pull-request title to erase");
+    const privateBody = uniqueName("A private pull-request body to erase");
+    const personal = await openPullRequest(
+      person,
+      "personal-pr-privacy",
+      privateTitle,
+      privateBody,
+    );
+    const colleagueTitle = uniqueName("A colleague's pull-request title remains intact");
+    const colleagueBody = uniqueName("A colleague's pull-request body remains intact");
+    const neighboring = await openPullRequest(
+      colleague,
+      "neighbor-pr-privacy",
+      colleagueTitle,
+      colleagueBody,
+    );
+
+    const idempotencyKey = `erase-my-git-pr-text-${randomUUID()}`;
+    const submitted = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "git_pull_request_text" },
+      idempotencyKey,
+      expectedStatus: 201,
+    });
+    const request = record(submitted.body.request, "completed Git PR-text erasure request");
+    const requestId = string(request.id, "Git PR-text erasure request id");
+    expect(request).toMatchObject({
+      kind: "erasure",
+      scope: "git_pull_request_text",
+      state: "completed",
+      attempt_count: 1,
+      certificate_available: true,
+    });
+
+    expect((await person.json(
+      `${personal.project.path}/prs/${personal.number}`,
+    )).body).toMatchObject({
+      number: personal.number,
+      title: "[erased pull request title]",
+      body_md: null,
+    });
+    expect(await personal.project.readFile("privacy-change", "private.txt"))
+      .toMatchObject({ contents: "Durable repository content for personal-pr-privacy.\n" });
+    expect((await colleague.json(
+      `${neighboring.project.path}/prs/${neighboring.number}`,
+    )).body).toMatchObject({
+      number: neighboring.number,
+      title: colleagueTitle,
+      body_md: colleagueBody,
+    });
+
+    const certified = await person.json(
+      `/v1/privacy/me/requests/${encodeURIComponent(requestId)}/certificate`,
+    );
+    const gitCertificate = record(
+      certified.body.certificate,
+      "Git PR-text erasure certificate",
+    );
+    expect(gitCertificate).toMatchObject({
+      request_id: requestId,
+      kind: "erasure",
+      scope: "git_pull_request_text",
+      holders: [expect.objectContaining({
+        holder: "git_pull_request_text",
+        operation: "erasure",
+        key_unrecoverable: true,
+      })],
+    });
+    const gitHolders = array(gitCertificate.holders, "Git PR-text erasure holders");
+    expect(integer(
+      record(gitHolders[0], "Git PR-text holder").records_erased,
+      "erased pull requests",
+    )).toBeGreaterThanOrEqual(1);
+
+    const freshTitle = uniqueName("Useful pull-request work written after the first request");
+    const freshBody = uniqueName("Useful pull-request context written after the first request");
+    const fresh = await openPullRequest(
+      person,
+      "fresh-pr-after-privacy",
+      freshTitle,
+      freshBody,
+    );
+    const replay = await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "git_pull_request_text" },
+      idempotencyKey,
+    });
+    expect(replay.body).toMatchObject({
+      created: false,
+      request: { id: requestId, state: "completed", attempt_count: 1 },
+    });
+    expect((await person.json(`${fresh.project.path}/prs/${fresh.number}`)).body)
+      .toMatchObject({ title: freshTitle, body_md: freshBody });
+
+    await person.json("/v1/privacy/me/requests", {
+      method: "POST",
+      body: { kind: "erasure", scope: "git_pull_request_text" },
+      idempotencyKey: `erase-my-new-git-pr-text-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    expect((await person.json(`${fresh.project.path}/prs/${fresh.number}`)).body)
+      .toMatchObject({ title: "[erased pull request title]", body_md: null });
+  }, 90_000);
 });

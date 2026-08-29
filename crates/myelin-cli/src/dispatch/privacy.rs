@@ -2,8 +2,10 @@ use serde_json::json;
 
 use super::{is_canonical_uuid, CliError, EdgeCall};
 
-const REQUEST_USAGE: &str = "request erase <agent-data|chat-messages|issue-titles> --confirm | \
-                             request status <request-id> | request certificate <request-id>";
+const REQUEST_USAGE: &str = "request erase \
+                             <agent-data|chat-messages|git-pull-request-text|issue-titles> \
+                             --confirm | request status <request-id> | \
+                             request certificate <request-id>";
 
 pub fn privacy_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     match args {
@@ -52,10 +54,11 @@ fn request_scope(scope: &str) -> Result<&'static str, CliError> {
     match scope {
         "agent-data" => Ok("agent_data"),
         "chat-messages" => Ok("chat_messages"),
+        "git-pull-request-text" => Ok("git_pull_request_text"),
         "issue-titles" => Ok("issue_titles"),
         _ => Err(CliError::Usage(format!(
-            "unknown privacy request scope `{scope}` (expected agent-data, chat-messages, or \
-             issue-titles)"
+            "unknown privacy request scope `{scope}` (expected agent-data, chat-messages, \
+             git-pull-request-text, or issue-titles)"
         ))),
     }
 }
@@ -110,6 +113,7 @@ mod tests {
         for (scope, wire_scope) in [
             ("agent-data", "agent_data"),
             ("chat-messages", "chat_messages"),
+            ("git-pull-request-text", "git_pull_request_text"),
             ("issue-titles", "issue_titles"),
         ] {
             let warning = privacy_dispatch(&["request", "erase", scope])

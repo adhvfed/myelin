@@ -439,6 +439,10 @@ impl DurableGitBackend {
         &self.outbox
     }
 
+    pub fn pg_pr_store(&self) -> Option<PgPrStore> {
+        self.pg_prs.clone()
+    }
+
     fn loc(tenant: &str, region: &str, slug: &str) -> RepoLoc {
         RepoLoc::new(tenant, region, slug)
     }

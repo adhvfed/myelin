@@ -92,3 +92,18 @@ pub fn privacy_request_issue_titles_scope_migrations() -> Migrations {
         PRIVACY_REQUEST_ISSUE_TITLES_SCOPE_MIGRATION,
     )])
 }
+
+pub const PRIVACY_REQUEST_GIT_PULL_REQUEST_TEXT_SCOPE_MIGRATION: &str = r#"
+ALTER TABLE privacy_request
+  DROP CONSTRAINT privacy_request_scope_check;
+ALTER TABLE privacy_request
+  ADD CONSTRAINT privacy_request_scope_check
+  CHECK (scope IN ('agent_data', 'chat_messages', 'issue_titles', 'git_pull_request_text'));
+"#;
+
+pub fn privacy_request_git_pull_request_text_scope_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0140_privacy_request_git_pull_request_text_scope",
+        PRIVACY_REQUEST_GIT_PULL_REQUEST_TEXT_SCOPE_MIGRATION,
+    )])
+}

@@ -159,6 +159,8 @@ myelin privacy agent-data erase --confirm
 # Or submit a durable holder-scoped request and retain its certificate:
 myelin privacy request erase chat-messages --confirm \
   --idempotency-key erase-my-chat-history
+myelin privacy request erase git-pull-request-text --confirm \
+  --idempotency-key erase-my-pull-request-text
 myelin privacy request status 55555555-5555-4555-8555-555555555555
 myelin privacy request certificate 55555555-5555-4555-8555-555555555555
 

@@ -5,6 +5,8 @@ use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::pg::MessageErasureAttempt;
 use myelin_chat::{DurableChatMessageEraser, DurableChatMessageErasureProof};
 use myelin_events::{Actor, Timestamp, UlidMinter};
+use myelin_git::durable_erase::{DurablePrTextEraser, DurablePrTextErasureProof};
+use myelin_git::pg_pr_store::PrTextErasureAttempt;
 use myelin_issues::{
     DurableIssueTitleEraser, DurableIssueTitleErasureProof, IssueTitleErasureAttempt,
 };
@@ -29,6 +31,7 @@ mod request;
 pub(super) struct PrivacyHttpApi {
     traces: DurableAgentTraceStore,
     chat_messages: DurableChatMessageEraser,
+    git_pull_request_text: DurablePrTextEraser,
     issue_titles: DurableIssueTitleEraser<crate::StoreBackedIssueAuthorizer>,
     requests: DurablePrivacyRequestStore,
     runtime: Handle,
@@ -110,6 +113,29 @@ impl PrivacyHttpApi {
             .map_err(|error| EdgeError::Internal(error.to_string()))
     }
 
+    async fn erase_git_pull_request_text(
+        &self,
+        principal: &myelin_identity::Principal,
+        operation_id: &str,
+    ) -> Result<DurablePrTextErasureProof, EdgeError> {
+        let observed = myelin_events::clock::system_clock_reading().map_err(|error| {
+            EdgeError::Unavailable(format!("privacy clock unavailable: {error}"))
+        })?;
+        let attempt = PrTextErasureAttempt::new(
+            operation_id,
+            Actor(pseudonymized_event_principal(
+                &principal.tenant.0,
+                principal,
+            )),
+            observed,
+        )
+        .map_err(|error| EdgeError::BadRequest(error.to_string()))?;
+        self.git_pull_request_text
+            .erase_subject_pr_text(&principal.tenant.0, &principal.principal_id.0, attempt)
+            .await
+            .map_err(|error| EdgeError::Internal(error.to_string()))
+    }
+
     pub(super) fn drive<F, T, E>(&self, future: F) -> Result<T, EdgeError>
     where
         F: std::future::Future<Output = Result<T, E>>,
@@ -174,6 +200,7 @@ pub fn register_privacy(
     builder: GatewayBuilder,
     traces: DurableAgentTraceStore,
     chat_messages: DurableChatMessageEraser,
+    git_pull_request_text: DurablePrTextEraser,
     issue_titles: DurableIssueTitleEraser<crate::StoreBackedIssueAuthorizer>,
     requests: DurablePrivacyRequestStore,
     runtime: Handle,
@@ -181,6 +208,7 @@ pub fn register_privacy(
     let api = PrivacyHttpApi {
         traces,
         chat_messages,
+        git_pull_request_text,
         issue_titles,
         requests,
         runtime,

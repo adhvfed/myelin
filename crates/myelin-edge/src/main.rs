@@ -1342,6 +1342,10 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         inbox_store.clone(),
         handle.clone(),
     );
+    let privacy_git_pr_store = git_backend.pg_pr_store().unwrap_or_else(|| {
+        eprintln!("edge: durable Git PR privacy holder is unavailable");
+        std::process::exit(1);
+    });
     builder = register_privacy(
         builder,
         agent_traces,
@@ -1351,6 +1355,11 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 provider.config().region.clone(),
                 myelin_chat::store::pg_conversation::MESSAGE_TABLE,
             ),
+            kms.clone(),
+            myelin_storage::DurablePostPitLedger::new(provider.clone()),
+        ),
+        myelin_git::durable_erase::DurablePrTextEraser::new(
+            privacy_git_pr_store,
             kms.clone(),
             myelin_storage::DurablePostPitLedger::new(provider.clone()),
         ),

@@ -81,6 +81,7 @@ fn scope_label(scope: &str) -> Option<&'static str> {
     match scope {
         "agent_data" => Some("agent traces and replay journals"),
         "chat_messages" => Some("messages you authored in Chat"),
+        "git_pull_request_text" => Some("pull-request titles and bodies you authored in Git"),
         "issue_titles" => Some("Issue titles you authored"),
         _ => None,
     }

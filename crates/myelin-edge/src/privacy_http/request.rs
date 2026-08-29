@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use myelin_chat::chat_message_holder_receipts;
+use myelin_git::durable_erase::pr_text_holder_receipts;
 use myelin_identity::Principal;
 use myelin_issues::issue_title_holder_receipts;
 use myelin_storage::{
@@ -271,6 +272,14 @@ async fn erasure_receipts(
                 .await
                 .map_err(|_| HolderWorkError::Retryable)?;
             chat_message_holder_receipts(&proof).map_err(HolderWorkError::Invariant)
+        }
+        PrivacyRequestScope::GitPullRequestText => {
+            let operation_id = format!("privacy-request:{}", request.request_id);
+            let proof = api
+                .erase_git_pull_request_text(principal, &operation_id)
+                .await
+                .map_err(|_| HolderWorkError::Retryable)?;
+            pr_text_holder_receipts(&proof).map_err(HolderWorkError::Invariant)
         }
         PrivacyRequestScope::IssueTitles => {
             let operation_id = format!("privacy-request:{}", request.request_id);

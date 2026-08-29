@@ -1,9 +1,9 @@
 # Reapply privacy erasures after a database restore
 
 This runbook is for a restored cell that may predate one or more completed
-agent-data, Chat-message, or Issue-title erasures. It reads the preserved live
-ledger and replays each scope through the same durable holder used by the
-privacy API.
+agent-data, Chat-message, Issue-title, or Git pull-request-text erasures. It
+reads the preserved live ledger and replays each scope through the same durable
+holder used by the privacy API.
 
 For `agent_data`, a successful pass deletes restored trace, model-replay, and
 tool-effect rows, destroys the scoped key, and restores the absorbing marker
@@ -15,10 +15,13 @@ For `issue_titles`, it destroys the restored Issues-scoped key, replaces each
 authored title with the explicit erased placeholder, removes its encrypted
 material and direct creator identity, and co-commits one content-free update
 event. The Issue itself and a colleague's work remain.
+For `git_pr_text`, it destroys the restored Git-scoped key, replaces each
+authored pull-request title and body with the explicit addressable tombstone,
+and co-commits one content-free update event. Repository history, the shared
+pull-request coordinate, and a colleague's work remain.
 
-The three ledger queries are scope-specific. No record can be routed to another
-holder. Git is not included until its durable erasure path writes this ledger
-and can return an equally strong proof.
+The four ledger queries are scope-specific. No record can be routed to another
+holder.
 
 ## Before running
 
@@ -83,6 +86,13 @@ for every supported scope, never subject identifiers:
         "already_erased_subjects": 0,
         "titles_erased": 4,
         "erasure_events_co_committed": 4
+      },
+      "git_pull_request_text": {
+        "selected_subjects": 2,
+        "newly_re_erased_subjects": 2,
+        "already_erased_subjects": 0,
+        "pull_requests_erased": 3,
+        "erasure_events_co_committed": 3
       }
     },
     "complete": true
@@ -113,6 +123,11 @@ The Issues disaster story in
 decryptable title, the live ledger selects only the Issue-title obligation,
 replay destroys the resurrected key and tombstones the title, neighboring work
 survives, and replaying the recovery receipt does not erase later work.
+The Git disaster story in
+`integration_git_pr_text_erasure_survives_restore.rs` applies the same real
+backup boundary to authored pull-request titles and bodies, including exact
+Git-key destruction, neighboring-author isolation, retained repository history,
+and later-work safety on an idempotent replay.
 
 ## Failure interpretation
 
