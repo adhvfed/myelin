@@ -4154,6 +4154,26 @@ observes actual `429`/retry behavior while human work continues.
 Proof: the complete Storage library suite and strict all-target/all-feature
 Storage compilation pass after deleting the uncomposed module and drill.
 
+## 2026-08-29 — Owner surge gates no longer certify disconnected simulations
+
+The same composition audit removed unconstructed process-local admission gates
+from Flow, Notification, Refs, and Knowledge, together with their report
+builders and drills. It also removed Chat and Git's separate surge-report
+generators while retaining their lower-level delivery and front-door shedding
+logic. Every deleted GREEN result was produced by calling an in-memory model
+directly; none drove an authenticated request, durable worker, broker delivery,
+provider call, Git clone, or collaborative document operation.
+
+This does not weaken a running limit because no running component referenced
+these gates. Threshold vocabulary remains available to real consumers, and
+Chat's `LiveDelivery` adapter still invokes its lower-level governor. Future
+capacity claims must begin at the service entry point, traverse the real durable
+path, and observe user-visible admission or retry behavior under load.
+
+Proof: strict all-target/all-feature compilation passes for Flow, Notification,
+Refs service, Knowledge, Chat gateway, and Git after removing the disconnected
+facades and their self-driven drills.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

@@ -25,7 +25,6 @@ pub mod read_state;
 pub mod router;
 pub mod schema;
 pub mod storm_control;
-pub mod surge;
 pub mod watch;
 pub mod write_fanout;
 
@@ -82,10 +81,6 @@ pub use router::{
 pub use storm_control::{
     dedup_collapse_ratio_bps, is_self_notification, subject_root_of, Coalescer, RateConfig,
     StormContext, StormControl, StormDecision, StormPrefs, SuppressReason, TokenBucket,
-};
-pub use surge::{
-    run_notif_surge, NotifShedGate, NotifShedRejection, NotifSurgeReport, ProviderBulkhead,
-    NOTIF_SURGE_MULTIPLIER, NOTIF_SURGE_SURFACE,
 };
 pub use watch::{
     cold_rebuild, cold_rebuild_item_ids, inbox_scope, inbox_stream, publish_inbox_frame,

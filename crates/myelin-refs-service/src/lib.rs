@@ -28,7 +28,6 @@ pub mod reach_index;
 pub mod residency;
 pub mod resolve;
 mod store;
-pub mod surge;
 pub mod traverse;
 
 pub use backlinks::{
@@ -105,9 +104,6 @@ pub use resolve::{
     RESOLVE_CACHE_HIT_RATIO_SIGNAL, VIEW_PERMISSION,
 };
 pub use store::{REFS_CACHE_STORE, REFS_EDGE_STORE};
-pub use surge::{
-    run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, REFS_SURGE_MULTIPLIER,
-};
 pub use traverse::{
     apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
     TraverseFilter, TraverseNode, TraverseResult, TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES,

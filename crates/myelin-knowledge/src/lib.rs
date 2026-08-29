@@ -17,7 +17,6 @@ pub mod refs_glue;
 pub mod rollup;
 pub mod store;
 pub mod subs;
-pub mod surge;
 pub mod sync_block;
 pub mod transport;
 pub mod yrs_engine;
@@ -99,10 +98,6 @@ pub use store::{knowledge_scope, knowledge_store_migrations, KnowledgeStore, Kno
 pub use subs::{
     mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
     KNOWLEDGE_SUBSYSTEM,
-};
-pub use surge::{
-    run_collab_surge, run_lexorank_storm, CollabShedReason, CollabShedRejection, CollabSurgeGate,
-    CollabSurgeReport, LexoStormReport, COLLAB_SURGE_MULTIPLIER,
 };
 pub use sync_block::{
     render_sync_block, AllowAll, DenyAll, ProjectionFreshness, SourceReadCheck,

@@ -49,7 +49,6 @@ pub mod scip;
 pub mod shed_clone;
 pub mod speculative_queue;
 pub mod subs;
-pub mod surge;
 pub mod tree_pagination;
 pub mod typed_edges;
 
