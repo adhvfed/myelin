@@ -27,7 +27,11 @@ import {
 import { Conversation } from "../src/journeys/chat.js";
 import { array, record, string } from "../src/json.js";
 import { reconcileAgentThreads } from "../src/operator.js";
-import { connectToWorkspace, generateEphemeralSshKey } from "../src/ssh.js";
+import {
+  connectToWorkspace,
+  generateEphemeralSshKey,
+  type WorkspaceOverSsh,
+} from "../src/ssh.js";
 
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
 
@@ -345,6 +349,18 @@ describe("private work with an agent", () => {
       workspace_generation: first.thread.workspace.generation,
     });
 
+    const useFreshWorkspace = async <T>(
+      action: (workspace: WorkspaceOverSsh) => Promise<T>,
+    ): Promise<T> => {
+      const key = await generateEphemeralSshKey();
+      try {
+        const access = await requestWorkspaceSshAccess(founder, first.thread.id, key.publicKey);
+        return await action(await connectToWorkspace(key, access.access));
+      } finally {
+        await key.remove();
+      }
+    };
+
     const workspaceKey = await generateEphemeralSshKey();
     try {
       const workspaceAccess = await requestWorkspaceSshAccess(
@@ -354,12 +370,16 @@ describe("private work with an agent", () => {
       );
       const workspace = await connectToWorkspace(workspaceKey, workspaceAccess.access);
       expect(await workspace.hasInteractiveTerminal()).toBe(true);
-      expect(await workspace.readText(notebookPath)).toBe(notebook);
-      expect(await workspace.readText(executionLogPath)).toBe(`${executionMarker}\n`);
-      await workspace.writeText(ownerNotePath, ownerNote);
+      await expect(workspace.readText(notebookPath)).rejects.toThrow(
+        "the host-key-pinned workspace SSH command failed",
+      );
     } finally {
       await workspaceKey.remove();
     }
+    expect(await useFreshWorkspace((workspace) => workspace.readText(notebookPath))).toBe(notebook);
+    expect(await useFreshWorkspace((workspace) => workspace.readText(executionLogPath)))
+      .toBe(`${executionMarker}\n`);
+    await useFreshWorkspace((workspace) => workspace.writeText(ownerNotePath, ownerNote));
     const workspaceHistory = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
     );
@@ -497,7 +517,8 @@ describe("private work with an agent", () => {
         expiryKey.publicKey,
       );
       const workspaceBeforeExpiry = await connectToWorkspace(expiryKey, accessBeforeExpiry.access);
-      expect(await workspaceBeforeExpiry.readText(notebookPath)).toBe(notebook);
+      expect(await useFreshWorkspace((workspace) => workspace.readText(notebookPath)))
+        .toBe(notebook);
 
       const runningCommandPath = "notes/running-command.txt";
       const runningCommand = askAgentToAct(
@@ -514,17 +535,7 @@ describe("private work with an agent", () => {
         },
         `private-agent-cancel-${randomUUID()}`,
       );
-      let commandStarted = false;
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        try {
-          commandStarted = await workspaceBeforeExpiry.readText(runningCommandPath) === "running\n";
-        } catch {
-          commandStarted = false;
-        }
-        if (commandStarted) break;
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-      expect(commandStarted).toBe(true);
+      await useFreshWorkspace((workspace) => workspace.waitForText(runningCommandPath, "running"));
 
       const inaccessible = await reconcileAgentThreads(first.thread.workspace.expires_at);
       expect(inaccessible.madeInaccessible).toBeGreaterThanOrEqual(1);

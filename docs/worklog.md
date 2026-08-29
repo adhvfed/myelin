@@ -4267,6 +4267,33 @@ mutation counter is latency telemetry. A real SLA claim needs a SCIM or admin
 deprovisioning entry point, independently timestamped authorization attempts at
 the running service boundaries, and an exported latency distribution.
 
+## 2026-08-29 — Workspace SSH credentials are now actually one-shot
+
+The CLI generated an ephemeral key and the product described its five-minute
+workspace grant as one-shot, but PostgreSQL did not remember consumption. The
+same route username and private key could authenticate any number of fresh SSH
+connections until expiry. The full-system journey accidentally relied on that
+reuse for several independent commands, so its green result certified the
+opposite of the documented authorization boundary.
+
+Migration `0141_agent_thread_ssh_single_use` adds durable grant consumption and
+backfills existing grants from their earliest retained workspace-session
+receipt without deleting audit history. Starting a session now atomically
+changes an unconsumed grant and co-commits the minimized owner-visible entry
+event. Two racing connections can therefore produce exactly one session. New
+authentication refuses a consumed grant, while that admitted session still
+revalidates the live owner, agent, thread, workspace generation, explicit
+revocation, and workspace expiry every fifteen seconds. The gateway records the
+authorized entry before launching the confined process, so no command can run
+in the race loser without an accountable receipt.
+
+The TypeScript full-system journey now requests a fresh ephemeral key and grant
+for each independent connection, proves immediate reuse of the first credential
+is rejected, resumes the same durable files with later grants, and retains an
+unused pre-expiry grant to prove workspace expiry revokes it. Proof also includes
+the live PostgreSQL lifecycle race, the complete Storage library suite, and the
+workspace-gateway suite.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

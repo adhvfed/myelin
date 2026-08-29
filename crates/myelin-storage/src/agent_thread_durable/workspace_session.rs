@@ -8,7 +8,7 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 use sqlx::Row;
 
-use super::ssh_access::{lookup_live_authority, LiveWorkspaceSshAuthorityRequest};
+use super::ssh_access::{consume_live_authority, LiveWorkspaceSshAuthorityRequest};
 use super::{canonical_ulid, DurableAgentThreadBacking, LiveWorkspaceSshAdmission};
 use crate::pgrelay::PgRelay;
 use crate::{PgError, ProviderError};
@@ -87,7 +87,7 @@ impl DurableAgentThreadBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    let Some(admission) = lookup_live_authority(
+                    let Some(admission) = consume_live_authority(
                         connection,
                         &LiveWorkspaceSshAuthorityRequest {
                             tenant: &tenant,
@@ -97,6 +97,7 @@ impl DurableAgentThreadBacking {
                             public_key_fingerprint: &proposal.public_key_fingerprint,
                             admitted_at: proposal.admitted_at,
                             observed_at: proposal.started_at,
+                            require_unconsumed: true,
                         },
                     )
                     .await?

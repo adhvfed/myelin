@@ -126,15 +126,15 @@ where
             WorkspaceSessionCommand::Exec(_) => WorkspaceSessionMode::Command,
         };
         let has_terminal = terminal.is_some();
-        let Ok(confined) = self.launcher.launch(&revalidated, command, terminal).await else {
-            session.channel_failure(channel_id)?;
-            return Ok(());
-        };
         let Some(recorded) = self
             .authenticator
             .start_session(&revalidated, self.session_ids.mint().0, mode, has_terminal)
             .await?
         else {
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        };
+        let Ok(confined) = self.launcher.launch(&recorded, command, terminal).await else {
             session.channel_failure(channel_id)?;
             return Ok(());
         };

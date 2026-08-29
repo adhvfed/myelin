@@ -17,8 +17,9 @@ pub use model::{
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
-    agent_thread_durable_migrations, AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY,
-    AGENT_THREAD_RUN_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
+    agent_thread_durable_migrations, agent_thread_ssh_single_use_migrations,
+    AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
+    AGENT_THREAD_SSH_GRANT_MIGRATION, AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
     AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
 };
 pub use ssh_access::{

@@ -23,6 +23,7 @@ export interface WorkspaceOverSsh {
   hasInteractiveTerminal(): Promise<boolean>;
   readText(path: string): Promise<string>;
   writeText(path: string, content: string): Promise<void>;
+  waitForText(path: string, content: string): Promise<void>;
 }
 
 export async function generateEphemeralSshKey(): Promise<EphemeralSshKey> {
@@ -86,6 +87,16 @@ export async function connectToWorkspace(
         `${prepare}printf %s ${shellWord(content)} > ${shellWord(relative)}`,
       );
     },
+    async waitForText(path: string, content: string): Promise<void> {
+      const relative = workspacePath(path);
+      const expected = shellWord(content);
+      await runWorkspaceCommand(
+        key,
+        access,
+        knownHostsPath,
+        `for attempt in $(seq 1 40); do if test -f ${shellWord(relative)} && test "$(cat ${shellWord(relative)})" = ${expected}; then exit 0; fi; sleep 0.25; done; exit 1`,
+      );
+    },
   };
 }
 
@@ -100,6 +111,8 @@ async function runWorkspaceCommand(
     const result = await run(
       "ssh",
       [
+        "-F",
+        "/dev/null",
         terminal ? "-tt" : "-T",
         "-i",
         key.privateKeyPath,
@@ -111,6 +124,8 @@ async function runWorkspaceCommand(
         "BatchMode=yes",
         "-o",
         "IdentitiesOnly=yes",
+        "-o",
+        "ControlMaster=no",
         "-o",
         "PasswordAuthentication=no",
         "-o",

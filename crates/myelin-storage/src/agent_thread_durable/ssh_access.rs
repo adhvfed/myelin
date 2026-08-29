@@ -59,6 +59,7 @@ pub(super) struct LiveWorkspaceSshAuthorityRequest<'a> {
     pub public_key_fingerprint: &'a str,
     pub admitted_at: DateTime<Utc>,
     pub observed_at: DateTime<Utc>,
+    pub require_unconsumed: bool,
 }
 
 impl DurableAgentThreadBacking {
@@ -164,14 +165,17 @@ impl DurableAgentThreadBacking {
         public_key_fingerprint: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<LiveWorkspaceSshAdmission>, ProviderError> {
-        self.live_ssh_authority(
+        let region = self.provider.config().region.clone();
+        self.live_ssh_authority(LiveWorkspaceSshAuthorityRequest {
             tenant,
+            region: &region,
             grant_id,
             route_username,
             public_key_fingerprint,
-            now,
-            now,
-        )
+            admitted_at: now,
+            observed_at: now,
+            require_unconsumed: true,
+        })
         .await
     }
 
@@ -193,30 +197,32 @@ impl DurableAgentThreadBacking {
         if now < admitted_at {
             return Ok(None);
         }
-        self.live_ssh_authority(
+        let region = self.provider.config().region.clone();
+        self.live_ssh_authority(LiveWorkspaceSshAuthorityRequest {
             tenant,
+            region: &region,
             grant_id,
             route_username,
             public_key_fingerprint,
             admitted_at,
-            now,
-        )
+            observed_at: now,
+            require_unconsumed: false,
+        })
         .await
     }
 
     async fn live_ssh_authority(
         &self,
-        tenant: &str,
-        grant_id: Uuid,
-        route_username: &str,
-        public_key_fingerprint: &str,
-        admitted_at: DateTime<Utc>,
-        observed_at: DateTime<Utc>,
+        request: LiveWorkspaceSshAuthorityRequest<'_>,
     ) -> Result<Option<LiveWorkspaceSshAdmission>, ProviderError> {
-        let tenant = tenant.to_string();
-        let region = self.provider.config().region.clone();
-        let route_username = route_username.to_string();
-        let fingerprint = public_key_fingerprint.to_string();
+        let tenant = request.tenant.to_string();
+        let region = request.region.to_string();
+        let grant_id = request.grant_id;
+        let route_username = request.route_username.to_string();
+        let fingerprint = request.public_key_fingerprint.to_string();
+        let admitted_at = request.admitted_at;
+        let observed_at = request.observed_at;
+        let require_unconsumed = request.require_unconsumed;
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
@@ -230,6 +236,7 @@ impl DurableAgentThreadBacking {
                             public_key_fingerprint: &fingerprint,
                             admitted_at,
                             observed_at,
+                            require_unconsumed,
                         },
                     )
                     .await
@@ -264,6 +271,7 @@ pub(super) async fn lookup_live_authority(
             AND access.grant_id = $3 AND access.route_username = $4
             AND access.public_key_fingerprint = $5
             AND access.revoked_at IS NULL
+            AND (NOT $10 OR access.consumed_at IS NULL)
             AND access.issued_at <= $6 AND access.expires_at > $6
             AND thread.state = 'ready' AND thread.expires_at > $7
             AND access.owner_principal_id = thread.owner_principal_id
@@ -281,9 +289,57 @@ pub(super) async fn lookup_live_authority(
     .bind(request.observed_at)
     .bind(HUMAN_PRINCIPAL_KIND_JSON)
     .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+    .bind(request.require_unconsumed)
     .fetch_optional(connection)
     .await
     .map_err(query_error("admit private workspace SSH key"))?;
+    row.as_ref().map(admission_from_row).transpose()
+}
+
+pub(super) async fn consume_live_authority(
+    connection: &mut sqlx::PgConnection,
+    request: &LiveWorkspaceSshAuthorityRequest<'_>,
+) -> Result<Option<LiveWorkspaceSshAdmission>, PgError> {
+    let row = sqlx::query(
+        "UPDATE agent_thread_ssh_grant access
+            SET consumed_at = $7
+           FROM agent_thread thread, principal owner, principal agent
+          WHERE access.tenant_id = $1 AND access.region = $2
+            AND access.grant_id = $3 AND access.route_username = $4
+            AND access.public_key_fingerprint = $5
+            AND access.revoked_at IS NULL AND access.consumed_at IS NULL
+            AND access.issued_at <= $6 AND access.expires_at > $6
+            AND thread.tenant_id = access.tenant_id
+            AND thread.region = access.region
+            AND thread.thread_id = access.thread_id
+            AND thread.state = 'ready' AND thread.expires_at > $7
+            AND access.owner_principal_id = thread.owner_principal_id
+            AND access.workspace_id = thread.workspace_id
+            AND access.workspace_generation = thread.workspace_generation
+            AND owner.tenant_id = thread.tenant_id
+            AND owner.region = thread.region
+            AND owner.principal_id = thread.owner_principal_id
+            AND owner.kind = $8 AND owner.status = $9
+            AND agent.tenant_id = thread.tenant_id
+            AND agent.region = thread.region
+            AND agent.principal_id = 'agent:' || thread.agent_id::text
+            AND agent.status = $9
+        RETURNING access.grant_id, access.thread_id, access.owner_principal_id,
+                  access.workspace_id, access.workspace_generation,
+                  thread.storage_locator, access.expires_at",
+    )
+    .bind(request.tenant)
+    .bind(request.region)
+    .bind(request.grant_id)
+    .bind(request.route_username)
+    .bind(request.public_key_fingerprint)
+    .bind(request.admitted_at)
+    .bind(request.observed_at)
+    .bind(HUMAN_PRINCIPAL_KIND_JSON)
+    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+    .fetch_optional(connection)
+    .await
+    .map_err(query_error("consume private workspace SSH grant"))?;
     row.as_ref().map(admission_from_row).transpose()
 }
 

@@ -166,6 +166,29 @@ CREATE POLICY myelin_tenant_isolation ON agent_thread_workspace_session
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_THREAD_SSH_SINGLE_USE_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_ssh_grant
+  ADD COLUMN IF NOT EXISTS consumed_at timestamptz;
+UPDATE agent_thread_ssh_grant access
+   SET consumed_at = prior.first_started_at
+  FROM (
+    SELECT tenant_id, region, grant_id, min(started_at) AS first_started_at
+      FROM agent_thread_workspace_session
+     GROUP BY tenant_id, region, grant_id
+  ) prior
+ WHERE access.tenant_id = prior.tenant_id
+   AND access.region = prior.region
+   AND access.grant_id = prior.grant_id
+   AND access.consumed_at IS NULL;
+ALTER TABLE agent_thread_ssh_grant
+  DROP CONSTRAINT IF EXISTS agent_thread_ssh_grant_consumed_after_issue;
+ALTER TABLE agent_thread_ssh_grant
+  ADD CONSTRAINT agent_thread_ssh_grant_consumed_after_issue
+  CHECK (consumed_at IS NULL OR consumed_at >= issued_at) NOT VALID;
+ALTER TABLE agent_thread_ssh_grant
+  VALIDATE CONSTRAINT agent_thread_ssh_grant_consumed_after_issue;
+"#;
+
 pub fn agent_thread_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0124_agent_thread", AGENT_THREAD_MIGRATION),
@@ -180,4 +203,11 @@ pub fn agent_thread_durable_migrations() -> Migrations {
             AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
         ),
     ])
+}
+
+pub fn agent_thread_ssh_single_use_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0141_agent_thread_ssh_single_use",
+        AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
+    )])
 }

@@ -490,48 +490,91 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .expect("a session admitted in time continues after its connection grant expires");
     assert_eq!(continuing_session.workspace_id, admitted.workspace_id);
     let session_ids = myelin_events::UlidMinter::new();
-    let first_session_id = session_ids.mint().0;
-    let first_session = threads
-        .start_ssh_session(
-            &tenant,
-            NewWorkspaceSshSession {
-                session_id: first_session_id.clone(),
-                grant_id: ssh_grant_id,
-                route_username: route_username.clone(),
-                public_key_fingerprint: ssh_intent.public_key_fingerprint.clone(),
-                admitted_at: ssh_issued_at,
-                started_at: ssh_issued_at + Duration::seconds(1),
-                mode: WorkspaceSessionMode::Shell,
-                terminal: true,
-            },
-        )
-        .await
-        .unwrap()
-        .expect("a launched confined shell records its exact workspace generation");
+    let first_candidate = NewWorkspaceSshSession {
+        session_id: session_ids.mint().0,
+        grant_id: ssh_grant_id,
+        route_username: route_username.clone(),
+        public_key_fingerprint: ssh_intent.public_key_fingerprint.clone(),
+        admitted_at: ssh_issued_at,
+        started_at: ssh_issued_at + Duration::seconds(1),
+        mode: WorkspaceSessionMode::Shell,
+        terminal: true,
+    };
+    let racing_candidate = NewWorkspaceSshSession {
+        session_id: session_ids.mint().0,
+        ..first_candidate.clone()
+    };
+    let (first_result, racing_result) = tokio::join!(
+        threads.start_ssh_session(&tenant, first_candidate),
+        threads.start_ssh_session(&tenant, racing_candidate),
+    );
+    let first_result = first_result.unwrap();
+    let racing_result = racing_result.unwrap();
+    assert_ne!(
+        first_result.is_some(),
+        racing_result.is_some(),
+        "exactly one racing connection atomically consumes the one-shot grant"
+    );
+    let first_session = first_result
+        .or(racing_result)
+        .expect("one racing confined shell receives the exact workspace generation");
+    let first_session_id = first_session.session.session_id.clone();
     assert_eq!(first_session.admission, admitted);
-    assert_eq!(first_session.session.session_id, first_session_id);
     assert_eq!(first_session.session.access_method, "ssh");
     assert_eq!(first_session.session.mode, WorkspaceSessionMode::Shell);
     assert!(first_session.session.terminal);
+    assert!(
+        threads
+            .live_ssh_admission(
+                &tenant,
+                ssh_grant_id,
+                &route_username,
+                &ssh_intent.public_key_fingerprint,
+                ssh_issued_at + Duration::seconds(2),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "a consumed one-shot grant cannot authenticate a fresh connection"
+    );
 
     let second_session_id = session_ids.mint().0;
+    let second_grant_id = Uuid::from_u128(153);
+    let second_route_username = route_key.seal(&tenant, second_grant_id).unwrap();
+    let second_ssh_intent = NewWorkspaceSshGrant {
+        grant_id: second_grant_id,
+        route_username: second_route_username.clone(),
+        thread_id: intended.thread_id,
+        owner_principal_id: owner.into(),
+        public_key_fingerprint: format!("SHA256:{}", "C".repeat(43)),
+        client_nonce: "private-workspace-ssh-second-entry".into(),
+        issued_at: ssh_issued_at,
+        expires_at: ssh_issued_at + Duration::minutes(5),
+    };
+    assert!(matches!(
+        threads
+            .create_ssh_grant(&tenant, second_ssh_intent.clone())
+            .await
+            .unwrap(),
+        CreateWorkspaceSshGrantOutcome::Created(_)
+    ));
     threads
         .start_ssh_session(
             &tenant,
             NewWorkspaceSshSession {
                 session_id: second_session_id.clone(),
-                started_at: ssh_issued_at + Duration::seconds(2),
+                started_at: ssh_issued_at + Duration::seconds(3),
                 mode: WorkspaceSessionMode::Command,
                 terminal: false,
-                grant_id: ssh_grant_id,
-                route_username: route_username.clone(),
-                public_key_fingerprint: ssh_intent.public_key_fingerprint.clone(),
+                grant_id: second_grant_id,
+                route_username: second_route_username,
+                public_key_fingerprint: second_ssh_intent.public_key_fingerprint,
                 admitted_at: ssh_issued_at,
             },
         )
         .await
         .unwrap()
-        .expect("a launched confined command records a distinct access");
+        .expect("a fresh one-shot grant records a distinct workspace entry");
     let ListWorkspaceSessionsOutcome::Page(first_page) = threads
         .list_workspace_sessions_for_owner(&tenant, owner, intended.thread_id, None, 1)
         .await
