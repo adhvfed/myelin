@@ -4174,6 +4174,22 @@ Proof: strict all-target/all-feature compilation passes for Flow, Notification,
 Refs service, Knowledge, Chat gateway, and Git after removing the disconnected
 facades and their self-driven drills.
 
+## 2026-08-29 — Git has one front-door admission owner
+
+The Git crate's unused `GitFrontDoorShed` and bundle-URI clone helper are gone.
+Edge already boots the threshold-backed Git admission lane and holds its permit
+around authenticated Git wire requests, returning a real `429` and
+`Retry-After` on refusal. The duplicate Git gate was instantiated only by
+tests, so its counters could not describe the running front door.
+
+The bundle helper likewise copied bytes into an in-memory blob adapter and read
+them back; it was never advertised through Git protocol v2, backed by a bundle
+publisher, or used by the clone path. Its unit and drill tests therefore proved
+blob round-tripping rather than bundle-URI clone acceleration.
+
+Proof: the complete Git library suite and strict all-target/all-feature Git
+compilation pass with the duplicate gate and unadvertised clone facade removed.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the
@@ -4323,3 +4339,8 @@ facades and their self-driven drills.
     self-driven GREEN drill were removed. A replacement needs to wrap real
     request and worker paths, coordinate across service processes, emit usable
     retry responses, and be exercised under full-system load.
+23. **Git bundle-URI/CDN acceleration is not shipped.** Authenticated smart-HTTP
+    clone and push work, and Edge owns their admission lane, but no bundle
+    publisher, protocol-v2 advertisement, regional CDN distribution, or clone
+    fallback path is composed. The former helper merely round-tripped bytes
+    through an in-memory blob adapter and was removed with its drills.

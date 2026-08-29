@@ -46,7 +46,6 @@ pub mod reconcile;
 pub mod refs_pagination;
 pub mod schema;
 pub mod scip;
-pub mod shed_clone;
 pub mod speculative_queue;
 pub mod subs;
 pub mod tree_pagination;
