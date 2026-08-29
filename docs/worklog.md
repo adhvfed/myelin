@@ -4122,6 +4122,20 @@ the focused live data journey (1.56 seconds after service startup); and the
 black-box CLI confirmation, submission, retry, status, JSON certificate, and
 human certificate journey (38.74 seconds).
 
+## 2026-08-29 — Reserve/settle no longer exports a self-certified drill result
+
+Storage's reserve/settle path used to export `ReserveSettleSignal`, a value
+whose only consumer constructed a GREEN result inside a unit test from the
+same in-memory counts it then asserted. The signal had no running producer,
+durable observation, operator surface, or product consumer. It and the paired
+synthetic green/red tests are gone. The behavioral ledger tests remain: they
+exercise admission, refusal, state transitions, exact cost events, refunds,
+overflow, replay, interruption accounting, and durable PostgreSQL behavior
+directly.
+
+Proof: the complete Storage library suite and strict all-target/all-feature
+Storage compilation pass without the unused public facade.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

@@ -149,7 +149,7 @@ pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
 pub use reserve_settle::{
     CostEvent, CostLedger, LedgerUnavailable, MeteredUnit, Reservation, ReservationState,
-    ReserveError, ReserveSettleSignal, RunId, SettleError, SettleOutcome,
+    ReserveError, RunId, SettleError, SettleOutcome,
 };
 pub use residency::{
     verify_region_pinning, RegionPinnedStore, RegionPinningAttestation, ResidencyStoreClass,

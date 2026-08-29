@@ -548,22 +548,6 @@ fn metered_units_match(events: &[CostEvent], units: &[MeteredUnit]) -> bool {
         })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReserveSettleSignal {
-    pub tenant: TenantId,
-    pub metered_units: u64,
-    pub cost_events: u64,
-    pub inflight_interrupt_count: u64,
-    pub wholesale_total: MicroUsd,
-    pub markup_total: MicroUsd,
-}
-
-impl ReserveSettleSignal {
-    pub fn is_green(&self) -> bool {
-        self.cost_events == self.metered_units && self.inflight_interrupt_count == 0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,50 +818,6 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_run_emits_a_green_drill_artifact() {
-        let mut ledger = CostLedger::new();
-        ledger
-            .reserve(tenant(), run(), MicroUsd(1_000), MicroUsd(5_000))
-            .unwrap();
-        ledger.begin(&tenant(), &run()).unwrap();
-        let units = vec![
-            MeteredUnit {
-                unit: "llm.tokens",
-                wholesale: MicroUsd(120),
-                markup: MicroUsd(30),
-            },
-            MeteredUnit {
-                unit: "ci.minute",
-                wholesale: MicroUsd(200),
-                markup: MicroUsd(50),
-            },
-        ];
-        let outcome = ledger.settle(&tenant(), &run(), &units).unwrap();
-
-        let wholesale_total = MicroUsd(120 + 200);
-        let markup_total = MicroUsd(30 + 50);
-        let signal = ReserveSettleSignal {
-            tenant: tenant(),
-            metered_units: units.len() as u64,
-            cost_events: outcome.cost_events.len() as u64,
-            inflight_interrupt_count: ledger.inflight_interrupt_count(),
-            wholesale_total,
-            markup_total,
-        };
-
-        assert!(
-            signal.is_green(),
-            "the synthetic-run drill must be GREEN: {signal:?}"
-        );
-        assert_eq!(signal.cost_events, 2);
-        assert_eq!(signal.metered_units, 2);
-        assert_eq!(signal.inflight_interrupt_count, 0);
-        assert_ne!(signal.wholesale_total, signal.markup_total);
-        assert_eq!(signal.wholesale_total, MicroUsd(320));
-        assert_eq!(signal.markup_total, MicroUsd(80));
-    }
-
-    #[test]
     fn metered_unit_total_sums_wholesale_and_markup() {
         let u = MeteredUnit {
             unit: "llm.tokens",
@@ -1130,32 +1070,6 @@ mod tests {
         assert_eq!(
             ledger.outstanding_reservations(&tenant()),
             Ok(MicroUsd(1_000))
-        );
-    }
-
-    #[test]
-    fn a_red_signal_is_not_green() {
-        let red_interrupt = ReserveSettleSignal {
-            tenant: tenant(),
-            metered_units: 2,
-            cost_events: 2,
-            inflight_interrupt_count: 1,
-            wholesale_total: MicroUsd(320),
-            markup_total: MicroUsd(80),
-        };
-        assert!(!red_interrupt.is_green(), "an interrupt must read RED");
-
-        let red_mismatch = ReserveSettleSignal {
-            tenant: tenant(),
-            metered_units: 2,
-            cost_events: 1,
-            inflight_interrupt_count: 0,
-            wholesale_total: MicroUsd(320),
-            markup_total: MicroUsd(80),
-        };
-        assert!(
-            !red_mismatch.is_green(),
-            "a cost-event mismatch must read RED"
         );
     }
 }
