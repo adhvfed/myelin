@@ -36,13 +36,23 @@ mod check_admission;
 use check_admission::overlay_projected_checks;
 mod list_queries;
 use list_queries::{pr_cross_list_page_sql, pr_list_page_sql, validate_cross_visible_slugs};
+pub(crate) mod pr_text_erasure;
+use pr_text_erasure::{
+    lock_pr_text_subject_write, CREATE_GIT_PR_TEXT_ERASURE_BATCH_INDEX_DDL,
+    CREATE_GIT_PR_TEXT_ERASURE_OPERATION_DDL, EXPAND_GIT_PR_TEXT_ERASURE_DDL,
+    GIT_PR_TEXT_ERASURE_OPERATION_TABLE,
+};
+pub use pr_text_erasure::{
+    AuthoredPrTextEraseReceipt, AuthoredPrTextErasureState, PrTextErasureAttempt,
+};
 
 pub const GIT_PR_TABLE: &str = "git_pr";
 pub const GIT_PR_COUNTER_TABLE: &str = "git_pr_counter";
 pub const GIT_PR_COMMAND_TABLE: &str = "git_pr_command";
 const PR_BATCH_MAX_COORDINATES: usize = 10_000;
 const PR_RECORD_COLUMNS: &str = "record, head_repo_slug, title_nonce, title_ciphertext, \
-title_pii_key_ref, body_nonce, body_ciphertext, body_pii_key_ref, author_subject_id";
+title_pii_key_ref, body_nonce, body_ciphertext, body_pii_key_ref, author_subject_id, \
+free_text_erased";
 
 pub const CREATE_GIT_PR_COUNTER_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS git_pr_counter (
@@ -259,11 +269,33 @@ pub fn git_pr_migrations() -> Migrations {
             MigrationPhase::Expand,
             GIT_PR_TABLE,
         ),
+        Migration::phased(
+            "git_0014_pr_text_erasure_expand",
+            EXPAND_GIT_PR_TEXT_ERASURE_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::plain_on(
+            "git_0015_pr_text_erasure_operation",
+            CREATE_GIT_PR_TEXT_ERASURE_OPERATION_DDL,
+            GIT_PR_TEXT_ERASURE_OPERATION_TABLE,
+        ),
+        Migration::phased(
+            "git_0016_pr_text_erasure_batch_index",
+            CREATE_GIT_PR_TEXT_ERASURE_BATCH_INDEX_DDL,
+            MigrationPhase::Contract,
+            GIT_PR_TABLE,
+        ),
     ])
 }
 
 pub fn git_pr_hot_tables() -> HotTables {
-    HotTables::declare([GIT_PR_TABLE, GIT_PR_COUNTER_TABLE, GIT_PR_COMMAND_TABLE])
+    HotTables::declare([
+        GIT_PR_TABLE,
+        GIT_PR_COUNTER_TABLE,
+        GIT_PR_COMMAND_TABLE,
+        GIT_PR_TEXT_ERASURE_OPERATION_TABLE,
+    ])
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1104,6 +1136,13 @@ impl PgPrStore {
                 .with_tenant_tx(&loc.tenant.clone(), move |conn| {
                     Box::pin(async move {
                         lock_operation(conn, &loc, &operation_id).await?;
+                        lock_pr_text_subject_write(
+                            conn,
+                            &loc.tenant,
+                            &loc.region,
+                            &record.author_subject_id,
+                        )
+                        .await?;
                         let command = PrCommandIdentity {
                             operation_id: &operation_id,
                             actor_subject_id: &actor_subject_id,
@@ -1200,6 +1239,7 @@ impl PgPrStore {
                 .with_tenant_tx(&loc.tenant.clone(), move |conn| {
                     Box::pin(async move {
                         lock_operation(conn, &loc, &operation_id).await?;
+                        lock_pr_text_write_for_row(conn, &loc, number_db).await?;
                         let command = PrCommandIdentity {
                             operation_id: &operation_id,
                             actor_subject_id: &actor_subject_id,
@@ -1232,37 +1272,59 @@ impl PgPrStore {
                                 "a merge operation is pending for this PR".into(),
                             ));
                         }
+                        let free_text_erased: bool = row
+                            .try_get("free_text_erased")
+                            .map_err(|_| pg_query("decode PR text erasure state"))?;
                         let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode PR"))?;
                         mutation.apply_to_at(&mut record, context.unix_seconds);
-                        let sealed = seal_pr_record(
-                            &kms,
-                            crypto_region.clone(),
-                            &TenantId(loc.tenant.clone()),
-                            &record,
-                        )
-                        .map_err(|_| pg_query("seal mutated PR"))?;
-                        sqlx::query(
-                            "UPDATE git_pr SET record=$5, head_repo_slug=$6, version=version+1, \
-                             title_nonce=$7,title_ciphertext=$8,title_pii_key_ref=$9, \
-                             body_nonce=$10,body_ciphertext=$11,body_pii_key_ref=$12, \
-                             updated_at=now() WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
-                        )
-                        .bind(&loc.tenant)
-                        .bind(&loc.region)
-                        .bind(&loc.repo)
-                        .bind(number_db)
-                        .bind(sealed.record)
-                        .bind(&record.head_repo_slug)
-                        .bind(sealed.title.nonce.to_vec())
-                        .bind(sealed.title.ciphertext)
-                        .bind(sealed.title.key_ref.to_uri())
-                        .bind(sealed.body.as_ref().map(|column| column.nonce.to_vec()))
-                        .bind(sealed.body.as_ref().map(|column| column.ciphertext.clone()))
-                        .bind(sealed.body.as_ref().map(|column| column.key_ref.to_uri()))
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(|_| pg_query("update PR"))?;
+                        if free_text_erased {
+                            let projection = command_projection(&record)
+                                .map_err(|_| pg_query("encode erased PR projection"))?;
+                            sqlx::query(
+                                "UPDATE git_pr SET record=$5,head_repo_slug=$6,version=version+1, \
+                                 updated_at=now() WHERE tenant_id=$1 AND region=$2 \
+                                 AND repo_slug=$3 AND number=$4 AND free_text_erased",
+                            )
+                            .bind(&loc.tenant)
+                            .bind(&loc.region)
+                            .bind(&loc.repo)
+                            .bind(number_db)
+                            .bind(projection)
+                            .bind(&record.head_repo_slug)
+                            .execute(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("update erased PR"))?;
+                        } else {
+                            let sealed = seal_pr_record(
+                                &kms,
+                                crypto_region.clone(),
+                                &TenantId(loc.tenant.clone()),
+                                &record,
+                            )
+                            .map_err(|_| pg_query("seal mutated PR"))?;
+                            sqlx::query(
+                                "UPDATE git_pr SET record=$5, head_repo_slug=$6, version=version+1, \
+                                 title_nonce=$7,title_ciphertext=$8,title_pii_key_ref=$9, \
+                                 body_nonce=$10,body_ciphertext=$11,body_pii_key_ref=$12, \
+                                 updated_at=now() WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
+                            )
+                            .bind(&loc.tenant)
+                            .bind(&loc.region)
+                            .bind(&loc.repo)
+                            .bind(number_db)
+                            .bind(sealed.record)
+                            .bind(&record.head_repo_slug)
+                            .bind(sealed.title.nonce.to_vec())
+                            .bind(sealed.title.ciphertext)
+                            .bind(sealed.title.key_ref.to_uri())
+                            .bind(sealed.body.as_ref().map(|column| column.nonce.to_vec()))
+                            .bind(sealed.body.as_ref().map(|column| column.ciphertext.clone()))
+                            .bind(sealed.body.as_ref().map(|column| column.key_ref.to_uri()))
+                            .execute(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("update PR"))?;
+                        }
                         co_commit_event(
                             conn,
                             minter,
@@ -2214,6 +2276,7 @@ impl PgPrStore {
         self.block_on(async move {
             provider.with_tenant_tx(&loc.tenant.clone(), move |conn| Box::pin(async move {
                 lock_operation(conn, &loc, &operation_id).await?;
+                lock_pr_text_write_for_row(conn, &loc, number_db).await?;
                 let row = sqlx::query(&format!("SELECT {PR_RECORD_COLUMNS}, merge_intent FROM git_pr WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4 FOR UPDATE"))
                     .bind(&loc.tenant).bind(&loc.region).bind(&loc.repo).bind(number_db)
                     .fetch_optional(&mut *conn).await.map_err(|_| pg_query("lock merge PR"))?
@@ -2236,22 +2299,31 @@ impl PgPrStore {
                 if existing_intent.as_ref() != Some(&expected) {
                     return Err(pg_query("merge finalize intent does not match the durable operation"));
                 }
+                let free_text_erased: bool = row.try_get("free_text_erased").map_err(|_| pg_query("decode PR text erasure state"))?;
                 let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row).map_err(|_| pg_query("decode merge PR"))?;
                 record.state = PrState::Merged;
                 record.updated_at = Some(ctx.unix_seconds);
-                let sealed = seal_pr_record(&kms, crypto_region.clone(), &TenantId(loc.tenant.clone()), &record)
-                    .map_err(|_| pg_query("seal merge PR"))?;
-                sqlx::query("UPDATE git_pr SET record=$5, version=version+1, merge_intent=$6, \
-                    title_nonce=$7,title_ciphertext=$8,title_pii_key_ref=$9,body_nonce=$10, \
-                    body_ciphertext=$11,body_pii_key_ref=$12,updated_at=now() \
-                    WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4")
-                    .bind(&loc.tenant).bind(&loc.region).bind(&loc.repo).bind(number_db)
-                    .bind(sealed.record).bind(Option::<serde_json::Value>::None)
-                    .bind(sealed.title.nonce.to_vec()).bind(sealed.title.ciphertext).bind(sealed.title.key_ref.to_uri())
-                    .bind(sealed.body.as_ref().map(|column| column.nonce.to_vec()))
-                    .bind(sealed.body.as_ref().map(|column| column.ciphertext.clone()))
-                    .bind(sealed.body.as_ref().map(|column| column.key_ref.to_uri()))
-                    .execute(&mut *conn).await.map_err(|_| pg_query("update merge PR"))?;
+                if free_text_erased {
+                    let projection = command_projection(&record).map_err(|_| pg_query("encode erased merge PR projection"))?;
+                    sqlx::query("UPDATE git_pr SET record=$5,version=version+1,merge_intent=NULL,updated_at=now() \
+                        WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4 AND free_text_erased")
+                        .bind(&loc.tenant).bind(&loc.region).bind(&loc.repo).bind(number_db).bind(projection)
+                        .execute(&mut *conn).await.map_err(|_| pg_query("update erased merge PR"))?;
+                } else {
+                    let sealed = seal_pr_record(&kms, crypto_region.clone(), &TenantId(loc.tenant.clone()), &record)
+                        .map_err(|_| pg_query("seal merge PR"))?;
+                    sqlx::query("UPDATE git_pr SET record=$5, version=version+1, merge_intent=$6, \
+                        title_nonce=$7,title_ciphertext=$8,title_pii_key_ref=$9,body_nonce=$10, \
+                        body_ciphertext=$11,body_pii_key_ref=$12,updated_at=now() \
+                        WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4")
+                        .bind(&loc.tenant).bind(&loc.region).bind(&loc.repo).bind(number_db)
+                        .bind(sealed.record).bind(Option::<serde_json::Value>::None)
+                        .bind(sealed.title.nonce.to_vec()).bind(sealed.title.ciphertext).bind(sealed.title.key_ref.to_uri())
+                        .bind(sealed.body.as_ref().map(|column| column.nonce.to_vec()))
+                        .bind(sealed.body.as_ref().map(|column| column.ciphertext.clone()))
+                        .bind(sealed.body.as_ref().map(|column| column.key_ref.to_uri()))
+                        .execute(&mut *conn).await.map_err(|_| pg_query("update merge PR"))?;
+                }
                 co_commit_event(conn, minter, ctx.emit, &loc, &record, GIT_PR_MERGED, Some(&expected)).await?;
                 let result = MergeCommandResult::Merged {
                     base_ref: record.base_ref.clone(),
@@ -2268,6 +2340,26 @@ impl PgPrStore {
             })).await
         }).map_err(pg_error)
     }
+}
+
+async fn lock_pr_text_write_for_row(
+    conn: &mut sqlx::PgConnection,
+    loc: &RepoLoc,
+    number: i64,
+) -> Result<(), myelin_storage::PgError> {
+    let subject: String = sqlx::query_scalar(
+        "SELECT author_subject_id FROM git_pr \
+         WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
+    )
+    .bind(&loc.tenant)
+    .bind(&loc.region)
+    .bind(&loc.repo)
+    .bind(number)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| pg_query("read PR text subject lifecycle"))?
+    .ok_or_else(|| pg_query("PR text subject not found"))?;
+    lock_pr_text_subject_write(conn, &loc.tenant, &loc.region, &subject).await
 }
 
 async fn lock_operation(
@@ -2667,6 +2759,15 @@ fn decode_record(
             "PR author subject locator is missing".into(),
         ));
     }
+    let free_text_erased: bool = row
+        .try_get("free_text_erased")
+        .map_err(|_| DurableError::Io("PR text erasure state malformed".into()))?;
+    if free_text_erased {
+        verify_erased_free_text_shape(&row)?;
+        record.title = pr_text_erasure::ERASED_PR_TITLE.into();
+        record.body_md = None;
+        return Ok(record);
+    }
     let title = encrypted_column(&row, "title", expected_tenant, &record.author_subject_id)?
         .ok_or_else(|| {
             DurableError::Io("PR title ciphertext is missing from authoritative row".into())
@@ -2690,6 +2791,39 @@ fn decode_record(
         );
     }
     Ok(record)
+}
+
+fn verify_erased_free_text_shape(row: &sqlx::postgres::PgRow) -> Result<(), DurableError> {
+    let nonce: Vec<u8> = row
+        .try_get("title_nonce")
+        .map_err(|_| DurableError::Io("erased PR title marker malformed".into()))?;
+    let ciphertext: Vec<u8> = row
+        .try_get("title_ciphertext")
+        .map_err(|_| DurableError::Io("erased PR title marker malformed".into()))?;
+    let key_ref: String = row
+        .try_get("title_pii_key_ref")
+        .map_err(|_| DurableError::Io("erased PR title marker malformed".into()))?;
+    let body_nonce: Option<Vec<u8>> = row
+        .try_get("body_nonce")
+        .map_err(|_| DurableError::Io("erased PR body marker malformed".into()))?;
+    let body_ciphertext: Option<Vec<u8>> = row
+        .try_get("body_ciphertext")
+        .map_err(|_| DurableError::Io("erased PR body marker malformed".into()))?;
+    let body_key_ref: Option<String> = row
+        .try_get("body_pii_key_ref")
+        .map_err(|_| DurableError::Io("erased PR body marker malformed".into()))?;
+    if nonce != pr_text_erasure::ERASED_TITLE_NONCE
+        || ciphertext != pr_text_erasure::ERASED_TITLE_CIPHERTEXT
+        || key_ref != pr_text_erasure::ERASED_TITLE_KEY_REF
+        || body_nonce.is_some()
+        || body_ciphertext.is_some()
+        || body_key_ref.is_some()
+    {
+        return Err(DurableError::Io(
+            "erased PR free-text marker violated its durable shape".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn encrypted_column(
@@ -2929,7 +3063,7 @@ mod tests {
     #[test]
     fn migration_set_is_forward_only_and_declares_mutated_tables_hot() {
         let migrations = git_pr_migrations();
-        assert_eq!(migrations.0.len(), 13);
+        assert_eq!(migrations.0.len(), 16);
         for migration in &migrations.0 {
             let upper = migration.ddl.to_ascii_uppercase();
             assert!(!upper.contains("DROP TABLE"));
@@ -2939,6 +3073,7 @@ mod tests {
         assert!(hot.is_hot(GIT_PR_TABLE));
         assert!(hot.is_hot(GIT_PR_COUNTER_TABLE));
         assert!(hot.is_hot(GIT_PR_COMMAND_TABLE));
+        assert!(hot.is_hot(GIT_PR_TEXT_ERASURE_OPERATION_TABLE));
         assert!(CREATE_GIT_PR_HEAD_REPO_INDEX_DDL.contains("CREATE INDEX CONCURRENTLY"));
         let mut runner = myelin_substrate::MigrationRunner::new();
         runner
@@ -3166,8 +3301,9 @@ mod tests {
         use myelin_config::{Mode, MyelinConfig};
         use myelin_events::{MonotonicMinter, OutboxStore};
         use myelin_identity::{PrincipalId, PrincipalKind, RuntimeRef};
-        use myelin_storage::kms::DekId;
-        use myelin_storage::PgBootstrap;
+        use myelin_storage::{
+            all_durable_migrations, DurablePostPitLedger, HotTables, PgBootstrap,
+        };
 
         fn principal(tenant: &str, region: &str, subject: &str) -> Principal {
             let mut principal = Principal::stub(
@@ -3263,6 +3399,10 @@ mod tests {
             .migrate_foundation()
             .await
             .expect("foundation migrations");
+        bootstrap
+            .migrate(&all_durable_migrations(), &HotTables::none())
+            .await
+            .expect("durable privacy migrations");
         bootstrap
             .migrate(&git_pr_migrations(), &git_pr_hot_tables())
             .await
@@ -4162,20 +4302,212 @@ mod tests {
             "all lifecycle envelopes remain PII-free"
         );
 
-        assert!(kms
-            .destroy_dek(&DekId::new(
-                TenantId(tenant_a.clone()),
-                crate::dek::git_subject_key_class(actor.principal_id.0.as_str()),
-            ))
-            .expect("destroy the pull-request actor's durable DEK"));
-        assert!(store.get(&scope_a, repo, opened.number).is_err());
+        let recovery_actor = principal(&tenant_a, &region, &format!("recovery-subject-{suffix}"));
+        let recovery_scope =
+            TenantScope::from_verified_token(&recovery_actor, recovery_actor.region.clone());
+        let recovery_repo = format!("erasure-recovery-{suffix}");
+        let recovery_pr = store
+            .open(
+                &recovery_scope,
+                &recovery_repo,
+                record(
+                    &"d".repeat(40),
+                    "private text across a key-destruction crash",
+                    &recovery_repo,
+                ),
+                &PrOperationId::parse("open-erasure-recovery").unwrap(),
+                &recovery_actor,
+            )
+            .expect("open a PR used to prove the erasure lifecycle fence");
+        let recovery_attempt = PrTextErasureAttempt::new(
+            "privacy-git-pr-text-recovery",
+            Actor(pseudonymized_event_principal(&tenant_a, &recovery_actor)),
+            system_clock_reading().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .prepare_pr_text_erasure(
+                    &tenant_a,
+                    recovery_actor.principal_id.0.as_str(),
+                    recovery_attempt.operation_id(),
+                )
+                .unwrap(),
+            AuthoredPrTextErasureState::Pending,
+        );
+        assert!(
+            store
+                .apply_mutation(
+                    &recovery_scope,
+                    &recovery_repo,
+                    recovery_pr.number,
+                    PrMutation::Touch,
+                    &PrOperationId::parse("mutate-during-erasure").unwrap(),
+                    &recovery_actor,
+                )
+                .is_err(),
+            "a pending erasure fences mutations that could race its validated row set",
+        );
+        assert!(
+            store
+                .open(
+                    &recovery_scope,
+                    &recovery_repo,
+                    record(
+                        &"e".repeat(40),
+                        "text that must not slip into a pending request",
+                        &recovery_repo,
+                    ),
+                    &PrOperationId::parse("open-during-erasure").unwrap(),
+                    &recovery_actor,
+                )
+                .is_err(),
+            "a pending erasure fences newly authored PR text for the same subject",
+        );
+        store
+            .verify_pr_text_erasure_ready(
+                &tenant_a,
+                recovery_actor.principal_id.0.as_str(),
+                recovery_attempt.operation_id(),
+            )
+            .expect("validate the exact rows before simulating a crash");
+        let ledger = DurablePostPitLedger::new(provider.clone());
+        ledger
+            .record(
+                myelin_storage::PostPitErasureScope::GitPrText,
+                &TenantId::from_token(&tenant_a),
+                &SubjectId::new(recovery_actor.principal_id.0.clone()),
+                recovery_attempt.completed_at_offset().unwrap(),
+            )
+            .await
+            .expect("persist the post-backup obligation before key destruction");
+        let recovery_key = myelin_storage::DekId::new(
+            TenantId::from_token(&tenant_a),
+            crate::dek::git_subject_key_class(recovery_actor.principal_id.0.as_str()),
+        );
+        assert!(
+            kms.try_destroy_dek(&recovery_key).unwrap(),
+            "the simulated first attempt destroys the exact Git subject key",
+        );
+        let eraser = crate::durable_erase::DurablePrTextEraser::new(
+            store.clone(),
+            kms.clone(),
+            ledger.clone(),
+        );
+        let recovered = eraser
+            .erase_subject_pr_text(
+                &tenant_a,
+                recovery_actor.principal_id.0.as_str(),
+                recovery_attempt,
+            )
+            .await
+            .expect("retry after key destruction completes the durable tombstone");
+        assert_eq!(recovered.pull_requests_erased, 1);
+        assert!(!recovered.key_destroyed_this_attempt);
+        assert!(recovered.key_unrecoverable);
+        assert_eq!(
+            store
+                .get(&recovery_scope, &recovery_repo, recovery_pr.number)
+                .unwrap()
+                .unwrap()
+                .title,
+            pr_text_erasure::ERASED_PR_TITLE,
+        );
+
+        let authored_before: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM git_pr WHERE tenant_id=$1 AND region=$2 \
+             AND author_subject_id=$3 AND NOT free_text_erased",
+        )
+        .bind(&tenant_a)
+        .bind(&region)
+        .bind(actor.principal_id.0.as_str())
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        let attempt = PrTextErasureAttempt::new(
+            "privacy-git-pr-text-1",
+            Actor(pseudonymized_event_principal(&tenant_a, &actor)),
+            system_clock_reading().unwrap(),
+        )
+        .unwrap();
+        let proof = eraser
+            .erase_subject_pr_text(&tenant_a, actor.principal_id.0.as_str(), attempt.clone())
+            .await
+            .expect("erase the actor's pull-request text");
+        assert_eq!(proof.pull_requests_erased, authored_before as u64);
+        assert_eq!(
+            proof.erasure_events_co_committed,
+            proof.pull_requests_erased
+        );
+        assert!(proof.key_unrecoverable);
+        let retry = eraser
+            .erase_subject_pr_text(&tenant_a, actor.principal_id.0.as_str(), attempt)
+            .await
+            .expect("retry completed pull-request text erasure");
+        assert!(retry.already_completed);
+        assert_eq!(retry.pull_requests_erased, proof.pull_requests_erased);
+
+        let erased = store
+            .get(&scope_a, repo, opened.number)
+            .expect("read tombstoned pull request")
+            .expect("tombstoned pull request remains addressable");
+        assert_eq!(erased.title, pr_text_erasure::ERASED_PR_TITLE);
+        assert_eq!(erased.body_md, None);
+        let touched = store
+            .apply_mutation(
+                &scope_a,
+                repo,
+                opened.number,
+                PrMutation::Touch,
+                &PrOperationId::parse("touch-erased-pr").unwrap(),
+                &actor,
+            )
+            .expect("non-text lifecycle mutation preserves the tombstone");
+        assert_eq!(touched.title, pr_text_erasure::ERASED_PR_TITLE);
+        let erased_shape: (bool, String, Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT free_text_erased,title_pii_key_ref,title_ciphertext,body_ciphertext \
+             FROM git_pr WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
+        )
+        .bind(&tenant_a)
+        .bind(&region)
+        .bind(repo)
+        .bind(opened.number as i64)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            erased_shape,
+            (
+                true,
+                pr_text_erasure::ERASED_TITLE_KEY_REF.into(),
+                pr_text_erasure::ERASED_TITLE_CIPHERTEXT.to_vec(),
+                None,
+            )
+        );
+        let ledger_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM post_pit_erasure_ledger WHERE tenant_id=$1 AND region=$2 \
+             AND scope='git_pr_text' AND subject=$3",
+        )
+        .bind(&tenant_a)
+        .bind(&region)
+        .bind(actor.principal_id.0.as_str())
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(ledger_rows, 1);
 
         sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant'=$1")
             .bind(&tenant_a)
             .execute(&admin)
             .await
             .unwrap();
-        for table in ["git_pr_command", "git_pr", "git_pr_counter"] {
+        for table in [
+            "git_pr_command",
+            "git_pr_text_erasure_operation",
+            "git_pr",
+            "git_pr_counter",
+            "post_pit_erasure_ledger",
+        ] {
             sqlx::query(&format!("DELETE FROM {table} WHERE tenant_id=$1"))
                 .bind(&tenant_a)
                 .execute(&admin)

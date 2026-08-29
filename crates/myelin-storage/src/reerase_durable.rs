@@ -84,10 +84,26 @@ pub fn post_pit_issue_titles_scope_migrations() -> Migrations {
     )])
 }
 
+pub const POST_PIT_ERASURE_GIT_PR_TEXT_SCOPE_MIGRATION: &str = r#"
+ALTER TABLE post_pit_erasure_ledger
+    DROP CONSTRAINT post_pit_erasure_ledger_scope_known;
+ALTER TABLE post_pit_erasure_ledger
+    ADD CONSTRAINT post_pit_erasure_ledger_scope_known
+      CHECK (scope IN ('agent_data', 'chat', 'issue_titles', 'git_pr_text'));
+"#;
+
+pub fn post_pit_git_pr_text_scope_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0139_post_pit_git_pr_text_scope",
+        POST_PIT_ERASURE_GIT_PR_TEXT_SCOPE_MIGRATION,
+    )])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostPitErasureScope {
     AgentData,
     Chat,
+    GitPrText,
     IssueTitles,
 }
 
@@ -96,6 +112,7 @@ impl PostPitErasureScope {
         match self {
             Self::AgentData => "agent_data",
             Self::Chat => "chat",
+            Self::GitPrText => "git_pr_text",
             Self::IssueTitles => "issue_titles",
         }
     }

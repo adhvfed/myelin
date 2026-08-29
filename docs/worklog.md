@@ -4070,9 +4070,36 @@ and the real PostgreSQL pull-request boundary, including isolation, atomicity,
 idempotency, recovery, authoritative key inspection, and key destruction (0.98
 seconds).
 
+## 2026-08-29 — Git pull-request text has a durable erasure holder
+
+The Git-specific key foundation now has the production holder that was
+deliberately missing. A forward-only PostgreSQL operation record validates an
+author's exact current key references in bounded batches before destruction,
+then replaces every authored title and body with an addressable tombstone and
+co-commits one PII-free update consequence per pull request. A per-subject
+database lock fences opens and mutations while an operation is pending; normal
+lifecycle mutations preserve completed tombstones. The operation and counts
+are durable and idempotent, and a retry can finish after the key was destroyed
+but before the tombstones committed.
+
+Git pull-request text also has its own post-PIT ledger scope and restore
+operator pass. The full-system restore story uses real `pg_dump` and
+`pg_restore`: it proves that a backup resurrects the erased author's exact
+decryptable title, replays the live ledger into the restored database, destroys
+the resurrected Git key, preserves a neighboring author's text, and leaves
+work authored after the completed request untouched on an idempotent replay.
+The holder is composed into the maintenance restore command, but the public
+privacy-request surface remains intentionally unchanged until its request
+runtime, certificate, CLI, and browser journey are wired as one truthful slice.
+
+Proof: the 499 Git library stories compile with all targets and features; the
+live PostgreSQL boundary proves pending-writer fencing, recovery after key
+destruction, bounded tombstoning, consequence co-commit, stable addressability,
+and retry; and the real backup/restore drill passes end to end (34.72 seconds).
+
 ## known gaps (honest list, in priority order)
 
-1. **erasure-restore is closed for three drilled scopes.** the
+1. **erasure-restore is closed for four drilled scopes.** the
    agent-data and authored-Chat-message erasers write separate post-PIT ledger
    scopes. the maintenance command replays both through their production
    holders before a restored cell can reopen. agent data is drilled against a
@@ -4080,16 +4107,20 @@ seconds).
    a deliberately resurrected decryptable body. authored Issue titles have the
    equivalent real restore proof around their independent keys, bounded
    tombstoning, holder receipt, public requests, ledger replay, and fail-closed
-   legacy-row handling. Git pull-request text now has an isolated key
-   foundation, but no durable erasure operation, tombstoning pass, holder
-   receipt, restore replay, or migration for generic-key rows; it must not be
-   exposed through privacy requests first.
+   legacy-row handling. Git pull-request text now has the equivalent isolated
+   key, bounded operation, holder receipt, lifecycle fence, failure recovery,
+   restore replay, and real dump/restore drill. It fails closed when validation
+   encounters a legacy generic-key row rather than overstating erasure; a
+   deliberate legacy rekey migration remains required before old rows can be
+   erased through this holder.
 2. **DSR has three truthful product slices, not full holder coverage.** durable
    submit/status/certificate is wired for `agent_data`, `chat_messages`, and
    `issue_titles`, with holder-specific proofs and black-box user journeys. the
    narrow scopes deliberately do not claim Chat drafts, read state, mentions in
    other people's content, Issue bodies/comments/custom fields, search
-   projections, or Git. those holders remain absent rather than being
+   projections. Git pull-request text now has a production holder and restore
+   proof, but is not yet composed into public request submission, certificates,
+   CLI, or the browser. Other absent holders remain absent rather than being
    represented by ceremonial receipts.
 3. **Search indexing is not a deployed durable worker yet.** Refs,
    Notification, governed-agent, CI-dispatch, and Git-check NATS consumers now

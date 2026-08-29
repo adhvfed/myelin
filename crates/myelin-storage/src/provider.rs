@@ -248,6 +248,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::authz_projection_durable::authz_projection_format_migrations(),
         crate::reerase_durable::post_pit_issue_titles_scope_migrations(),
         crate::privacy_request_durable::privacy_request_issue_titles_scope_migrations(),
+        crate::reerase_durable::post_pit_git_pr_text_scope_migrations(),
     ]
 }
 

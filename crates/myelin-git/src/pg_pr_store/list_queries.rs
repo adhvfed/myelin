@@ -113,7 +113,8 @@ pub(super) fn pr_list_page_sql(query: &PrListQuery) -> String {
          SELECT c.open_count,c.merged_count,c.closed_count,c.all_count,c.yours_count,\
                 c.needs_review_count,f.has_newer,f.has_older,p.page_number,p.page_updated_at,\
                 p.record,p.head_repo_slug,p.title_nonce,p.title_ciphertext,p.title_pii_key_ref,\
-                p.body_nonce,p.body_ciphertext,p.body_pii_key_ref,p.author_subject_id \
+                p.body_nonce,p.body_ciphertext,p.body_pii_key_ref,p.author_subject_id, \
+                p.free_text_erased \
            FROM counts c CROSS JOIN flags f LEFT JOIN page_rows p ON TRUE ORDER BY {output_order}",
         columns = PR_RECORD_COLUMNS,
         state = pr_list_state_predicate(query.state),
@@ -220,7 +221,8 @@ pub(super) fn pr_cross_list_page_sql(query: &PrCrossListQuery) -> String {
                             AND ({x_predicate}) AND ({has_older_predicate})) AS has_older\
          ) SELECT c.bucket_count,f.has_newer,f.has_older,p.page_repo_slug,p.page_number,p.page_updated_at,\
                 p.record,p.head_repo_slug,p.title_nonce,p.title_ciphertext,p.title_pii_key_ref,\
-                p.body_nonce,p.body_ciphertext,p.body_pii_key_ref,p.author_subject_id \
+                p.body_nonce,p.body_ciphertext,p.body_pii_key_ref,p.author_subject_id, \
+                p.free_text_erased \
            FROM counts c CROSS JOIN flags f LEFT JOIN page_rows p ON TRUE ORDER BY {output_order}",
         columns = PR_RECORD_COLUMNS,
         x_predicate = predicate.replace("g.", "x."),

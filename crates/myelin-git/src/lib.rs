@@ -15,6 +15,7 @@ pub mod core;
 pub mod cross_cell;
 pub mod dek;
 pub mod durable;
+pub mod durable_erase;
 pub mod events;
 pub mod fork_gate;
 pub mod front_door;
@@ -31,6 +32,10 @@ pub mod pack_tier;
 pub mod patch_id_chain;
 mod pg_pr_event;
 pub mod pg_pr_store;
+pub mod post_restore;
+pub use post_restore::{
+    PostRestorePrTextError, PostRestorePrTextReEraser, PostRestorePrTextReport,
+};
 pub mod pr_list_pagination;
 pub mod pr_store;
 pub mod pr_threads;

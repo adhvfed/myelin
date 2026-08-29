@@ -5,6 +5,7 @@ use myelin_chat::store::pg_conversation::MESSAGE_TABLE;
 use myelin_chat::{PostRestoreChatMessageReEraser, PostRestoreChatMessageReport};
 use myelin_events::clock::system_clock_reading;
 use myelin_events::UlidMinter;
+use myelin_git::{PostRestorePrTextReEraser, PostRestorePrTextReport};
 use myelin_issues::{PostRestoreIssueTitleReEraser, PostRestoreIssueTitleReport};
 use myelin_storage::{
     DurableAgentTraceStore, DurablePostPitLedger, KmsEngine, PostRestoreAgentDataReEraser,
@@ -111,7 +112,7 @@ pub async fn run(
     let live_ledger = DurablePostPitLedger::new(live_provider);
     let restored_holder = DurableAgentTraceStore::with_runtime(
         restored_provider.clone(),
-        runtime,
+        runtime.clone(),
         restored_kms.clone(),
     );
     let agent_data = PostRestoreAgentDataReEraser::new(live_ledger.clone(), restored_holder)
@@ -136,15 +137,26 @@ pub async fn run(
     )
     .await
     .unwrap_or_else(|error| refuse(error.to_string(), 1));
-    let issue_titles =
-        PostRestoreIssueTitleReEraser::new(live_ledger, restored_provider, restored_kms)
+    let issue_titles = PostRestoreIssueTitleReEraser::new(
+        live_ledger.clone(),
+        restored_provider.clone(),
+        restored_kms.clone(),
+    )
+    .run(command.restored_before_unix, observed)
+    .await
+    .unwrap_or_else(|error| refuse(error.to_string(), 1));
+    let observed = system_clock_reading()
+        .unwrap_or_else(|error| refuse(format!("the privacy clock is unavailable: {error}"), 1));
+    let git_pr_text =
+        PostRestorePrTextReEraser::new(live_ledger, restored_provider, restored_kms, runtime)
+            .unwrap_or_else(|error| refuse(error.to_string(), 1))
             .run(command.restored_before_unix, observed)
             .await
             .unwrap_or_else(|error| refuse(error.to_string(), 1));
 
     println!(
         "{}",
-        report_json(&agent_data, &chat_messages, &issue_titles)
+        report_json(&agent_data, &chat_messages, &issue_titles, &git_pr_text)
     );
 }
 
@@ -152,6 +164,7 @@ fn report_json(
     agent_data: &PostRestoreAgentDataReport,
     chat_messages: &PostRestoreChatMessageReport,
     issue_titles: &PostRestoreIssueTitleReport,
+    git_pr_text: &PostRestorePrTextReport,
 ) -> serde_json::Value {
     json!({
         "restore_reerase": {
@@ -177,6 +190,13 @@ fn report_json(
                     "already_erased_subjects": issue_titles.already_erased_subjects,
                     "titles_erased": issue_titles.titles_erased,
                     "erasure_events_co_committed": issue_titles.erasure_events_co_committed,
+                },
+                "git_pull_request_text": {
+                    "selected_subjects": git_pr_text.selected_subjects,
+                    "newly_re_erased_subjects": git_pr_text.newly_re_erased_subjects,
+                    "already_erased_subjects": git_pr_text.already_erased_subjects,
+                    "pull_requests_erased": git_pr_text.pull_requests_erased,
+                    "erasure_events_co_committed": git_pr_text.erasure_events_co_committed,
                 },
             },
             "complete": true,
@@ -312,6 +332,14 @@ mod tests {
                 titles_erased: 4,
                 erasure_events_co_committed: 4,
             },
+            &PostRestorePrTextReport {
+                restored_to_offset: 42,
+                selected_subjects: 1,
+                newly_re_erased_subjects: 1,
+                already_erased_subjects: 0,
+                pull_requests_erased: 2,
+                erasure_events_co_committed: 2,
+            },
         );
         assert_eq!(body["restore_reerase"]["restored_before_unix"], 42);
         assert_eq!(
@@ -325,6 +353,10 @@ mod tests {
         assert_eq!(
             body["restore_reerase"]["scopes"]["issue_titles"]["titles_erased"],
             4,
+        );
+        assert_eq!(
+            body["restore_reerase"]["scopes"]["git_pull_request_text"]["pull_requests_erased"],
+            2,
         );
         assert_eq!(body["restore_reerase"]["complete"], true);
     }
