@@ -467,6 +467,28 @@ pub trait QuarantineMigration {
     fn migrate(&self, objects: &[QuarantineObject]) -> Result<(), String>;
 }
 
+/// Migration policy for ref advances that may only point at objects already in
+/// the repository's durable object database.
+///
+/// Merge operations use this policy after independently verifying their target
+/// commit. Rejecting non-empty quarantine input keeps that production path from
+/// silently turning into an object-ingest path without a durable migrator.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct EmptyQuarantineMigration;
+
+impl QuarantineMigration for EmptyQuarantineMigration {
+    fn migrate(&self, objects: &[QuarantineObject]) -> Result<(), String> {
+        if objects.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "existing-object ref advance received {} quarantined object(s)",
+                objects.len()
+            ))
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct InMemoryObjectDb {
     migrated: Arc<std::sync::Mutex<std::collections::BTreeSet<Oid>>>,
@@ -1032,6 +1054,20 @@ mod tests {
 
     const WRITER: bool = false;
     const ADMIN: bool = true;
+
+    #[test]
+    fn empty_quarantine_migration_rejects_object_ingest() {
+        let migration = EmptyQuarantineMigration;
+
+        assert_eq!(migration.migrate(&[]), Ok(()));
+        assert_eq!(
+            migration.migrate(&[QuarantineObject {
+                oid: Oid::new("cafe"),
+                bytes: b"unexpected object".to_vec(),
+            }]),
+            Err("existing-object ref advance received 1 quarantined object(s)".into())
+        );
+    }
 
     fn protected_ruleset(required: &[&str], allow_force_push: bool) -> BranchProtectionRuleset {
         BranchProtectionRuleset {

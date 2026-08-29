@@ -16,9 +16,11 @@ use crate::lifecycle::{
     ReviewState, ReviewVerdict, RulesetOutcome,
 };
 use crate::merge_gate::{evaluate_merge_gate, MergeGateOutcome, MergeGatePolicy};
+#[cfg(test)]
+use crate::receive_pack::InMemoryObjectDb;
 use crate::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushProvenance,
-    PushSession, Pusher, RefName, RefStore,
+    CrashPoint, EmptyQuarantineMigration, Oid as PushOid, ProposedRefUpdate, PushOutcome,
+    PushProvenance, PushSession, Pusher, RefName, RefStore,
 };
 
 pub(crate) const PR_RECORD_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -1148,7 +1150,7 @@ pub fn merge_pr<P: RepoPathResolver>(
         pusher: Pusher::new(merger_pseudonym, provenance),
     };
     let outcome = ref_store
-        .receive(&push, &InMemoryObjectDb::new(), CrashPoint::None)
+        .receive(&push, &EmptyQuarantineMigration, CrashPoint::None)
         .map_err(|e| DurableError::Git(format!("merge ref advance failed: {e:?}")))?;
 
     match outcome {

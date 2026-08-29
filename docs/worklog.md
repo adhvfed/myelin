@@ -3989,6 +3989,27 @@ Proof: complete normal Agent-service suite, strict all-target/all-feature
 Clippy, and workspace compilation; repository-wide search finding no mock
 selector or scripted runtime. Net removal: 791 code/test lines.
 
+## 2026-08-29 — Merge ref advances cannot become accidental object ingest
+
+Direct and crash-resumed pull-request merges advance a branch to a commit that
+has already been verified in the repository's durable object database. Both
+production paths nevertheless passed an `InMemoryObjectDb` to receive-pack.
+The quarantine was empty, so no object was actually lost, but a test store was
+standing in for a security- and durability-relevant production invariant. A
+later change could have attached quarantined objects and silently promoted them
+only into process memory before committing the ref.
+
+Merge ref advancement now uses a dedicated empty-quarantine migration policy.
+It accepts the intended metadata-only advance and fails closed if even one
+object is supplied. Wire pushes retain their real durable object migrators, and
+the in-memory object database remains only as explicit test support.
+
+Proof: the focused fail-closed migration story; all 491 Git library stories and
+the complete normal Git suite, including durable ref storage, merge lifecycle,
+receive-pack crash recovery, and concurrent merge linearizability; strict
+all-target/all-feature Git Clippy; and workspace-wide all-target/all-feature
+compilation.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

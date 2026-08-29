@@ -27,8 +27,8 @@ use crate::pr_store::{
     PrListSlice, PrRecord,
 };
 use crate::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushProvenance,
-    PushSession, Pusher, RefName, RefStore,
+    CrashPoint, EmptyQuarantineMigration, Oid as PushOid, ProposedRefUpdate, PushOutcome,
+    PushProvenance, PushSession, Pusher, RefName, RefStore,
 };
 use myelin_events::clock::system_clock_reading;
 
@@ -1717,7 +1717,7 @@ impl PgPrStore {
             pusher: Pusher::new(merger_pseudonym, intent.ref_update_provenance),
         };
         match ref_store
-            .receive(&push, &InMemoryObjectDb::new(), CrashPoint::None)
+            .receive(&push, &EmptyQuarantineMigration, CrashPoint::None)
             .map_err(|_| DurableError::Git("merge ref advance failed".into()))?
         {
             PushOutcome::Accepted { moved, .. } => {
