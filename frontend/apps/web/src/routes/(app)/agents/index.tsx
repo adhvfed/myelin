@@ -149,10 +149,12 @@ export default function AgentThreadsIndex() {
     recentSessions()?.page?.items,
     workspaceSessionPages().map((page) => page.items),
   ));
-  const agentName = () => {
+  const selectedAgent = () => {
     const id = selectedThread()?.page?.agent_id;
-    return agents().find((agent) => agent.id === id)?.name ?? (id ? `Agent ${id.slice(0, 8)}` : "Agent");
+    return agents().find((agent) => agent.id === id);
   };
+  const agentName = () => selectedAgent()?.name ??
+    (selectedThread()?.page?.agent_id ? `Agent ${selectedThread()!.page!.agent_id.slice(0, 8)}` : "Agent");
   const nextThreadCursor = () => threadPages().at(-1)?.page.next_cursor ??
     firstThreads()?.page?.page.next_cursor ?? null;
   const nextAgentCursor = () => agentPages().at(-1)?.page.next_cursor ??
@@ -206,7 +208,7 @@ export default function AgentThreadsIndex() {
     pane.setContextPaneLabel("Agent workspace");
     pane.setContextPane(thread ? () => <AgentWorkspaceContext
       thread={thread}
-      agentName={agentName()}
+      agent={selectedAgent()}
       sessions={workspaceSessions()}
       sessionsLoading={recentSessions() === undefined}
       sessionsUnavailable={Boolean(recentSessions()?.error)}

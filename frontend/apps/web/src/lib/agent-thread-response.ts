@@ -13,6 +13,8 @@ export interface AgentChoice {
   name: string;
   runtime_ref: "external:mcp" | "hosted:luna";
   status: "active" | "suspended" | "disabled";
+  selected_tools: string[];
+  effective_tools: string[];
 }
 
 export interface AgentChoicePage {
@@ -109,16 +111,22 @@ function stringArray(value: unknown, maximum: number): value is string[] {
   return Array.isArray(value) && value.length <= maximum && value.every((item) => cleanText(item, 4_096));
 }
 
-function toolRows(value: unknown): boolean {
-  return Array.isArray(value) && value.length <= 128 && value.every((item) => {
+function toolNames(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > 128) return null;
+  const names: string[] = [];
+  for (const item of value) {
     const row = record(item);
-    return row && exact(row, ["name", "version", "ref"]) && cleanText(row.name, 255) &&
-      positiveInteger(row.version, 65_535) && cleanText(row.ref, 4_096);
-  });
+    if (!row || !exact(row, ["name", "version", "ref"]) || !cleanText(row.name, 255) ||
+        !positiveInteger(row.version, 65_535) || !cleanText(row.ref, 4_096)) return null;
+    names.push(row.name);
+  }
+  return new Set(names).size === names.length ? names : null;
 }
 
 function agentChoice(value: unknown): AgentChoice | null {
   const row = record(value);
+  const selectedTools = toolNames(row?.selected_tools);
+  const effectiveTools = toolNames(row?.effective_tools);
   if (!row || !exact(row, [
     "id", "ref", "principal_id", "name", "runtime_ref", "on_behalf_of", "status",
     "selected_tools", "effective_tools", "grants", "created_at",
@@ -127,13 +135,15 @@ function agentChoice(value: unknown): AgentChoice | null {
       !["external:mcp", "hosted:luna"].includes(row.runtime_ref as string) ||
       !cleanText(row.on_behalf_of, 512) ||
       !["active", "suspended", "disabled"].includes(row.status as string) ||
-      !toolRows(row.selected_tools) || !toolRows(row.effective_tools) ||
+      !selectedTools || !effectiveTools ||
       !stringArray(row.grants, 512) || !timestamp(row.created_at)) return null;
   return {
     id: row.id,
     name: row.name,
     runtime_ref: row.runtime_ref,
     status: row.status,
+    selected_tools: selectedTools,
+    effective_tools: effectiveTools,
   } as AgentChoice;
 }
 

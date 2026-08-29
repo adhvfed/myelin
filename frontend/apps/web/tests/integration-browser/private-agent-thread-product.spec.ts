@@ -9,7 +9,7 @@ import {
 } from "./product-api";
 import { signIn, waitForAppHydration } from "./session";
 
-test("an engineer keeps a named problem and its workspace with one agent", async ({
+test("an engineer authorizes bounded commands and keeps a named problem with one agent", async ({
   page,
   request,
 }) => {
@@ -25,6 +25,7 @@ test("an engineer keeps a named problem and its workspace with one agent", async
   await page.getByRole("button", { name: "Activate an agent" }).click();
   const activation = page.getByRole("dialog", { name: "Activate private-work agent" });
   await activation.getByRole("textbox", { name: "Agent name" }).fill(agentName);
+  await activation.getByRole("checkbox", { name: "Allow bounded workspace commands" }).check();
   await activation.getByRole("button", { name: "Activate agent" }).click();
 
   const dialog = page.getByRole("dialog", { name: "Start private agent thread" });
@@ -44,6 +45,8 @@ test("an engineer keeps a named problem and its workspace with one agent", async
   const workspace = page.getByRole("dialog", { name: "Agent workspace" });
   await expect(workspace.getByText("Generation 1", { exact: true })).toBeVisible();
   await expect(workspace.getByText("No workspace entries yet.")).toBeVisible();
+  await expect(workspace.getByTestId("agent-command-scope"))
+    .toContainText("Bounded commands enabled");
   await expect(workspace.getByTestId("agent-connect-command"))
     .toContainText(`myelin mcp serve --as ${agentId}`);
   const sshCommand = workspace.getByTestId("agent-workspace-command");
@@ -61,6 +64,26 @@ test("an engineer keeps a named problem and its workspace with one agent", async
   await expect(page.getByText(`Private with ${agentName}`)).toBeVisible();
 
   const threadId = new URL(page.url()).searchParams.get("thread")!;
+  const agentResponse = await request.get(
+    `${integrationEdgeUrl}/v1/agents/${encodeURIComponent(agentId)}`,
+    {
+      headers: {
+        authorization: `Bearer ${sessionToken}`,
+        "x-myelin-token-scheme": "session",
+      },
+    },
+  );
+  const agentText = await agentResponse.text();
+  expect(agentResponse.status(), agentText).toBe(200);
+  const durableAgent = (JSON.parse(agentText) as {
+    agent: { selected_tools: Array<{ name: string }>; effective_tools: Array<{ name: string }> };
+  }).agent;
+  expect(durableAgent.selected_tools).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "workspace.exec" }),
+  ]));
+  expect(durableAgent.effective_tools).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "workspace.exec" }),
+  ]));
   const durable = await request.get(
     `${integrationEdgeUrl}/v1/agent-threads/${encodeURIComponent(threadId)}/messages?limit=100`,
     {

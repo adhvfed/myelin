@@ -225,6 +225,24 @@
 }
 .agent-activation-scope > svg { flex: none; margin-block-start: .1rem; }
 .agent-activation-scope p { margin: 0; }
+.agent-thread-create .agent-activation-command-toggle {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: var(--hairline) solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+}
+.agent-thread-create .agent-activation-command-toggle input {
+  grid-row: 1 / span 2;
+  width: auto;
+  min-height: auto;
+  margin: .15rem 0 0;
+  accent-color: var(--accent);
+}
+.agent-activation-command-toggle small { color: var(--text-subtle); font-weight: var(--weight-normal); }
 
 .agent-workspace-context { display: flex; flex-direction: column; gap: var(--space-5); }
 .agent-workspace-context section { display: flex; flex-direction: column; gap: var(--space-2); }

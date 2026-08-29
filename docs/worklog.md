@@ -4010,6 +4010,39 @@ receive-pack crash recovery, and concurrent merge linearizability; strict
 all-target/all-feature Git Clippy; and workspace-wide all-target/all-feature
 compilation.
 
+## 2026-08-29 — Owners can deliberately give a private agent command authority
+
+The durable private-work runtime already supported `workspace.exec`, but the
+browser could activate only a fixed file-oriented agent. An owner using the
+first-class Agents journey therefore had to leave the product and recreate the
+agent through a lower-level API before it could run a bounded build, test, or
+diagnostic command. The UI also discarded the selected tool projection, so it
+could not tell the owner which workspace authority the chosen agent actually
+carried.
+
+Activation now offers an explicit command-execution choice that is off by
+default. Opting in adds only `workspace.exec` to the existing private Chat and
+file tools; Edge still verifies that the signed-in owner can delegate every
+required capability. The strict browser decoder retains selected and effective
+tool names, rejects duplicate projections, and the workspace pane states
+whether command execution was authorized. No provider credential or separate
+API key is introduced.
+
+The live validation also caught a default-feature build regression left by a
+removed test module: a conditional-compilation attribute had accidentally
+moved onto Refs' production residency module. All-feature compilation masked
+the problem, while the assembled Edge service could not build. The residency
+module is again present in the default product build.
+
+Proof: all 658 frontend unit stories; frontend typecheck, lint, and production
+build; all 238 Refs-service library stories and its complete normal suite;
+strict default-feature Refs-service Clippy; default-feature Edge compilation;
+and the live PostgreSQL-backed browser journey, which opts into bounded
+commands, reads the owner-facing scope, inspects `workspace.exec` in both the
+durable selected and effective tool projections, creates the private thread,
+persists its message across reload, and links back to it from Chat (9.9
+seconds).
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for three drilled scopes.** the

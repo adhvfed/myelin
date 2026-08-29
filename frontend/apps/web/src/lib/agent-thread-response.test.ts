@@ -113,6 +113,8 @@ describe("private agent work wire projection", () => {
       name: "Checkout companion",
       runtime_ref: "external:mcp",
       status: "active",
+      selected_tools: ["chat.post"],
+      effective_tools: [],
     }]);
     expect(parseAgentActivationReceipt({ agent, created: true, durable: true, governance })).toEqual({
       agent: {
@@ -120,6 +122,8 @@ describe("private agent work wire projection", () => {
         name: "Checkout companion",
         runtime_ref: "external:mcp",
         status: "active",
+        selected_tools: ["chat.post"],
+        effective_tools: [],
       },
       created: true,
       durable: true,
@@ -177,6 +181,10 @@ describe("private agent work wire projection", () => {
         ...governance,
         policy_revisions: { ...governance.policy_revisions, tenant: -1 },
       },
+    })).toBeNull();
+    expect(parseAgentChoices({
+      items: [{ ...agent, selected_tools: [agent.selected_tools[0], agent.selected_tools[0]] }],
+      page: { next_cursor: null, limit: 100 },
     })).toBeNull();
   });
 });

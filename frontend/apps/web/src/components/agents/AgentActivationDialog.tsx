@@ -22,6 +22,7 @@ export function AgentActivationDialog(props: {
 }) {
   const mutate = useAction(mutateAgentThread);
   const [name, setName] = createSignal("");
+  const [allowWorkspaceCommands, setAllowWorkspaceCommands] = createSignal(false);
   const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -32,6 +33,7 @@ export function AgentActivationDialog(props: {
     openingGeneration += 1;
     if (!props.open) return;
     setName("");
+    setAllowWorkspaceCommands(false);
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
@@ -58,6 +60,7 @@ export function AgentActivationDialog(props: {
       const result = await mutate({
         op: "activate-agent",
         name: name(),
+        allowWorkspaceCommands: allowWorkspaceCommands(),
         clientNonce: clientNonce(),
       });
       if (generation !== openingGeneration) return;
@@ -114,6 +117,21 @@ export function AgentActivationDialog(props: {
             generation-fenced workspace. Your live permissions remain the authority ceiling.
           </p>
         </div>
+        <label class="agent-activation-command-toggle" for="agent-allow-workspace-commands">
+          <input
+            id="agent-allow-workspace-commands"
+            type="checkbox"
+            checked={allowWorkspaceCommands()}
+            disabled={submitting()}
+            onChange={(event) => {
+              setAllowWorkspaceCommands(event.currentTarget.checked);
+              setClientNonce(crypto.randomUUID());
+              setError(null);
+            }}
+          />
+          <strong>Allow bounded workspace commands</strong>
+          <small>Lets this agent run generation-fenced, network-denied commands with durable effect receipts.</small>
+        </label>
         <Show when={error()}>{(message) => <p role="alert" class="agent-thread-error">{message()}</p>}</Show>
       </form>
     </Dialog>

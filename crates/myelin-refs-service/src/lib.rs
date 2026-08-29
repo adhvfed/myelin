@@ -25,7 +25,6 @@ pub mod mirror;
 #[cfg(feature = "integration")]
 pub mod pg_edge;
 pub mod reach_index;
-#[cfg(any(test, feature = "test-support"))]
 pub mod residency;
 pub mod resolve;
 mod store;

@@ -35,6 +35,7 @@ const PRIVATE_WORK_AGENT_TOOLS = [
   "workspace.read_file",
   "workspace.write_file",
 ] as const;
+const PRIVATE_WORK_COMMAND_TOOL = "workspace.exec" as const;
 
 export class AgentThreadRouteError extends Error {
   readonly kind: AgentThreadErrorKind;
@@ -198,12 +199,15 @@ export const mutateAgentThread = action(async (input: unknown) => {
   const mutation = input as Record<string, unknown>;
   try {
     if (mutation.op === "activate-agent" && Object.keys(mutation).every((key) =>
-      ["op", "name", "clientNonce"].includes(key)) && Object.keys(mutation).length === 3 &&
-        cleanText(mutation.name, 80) && cleanNonce(mutation.clientNonce)) {
+      ["op", "name", "allowWorkspaceCommands", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 4 && cleanText(mutation.name, 80) &&
+        typeof mutation.allowWorkspaceCommands === "boolean" && cleanNonce(mutation.clientNonce)) {
       const receipt = parseAgentActivationReceipt(await edgePost("/v1/agents", {
         name: mutation.name,
         runtime: "external",
-        tools: PRIVATE_WORK_AGENT_TOOLS,
+        tools: mutation.allowWorkspaceCommands
+          ? [...PRIVATE_WORK_AGENT_TOOLS, PRIVATE_WORK_COMMAND_TOOL]
+          : PRIVATE_WORK_AGENT_TOOLS,
       }, { idempotencyKey: mutation.clientNonce }));
       return receipt
         ? respond({ ok: true, op: "activate-agent", receipt })

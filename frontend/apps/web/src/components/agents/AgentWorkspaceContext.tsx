@@ -1,7 +1,7 @@
 import { Icon } from "@myelin/design-system";
 import { For, Show } from "solid-js";
 
-import type { AgentThread, WorkspaceSession } from "~/lib/agent-thread-response";
+import type { AgentChoice, AgentThread, WorkspaceSession } from "~/lib/agent-thread-response";
 
 function dateTime(value: string): string {
   return `${new Date(value).toISOString().slice(0, 16).replace("T", " ")} UTC`;
@@ -9,7 +9,7 @@ function dateTime(value: string): string {
 
 export function AgentWorkspaceContext(props: {
   thread: AgentThread;
-  agentName: string;
+  agent: AgentChoice | undefined;
   sessions: WorkspaceSession[];
   sessionsLoading: boolean;
   sessionsUnavailable: boolean;
@@ -19,6 +19,8 @@ export function AgentWorkspaceContext(props: {
 }) {
   const agentCommand = () => `myelin mcp serve --as ${props.thread.agent_id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
+  const agentName = () => props.agent?.name ?? `Agent ${props.thread.agent_id.slice(0, 8)}`;
+  const commandScope = () => props.agent?.selected_tools.includes("workspace.exec");
   return (
     <div class="agent-workspace-context">
       <section>
@@ -26,10 +28,20 @@ export function AgentWorkspaceContext(props: {
         <h2>Generation {props.thread.workspace.generation}</h2>
         <dl>
           <div><dt>State</dt><dd>{props.thread.workspace.state}</dd></div>
-          <div><dt>Agent</dt><dd>{props.agentName}</dd></div>
+          <div><dt>Agent</dt><dd>{agentName()}</dd></div>
           <div><dt>Expires</dt><dd><time datetime={props.thread.workspace.expires_at}>{dateTime(props.thread.workspace.expires_at)}</time></dd></div>
           <div><dt>Workspace</dt><dd><code>{props.thread.workspace.id}</code></dd></div>
         </dl>
+      </section>
+      <section>
+        <h3>Agent workspace authority</h3>
+        <Show when={props.agent} fallback={<p data-testid="agent-command-scope">Tool scope is temporarily unavailable.</p>}>
+          <p data-testid="agent-command-scope">
+            {commandScope()
+              ? "Bounded commands enabled · files and command effects remain generation-fenced."
+              : "File access only · command execution was not authorized."}
+          </p>
+        </Show>
       </section>
       <section>
         <h3>Connect the agent</h3>
