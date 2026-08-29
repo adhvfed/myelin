@@ -4207,6 +4207,23 @@ values.
 Proof: the complete Storage library suite and strict all-target/all-feature
 Storage compilation pass after removing the wrapper and its drills.
 
+## 2026-08-29 — Git object-tier latency claims require a real clock
+
+Storage no longer exports `SingleNodeServe`, `ObjectBackedServe`, or the GIT-D4
+GREEN report. Their `measure` functions never performed I/O or observed time:
+one returned `500 + clone_count * object_count` microseconds and the other
+always returned exactly `500` microseconds. The dated drill compared those
+constants with a threshold and called the result measured performance.
+
+Direct tests of the object tier remain, including content addressing,
+replicated reads, corruption refusal, placement, relocation, and byte-identical
+clone objects. A future clone latency gate must run the smart-HTTP service and
+durable/object-store backing under concurrent load, record an actual latency
+distribution, and compare its observed p99 with the versioned threshold.
+
+Proof: the complete Storage library suite and strict all-target/all-feature
+Storage compilation pass without the fabricated performance API and drill.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

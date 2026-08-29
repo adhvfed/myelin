@@ -138,8 +138,7 @@ pub use migration_under_load::{
 pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
 pub use money::MicroUsd;
 pub use object_packs::{
-    object_backed_pack_tier, place_repo_object_backed, served_from_object_tier, CloneStormLoad,
-    GitD4Ceiling, GitD4Report, ObjectBackedServe, SingleNodeServe,
+    object_backed_pack_tier, place_repo_object_backed, served_from_object_tier,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
