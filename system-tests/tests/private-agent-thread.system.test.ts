@@ -68,6 +68,54 @@ describe("private work with an agent", () => {
     );
   });
 
+  test("lists the newest named work first and binds continuation cursors to its owner", async () => {
+    const founder = await browserApprovedCliClient();
+    const teammate = await browserApprovedCliClient(reviewerClient);
+    const companion = await activateExternalAgent(
+      founder,
+      uniqueName("Recent work companion"),
+      ["chat.read_messages", "workspace.read_file"],
+    );
+    const created = [];
+    for (const label of ["Oldest", "Middle", "Newest"]) {
+      created.push(await startPrivateAgentThread(founder, {
+        name: uniqueName(`${label} private investigation`),
+        agentId: companion.agent.id,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+
+    const first = await founder.json("/v1/agent-threads?limit=2");
+    const firstItems = array(first.body.items, "newest private thread page")
+      .map((item) => parsePrivateAgentThread(item));
+    expect(firstItems.map((thread) => thread.id)).toEqual([
+      created[2]!.thread.id,
+      created[1]!.thread.id,
+    ]);
+    expect(first.body.page).toEqual({
+      next_cursor: created[1]!.thread.id,
+      limit: 2,
+    });
+
+    const second = await founder.json(
+      `/v1/agent-threads?limit=2&cursor=${encodeURIComponent(created[1]!.thread.id)}`,
+    );
+    const secondItems = array(second.body.items, "continued private thread page")
+      .map((item) => parsePrivateAgentThread(item));
+    expect(secondItems[0]?.id).toBe(created[0]!.thread.id);
+
+    for (const [client, cursor] of [
+      [founder, randomUUID()],
+      [teammate, created[1]!.thread.id],
+    ] as const) {
+      const rejected = await client.json(
+        `/v1/agent-threads?limit=2&cursor=${encodeURIComponent(cursor)}`,
+        { expectedStatus: 400 },
+      );
+      expect(rejected.body).toMatchObject({ error: { code: "bad_request" } });
+    }
+  });
+
   test("keeps one named problem and workspace private while fresh agent context resumes it", async () => {
     const founder = await browserApprovedCliClient();
     const teammate = await browserApprovedCliClient(reviewerClient);

@@ -4316,6 +4316,28 @@ that same file through a fresh owner-authorized OpenSSH connection, replays the
 old agent request, and proves both that its receipt is stable and that the newer
 owner content survives into a fresh agent context.
 
+## 2026-08-29 — Private work lists are recent and cursors are owner-bound
+
+The private-thread list called its index `owner_recent`, but ordered rows only by
+the random UUID v4 thread identifier. As an owner accumulated named work, the
+CLI and browser therefore displayed an arbitrary order rather than the newest
+investigation first. Any canonical UUID was also accepted as a continuation
+threshold even when it was fabricated or belonged to another person's thread.
+
+The durable list now orders by creation time, the monotonic conversation ULID,
+and thread UUID as a total keyset. A supplied UUID must resolve to an exact
+thread owned by that caller before it can anchor the composite continuation.
+Deleted anchors remain valid so lifecycle cleanup cannot break an already-issued
+page, while deleted threads themselves stay out of the resumable-work list.
+Migration `0142_agent_thread_recent_list_index` installs the matching partial
+index concurrently without locking the live table for an ordinary index build.
+
+The PostgreSQL lifecycle uses deliberately inverted UUIDs to prove time, not
+identifier chance, controls ordering and checks both fabricated and foreign
+cursors. The TypeScript product journey creates three named investigations,
+walks two public API pages newest-first, and observes the same bounded cursor
+refusals through rebuilt Edge.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

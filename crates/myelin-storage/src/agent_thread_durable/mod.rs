@@ -17,8 +17,9 @@ pub use model::{
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
-    agent_thread_durable_migrations, agent_thread_ssh_single_use_migrations,
-    AGENT_THREAD_MIGRATION, AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
+    agent_thread_durable_migrations, agent_thread_recent_list_migrations,
+    agent_thread_ssh_single_use_migrations, AGENT_THREAD_MIGRATION,
+    AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
     AGENT_THREAD_SSH_GRANT_MIGRATION, AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
     AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
 };
@@ -45,6 +46,12 @@ use crate::{
 
 const RESUMABLE_AGENT_RUNTIME_REF: &str = "external:mcp";
 const EXACT_AGENT_THREAD_BATCH_MAX: usize = 10_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListAgentThreadsOutcome {
+    Page(Vec<DurableAgentThread>),
+    CursorNotFound,
+}
 
 #[derive(Clone)]
 pub struct DurableAgentThreadBacking {
@@ -292,7 +299,7 @@ impl DurableAgentThreadBacking {
         owner_principal_id: &str,
         before: Option<Uuid>,
         limit: u32,
-    ) -> Result<Vec<DurableAgentThread>, ProviderError> {
+    ) -> Result<ListAgentThreadsOutcome, ProviderError> {
         if limit == 0 || limit > 101 {
             return Err(query("agent thread page limit must be between 1 and 101"));
         }
@@ -302,15 +309,40 @@ impl DurableAgentThreadBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
+                    if let Some(cursor) = before {
+                        let exists = sqlx::query_scalar::<_, bool>(
+                            "SELECT EXISTS (
+                               SELECT 1 FROM agent_thread
+                                WHERE tenant_id = $1 AND region = $2
+                                  AND owner_principal_id = $3 AND thread_id = $4
+                             )",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&owner)
+                        .bind(cursor)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .map_err(query_error("resolve agent thread cursor"))?;
+                        if !exists {
+                            return Ok(ListAgentThreadsOutcome::CursorNotFound);
+                        }
+                    }
                     let rows = sqlx::query(
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            retention_days, state, storage_locator, failure_reason, created_at,
                            expires_at, updated_at
-                         FROM agent_thread
+                        FROM agent_thread
                         WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3
-                          AND state <> 'deleted' AND ($4::uuid IS NULL OR thread_id < $4)
-                        ORDER BY thread_id DESC LIMIT $5",
+                          AND state <> 'deleted'
+                          AND ($4::uuid IS NULL OR (created_at, conversation_id, thread_id) < (
+                            SELECT cursor.created_at, cursor.conversation_id, cursor.thread_id
+                              FROM agent_thread cursor
+                             WHERE cursor.tenant_id = $1 AND cursor.region = $2
+                               AND cursor.owner_principal_id = $3 AND cursor.thread_id = $4
+                          ))
+                        ORDER BY created_at DESC, conversation_id DESC, thread_id DESC LIMIT $5",
                     )
                     .bind(&tenant)
                     .bind(&region)
@@ -320,7 +352,10 @@ impl DurableAgentThreadBacking {
                     .fetch_all(&mut *conn)
                     .await
                     .map_err(query_error("list agent threads"))?;
-                    rows.iter().map(row_to_thread).collect()
+                    rows.iter()
+                        .map(row_to_thread)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(ListAgentThreadsOutcome::Page)
                 })
             })
             .await

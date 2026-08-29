@@ -10,9 +10,9 @@ use myelin_identity::{Principal, PrincipalId};
 use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome,
-    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, NewAgentThread,
-    WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
-    MIN_AGENT_THREAD_RETENTION_DAYS,
+    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking,
+    ListAgentThreadsOutcome, NewAgentThread, WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES,
+    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -470,7 +470,7 @@ impl Handler for AgentThreadListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_body(ctx)?;
         let (limit, cursor) = page_query(&ctx.request.query)?;
-        let mut threads = self
+        let outcome = self
             .api
             .drive(self.api.threads.list_for_owner(
                 &ctx.principal.tenant.0,
@@ -479,6 +479,11 @@ impl Handler for AgentThreadListHandler {
                 limit + 1,
             ))?
             .map_err(|_| EdgeError::Internal("agent thread list failed".into()))?;
+        let ListAgentThreadsOutcome::Page(mut threads) = outcome else {
+            return Err(EdgeError::BadRequest(
+                "agent thread cursor does not identify this owner's thread list".into(),
+            ));
+        };
         let has_more = threads.len() > limit as usize;
         threads.truncate(limit as usize);
         let next = has_more

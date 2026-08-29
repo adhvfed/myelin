@@ -7,7 +7,7 @@ use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
     all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadExpiryCompletion,
     AgentThreadExpiryFailure, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
-    CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
+    CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables, ListAgentThreadsOutcome,
     ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant, NewWorkspaceSshSession,
     SealKey, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
     AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
@@ -761,12 +761,94 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             .unwrap(),
         Some(ready)
     );
-    let listed = threads
+    let ListAgentThreadsOutcome::Page(listed) = threads
         .list_for_owner(&tenant, owner, None, 100)
         .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("an initial private-thread page has no cursor to reject");
+    };
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].thread_id, intended.thread_id.to_string());
+
+    let middle_intent = NewAgentThread {
+        name: "Investigate cache handoff".into(),
+        client_nonce: "private-thread-middle".into(),
+        created_at: intended.created_at + Duration::seconds(1),
+        expires_at: intended.expires_at + Duration::seconds(1),
+        ..proposal(owner, agent_id, 3)
+    };
+    let newest_intent = NewAgentThread {
+        name: "Investigate shutdown handoff".into(),
+        client_nonce: "private-thread-newest".into(),
+        created_at: intended.created_at + Duration::seconds(2),
+        expires_at: intended.expires_at + Duration::seconds(2),
+        ..proposal(owner, agent_id, 2)
+    };
+    assert!(matches!(
+        threads
+            .create(&tenant, middle_intent.clone())
+            .await
+            .unwrap(),
+        CreateAgentThreadOutcome::Created(_)
+    ));
+    assert!(matches!(
+        threads
+            .create(&tenant, newest_intent.clone())
+            .await
+            .unwrap(),
+        CreateAgentThreadOutcome::Created(_)
+    ));
+    let ListAgentThreadsOutcome::Page(first_recent_page) = threads
+        .list_for_owner(&tenant, owner, None, 2)
+        .await
+        .unwrap()
+    else {
+        panic!("an initial recent-thread page has no cursor to reject");
+    };
+    assert_eq!(
+        first_recent_page
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            newest_intent.thread_id.to_string(),
+            middle_intent.thread_id.to_string(),
+        ]
+    );
+    let ListAgentThreadsOutcome::Page(second_recent_page) = threads
+        .list_for_owner(&tenant, owner, Some(middle_intent.thread_id), 2)
+        .await
+        .unwrap()
+    else {
+        panic!("the owner's visible cursor remains valid");
+    };
+    assert_eq!(
+        second_recent_page
+            .first()
+            .map(|thread| thread.thread_id.clone()),
+        Some(intended.thread_id.to_string())
+    );
+    assert_eq!(
+        threads
+            .list_for_owner(&tenant, owner, Some(Uuid::from_u128(999)), 2)
+            .await
+            .unwrap(),
+        ListAgentThreadsOutcome::CursorNotFound
+    );
+    assert_eq!(
+        threads
+            .list_for_owner(&tenant, "p:bob", Some(middle_intent.thread_id), 2)
+            .await
+            .unwrap(),
+        ListAgentThreadsOutcome::CursorNotFound
+    );
+    sqlx::query("DELETE FROM agent_thread WHERE tenant_id = $1 AND thread_id = ANY($2)")
+        .bind(&tenant)
+        .bind(vec![middle_intent.thread_id, newest_intent.thread_id])
+        .execute(admin.db_pool())
+        .await
+        .unwrap();
     assert!(threads
         .get_for_owner(&tenant, "p:bob", intended.thread_id)
         .await
@@ -897,11 +979,14 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .await
         .unwrap()
         .is_empty());
-    assert!(threads
+    let ListAgentThreadsOutcome::Page(after_cleanup) = threads
         .list_for_owner(&tenant, owner, None, 100)
         .await
         .unwrap()
-        .is_empty());
+    else {
+        panic!("an initial private-thread page has no cursor to reject");
+    };
+    assert!(after_cleanup.is_empty());
     let ListWorkspaceSessionsOutcome::Page(retained_access_history) = threads
         .list_workspace_sessions_for_owner(&tenant, owner, intended.thread_id, None, 10)
         .await

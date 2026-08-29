@@ -189,6 +189,15 @@ ALTER TABLE agent_thread_ssh_grant
   VALIDATE CONSTRAINT agent_thread_ssh_grant_consumed_after_issue;
 "#;
 
+pub const AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_thread_owner_created_recent
+  ON agent_thread (
+    tenant_id, region, owner_principal_id,
+    created_at DESC, conversation_id DESC, thread_id DESC
+  )
+  WHERE state <> 'deleted';
+"#;
+
 pub fn agent_thread_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0124_agent_thread", AGENT_THREAD_MIGRATION),
@@ -209,5 +218,14 @@ pub fn agent_thread_ssh_single_use_migrations() -> Migrations {
     Migrations::of([Migration::plain(
         "0141_agent_thread_ssh_single_use",
         AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
+    )])
+}
+
+pub fn agent_thread_recent_list_migrations() -> Migrations {
+    Migrations::of([Migration::phased(
+        "0142_agent_thread_recent_list_index",
+        AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,
+        crate::MigrationPhase::Expand,
+        "agent_thread",
     )])
 }
