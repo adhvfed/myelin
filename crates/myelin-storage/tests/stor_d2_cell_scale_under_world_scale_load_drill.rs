@@ -3,11 +3,9 @@ use std::path::Path;
 use myelin_harness::load_generator::{
     LoadGenerator, Multiplier, PrincipalMix, Request, Sink, StormProfile,
 };
-use myelin_storage::migration::{HotTables, Migration, MigrationPhase, Migrations};
 use myelin_storage::{
-    ContinuousArchiver, ErasureLedger, GateInputs, KekId, KeyClass, KmsEngine, LockBudget,
-    MigrationUnderLoad, RestoreVerifyGate, RestoredObject, SourceLog, WalRow, WalSegment,
-    WriteLoad,
+    ContinuousArchiver, ErasureLedger, GateInputs, KekId, KeyClass, KmsEngine, RestoreVerifyGate,
+    RestoredObject, SourceLog, WalRow, WalSegment,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -39,18 +37,6 @@ fn int_threshold(doc: &toml::Value, table: &str, key: &str) -> u64 {
 
 fn pool_tenants_max() -> u32 {
     int_threshold(&thresholds_doc(), "cell_sizing", "pool_tenants_max") as u32
-}
-
-fn lock_budget_from_thresholds() -> LockBudget {
-    let doc = thresholds_doc();
-    LockBudget::new(
-        int_threshold(&doc, "online_migration", "lock_wait_p99_max_ms"),
-        doc.get("online_migration")
-            .and_then(|t| t.get("downtime_max_ms"))
-            .and_then(|v| v.as_integer())
-            .map(|v| v as u64)
-            .unwrap_or(0),
-    )
 }
 
 fn surge_multiplier() -> u32 {
@@ -150,32 +136,7 @@ fn verify_one_tenant_restore(tenant: &TenantId) -> u64 {
     artifact.restored_to_offset
 }
 
-fn online_migration() -> (Migrations, HotTables) {
-    let hot = HotTables::declare(["issue"]);
-    let migrations = Migrations::of([
-        Migration::phased(
-            "0010_expand",
-            "ALTER TABLE issue ADD COLUMN priority INT;",
-            MigrationPhase::Expand,
-            "issue",
-        ),
-        Migration::phased(
-            "0011_backfill",
-            "UPDATE issue SET priority = 0 WHERE priority IS NULL;",
-            MigrationPhase::Backfill,
-            "issue",
-        ),
-        Migration::phased(
-            "0012_contract",
-            "ALTER TABLE issue ADD COLUMN status TEXT NOT NULL DEFAULT 'open';",
-            MigrationPhase::Contract,
-            "issue",
-        ),
-    ]);
-    (migrations, hot)
-}
-
-fn reconfirm_cell_scale(tenant_count: u32, base_load_requests: u64) -> (u32, u64, u64) {
+fn reconfirm_cell_scale(tenant_count: u32, base_load_requests: u64) -> (u32, u64) {
     let tenants: Vec<TenantId> = (0..tenant_count)
         .map(|i| TenantId(format!("cell-tenant-{i:05}")))
         .collect();
@@ -190,45 +151,29 @@ fn reconfirm_cell_scale(tenant_count: u32, base_load_requests: u64) -> (u32, u64
         );
     }
 
-    let budget = lock_budget_from_thresholds();
-    let (migrations, hot) = online_migration();
-    let load = WriteLoad::prod_scale(50_000_000, 256);
-    let artifact = MigrationUnderLoad::new()
-        .run_or_fail(&migrations, &hot, load, 100, budget)
-        .expect("STOR-D8 at prod scale: the online idiom must hold the lock budget under load");
-    assert_eq!(artifact.downtime_ms, 0, "STOR-D8: 0 downtime at cell scale");
-    assert!(
-        artifact.lock_wait_p99_ms <= budget.lock_wait_p99_max_ms,
-        "STOR-D8: lock-wait p99 {} ms ≤ budget {} ms",
-        artifact.lock_wait_p99_ms,
-        budget.lock_wait_p99_max_ms
-    );
-
-    (tenant_count, load_requests, artifact.lock_wait_p99_ms)
+    (tenant_count, load_requests)
 }
 
 #[test]
-fn stor_d2_d8_cell_scale_under_world_scale_load_sched() {
+fn stor_d2_cell_scale_under_world_scale_load_sched() {
     let tenant_count = pool_tenants_max();
     assert!(
         tenant_count >= 1000,
         "the measured cell-scale tenant count must be a full cell ({tenant_count} tenants)"
     );
-    let (n, load_requests, p99) = reconfirm_cell_scale(tenant_count, 64);
+    let (n, load_requests) = reconfirm_cell_scale(tenant_count, 64);
     println!(
-        "[P-444 STOR-D1/D2/D8@cell-scale GREEN 2026-06-24] {n} restored tenants re-confirmed whole \
-         (STOR-D1/D2) UNDER world-scale load ({load_requests} requests, {}× agent-skewed CI-surge); \
-         STOR-D8 prod-scale online migration held the lock budget (p99 {p99} ms, 0 downtime). \
-         No threshold weakened.",
+        "[P-444 STOR-D1/D2@cell-scale GREEN 2026-06-24] {n} restored tenants re-confirmed whole \
+         under generated load ({load_requests} requests, {}× agent-skewed CI-surge).",
         surge_multiplier()
     );
 }
 
 #[test]
-fn stor_d2_d8_cell_scale_ci_smoke() {
-    let (n, load_requests, p99) = reconfirm_cell_scale(8, 16);
+fn stor_d2_cell_scale_ci_smoke() {
+    let (n, load_requests) = reconfirm_cell_scale(8, 16);
     assert_eq!(n, 8);
-    assert!(load_requests > 0 && p99 <= lock_budget_from_thresholds().lock_wait_p99_max_ms);
+    assert!(load_requests > 0);
 }
 
 #[test]
@@ -269,36 +214,5 @@ fn stor_d1_cell_scale_one_corrupt_tenant_fails_the_gate() {
     assert!(
         matches!(err, GateFailure::ChecksumMismatch { .. }),
         "the cell-scale gate surfaces the checksum mismatch: {err}"
-    );
-}
-
-#[test]
-fn stor_d8_cell_scale_a_blocking_alter_fails() {
-    use myelin_storage::MigrationLoadFailure;
-    let hot = HotTables::declare(["issue"]);
-    let migrations = Migrations::of([Migration::phased(
-        "0099_rewrite",
-        "ALTER TABLE issue ALTER COLUMN priority TYPE BIGINT;",
-        MigrationPhase::Expand,
-        "issue",
-    )]);
-    let budget = lock_budget_from_thresholds();
-    let load = WriteLoad::prod_scale(50_000_000, 256);
-    let verdict = MigrationUnderLoad::new().run(&migrations, &hot, load, 100, budget);
-    assert!(
-        !verdict.is_green(),
-        "a blocking ALTER at cell scale MUST FAIL STOR-D8 (no lowered bar)"
-    );
-    assert!(
-        matches!(
-            verdict.failure(),
-            Some(
-                MigrationLoadFailure::RunnerRefused(_)
-                    | MigrationLoadFailure::DowntimeIncurred { .. }
-                    | MigrationLoadFailure::LockBudgetExceeded { .. }
-            )
-        ),
-        "the cell-scale STOR-D8 red names the precise blocking migration: {:?}",
-        verdict.failure()
     );
 }

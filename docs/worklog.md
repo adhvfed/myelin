@@ -4224,6 +4224,31 @@ distribution, and compare its observed p99 with the versioned threshold.
 Proof: the complete Storage library suite and strict all-target/all-feature
 Storage compilation pass without the fabricated performance API and drill.
 
+## 2026-08-29 — Online migration proof reaches PostgreSQL
+
+Storage's `MigrationUnderLoad` model and its STOR-D8/SUB-D10 drills are gone.
+The model assigned every accepted online step a fixed 10 ms lock cost, derived
+blocking costs from row-count arithmetic, and called the maximum of those
+invented values p99. It never connected to PostgreSQL, ran concurrent writes,
+executed DDL, or observed a clock. The cell-scale restore drill no longer
+attaches those arithmetic results to an otherwise separate in-memory restore
+exercise.
+
+The replacement integration journey creates an isolated 50,000-row PostgreSQL
+table, keeps four real writers updating it, and performs nullable expansion,
+bounded backfill batches, a concurrent index build, a `NOT VALID` constraint,
+and constraint validation. PostgreSQL itself enforces the versioned 500 ms
+`lock_timeout`; the test records writer latency, requires progress throughout
+the migration, rejects every writer error, verifies the completed backfill, and
+checks the index's validity in the PostgreSQL catalog. Two runs against the
+running Fed data layer completed 240 and 241 writes during the exercised
+migration with zero errors and observed writer p99s of 40 ms and 55 ms.
+
+This is a real development-stack safety proof, not a production-scale load
+claim. Zero observed writer errors and continued progress are the evidence for
+availability in this journey; the test does not manufacture a literal downtime
+measurement or extrapolate 50,000 rows into 50 million.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

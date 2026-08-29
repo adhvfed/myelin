@@ -20,7 +20,6 @@ pub mod firehose_archive;
 pub mod gitpack;
 pub mod kms;
 pub mod migration;
-pub mod migration_under_load;
 pub mod mirror;
 pub mod money;
 pub mod object_packs;
@@ -130,10 +129,6 @@ pub use kms::{
 pub use migration::{
     is_blocking_alter, is_destructive, HotTables, Migration, MigrationError, MigrationPhase,
     Migrations, OnlineMigrationRunner, PhaseProgress,
-};
-pub use migration_under_load::{
-    lock_cost_ms, LockBudget, LockClass, MigrationLoadArtifact, MigrationLoadFailure,
-    MigrationLoadVerdict, MigrationUnderLoad, StepLockMeasure, WriteLoad,
 };
 pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
 pub use money::MicroUsd;
