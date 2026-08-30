@@ -110,7 +110,9 @@ impl DurableAgentThreadBacking {
                             AND agent.principal_id = 'agent:' || thread.agent_id::text
                           WHERE thread.tenant_id = $1 AND thread.region = $2
                             AND thread.thread_id = $3 AND thread.owner_principal_id = $10
-                            AND thread.state = 'ready' AND thread.expires_at >= $9
+                            AND thread.state = 'ready'
+                            AND thread.publication_completed_at IS NOT NULL
+                            AND thread.expires_at >= $9
                             AND owner.kind = $11 AND owner.status = $12 AND agent.status = $12
                          ON CONFLICT DO NOTHING
                          RETURNING grant_id, route_username, thread_id, owner_principal_id,
@@ -273,7 +275,9 @@ pub(super) async fn lookup_live_authority(
             AND access.revoked_at IS NULL
             AND (NOT $10 OR access.consumed_at IS NULL)
             AND access.issued_at <= $6 AND access.expires_at > $6
-            AND thread.state = 'ready' AND thread.expires_at > $7
+            AND thread.state = 'ready'
+            AND thread.publication_completed_at IS NOT NULL
+            AND thread.expires_at > $7
             AND access.owner_principal_id = thread.owner_principal_id
             AND access.workspace_id = thread.workspace_id
             AND access.workspace_generation = thread.workspace_generation
@@ -312,7 +316,9 @@ pub(super) async fn consume_live_authority(
             AND thread.tenant_id = access.tenant_id
             AND thread.region = access.region
             AND thread.thread_id = access.thread_id
-            AND thread.state = 'ready' AND thread.expires_at > $7
+            AND thread.state = 'ready'
+            AND thread.publication_completed_at IS NOT NULL
+            AND thread.expires_at > $7
             AND access.owner_principal_id = thread.owner_principal_id
             AND access.workspace_id = thread.workspace_id
             AND access.workspace_generation = thread.workspace_generation

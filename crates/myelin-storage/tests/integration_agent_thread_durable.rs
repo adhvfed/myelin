@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use myelin_config::MyelinConfig;
 use myelin_events::IdMinter;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
@@ -45,7 +45,9 @@ fn unique() -> String {
 }
 
 fn proposal(owner: &str, agent_id: Uuid, suffix: u128) -> NewAgentThread {
-    let created_at = Utc.timestamp_opt(1_787_356_800, 0).single().unwrap();
+    let created_at = Utc::now()
+        .with_nanosecond(0)
+        .expect("zero nanoseconds is a valid test timestamp");
     NewAgentThread {
         thread_id: Uuid::from_u128(suffix),
         owner_principal_id: owner.into(),
@@ -264,7 +266,12 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         myelin_storage::AgentThreadState::Provisioning
     );
     assert_eq!(created.retention_days, 3);
-    assert_eq!(created.expires_at, "2026-08-25T00:00:00Z");
+    assert_eq!(
+        created.expires_at,
+        intended
+            .expires_at
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
     assert!(created.storage_locator.is_none());
 
     assert!(threads
@@ -301,6 +308,40 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             .unwrap(),
         ActivateAgentThreadOutcome::Conflict,
         "partial storage cannot become accessible while its durable receipt is failed"
+    );
+
+    let automatically_claimed = threads
+        .claim_provisioning_recovery(
+            &tenant,
+            intended.created_at + Duration::minutes(1),
+            intended.created_at + Duration::minutes(2),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(automatically_claimed.len(), 1);
+    assert_eq!(automatically_claimed[0].thread_id, created.thread_id);
+    assert_eq!(
+        automatically_claimed[0].conversation_id,
+        created.conversation_id
+    );
+    assert_eq!(automatically_claimed[0].workspace_id, created.workspace_id);
+    assert_eq!(
+        automatically_claimed[0].state,
+        myelin_storage::AgentThreadState::Provisioning
+    );
+    assert!(
+        threads
+            .claim_provisioning_recovery(
+                &tenant,
+                intended.created_at + Duration::minutes(1),
+                intended.created_at + Duration::minutes(2),
+                10,
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "the refreshed claim lease prevents a concurrent recovery sweep"
     );
 
     assert_eq!(
@@ -421,13 +462,101 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         )
         .await
         .unwrap();
-    let ActivateAgentThreadOutcome::Activated(ready) = activated else {
+    let ActivateAgentThreadOutcome::Activated(workspace_ready) = activated else {
         panic!("the exact provisioning receipt should activate: {activated:?}");
     };
-    assert_eq!(ready.state, myelin_storage::AgentThreadState::Ready);
     assert_eq!(
-        ready.storage_locator.as_deref(),
+        workspace_ready.state,
+        myelin_storage::AgentThreadState::Ready
+    );
+    assert_eq!(
+        workspace_ready.storage_locator.as_deref(),
         Some("workspace://local/101")
+    );
+    assert!(workspace_ready.publication_completed_at.is_none());
+    let owner_visible_unpublished = threads
+        .get_live_exact_for_owner(&tenant, owner, &[intended.thread_id])
+        .await
+        .unwrap();
+    assert_eq!(owner_visible_unpublished.len(), 1);
+    assert!(!owner_visible_unpublished[0].is_published());
+    let prepublication_grant_id = Uuid::from_u128(150);
+    let prepublication_route_key =
+        WorkspaceSshRouteKey::from_seal_key(&SealKey::from_bytes([0x50; 32]));
+    assert_eq!(
+        threads
+            .create_ssh_grant(
+                &tenant,
+                NewWorkspaceSshGrant {
+                    grant_id: prepublication_grant_id,
+                    route_username: prepublication_route_key
+                        .seal(&tenant, prepublication_grant_id)
+                        .unwrap(),
+                    thread_id: intended.thread_id,
+                    owner_principal_id: owner.into(),
+                    public_key_fingerprint: format!("SHA256:{}", "P".repeat(43)),
+                    client_nonce: "unpublished-workspace-must-stay-closed".into(),
+                    issued_at: intended.created_at + Duration::minutes(30),
+                    expires_at: intended.created_at + Duration::minutes(35),
+                },
+            )
+            .await
+            .unwrap(),
+        CreateWorkspaceSshGrantOutcome::ThreadUnavailable,
+        "an activated workspace cannot issue SSH authority before Chat publication"
+    );
+    let recovery_claimed_at = Utc::now() + Duration::seconds(2);
+    let publication_recovery = threads
+        .claim_provisioning_recovery(
+            &tenant,
+            recovery_claimed_at - Duration::seconds(1),
+            recovery_claimed_at,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(publication_recovery.len(), 1);
+    assert_eq!(publication_recovery[0].thread_id, workspace_ready.thread_id);
+    assert_eq!(
+        publication_recovery[0].conversation_id,
+        workspace_ready.conversation_id
+    );
+    assert_eq!(
+        publication_recovery[0].workspace_id,
+        workspace_ready.workspace_id
+    );
+    assert_eq!(
+        publication_recovery[0].state,
+        myelin_storage::AgentThreadState::Ready,
+        "recovery preserves the activated workspace instead of reprovisioning it"
+    );
+    let ready = threads
+        .complete_publication(
+            &tenant,
+            owner,
+            intended.thread_id,
+            &intended.conversation_id,
+            recovery_claimed_at + Duration::seconds(1),
+        )
+        .await
+        .unwrap()
+        .expect("the exact Chat publication completes the aggregate");
+    assert!(ready.is_published());
+    assert_eq!(
+        threads
+            .complete_publication(
+                &tenant,
+                owner,
+                intended.thread_id,
+                &intended.conversation_id,
+                recovery_claimed_at + Duration::seconds(2),
+            )
+            .await
+            .unwrap()
+            .expect("a repeated publication completion is the same receipt")
+            .publication_completed_at,
+        ready.publication_completed_at,
+        "publication completion keeps its first durable timestamp"
     );
     assert_eq!(
         threads

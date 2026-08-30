@@ -147,6 +147,7 @@ services:
       MYELIN_DEV_LOGIN: "1"
       MYELIN_TOKEN_LOGIN: "1"
       MYELIN_ISSUES_RECONCILE_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"
+      MYELIN_AGENT_THREAD_RECOVERY_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"
     healthcheck:
       http_get: "http://127.0.0.1:{{EDGE_PORT}}/readyz"
       timeout: 120s

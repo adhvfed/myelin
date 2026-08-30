@@ -226,6 +226,50 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_thread_workspace_session_launched_
   WHERE launched_at IS NOT NULL;
 "#;
 
+pub const AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  ADD COLUMN IF NOT EXISTS publication_completed_at timestamptz;
+"#;
+
+pub const AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION: &str = r#"
+DO $migration$
+BEGIN
+  IF to_regclass('public.chat_conversation') IS NOT NULL THEN
+    UPDATE agent_thread thread
+       SET publication_completed_at = thread.updated_at
+      FROM chat_conversation conversation
+     WHERE thread.tenant_id = conversation.tenant_id
+       AND thread.region = conversation.region
+       AND thread.conversation_id = conversation.conversation_id
+       AND thread.state = 'ready'
+       AND thread.publication_completed_at IS NULL
+       AND conversation.acl_zookie IS NOT NULL;
+  END IF;
+END
+$migration$;
+"#;
+
+pub const AGENT_THREAD_PUBLICATION_RECOVERY_INDEX: &str = "agent_thread_provisioning_recovery";
+
+pub const AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_thread_provisioning_recovery
+  ON agent_thread (tenant_id, region, updated_at, thread_id)
+  WHERE state IN ('provisioning', 'failed')
+     OR (state = 'ready' AND publication_completed_at IS NULL);
+"#;
+
+pub const AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  DROP CONSTRAINT IF EXISTS agent_thread_publication_after_creation;
+ALTER TABLE agent_thread
+  ADD CONSTRAINT agent_thread_publication_after_creation
+  CHECK (publication_completed_at IS NULL
+    OR (state IN ('ready', 'expiring', 'deleted')
+      AND publication_completed_at >= created_at)) NOT VALID;
+ALTER TABLE agent_thread
+  VALIDATE CONSTRAINT agent_thread_publication_after_creation;
+"#;
+
 pub fn agent_thread_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0124_agent_thread", AGENT_THREAD_MIGRATION),
@@ -287,6 +331,35 @@ pub fn agent_thread_session_launch_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_publication_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0147_agent_thread_publication_expand",
+            AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0148_agent_thread_publication_backfill",
+            AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0149_agent_thread_publication_invariant",
+            AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0150_agent_thread_publication_recovery_index",
+            AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread",
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +381,24 @@ mod tests {
         assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
         assert_eq!(migrations.0[3].phase, MigrationPhase::Expand);
         assert!(AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION.contains("CONCURRENTLY"));
+    }
+
+    #[test]
+    fn thread_publication_is_backfilled_only_from_visible_chat_and_indexed_online() {
+        let migrations = agent_thread_publication_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["agent_thread"]))
+            .expect("the live agent thread publication migration is online-safe");
+        assert_eq!(migrations.0.len(), 4);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+        assert_eq!(migrations.0[3].phase, MigrationPhase::Expand);
+        assert!(AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION.contains("to_regclass"));
+        assert!(AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION.contains("acl_zookie IS NOT NULL"));
+        assert!(AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION.contains("CONCURRENTLY"));
+        assert!(AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION
+            .contains(AGENT_THREAD_PUBLICATION_RECOVERY_INDEX));
     }
 }

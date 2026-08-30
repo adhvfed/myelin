@@ -197,6 +197,7 @@ export MYELIN_GIT_ROOT="${git_root}"   # on-disk bare-repo root
 export MYELIN_CI_CHECKOUT_REPO_ROOT="${git_root}"  # checkout runner's boot-validated bare-repo root
 export MYELIN_REGION="${region}"       # residency region
 export MYELIN_ISSUES_RECONCILE_TENANTS="\${MYELIN_ISSUES_RECONCILE_TENANTS:-acme}"  # explicit FORCE-RLS partitions; defaults to the runbook's canonical self-host tenant
+export MYELIN_AGENT_THREAD_RECOVERY_TENANTS="\${MYELIN_AGENT_THREAD_RECOVERY_TENANTS:-acme}"  # explicit FORCE-RLS partitions for private-work recovery
 export MYELIN_SELF_HOST_ISSUES_PROJECT="\${MYELIN_SELF_HOST_ISSUES_PROJECT:-${SELF_HOST_ISSUES_PROJECT}}"  # canonical founder project UUID (bootstrap reader grant)
 export MYELIN_SELF_HOST_ISSUES_TYPE="\${MYELIN_SELF_HOST_ISSUES_TYPE:-${SELF_HOST_ISSUES_TYPE}}"        # explicit v1 type UUID (no type catalogue/FK yet)
 export MYELIN_SELF_HOST_ISSUES_PREFIX="\${MYELIN_SELF_HOST_ISSUES_PREFIX:-${SELF_HOST_ISSUES_PREFIX}}"                                     # canonical founder issue-key prefix

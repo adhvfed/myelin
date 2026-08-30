@@ -4471,6 +4471,38 @@ OpenSSH (3 stories in 9.41 seconds); and the live Chromium private-agent product
 accessibility scan (5.7 seconds). A boot-wide unattended provisioning sweeper remains open, but a
 failed receipt is no longer abandoned merely because its creating browser or CLI process exited.
 
+## 2026-08-30 — Private-work provisioning now recovers after an Edge restart
+
+Manual retry closed the visible failed-state journey, but an Edge process could still exit after
+allocating a durable receipt, activating its workspace, or publishing the private Chat ACL. The
+first two states looked alike in storage, and the last crash window left a `ready` row whose Chat
+publication could not be distinguished from a completed aggregate. An operator restart therefore
+had no safe way to decide which work to resume, while treating every `ready` row as usable could
+expose workspace, run, or SSH authority before the private conversation was fully published.
+
+Agent threads now retain an explicit `publication_completed_at` receipt. Workspace activation and
+Chat publication remain separate retry-safe steps: an internally ready but unpublished row is
+projected publicly as `provisioning`, and every workspace, run, and SSH authority path requires the
+publication receipt. The online migration backfills only ready rows whose durable Chat conversation
+already has its ACL stamp, preserves the receipt through expiry and deletion, and indexes unfinished
+work for recovery. Repeating publication is a true durable no-op, including `updated_at`.
+
+Edge now starts a bounded recovery worker over explicit FORCE-RLS tenant partitions. It claims
+stale `provisioning`, `failed`, and ready-but-unpublished rows with `FOR UPDATE SKIP LOCKED`, refreshes
+their lease, and reuses the production provisioning operation with the original owner, thread,
+conversation, workspace, and mutation identities. Empty, malformed, duplicate, or unbounded tenant
+configuration fails startup, the concurrent recovery index is verified fail-closed at boot, and the
+worker drains through Edge's normal graceful shutdown.
+
+Proof includes all 352 Storage and 370 Edge library stories and strict all-target/all-feature Clippy;
+the constrained-role PostgreSQL lifecycle covering both recovery windows, pre-publication SSH
+denial, stable completion replay, and later cleanup; the live TypeScript private-work journey through
+Edge, Chat, workspaces, PostgreSQL, and pinned OpenSSH (3 stories in 11.91 seconds); and the live
+Chromium product journey (5.6 seconds). A separate operational boot proof created a real thread
+through the public API, stopped Edge, removed only its publication receipt to reproduce the exact
+post-ACL crash state, and started the unchanged production binary. The boot worker restored that
+same thread's receipt and lease in PostgreSQL without a fake service or test-only endpoint.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

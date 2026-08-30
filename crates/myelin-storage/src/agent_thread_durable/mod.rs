@@ -17,13 +17,17 @@ pub use model::{
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
-    agent_thread_durable_migrations, agent_thread_recent_list_migrations,
-    agent_thread_session_launch_migrations, agent_thread_ssh_single_use_migrations,
-    AGENT_THREAD_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_RLS_POLICY,
-    AGENT_THREAD_RUN_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION,
-    AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION,
-    AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
-    AGENT_THREAD_SSH_SINGLE_USE_MIGRATION, AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
+    agent_thread_durable_migrations, agent_thread_publication_migrations,
+    agent_thread_recent_list_migrations, agent_thread_session_launch_migrations,
+    agent_thread_ssh_single_use_migrations, AGENT_THREAD_MIGRATION,
+    AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
+    AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX,
+    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,
+    AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
+    AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,
+    AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION,
+    AGENT_THREAD_SSH_GRANT_MIGRATION, AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
+    AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
 };
 pub use ssh_access::{
     CreateWorkspaceSshGrantOutcome, DurableWorkspaceSshGrant, LiveWorkspaceSshAdmission,
@@ -46,6 +50,7 @@ use crate::{
 
 const RESUMABLE_AGENT_RUNTIME_REF: &str = "external:mcp";
 const EXACT_AGENT_THREAD_BATCH_MAX: usize = 10_000;
+const MAX_AGENT_THREAD_RECOVERY_BATCH: u32 = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListAgentThreadsOutcome {
@@ -97,7 +102,8 @@ impl DurableAgentThreadBacking {
                                 AND owner_principal_id = $4 AND state = 'failed'
                             RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                               conversation_id, workspace_id, workspace_generation, name, project_id,
-                              retention_days, state, storage_locator, failure_reason, created_at,
+                              retention_days, state, storage_locator, publication_completed_at,
+                              failure_reason, created_at,
                               expires_at, updated_at",
                         )
                         .bind(&tenant)
@@ -182,7 +188,8 @@ impl DurableAgentThreadBacking {
                          ON CONFLICT DO NOTHING
                          RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
-                           retention_days, state, storage_locator, failure_reason, created_at,
+                           retention_days, state, storage_locator, publication_completed_at,
+                           failure_reason, created_at,
                            expires_at, updated_at",
                     )
                     .bind(&tenant)
@@ -275,7 +282,8 @@ impl DurableAgentThreadBacking {
                             AND conversation_id = $7 AND state = 'provisioning'
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
-                          retention_days, state, storage_locator, failure_reason, created_at,
+                          retention_days, state, storage_locator, publication_completed_at,
+                          failure_reason, created_at,
                           expires_at, updated_at",
                     )
                     .bind(&tenant)
@@ -336,6 +344,112 @@ impl DurableAgentThreadBacking {
             .await
     }
 
+    pub async fn complete_publication(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        thread_id: Uuid,
+        conversation_id: &str,
+        completed_at: DateTime<Utc>,
+    ) -> Result<Option<DurableAgentThread>, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        let conversation = conversation_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "UPDATE agent_thread
+                            SET publication_completed_at = COALESCE(publication_completed_at, $6),
+                                updated_at = CASE WHEN publication_completed_at IS NULL
+                                  THEN GREATEST(updated_at, $6) ELSE updated_at END
+                          WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                            AND owner_principal_id = $4 AND conversation_id = $5
+                            AND state = 'ready' AND storage_locator IS NOT NULL
+                        RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
+                          conversation_id, workspace_id, workspace_generation, name, project_id,
+                          retention_days, state, storage_locator, publication_completed_at,
+                          failure_reason, created_at, expires_at, updated_at",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(thread_id)
+                    .bind(&owner)
+                    .bind(&conversation)
+                    .bind(completed_at)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("complete agent thread publication"))?;
+                    row.as_ref().map(row_to_thread).transpose()
+                })
+            })
+            .await
+    }
+
+    pub async fn claim_provisioning_recovery(
+        &self,
+        tenant: &str,
+        stale_before: DateTime<Utc>,
+        claimed_at: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<DurableAgentThread>, ProviderError> {
+        if !(1..=MAX_AGENT_THREAD_RECOVERY_BATCH).contains(&limit) {
+            return Err(query(
+                "agent thread recovery limit must be between 1 and 100",
+            ));
+        }
+        if stale_before > claimed_at {
+            return Err(query(
+                "agent thread recovery lease boundary is in the future",
+            ));
+        }
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "WITH recoverable AS (
+                           SELECT thread_id
+                             FROM agent_thread
+                            WHERE tenant_id = $1 AND region = $2
+                              AND expires_at > $4 AND updated_at <= $3
+                              AND (state IN ('provisioning', 'failed')
+                                OR (state = 'ready' AND publication_completed_at IS NULL))
+                            ORDER BY updated_at, thread_id
+                            LIMIT $5
+                            FOR UPDATE SKIP LOCKED
+                         )
+                         UPDATE agent_thread thread
+                            SET state = CASE WHEN thread.state = 'failed'
+                                             THEN 'provisioning' ELSE thread.state END,
+                                failure_reason = NULL, updated_at = $4
+                           FROM recoverable
+                          WHERE thread.tenant_id = $1 AND thread.region = $2
+                            AND thread.thread_id = recoverable.thread_id
+                        RETURNING thread.tenant_id, thread.region, thread.thread_id,
+                          thread.owner_principal_id, thread.agent_id, thread.conversation_id,
+                          thread.workspace_id, thread.workspace_generation, thread.name,
+                          thread.project_id, thread.retention_days, thread.state,
+                          thread.storage_locator, thread.publication_completed_at,
+                          thread.failure_reason, thread.created_at, thread.expires_at,
+                          thread.updated_at",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(stale_before)
+                    .bind(claimed_at)
+                    .bind(i64::from(limit))
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(query_error("claim agent thread provisioning recovery"))?;
+                    rows.iter().map(row_to_thread).collect()
+                })
+            })
+            .await
+    }
+
     /// Reopens one owner's durable provisioning receipt without requiring the
     /// original request nonce. The thread, conversation, and workspace
     /// identities remain unchanged, so a response-lost retry is the same
@@ -382,7 +496,8 @@ impl DurableAgentThreadBacking {
                                     AND owner_principal_id = $4 AND state = 'failed'
                                 RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                                   conversation_id, workspace_id, workspace_generation, name, project_id,
-                                  retention_days, state, storage_locator, failure_reason, created_at,
+                                  retention_days, state, storage_locator, publication_completed_at,
+                                  failure_reason, created_at,
                                   expires_at, updated_at",
                             )
                             .bind(&tenant)
@@ -470,7 +585,8 @@ impl DurableAgentThreadBacking {
                     let rows = sqlx::query(
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
-                           retention_days, state, storage_locator, failure_reason, created_at,
+                           retention_days, state, storage_locator, publication_completed_at,
+                           failure_reason, created_at,
                            expires_at, updated_at
                         FROM agent_thread
                         WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3
@@ -522,7 +638,8 @@ impl DurableAgentThreadBacking {
                     let rows = sqlx::query(
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
-                           retention_days, state, storage_locator, failure_reason, created_at,
+                           retention_days, state, storage_locator, publication_completed_at,
+                           failure_reason, created_at,
                            expires_at, updated_at
                          FROM agent_thread
                         WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3
@@ -655,7 +772,7 @@ async fn by_nonce(
     let row = sqlx::query(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
-           retention_days, state, storage_locator, failure_reason, created_at,
+           retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
         WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3 AND client_nonce = $4
@@ -680,7 +797,7 @@ async fn by_id(
     let row = sqlx::query(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
-           retention_days, state, storage_locator, failure_reason, created_at,
+           retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
         WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
@@ -715,6 +832,9 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
         retention_days: row.get("retention_days"),
         state,
         storage_locator: row.get("storage_locator"),
+        publication_completed_at: row
+            .get::<Option<DateTime<Utc>>, _>("publication_completed_at")
+            .map(DurableAgentThread::timestamp),
         failure_reason: row.get("failure_reason"),
         created_at: DurableAgentThread::timestamp(row.get("created_at")),
         expires_at: DurableAgentThread::timestamp(row.get("expires_at")),

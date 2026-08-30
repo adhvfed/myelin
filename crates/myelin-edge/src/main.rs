@@ -16,14 +16,14 @@ use myelin_edge::{
     register_privacy, register_projects, register_refs, register_tools,
     serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AgentMcpAuthority,
     AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices, AgentThreadHttpInputs,
-    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
-    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableAgentThreadReferenceApi,
-    DurableAgentWorkspaceAccess, DurableChatMutationApi, DurableChatReadApi,
-    DurableChatReferenceApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeMutationApi,
-    DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
-    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
-    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
-    WorkspaceSshEndpoint,
+    AgentThreadRecoveryConfig, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy,
+    BootstrapParams, CheckBackedRepoAuthorizer, DeviceAuthorizationBroker,
+    DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess, DurableChatMutationApi,
+    DurableChatReadApi, DurableChatReferenceApi, DurableCiReadApi, DurableGitBackend,
+    DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway, GitDatabaseProviders,
+    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
+    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
 };
 use myelin_events::OutboxStore;
 use myelin_identity::{
@@ -668,6 +668,13 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         .await
     {
         eprintln!("edge: cannot apply the durable migration aggregate: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .verify_index_ready(myelin_storage::AGENT_THREAD_PUBLICATION_RECOVERY_INDEX)
+        .await
+    {
+        eprintln!("edge: agent thread recovery index is not ready: {e}");
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
@@ -1425,7 +1432,13 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             handle.clone(),
         ),
     );
-    builder = register_agent_threads(
+    let agent_thread_recovery_config =
+        AgentThreadRecoveryConfig::from_env(Region::new(provider.config().region.clone()))
+            .unwrap_or_else(|error| {
+                eprintln!("edge: agent thread recovery refused to start: {error}");
+                std::process::exit(1);
+            });
+    let (next_builder, agent_thread_recovery) = register_agent_threads(
         builder,
         AgentThreadHttpInputs {
             threads: agent_threads,
@@ -1436,8 +1449,10 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             ssh_routes: workspace_ssh_routes,
             ssh_endpoint: workspace_ssh_endpoint,
             runtime: handle.clone(),
+            recovery: agent_thread_recovery_config,
         },
     );
+    builder = next_builder;
     builder = register_tools(builder);
     builder = register_chat(builder, mcp_chat, chat_principals);
     builder = register_knowledge(builder, knowledge_mutations);
@@ -1484,6 +1499,10 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     let reconciliation_result = issue_reconciler.shutdown().await;
     if let Err(e) = reconciliation_result {
         eprintln!("edge: Issues authorization reconciler did not drain cleanly: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = agent_thread_recovery.shutdown().await {
+        eprintln!("edge: agent thread recovery did not drain cleanly: {e}");
         std::process::exit(1);
     }
     if let Err(e) = server_result {

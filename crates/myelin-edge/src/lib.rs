@@ -58,7 +58,10 @@ pub use agent_mcp_http::{
     register_agent_mcp, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources,
     AgentMcpServices,
 };
-pub use agent_thread_http::{register_agent_threads, AgentThreadHttpInputs};
+pub use agent_thread_http::{
+    register_agent_threads, AgentThreadHttpInputs, AgentThreadRecoveryConfig,
+    AgentThreadRecoveryHandle, AGENT_THREAD_RECOVERY_TENANTS_ENV,
+};
 pub use agent_thread_reconcile::{
     AgentThreadReconciler, AgentThreadReconciliationError, AgentThreadReconciliationReport,
 };

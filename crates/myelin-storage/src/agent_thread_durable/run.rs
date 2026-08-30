@@ -56,7 +56,9 @@ impl DurableAgentThreadBacking {
                             AND thread.thread_id = $3 AND run.run_id = $4
                             AND thread.owner_principal_id = $5
                             AND run.trigger_actor_id = $5
-                            AND thread.state = 'ready' AND thread.expires_at > $6
+                            AND thread.state = 'ready'
+                            AND thread.publication_completed_at IS NOT NULL
+                            AND thread.expires_at > $6
                             AND run.state = 'ready' AND run.expires_at > $6
                             AND run.expires_at <= thread.expires_at
                          ON CONFLICT (tenant_id, region, run_id) DO NOTHING
@@ -145,7 +147,9 @@ impl DurableAgentThreadBacking {
                             AND binding.run_id = $3 AND run.agent_id = $4
                             AND run.token_jti = $5
                             AND run.state = 'ready' AND run.expires_at > $6
-                            AND thread.state = 'ready' AND thread.expires_at > $6
+                            AND thread.state = 'ready'
+                            AND thread.publication_completed_at IS NOT NULL
+                            AND thread.expires_at > $6
                             AND binding.conversation_id = thread.conversation_id
                             AND binding.workspace_id = thread.workspace_id
                             AND binding.workspace_generation = thread.workspace_generation",
@@ -193,7 +197,9 @@ async fn binding_for_intent(
             AND binding.thread_id = $3 AND binding.run_id = $4
             AND thread.owner_principal_id = $5 AND run.trigger_actor_id = $5
             AND run.agent_id = thread.agent_id
-            AND thread.state = 'ready' AND thread.expires_at > $6
+            AND thread.state = 'ready'
+            AND thread.publication_completed_at IS NOT NULL
+            AND thread.expires_at > $6
             AND run.state = 'ready' AND run.expires_at > $6
             AND run.expires_at <= thread.expires_at
             AND binding.conversation_id = thread.conversation_id

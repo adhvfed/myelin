@@ -6,6 +6,7 @@ use serde::Serialize;
 use sqlx::types::Uuid;
 use std::sync::Arc;
 
+use crate::agent_thread_http::agent_thread_public_state;
 use crate::ci_http::{canonical_uuid, repo_slug_from_ref, DurableCiReadApi};
 use crate::{
     DurableAgentThreadReferenceApi, DurableChatReferenceApi, DurableGitBackend,
@@ -252,12 +253,8 @@ impl ReferenceCardProjector for AgentThreadReferenceCardProjector {
             let Some(references) = canonical_references.get(&thread.thread_id) else {
                 continue;
             };
-            let card = ReferenceCard::projection(
-                thread.name,
-                thread.state.token(),
-                "agent",
-                "agent_thread",
-            );
+            let state = agent_thread_public_state(&thread);
+            let card = ReferenceCard::projection(thread.name, state, "agent", "agent_thread");
             for reference in references {
                 cards.insert(reference.clone(), card.clone());
             }

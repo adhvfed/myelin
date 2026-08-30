@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use myelin_agent_service::{workspace::AgentWorkspaceStore, PlatformToolCatalogue};
@@ -6,7 +6,7 @@ use myelin_chat::conversation::{Conversation, ConversationKind};
 use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::{ConversationId, SystemUlidSource, UlidSource};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
-use myelin_identity::{Principal, PrincipalId};
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadProvisioningFailure, AgentThreadRunBinding,
@@ -19,6 +19,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::types::Uuid;
 use tokio::runtime::Handle;
+use tokio::sync::watch;
+
+use myelin_tenancy::{Region, TenantId};
 
 use crate::agent_http::{agent_session_json, map_session_error};
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
@@ -35,6 +38,107 @@ use crate::{EdgeError, Method};
 
 pub(crate) const MAX_AGENT_THREAD_JSON_BYTES: usize = 16 * 1024;
 const DEFAULT_RETENTION_DAYS: i16 = 3;
+pub const AGENT_THREAD_RECOVERY_TENANTS_ENV: &str = "MYELIN_AGENT_THREAD_RECOVERY_TENANTS";
+const DEFAULT_RECOVERY_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_RECOVERY_STALE_MS: u64 = 30_000;
+const MAX_RECOVERY_BATCH: u32 = 100;
+
+#[derive(Clone)]
+pub struct AgentThreadRecoveryConfig {
+    tenants: Vec<TenantId>,
+    region: Region,
+    interval: StdDuration,
+    stale_after: StdDuration,
+    batch_limit: u32,
+}
+
+impl AgentThreadRecoveryConfig {
+    pub fn new(
+        tenants: Vec<TenantId>,
+        region: Region,
+        interval: StdDuration,
+        stale_after: StdDuration,
+        batch_limit: u32,
+    ) -> Result<Self, String> {
+        if tenants.is_empty() {
+            return Err("at least one agent thread recovery tenant is required".into());
+        }
+        let mut unique = BTreeSet::new();
+        for tenant in &tenants {
+            let token = tenant.as_str();
+            if token.is_empty()
+                || token.len() > 128
+                || !token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(
+                    "agent thread recovery tenants must be opaque 1..=128 byte tokens".into(),
+                );
+            }
+            if !unique.insert(token.to_string()) {
+                return Err("agent thread recovery tenant list contains a duplicate".into());
+            }
+        }
+        if region.as_str().is_empty() {
+            return Err("agent thread recovery region must not be empty".into());
+        }
+        if interval.is_zero() {
+            return Err("agent thread recovery interval must be non-zero".into());
+        }
+        if stale_after < interval {
+            return Err("agent thread recovery staleness must be at least the interval".into());
+        }
+        if chrono::Duration::from_std(stale_after).is_err() {
+            return Err("agent thread recovery staleness exceeds the supported range".into());
+        }
+        if !(1..=MAX_RECOVERY_BATCH).contains(&batch_limit) {
+            return Err(format!(
+                "agent thread recovery batch must be between 1 and {MAX_RECOVERY_BATCH}"
+            ));
+        }
+        Ok(Self {
+            tenants,
+            region,
+            interval,
+            stale_after,
+            batch_limit,
+        })
+    }
+
+    pub fn from_env(region: Region) -> Result<Self, String> {
+        let raw = std::env::var(AGENT_THREAD_RECOVERY_TENANTS_ENV).map_err(|_| {
+            format!("{AGENT_THREAD_RECOVERY_TENANTS_ENV} is required (comma-separated opaque tenant tokens)")
+        })?;
+        let tenants = raw
+            .split(',')
+            .map(str::trim)
+            .map(|value| TenantId::from_token(value.to_string()))
+            .collect::<Vec<_>>();
+        Self::new(
+            tenants,
+            region,
+            StdDuration::from_millis(DEFAULT_RECOVERY_INTERVAL_MS),
+            StdDuration::from_millis(DEFAULT_RECOVERY_STALE_MS),
+            MAX_RECOVERY_BATCH,
+        )
+    }
+}
+
+pub struct AgentThreadRecoveryHandle {
+    shutdown: watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl AgentThreadRecoveryHandle {
+    pub async fn shutdown(self) -> Result<(), String> {
+        let _ = self.shutdown.send(true);
+        tokio::time::timeout(StdDuration::from_secs(10), self.join)
+            .await
+            .map_err(|_| "agent thread recovery did not stop within 10 seconds".to_string())?
+            .map_err(|_| "agent thread recovery task join failed".to_string())
+    }
+}
 
 #[derive(Clone)]
 struct AgentThreadHttpApi {
@@ -139,6 +243,20 @@ impl AgentThreadHttpApi {
         self.provision(principal, thread)
     }
 
+    fn recover(&self, tenant: &TenantId, region: &Region, thread: DurableAgentThread) {
+        let owner = Principal::new(
+            tenant.clone(),
+            region.clone(),
+            PrincipalId(thread.owner_principal_id.clone()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        if let Err(error) = self.provision(&owner, thread) {
+            eprintln!("agent thread recovery: provisioning attempt failed: {error}");
+        }
+    }
+
     fn provision(
         &self,
         principal: &Principal,
@@ -148,7 +266,7 @@ impl AgentThreadHttpApi {
             let (conversation, zookie) = self.create_private_conversation(principal, &thread)?;
             self.chat_mutations
                 .activate_private_conversation(&conversation, &zookie)?;
-            return Ok(thread);
+            return self.complete_publication(principal, thread);
         }
         if thread.state != AgentThreadState::Provisioning {
             return Err(EdgeError::Conflict(
@@ -215,7 +333,30 @@ impl AgentThreadHttpApi {
         };
         self.chat_mutations
             .activate_private_conversation(&conversation, &zookie)?;
-        Ok(ready)
+        self.complete_publication(principal, ready)
+    }
+
+    fn complete_publication(
+        &self,
+        principal: &Principal,
+        thread: DurableAgentThread,
+    ) -> Result<DurableAgentThread, EdgeError> {
+        let completed = self
+            .drive(
+                self.threads.complete_publication(
+                    &principal.tenant.0,
+                    &principal.principal_id.0,
+                    parse_uuid("stored thread id", &thread.thread_id).map_err(|_| {
+                        EdgeError::Internal("stored agent thread id is invalid".into())
+                    })?,
+                    &thread.conversation_id,
+                    Utc::now(),
+                ),
+            )?
+            .map_err(|_| EdgeError::Internal("agent thread publication failed".into()))?;
+        completed.ok_or_else(|| {
+            EdgeError::Conflict("agent thread changed while publication was completing".into())
+        })
     }
 
     fn record_provisioning_failure(
@@ -318,6 +459,7 @@ pub struct AgentThreadHttpInputs {
     pub ssh_routes: WorkspaceSshRouteKey,
     pub ssh_endpoint: WorkspaceSshEndpoint,
     pub runtime: Handle,
+    pub recovery: AgentThreadRecoveryConfig,
 }
 
 #[derive(Deserialize)]
@@ -643,13 +785,14 @@ impl Handler for AgentThreadListHandler {
 pub fn register_agent_threads(
     builder: GatewayBuilder,
     inputs: AgentThreadHttpInputs,
-) -> GatewayBuilder {
+) -> (GatewayBuilder, AgentThreadRecoveryHandle) {
     let ssh = WorkspaceSshHttpInputs {
         threads: inputs.threads.clone(),
         routes: inputs.ssh_routes,
         endpoint: inputs.ssh_endpoint,
         runtime: inputs.runtime.clone(),
     };
+    let recovery_config = inputs.recovery;
     let api = AgentThreadHttpApi {
         threads: inputs.threads,
         chat_reads: inputs.chat_reads,
@@ -705,9 +848,64 @@ pub fn register_agent_threads(
             Method::Post,
             "/v1/agent-threads/{thread}/messages",
             "chat.message.post",
-            Arc::new(AgentThreadMessagePostHandler { api }),
+            Arc::new(AgentThreadMessagePostHandler { api: api.clone() }),
         );
-    register_workspace_ssh_access(builder, ssh)
+    let builder = register_workspace_ssh_access(builder, ssh);
+    let recovery = spawn_agent_thread_recovery(api, recovery_config);
+    (builder, recovery)
+}
+
+fn spawn_agent_thread_recovery(
+    api: AgentThreadHttpApi,
+    config: AgentThreadRecoveryConfig,
+) -> AgentThreadRecoveryHandle {
+    let (shutdown, receiver) = watch::channel(false);
+    let join = tokio::spawn(run_agent_thread_recovery(api, config, receiver));
+    AgentThreadRecoveryHandle { shutdown, join }
+}
+
+async fn run_agent_thread_recovery(
+    api: AgentThreadHttpApi,
+    config: AgentThreadRecoveryConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let now = Utc::now();
+        let stale_before = now
+            - chrono::Duration::from_std(config.stale_after)
+                .expect("validated agent thread recovery staleness");
+        for tenant in &config.tenants {
+            if *shutdown.borrow() {
+                return;
+            }
+            match api
+                .threads
+                .claim_provisioning_recovery(tenant.as_str(), stale_before, now, config.batch_limit)
+                .await
+            {
+                Ok(work) => {
+                    for thread in work {
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                        api.recover(tenant, &config.region, thread);
+                    }
+                }
+                Err(error) => eprintln!("agent thread recovery: tenant sweep failed: {error}"),
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(config.interval) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn thread_run_json(
@@ -735,6 +933,7 @@ fn thread_run_json(
 }
 
 fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
+    let public_state = agent_thread_public_state(thread);
     json!({
         "id": thread.thread_id,
         "ref": thread_ref(tenant, &thread.thread_id),
@@ -750,13 +949,21 @@ fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
         "workspace": {
             "id": thread.workspace_id,
             "generation": thread.workspace_generation,
-            "state": thread.state.token(),
+            "state": public_state,
             "retention_days": thread.retention_days,
             "expires_at": thread.expires_at,
         },
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
     })
+}
+
+pub(crate) fn agent_thread_public_state(thread: &DurableAgentThread) -> &'static str {
+    if thread.state == AgentThreadState::Ready && !thread.is_published() {
+        AgentThreadState::Provisioning.token()
+    } else {
+        thread.state.token()
+    }
 }
 
 fn thread_ref(tenant: &str, thread_id: &str) -> String {
@@ -779,7 +986,7 @@ fn workspace_is_available_at(
     expires_at: DateTime<Utc>,
     observed_at: DateTime<Utc>,
 ) -> bool {
-    thread.state == AgentThreadState::Ready && expires_at > observed_at
+    thread.is_published() && expires_at > observed_at
 }
 
 fn parse_create_body(body: &[u8]) -> Result<CreateAgentThreadBody, EdgeError> {
@@ -939,6 +1146,59 @@ mod tests {
     }
 
     #[test]
+    fn recovery_config_requires_exact_bounded_tenant_partitions() {
+        let interval = StdDuration::from_secs(5);
+        let stale_after = StdDuration::from_secs(30);
+        assert!(AgentThreadRecoveryConfig::new(
+            vec![TenantId::from_token("acme")],
+            Region::new("local"),
+            interval,
+            stale_after,
+            100,
+        )
+        .is_ok());
+        for tenants in [
+            Vec::new(),
+            vec![TenantId::from_token("")],
+            vec![TenantId::from_token("acme"), TenantId::from_token("acme")],
+            vec![TenantId::from_token("tenant@example.test")],
+        ] {
+            assert!(AgentThreadRecoveryConfig::new(
+                tenants,
+                Region::new("local"),
+                interval,
+                stale_after,
+                100,
+            )
+            .is_err());
+        }
+        assert!(AgentThreadRecoveryConfig::new(
+            vec![TenantId::from_token("acme")],
+            Region::new("local"),
+            StdDuration::ZERO,
+            stale_after,
+            100,
+        )
+        .is_err());
+        assert!(AgentThreadRecoveryConfig::new(
+            vec![TenantId::from_token("acme")],
+            Region::new("local"),
+            interval,
+            StdDuration::from_secs(1),
+            100,
+        )
+        .is_err());
+        assert!(AgentThreadRecoveryConfig::new(
+            vec![TenantId::from_token("acme")],
+            Region::new("local"),
+            interval,
+            stale_after,
+            MAX_RECOVERY_BATCH + 1,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn malformed_or_surprising_creation_input_is_refused() {
         for body in [
             br#"{}"#.as_slice(),
@@ -968,6 +1228,7 @@ mod tests {
             retention_days: 3,
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),
+            publication_completed_at: Some("2026-08-22T00:00:01Z".into()),
             failure_reason: None,
             created_at: "2026-08-22T00:00:00Z".into(),
             expires_at: "2026-08-25T00:00:00Z".into(),
@@ -977,8 +1238,18 @@ mod tests {
         assert!(!rendered.to_string().contains("internal"));
         assert_eq!(rendered["workspace"]["state"], "ready");
 
+        thread.publication_completed_at = None;
+        let unpublished = thread_json("acme", &thread);
+        assert_eq!(unpublished["workspace"]["state"], "provisioning");
+        assert!(!workspace_is_available_at(
+            &thread,
+            Utc::now() + Duration::hours(1),
+            Utc::now(),
+        ));
+
         thread.state = AgentThreadState::Failed;
         thread.storage_locator = None;
+        thread.publication_completed_at = None;
         thread.failure_reason = Some("workspace_provisioning_failed".into());
         let failed = thread_json("acme", &thread);
         assert_eq!(failed["workspace"]["state"], "failed");
@@ -999,6 +1270,7 @@ mod tests {
             retention_days: 3,
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),
+            publication_completed_at: Some("2026-08-22T00:00:01Z".into()),
             failure_reason: None,
             created_at: "2026-08-22T00:00:00Z".into(),
             expires_at: "2026-08-25T00:00:00Z".into(),

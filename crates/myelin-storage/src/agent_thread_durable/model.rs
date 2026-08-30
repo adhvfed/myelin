@@ -82,6 +82,7 @@ pub struct DurableAgentThread {
     pub retention_days: i16,
     pub state: AgentThreadState,
     pub storage_locator: Option<String>,
+    pub publication_completed_at: Option<String>,
     pub failure_reason: Option<String>,
     pub created_at: String,
     pub expires_at: String,
@@ -91,6 +92,10 @@ pub struct DurableAgentThread {
 impl DurableAgentThread {
     pub(crate) fn timestamp(value: DateTime<Utc>) -> String {
         value.to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    pub fn is_published(&self) -> bool {
+        self.state == AgentThreadState::Ready && self.publication_completed_at.is_some()
     }
 }
 

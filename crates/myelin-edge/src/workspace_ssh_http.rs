@@ -3,10 +3,9 @@ use myelin_events::clock::system_clock_reading;
 use myelin_identity::Principal;
 use myelin_identity_service::workspace_ssh_public_key_fingerprint;
 use myelin_storage::{
-    AgentThreadState, CreateWorkspaceSshGrantOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, DurableWorkspaceSession, DurableWorkspaceSshGrant,
-    ListWorkspaceSessionsOutcome, NewWorkspaceSshGrant, WorkspaceSshRouteKey,
-    MAX_WORKSPACE_SSH_GRANT_SECONDS,
+    CreateWorkspaceSshGrantOutcome, DurableAgentThread, DurableAgentThreadBacking,
+    DurableWorkspaceSession, DurableWorkspaceSshGrant, ListWorkspaceSessionsOutcome,
+    NewWorkspaceSshGrant, WorkspaceSshRouteKey, MAX_WORKSPACE_SSH_GRANT_SECONDS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -180,7 +179,7 @@ impl Handler for WorkspaceSshAccessCreateHandler {
             EdgeError::Unavailable("workspace SSH clock is temporarily unavailable".into())
         })?;
         let workspace_expires_at = parse_stored_timestamp(&thread.expires_at)?;
-        if thread.state != AgentThreadState::Ready || workspace_expires_at <= now {
+        if !thread.is_published() || workspace_expires_at <= now {
             return Err(EdgeError::Conflict(
                 "agent thread workspace is not available for SSH access".into(),
             ));
