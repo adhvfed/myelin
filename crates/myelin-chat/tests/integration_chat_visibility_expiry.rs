@@ -13,6 +13,7 @@ use myelin_identity_service::TupleStore;
 use myelin_storage::{all_durable_migrations, DurableTupleBacking, SubstrateProvider, TenantScope};
 use myelin_substrate::HotTables;
 use myelin_tenancy::{Region, TenantId};
+use std::collections::BTreeSet;
 
 fn test_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
@@ -352,6 +353,7 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
     let bob_channel = ids.mint().0;
     let expired_channel = ids.mint().0;
     let missing_channel = ids.mint().0;
+    let leased_channel = ids.mint().0;
 
     for conversation in [
         private_channel(
@@ -367,6 +369,13 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
             &region,
             &expired_channel,
             "Alice's expired thread",
+            &alice.principal_id.0,
+        ),
+        private_channel(
+            &tenant,
+            &region,
+            &leased_channel,
+            "Alice's live leased thread",
             &alice.principal_id.0,
         ),
     ] {
@@ -402,6 +411,18 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
         Some(Timestamp("2020-01-01T00:01:00Z".into())),
     )
     .await;
+    write_until(
+        &tuples,
+        &scope,
+        &alice,
+        vec![add(
+            format!("channel:{leased_channel}"),
+            "member",
+            &alice.principal_id.0,
+        )],
+        Some(Timestamp("2099-01-01T00:00:00Z".into())),
+    )
+    .await;
 
     let visible = conversations
         .list_visible(&tenant, &region, &alice.principal_id.0, None, 100)
@@ -411,10 +432,39 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
         visible
             .iter()
             .map(|conversation| conversation.id.conversation_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![alice_channel.as_str()],
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([alice_channel.as_str(), leased_channel.as_str()]),
         "Alice sees her live private thread, never Bob's or an expired membership"
     );
+    assert_eq!(
+        conversations
+            .live_direct_membership_expiry_unix(
+                &ConversationId::new(&tenant, &region, &alice_channel),
+                &alice.principal_id.0,
+            )
+            .await
+            .expect("read Alice's unbounded live membership"),
+        None,
+    );
+    assert_eq!(
+        conversations
+            .live_direct_membership_expiry_unix(
+                &ConversationId::new(&tenant, &region, &leased_channel),
+                &alice.principal_id.0,
+            )
+            .await
+            .expect("read Alice's finite live membership"),
+        Some(4_070_908_800),
+    );
+    assert!(matches!(
+        conversations
+            .live_direct_membership_expiry_unix(
+                &ConversationId::new(&tenant, &region, &expired_channel),
+                &alice.principal_id.0,
+            )
+            .await,
+        Err(myelin_chat::conversation::ConversationError::NotFound(_))
+    ));
     let exact = conversations
         .get_visible_exact(
             &tenant,
@@ -426,6 +476,7 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
                 expired_channel,
                 alice_channel.clone(),
                 missing_channel,
+                leased_channel.clone(),
             ],
         )
         .await
@@ -435,7 +486,7 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
             .iter()
             .map(|conversation| conversation.id.conversation_id.as_str())
             .collect::<Vec<_>>(),
-        [alice_channel.as_str()],
+        [alice_channel.as_str(), leased_channel.as_str()],
         "exact resolution deduplicates ids and applies live membership before returning metadata"
     );
 

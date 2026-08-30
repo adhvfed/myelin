@@ -314,6 +314,44 @@ impl PgConversationStore {
         row_to_conversation(&row)
     }
 
+    /// Return the deadline of the subject's live direct membership, if it has one.
+    ///
+    /// A `None` deadline means the membership is deliberately unbounded. Absence is
+    /// reported as `NotFound`, which lets long-lived callers fail closed if the
+    /// relationship expires between their initial authorization check and lease
+    /// construction.
+    pub async fn live_direct_membership_expiry_unix(
+        &self,
+        id: &ConversationId,
+        subject: &str,
+    ) -> Result<Option<i64>, ConversationError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(storage("acquire conversation membership connection"))?;
+        self.set_session_scope(&mut conn, &id.tenant, &id.region)
+            .await?;
+        let row = sqlx::query(
+            "SELECT floor(EXTRACT(EPOCH FROM expires_at))::bigint AS expires_at_unix
+               FROM rebac_tuple
+              WHERE tenant_id = $1 AND region = $2
+                AND object_id = 'channel:' || $3
+                AND relation = 'member' AND subject = $4
+                AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)",
+        )
+        .bind(&id.tenant)
+        .bind(&id.region)
+        .bind(&id.conversation_id)
+        .bind(subject)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(storage("read live direct conversation membership"))?
+        .ok_or_else(|| ConversationError::NotFound(id.conversation_id.clone()))?;
+        row.try_get("expires_at_unix")
+            .map_err(storage("decode direct conversation membership expiry"))
+    }
+
     pub async fn stamp_acl_zookie(
         &self,
         id: &ConversationId,

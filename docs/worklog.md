@@ -4401,6 +4401,25 @@ a file through `workspace.write_file`, closes the run at end-of-input, and reads
 file through a fresh owner-authorized one-shot SSH connection. This proves the public command reaches
 the running Edge thread endpoint and the real workspace rather than only checking its string shape.
 
+## 2026-08-30 — Private live delivery ends with private membership
+
+Canonical Chat reads and posts already evaluate expiring ReBAC relationships at request time, but
+an SSE subscription evaluated that relationship only while opening. Once admitted, its transport
+lease lasted until the caller's login capability expired. An owner who opened a private-agent stream
+before the workspace deadline could therefore retain that subscription beyond the authority that
+made the conversation visible.
+
+Private Chat subscriptions now read the caller's live direct-membership deadline from PostgreSQL
+after the ordinary Chat visibility check and close at the earlier of that deadline and the signed
+capability expiry. If the tuple disappears between admission and lease construction, the route fails
+closed. Public project-backed subscriptions retain their existing capability-bounded lifecycle, and
+unbounded private memberships remain representable without manufacturing a deadline.
+
+Proof includes all 199 Chat and 369 Edge library stories; strict all-target/all-feature Clippy for
+both crates; the live PostgreSQL visibility story, which distinguishes unbounded, finite, and expired
+direct memberships through the production store; and five live TypeScript Chat/private-agent
+journeys against rebuilt Edge, PostgreSQL, the event relay, and the confined workspace services.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

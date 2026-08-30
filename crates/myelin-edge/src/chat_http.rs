@@ -134,6 +134,21 @@ impl DurableChatReadApi {
         Ok(conversation)
     }
 
+    async fn conversation_event_expiry_unix(
+        &self,
+        principal: &Principal,
+        opaque_id: &str,
+    ) -> Result<Option<i64>, EdgeError> {
+        let conversation = self.visible_conversation(principal, opaque_id).await?;
+        if !conversation.kind.membership_is_acl() {
+            return Ok(None);
+        }
+        self.conversations
+            .live_direct_membership_expiry_unix(&conversation.id, &principal.principal_id.0)
+            .await
+            .map_err(map_conversation_error)
+    }
+
     pub fn list_conversations(
         &self,
         principal: &Principal,
@@ -807,15 +822,20 @@ impl Handler for ConversationEventsHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
         let conversation_id = conversation_param(ctx)?;
-        self.api.drive(
+        let membership_expiry_unix = self.api.drive(
             self.api
-                .visible_conversation(ctx.principal, conversation_id),
+                .conversation_event_expiry_unix(ctx.principal, conversation_id),
         )?;
         let scope =
             sse_scope_for_resource(&ctx.principal.tenant.0, "conversation", conversation_id);
         Ok(EdgeResponse::sse(
             self.sse.subscribe("chat", &scope),
-            ctx.identity.capability().expires_at_unix,
+            membership_expiry_unix.map_or(
+                ctx.identity.capability().expires_at_unix,
+                |membership_expiry| {
+                    membership_expiry.min(ctx.identity.capability().expires_at_unix)
+                },
+            ),
         ))
     }
 }
