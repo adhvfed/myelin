@@ -26,5 +26,11 @@ export default defineConfig({
   vite: {
     // The design-system ships .ts/.tsx source (workspace package); let vite transform it.
     ssr: { noExternal: ["@myelin/design-system"] },
+    server: {
+      // Vinxi writes production intermediates beside its live development metadata. A concurrent
+      // `vinxi build` must not make the dev server hot-reload generated bundles or its generated
+      // tsconfig; source routes and package files remain watched normally.
+      watch: { ignored: ["**/.vinxi/build/**", "**/.vinxi/types/**", "**/.output/**"] },
+    },
   },
 });

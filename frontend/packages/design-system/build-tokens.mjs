@@ -1,8 +1,9 @@
 // Generate the package's CSS and TypeScript token APIs from its DTCG source.
 
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
-import { readFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import StyleDictionary from "style-dictionary";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -271,22 +272,37 @@ StyleDictionary.registerFormat({ name: "myelin/ts", format: ({ dictionary }) => 
 
 mkdirSync(OUT_DIR, { recursive: true });
 
-const sd = new StyleDictionary({
-  usesDtcg: true,
-  source: [TOKENS_SRC],
-  // Our custom format keys off each token's `path` directly (not SD's default name transform), so
-  // SD's internal name-collision heuristic is irrelevant here — silence its (benign) warning.
-  log: { warnings: "disabled" },
-  platforms: {
-    web: {
-      buildPath: "generated/",
-      files: [
-        { destination: "tokens.css", format: "myelin/css" },
-        { destination: "tokens.ts", format: "myelin/ts" },
-      ],
+const buildDir = mkdtempSync(join(tmpdir(), "myelin-design-tokens-"));
+try {
+  const sd = new StyleDictionary({
+    usesDtcg: true,
+    source: [TOKENS_SRC],
+    // Our custom format keys off each token's `path` directly (not SD's default name transform), so
+    // SD's internal name-collision heuristic is irrelevant here — silence its (benign) warning.
+    log: { warnings: "disabled" },
+    platforms: {
+      web: {
+        buildPath: `${buildDir}/`,
+        files: [
+          { destination: "tokens.css", format: "myelin/css" },
+          { destination: "tokens.ts", format: "myelin/ts" },
+        ],
+      },
     },
-  },
-});
-
-await sd.buildAllPlatforms();
+  });
+  await sd.buildAllPlatforms();
+  for (const file of ["tokens.css", "tokens.ts"]) {
+    const generated = readFileSync(resolve(buildDir, file));
+    const destination = resolve(OUT_DIR, file);
+    let current;
+    try {
+      current = readFileSync(destination);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    if (!current?.equals(generated)) writeFileSync(destination, generated);
+  }
+} finally {
+  rmSync(buildDir, { recursive: true, force: true });
+}
 console.log("tokens: built generated/tokens.css + generated/tokens.ts from", TOKENS_SRC);
