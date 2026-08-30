@@ -189,7 +189,6 @@ mod tests {
             );
         }
         for unavailable in [
-            "git.comment",
             "git.history_rewrite",
             "git.scip_index",
             "git.suggest_change",
@@ -238,6 +237,7 @@ mod tests {
             "git.list_repositories",
             "git.read_file",
             "git.search_code",
+            "git.comment",
             "git.merge",
             "git.open_pr",
             "git.write_file",

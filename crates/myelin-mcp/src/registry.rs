@@ -181,6 +181,7 @@ mod tests {
                 "chat.reply",
                 "ci.read_log",
                 "ci.read_run",
+                "git.comment",
                 "git.endorse_fork_ci",
                 "git.list_repositories",
                 "git.merge",

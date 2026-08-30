@@ -516,6 +516,14 @@ fn agent_tool_schemas_describe_the_arguments_the_git_adapter_consumes() {
         .collect::<std::collections::BTreeMap<_, _>>();
 
     assert_eq!(schemas["git.merge"]["required"], json!(["repo", "number"]));
+    assert_eq!(
+        schemas["git.comment"]["required"],
+        json!(["repo", "number", "body_md"])
+    );
+    assert_eq!(
+        schemas["git.comment"]["properties"]["anchor"]["required"],
+        json!(["path", "line", "side"])
+    );
     assert_eq!(schemas["git.open_pr"]["required"], json!(["repo", "title"]));
     assert_eq!(
         schemas["git.write_file"]["required"],

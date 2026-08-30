@@ -4571,6 +4571,29 @@ all-target Clippy was clean, and system/frontend type checking, frontend lint, a
 passed. The real Chromium private-agent journey also created a thread with the expanded default
 tool selection and completed its retained-workspace and accessibility story in 5.7 seconds.
 
+## 2026-08-30 — Agents can leave exact pull-request feedback
+
+Agents could write a branch, open its pull request, and record a review verdict, but could not
+leave the review context that makes collaboration useful. General discussion and line-specific
+feedback were both human-only even though the durable Git thread store already modeled them.
+
+The shared catalogue now exposes `git.comment` with a strict body and an optional exact
+path/line/side anchor. The effect requires pull-request review capability, derives tenant and region
+only from the verified run, and rechecks the delegating human's current review authority before it
+writes. The durable thread retains the agent as author, resolves an inline location against the real
+base and head commits, and returns the canonical thread reference. Its operation key is the governed
+request digest, so replay after a lost response returns the same thread instead of duplicating the
+comment. Attempted, applied, gated, denied, and indeterminate outcomes all have registered Git audit
+events.
+
+The readable TypeScript CLI journey now lets the agent comment on the exact changed line of its real
+pull request, repeats the governed call with the same retry identity, then has the human read one
+live anchored thread containing one agent-authored comment. All 16 stages passed against the running
+Edge, PostgreSQL, and durable Git store in 41.64 seconds. The stored thread document retained the
+real base/head object IDs and one command-ledger entry; PostgreSQL retained two attempted and two
+applied, published governance events for the original call and retry. All 1,000 affected Rust library
+stories passed, strict all-target Clippy was clean, and the TypeScript system suite typechecked.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the
@@ -4679,22 +4702,25 @@ tool selection and completed its retained-workspace and accessibility story in 5
     executor. They remain absent from discovery until backed by the page store,
     authorization, audit, and a full-system agent journey.
 17. **Agents can post and reply in Chat, but cannot manage richer Chat
-    actions.** Humans can create and manage conversations and use reaction
-    behavior through the durable Chat product, but reaction, direct-message,
-    channel creation, invitation, and archival have no governed agent effect
-    carrier. They remain absent from discovery until each action has exact
-    authorization, audit, idempotency, and a full-system agent journey. Hosted agent answer
-    presence/partial streaming also has no end-to-end Edge/gateway carrier; the
-    former prewritten-answer mock was removed.
+    actions.** Humans can create and manage durable conversations and threads.
+    Reaction tokens are reserved in the event vocabulary, but no durable
+    reaction store, authenticated API, or browser journey exists; reaction,
+    direct-message, channel creation, invitation, and archival likewise have no
+    governed agent effect carrier. They remain absent from discovery until each
+    action has exact authorization, audit, idempotency, and a full-system agent
+    journey. Hosted agent answer presence/partial streaming also has no
+    end-to-end Edge/gateway carrier; the former prewritten-answer mock was
+    removed.
 18. **Several Git collaboration and maintenance actions are not agent effects.**
     Agents can durably write files, open pull requests, submit review verdicts,
-    endorse fork CI, and merge with human approval. Inline comment authoring,
-    suggested changes, thread resolution, SCIP indexing, and audited history
-    rewrite have no governed carrier; the former injected-fake rewrite/index
-    module was removed. Each future action needs a durable owner boundary and a
-    full-system agent journey before discovery. Git also has no production
-    merge queue: durable checks and direct merges ship, but no PostgreSQL Flow
-    merge body consumes `ci.result` and survives restart.
+    open general or line-anchored review threads, endorse fork CI, and merge
+    with human approval. Suggested changes, replies to or resolution of review
+    threads, SCIP indexing, and audited history rewrite have no governed
+    carrier; the former injected-fake rewrite/index module was removed. Each
+    future action needs a durable owner boundary and a full-system agent journey
+    before discovery. Git also has no production merge queue: durable checks
+    and direct merges ship, but no PostgreSQL Flow merge body consumes
+    `ci.result` and survives restart.
 19. **Agents can inspect CI, but cannot command it directly.** They can read
     durable runs and bounded logs. Pipeline trigger/retry/cancel, validation,
     planning, deploy/approve/rollback, and secret administration have no CI

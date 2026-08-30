@@ -64,6 +64,13 @@ pub(super) fn effect_event_type(
             denied: myelin_git::events::GIT_SUBMIT_REVIEW_DENIED,
             indeterminate: myelin_git::events::GIT_SUBMIT_REVIEW_INDETERMINATE,
         },
+        "git.comment" => EffectAuditEvents {
+            attempted: myelin_git::events::GIT_COMMENT_ATTEMPTED,
+            applied: myelin_git::events::GIT_COMMENT_APPLIED,
+            gated: myelin_git::events::GIT_COMMENT_GATED,
+            denied: myelin_git::events::GIT_COMMENT_DENIED,
+            indeterminate: myelin_git::events::GIT_COMMENT_INDETERMINATE,
+        },
         "git.endorse_fork_ci" => EffectAuditEvents {
             attempted: myelin_git::events::GIT_ENDORSE_FORK_CI_ATTEMPTED,
             applied: myelin_git::events::GIT_ENDORSE_FORK_CI_APPLIED,
@@ -149,6 +156,31 @@ pub(super) fn approval_event_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_side_effecting_platform_tool_has_a_complete_audit_lifecycle() {
+        let outcomes = [
+            EffectAuditOutcome::Attempted,
+            EffectAuditOutcome::Applied,
+            EffectAuditOutcome::Gated,
+            EffectAuditOutcome::Denied,
+            EffectAuditOutcome::Indeterminate,
+        ];
+        for tool in crate::registry::ToolRegistry::platform()
+            .unwrap()
+            .tools()
+            .iter()
+            .filter(|tool| tool.side_effecting())
+        {
+            for outcome in outcomes {
+                assert!(
+                    effect_event_type(tool.name(), outcome).is_ok(),
+                    "side-effecting tool `{}` has no complete governance audit taxonomy",
+                    tool.name()
+                );
+            }
+        }
+    }
 
     #[test]
     fn workspace_mutations_have_complete_durable_audit_lifecycles() {

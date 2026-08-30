@@ -655,6 +655,13 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
             handler: Handler::MergeGate,
         },
         AgentToolDef {
+            local_name: "comment",
+            input_schema: r#"{"type":"object","required":["repo","number","body_md"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"body_md":{"type":"string","minLength":1,"maxLength":65536},"anchor":{"type":"object","required":["path","line","side"],"properties":{"path":{"type":"string","minLength":1,"maxLength":4096},"line":{"type":"integer","minimum":1,"maximum":4294967295},"side":{"type":"string","enum":["old","new"]}},"additionalProperties":false}},"additionalProperties":false}"#,
+            requires_approval: false,
+            required_caps: &["pull_request.review"],
+            handler: Handler::Lifecycle,
+        },
+        AgentToolDef {
             local_name: "open_pr",
             input_schema: r#"{"type":"object","required":["repo","title"],"properties":{"repo":{"type":"string","description":"the target repository slug; tenant and region come from the verified run token"},"title":{"type":"string"},"head_ref":{"type":"string"},"base_ref":{"type":"string"},"head_repo":{"type":"string"},"head_oid":{"type":"string"},"body_md":{"type":"string"},"draft":{"type":"boolean"},"reviewers":{"type":"array","items":{"type":"string"},"maxItems":100}},"additionalProperties":false}"#,
             requires_approval: false,

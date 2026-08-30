@@ -102,6 +102,11 @@ pub const GIT_SUBMIT_REVIEW_APPLIED: &str = "git.submit_review.applied";
 pub const GIT_SUBMIT_REVIEW_GATED: &str = "git.submit_review.gated";
 pub const GIT_SUBMIT_REVIEW_DENIED: &str = "git.submit_review.denied";
 pub const GIT_SUBMIT_REVIEW_INDETERMINATE: &str = "git.submit_review.indeterminate";
+pub const GIT_COMMENT_ATTEMPTED: &str = "git.comment.attempted";
+pub const GIT_COMMENT_APPLIED: &str = "git.comment.applied";
+pub const GIT_COMMENT_GATED: &str = "git.comment.gated";
+pub const GIT_COMMENT_DENIED: &str = "git.comment.denied";
+pub const GIT_COMMENT_INDETERMINATE: &str = "git.comment.indeterminate";
 pub const GIT_ENDORSE_FORK_CI_ATTEMPTED: &str = "git.endorse_fork_ci.attempted";
 pub const GIT_ENDORSE_FORK_CI_APPLIED: &str = "git.endorse_fork_ci.applied";
 pub const GIT_ENDORSE_FORK_CI_GATED: &str = "git.endorse_fork_ci.gated";
@@ -132,6 +137,11 @@ pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     GIT_SUBMIT_REVIEW_GATED,
     GIT_SUBMIT_REVIEW_DENIED,
     GIT_SUBMIT_REVIEW_INDETERMINATE,
+    GIT_COMMENT_ATTEMPTED,
+    GIT_COMMENT_APPLIED,
+    GIT_COMMENT_GATED,
+    GIT_COMMENT_DENIED,
+    GIT_COMMENT_INDETERMINATE,
     GIT_ENDORSE_FORK_CI_ATTEMPTED,
     GIT_ENDORSE_FORK_CI_APPLIED,
     GIT_ENDORSE_FORK_CI_GATED,
@@ -203,6 +213,11 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_SUBMIT_REVIEW_GATED,
     GIT_SUBMIT_REVIEW_DENIED,
     GIT_SUBMIT_REVIEW_INDETERMINATE,
+    GIT_COMMENT_ATTEMPTED,
+    GIT_COMMENT_APPLIED,
+    GIT_COMMENT_GATED,
+    GIT_COMMENT_DENIED,
+    GIT_COMMENT_INDETERMINATE,
     GIT_ENDORSE_FORK_CI_ATTEMPTED,
     GIT_ENDORSE_FORK_CI_APPLIED,
     GIT_ENDORSE_FORK_CI_GATED,

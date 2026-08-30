@@ -162,6 +162,7 @@ describe.sequential("the CLI authentication journey", () => {
   let agentVisiblePageRef: string;
   let agentPullRequestRef: string;
   let agentPullRequestTitle: string;
+  let agentPullRequestNumber: number;
   let agentIssueRef: string;
   let agentIssueTitle: string;
 
@@ -344,6 +345,7 @@ describe.sequential("the CLI authentication journey", () => {
     };
     expect(mcpManifest.tools.map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
+        "git.comment",
         "git.open_pr",
         "git.write_file",
         "git.list_repositories",
@@ -385,6 +387,8 @@ describe.sequential("the CLI authentication journey", () => {
       agentName,
       "--tool",
       "ci.read_run",
+      "--tool",
+      "git.comment",
       "--tool",
       "git.open_pr",
       "--tool",
@@ -436,6 +440,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "chat.read_messages", version: 1 },
           { name: "chat.reply", version: 1 },
           { name: "ci.read_run", version: 1 },
+          { name: "git.comment", version: 1 },
           { name: "git.list_repositories", version: 1 },
           { name: "git.open_pr", version: 1 },
           { name: "git.read_file", version: 1 },
@@ -461,6 +466,7 @@ describe.sequential("the CLI authentication journey", () => {
           "knowledge.edit",
           "knowledge.read",
           "project.view",
+          "pull_request.review",
           "repo.pull",
           "repo.push",
           "run.view",
@@ -476,6 +482,7 @@ describe.sequential("the CLI authentication journey", () => {
     );
     expect(activated.agent.effective_tools.map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
+        "git.comment",
         "ci.read_run",
         "ci.read_log",
         "git.open_pr",
@@ -515,6 +522,8 @@ describe.sequential("the CLI authentication journey", () => {
       agentName,
       "--tool",
       "ci.read_run",
+      "--tool",
+      "git.comment",
       "--tool",
       "git.open_pr",
       "--tool",
@@ -795,6 +804,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "chat.read_messages", version: 1 },
           { name: "chat.reply", version: 1 },
           { name: "ci.read_run", version: 1 },
+          { name: "git.comment", version: 1 },
           { name: "git.list_repositories", version: 1 },
           { name: "git.open_pr", version: 1 },
           { name: "git.read_file", version: 1 },
@@ -889,6 +899,7 @@ describe.sequential("the CLI authentication journey", () => {
       "chat.read_messages",
       "chat.reply",
       "ci.read_run",
+      "git.comment",
       "git.list_repositories",
       "git.open_pr",
       "git.read_file",
@@ -939,6 +950,11 @@ describe.sequential("the CLI authentication journey", () => {
     expect(schemaFor("git.open_pr")).toMatchObject({
       type: "object",
       required: ["repo", "title"],
+      additionalProperties: false,
+    });
+    expect(schemaFor("git.comment")).toMatchObject({
+      type: "object",
+      required: ["repo", "number", "body_md"],
       additionalProperties: false,
     });
     expect(schemaFor("git.read_file")).toMatchObject({
@@ -1110,6 +1126,7 @@ describe.sequential("the CLI authentication journey", () => {
       "chat.read_messages",
       "chat.reply",
       "ci.read_run",
+      "git.comment",
       "git.list_repositories",
       "git.open_pr",
       "git.read_file",
@@ -1932,7 +1949,7 @@ describe.sequential("the CLI authentication journey", () => {
       openedByAgent.data,
       "agent pull request receipt data",
     );
-    const agentPullRequestNumber = integer(
+    agentPullRequestNumber = integer(
       agentPullRequestReceipt.number,
       "agent pull request number",
     );
@@ -1971,6 +1988,70 @@ describe.sequential("the CLI authentication journey", () => {
       author: `${activated.agent.principal_id}@${systemTestConfig.tenant}.noreply`,
     });
     expect(humanVisibleAgentPullRequest.number).toBe(agentPullRequestNumber);
+
+    // The same bounded collaborator can leave review context at the exact changed line. A retry
+    // reuses the durable thread, and the human sees agent attribution rather than their own name.
+    const agentReviewComment = uniqueName("Keep the credentialless invariant explicit");
+    const agentCommentKey = `agent-pr-comment-${randomUUID()}`;
+    const commentedByAgent = await askAgentToAct(
+      resumedRun,
+      27,
+      "git.comment",
+      {
+        repo: sourceRepository.slug,
+        number: agentPullRequestNumber,
+        body_md: agentReviewComment,
+        anchor: { path: sourcePath, line: 2, side: "new" },
+      },
+      agentCommentKey,
+    );
+    const replayedAgentComment = await askAgentToAct(
+      resumedRun,
+      28,
+      "git.comment",
+      {
+        repo: sourceRepository.slug,
+        number: agentPullRequestNumber,
+        body_md: agentReviewComment,
+        anchor: { path: sourcePath, line: 2, side: "new" },
+      },
+      agentCommentKey,
+    );
+    expect(replayedAgentComment).toEqual(commentedByAgent);
+    const agentCommentReceipt = record(commentedByAgent.data, "agent comment receipt data");
+    const agentCommentThreadId = string(agentCommentReceipt.thread_id, "agent comment thread id");
+    expect(commentedByAgent.ref).toBe(
+      `myelin://${systemTestConfig.tenant}/git/pr/${sourceRepository.slug}:${agentPullRequestNumber}#thread-${agentCommentThreadId}`,
+    );
+
+    const humanReviewThreads = await systemClient.json(
+      `${sourceRepository.path}/prs/${agentPullRequestNumber}/threads`,
+    );
+    const matchingAgentThreads = array(humanReviewThreads.body.anchored, "anchored review threads")
+      .map((thread, index) => record(thread, `anchored review thread ${index}`))
+      .filter((thread) => {
+        const comments = array(thread.comments, "anchored review comments")
+          .map((comment, index) => record(comment, `anchored review comment ${index}`));
+        return comments.some((comment) => comment.body_md === agentReviewComment);
+      });
+    expect(matchingAgentThreads).toEqual([
+      expect.objectContaining({
+        id: agentCommentThreadId,
+        resolved: false,
+        anchor: expect.objectContaining({
+          path: sourcePath,
+          line: 2,
+          side: "new",
+          anchor_state: "live",
+        }),
+        comments: [
+          expect.objectContaining({
+            body_md: agentReviewComment,
+            author: expect.objectContaining({ kind: "agent" }),
+          }),
+        ],
+      }),
+    ]);
   }, 120_000);
 
   test("agent-created work stays pseudonymous and approval-gated", async () => {

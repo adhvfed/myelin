@@ -112,6 +112,58 @@ impl GitEffectApi {
     ) -> EffectResult {
         let (t, r) = (self.tenant.as_str(), self.region.as_str());
         match tool {
+            "git.comment" => {
+                let (repo, number) = match repo_and_number(args) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+                let body_md = match str_arg(args, "body_md") {
+                    Some(value) => value,
+                    None => return deny_missing("body_md"),
+                };
+                if !self
+                    .backend
+                    .authorize_pr_review(t, r, repo, number, &self.delegator)
+                {
+                    return EffectResult::Denied(
+                        "the delegating human has no review authority for this pull request".into(),
+                    );
+                }
+                let mut body = serde_json::json!({ "body_md": body_md });
+                if let Some(anchor) = args.get("anchor") {
+                    body["anchor"] = anchor.clone();
+                }
+                match self.backend.create_thread(
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
+                    operation_id.digest(),
+                    &body,
+                ) {
+                    Ok(thread) => {
+                        let Some(thread_id) =
+                            thread.get("id").and_then(Value::as_str).map(str::to_owned)
+                        else {
+                            return EffectResult::Denied("internal error".into());
+                        };
+                        let reference =
+                            match myelin_git::subs::mint_pr_thread(t, repo, number, &thread_id) {
+                                Ok(reference) => myelin_refs::format(&reference),
+                                Err(_) => return EffectResult::Denied("internal error".into()),
+                            };
+                        applied_resource(
+                            run,
+                            &format!("git.pr.comment:#{number}:{thread_id}"),
+                            reference,
+                            serde_json::json!({
+                                "repo": repo,
+                                "number": number,
+                                "thread_id": thread_id,
+                                "thread": thread,
+                            }),
+                        )
+                    }
+                    Err(error) => deny_durable_error(error),
+                }
+            }
             "git.write_file" => {
                 let required = |name| {
                     str_arg(args, name).ok_or_else(|| {

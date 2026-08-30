@@ -6,6 +6,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("ci", "read_run") => false,
 
         ("git", "merge") => true,
+        ("git", "comment") => false,
         ("git", "open_pr") => false,
         ("git", "write_file") => false,
         ("git", "submit_review") => false,
@@ -200,6 +201,10 @@ mod tests {
         assert!(
             !requires_approval_default("git", "submit_review"),
             "git.submit_review is reversible → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("git", "comment"),
+            "git.comment is an ordinary review action → NOT gated"
         );
         for read in ["list_repositories", "read_file", "search_code"] {
             assert!(
