@@ -56,9 +56,9 @@ pub use issues_read_tools::{
 };
 
 pub use knowledge_mcp_tools::{
-    knowledge_mcp_tool_defs, link_work_tool_def, KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION,
-    LINK_WORK_TOOL, LINK_WORK_TOOL_VERSION, LIST_PAGES_TOOL, READ_PAGE_TOOL,
-    READ_PAGE_TOOL_VERSION,
+    create_page_tool_def, knowledge_mcp_tool_defs, link_work_tool_def, CREATE_PAGE_TOOL,
+    KNOWLEDGE_SUBSYSTEM, KNOWLEDGE_TOOL_VERSION, LINK_WORK_TOOL, LINK_WORK_TOOL_VERSION,
+    LIST_PAGES_TOOL, READ_PAGE_TOOL, READ_PAGE_TOOL_VERSION,
 };
 
 pub use project_read_tools::{

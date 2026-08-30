@@ -8,6 +8,7 @@ pub const READ_PAGE_TOOL: &str = "read_page";
 pub const READ_PAGE_TOOL_VERSION: u32 = 2;
 pub const LINK_WORK_TOOL: &str = "link_work";
 pub const LINK_WORK_TOOL_VERSION: u32 = 2;
+pub const CREATE_PAGE_TOOL: &str = "create_page";
 
 fn read_tool(name: &str, version: u32, input_schema: &str) -> ToolDef {
     ToolDef {
@@ -44,8 +45,23 @@ pub fn link_work_tool_def() -> ToolDef {
     )
 }
 
+pub fn create_page_tool_def() -> ToolDef {
+    ToolDef {
+        name: ToolName(CREATE_PAGE_TOOL.into()),
+        subsystem: KNOWLEDGE_SUBSYSTEM.into(),
+        version: KNOWLEDGE_TOOL_VERSION,
+        input_schema: r#"{"type":"object","required":["title","template","visibility"],"properties":{"title":{"type":"string","minLength":1,"maxLength":512},"template":{"type":"string","enum":["blank","product-spec","runbook"]},"visibility":{"type":"string","enum":["private","team"]}},"additionalProperties":false}"#.into(),
+        required_caps: vec!["knowledge.edit".into()],
+        effect_kind: EffectKind::Mutate,
+        side_effecting: true,
+        requires_approval: false,
+        exposed_over_mcp: true,
+    }
+}
+
 pub fn knowledge_mcp_tool_defs() -> Vec<ToolDef> {
     vec![
+        create_page_tool_def(),
         read_tool(
             LIST_PAGES_TOOL,
             KNOWLEDGE_TOOL_VERSION,
@@ -85,6 +101,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             [
+                "knowledge.create_page.v1",
                 "knowledge.list_pages.v1",
                 "knowledge.read_page.v1",
                 "knowledge.read_page.v2",
@@ -101,20 +118,26 @@ mod tests {
             );
         }
 
-        let reads = &definitions[..3];
+        let create = &definitions[0];
+        assert_eq!(create.required_caps, ["knowledge.edit"]);
+        assert_eq!(create.effect_kind, EffectKind::Mutate);
+        assert!(create.side_effecting);
+        assert!(!create.requires_approval);
+
+        let reads = &definitions[1..4];
         assert!(reads.iter().all(|definition| {
             definition.required_caps == ["knowledge.read"]
                 && definition.effect_kind == EffectKind::Read
                 && !definition.side_effecting
         }));
 
-        let current_read = &definitions[2];
+        let current_read = &definitions[3];
         let schema: serde_json::Value = serde_json::from_str(&current_read.input_schema).unwrap();
         assert_eq!(current_read.version, READ_PAGE_TOOL_VERSION);
         assert_eq!(schema["required"], serde_json::json!(["page_ref"]));
         assert!(schema["properties"].get("page_id").is_none());
 
-        let links = &definitions[3..];
+        let links = &definitions[4..];
         assert!(links.iter().all(|link| {
             link.required_caps == ["knowledge.edit"]
                 && link.effect_kind == EffectKind::Mutate

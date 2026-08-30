@@ -196,6 +196,7 @@ mod tests {
                 "issues.create",
                 "issues.list",
                 "issues.view",
+                "knowledge.create_page",
                 "knowledge.link_work",
                 "knowledge.list_pages",
                 "knowledge.read_page",

@@ -4571,6 +4571,28 @@ all-target Clippy was clean, and system/frontend type checking, frontend lint, a
 passed. The real Chromium private-agent journey also created a thread with the expanded default
 tool selection and completed its retained-workspace and accessibility story in 5.7 seconds.
 
+## 2026-08-30 — Agent-authored Knowledge pages remain human-owned
+
+Agents could read a living document and append a structured work link, but could not originate even
+a template-backed page. Calling the human handler under the agent identity would have been a bad
+shortcut: Knowledge's current edit model is owner-scoped, so the transient agent would become the
+only principal able to maintain the page.
+
+Knowledge creation is now one reusable production operation with separate actor and owner roles.
+The governed `knowledge.create_page` effect validates the same title, template, visibility, size,
+and encryption rules as the human API, rechecks the active delegation and `knowledge.edit` run
+authority, and derives an opaque actor-scoped retry nonce. The delegating human owns the resulting
+page and title key, while template blocks retain the agent's author identity and subject key. A
+lost-response retry resolves to the original page rather than minting another one, and all five
+governance outcomes are registered as durable Knowledge events.
+
+The TypeScript collaboration journey now has an external agent create a real team page, replay the
+same governed request, and let the human read it with edit authority while the initial block remains
+agent-attributed. All 16 stages passed against the running services in 44.20 seconds. PostgreSQL
+independently showed one page whose owner/title key and block author/key are distinct, plus two
+attempted and two applied, published `knowledge.create_page` audits. All 857 affected Rust library
+stories passed, strict all-target Clippy was clean, and the system suite typechecked.
+
 ## 2026-08-30 — Agents can finish the review conversations they answer
 
 The governed review journey could create and answer a thread but still needed a human to change its
@@ -4740,11 +4762,12 @@ stories passed, strict all-target Clippy was clean, and the TypeScript system su
     rollup store, or cross-cell portfolio worker. Agent discovery now exposes
     only the working create/close mutations; each additional effect needs an
     authorized executor and restart-safe full-system journey before registration.
-16. **Agents cannot author general Knowledge content yet.** Humans have the
-    durable page surface and agents can list/read pages and link related work,
-    but publish, draft, confidential edit, and comment have no governed effect
-    executor. They remain absent from discovery until backed by the page store,
-    authorization, audit, and a full-system agent journey.
+16. **Agent Knowledge authoring is still template-limited.** Agents can
+    originate durable human-owned pages from the blank, product-spec, and
+    runbook templates, then list/read pages and link related work. Arbitrary
+    block editing, draft/publish lifecycle, and comments still have no governed
+    effect executor. They remain absent from discovery until backed by the page
+    store, authorization, audit, and a full-system agent journey.
 17. **Agents can post and reply in Chat, but cannot manage richer Chat
     actions.** Humans can create and manage durable conversations and threads.
     Reaction tokens are reserved in the event vocabulary, but no durable

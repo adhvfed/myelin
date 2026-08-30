@@ -249,6 +249,7 @@ mod tests {
             "issues.list",
             "issues.view",
             "knowledge.list_pages",
+            "knowledge.create_page",
             "knowledge.link_work",
             "knowledge.read_page",
             "projects.list",

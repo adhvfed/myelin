@@ -120,6 +120,13 @@ pub(super) fn effect_event_type(
             denied: myelin_issues::events::ISSUE_CLOSE_DENIED,
             indeterminate: myelin_issues::events::ISSUE_CLOSE_INDETERMINATE,
         },
+        "knowledge.create_page" => EffectAuditEvents {
+            attempted: myelin_content::events::KNOWLEDGE_CREATE_PAGE_ATTEMPTED,
+            applied: myelin_content::events::KNOWLEDGE_CREATE_PAGE_APPLIED,
+            gated: myelin_content::events::KNOWLEDGE_CREATE_PAGE_GATED,
+            denied: myelin_content::events::KNOWLEDGE_CREATE_PAGE_DENIED,
+            indeterminate: myelin_content::events::KNOWLEDGE_CREATE_PAGE_INDETERMINATE,
+        },
         "knowledge.link_work" => EffectAuditEvents {
             attempted: myelin_content::events::KNOWLEDGE_LINK_WORK_ATTEMPTED,
             applied: myelin_content::events::KNOWLEDGE_LINK_WORK_APPLIED,

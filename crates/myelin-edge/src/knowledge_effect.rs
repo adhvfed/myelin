@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::agent_delegation::is_active_delegation;
 use crate::effect_carrier::parse_proposed;
-use crate::{DurableKnowledgeMutationApi, KnowledgeLinkRequest};
+use crate::{DurableKnowledgeMutationApi, KnowledgeCreateRequest, KnowledgeLinkRequest};
 
 pub struct KnowledgeEffectApi {
     knowledge: DurableKnowledgeMutationApi,
@@ -75,7 +75,11 @@ impl KnowledgeEffectApi {
         if !is_active_delegation(&self.principal, &self.delegator) {
             return Err("Knowledge effect delegation is not an active human relationship".into());
         }
-        let definition = myelin_agent_service::link_work_tool_def();
+        let definition = match proposed_tool {
+            "knowledge.create_page" => myelin_agent_service::create_page_tool_def(),
+            "knowledge.link_work" => myelin_agent_service::link_work_tool_def(),
+            _ => return Err(format!("unknown Knowledge tool `{proposed_tool}`")),
+        };
         if definition.canonical_name() != proposed_tool || !definition.exposed_over_mcp {
             return Err(format!("unknown Knowledge tool `{proposed_tool}`"));
         }
@@ -98,10 +102,60 @@ impl KnowledgeEffectApi {
         arguments: serde_json::Value,
         idempotency_key: &str,
     ) -> EffectResult {
+        if tool == "knowledge.create_page" {
+            let request: KnowledgeCreateRequest = match serde_json::from_value(arguments) {
+                Ok(request) => request,
+                Err(error) => {
+                    return EffectResult::Denied(format!(
+                        "invalid knowledge.create_page arguments: {error}"
+                    ))
+                }
+            };
+            let nonce = create_page_nonce(
+                &self.principal.tenant.0,
+                &self.principal.principal_id.0,
+                idempotency_key,
+            );
+            return match self.knowledge.create_page(
+                &self.principal,
+                &self.delegator,
+                request,
+                nonce,
+            ) {
+                Ok(outcome) => {
+                    let Some(page_id) = outcome
+                        .page
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                    else {
+                        return EffectResult::Denied("internal error".into());
+                    };
+                    let Some(page_reference) = outcome
+                        .page
+                        .get("ref")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                    else {
+                        return EffectResult::Denied("internal error".into());
+                    };
+                    EffectResult::AppliedResource {
+                        event_id: EventId(format!("knowledge.page.create:{page_id}|{}", run.0)),
+                        resource: EffectResource::new(
+                            page_reference,
+                            serde_json::json!({
+                                "page_id": page_id,
+                                "page": outcome.page,
+                                "created": outcome.created,
+                            }),
+                        ),
+                    }
+                }
+                Err(error) => EffectResult::Denied(error.client_message()),
+            };
+        }
         if tool != "knowledge.link_work" {
-            return EffectResult::Denied(format!(
-                "Knowledge tool `{tool}` is registered but not wired through KnowledgeEffectApi"
-            ));
+            return EffectResult::Denied(format!("unknown Knowledge tool `{tool}`"));
         }
         let arguments: KnowledgeLinkArguments = match serde_json::from_value(arguments) {
             Ok(arguments) => arguments,
@@ -152,6 +206,15 @@ impl KnowledgeEffectApi {
     }
 }
 
+fn create_page_nonce(tenant: &str, actor: &str, idempotency_key: &str) -> String {
+    let mut digest = blake3::Hasher::new_derive_key("myelin.knowledge.agent-create-page.v1");
+    for part in [tenant, actor, idempotency_key] {
+        digest.update(&(part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest.finalize().to_hex().to_string()
+}
+
 impl EffectApi for KnowledgeEffectApi {
     fn apply(&self, _run: &RunCtx, _effect: ProposedEffect) -> EffectResult {
         EffectResult::Denied(
@@ -178,6 +241,25 @@ impl EffectApi for KnowledgeEffectApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_creation_retry_identity_is_stable_scoped_and_opaque() {
+        let first = create_page_nonce("acme", "agent:writer", "private-retry-key");
+        assert_eq!(
+            first,
+            create_page_nonce("acme", "agent:writer", "private-retry-key")
+        );
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("private-retry-key"));
+        assert_ne!(
+            first,
+            create_page_nonce("acme", "agent:other", "private-retry-key")
+        );
+        assert_ne!(
+            first,
+            create_page_nonce("other", "agent:writer", "private-retry-key")
+        );
+    }
 
     #[test]
     fn proposed_knowledge_links_accept_one_versioned_identity_without_aliasing() {

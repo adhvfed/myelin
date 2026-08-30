@@ -360,6 +360,7 @@ describe.sequential("the CLI authentication journey", () => {
         "issues.create",
         "issues.list",
         "issues.view",
+        "knowledge.create_page",
         "knowledge.link_work",
         "knowledge.list_pages",
         "knowledge.read_page",
@@ -414,6 +415,8 @@ describe.sequential("the CLI authentication journey", () => {
       "--tool",
       "issues.view",
       "--tool",
+      "knowledge.create_page",
+      "--tool",
       "knowledge.link_work",
       "--tool",
       "knowledge.list_pages",
@@ -458,6 +461,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "issues.create", version: 2 },
           { name: "issues.list", version: 1 },
           { name: "issues.view", version: 2 },
+          { name: "knowledge.create_page", version: 1 },
           { name: "knowledge.link_work", version: 2 },
           { name: "knowledge.list_pages", version: 1 },
           { name: "knowledge.read_page", version: 2 },
@@ -504,6 +508,7 @@ describe.sequential("the CLI authentication journey", () => {
         "issues.create",
         "issues.list",
         "issues.view",
+        "knowledge.create_page",
         "knowledge.link_work",
         "knowledge.list_pages",
         "knowledge.read_page",
@@ -556,6 +561,8 @@ describe.sequential("the CLI authentication journey", () => {
       "issues.list",
       "--tool",
       "issues.view",
+      "--tool",
+      "knowledge.create_page",
       "--tool",
       "knowledge.link_work",
       "--tool",
@@ -830,6 +837,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "issues.create", version: 2 },
           { name: "issues.list", version: 1 },
           { name: "issues.view", version: 2 },
+          { name: "knowledge.create_page", version: 1 },
           { name: "knowledge.link_work", version: 2 },
           { name: "knowledge.list_pages", version: 1 },
           { name: "knowledge.read_page", version: 2 },
@@ -927,6 +935,7 @@ describe.sequential("the CLI authentication journey", () => {
       "issues.create",
       "issues.list",
       "issues.view",
+      "knowledge.create_page",
       "knowledge.link_work",
       "knowledge.list_pages",
       "knowledge.read_page",
@@ -1022,6 +1031,11 @@ describe.sequential("the CLI authentication journey", () => {
     expect(schemaFor("knowledge.link_work")).toMatchObject({
       type: "object",
       required: ["page_ref", "reference"],
+      additionalProperties: false,
+    });
+    expect(schemaFor("knowledge.create_page")).toMatchObject({
+      type: "object",
+      required: ["title", "template", "visibility"],
       additionalProperties: false,
     });
     expect(schemaFor("knowledge.list_pages")).toMatchObject({
@@ -1166,6 +1180,7 @@ describe.sequential("the CLI authentication journey", () => {
       "issues.create",
       "issues.list",
       "issues.view",
+      "knowledge.create_page",
       "knowledge.link_work",
       "knowledge.list_pages",
       "knowledge.read_page",
@@ -2430,6 +2445,45 @@ describe.sequential("the CLI authentication journey", () => {
   }, 120_000);
 
   test("agent context enriches the living spec, the room, and the graph", async () => {
+    // An agent can originate a durable page without becoming its unreachable long-term owner.
+    // The founder retains edit authority while the initial block keeps agent attribution.
+    const agentPageTitle = uniqueName("Credentialless collaboration notes");
+    const agentPageKey = `agent-knowledge-page-${randomUUID()}`;
+    const createdPageByAgent = await askAgentToAct(
+      resumedRun,
+      35,
+      "knowledge.create_page",
+      { title: agentPageTitle, template: "blank", visibility: "team" },
+      agentPageKey,
+    );
+    const replayedAgentPage = await askAgentToAct(
+      resumedRun,
+      36,
+      "knowledge.create_page",
+      { title: agentPageTitle, template: "blank", visibility: "team" },
+      agentPageKey,
+    );
+    const agentPageData = record(createdPageByAgent.data, "agent page receipt data");
+    expect(replayedAgentPage).toEqual({
+      ...createdPageByAgent,
+      data: { ...agentPageData, created: false },
+    });
+    const agentPageId = string(agentPageData.page_id, "agent-created page id");
+    expect(createdPageByAgent.ref).toBe(
+      `myelin://${systemTestConfig.tenant}/knowledge/page/${agentPageId}`,
+    );
+    const humanVisibleAgentPage = await systemClient.json(
+      `/v1/knowledge/pages/${encodeURIComponent(agentPageId)}`,
+    );
+    expect(humanVisibleAgentPage.body).toMatchObject({
+      page: {
+        id: agentPageId,
+        title: agentPageTitle,
+        can_edit: true,
+        blocks: [expect.objectContaining({ type: "paragraph", markdown: "", is_you: false })],
+      },
+    });
+
     // The collaborator can add context to the human-owned living spec through the same
     // governed surface. Myelin records an agent-authored encrypted block, while the founder's
     // live ownership remains the resource authority; neither identity is flattened into the

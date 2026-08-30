@@ -25,6 +25,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("knowledge", "list_pages") => false,
         ("knowledge", "read_page") => false,
         ("knowledge", "link_work") => false,
+        ("knowledge", "create_page") => false,
 
         ("chat", "post") => false,
         ("chat", "reply") => false,

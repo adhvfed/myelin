@@ -185,14 +185,94 @@ impl DurableKnowledgeMutationApi {
     fn viewer(&self, principal: &Principal) -> String {
         self.reads.viewer(principal)
     }
+
+    pub fn create_page(
+        &self,
+        actor: &Principal,
+        owner: &Principal,
+        request: KnowledgeCreateRequest,
+        client_nonce: String,
+    ) -> Result<KnowledgeCreateOutcome, EdgeError> {
+        if actor.tenant != owner.tenant || actor.region != owner.region {
+            return Err(EdgeError::Forbidden(
+                "Knowledge pages cannot cross a tenant or region boundary".into(),
+            ));
+        }
+        if client_nonce.is_empty() || client_nonce.len() > 512 {
+            return Err(EdgeError::BadRequest(
+                "Knowledge page idempotency identity must be 1-512 bytes".into(),
+            ));
+        }
+        validate_title(&request.title)?;
+        let visibility = parse_visibility(&request.visibility)?;
+        let template = template_blocks(&request.template)?;
+        let page_id = self.mint_id();
+        let owner_id = self.viewer(owner);
+        let actor_id = self.viewer(actor);
+        let title = seal(
+            self.kms(),
+            owner,
+            &owner_id,
+            &title_scope(&page_id),
+            request.title.as_bytes(),
+        )?;
+        let blocks = template
+            .into_iter()
+            .map(|(block_type, markdown)| {
+                let block_id = self.mint_id();
+                Ok(KnowledgeBlockRecord {
+                    inline: seal(
+                        self.kms(),
+                        actor,
+                        &actor_id,
+                        &block_scope(&page_id, &block_id),
+                        markdown.as_bytes(),
+                    )?,
+                    block_id,
+                    block_type: block_type.into(),
+                    references: Vec::new(),
+                    created_by: actor_id.clone(),
+                    edited_by: actor_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, EdgeError>>()?;
+        let event_actor = pseudonymized_event_principal(&actor.tenant.0, actor);
+        let page = NewKnowledgePage {
+            tenant: owner.tenant.0.clone(),
+            region: owner.region.0.clone(),
+            page_id,
+            space_key: "engineering".into(),
+            parent_page_id: None,
+            title,
+            owner: owner_id,
+            visibility,
+            client_nonce,
+            blocks,
+        };
+        let (stored_id, created) = self.drive(self.store().create(
+            &page,
+            EventId(self.mint_id()),
+            Actor(event_actor),
+            now_timestamp(),
+        ))?;
+        Ok(KnowledgeCreateOutcome {
+            page: self.reads.read_page(owner, &stored_id)?,
+            created,
+        })
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreatePageBody {
-    title: String,
-    template: String,
-    visibility: String,
+pub struct KnowledgeCreateRequest {
+    pub title: String,
+    pub template: String,
+    pub visibility: String,
+}
+
+pub struct KnowledgeCreateOutcome {
+    pub page: Value,
+    pub created: bool,
 }
 
 #[derive(Deserialize)]
@@ -242,67 +322,18 @@ struct PageCreateHandler {
 impl Handler for PageCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
-        let body: CreatePageBody = parse_body(&ctx.request.body)?;
-        validate_title(&body.title)?;
+        let body: KnowledgeCreateRequest = parse_body(&ctx.request.body)?;
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
-        let visibility = parse_visibility(&body.visibility)?;
-        let template = template_blocks(&body.template)?;
-        let page_id = self.api.mint_id();
-        let viewer = self.api.viewer(ctx.principal);
-        let title = seal(
-            self.api.kms(),
-            ctx.principal,
-            &viewer,
-            &title_scope(&page_id),
-            body.title.as_bytes(),
-        )?;
-        let blocks = template
-            .into_iter()
-            .map(|(block_type, markdown)| {
-                let block_id = self.api.mint_id();
-                Ok(KnowledgeBlockRecord {
-                    inline: seal(
-                        self.api.kms(),
-                        ctx.principal,
-                        &viewer,
-                        &block_scope(&page_id, &block_id),
-                        markdown.as_bytes(),
-                    )?,
-                    block_id,
-                    block_type: block_type.into(),
-                    references: Vec::new(),
-                    created_by: viewer.clone(),
-                    edited_by: viewer.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, EdgeError>>()?;
-        let event_actor = pseudonymized_event_principal(&ctx.principal.tenant.0, ctx.principal);
-        let page = NewKnowledgePage {
-            tenant: ctx.principal.tenant.0.clone(),
-            region: ctx.principal.region.0.clone(),
-            page_id: page_id.clone(),
-            space_key: "engineering".into(),
-            parent_page_id: None,
-            title,
-            owner: viewer.clone(),
-            visibility,
-            client_nonce,
-            blocks,
-        };
-        let (stored_id, created) = self.api.drive(self.api.store().create(
-            &page,
-            EventId(self.api.mint_id()),
-            Actor(event_actor),
-            now_timestamp(),
-        ))?;
-        let stored = self.api.reads.read_page(ctx.principal, &stored_id)?;
+        let outcome = self
+            .api
+            .create_page(ctx.principal, ctx.principal, body, client_nonce)?;
         Ok(no_store(EdgeResponse::json(
-            if created { 201 } else { 200 },
+            if outcome.created { 201 } else { 200 },
             &json!({
-                "page": stored,
-                "created": created,
+                "page": outcome.page,
+                "created": outcome.created,
                 "durable": true,
             }),
         )))
@@ -994,11 +1025,11 @@ mod tests {
 
     #[test]
     fn creation_body_contains_domain_input_not_retry_transport_metadata() {
-        assert!(parse_body::<CreatePageBody>(
+        assert!(parse_body::<KnowledgeCreateRequest>(
             br#"{"title":"Runbook","template":"blank","visibility":"team"}"#
         )
         .is_ok());
-        assert!(parse_body::<CreatePageBody>(
+        assert!(parse_body::<KnowledgeCreateRequest>(
             br#"{"title":"Runbook","template":"blank","visibility":"team","client_nonce":"legacy"}"#
         )
         .is_err());

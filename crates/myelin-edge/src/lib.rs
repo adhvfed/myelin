@@ -119,8 +119,8 @@ pub use issues_http::{
 };
 pub use knowledge_effect::KnowledgeEffectApi;
 pub use knowledge_http::{
-    register_knowledge, DurableKnowledgeMutationApi, DurableKnowledgeReadApi, KnowledgeLinkOutcome,
-    KnowledgeLinkRequest,
+    register_knowledge, DurableKnowledgeMutationApi, DurableKnowledgeReadApi,
+    KnowledgeCreateOutcome, KnowledgeCreateRequest, KnowledgeLinkOutcome, KnowledgeLinkRequest,
 };
 pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
