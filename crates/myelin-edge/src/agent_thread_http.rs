@@ -11,8 +11,9 @@ use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadProvisioningFailure, AgentThreadRunBinding,
     AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread, WorkspaceSshRouteKey,
-    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread, RetryAgentThreadOutcome,
+    WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -100,14 +101,54 @@ impl AgentThreadHttpApi {
         if !created && parse_stored_timestamp(&thread.expires_at)? <= Utc::now() {
             return Ok((thread, false));
         }
+        if !created
+            && thread.state != AgentThreadState::Provisioning
+            && thread.state != AgentThreadState::Ready
+        {
+            return Ok((thread, false));
+        }
+        self.provision(principal, thread)
+            .map(|thread| (thread, created))
+    }
+
+    fn retry(
+        &self,
+        principal: &Principal,
+        thread_id: Uuid,
+    ) -> Result<DurableAgentThread, EdgeError> {
+        let outcome = self
+            .drive(self.threads.retry_provisioning(
+                &principal.tenant.0,
+                &principal.principal_id.0,
+                thread_id,
+                Utc::now(),
+            ))?
+            .map_err(|_| EdgeError::Internal("agent thread retry storage failed".into()))?;
+        let thread = match outcome {
+            RetryAgentThreadOutcome::Retrying(thread)
+            | RetryAgentThreadOutcome::AlreadyReady(thread) => thread,
+            RetryAgentThreadOutcome::NotFound => {
+                return Err(EdgeError::NotFound("agent thread not found".into()))
+            }
+            RetryAgentThreadOutcome::Unavailable => {
+                return Err(EdgeError::Conflict(
+                    "agent thread is no longer available for provisioning".into(),
+                ))
+            }
+        };
+        self.provision(principal, thread)
+    }
+
+    fn provision(
+        &self,
+        principal: &Principal,
+        thread: DurableAgentThread,
+    ) -> Result<DurableAgentThread, EdgeError> {
         if thread.state == AgentThreadState::Ready {
             let (conversation, zookie) = self.create_private_conversation(principal, &thread)?;
             self.chat_mutations
                 .activate_private_conversation(&conversation, &zookie)?;
-            return Ok((thread, created));
-        }
-        if !created && thread.state != AgentThreadState::Provisioning {
-            return Ok((thread, false));
+            return Ok(thread);
         }
         if thread.state != AgentThreadState::Provisioning {
             return Err(EdgeError::Conflict(
@@ -174,7 +215,7 @@ impl AgentThreadHttpApi {
         };
         self.chat_mutations
             .activate_private_conversation(&conversation, &zookie)?;
-        Ok((ready, created))
+        Ok(ready)
     }
 
     fn record_provisioning_failure(
@@ -382,6 +423,30 @@ impl Handler for AgentThreadCreateHandler {
 
 struct AgentThreadGetHandler {
     api: AgentThreadHttpApi,
+}
+
+struct AgentThreadRetryHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadRetryHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "private agent thread retry",
+            MAX_AGENT_THREAD_JSON_BYTES,
+        )?;
+        let thread = self.api.retry(ctx.principal, thread_param(ctx)?)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "thread": thread_json(&ctx.principal.tenant.0, &thread),
+                "created": false,
+                "durable": true,
+            }),
+        )))
+    }
 }
 
 struct AgentThreadRunCreateHandler {
@@ -617,6 +682,12 @@ pub fn register_agent_threads(
             "/v1/agent-threads/{thread}",
             "identity.agent_thread.view",
             Arc::new(AgentThreadGetHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agent-threads/{thread}/retry",
+            "identity.agent_thread.create",
+            Arc::new(AgentThreadRetryHandler { api: api.clone() }),
         )
         .route(
             Method::Post,

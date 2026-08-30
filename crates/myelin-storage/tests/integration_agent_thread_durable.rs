@@ -9,8 +9,9 @@ use myelin_storage::{
     AgentThreadExpiryFailure, AgentThreadProvisioningFailure, BindAgentThreadRunOutcome,
     CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
     ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant,
-    NewWorkspaceSshSession, SealKey, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
-    AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
+    NewWorkspaceSshSession, RetryAgentThreadOutcome, SealKey, SubstrateProvider,
+    WorkspaceSessionMode, WorkspaceSshRouteKey, AGENT_THREAD_EXPIRY_GRACE_SECONDS,
+    WORKSPACE_SSH_SESSION_STARTED,
 };
 use sqlx::types::Uuid;
 
@@ -302,6 +303,50 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         "partial storage cannot become accessible while its durable receipt is failed"
     );
 
+    assert_eq!(
+        threads
+            .retry_provisioning(
+                &tenant,
+                "p:bob",
+                intended.thread_id,
+                intended.created_at + Duration::minutes(2),
+            )
+            .await
+            .unwrap(),
+        RetryAgentThreadOutcome::NotFound,
+        "another human cannot probe or reopen the owner's failed receipt"
+    );
+    let owner_retry = threads
+        .retry_provisioning(
+            &tenant,
+            owner,
+            intended.thread_id,
+            intended.created_at + Duration::minutes(2),
+        )
+        .await
+        .unwrap();
+    let RetryAgentThreadOutcome::Retrying(owner_restarted) = owner_retry else {
+        panic!("the owner should be able to reopen the failed receipt: {owner_retry:?}");
+    };
+    assert_eq!(owner_restarted.thread_id, created.thread_id);
+    assert_eq!(owner_restarted.conversation_id, created.conversation_id);
+    assert_eq!(owner_restarted.workspace_id, created.workspace_id);
+    assert_eq!(
+        owner_restarted.state,
+        myelin_storage::AgentThreadState::Provisioning
+    );
+    assert!(owner_restarted.failure_reason.is_none());
+    assert!(threads
+        .record_provisioning_failure(
+            &tenant,
+            owner,
+            intended.thread_id,
+            AgentThreadProvisioningFailure::WorkspaceUnavailable,
+            intended.created_at + Duration::minutes(3),
+        )
+        .await
+        .unwrap());
+
     let replay_proposal = NewAgentThread {
         thread_id: Uuid::from_u128(102),
         conversation_id: "01J00000000000000000000102".into(),
@@ -415,6 +460,27 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             .await
             .unwrap(),
         ActivateAgentThreadOutcome::AlreadyReady(ready.clone())
+    );
+    assert_eq!(
+        threads
+            .retry_provisioning(
+                &tenant,
+                owner,
+                intended.thread_id,
+                intended.created_at + Duration::hours(2),
+            )
+            .await
+            .unwrap(),
+        RetryAgentThreadOutcome::AlreadyReady(ready.clone()),
+        "a lost retry response converges on the existing ready receipt"
+    );
+    assert_eq!(
+        threads
+            .retry_provisioning(&tenant, owner, intended.thread_id, intended.expires_at)
+            .await
+            .unwrap(),
+        RetryAgentThreadOutcome::Unavailable,
+        "the owner cannot reopen a receipt at its exact lifetime boundary"
     );
 
     let ssh_issued_at = intended.created_at + Duration::hours(1);

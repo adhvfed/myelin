@@ -106,6 +106,14 @@ pub enum CreateAgentThreadOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetryAgentThreadOutcome {
+    Retrying(DurableAgentThread),
+    AlreadyReady(DurableAgentThread),
+    NotFound,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActivateAgentThreadOutcome {
     Activated(DurableAgentThread),
     AlreadyReady(DurableAgentThread),

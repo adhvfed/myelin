@@ -108,6 +108,8 @@ myelin agent thread start "Investigate checkout race" \
   --agent 22222222-2222-2222-2222-222222222222 --retention-days 3 \
   --idempotency-key investigate-checkout-race
 myelin agent thread list
+# If startup was interrupted, reopen the same durable conversation and workspace identities.
+myelin agent thread retry 33333333-3333-4333-8333-333333333333
 myelin agent thread say 33333333-3333-4333-8333-333333333333 \
   "The final reader still owns its checkout lease."
 myelin agent thread history 33333333-3333-4333-8333-333333333333

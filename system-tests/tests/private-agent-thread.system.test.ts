@@ -22,6 +22,7 @@ import {
   listPrivateAgentThreads,
   parsePrivateAgentThread,
   requestWorkspaceSshAccess,
+  retryPrivateAgentThread,
   startPrivateAgentThread,
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
@@ -166,6 +167,17 @@ describe("private work with an agent", () => {
     });
     expect(retry.created).toBe(false);
     expect(retry.thread).toEqual(first.thread);
+
+    const recoveredAfterReload = await retryPrivateAgentThread(founder, first.thread.id);
+    expect(recoveredAfterReload).toEqual({ created: false, thread: first.thread });
+    await teammate.json(
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/retry`,
+      {
+        method: "POST",
+        body: {},
+        expectedStatus: 404,
+      },
+    );
 
     expect(await listPrivateAgentThreads(founder)).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: first.thread.id, name: threadName })]),

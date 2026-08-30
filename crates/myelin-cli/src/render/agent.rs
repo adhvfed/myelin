@@ -145,6 +145,10 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
             "  message: myelin agent thread say {id} \"<message>\""
         );
         let _ = writeln!(output, "  workspace: myelin agent thread ssh {id}");
+    } else if matches!(state.as_str(), "failed" | "provisioning")
+        && DateTime::parse_from_rfc3339(&expires_at).is_ok_and(|deadline| deadline > Utc::now())
+    {
+        let _ = writeln!(output, "  retry: myelin agent thread retry {id}");
     }
     Some(output)
 }
@@ -348,6 +352,12 @@ mod tests {
         assert!(rendered.starts_with("Private agent thread:"));
         assert!(!rendered.contains("myelin agent thread ssh"));
         assert!(!rendered.contains("myelin mcp serve"));
+
+        let mut failed = thread();
+        failed["workspace"]["state"] = json!("failed");
+        let rendered = render_response(&json!({ "thread": failed })).unwrap();
+        assert!(rendered.contains(&format!("myelin agent thread retry {THREAD_ID}")));
+        assert!(!rendered.contains("myelin agent thread ssh"));
 
         let mut elapsed = thread();
         elapsed["workspace"]["expires_at"] = json!("2020-08-25T12:00:00Z");

@@ -15,12 +15,13 @@ pub(super) fn agent_thread_dispatch(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent thread command given (try: start <name> --agent <id> | list | show <id> | say <id> <message> | history <id>)"
+            "no agent thread command given (try: start <name> --agent <id> | retry <id> | list | show <id> | say <id> <message> | history <id>)"
                 .into(),
         )
     })?;
     match *verb {
         "start" => start_call(rest, default_project),
+        "retry" => retry_call(rest),
         "list" => list_call(rest),
         "show" => show_call(rest),
         "say" => say_call(rest),
@@ -117,6 +118,15 @@ fn show_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     let id = exactly_one_id(args, "agent thread show", "thread id")?;
     require_agent_id("agent thread id", id)?;
     Ok(EdgeCall::get(format!("/v1/agent-threads/{id}")))
+}
+
+fn retry_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let id = exactly_one_id(args, "agent thread retry", "thread id")?;
+    require_agent_id("agent thread id", id)?;
+    Ok(EdgeCall::post_retry_safe_json(
+        format!("/v1/agent-threads/{id}/retry"),
+        json!({}),
+    ))
 }
 
 fn say_call(args: &[&str]) -> Result<EdgeCall, CliError> {
@@ -252,6 +262,10 @@ mod tests {
             agent_dispatch(&["thread", "show", THREAD]).unwrap().path,
             format!("/v1/agent-threads/{THREAD}")
         );
+        let retry = agent_dispatch(&["thread", "retry", THREAD]).unwrap();
+        assert_eq!(retry.path, format!("/v1/agent-threads/{THREAD}/retry"));
+        assert_eq!(retry.retry_policy, RetryPolicy::None);
+        assert_eq!(retry.payload.as_deref(), Some(b"{}".as_slice()));
 
         let say = agent_dispatch(&[
             "thread",
@@ -307,6 +321,8 @@ mod tests {
             vec!["thread", "list", "--cursor", "not-a-thread"],
             vec!["thread", "show"],
             vec!["thread", "show", "not-a-thread"],
+            vec!["thread", "retry"],
+            vec!["thread", "retry", "not-a-thread"],
             vec!["thread", "say", THREAD],
             vec!["thread", "say", THREAD, "  "],
             vec!["thread", "history"],

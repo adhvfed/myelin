@@ -77,6 +77,24 @@ export async function listPrivateAgentThreads(
     .map((item) => parsePrivateAgentThread(item));
 }
 
+export async function retryPrivateAgentThread(
+  client: SystemTestClient,
+  threadId: string,
+): Promise<{ thread: PrivateAgentThread; created: boolean }> {
+  const response = await client.json(
+    `/v1/agent-threads/${encodeURIComponent(threadId)}/retry`,
+    {
+      method: "POST",
+      body: {},
+      expectedStatus: 200,
+    },
+  );
+  return {
+    thread: parsePrivateAgentThread(response.body.thread),
+    created: response.body.created === true,
+  };
+}
+
 export async function requestWorkspaceSshAccess(
   client: SystemTestClient,
   threadId: string,

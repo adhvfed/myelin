@@ -25,6 +25,7 @@ import type { ChatMessagePage } from "./chat-response";
 export type AgentThreadErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
 export type AgentThreadMutationResult =
   | { ok: true; op: "create"; receipt: AgentThreadCreateReceipt }
+  | { ok: true; op: "retry"; receipt: AgentThreadCreateReceipt }
   | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
   | { ok: true; op: "post-message"; messageId: string; threadId: string }
   | { ok: false; error: AgentThreadErrorKind };
@@ -237,6 +238,17 @@ export const mutateAgentThread = action(async (input: unknown) => {
       }, { idempotencyKey: mutation.clientNonce }));
       return receipt
         ? respond({ ok: true, op: "create", receipt })
+        : respond({ ok: false, error: "error" });
+    }
+    if (mutation.op === "retry" && Object.keys(mutation).every((key) =>
+      ["op", "threadId"].includes(key)) && Object.keys(mutation).length === 2 &&
+        isAgentThreadId(mutation.threadId)) {
+      const receipt = parseAgentThreadCreateReceipt(await edgePost(
+        `/v1/agent-threads/${segment(mutation.threadId)}/retry`,
+        {},
+      ));
+      return receipt
+        ? respond({ ok: true, op: "retry", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "post-message" && Object.keys(mutation).every((key) =>

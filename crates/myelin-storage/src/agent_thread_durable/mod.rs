@@ -12,8 +12,8 @@ pub use expiry::{
 };
 pub use model::{
     ActivateAgentThreadOutcome, AgentThreadProvisioningFailure, AgentThreadState,
-    CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread, MAX_AGENT_THREAD_NAME_BYTES,
-    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread, RetryAgentThreadOutcome,
+    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
@@ -35,9 +35,7 @@ pub use workspace_session::{
     ReservedWorkspaceSshSession, WorkspaceSessionMode, WORKSPACE_SSH_SESSION_STARTED,
 };
 
-use chrono::Duration;
-#[cfg(test)]
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use sqlx::types::Uuid;
 use sqlx::Row;
 
@@ -333,6 +331,82 @@ impl DurableAgentThreadBacking {
                     .map_err(query_error("record agent thread provisioning failure"))?
                     .rows_affected();
                     Ok(changed == 1)
+                })
+            })
+            .await
+    }
+
+    /// Reopens one owner's durable provisioning receipt without requiring the
+    /// original request nonce. The thread, conversation, and workspace
+    /// identities remain unchanged, so a response-lost retry is the same
+    /// provisioning operation rather than a replacement thread.
+    pub async fn retry_provisioning(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        thread_id: Uuid,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RetryAgentThreadOutcome, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let current = by_id(conn, &tenant, &region, thread_id).await?;
+                    let Some(current) = current else {
+                        return Ok(RetryAgentThreadOutcome::NotFound);
+                    };
+                    if current.owner_principal_id != owner {
+                        return Ok(RetryAgentThreadOutcome::NotFound);
+                    }
+                    let expires_at = DateTime::parse_from_rfc3339(&current.expires_at)
+                        .map_err(|_| PgError::Query("stored agent thread expiry is invalid".into()))?
+                        .with_timezone(&Utc);
+                    if expires_at <= observed_at {
+                        return Ok(RetryAgentThreadOutcome::Unavailable);
+                    }
+                    match current.state {
+                        AgentThreadState::Ready => {
+                            Ok(RetryAgentThreadOutcome::AlreadyReady(current))
+                        }
+                        AgentThreadState::Provisioning => {
+                            Ok(RetryAgentThreadOutcome::Retrying(current))
+                        }
+                        AgentThreadState::Failed => {
+                            let row = sqlx::query(
+                                "UPDATE agent_thread
+                                    SET state = 'provisioning', failure_reason = NULL,
+                                        updated_at = $5
+                                  WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                                    AND owner_principal_id = $4 AND state = 'failed'
+                                RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
+                                  conversation_id, workspace_id, workspace_generation, name, project_id,
+                                  retention_days, state, storage_locator, failure_reason, created_at,
+                                  expires_at, updated_at",
+                            )
+                            .bind(&tenant)
+                            .bind(&region)
+                            .bind(thread_id)
+                            .bind(&owner)
+                            .bind(observed_at)
+                            .fetch_optional(&mut *conn)
+                            .await
+                            .map_err(query_error("retry failed agent thread provisioning"))?;
+                            row.as_ref()
+                                .map(row_to_thread)
+                                .transpose()?
+                                .map(RetryAgentThreadOutcome::Retrying)
+                                .ok_or_else(|| {
+                                    PgError::Query(
+                                        "agent thread retry lost its locked receipt".into(),
+                                    )
+                                })
+                        }
+                        AgentThreadState::Expiring | AgentThreadState::Deleted => {
+                            Ok(RetryAgentThreadOutcome::Unavailable)
+                        }
+                    }
                 })
             })
             .await

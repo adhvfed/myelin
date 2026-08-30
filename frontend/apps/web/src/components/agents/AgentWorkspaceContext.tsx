@@ -22,12 +22,16 @@ export function AgentWorkspaceContext(props: {
   sessionsLoadingMore: boolean;
   onLoadMoreSessions: () => void;
   workspaceAvailable: boolean;
+  retrying: boolean;
+  retryError: string | null;
+  onRetry: () => void;
 }) {
   const agentCommand = () =>
     `myelin mcp serve --as ${props.thread.agent_id} --thread ${props.thread.id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
   const agentName = () => props.agent?.name ?? `Agent ${props.thread.agent_id.slice(0, 8)}`;
   const commandScope = () => props.agent?.selected_tools.includes("workspace.exec");
+  const retryable = () => ["failed", "provisioning"].includes(props.thread.workspace.state);
   const connectUnavailableCopy = () => {
     if (!props.agent) return "Agent connection is unavailable until its identity can be loaded.";
     if (props.agent.status === "suspended") {
@@ -61,7 +65,28 @@ export function AgentWorkspaceContext(props: {
       <Show when={props.workspaceAvailable} fallback={
         <section data-testid="workspace-unavailable">
           <h3>Workspace unavailable</h3>
-          <p>This retained receipt is no longer active. New messages, agent runs, and SSH access are unavailable.</p>
+          <Show when={retryable()} fallback={
+            <p>This retained receipt is no longer active. New messages, agent runs, and SSH access are unavailable.</p>
+          }>
+            <p>
+              {props.thread.workspace.state === "failed"
+                ? "Myelin couldn’t finish starting this workspace. Its private identities are retained and safe to retry."
+                : "This workspace is still being prepared. Retry the same receipt if startup was interrupted."}
+            </p>
+            <button
+              type="button"
+              class="agent-thread-button primary"
+              disabled={props.retrying}
+              onClick={() => props.onRetry()}
+              data-testid="agent-thread-retry"
+            >
+              <Icon name={props.retrying ? "cycle" : "agent"} />
+              {props.retrying ? "Retrying…" : "Retry startup"}
+            </button>
+            <Show when={props.retryError}>
+              <p role="alert">{props.retryError}</p>
+            </Show>
+          </Show>
         </section>
       }>
         <section>

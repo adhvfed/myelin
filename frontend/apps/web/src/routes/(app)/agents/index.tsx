@@ -1,6 +1,6 @@
 import { useToast } from "@myelin/design-system";
 import { Title } from "@solidjs/meta";
-import { createAsync, revalidate, useNavigate, useSearchParams } from "@solidjs/router";
+import { createAsync, revalidate, useAction, useNavigate, useSearchParams } from "@solidjs/router";
 import {
   createEffect,
   createMemo,
@@ -29,6 +29,7 @@ import {
   getAgentThreadMessages,
   getAgentThreads,
   getWorkspaceSessions,
+  mutateAgentThread,
   type AgentThreadErrorKind,
 } from "~/lib/agent-thread-api";
 import {
@@ -63,6 +64,7 @@ export default function AgentThreadsIndex() {
   const navigate = useNavigate();
   const toast = useToast();
   const pane = useContextPane();
+  const mutate = useAction(mutateAgentThread);
   const selectedId = () => typeof search.thread === "string" ? search.thread : undefined;
   const validSelectedId = () => isAgentThreadId(selectedId()) ? selectedId() : undefined;
   const createOpen = () => search.new === "1";
@@ -80,6 +82,8 @@ export default function AgentThreadsIndex() {
   const [loadingEarlier, setLoadingEarlier] = createSignal(false);
   const [workspaceSessionPages, setWorkspaceSessionPages] = createSignal<WorkspaceSessionPage[]>([]);
   const [loadingMoreSessions, setLoadingMoreSessions] = createSignal(false);
+  const [retryingWorkspace, setRetryingWorkspace] = createSignal(false);
+  const [retryWorkspaceError, setRetryWorkspaceError] = createSignal<string | null>(null);
   let threadGeneration = 0;
   let messageGeneration = 0;
   let workspaceSessionGeneration = 0;
@@ -204,7 +208,45 @@ export default function AgentThreadsIndex() {
     setLoadingEarlier(false);
     setWorkspaceSessionPages([]);
     setLoadingMoreSessions(false);
+    setRetryingWorkspace(false);
+    setRetryWorkspaceError(null);
   });
+
+  const retryWorkspace = async () => {
+    const threadId = validSelectedId();
+    if (!threadId || retryingWorkspace()) return;
+    setRetryingWorkspace(true);
+    setRetryWorkspaceError(null);
+    try {
+      const result = await mutate({
+        op: "retry",
+        threadId,
+      });
+      if (!result.ok || result.op !== "retry") {
+        setRetryWorkspaceError(result.ok || result.error === "error"
+          ? "Myelin couldn’t confirm the retry. Try again with the same retained thread."
+          : result.error === "conflict"
+            ? "This workspace has reached the end of its retained lifetime."
+            : result.error === "not-found"
+              ? "This private thread is no longer available."
+              : "Workspace startup is temporarily unavailable. Try again shortly.");
+        return;
+      }
+      threadGeneration += 1;
+      setThreadPages([]);
+      await Promise.all([
+        revalidate(getAgentThread.keyFor(threadId)),
+        revalidate(getAgentThreads.keyFor({ limit: 100 })),
+        revalidate(getAgentThreadMessages.keyFor({ threadId, limit: 100 })),
+        revalidate(getWorkspaceSessions.keyFor({ threadId, limit: 100 })),
+      ]);
+      toast.show({ title: "Private workspace is ready", variant: "success" });
+    } catch {
+      setRetryWorkspaceError("Myelin couldn’t confirm the retry. Try again with the same retained thread.");
+    } finally {
+      setRetryingWorkspace(false);
+    }
+  };
   createEffect(() => {
     const id = validSelectedId();
     const conversationId = selectedThread()?.page?.conversation_id;
@@ -235,6 +277,9 @@ export default function AgentThreadsIndex() {
       sessionsLoadingMore={loadingMoreSessions()}
       onLoadMoreSessions={() => void loadMoreWorkspaceSessions()}
       workspaceAvailable={workspaceAvailable()}
+      retrying={retryingWorkspace()}
+      retryError={retryWorkspaceError()}
+      onRetry={() => void retryWorkspace()}
     /> : null);
     onCleanup(() => pane.setContextPane(null));
   });

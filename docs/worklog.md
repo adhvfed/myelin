@@ -4446,6 +4446,31 @@ Chat/private-agent journeys. An unattended boot-wide provisioning sweeper remain
 currently driven by replaying the saved mutation identity, while abandoned receipts remain
 inaccessible and eventually enter the existing expiry cleanup.
 
+## 2026-08-30 — A failed private workspace is recoverable after reload
+
+The exact creation retry above depended on the browser still holding its original mutation nonce.
+After a reload, the owner could see the durable `failed` receipt in the private-work list but could
+not ask Myelin to finish it; the workspace pane described every non-ready state as permanently
+inactive. The CLI exposed the same receipt without a recovery command. This turned a recoverable
+state machine into a dead-end user journey whenever the initiating client state was lost.
+
+An owner-scoped retry operation now locks the existing thread receipt and reopens only `failed` or
+already-`provisioning` work. It never accepts replacement intent or allocates another thread,
+conversation, or workspace identity. Repeating the operation after response loss converges on the
+same ready receipt and also replays the deferred Chat publication, while another human receives the
+same content-free not-found response and a receipt at its exact expiry boundary cannot be revived.
+The browser offers **Retry startup** for retained failed or interrupted work, and the CLI exposes
+the intrinsically retry-safe `myelin agent thread retry` command with a copyable hint on failed
+thread detail; neither client has to retain or invent another domain identity.
+
+Proof includes all 351 Storage, 369 Edge, and 160 CLI library stories; 659 frontend stories plus
+typecheck and lint; strict all-target/all-feature Clippy for Storage, Edge, and CLI; the live
+PostgreSQL lifecycle proving owner isolation, fixed-identity recovery, ready replay, and exact expiry;
+the rebuilt TypeScript private-work journey through Edge, Chat, confined workspaces, and real pinned
+OpenSSH (3 stories in 9.41 seconds); and the live Chromium private-agent product journey with its
+accessibility scan (5.7 seconds). A boot-wide unattended provisioning sweeper remains open, but a
+failed receipt is no longer abandoned merely because its creating browser or CLI process exited.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the
