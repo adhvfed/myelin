@@ -1,3 +1,4 @@
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -6,40 +7,62 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { systemTestConfig } from "../src/config.js";
-import { browserApprovedCliCredential, uniqueName } from "../src/context.js";
-import { activateExternalAgent } from "../src/journeys/agents.js";
+import { systemClient, uniqueName } from "../src/context.js";
 import { record, string } from "../src/json.js";
-import { runCliWith, type CliResult } from "../src/myelin-cli.js";
+import { finish, runCli, runCliWith, startCli, waitForCode } from "../src/myelin-cli.js";
 
 describe("private agent work from the CLI", () => {
   let configDirectory: string;
+  let login: ChildProcessWithoutNullStreams | undefined;
 
   beforeAll(async () => {
     configDirectory = await mkdtemp(resolve(tmpdir(), "myelin-private-thread-cli-"));
   });
 
   afterAll(async () => {
+    if (login && login.exitCode === null) login.kill("SIGTERM");
     await rm(configDirectory, { recursive: true, force: true });
   });
 
-  test("a developer names the problem, returns to its history, and enters its workspace", async () => {
-    const session = await browserApprovedCliCredential();
-    const companion = await activateExternalAgent(
-      session.client,
-      uniqueName("CLI checkout companion"),
-      ["chat.read_messages", "chat.post", "workspace.read_file", "workspace.write_file"],
-    );
-    const runMyelin = (...args: string[]): Promise<CliResult> => runCliWith(
+  test("a developer names the problem and resumes it with the agent and SSH", async () => {
+    login = startCli(
       configDirectory,
-      {
-        environment: {
-          MYELIN_EDGE: systemTestConfig.edgeUrl,
-          MYELIN_TOKEN: session.token,
-          MYELIN_TOKEN_SCHEME: session.tokenScheme,
-        },
-      },
-      args,
+      "--edge",
+      systemTestConfig.edgeUrl,
+      "auth",
+      "login",
+      "--no-browser",
     );
+    const approval = await waitForCode(login);
+    await systemClient.json("/v1/auth/device/approval", {
+      method: "POST",
+      body: { user_code: approval.code },
+    });
+    expect(await finish(login, approval)).toContain("Approved. Your CLI session is ready");
+
+    const runMyelin = (...args: string[]) => runCli(configDirectory, ...args);
+    const activated = await runMyelin(
+      "--json",
+      "--idempotency-key",
+      `cli-private-agent-${randomUUID()}`,
+      "agent",
+      "create",
+      uniqueName("CLI checkout companion"),
+      "--tool",
+      "chat.read_messages",
+      "--tool",
+      "chat.post",
+      "--tool",
+      "workspace.read_file",
+      "--tool",
+      "workspace.write_file",
+    );
+    expect(activated.exitCode, activated.stderr).toBe(0);
+    const companion = record(
+      record(JSON.parse(activated.stdout), "CLI agent activation").agent,
+      "activated private-work agent",
+    );
+    const companionId = string(companion.id, "activated private-work agent id");
 
     const threadName = uniqueName("Investigate checkout final-reader race");
     const started = await runMyelin(
@@ -51,7 +74,7 @@ describe("private agent work from the CLI", () => {
       "start",
       threadName,
       "--agent",
-      companion.agent.id,
+      companionId,
       "--retention-days",
       "3",
     );
@@ -63,7 +86,7 @@ describe("private agent work from the CLI", () => {
     const threadId = string(thread.id, "created private thread id");
     expect(thread).toMatchObject({
       name: threadName,
-      agent_id: companion.agent.id,
+      agent_id: companionId,
       workspace: { state: "ready", retention_days: 3 },
     });
 
@@ -72,6 +95,9 @@ describe("private agent work from the CLI", () => {
     expect(shown.stdout).toContain(`Private agent thread: ${threadName}`);
     expect(shown.stdout).toContain(`myelin agent thread say ${threadId}`);
     expect(shown.stdout).toContain(`myelin agent thread ssh ${threadId}`);
+    expect(shown.stdout).toContain(
+      `myelin mcp serve --as ${companionId} --thread ${threadId}`,
+    );
 
     const listed = await runMyelin("agent", "thread", "list", "--limit", "100");
     expect(listed.exitCode, listed.stderr).toBe(0);
@@ -102,6 +128,46 @@ describe("private agent work from the CLI", () => {
     expect(history.exitCode, history.stderr).toBe(0);
     expect(history.stdout).toContain(problem);
 
+    const agentObservation = uniqueName("The thread-bound MCP agent was here");
+    const agentPath = "notes/from-thread-agent.txt";
+    const bridge = await runCliWith(
+      configDirectory,
+      {
+        input: [
+          JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: {
+              name: "workspace.write_file",
+              arguments: { path: agentPath, content: agentObservation },
+              _meta: { "com.myelin/idempotencyKey": `cli-thread-write-${randomUUID()}` },
+            },
+          }),
+          "",
+        ].join("\n"),
+      },
+      ["mcp", "serve", "--as", companionId, "--thread", threadId],
+    );
+    expect(bridge.exitCode, bridge.stderr).toBe(0);
+    expect(bridge.stderr).toBe("");
+    const bridgeResponses = bridge.stdout.trim().split("\n").map((line) => JSON.parse(line));
+    expect(bridgeResponses).toHaveLength(2);
+    expect(record(bridgeResponses[1]?.result, "thread-bound MCP write result"))
+      .toMatchObject({ isError: false, _meta: { tool: "workspace.write_file" } });
+
+    const agentWorkspace = await runMyelin(
+      "agent",
+      "thread",
+      "ssh",
+      threadId,
+      "--command",
+      `cat ${agentPath}`,
+    );
+    expect(agentWorkspace.exitCode, agentWorkspace.stderr).toBe(0);
+    expect(agentWorkspace.stdout).toBe(agentObservation);
+
     const observation = uniqueName("The CLI was here");
     const wroteWorkspace = await runMyelin(
       "agent",
@@ -124,9 +190,21 @@ describe("private agent work from the CLI", () => {
     expect(resumedWorkspace.exitCode, resumedWorkspace.stderr).toBe(0);
     expect(resumedWorkspace.stdout).toBe(observation);
 
-    for (const result of [started, shown, listed, said, history, wroteWorkspace, resumedWorkspace]) {
-      expect(result.stdout).not.toContain(session.token);
-      expect(result.stderr).not.toContain(session.token);
+    for (const result of [
+      activated,
+      started,
+      shown,
+      listed,
+      said,
+      history,
+      bridge,
+      agentWorkspace,
+      wroteWorkspace,
+      resumedWorkspace,
+    ]) {
+      expect(result.stdout).not.toContain(systemTestConfig.token);
+      expect(result.stderr).not.toContain(systemTestConfig.token);
+      expect(`${result.stdout}${result.stderr}`).not.toMatch(/v4\.public\./);
       expect(`${result.stdout}${result.stderr}`).not.toContain("id_ed25519");
     }
   }, 120_000);

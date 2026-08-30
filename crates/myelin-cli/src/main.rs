@@ -186,6 +186,9 @@ enum McpCommand {
         /// Run as this activated external-agent identity.
         #[arg(long = "as", value_name = "AGENT_ID")]
         agent_id: String,
+        /// Resume this named private thread and its retained workspace.
+        #[arg(long = "thread", value_name = "THREAD_ID")]
+        thread_id: Option<String>,
     },
 }
 
@@ -329,7 +332,10 @@ async fn run() -> Result<(), CliError> {
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Mcp { command } => match command {
-            McpCommand::Serve { agent_id } => serve_mcp(&cli, agent_id, &getenv, &read_file).await,
+            McpCommand::Serve {
+                agent_id,
+                thread_id,
+            } => serve_mcp(&cli, agent_id, thread_id.as_deref(), &getenv, &read_file).await,
         },
     }
 }
@@ -358,6 +364,7 @@ async fn doctor(
 async fn serve_mcp(
     cli: &Cli,
     agent_id: &str,
+    thread_id: Option<&str>,
     getenv: &dyn Fn(&str) -> Option<String>,
     read_file: &dyn Fn(&std::path::Path) -> Option<String>,
 ) -> Result<(), CliError> {
@@ -395,7 +402,7 @@ async fn serve_mcp(
         url: edge_url.into(),
         scheme: SESSION_SCHEME.into(),
     };
-    myelin_cli::mcp_bridge::serve_stdio(&edge, &credential.token, agent_id).await
+    myelin_cli::mcp_bridge::serve_stdio(&edge, &credential.token, agent_id, thread_id).await
 }
 
 fn read_import_input(path: &str) -> Result<String, CliError> {
@@ -1040,6 +1047,8 @@ mod tests {
                 "serve",
                 "--as",
                 "11111111-1111-1111-1111-111111111111",
+                "--thread",
+                "22222222-2222-2222-2222-222222222222",
             ][..],
             &["myelin", "doctor"][..],
             &["myelin", "issue", "list"][..],

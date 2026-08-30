@@ -111,6 +111,8 @@ myelin agent thread list
 myelin agent thread say 33333333-3333-4333-8333-333333333333 \
   "The final reader still owns its checkout lease."
 myelin agent thread history 33333333-3333-4333-8333-333333333333
+myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \
+  --thread 33333333-3333-4333-8333-333333333333
 myelin agent thread ssh 33333333-3333-4333-8333-333333333333
 
 myelin agent create "Mainline triage" --runtime hosted \
@@ -223,7 +225,8 @@ without leaving Myelin. Every save is a branch-policy-aware compare-and-swap com
 retry identity, so a lost response is safe to repeat and a teammate's intervening edit preserves
 the browser draft instead of being overwritten.
 
-External MCP clients can use `myelin mcp serve --as <agent-id>` as their server command. The CLI
+External MCP clients can use `myelin mcp serve --as <agent-id>` for general work, or add
+`--thread <thread-id>` to resume one named private conversation and workspace. The CLI
 exchanges the saved browser-approved session for a one-minute run identity, keeps the bearer off
 protocol output, and closes it when the client disconnects. Suspending or retiring the agent also
 terminates every unfinished run atomically; resuming permits fresh work but never revives an old

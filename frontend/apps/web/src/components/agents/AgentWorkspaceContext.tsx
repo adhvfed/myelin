@@ -23,7 +23,8 @@ export function AgentWorkspaceContext(props: {
   onLoadMoreSessions: () => void;
   workspaceAvailable: boolean;
 }) {
-  const agentCommand = () => `myelin mcp serve --as ${props.thread.agent_id}`;
+  const agentCommand = () =>
+    `myelin mcp serve --as ${props.thread.agent_id} --thread ${props.thread.id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
   const agentName = () => props.agent?.name ?? `Agent ${props.thread.agent_id.slice(0, 8)}`;
   const commandScope = () => props.agent?.selected_tools.includes("workspace.exec");

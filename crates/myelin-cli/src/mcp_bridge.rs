@@ -24,10 +24,14 @@ pub async fn serve_stdio(
     edge: &EdgeConfig,
     browser_session: &str,
     agent_id: &str,
+    thread_id: Option<&str>,
 ) -> Result<(), CliError> {
     require_agent_id(agent_id)?;
+    if let Some(thread_id) = thread_id {
+        require_thread_id(thread_id)?;
+    }
     let client = EdgeHttpClient::new()?;
-    let mut run = AgentRun::start(&client, edge, browser_session, agent_id).await?;
+    let mut run = AgentRun::start(&client, edge, browser_session, agent_id, thread_id).await?;
     let result = proxy_frames(&client, edge, &run, tokio::io::stdin(), tokio::io::stdout()).await;
     let cleanup = run.close(&client, edge).await;
 
@@ -51,17 +55,33 @@ impl AgentRun {
         edge: &EdgeConfig,
         browser_session: &str,
         agent_id: &str,
+        thread_id: Option<&str>,
     ) -> Result<Self, CliError> {
+        if let Some(thread_id) = thread_id {
+            let lookup = EdgeCall {
+                method: HttpMethod::Get,
+                path: format!("/v1/agent-threads/{thread_id}"),
+                query: None,
+                payload: None,
+                idempotency_key: None,
+                retry_policy: RetryPolicy::None,
+            };
+            let response = client.execute(edge, browser_session, &lookup).await?;
+            validate_thread_identity(&response, thread_id, agent_id)?;
+        }
         let call = EdgeCall {
             method: HttpMethod::Post,
-            path: format!("/v1/agents/{agent_id}/runs"),
+            path: thread_id.map_or_else(
+                || format!("/v1/agents/{agent_id}/runs"),
+                |thread_id| format!("/v1/agent-threads/{thread_id}/runs"),
+            ),
             query: None,
             payload: Some(b"{}".to_vec()),
             idempotency_key: Some(new_idempotency_key("mcp-run")),
             retry_policy: RetryPolicy::CallerKeyRequired,
         };
         let response = execute_retry_safe(client, edge, browser_session, &call).await?;
-        validate_started_run(response, agent_id)
+        validate_started_run(response, agent_id, thread_id)
     }
 
     async fn send(
@@ -107,6 +127,24 @@ impl AgentRun {
         self.closed = true;
         Ok(())
     }
+}
+
+fn validate_thread_identity(
+    response: &Value,
+    expected_thread_id: &str,
+    expected_agent_id: &str,
+) -> Result<(), CliError> {
+    if response.pointer("/thread/id").and_then(Value::as_str) != Some(expected_thread_id) {
+        return Err(malformed_run_response(
+            "thread lookup does not match the requested private thread",
+        ));
+    }
+    if response.pointer("/thread/agent_id").and_then(Value::as_str) != Some(expected_agent_id) {
+        return Err(CliError::Usage(
+            "--as must name the agent selected by --thread".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn proxy_frames<R, W>(
@@ -237,6 +275,13 @@ struct StartedRun {
     state: String,
     issued_at: String,
     expires_at: String,
+    #[serde(default)]
+    context: Option<StartedRunContext>,
+}
+
+#[derive(Deserialize)]
+struct StartedRunContext {
+    thread_id: String,
 }
 
 #[derive(Deserialize)]
@@ -246,7 +291,11 @@ struct RunCredential {
     expires_at: String,
 }
 
-fn validate_started_run(response: Value, expected_agent_id: &str) -> Result<AgentRun, CliError> {
+fn validate_started_run(
+    response: Value,
+    expected_agent_id: &str,
+    expected_thread_id: Option<&str>,
+) -> Result<AgentRun, CliError> {
     let started: StartedRunResponse = serde_json::from_value(response).map_err(|error| {
         malformed_run_response(format!("start response has an invalid shape: {error}"))
     })?;
@@ -263,6 +312,17 @@ fn validate_started_run(response: Value, expected_agent_id: &str) -> Result<Agen
     }
     if started.run.state != "ready" {
         return Err(malformed_run_response("run is not ready"));
+    }
+    if started
+        .run
+        .context
+        .as_ref()
+        .map(|context| context.thread_id.as_str())
+        != expected_thread_id
+    {
+        return Err(malformed_run_response(
+            "run context does not match the requested private thread",
+        ));
     }
     if started.credential.scheme != AGENT_SCHEME {
         return Err(malformed_run_response(
@@ -330,6 +390,16 @@ fn require_agent_id(agent_id: &str) -> Result<(), CliError> {
     }
 }
 
+fn require_thread_id(thread_id: &str) -> Result<(), CliError> {
+    if is_canonical_agent_id(thread_id) {
+        Ok(())
+    } else {
+        Err(CliError::Usage(
+            "--thread must be a canonical lowercase thread UUID".into(),
+        ))
+    }
+}
+
 fn require_server_uuid(label: &str, value: &str) -> Result<(), CliError> {
     if is_canonical_agent_id(value) {
         Ok(())
@@ -376,6 +446,7 @@ mod tests {
 
     const AGENT: &str = "11111111-1111-1111-1111-111111111111";
     const RUN: &str = "22222222-2222-2222-2222-222222222222";
+    const THREAD: &str = "33333333-3333-3333-3333-333333333333";
 
     fn started_response() -> Value {
         let issued = Utc::now() - chrono::Duration::seconds(1);
@@ -402,17 +473,31 @@ mod tests {
 
     #[test]
     fn a_started_run_is_bound_to_the_requested_durable_agent() {
-        let run = validate_started_run(started_response(), AGENT).unwrap();
+        let run = validate_started_run(started_response(), AGENT, None).unwrap();
         assert_eq!(run.id, RUN);
         assert_eq!(run.agent_id, AGENT);
 
         let mut wrong_agent = started_response();
         wrong_agent["run"]["agent_id"] = json!(RUN);
-        assert!(validate_started_run(wrong_agent, AGENT).is_err());
+        assert!(validate_started_run(wrong_agent, AGENT, None).is_err());
 
         let mut long_lived_scheme = started_response();
         long_lived_scheme["credential"]["scheme"] = json!("session");
-        assert!(validate_started_run(long_lived_scheme, AGENT).is_err());
+        assert!(validate_started_run(long_lived_scheme, AGENT, None).is_err());
+
+        let mut bound = started_response();
+        bound["run"]["context"] = json!({ "thread_id": THREAD });
+        assert!(validate_started_run(bound.clone(), AGENT, Some(THREAD)).is_ok());
+        assert!(validate_started_run(bound.clone(), AGENT, None).is_err());
+        assert!(validate_started_run(bound, AGENT, Some(RUN)).is_err());
+    }
+
+    #[test]
+    fn a_thread_is_checked_before_it_can_start_a_different_agent() {
+        let receipt = json!({ "thread": { "id": THREAD, "agent_id": AGENT } });
+        validate_thread_identity(&receipt, THREAD, AGENT).unwrap();
+        assert!(validate_thread_identity(&receipt, THREAD, RUN).is_err());
+        assert!(validate_thread_identity(&receipt, RUN, AGENT).is_err());
     }
 
     #[test]

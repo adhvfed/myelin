@@ -49,7 +49,9 @@ test("an engineer authorizes bounded commands and keeps a named problem with one
   await expect(workspace.getByTestId("agent-command-scope"))
     .toContainText("Bounded commands authorized");
   await expect(workspace.getByTestId("agent-connect-command"))
-    .toContainText(`myelin mcp serve --as ${agentId}`);
+    .toContainText(`myelin mcp serve --as ${agentId} --thread ${
+      new URL(page.url()).searchParams.get("thread")!
+    }`);
   const sshCommand = workspace.getByTestId("agent-workspace-command");
   await expect(sshCommand).toContainText("myelin agent thread ssh");
   await expect(sshCommand).toContainText(new URL(page.url()).searchParams.get("thread")!);

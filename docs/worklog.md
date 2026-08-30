@@ -4381,6 +4381,26 @@ workspace files; and the real browser journey, which suspends the selected agent
 reloads its durable status, observes that MCP is unavailable while owner SSH remains available, and
 resumes the identity before continuing the named thread.
 
+## 2026-08-30 — The advertised MCP command now resumes the named workspace
+
+The private-thread browser told an external client to run `myelin mcp serve --as <agent>`. That
+command created a general agent run, not the thread-bound run described by the product, so the
+agent could not reach the retained workspace and did not receive the named conversation context.
+The API for the right behavior existed, but neither the CLI command nor its browser guidance used
+it.
+
+`mcp serve` now accepts `--thread <thread-id>` and exchanges the saved human session through the
+thread run endpoint. The bridge validates that Edge returned the exact requested thread context
+before forwarding any MCP frame; a general run carrying unexpected thread context is rejected too.
+Both the CLI thread receipt and browser workspace panel expose the complete copyable command, while
+the general `--as` form remains available for work that intentionally has no private workspace.
+
+The TypeScript full-system CLI journey now performs a real browser-approved device login, activates
+the external agent, creates and messages a named thread, launches the displayed MCP command, writes
+a file through `workspace.write_file`, closes the run at end-of-input, and reads the same durable
+file through a fresh owner-authorized one-shot SSH connection. This proves the public command reaches
+the running Edge thread endpoint and the real workspace rather than only checking its string shape.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

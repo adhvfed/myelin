@@ -120,6 +120,10 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
     let id = terminal_safe_single_line(thread.get("id")?.as_str()?);
     let conversation = terminal_safe_single_line(thread.get("conversation_ref")?.as_str()?);
     let agent = terminal_safe_single_line(thread.get("agent_ref")?.as_str()?);
+    let agent_id = thread.get("agent_id")?.as_str()?;
+    if !is_canonical_agent_id(agent_id) {
+        return None;
+    }
     let workspace = thread.get("workspace")?;
     let state = terminal_safe_single_line(workspace.get("state")?.as_str()?);
     let expires_at = terminal_safe_single_line(workspace.get("expires_at")?.as_str()?);
@@ -132,6 +136,10 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
         "{prefix}: {summary}\n  agent: {agent}\n  conversation: {conversation}\n  workspace: {state}; retained until {expires_at}\n"
     );
     if workspace_is_available(&state, &expires_at, Utc::now()) {
+        let _ = writeln!(
+            output,
+            "  connect: myelin mcp serve --as {agent_id} --thread {id}"
+        );
         let _ = writeln!(
             output,
             "  message: myelin agent thread say {id} \"<message>\""
@@ -331,6 +339,7 @@ mod tests {
         assert!(rendered.contains("workspace: ready; retained until 2099-08-25T12:00:00Z"));
         assert!(rendered.contains(&format!("myelin agent thread say {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID}")));
+        assert!(rendered.contains(&format!("myelin mcp serve --as {ID} --thread {THREAD_ID}")));
         assert!(!rendered.contains("storage_locator"));
 
         let mut expiring = thread();
@@ -338,12 +347,14 @@ mod tests {
         let rendered = render_response(&json!({ "thread": expiring })).unwrap();
         assert!(rendered.starts_with("Private agent thread:"));
         assert!(!rendered.contains("myelin agent thread ssh"));
+        assert!(!rendered.contains("myelin mcp serve"));
 
         let mut elapsed = thread();
         elapsed["workspace"]["expires_at"] = json!("2020-08-25T12:00:00Z");
         let rendered = render_response(&json!({ "thread": elapsed })).unwrap();
         assert!(!rendered.contains("myelin agent thread say"));
         assert!(!rendered.contains("myelin agent thread ssh"));
+        assert!(!rendered.contains("myelin mcp serve"));
     }
 
     #[test]
