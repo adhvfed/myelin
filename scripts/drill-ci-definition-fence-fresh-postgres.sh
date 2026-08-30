@@ -31,14 +31,16 @@ command -v docker >/dev/null || { echo "docker is required for this drill" >&2; 
 command -v psql  >/dev/null || { echo "psql is required for this drill" >&2; exit 1; }
 
 log "starting a disposable postgres:16 as $CONTAINER on 127.0.0.1:$PORT"
-# `pg-init` is mounted read-only into the entrypoint directory: Docker runs *.sql in filename order
-# (00- then 01-) exactly once, on a fresh volume, before accepting external connections.
+# Only the bootstrap scripts are mounted into the entrypoint directory. The adjacent
+# 03-dev-placement.sql requires Fed runtime variables and runs after application migrations.
 docker run -d --name "$CONTAINER" \
   -e POSTGRES_USER=myelin_admin \
   -e POSTGRES_PASSWORD="$SUPER_PW" \
   -e POSTGRES_DB=myelin \
   -p "127.0.0.1:$PORT:5432" \
-  -v "$REPO_ROOT/scripts/pg-init:/docker-entrypoint-initdb.d:ro" \
+  -v "$REPO_ROOT/scripts/pg-init/00-rls-conventions.sql:/docker-entrypoint-initdb.d/00-rls-conventions.sql:ro" \
+  -v "$REPO_ROOT/scripts/pg-init/01-ci-definition-fence.sql:/docker-entrypoint-initdb.d/01-ci-definition-fence.sql:ro" \
+  -v "$REPO_ROOT/scripts/pg-init/02-dev-roles.sql:/docker-entrypoint-initdb.d/02-dev-roles.sql:ro" \
   postgres:16 >/dev/null
 
 ADMIN_URL="postgres://myelin_admin:$SUPER_PW@127.0.0.1:$PORT/myelin"

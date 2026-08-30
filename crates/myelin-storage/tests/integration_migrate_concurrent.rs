@@ -21,15 +21,24 @@ fn concurrent_migration_set() -> (Migrations, Vec<String>) {
     let mut migrations = Vec::new();
     let mut ids = Vec::new();
     for n in 0..4u32 {
-        let id = format!("racetest_{suffix}_{n:04}");
+        let table_id = format!("racetest_{suffix}_{n:04}_table");
+        let index_id = format!("racetest_{suffix}_{n:04}_index");
         let table = format!("racetest_{suffix}_t{n}");
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (\
-                    id text PRIMARY KEY, tenant_id text NOT NULL, body text NOT NULL);\
-                 CREATE INDEX IF NOT EXISTS {table}_tenant_idx ON {table} (tenant_id);"
-        );
-        migrations.push(Migration::plain(id.clone(), ddl));
-        ids.push(id);
+        migrations.push(Migration::plain(
+            table_id.clone(),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {table} (\
+                    id text PRIMARY KEY, tenant_id text NOT NULL, body text NOT NULL);"
+            ),
+        ));
+        migrations.push(Migration::plain(
+            index_id.clone(),
+            format!(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS {table}_tenant_idx \
+                 ON {table} (tenant_id);"
+            ),
+        ));
+        ids.extend([table_id, index_id]);
     }
     (Migrations::of(migrations), ids)
 }
@@ -100,13 +109,14 @@ async fn concurrent_migrate_is_race_safe_and_applied_once() {
             }
 
             for m in &migrations.0 {
-                let table = table_name_of(m.ddl.as_ref()).expect("ddl names a table");
-                let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-                    .bind(table)
-                    .fetch_one(&pool)
-                    .await
-                    .expect("probe table existence");
-                assert!(exists, "table {table} must exist after concurrent migrate");
+                if let Some(table) = table_name_of(m.ddl.as_ref()) {
+                    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                        .bind(table)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("probe table existence");
+                    assert!(exists, "table {table} must exist after concurrent migrate");
+                }
             }
 
             println!(

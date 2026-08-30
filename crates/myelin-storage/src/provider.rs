@@ -255,6 +255,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_thread_durable::agent_thread_session_launch_migrations(),
         crate::agent_thread_durable::agent_thread_publication_migrations(),
         crate::agent_thread_durable::agent_thread_git_binding_migrations(),
+        crate::agent_thread_durable::agent_thread_ssh_connection_migrations(),
     ]
 }
 
@@ -396,10 +397,15 @@ async fn validate_bootstrap_pair(
     // @tenant-cross-scope: validates a PostgreSQL catalog grant for the migration role.
     let can_lock: bool = sqlx::query_scalar(
         "SELECT has_function_privilege(
-             current_user,
-             'pg_catalog.pg_advisory_lock(bigint)'::regprocedure,
-             'EXECUTE'
-         )",
+                   current_user,
+                   'pg_catalog.pg_advisory_lock(bigint)'::regprocedure,
+                   'EXECUTE'
+                )
+            AND has_function_privilege(
+                   current_user,
+                   'pg_catalog.pg_try_advisory_lock(bigint)'::regprocedure,
+                   'EXECUTE'
+                )",
     )
     .fetch_one(migration_pool)
     .await

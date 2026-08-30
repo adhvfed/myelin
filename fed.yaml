@@ -20,7 +20,9 @@ services:
     ports: ["{{POSTGRES_PORT}}:5432"]
     volumes:
       - fed-myelin-pg-data:/var/lib/postgresql/data
-      - ./scripts/pg-init:/docker-entrypoint-initdb.d:ro
+      - ./scripts/pg-init/00-rls-conventions.sql:/docker-entrypoint-initdb.d/00-rls-conventions.sql:ro
+      - ./scripts/pg-init/01-ci-definition-fence.sql:/docker-entrypoint-initdb.d/01-ci-definition-fence.sql:ro
+      - ./scripts/pg-init/02-dev-roles.sql:/docker-entrypoint-initdb.d/02-dev-roles.sql:ro
     environment:
       POSTGRES_USER: myelin_admin
       POSTGRES_PASSWORD: myelin_dev_pw

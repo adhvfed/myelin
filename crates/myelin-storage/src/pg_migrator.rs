@@ -3,8 +3,10 @@ use crate::pg::PgError;
 use sqlx::postgres::PgPool;
 use sqlx::Executor;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub const MIGRATION_LOCK_KEY: i64 = migration_lock_key();
+const MIGRATION_LOCK_RETRY: Duration = Duration::from_millis(25);
 
 const fn migration_lock_key() -> i64 {
     const BYTES: [u8; 8] = [0xf5, 0xd2, 0x6c, 0x96, 0x2c, 0x93, 0x58, 0x05];
@@ -65,11 +67,7 @@ impl PgMigrator {
             .map_err(|e| PgError::Migrate(format!("acquire migration connection: {e}")))?;
 
         let conn: &mut sqlx::PgConnection = &mut conn;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(MIGRATION_LOCK_KEY)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| PgError::Migrate(format!("acquire advisory migration lock: {e}")))?;
+        acquire_migration_lock(conn).await?;
 
         let result = Self::apply_locked(&mut *conn, migrations).await;
 
@@ -211,11 +209,7 @@ pub async fn with_migration_lock(pool: &PgPool, ddl: &str) -> Result<(), PgError
         .await
         .map_err(|e| PgError::Migrate(format!("acquire migration connection: {e}")))?;
     let conn: &mut sqlx::PgConnection = &mut conn;
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MIGRATION_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| PgError::Migrate(format!("acquire advisory migration lock: {e}")))?;
+    acquire_migration_lock(conn).await?;
 
     let result = conn
         .execute(ddl)
@@ -229,6 +223,27 @@ pub async fn with_migration_lock(pool: &PgPool, ddl: &str) -> Result<(), PgError
         .await;
 
     result
+}
+
+async fn acquire_migration_lock(conn: &mut sqlx::PgConnection) -> Result<(), PgError> {
+    loop {
+        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(MIGRATION_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|error| {
+                PgError::Migrate(format!("acquire advisory migration lock: {error}"))
+            })?;
+        if acquired {
+            return Ok(());
+        }
+
+        // A blocked `pg_advisory_lock` statement keeps its implicit transaction and snapshot
+        // alive. That snapshot can make CREATE INDEX CONCURRENTLY wait on the lock waiter while
+        // the waiter waits on the migrator: a PostgreSQL-detected deadlock. Failed try-lock
+        // statements finish before sleeping, so no waiting migrator pins a snapshot.
+        tokio::time::sleep(MIGRATION_LOCK_RETRY).await;
+    }
 }
 
 pub fn ddl_checksum(ddl: &str) -> String {
