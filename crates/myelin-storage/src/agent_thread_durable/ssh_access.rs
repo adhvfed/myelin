@@ -300,18 +300,22 @@ pub(super) async fn lookup_live_authority(
     row.as_ref().map(admission_from_row).transpose()
 }
 
-pub(super) async fn consume_live_authority(
+pub(super) async fn claim_live_authority(
     connection: &mut sqlx::PgConnection,
     request: &LiveWorkspaceSshAuthorityRequest<'_>,
+    connection_id: &str,
 ) -> Result<Option<LiveWorkspaceSshAdmission>, PgError> {
     let row = sqlx::query(
         "UPDATE agent_thread_ssh_grant access
-            SET consumed_at = $7
+            SET consumed_at = COALESCE(access.consumed_at, $7),
+                connection_id = COALESCE(access.connection_id, $10)
            FROM agent_thread thread, principal owner, principal agent
           WHERE access.tenant_id = $1 AND access.region = $2
             AND access.grant_id = $3 AND access.route_username = $4
             AND access.public_key_fingerprint = $5
-            AND access.revoked_at IS NULL AND access.consumed_at IS NULL
+            AND access.revoked_at IS NULL
+            AND ((access.consumed_at IS NULL AND access.connection_id IS NULL)
+                 OR access.connection_id = $10)
             AND access.issued_at <= $6 AND access.expires_at > $6
             AND thread.tenant_id = access.tenant_id
             AND thread.region = access.region
@@ -343,9 +347,10 @@ pub(super) async fn consume_live_authority(
     .bind(request.observed_at)
     .bind(HUMAN_PRINCIPAL_KIND_JSON)
     .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+    .bind(connection_id)
     .fetch_optional(connection)
     .await
-    .map_err(query_error("consume private workspace SSH grant"))?;
+    .map_err(query_error("claim private workspace SSH connection"))?;
     row.as_ref().map(admission_from_row).transpose()
 }
 

@@ -8,7 +8,7 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 use sqlx::Row;
 
-use super::ssh_access::{consume_live_authority, LiveWorkspaceSshAuthorityRequest};
+use super::ssh_access::{claim_live_authority, LiveWorkspaceSshAuthorityRequest};
 use super::{canonical_ulid, DurableAgentThreadBacking, LiveWorkspaceSshAdmission};
 use crate::pgrelay::PgRelay;
 use crate::{PgError, ProviderError};
@@ -41,6 +41,7 @@ impl WorkspaceSessionMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewWorkspaceSshSession {
     pub session_id: String,
+    pub connection_id: String,
     pub grant_id: Uuid,
     pub route_username: String,
     pub public_key_fingerprint: String,
@@ -76,7 +77,8 @@ pub enum ListWorkspaceSessionsOutcome {
 }
 
 impl DurableAgentThreadBacking {
-    /// Atomically consumes one connection grant and reserves its sole session identity. The
+    /// Atomically claims a one-shot grant for one SSH connection and reserves a channel session.
+    /// Further channels from that exact connection may reserve their own audited sessions. The
     /// reservation remains invisible to owner history until confinement has actually launched.
     pub async fn reserve_ssh_session(
         &self,
@@ -89,7 +91,7 @@ impl DurableAgentThreadBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    let Some(admission) = consume_live_authority(
+                    let Some(admission) = claim_live_authority(
                         connection,
                         &LiveWorkspaceSshAuthorityRequest {
                             tenant: &tenant,
@@ -101,6 +103,7 @@ impl DurableAgentThreadBacking {
                             observed_at: proposal.reserved_at,
                             require_unconsumed: true,
                         },
+                        &proposal.connection_id,
                     )
                     .await?
                     else {
@@ -297,6 +300,11 @@ impl DurableAgentThreadBacking {
 }
 
 fn validate_proposal(proposal: &NewWorkspaceSshSession) -> Result<(), ProviderError> {
+    if !canonical_ulid(&proposal.connection_id) {
+        return Err(
+            query_error_value("workspace SSH connection id is not a canonical ULID").into(),
+        );
+    }
     if !canonical_ulid(&proposal.session_id) {
         return Err(query_error_value("workspace session id is not a canonical ULID").into());
     }

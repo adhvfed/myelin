@@ -118,6 +118,8 @@ myelin agent thread say 33333333-3333-4333-8333-333333333333 \
 myelin agent thread history 33333333-3333-4333-8333-333333333333
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \
   --thread 33333333-3333-4333-8333-333333333333
+# The one-shot credential claims one SSH transport, which may carry multiple bounded, separately
+# audited command/shell channels (including ordinary OpenSSH ControlMaster multiplexing).
 myelin agent thread ssh 33333333-3333-4333-8333-333333333333
 
 myelin agent create "Mainline triage" --runtime hosted \

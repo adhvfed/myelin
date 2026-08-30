@@ -187,6 +187,7 @@ where
     pub(crate) async fn reserve_session(
         &self,
         authenticated: &AuthenticatedWorkspace,
+        connection_id: String,
         session_id: String,
         mode: WorkspaceSessionMode,
         terminal: bool,
@@ -199,6 +200,7 @@ where
             .admissions
             .reserve_session(&WorkspaceSessionStartRequest {
                 tenant: authenticated.tenant.clone(),
+                connection_id,
                 session_id,
                 grant_id: credential.grant_id,
                 route_username: credential.route_username.to_string(),
@@ -522,6 +524,7 @@ mod tests {
         assert!(authenticator
             .reserve_session(
                 &authenticated,
+                "01J00000000000000000000000".into(),
                 "01J00000000000000000000001".into(),
                 WorkspaceSessionMode::Command,
                 true,

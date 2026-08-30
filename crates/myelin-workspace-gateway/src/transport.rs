@@ -16,6 +16,8 @@ use crate::{
     WorkspaceSshAuthenticationError, WorkspaceSshAuthenticator,
 };
 
+const MAX_SESSIONS_PER_CONNECTION: usize = 16;
+
 #[derive(Clone)]
 pub struct WorkspaceSshGateway<A> {
     authenticator: WorkspaceSshAuthenticator<A>,
@@ -50,11 +52,11 @@ where
             authenticator: self.authenticator.clone(),
             launcher: self.launcher.clone(),
             session_ids: Arc::clone(&self.session_ids),
+            connection_id: self.session_ids.mint().0,
             authenticated: None,
             pending_channels: HashMap::new(),
             pending_terminals: HashMap::new(),
-            active_session: None,
-            session_started: false,
+            active_sessions: HashMap::new(),
         }
     }
 }
@@ -63,16 +65,11 @@ pub struct WorkspaceSshConnection<A> {
     authenticator: WorkspaceSshAuthenticator<A>,
     launcher: LocalConfinedWorkspaceLauncher,
     session_ids: Arc<UlidMinter>,
+    connection_id: String,
     authenticated: Option<AuthenticatedWorkspace>,
     pending_channels: HashMap<ChannelId, Channel<Msg>>,
     pending_terminals: HashMap<ChannelId, WorkspaceTerminal>,
-    active_session: Option<ActiveWorkspaceSession>,
-    session_started: bool,
-}
-
-struct ActiveWorkspaceSession {
-    channel: ChannelId,
-    handle: ConfinedWorkspaceSessionHandle,
+    active_sessions: HashMap<ChannelId, ConfinedWorkspaceSessionHandle>,
 }
 
 fn requested_terminal(
@@ -108,11 +105,10 @@ where
             return Ok(());
         };
         let terminal = self.pending_terminals.remove(&channel_id);
-        if self.session_started {
+        if self.active_sessions.len() >= MAX_SESSIONS_PER_CONNECTION {
             session.channel_failure(channel_id)?;
             return Ok(());
         }
-        self.session_started = true;
         let Some(authenticated) = self.authenticated.clone() else {
             session.channel_failure(channel_id)?;
             return Ok(());
@@ -129,7 +125,13 @@ where
         let session_id = self.session_ids.mint().0;
         let Some(reserved) = self
             .authenticator
-            .reserve_session(&revalidated, session_id.clone(), mode, has_terminal)
+            .reserve_session(
+                &revalidated,
+                self.connection_id.clone(),
+                session_id.clone(),
+                mode,
+                has_terminal,
+            )
             .await?
         else {
             session.channel_failure(channel_id)?;
@@ -156,10 +158,7 @@ where
             }
         }
 
-        self.active_session = Some(ActiveWorkspaceSession {
-            channel: channel_id,
-            handle: confined.handle(),
-        });
+        self.active_sessions.insert(channel_id, confined.handle());
         session.channel_success(channel_id)?;
         spawn_session_bridge(confined, channel, self.authenticator.clone(), reserved);
         Ok(())
@@ -168,8 +167,8 @@ where
 
 impl<A> Drop for WorkspaceSshConnection<A> {
     fn drop(&mut self) {
-        if let Some(active) = self.active_session.as_ref() {
-            active.handle.terminate();
+        for active in self.active_sessions.values() {
+            active.terminate();
         }
     }
 }
@@ -202,8 +201,8 @@ where
         reply: russh::server::ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.authenticated.is_some() && !self.session_started && self.pending_channels.is_empty()
-        {
+        let session_count = self.pending_channels.len() + self.active_sessions.len();
+        if self.authenticated.is_some() && session_count < MAX_SESSIONS_PER_CONNECTION {
             self.pending_channels.insert(channel.id(), channel);
             reply.accept().await;
         }
@@ -217,14 +216,8 @@ where
     ) -> Result<(), Self::Error> {
         self.pending_channels.remove(&channel);
         self.pending_terminals.remove(&channel);
-        if self
-            .active_session
-            .as_ref()
-            .is_some_and(|active| active.channel == channel)
-        {
-            if let Some(active) = self.active_session.take() {
-                active.handle.terminate();
-            }
+        if let Some(active) = self.active_sessions.remove(&channel) {
+            active.terminate();
         }
         Ok(())
     }
@@ -267,13 +260,8 @@ where
             terminal
                 .resize(col_width, row_height, pix_width, pix_height)
                 .is_ok()
-        } else if let Some(active) = self
-            .active_session
-            .as_ref()
-            .filter(|active| active.channel == channel)
-        {
+        } else if let Some(active) = self.active_sessions.get(&channel) {
             active
-                .handle
                 .resize_terminal(col_width, row_height, pix_width, pix_height)
                 .is_ok()
         } else {

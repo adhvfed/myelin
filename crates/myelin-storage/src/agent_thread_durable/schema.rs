@@ -236,6 +236,47 @@ UPDATE agent_thread
  WHERE num_nonnulls(repository_slug, base_ref, base_oid, workspace_branch) NOT IN (0, 4);
 "#;
 
+pub const AGENT_THREAD_SSH_CONNECTION_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_ssh_grant
+  ADD COLUMN IF NOT EXISTS connection_id text;
+ALTER TABLE agent_thread_ssh_grant
+  DROP CONSTRAINT IF EXISTS agent_thread_ssh_grant_connection_id_shape;
+ALTER TABLE agent_thread_ssh_grant
+  ADD CONSTRAINT agent_thread_ssh_grant_connection_id_shape CHECK (
+    connection_id IS NULL
+    OR (num_nonnulls(consumed_at, connection_id) = 2 AND length(connection_id) = 26)
+  ) NOT VALID;
+"#;
+
+pub const AGENT_THREAD_SSH_CONNECTION_BACKFILL_MIGRATION: &str = r#"
+UPDATE agent_thread_ssh_grant access
+   SET connection_id = prior.connection_id
+  FROM (
+    SELECT tenant_id, region, grant_id, min(session_id) AS connection_id
+      FROM agent_thread_workspace_session
+     GROUP BY tenant_id, region, grant_id
+  ) prior
+ WHERE access.tenant_id = prior.tenant_id
+   AND access.region = prior.region
+   AND access.grant_id = prior.grant_id
+   AND access.consumed_at IS NOT NULL
+   AND access.connection_id IS NULL;
+"#;
+
+pub const AGENT_THREAD_SSH_CONNECTION_INVARIANT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_ssh_grant
+  DROP CONSTRAINT IF EXISTS agent_thread_ssh_grant_connection_id_shape;
+ALTER TABLE agent_thread_ssh_grant
+  DROP CONSTRAINT IF EXISTS agent_thread_ssh_grant_connection_claim_complete;
+ALTER TABLE agent_thread_ssh_grant
+  ADD CONSTRAINT agent_thread_ssh_grant_connection_claim_complete CHECK (
+    num_nonnulls(consumed_at, connection_id) = 0
+    OR (num_nonnulls(consumed_at, connection_id) = 2 AND length(connection_id) = 26)
+  ) NOT VALID;
+ALTER TABLE agent_thread_ssh_grant
+  VALIDATE CONSTRAINT agent_thread_ssh_grant_connection_claim_complete;
+"#;
+
 pub const AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION: &str = r#"
 UPDATE agent_thread_workspace_session
    SET launched_at = started_at
@@ -416,10 +457,46 @@ pub fn agent_thread_git_binding_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_ssh_connection_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0154_agent_thread_ssh_connection_expand",
+            AGENT_THREAD_SSH_CONNECTION_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread_ssh_grant",
+        ),
+        Migration::phased(
+            "0155_agent_thread_ssh_connection_backfill",
+            AGENT_THREAD_SSH_CONNECTION_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread_ssh_grant",
+        ),
+        Migration::phased(
+            "0156_agent_thread_ssh_connection_invariant",
+            AGENT_THREAD_SSH_CONNECTION_INVARIANT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread_ssh_grant",
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{HotTables, MigrationPhase, OnlineMigrationRunner};
+
+    #[test]
+    fn ssh_connection_claim_is_an_online_expand_backfill_contract_cycle() {
+        let migrations = agent_thread_ssh_connection_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["agent_thread_ssh_grant"]))
+            .expect("the live SSH grant migration is online-safe");
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+    }
 
     #[test]
     fn session_publication_uses_an_online_expand_backfill_contract_cycle() {

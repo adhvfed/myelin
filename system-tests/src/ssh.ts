@@ -26,6 +26,10 @@ export interface WorkspaceOverSsh {
   waitForText(path: string, content: string): Promise<void>;
 }
 
+export interface MultiplexedWorkspaceOverSsh extends WorkspaceOverSsh {
+  close(): Promise<void>;
+}
+
 export async function generateEphemeralSshKey(): Promise<EphemeralSshKey> {
   const directory = await mkdtemp(join(tmpdir(), "myelin-workspace-ssh-"));
   const privateKeyPath = join(directory, "id_ed25519");
@@ -100,6 +104,69 @@ export async function connectToWorkspace(
   };
 }
 
+export async function connectMultiplexedToWorkspace(
+  key: EphemeralSshKey,
+  access: WorkspaceSshAccess,
+): Promise<MultiplexedWorkspaceOverSsh> {
+  const knownHostsPath = join(dirname(key.privateKeyPath), "known_hosts");
+  const controlPath = join(dirname(key.privateKeyPath), "workspace-control.sock");
+  const host = knownHostName(access.host, access.port);
+  await writeFile(knownHostsPath, `${host} ${access.host_public_key}\n`, { mode: 0o600 });
+  await run("ssh", [
+    ...workspaceSshArgs(key, access, knownHostsPath, false),
+    "-M",
+    "-N",
+    "-f",
+    "-o",
+    `ControlPath=${controlPath}`,
+    "-o",
+    "ControlPersist=no",
+    access.host,
+  ], { timeout: 30_000, maxBuffer: 512 * 1024 });
+
+  const runCommand = (command: string, terminal = false): Promise<string> =>
+    runMultiplexedWorkspaceCommand(access, controlPath, command, terminal);
+  return {
+    async hasInteractiveTerminal(): Promise<boolean> {
+      const answer = await runCommand(
+        "if test -t 0 && test -t 1; then printf yes; else printf no; fi",
+        true,
+      );
+      return answer.trim() === "yes";
+    },
+    async readText(path: string): Promise<string> {
+      return runCommand(`cat ${shellWord(workspacePath(path))}`);
+    },
+    async writeText(path: string, content: string): Promise<void> {
+      const relative = workspacePath(path);
+      const parent = dirname(relative);
+      const prepare = parent === "." ? "" : `mkdir -p ${shellWord(parent)} && `;
+      await runCommand(`${prepare}printf %s ${shellWord(content)} > ${shellWord(relative)}`);
+    },
+    async waitForText(path: string, content: string): Promise<void> {
+      const relative = workspacePath(path);
+      await runCommand(
+        `for attempt in $(seq 1 40); do if test -f ${shellWord(relative)} && test "$(cat ${shellWord(relative)})" = ${shellWord(content)}; then exit 0; fi; sleep 0.25; done; exit 1`,
+      );
+    },
+    async close(): Promise<void> {
+      try {
+        await run("ssh", [
+          "-F",
+          "/dev/null",
+          "-S",
+          controlPath,
+          "-O",
+          "exit",
+          access.host,
+        ], { timeout: 10_000 });
+      } catch {
+        // A gateway-side close races harmlessly with explicit OpenSSH master shutdown.
+      }
+    },
+  };
+}
+
 export async function expectWorkspaceCommandRejected(
   key: EphemeralSshKey,
   access: WorkspaceSshAccess,
@@ -127,33 +194,7 @@ async function runWorkspaceCommand(
     const result = await run(
       "ssh",
       [
-        "-F",
-        "/dev/null",
-        terminal ? "-tt" : "-T",
-        "-i",
-        key.privateKeyPath,
-        "-l",
-        access.username,
-        "-p",
-        String(access.port),
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "ControlMaster=no",
-        "-o",
-        "PasswordAuthentication=no",
-        "-o",
-        "KbdInteractiveAuthentication=no",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        `UserKnownHostsFile=${knownHostsPath}`,
-        "-o",
-        "GlobalKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=10",
+        ...workspaceSshArgs(key, access, knownHostsPath, terminal),
         access.host,
         command,
       ],
@@ -163,6 +204,69 @@ async function runWorkspaceCommand(
   } catch {
     throw new Error("the host-key-pinned workspace SSH command failed");
   }
+}
+
+async function runMultiplexedWorkspaceCommand(
+  access: WorkspaceSshAccess,
+  controlPath: string,
+  command: string,
+  terminal: boolean,
+): Promise<string> {
+  try {
+    const result = await run("ssh", [
+      "-F",
+      "/dev/null",
+      terminal ? "-tt" : "-T",
+      "-S",
+      controlPath,
+      "-l",
+      access.username,
+      "-p",
+      String(access.port),
+      access.host,
+      command,
+    ], { timeout: 30_000, maxBuffer: 512 * 1024 });
+    return result.stdout;
+  } catch {
+    throw new Error("the multiplexed workspace SSH command failed");
+  }
+}
+
+function workspaceSshArgs(
+  key: EphemeralSshKey,
+  access: WorkspaceSshAccess,
+  knownHostsPath: string,
+  terminal: boolean,
+): string[] {
+  return [
+    "-F",
+    "/dev/null",
+    terminal ? "-tt" : "-T",
+    "-i",
+    key.privateKeyPath,
+    "-l",
+    access.username,
+    "-p",
+    String(access.port),
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "KbdInteractiveAuthentication=no",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    `UserKnownHostsFile=${knownHostsPath}`,
+    "-o",
+    "GlobalKnownHostsFile=/dev/null",
+    "-o",
+    "ConnectTimeout=10",
+  ];
 }
 
 function knownHostName(host: string, port: number): string {

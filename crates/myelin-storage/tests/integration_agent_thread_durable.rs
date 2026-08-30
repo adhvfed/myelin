@@ -732,8 +732,11 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .expect("a session admitted in time continues after its connection grant expires");
     assert_eq!(continuing_session.workspace_id, admitted.workspace_id);
     let session_ids = myelin_events::UlidMinter::new();
+    let first_connection_id = session_ids.mint().0;
+    let racing_connection_id = session_ids.mint().0;
     let first_candidate = NewWorkspaceSshSession {
         session_id: session_ids.mint().0,
+        connection_id: first_connection_id.clone(),
         grant_id: ssh_grant_id,
         route_username: route_username.clone(),
         public_key_fingerprint: ssh_intent.public_key_fingerprint.clone(),
@@ -744,10 +747,11 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     };
     let racing_candidate = NewWorkspaceSshSession {
         session_id: session_ids.mint().0,
+        connection_id: racing_connection_id.clone(),
         ..first_candidate.clone()
     };
     let (first_result, racing_result) = tokio::join!(
-        threads.reserve_ssh_session(&tenant, first_candidate),
+        threads.reserve_ssh_session(&tenant, first_candidate.clone()),
         threads.reserve_ssh_session(&tenant, racing_candidate),
     );
     let first_result = first_result.unwrap();
@@ -758,10 +762,33 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         "exactly one racing connection atomically consumes the one-shot grant"
     );
     let first_reservation = first_result
-        .or(racing_result)
+        .clone()
+        .or_else(|| racing_result.clone())
         .expect("one racing confined shell reserves the exact workspace generation");
+    let claimed_connection_id = if first_result.is_some() {
+        first_connection_id
+    } else {
+        racing_connection_id
+    };
     let first_session_id = first_reservation.session_id.clone();
     assert_eq!(first_reservation.admission, admitted);
+    assert!(
+        threads
+            .reserve_ssh_session(
+                &tenant,
+                NewWorkspaceSshSession {
+                    session_id: session_ids.mint().0,
+                    connection_id: claimed_connection_id,
+                    mode: WorkspaceSessionMode::Command,
+                    terminal: false,
+                    ..first_candidate.clone()
+                },
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "the claimed SSH connection can reserve another audited channel"
+    );
     let ListWorkspaceSessionsOutcome::Page(before_launch) = threads
         .list_workspace_sessions_for_owner(&tenant, owner, intended.thread_id, None, 10)
         .await
@@ -839,6 +866,7 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             &tenant,
             NewWorkspaceSshSession {
                 session_id: second_session_id.clone(),
+                connection_id: session_ids.mint().0,
                 reserved_at: ssh_issued_at + Duration::seconds(3),
                 mode: WorkspaceSessionMode::Command,
                 terminal: false,

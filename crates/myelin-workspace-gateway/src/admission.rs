@@ -30,6 +30,7 @@ pub struct LiveSessionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceSessionStartRequest {
     pub tenant: String,
+    pub connection_id: String,
     pub session_id: String,
     pub grant_id: Uuid,
     pub route_username: String,
@@ -174,6 +175,7 @@ impl WorkspaceSshAdmissionStore for DurableAgentThreadBacking {
                 &request.tenant,
                 NewWorkspaceSshSession {
                     session_id: request.session_id.clone(),
+                    connection_id: request.connection_id.clone(),
                     grant_id: request.grant_id,
                     route_username: request.route_username.clone(),
                     public_key_fingerprint: request.public_key_fingerprint.clone(),

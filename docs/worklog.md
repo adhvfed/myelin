@@ -4,6 +4,43 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — One private SSH transport can carry real editor-shaped work
+
+The one-shot workspace credential had been modeled as one process rather than one SSH
+connection. The gateway consequently rejected every session channel after the first, so standard
+OpenSSH connection sharing—and the multi-command shape used by remote development tools—could not
+work. Simply removing that boolean would have allowed two independently authenticated connections
+to race through the same ephemeral grant.
+
+Migrations `0154`–`0156` now bind grant consumption to a durable connection ULID through an online
+expand/backfill/contract cycle. Two connections racing one credential still produce exactly one
+winner. That winning connection may reserve up to sixteen command or shell channels; every channel
+revalidates the current owner, agent, thread, workspace generation, revocation, and expiry, launches
+in its own gVisor confinement, and receives its own owner-visible session receipt only after launch.
+Closing a channel terminates only its confined process, while closing the transport terminates all
+remaining processes. SFTP, port forwarding, and a persistent remote editor server are still absent;
+this is the secure multiplexing foundation, not a claim that every Remote SSH client already works.
+
+The readable TypeScript journey uses an ordinary host-key-pinned OpenSSH ControlMaster. One channel
+waits for a file while a second writes it, then later channels read both that result and agent work
+from the same durable workspace. The complete four-story private-agent-thread file passed against a
+fresh isolated PostgreSQL database, Edge, the workspace gateway, OpenSSH, and gVisor.
+
+That clean-room run found two default-stack failures too. The Fed manifest mounted the runtime-only
+`03-dev-placement.sql` into PostgreSQL's automatic init directory, so every new volume exited after
+briefly becoming healthy because its Fed variables were unavailable. The manifest and fresh-volume
+definition-fence drill now mount only the three bootstrap scripts. Then concurrent service startup
+found a PostgreSQL lock inversion: a blocking `pg_advisory_lock` waiter retained an implicit
+transaction snapshot while the lock holder ran `CREATE INDEX CONCURRENTLY`. Migration locking now
+polls `pg_try_advisory_lock`, completing each failed statement before sleeping. The concurrent
+migrator integration test deliberately includes concurrent indexes, and twelve migrators complete
+with every migration recorded exactly once.
+
+Proof: the four full-system private-work stories passed from fresh Fed isolation; the live durable
+workspace lifecycle and twelve-way concurrent-migrator integration tests passed; the disposable
+fresh-PostgreSQL definition-fence drill passed; Storage and workspace-gateway compilation, tests,
+strict Clippy, system-test TypeScript checking, and migration-shape validation passed.
+
 ## 2026-08-31 — Private agent work can start as a real cloud branch
 
 A named private thread previously opened an empty directory even when the problem lived in a

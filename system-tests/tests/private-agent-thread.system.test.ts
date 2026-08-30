@@ -30,6 +30,7 @@ import { GitProject } from "../src/git-project.js";
 import { array, record, string } from "../src/json.js";
 import { reconcileAgentThreads } from "../src/operator.js";
 import {
+  connectMultiplexedToWorkspace,
   connectToWorkspace,
   expectWorkspaceCommandRejected,
   generateEphemeralSshKey,
@@ -584,6 +585,33 @@ describe("private work with an agent", () => {
     );
     expect(await useFreshWorkspace((workspace) => workspace.readText(notebookPath)))
       .toBe(ownerRevisedNotebook);
+
+    const editorKey = await generateEphemeralSshKey();
+    const editorPath = "notes/editor-multiplexing.txt";
+    const editorText = "one pinned SSH transport, multiple confined channels";
+    try {
+      const editorAccess = await requestWorkspaceSshAccess(
+        founder,
+        first.thread.id,
+        editorKey.publicKey,
+      );
+      const editorWorkspace = await connectMultiplexedToWorkspace(
+        editorKey,
+        editorAccess.access,
+      );
+      try {
+        await Promise.all([
+          editorWorkspace.waitForText(editorPath, editorText),
+          editorWorkspace.writeText(editorPath, editorText),
+        ]);
+        expect(await editorWorkspace.readText(editorPath)).toBe(editorText);
+        expect(await editorWorkspace.readText(notebookPath)).toBe(ownerRevisedNotebook);
+      } finally {
+        await editorWorkspace.close();
+      }
+    } finally {
+      await editorKey.remove();
+    }
     const workspaceHistory = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
     );
