@@ -33,6 +33,7 @@ import {
   type AgentThreadErrorKind,
 } from "~/lib/agent-thread-api";
 import {
+  agentThreadAwaitingRecovery,
   agentThreadWorkspaceAvailable,
   isAgentThreadId,
   type AgentChoice,
@@ -198,6 +199,19 @@ export default function AgentThreadsIndex() {
       if (agentId) void revalidate(getAgentChoice.keyFor(agentId));
       void revalidate(getWorkspaceSessions.keyFor({ threadId, limit: 100 }));
     }, 30_000);
+    onCleanup(() => window.clearInterval(timer));
+  });
+  createEffect(() => {
+    if (!interactive() || !threads().some(agentThreadAwaitingRecovery)) return;
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      void revalidate(getAgentThreads.keyFor({ limit: 100 }));
+      const threadId = validSelectedId();
+      if (!threadId) return;
+      void revalidate(getAgentThread.keyFor(threadId));
+      void revalidate(getAgentThreadMessages.keyFor({ threadId, limit: 100 }));
+      void revalidate(getWorkspaceSessions.keyFor({ threadId, limit: 100 }));
+    }, 5_000);
     onCleanup(() => window.clearInterval(timer));
   });
   createEffect(() => {

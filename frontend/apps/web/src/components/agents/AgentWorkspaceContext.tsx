@@ -2,6 +2,7 @@ import { Icon } from "@myelin/design-system";
 import { For, Show } from "solid-js";
 
 import {
+  agentThreadAwaitingRecovery,
   externalAgentCanConnect,
   type AgentChoice,
   type AgentThread,
@@ -31,7 +32,7 @@ export function AgentWorkspaceContext(props: {
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
   const agentName = () => props.agent?.name ?? `Agent ${props.thread.agent_id.slice(0, 8)}`;
   const commandScope = () => props.agent?.selected_tools.includes("workspace.exec");
-  const retryable = () => ["failed", "provisioning"].includes(props.thread.workspace.state);
+  const retryable = () => agentThreadAwaitingRecovery(props.thread);
   const connectUnavailableCopy = () => {
     if (!props.agent) return "Agent connection is unavailable until its identity can be loaded.";
     if (props.agent.status === "suspended") {

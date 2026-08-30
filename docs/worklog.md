@@ -4503,6 +4503,26 @@ through the public API, stopped Edge, removed only its publication receipt to re
 post-ACL crash state, and started the unchanged production binary. The boot worker restored that
 same thread's receipt and lease in PostgreSQL without a fake service or test-only endpoint.
 
+## 2026-08-30 — Recovered private work becomes visible without a reload
+
+The recovery worker could finish an interrupted workspace while an owner already had Agents open,
+but the browser refreshed only the selected detail on its normal thirty-second live-data fallback.
+The private-work list retained its original `provisioning` or `failed` receipt indefinitely, so a
+recovered workspace could remain visibly unavailable until the owner reloaded the whole route.
+
+The route now recognizes exactly the two receipts that unattended recovery can advance and, only
+while either is visible, revalidates the bounded first list page plus the selected thread, messages,
+and workspace sessions every five seconds. The recovery poll pauses in a hidden tab and tears itself
+down as soon as every visible receipt is stable; the ordinary thirty-second stream fallback remains
+unchanged for ready work. The workspace pane and polling decision share one state predicate so their
+retry/recovery semantics cannot drift independently.
+
+Proof includes the complete frontend gate: lint, type checking, production builds, 74 design-system
+tests, 4 desktop tests, and 660 web tests. The real Chromium private-agent journey then activated a
+bounded-command agent, created a named retained workspace, suspended and resumed its identity,
+persisted a private problem across reload, handed the thread through Chat by canonical reference,
+and passed its accessibility scan against Edge, PostgreSQL, and the workspace gateway in 5.8 seconds.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

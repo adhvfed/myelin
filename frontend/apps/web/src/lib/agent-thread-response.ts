@@ -81,6 +81,10 @@ export function agentThreadWorkspaceAvailable(
   return thread.workspace.state === "ready" && Date.parse(thread.workspace.expires_at) > observedAt;
 }
 
+export function agentThreadAwaitingRecovery(thread: AgentThread): boolean {
+  return thread.workspace.state === "provisioning" || thread.workspace.state === "failed";
+}
+
 export function externalAgentCanConnect(agent: AgentChoice | undefined): boolean {
   return agent?.runtime_ref === "external:mcp" && agent.status === "active";
 }

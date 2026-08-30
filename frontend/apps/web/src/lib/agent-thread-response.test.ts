@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  agentThreadAwaitingRecovery,
   agentThreadWorkspaceAvailable,
   externalAgentCanConnect,
   parseAgentActivationReceipt,
@@ -90,6 +91,24 @@ describe("private agent work wire projection", () => {
     expect(externalAgentCanConnect(choice)).toBe(true);
     expect(externalAgentCanConnect({ ...choice!, status: "suspended" })).toBe(false);
     expect(externalAgentCanConnect(undefined)).toBe(false);
+  });
+
+  it("polls only receipts that automatic recovery can still advance", () => {
+    const decoded = parseAgentThread({ thread: subject })!;
+    expect(agentThreadAwaitingRecovery({
+      ...decoded,
+      workspace: { ...decoded.workspace, state: "provisioning" },
+    })).toBe(true);
+    expect(agentThreadAwaitingRecovery({
+      ...decoded,
+      workspace: { ...decoded.workspace, state: "failed" },
+    })).toBe(true);
+    for (const state of ["ready", "expiring", "deleted"] as const) {
+      expect(agentThreadAwaitingRecovery({
+        ...decoded,
+        workspace: { ...decoded.workspace, state },
+      })).toBe(false);
+    }
   });
 
   it("decodes threads, messages, agents, and accountable workspace entries", () => {
