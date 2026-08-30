@@ -18,10 +18,12 @@ pub use model::{
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
     agent_thread_durable_migrations, agent_thread_recent_list_migrations,
-    agent_thread_ssh_single_use_migrations, AGENT_THREAD_MIGRATION,
-    AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
-    AGENT_THREAD_SSH_GRANT_MIGRATION, AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
-    AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
+    agent_thread_session_launch_migrations, agent_thread_ssh_single_use_migrations,
+    AGENT_THREAD_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_RLS_POLICY,
+    AGENT_THREAD_RUN_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION,
+    AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION,
+    AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
+    AGENT_THREAD_SSH_SINGLE_USE_MIGRATION, AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
 };
 pub use ssh_access::{
     CreateWorkspaceSshGrantOutcome, DurableWorkspaceSshGrant, LiveWorkspaceSshAdmission,
@@ -30,7 +32,7 @@ pub use ssh_access::{
 pub use ssh_route::{WorkspaceSshRoute, WorkspaceSshRouteError, WorkspaceSshRouteKey};
 pub use workspace_session::{
     DurableWorkspaceSession, ListWorkspaceSessionsOutcome, NewWorkspaceSshSession,
-    StartedWorkspaceSshSession, WorkspaceSessionMode, WORKSPACE_SSH_SESSION_STARTED,
+    ReservedWorkspaceSshSession, WorkspaceSessionMode, WORKSPACE_SSH_SESSION_STARTED,
 };
 
 use chrono::Duration;

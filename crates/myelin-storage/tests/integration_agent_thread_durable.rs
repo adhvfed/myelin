@@ -496,7 +496,7 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         route_username: route_username.clone(),
         public_key_fingerprint: ssh_intent.public_key_fingerprint.clone(),
         admitted_at: ssh_issued_at,
-        started_at: ssh_issued_at + Duration::seconds(1),
+        reserved_at: ssh_issued_at + Duration::seconds(1),
         mode: WorkspaceSessionMode::Shell,
         terminal: true,
     };
@@ -505,8 +505,8 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         ..first_candidate.clone()
     };
     let (first_result, racing_result) = tokio::join!(
-        threads.start_ssh_session(&tenant, first_candidate),
-        threads.start_ssh_session(&tenant, racing_candidate),
+        threads.reserve_ssh_session(&tenant, first_candidate),
+        threads.reserve_ssh_session(&tenant, racing_candidate),
     );
     let first_result = first_result.unwrap();
     let racing_result = racing_result.unwrap();
@@ -515,14 +515,48 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         racing_result.is_some(),
         "exactly one racing connection atomically consumes the one-shot grant"
     );
-    let first_session = first_result
+    let first_reservation = first_result
         .or(racing_result)
-        .expect("one racing confined shell receives the exact workspace generation");
-    let first_session_id = first_session.session.session_id.clone();
-    assert_eq!(first_session.admission, admitted);
-    assert_eq!(first_session.session.access_method, "ssh");
-    assert_eq!(first_session.session.mode, WorkspaceSessionMode::Shell);
-    assert!(first_session.session.terminal);
+        .expect("one racing confined shell reserves the exact workspace generation");
+    let first_session_id = first_reservation.session_id.clone();
+    assert_eq!(first_reservation.admission, admitted);
+    let ListWorkspaceSessionsOutcome::Page(before_launch) = threads
+        .list_workspace_sessions_for_owner(&tenant, owner, intended.thread_id, None, 10)
+        .await
+        .unwrap()
+    else {
+        panic!("an initial workspace-history page has no cursor to resolve");
+    };
+    assert!(
+        before_launch.is_empty(),
+        "a consumed reservation is not reported as a started session"
+    );
+    let first_session = threads
+        .confirm_ssh_session_started(
+            &tenant,
+            ssh_grant_id,
+            &first_session_id,
+            ssh_issued_at + Duration::seconds(5),
+        )
+        .await
+        .unwrap()
+        .expect("the launched shell becomes owner-visible");
+    assert_eq!(first_session.access_method, "ssh");
+    assert_eq!(first_session.mode, WorkspaceSessionMode::Shell);
+    assert!(first_session.terminal);
+    assert_eq!(
+        threads
+            .confirm_ssh_session_started(
+                &tenant,
+                ssh_grant_id,
+                &first_session_id,
+                ssh_issued_at + Duration::seconds(6),
+            )
+            .await
+            .unwrap(),
+        Some(first_session.clone()),
+        "a response-lost launch confirmation is retry-safe"
+    );
     assert!(
         threads
             .live_ssh_admission(
@@ -558,12 +592,12 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             .unwrap(),
         CreateWorkspaceSshGrantOutcome::Created(_)
     ));
-    threads
-        .start_ssh_session(
+    let second_reservation = threads
+        .reserve_ssh_session(
             &tenant,
             NewWorkspaceSshSession {
                 session_id: second_session_id.clone(),
-                started_at: ssh_issued_at + Duration::seconds(3),
+                reserved_at: ssh_issued_at + Duration::seconds(3),
                 mode: WorkspaceSessionMode::Command,
                 terminal: false,
                 grant_id: second_grant_id,
@@ -574,7 +608,18 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         )
         .await
         .unwrap()
-        .expect("a fresh one-shot grant records a distinct workspace entry");
+        .expect("a fresh one-shot grant reserves a distinct workspace entry");
+    assert_eq!(second_reservation.session_id, second_session_id);
+    let second_session = threads
+        .confirm_ssh_session_started(
+            &tenant,
+            second_grant_id,
+            &second_session_id,
+            ssh_issued_at + Duration::seconds(4),
+        )
+        .await
+        .unwrap()
+        .expect("the second launched command becomes owner-visible");
     let ListWorkspaceSessionsOutcome::Page(first_page) = threads
         .list_workspace_sessions_for_owner(&tenant, owner, intended.thread_id, None, 1)
         .await
@@ -582,13 +627,16 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     else {
         panic!("the first workspace history page has no cursor to resolve");
     };
-    assert_eq!(first_page[0].session_id, second_session_id);
+    assert_eq!(
+        first_page[0], first_session,
+        "confirmed launch time, not the earlier reservation ULID, controls recency"
+    );
     let ListWorkspaceSessionsOutcome::Page(second_page) = threads
         .list_workspace_sessions_for_owner(
             &tenant,
             owner,
             intended.thread_id,
-            Some(second_session_id.clone()),
+            Some(first_session_id.clone()),
             2,
         )
         .await
@@ -596,7 +644,7 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     else {
         panic!("the second workspace history page resolves its own cursor");
     };
-    assert_eq!(second_page, vec![first_session.session.clone()]);
+    assert_eq!(second_page, vec![second_session]);
     assert_eq!(
         threads
             .list_workspace_sessions_for_owner(

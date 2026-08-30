@@ -45,7 +45,7 @@ pub struct NewWorkspaceSshSession {
     pub route_username: String,
     pub public_key_fingerprint: String,
     pub admitted_at: DateTime<Utc>,
-    pub started_at: DateTime<Utc>,
+    pub reserved_at: DateTime<Utc>,
     pub mode: WorkspaceSessionMode,
     pub terminal: bool,
 }
@@ -64,9 +64,9 @@ pub struct DurableWorkspaceSession {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StartedWorkspaceSshSession {
+pub struct ReservedWorkspaceSshSession {
     pub admission: LiveWorkspaceSshAdmission,
-    pub session: DurableWorkspaceSession,
+    pub session_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,11 +76,13 @@ pub enum ListWorkspaceSessionsOutcome {
 }
 
 impl DurableAgentThreadBacking {
-    pub async fn start_ssh_session(
+    /// Atomically consumes one connection grant and reserves its sole session identity. The
+    /// reservation remains invisible to owner history until confinement has actually launched.
+    pub async fn reserve_ssh_session(
         &self,
         tenant: &str,
         proposal: NewWorkspaceSshSession,
-    ) -> Result<Option<StartedWorkspaceSshSession>, ProviderError> {
+    ) -> Result<Option<ReservedWorkspaceSshSession>, ProviderError> {
         validate_proposal(&proposal)?;
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
@@ -96,7 +98,7 @@ impl DurableAgentThreadBacking {
                             route_username: &proposal.route_username,
                             public_key_fingerprint: &proposal.public_key_fingerprint,
                             admitted_at: proposal.admitted_at,
-                            observed_at: proposal.started_at,
+                            observed_at: proposal.reserved_at,
                             require_unconsumed: true,
                         },
                     )
@@ -105,7 +107,7 @@ impl DurableAgentThreadBacking {
                         return Ok(None);
                     };
 
-                    let row = sqlx::query(
+                    let inserted = sqlx::query_scalar::<_, String>(
                         "INSERT INTO agent_thread_workspace_session (
                            tenant_id, region, session_id, grant_id, thread_id,
                            owner_principal_id, workspace_id, workspace_generation,
@@ -117,9 +119,7 @@ impl DurableAgentThreadBacking {
                            FROM agent_thread_ssh_grant access
                           WHERE access.tenant_id = $1 AND access.region = $2
                             AND access.grant_id = $3
-                         RETURNING session_id, thread_id, owner_principal_id, workspace_id,
-                                   workspace_generation, access_method, session_mode, terminal,
-                                   started_at",
+                         RETURNING session_id",
                     )
                     .bind(&tenant)
                     .bind(&region)
@@ -127,14 +127,85 @@ impl DurableAgentThreadBacking {
                     .bind(&proposal.session_id)
                     .bind(proposal.mode.token())
                     .bind(proposal.terminal)
-                    .bind(proposal.started_at)
+                    .bind(proposal.reserved_at)
                     .fetch_one(&mut *connection)
                     .await
-                    .map_err(query_error("record private workspace session"))?;
+                    .map_err(query_error("reserve private workspace session"))?;
+                    Ok(Some(ReservedWorkspaceSshSession {
+                        admission,
+                        session_id: inserted,
+                    }))
+                })
+            })
+            .await
+    }
+
+    /// Publishes a reserved session only after its confined process exists. Repeating the exact
+    /// confirmation is safe after an indeterminate database response; the event and row commit
+    /// together on the first successful call.
+    pub async fn confirm_ssh_session_started(
+        &self,
+        tenant: &str,
+        grant_id: Uuid,
+        session_id: &str,
+        launched_at: DateTime<Utc>,
+    ) -> Result<Option<DurableWorkspaceSession>, ProviderError> {
+        if !canonical_ulid(session_id) {
+            return Err(query_error_value("workspace session id is not a canonical ULID").into());
+        }
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let session_id = session_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "UPDATE agent_thread_workspace_session
+                            SET launched_at = $5
+                          WHERE tenant_id = $1 AND region = $2 AND grant_id = $3
+                            AND session_id = $4 AND launched_at IS NULL
+                        RETURNING session_id, thread_id, owner_principal_id, workspace_id,
+                                  workspace_generation, access_method, session_mode, terminal,
+                                  launched_at AS started_at",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(grant_id)
+                    .bind(&session_id)
+                    .bind(launched_at)
+                    .fetch_optional(&mut *connection)
+                    .await
+                    .map_err(query_error("publish private workspace session"))?;
+                    let (row, publish_event) = match row {
+                        Some(row) => (row, true),
+                        None => {
+                            let existing = sqlx::query(
+                                "SELECT session_id, thread_id, owner_principal_id, workspace_id,
+                                    workspace_generation, access_method, session_mode, terminal,
+                                    launched_at AS started_at
+                               FROM agent_thread_workspace_session
+                              WHERE tenant_id = $1 AND region = $2 AND grant_id = $3
+                                AND session_id = $4 AND launched_at IS NOT NULL",
+                            )
+                            .bind(&tenant)
+                            .bind(&region)
+                            .bind(grant_id)
+                            .bind(&session_id)
+                            .fetch_optional(&mut *connection)
+                            .await
+                            .map_err(query_error("resolve published private workspace session"))?;
+                            let Some(existing) = existing else {
+                                return Ok(None);
+                            };
+                            (existing, false)
+                        }
+                    };
                     let session = session_from_row(&row)?;
-                    let event = session_started_event(&tenant, &region, &session);
-                    PgRelay::co_commit_in_tx(connection, &event.aggregate.0, &event).await?;
-                    Ok(Some(StartedWorkspaceSshSession { admission, session }))
+                    if publish_event {
+                        let event = session_started_event(&tenant, &region, &session);
+                        PgRelay::co_commit_in_tx(connection, &event.aggregate.0, &event).await?;
+                    }
+                    Ok(Some(session))
                 })
             })
             .await
@@ -174,7 +245,7 @@ impl DurableAgentThreadBacking {
                                SELECT 1 FROM agent_thread_workspace_session
                                 WHERE tenant_id = $1 AND region = $2
                                   AND owner_principal_id = $3 AND thread_id = $4
-                                  AND session_id = $5
+                                  AND session_id = $5 AND launched_at IS NOT NULL
                              )",
                         )
                         .bind(&tenant)
@@ -192,12 +263,18 @@ impl DurableAgentThreadBacking {
                     let rows = sqlx::query(
                         "SELECT session_id, thread_id, owner_principal_id, workspace_id,
                                 workspace_generation, access_method, session_mode, terminal,
-                                started_at
+                                launched_at AS started_at
                            FROM agent_thread_workspace_session
                           WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3
-                            AND thread_id = $4
-                            AND ($5::text IS NULL OR session_id < $5)
-                          ORDER BY session_id DESC LIMIT $6",
+                            AND thread_id = $4 AND launched_at IS NOT NULL
+                            AND ($5::text IS NULL OR (launched_at, session_id) < (
+                              SELECT cursor.launched_at, cursor.session_id
+                                FROM agent_thread_workspace_session cursor
+                               WHERE cursor.tenant_id = $1 AND cursor.region = $2
+                                 AND cursor.owner_principal_id = $3 AND cursor.thread_id = $4
+                                 AND cursor.session_id = $5 AND cursor.launched_at IS NOT NULL
+                            ))
+                          ORDER BY launched_at DESC, session_id DESC LIMIT $6",
                     )
                     .bind(&tenant)
                     .bind(&region)
@@ -223,8 +300,8 @@ fn validate_proposal(proposal: &NewWorkspaceSshSession) -> Result<(), ProviderEr
     if !canonical_ulid(&proposal.session_id) {
         return Err(query_error_value("workspace session id is not a canonical ULID").into());
     }
-    if proposal.started_at < proposal.admitted_at {
-        return Err(query_error_value("workspace session started before SSH admission").into());
+    if proposal.reserved_at < proposal.admitted_at {
+        return Err(query_error_value("workspace session reserved before SSH admission").into());
     }
     Ok(())
 }

@@ -252,6 +252,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::privacy_request_durable::privacy_request_git_pull_request_text_scope_migrations(),
         crate::agent_thread_durable::agent_thread_ssh_single_use_migrations(),
         crate::agent_thread_durable::agent_thread_recent_list_migrations(),
+        crate::agent_thread_durable::agent_thread_session_launch_migrations(),
     ]
 }
 

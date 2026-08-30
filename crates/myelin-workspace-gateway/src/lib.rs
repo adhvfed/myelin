@@ -7,8 +7,8 @@ mod session_bridge;
 mod transport;
 
 pub use admission::{
-    AdmissionLookupError, LiveAdmissionRequest, LiveSessionRequest, WorkspaceSessionStartRequest,
-    WorkspaceSshAdmissionStore,
+    AdmissionLookupError, LiveAdmissionRequest, LiveSessionRequest, WorkspaceSessionConfirmRequest,
+    WorkspaceSessionStartRequest, WorkspaceSshAdmissionStore,
 };
 pub use authentication::{
     AuthenticatedWorkspace, WorkspaceSshAuthenticationError, WorkspaceSshAuthenticator,

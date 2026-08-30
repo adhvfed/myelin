@@ -4338,6 +4338,28 @@ cursors. The TypeScript product journey creates three named investigations,
 walks two public API pages newest-first, and observes the same bounded cursor
 refusals through rebuilt Edge.
 
+## 2026-08-30 — SSH history begins only after confinement does
+
+Workspace SSH atomically consumed its one-shot grant and wrote the owner-visible
+`workspace.session.started` row before attempting to launch the confined process. A missing
+workspace, unavailable gVisor runtime, or invalid command could therefore leave durable history
+claiming that an SSH session had started when no session ever reached the user.
+
+The gateway now uses a two-phase durable lifecycle. Authentication consumes the one-shot grant and
+reserves a session identity first, so concurrent connections still cannot replay it. That
+reservation remains absent from owner history and emits no event. Only after the confined process
+exists does the gateway confirm the reservation, atomically publish the session, and co-commit
+`workspace.session.started`; a response-lost confirmation returns the original published receipt.
+If publication fails, the new confined process is terminated before SSH channel success.
+
+Migrations `0143`–`0146` add the nullable launch instant through an online
+expand/backfill/contract cycle and install the launch-time owner index concurrently. The live
+PostgreSQL lifecycle proves reservations are hidden, confirmation is retry-safe, and only the
+confirmed rows own events. The TypeScript full-system journey sends a real OpenSSH command one byte
+past the confinement limit, proves that launch is rejected and the grant stays single-use, then
+observes no false workspace entry. The durable database retains exactly the expected internal
+reservation with `consumed_at` set, `launched_at` absent, and no started event.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

@@ -126,25 +126,42 @@ where
             WorkspaceSessionCommand::Exec(_) => WorkspaceSessionMode::Command,
         };
         let has_terminal = terminal.is_some();
-        let Some(recorded) = self
+        let session_id = self.session_ids.mint().0;
+        let Some(reserved) = self
             .authenticator
-            .start_session(&revalidated, self.session_ids.mint().0, mode, has_terminal)
+            .reserve_session(&revalidated, session_id.clone(), mode, has_terminal)
             .await?
         else {
             session.channel_failure(channel_id)?;
             return Ok(());
         };
-        let Ok(confined) = self.launcher.launch(&recorded, command, terminal).await else {
+        let Ok(confined) = self.launcher.launch(&reserved, command, terminal).await else {
             session.channel_failure(channel_id)?;
             return Ok(());
         };
+        match self
+            .authenticator
+            .confirm_session(&reserved, &session_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                confined.handle().terminate();
+                session.channel_failure(channel_id)?;
+                return Ok(());
+            }
+            Err(error) => {
+                confined.handle().terminate();
+                return Err(error.into());
+            }
+        }
 
         self.active_session = Some(ActiveWorkspaceSession {
             channel: channel_id,
             handle: confined.handle(),
         });
         session.channel_success(channel_id)?;
-        spawn_session_bridge(confined, channel, self.authenticator.clone(), recorded);
+        spawn_session_bridge(confined, channel, self.authenticator.clone(), reserved);
         Ok(())
     }
 }

@@ -12,7 +12,7 @@ export interface EphemeralSshKey {
   remove(): Promise<void>;
 }
 
-interface WorkspaceSshAccess {
+export interface WorkspaceSshAccess {
   host: string;
   port: number;
   username: string;
@@ -98,6 +98,22 @@ export async function connectToWorkspace(
       );
     },
   };
+}
+
+export async function expectWorkspaceCommandRejected(
+  key: EphemeralSshKey,
+  access: WorkspaceSshAccess,
+  command: string,
+): Promise<void> {
+  const knownHostsPath = join(dirname(key.privateKeyPath), "known_hosts");
+  const host = knownHostName(access.host, access.port);
+  await writeFile(knownHostsPath, `${host} ${access.host_public_key}\n`, { mode: 0o600 });
+  try {
+    await runWorkspaceCommand(key, access, knownHostsPath, command);
+  } catch {
+    return;
+  }
+  throw new Error("the workspace SSH command was unexpectedly accepted");
 }
 
 async function runWorkspaceCommand(

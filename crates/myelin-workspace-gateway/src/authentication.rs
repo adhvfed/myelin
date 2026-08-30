@@ -10,8 +10,8 @@ use russh::keys::PublicKeyBase64;
 use uuid::Uuid;
 
 use crate::{
-    AdmissionLookupError, LiveAdmissionRequest, LiveSessionRequest, WorkspaceSessionStartRequest,
-    WorkspaceSshAdmissionStore,
+    AdmissionLookupError, LiveAdmissionRequest, LiveSessionRequest, WorkspaceSessionConfirmRequest,
+    WorkspaceSessionStartRequest, WorkspaceSshAdmissionStore,
 };
 
 type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -184,7 +184,7 @@ where
         Ok(current.filter(|current| same_workspace_authority(current, authenticated)))
     }
 
-    pub(crate) async fn start_session(
+    pub(crate) async fn reserve_session(
         &self,
         authenticated: &AuthenticatedWorkspace,
         session_id: String,
@@ -194,17 +194,17 @@ where
         let Some(credential) = session_credential(authenticated) else {
             return Ok(None);
         };
-        let started_at = (self.clock)();
+        let reserved_at = (self.clock)();
         let current = self
             .admissions
-            .start_session(&WorkspaceSessionStartRequest {
+            .reserve_session(&WorkspaceSessionStartRequest {
                 tenant: authenticated.tenant.clone(),
                 session_id,
                 grant_id: credential.grant_id,
                 route_username: credential.route_username.to_string(),
                 public_key_fingerprint: credential.public_key_fingerprint,
                 admitted_at: authenticated.admitted_at,
-                started_at,
+                reserved_at,
                 mode,
                 terminal,
             })
@@ -216,6 +216,24 @@ where
                 credential: authenticated.credential.clone(),
             });
         Ok(current.filter(|current| same_workspace_authority(current, authenticated)))
+    }
+
+    pub(crate) async fn confirm_session(
+        &self,
+        authenticated: &AuthenticatedWorkspace,
+        session_id: &str,
+    ) -> Result<bool, AdmissionLookupError> {
+        let Some(credential) = session_credential(authenticated) else {
+            return Ok(false);
+        };
+        self.admissions
+            .confirm_session(&WorkspaceSessionConfirmRequest {
+                tenant: authenticated.tenant.clone(),
+                grant_id: credential.grant_id,
+                session_id: session_id.to_string(),
+                launched_at: (self.clock)(),
+            })
+            .await
     }
 }
 
@@ -254,7 +272,7 @@ mod tests {
 
     use chrono::TimeZone;
     use myelin_identity_service::WorkspaceSshHostIdentity;
-    use myelin_storage::{DurableWorkspaceSession, SealKey, StartedWorkspaceSshSession, KEY_LEN};
+    use myelin_storage::{ReservedWorkspaceSshSession, SealKey, KEY_LEN};
     use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
     use russh::keys::PrivateKey;
 
@@ -265,6 +283,7 @@ mod tests {
         admissions: Arc<Mutex<Vec<LiveAdmissionRequest>>>,
         sessions: Arc<Mutex<Vec<LiveSessionRequest>>>,
         starts: Arc<Mutex<Vec<WorkspaceSessionStartRequest>>>,
+        confirmations: Arc<Mutex<Vec<WorkspaceSessionConfirmRequest>>>,
         result: Result<Option<LiveWorkspaceSshAdmission>, AdmissionLookupError>,
     }
 
@@ -276,6 +295,7 @@ mod tests {
                 admissions: Arc::new(Mutex::new(Vec::new())),
                 sessions: Arc::new(Mutex::new(Vec::new())),
                 starts: Arc::new(Mutex::new(Vec::new())),
+                confirmations: Arc::new(Mutex::new(Vec::new())),
                 result,
             }
         }
@@ -314,13 +334,13 @@ mod tests {
             })
         }
 
-        fn start_session<'a>(
+        fn reserve_session<'a>(
             &'a self,
             request: &'a WorkspaceSessionStartRequest,
         ) -> Pin<
             Box<
                 dyn Future<
-                        Output = Result<Option<StartedWorkspaceSshSession>, AdmissionLookupError>,
+                        Output = Result<Option<ReservedWorkspaceSshSession>, AdmissionLookupError>,
                     > + Send
                     + 'a,
             >,
@@ -328,21 +348,21 @@ mod tests {
             Box::pin(async move {
                 self.starts.lock().unwrap().push(request.clone());
                 self.result.clone().map(|result| {
-                    result.map(|admission| StartedWorkspaceSshSession {
-                        session: DurableWorkspaceSession {
-                            session_id: request.session_id.clone(),
-                            thread_id: admission.thread_id.clone(),
-                            owner_principal_id: admission.owner_principal_id.clone(),
-                            workspace_id: admission.workspace_id.clone(),
-                            workspace_generation: admission.workspace_generation,
-                            access_method: "ssh".into(),
-                            mode: request.mode,
-                            terminal: request.terminal,
-                            started_at: request.started_at.to_rfc3339(),
-                        },
+                    result.map(|admission| ReservedWorkspaceSshSession {
+                        session_id: request.session_id.clone(),
                         admission,
                     })
                 })
+            })
+        }
+
+        fn confirm_session<'a>(
+            &'a self,
+            request: &'a WorkspaceSessionConfirmRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, AdmissionLookupError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.confirmations.lock().unwrap().push(request.clone());
+                self.result.clone().map(|result| result.is_some())
             })
         }
     }
@@ -479,7 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn starting_a_confined_session_records_only_its_minimized_shape() {
+    async fn reserving_then_confirming_a_confined_session_records_its_two_instants() {
         let admitted_at = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
         let started_at = admitted_at + chrono::Duration::seconds(1);
         let now = Arc::new(Mutex::new(admitted_at));
@@ -488,6 +508,7 @@ mod tests {
         let username = routes.seal("acme", grant_id).unwrap();
         let admissions = RecordingAdmissions::returning(Ok(Some(admission(grant_id))));
         let starts = admissions.starts.clone();
+        let confirmations = admissions.confirmations.clone();
         let clock = now.clone();
         let authenticator = WorkspaceSshAuthenticator::new(routes, admissions)
             .with_clock(move || *clock.lock().unwrap());
@@ -499,7 +520,7 @@ mod tests {
 
         *now.lock().unwrap() = started_at;
         assert!(authenticator
-            .start_session(
+            .reserve_session(
                 &authenticated,
                 "01J00000000000000000000001".into(),
                 WorkspaceSessionMode::Command,
@@ -509,14 +530,29 @@ mod tests {
             .unwrap()
             .is_some());
 
-        let starts = starts.lock().unwrap();
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0].tenant, "acme");
-        assert_eq!(starts[0].grant_id, grant_id);
-        assert_eq!(starts[0].admitted_at, admitted_at);
-        assert_eq!(starts[0].started_at, started_at);
-        assert_eq!(starts[0].mode, WorkspaceSessionMode::Command);
-        assert!(starts[0].terminal);
+        {
+            let starts = starts.lock().unwrap();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].tenant, "acme");
+            assert_eq!(starts[0].grant_id, grant_id);
+            assert_eq!(starts[0].admitted_at, admitted_at);
+            assert_eq!(starts[0].reserved_at, started_at);
+            assert_eq!(starts[0].mode, WorkspaceSessionMode::Command);
+            assert!(starts[0].terminal);
+        }
+
+        let launched_at = started_at + chrono::Duration::seconds(1);
+        *now.lock().unwrap() = launched_at;
+        assert!(authenticator
+            .confirm_session(&authenticated, "01J00000000000000000000001")
+            .await
+            .unwrap());
+        let confirmations = confirmations.lock().unwrap();
+        assert_eq!(confirmations.len(), 1);
+        assert_eq!(confirmations[0].tenant, "acme");
+        assert_eq!(confirmations[0].grant_id, grant_id);
+        assert_eq!(confirmations[0].session_id, "01J00000000000000000000001");
+        assert_eq!(confirmations[0].launched_at, launched_at);
     }
 
     #[test]

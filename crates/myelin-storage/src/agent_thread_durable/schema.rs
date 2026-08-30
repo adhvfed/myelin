@@ -198,6 +198,34 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_thread_owner_created_recent
   WHERE state <> 'deleted';
 "#;
 
+pub const AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_workspace_session
+  ADD COLUMN IF NOT EXISTS launched_at timestamptz;
+"#;
+
+pub const AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION: &str = r#"
+UPDATE agent_thread_workspace_session
+   SET launched_at = started_at
+ WHERE launched_at IS NULL;
+"#;
+
+pub const AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_workspace_session
+  DROP CONSTRAINT IF EXISTS agent_thread_workspace_session_launch_after_reservation;
+ALTER TABLE agent_thread_workspace_session
+  ADD CONSTRAINT agent_thread_workspace_session_launch_after_reservation
+  CHECK (launched_at IS NULL OR launched_at >= started_at) NOT VALID;
+ALTER TABLE agent_thread_workspace_session
+  VALIDATE CONSTRAINT agent_thread_workspace_session_launch_after_reservation;
+"#;
+
+pub const AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_thread_workspace_session_launched_recent
+  ON agent_thread_workspace_session
+    (tenant_id, region, owner_principal_id, thread_id, launched_at DESC, session_id DESC)
+  WHERE launched_at IS NOT NULL;
+"#;
+
 pub fn agent_thread_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0124_agent_thread", AGENT_THREAD_MIGRATION),
@@ -228,4 +256,57 @@ pub fn agent_thread_recent_list_migrations() -> Migrations {
         crate::MigrationPhase::Expand,
         "agent_thread",
     )])
+}
+
+pub fn agent_thread_session_launch_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0143_agent_thread_session_launch_expand",
+            AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread_workspace_session",
+        ),
+        Migration::phased(
+            "0144_agent_thread_session_launch_backfill",
+            AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread_workspace_session",
+        ),
+        Migration::phased(
+            "0145_agent_thread_session_launch_invariant",
+            AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread_workspace_session",
+        ),
+        Migration::phased(
+            "0146_agent_thread_session_launch_index",
+            AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread_workspace_session",
+        ),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HotTables, MigrationPhase, OnlineMigrationRunner};
+
+    #[test]
+    fn session_publication_uses_an_online_expand_backfill_contract_cycle() {
+        let migrations = agent_thread_session_launch_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(
+                &migrations,
+                &HotTables::declare(["agent_thread_workspace_session"]),
+            )
+            .expect("the live workspace history migration is online-safe");
+        assert_eq!(migrations.0.len(), 4);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+        assert_eq!(migrations.0[3].phase, MigrationPhase::Expand);
+        assert!(AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION.contains("CONCURRENTLY"));
+    }
 }

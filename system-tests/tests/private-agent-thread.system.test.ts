@@ -29,6 +29,7 @@ import { array, record, string } from "../src/json.js";
 import { reconcileAgentThreads } from "../src/operator.js";
 import {
   connectToWorkspace,
+  expectWorkspaceCommandRejected,
   generateEphemeralSshKey,
   type WorkspaceOverSsh,
 } from "../src/ssh.js";
@@ -297,6 +298,24 @@ describe("private work with an agent", () => {
       expect(changedKey.body).toMatchObject({ error: { code: "conflict" } });
       expect(JSON.stringify(sshAccess)).not.toContain(sshKey.privateKeyPath);
       expect(JSON.stringify(sshAccess)).not.toContain("private_key");
+
+      const historyBeforeRejectedLaunch = await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
+      );
+      expect(array(historyBeforeRejectedLaunch.body.items, "workspace history before rejection"))
+        .toEqual([]);
+      const commandOneBytePastTheConfinementLimit = "x".repeat(65_537);
+      await expectWorkspaceCommandRejected(
+        sshKey,
+        sshAccess.access,
+        commandOneBytePastTheConfinementLimit,
+      );
+      await expectWorkspaceCommandRejected(sshKey, sshAccess.access, "printf should-not-run");
+      const historyAfterRejectedLaunch = await founder.json(
+        `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
+      );
+      expect(array(historyAfterRejectedLaunch.body.items, "workspace history after rejection"))
+        .toEqual([]);
     } finally {
       await Promise.all([sshKey.remove(), anotherSshKey.remove()]);
     }
