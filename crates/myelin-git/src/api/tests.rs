@@ -524,6 +524,10 @@ fn agent_tool_schemas_describe_the_arguments_the_git_adapter_consumes() {
         schemas["git.comment"]["properties"]["anchor"]["required"],
         json!(["path", "line", "side"])
     );
+    assert_eq!(
+        schemas["git.reply"]["required"],
+        json!(["repo", "number", "thread_id", "body_md"])
+    );
     assert_eq!(schemas["git.open_pr"]["required"], json!(["repo", "title"]));
     assert_eq!(
         schemas["git.write_file"]["required"],

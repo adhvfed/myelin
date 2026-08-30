@@ -107,6 +107,11 @@ pub const GIT_COMMENT_APPLIED: &str = "git.comment.applied";
 pub const GIT_COMMENT_GATED: &str = "git.comment.gated";
 pub const GIT_COMMENT_DENIED: &str = "git.comment.denied";
 pub const GIT_COMMENT_INDETERMINATE: &str = "git.comment.indeterminate";
+pub const GIT_REPLY_ATTEMPTED: &str = "git.reply.attempted";
+pub const GIT_REPLY_APPLIED: &str = "git.reply.applied";
+pub const GIT_REPLY_GATED: &str = "git.reply.gated";
+pub const GIT_REPLY_DENIED: &str = "git.reply.denied";
+pub const GIT_REPLY_INDETERMINATE: &str = "git.reply.indeterminate";
 pub const GIT_ENDORSE_FORK_CI_ATTEMPTED: &str = "git.endorse_fork_ci.attempted";
 pub const GIT_ENDORSE_FORK_CI_APPLIED: &str = "git.endorse_fork_ci.applied";
 pub const GIT_ENDORSE_FORK_CI_GATED: &str = "git.endorse_fork_ci.gated";
@@ -142,6 +147,11 @@ pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     GIT_COMMENT_GATED,
     GIT_COMMENT_DENIED,
     GIT_COMMENT_INDETERMINATE,
+    GIT_REPLY_ATTEMPTED,
+    GIT_REPLY_APPLIED,
+    GIT_REPLY_GATED,
+    GIT_REPLY_DENIED,
+    GIT_REPLY_INDETERMINATE,
     GIT_ENDORSE_FORK_CI_ATTEMPTED,
     GIT_ENDORSE_FORK_CI_APPLIED,
     GIT_ENDORSE_FORK_CI_GATED,
@@ -218,6 +228,11 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_COMMENT_GATED,
     GIT_COMMENT_DENIED,
     GIT_COMMENT_INDETERMINATE,
+    GIT_REPLY_ATTEMPTED,
+    GIT_REPLY_APPLIED,
+    GIT_REPLY_GATED,
+    GIT_REPLY_DENIED,
+    GIT_REPLY_INDETERMINATE,
     GIT_ENDORSE_FORK_CI_ATTEMPTED,
     GIT_ENDORSE_FORK_CI_APPLIED,
     GIT_ENDORSE_FORK_CI_GATED,

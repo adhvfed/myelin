@@ -238,6 +238,7 @@ mod tests {
             "git.read_file",
             "git.search_code",
             "git.comment",
+            "git.reply",
             "git.merge",
             "git.open_pr",
             "git.write_file",

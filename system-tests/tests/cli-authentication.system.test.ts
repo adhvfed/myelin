@@ -350,6 +350,7 @@ describe.sequential("the CLI authentication journey", () => {
         "git.write_file",
         "git.list_repositories",
         "git.read_file",
+        "git.reply",
         "git.search_code",
         "git.merge",
         "ci.read_run",
@@ -398,6 +399,8 @@ describe.sequential("the CLI authentication journey", () => {
       "--tool",
       "git.read_file",
       "--tool",
+      "git.reply",
+      "--tool",
       "git.search_code",
       "--tool",
       "issues.close",
@@ -444,6 +447,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "git.list_repositories", version: 1 },
           { name: "git.open_pr", version: 1 },
           { name: "git.read_file", version: 1 },
+          { name: "git.reply", version: 1 },
           { name: "git.search_code", version: 1 },
           { name: "git.write_file", version: 1 },
           { name: "issues.close", version: 1 },
@@ -489,6 +493,7 @@ describe.sequential("the CLI authentication journey", () => {
         "git.write_file",
         "git.list_repositories",
         "git.read_file",
+        "git.reply",
         "git.search_code",
         "issues.close",
         "issues.create",
@@ -532,6 +537,8 @@ describe.sequential("the CLI authentication journey", () => {
       "git.list_repositories",
       "--tool",
       "git.read_file",
+      "--tool",
+      "git.reply",
       "--tool",
       "git.search_code",
       "--tool",
@@ -808,6 +815,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "git.list_repositories", version: 1 },
           { name: "git.open_pr", version: 1 },
           { name: "git.read_file", version: 1 },
+          { name: "git.reply", version: 1 },
           { name: "git.search_code", version: 1 },
           { name: "git.write_file", version: 1 },
           { name: "issues.close", version: 1 },
@@ -903,6 +911,7 @@ describe.sequential("the CLI authentication journey", () => {
       "git.list_repositories",
       "git.open_pr",
       "git.read_file",
+      "git.reply",
       "git.search_code",
       "git.write_file",
       "issues.close",
@@ -955,6 +964,11 @@ describe.sequential("the CLI authentication journey", () => {
     expect(schemaFor("git.comment")).toMatchObject({
       type: "object",
       required: ["repo", "number", "body_md"],
+      additionalProperties: false,
+    });
+    expect(schemaFor("git.reply")).toMatchObject({
+      type: "object",
+      required: ["repo", "number", "thread_id", "body_md"],
       additionalProperties: false,
     });
     expect(schemaFor("git.read_file")).toMatchObject({
@@ -1130,6 +1144,7 @@ describe.sequential("the CLI authentication journey", () => {
       "git.list_repositories",
       "git.open_pr",
       "git.read_file",
+      "git.reply",
       "git.search_code",
       "git.write_file",
       "issues.close",
@@ -2052,6 +2067,78 @@ describe.sequential("the CLI authentication journey", () => {
         ],
       }),
     ]);
+
+    // A human can then ask a question in the review itself and receive one durable agent reply.
+    // Replaying the governed call proves the product-level comment ledger, not an MCP-only cache.
+    const humanQuestion = uniqueName("What evidence should we retain here?");
+    const humanThreadReceipt = await systemClient.json(
+      `${sourceRepository.path}/prs/${agentPullRequestNumber}/threads`,
+      {
+        method: "POST",
+        body: { body_md: humanQuestion },
+        idempotencyKey: `human-agent-review-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const humanThread = record(
+      record(humanThreadReceipt.body.applied, "human review-thread receipt").thread,
+      "human review thread",
+    );
+    const humanThreadId = string(humanThread.id, "human review thread id");
+    const agentReviewReply = uniqueName("Retain the durable audit and exact retry receipt");
+    const agentReplyKey = `agent-pr-reply-${randomUUID()}`;
+    const repliedOnPullRequest = await askAgentToAct(
+      resumedRun,
+      29,
+      "git.reply",
+      {
+        repo: sourceRepository.slug,
+        number: agentPullRequestNumber,
+        thread_id: humanThreadId,
+        body_md: agentReviewReply,
+      },
+      agentReplyKey,
+    );
+    const replayedPullRequestReply = await askAgentToAct(
+      resumedRun,
+      30,
+      "git.reply",
+      {
+        repo: sourceRepository.slug,
+        number: agentPullRequestNumber,
+        thread_id: humanThreadId,
+        body_md: agentReviewReply,
+      },
+      agentReplyKey,
+    );
+    expect(replayedPullRequestReply).toEqual(repliedOnPullRequest);
+    const replyReceipt = record(repliedOnPullRequest.data, "agent review-reply receipt data");
+    const replyCommentId = string(replyReceipt.comment_id, "agent review-reply comment id");
+    expect(repliedOnPullRequest.ref).toBe(
+      `myelin://${systemTestConfig.tenant}/git/pr/${sourceRepository.slug}:${agentPullRequestNumber}#thread-${humanThreadId}`,
+    );
+
+    const repliedReviewThreads = await systemClient.json(
+      `${sourceRepository.path}/prs/${agentPullRequestNumber}/threads`,
+    );
+    const repliedDiscussion = array(repliedReviewThreads.body.discussion, "review discussions")
+      .map((thread, index) => record(thread, `review discussion ${index}`))
+      .find((thread) => thread.id === humanThreadId);
+    expect(repliedDiscussion).toMatchObject({
+      id: humanThreadId,
+      resolved: false,
+      comments: [
+        expect.objectContaining({
+          body_md: humanQuestion,
+          author: expect.objectContaining({ kind: "human" }),
+        }),
+        expect.objectContaining({
+          id: replyCommentId,
+          body_md: agentReviewReply,
+          author: expect.objectContaining({ kind: "agent" }),
+        }),
+      ],
+    });
   }, 120_000);
 
   test("agent-created work stays pseudonymous and approval-gated", async () => {

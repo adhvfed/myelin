@@ -71,6 +71,13 @@ pub(super) fn effect_event_type(
             denied: myelin_git::events::GIT_COMMENT_DENIED,
             indeterminate: myelin_git::events::GIT_COMMENT_INDETERMINATE,
         },
+        "git.reply" => EffectAuditEvents {
+            attempted: myelin_git::events::GIT_REPLY_ATTEMPTED,
+            applied: myelin_git::events::GIT_REPLY_APPLIED,
+            gated: myelin_git::events::GIT_REPLY_GATED,
+            denied: myelin_git::events::GIT_REPLY_DENIED,
+            indeterminate: myelin_git::events::GIT_REPLY_INDETERMINATE,
+        },
         "git.endorse_fork_ci" => EffectAuditEvents {
             attempted: myelin_git::events::GIT_ENDORSE_FORK_CI_ATTEMPTED,
             applied: myelin_git::events::GIT_ENDORSE_FORK_CI_APPLIED,

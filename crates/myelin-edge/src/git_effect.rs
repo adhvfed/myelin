@@ -121,13 +121,8 @@ impl GitEffectApi {
                     Some(value) => value,
                     None => return deny_missing("body_md"),
                 };
-                if !self
-                    .backend
-                    .authorize_pr_review(t, r, repo, number, &self.delegator)
-                {
-                    return EffectResult::Denied(
-                        "the delegating human has no review authority for this pull request".into(),
-                    );
+                if let Err(denied) = self.authorize_delegated_pr_review(repo, number) {
+                    return denied;
                 }
                 let mut body = serde_json::json!({ "body_md": body_md });
                 if let Some(anchor) = args.get("anchor") {
@@ -158,6 +153,55 @@ impl GitEffectApi {
                                 "number": number,
                                 "thread_id": thread_id,
                                 "thread": thread,
+                            }),
+                        )
+                    }
+                    Err(error) => deny_durable_error(error),
+                }
+            }
+            "git.reply" => {
+                let (repo, number) = match repo_and_number(args) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+                let thread_id = match str_arg(args, "thread_id") {
+                    Some(value) => value,
+                    None => return deny_missing("thread_id"),
+                };
+                let body_md = match str_arg(args, "body_md") {
+                    Some(value) => value,
+                    None => return deny_missing("body_md"),
+                };
+                if let Err(denied) = self.authorize_delegated_pr_review(repo, number) {
+                    return denied;
+                }
+                match self.backend.add_thread_comment(
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
+                    thread_id,
+                    operation_id.digest(),
+                    &serde_json::json!({ "body_md": body_md }),
+                ) {
+                    Ok(comment) => {
+                        let Some(comment_id) =
+                            comment.get("id").and_then(Value::as_str).map(str::to_owned)
+                        else {
+                            return EffectResult::Denied("internal error".into());
+                        };
+                        let reference =
+                            match myelin_git::subs::mint_pr_thread(t, repo, number, thread_id) {
+                                Ok(reference) => myelin_refs::format(&reference),
+                                Err(_) => return EffectResult::Denied("internal error".into()),
+                            };
+                        applied_resource(
+                            run,
+                            &format!("git.pr.reply:#{number}:{thread_id}:{comment_id}"),
+                            reference,
+                            serde_json::json!({
+                                "repo": repo,
+                                "number": number,
+                                "thread_id": thread_id,
+                                "comment_id": comment_id,
+                                "comment": comment,
                             }),
                         )
                     }
@@ -341,6 +385,22 @@ impl GitEffectApi {
             Err(EffectResult::Denied(format!(
                 "object authorization denied `{permission:?}` on repository `{repo}`"
             )))
+        }
+    }
+
+    fn authorize_delegated_pr_review(&self, repo: &str, number: u64) -> Result<(), EffectResult> {
+        if self.backend.authorize_pr_review(
+            &self.tenant,
+            &self.region,
+            repo,
+            number,
+            &self.delegator,
+        ) {
+            Ok(())
+        } else {
+            Err(EffectResult::Denied(
+                "the delegating human has no review authority for this pull request".into(),
+            ))
         }
     }
 }

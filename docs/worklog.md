@@ -4571,6 +4571,29 @@ all-target Clippy was clean, and system/frontend type checking, frontend lint, a
 passed. The real Chromium private-agent journey also created a thread with the expanded default
 tool selection and completed its retained-workspace and accessibility story in 5.7 seconds.
 
+## 2026-08-30 — A pull-request discussion can continue with an agent
+
+An agent could open a Git review thread, but a human's follow-up question still ended the governed
+conversation: the agent had no effect for adding another comment to an existing thread. Treating
+every answer as a new discussion would have lost the relationship and made retries ambiguous.
+
+The shared catalogue now exposes `git.reply` with a strict repository, pull-request, thread, and
+body contract. It carries the same bounded review capability as thread creation, derives placement
+from the verified run, and rechecks the delegating human's live review authority before every write.
+The existing Git conversation ledger binds the governed operation digest to the thread, agent
+author, and body; a lost-response retry therefore returns the original comment. The result points
+back to the canonical parent thread, and every governance outcome is covered by Git's registered
+audit vocabulary. The catalogue-wide invariant prevents any side-effecting MCP tool from shipping
+without all five audit outcomes.
+
+The readable TypeScript CLI journey now has the human open a real pull-request discussion, the
+external agent answer it, the agent repeat the call with the same retry identity, and the human read
+back exactly one human root plus one agent reply. All 16 stages passed against the running Edge,
+PostgreSQL, and durable Git store in 44.47 seconds. The stored conversation retained one reply
+command receipt and one agent comment; PostgreSQL retained two attempted and two applied, published
+`git.reply` events for the call and retry. All 1,000 affected Rust library stories passed, strict
+all-target Clippy was clean, and the TypeScript system suite typechecked.
+
 ## 2026-08-30 — Agents can leave exact pull-request feedback
 
 Agents could write a branch, open its pull request, and record a review verdict, but could not
@@ -4714,13 +4737,13 @@ stories passed, strict all-target Clippy was clean, and the TypeScript system su
 18. **Several Git collaboration and maintenance actions are not agent effects.**
     Agents can durably write files, open pull requests, submit review verdicts,
     open general or line-anchored review threads, endorse fork CI, and merge
-    with human approval. Suggested changes, replies to or resolution of review
-    threads, SCIP indexing, and audited history rewrite have no governed
-    carrier; the former injected-fake rewrite/index module was removed. Each
-    future action needs a durable owner boundary and a full-system agent journey
-    before discovery. Git also has no production merge queue: durable checks
-    and direct merges ship, but no PostgreSQL Flow merge body consumes
-    `ci.result` and survives restart.
+    with human approval, and reply inside existing review discussions. Suggested
+    changes, resolution of review threads, SCIP indexing, and audited history
+    rewrite have no governed carrier; the former injected-fake rewrite/index
+    module was removed. Each future action needs a durable owner boundary and a
+    full-system agent journey before discovery. Git also has no production merge
+    queue: durable checks and direct merges ship, but no PostgreSQL Flow merge
+    body consumes `ci.result` and survives restart.
 19. **Agents can inspect CI, but cannot command it directly.** They can read
     durable runs and bounded logs. Pipeline trigger/retry/cancel, validation,
     planning, deploy/approve/rollback, and secret administration have no CI
