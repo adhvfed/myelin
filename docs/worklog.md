@@ -4,6 +4,36 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — A standard editor can change private workspace files over confined SFTP
+
+SSH multiplexing supplied the channel shape remote tools need, but the gateway still rejected the
+standard SFTP subsystem. Calling shell commands from a bespoke helper was useful proof of shared
+state, not a real editor-facing file protocol, and running an in-process filesystem server in the
+gateway would have created a second, difficult-to-secure workspace boundary.
+
+The pinned Git rootfs now also contains OpenSSH 10.3p1's real `sftp-server`. An owner-authorized
+`sftp` subsystem request is separately revalidated and reserved, then launches that fixed binary as
+uid 65534 inside the same read-only-root, deny-all-network gVisor confinement used by workspace
+commands. It starts in `/workspace`; the gateway never resolves a client path on the host. The
+rootfs staging recipe requires the binary, the complete tree has a new canonical digest pin, and
+startup refuses a missing, symlinked, non-executable, or drifted server.
+
+Migrations `0157`–`0159` add the truthful `file_transfer` audit mode through an online
+expand/backfill/contract cycle. The readable TypeScript journey uses the operating system's
+ordinary OpenSSH `sftp` client over the same host-key-pinned ControlMaster as concurrent command
+channels, uploads and downloads a file, reads it through another SSH command, and then has a fresh
+agent context read the edit from the durable workspace. The owner-visible history contains separate
+`file_transfer` receipts without exposing commands, keys, routes, grants, locators, or host data.
+
+This gives generic SFTP-capable editors and mounts a real path into a personal cloud branch. It does
+not yet claim VS Code Remote SSH compatibility: TCP forwarding and a persistent editor server
+shared across channels remain absent.
+
+Proof: all four private-agent-thread system stories passed against live PostgreSQL, Edge, the
+workspace gateway, the standard OpenSSH client, and gVisor; the rootfs digest-pin test reproduced
+the committed tree; the online migration-shape test, TypeScript typecheck, and focused sandbox
+command test passed.
+
 ## 2026-08-31 — One private SSH transport can carry real editor-shaped work
 
 The one-shot workspace credential had been modeled as one process rather than one SSH
@@ -18,8 +48,8 @@ winner. That winning connection may reserve up to sixteen command or shell chann
 revalidates the current owner, agent, thread, workspace generation, revocation, and expiry, launches
 in its own gVisor confinement, and receives its own owner-visible session receipt only after launch.
 Closing a channel terminates only its confined process, while closing the transport terminates all
-remaining processes. SFTP, port forwarding, and a persistent remote editor server are still absent;
-this is the secure multiplexing foundation, not a claim that every Remote SSH client already works.
+remaining processes. At this checkpoint SFTP, port forwarding, and a persistent remote editor
+server were still absent; the next checkpoint adds confined SFTP, while the latter two remain open.
 
 The readable TypeScript journey uses an ordinary host-key-pinned OpenSSH ControlMaster. One channel
 waits for a file while a second writes it, then later channels read both that result and agent work

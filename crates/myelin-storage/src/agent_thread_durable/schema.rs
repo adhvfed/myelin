@@ -277,6 +277,24 @@ ALTER TABLE agent_thread_ssh_grant
   VALIDATE CONSTRAINT agent_thread_ssh_grant_connection_claim_complete;
 "#;
 
+pub const AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_workspace_session
+  DROP CONSTRAINT IF EXISTS agent_thread_workspace_session_mode;
+ALTER TABLE agent_thread_workspace_session
+  ADD CONSTRAINT agent_thread_workspace_session_mode
+  CHECK (session_mode IN ('shell', 'command', 'file_transfer')) NOT VALID;
+"#;
+
+pub const AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_workspace_session
+  VALIDATE CONSTRAINT agent_thread_workspace_session_mode;
+"#;
+
+pub const AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_workspace_session
+  DROP CONSTRAINT IF EXISTS agent_thread_workspace_session_session_mode_check;
+"#;
+
 pub const AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION: &str = r#"
 UPDATE agent_thread_workspace_session
    SET launched_at = started_at
@@ -480,6 +498,29 @@ pub fn agent_thread_ssh_connection_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_file_transfer_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0157_agent_thread_file_transfer_expand",
+            AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread_workspace_session",
+        ),
+        Migration::phased(
+            "0158_agent_thread_file_transfer_backfill",
+            AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread_workspace_session",
+        ),
+        Migration::phased(
+            "0159_agent_thread_file_transfer_contract",
+            AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread_workspace_session",
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +533,22 @@ mod tests {
         runner
             .run(&migrations, &HotTables::declare(["agent_thread_ssh_grant"]))
             .expect("the live SSH grant migration is online-safe");
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+    }
+
+    #[test]
+    fn file_transfer_mode_is_an_online_expand_contract_cycle() {
+        let migrations = agent_thread_file_transfer_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(
+                &migrations,
+                &HotTables::declare(["agent_thread_workspace_session"]),
+            )
+            .expect("the live workspace history migration is online-safe");
         assert_eq!(migrations.0.len(), 3);
         assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
         assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);

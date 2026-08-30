@@ -21,9 +21,9 @@ env_var = "MYELIN_GVISOR_GIT_ROOTFS"
 default_path = "~/.local/share/gvisor-assets/git-rootfs"
 source_image = "host-git:2.54.0"
 source_image_digest = "sha256:bb6007e89e15dad35cf623a203db26dde9e042cb2df844320055cad3cd2eb5d0"
-canonical_tree_sha256 = "0ac70764ba20a043d19933213d60070c7f8712947a86753bab518569df302646"
-image = "myelin.local/git-v1-rootfs@sha256:0ac70764ba20a043d19933213d60070c7f8712947a86753bab518569df302646"
-note = "Founder-dogfood git-bearing rootfs used for exact-commit checkout and git wire. The shared tree is read-only to OCI workloads, all mount targets are precreated and empty, registry construction pins the complete content, and each git execution re-verifies the same canonical digest before spawning."
+canonical_tree_sha256 = "1c79670ce9fe3de0c0e6d4443059dc10a9f91e3e75f502bd3ed071b6a8aa31b8"
+image = "myelin.local/git-v1-rootfs@sha256:1c79670ce9fe3de0c0e6d4443059dc10a9f91e3e75f502bd3ed071b6a8aa31b8"
+note = "Founder-dogfood rootfs used for exact-commit checkout, Git wire, and owner-authorized SFTP. It contains host Git 2.54.0 (sha256:bb6007e89e15dad35cf623a203db26dde9e042cb2df844320055cad3cd2eb5d0) and OpenSSH 10.3p1 sftp-server (sha256:c3451f38fe40cb9d5104a4c57525c9e0665e85150efdb9b516b6fe29f03b086a). The shared tree is read-only to OCI workloads, all mount targets are precreated and empty, registry construction pins the complete content, and each execution re-verifies the same canonical digest before spawning."
 
 [[asset]]
 id = "cargo-vendor-smoke-v1"

@@ -589,6 +589,8 @@ describe("private work with an agent", () => {
     const editorKey = await generateEphemeralSshKey();
     const editorPath = "notes/editor-multiplexing.txt";
     const editorText = "one pinned SSH transport, multiple confined channels";
+    const standardEditorPath = "notes/standard-editor-sftp.txt";
+    const standardEditorText = "edited through the standard OpenSSH SFTP client";
     try {
       const editorAccess = await requestWorkspaceSshAccess(
         founder,
@@ -606,6 +608,9 @@ describe("private work with an agent", () => {
         ]);
         expect(await editorWorkspace.readText(editorPath)).toBe(editorText);
         expect(await editorWorkspace.readText(notebookPath)).toBe(ownerRevisedNotebook);
+        await editorWorkspace.writeTextViaSftp(standardEditorPath, standardEditorText);
+        expect(await editorWorkspace.readTextViaSftp(standardEditorPath)).toBe(standardEditorText);
+        expect(await editorWorkspace.readText(standardEditorPath)).toBe(standardEditorText);
       } finally {
         await editorWorkspace.close();
       }
@@ -613,7 +618,7 @@ describe("private work with an agent", () => {
       await editorKey.remove();
     }
     const workspaceHistory = await founder.json(
-      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=10`,
+      `/v1/agent-threads/${encodeURIComponent(first.thread.id)}/workspace-sessions?limit=20`,
     );
     const workspaceSessions = array(
       workspaceHistory.body.items,
@@ -638,6 +643,15 @@ describe("private work with an agent", () => {
         }),
         expect.objectContaining({
           method: "ssh",
+          mode: "file_transfer",
+          terminal: false,
+          workspace: {
+            id: first.thread.workspace.id,
+            generation: first.thread.workspace.generation,
+          },
+        }),
+        expect.objectContaining({
+          method: "ssh",
           mode: "command",
           terminal: false,
           workspace: {
@@ -647,7 +661,7 @@ describe("private work with an agent", () => {
         }),
       ]),
     );
-    expect(workspaceHistory.body.page).toEqual({ next_cursor: null, limit: 10 });
+    expect(workspaceHistory.body.page).toEqual({ next_cursor: null, limit: 20 });
     expect(workspaceHistory.headers.get("cache-control")).toBe("no-store");
     expect(JSON.stringify(workspaceHistory.body)).not.toMatch(
       /fingerprint|grant|host|locator|public_key|route|username/i,
@@ -704,18 +718,30 @@ describe("private work with an agent", () => {
       byte_len: Buffer.byteLength(ownerNote),
       workspace_generation: first.thread.workspace.generation,
     });
+    const standardEditorFile = await askAgent(
+      freshContext,
+      5,
+      "workspace.read_file",
+      { path: standardEditorPath },
+    );
+    expect(standardEditorFile).toMatchObject({
+      path: standardEditorPath,
+      content: standardEditorText,
+      byte_len: Buffer.byteLength(standardEditorText),
+      workspace_generation: first.thread.workspace.generation,
+    });
     const answer = "The cleanup races because the final reader still owns its lease.";
     const answerKey = `private-agent-answer-${randomUUID()}`;
     const postedAnswer = await askAgentToAct(
       freshContext,
-      5,
+      6,
       "chat.post",
       { conversation_id: conversation.id, content: answer },
       answerKey,
     );
     const replayedAnswer = await askAgentToAct(
       freshContext,
-      6,
+      7,
       "chat.post",
       { conversation_id: conversation.id, content: answer },
       answerKey,
@@ -757,7 +783,7 @@ describe("private work with an agent", () => {
       const runningCommandPath = "notes/running-command.txt";
       const runningCommand = askAgentToAct(
         freshContext,
-        7,
+        8,
         "workspace.exec",
         {
           command: [

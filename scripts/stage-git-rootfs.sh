@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Stage a Git-capable gVisor rootfs for clone, fetch, and push. It layers the host Git binary, shared
-# libraries, and helpers onto the base BusyBox rootfs. The guest runs as uid 65534. Deployed assets
-# should instead come from an immutable, digest-pinned image.
+# Stage a Git- and SFTP-capable gVisor rootfs for clone, fetch, push, and owner file access. It
+# layers the host Git and OpenSSH sftp-server binaries, shared libraries, and helpers onto the base
+# BusyBox rootfs. The guest runs as uid 65534. Deployed assets should instead come from an immutable,
+# digest-pinned image.
 #
 #   ./scripts/stage-git-rootfs.sh          stage into ~/.local/share/gvisor-assets/git-rootfs (idempotent)
 #   FORCE=1 ./scripts/stage-git-rootfs.sh  re-stage from scratch (removes the existing staged tree)
@@ -18,6 +19,14 @@ die() { echo "stage-git-rootfs: $*" >&2; exit 1; }
 
 [[ -d "${BASE_ROOTFS}" ]] || die "base rootfs absent at ${BASE_ROOTFS} — build/stage it first (MYELIN_GVISOR_ROOTFS overrides)"
 HOST_GIT="$(command -v git)" || die "no host \`git\` on PATH to bake into the guest"
+HOST_SFTP_SERVER=""
+for candidate in /usr/lib/ssh/sftp-server /usr/lib/openssh/sftp-server; do
+  if [[ -x "${candidate}" ]]; then
+    HOST_SFTP_SERVER="${candidate}"
+    break
+  fi
+done
+[[ -n "${HOST_SFTP_SERVER}" ]] || die "no OpenSSH sftp-server found under /usr/lib/ssh or /usr/lib/openssh"
 
 # Every OCI destination this shared tree can receive must exist before the tree is content-pinned.
 # `/tmp` is the tmpfs target on both paths; checkout binds `/workspace`; git-wire binds `/repo` and
@@ -33,7 +42,8 @@ for mountpoint in "${REQUIRED_MOUNTPOINTS[@]}"; do
 done
 
 # Reuse the tree only when Git and every required mountpoint are present.
-if [[ "${FORCE:-0}" != "1" && -x "${STAGED}/usr/bin/git" && "${mountpoints_ready}" == "1" ]]; then
+if [[ "${FORCE:-0}" != "1" && -x "${STAGED}/usr/bin/git" \
+    && -x "${STAGED}/usr/lib/ssh/sftp-server" && "${mountpoints_ready}" == "1" ]]; then
   echo "stage-git-rootfs: already staged at ${STAGED} (FORCE=1 to re-stage)" >&2
   echo "${STAGED}"
   exit 0
@@ -47,6 +57,7 @@ cp -a "${BASE_ROOTFS}/." "${STAGED}/"
 
 # The host `git` (a single multi-call binary; upload-pack/receive-pack dispatch off argv[0]).
 install -Dm755 "${HOST_GIT}" "${STAGED}/usr/bin/git"
+install -Dm755 "${HOST_SFTP_SERVER}" "${STAGED}/usr/lib/ssh/sftp-server"
 
 # Copy each host library into /usr/lib and /lib with its soname symlink.
 stage_lib() {

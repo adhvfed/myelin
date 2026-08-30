@@ -120,6 +120,7 @@ where
         let mode = match &command {
             WorkspaceSessionCommand::Shell => WorkspaceSessionMode::Shell,
             WorkspaceSessionCommand::Exec(_) => WorkspaceSessionMode::Command,
+            WorkspaceSessionCommand::Sftp => WorkspaceSessionMode::FileTransfer,
         };
         let has_terminal = terminal.is_some();
         let session_id = self.session_ids.mint().0;
@@ -311,5 +312,19 @@ where
             session,
         )
         .await
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if name != "sftp" || self.pending_terminals.contains_key(&channel) {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        self.start_session(channel, WorkspaceSessionCommand::Sftp, session)
+            .await
     }
 }

@@ -27,6 +27,8 @@ export interface WorkspaceOverSsh {
 }
 
 export interface MultiplexedWorkspaceOverSsh extends WorkspaceOverSsh {
+  readTextViaSftp(path: string): Promise<string>;
+  writeTextViaSftp(path: string, content: string): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -149,6 +151,32 @@ export async function connectMultiplexedToWorkspace(
         `for attempt in $(seq 1 40); do if test -f ${shellWord(relative)} && test "$(cat ${shellWord(relative)})" = ${shellWord(content)}; then exit 0; fi; sleep 0.25; done; exit 1`,
       );
     },
+    async readTextViaSftp(path: string): Promise<string> {
+      const relative = workspacePath(path);
+      const transfer = await mkdtemp(join(tmpdir(), "myelin-workspace-sftp-read-"));
+      try {
+        const downloaded = join(transfer, "downloaded");
+        const batch = join(transfer, "batch");
+        await writeFile(batch, `get ${sftpWord(relative)} ${sftpWord(downloaded)}\n`);
+        await runMultiplexedSftp(access, controlPath, batch);
+        return await readFile(downloaded, "utf8");
+      } finally {
+        await rm(transfer, { recursive: true, force: true });
+      }
+    },
+    async writeTextViaSftp(path: string, content: string): Promise<void> {
+      const relative = workspacePath(path);
+      const transfer = await mkdtemp(join(tmpdir(), "myelin-workspace-sftp-write-"));
+      try {
+        const upload = join(transfer, "upload");
+        const batch = join(transfer, "batch");
+        await writeFile(upload, content);
+        await writeFile(batch, `put ${sftpWord(upload)} ${sftpWord(relative)}\n`);
+        await runMultiplexedSftp(access, controlPath, batch);
+      } finally {
+        await rm(transfer, { recursive: true, force: true });
+      }
+    },
     async close(): Promise<void> {
       try {
         await run("ssh", [
@@ -165,6 +193,30 @@ export async function connectMultiplexedToWorkspace(
       }
     },
   };
+}
+
+async function runMultiplexedSftp(
+  access: WorkspaceSshAccess,
+  controlPath: string,
+  batchPath: string,
+): Promise<void> {
+  try {
+    await run("sftp", [
+      "-F",
+      "/dev/null",
+      "-b",
+      batchPath,
+      "-o",
+      `ControlPath=${controlPath}`,
+      "-o",
+      "BatchMode=yes",
+      "-P",
+      String(access.port),
+      `${access.username}@${access.host}`,
+    ], { timeout: 30_000, maxBuffer: 512 * 1024 });
+  } catch {
+    throw new Error("the multiplexed workspace SFTP transfer failed");
+  }
 }
 
 export async function expectWorkspaceCommandRejected(
@@ -279,7 +331,12 @@ function workspacePath(path: string): string {
     path.length === 0
     || path.length > 1_024
     || path.startsWith("/")
-    || parts.some((part) => part.length === 0 || part === "." || part === ".." || part.includes("\0"))
+    || parts.some((part) =>
+      part.length === 0
+      || part === "."
+      || part === ".."
+      || /[\u0000-\u001f\u007f]/u.test(part)
+    )
   ) {
     throw new TypeError("workspace SSH paths must be relative canonical paths");
   }
@@ -288,4 +345,8 @@ function workspacePath(path: string): string {
 
 function shellWord(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function sftpWord(value: string): string {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }

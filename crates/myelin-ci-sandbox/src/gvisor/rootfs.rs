@@ -1,6 +1,7 @@
 use super::*;
 use crate::hardening::HardeningProfile;
 use crate::JobSpec;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub const ENV_GVISOR_ROOTFS: &str = "MYELIN_GVISOR_ROOTFS";
@@ -24,7 +25,7 @@ pub const LINUX_RUST_V1_ROOTFS_SHA256: &str =
     "e6684d70e026a1433a7e32e2d29c100468d08579ef532834fdd27d4808c35a60";
 
 pub const GVISOR_GIT_ROOTFS_SHA256: &str =
-    "0ac70764ba20a043d19933213d60070c7f8712947a86753bab518569df302646";
+    "1c79670ce9fe3de0c0e6d4443059dc10a9f91e3e75f502bd3ed071b6a8aa31b8";
 
 pub const ENV_GVISOR_RUST_ROOTFS: &str = "MYELIN_GVISOR_RUST_ROOTFS";
 
@@ -196,6 +197,20 @@ fn verify_gvisor_git_rootfs_given(
         }
     }
 
+    let sftp_server = canonical.join("usr/lib/ssh/sftp-server");
+    let sftp_metadata = std::fs::symlink_metadata(&sftp_server).map_err(|error| {
+        format!(
+            "git rootfs must carry the confined OpenSSH sftp-server at /usr/lib/ssh/sftp-server: \
+             {error}"
+        )
+    })?;
+    if sftp_metadata.file_type().is_symlink()
+        || !sftp_metadata.is_file()
+        || sftp_metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err("git rootfs /usr/lib/ssh/sftp-server must be a real executable file".into());
+    }
+
     let actual = crate::canonical_tar::canonical_tree_sha256_hex(&canonical)
         .map_err(|error| format!("hash staged gVisor git rootfs: {error}"))?;
     if actual != expected_digest {
@@ -221,6 +236,10 @@ mod tests {
         for destination in ["tmp", "workspace", "repo", "quarantine"] {
             std::fs::create_dir(rootfs.join(destination)).unwrap();
         }
+        std::fs::create_dir_all(rootfs.join("usr/lib/ssh")).unwrap();
+        let sftp_server = rootfs.join("usr/lib/ssh/sftp-server");
+        std::fs::write(&sftp_server, b"test sftp server").unwrap();
+        std::fs::set_permissions(&sftp_server, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(rootfs.join("git-payload"), b"pinned git rootfs bytes").unwrap();
         let digest = crate::canonical_tar::canonical_tree_sha256_hex(&rootfs).unwrap();
 

@@ -28,6 +28,7 @@ pub trait VerifiedWorkspaceMount: Send + Sync {
 pub enum WorkspaceSessionCommand {
     Shell,
     Exec(String),
+    Sftp,
 }
 
 impl WorkspaceSessionCommand {
@@ -44,6 +45,12 @@ impl WorkspaceSessionCommand {
             Self::Exec(_) => Err(WorkspaceSessionError::InvalidRequest(
                 "an SSH exec command must contain 1..=65536 bytes and no NUL".into(),
             )),
+            Self::Sftp => Ok(vec![
+                "/usr/lib/ssh/sftp-server".into(),
+                "-e".into(),
+                "-d".into(),
+                "/workspace".into(),
+            ]),
         }
     }
 }
@@ -571,6 +578,14 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn sftp_uses_only_the_fixed_confined_server_and_workspace_root() {
+        assert_eq!(
+            WorkspaceSessionCommand::Sftp.argv().unwrap(),
+            ["/usr/lib/ssh/sftp-server", "-e", "-d", "/workspace"]
+        );
     }
 
     #[test]

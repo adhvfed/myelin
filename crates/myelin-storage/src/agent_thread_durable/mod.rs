@@ -19,10 +19,12 @@ pub use model::{
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
-    agent_thread_durable_migrations, agent_thread_git_binding_migrations,
-    agent_thread_publication_migrations, agent_thread_recent_list_migrations,
-    agent_thread_session_launch_migrations, agent_thread_ssh_connection_migrations,
-    agent_thread_ssh_single_use_migrations, AGENT_THREAD_MIGRATION,
+    agent_thread_durable_migrations, agent_thread_file_transfer_migrations,
+    agent_thread_git_binding_migrations, agent_thread_publication_migrations,
+    agent_thread_recent_list_migrations, agent_thread_session_launch_migrations,
+    agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
+    AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION, AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION,
+    AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION, AGENT_THREAD_MIGRATION,
     AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
     AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX,
     AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,

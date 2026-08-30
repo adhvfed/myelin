@@ -19,6 +19,7 @@ pub const WORKSPACE_SSH_SESSION_STARTED: &str = "workspace.session.started";
 pub enum WorkspaceSessionMode {
     Shell,
     Command,
+    FileTransfer,
 }
 
 impl WorkspaceSessionMode {
@@ -26,6 +27,7 @@ impl WorkspaceSessionMode {
         match self {
             Self::Shell => "shell",
             Self::Command => "command",
+            Self::FileTransfer => "file_transfer",
         }
     }
 
@@ -33,6 +35,7 @@ impl WorkspaceSessionMode {
         match value {
             "shell" => Ok(Self::Shell),
             "command" => Ok(Self::Command),
+            "file_transfer" => Ok(Self::FileTransfer),
             _ => Err(query_error_value("workspace session has an invalid mode")),
         }
     }
