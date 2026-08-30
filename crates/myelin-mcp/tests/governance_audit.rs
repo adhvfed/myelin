@@ -137,56 +137,65 @@ fn governance_audit_refuses_unregistered_dynamic_tool_taxonomy() {
 }
 
 #[test]
-fn chat_post_governance_has_a_durable_registered_taxonomy() {
-    let store = OutboxStore::new();
-    let audit = OutboxGovernanceAudit::new(store.clone(), Arc::new(MonotonicMinter::new()));
-    let actor = actor();
-    let scope = TenantScope::from_verified_token(&actor, actor.region.clone());
-    let run = RunId("run:chat-post".into());
-    let now = Timestamp("2026-07-18T00:00:00Z".into());
+fn chat_mutation_governance_has_a_durable_registered_taxonomy() {
+    for (tool, event_id) in [
+        ("chat.post", "chat.message.post:01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        (
+            "chat.reply",
+            "chat.message.reply:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ),
+    ] {
+        let store = OutboxStore::new();
+        let audit = OutboxGovernanceAudit::new(store.clone(), Arc::new(MonotonicMinter::new()));
+        let actor = actor();
+        let scope = TenantScope::from_verified_token(&actor, actor.region.clone());
+        let run = RunId(format!("run:{tool}"));
+        let jti = format!("jti:{tool}");
+        let now = Timestamp("2026-07-18T00:00:00Z".into());
 
-    audit
-        .record(GovernanceAuditRecord {
-            scope: &scope,
-            actor: &actor,
-            run_id: &run,
-            target: GovernanceAuditTarget::Run,
-            tool: "chat.post",
-            jti: "jti:chat-post",
-            phase: AuditPhase::Attempt,
-            outcome: None,
-            now: &now,
-        })
-        .unwrap();
-    let applied = CallOutcome::Applied {
-        event_id: "chat.message.post:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-        resource: None,
-        jti: "jti:chat-post".into(),
-    };
-    audit
-        .record(GovernanceAuditRecord {
-            scope: &scope,
-            actor: &actor,
-            run_id: &run,
-            target: GovernanceAuditTarget::Run,
-            tool: "chat.post",
-            jti: "jti:chat-post",
-            phase: AuditPhase::Outcome,
-            outcome: Some(GovernanceAuditOutcome::Effect(&applied)),
-            now: &now,
-        })
-        .unwrap();
+        audit
+            .record(GovernanceAuditRecord {
+                scope: &scope,
+                actor: &actor,
+                run_id: &run,
+                target: GovernanceAuditTarget::Run,
+                tool,
+                jti: &jti,
+                phase: AuditPhase::Attempt,
+                outcome: None,
+                now: &now,
+            })
+            .unwrap();
+        let applied = CallOutcome::Applied {
+            event_id: event_id.into(),
+            resource: None,
+            jti: jti.clone(),
+        };
+        audit
+            .record(GovernanceAuditRecord {
+                scope: &scope,
+                actor: &actor,
+                run_id: &run,
+                target: GovernanceAuditTarget::Run,
+                tool,
+                jti: &jti,
+                phase: AuditPhase::Outcome,
+                outcome: Some(GovernanceAuditOutcome::Effect(&applied)),
+                now: &now,
+            })
+            .unwrap();
 
-    let rows = store.committed_rows();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].envelope.type_.0, "chat.post.attempted");
-    assert_eq!(rows[1].envelope.type_.0, "chat.post.applied");
-    for row in rows {
-        assert!(
-            myelin_chat::events::CHAT_GOVERNANCE_AUDIT_EVENT_TOKENS
-                .contains(&row.envelope.type_.0.as_str()),
-            "every Chat governance event must be registered in Chat's durable taxonomy"
-        );
+        let rows = store.committed_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].envelope.type_.0, format!("{tool}.attempted"));
+        assert_eq!(rows[1].envelope.type_.0, format!("{tool}.applied"));
+        for row in rows {
+            assert!(
+                myelin_chat::events::CHAT_GOVERNANCE_AUDIT_EVENT_TOKENS
+                    .contains(&row.envelope.type_.0.as_str()),
+                "every Chat governance event must be registered in Chat's durable taxonomy"
+            );
+        }
     }
 }
 

@@ -118,6 +118,51 @@ impl ChatEffectApi {
                     Err(error) => EffectResult::Denied(error.client_message()),
                 }
             }
+            "chat.reply" => {
+                let Some(root_message_id) = string_argument(arguments, "root_message_id") else {
+                    return missing("root_message_id");
+                };
+                let Some(content) = string_argument(arguments, "content") else {
+                    return missing("content");
+                };
+                let references = match string_array_argument(arguments, "references") {
+                    Ok(references) => references,
+                    Err(reason) => return EffectResult::Denied(reason),
+                };
+                let nonce = reply_mutation_nonce(
+                    &self.principal.tenant.0,
+                    &self.principal.principal_id.0,
+                    idempotency_key,
+                );
+                match self.chat.post_reply(
+                    &self.principal,
+                    &self.delegator,
+                    root_message_id,
+                    content,
+                    &references,
+                    nonce,
+                ) {
+                    Ok(message_id) => EffectResult::AppliedResource {
+                        event_id: EventId(format!(
+                            "chat.message.reply:{}|{}",
+                            message_id.as_str(),
+                            run.0
+                        )),
+                        resource: EffectResource::new(
+                            format!(
+                                "myelin://{}/chat/message/{}",
+                                self.principal.tenant.0,
+                                message_id.as_str()
+                            ),
+                            serde_json::json!({
+                                "id": message_id.as_str(),
+                                "root_message_id": root_message_id,
+                            }),
+                        ),
+                    },
+                    Err(error) => EffectResult::Denied(error.client_message()),
+                }
+            }
             other => EffectResult::Denied(format!(
                 "Chat tool `{other}` is registered but not yet wired through ChatEffectApi"
             )),
@@ -176,9 +221,35 @@ fn missing(field: &str) -> EffectResult {
 }
 
 fn mutation_nonce(tenant: &str, principal: &str, idempotency_key: &str) -> String {
+    scoped_mutation_nonce(
+        "myelin.chat.mcp-effect.v1",
+        "mcp-v1",
+        tenant,
+        principal,
+        idempotency_key,
+    )
+}
+
+fn reply_mutation_nonce(tenant: &str, principal: &str, idempotency_key: &str) -> String {
+    scoped_mutation_nonce(
+        "myelin.chat.mcp-reply-effect.v1",
+        "mcp-reply-v1",
+        tenant,
+        principal,
+        idempotency_key,
+    )
+}
+
+fn scoped_mutation_nonce(
+    domain: &str,
+    prefix: &str,
+    tenant: &str,
+    principal: &str,
+    idempotency_key: &str,
+) -> String {
     let mut digest = blake3::Hasher::new();
     for part in [
-        b"myelin.chat.mcp-effect.v1".as_slice(),
+        domain.as_bytes(),
         tenant.as_bytes(),
         principal.as_bytes(),
         idempotency_key.as_bytes(),
@@ -186,7 +257,7 @@ fn mutation_nonce(tenant: &str, principal: &str, idempotency_key: &str) -> Strin
         digest.update(&(part.len() as u64).to_be_bytes());
         digest.update(part);
     }
-    format!("mcp-v1-{}", digest.finalize().to_hex())
+    format!("{prefix}-{}", digest.finalize().to_hex())
 }
 
 #[cfg(test)]
@@ -207,6 +278,15 @@ mod tests {
         );
         assert!(!nonce.contains("private"));
         assert!(nonce.len() <= 128);
+        assert_ne!(
+            nonce,
+            reply_mutation_nonce("acme", "agent:a", "private-retry-key"),
+            "post and reply idempotency keys must not alias one durable message"
+        );
+        assert_eq!(
+            reply_mutation_nonce("acme", "agent:a", "private-retry-key"),
+            reply_mutation_nonce("acme", "agent:a", "private-retry-key")
+        );
     }
 
     #[test]

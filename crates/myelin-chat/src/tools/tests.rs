@@ -1,9 +1,9 @@
 use super::*;
 
 #[test]
-fn catalogue_advertises_only_the_executable_post_effect() {
+fn catalogue_advertises_the_executable_post_and_reply_effects() {
     let definitions = chat_tool_defs();
-    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions.len(), 2);
 
     let post = &definitions[0];
     post.validate().unwrap();
@@ -13,6 +13,15 @@ fn catalogue_advertises_only_the_executable_post_effect() {
     assert!(post.side_effecting);
     assert!(!post.requires_approval);
     assert!(post.exposed_over_mcp);
+
+    let reply = &definitions[1];
+    reply.validate().unwrap();
+    assert_eq!(reply.canonical_name(), "chat.reply");
+    assert_eq!(reply.required_caps, ["chat.post"]);
+    assert_eq!(reply.effect_kind, EffectKind::Mutate);
+    assert!(reply.side_effecting);
+    assert!(!reply.requires_approval);
+    assert!(reply.exposed_over_mcp);
 }
 
 #[test]

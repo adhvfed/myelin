@@ -24,6 +24,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("knowledge", "link_work") => false,
 
         ("chat", "post") => false,
+        ("chat", "reply") => false,
         ("chat", "list_conversations") => false,
         ("chat", "read_messages") => false,
 
@@ -236,10 +237,12 @@ mod tests {
             );
         }
 
-        assert!(
-            !requires_approval_default("chat", "post"),
-            "the executable post effect is reversible → NOT gated"
-        );
+        for mutation in ["post", "reply"] {
+            assert!(
+                !requires_approval_default("chat", mutation),
+                "the executable Chat {mutation} effect is reversible → NOT gated"
+            );
+        }
         assert!(
             !requires_approval_default("workspace", "exec"),
             "a confined command affects only the already-delegated durable workspace"

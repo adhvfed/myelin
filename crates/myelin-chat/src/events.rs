@@ -73,12 +73,23 @@ pub const CHAT_POST_GATED: &str = "chat.post.gated";
 pub const CHAT_POST_DENIED: &str = "chat.post.denied";
 pub const CHAT_POST_INDETERMINATE: &str = "chat.post.indeterminate";
 
+pub const CHAT_REPLY_ATTEMPTED: &str = "chat.reply.attempted";
+pub const CHAT_REPLY_APPLIED: &str = "chat.reply.applied";
+pub const CHAT_REPLY_GATED: &str = "chat.reply.gated";
+pub const CHAT_REPLY_DENIED: &str = "chat.reply.denied";
+pub const CHAT_REPLY_INDETERMINATE: &str = "chat.reply.indeterminate";
+
 pub const CHAT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     CHAT_POST_ATTEMPTED,
     CHAT_POST_APPLIED,
     CHAT_POST_GATED,
     CHAT_POST_DENIED,
     CHAT_POST_INDETERMINATE,
+    CHAT_REPLY_ATTEMPTED,
+    CHAT_REPLY_APPLIED,
+    CHAT_REPLY_GATED,
+    CHAT_REPLY_DENIED,
+    CHAT_REPLY_INDETERMINATE,
 ];
 
 pub const CHAT_CHANNEL_SNAPSHOT: &str = "chat.channel.snapshot";
@@ -106,6 +117,11 @@ pub const CHAT_DURABLE_TOKENS: &[&str] = &[
     CHAT_POST_GATED,
     CHAT_POST_DENIED,
     CHAT_POST_INDETERMINATE,
+    CHAT_REPLY_ATTEMPTED,
+    CHAT_REPLY_APPLIED,
+    CHAT_REPLY_GATED,
+    CHAT_REPLY_DENIED,
+    CHAT_REPLY_INDETERMINATE,
     CHAT_CHANNEL_SNAPSHOT,
     CHAT_MESSAGE_SNAPSHOT,
     CHAT_THREAD_SNAPSHOT,

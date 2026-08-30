@@ -178,6 +178,7 @@ mod tests {
                 "chat.list_conversations",
                 "chat.post",
                 "chat.read_messages",
+                "chat.reply",
                 "ci.read_log",
                 "ci.read_run",
                 "git.endorse_fork_ci",

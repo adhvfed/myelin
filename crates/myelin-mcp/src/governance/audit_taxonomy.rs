@@ -78,6 +78,13 @@ pub(super) fn effect_event_type(
             denied: myelin_chat::events::CHAT_POST_DENIED,
             indeterminate: myelin_chat::events::CHAT_POST_INDETERMINATE,
         },
+        "chat.reply" => EffectAuditEvents {
+            attempted: myelin_chat::events::CHAT_REPLY_ATTEMPTED,
+            applied: myelin_chat::events::CHAT_REPLY_APPLIED,
+            gated: myelin_chat::events::CHAT_REPLY_GATED,
+            denied: myelin_chat::events::CHAT_REPLY_DENIED,
+            indeterminate: myelin_chat::events::CHAT_REPLY_INDETERMINATE,
+        },
         "issues.create" => EffectAuditEvents {
             attempted: myelin_issues::events::ISSUE_CREATE_ATTEMPTED,
             applied: myelin_issues::events::ISSUE_CREATE_APPLIED,

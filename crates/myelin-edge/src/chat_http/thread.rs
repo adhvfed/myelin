@@ -98,6 +98,24 @@ impl DurableChatReadApi {
 }
 
 impl DurableChatMutationApi {
+    pub fn post_reply(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        root_message_id: &str,
+        content: &str,
+        references: &[String],
+        client_nonce: String,
+    ) -> Result<MessageId, EdgeError> {
+        self.post_reply_input(
+            actor,
+            authorized_viewer,
+            root_message_id,
+            &MessageInput::references(content, references),
+            client_nonce,
+        )
+    }
+
     fn set_thread_following(
         &self,
         principal: &Principal,

@@ -234,6 +234,7 @@ mod tests {
             "chat.list_conversations",
             "chat.post",
             "chat.read_messages",
+            "chat.reply",
             "git.list_repositories",
             "git.read_file",
             "git.search_code",

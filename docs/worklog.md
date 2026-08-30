@@ -4545,6 +4545,32 @@ an identical rebuild. Lint, type checking, 74 design-system tests, 4 desktop tes
 and every production build passed. Without restarting web afterward, the real Chromium private-agent
 journey passed against Edge, PostgreSQL, and the workspace gateway in 4.9 seconds.
 
+## 2026-08-30 — Agents can answer a specific Chat thread
+
+Agents could post into a visible conversation, but they could not express that an answer belonged
+to a human's specific message. Posting another channel message discarded the thread relationship,
+made focused conversation harder to follow, and left humans and external MCP clients with different
+collaboration abilities.
+
+The shared catalogue now exposes `chat.reply` with one strict root-message contract and the same
+`chat.post` capability as an ordinary message. Edge resolves the durable root, rechecks the human
+delegator's live conversation visibility and posting authority, refuses nested or removed roots,
+and appends the reply with the agent as its attributed author. Reply retries use their own opaque,
+stable nonce domain, so they cannot alias ordinary posts and the established `chat.post` replay
+identity remains deployment-compatible. Every attempted, applied, gated, denied, or indeterminate
+reply also has a registered durable governance event. New private-work agents select the effect by
+default alongside Chat read and post.
+
+The readable TypeScript CLI journey now has a human create a real root, lets an external agent
+discover and invoke `chat.reply`, repeats the same governed request after a simulated lost response,
+then reads the focused thread back as the human and observes exactly one active agent-authored
+reply. All 16 stages passed against the restarted Edge, PostgreSQL, and the other running services
+in 49.88 seconds. PostgreSQL retained one reply row and both governance attempts/outcomes from the
+original call and retry. The four affected Rust library suites passed all 713 stories, strict
+all-target Clippy was clean, and system/frontend type checking, frontend lint, and all 660 web tests
+passed. The real Chromium private-agent journey also created a thread with the expanded default
+tool selection and completed its retained-workspace and accessibility story in 5.7 seconds.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the
@@ -4652,12 +4678,12 @@ journey passed against Edge, PostgreSQL, and the workspace gateway in 4.9 second
     but publish, draft, confidential edit, and comment have no governed effect
     executor. They remain absent from discovery until backed by the page store,
     authorization, audit, and a full-system agent journey.
-17. **Agents have only the general Chat post effect.** Humans can create and
-    manage conversations and use richer thread/reaction behavior through the
-    durable Chat product, but reply, reaction, direct-message, channel creation,
-    invitation, and archival have no governed agent effect carrier. They remain
-    absent from discovery until each action has exact authorization, audit,
-    idempotency, and a full-system agent journey. Hosted agent answer
+17. **Agents can post and reply in Chat, but cannot manage richer Chat
+    actions.** Humans can create and manage conversations and use reaction
+    behavior through the durable Chat product, but reaction, direct-message,
+    channel creation, invitation, and archival have no governed agent effect
+    carrier. They remain absent from discovery until each action has exact
+    authorization, audit, idempotency, and a full-system agent journey. Hosted agent answer
     presence/partial streaming also has no end-to-end Edge/gateway carrier; the
     former prewritten-answer mock was removed.
 18. **Several Git collaboration and maintenance actions are not agent effects.**

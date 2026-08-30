@@ -149,6 +149,7 @@ describe.sequential("the CLI authentication journey", () => {
   let chatTopic: string;
   let conversationId: string;
   let chatMessage: string;
+  let chatMessageId: string;
   let sourceRepository: GitProject;
   let sourceMarker: string;
   let sourcePath: string;
@@ -362,6 +363,7 @@ describe.sequential("the CLI authentication journey", () => {
         "chat.list_conversations",
         "chat.post",
         "chat.read_messages",
+        "chat.reply",
       ]),
     );
     expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
@@ -415,6 +417,8 @@ describe.sequential("the CLI authentication journey", () => {
       "chat.post",
       "--tool",
       "chat.read_messages",
+      "--tool",
+      "chat.reply",
     );
     expect(createAgent.exitCode, createAgent.stderr).toBe(0);
     activated = JSON.parse(createAgent.stdout) as ActivatedAgentEnvelope;
@@ -430,6 +434,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "chat.list_conversations", version: 1 },
           { name: "chat.post", version: 1 },
           { name: "chat.read_messages", version: 1 },
+          { name: "chat.reply", version: 1 },
           { name: "ci.read_run", version: 1 },
           { name: "git.list_repositories", version: 1 },
           { name: "git.open_pr", version: 1 },
@@ -489,6 +494,7 @@ describe.sequential("the CLI authentication journey", () => {
         "chat.list_conversations",
         "chat.post",
         "chat.read_messages",
+        "chat.reply",
       ]),
     );
     for (const tool of activated.agent.selected_tools) {
@@ -541,6 +547,8 @@ describe.sequential("the CLI authentication journey", () => {
       "chat.post",
       "--tool",
       "chat.read_messages",
+      "--tool",
+      "chat.reply",
     );
     expect(replayAgent.exitCode, replayAgent.stderr).toBe(0);
     expect(JSON.parse(replayAgent.stdout)).toMatchObject({
@@ -785,6 +793,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "chat.list_conversations", version: 1 },
           { name: "chat.post", version: 1 },
           { name: "chat.read_messages", version: 1 },
+          { name: "chat.reply", version: 1 },
           { name: "ci.read_run", version: 1 },
           { name: "git.list_repositories", version: 1 },
           { name: "git.open_pr", version: 1 },
@@ -878,6 +887,7 @@ describe.sequential("the CLI authentication journey", () => {
       "chat.list_conversations",
       "chat.post",
       "chat.read_messages",
+      "chat.reply",
       "ci.read_run",
       "git.list_repositories",
       "git.open_pr",
@@ -910,6 +920,11 @@ describe.sequential("the CLI authentication journey", () => {
     expect(schemaFor("chat.read_messages")).toMatchObject({
       type: "object",
       required: ["conversation_id"],
+      additionalProperties: false,
+    });
+    expect(schemaFor("chat.reply")).toMatchObject({
+      type: "object",
+      required: ["root_message_id", "content"],
       additionalProperties: false,
     });
     expect(schemaFor("ci.read_run")).toMatchObject({
@@ -1093,6 +1108,7 @@ describe.sequential("the CLI authentication journey", () => {
       "chat.list_conversations",
       "chat.post",
       "chat.read_messages",
+      "chat.reply",
       "ci.read_run",
       "git.list_repositories",
       "git.open_pr",
@@ -1566,7 +1582,9 @@ describe.sequential("the CLI authentication journey", () => {
       chatMessage,
     );
     expect(sentMessage.exitCode, sentMessage.stderr).toBe(0);
-    expect(JSON.parse(sentMessage.stdout)).toMatchObject({ durable: true });
+    const sentMessageEnvelope = record(JSON.parse(sentMessage.stdout), "CLI Chat message");
+    expect(sentMessageEnvelope).toMatchObject({ durable: true });
+    chatMessageId = string(sentMessageEnvelope.message_id, "CLI Chat message id");
 
     sourceRepository = new GitProject(uniqueName("agent-context"), systemClient);
 
@@ -2342,6 +2360,61 @@ describe.sequential("the CLI authentication journey", () => {
     expect(postedByAgent.ref).toMatch(
       new RegExp(`^myelin://${systemTestConfig.tenant}/chat/message/[0-9A-Z]{26}$`),
     );
+
+    // A collaborator can answer the human's actual message in its thread, not merely post an
+    // unrelated channel message. The same governed retry key resolves to the same durable reply.
+    const agentReplyMessage = uniqueName("Agent answered in the release thread");
+    const agentReplyKey = `agent-chat-reply-${randomUUID()}`;
+    const repliedByAgent = await askAgentToAct(
+      resumedRun,
+      25,
+      "chat.reply",
+      { root_message_id: chatMessageId, content: agentReplyMessage },
+      agentReplyKey,
+    );
+    const replayedAgentReply = await askAgentToAct(
+      resumedRun,
+      26,
+      "chat.reply",
+      { root_message_id: chatMessageId, content: agentReplyMessage },
+      agentReplyKey,
+    );
+    expect(replayedAgentReply).toEqual(repliedByAgent);
+    expect(repliedByAgent.ref).toMatch(
+      new RegExp(`^myelin://${systemTestConfig.tenant}/chat/message/[0-9A-Z]{26}$`),
+    );
+    expect(repliedByAgent.data).toMatchObject({ root_message_id: chatMessageId });
+
+    const humanThread = await runCli(
+      configDirectory,
+      "--json",
+      "chat",
+      "thread",
+      chatMessageId,
+      "--limit",
+      "100",
+    );
+    expect(humanThread.exitCode, humanThread.stderr).toBe(0);
+    const humanThreadEnvelope = record(JSON.parse(humanThread.stdout), "human-visible Chat thread");
+    expect(record(humanThreadEnvelope.root, "human-visible Chat root")).toMatchObject({
+      id: chatMessageId,
+      content: chatMessage,
+      author_kind: "human",
+    });
+    const humanVisibleReplies = array(
+      humanThreadEnvelope.items,
+      "human-visible Chat replies",
+    ).map((message, index) => record(message, `human-visible Chat reply ${index}`));
+    expect(
+      humanVisibleReplies.filter((message) => message.content === agentReplyMessage),
+    ).toEqual([
+      expect.objectContaining({
+        author_kind: "agent",
+        is_you: false,
+        state: "active",
+        thread_root_id: chatMessageId,
+      }),
+    ]);
 
     const humanHistory = await runCli(
       configDirectory,

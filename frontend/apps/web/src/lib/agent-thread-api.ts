@@ -35,6 +35,7 @@ const utf8 = new TextEncoder();
 const PRIVATE_WORK_AGENT_TOOLS = [
   "chat.read_messages",
   "chat.post",
+  "chat.reply",
   "workspace.read_file",
   "workspace.write_file",
 ] as const;
