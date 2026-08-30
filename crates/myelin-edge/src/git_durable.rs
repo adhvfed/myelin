@@ -17,6 +17,7 @@ use myelin_git::api::{
     Operation as GitOperation,
 };
 use myelin_git::check_status::GitOid;
+use myelin_git::coordinate::RepositorySlug;
 use myelin_git::core::{Oid as CoreOid, RepoLoc};
 use myelin_git::durable::{
     BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrCommitPageError, PrCommitSnapshot,
@@ -294,6 +295,15 @@ pub struct DurableGitBackend {
     git_wire_credentials: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuerFactory>,
     repo_authz: Arc<dyn RepoAuthorizer>,
     bootstrap: Arc<dyn RepoBootstrapGrants>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedWorkspaceRepository {
+    pub repository: String,
+    pub repository_path: PathBuf,
+    pub clone_url: String,
+    pub base_ref: String,
+    pub base_oid: String,
 }
 
 pub(crate) struct AgentFileWrite<'a> {
@@ -860,6 +870,90 @@ impl DurableGitBackend {
     fn clone_url(&self, tenant: &str, region: &str, slug: &str) -> String {
         let wire_slug = slug.replace('/', "%2F");
         format!("{}/{tenant}/{region}/{wire_slug}.git", self.clone_base)
+    }
+
+    pub(crate) fn resolve_workspace_repository(
+        &self,
+        principal: &Principal,
+        slug: &str,
+        requested_base_ref: &str,
+    ) -> Result<ResolvedWorkspaceRepository, DurableError> {
+        RepositorySlug::parse(slug).map_err(|_| {
+            DurableError::InvalidInput("workspace repository slug is malformed".into())
+        })?;
+        let base_ref = if requested_base_ref.starts_with("refs/heads/") {
+            requested_base_ref.to_string()
+        } else if !requested_base_ref.starts_with("refs/") {
+            format!("refs/heads/{requested_base_ref}")
+        } else {
+            return Err(DurableError::InvalidInput(
+                "workspace base_ref must identify a branch".into(),
+            ));
+        };
+        if !git2::Reference::is_valid_name(&base_ref) {
+            return Err(DurableError::InvalidInput(
+                "workspace base_ref must be a canonical Git branch".into(),
+            ));
+        }
+        let tenant = principal.tenant.as_str();
+        let region = principal.region.as_str();
+        let location = Self::loc(tenant, region, slug);
+        if !self
+            .repo_authz
+            .authorize_repo_permission(principal, &location, RepoPermission::Pull)
+        {
+            return Err(DurableError::NotFound("repository".into()));
+        }
+        let repository = self.store.open_repo(&location)?;
+        let base_oid = repository
+            .resolve_commit_oid(&base_ref)?
+            .ok_or_else(|| DurableError::NotFound("repository branch".into()))?;
+        Ok(ResolvedWorkspaceRepository {
+            repository: slug.to_string(),
+            repository_path: repository.path().to_path_buf(),
+            clone_url: self.clone_url(tenant, region, slug),
+            base_ref,
+            base_oid: base_oid.as_str().to_string(),
+        })
+    }
+
+    pub(crate) fn reopen_workspace_repository(
+        &self,
+        principal: &Principal,
+        repository_slug: &str,
+        base_ref: &str,
+        base_oid: &str,
+    ) -> Result<ResolvedWorkspaceRepository, DurableError> {
+        RepositorySlug::parse(repository_slug).map_err(|_| {
+            DurableError::InvalidInput("workspace repository slug is malformed".into())
+        })?;
+        if !base_ref.starts_with("refs/heads/") || !git2::Reference::is_valid_name(base_ref) {
+            return Err(DurableError::InvalidInput(
+                "stored workspace base_ref is not a canonical Git branch".into(),
+            ));
+        }
+        let tenant = principal.tenant.as_str();
+        let region = principal.region.as_str();
+        let location = Self::loc(tenant, region, repository_slug);
+        if !self
+            .repo_authz
+            .authorize_repo_permission(principal, &location, RepoPermission::Pull)
+        {
+            return Err(DurableError::NotFound("repository".into()));
+        }
+        let repository = self.store.open_repo(&location)?;
+        if repository.resolve_commit_oid(base_oid)?.is_none() {
+            return Err(DurableError::NotFound(
+                "workspace base commit is no longer available".into(),
+            ));
+        }
+        Ok(ResolvedWorkspaceRepository {
+            repository: repository_slug.to_string(),
+            repository_path: repository.path().to_path_buf(),
+            clone_url: self.clone_url(tenant, region, repository_slug),
+            base_ref: base_ref.to_string(),
+            base_oid: base_oid.to_string(),
+        })
     }
 
     fn commit_log(

@@ -203,6 +203,39 @@ ALTER TABLE agent_thread_workspace_session
   ADD COLUMN IF NOT EXISTS launched_at timestamptz;
 "#;
 
+pub const AGENT_THREAD_GIT_BINDING_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  ADD COLUMN IF NOT EXISTS repository_slug text,
+  ADD COLUMN IF NOT EXISTS base_ref text,
+  ADD COLUMN IF NOT EXISTS base_oid text,
+  ADD COLUMN IF NOT EXISTS workspace_branch text;
+ALTER TABLE agent_thread
+  DROP CONSTRAINT IF EXISTS agent_thread_git_binding_complete;
+ALTER TABLE agent_thread
+  ADD CONSTRAINT agent_thread_git_binding_complete CHECK (
+    (repository_slug IS NULL AND base_ref IS NULL AND base_oid IS NULL
+      AND workspace_branch IS NULL)
+    OR (octet_length(repository_slug) BETWEEN 1 AND 255
+      AND octet_length(base_ref) BETWEEN 12 AND 1024
+      AND base_oid ~ '^[0-9a-f]{40}$'
+      AND octet_length(workspace_branch) BETWEEN 1 AND 1024)
+  ) NOT VALID;
+"#;
+
+pub const AGENT_THREAD_GIT_BINDING_INVARIANT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  VALIDATE CONSTRAINT agent_thread_git_binding_complete;
+"#;
+
+pub const AGENT_THREAD_GIT_BINDING_BACKFILL_MIGRATION: &str = r#"
+UPDATE agent_thread
+   SET repository_slug = NULL,
+       base_ref = NULL,
+       base_oid = NULL,
+       workspace_branch = NULL
+ WHERE num_nonnulls(repository_slug, base_ref, base_oid, workspace_branch) NOT IN (0, 4);
+"#;
+
 pub const AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION: &str = r#"
 UPDATE agent_thread_workspace_session
    SET launched_at = started_at
@@ -360,6 +393,29 @@ pub fn agent_thread_publication_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_git_binding_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0151_agent_thread_git_binding_expand",
+            AGENT_THREAD_GIT_BINDING_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0152_agent_thread_git_binding_backfill",
+            AGENT_THREAD_GIT_BINDING_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0153_agent_thread_git_binding_invariant",
+            AGENT_THREAD_GIT_BINDING_INVARIANT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread",
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +456,21 @@ mod tests {
         assert!(AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION.contains("CONCURRENTLY"));
         assert!(AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION
             .contains(AGENT_THREAD_PUBLICATION_RECOVERY_INDEX));
+    }
+
+    #[test]
+    fn git_binding_is_a_forward_only_online_schema_change() {
+        let migrations = agent_thread_git_binding_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["agent_thread"]))
+            .expect("the live agent thread Git binding migration is online-safe");
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+        assert!(AGENT_THREAD_GIT_BINDING_EXPAND_MIGRATION.contains("NOT VALID"));
+        assert!(AGENT_THREAD_GIT_BINDING_BACKFILL_MIGRATION.contains("num_nonnulls"));
+        assert!(AGENT_THREAD_GIT_BINDING_INVARIANT_MIGRATION.contains("VALIDATE CONSTRAINT"));
     }
 }

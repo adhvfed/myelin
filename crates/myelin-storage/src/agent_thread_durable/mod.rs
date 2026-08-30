@@ -11,19 +11,21 @@ pub use expiry::{
     AGENT_THREAD_EXPIRY_GRACE_SECONDS,
 };
 pub use model::{
-    ActivateAgentThreadOutcome, AgentThreadProvisioningFailure, AgentThreadState,
-    CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread, RetryAgentThreadOutcome,
-    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    ActivateAgentThreadOutcome, AgentThreadGitBinding, AgentThreadProvisioningFailure,
+    AgentThreadState, CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread,
+    RetryAgentThreadOutcome, MAX_AGENT_THREAD_GIT_REF_BYTES, MAX_AGENT_THREAD_NAME_BYTES,
+    MAX_AGENT_THREAD_REPOSITORY_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
-    agent_thread_durable_migrations, agent_thread_publication_migrations,
-    agent_thread_recent_list_migrations, agent_thread_session_launch_migrations,
-    agent_thread_ssh_single_use_migrations, AGENT_THREAD_MIGRATION,
-    AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
-    AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX,
-    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,
-    AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
+    agent_thread_durable_migrations, agent_thread_git_binding_migrations,
+    agent_thread_publication_migrations, agent_thread_recent_list_migrations,
+    agent_thread_session_launch_migrations, agent_thread_ssh_single_use_migrations,
+    AGENT_THREAD_MIGRATION, AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION,
+    AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION, AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION,
+    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION,
+    AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION,
     AGENT_THREAD_SSH_GRANT_MIGRATION, AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
@@ -102,6 +104,7 @@ impl DurableAgentThreadBacking {
                                 AND owner_principal_id = $4 AND state = 'failed'
                             RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                               conversation_id, workspace_id, workspace_generation, name, project_id,
+                              repository_slug, base_ref, base_oid, workspace_branch,
                               retention_days, state, storage_locator, publication_completed_at,
                               failure_reason, created_at,
                               expires_at, updated_at",
@@ -183,11 +186,13 @@ impl DurableAgentThreadBacking {
                         "INSERT INTO agent_thread (
                            tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
+                           repository_slug, base_ref, base_oid, workspace_branch,
                            retention_days, client_nonce, state, created_at, expires_at, updated_at
-                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,'provisioning',$12,$13,$12)
+                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,$14,$15,'provisioning',$16,$17,$16)
                          ON CONFLICT DO NOTHING
                          RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
+                           repository_slug, base_ref, base_oid, workspace_branch,
                            retention_days, state, storage_locator, publication_completed_at,
                            failure_reason, created_at,
                            expires_at, updated_at",
@@ -201,6 +206,10 @@ impl DurableAgentThreadBacking {
                     .bind(proposal.workspace_id)
                     .bind(&proposal.name)
                     .bind(proposal.project_id)
+                    .bind(proposal.git.as_ref().map(|git| git.repository.as_str()))
+                    .bind(proposal.git.as_ref().map(|git| git.base_ref.as_str()))
+                    .bind(proposal.git.as_ref().map(|git| git.base_oid.as_str()))
+                    .bind(proposal.git.as_ref().map(|git| git.branch.as_str()))
                     .bind(proposal.retention_days)
                     .bind(&proposal.client_nonce)
                     .bind(proposal.created_at)
@@ -282,6 +291,7 @@ impl DurableAgentThreadBacking {
                             AND conversation_id = $7 AND state = 'provisioning'
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
+                          repository_slug, base_ref, base_oid, workspace_branch,
                           retention_days, state, storage_locator, publication_completed_at,
                           failure_reason, created_at,
                           expires_at, updated_at",
@@ -369,6 +379,7 @@ impl DurableAgentThreadBacking {
                             AND state = 'ready' AND storage_locator IS NOT NULL
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
+                          repository_slug, base_ref, base_oid, workspace_branch,
                           retention_days, state, storage_locator, publication_completed_at,
                           failure_reason, created_at, expires_at, updated_at",
                     )
@@ -431,7 +442,8 @@ impl DurableAgentThreadBacking {
                         RETURNING thread.tenant_id, thread.region, thread.thread_id,
                           thread.owner_principal_id, thread.agent_id, thread.conversation_id,
                           thread.workspace_id, thread.workspace_generation, thread.name,
-                          thread.project_id, thread.retention_days, thread.state,
+                          thread.project_id, thread.repository_slug, thread.base_ref,
+                          thread.base_oid, thread.workspace_branch, thread.retention_days, thread.state,
                           thread.storage_locator, thread.publication_completed_at,
                           thread.failure_reason, thread.created_at, thread.expires_at,
                           thread.updated_at",
@@ -496,6 +508,7 @@ impl DurableAgentThreadBacking {
                                     AND owner_principal_id = $4 AND state = 'failed'
                                 RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                                   conversation_id, workspace_id, workspace_generation, name, project_id,
+                                  repository_slug, base_ref, base_oid, workspace_branch,
                                   retention_days, state, storage_locator, publication_completed_at,
                                   failure_reason, created_at,
                                   expires_at, updated_at",
@@ -547,6 +560,28 @@ impl DurableAgentThreadBacking {
             .await
     }
 
+    pub async fn get_for_owner_by_nonce(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        client_nonce: &str,
+    ) -> Result<Option<DurableAgentThread>, ProviderError> {
+        if !valid_client_nonce(client_nonce) {
+            return Err(query(
+                "agent thread client nonce is not URL-safe bounded text",
+            ));
+        }
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        let nonce = client_nonce.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move { by_nonce(conn, &tenant, &region, &owner, &nonce).await })
+            })
+            .await
+    }
+
     pub async fn list_for_owner(
         &self,
         tenant: &str,
@@ -585,6 +620,7 @@ impl DurableAgentThreadBacking {
                     let rows = sqlx::query(
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
+                           repository_slug, base_ref, base_oid, workspace_branch,
                            retention_days, state, storage_locator, publication_completed_at,
                            failure_reason, created_at,
                            expires_at, updated_at
@@ -638,6 +674,7 @@ impl DurableAgentThreadBacking {
                     let rows = sqlx::query(
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
+                           repository_slug, base_ref, base_oid, workspace_branch,
                            retention_days, state, storage_locator, publication_completed_at,
                            failure_reason, created_at,
                            expires_at, updated_at
@@ -695,6 +732,27 @@ fn validate_proposal(proposal: &NewAgentThread) -> Result<(), ProviderError> {
             "agent thread client nonce is not URL-safe bounded text",
         ));
     }
+    if let Some(git) = &proposal.git {
+        if git.repository.is_empty()
+            || git.repository.len() > model::MAX_AGENT_THREAD_REPOSITORY_BYTES
+            || git.repository.chars().any(char::is_control)
+            || !git.base_ref.starts_with("refs/heads/")
+            || git.base_ref.len() > model::MAX_AGENT_THREAD_GIT_REF_BYTES
+            || git.base_ref.chars().any(char::is_control)
+            || git.base_oid.len() != 40
+            || git
+                .base_oid
+                .bytes()
+                .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+            || git.branch.is_empty()
+            || git.branch.len() > model::MAX_AGENT_THREAD_GIT_REF_BYTES
+            || git.branch.chars().any(char::is_control)
+        {
+            return Err(query(
+                "agent thread Git binding is not a canonical bounded receipt",
+            ));
+        }
+    }
     let expected_expiry = proposal
         .created_at
         .checked_add_signed(Duration::days(i64::from(proposal.retention_days)))
@@ -736,7 +794,23 @@ fn same_intent(thread: &DurableAgentThread, proposal: &NewAgentThread) -> bool {
         && thread.agent_id == proposal.agent_id.to_string()
         && thread.name == proposal.name
         && thread.project_id == proposal.project_id.map(|id| id.to_string())
+        && same_git_intent(thread.git.as_ref(), proposal.git.as_ref())
         && thread.retention_days == proposal.retention_days
+}
+
+fn same_git_intent(
+    stored: Option<&AgentThreadGitBinding>,
+    proposed: Option<&AgentThreadGitBinding>,
+) -> bool {
+    match (stored, proposed) {
+        (None, None) => true,
+        (Some(stored), Some(proposed)) => {
+            stored.repository == proposed.repository
+                && stored.base_ref == proposed.base_ref
+                && stored.branch == proposed.branch
+        }
+        _ => false,
+    }
 }
 
 async fn live_name_exists(
@@ -772,6 +846,7 @@ async fn by_nonce(
     let row = sqlx::query(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
+           repository_slug, base_ref, base_oid, workspace_branch,
            retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
@@ -797,6 +872,7 @@ async fn by_id(
     let row = sqlx::query(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
+           repository_slug, base_ref, base_oid, workspace_branch,
            retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
@@ -818,6 +894,27 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
     let generation = row.get::<i32, _>("workspace_generation");
     let workspace_generation = u32::try_from(generation)
         .map_err(|_| PgError::Query("agent thread workspace generation is invalid".into()))?;
+    let git = match (
+        row.get::<Option<String>, _>("repository_slug"),
+        row.get::<Option<String>, _>("base_ref"),
+        row.get::<Option<String>, _>("base_oid"),
+        row.get::<Option<String>, _>("workspace_branch"),
+    ) {
+        (None, None, None, None) => None,
+        (Some(repository), Some(base_ref), Some(base_oid), Some(branch)) => {
+            Some(AgentThreadGitBinding {
+                repository,
+                base_ref,
+                base_oid,
+                branch,
+            })
+        }
+        _ => {
+            return Err(PgError::Query(
+                "agent thread has an incomplete durable Git binding".into(),
+            ))
+        }
+    };
     Ok(DurableAgentThread {
         thread_id: row.get::<Uuid, _>("thread_id").to_string(),
         owner_principal_id: row.get("owner_principal_id"),
@@ -829,6 +926,7 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
         project_id: row
             .get::<Option<Uuid>, _>("project_id")
             .map(|id| id.to_string()),
+        git,
         retention_days: row.get("retention_days"),
         state,
         storage_locator: row.get("storage_locator"),
@@ -865,6 +963,7 @@ mod tests {
             workspace_id: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
             name: "Investigate checkout race".into(),
             project_id: None,
+            git: None,
             retention_days: 3,
             client_nonce: "thread-retry".into(),
             created_at,

@@ -37,6 +37,9 @@ fn start_call(args: &[&str], default_project: Option<&str>) -> Result<EdgeCall, 
     let mut agent = None;
     let mut project = None;
     let mut retention_days = None;
+    let mut repository = None;
+    let mut base_ref = None;
+    let mut branch = None;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
@@ -60,6 +63,30 @@ fn start_call(args: &[&str], default_project: Option<&str>) -> Result<EdgeCall, 
             "--retention-days" => {
                 return Err(CliError::Usage(
                     "agent thread start accepts --retention-days only once".into(),
+                ));
+            }
+            "--repository" if repository.is_none() => {
+                repository = Some(flag_value(args, &mut index, "--repository")?);
+            }
+            "--repository" => {
+                return Err(CliError::Usage(
+                    "agent thread start accepts --repository only once".into(),
+                ));
+            }
+            "--base-ref" if base_ref.is_none() => {
+                base_ref = Some(flag_value(args, &mut index, "--base-ref")?);
+            }
+            "--base-ref" => {
+                return Err(CliError::Usage(
+                    "agent thread start accepts --base-ref only once".into(),
+                ));
+            }
+            "--branch" if branch.is_none() => {
+                branch = Some(flag_value(args, &mut index, "--branch")?);
+            }
+            "--branch" => {
+                return Err(CliError::Usage(
+                    "agent thread start accepts --branch only once".into(),
                 ));
             }
             token if !token.starts_with('-') && name.is_none() => name = Some(token),
@@ -101,6 +128,24 @@ fn start_call(args: &[&str], default_project: Option<&str>) -> Result<EdgeCall, 
     });
     if let Some(project) = project {
         payload["project_id"] = json!(project);
+    }
+    if repository.is_none() && (base_ref.is_some() || branch.is_some()) {
+        return Err(CliError::Usage(
+            "agent thread --base-ref and --branch require --repository <slug>".into(),
+        ));
+    }
+    if let Some(repository) = repository {
+        validate_workspace_text("repository", repository, 255)?;
+        let mut workspace = json!({ "repository": repository });
+        if let Some(base_ref) = base_ref {
+            validate_workspace_text("base ref", base_ref, 1024)?;
+            workspace["base_ref"] = json!(base_ref);
+        }
+        if let Some(branch) = branch {
+            validate_workspace_text("branch", branch, 1024)?;
+            workspace["branch"] = json!(branch);
+        }
+        payload["workspace"] = workspace;
     }
     Ok(EdgeCall::post_json("/v1/agent-threads", payload))
 }
@@ -203,6 +248,19 @@ fn parse_retention_days(value: &str) -> Result<u8, CliError> {
         })
 }
 
+fn validate_workspace_text(label: &str, value: &str, maximum: usize) -> Result<(), CliError> {
+    if value.is_empty()
+        || value.len() > maximum
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(CliError::Usage(format!(
+            "agent thread {label} must contain 1..={maximum} clean UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +309,47 @@ mod tests {
                 "retention_days": 3,
             })
         );
+
+        let repository_workspace = agent_dispatch(&[
+            "thread",
+            "start",
+            "Private cloud branch",
+            "--agent",
+            AGENT,
+            "--repository",
+            "platform/api",
+            "--base-ref",
+            "release",
+            "--branch",
+            "alice/diagnosis",
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                repository_workspace.payload.as_ref().unwrap()
+            )
+            .unwrap(),
+            json!({
+                "name": "Private cloud branch",
+                "agent_id": AGENT,
+                "retention_days": 3,
+                "workspace": {
+                    "repository": "platform/api",
+                    "base_ref": "release",
+                    "branch": "alice/diagnosis",
+                },
+            })
+        );
+        assert!(agent_dispatch(&[
+            "thread",
+            "start",
+            "Missing repository",
+            "--agent",
+            AGENT,
+            "--base-ref",
+            "main",
+        ])
+        .is_err());
 
         let list = agent_dispatch(&["thread", "list", "--limit", "7", "--cursor", THREAD]).unwrap();
         assert_eq!(list.path, "/v1/agent-threads");

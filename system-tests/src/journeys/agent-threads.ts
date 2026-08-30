@@ -9,6 +9,14 @@ export interface AgentThreadWorkspace {
   state: string;
   retention_days: number;
   expires_at: string;
+  repository: AgentThreadWorkspaceRepository | null;
+}
+
+export interface AgentThreadWorkspaceRepository {
+  slug: string;
+  base_ref: string;
+  base_oid: string;
+  branch: string;
 }
 
 export interface PrivateAgentThread {
@@ -50,6 +58,11 @@ export async function startPrivateAgentThread(
     retentionDays?: number;
     idempotencyKey?: string;
     expectedStatus?: 200 | 201;
+    workspace?: {
+      repository: string;
+      baseRef?: string;
+      branch?: string;
+    };
   },
 ): Promise<{ thread: PrivateAgentThread; created: boolean }> {
   const response = await client.json("/v1/agent-threads", {
@@ -59,6 +72,19 @@ export async function startPrivateAgentThread(
       agent_id: intent.agentId,
       ...(intent.projectId === undefined ? {} : { project_id: intent.projectId }),
       ...(intent.retentionDays === undefined ? {} : { retention_days: intent.retentionDays }),
+      ...(intent.workspace === undefined
+        ? {}
+        : {
+            workspace: {
+              repository: intent.workspace.repository,
+              ...(intent.workspace.baseRef === undefined
+                ? {}
+                : { base_ref: intent.workspace.baseRef }),
+              ...(intent.workspace.branch === undefined
+                ? {}
+                : { branch: intent.workspace.branch }),
+            },
+          }),
     },
     idempotencyKey: intent.idempotencyKey ?? `agent-thread-${randomUUID()}`,
     expectedStatus: intent.expectedStatus ?? 201,
@@ -142,6 +168,9 @@ export async function requestWorkspaceSshAccess(
 export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
   const thread = record(value, "private agent thread");
   const workspace = record(thread.workspace, "private agent workspace");
+  const repository = workspace.repository === null
+    ? null
+    : record(workspace.repository, "private agent workspace repository");
   return {
     id: string(thread.id, "agent thread id"),
     ref: string(thread.ref, "agent thread ref"),
@@ -157,6 +186,14 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
       state: string(workspace.state, "agent workspace state"),
       retention_days: positiveInteger(workspace.retention_days, "workspace retention days"),
       expires_at: string(workspace.expires_at, "workspace expiry"),
+      repository: repository === null
+        ? null
+        : {
+            slug: string(repository.slug, "workspace repository slug"),
+            base_ref: string(repository.base_ref, "workspace repository base ref"),
+            base_oid: string(repository.base_oid, "workspace repository base oid"),
+            branch: string(repository.branch, "workspace repository branch"),
+          },
     },
     created_at: string(thread.created_at, "agent thread creation time"),
     updated_at: string(thread.updated_at, "agent thread update time"),

@@ -1445,6 +1445,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             chat_reads: mcp_chat.clone(),
             chat_mutations: agent_thread_chat_mutations,
             workspaces: agent_workspaces,
+            git: git_backend.clone(),
             sessions: agent_sessions,
             ssh_routes: workspace_ssh_routes,
             ssh_endpoint: workspace_ssh_endpoint,

@@ -20,6 +20,16 @@ pub struct ProvisionedWorkspace {
     pub locator: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryWorkspaceSource {
+    pub repository: String,
+    pub repository_path: PathBuf,
+    pub clone_url: String,
+    pub base_ref: String,
+    pub base_oid: String,
+    pub branch: String,
+}
+
 #[derive(Debug)]
 pub enum WorkspaceProvisionError {
     InvalidRoot(String),
@@ -165,6 +175,13 @@ pub trait AgentWorkspaceProvisioner: Send + Sync {
         &self,
         tenant: &str,
         workspace_id: Uuid,
+    ) -> Result<ProvisionedWorkspace, WorkspaceProvisionError>;
+
+    fn provision_from_repository(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        source: &RepositoryWorkspaceSource,
     ) -> Result<ProvisionedWorkspace, WorkspaceProvisionError>;
 }
 
@@ -328,6 +345,205 @@ impl AgentWorkspaceProvisioner for LocalDevelopmentWorkspaceProvisioner {
             locator: Self::locator(tenant, workspace_id),
         })
     }
+
+    fn provision_from_repository(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        source: &RepositoryWorkspaceSource,
+    ) -> Result<ProvisionedWorkspace, WorkspaceProvisionError> {
+        validate_repository_source(source)?;
+        self.verify_root()?;
+        let tenant_directory = self.tenant_directory(tenant);
+        create_private_directory(&tenant_directory)?;
+        let workspace_directory = tenant_directory.join(workspace_id.to_string());
+        if workspace_directory.exists() {
+            verify_repository_workspace(&workspace_directory, source)?;
+            return Ok(ProvisionedWorkspace {
+                locator: Self::locator(tenant, workspace_id),
+            });
+        }
+
+        let staging_directory =
+            tenant_directory.join(format!(".{}-repository-{}", workspace_id, Uuid::new_v4()));
+        create_private_directory(&staging_directory)?;
+        let seeded = seed_repository_workspace(&staging_directory, source);
+        if let Err(error) = seeded {
+            let _ = std::fs::remove_dir_all(&staging_directory);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&staging_directory, &workspace_directory) {
+            let _ = std::fs::remove_dir_all(&staging_directory);
+            return Err(io_error("publish repository workspace")(error));
+        }
+        sync_directory(&tenant_directory)?;
+        sync_directory(self.root.as_path())?;
+        verify_repository_workspace(&workspace_directory, source)?;
+        Ok(ProvisionedWorkspace {
+            locator: Self::locator(tenant, workspace_id),
+        })
+    }
+}
+
+fn validate_repository_source(
+    source: &RepositoryWorkspaceSource,
+) -> Result<(), WorkspaceProvisionError> {
+    let clean = |value: &str, maximum: usize| {
+        !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+    };
+    if !clean(&source.repository, 255)
+        || !clean(&source.clone_url, 2048)
+        || !clean(&source.base_ref, 1024)
+        || !clean(&source.branch, 1024)
+    {
+        return Err(WorkspaceProvisionError::InvalidRoot(
+            "repository workspace source contains invalid bounded text".into(),
+        ));
+    }
+    if !source.base_ref.starts_with("refs/heads/")
+        || !git2::Reference::is_valid_name(&source.base_ref)
+    {
+        return Err(WorkspaceProvisionError::InvalidRoot(
+            "repository workspace base_ref must be a canonical branch ref".into(),
+        ));
+    }
+    let workspace_ref = format!("refs/heads/{}", source.branch);
+    if !git2::Reference::is_valid_name(&workspace_ref) {
+        return Err(WorkspaceProvisionError::InvalidRoot(
+            "repository workspace branch is invalid".into(),
+        ));
+    }
+    git2::Oid::from_str(&source.base_oid).map_err(|_| {
+        WorkspaceProvisionError::InvalidRoot(
+            "repository workspace base_oid must be a canonical Git object id".into(),
+        )
+    })?;
+    if source.base_oid.len() != 40
+        || source
+            .base_oid
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(WorkspaceProvisionError::InvalidRoot(
+            "repository workspace base_oid must be a canonical Git object id".into(),
+        ));
+    }
+    let metadata = source
+        .repository_path
+        .symlink_metadata()
+        .map_err(io_error("inspect repository workspace source"))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(WorkspaceProvisionError::UnsafeRoot(
+            "repository workspace source is not a real directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn seed_repository_workspace(
+    destination: &Path,
+    source: &RepositoryWorkspaceSource,
+) -> Result<(), WorkspaceProvisionError> {
+    let repository_path = source.repository_path.to_str().ok_or_else(|| {
+        WorkspaceProvisionError::InvalidRoot(
+            "repository workspace source path is not clean UTF-8".into(),
+        )
+    })?;
+    let base_branch = source
+        .base_ref
+        .strip_prefix("refs/heads/")
+        .expect("validated repository workspace branch ref");
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.branch(base_branch);
+    let repository = builder
+        .clone(repository_path, destination)
+        .map_err(git_error("clone repository workspace source"))?;
+    std::fs::set_permissions(
+        destination,
+        std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+    )
+    .map_err(io_error("make repository workspace private"))?;
+
+    let oid = git2::Oid::from_str(&source.base_oid)
+        .map_err(git_error("parse repository workspace base commit"))?;
+    let commit = repository
+        .find_commit(oid)
+        .map_err(git_error("find repository workspace base commit"))?;
+    let workspace_ref = format!("refs/heads/{}", source.branch);
+    match repository.find_reference(&workspace_ref) {
+        Ok(mut reference) => {
+            reference
+                .set_target(oid, "pin Myelin workspace base")
+                .map_err(git_error("pin repository workspace branch"))?;
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {
+            repository
+                .branch(&source.branch, &commit, false)
+                .map_err(git_error("create repository workspace branch"))?;
+        }
+        Err(error) => return Err(git_error("open repository workspace branch")(error)),
+    }
+    repository
+        .set_head(&workspace_ref)
+        .map_err(git_error("select repository workspace branch"))?;
+    repository
+        .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+        .map_err(git_error("checkout repository workspace branch"))?;
+    repository
+        .remote_set_url("origin", &source.clone_url)
+        .map_err(git_error("publish repository workspace origin"))?;
+    let mut config = repository
+        .config()
+        .map_err(git_error("open repository workspace configuration"))?;
+    config
+        .set_str("myelin.workspace.repository", &source.repository)
+        .and_then(|()| config.set_str("myelin.workspace.base-ref", &source.base_ref))
+        .and_then(|()| config.set_str("myelin.workspace.base-oid", &source.base_oid))
+        .map_err(git_error("record repository workspace receipt"))?;
+    Ok(())
+}
+
+fn verify_repository_workspace(
+    path: &Path,
+    source: &RepositoryWorkspaceSource,
+) -> Result<(), WorkspaceProvisionError> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(io_error("inspect repository workspace"))?;
+    require_private_directory(path, &metadata)?;
+    let repository =
+        git2::Repository::open(path).map_err(git_error("open existing repository workspace"))?;
+    let head = repository
+        .head()
+        .map_err(git_error("read existing repository workspace HEAD"))?;
+    let expected_head = format!("refs/heads/{}", source.branch);
+    if head.name().ok() != Some(expected_head.as_str())
+        || head.target().map(|oid| oid.to_string()).as_deref() != Some(source.base_oid.as_str())
+    {
+        return Err(WorkspaceProvisionError::UnsafeRoot(
+            "existing repository workspace does not match its durable branch receipt".into(),
+        ));
+    }
+    let config = repository.config().map_err(git_error(
+        "open existing repository workspace configuration",
+    ))?;
+    for (key, expected) in [
+        ("myelin.workspace.repository", source.repository.as_str()),
+        ("myelin.workspace.base-ref", source.base_ref.as_str()),
+        ("myelin.workspace.base-oid", source.base_oid.as_str()),
+        ("remote.origin.url", source.clone_url.as_str()),
+    ] {
+        if config.get_string(key).ok().as_deref() != Some(expected) {
+            return Err(WorkspaceProvisionError::UnsafeRoot(
+                "existing repository workspace does not match its durable source receipt".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_error(context: &'static str) -> impl FnOnce(git2::Error) -> WorkspaceProvisionError {
+    move |error| WorkspaceProvisionError::Io(format!("{context}: {error}"))
 }
 
 impl AgentWorkspaceStore for LocalDevelopmentWorkspaceProvisioner {
@@ -805,6 +1021,68 @@ mod tests {
         assert_eq!(
             entries[0].metadata().unwrap().permissions().mode() & 0o777,
             0o700
+        );
+    }
+
+    #[test]
+    fn repository_workspace_is_an_exact_idempotent_checkout() {
+        let source_root = durable_test_root();
+        let source_path = source_root.path().join("source.git");
+        let source_repository = git2::Repository::init_bare(&source_path).unwrap();
+        let blob = source_repository.blob(b"hello from Myelin\n").unwrap();
+        let mut tree = source_repository.treebuilder(None).unwrap();
+        tree.insert("README.md", blob, 0o100644).unwrap();
+        let tree_oid = tree.write().unwrap();
+        let tree = source_repository.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Myelin", "myelin@example.invalid").unwrap();
+        let base_oid = source_repository
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "seed",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        source_repository.set_head("refs/heads/main").unwrap();
+
+        let temporary = durable_test_root();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalDevelopmentWorkspaceProvisioner::open(temporary.path()).unwrap();
+        let workspace_id = Uuid::parse_str("66666666-6666-4666-8666-666666666666").unwrap();
+        let source = RepositoryWorkspaceSource {
+            repository: "sweet-platform".into(),
+            repository_path: source_path,
+            clone_url: "https://myelin.example/acme/eu/sweet-platform.git".into(),
+            base_ref: "refs/heads/main".into(),
+            base_oid: base_oid.to_string(),
+            branch: "myelin/thread-delight".into(),
+        };
+
+        let first = store
+            .provision_from_repository("acme", workspace_id, &source)
+            .unwrap();
+        let replay = store
+            .provision_from_repository("acme", workspace_id, &source)
+            .unwrap();
+        assert_eq!(first, replay);
+        let workspace = store
+            .tenant_directory("acme")
+            .join(workspace_id.to_string());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("README.md")).unwrap(),
+            "hello from Myelin\n"
+        );
+        let checkout = git2::Repository::open(&workspace).unwrap();
+        assert_eq!(checkout.head().unwrap().target(), Some(base_oid));
+        assert_eq!(
+            checkout.head().unwrap().name().unwrap(),
+            "refs/heads/myelin/thread-delight"
+        );
+        assert_eq!(
+            checkout.find_remote("origin").unwrap().url().unwrap(),
+            source.clone_url.as_str()
         );
     }
 

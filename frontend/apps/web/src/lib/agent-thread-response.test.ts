@@ -57,6 +57,7 @@ const subject = {
     state: "ready",
     retention_days: 3,
     expires_at: "2026-08-25T12:00:00Z",
+    repository: null,
   },
   created_at: "2026-08-22T12:00:00Z",
   updated_at: "2026-08-22T12:00:01Z",
@@ -74,6 +75,24 @@ const conversation = {
 };
 
 describe("private agent work wire projection", () => {
+  it("decodes the exact repository receipt for a private cloud branch", () => {
+    const repository = {
+      slug: "platform/api",
+      base_ref: "refs/heads/main",
+      base_oid: "0123456789abcdef0123456789abcdef01234567",
+      branch: "myelin/thread-0123456789abcdef0123",
+    };
+    expect(parseAgentThread({
+      thread: { ...subject, workspace: { ...subject.workspace, repository } },
+    })?.workspace.repository).toEqual(repository);
+    expect(parseAgentThread({
+      thread: {
+        ...subject,
+        workspace: { ...subject.workspace, repository: { ...repository, base_oid: "short" } },
+      },
+    })).toBeNull();
+  });
+
   it("ends client authority at the exact workspace deadline", () => {
     const decoded = parseAgentThread({ thread: subject })!;
     expect(agentThreadWorkspaceAvailable(decoded, Date.parse("2026-08-25T11:59:59Z"))).toBe(true);

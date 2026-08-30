@@ -43,6 +43,12 @@ export interface AgentThread {
     state: AgentThreadState;
     retention_days: number;
     expires_at: string;
+    repository: {
+      slug: string;
+      base_ref: string;
+      base_oid: string;
+      branch: string;
+    } | null;
   };
   created_at: string;
   updated_at: string;
@@ -211,11 +217,12 @@ function policyCoordinates(value: unknown): boolean {
 function thread(value: unknown): AgentThread | null {
   const row = record(value);
   const workspace = record(row?.workspace);
+  const repository = workspace?.repository === null ? null : record(workspace?.repository);
   if (!row || !exact(row, [
     "id", "ref", "name", "agent_id", "agent_ref", "project_id", "conversation_id",
     "conversation_ref", "workspace", "created_at", "updated_at",
   ]) || !workspace || !exact(workspace, [
-    "id", "generation", "state", "retention_days", "expires_at",
+    "id", "generation", "state", "retention_days", "expires_at", "repository",
   ]) || !isAgentThreadId(row.id) || !cleanText(row.ref, 4_096) || !cleanText(row.name, 80) ||
       !isAgentThreadId(row.agent_id) || !cleanText(row.agent_ref, 4_096) ||
       (row.project_id !== null && !isAgentThreadId(row.project_id)) ||
@@ -223,6 +230,11 @@ function thread(value: unknown): AgentThread | null {
       !isAgentThreadId(workspace.id) || !positiveInteger(workspace.generation, 4_294_967_295) ||
       !["provisioning", "ready", "expiring", "deleted", "failed"].includes(workspace.state as string) ||
       !positiveInteger(workspace.retention_days, 30) || !timestamp(workspace.expires_at) ||
+      (repository !== null && (!exact(repository, ["slug", "base_ref", "base_oid", "branch"]) ||
+        !cleanText(repository.slug, 255) || !cleanText(repository.base_ref, 1_024) ||
+        !(repository.base_ref as string).startsWith("refs/heads/") ||
+        typeof repository.base_oid !== "string" || !/^[0-9a-f]{40}$/.test(repository.base_oid) ||
+        !cleanText(repository.branch, 1_024))) ||
       !timestamp(row.created_at) || !timestamp(row.updated_at)) return null;
   const thread = row as unknown as AgentThread;
   if (!thread.ref.endsWith(`/agent/thread/${thread.id}`) ||

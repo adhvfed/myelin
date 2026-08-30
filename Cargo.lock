@@ -3147,6 +3147,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "chrono",
+ "git2",
  "hex",
  "jsonschema",
  "libc",
@@ -3394,6 +3395,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "git2",
  "http-body-util",
  "hyper",
  "hyper-rustls",

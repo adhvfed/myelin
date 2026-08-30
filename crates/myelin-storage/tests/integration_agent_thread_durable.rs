@@ -56,6 +56,7 @@ fn proposal(owner: &str, agent_id: Uuid, suffix: u128) -> NewAgentThread {
         workspace_id: Uuid::from_u128(suffix + 10_000),
         name: "Investigate checkout race".into(),
         project_id: None,
+        git: None,
         retention_days: 3,
         client_nonce: "private-thread-retry".into(),
         created_at,

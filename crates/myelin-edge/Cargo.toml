@@ -58,6 +58,7 @@ bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tempfile.workspace = true
+git2.workspace = true
 
 sqlx = { workspace = true }
 

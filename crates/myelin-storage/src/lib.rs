@@ -156,10 +156,11 @@ pub use restore_verify::{
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
 
 pub use agent_thread_durable::{
-    agent_thread_durable_migrations, agent_thread_publication_migrations,
-    agent_thread_recent_list_migrations, agent_thread_session_launch_migrations,
-    agent_thread_ssh_single_use_migrations, ActivateAgentThreadOutcome, AgentThreadExpiry,
-    AgentThreadExpiryCompletion, AgentThreadExpiryFailure, AgentThreadProvisioningFailure,
+    agent_thread_durable_migrations, agent_thread_git_binding_migrations,
+    agent_thread_publication_migrations, agent_thread_recent_list_migrations,
+    agent_thread_session_launch_migrations, agent_thread_ssh_single_use_migrations,
+    ActivateAgentThreadOutcome, AgentThreadExpiry, AgentThreadExpiryCompletion,
+    AgentThreadExpiryFailure, AgentThreadGitBinding, AgentThreadProvisioningFailure,
     AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
     CreateWorkspaceSshGrantOutcome, DurableAgentThread, DurableAgentThreadBacking,
     DurableWorkspaceSession, DurableWorkspaceSshGrant, ListAgentThreadsOutcome,
@@ -174,7 +175,8 @@ pub use agent_thread_durable::{
     AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION,
     AGENT_THREAD_SSH_GRANT_MIGRATION, AGENT_THREAD_SSH_SINGLE_USE_MIGRATION,
-    AGENT_THREAD_WORKSPACE_SESSION_MIGRATION, MAX_AGENT_THREAD_NAME_BYTES,
+    AGENT_THREAD_WORKSPACE_SESSION_MIGRATION, MAX_AGENT_THREAD_GIT_REF_BYTES,
+    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_REPOSITORY_BYTES,
     MAX_AGENT_THREAD_RETENTION_DAYS, MAX_WORKSPACE_SSH_GRANT_SECONDS,
     MIN_AGENT_THREAD_RETENTION_DAYS, WORKSPACE_SSH_SESSION_STARTED,
 };

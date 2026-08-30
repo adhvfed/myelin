@@ -50,6 +50,11 @@ export function AgentWorkspaceContext(props: {
           <div><dt>State</dt><dd>{props.thread.workspace.state}</dd></div>
           <div><dt>Agent</dt><dd>{agentName()}</dd></div>
           <div><dt>Expires</dt><dd><time datetime={props.thread.workspace.expires_at}>{dateTime(props.thread.workspace.expires_at)}</time></dd></div>
+          <Show when={props.thread.workspace.repository}>{(repository) => <>
+            <div><dt>Repository</dt><dd>{repository().slug}</dd></div>
+            <div><dt>Branch</dt><dd>{repository().branch}</dd></div>
+            <div><dt>Base</dt><dd>{repository().base_ref} · {repository().base_oid.slice(0, 12)}</dd></div>
+          </>}</Show>
           <div><dt>Workspace</dt><dd><code>{props.thread.workspace.id}</code></dd></div>
         </dl>
       </section>

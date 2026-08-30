@@ -4,6 +4,41 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Private agent work can start as a real cloud branch
+
+A named private thread previously opened an empty directory even when the problem lived in a
+Myelin repository. A person had to copy context into the workspace by hand, agents could not
+inspect the real tree, and the durable receipt said nothing about which source revision the work
+meant. That stopped the private-work surface short of being a credible cloud development
+workspace.
+
+Thread creation can now name an optional repository, base branch, and private branch. Edge applies
+the normal pull-visibility boundary, resolves the base to one exact commit, and stores the complete
+binding with the thread. Provisioning clones into a private staging directory, checks out the
+pinned commit on the requested branch, records a public Myelin origin, and atomically publishes the
+workspace only after its Git receipt verifies. The default `myelin/thread-*` branch is stable across
+idempotent retries. A replay consults its existing durable receipt before current repository state,
+so moving trunk or later changing repository visibility cannot rewrite or invalidate completed
+work. The schema change is a forward-only expand/backfill/contract migration rather than an edit to
+historical DDL.
+
+This is available through the public API, `myelin agent thread start --repository ...`, and the web
+creation dialog. The owner-facing workspace pane shows the repository, private branch, base ref,
+and abbreviated pinned commit. Scratch threads remain valid and return an explicit null repository
+binding.
+
+**Proof:** the TypeScript full-system cloud-branch story creates a real repository through Edge,
+starts private work from it, advances trunk, replays the original request, reads the older pinned
+file through a scoped agent run, and executes Git inside the gVisor workspace to verify branch,
+commit, and public origin. That focused path passed against PostgreSQL, durable Git, Edge, and the
+workspace sandbox, while the three pre-existing private-thread stories passed against the same
+changed stack. The
+atomic-checkout unit story uses a real bare Git repository and verifies idempotent replay. The
+request-validation stories reject non-branch refs and prove replay matching does not depend on a
+newly resolved commit. The online-migration validator accepts the three-phase change. Strict Clippy
+and all-target/all-feature compilation pass for Storage, Agent Service, Edge, and CLI; CLI dispatch
+tests pass; system-test and web typechecks, web lint, and all 661 web unit tests pass.
+
 ## 2026-08-26 — An issue title no longer shares another product's erasure key
 
 The shipped PostgreSQL Issues path encrypted each title, but selected the old unscoped subject key.

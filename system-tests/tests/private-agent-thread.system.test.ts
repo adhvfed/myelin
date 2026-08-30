@@ -26,6 +26,7 @@ import {
   startPrivateAgentThread,
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
+import { GitProject } from "../src/git-project.js";
 import { array, record, string } from "../src/json.js";
 import { reconcileAgentThreads } from "../src/operator.js";
 import {
@@ -38,6 +39,108 @@ import {
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
 
 describe("private work with an agent", () => {
+  test("starts from an exact repository commit on a durable private branch", async () => {
+    const founder = await browserApprovedCliClient();
+    const companion = await activateExternalAgent(
+      founder,
+      uniqueName("Cloud branch companion"),
+      ["workspace.read_file", "workspace.exec"],
+    );
+    const repository = new GitProject(uniqueName("cloud-workspace"), founder);
+    await repository.create();
+    const initialReadme = "# A real project\n\nCheckout the durable source, not a synthetic fixture.\n";
+    const initial = await repository.writeFile("main", "README.md", initialReadme);
+    const idempotencyKey = `repository-agent-thread-${randomUUID()}`;
+
+    const teammate = await browserApprovedCliClient(reviewerClient);
+    const teammateCompanion = await activateExternalAgent(
+      teammate,
+      uniqueName("Other cloud branch companion"),
+      ["workspace.read_file"],
+    );
+    const hiddenThreadName = uniqueName("Cannot see somebody else's source");
+    const hiddenSource = await teammate.json("/v1/agent-threads", {
+      method: "POST",
+      body: {
+        name: hiddenThreadName,
+        agent_id: teammateCompanion.agent.id,
+        workspace: { repository: repository.slug },
+      },
+      idempotencyKey: `hidden-repository-thread-${randomUUID()}`,
+      expectedStatus: 404,
+    });
+    expect(hiddenSource.body).toMatchObject({ error: { code: "not_found" } });
+    expect(await listPrivateAgentThreads(teammate)).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: hiddenThreadName })]),
+    );
+
+    const invalidRef = await founder.json("/v1/agent-threads", {
+      method: "POST",
+      body: {
+        name: uniqueName("Invalid tag workspace"),
+        agent_id: companion.agent.id,
+        workspace: { repository: repository.slug, base_ref: "refs/tags/v1" },
+      },
+      idempotencyKey: `invalid-repository-ref-${randomUUID()}`,
+      expectedStatus: 400,
+    });
+    expect(invalidRef.body).toMatchObject({ error: { code: "bad_request" } });
+
+    const created = await startPrivateAgentThread(founder, {
+      name: uniqueName("Talk through my cloud branch"),
+      agentId: companion.agent.id,
+      idempotencyKey,
+      workspace: { repository: repository.slug },
+    });
+    expect(created.thread.workspace.repository).toEqual({
+      slug: repository.slug,
+      base_ref: "refs/heads/main",
+      base_oid: initial.commitOid,
+      branch: expect.stringMatching(/^myelin\/thread-[0-9a-f]{20}$/),
+    });
+
+    await repository.updateFile(
+      "main",
+      "README.md",
+      "# A newer trunk\n",
+    );
+    const replay = await startPrivateAgentThread(founder, {
+      name: created.thread.name,
+      agentId: companion.agent.id,
+      idempotencyKey,
+      workspace: { repository: repository.slug },
+      expectedStatus: 200,
+    });
+    expect(replay).toEqual({ created: false, thread: created.thread });
+
+    const run = await beginAgentThreadRun(founder, created.thread.id);
+    try {
+      const readme = await askAgent(run, 1, "workspace.read_file", { path: "README.md" });
+      expect(readme).toMatchObject({ content: initialReadme });
+      const repositoryReceipt = record(
+        (await askAgentToAct(
+          run,
+          2,
+          "workspace.exec",
+          {
+            command: "git branch --show-current && git rev-parse HEAD && git remote get-url origin",
+            timeout_seconds: 10,
+          },
+          `inspect-cloud-branch-${randomUUID()}`,
+        )).data,
+        "repository workspace command",
+      );
+      expect(string(repositoryReceipt.stdout, "repository workspace stdout").trim().split("\n"))
+        .toEqual([
+          created.thread.workspace.repository!.branch,
+          initial.commitOid,
+          expect.stringContaining(`/${repository.slug}.git`),
+        ]);
+    } finally {
+      await closeAgentRun(run);
+    }
+  });
+
   test("refuses an agent runtime that cannot resume private work before provisioning anything", async () => {
     const founder = await browserApprovedCliClient();
     const threadName = uniqueName("Hosted thread that must not exist");

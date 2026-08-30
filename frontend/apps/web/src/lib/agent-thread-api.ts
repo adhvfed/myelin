@@ -228,14 +228,26 @@ export const mutateAgentThread = action(async (input: unknown) => {
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "create" && Object.keys(mutation).every((key) =>
-      ["op", "name", "agentId", "retentionDays", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 5 && cleanText(mutation.name, 80) &&
+      ["op", "name", "agentId", "retentionDays", "repository", "baseRef", "branch", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 8 && cleanText(mutation.name, 80) &&
         isAgentThreadId(mutation.agentId) && positiveRetention(mutation.retentionDays) &&
+        typeof mutation.repository === "string" &&
+        (mutation.repository === "" || cleanText(mutation.repository, 255)) &&
+        typeof mutation.baseRef === "string" && cleanText(mutation.baseRef, 1_024) &&
+        typeof mutation.branch === "string" &&
+        (mutation.branch === "" || cleanText(mutation.branch, 1_024)) &&
         cleanNonce(mutation.clientNonce)) {
       const receipt = parseAgentThreadCreateReceipt(await edgePost("/v1/agent-threads", {
         name: mutation.name,
         agent_id: mutation.agentId,
         retention_days: mutation.retentionDays,
+        ...(mutation.repository === "" ? {} : {
+          workspace: {
+            repository: mutation.repository,
+            base_ref: mutation.baseRef,
+            ...(mutation.branch === "" ? {} : { branch: mutation.branch }),
+          },
+        }),
       }, { idempotencyKey: mutation.clientNonce }));
       return receipt
         ? respond({ ok: true, op: "create", receipt })

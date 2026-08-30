@@ -106,7 +106,10 @@ myelin agent retire 22222222-2222-2222-2222-222222222222 \
 # fresh agent contexts until the chosen retention window ends.
 myelin agent thread start "Investigate checkout race" \
   --agent 22222222-2222-2222-2222-222222222222 --retention-days 3 \
+  --repository platform/api --base-ref main \
   --idempotency-key investigate-checkout-race
+# Myelin pins the exact base commit and creates a durable private `myelin/thread-*` branch in the
+# workspace. Use `--branch alice/checkout-race` when you want to name it yourself.
 myelin agent thread list
 # If startup was interrupted, reopen the same durable conversation and workspace identities.
 myelin agent thread retry 33333333-3333-4333-8333-333333333333

@@ -4,6 +4,16 @@ use sqlx::types::Uuid;
 pub const MIN_AGENT_THREAD_RETENTION_DAYS: i16 = 1;
 pub const MAX_AGENT_THREAD_RETENTION_DAYS: i16 = 30;
 pub const MAX_AGENT_THREAD_NAME_BYTES: usize = 80;
+pub const MAX_AGENT_THREAD_REPOSITORY_BYTES: usize = 255;
+pub const MAX_AGENT_THREAD_GIT_REF_BYTES: usize = 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadGitBinding {
+    pub repository: String,
+    pub base_ref: String,
+    pub base_oid: String,
+    pub branch: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentThreadState {
@@ -63,6 +73,7 @@ pub struct NewAgentThread {
     pub workspace_id: Uuid,
     pub name: String,
     pub project_id: Option<Uuid>,
+    pub git: Option<AgentThreadGitBinding>,
     pub retention_days: i16,
     pub client_nonce: String,
     pub created_at: DateTime<Utc>,
@@ -79,6 +90,7 @@ pub struct DurableAgentThread {
     pub workspace_generation: u32,
     pub name: String,
     pub project_id: Option<String>,
+    pub git: Option<AgentThreadGitBinding>,
     pub retention_days: i16,
     pub state: AgentThreadState,
     pub storage_locator: Option<String>,

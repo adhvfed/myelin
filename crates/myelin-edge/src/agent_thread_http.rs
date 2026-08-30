@@ -1,7 +1,10 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-use myelin_agent_service::{workspace::AgentWorkspaceStore, PlatformToolCatalogue};
+use myelin_agent_service::{
+    workspace::{AgentWorkspaceStore, RepositoryWorkspaceSource},
+    PlatformToolCatalogue,
+};
 use myelin_chat::conversation::{Conversation, ConversationKind};
 use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::{ConversationId, SystemUlidSource, UlidSource};
@@ -9,11 +12,11 @@ use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
-    ActivateAgentThreadOutcome, AgentThreadProvisioningFailure, AgentThreadRunBinding,
-    AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread, RetryAgentThreadOutcome,
-    WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
-    MIN_AGENT_THREAD_RETENTION_DAYS,
+    ActivateAgentThreadOutcome, AgentThreadGitBinding, AgentThreadProvisioningFailure,
+    AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
+    DurableAgentThread, DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread,
+    RetryAgentThreadOutcome, WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES,
+    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -29,6 +32,7 @@ use crate::chat_http::{
     parse_messages_query, DurableChatMutationApi, DurableChatReadApi, PrivateConversationCreation,
 };
 use crate::gateway::GatewayBuilder;
+use crate::git_durable::{map_durable_err, DurableGitBackend, ResolvedWorkspaceRepository};
 use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
 use crate::workspace_ssh_http::{
@@ -146,6 +150,7 @@ struct AgentThreadHttpApi {
     chat_reads: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
     workspaces: Arc<dyn AgentWorkspaceStore>,
+    git: Arc<DurableGitBackend>,
     sessions: AgentSessionIssuer,
     catalogue: Arc<PlatformToolCatalogue>,
     event_ids: Arc<dyn IdMinter>,
@@ -168,12 +173,56 @@ impl AgentThreadHttpApi {
         client_nonce: String,
     ) -> Result<(DurableAgentThread, bool), EdgeError> {
         let intent = ValidatedThreadIntent::new(principal, body, client_nonce)?;
+        if let Some(existing) = self
+            .drive(self.threads.get_for_owner_by_nonce(
+                &principal.tenant.0,
+                &principal.principal_id.0,
+                &intent.client_nonce,
+            ))?
+            .map_err(|_| EdgeError::Internal("agent thread replay lookup failed".into()))?
+        {
+            if !intent.matches(&existing) {
+                return Err(EdgeError::Conflict(
+                    "that idempotency key was already used for a different agent thread".into(),
+                ));
+            }
+            if parse_stored_timestamp(&existing.expires_at)? <= Utc::now() {
+                return Ok((existing, false));
+            }
+            return match existing.state {
+                AgentThreadState::Failed => self.retry(
+                    principal,
+                    parse_uuid("stored thread id", &existing.thread_id).map_err(|_| {
+                        EdgeError::Internal("stored agent thread id is invalid".into())
+                    })?,
+                ),
+                AgentThreadState::Provisioning | AgentThreadState::Ready => {
+                    self.provision(principal, existing)
+                }
+                AgentThreadState::Expiring | AgentThreadState::Deleted => Ok(existing),
+            }
+            .map(|thread| (thread, false));
+        }
         if let Some(project_id) = intent.project_id.as_deref() {
             if !self.chat_reads.may_view_project(principal, project_id) {
                 return Err(EdgeError::NotFound("project not found".into()));
             }
         }
-        let proposal = intent.proposal(self.conversation_ids.mint().as_str())?;
+        let repository = intent
+            .workspace
+            .as_ref()
+            .map(|workspace| {
+                self.git
+                    .resolve_workspace_repository(
+                        principal,
+                        &workspace.repository,
+                        &workspace.base_ref,
+                    )
+                    .map_err(map_durable_err)
+            })
+            .transpose()?;
+        let proposal =
+            intent.proposal(self.conversation_ids.mint().as_str(), repository.as_ref())?;
         let outcome = self
             .drive(self.threads.create(&principal.tenant.0, proposal))?
             .map_err(|_| EdgeError::Internal("agent thread storage failed".into()))?;
@@ -287,7 +336,7 @@ impl AgentThreadHttpApi {
         };
         let workspace_id = parse_uuid("stored workspace id", &thread.workspace_id)
             .map_err(|_| EdgeError::Internal("stored agent workspace id is invalid".into()))?;
-        let provisioned = match self.workspaces.provision(&principal.tenant.0, workspace_id) {
+        let provisioned = match self.provision_workspace(principal, &thread, workspace_id) {
             Ok(provisioned) => provisioned,
             Err(_) => {
                 self.record_provisioning_failure(
@@ -334,6 +383,43 @@ impl AgentThreadHttpApi {
         self.chat_mutations
             .activate_private_conversation(&conversation, &zookie)?;
         self.complete_publication(principal, ready)
+    }
+
+    fn provision_workspace(
+        &self,
+        principal: &Principal,
+        thread: &DurableAgentThread,
+        workspace_id: Uuid,
+    ) -> Result<myelin_agent_service::workspace::ProvisionedWorkspace, String> {
+        let Some(binding) = thread.git.as_ref() else {
+            return self
+                .workspaces
+                .provision(&principal.tenant.0, workspace_id)
+                .map_err(|error| error.to_string());
+        };
+        let resolved = self
+            .git
+            .reopen_workspace_repository(
+                principal,
+                &binding.repository,
+                &binding.base_ref,
+                &binding.base_oid,
+            )
+            .map_err(|error| error.to_string())?;
+        self.workspaces
+            .provision_from_repository(
+                &principal.tenant.0,
+                workspace_id,
+                &RepositoryWorkspaceSource {
+                    repository: resolved.repository,
+                    repository_path: resolved.repository_path,
+                    clone_url: resolved.clone_url,
+                    base_ref: resolved.base_ref,
+                    base_oid: resolved.base_oid,
+                    branch: binding.branch.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())
     }
 
     fn complete_publication(
@@ -455,6 +541,7 @@ pub struct AgentThreadHttpInputs {
     pub chat_reads: DurableChatReadApi,
     pub chat_mutations: DurableChatMutationApi,
     pub workspaces: Arc<dyn AgentWorkspaceStore>,
+    pub git: Arc<DurableGitBackend>,
     pub sessions: AgentSessionIssuer,
     pub ssh_routes: WorkspaceSshRouteKey,
     pub ssh_endpoint: WorkspaceSshEndpoint,
@@ -471,6 +558,18 @@ struct CreateAgentThreadBody {
     project_id: Option<String>,
     #[serde(default = "default_retention_days")]
     retention_days: i16,
+    #[serde(default)]
+    workspace: Option<CreateAgentThreadWorkspaceBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateAgentThreadWorkspaceBody {
+    repository: String,
+    #[serde(default = "default_workspace_base_ref")]
+    base_ref: String,
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 struct ValidatedThreadIntent {
@@ -479,6 +578,7 @@ struct ValidatedThreadIntent {
     agent_id: Uuid,
     project_id: Option<String>,
     retention_days: i16,
+    workspace: Option<CreateAgentThreadWorkspaceBody>,
     client_nonce: String,
     now: DateTime<Utc>,
 }
@@ -501,6 +601,12 @@ impl ValidatedThreadIntent {
                 "agent thread retention_days must be between {MIN_AGENT_THREAD_RETENTION_DAYS} and {MAX_AGENT_THREAD_RETENTION_DAYS}"
             )));
         }
+        if let Some(workspace) = body.workspace.as_ref() {
+            validate_workspace_branch(&workspace.base_ref, "base_ref", true)?;
+            if let Some(branch) = workspace.branch.as_deref() {
+                validate_workspace_branch(branch, "branch", false)?;
+            }
+        }
         let now = Utc::now()
             .with_nanosecond(0)
             .expect("zero nanoseconds is a valid timestamp");
@@ -510,12 +616,17 @@ impl ValidatedThreadIntent {
             agent_id,
             project_id: body.project_id,
             retention_days: body.retention_days,
+            workspace: body.workspace,
             client_nonce,
             now,
         })
     }
 
-    fn proposal(&self, conversation_id: &str) -> Result<NewAgentThread, EdgeError> {
+    fn proposal(
+        &self,
+        conversation_id: &str,
+        repository: Option<&ResolvedWorkspaceRepository>,
+    ) -> Result<NewAgentThread, EdgeError> {
         let expires_at = self
             .now
             .checked_add_signed(Duration::days(i64::from(self.retention_days)))
@@ -532,11 +643,46 @@ impl ValidatedThreadIntent {
                 .as_deref()
                 .map(|value| parse_uuid("project_id", value))
                 .transpose()?,
+            git: repository.map(|repository| AgentThreadGitBinding {
+                repository: repository.repository.clone(),
+                base_ref: repository.base_ref.clone(),
+                base_oid: repository.base_oid.clone(),
+                branch: self
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.branch.clone())
+                    .unwrap_or_else(|| {
+                        default_workspace_branch(&self.owner_principal_id, &self.client_nonce)
+                    }),
+            }),
             retention_days: self.retention_days,
             client_nonce: self.client_nonce.clone(),
             created_at: self.now,
             expires_at,
         })
+    }
+
+    fn matches(&self, thread: &DurableAgentThread) -> bool {
+        if thread.owner_principal_id != self.owner_principal_id
+            || thread.agent_id != self.agent_id.to_string()
+            || thread.name != self.name
+            || thread.project_id != self.project_id
+            || thread.retention_days != self.retention_days
+        {
+            return false;
+        }
+        match (self.workspace.as_ref(), thread.git.as_ref()) {
+            (None, None) => true,
+            (Some(requested), Some(stored)) => {
+                let branch = requested.branch.clone().unwrap_or_else(|| {
+                    default_workspace_branch(&self.owner_principal_id, &self.client_nonce)
+                });
+                stored.repository == requested.repository
+                    && stored.base_ref == normalized_workspace_base_ref(&requested.base_ref)
+                    && stored.branch == branch
+            }
+            _ => false,
+        }
     }
 }
 
@@ -798,6 +944,7 @@ pub fn register_agent_threads(
         chat_reads: inputs.chat_reads,
         chat_mutations: inputs.chat_mutations,
         workspaces: inputs.workspaces,
+        git: inputs.git,
         sessions: inputs.sessions,
         catalogue: Arc::new(
             PlatformToolCatalogue::platform()
@@ -952,6 +1099,12 @@ fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
             "state": public_state,
             "retention_days": thread.retention_days,
             "expires_at": thread.expires_at,
+            "repository": thread.git.as_ref().map(|git| json!({
+                "slug": git.repository,
+                "base_ref": git.base_ref,
+                "base_oid": git.base_oid,
+                "branch": git.branch,
+            })),
         },
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
@@ -968,6 +1121,59 @@ pub(crate) fn agent_thread_public_state(thread: &DurableAgentThread) -> &'static
 
 fn thread_ref(tenant: &str, thread_id: &str) -> String {
     format!("myelin://{tenant}/agent/thread/{thread_id}")
+}
+
+fn default_workspace_base_ref() -> String {
+    "main".into()
+}
+
+fn default_workspace_branch(owner: &str, client_nonce: &str) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"myelin.agent-thread.workspace-branch.v1\0");
+    digest.update(owner.as_bytes());
+    digest.update(b"\0");
+    digest.update(client_nonce.as_bytes());
+    format!("myelin/thread-{}", &digest.finalize().to_hex()[..20])
+}
+
+fn normalized_workspace_base_ref(value: &str) -> String {
+    if value.starts_with("refs/heads/") {
+        value.to_string()
+    } else {
+        format!("refs/heads/{value}")
+    }
+}
+
+fn validate_workspace_branch(
+    value: &str,
+    field: &str,
+    allow_full_ref: bool,
+) -> Result<(), EdgeError> {
+    let branch = if allow_full_ref {
+        if let Some(branch) = value.strip_prefix("refs/heads/") {
+            branch
+        } else if value.starts_with("refs/") {
+            return Err(EdgeError::BadRequest(format!(
+                "agent thread workspace {field} must identify a branch"
+            )));
+        } else {
+            value
+        }
+    } else {
+        if value.starts_with("refs/") {
+            return Err(EdgeError::BadRequest(format!(
+                "agent thread workspace {field} must be a branch name, not a full ref"
+            )));
+        }
+        value
+    };
+    let full_ref = format!("refs/heads/{branch}");
+    if value.is_empty() || value.len() > 1024 || !git2::Reference::is_valid_name(&full_ref) {
+        return Err(EdgeError::BadRequest(format!(
+            "agent thread workspace {field} must be a canonical Git branch"
+        )));
+    }
+    Ok(())
 }
 
 fn workspace_is_available(
@@ -1141,8 +1347,74 @@ mod tests {
         }))
         .unwrap();
         let intent = ValidatedThreadIntent::new(&principal(), body, "retry".into()).unwrap();
-        let proposal = intent.proposal("01J00000000000000000000000").unwrap();
+        let proposal = intent.proposal("01J00000000000000000000000", None).unwrap();
         assert_eq!(proposal.expires_at - proposal.created_at, Duration::days(3));
+    }
+
+    #[test]
+    fn repository_workspace_intent_has_a_stable_private_branch() {
+        let parse = || {
+            serde_json::from_value::<CreateAgentThreadBody>(json!({
+                "name": "Investigate checkout race",
+                "agent_id": "11111111-1111-4111-8111-111111111111",
+                "workspace": { "repository": "platform", "base_ref": "main" },
+            }))
+            .unwrap()
+        };
+        let source = ResolvedWorkspaceRepository {
+            repository: "platform".into(),
+            repository_path: "/durable/git/platform.git".into(),
+            clone_url: "https://myelin.example/acme/local/platform.git".into(),
+            base_ref: "refs/heads/main".into(),
+            base_oid: "0123456789abcdef0123456789abcdef01234567".into(),
+        };
+        let first = ValidatedThreadIntent::new(&principal(), parse(), "same-retry".into())
+            .unwrap()
+            .proposal("01J00000000000000000000000", Some(&source))
+            .unwrap();
+        let replay = ValidatedThreadIntent::new(&principal(), parse(), "same-retry".into())
+            .unwrap()
+            .proposal("01J00000000000000000000001", Some(&source))
+            .unwrap();
+        assert_eq!(first.git, replay.git);
+        assert!(first.git.unwrap().branch.starts_with("myelin/thread-"));
+
+        let intent =
+            ValidatedThreadIntent::new(&principal(), parse(), "same-retry".into()).unwrap();
+        let stored = DurableAgentThread {
+            thread_id: "11111111-1111-4111-8111-111111111111".into(),
+            owner_principal_id: "p:alice".into(),
+            agent_id: "11111111-1111-4111-8111-111111111111".into(),
+            conversation_id: "01J00000000000000000000000".into(),
+            workspace_id: "22222222-2222-4222-8222-222222222222".into(),
+            workspace_generation: 1,
+            name: "Investigate checkout race".into(),
+            project_id: None,
+            git: replay.git,
+            retention_days: 3,
+            state: AgentThreadState::Ready,
+            storage_locator: Some("workspace:v1:receipt".into()),
+            publication_completed_at: Some("2026-08-31T00:00:01Z".into()),
+            failure_reason: None,
+            created_at: "2026-08-31T00:00:00Z".into(),
+            expires_at: "2026-09-03T00:00:00Z".into(),
+            updated_at: "2026-08-31T00:00:01Z".into(),
+        };
+        assert!(intent.matches(&stored));
+    }
+
+    #[test]
+    fn repository_workspace_rejects_non_branch_refs() {
+        let body: CreateAgentThreadBody = serde_json::from_value(json!({
+            "name": "Invalid source",
+            "agent_id": "11111111-1111-4111-8111-111111111111",
+            "workspace": { "repository": "platform", "base_ref": "refs/tags/v1" },
+        }))
+        .unwrap();
+        assert!(matches!(
+            ValidatedThreadIntent::new(&principal(), body, "retry".into()),
+            Err(EdgeError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -1225,6 +1497,7 @@ mod tests {
             workspace_generation: 1,
             name: "Investigate checkout race".into(),
             project_id: None,
+            git: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),
@@ -1267,6 +1540,7 @@ mod tests {
             workspace_generation: 1,
             name: "Investigate checkout race".into(),
             project_id: None,
+            git: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),

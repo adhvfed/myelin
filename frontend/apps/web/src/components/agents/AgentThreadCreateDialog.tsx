@@ -10,7 +10,7 @@ import type { AgentChoice, AgentThreadCreateReceipt } from "~/lib/agent-thread-r
 
 function errorCopy(kind: AgentThreadErrorKind): string {
   if (kind === "bad-input") return "Use a clean name and choose an active external agent.";
-  if (kind === "not-found") return "That agent is no longer available.";
+  if (kind === "not-found") return "That agent or repository is no longer available to you.";
   if (kind === "conflict") return "You already have a live private thread with that name.";
   if (kind === "unavailable") return "Private work is temporarily unavailable. This draft is safe to retry.";
   return "We couldn’t confirm the new thread. This draft keeps its retry identity until you edit it.";
@@ -32,6 +32,9 @@ export function AgentThreadCreateDialog(props: {
   const [name, setName] = createSignal("");
   const [agentId, setAgentId] = createSignal("");
   const [retentionDays, setRetentionDays] = createSignal(3);
+  const [repository, setRepository] = createSignal("");
+  const [baseRef, setBaseRef] = createSignal("main");
+  const [branch, setBranch] = createSignal("");
   const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -49,6 +52,9 @@ export function AgentThreadCreateDialog(props: {
     const canUsePreferred = untrack(() => available().some((agent) => agent.id === preferred));
     setAgentId(canUsePreferred && preferred ? preferred : "");
     setRetentionDays(3);
+    setRepository("");
+    setBaseRef("main");
+    setBranch("");
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
@@ -62,8 +68,11 @@ export function AgentThreadCreateDialog(props: {
   const close = () => { if (!submitting()) props.onClose(); };
   const submit = async (event: SubmitEvent) => {
     event.preventDefault();
-    if (!name().trim() || name().trim() !== name() || !agentId()) {
-      setError("A clean problem name and an active external agent are required.");
+    if (!name().trim() || name().trim() !== name() || !agentId() ||
+        repository().trim() !== repository() ||
+        (repository() !== "" && (!baseRef() || baseRef().trim() !== baseRef() ||
+          branch().trim() !== branch()))) {
+      setError("Use a clean problem name, active external agent, and valid repository fields.");
       nameInput?.focus();
       return;
     }
@@ -76,6 +85,9 @@ export function AgentThreadCreateDialog(props: {
         name: name(),
         agentId: agentId(),
         retentionDays: retentionDays(),
+        repository: repository(),
+        baseRef: baseRef(),
+        branch: branch(),
         clientNonce: clientNonce(),
       });
       if (generation !== openingGeneration) return;
@@ -173,8 +185,46 @@ export function AgentThreadCreateDialog(props: {
             <option value="30">30 days</option>
           </select>
         </label>
+        <label>
+          Repository slug <span aria-hidden="true">(optional)</span>
+          <input
+            value={repository()}
+            maxlength={255}
+            autocomplete="off"
+            placeholder="platform/api"
+            disabled={submitting()}
+            onInput={(event) => { setRepository(event.currentTarget.value); edit(); }}
+          />
+        </label>
+        <Show when={repository() !== ""}>
+          <div class="agent-thread-create-repository">
+            <label>
+              Start from branch
+              <input
+                value={baseRef()}
+                maxlength={1024}
+                autocomplete="off"
+                placeholder="main"
+                disabled={submitting()}
+                onInput={(event) => { setBaseRef(event.currentTarget.value); edit(); }}
+              />
+            </label>
+            <label>
+              Private branch <span aria-hidden="true">(generated if blank)</span>
+              <input
+                value={branch()}
+                maxlength={1024}
+                autocomplete="off"
+                placeholder="myelin/thread-…"
+                disabled={submitting()}
+                onInput={(event) => { setBranch(event.currentTarget.value); edit(); }}
+              />
+            </label>
+          </div>
+        </Show>
         <p class="agent-thread-note">
           A fresh agent context can reopen this conversation and the same workspace until it expires.
+          Add a Myelin repository to begin from an exact commit on a private branch.
         </p>
         <Show when={error()}>{(message) => <p role="alert" class="agent-thread-error">{message()}</p>}</Show>
       </form>
