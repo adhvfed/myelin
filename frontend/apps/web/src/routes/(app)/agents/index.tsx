@@ -23,6 +23,7 @@ import { AgentWorkspaceContext } from "~/components/agents/AgentWorkspaceContext
 import { useContextPane } from "~/components/AppShell";
 import {
   agentThreadErrorKind,
+  getAgentChoice,
   getAgentChoices,
   getAgentThread,
   getAgentThreadMessages,
@@ -31,6 +32,7 @@ import {
   type AgentThreadErrorKind,
 } from "~/lib/agent-thread-api";
 import {
+  agentThreadWorkspaceAvailable,
   isAgentThreadId,
   type AgentChoice,
   type AgentChoicePage,
@@ -66,6 +68,7 @@ export default function AgentThreadsIndex() {
   const createOpen = () => search.new === "1";
   const activationOpen = () => search.activate === "1";
   const [interactive, setInteractive] = createSignal(false);
+  const [observedAt, setObservedAt] = createSignal(Date.now());
 
   const [threadPages, setThreadPages] = createSignal<AgentThreadPage[]>([]);
   const [loadingMoreThreads, setLoadingMoreThreads] = createSignal(false);
@@ -111,6 +114,17 @@ export default function AgentThreadsIndex() {
     }
   }, { deferStream: true });
 
+  const selectedThreadAgent = createAsync(async (): Promise<PageResult<AgentChoice> | null> => {
+    const agentId = selectedThread()?.page?.agent_id;
+    if (!agentId) return null;
+    try {
+      return { page: await getAgentChoice(agentId), error: null };
+    } catch (error) {
+      if (error instanceof Response) throw error;
+      return { page: null, error: agentThreadErrorKind(error) };
+    }
+  }, { deferStream: true });
+
   const recentMessages = createAsync(async () => {
     const id = validSelectedId();
     if (!id) return null;
@@ -149,9 +163,10 @@ export default function AgentThreadsIndex() {
     recentSessions()?.page?.items,
     workspaceSessionPages().map((page) => page.items),
   ));
-  const selectedAgent = () => {
-    const id = selectedThread()?.page?.agent_id;
-    return agents().find((agent) => agent.id === id);
+  const selectedAgent = () => selectedThreadAgent()?.page ?? undefined;
+  const workspaceAvailable = () => {
+    const thread = selectedThread()?.page;
+    return Boolean(thread && agentThreadWorkspaceAvailable(thread, observedAt()));
   };
   const agentName = () => selectedAgent()?.name ??
     (selectedThread()?.page?.agent_id ? `Agent ${selectedThread()!.page!.agent_id.slice(0, 8)}` : "Agent");
@@ -166,13 +181,17 @@ export default function AgentThreadsIndex() {
 
   onMount(() => {
     setInteractive(true);
+    setObservedAt(Date.now());
     // SSE is the fast path below. The slower poll keeps a silently dead stream
     // from leaving a private thread frozen indefinitely.
     const timer = window.setInterval(() => {
+      setObservedAt(Date.now());
       const threadId = validSelectedId();
       if (!threadId || document.hidden) return;
+      const agentId = selectedThread()?.page?.agent_id;
       void revalidate(getAgentThreadMessages.keyFor({ threadId, limit: 100 }));
       void revalidate(getAgentThread.keyFor(threadId));
+      if (agentId) void revalidate(getAgentChoice.keyFor(agentId));
       void revalidate(getWorkspaceSessions.keyFor({ threadId, limit: 100 }));
     }, 30_000);
     onCleanup(() => window.clearInterval(timer));
@@ -215,6 +234,7 @@ export default function AgentThreadsIndex() {
       sessionsHaveMore={Boolean(nextWorkspaceSessionCursor())}
       sessionsLoadingMore={loadingMoreSessions()}
       onLoadMoreSessions={() => void loadMoreWorkspaceSessions()}
+      workspaceAvailable={workspaceAvailable()}
     /> : null);
     onCleanup(() => pane.setContextPane(null));
   });
@@ -339,6 +359,7 @@ export default function AgentThreadsIndex() {
                   loadingEarlier={loadingEarlier()}
                   onLoadEarlier={() => void loadEarlier()}
                   onPosted={refreshMessages}
+                  workspaceAvailable={workspaceAvailable()}
                 />
               </Show>
             </Show>

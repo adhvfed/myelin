@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  agentThreadWorkspaceAvailable,
+  externalAgentCanConnect,
   parseAgentActivationReceipt,
+  parseAgentChoice,
   parseAgentChoices,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
@@ -70,6 +73,25 @@ const conversation = {
 };
 
 describe("private agent work wire projection", () => {
+  it("ends client authority at the exact workspace deadline", () => {
+    const decoded = parseAgentThread({ thread: subject })!;
+    expect(agentThreadWorkspaceAvailable(decoded, Date.parse("2026-08-25T11:59:59Z"))).toBe(true);
+    expect(agentThreadWorkspaceAvailable(decoded, Date.parse(subject.workspace.expires_at)))
+      .toBe(false);
+    expect(agentThreadWorkspaceAvailable({
+      ...decoded,
+      workspace: { ...decoded.workspace, state: "expiring" },
+    }, Date.parse("2026-08-24T00:00:00Z"))).toBe(false);
+
+    const choice = parseAgentChoices({
+      items: [agent],
+      page: { next_cursor: null, limit: 100 },
+    })!.items[0];
+    expect(externalAgentCanConnect(choice)).toBe(true);
+    expect(externalAgentCanConnect({ ...choice!, status: "suspended" })).toBe(false);
+    expect(externalAgentCanConnect(undefined)).toBe(false);
+  });
+
   it("decodes threads, messages, agents, and accountable workspace entries", () => {
     expect(parseAgentThreads({ items: [subject], page: { next_cursor: null, limit: 100 } })?.items)
       .toEqual([subject]);
@@ -116,6 +138,14 @@ describe("private agent work wire projection", () => {
       selected_tools: ["chat.post"],
       effective_tools: [],
     }]);
+    expect(parseAgentChoice({ agent })).toEqual({
+      id: AGENT,
+      name: "Checkout companion",
+      runtime_ref: "external:mcp",
+      status: "active",
+      selected_tools: ["chat.post"],
+      effective_tools: [],
+    });
     expect(parseAgentActivationReceipt({ agent, created: true, durable: true, governance })).toEqual({
       agent: {
         id: AGENT,

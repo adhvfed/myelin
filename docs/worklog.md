@@ -4360,6 +4360,27 @@ past the confinement limit, proves that launch is rejected and the grant stays s
 observes no false workspace entry. The durable database retains exactly the expected internal
 reservation with `consumed_at` set, `launched_at` absent, and no started event.
 
+## 2026-08-30 — Private-work authority now ends everywhere at one deadline
+
+New agent runs and SSH grants checked both the durable workspace state and its exact expiry, but
+private-thread message reads and posts waited for the asynchronous expiry reconciler to archive the
+conversation. During that gap, an elapsed workspace could still accept human messages. The browser
+and CLI also advertised continuation commands from a retained `ready` receipt without checking the
+deadline; the browser kept advertising an external MCP command after the agent was suspended.
+
+The Edge message handlers now use the same state-and-deadline predicate as run issuance, while the
+reconciler remains responsible for durable archival and cleanup. The CLI suppresses message and SSH
+commands at the exact deadline. The browser observes the deadline while open, disables its composer,
+replaces stale workspace commands with an honest retained-receipt explanation, and distinguishes
+agent availability from owner SSH authority: suspending an agent hides its MCP command without
+taking the still-live workspace away from its owner.
+
+Proof includes the exact-boundary Edge, CLI, and TypeScript tests; the complete live TypeScript
+private-thread lifecycle against Edge, PostgreSQL, OpenSSH, the workspace gateway, and durable
+workspace files; and the real browser journey, which suspends the selected agent through Edge,
+reloads its durable status, observes that MCP is unavailable while owner SSH remains available, and
+resumes the identity before continuing the named thread.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

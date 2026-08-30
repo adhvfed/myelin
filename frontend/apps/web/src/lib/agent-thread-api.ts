@@ -4,6 +4,7 @@ import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gatew
 import {
   isAgentThreadId,
   parseAgentActivationReceipt,
+  parseAgentChoice,
   parseAgentChoices,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
@@ -11,6 +12,7 @@ import {
   parseAgentThreadMessages,
   parseAgentThreads,
   parseWorkspaceSessions,
+  type AgentChoice,
   type AgentChoicePage,
   type AgentActivationReceipt,
   type AgentThread,
@@ -116,6 +118,16 @@ export const getAgentChoices = query(async (request: {
     return response;
   });
 }, "agent-thread-agent-choices");
+
+export const getAgentChoice = query(async (agentId: string): Promise<AgentChoice> => {
+  "use server";
+  if (!isAgentThreadId(agentId)) throw new AgentThreadRouteError("bad-input");
+  return authed(async () => {
+    const response = parseAgentChoice(await edgeGet(`/v1/agents/${segment(agentId)}`));
+    if (!response || response.id !== agentId) throw new AgentThreadRouteError("error");
+    return response;
+  });
+}, "agent-thread-agent-choice");
 
 export const getAgentThreads = query(async (request: {
   cursor?: string;

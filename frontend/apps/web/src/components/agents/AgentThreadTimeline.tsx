@@ -15,8 +15,8 @@ export function AgentThreadTimeline(props: {
   loadingEarlier: boolean;
   onLoadEarlier: () => void;
   onPosted: (threadId: string) => Promise<void> | void;
+  workspaceAvailable: boolean;
 }) {
-  const ready = () => props.thread.workspace.state === "ready";
   return (
     <ConversationTimeline
       headingId="agent-thread-heading"
@@ -40,7 +40,7 @@ export function AgentThreadTimeline(props: {
       composer={<AgentThreadComposer
         threadId={props.thread.id}
         threadName={props.thread.name}
-        disabled={!ready()}
+        disabled={!props.workspaceAvailable}
         onPosted={props.onPosted}
       />}
     />

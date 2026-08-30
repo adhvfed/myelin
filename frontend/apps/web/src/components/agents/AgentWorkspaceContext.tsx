@@ -1,7 +1,12 @@
 import { Icon } from "@myelin/design-system";
 import { For, Show } from "solid-js";
 
-import type { AgentChoice, AgentThread, WorkspaceSession } from "~/lib/agent-thread-response";
+import {
+  externalAgentCanConnect,
+  type AgentChoice,
+  type AgentThread,
+  type WorkspaceSession,
+} from "~/lib/agent-thread-response";
 
 function dateTime(value: string): string {
   return `${new Date(value).toISOString().slice(0, 16).replace("T", " ")} UTC`;
@@ -16,11 +21,20 @@ export function AgentWorkspaceContext(props: {
   sessionsHaveMore: boolean;
   sessionsLoadingMore: boolean;
   onLoadMoreSessions: () => void;
+  workspaceAvailable: boolean;
 }) {
   const agentCommand = () => `myelin mcp serve --as ${props.thread.agent_id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
   const agentName = () => props.agent?.name ?? `Agent ${props.thread.agent_id.slice(0, 8)}`;
   const commandScope = () => props.agent?.selected_tools.includes("workspace.exec");
+  const connectUnavailableCopy = () => {
+    if (!props.agent) return "Agent connection is unavailable until its identity can be loaded.";
+    if (props.agent.status === "suspended") {
+      return `${agentName()} is suspended. Resume the identity before connecting it.`;
+    }
+    if (props.agent.status === "disabled") return `${agentName()} has been retired and cannot connect.`;
+    return `${agentName()} is managed by Myelin and does not use an external MCP command.`;
+  };
   return (
     <div class="agent-workspace-context">
       <section>
@@ -38,21 +52,32 @@ export function AgentWorkspaceContext(props: {
         <Show when={props.agent} fallback={<p data-testid="agent-command-scope">Tool scope is temporarily unavailable.</p>}>
           <p data-testid="agent-command-scope">
             {commandScope()
-              ? "Bounded commands enabled · files and command effects remain generation-fenced."
-              : "File access only · command execution was not authorized."}
+              ? "Bounded commands authorized · files and command effects remain generation-fenced."
+              : "File access authorized · command execution was not selected."}
           </p>
         </Show>
       </section>
-      <section>
-        <h3>Connect the agent</h3>
-        <p>Use this as the MCP server command for an external client. Myelin exchanges your signed-in session for short-lived run authority.</p>
-        <code class="agent-workspace-command" data-testid="agent-connect-command">{agentCommand()}</code>
-      </section>
-      <section>
-        <h3>Enter with SSH</h3>
-        <p>Run this from an authenticated Myelin CLI. It creates a one-shot key and pins the workspace host.</p>
-        <code class="agent-workspace-command" data-testid="agent-workspace-command">{command()}</code>
-      </section>
+      <Show when={props.workspaceAvailable} fallback={
+        <section data-testid="workspace-unavailable">
+          <h3>Workspace unavailable</h3>
+          <p>This retained receipt is no longer active. New messages, agent runs, and SSH access are unavailable.</p>
+        </section>
+      }>
+        <section>
+          <h3>Connect the agent</h3>
+          <Show when={externalAgentCanConnect(props.agent)} fallback={
+            <p data-testid="agent-connect-unavailable">{connectUnavailableCopy()}</p>
+          }>
+            <p>Use this as the MCP server command for an external client. Myelin exchanges your signed-in session for short-lived run authority.</p>
+            <code class="agent-workspace-command" data-testid="agent-connect-command">{agentCommand()}</code>
+          </Show>
+        </section>
+        <section>
+          <h3>Enter with SSH</h3>
+          <p>Run this from an authenticated Myelin CLI. It creates a one-shot key and pins the workspace host.</p>
+          <code class="agent-workspace-command" data-testid="agent-workspace-command">{command()}</code>
+        </section>
+      </Show>
       <section>
         <h3>Workspace entries</h3>
         <Show when={!props.sessionsLoading} fallback={<p>Loading accountable entries…</p>}>

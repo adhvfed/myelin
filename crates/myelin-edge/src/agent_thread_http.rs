@@ -153,6 +153,19 @@ impl AgentThreadHttpApi {
         .ok_or_else(|| EdgeError::NotFound("agent thread not found".into()))
     }
 
+    fn available_owner_thread(
+        &self,
+        principal: &Principal,
+        thread_id: Uuid,
+        observed_at: DateTime<Utc>,
+    ) -> Result<DurableAgentThread, EdgeError> {
+        let thread = self.owner_thread(principal, thread_id)?;
+        if !workspace_is_available(&thread, observed_at)? {
+            return Err(EdgeError::NotFound("agent thread not found".into()));
+        }
+        Ok(thread)
+    }
+
     fn create_private_conversation(
         &self,
         principal: &Principal,
@@ -330,7 +343,9 @@ struct AgentThreadMessageListHandler {
 impl Handler for AgentThreadMessageListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_body(ctx)?;
-        let thread = self.api.owner_thread(ctx.principal, thread_param(ctx)?)?;
+        let thread =
+            self.api
+                .available_owner_thread(ctx.principal, thread_param(ctx)?, Utc::now())?;
         let (limit, before) = parse_messages_query(&ctx.request.query)?;
         Ok(no_store(EdgeResponse::json(
             200,
@@ -353,7 +368,9 @@ impl Handler for AgentThreadMessagePostHandler {
         require_empty_query(ctx)?;
         let body: AgentThreadMessageBody =
             parse_interactive_body(&ctx.request.body, "agent thread message")?;
-        let thread = self.api.owner_thread(ctx.principal, thread_param(ctx)?)?;
+        let thread =
+            self.api
+                .available_owner_thread(ctx.principal, thread_param(ctx)?, Utc::now())?;
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
@@ -388,7 +405,7 @@ impl Handler for AgentThreadRunCreateHandler {
         let thread = self.api.owner_thread(ctx.principal, thread_id)?;
         let now = Utc::now();
         let workspace_expires_at = parse_stored_timestamp(&thread.expires_at)?;
-        if thread.state != AgentThreadState::Ready || workspace_expires_at <= now {
+        if !workspace_is_available_at(&thread, workspace_expires_at, now) {
             return Err(EdgeError::Conflict(
                 "agent thread workspace is not available for a new run".into(),
             ));
@@ -617,6 +634,25 @@ fn thread_ref(tenant: &str, thread_id: &str) -> String {
     format!("myelin://{tenant}/agent/thread/{thread_id}")
 }
 
+fn workspace_is_available(
+    thread: &DurableAgentThread,
+    observed_at: DateTime<Utc>,
+) -> Result<bool, EdgeError> {
+    Ok(workspace_is_available_at(
+        thread,
+        parse_stored_timestamp(&thread.expires_at)?,
+        observed_at,
+    ))
+}
+
+fn workspace_is_available_at(
+    thread: &DurableAgentThread,
+    expires_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+) -> bool {
+    thread.state == AgentThreadState::Ready && expires_at > observed_at
+}
+
 fn parse_create_body(body: &[u8]) -> Result<CreateAgentThreadBody, EdgeError> {
     parse_interactive_body(body, "agent thread")
 }
@@ -811,5 +847,30 @@ mod tests {
         let rendered = thread_json("acme", &thread);
         assert!(!rendered.to_string().contains("internal"));
         assert_eq!(rendered["workspace"]["state"], "ready");
+    }
+
+    #[test]
+    fn message_authority_ends_at_the_workspace_deadline_even_before_reconciliation() {
+        let thread = DurableAgentThread {
+            thread_id: "11111111-1111-4111-8111-111111111111".into(),
+            owner_principal_id: "p:alice".into(),
+            agent_id: "22222222-2222-4222-8222-222222222222".into(),
+            conversation_id: "01J00000000000000000000000".into(),
+            workspace_id: "33333333-3333-4333-8333-333333333333".into(),
+            workspace_generation: 1,
+            name: "Investigate checkout race".into(),
+            project_id: None,
+            retention_days: 3,
+            state: AgentThreadState::Ready,
+            storage_locator: Some("workspace:v1:internal".into()),
+            failure_reason: None,
+            created_at: "2026-08-22T00:00:00Z".into(),
+            expires_at: "2026-08-25T00:00:00Z".into(),
+            updated_at: "2026-08-22T00:00:01Z".into(),
+        };
+        let before = parse_stored_timestamp("2026-08-24T23:59:59Z").unwrap();
+        let deadline = parse_stored_timestamp(&thread.expires_at).unwrap();
+        assert!(workspace_is_available(&thread, before).unwrap());
+        assert!(!workspace_is_available(&thread, deadline).unwrap());
     }
 }

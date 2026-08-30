@@ -74,6 +74,17 @@ export interface WorkspaceSessionPage {
   page: { next_cursor: string | null; limit: number };
 }
 
+export function agentThreadWorkspaceAvailable(
+  thread: AgentThread,
+  observedAt = Date.now(),
+): boolean {
+  return thread.workspace.state === "ready" && Date.parse(thread.workspace.expires_at) > observedAt;
+}
+
+export function externalAgentCanConnect(agent: AgentChoice | undefined): boolean {
+  return agent?.runtime_ref === "external:mcp" && agent.status === "active";
+}
+
 function record(value: unknown): WireRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as WireRecord
@@ -145,6 +156,11 @@ function agentChoice(value: unknown): AgentChoice | null {
     selected_tools: selectedTools,
     effective_tools: effectiveTools,
   } as AgentChoice;
+}
+
+export function parseAgentChoice(value: unknown): AgentChoice | null {
+  const envelope = record(value);
+  return envelope && exact(envelope, ["agent"]) ? agentChoice(envelope.agent) : null;
 }
 
 function page(

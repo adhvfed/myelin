@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::dispatch::{is_canonical_agent_id, EdgeCall};
@@ -130,7 +131,7 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
     let mut output = format!(
         "{prefix}: {summary}\n  agent: {agent}\n  conversation: {conversation}\n  workspace: {state}; retained until {expires_at}\n"
     );
-    if state == "ready" {
+    if workspace_is_available(&state, &expires_at, Utc::now()) {
         let _ = writeln!(
             output,
             "  message: myelin agent thread say {id} \"<message>\""
@@ -138,6 +139,11 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
         let _ = writeln!(output, "  workspace: myelin agent thread ssh {id}");
     }
     Some(output)
+}
+
+fn workspace_is_available(state: &str, expires_at: &str, observed_at: DateTime<Utc>) -> bool {
+    state == "ready"
+        && DateTime::parse_from_rfc3339(expires_at).is_ok_and(|deadline| deadline > observed_at)
 }
 
 fn render_thread(value: &Value) -> Option<String> {
@@ -232,7 +238,7 @@ mod tests {
                 "generation": 1,
                 "state": "ready",
                 "retention_days": 3,
-                "expires_at": "2026-08-25T12:00:00Z",
+                "expires_at": "2099-08-25T12:00:00Z",
             },
             "created_at": "2026-08-22T12:00:00Z",
             "updated_at": "2026-08-22T12:00:00Z",
@@ -322,7 +328,7 @@ mod tests {
         }))
         .unwrap();
         assert!(rendered.starts_with("Started private agent thread: Checkout\\nrace"));
-        assert!(rendered.contains("workspace: ready; retained until 2026-08-25T12:00:00Z"));
+        assert!(rendered.contains("workspace: ready; retained until 2099-08-25T12:00:00Z"));
         assert!(rendered.contains(&format!("myelin agent thread say {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID}")));
         assert!(!rendered.contains("storage_locator"));
@@ -331,6 +337,12 @@ mod tests {
         expiring["workspace"]["state"] = json!("expiring");
         let rendered = render_response(&json!({ "thread": expiring })).unwrap();
         assert!(rendered.starts_with("Private agent thread:"));
+        assert!(!rendered.contains("myelin agent thread ssh"));
+
+        let mut elapsed = thread();
+        elapsed["workspace"]["expires_at"] = json!("2020-08-25T12:00:00Z");
+        let rendered = render_response(&json!({ "thread": elapsed })).unwrap();
+        assert!(!rendered.contains("myelin agent thread say"));
         assert!(!rendered.contains("myelin agent thread ssh"));
     }
 

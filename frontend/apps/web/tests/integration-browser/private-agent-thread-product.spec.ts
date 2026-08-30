@@ -5,6 +5,7 @@ import { expect, test } from "@playwright/test";
 import {
   browserApprovedSession,
   integrationEdgeUrl,
+  postProductJson,
   type JsonObject,
 } from "./product-api";
 import { signIn, waitForAppHydration } from "./session";
@@ -46,7 +47,7 @@ test("an engineer authorizes bounded commands and keeps a named problem with one
   await expect(workspace.getByText("Generation 1", { exact: true })).toBeVisible();
   await expect(workspace.getByText("No workspace entries yet.")).toBeVisible();
   await expect(workspace.getByTestId("agent-command-scope"))
-    .toContainText("Bounded commands enabled");
+    .toContainText("Bounded commands authorized");
   await expect(workspace.getByTestId("agent-connect-command"))
     .toContainText(`myelin mcp serve --as ${agentId}`);
   const sshCommand = workspace.getByTestId("agent-workspace-command");
@@ -54,6 +55,31 @@ test("an engineer authorizes bounded commands and keeps a named problem with one
   await expect(sshCommand).toContainText(new URL(page.url()).searchParams.get("thread")!);
   await page.keyboard.press("Escape");
   await expect(workspace).toBeHidden();
+
+  await postProductJson(
+    request,
+    `/v1/agents/${encodeURIComponent(agentId)}/suspend`,
+    {},
+    { token: sessionToken, scheme: "session", status: 200 },
+  );
+  try {
+    await page.reload();
+    await waitForAppHydration(page);
+    await page.getByRole("button", { name: "Agent workspace" }).click();
+    await expect(workspace.getByTestId("agent-connect-unavailable"))
+      .toContainText(`${agentName} is suspended`);
+    await expect(workspace.getByTestId("agent-connect-command")).toHaveCount(0);
+    await expect(workspace.getByTestId("agent-workspace-command"))
+      .toContainText("myelin agent thread ssh");
+    await page.keyboard.press("Escape");
+  } finally {
+    await postProductJson(
+      request,
+      `/v1/agents/${encodeURIComponent(agentId)}/resume`,
+      {},
+      { token: sessionToken, scheme: "session", status: 200 },
+    );
+  }
 
   await page.getByLabel(`Message ${threadName}`).fill(problem);
   await page.getByRole("button", { name: "Send privately" }).click();
