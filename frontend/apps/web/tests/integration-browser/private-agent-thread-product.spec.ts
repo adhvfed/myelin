@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
@@ -9,6 +9,18 @@ import {
   type JsonObject,
 } from "./product-api";
 import { signIn, waitForAppHydration } from "./session";
+
+function ephemeralEd25519PublicKey(): string {
+  const algorithm = Buffer.from("ssh-ed25519");
+  const key = randomBytes(32);
+  const length = (value: Buffer) => {
+    const encoded = Buffer.alloc(4);
+    encoded.writeUInt32BE(value.length);
+    return encoded;
+  };
+  const blob = Buffer.concat([length(algorithm), algorithm, length(key), key]);
+  return `ssh-ed25519 ${blob.toString("base64")}`;
+}
 
 test("an engineer authorizes bounded commands and keeps a named problem with one agent", async ({
   page,
@@ -71,8 +83,17 @@ test("an engineer authorizes bounded commands and keeps a named problem with one
     await expect(workspace.getByTestId("agent-connect-unavailable"))
       .toContainText(`${agentName} is suspended`);
     await expect(workspace.getByTestId("agent-connect-command")).toHaveCount(0);
-    await expect(workspace.getByTestId("agent-workspace-command"))
-      .toContainText("myelin agent thread ssh");
+    await expect(workspace.getByTestId("agent-workspace-command")).toHaveCount(0);
+    await expect(workspace.getByTestId("workspace-ssh-unavailable"))
+      .toContainText("until the selected agent identity is active");
+    await postProductJson(
+      request,
+      `/v1/agent-threads/${encodeURIComponent(
+        new URL(page.url()).searchParams.get("thread")!,
+      )}/ssh-access`,
+      { public_key: ephemeralEd25519PublicKey() },
+      { token: sessionToken, scheme: "session", status: 409 },
+    );
     await page.keyboard.press("Escape");
   } finally {
     await postProductJson(

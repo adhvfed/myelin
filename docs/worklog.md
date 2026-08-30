@@ -4371,15 +4371,15 @@ deadline; the browser kept advertising an external MCP command after the agent w
 The Edge message handlers now use the same state-and-deadline predicate as run issuance, while the
 reconciler remains responsible for durable archival and cleanup. The CLI suppresses message and SSH
 commands at the exact deadline. The browser observes the deadline while open, disables its composer,
-replaces stale workspace commands with an honest retained-receipt explanation, and distinguishes
-agent availability from owner SSH authority: suspending an agent hides its MCP command without
-taking the still-live workspace away from its owner.
+replaces stale workspace commands with an honest retained-receipt explanation, and tracks the
+selected agent's live status. Suspending an agent leaves owner messages available but hides both
+new-run and SSH commands, matching the durable admission rules.
 
 Proof includes the exact-boundary Edge, CLI, and TypeScript tests; the complete live TypeScript
 private-thread lifecycle against Edge, PostgreSQL, OpenSSH, the workspace gateway, and durable
 workspace files; and the real browser journey, which suspends the selected agent through Edge,
-reloads its durable status, observes that MCP is unavailable while owner SSH remains available, and
-resumes the identity before continuing the named thread.
+reloads its durable status, observes that MCP and a real SSH grant request are both unavailable,
+and resumes the identity before continuing the named thread.
 
 ## 2026-08-30 — The advertised MCP command now resumes the named workspace
 

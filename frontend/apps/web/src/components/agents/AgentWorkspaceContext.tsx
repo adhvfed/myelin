@@ -75,8 +75,14 @@ export function AgentWorkspaceContext(props: {
         </section>
         <section>
           <h3>Enter with SSH</h3>
-          <p>Run this from an authenticated Myelin CLI. It creates a one-shot key and pins the workspace host.</p>
-          <code class="agent-workspace-command" data-testid="agent-workspace-command">{command()}</code>
+          <Show when={externalAgentCanConnect(props.agent)} fallback={
+            <p data-testid="workspace-ssh-unavailable">
+              SSH access is unavailable until the selected agent identity is active.
+            </p>
+          }>
+            <p>Run this from an authenticated Myelin CLI. It creates a one-shot key and pins the workspace host.</p>
+            <code class="agent-workspace-command" data-testid="agent-workspace-command">{command()}</code>
+          </Show>
         </section>
       </Show>
       <section>
