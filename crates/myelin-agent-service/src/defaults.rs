@@ -8,6 +8,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "merge") => true,
         ("git", "comment") => false,
         ("git", "reply") => false,
+        ("git", "resolve_thread") => false,
         ("git", "open_pr") => false,
         ("git", "write_file") => false,
         ("git", "submit_review") => false,
@@ -210,6 +211,10 @@ mod tests {
         assert!(
             !requires_approval_default("git", "reply"),
             "git.reply is an ordinary review action → NOT gated"
+        );
+        assert!(
+            !requires_approval_default("git", "resolve_thread"),
+            "git.resolve_thread is reversible → NOT gated"
         );
         for read in ["list_repositories", "read_file", "search_code"] {
             assert!(

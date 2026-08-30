@@ -78,6 +78,13 @@ pub(super) fn effect_event_type(
             denied: myelin_git::events::GIT_REPLY_DENIED,
             indeterminate: myelin_git::events::GIT_REPLY_INDETERMINATE,
         },
+        "git.resolve_thread" => EffectAuditEvents {
+            attempted: myelin_git::events::GIT_RESOLVE_THREAD_ATTEMPTED,
+            applied: myelin_git::events::GIT_RESOLVE_THREAD_APPLIED,
+            gated: myelin_git::events::GIT_RESOLVE_THREAD_GATED,
+            denied: myelin_git::events::GIT_RESOLVE_THREAD_DENIED,
+            indeterminate: myelin_git::events::GIT_RESOLVE_THREAD_INDETERMINATE,
+        },
         "git.endorse_fork_ci" => EffectAuditEvents {
             attempted: myelin_git::events::GIT_ENDORSE_FORK_CI_ATTEMPTED,
             applied: myelin_git::events::GIT_ENDORSE_FORK_CI_APPLIED,

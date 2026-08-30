@@ -112,6 +112,11 @@ pub const GIT_REPLY_APPLIED: &str = "git.reply.applied";
 pub const GIT_REPLY_GATED: &str = "git.reply.gated";
 pub const GIT_REPLY_DENIED: &str = "git.reply.denied";
 pub const GIT_REPLY_INDETERMINATE: &str = "git.reply.indeterminate";
+pub const GIT_RESOLVE_THREAD_ATTEMPTED: &str = "git.resolve_thread.attempted";
+pub const GIT_RESOLVE_THREAD_APPLIED: &str = "git.resolve_thread.applied";
+pub const GIT_RESOLVE_THREAD_GATED: &str = "git.resolve_thread.gated";
+pub const GIT_RESOLVE_THREAD_DENIED: &str = "git.resolve_thread.denied";
+pub const GIT_RESOLVE_THREAD_INDETERMINATE: &str = "git.resolve_thread.indeterminate";
 pub const GIT_ENDORSE_FORK_CI_ATTEMPTED: &str = "git.endorse_fork_ci.attempted";
 pub const GIT_ENDORSE_FORK_CI_APPLIED: &str = "git.endorse_fork_ci.applied";
 pub const GIT_ENDORSE_FORK_CI_GATED: &str = "git.endorse_fork_ci.gated";
@@ -152,6 +157,11 @@ pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     GIT_REPLY_GATED,
     GIT_REPLY_DENIED,
     GIT_REPLY_INDETERMINATE,
+    GIT_RESOLVE_THREAD_ATTEMPTED,
+    GIT_RESOLVE_THREAD_APPLIED,
+    GIT_RESOLVE_THREAD_GATED,
+    GIT_RESOLVE_THREAD_DENIED,
+    GIT_RESOLVE_THREAD_INDETERMINATE,
     GIT_ENDORSE_FORK_CI_ATTEMPTED,
     GIT_ENDORSE_FORK_CI_APPLIED,
     GIT_ENDORSE_FORK_CI_GATED,
@@ -233,6 +243,11 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_REPLY_GATED,
     GIT_REPLY_DENIED,
     GIT_REPLY_INDETERMINATE,
+    GIT_RESOLVE_THREAD_ATTEMPTED,
+    GIT_RESOLVE_THREAD_APPLIED,
+    GIT_RESOLVE_THREAD_GATED,
+    GIT_RESOLVE_THREAD_DENIED,
+    GIT_RESOLVE_THREAD_INDETERMINATE,
     GIT_ENDORSE_FORK_CI_ATTEMPTED,
     GIT_ENDORSE_FORK_CI_APPLIED,
     GIT_ENDORSE_FORK_CI_GATED,

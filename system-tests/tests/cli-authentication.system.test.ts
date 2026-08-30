@@ -351,6 +351,7 @@ describe.sequential("the CLI authentication journey", () => {
         "git.list_repositories",
         "git.read_file",
         "git.reply",
+        "git.resolve_thread",
         "git.search_code",
         "git.merge",
         "ci.read_run",
@@ -401,6 +402,8 @@ describe.sequential("the CLI authentication journey", () => {
       "--tool",
       "git.reply",
       "--tool",
+      "git.resolve_thread",
+      "--tool",
       "git.search_code",
       "--tool",
       "issues.close",
@@ -448,6 +451,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "git.open_pr", version: 1 },
           { name: "git.read_file", version: 1 },
           { name: "git.reply", version: 1 },
+          { name: "git.resolve_thread", version: 1 },
           { name: "git.search_code", version: 1 },
           { name: "git.write_file", version: 1 },
           { name: "issues.close", version: 1 },
@@ -494,6 +498,7 @@ describe.sequential("the CLI authentication journey", () => {
         "git.list_repositories",
         "git.read_file",
         "git.reply",
+        "git.resolve_thread",
         "git.search_code",
         "issues.close",
         "issues.create",
@@ -539,6 +544,8 @@ describe.sequential("the CLI authentication journey", () => {
       "git.read_file",
       "--tool",
       "git.reply",
+      "--tool",
+      "git.resolve_thread",
       "--tool",
       "git.search_code",
       "--tool",
@@ -816,6 +823,7 @@ describe.sequential("the CLI authentication journey", () => {
           { name: "git.open_pr", version: 1 },
           { name: "git.read_file", version: 1 },
           { name: "git.reply", version: 1 },
+          { name: "git.resolve_thread", version: 1 },
           { name: "git.search_code", version: 1 },
           { name: "git.write_file", version: 1 },
           { name: "issues.close", version: 1 },
@@ -912,6 +920,7 @@ describe.sequential("the CLI authentication journey", () => {
       "git.open_pr",
       "git.read_file",
       "git.reply",
+      "git.resolve_thread",
       "git.search_code",
       "git.write_file",
       "issues.close",
@@ -969,6 +978,11 @@ describe.sequential("the CLI authentication journey", () => {
     expect(schemaFor("git.reply")).toMatchObject({
       type: "object",
       required: ["repo", "number", "thread_id", "body_md"],
+      additionalProperties: false,
+    });
+    expect(schemaFor("git.resolve_thread")).toMatchObject({
+      type: "object",
+      required: ["repo", "number", "thread_id"],
       additionalProperties: false,
     });
     expect(schemaFor("git.read_file")).toMatchObject({
@@ -1145,6 +1159,7 @@ describe.sequential("the CLI authentication journey", () => {
       "git.open_pr",
       "git.read_file",
       "git.reply",
+      "git.resolve_thread",
       "git.search_code",
       "git.write_file",
       "issues.close",
@@ -2137,6 +2152,58 @@ describe.sequential("the CLI authentication journey", () => {
           body_md: agentReviewReply,
           author: expect.objectContaining({ kind: "agent" }),
         }),
+      ],
+    });
+
+    // Resolution is a separate reversible command. The agent can close the answered discussion,
+    // and replay cannot toggle or duplicate any part of the conversation.
+    const agentResolveKey = `agent-pr-resolve-${randomUUID()}`;
+    const resolvedByAgent = await askAgentToAct(
+      resumedRun,
+      33,
+      "git.resolve_thread",
+      {
+        repo: sourceRepository.slug,
+        number: agentPullRequestNumber,
+        thread_id: humanThreadId,
+        resolved: true,
+      },
+      agentResolveKey,
+    );
+    const replayedAgentResolution = await askAgentToAct(
+      resumedRun,
+      34,
+      "git.resolve_thread",
+      {
+        repo: sourceRepository.slug,
+        number: agentPullRequestNumber,
+        thread_id: humanThreadId,
+        resolved: true,
+      },
+      agentResolveKey,
+    );
+    expect(replayedAgentResolution).toEqual(resolvedByAgent);
+    expect(resolvedByAgent.data).toMatchObject({
+      thread_id: humanThreadId,
+      resolved: true,
+      result: { thread_id: humanThreadId, resolved: true },
+    });
+    expect(resolvedByAgent.ref).toBe(
+      `myelin://${systemTestConfig.tenant}/git/pr/${sourceRepository.slug}:${agentPullRequestNumber}#thread-${humanThreadId}`,
+    );
+
+    const resolvedReviewThreads = await systemClient.json(
+      `${sourceRepository.path}/prs/${agentPullRequestNumber}/threads`,
+    );
+    const resolvedDiscussion = array(resolvedReviewThreads.body.discussion, "resolved discussions")
+      .map((thread, index) => record(thread, `resolved discussion ${index}`))
+      .find((thread) => thread.id === humanThreadId);
+    expect(resolvedDiscussion).toMatchObject({
+      id: humanThreadId,
+      resolved: true,
+      comments: [
+        expect.objectContaining({ body_md: humanQuestion }),
+        expect.objectContaining({ id: replyCommentId, body_md: agentReviewReply }),
       ],
     });
   }, 120_000);

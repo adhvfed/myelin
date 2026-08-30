@@ -192,7 +192,6 @@ mod tests {
             "git.history_rewrite",
             "git.scip_index",
             "git.suggest_change",
-            "git.resolve_thread",
         ] {
             assert!(
                 catalogue.resolve(unavailable).is_none(),
@@ -239,6 +238,7 @@ mod tests {
             "git.search_code",
             "git.comment",
             "git.reply",
+            "git.resolve_thread",
             "git.merge",
             "git.open_pr",
             "git.write_file",

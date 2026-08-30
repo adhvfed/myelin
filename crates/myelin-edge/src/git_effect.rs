@@ -208,6 +208,50 @@ impl GitEffectApi {
                     Err(error) => deny_durable_error(error),
                 }
             }
+            "git.resolve_thread" => {
+                let (repo, number) = match repo_and_number(args) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+                let thread_id = match str_arg(args, "thread_id") {
+                    Some(value) => value,
+                    None => return deny_missing("thread_id"),
+                };
+                if let Err(denied) = self.authorize_delegated_pr_review(repo, number) {
+                    return denied;
+                }
+                let resolved = args
+                    .get("resolved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                match self.backend.resolve_thread(
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
+                    thread_id,
+                    operation_id.digest(),
+                    &serde_json::json!({ "resolved": resolved }),
+                ) {
+                    Ok(result) => {
+                        let reference =
+                            match myelin_git::subs::mint_pr_thread(t, repo, number, thread_id) {
+                                Ok(reference) => myelin_refs::format(&reference),
+                                Err(_) => return EffectResult::Denied("internal error".into()),
+                            };
+                        applied_resource(
+                            run,
+                            &format!("git.pr.thread.resolve:#{number}:{thread_id}:{resolved}"),
+                            reference,
+                            serde_json::json!({
+                                "repo": repo,
+                                "number": number,
+                                "thread_id": thread_id,
+                                "resolved": resolved,
+                                "result": result,
+                            }),
+                        )
+                    }
+                    Err(error) => deny_durable_error(error),
+                }
+            }
             "git.write_file" => {
                 let required = |name| {
                     str_arg(args, name).ok_or_else(|| {
