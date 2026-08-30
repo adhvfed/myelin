@@ -11,9 +11,9 @@ pub use expiry::{
     AGENT_THREAD_EXPIRY_GRACE_SECONDS,
 };
 pub use model::{
-    ActivateAgentThreadOutcome, AgentThreadState, CreateAgentThreadOutcome, DurableAgentThread,
-    NewAgentThread, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
-    MIN_AGENT_THREAD_RETENTION_DAYS,
+    ActivateAgentThreadOutcome, AgentThreadProvisioningFailure, AgentThreadState,
+    CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread, MAX_AGENT_THREAD_NAME_BYTES,
+    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
@@ -85,11 +85,38 @@ impl DurableAgentThreadBacking {
                     )
                     .await?
                     {
-                        return Ok(if same_intent(&existing, &proposal) {
-                            CreateAgentThreadOutcome::Replayed(existing)
-                        } else {
-                            CreateAgentThreadOutcome::Conflict
-                        });
+                        if !same_intent(&existing, &proposal) {
+                            return Ok(CreateAgentThreadOutcome::Conflict);
+                        }
+                        if existing.state != AgentThreadState::Failed {
+                            return Ok(CreateAgentThreadOutcome::Replayed(existing));
+                        }
+                        let restarted = sqlx::query(
+                            "UPDATE agent_thread
+                                SET state = 'provisioning', failure_reason = NULL,
+                                    updated_at = CURRENT_TIMESTAMP
+                              WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                                AND owner_principal_id = $4 AND state = 'failed'
+                            RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
+                              conversation_id, workspace_id, workspace_generation, name, project_id,
+                              retention_days, state, storage_locator, failure_reason, created_at,
+                              expires_at, updated_at",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(Uuid::parse_str(&existing.thread_id).map_err(|_| {
+                            PgError::Query("stored agent thread id is invalid".into())
+                        })?)
+                        .bind(&proposal.owner_principal_id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(query_error("restart failed agent thread provisioning"))?;
+                        let restarted = restarted
+                            .as_ref()
+                            .map(row_to_thread)
+                            .transpose()?
+                            .unwrap_or(existing);
+                        return Ok(CreateAgentThreadOutcome::Replayed(restarted));
                     }
 
                     let owner = sqlx::query_as::<_, (String, String)>(
@@ -270,6 +297,42 @@ impl DurableAgentThreadBacking {
                         .ok_or_else(|| {
                             PgError::Query("agent thread activation lost its locked row".into())
                         })
+                })
+            })
+            .await
+    }
+
+    pub async fn record_provisioning_failure(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        thread_id: Uuid,
+        failure: AgentThreadProvisioningFailure,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let changed = sqlx::query(
+                        "UPDATE agent_thread
+                            SET state = 'failed', failure_reason = $5, updated_at = $6
+                          WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                            AND owner_principal_id = $4 AND state = 'provisioning'",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(thread_id)
+                    .bind(&owner)
+                    .bind(failure.token())
+                    .bind(observed_at)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(query_error("record agent thread provisioning failure"))?
+                    .rows_affected();
+                    Ok(changed == 1)
                 })
             })
             .await
@@ -521,7 +584,8 @@ async fn by_nonce(
            retention_days, state, storage_locator, failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
-        WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3 AND client_nonce = $4",
+        WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3 AND client_nonce = $4
+        FOR UPDATE",
     )
     .bind(tenant)
     .bind(region)

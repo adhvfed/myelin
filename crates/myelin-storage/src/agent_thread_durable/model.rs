@@ -14,6 +14,23 @@ pub enum AgentThreadState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentThreadProvisioningFailure {
+    ChatUnavailable,
+    WorkspaceUnavailable,
+    ActivationUnavailable,
+}
+
+impl AgentThreadProvisioningFailure {
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::ChatUnavailable => "chat_provisioning_failed",
+            Self::WorkspaceUnavailable => "workspace_provisioning_failed",
+            Self::ActivationUnavailable => "activation_failed",
+        }
+    }
+}
+
 impl AgentThreadState {
     pub fn token(self) -> &'static str {
         match self {

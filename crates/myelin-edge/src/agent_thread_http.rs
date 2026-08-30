@@ -9,10 +9,10 @@ use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::{Principal, PrincipalId};
 use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
-    ActivateAgentThreadOutcome, AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome,
-    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking,
-    ListAgentThreadsOutcome, NewAgentThread, WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES,
-    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    ActivateAgentThreadOutcome, AgentThreadProvisioningFailure, AgentThreadRunBinding,
+    AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
+    DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread, WorkspaceSshRouteKey,
+    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -97,11 +97,17 @@ impl AgentThreadHttpApi {
                 ))
             }
         };
-        if !created && thread.state != AgentThreadState::Provisioning {
+        if !created && parse_stored_timestamp(&thread.expires_at)? <= Utc::now() {
             return Ok((thread, false));
         }
         if thread.state == AgentThreadState::Ready {
+            let (conversation, zookie) = self.create_private_conversation(principal, &thread)?;
+            self.chat_mutations
+                .activate_private_conversation(&conversation, &zookie)?;
             return Ok((thread, created));
+        }
+        if !created && thread.state != AgentThreadState::Provisioning {
+            return Ok((thread, false));
         }
         if thread.state != AgentThreadState::Provisioning {
             return Err(EdgeError::Conflict(
@@ -109,34 +115,85 @@ impl AgentThreadHttpApi {
             ));
         }
 
-        self.create_private_conversation(principal, &thread)?;
+        let (conversation, zookie) = match self.create_private_conversation(principal, &thread) {
+            Ok(conversation) => conversation,
+            Err(error) => {
+                self.record_provisioning_failure(
+                    principal,
+                    &thread,
+                    AgentThreadProvisioningFailure::ChatUnavailable,
+                )?;
+                return Err(error);
+            }
+        };
         let workspace_id = parse_uuid("stored workspace id", &thread.workspace_id)
             .map_err(|_| EdgeError::Internal("stored agent workspace id is invalid".into()))?;
-        let provisioned = self
-            .workspaces
-            .provision(&principal.tenant.0, workspace_id)
-            .map_err(|_| EdgeError::Unavailable("agent workspace provisioning failed".into()))?;
-        let activated = self
-            .drive(
-                self.threads.activate(
-                    &principal.tenant.0,
-                    &principal.principal_id.0,
-                    parse_uuid("stored thread id", &thread.thread_id).map_err(|_| {
-                        EdgeError::Internal("stored agent thread id is invalid".into())
-                    })?,
-                    workspace_id,
-                    &thread.conversation_id,
-                    &provisioned.locator,
-                ),
-            )?
-            .map_err(|_| EdgeError::Internal("agent thread activation failed".into()))?;
-        match activated {
-            ActivateAgentThreadOutcome::Activated(ready)
-            | ActivateAgentThreadOutcome::AlreadyReady(ready) => Ok((ready, created)),
-            ActivateAgentThreadOutcome::NotFound | ActivateAgentThreadOutcome::Conflict => Err(
-                EdgeError::Conflict("agent thread provisioning receipt changed".into()),
+        let provisioned = match self.workspaces.provision(&principal.tenant.0, workspace_id) {
+            Ok(provisioned) => provisioned,
+            Err(_) => {
+                self.record_provisioning_failure(
+                    principal,
+                    &thread,
+                    AgentThreadProvisioningFailure::WorkspaceUnavailable,
+                )?;
+                return Err(EdgeError::Unavailable(
+                    "agent workspace provisioning failed".into(),
+                ));
+            }
+        };
+        let activation = self.drive(
+            self.threads.activate(
+                &principal.tenant.0,
+                &principal.principal_id.0,
+                parse_uuid("stored thread id", &thread.thread_id)
+                    .map_err(|_| EdgeError::Internal("stored agent thread id is invalid".into()))?,
+                workspace_id,
+                &thread.conversation_id,
+                &provisioned.locator,
             ),
-        }
+        )?;
+        let activated = match activation {
+            Ok(activated) => activated,
+            Err(_) => {
+                self.record_provisioning_failure(
+                    principal,
+                    &thread,
+                    AgentThreadProvisioningFailure::ActivationUnavailable,
+                )?;
+                return Err(EdgeError::Internal("agent thread activation failed".into()));
+            }
+        };
+        let ready = match activated {
+            ActivateAgentThreadOutcome::Activated(ready)
+            | ActivateAgentThreadOutcome::AlreadyReady(ready) => ready,
+            ActivateAgentThreadOutcome::NotFound | ActivateAgentThreadOutcome::Conflict => {
+                return Err(EdgeError::Conflict(
+                    "agent thread provisioning receipt changed".into(),
+                ))
+            }
+        };
+        self.chat_mutations
+            .activate_private_conversation(&conversation, &zookie)?;
+        Ok((ready, created))
+    }
+
+    fn record_provisioning_failure(
+        &self,
+        principal: &Principal,
+        thread: &DurableAgentThread,
+        failure: AgentThreadProvisioningFailure,
+    ) -> Result<(), EdgeError> {
+        let thread_id = parse_uuid("stored thread id", &thread.thread_id)
+            .map_err(|_| EdgeError::Internal("stored agent thread id is invalid".into()))?;
+        self.drive(self.threads.record_provisioning_failure(
+            &principal.tenant.0,
+            &principal.principal_id.0,
+            thread_id,
+            failure,
+            Utc::now(),
+        ))?
+        .map_err(|_| EdgeError::Internal("agent thread failure could not be recorded".into()))?;
+        Ok(())
     }
 
     fn owner_thread(
@@ -170,7 +227,7 @@ impl AgentThreadHttpApi {
         &self,
         principal: &Principal,
         thread: &DurableAgentThread,
-    ) -> Result<(), EdgeError> {
+    ) -> Result<(ConversationId, String), EdgeError> {
         let conversation_id = ConversationId::new(
             principal.tenant.0.clone(),
             principal.region.0.clone(),
@@ -191,7 +248,7 @@ impl AgentThreadHttpApi {
             created_by: event_principal.principal_id.0.clone(),
             acl_zookie: None,
         };
-        self.chat_mutations.create_private_conversation(
+        let (conversation, _, zookie) = self.chat_mutations.create_private_conversation(
             principal,
             PrivateConversationCreation {
                 conversation,
@@ -204,9 +261,10 @@ impl AgentThreadHttpApi {
                 event_id: EventId(self.event_ids.mint().0),
                 actor: Actor(event_principal),
                 now: Timestamp(thread.created_at.clone()),
+                defer_visibility: true,
             },
         )?;
-        Ok(())
+        Ok((conversation.id, zookie))
     }
 }
 
@@ -827,7 +885,7 @@ mod tests {
 
     #[test]
     fn thread_json_never_projects_the_internal_storage_locator() {
-        let thread = DurableAgentThread {
+        let mut thread = DurableAgentThread {
             thread_id: "11111111-1111-4111-8111-111111111111".into(),
             owner_principal_id: "p:alice".into(),
             agent_id: "22222222-2222-4222-8222-222222222222".into(),
@@ -847,6 +905,13 @@ mod tests {
         let rendered = thread_json("acme", &thread);
         assert!(!rendered.to_string().contains("internal"));
         assert_eq!(rendered["workspace"]["state"], "ready");
+
+        thread.state = AgentThreadState::Failed;
+        thread.storage_locator = None;
+        thread.failure_reason = Some("workspace_provisioning_failed".into());
+        let failed = thread_json("acme", &thread);
+        assert_eq!(failed["workspace"]["state"], "failed");
+        assert!(!failed.to_string().contains("provisioning_failed"));
     }
 
     #[test]

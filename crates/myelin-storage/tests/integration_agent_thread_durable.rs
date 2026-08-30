@@ -6,10 +6,10 @@ use myelin_events::IdMinter;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
     all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadExpiryCompletion,
-    AgentThreadExpiryFailure, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
-    CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables, ListAgentThreadsOutcome,
-    ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant, NewWorkspaceSshSession,
-    SealKey, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
+    AgentThreadExpiryFailure, AgentThreadProvisioningFailure, BindAgentThreadRunOutcome,
+    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
+    ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant,
+    NewWorkspaceSshSession, SealKey, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
     AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
 };
 use sqlx::types::Uuid;
@@ -266,6 +266,42 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     assert_eq!(created.expires_at, "2026-08-25T00:00:00Z");
     assert!(created.storage_locator.is_none());
 
+    assert!(threads
+        .record_provisioning_failure(
+            &tenant,
+            owner,
+            intended.thread_id,
+            AgentThreadProvisioningFailure::WorkspaceUnavailable,
+            intended.created_at + Duration::minutes(1),
+        )
+        .await
+        .unwrap());
+    let failed = threads
+        .get_for_owner(&tenant, owner, intended.thread_id)
+        .await
+        .unwrap()
+        .expect("the failed provisioning receipt remains owner-visible");
+    assert_eq!(failed.state, myelin_storage::AgentThreadState::Failed);
+    assert_eq!(
+        failed.failure_reason.as_deref(),
+        Some("workspace_provisioning_failed")
+    );
+    assert_eq!(
+        threads
+            .activate(
+                &tenant,
+                owner,
+                intended.thread_id,
+                intended.workspace_id,
+                &intended.conversation_id,
+                "workspace://local/101",
+            )
+            .await
+            .unwrap(),
+        ActivateAgentThreadOutcome::Conflict,
+        "partial storage cannot become accessible while its durable receipt is failed"
+    );
+
     let replay_proposal = NewAgentThread {
         thread_id: Uuid::from_u128(102),
         conversation_id: "01J00000000000000000000102".into(),
@@ -276,7 +312,17 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     };
     set_agent_status(&app, &tenant, agent_id, PrincipalStatus::Suspended).await;
     let replay = threads.create(&tenant, replay_proposal).await.unwrap();
-    assert_eq!(replay, CreateAgentThreadOutcome::Replayed(created.clone()));
+    let CreateAgentThreadOutcome::Replayed(restarted) = replay else {
+        panic!("the unchanged mutation should reopen failed provisioning: {replay:?}");
+    };
+    assert_eq!(restarted.thread_id, created.thread_id);
+    assert_eq!(restarted.conversation_id, created.conversation_id);
+    assert_eq!(restarted.workspace_id, created.workspace_id);
+    assert_eq!(
+        restarted.state,
+        myelin_storage::AgentThreadState::Provisioning
+    );
+    assert!(restarted.failure_reason.is_none());
     set_agent_status(&app, &tenant, agent_id, PrincipalStatus::Active).await;
 
     let conflicting_retry = threads

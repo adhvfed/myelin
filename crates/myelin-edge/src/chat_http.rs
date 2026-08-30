@@ -300,6 +300,7 @@ pub struct PrivateConversationCreation {
     pub event_id: EventId,
     pub actor: Actor,
     pub now: Timestamp,
+    pub defer_visibility: bool,
 }
 
 impl DurableChatMutationApi {
@@ -364,7 +365,7 @@ impl DurableChatMutationApi {
         &self,
         principal: &Principal,
         request: PrivateConversationCreation,
-    ) -> Result<(Conversation, bool), EdgeError> {
+    ) -> Result<(Conversation, bool, String), EdgeError> {
         let PrivateConversationCreation {
             conversation,
             members,
@@ -373,6 +374,7 @@ impl DurableChatMutationApi {
             event_id,
             actor,
             now,
+            defer_visibility,
         } = request;
         if !conversation.kind.membership_is_acl() {
             return Err(EdgeError::BadRequest(
@@ -394,15 +396,25 @@ impl DurableChatMutationApi {
             .reads
             .authorization
             .bind_direct_members(principal, &persisted, &members, expires_at, now)?;
+        if !defer_visibility {
+            self.activate_private_conversation(&persisted.id, &zookie.0)?;
+            persisted.acl_zookie = Some(zookie.0.clone());
+        }
+        Ok((persisted, created, zookie.0))
+    }
+
+    pub fn activate_private_conversation(
+        &self,
+        conversation: &ConversationId,
+        acl_zookie: &str,
+    ) -> Result<(), EdgeError> {
         self.drive(async {
             self.reads
                 .conversations
-                .stamp_acl_zookie(&persisted.id, &zookie.0)
+                .stamp_acl_zookie(conversation, acl_zookie)
                 .await
                 .map_err(map_conversation_error)
-        })?;
-        persisted.acl_zookie = Some(zookie.0);
-        Ok((persisted, created))
+        })
     }
 
     fn persist_conversation(

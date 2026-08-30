@@ -4420,6 +4420,32 @@ both crates; the live PostgreSQL visibility story, which distinguishes unbounded
 direct memberships through the production store; and five live TypeScript Chat/private-agent
 journeys against rebuilt Edge, PostgreSQL, the event relay, and the confined workspace services.
 
+## 2026-08-30 — Failed private-work creation has a real retry path
+
+The private-thread schema declared a `failed` state and bounded reason, but no production path could
+write it. A Chat, workspace, or activation error instead left an owner-visible `provisioning` row
+forever. The original idempotency key could resume that row, but the product could neither distinguish
+an in-flight operation from an attempted failure nor prove the browser's “safe to retry” promise.
+Publishing Chat membership before workspace activation also meant a partially provisioned thread's
+conversation could become visible through canonical Chat even though aggregate workspace routes
+correctly refused it.
+
+Provisioning now records one of three fixed, non-sensitive failure codes and leaves the workspace
+inaccessible. The durable retry lookup locks the original mutation receipt; an unchanged replay of a
+failed receipt clears its reason and reopens `provisioning` on the same thread, conversation, and
+workspace identities. A different intent still conflicts. Private Chat creation now persists its
+conversation and expiring memberships with the ACL stamp withheld. Only after workspace activation
+does Edge publish that stamp. A response-lost retry of an already-ready receipt replays the same Chat
+operation and finishes the visibility stamp, rather than assuming the final seam completed.
+
+Proof includes all 351 Storage and 369 Edge library stories; strict all-target/all-feature Clippy for
+Storage, Chat, and Edge; the live PostgreSQL agent-thread lifecycle, which records failure, refuses
+activation, and resumes the exact receipt; the live PostgreSQL Chat story, which proves membership
+cannot expose the withheld conversation before its ACL stamp; and five rebuilt full-system
+Chat/private-agent journeys. An unattended boot-wide provisioning sweeper remains open: recovery is
+currently driven by replaying the saved mutation identity, while abandoned receipts remain
+inaccessible and eventually enter the existing expiry cleanup.
+
 ## known gaps (honest list, in priority order)
 
 1. **erasure-restore is closed for four drilled scopes.** the

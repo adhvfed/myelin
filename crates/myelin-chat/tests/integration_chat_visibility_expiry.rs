@@ -354,6 +354,16 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
     let expired_channel = ids.mint().0;
     let missing_channel = ids.mint().0;
     let leased_channel = ids.mint().0;
+    let withheld_channel = ids.mint().0;
+
+    let mut withheld = private_channel(
+        &tenant,
+        &region,
+        &withheld_channel,
+        "Alice's workspace still provisioning",
+        &alice.principal_id.0,
+    );
+    withheld.acl_zookie = None;
 
     for conversation in [
         private_channel(
@@ -363,6 +373,7 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
             "Alice and her agent",
             &alice.principal_id.0,
         ),
+        withheld,
         private_channel(&tenant, &region, &bob_channel, "Bob and his agent", "p:bob"),
         private_channel(
             &tenant,
@@ -395,6 +406,11 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
                 &alice.principal_id.0,
             ),
             add(format!("channel:{bob_channel}"), "member", "p:bob"),
+            add(
+                format!("channel:{withheld_channel}"),
+                "member",
+                &alice.principal_id.0,
+            ),
         ],
         None,
     )
@@ -477,6 +493,7 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
                 alice_channel.clone(),
                 missing_channel,
                 leased_channel.clone(),
+                withheld_channel.clone(),
             ],
         )
         .await
@@ -488,6 +505,30 @@ async fn private_channels_are_visible_only_through_live_direct_membership() {
             .collect::<Vec<_>>(),
         [alice_channel.as_str(), leased_channel.as_str()],
         "exact resolution deduplicates ids and applies live membership before returning metadata"
+    );
+
+    conversations
+        .stamp_acl_zookie(
+            &ConversationId::new(&tenant, &region, &withheld_channel),
+            "zk-workspace-ready",
+        )
+        .await
+        .expect("publish the conversation only after its workspace is ready");
+    let after_workspace_ready = conversations
+        .list_visible(&tenant, &region, &alice.principal_id.0, None, 100)
+        .await
+        .expect("list private conversations after workspace activation");
+    assert_eq!(
+        after_workspace_ready
+            .iter()
+            .map(|conversation| conversation.id.conversation_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            alice_channel.as_str(),
+            leased_channel.as_str(),
+            withheld_channel.as_str(),
+        ]),
+        "live membership alone cannot expose a partially provisioned private conversation"
     );
 
     sqlx::query("DELETE FROM chat_conversation WHERE tenant_id = $1")
