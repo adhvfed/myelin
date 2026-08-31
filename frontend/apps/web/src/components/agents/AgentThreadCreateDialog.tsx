@@ -41,7 +41,7 @@ export function AgentThreadCreateDialog(props: {
   const catalogue = createProjectCatalogue();
   const [name, setName] = createSignal("");
   const [agentId, setAgentId] = createSignal("");
-  const [projectId, setProjectId] = createSignal<string>();
+  const [projectId, setProjectId] = createSignal("");
   const [retentionDays, setRetentionDays] = createSignal(3);
   const [repository, setRepository] = createSignal("");
   const [baseRef, setBaseRef] = createSignal("main");
@@ -65,7 +65,7 @@ export function AgentThreadCreateDialog(props: {
     const preferred = untrack(() => props.preferredAgentId);
     const canUsePreferred = untrack(() => available().some((agent) => agent.id === preferred));
     setAgentId(canUsePreferred && preferred ? preferred : "");
-    setProjectId(undefined);
+    setProjectId("");
     setRetentionDays(3);
     setRepository("");
     setBaseRef("main");
@@ -75,11 +75,6 @@ export function AgentThreadCreateDialog(props: {
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
-  });
-  createEffect(() => {
-    if (props.open && projectId() === undefined && !catalogue.loading()) {
-      setProjectId(catalogue.projects()[0]?.id ?? "");
-    }
   });
   onCleanup(() => { openingGeneration += 1; });
 
@@ -112,7 +107,7 @@ export function AgentThreadCreateDialog(props: {
         op: "create",
         name: name(),
         agentId: agentId(),
-        projectId: projectId() ?? "",
+        projectId: projectId(),
         retentionDays: retentionDays(),
         repository: repository(),
         baseRef: baseRef(),
@@ -229,7 +224,7 @@ export function AgentThreadCreateDialog(props: {
         <label>
           Project for eventual review <span aria-hidden="true">(optional)</span>
           <select
-            value={projectId() ?? ""}
+            value={projectId()}
             disabled={submitting() || catalogue.loading()}
             onChange={(event) => { setProjectId(event.currentTarget.value); edit(); }}
           >
@@ -239,6 +234,10 @@ export function AgentThreadCreateDialog(props: {
             )}</For>
           </select>
         </label>
+        <p class="agent-thread-note">
+          New work starts personal-only. Choose a project only when you already know where a later
+          review should go.
+        </p>
         <Show when={catalogue.loading()}>
           <p class="agent-thread-note">Loading projects… You can still start personal-only work.</p>
         </Show>

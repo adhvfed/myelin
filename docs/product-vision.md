@@ -65,7 +65,9 @@ startup scripts must not become a configuration escape hatch.
 
 Exploration is private by default. A personal agent thread, its conversation, branch intent,
 environment receipt, and workspace metadata are visible only to its owner and selected agent while
-the work is a draft. Project membership alone must not reveal that the draft exists.
+the work is a draft. Project membership alone must not reveal that the draft exists. New work starts
+personal-only; a future review project is attached only through an explicit choice, never by silently
+selecting the first project the viewer can see.
 
 The owner can deliberately mark project-bound work **ready for review**. That one-way transition
 makes the durable conversation visible to the project's current collaborators and clearly records

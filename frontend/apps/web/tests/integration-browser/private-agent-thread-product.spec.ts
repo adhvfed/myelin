@@ -130,6 +130,11 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await agentChoice.selectOption({ label: renamedAgentName });
   const agentId = await agentChoice.inputValue();
   expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  const reviewProject = dialog.getByRole("combobox", { name: "Project for eventual review" });
+  await expect(reviewProject).toHaveValue("");
+  const reviewProjectId = await reviewProject.locator("option").nth(1).getAttribute("value");
+  expect(reviewProjectId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  await reviewProject.selectOption(reviewProjectId!);
   await expect(dialog.getByText("This agent carries private workspace defaults at revision 2."))
     .toBeVisible();
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");

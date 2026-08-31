@@ -4,6 +4,15 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Private threads no longer acquire an implicit review project
+
+The private-thread dialog labeled its project as optional but silently selected the first visible
+project when the catalogue loaded. The draft itself remained private, yet a later “ready” action
+could publish into a destination the owner had never chosen. New work now starts truly personal-only
+and explains that choosing a project opts into a future review destination. The Chromium product
+journey first proves the selector is empty, then deliberately chooses a real project before starting
+the thread and completing the private-to-review lifecycle.
+
 ## 2026-08-31 — Personal agents can change names without changing identity
 
 A named agent's owner can now rename it from the personal roster or the CLI without replacing its
