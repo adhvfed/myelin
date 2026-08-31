@@ -1,8 +1,9 @@
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { promisify } from "node:util";
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
@@ -10,17 +11,26 @@ import { systemTestConfig } from "../src/config.js";
 import { systemClient, uniqueName } from "../src/context.js";
 import { record, string } from "../src/json.js";
 import { finish, runCli, runCliWith, startCli, waitForCode } from "../src/myelin-cli.js";
+import {
+  generateEphemeralSshKey,
+  sftpBatchPath,
+  type EphemeralSshKey,
+} from "../src/ssh.js";
+
+const run = promisify(execFile);
 
 describe("private agent work from the CLI", () => {
   let configDirectory: string;
   let login: ChildProcessWithoutNullStreams | undefined;
+  let editorKey: EphemeralSshKey | undefined;
 
   beforeAll(async () => {
-    configDirectory = await mkdtemp(resolve(tmpdir(), "myelin-private-thread-cli-"));
+    configDirectory = await mkdtemp(resolve(tmpdir(), "myelin private thread cli-"));
   });
 
   afterAll(async () => {
     if (login && login.exitCode === null) login.kill("SIGTERM");
+    await editorKey?.remove();
     await rm(configDirectory, { recursive: true, force: true });
   });
 
@@ -249,8 +259,8 @@ describe("private agent work from the CLI", () => {
       configDirectory,
       {
         input: [
-          `put ${uploadPath} notes/from-cli-sftp.txt`,
-          `get notes/from-cli-sftp.txt ${downloadPath}`,
+          `put ${sftpBatchPath(uploadPath)} notes/from-cli-sftp.txt`,
+          `get notes/from-cli-sftp.txt ${sftpBatchPath(downloadPath)}`,
           "bye",
           "",
         ].join("\n"),
@@ -259,6 +269,79 @@ describe("private agent work from the CLI", () => {
     );
     expect(transferredWorkspace.exitCode, transferredWorkspace.stderr).toBe(0);
     expect(await readFile(downloadPath, "utf8")).toBe(editorObservation);
+
+    editorKey = await generateEphemeralSshKey();
+    const configuredEditor = await runMyelin(
+      "--json",
+      "agent",
+      "thread",
+      "ssh-config",
+      threadId,
+      "--identity",
+      editorKey.privateKeyPath,
+    );
+    expect(configuredEditor.exitCode, configuredEditor.stderr).toBe(0);
+    const editorProfile = record(JSON.parse(configuredEditor.stdout), "editor SSH profile");
+    const editorHost = string(editorProfile.host_alias, "editor SSH host alias");
+    const editorConfig = string(editorProfile.config_path, "editor SSH config path");
+    const editorKnownHosts = string(
+      editorProfile.known_hosts_path,
+      "editor known-hosts path",
+    );
+    expect(editorProfile).toMatchObject({
+      host_alias: `myelin-thread-${threadId}`,
+      expires_at: expect.stringMatching(/^20[0-9]{2}-/),
+      workspace: {
+        id: string(record(thread.workspace, "created workspace").id, "workspace id"),
+        generation: 1,
+      },
+    });
+    expect((await stat(editorConfig)).mode & 0o777).toBe(0o600);
+    expect((await stat(editorKnownHosts)).mode & 0o777).toBe(0o600);
+    const editorConfigText = await readFile(editorConfig, "utf8");
+    expect(editorConfigText).toContain(`Host ${editorHost}`);
+    expect(editorConfigText).toContain(`IdentityFile \"${editorKey.privateKeyPath}\"`);
+    expect(editorConfigText).toContain("StrictHostKeyChecking yes");
+    expect(editorConfigText).toContain("ControlMaster auto");
+    expect(editorConfigText).not.toContain(systemTestConfig.token);
+
+    const configuredEditorObservation = uniqueName("The configured editor was here");
+    const editorCommand = await run(
+      "ssh",
+      [
+        "-F",
+        editorConfig,
+        editorHost,
+        `printf %s '${configuredEditorObservation}' > notes/from-configured-editor.txt`,
+      ],
+      { timeout: 30_000, maxBuffer: 512 * 1024 },
+    );
+    expect(editorCommand.stderr).toBe("");
+
+    const profileUpload = resolve(configDirectory, "profile-upload.txt");
+    const profileDownload = resolve(configDirectory, "profile-download.txt");
+    const profileBatch = resolve(configDirectory, "profile-sftp.batch");
+    await writeFile(profileUpload, configuredEditorObservation, { mode: 0o600 });
+    await writeFile(
+      profileBatch,
+      `put ${sftpBatchPath(profileUpload)} notes/from-profile-sftp.txt\nget notes/from-profile-sftp.txt ${sftpBatchPath(profileDownload)}\n`,
+      { mode: 0o600 },
+    );
+    await run("sftp", ["-F", editorConfig, "-b", profileBatch, editorHost], {
+      timeout: 30_000,
+      maxBuffer: 512 * 1024,
+    });
+    expect(await readFile(profileDownload, "utf8")).toBe(configuredEditorObservation);
+    const editorRead = await run(
+      "ssh",
+      ["-F", editorConfig, editorHost, "cat notes/from-configured-editor.txt"],
+      { timeout: 30_000, maxBuffer: 512 * 1024 },
+    );
+    expect(editorRead.stdout).toBe(configuredEditorObservation);
+    await run("ssh", ["-F", editorConfig, "-O", "exit", editorHost], {
+      timeout: 10_000,
+      maxBuffer: 512 * 1024,
+    });
 
     for (const result of [
       activated,
@@ -272,6 +355,7 @@ describe("private agent work from the CLI", () => {
       wroteWorkspace,
       resumedWorkspace,
       transferredWorkspace,
+      configuredEditor,
     ]) {
       expect(result.stdout).not.toContain(systemTestConfig.token);
       expect(result.stderr).not.toContain(systemTestConfig.token);

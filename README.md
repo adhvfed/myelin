@@ -136,6 +136,10 @@ myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \
 myelin agent thread ssh 33333333-3333-4333-8333-333333333333
 # Or open the same confined workspace with the standard OpenSSH SFTP client.
 myelin agent thread ssh 33333333-3333-4333-8333-333333333333 --sftp
+# Or authorize an existing Ed25519 key and generate a host-pinned OpenSSH profile for an
+# SFTP-capable editor. The profile is owner-only and must be refreshed after its short grant ends.
+myelin agent thread ssh-config 33333333-3333-4333-8333-333333333333 \
+  --identity ~/.ssh/id_ed25519
 
 myelin agent create "Mainline triage" --runtime hosted \
   --tool ci.read_run --tool issues.create --idempotency-key mainline-triage

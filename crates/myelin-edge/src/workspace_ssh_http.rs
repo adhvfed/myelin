@@ -167,7 +167,7 @@ impl Handler for WorkspaceSshAccessCreateHandler {
         let public_key_fingerprint = workspace_ssh_public_key_fingerprint(&body.public_key)
             .map_err(|_| {
                 EdgeError::BadRequest(
-                    "workspace SSH access requires one valid ephemeral Ed25519 public key".into(),
+                    "workspace SSH access requires one valid Ed25519 public key".into(),
                 )
             })?;
         let thread_id = thread_param(ctx)?;

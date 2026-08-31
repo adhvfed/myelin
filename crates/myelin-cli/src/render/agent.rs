@@ -173,6 +173,10 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
         );
         let _ = writeln!(output, "  workspace: myelin agent thread ssh {id}");
         let _ = writeln!(output, "  files: myelin agent thread ssh {id} --sftp");
+        let _ = writeln!(
+            output,
+            "  editor: myelin agent thread ssh-config {id} --identity /path/to/ssh_identity"
+        );
         if review_state == "draft" && thread.get("project_id").is_some_and(|id| !id.is_null()) {
             let _ = writeln!(output, "  share for review: myelin agent thread ready {id}");
         } else if review_state == "ready" {
@@ -384,6 +388,7 @@ mod tests {
         assert!(rendered.contains(&format!("myelin agent thread say {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID} --sftp")));
+        assert!(rendered.contains(&format!("myelin agent thread ssh-config {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin mcp serve --as {ID} --thread {THREAD_ID}")));
         assert!(!rendered.contains("storage_locator"));
 

@@ -4,6 +4,38 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — An existing owner key opens the private workspace in an editor
+
+The supported CLI could launch its own shell or SFTP process, but it always generated and destroyed
+the key internally. That made the workspace reachable from a terminal while leaving a real editor
+with no reusable host alias, key binding, or host pin. The product copy's generic “remote file
+editing” claim was therefore ahead of the supported journey.
+
+`myelin agent thread ssh-config <thread> --identity <path>` now reads the sibling public key (or an
+explicit `--public-key`), obtains the same short-lived owner-authorized grant, strictly binds the
+response to that key and workspace, and writes a refreshable OpenSSH profile plus exact known-hosts
+pin beneath Myelin's config directory. It only inspects the private key path; private key contents
+never enter Myelin. Managed directories are mode 0700 and files mode 0600 on Unix. The profile
+disables ambient identities, passwords, host-key updates, proxies, agent/X11 forwarding, and TCP
+forwarding. `ControlMaster`/`ControlPersist` lets several OpenSSH channels share the one consumed
+transport, while the server still revalidates the owner, lifecycle, generation, and five-minute
+grant deadline for every newly opened channel. Rerunning the command installs a fresh route and
+short random control-socket path without replacing workspace data. The web workspace pane and CLI
+thread receipt expose the command, and JSON output gives tools the bounded alias, config paths,
+expiry, and workspace receipt. This intentionally supports OpenSSH/SFTP-capable editors; it still
+does not claim VS Code Remote-SSH server or port-forwarding compatibility.
+
+The readable TypeScript CLI journey generates a real Ed25519 identity and calls the shipped product
+command. It checks the protected files and safe config, then leaves Myelin's process and uses the
+operating system's ordinary `ssh -F` and `sftp -F` clients to write, upload, download, and reread the
+same confined durable workspace. The first run caught OpenSSH's extra temporary control-socket
+suffix exceeding Unix's path limit; the production layout now bounds a short randomized socket
+path. A follow-up path-with-spaces drill also found and fixed the test client's previously unquoted
+local SFTP batch paths. The strengthened journey passed in 8.54 seconds against Edge, PostgreSQL,
+the workspace gateway, OpenSSH, and gVisor. The Chromium private-agent journey passed against the
+running web product with the new command visible. CLI units and all-target checks, strict CLI/Edge
+Clippy, system and web TypeScript checks, web lint, and the production web build pass.
+
 ## 2026-08-31 — Named-agent tool palettes are explicit, editable, and immediately enforced
 
 Agent activation used to hide five fixed tools behind prose and one command checkbox, while the

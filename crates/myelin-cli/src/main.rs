@@ -935,7 +935,7 @@ async fn run_workspace_ssh(
     read_file: &dyn Fn(&std::path::Path) -> Option<String>,
     command: &myelin_cli::workspace_ssh::WorkspaceSshCommand,
 ) -> Result<(), CliError> {
-    if cli.json {
+    if cli.json && !command.is_profile() {
         return Err(CliError::Usage(
             "agent thread ssh is an interactive transport and does not support --json".into(),
         ));
@@ -952,7 +952,22 @@ async fn run_workspace_ssh(
         ));
     }
     let invocation = resolve_edge_invocation(cli, getenv, read_file)?;
-    myelin_cli::workspace_ssh::enter(&invocation.edge, &invocation.credential.token, command).await
+    if command.is_profile() {
+        let config_root = config::config_dir(getenv)?;
+        let rendered = myelin_cli::workspace_ssh::install_profile(
+            &invocation.edge,
+            &invocation.credential.token,
+            &config_root,
+            command,
+            cli.json,
+        )
+        .await?;
+        print!("{rendered}");
+        Ok(())
+    } else {
+        myelin_cli::workspace_ssh::enter(&invocation.edge, &invocation.credential.token, command)
+            .await
+    }
 }
 
 fn apply_response_effect(

@@ -156,6 +156,10 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
     .toContainText(`myelin agent thread ssh ${
       new URL(page.url()).searchParams.get("thread")!
     } --sftp`);
+  await expect(workspace.getByTestId("agent-workspace-editor-command"))
+    .toContainText(`myelin agent thread ssh-config ${
+      new URL(page.url()).searchParams.get("thread")!
+    } --identity /path/to/ssh_identity`);
   await page.keyboard.press("Escape");
   await expect(workspace).toBeHidden();
 

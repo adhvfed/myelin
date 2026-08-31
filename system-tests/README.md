@@ -75,6 +75,10 @@ The suite is intentionally organized around externally visible contracts:
   recipient-scoped delivery, addressable inbox items, broker de-duplication, collapse, individual
   and view-scoped read state, snooze and timed resurfacing, terminal-state safety, self-suppression,
   and complete duplicate-free traversal through opaque inbox cursors.
+- `private-agent-thread-cli` logs in through browser approval, configures a named agent, resumes one
+  retained private workspace through fresh agent contexts and one-shot SSH/SFTP, then authorizes an
+  existing key and proves ordinary OpenSSH command and SFTP clients can use the generated,
+  host-pinned editor profile without receiving a Myelin credential.
 - `api-contracts` checks strict inputs, resource identifiers, payload limits, notification inbox
   scoping, and public error envelopes.
 

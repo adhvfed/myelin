@@ -157,7 +157,10 @@ export async function connectMultiplexedToWorkspace(
       try {
         const downloaded = join(transfer, "downloaded");
         const batch = join(transfer, "batch");
-        await writeFile(batch, `get ${sftpWord(relative)} ${sftpWord(downloaded)}\n`);
+        await writeFile(
+          batch,
+          `get ${sftpBatchPath(relative)} ${sftpBatchPath(downloaded)}\n`,
+        );
         await runMultiplexedSftp(access, controlPath, batch);
         return await readFile(downloaded, "utf8");
       } finally {
@@ -171,7 +174,10 @@ export async function connectMultiplexedToWorkspace(
         const upload = join(transfer, "upload");
         const batch = join(transfer, "batch");
         await writeFile(upload, content);
-        await writeFile(batch, `put ${sftpWord(upload)} ${sftpWord(relative)}\n`);
+        await writeFile(
+          batch,
+          `put ${sftpBatchPath(upload)} ${sftpBatchPath(relative)}\n`,
+        );
         await runMultiplexedSftp(access, controlPath, batch);
       } finally {
         await rm(transfer, { recursive: true, force: true });
@@ -347,6 +353,6 @@ function shellWord(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function sftpWord(value: string): string {
+export function sftpBatchPath(value: string): string {
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
 }

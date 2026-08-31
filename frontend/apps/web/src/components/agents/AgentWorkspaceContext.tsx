@@ -37,6 +37,8 @@ export function AgentWorkspaceContext(props: {
     `myelin mcp serve --as ${props.thread.agent_id} --thread ${props.thread.id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
   const fileCommand = () => `${command()} --sftp`;
+  const editorCommand = () =>
+    `myelin agent thread ssh-config ${props.thread.id} --identity /path/to/ssh_identity`;
   const agentName = () => props.agent?.name ?? `Agent ${props.thread.agent_id.slice(0, 8)}`;
   const commandScope = () => props.agent?.selected_tools.includes("workspace.exec");
   const retryable = () => agentThreadAwaitingRecovery(props.thread);
@@ -154,6 +156,8 @@ export function AgentWorkspaceContext(props: {
             <code class="agent-workspace-command" data-testid="agent-workspace-command">{command()}</code>
             <p>Open the same workspace with the standard SFTP client for remote file editing.</p>
             <code class="agent-workspace-command" data-testid="agent-workspace-file-command">{fileCommand()}</code>
+            <p>Or authorize your existing key and generate an expiring OpenSSH profile for an SFTP-capable editor.</p>
+            <code class="agent-workspace-command" data-testid="agent-workspace-editor-command">{editorCommand()}</code>
           </Show>
         </section>
       </Show>

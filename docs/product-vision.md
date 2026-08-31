@@ -16,7 +16,9 @@ Every person can keep a small stable of named agents that reflect how they work:
 tool palette, runtime, project context, and spending boundaries are explicit and editable. Starting
 work with one creates a named cloud thread with a durable branch, conversation, and workspace. The
 same workspace survives model context changes and can be opened through ordinary SSH or SFTP with a
-short-lived owner-authorized credential.
+short-lived owner-authorized credential. A person can also authorize an existing Ed25519 key and
+generate an expiring, host-key-pinned OpenSSH profile for an SFTP-capable editor; Myelin never
+copies or prints the private key, and refreshing access does not replace the retained workspace.
 
 An agent's owner can maintain a private default workspace augmentation on that named agent:
 `AGENTS.md` instructions plus bounded create-only context files. The organization-visible roster
@@ -92,3 +94,7 @@ precedence, and existing work retains its original instruction-and-file snapshot
 change. Tool-palette journeys must prove a second identity cannot edit, a real live run is
 terminated, its credential stops authenticating, an exact retry is inert, a stale edit conflicts,
 and a fresh run exposes only the saved tools while retaining its workspace.
+Editor-profile journeys must generate a real key, create the profile through the product CLI, and
+then leave Myelin's process: ordinary OpenSSH must use that profile for both a command and an SFTP
+transfer against the same retained workspace. The proof must check file permissions, exact host
+pinning, connection sharing, and absence of credentials from CLI output and generated config.

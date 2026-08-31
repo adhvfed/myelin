@@ -3,15 +3,15 @@ use std::net::IpAddr;
 use chrono::DateTime;
 use serde::Deserialize;
 
-use super::key::{ed25519_fingerprint, EphemeralSshKey};
+use super::key::ed25519_fingerprint;
 use crate::dispatch::is_canonical_uuid;
 use crate::error::CliError;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WorkspaceSshGrant {
-    access: WorkspaceSshAccess,
-    workspace: WorkspaceReceipt,
+    pub(super) access: WorkspaceSshAccess,
+    pub(super) workspace: WorkspaceReceipt,
     #[serde(rename = "created")]
     _created: bool,
 }
@@ -22,24 +22,24 @@ pub(super) struct WorkspaceSshAccess {
     pub(super) host: String,
     pub(super) port: u16,
     pub(super) username: String,
-    expires_at: String,
-    public_key_fingerprint: String,
+    pub(super) expires_at: String,
+    pub(super) public_key_fingerprint: String,
     pub(super) host_public_key: String,
     host_key_fingerprint: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkspaceReceipt {
-    id: String,
-    generation: u64,
+pub(super) struct WorkspaceReceipt {
+    pub(super) id: String,
+    pub(super) generation: u64,
 }
 
 impl WorkspaceSshGrant {
     pub(super) fn parse(
         value: serde_json::Value,
-        key: &EphemeralSshKey,
-    ) -> Result<WorkspaceSshAccess, CliError> {
+        expected_public_key_fingerprint: &str,
+    ) -> Result<Self, CliError> {
         let grant: Self = serde_json::from_value(value).map_err(|error| {
             CliError::Transport(format!(
                 "Edge returned malformed workspace SSH access: {error}"
@@ -55,10 +55,8 @@ impl WorkspaceSshGrant {
         if expires_at.timestamp() <= crate::clock::unix_seconds()? {
             return Err(unsafe_access("grant is already expired"));
         }
-        if grant.access.public_key_fingerprint != key.fingerprint {
-            return Err(unsafe_access(
-                "grant is not bound to the generated one-shot key",
-            ));
+        if grant.access.public_key_fingerprint != expected_public_key_fingerprint {
+            return Err(unsafe_access("grant is not bound to the requested key"));
         }
         let host_fingerprint = ed25519_fingerprint(&grant.access.host_public_key, false)?;
         if grant.access.host_key_fingerprint != host_fingerprint {
@@ -67,7 +65,7 @@ impl WorkspaceSshGrant {
         if !is_canonical_uuid(&grant.workspace.id) || grant.workspace.generation == 0 {
             return Err(unsafe_access("workspace receipt is not canonical"));
         }
-        Ok(grant.access)
+        Ok(grant)
     }
 }
 
