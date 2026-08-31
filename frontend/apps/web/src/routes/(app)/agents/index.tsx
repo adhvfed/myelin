@@ -48,6 +48,7 @@ import {
   type WorkspaceSessionPage,
 } from "~/lib/agent-thread-response";
 import { mergeMessagePages } from "~/lib/chat-view";
+import { nextCursorForPages } from "~/lib/pagination";
 
 interface PageResult<T> {
   page: T | null;
@@ -194,14 +195,13 @@ export default function AgentThreadsIndex() {
   };
   const agentName = () => selectedAgent()?.name ??
     (selectedThread()?.page?.agent_id ? `Agent ${selectedThread()!.page!.agent_id.slice(0, 8)}` : "Agent");
-  const nextThreadCursor = () => threadPages().at(-1)?.page.next_cursor ??
-    firstThreads()?.page?.page.next_cursor ?? null;
-  const nextAgentCursor = () => agentPages().at(-1)?.page.next_cursor ??
-    firstAgents()?.page?.page.next_cursor ?? null;
-  const nextMessageCursor = () => earlierMessagePages().at(-1)?.page.next_cursor ??
-    recentMessages()?.page?.page.next_cursor ?? null;
-  const nextWorkspaceSessionCursor = () => workspaceSessionPages().at(-1)?.page.next_cursor ??
-    recentSessions()?.page?.page.next_cursor ?? null;
+  const nextThreadCursor = () => nextCursorForPages(firstThreads()?.page, threadPages());
+  const nextAgentCursor = () => nextCursorForPages(firstAgents()?.page, agentPages());
+  const nextMessageCursor = () => nextCursorForPages(recentMessages()?.page, earlierMessagePages());
+  const nextWorkspaceSessionCursor = () => nextCursorForPages(
+    recentSessions()?.page,
+    workspaceSessionPages(),
+  );
 
   onMount(() => {
     setInteractive(true);

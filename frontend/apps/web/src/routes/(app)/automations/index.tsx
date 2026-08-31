@@ -7,17 +7,23 @@ import { AutomationStateLabel } from "~/components/AutomationStateLabel";
 import { AutomationCreateDialog } from "~/components/AutomationCreateDialog";
 import { useAppViewer } from "~/components/AppShell";
 import { getAutomations } from "~/lib/automation-api";
+import { mergeAutomationAgentPages } from "~/lib/automation-agent-catalogue";
 import { getAgentChoices } from "~/lib/agent-thread-api";
 import {
   AUTOMATION_PAGE_LIMIT,
   type AutomationVM,
 } from "~/lib/automation-response";
+import type { AgentChoicePage } from "~/lib/agent-thread-response";
+import { nextCursorForPages } from "~/lib/pagination";
 
 export default function AutomationsIndex() {
   const [search] = useSearchParams();
   const navigate = useNavigate();
   const viewer = useAppViewer();
   const [creating, setCreating] = createSignal(false);
+  const [agentPages, setAgentPages] = createSignal<AgentChoicePage[]>([]);
+  const [loadingMoreAgents, setLoadingMoreAgents] = createSignal(false);
+  const [agentPageUnavailable, setAgentPageUnavailable] = createSignal(false);
   const cursor = () => search.cursor as string | undefined;
   const limit = () => search.limit === undefined
     ? AUTOMATION_PAGE_LIMIT
@@ -30,7 +36,7 @@ export default function AutomationsIndex() {
       : { limit: limit(), cursor: cursor() }),
     { deferStream: true },
   );
-  const agentPage = createAsync(async () => {
+  const firstAgentPage = createAsync(async () => {
     try {
       return await getAgentChoices({ limit: 100 });
     } catch (error) {
@@ -38,9 +44,28 @@ export default function AutomationsIndex() {
       return null;
     }
   }, { deferStream: true });
-  const hostedAgents = createMemo(() => (agentPage()?.items ?? []).filter((agent) =>
+  const allAgents = createMemo(() => mergeAutomationAgentPages(
+    firstAgentPage()?.items,
+    agentPages(),
+  ));
+  const hostedAgents = createMemo(() => allAgents().filter((agent) =>
     agent.owner_principal_id === viewer.principalId && agent.status === "active" &&
     agent.runtime_ref === "hosted:luna"));
+  const nextAgentCursor = () => nextCursorForPages(firstAgentPage(), agentPages());
+  const loadMoreAgents = async () => {
+    const cursor = nextAgentCursor();
+    if (!cursor || loadingMoreAgents()) return;
+    setLoadingMoreAgents(true);
+    setAgentPageUnavailable(false);
+    try {
+      const page = await getAgentChoices({ cursor, limit: 100 });
+      if (nextAgentCursor() === cursor) setAgentPages((pages) => [...pages, page]);
+    } catch {
+      setAgentPageUnavailable(true);
+    } finally {
+      setLoadingMoreAgents(false);
+    }
+  };
 
   return (
     <section aria-labelledby="automations-heading" class="automation-screen">
@@ -111,8 +136,17 @@ export default function AutomationsIndex() {
       <AutomationCreateDialog
         open={creating()}
         agents={hostedAgents()}
-        agentsLoading={agentPage() === undefined}
-        agentsTruncated={Boolean(agentPage()?.page.next_cursor)}
+        agentsLoading={firstAgentPage() === undefined}
+        agentsHaveMore={Boolean(nextAgentCursor())}
+        agentsLoadingMore={loadingMoreAgents()}
+        agentsUnavailable={firstAgentPage() === null}
+        earlierAgentsUnavailable={agentPageUnavailable()}
+        onLoadMoreAgents={() => void loadMoreAgents()}
+        onRetryAgents={() => {
+          setAgentPages([]);
+          setAgentPageUnavailable(false);
+          void revalidate(getAgentChoices.keyFor({ limit: 100 }));
+        }}
         onClose={() => setCreating(false)}
         onCreated={(receipt) => {
           void revalidate("automations");

@@ -37,7 +37,10 @@ per-firing budget, lifetime firing limit, and human-approval rule. The safe init
 refuses personal-data events and delegates no extra caveats; advanced constraints may remain in the
 CLI until the web can present them without obscuring their authority. Creation uses a retained
 idempotency identity, lands on the durable rule, and exposes the same pause, resume, disable, firing,
-approval, result, and erasure history as rules created by other clients.
+approval, result, and erasure history as rules created by other clients. Agent selection traverses
+the owner's complete paged catalogue, including the case where no eligible hosted identity appears
+in the newest page; an unavailable catalogue is presented as a retriable failure, never as proof
+that the owner has no agent.
 
 An agent's owner can maintain a private default workspace augmentation on that named agent:
 `AGENTS.md` instructions plus bounded create-only context files. The organization-visible roster

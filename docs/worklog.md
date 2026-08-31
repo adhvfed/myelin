@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Automation creation searches the complete private agent catalogue
+
+The new web automation dialog initially inspected only the newest 100 identities. That bounded read
+could falsely tell a long-standing user to activate another hosted agent even when an eligible one
+existed on an earlier page. The picker now follows Edge's opaque keyset cursor across the owner's
+catalogue, merges overlapping pages by stable identity, and keeps an unavailable first page distinct
+from a genuinely empty catalogue. Loading remains available when a page contains no eligible hosted
+identity, and an earlier-page failure is explicitly retriable without losing the automation draft.
+A shared terminal-cursor rule also closes the same loop in private-thread, conversation, and SSH
+session pagination: a terminal later page cannot fall back to the first cursor.
+
+Focused catalogue and shared-pagination tests prove overlap de-duplication, first-page selection,
+last-page selection, and terminal cursor handling. All 674 web unit tests pass alongside TypeScript
+checking, lint, and the production build. The Chromium product journey also activated a hosted
+identity and created, reloaded, verified, and disabled its durable automation through the running
+Fed stack, Edge, and PostgreSQL. The Chromium private-agent journey also completed its full branch,
+conversation, personalized workspace, lifecycle, and review flow through the route using the shared
+pager.
+
 ## 2026-08-31 — Closing an issue is no longer a one-way mistake
 
 The issue detail explicitly warned that its close action could not be undone even though the event
@@ -33,7 +52,8 @@ budget, lifetime firing limit, and approval rule. The initial safe path always r
 events and adds no hidden delegation caveats. Its server action validates an exact bounded request,
 retains one idempotency key while a failed submission is retried, strictly decodes the Edge receipt,
 and distinguishes conflicts and temporary unavailability without discarding the draft. The agent
-picker is owner-only and honest about its bounded newest-100 view.
+picker is owner-only; a follow-up closed its initial newest-100 boundary by traversing the complete
+paged catalogue.
 
 The Chromium product journey runs against the assembled Fed stack and PostgreSQL: it activates a
 hosted identity, creates a CI-failure automation in the browser, lands on the durable detail, checks

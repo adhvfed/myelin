@@ -18,7 +18,12 @@ export function AutomationCreateDialog(props: {
   open: boolean;
   agents: AgentChoice[];
   agentsLoading: boolean;
-  agentsTruncated: boolean;
+  agentsHaveMore: boolean;
+  agentsLoadingMore: boolean;
+  agentsUnavailable: boolean;
+  earlierAgentsUnavailable: boolean;
+  onLoadMoreAgents: () => void;
+  onRetryAgents: () => void;
   onClose: () => void;
   onCreated: (receipt: AutomationCreateReceipt) => void;
 }) {
@@ -101,13 +106,28 @@ export function AutomationCreateDialog(props: {
       </>}
     >
       <form id="automation-create" class="agent-thread-create" onSubmit={submit}>
-        <Show when={!props.agentsLoading && props.agents.length === 0}>
+        <Show when={!props.agentsLoading && props.agents.length === 0 && props.agentsUnavailable}>
+          <div class="automation-empty" role="alert">
+            <strong>Hosted agents couldn’t be loaded</strong>
+            <p>Retry the personal agent catalogue without losing this automation draft.</p>
+            <button type="button" class="automation-button automation-button-secondary" onClick={() => props.onRetryAgents()}>
+              <Icon name="cycle" /> Try again
+            </button>
+          </div>
+        </Show>
+        <Show when={!props.agentsLoading && props.agents.length === 0 && !props.agentsUnavailable && !props.agentsHaveMore}>
           <div class="automation-empty">
             <strong>No active hosted agent is ready</strong>
             <p>Activate a named agent with the Hosted Myelin runtime first.</p>
             <A href="/agents?activate=1" class="automation-button automation-button-secondary">
               <Icon name="agent" /> Activate agent
             </A>
+          </div>
+        </Show>
+        <Show when={!props.agentsLoading && props.agents.length === 0 && !props.agentsUnavailable && props.agentsHaveMore}>
+          <div class="automation-empty">
+            <strong>No hosted agent in the newest results</strong>
+            <p>Continue through your private agent catalogue to find an earlier active agent.</p>
           </div>
         </Show>
         <Show when={props.agents.length > 0}>
@@ -124,9 +144,6 @@ export function AutomationCreateDialog(props: {
               )}</For>
             </select>
           </label>
-          <Show when={props.agentsTruncated}>
-            <p class="agent-thread-note">Showing the newest 100 agents. Retire unused identities to keep the roster focused.</p>
-          </Show>
           <label>
             Platform event
             <input
@@ -192,6 +209,23 @@ export function AutomationCreateDialog(props: {
           <p class="agent-thread-note">
             Personal-data events are refused. The hosted run receives only this agent’s selected
             tools under your current authority ceiling.
+          </p>
+        </Show>
+        <Show when={!props.agentsUnavailable && props.agentsHaveMore}>
+          <button
+            type="button"
+            class="agent-thread-load-more"
+            disabled={submitting() || props.agentsLoadingMore}
+            onClick={() => props.onLoadMoreAgents()}
+          >
+            <Icon name={props.agentsLoadingMore ? "cycle" : "chevron"} />
+            {props.agentsLoadingMore ? "Loading earlier agents…" : "Load earlier agents"}
+          </button>
+        </Show>
+        <Show when={props.earlierAgentsUnavailable}>
+          <p class="agent-thread-note" role="alert">
+            Earlier agents couldn’t be loaded. {" "}
+            <button type="button" onClick={() => props.onLoadMoreAgents()}>Try again</button>
           </p>
         </Show>
         <Show when={error()}>{(message) => (
