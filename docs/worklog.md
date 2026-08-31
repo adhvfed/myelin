@@ -12,8 +12,8 @@ existed on an earlier page. The picker now follows Edge's opaque keyset cursor a
 catalogue, merges overlapping pages by stable identity, and keeps an unavailable first page distinct
 from a genuinely empty catalogue. Loading remains available when a page contains no eligible hosted
 identity, and an earlier-page failure is explicitly retriable without losing the automation draft.
-A shared terminal-cursor rule also closes the same loop in private-thread, conversation, and SSH
-session pagination: a terminal later page cannot fall back to the first cursor.
+A shared terminal-cursor rule also closes the same loop in Knowledge, private-thread, conversation,
+and SSH-session pagination: a terminal later page cannot fall back to the first cursor.
 
 Focused catalogue and shared-pagination tests prove overlap de-duplication, first-page selection,
 last-page selection, and terminal cursor handling. All 674 web unit tests pass alongside TypeScript

@@ -6,6 +6,7 @@ import { KnowledgeCreateDialog } from "~/components/knowledge/KnowledgeCreateDia
 import { KnowledgeSidebar, knowledgeHref } from "~/components/knowledge/KnowledgeSidebar";
 import { KnowledgeWorkspace } from "~/components/knowledge/KnowledgeWorkspace";
 import { getKnowledgePage, getKnowledgePages, isKnowledgeUlid, KnowledgeRouteError, type KnowledgeErrorKind, type KnowledgePageList } from "~/lib/knowledge-api";
+import { nextCursorForPages } from "~/lib/pagination";
 
 interface PageResult<T> { value: T | null; error: KnowledgeErrorKind | null }
 function kind(error: unknown): KnowledgeErrorKind { return error instanceof KnowledgeRouteError ? error.kind : "error"; }
@@ -44,7 +45,7 @@ export default function KnowledgeIndex() {
   }, { deferStream: true });
 
   const pages = createMemo(() => mergePages(first()?.value ?? undefined, more()));
-  const nextCursor = () => more().at(-1)?.page.next_cursor ?? first()?.value?.page.next_cursor ?? null;
+  const nextCursor = () => nextCursorForPages(first()?.value, more());
   onMount(() => setInteractive(true));
 
   const loadMore = async () => {
