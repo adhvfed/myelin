@@ -580,7 +580,9 @@ impl DurableGitBackend {
             );
         }
         self.prs.update(loc, number, |record| {
-            mutation.apply_to_at(record, now_unix()?);
+            mutation
+                .apply_to_at(record, now_unix()?)
+                .map_err(|reason| DurableError::Conflict(reason.into()))?;
             Ok(record.clone())
         })
     }
@@ -1794,6 +1796,64 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Option<PrRecord>, DurableError> {
         self.pr_get(&Self::loc(tenant, region, slug), number, principal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn synchronize_pr_head_with_operation(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        number: u64,
+        expected_head_oid: &str,
+        head_oid: &str,
+        principal: &Principal,
+        operation_id: &PrOperationId,
+    ) -> Result<PrRecord, DurableError> {
+        if principal.tenant.0 != tenant || principal.region.0 != region {
+            return Err(DurableError::NotFound("pull request not found".into()));
+        }
+        let loc = Self::loc(tenant, region, slug);
+        let record = self
+            .pr_get(&loc, number, principal)?
+            .ok_or_else(|| DurableError::NotFound("pull request not found".into()))?;
+        if record.author_pseudonym != Self::pseudonym(tenant, principal)
+            || record.head_repo_slug != slug
+        {
+            return Err(DurableError::NotFound("pull request not found".into()));
+        }
+        if record.head_oid == head_oid {
+            return Ok(record);
+        }
+        if record.head_oid != expected_head_oid {
+            return Err(DurableError::Conflict(
+                "pull request head changed before synchronization".into(),
+            ));
+        }
+        let repository = self.store.open_repo(&loc)?;
+        let current_tip = repository.read_ref(&record.head_ref)?;
+        if current_tip.as_ref().map(CoreOid::as_str) != Some(head_oid) {
+            return Err(DurableError::Conflict(
+                "pull request branch tip does not match the synchronized head".into(),
+            ));
+        }
+        let previous = CoreOid::new(expected_head_oid.to_string());
+        let next = CoreOid::new(head_oid.to_string());
+        if !repository.is_fast_forward(Some(&previous), &next)? {
+            return Err(DurableError::Conflict(
+                "pull request head update is not a fast-forward".into(),
+            ));
+        }
+        self.pr_mutate(
+            &loc,
+            number,
+            PrMutation::SynchronizeHead {
+                expected_head_oid: expected_head_oid.into(),
+                head_oid: head_oid.into(),
+            },
+            operation_id,
+            principal,
+        )
     }
 
     fn next_pr_number(&self, loc: &RepoLoc) -> Result<u64, DurableError> {
@@ -3309,6 +3369,142 @@ mod agent_file_write_tests {
             MergeAttempt::Merged { .. }
         ));
         assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(head));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn an_open_pull_request_safely_tracks_fast_forwarded_private_branch_work() {
+        let root = temp_root();
+        let backend = DurableGitBackend::rooted_inmem_for_test(&root);
+        backend.create_repo(TENANT, REGION, REPO).unwrap();
+        let repo = backend.store.open_repo(&repo_loc()).unwrap();
+        let (base, _, _) = repo
+            .build_file_commit(
+                "refs/heads/main",
+                "README.md",
+                b"# Product\n",
+                "seed",
+                "human:founder@acme.noreply",
+                "human:founder@acme.noreply",
+            )
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&base),
+            "seed main",
+            "human:founder@acme.noreply",
+        )
+        .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/agent/private-work",
+            None,
+            Some(&base),
+            "start private work",
+            "agent:release-helper@acme.noreply",
+        )
+        .unwrap();
+        let (first, _, _) = repo
+            .build_file_commit(
+                "refs/heads/agent/private-work",
+                "first.txt",
+                b"first\n",
+                "first private change",
+                "agent:release-helper@acme.noreply",
+                "agent:release-helper@acme.noreply",
+            )
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/agent/private-work",
+            Some(&base),
+            Some(&first),
+            "publish first change",
+            "agent:release-helper@acme.noreply",
+        )
+        .unwrap();
+
+        let actor = agent();
+        let opened = backend
+            .open_pr_with_operation(
+                TENANT,
+                REGION,
+                REPO,
+                &serde_json::json!({
+                    "title": "Private work ready for review",
+                    "base_ref": "refs/heads/main",
+                    "head_ref": "refs/heads/agent/private-work",
+                    "head_oid": first.0,
+                    "reviewers": ["human:reviewer"]
+                }),
+                &actor,
+                &PrOperationId::parse("open-private-work").unwrap(),
+            )
+            .unwrap();
+        let (second, _, _) = repo
+            .build_file_commit(
+                "refs/heads/agent/private-work",
+                "second.txt",
+                b"second\n",
+                "follow up after review",
+                "agent:release-helper@acme.noreply",
+                "agent:release-helper@acme.noreply",
+            )
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/agent/private-work",
+            Some(&first),
+            Some(&second),
+            "publish follow-up",
+            "agent:release-helper@acme.noreply",
+        )
+        .unwrap();
+
+        let operation = PrOperationId::parse("synchronize-private-work").unwrap();
+        let synchronized = backend
+            .synchronize_pr_head_with_operation(
+                TENANT,
+                REGION,
+                REPO,
+                opened.number,
+                first.as_str(),
+                second.as_str(),
+                &actor,
+                &operation,
+            )
+            .unwrap();
+        assert_eq!(synchronized.number, opened.number);
+        assert_eq!(synchronized.head_oid, second.0);
+        assert_eq!(synchronized.reviews, opened.reviews);
+        assert_eq!(
+            backend
+                .synchronize_pr_head_with_operation(
+                    TENANT,
+                    REGION,
+                    REPO,
+                    opened.number,
+                    first.as_str(),
+                    second.as_str(),
+                    &actor,
+                    &operation,
+                )
+                .unwrap(),
+            synchronized,
+            "the exact update operation is retry-safe after the PR has advanced"
+        );
+
+        let stale = backend
+            .synchronize_pr_head_with_operation(
+                TENANT,
+                REGION,
+                REPO,
+                opened.number,
+                first.as_str(),
+                base.as_str(),
+                &actor,
+                &PrOperationId::parse("stale-private-work").unwrap(),
+            )
+            .unwrap_err();
+        assert!(matches!(stale, DurableError::Conflict(_)));
         std::fs::remove_dir_all(root).ok();
     }
 

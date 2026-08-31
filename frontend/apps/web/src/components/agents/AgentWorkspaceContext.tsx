@@ -180,7 +180,7 @@ export function AgentWorkspaceContext(props: {
                     <Icon name={props.publishingReview ? "cycle" : "external-link"} />
                     {props.publishingReview ? "Opening review…" : "Open pull request"}
                   </button>
-                </>}>{(handoff) => (
+                </>}>{(handoff) => (<>
                   <p>
                     <A href={`${gitRepositoryPath(repository().slug)}/prs/${handoff().pull_request.number}`}>
                       Pull request #{handoff().pull_request.number}
@@ -188,7 +188,21 @@ export function AgentWorkspaceContext(props: {
                     tracks <code>{handoff().head_ref}</code> at{" "}
                     <code>{handoff().head_oid.slice(0, 12)}</code>.
                   </p>
-                )}</Show>
+                  <button
+                    type="button"
+                    class="agent-thread-button secondary"
+                    disabled={props.publishingReview}
+                    onClick={() => props.onPublishReview()}
+                    data-testid="update-workspace-review"
+                  >
+                    <Icon name={props.publishingReview ? "cycle" : "pull-request"} />
+                    {props.publishingReview ? "Updating review…" : "Update pull request"}
+                  </button>
+                  <p class="agent-thread-note">
+                    New committed work fast-forwards this pull request. Existing approvals and
+                    checks are cleared because they apply to its previous head.
+                  </p>
+                </>)}</Show>
               </Show>
               <Show when={props.reviewHandoffError}>
                 <p role="alert">{props.reviewHandoffError}</p>

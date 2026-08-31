@@ -475,6 +475,7 @@ describe("private agent work from the CLI", () => {
     const branch = string(workspaceRepository.branch, "private workspace branch");
     expect(reviewReceipt).toMatchObject({
       created: true,
+      updated: false,
       durable: true,
       handoff: {
         thread_id: threadId,
@@ -499,11 +500,41 @@ describe("private agent work from the CLI", () => {
     );
     expect(replayedReview.exitCode, replayedReview.stderr).toBe(0);
     expect(replayedReview.stdout).toContain(
-      `Pull request already open: ${repository.slug}#${pullRequestNumber}`,
+      `Pull request already current: ${repository.slug}#${pullRequestNumber}`,
     );
     expect(replayedReview.stdout).toContain(
       `myelin git pr view ${repository.slug} ${pullRequestNumber}`,
     );
+
+    const followUp = await runMyelin(
+      "agent",
+      "thread",
+      "ssh",
+      threadId,
+      "--command",
+      "printf 'follow-up from the CLI\\n' > notes/review-follow-up.txt && git add notes/review-follow-up.txt && git commit -m 'Update CLI workspace review'",
+    );
+    expect(followUp.exitCode, followUp.stderr).toBe(0);
+    expect(followUp.stdout).toContain("Update CLI workspace review");
+    const updatedReview = await runMyelin(
+      "--idempotency-key",
+      `cli-private-review-update-${randomUUID()}`,
+      ...publishArgs,
+    );
+    expect(updatedReview.exitCode, updatedReview.stderr).toBe(0);
+    expect(updatedReview.stdout).toContain(
+      `Updated pull request: ${repository.slug}#${pullRequestNumber}`,
+    );
+    const updatedPullRequest = await systemClient.json(
+      `${repository.path}/prs/${pullRequestNumber}`,
+    );
+    expect(updatedPullRequest.body).toMatchObject({
+      number: pullRequestNumber,
+      head_ref: `refs/heads/${branch}`,
+      head_oid: expect.stringMatching(/^[0-9a-f]{40}$/),
+    });
+    expect(record(updatedPullRequest.body, "updated CLI pull request").head_oid)
+      .not.toBe(handoff.head_oid);
 
     for (const result of [
       activated,
@@ -524,6 +555,8 @@ describe("private agent work from the CLI", () => {
       ready,
       published,
       replayedReview,
+      followUp,
+      updatedReview,
     ]) {
       expect(result.stdout).not.toContain(systemTestConfig.token);
       expect(result.stderr).not.toContain(systemTestConfig.token);

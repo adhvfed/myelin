@@ -14,6 +14,7 @@ pub struct AgentThreadReviewHandoff {
     pub head_oid: String,
     pub pull_request_number: u64,
     pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +35,14 @@ pub enum BindAgentThreadReviewHandoffOutcome {
     Unavailable,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdvanceAgentThreadReviewHandoffOutcome {
+    Advanced(AgentThreadReviewHandoff),
+    AlreadyCurrent(AgentThreadReviewHandoff),
+    Conflict,
+    NotFound,
+}
+
 impl DurableAgentThreadBacking {
     pub async fn review_handoff(
         &self,
@@ -49,7 +58,7 @@ impl DurableAgentThreadBacking {
                 Box::pin(async move {
                     let row = sqlx::query(
                         "SELECT thread_id, repository_slug, base_ref, head_ref, head_oid,
-                                pull_request_number, created_at
+                                pull_request_number, created_at, updated_at
                            FROM agent_thread_review_handoff
                           WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
                             AND owner_principal_id = $4",
@@ -113,8 +122,8 @@ impl DurableAgentThreadBacking {
                     let inserted = sqlx::query(
                         "INSERT INTO agent_thread_review_handoff (
                            tenant_id, region, thread_id, owner_principal_id, repository_slug,
-                           base_ref, head_ref, head_oid, pull_request_number, created_at
-                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                           base_ref, head_ref, head_oid, pull_request_number, created_at, updated_at
+                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
                          ON CONFLICT (tenant_id, region, thread_id) DO NOTHING",
                     )
                     .bind(&tenant)
@@ -134,7 +143,7 @@ impl DurableAgentThreadBacking {
                         == 1;
                     let row = sqlx::query(
                         "SELECT thread_id, repository_slug, base_ref, head_ref, head_oid,
-                                pull_request_number, created_at
+                                pull_request_number, created_at, updated_at
                            FROM agent_thread_review_handoff
                           WHERE tenant_id = $1 AND region = $2 AND thread_id = $3",
                     )
@@ -158,6 +167,91 @@ impl DurableAgentThreadBacking {
                     } else {
                         BindAgentThreadReviewHandoffOutcome::AlreadyBound(handoff)
                     })
+                })
+            })
+            .await
+    }
+
+    pub async fn advance_review_handoff(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        thread_id: Uuid,
+        expected_head_oid: &str,
+        head_oid: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<AdvanceAgentThreadReviewHandoffOutcome, ProviderError> {
+        validate_head_oid(expected_head_oid)?;
+        validate_head_oid(head_oid)?;
+        let updated_at = updated_at
+            .with_nanosecond(0)
+            .ok_or_else(|| query("agent thread review handoff update timestamp is invalid"))?;
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        let expected = expected_head_oid.to_string();
+        let head = head_oid.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT thread_id, repository_slug, base_ref, head_ref, head_oid,
+                                pull_request_number, created_at, updated_at
+                           FROM agent_thread_review_handoff
+                          WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                            AND owner_principal_id = $4
+                          FOR UPDATE",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(thread_id)
+                    .bind(&owner)
+                    .fetch_optional(&mut *connection)
+                    .await
+                    .map_err(query_error("lock agent thread review handoff"))?;
+                    let Some(row) = row else {
+                        return Ok(AdvanceAgentThreadReviewHandoffOutcome::NotFound);
+                    };
+                    let current = handoff_from_row(&row)?;
+                    if current.head_oid == head {
+                        return Ok(AdvanceAgentThreadReviewHandoffOutcome::AlreadyCurrent(
+                            current,
+                        ));
+                    }
+                    if current.head_oid != expected {
+                        return Ok(AdvanceAgentThreadReviewHandoffOutcome::Conflict);
+                    }
+                    sqlx::query(
+                        "UPDATE agent_thread_review_handoff
+                            SET head_oid = $5,
+                                updated_at = GREATEST($6, updated_at + INTERVAL '1 second')
+                          WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                            AND owner_principal_id = $4",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(thread_id)
+                    .bind(&owner)
+                    .bind(&head)
+                    .bind(updated_at)
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(query_error("advance agent thread review handoff"))?;
+                    let row = sqlx::query(
+                        "SELECT thread_id, repository_slug, base_ref, head_ref, head_oid,
+                                pull_request_number, created_at, updated_at
+                           FROM agent_thread_review_handoff
+                          WHERE tenant_id = $1 AND region = $2 AND thread_id = $3",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(thread_id)
+                    .fetch_one(&mut *connection)
+                    .await
+                    .map_err(query_error("read advanced agent thread review handoff"))?;
+                    Ok(AdvanceAgentThreadReviewHandoffOutcome::Advanced(
+                        handoff_from_row(&row)?,
+                    ))
                 })
             })
             .await
@@ -188,6 +282,17 @@ fn validate_proposal(proposal: &NewAgentThreadReviewHandoff) -> Result<(), Provi
     Ok(())
 }
 
+fn validate_head_oid(head_oid: &str) -> Result<(), ProviderError> {
+    if head_oid.len() != 40
+        || !head_oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(query("agent thread review handoff head is invalid"));
+    }
+    Ok(())
+}
+
 fn handoff_from_row(row: &sqlx::postgres::PgRow) -> Result<AgentThreadReviewHandoff, PgError> {
     let number = row.get::<i64, _>("pull_request_number");
     Ok(AgentThreadReviewHandoff {
@@ -200,6 +305,9 @@ fn handoff_from_row(row: &sqlx::postgres::PgRow) -> Result<AgentThreadReviewHand
             .map_err(|_| PgError::Query("stored review handoff PR number is invalid".into()))?,
         created_at: row
             .get::<DateTime<Utc>, _>("created_at")
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+        updated_at: row
+            .get::<DateTime<Utc>, _>("updated_at")
             .to_rfc3339_opts(SecondsFormat::Secs, true),
     })
 }

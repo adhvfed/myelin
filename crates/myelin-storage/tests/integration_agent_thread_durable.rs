@@ -5,16 +5,16 @@ use myelin_config::MyelinConfig;
 use myelin_events::IdMinter;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
-    all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadActivation,
-    AgentThreadExpiryCompletion, AgentThreadExpiryFailure, AgentThreadGitBinding,
-    AgentThreadProvisioningFailure, AgentThreadWorkspaceGuidance, BeginAgentThreadRenewalOutcome,
-    BindAgentThreadReviewHandoffOutcome, BindAgentThreadRunOutcome, ColumnCryptor,
-    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
-    KekId, KmsEngine, ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome, NewAgentThread,
-    NewAgentThreadReviewHandoff, NewWorkspaceSshGrant, NewWorkspaceSshSession,
-    RetryAgentThreadOutcome, SealKey, SubjectId, SubjectKeyScope, SubstrateProvider,
-    WorkspaceSessionMode, WorkspaceSshRouteKey, AGENT_THREAD_EXPIRY_GRACE_SECONDS,
-    WORKSPACE_SSH_SESSION_STARTED,
+    all_durable_migrations, ActivateAgentThreadOutcome, AdvanceAgentThreadReviewHandoffOutcome,
+    AgentThreadActivation, AgentThreadExpiryCompletion, AgentThreadExpiryFailure,
+    AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadWorkspaceGuidance,
+    BeginAgentThreadRenewalOutcome, BindAgentThreadReviewHandoffOutcome, BindAgentThreadRunOutcome,
+    ColumnCryptor, CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome,
+    DurableAgentThreadBacking, HotTables, KekId, KmsEngine, ListAgentThreadsOutcome,
+    ListWorkspaceSessionsOutcome, NewAgentThread, NewAgentThreadReviewHandoff,
+    NewWorkspaceSshGrant, NewWorkspaceSshSession, RetryAgentThreadOutcome, SealKey, SubjectId,
+    SubjectKeyScope, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
+    AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
@@ -387,7 +387,66 @@ async fn a_review_handoff_is_one_durable_receipt_for_the_ready_workspace_branch(
             )
             .await
             .unwrap(),
-        BindAgentThreadReviewHandoffOutcome::AlreadyBound(bound)
+        BindAgentThreadReviewHandoffOutcome::AlreadyBound(bound.clone())
+    );
+    let AdvanceAgentThreadReviewHandoffOutcome::Advanced(advanced) = threads
+        .advance_review_handoff(
+            &tenant,
+            owner,
+            intended.thread_id,
+            &"2".repeat(40),
+            &"3".repeat(40),
+            intended.created_at + Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a fast-forwarded review handoff should advance its durable receipt");
+    };
+    assert_eq!(advanced.head_oid, "3".repeat(40));
+    assert_eq!(advanced.created_at, bound.created_at);
+    assert_ne!(advanced.updated_at, bound.updated_at);
+    assert_eq!(
+        threads
+            .advance_review_handoff(
+                &tenant,
+                owner,
+                intended.thread_id,
+                &"2".repeat(40),
+                &"3".repeat(40),
+                intended.created_at + Duration::minutes(6),
+            )
+            .await
+            .unwrap(),
+        AdvanceAgentThreadReviewHandoffOutcome::AlreadyCurrent(advanced.clone())
+    );
+    assert_eq!(
+        threads
+            .advance_review_handoff(
+                &tenant,
+                owner,
+                intended.thread_id,
+                &"2".repeat(40),
+                &"4".repeat(40),
+                intended.created_at + Duration::minutes(7),
+            )
+            .await
+            .unwrap(),
+        AdvanceAgentThreadReviewHandoffOutcome::Conflict
+    );
+    assert_eq!(
+        threads
+            .advance_review_handoff(
+                &tenant,
+                "p:somebody-else",
+                intended.thread_id,
+                &"3".repeat(40),
+                &"4".repeat(40),
+                intended.created_at + Duration::minutes(7),
+            )
+            .await
+            .unwrap(),
+        AdvanceAgentThreadReviewHandoffOutcome::NotFound
     );
     assert_eq!(
         threads
@@ -396,10 +455,10 @@ async fn a_review_handoff_is_one_durable_receipt_for_the_ready_workspace_branch(
                 owner,
                 intended.thread_id,
                 NewAgentThreadReviewHandoff {
-                    head_oid: "3".repeat(40),
+                    head_oid: "4".repeat(40),
                     ..proposal
                 },
-                intended.created_at + Duration::minutes(5),
+                intended.created_at + Duration::minutes(8),
             )
             .await
             .unwrap(),

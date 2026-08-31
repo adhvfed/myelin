@@ -477,7 +477,9 @@ export default function AgentThreadsIndex() {
       toast.show({
         title: result.receipt.created
           ? `Pull request #${result.receipt.handoff.pull_request.number} opened`
-          : `Pull request #${result.receipt.handoff.pull_request.number} is already open`,
+          : result.receipt.updated
+            ? `Pull request #${result.receipt.handoff.pull_request.number} updated`
+            : `Pull request #${result.receipt.handoff.pull_request.number} is already current`,
         variant: "success",
       });
     } catch {

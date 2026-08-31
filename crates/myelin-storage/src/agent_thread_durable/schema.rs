@@ -541,6 +541,23 @@ CREATE POLICY myelin_tenant_isolation ON agent_thread_review_handoff
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_THREAD_REVIEW_HANDOFF_UPDATE_MIGRATION: &str = r#"
+ALTER TABLE agent_thread_review_handoff
+  ADD COLUMN IF NOT EXISTS updated_at timestamptz;
+UPDATE agent_thread_review_handoff
+   SET updated_at = created_at
+ WHERE updated_at IS NULL;
+ALTER TABLE agent_thread_review_handoff
+  ALTER COLUMN updated_at SET NOT NULL;
+ALTER TABLE agent_thread_review_handoff
+  DROP CONSTRAINT IF EXISTS agent_thread_review_handoff_update_order;
+ALTER TABLE agent_thread_review_handoff
+  ADD CONSTRAINT agent_thread_review_handoff_update_order
+  CHECK (updated_at >= created_at) NOT VALID;
+ALTER TABLE agent_thread_review_handoff
+  VALIDATE CONSTRAINT agent_thread_review_handoff_update_order;
+"#;
+
 pub const AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION: &str = r#"
 ALTER TABLE agent_thread
   DROP CONSTRAINT IF EXISTS agent_thread_publication_after_creation;
@@ -651,10 +668,16 @@ pub fn agent_thread_renewal_migrations() -> Migrations {
 }
 
 pub fn agent_thread_review_handoff_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0176_agent_thread_review_handoff",
-        AGENT_THREAD_REVIEW_HANDOFF_MIGRATION,
-    )])
+    Migrations::of([
+        Migration::plain(
+            "0176_agent_thread_review_handoff",
+            AGENT_THREAD_REVIEW_HANDOFF_MIGRATION,
+        ),
+        Migration::plain(
+            "0177_agent_thread_review_handoff_update",
+            AGENT_THREAD_REVIEW_HANDOFF_UPDATE_MIGRATION,
+        ),
+    ])
 }
 
 pub fn agent_thread_git_binding_migrations() -> Migrations {

@@ -132,6 +132,15 @@ ref, commit, and pull-request number. This boundary is available from both the w
 CLI or manually reconstruct an internal HTTP request. Both clients name the same stable intent and
 render the existing pull request honestly on replay.
 
+The handoff remains useful while review is active. The owner can commit more work in the retained
+workspace and deliberately update the same pull request from either the workspace pane or CLI.
+Updates are fast-forward-only: the durable branch tip, pull-request head, and thread receipt advance
+through one retry-safe saga with compare-and-swap checks at each boundary. Reviewer assignments
+remain, but approvals, code-owner satisfaction, endorsements, and check facts for the previous head
+are cleared; an event with the new head generation lets CI and other consumers evaluate the exact
+commit now under review. Replaying an already-current update is inert and reports that state
+honestly rather than opening a second pull request.
+
 This creates a humane gradient rather than a false choice between secret local work and noisy public
 automation:
 
@@ -139,9 +148,9 @@ automation:
 personal draft -> owner and agent iterate -> owner marks ready -> publish committed branch -> review
 ```
 
-Future slices may add reversible archival, incremental updates to an opened handoff, and richer
-agent profiles, but they must preserve the private-by-default boundary and use the same production
-authorization path as every other Myelin artifact.
+Future slices may add reversible archival and richer agent profiles, but they must preserve the
+private-by-default boundary and use the same production authorization path as every other Myelin
+artifact.
 
 ## Evidence standard
 
@@ -156,8 +165,10 @@ again. A browser journey must repeat the grant and revoke through the visible pr
 Cloud-branch handoff journeys must additionally prove the ref is absent before the explicit action,
 publish a real commit made inside the confined workspace, give a named reviewer access to the exact
 pull request, survive a reload and retry, and demonstrate that private augmentation paths are absent
-from the shared repository. The browser journey must load reviewer choices from the live project
-authorization graph, select the named human through the visible product, and prove their exact PR
+from the shared repository. It must then make another real workspace commit, update the existing
+pull request without changing its identity, and prove an exact replay is inert. The browser journey
+must load reviewer choices from the live project authorization graph, select the named human through
+the visible product, update the same review through its visible control, and prove their exact PR
 access with a separate identity. The CLI journey must cross the actual device-login, MCP, SSH/SFTP,
 editor-profile, Git commit, ready, and pull-request boundaries rather than certifying only argument
 parsing or a mocked transport.

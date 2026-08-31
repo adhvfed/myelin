@@ -101,10 +101,12 @@ describe("private agent work wire projection", () => {
         ref: "myelin://acme/git/pr/platform/api:42",
       },
       created_at: "2026-08-22T12:30:00Z",
+      updated_at: "2026-08-22T12:35:00Z",
     };
     expect(parseAgentThreadReviewHandoff({ handoff, durable: true })).toEqual(handoff);
-    expect(parseAgentThreadReviewHandoffReceipt({ handoff, created: true, durable: true }))
-      .toEqual({ handoff, created: true, durable: true });
+    expect(parseAgentThreadReviewHandoffReceipt({
+      handoff, created: true, updated: false, durable: true,
+    })).toEqual({ handoff, created: true, updated: false, durable: true });
     expect(parseAgentThreadReviewHandoff({
       handoff: { ...handoff, private_workspace_path: "/srv/workspaces/secret" },
       durable: true,
@@ -113,8 +115,13 @@ describe("private agent work wire projection", () => {
       handoff: { ...handoff, pull_request: { ...handoff.pull_request, ref: "wrong" } },
       durable: true,
     })).toBeNull();
-    expect(parseAgentThreadReviewHandoffReceipt({ handoff, created: "yes", durable: true }))
+    expect(parseAgentThreadReviewHandoffReceipt({
+      handoff, created: "yes", updated: false, durable: true,
+    }))
       .toBeNull();
+    expect(parseAgentThreadReviewHandoffReceipt({
+      handoff, created: true, updated: true, durable: true,
+    })).toBeNull();
   });
 
   it("decodes the exact repository and environment receipt for a private cloud branch", () => {

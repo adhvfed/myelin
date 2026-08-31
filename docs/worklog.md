@@ -4,6 +4,31 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — An active cloud review follows new committed work without changing identity
+
+A personal cloud branch no longer becomes a dead end after its first pull-request handoff. Its
+owner can continue in the retained workspace and update the existing review from the workspace
+pane or the same CLI command. Publication still refuses dirty, protected, divergent, or
+non-descendant work. A deterministic old-head/new-head operation advances the exact author-owned
+pull request only when its durable ref has fast-forwarded, and a PostgreSQL compare-and-swap then
+advances the thread receipt. Any interrupted ordering converges on retry; an already-current update
+is inert and no second pull request is created.
+
+Synchronizing a head emits the existing `git.pr.synchronized` head-trigger event with a serialized
+generation. Requested reviewers remain attached, while submitted reviews, CI contexts,
+endorsements, and code-owner satisfaction tied to the previous commit are cleared. The receipt now
+records distinct creation and latest-update timestamps, the strict web contract exposes created,
+updated, and unchanged outcomes, and the workspace names the update action directly.
+
+The readable TypeScript journey opens a real review, resumes its gVisor workspace, commits a second
+file, updates the same PR, reads the new durable branch and PR head as the named reviewer, and
+replays the exact update without another state change. The Chromium journey uses the visible Update
+pull request control and confirms the reviewer retains access to the same PR identity at its new
+head. The CLI journey makes another commit over owner-authorized SSH, invokes the same
+`pull-request` command with a fresh intent, and renders the in-place update honestly. PostgreSQL
+receipt tests cover advance, replay, stale compare-and-swap, and owner isolation; Git tests cover
+fast-forward enforcement, retry, reviewer retention, and stale decision invalidation.
+
 ## 2026-09-01 — Project writers can manage real collaborators in the product
 
 Creating a project no longer leaves its useful authorization graph dependent on bootstrap policy.

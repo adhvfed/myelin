@@ -146,11 +146,13 @@ export interface AgentThreadReviewHandoff {
   head_oid: string;
   pull_request: { number: number; ref: string };
   created_at: string;
+  updated_at: string;
 }
 
 export interface AgentThreadReviewHandoffReceipt {
   handoff: AgentThreadReviewHandoff;
   created: boolean;
+  updated: boolean;
   durable: true;
 }
 
@@ -506,14 +508,15 @@ function reviewHandoff(value: unknown): AgentThreadReviewHandoff | null {
   const row = record(value);
   const pullRequest = record(row?.pull_request);
   if (!row || !pullRequest ||
-      !exact(row, ["thread_id", "repository", "base_ref", "head_ref", "head_oid", "pull_request", "created_at"]) ||
+      !exact(row, ["thread_id", "repository", "base_ref", "head_ref", "head_oid", "pull_request", "created_at", "updated_at"]) ||
       !exact(pullRequest, ["number", "ref"]) || !isAgentThreadId(row.thread_id) ||
       !cleanText(row.repository, 255) || !cleanText(row.base_ref, 1_024) ||
       !cleanText(row.head_ref, 1_024) || !(row.base_ref as string).startsWith("refs/heads/") ||
       !(row.head_ref as string).startsWith("refs/heads/") ||
       typeof row.head_oid !== "string" || !/^[0-9a-f]{40}$/.test(row.head_oid) ||
       !positiveInteger(pullRequest.number, Number.MAX_SAFE_INTEGER) ||
-      !cleanText(pullRequest.ref, 4_096) || !timestamp(row.created_at)) return null;
+      !cleanText(pullRequest.ref, 4_096) || !timestamp(row.created_at) ||
+      !timestamp(row.updated_at) || (row.updated_at as string) < (row.created_at as string)) return null;
   const expectedSuffix = `/git/pr/${row.repository}:${pullRequest.number}`;
   return (pullRequest.ref as string).endsWith(expectedSuffix)
     ? row as unknown as AgentThreadReviewHandoff
@@ -535,9 +538,10 @@ export function parseAgentThreadReviewHandoffReceipt(
 ): AgentThreadReviewHandoffReceipt | null {
   const receipt = record(value);
   const handoff = reviewHandoff(receipt?.handoff);
-  return receipt && exact(receipt, ["handoff", "created", "durable"]) &&
-    typeof receipt.created === "boolean" && receipt.durable === true && handoff
-    ? { handoff, created: receipt.created, durable: true }
+  return receipt && exact(receipt, ["handoff", "created", "updated", "durable"]) &&
+    typeof receipt.created === "boolean" && typeof receipt.updated === "boolean" &&
+    !(receipt.created && receipt.updated) && receipt.durable === true && handoff
+    ? { handoff, created: receipt.created, updated: receipt.updated, durable: true }
     : null;
 }
 

@@ -30,6 +30,7 @@ async function commitWorkspaceReview(
   request: APIRequestContext,
   sessionToken: string,
   threadId: string,
+  change: "initial" | "follow-up" = "initial",
 ): Promise<void> {
   const envelope = await postProductJson(
     request,
@@ -55,16 +56,22 @@ async function commitWorkspaceReview(
         params: {
           name: "workspace.exec",
           arguments: {
-            command: [
-              "git config user.name 'Myelin browser agent'",
-              "git config user.email 'browser-agent@myelin.invalid'",
-              "printf 'export const browserReview = true;\\n' > browser-review.ts",
-              "git add browser-review.ts",
-              "git commit -m 'Prepare browser cloud branch for review'",
-            ].join(" && "),
+            command: change === "initial"
+              ? [
+                  "git config user.name 'Myelin browser agent'",
+                  "git config user.email 'browser-agent@myelin.invalid'",
+                  "printf 'export const browserReview = true;\\n' > browser-review.ts",
+                  "git add browser-review.ts",
+                  "git commit -m 'Prepare browser cloud branch for review'",
+                ].join(" && ")
+              : [
+                  "printf 'export const browserFollowUp = true;\\n' > browser-follow-up.ts",
+                  "git add browser-follow-up.ts",
+                  "git commit -m 'Follow up on browser cloud review'",
+                ].join(" && "),
             timeout_seconds: 10,
           },
-          _meta: { "com.myelin/idempotencyKey": `browser-review-${randomUUID()}` },
+          _meta: { "com.myelin/idempotencyKey": `browser-review-${change}-${randomUUID()}` },
         },
       },
       failOnStatusCode: false,
@@ -430,6 +437,22 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   });
   const reviewerPullRequestText = await reviewerPullRequest.text();
   expect(reviewerPullRequest.status(), reviewerPullRequestText).toBe(200);
+  const originalHead = String((JSON.parse(reviewerPullRequestText) as JsonObject).head_oid);
+  await commitWorkspaceReview(request, sessionToken, threadId, "follow-up");
+  await expect(workspace.getByRole("button", { name: "Update pull request" })).toBeVisible();
+  await workspace.getByRole("button", { name: "Update pull request" }).click();
+  await expect.poll(async () => {
+    const response = await request.get(`${integrationEdgeUrl}/v1${pullRequestHref}`, {
+      headers: {
+        authorization: `Bearer ${integrationReviewerToken}`,
+        "x-myelin-token-scheme": "agent",
+      },
+    });
+    if (response.status() !== 200) return null;
+    return String(((await response.json()) as JsonObject).head_oid);
+  }).not.toBe(originalHead);
+  await expect(workspace.getByRole("link", { name: /^Pull request #\d+$/ }))
+    .toHaveAttribute("href", pullRequestHref!);
   await page.keyboard.press("Escape");
   await page.reload();
   await waitForAppHydration(page);

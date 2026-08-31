@@ -89,10 +89,14 @@ fn render_review_handoff(value: &Value, handoff: &Value) -> Option<String> {
     if number == 0 {
         return None;
     }
-    let disposition = match value.get("created").and_then(Value::as_bool) {
-        Some(true) => "Opened pull request",
-        Some(false) => "Pull request already open",
-        None => "Pull request",
+    let disposition = match (
+        value.get("created").and_then(Value::as_bool),
+        value.get("updated").and_then(Value::as_bool),
+    ) {
+        (Some(true), Some(false)) => "Opened pull request",
+        (Some(false), Some(true)) => "Updated pull request",
+        (Some(false), Some(false)) => "Pull request already current",
+        _ => "Pull request",
     };
     Some(format!(
         "{disposition}: {repository}#{number}\n  branch: {head_ref}\n  commit: {head_oid}\n  view: myelin git pr view {repository} {number}\n"
@@ -575,8 +579,10 @@ mod tests {
                     "ref": "myelin://acme/git/pr/platform/api:42",
                 },
                 "created_at": "2026-08-22T13:00:00Z",
+                "updated_at": "2026-08-22T13:00:00Z",
             },
             "created": true,
+            "updated": false,
             "durable": true,
         });
         let rendered = render_response(&receipt, None).unwrap();
@@ -589,9 +595,14 @@ mod tests {
         );
         let mut replay = receipt;
         replay["created"] = json!(false);
+        replay["updated"] = json!(true);
         assert!(render_response(&replay, None)
             .unwrap()
-            .starts_with("Pull request already open:"));
+            .starts_with("Updated pull request:"));
+        replay["updated"] = json!(false);
+        assert!(render_response(&replay, None)
+            .unwrap()
+            .starts_with("Pull request already current:"));
         replay["handoff"]["head_oid"] = json!("not-an-oid");
         assert!(render_response(&replay, None).is_none());
     }

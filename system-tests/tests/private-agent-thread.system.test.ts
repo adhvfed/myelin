@@ -374,7 +374,9 @@ describe("private work with an agent", () => {
       head_ref: `refs/heads/${branch}`,
       head_oid: expect.stringMatching(/^[0-9a-f]{40}$/),
       created_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+      updated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
     });
+    expect(opened.body).toMatchObject({ created: true, updated: false, durable: true });
     const replayedHandoff = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
       {
@@ -391,6 +393,7 @@ describe("private work with an agent", () => {
     expect(replayedHandoff.body).toEqual({
       handoff,
       created: false,
+      updated: false,
       durable: true,
     });
     const loadedHandoff = await founder.json(
@@ -413,6 +416,86 @@ describe("private work with an agent", () => {
       head_ref: `refs/heads/${branch}`,
       head_oid: handoff.head_oid,
       pr_state: "open",
+    });
+    await teammate.json(`${repository.path}/prs/${pullRequestNumber}/reviews`, {
+      method: "POST",
+      body: { verdict: "approve" },
+      idempotencyKey: `approve-private-review-${randomUUID()}`,
+    });
+    expect((await teammate.json(`${repository.path}/prs/${pullRequestNumber}/checks`)).body)
+      .toMatchObject({ current_approvals: 1 });
+
+    const followUpRun = await beginAgentThreadRun(founder, created.thread.id);
+    try {
+      const committed = record(
+        (await askAgentToAct(
+          followUpRun,
+          1,
+          "workspace.exec",
+          {
+            command: [
+              "printf 'export const followedUp = true;\\n' > review-follow-up.ts",
+              "git add review-follow-up.ts",
+              "git commit -m 'Follow up on the private review'",
+              "git rev-parse HEAD",
+            ].join(" && "),
+            timeout_seconds: 10,
+          },
+          `follow-up-cloud-review-${randomUUID()}`,
+        )).data,
+        "follow-up cloud branch command",
+      );
+      expect(string(committed.stdout, "follow-up cloud branch stdout"))
+        .toContain("Follow up on the private review");
+    } finally {
+      await closeAgentRun(followUpRun);
+    }
+
+    const updateKey = `private-review-update-${randomUUID()}`;
+    const updated = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: updateKey,
+      },
+    );
+    const updatedHandoff = record(updated.body.handoff, "updated private branch handoff");
+    expect(updated.body).toMatchObject({ created: false, updated: true, durable: true });
+    expect(updatedHandoff).toMatchObject({
+      thread_id: created.thread.id,
+      repository: repository.slug,
+      head_ref: `refs/heads/${branch}`,
+      head_oid: expect.stringMatching(/^[0-9a-f]{40}$/),
+      pull_request: { number: pullRequestNumber },
+      created_at: handoff.created_at,
+    });
+    expect(updatedHandoff.head_oid).not.toBe(handoff.head_oid);
+    expect(updatedHandoff.updated_at).not.toBe(handoff.updated_at);
+    expect((await repository.readFile(branch, "review-follow-up.ts")).contents)
+      .toBe("export const followedUp = true;\n");
+    expect((await teammate.json(`${repository.path}/prs/${pullRequestNumber}`)).body)
+      .toMatchObject({
+        number: pullRequestNumber,
+        head_ref: `refs/heads/${branch}`,
+        head_oid: updatedHandoff.head_oid,
+        pr_state: "open",
+      });
+    expect((await teammate.json(`${repository.path}/prs/${pullRequestNumber}/checks`)).body)
+      .toMatchObject({ current_approvals: 0 });
+    const replayedUpdate = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: updateKey,
+      },
+    );
+    expect(replayedUpdate.body).toEqual({
+      handoff: updatedHandoff,
+      created: false,
+      updated: false,
+      durable: true,
     });
   });
 

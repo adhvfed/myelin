@@ -16,7 +16,7 @@ use crate::dek::{encrypt_free_text, is_git_subject_key_class, GitFreeText};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
     event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_MERGED, GIT_PR_OPENED,
-    GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
+    GIT_PR_SYNCHRONIZED, GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
 };
 use crate::lifecycle::{BranchProtectionRuleset, PrState};
 use crate::pg_pr_event::co_commit_event;
@@ -424,6 +424,10 @@ pub enum PrMutation {
     },
     SubmitReview(crate::pr_store::ReviewRecord),
     EndorseContexts(Vec<String>),
+    SynchronizeHead {
+        expected_head_oid: String,
+        head_oid: String,
+    },
     Touch,
 }
 
@@ -433,6 +437,7 @@ impl PrMutation {
             Self::ReportChecks { .. } => "report-checks",
             Self::SubmitReview(_) => "submit-review",
             Self::EndorseContexts(_) => "endorse-contexts",
+            Self::SynchronizeHead { .. } => "synchronize-head",
             Self::Touch => "touch",
         }
     }
@@ -440,11 +445,16 @@ impl PrMutation {
     fn event_type(&self) -> &'static str {
         match self {
             Self::SubmitReview(_) => GIT_REVIEW_SUBMITTED,
+            Self::SynchronizeHead { .. } => GIT_PR_SYNCHRONIZED,
             Self::ReportChecks { .. } | Self::EndorseContexts(_) | Self::Touch => GIT_PR_UPDATED,
         }
     }
 
-    pub fn apply_to_at(self, record: &mut PrRecord, updated_at_unix: i64) {
+    pub fn apply_to_at(
+        self,
+        record: &mut PrRecord,
+        updated_at_unix: i64,
+    ) -> Result<(), &'static str> {
         match self {
             Self::ReportChecks {
                 green_contexts,
@@ -473,9 +483,36 @@ impl PrMutation {
                     }
                 }
             }
+            Self::SynchronizeHead {
+                expected_head_oid,
+                head_oid,
+            } => {
+                if !matches!(record.state, PrState::Draft | PrState::Open) {
+                    return Err("pull request is not open for head synchronization");
+                }
+                if record.head_oid != expected_head_oid {
+                    return Err("pull request head changed before synchronization");
+                }
+                if head_oid.len() != 40
+                    || !head_oid
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err("pull request synchronized head is malformed");
+                }
+                record.head_oid = head_oid;
+                record.reviews.retain(|review| {
+                    matches!(review.state, crate::lifecycle::ReviewState::Requested)
+                });
+                record.green_contexts.clear();
+                record.fork_unendorsed_contexts.clear();
+                record.endorsed_contexts.clear();
+                record.codeowner_review_satisfied = false;
+            }
             Self::Touch => {}
         }
         record.updated_at = Some(updated_at_unix);
+        Ok(())
     }
 }
 
@@ -1277,7 +1314,9 @@ impl PgPrStore {
                             .map_err(|_| pg_query("decode PR text erasure state"))?;
                         let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode PR"))?;
-                        mutation.apply_to_at(&mut record, context.unix_seconds);
+                        mutation
+                            .apply_to_at(&mut record, context.unix_seconds)
+                            .map_err(pg_query)?;
                         if free_text_erased {
                             let projection = command_projection(&record)
                                 .map_err(|_| pg_query("encode erased PR projection"))?;
@@ -2879,6 +2918,14 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         DurableError::Git("pull request list limit exceeded: serialized bytes".into())
     } else if message.contains("not found") {
         DurableError::NotFound("pull request not found".into())
+    } else if message.contains("not open for head synchronization")
+        || message.contains("head changed before synchronization")
+    {
+        DurableError::Conflict(
+            "pull request head synchronization conflicts with durable state".into(),
+        )
+    } else if message.contains("synchronized head is malformed") {
+        DurableError::InvalidInput("pull request synchronized head is malformed".into())
     } else if message.contains("different repository")
         || message.contains("different command")
         || message.contains("different merge")
@@ -3176,9 +3223,73 @@ mod tests {
         );
         let mut record = PrRecord::open(&pull_request, "a".repeat(40));
 
-        PrMutation::Touch.apply_to_at(&mut record, 1_722_470_400);
+        PrMutation::Touch
+            .apply_to_at(&mut record, 1_722_470_400)
+            .expect("touch is infallible");
 
         assert_eq!(record.updated_at, Some(1_722_470_400));
+    }
+
+    #[test]
+    fn synchronizing_a_head_invalidates_stale_decisions_but_keeps_review_requests() {
+        let pull_request = crate::lifecycle::PullRequest::open(
+            1,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pull_request, "a".repeat(40));
+        record.reviews = vec![
+            crate::pr_store::ReviewRecord {
+                reviewer_pseudonym: "requested@acme.noreply".into(),
+                state: crate::lifecycle::ReviewState::Requested,
+                is_agent: false,
+            },
+            crate::pr_store::ReviewRecord {
+                reviewer_pseudonym: "approved@acme.noreply".into(),
+                state: crate::lifecycle::ReviewState::Submitted(
+                    crate::lifecycle::ReviewVerdict::Approve,
+                ),
+                is_agent: false,
+            },
+        ];
+        record.green_contexts = vec!["ci/test".into()];
+        record.fork_unendorsed_contexts = vec!["ci/untrusted".into()];
+        record.endorsed_contexts = vec!["ci/endorsed".into()];
+        record.codeowner_review_satisfied = true;
+        record.outstanding_conversations = 2;
+
+        let synchronization = PrMutation::SynchronizeHead {
+            expected_head_oid: "a".repeat(40),
+            head_oid: "b".repeat(40),
+        };
+        assert_eq!(synchronization.event_type(), GIT_PR_SYNCHRONIZED);
+        assert_eq!(synchronization.command_kind(), "synchronize-head");
+        synchronization
+            .apply_to_at(&mut record, 1_722_470_401)
+            .expect("open PR fast-forward synchronizes");
+
+        assert_eq!(record.head_oid, "b".repeat(40));
+        assert_eq!(record.reviews.len(), 1);
+        assert!(matches!(
+            record.reviews[0].state,
+            crate::lifecycle::ReviewState::Requested
+        ));
+        assert!(record.green_contexts.is_empty());
+        assert!(record.fork_unendorsed_contexts.is_empty());
+        assert!(record.endorsed_contexts.is_empty());
+        assert!(!record.codeowner_review_satisfied);
+        assert_eq!(record.outstanding_conversations, 2);
+        assert_eq!(record.updated_at, Some(1_722_470_401));
+        assert_eq!(
+            PrMutation::SynchronizeHead {
+                expected_head_oid: "a".repeat(40),
+                head_oid: "c".repeat(40),
+            }
+            .apply_to_at(&mut record, 1_722_470_402),
+            Err("pull request head changed before synchronization")
+        );
     }
 
     #[test]

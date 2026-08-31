@@ -18,9 +18,9 @@ use myelin_identity_service::{
     AgentRegistryError, AgentSessionIssuer, AgentSessionRequest, PgAgentRegistry,
 };
 use myelin_storage::{
-    ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
-    AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRenewal,
-    AgentThreadReviewHandoff, AgentThreadRunBinding, AgentThreadState,
+    ActivateAgentThreadOutcome, AdvanceAgentThreadReviewHandoffOutcome, AgentThreadActivation,
+    AgentThreadEnvironmentBinding, AgentThreadGitBinding, AgentThreadProvisioningFailure,
+    AgentThreadRenewal, AgentThreadReviewHandoff, AgentThreadRunBinding, AgentThreadState,
     AgentThreadWorkspaceGuidance, BeginAgentThreadRenewalOutcome,
     BindAgentThreadReviewHandoffOutcome, BindAgentThreadRunOutcome, ColumnCryptor,
     CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, KmsEngine,
@@ -419,10 +419,8 @@ impl AgentThreadHttpApi {
         title: Option<String>,
         body_md: Option<String>,
         reviewers: Vec<String>,
-    ) -> Result<(AgentThreadReviewHandoff, bool), EdgeError> {
-        if let Some(existing) = self.review_handoff(principal, thread_id)? {
-            return Ok((existing, false));
-        }
+    ) -> Result<(AgentThreadReviewHandoff, bool, bool), EdgeError> {
+        let existing = self.review_handoff(principal, thread_id)?;
         let observed_at = Utc::now();
         let thread = self.available_owner_thread(principal, thread_id, observed_at)?;
         if thread.review_ready_at.is_none() {
@@ -455,6 +453,17 @@ impl AgentThreadHttpApi {
             base_oid: resolved.base_oid,
             branch: binding.branch.clone(),
         };
+        let head_ref = format!("refs/heads/{}", binding.branch);
+        if let Some(handoff) = existing.as_ref() {
+            if handoff.repository_slug != binding.repository
+                || handoff.base_ref != binding.base_ref
+                || handoff.head_ref != head_ref
+            {
+                return Err(EdgeError::Conflict(
+                    "agent thread review handoff conflicts with its durable branch".into(),
+                ));
+            }
+        }
         let protected_paths = self.protected_workspace_paths(principal, &thread, workspace_id)?;
         let published = self
             .workspaces
@@ -468,7 +477,65 @@ impl AgentThreadHttpApi {
                 },
             )
             .map_err(map_workspace_publication_error)?;
-        let head_ref = format!("refs/heads/{}", binding.branch);
+
+        if let Some(existing) = existing {
+            if existing.head_oid == published.head_oid {
+                return Ok((existing, false, false));
+            }
+            let operation = PrOperationId::derive(
+                "myelin.agent-thread.review-handoff-update.v1",
+                &[
+                    principal.tenant.0.as_bytes(),
+                    principal.region.0.as_bytes(),
+                    thread.thread_id.as_bytes(),
+                    existing.head_oid.as_bytes(),
+                    published.head_oid.as_bytes(),
+                ],
+            )
+            .map_err(map_durable_err)?;
+            self.git
+                .synchronize_pr_head_with_operation(
+                    &principal.tenant.0,
+                    &principal.region.0,
+                    &binding.repository,
+                    existing.pull_request_number,
+                    &existing.head_oid,
+                    &published.head_oid,
+                    principal,
+                    &operation,
+                )
+                .map_err(map_durable_err)?;
+            let outcome = self
+                .drive(self.threads.advance_review_handoff(
+                    &principal.tenant.0,
+                    &principal.principal_id.0,
+                    thread_id,
+                    &existing.head_oid,
+                    &published.head_oid,
+                    observed_at,
+                ))?
+                .map_err(|_| {
+                    EdgeError::Internal(
+                        "agent thread review handoff update could not be saved".into(),
+                    )
+                })?;
+            return match outcome {
+                AdvanceAgentThreadReviewHandoffOutcome::Advanced(handoff) => {
+                    Ok((handoff, false, true))
+                }
+                AdvanceAgentThreadReviewHandoffOutcome::AlreadyCurrent(handoff) => {
+                    Ok((handoff, false, false))
+                }
+                AdvanceAgentThreadReviewHandoffOutcome::NotFound => {
+                    Err(EdgeError::NotFound("agent thread not found".into()))
+                }
+                AdvanceAgentThreadReviewHandoffOutcome::Conflict => Err(EdgeError::Conflict(
+                    "agent thread review handoff changed during publication; retry the update"
+                        .into(),
+                )),
+            };
+        }
+
         let title = title.unwrap_or_else(|| thread.name.clone());
         let body_md = body_md.or_else(|| {
             Some(format!(
@@ -523,8 +590,10 @@ impl AgentThreadHttpApi {
                 EdgeError::Internal("agent thread review handoff could not be saved".into())
             })?;
         match outcome {
-            BindAgentThreadReviewHandoffOutcome::Bound(handoff) => Ok((handoff, true)),
-            BindAgentThreadReviewHandoffOutcome::AlreadyBound(handoff) => Ok((handoff, false)),
+            BindAgentThreadReviewHandoffOutcome::Bound(handoff) => Ok((handoff, true, false)),
+            BindAgentThreadReviewHandoffOutcome::AlreadyBound(handoff) => {
+                Ok((handoff, false, false))
+            }
             BindAgentThreadReviewHandoffOutcome::NotFound => {
                 Err(EdgeError::NotFound("agent thread not found".into()))
             }
@@ -1446,7 +1515,7 @@ impl Handler for AgentThreadReviewHandoffCreateHandler {
         let _client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
-        let (handoff, created) = self.api.publish_review_handoff(
+        let (handoff, created, updated) = self.api.publish_review_handoff(
             ctx.principal,
             thread_param(ctx)?,
             body.title,
@@ -1458,6 +1527,7 @@ impl Handler for AgentThreadReviewHandoffCreateHandler {
             &json!({
                 "handoff": review_handoff_json(&ctx.principal.tenant.0, &handoff),
                 "created": created,
+                "updated": updated,
                 "durable": true,
             }),
         )))
@@ -1920,6 +1990,7 @@ fn review_handoff_json(tenant: &str, handoff: &AgentThreadReviewHandoff) -> Valu
             ),
         },
         "created_at": handoff.created_at,
+        "updated_at": handoff.updated_at,
     })
 }
 
