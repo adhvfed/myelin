@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Hosted automation begins in the web product
+
+The web could activate a hosted named agent and inspect existing automations, but creating one still
+ended in instructions to use the CLI. The Automations surface now creates a governed rule directly:
+the owner deliberately selects an active hosted identity, platform event, bounded task, per-firing
+budget, lifetime firing limit, and approval rule. The initial safe path always refuses personal-data
+events and adds no hidden delegation caveats. Its server action validates an exact bounded request,
+retains one idempotency key while a failed submission is retried, strictly decodes the Edge receipt,
+and distinguishes conflicts and temporary unavailability without discarding the draft. The agent
+picker is owner-only and honest about its bounded newest-100 view.
+
+The Chromium product journey runs against the assembled Fed stack and PostgreSQL: it activates a
+hosted identity, creates a CI-failure automation in the browser, lands on the durable detail, checks
+the 250,000-minor-unit budget, two-firing lifetime, required human approval, and personal-data
+refusal, disables the rule through the authenticated mutation, and retires the identity. Existing
+TypeScript full-system automation journeys remain the proof that matching durable events proceed
+through approval into hosted execution; this browser journey proves that their configuration no
+longer requires a provider key or a CLI detour. Strict response tests reject surplus secret-shaped
+fields.
+
 ## 2026-08-31 — Agent runtime is an honest activation choice in the web product
 
 The backend and CLI supported both external MCP identities and Myelin-hosted automation identities,

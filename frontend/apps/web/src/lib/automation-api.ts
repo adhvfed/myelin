@@ -4,12 +4,14 @@ import {
   AUTOMATION_PAGE_LIMIT,
   isAutomationId,
   parseAutomation,
+  parseAutomationCreate,
   parseAutomationErasure,
   parseAutomationFiringPage,
   parseAutomationLifecycle,
   parseAutomationPage,
   parseAutomationResult,
   type AutomationErasureVM,
+  type AutomationCreateReceipt,
   type AutomationFiringPage,
   type AutomationLifecycleVM,
   type AutomationPage,
@@ -133,6 +135,64 @@ export const getAutomationResult = query(async (
     return result;
   });
 }, "automation-result");
+
+const utf8 = new TextEncoder();
+const EVENT_TYPE = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
+
+export const createAutomation = action(async (input: unknown) => {
+  "use server";
+  const respond = (value: AutomationMutationResult<AutomationCreateReceipt>) =>
+    json(value, { revalidate: [] });
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return respond({ ok: false, error: "bad-input" });
+  }
+  const value = input as Record<string, unknown>;
+  if (!Object.keys(value).every((key) => [
+    "eventType", "agentId", "task", "budgetMinorUnits", "maxFirings",
+    "requireHumanApproval", "clientNonce",
+  ].includes(key)) || Object.keys(value).length !== 7 ||
+      typeof value.eventType !== "string" || !EVENT_TYPE.test(value.eventType) ||
+      utf8.encode(value.eventType).byteLength > 255 || !isAutomationId(value.agentId) ||
+      typeof value.task !== "string" || value.task.trim() !== value.task ||
+      utf8.encode(value.task).byteLength > 4 * 1_024 || value.task.length === 0 ||
+      [...value.task].some((character) => {
+        const point = character.codePointAt(0)!;
+        return point === 0 || point === 0x7f || (point < 0x20 && character !== "\n" && character !== "\t");
+      }) || !Number.isSafeInteger(value.budgetMinorUnits) ||
+      (value.budgetMinorUnits as number) < 1 ||
+      (value.budgetMinorUnits as number) > 1_000_000_000_000 ||
+      !Number.isSafeInteger(value.maxFirings) || (value.maxFirings as number) < 1 ||
+      (value.maxFirings as number) > 1_000_000 ||
+      typeof value.requireHumanApproval !== "boolean" ||
+      typeof value.clientNonce !== "string" ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(value.clientNonce)) {
+    return respond({ ok: false, error: "bad-input" });
+  }
+  try {
+    const receipt = parseAutomationCreate(await edgePost("/v1/triggers", {
+      event_type: value.eventType,
+      run_as_agent_id: value.agentId,
+      task: value.task,
+      budget_minor_units: value.budgetMinorUnits,
+      max_firings: value.maxFirings,
+      delegation_caveats: [],
+      require_no_personal_data: true,
+      require_human_approval: value.requireHumanApproval,
+    }, { idempotencyKey: value.clientNonce }));
+    return receipt ? respond({ ok: true, receipt }) : respond({ ok: false, error: "error" });
+  } catch (error) {
+    if (isUnauthorized(error)) throw redirect("/login");
+    if (error instanceof GatewayError) {
+      if (error.status === 400) return respond({ ok: false, error: "bad-input" });
+      if (error.status === 403 || error.status === 404) {
+        return respond({ ok: false, error: "not-found" });
+      }
+      if (error.status === 409) return respond({ ok: false, error: "conflict" });
+      if (error.status === 503) return respond({ ok: false, error: "unavailable" });
+    }
+    return respond({ ok: false, error: "error" });
+  }
+}, "automation-create");
 
 export const changeAutomationLifecycle = action(async (input: {
   automationId: string;

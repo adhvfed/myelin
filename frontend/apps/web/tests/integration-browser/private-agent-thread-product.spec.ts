@@ -351,8 +351,41 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const hostedAgent = hostedRoster.getByRole("listitem").filter({ hasText: hostedAgentName });
   await expect(hostedAgent).toContainText("active · hosted");
   await expect(page.getByRole("dialog", { name: "Start private agent thread" })).toHaveCount(0);
-  await hostedAgent.getByRole("button", { name: "Retire" }).click();
+  await hostedRoster.getByRole("button", { name: "Close", exact: true }).click();
+
+  await page.getByRole("link", { name: "Automations" }).click();
+  await page.waitForURL("**/automations");
+  await page.getByRole("button", { name: "New automation" }).click();
+  const automation = page.getByRole("dialog", { name: "Create governed automation" });
+  const automationTask = `Read the failed ${suffix} run and open one focused issue.`;
+  await automation.getByRole("combobox", { name: "Run as hosted agent" })
+    .selectOption({ label: hostedAgentName });
+  await expect(automation.getByRole("combobox", { name: "Platform event" }))
+    .toHaveValue("ci.run.failed");
+  await automation.getByRole("textbox", { name: "Agent task" }).fill(automationTask);
+  await automation.getByRole("spinbutton", { name: "Budget per firing · minor units" })
+    .fill("250000");
+  await automation.getByRole("spinbutton", { name: "Maximum firings" }).fill("2");
+  await expect(automation.getByRole("checkbox", { name: "Require a human approval" }))
+    .toBeChecked();
+  await automation.getByRole("button", { name: "Create automation" }).click();
+  await page.waitForURL(/\/automations\/[0-9a-f-]{36}$/);
+  await expect(page.getByRole("heading", { level: 1, name: automationTask })).toBeVisible();
+  await expect(page.getByText("250,000 minor-units", { exact: true })).toBeVisible();
+  await expect(page.getByText("0 of 2", { exact: true })).toBeVisible();
+  await expect(page.getByText("Required", { exact: true })).toBeVisible();
+  await expect(page.getByText("Refused", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Disable" }).click();
+  await page.getByRole("alertdialog", { name: "Disable this automation?" })
+    .getByRole("button", { name: "Disable automation" }).click();
+  await expect(page.getByText("Disabled", { exact: true })).toBeVisible();
+
+  await page.getByRole("link", { name: "Agents" }).click();
+  await page.getByRole("button", { name: "Manage my agents" }).click();
+  const cleanupRoster = page.getByRole("dialog", { name: "My named agents" });
+  const cleanupAgent = cleanupRoster.getByRole("listitem").filter({ hasText: hostedAgentName });
+  await cleanupAgent.getByRole("button", { name: "Retire" }).click();
   await page.getByRole("alertdialog", { name: `Retire ${hostedAgentName}?` })
     .getByRole("button", { name: "Retire agent" }).click();
-  await expect(hostedAgent).toContainText("Retired permanently");
+  await expect(cleanupAgent).toContainText("Retired permanently");
 });

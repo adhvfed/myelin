@@ -1,5 +1,5 @@
 /** Safe presentation categories carried across the SolidStart server-function boundary. */
-export type AutomationErrorKind = "bad-input" | "not-found" | "unavailable" | "error";
+export type AutomationErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
 export const AUTOMATION_ERR_PREFIX = "AUTOMATION_ERR:";
 
 export class AutomationRouteError extends Error {

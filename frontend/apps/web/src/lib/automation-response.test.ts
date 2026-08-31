@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_AUTOMATION_TASK_BYTES,
   parseAutomation,
+  parseAutomationCreate,
   parseAutomationErasure,
   parseAutomationFiringPage,
   parseAutomationLifecycle,
@@ -68,6 +69,8 @@ describe("automation response decoding", () => {
     expect(parseAutomationPage({ items: [automation], page: { next_cursor: null, limit: 25 } }))
       .toEqual({ items: [automation], page: { next_cursor: null, limit: 25 } });
     expect(parseAutomation({ trigger: automation })).toEqual(automation);
+    expect(parseAutomationCreate({ trigger: automation, created: true, durable: true }))
+      .toEqual({ trigger: automation, created: true, durable: true });
     expect(parseAutomationFiringPage({ items: [firing], page: { next_cursor: null, limit: 25 } }))
       .toEqual({ items: [firing], page: { next_cursor: null, limit: 25 } });
     expect(parseAutomationResult({ result })).toEqual(result);
@@ -97,6 +100,12 @@ describe("automation response decoding", () => {
     expect(parseAutomationPage({
       items: [{ ...automation, integration_api_key: "must-never-cross" }],
       page: { next_cursor: null, limit: 25 },
+    })).toBeNull();
+    expect(parseAutomationCreate({
+      trigger: automation,
+      created: true,
+      durable: true,
+      provider_token: "must-never-cross",
     })).toBeNull();
     expect(parseAutomationFiringPage({
       items: [{ ...firing, run_ref: `myelin://${tenant}/agent/run/another-run` }],

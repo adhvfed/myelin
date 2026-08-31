@@ -99,6 +99,12 @@ export interface AutomationPage {
   page: { next_cursor: string | null; limit: number };
 }
 
+export interface AutomationCreateReceipt {
+  trigger: AutomationVM;
+  created: boolean;
+  durable: true;
+}
+
 export interface AutomationFiringPage {
   items: AutomationFiringVM[];
   page: { next_cursor: string | null; limit: number };
@@ -256,6 +262,15 @@ export function parseAutomationPage(value: unknown): AutomationPage | null {
   const items = envelope.items.map(automation);
   return items.every((item): item is AutomationVM => item !== null)
     ? { items, page: pagination }
+    : null;
+}
+
+export function parseAutomationCreate(value: unknown): AutomationCreateReceipt | null {
+  const envelope = record(value);
+  const trigger = automation(envelope?.trigger);
+  return envelope && exact(envelope, ["trigger", "created", "durable"]) && trigger &&
+      typeof envelope.created === "boolean" && envelope.durable === true
+    ? { trigger, created: envelope.created, durable: true }
     : null;
 }
 

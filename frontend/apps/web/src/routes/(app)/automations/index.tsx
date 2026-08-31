@@ -1,10 +1,13 @@
-import { ErrorBoundary, For, Show, Suspense } from "solid-js";
+import { ErrorBoundary, For, Show, Suspense, createMemo, createSignal } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { A, createAsync, useSearchParams } from "@solidjs/router";
+import { A, createAsync, revalidate, useNavigate, useSearchParams } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
 import { AutomationErrorState, automationErrorKind } from "~/components/AutomationErrorState";
 import { AutomationStateLabel } from "~/components/AutomationStateLabel";
+import { AutomationCreateDialog } from "~/components/AutomationCreateDialog";
+import { useAppViewer } from "~/components/AppShell";
 import { getAutomations } from "~/lib/automation-api";
+import { getAgentChoices } from "~/lib/agent-thread-api";
 import {
   AUTOMATION_PAGE_LIMIT,
   type AutomationVM,
@@ -12,6 +15,9 @@ import {
 
 export default function AutomationsIndex() {
   const [search] = useSearchParams();
+  const navigate = useNavigate();
+  const viewer = useAppViewer();
+  const [creating, setCreating] = createSignal(false);
   const cursor = () => search.cursor as string | undefined;
   const limit = () => search.limit === undefined
     ? AUTOMATION_PAGE_LIMIT
@@ -24,6 +30,17 @@ export default function AutomationsIndex() {
       : { limit: limit(), cursor: cursor() }),
     { deferStream: true },
   );
+  const agentPage = createAsync(async () => {
+    try {
+      return await getAgentChoices({ limit: 100 });
+    } catch (error) {
+      if (error instanceof Response) throw error;
+      return null;
+    }
+  }, { deferStream: true });
+  const hostedAgents = createMemo(() => (agentPage()?.items ?? []).filter((agent) =>
+    agent.owner_principal_id === viewer.principalId && agent.status === "active" &&
+    agent.runtime_ref === "hosted:luna"));
 
   return (
     <section aria-labelledby="automations-heading" class="automation-screen">
@@ -33,11 +50,16 @@ export default function AutomationsIndex() {
           <p class="automation-eyebrow">Governed agent work</p>
           <h1 id="automations-heading"><Icon name="run" /> Automations</h1>
         </div>
-        <Show when={search.cursor}>
-          <A href="/automations" class="automation-button automation-button-secondary">
-            <Icon name="cycle" /> Latest
-          </A>
-        </Show>
+        <div class="automation-actions">
+          <Show when={search.cursor}>
+            <A href="/automations" class="automation-button automation-button-secondary">
+              <Icon name="cycle" /> Latest
+            </A>
+          </Show>
+          <button type="button" class="automation-button automation-button-primary" onClick={() => setCreating(true)}>
+            <Icon name="run" /> New automation
+          </button>
+        </div>
       </header>
       <p class="automation-intro">
         Platform events wake narrowly delegated agents. Myelin supplies their integrations and keeps
@@ -59,8 +81,8 @@ export default function AutomationsIndex() {
                     <Icon name="agent" size={28} title="No automations" />
                     <h2>No automations yet</h2>
                     <p>
-                      Start with <code>myelin automation create</code>. The resulting governed work
-                      will be visible here without configuring a provider API key.
+                      Create one here with a hosted named agent. The resulting governed work stays
+                      visible without configuring a provider API key.
                     </p>
                   </div>
                 }
@@ -86,6 +108,17 @@ export default function AutomationsIndex() {
           </Show>
         </Suspense>
       </ErrorBoundary>
+      <AutomationCreateDialog
+        open={creating()}
+        agents={hostedAgents()}
+        agentsLoading={agentPage() === undefined}
+        agentsTruncated={Boolean(agentPage()?.page.next_cursor)}
+        onClose={() => setCreating(false)}
+        onCreated={(receipt) => {
+          void revalidate("automations");
+          navigate(`/automations/${encodeURIComponent(receipt.trigger.id)}`);
+        }}
+      />
     </section>
   );
 }

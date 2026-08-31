@@ -11,7 +11,7 @@ export function automationErrorKind(error: unknown): AutomationErrorKind {
   const message = error instanceof Error ? error.message : String(error ?? "");
   if (message.startsWith(AUTOMATION_ERR_PREFIX)) {
     const kind = message.slice(AUTOMATION_ERR_PREFIX.length);
-    if (["bad-input", "not-found", "unavailable", "error"].includes(kind)) {
+    if (["bad-input", "not-found", "conflict", "unavailable", "error"].includes(kind)) {
       return kind as AutomationErrorKind;
     }
   }
