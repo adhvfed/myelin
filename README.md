@@ -208,6 +208,7 @@ myelin issue relation list DX-1
 myelin issue relation remove DX-1 \
   55555555-5555-5555-5555-555555555555
 myelin issue close DX-1
+myelin issue reopen DX-1
 myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \
   --input jira-issues.json --dry-run
 myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \

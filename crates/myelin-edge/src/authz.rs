@@ -51,6 +51,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "issues.authorization_status",
     "issues.view",
     "issues.close",
+    "issues.reopen",
     "issues.relations.list",
     "issues.relations.create",
     "issues.relations.remove",
@@ -277,6 +278,7 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("issues.authorization_status", "issue.view", OP_PAT),
     requirement!("issues.view", "issue.view", OP_PAT),
     requirement!("issues.close", "issue.transition", OP_PAT),
+    requirement!("issues.reopen", "issue.transition", OP_PAT),
     requirement!("issues.relations.list", "issue.view", OP_PAT),
     requirement!("issues.relations.create", "issue.transition", OP_PAT),
     requirement!("issues.relations.remove", "issue.transition", OP_PAT),
@@ -801,6 +803,7 @@ mod tests {
             "issues.import.run"
         ));
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.close"));
+        assert!(!authorize_edge_action(&AllowAll, &view, "issues.reopen"));
         assert!(!authorize_edge_action(
             &AllowAll,
             &view,
@@ -816,6 +819,11 @@ mod tests {
             &AllowAll,
             &transition,
             "issues.close"
+        ));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &transition,
+            "issues.reopen"
         ));
         assert!(authorize_edge_action(
             &AllowAll,
@@ -855,6 +863,7 @@ mod tests {
             "issues.authorization_status"
         ));
         assert!(!authorize_edge_action(&AllowAll, &create, "issues.close"));
+        assert!(!authorize_edge_action(&AllowAll, &create, "issues.reopen"));
     }
 
     #[test]

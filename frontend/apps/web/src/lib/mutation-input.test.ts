@@ -7,7 +7,7 @@ import {
 } from "./mutation-input";
 
 describe("parseIssueMutation", () => {
-  it("normalizes a valid create and admits canonical close/activation ids", () => {
+  it("normalizes a valid create and admits canonical lifecycle/activation ids", () => {
     expect(parseIssueMutation({
       op: "create",
       projectId: "123e4567-e89b-12d3-a456-426614174000",
@@ -24,6 +24,10 @@ describe("parseIssueMutation", () => {
       issueId: "123e4567-e89b-12d3-a456-426614174000",
     })).not.toBeNull();
     expect(parseIssueMutation({
+      op: "reopen",
+      issueId: "123e4567-e89b-12d3-a456-426614174000",
+    })).not.toBeNull();
+    expect(parseIssueMutation({
       op: "activation",
       requestEventId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
     })).not.toBeNull();
@@ -32,7 +36,7 @@ describe("parseIssueMutation", () => {
   it.each([
     null,
     [],
-    { op: "reopen", issueId: "123e4567-e89b-12d3-a456-426614174000" },
+    { op: "reopen", issueId: "123e4567-e89b-12d3-a456-426614174000", state: "Backlog" },
     { op: "close", issueId: "not-a-uuid" },
     { op: "activation", requestEventId: "01arz3ndektsv4rrffq69g5fav" },
     { op: "create", projectId: "not-a-uuid", title: "ok", clientNonce: "create_1" },

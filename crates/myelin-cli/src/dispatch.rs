@@ -849,6 +849,10 @@ mod tests {
         assert_eq!(close.method, HttpMethod::Post);
         assert_eq!(close.path, format!("/v1/issues/{issue}/close"));
         assert_eq!(close.payload, Some(b"{}".to_vec()));
+        let reopen = issues_dispatch(&["reopen", issue]).unwrap();
+        assert_eq!(reopen.method, HttpMethod::Post);
+        assert_eq!(reopen.path, format!("/v1/issues/{issue}/reopen"));
+        assert_eq!(reopen.payload, Some(b"{}".to_vec()));
     }
 
     #[test]

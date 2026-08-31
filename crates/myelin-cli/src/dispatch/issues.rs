@@ -178,6 +178,9 @@ fn command_to_call(
         CliCommand::Close { issue_locator } => {
             EdgeCall::post_retry_safe_json(format!("/v1/issues/{issue_locator}/close"), json!({}))
         }
+        CliCommand::Reopen { issue_locator } => {
+            EdgeCall::post_retry_safe_json(format!("/v1/issues/{issue_locator}/reopen"), json!({}))
+        }
         CliCommand::ListRelations { issue_locator } => {
             EdgeCall::get(format!("/v1/issues/{issue_locator}/relations"))
         }
@@ -317,13 +320,22 @@ mod tests {
     }
 
     #[test]
-    fn close_targets_one_idempotent_terminal_state_without_retry_ceremony() {
+    fn lifecycle_commands_target_idempotent_states_without_retry_ceremony() {
         let close = issues_dispatch(&["close", ISSUE]).unwrap();
         assert_eq!(close.method, HttpMethod::Post);
         assert_eq!(close.path, format!("/v1/issues/{ISSUE}/close"));
         assert_eq!(close.retry_policy, RetryPolicy::None);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(close.payload.as_deref().unwrap()).unwrap(),
+            json!({}),
+        );
+        let reopen = issues_dispatch(&["reopen", ISSUE]).unwrap();
+        assert_eq!(reopen.method, HttpMethod::Post);
+        assert_eq!(reopen.path, format!("/v1/issues/{ISSUE}/reopen"));
+        assert_eq!(reopen.retry_policy, RetryPolicy::None);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(reopen.payload.as_deref().unwrap())
+                .unwrap(),
             json!({}),
         );
     }

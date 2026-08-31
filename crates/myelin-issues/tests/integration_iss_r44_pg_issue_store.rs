@@ -92,7 +92,7 @@ impl IssueAuthorizer for RebacAuthorizer {
     ) -> bool {
         let permission = match permission {
             IssuePermission::View => "view",
-            IssuePermission::Close | IssuePermission::ManageRelations => "manage",
+            IssuePermission::Transition | IssuePermission::ManageRelations => "manage",
         };
         self.allows(principal, permission, format!("issue:{issue_id}"))
     }

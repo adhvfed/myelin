@@ -20,7 +20,7 @@ use myelin_identity_service::{
     PasetoCapabilityVerifier, PgProjectStore, PrincipalStore, RevocationStore, StoreBackedCheck,
     TupleStore,
 };
-use myelin_issues::events::ISSUE_CLOSED;
+use myelin_issues::events::{ISSUE_CLOSED, ISSUE_REOPENED};
 use myelin_issues::{
     is_resolvable_pseudonym, issues_hot_tables, issues_migrations, IssueAuthorizationBinding,
     IssueAuthorizationStatus, IssueTupleWriter, PgIssueStore, ISSUE_KEY_PREFIX_LIST_INDEX,
@@ -433,6 +433,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     );
     let issue_path = format!("/v1/issues/{issue_id}");
     let close_path = format!("{issue_path}/close");
+    let reopen_path = format!("{issue_path}/reopen");
 
     let (status, pending_headers, pending_status) = http_with_headers(
         address,
@@ -767,6 +768,14 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         b"{}".to_vec(),
     )
     .await;
+    let denied_reopen = http(
+        address,
+        "POST",
+        &reopen_path,
+        Some(&intruder_token),
+        b"{}".to_vec(),
+    )
+    .await;
     let absent = http(
         address,
         "GET",
@@ -776,6 +785,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     )
     .await;
     assert_eq!(denied_view, denied_close);
+    assert_eq!(denied_view, denied_reopen);
     assert_eq!(denied_view, absent);
     assert_eq!(denied_view.0, 404);
     let foreign_view = http(
@@ -1175,6 +1185,45 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     let closed_envelope: serde_json::Value = closed_rows[0].get("envelope");
     assert!(!closed_envelope.to_string().contains(title));
     assert_eq!(closed_envelope["payload"]["category"], "completed");
+
+    let (status, first_reopen) = http(
+        address,
+        "POST",
+        &reopen_path,
+        Some(&creator_token),
+        b"{}".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(first_reopen["state"], "Backlog");
+    assert_eq!(first_reopen["state_category"], "unstarted");
+    let reopened_version = first_reopen["version"].as_i64().unwrap();
+    let (status, retry_reopen) = http(
+        address,
+        "POST",
+        &reopen_path,
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(retry_reopen["version"], reopened_version);
+
+    let reopened_rows = sqlx::query(
+        "SELECT envelope FROM outbox WHERE envelope->>'tenant' = $1 \
+         AND envelope->>'type_' = $2 AND aggregate = $3",
+    )
+    .bind(&tenant)
+    .bind(ISSUE_REOPENED)
+    .bind(format!("issue:{issue_id}"))
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(reopened_rows.len(), 1, "retry emits no second reopen event");
+    let reopened_envelope: serde_json::Value = reopened_rows[0].get("envelope");
+    assert!(!reopened_envelope.to_string().contains(title));
+    assert_eq!(reopened_envelope["payload"]["from"], "Done");
+    assert_eq!(reopened_envelope["payload"]["category"], "unstarted");
 
     for statement in [
         "DELETE FROM issue_authz_binding WHERE tenant_id = $1",

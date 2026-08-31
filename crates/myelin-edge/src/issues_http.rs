@@ -245,6 +245,16 @@ impl DurableIssueMutationApi {
         self.close_issue(actor, authorized_viewer, &issue_id)
     }
 
+    pub fn reopen_issue(
+        &self,
+        actor: &myelin_identity::Principal,
+        authorized_viewer: &myelin_identity::Principal,
+        issue_id: &str,
+    ) -> Result<StoredIssue, EdgeError> {
+        self.drive(self.store.reopen_as(actor, authorized_viewer, issue_id))
+            .map_err(map_store_error)
+    }
+
     pub fn may_close_ref(
         &self,
         authorized_viewer: &myelin_identity::Principal,
@@ -258,7 +268,7 @@ impl DurableIssueMutationApi {
         };
         Ok(self
             .authorizer
-            .may_access(authorized_viewer, &issue_id, IssuePermission::Close))
+            .may_access(authorized_viewer, &issue_id, IssuePermission::Transition))
     }
 
     fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
@@ -721,11 +731,18 @@ impl Handler for IssueViewHandler {
     }
 }
 
-struct IssueCloseHandler {
-    api: DurableIssueMutationApi,
+#[derive(Clone, Copy)]
+enum IssueLifecycleAction {
+    Close,
+    Reopen,
 }
 
-impl Handler for IssueCloseHandler {
+struct IssueLifecycleHandler {
+    api: DurableIssueMutationApi,
+    action: IssueLifecycleAction,
+}
+
+impl Handler for IssueLifecycleHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if ctx.request.body.len() > MAX_ISSUE_JSON_BYTES {
             return Err(EdgeError::PayloadTooLarge(format!(
@@ -736,12 +753,19 @@ impl Handler for IssueCloseHandler {
             let value = ctx.request.json_body()?;
             if value.as_object().is_none_or(|object| !object.is_empty()) {
                 return Err(EdgeError::BadRequest(
-                    "issue close body must be an empty JSON object".into(),
+                    "issue lifecycle body must be an empty JSON object".into(),
                 ));
             }
         }
         let id = resolved_issue_id(ctx)?;
-        let issue = self.api.close_issue(ctx.principal, ctx.principal, id)?;
+        let issue = match self.action {
+            IssueLifecycleAction::Close => {
+                self.api.close_issue(ctx.principal, ctx.principal, id)?
+            }
+            IssueLifecycleAction::Reopen => {
+                self.api.reopen_issue(ctx.principal, ctx.principal, id)?
+            }
+        };
         Ok(no_store(EdgeResponse::json(
             200,
             &issue_json(&ctx.principal.tenant.0, &issue),
@@ -946,8 +970,25 @@ pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) ->
             guarded(
                 &authorizer,
                 &reads,
-                IssuePermission::Close,
-                Arc::new(IssueCloseHandler { api }),
+                IssuePermission::Transition,
+                Arc::new(IssueLifecycleHandler {
+                    api: api.clone(),
+                    action: IssueLifecycleAction::Close,
+                }),
+            ),
+        )
+        .route(
+            Method::Post,
+            "/v1/issues/{issue}/reopen",
+            "issues.reopen",
+            guarded(
+                &authorizer,
+                &reads,
+                IssuePermission::Transition,
+                Arc::new(IssueLifecycleHandler {
+                    api,
+                    action: IssueLifecycleAction::Reopen,
+                }),
             ),
         )
 }

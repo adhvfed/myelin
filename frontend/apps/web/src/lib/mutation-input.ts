@@ -12,6 +12,7 @@ export const MAX_GIT_PATH_BYTES = 4 * 1024;
 export type IssueMutation =
   | { op: "create"; projectId: string; title: string; clientNonce: string }
   | { op: "close"; issueId: string }
+  | { op: "reopen"; issueId: string }
   | { op: "activation"; requestEventId: string };
 
 export type PrMutation =
@@ -116,8 +117,9 @@ export function parseIssueMutation(value: unknown): IssueMutation | null {
         : { op: "create", projectId: input.projectId, title, clientNonce: input.clientNonce };
     }
     case "close":
+    case "reopen":
       return exactKeys(input, ["op", "issueId"]) && canonicalUuid(input.issueId)
-        ? { op: "close", issueId: input.issueId }
+        ? { op: input.op, issueId: input.issueId }
         : null;
     case "activation":
       return exactKeys(input, ["op", "requestEventId"]) && canonicalUlid(input.requestEventId)

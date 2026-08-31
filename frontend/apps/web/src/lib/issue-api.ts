@@ -105,6 +105,7 @@ export const getIssue = query(async (id: string): Promise<IssueVM> => {
 export type IssueMutationResult =
   | { ok: true; op: "create"; receipt: IssueCreateReceipt }
   | { ok: true; op: "close"; issue: IssueVM }
+  | { ok: true; op: "reopen"; issue: IssueVM }
   | { ok: true; op: "activation"; status: IssueAuthorizationStatus }
   | { ok: false; error: IssueErrorKind };
 
@@ -141,12 +142,16 @@ export const issuesMutate = action(async (mutation: IssueMutation) => {
       });
       return result({ ok: true, op: "activation", status });
     }
+    const operation = parsed.op;
     const issue = await issueAuthed(async () => {
-      const decoded = parseIssue(await edgePost(`/v1/issues/${seg(parsed.issueId)}/close`, {}));
+      const decoded = parseIssue(await edgePost(
+        `/v1/issues/${seg(parsed.issueId)}/${operation}`,
+        {},
+      ));
       if (!decoded) throw new IssueRouteError("error");
       return decoded;
     });
-    return result({ ok: true, op: "close", issue });
+    return result({ ok: true, op: operation, issue });
   } catch (error) {
     if (error instanceof IssueRouteError) return result({ ok: false, error: error.kind });
     throw error;

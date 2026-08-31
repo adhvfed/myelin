@@ -28,7 +28,8 @@ use create_idempotency::{CreateClaim, CreateIdentity};
 use event_envelopes::{
     authorization_requested as authorization_request_envelope,
     issue_closed as issue_closed_envelope, issue_created as issue_created_envelope,
-    issue_relation as issue_relation_envelope, validate_authorization_request,
+    issue_relation as issue_relation_envelope, issue_reopened as issue_reopened_envelope,
+    validate_authorization_request,
 };
 use import_creation::{ImportClaim, ImportIdentity};
 pub use import_creation::{ImportIssue, ImportIssueReceipt};
@@ -56,8 +57,30 @@ pub(crate) fn is_valid_issue_title(value: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssuePermission {
     View,
-    Close,
+    Transition,
     ManageRelations,
+}
+
+#[derive(Clone, Copy)]
+enum IssueTransition {
+    Close,
+    Reopen,
+}
+
+impl IssueTransition {
+    fn applies_to(self, category: &str) -> bool {
+        match self {
+            Self::Close => category != "completed",
+            Self::Reopen => category == "completed",
+        }
+    }
+
+    fn target(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Close => ("Done", "completed"),
+            Self::Reopen => ("Backlog", "unstarted"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1738,6 +1761,35 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         authorized_viewer: &Principal,
         issue_id: &str,
     ) -> Result<StoredIssue, IssueStoreError> {
+        self.transition_as(actor, authorized_viewer, issue_id, IssueTransition::Close)
+            .await
+    }
+
+    pub async fn reopen(
+        &self,
+        principal: &Principal,
+        issue_id: &str,
+    ) -> Result<StoredIssue, IssueStoreError> {
+        self.reopen_as(principal, principal, issue_id).await
+    }
+
+    pub async fn reopen_as(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        issue_id: &str,
+    ) -> Result<StoredIssue, IssueStoreError> {
+        self.transition_as(actor, authorized_viewer, issue_id, IssueTransition::Reopen)
+            .await
+    }
+
+    async fn transition_as(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        issue_id: &str,
+        transition: IssueTransition,
+    ) -> Result<StoredIssue, IssueStoreError> {
         let scope = self.scope(actor)?;
         if self.scope(authorized_viewer)? != scope {
             return Err(IssueStoreError::BadInput(
@@ -1747,7 +1799,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let id = parse_uuid("issue_id", issue_id)?;
         if !self
             .authorizer
-            .may_access(authorized_viewer, issue_id, IssuePermission::Close)
+            .may_access(authorized_viewer, issue_id, IssuePermission::Transition)
         {
             return Err(IssueStoreError::NotFound);
         }
@@ -1757,7 +1809,8 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
         let actor = actor.clone();
-        let closed_event_id: EventId = self.minter.mint().into();
+        let transition_event_id: EventId = self.minter.mint().into();
+        let (target_state, target_category) = transition.target();
         let row = self
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
@@ -1768,13 +1821,15 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let Some(current) = current else {
                         return Ok(None);
                     };
-                    if current.get::<String, _>("state_category") == "completed" {
+                    if !transition
+                        .applies_to(current.get::<String, _>("state_category").as_str())
+                    {
                         return Ok(Some(current));
                     }
                     let previous_state = current.get::<String, _>("state");
                     let row = sqlx::query(&format!(
-                        "UPDATE issue SET state = 'Done', state_category = 'completed', \
-                         state_changed_at = to_timestamp($4), updated_at = to_timestamp($4), \
+                        "UPDATE issue SET state = $4, state_category = $5, \
+                         state_changed_at = to_timestamp($6), updated_at = to_timestamp($6), \
                          version = version + 1 \
                          WHERE tenant_id = $1 AND region = $2 AND id = $3 \
                            AND EXISTS (SELECT 1 FROM issue_authz_binding b \
@@ -1786,6 +1841,8 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(&tenant_id)
                     .bind(&region)
                     .bind(id)
+                    .bind(target_state)
+                    .bind(target_category)
                     .bind(observed_unix)
                     .fetch_optional(&mut *conn)
                     .await
@@ -1793,14 +1850,25 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let Some(row) = row else {
                         return Ok(None);
                     };
-                    let envelope = issue_closed_envelope(
-                        &actor,
-                        id,
-                        row.get::<String, _>("key").as_str(),
-                        previous_state.as_str(),
-                        closed_event_id,
-                        observed_at,
-                    );
+                    let key = row.get::<String, _>("key");
+                    let envelope = match transition {
+                        IssueTransition::Close => issue_closed_envelope(
+                            &actor,
+                            id,
+                            &key,
+                            &previous_state,
+                            transition_event_id,
+                            observed_at,
+                        ),
+                        IssueTransition::Reopen => issue_reopened_envelope(
+                            &actor,
+                            id,
+                            &key,
+                            &previous_state,
+                            transition_event_id,
+                            observed_at,
+                        ),
+                    };
                     let aggregate = envelope.aggregate.0.clone();
                     PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &envelope).await?;
                     Ok(Some(row))
@@ -2316,7 +2384,7 @@ pub fn is_canonical_request_event_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::ISSUE_CLOSED;
+    use crate::events::{ISSUE_CLOSED, ISSUE_REOPENED};
     use myelin_events::{Actor, Timestamp};
     use myelin_identity::{DataRole, PrincipalId, PrincipalStatus, RuntimeRef};
     use myelin_tenancy::{Region, TenantId};
@@ -2607,5 +2675,41 @@ mod tests {
         assert!(!closed.contains_personal_data);
         assert!(closed.pii_key_ref.is_none());
         assert!(!closed.payload.to_string().contains("title"));
+    }
+
+    #[test]
+    fn reopen_event_is_canonical_references_only_and_actor_scoped() {
+        let actor = Principal::new(
+            TenantId::from_token("acme"),
+            Region::new("fr-par"),
+            PrincipalId("human:reopener".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let issue_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let event_id: EventId = UlidMinter::new().mint().into();
+        let reopened = issue_reopened_envelope(
+            &actor,
+            issue_id,
+            "ENG-7",
+            "Done",
+            event_id.clone(),
+            fixed_time(),
+        );
+
+        assert_eq!(reopened.event_id, event_id);
+        assert_eq!(reopened.type_.0, ISSUE_REOPENED);
+        assert_eq!(reopened.tenant, actor.tenant);
+        assert_eq!(reopened.region, actor.region);
+        assert_eq!(reopened.actor, Actor(actor));
+        assert_eq!(reopened.aggregate.0, format!("issue:{issue_id}"));
+        assert_eq!(reopened.payload["issue_key"], "ENG-7");
+        assert_eq!(reopened.payload["from"], "Done");
+        assert_eq!(reopened.payload["to"], "Backlog");
+        assert_eq!(reopened.payload["category"], "unstarted");
+        assert!(!reopened.contains_personal_data);
+        assert!(reopened.pii_key_ref.is_none());
+        assert!(!reopened.payload.to_string().contains("title"));
     }
 }

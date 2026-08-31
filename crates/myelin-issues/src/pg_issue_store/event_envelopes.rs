@@ -1,4 +1,4 @@
-use crate::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED};
+use crate::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED, ISSUE_REOPENED};
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
     EventId, EventType, Timestamp, Visibility,
@@ -147,6 +147,45 @@ pub(super) fn issue_closed(
                 "from": previous_state,
                 "to": "Done",
                 "category": "completed",
+            }),
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        },
+        EmitContext {
+            event_id,
+            tenant: actor.tenant.clone(),
+            region: actor.region.clone(),
+            actor: Actor(actor.clone()),
+            schema_ver: 1,
+            occurred_at: timestamp.clone(),
+            recorded_at: timestamp,
+            caused_by: None,
+        },
+        None,
+    )
+}
+
+pub(super) fn issue_reopened(
+    actor: &Principal,
+    issue_id: Uuid,
+    key: &str,
+    previous_state: &str,
+    event_id: EventId,
+    timestamp: Timestamp,
+) -> EventEnvelope {
+    derive_envelope(
+        EventDraft {
+            type_: EventType(ISSUE_REOPENED.into()),
+            subject: issue_subject(actor.tenant.as_str(), issue_id),
+            aggregate: AggregateKey(format!("issue:{issue_id}")),
+            payload: serde_json::json!({
+                "issue_id": issue_id.to_string(),
+                "issue_key": key,
+                "from": previous_state,
+                "to": "Backlog",
+                "category": "unstarted",
             }),
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,

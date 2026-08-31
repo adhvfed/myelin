@@ -244,4 +244,22 @@ command = ["true"]
     200,
   );
   expect(closedIssue).toMatchObject({ id: issueId, key: issueKey, state_category: "completed" });
+
+  await page.getByRole("button", { name: "Reopen issue" }).click();
+  await expect(page.getByRole("button", { name: "Close issue" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reopen issue" })).toHaveCount(0);
+  await expect(page.getByText(`${issueKey} reopened`)).toBeVisible();
+
+  const reopenedIssue = await edgeRequest(
+    request,
+    "GET",
+    `/v1/issues/${encodeURIComponent(issueId)}`,
+    200,
+  );
+  expect(reopenedIssue).toMatchObject({
+    id: issueId,
+    key: issueKey,
+    state: "Backlog",
+    state_category: "unstarted",
+  });
 });

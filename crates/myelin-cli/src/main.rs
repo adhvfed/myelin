@@ -82,7 +82,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// List, create, inspect, and close issues.
+    /// List, create, inspect, close, and reopen issues.
     #[command(name = "issue", visible_alias = "issues")]
     Issue {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

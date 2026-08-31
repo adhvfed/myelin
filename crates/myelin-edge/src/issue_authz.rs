@@ -73,7 +73,7 @@ impl IssueAuthorizer for StoreBackedIssueAuthorizer {
     ) -> bool {
         let permission = match permission {
             IssuePermission::View => "view",
-            IssuePermission::Close => "transition",
+            IssuePermission::Transition => "transition",
             IssuePermission::ManageRelations => "manage",
         };
         self.allows(principal, permission, format!("issue:{issue_id}"))

@@ -113,7 +113,7 @@ describe("issue lifecycle", () => {
     await expect(findProject(reviewerClient, projectId)).resolves.toBeUndefined();
   });
 
-  test("moves an issue through authorization, discovery, and completion", async () => {
+  test("moves an issue through authorization, discovery, completion, and reopening", async () => {
     const title = uniqueName("Ship the backend lifecycle suite");
     const proposed = await systemClient.json("/v1/issues", {
       method: "POST",
@@ -165,6 +165,33 @@ describe("issue lifecycle", () => {
       systemClient,
       (item) => item.id === issueId,
       { state: "closed" },
+    )).toEqual([expect.objectContaining({ id: issueId, title })]);
+
+    const reopened = await systemClient.json(`/v1/issues/${encodeURIComponent(issueKey)}/reopen`, {
+      method: "POST",
+      body: {},
+    });
+    expect(reopened.body).toMatchObject({
+      id: issueId,
+      title,
+      state: "Backlog",
+      state_category: "unstarted",
+    });
+    const reopenedVersion = reopened.body.version;
+
+    const reopenRetry = await systemClient.json(
+      `/v1/issues/${encodeURIComponent(issueKey)}/reopen`,
+      { method: "POST", body: {} },
+    );
+    expect(reopenRetry.body).toMatchObject({
+      id: issueId,
+      state_category: "unstarted",
+      version: reopenedVersion,
+    });
+    expect(await issuesMatching(
+      systemClient,
+      (item) => item.id === issueId,
+      { state: "open" },
     )).toEqual([expect.objectContaining({ id: issueId, title })]);
   });
 

@@ -10,6 +10,12 @@ stack with `fed.yaml` and optional `.fed` configuration; Myelin can pin that dec
 source revision and use it as the default environment recipe. Projects that do not use Service
 Federation remain first-class.
 
+Everyday work should remain forgiving. A person can create, find, close, and reopen an issue through
+the web or CLI under the same project-derived transition authority. Close and reopen are durable,
+retry-safe state changes with metadata-only audit events; reopening restores the issue to Backlog
+without discarding its identity or history. Richer configurable workflows must extend that durable
+transition boundary rather than replacing it with client-side state.
+
 ## Personal cloud agents
 
 Every person can keep a small stable of named agents that reflect how they work. Instructions and

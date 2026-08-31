@@ -205,6 +205,9 @@ pub enum CliCommand {
     Close {
         issue_locator: String,
     },
+    Reopen {
+        issue_locator: String,
+    },
     ListRelations {
         issue_locator: String,
     },
@@ -235,7 +238,7 @@ impl core::fmt::Display for CliParseError {
         match self {
             Self::Empty => write!(
                 f,
-                "no Issues command given (try: list | create | import | view | close | relation)"
+                "no Issues command given (try: list | create | import | view | close | reopen | relation)"
             ),
             Self::Unknown { token } => write!(f, "unknown Issues command token `{token}`"),
             Self::MissingValue { flag } => write!(f, "missing value for `{flag}`"),
@@ -262,6 +265,7 @@ pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
         "import" => parse_import(rest),
         "view" => parse_issue_locator(rest, |issue_locator| CliCommand::View { issue_locator }),
         "close" => parse_issue_locator(rest, |issue_locator| CliCommand::Close { issue_locator }),
+        "reopen" => parse_issue_locator(rest, |issue_locator| CliCommand::Reopen { issue_locator }),
         "relation" => parse_relation(rest),
         other => Err(CliParseError::Unknown {
             token: other.to_string(),
@@ -702,6 +706,12 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_cli(&["reopen", PROJECT]).unwrap(),
+            CliCommand::Reopen {
+                issue_locator: PROJECT.into()
+            }
+        );
+        assert_eq!(
             parse_cli(&["relation", "list", PROJECT]).unwrap(),
             CliCommand::ListRelations {
                 issue_locator: PROJECT.into()
@@ -758,6 +768,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_cli(&["close"]),
+            Err(CliParseError::MissingValue { .. })
+        ));
+        assert!(matches!(
+            parse_cli(&["reopen"]),
             Err(CliParseError::MissingValue { .. })
         ));
         for locator in ["eng-41", "ENG-01", "ENG", "not-an-issue"] {

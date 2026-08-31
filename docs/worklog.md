@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Closing an issue is no longer a one-way mistake
+
+The issue detail explicitly warned that its close action could not be undone even though the event
+taxonomy already reserved `issue.issue.reopened`. Close and reopen now share one PostgreSQL
+transition primitive: the same `issue.transition` permission, row lock, active-authorization fence,
+parameter-bound state update, monotonic version, and outbox co-commit govern both directions. An
+exact retry returns the durable row without changing its version or publishing another event. The
+reopen event contains only stable issue metadata and the state change, never encrypted title text.
+Edge exposes an authenticated `/reopen` route, the CLI accepts `myelin issue reopen`, and the web
+replaces a completed issue's destructive action with a direct Reopen control.
+
+The PostgreSQL Edge integration proves a denied viewer gets the same not-found response as an absent
+issue, close and reopen each emit exactly once, and neither event contains the title. The readable
+TypeScript system journey creates and authorizes a real issue, closes it, finds it in the closed
+list, reopens it twice, proves the retry preserves its version, and finds it in the open list. The
+Chromium journey performs the same close/reopen cycle after browser login and confirms the durable
+row through Edge. A stale running Edge initially returned “no route,” demonstrating that the system
+test was genuinely outside the implementation; after rebuilding the service, all three journeys
+passed.
+
 ## 2026-08-31 — Hosted automation begins in the web product
 
 The web could activate a hosted named agent and inspect existing automations, but creating one still
@@ -5207,8 +5227,9 @@ stories passed, strict all-target Clippy was clean, and the TypeScript system su
     planner and facet feeder never reached it. Dynamic fields need a durable
     definition/usage store, safe SQL lowering integrated into `PgIssueStore`,
     online index lifecycle ownership, and a live Edge/browser journey.
-15. **Issue automation and hierarchy processing are not shipped.** There is no
-    durable workflow transition command, CI/reflex/trigger/SLA consumer, parent
+15. **Issue automation and hierarchy processing are not shipped.** Fixed close and reopen commands
+    are durable, but there is no configurable workflow transition command,
+    CI/reflex/trigger/SLA consumer, parent
     rollup store, or cross-cell portfolio worker. Agent discovery now exposes
     only the working create/close mutations; each additional effect needs an
     authorized executor and restart-safe full-system journey before registration.

@@ -19,9 +19,9 @@ export default function IssueDetail() {
   const mutate = useAction(issuesMutate);
   const [replacement, setReplacement] = createSignal<IssueVM | null>(null);
   const [confirming, setConfirming] = createSignal(false);
-  const [closing, setClosing] = createSignal(false);
-  const [closeError, setCloseError] = createSignal<IssueErrorKind | null>(null);
-  // SSR can paint before the lazily loaded route chunk hydrates. Keep the destructive control
+  const [transitioning, setTransitioning] = createSignal<"close" | "reopen" | null>(null);
+  const [transitionError, setTransitionError] = createSignal<IssueErrorKind | null>(null);
+  // SSR can paint before the lazily loaded route chunk hydrates. Keep lifecycle controls
   // disabled until its click handler exists so an early user click is never silently discarded.
   const [interactive, setInteractive] = createSignal(false);
   let routeGeneration = 0;
@@ -47,32 +47,32 @@ export default function IssueDetail() {
     routeGeneration += 1;
     setReplacement(null);
     setConfirming(false);
-    setClosing(false);
-    setCloseError(null);
+    setTransitioning(null);
+    setTransitionError(null);
   });
 
-  const close = async () => {
+  const transition = async (operation: "close" | "reopen") => {
     const row = current();
-    if (!row || closing()) return;
+    if (!row || transitioning()) return;
     const generation = routeGeneration;
-    setClosing(true);
-    setCloseError(null);
+    setTransitioning(operation);
+    setTransitionError(null);
     try {
-      const result = await mutate({ op: "close", issueId: row.id });
+      const result = await mutate({ op: operation, issueId: row.id });
       if (generation !== routeGeneration || issueId() !== row.id) {
-        if (result.ok && result.op === "close") {
+        if (result.ok && result.op === operation) {
           void revalidate(getIssue.keyFor(row.id));
           void revalidate("issues-list");
         }
         return;
       }
       if (!result.ok) {
-        setCloseError(result.error);
+        setTransitionError(result.error);
         setConfirming(false);
         return;
       }
-      if (result.op !== "close") {
-        setCloseError("error");
+      if (result.op !== operation) {
+        setTransitionError("error");
         setConfirming(false);
         return;
       }
@@ -80,14 +80,17 @@ export default function IssueDetail() {
       setConfirming(false);
       void revalidate("issue-detail");
       void revalidate("issues-list");
-      toast.show({ title: `${result.issue.key} closed`, variant: "success" });
+      toast.show({
+        title: `${result.issue.key} ${operation === "close" ? "closed" : "reopened"}`,
+        variant: "success",
+      });
     } catch {
       if (generation === routeGeneration && issueId() === row.id) {
-        setCloseError("error");
+        setTransitionError("error");
         setConfirming(false);
       }
     } finally {
-      if (generation === routeGeneration && issueId() === row.id) setClosing(false);
+      if (generation === routeGeneration && issueId() === row.id) setTransitioning(null);
     }
   };
 
@@ -120,29 +123,39 @@ export default function IssueDetail() {
                 <div><dt>Updated</dt><dd><time datetime={row().updated_at}>{issueTimestamp(row().updated_at)}</time></dd></div>
               </dl>
 
-              <Show when={!isClosedCategory(row().state_category)}>
-                <div class="issue-detail-actions">
+              <div class="issue-detail-actions">
+                <Show when={isClosedCategory(row().state_category)} fallback={
                   <button
                     type="button"
                     class="issues-button issues-button-danger"
-                    disabled={!interactive()}
+                    disabled={!interactive() || Boolean(transitioning())}
                     onClick={() => setConfirming(true)}
                   >
                     <Icon name="close" /> Close issue
                   </button>
-                  <Show when={closeError()}>
-                    {(kind) => <p role="alert" class="issues-field-error">{closeErrorText(kind())}</p>}
-                  </Show>
-                </div>
-              </Show>
+                }>
+                  <button
+                    type="button"
+                    class="issues-button issues-button-secondary"
+                    disabled={!interactive() || Boolean(transitioning())}
+                    onClick={() => void transition("reopen")}
+                  >
+                    <Icon name={transitioning() === "reopen" ? "cycle" : "issue"} />
+                    {transitioning() === "reopen" ? "Reopening…" : "Reopen issue"}
+                  </button>
+                </Show>
+                <Show when={transitionError()}>
+                  {(kind) => <p role="alert" class="issues-field-error">{transitionErrorText(kind())}</p>}
+                </Show>
+              </div>
 
               <ConfirmDialog
                 open={confirming()}
-                onCancel={() => !closing() && setConfirming(false)}
-                onConfirm={() => void close()}
+                onCancel={() => !transitioning() && setConfirming(false)}
+                onConfirm={() => void transition("close")}
                 title={`Close ${row().key}?`}
-                description="This moves the issue to Done. The current web floor cannot reopen it."
-                confirmLabel={closing() ? "Closing…" : "Close issue"}
+                description="This moves the issue to Done. You can reopen it later without losing its history."
+                confirmLabel={transitioning() === "close" ? "Closing…" : "Close issue"}
                 cancelLabel="Cancel"
                 variant="destructive"
               />
@@ -156,9 +169,9 @@ export default function IssueDetail() {
   );
 }
 
-function closeErrorText(kind: IssueErrorKind): string {
+function transitionErrorText(kind: IssueErrorKind): string {
   if (kind === "not-found") return "This issue is not available to you.";
-  return "We couldn't confirm whether this issue was closed. Refresh and check its current state before retrying.";
+  return "We couldn't confirm the issue state. Refresh and check its current state before retrying.";
 }
 
 function IssueDetailError(props: { kind: IssueErrorKind }) {
