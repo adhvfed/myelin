@@ -29,7 +29,9 @@ revision, while an exact semantic retry converges on the already-written state.
 The web product gives each person a direct roster for their own named agents; maintaining an agent
 must not require beginning an unrelated thread. Organization agents owned by somebody else can
 still be selected where policy permits, but their private configuration is never presented as an
-editable action to the viewer.
+editable action to the viewer. The same owner surface can pause an identity immediately, resume it
+later, or retire it permanently with an explicit confirmation; pausing or retirement revokes live
+agent authority without making retained work disappear.
 
 The workspace is personalizable at creation time. Repository guidance remains the shared default,
 while an owner can layer their own way of working into the assigned workspace—for example, custom

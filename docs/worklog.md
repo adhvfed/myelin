@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Owners manage named-agent lifecycle in the web product
+
+The durable owner-only suspend, resume, and retire boundary already terminated live runs,
+co-committed an audit event, retained idempotent command receipts, and served the API and CLI. The
+new personal-agent roster nevertheless showed lifecycle state without letting a person change it,
+forcing normal identity maintenance out of the web product.
+
+Each active personal agent can now be suspended or retired from its roster row; a suspended agent
+can be resumed. Ambiguous network retries retain their original idempotency identity. Retirement
+uses the shared destructive confirmation and is presented as irreversible, while retired agents
+remain visible as durable history without offering meaningless configuration or resume controls.
+Strict response decoding checks the action/status relationship, rejects credential-shaped surplus
+data, and refuses a resume receipt that claims it terminated runs.
+
+The Chromium product journey suspends its working agent from the roster, reloads, proves MCP, SSH,
+and SFTP access disappeared, asks the real SSH endpoint and receives a conflict, resumes through
+the roster, and continues private work. After publishing the review surface and completing the
+accessibility audit, it retires the agent with the confirmation dialog, reloads again, and proves
+the disabled lifecycle state came from the durable store. The journey passed against the running
+web app, Edge, PostgreSQL, workspace gateway, and gVisor. All 663 frontend contract tests,
+TypeScript checking, lint, and the production build pass.
+
 ## 2026-08-31 — Personal agent configuration is a first-class owner journey
 
 Named-agent defaults could be edited in the web only after opening “Start private agent thread”

@@ -7,6 +7,7 @@ import {
   parseAgentActivationReceipt,
   parseAgentChoice,
   parseAgentChoices,
+  parseAgentLifecycleReceipt,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
   parseAgentThreadMessageReceipt,
@@ -296,6 +297,38 @@ describe("private agent work wire projection", () => {
       revision: 0,
       instructions: "impossible pre-revision defaults",
       updated_at: null,
+    })).toBeNull();
+  });
+
+  it("decodes exact durable lifecycle receipts without inventing resumability", () => {
+    const suspended = { ...agent, status: "suspended" };
+    expect(parseAgentLifecycleReceipt({
+      agent: suspended,
+      action: "suspend",
+      changed: true,
+      terminated_runs: 2,
+      durable: true,
+    })).toMatchObject({
+      agent: { id: AGENT, status: "suspended" },
+      action: "suspend",
+      changed: true,
+      terminated_runs: 2,
+      durable: true,
+    });
+    expect(parseAgentLifecycleReceipt({
+      agent: { ...agent, status: "active" },
+      action: "resume",
+      changed: false,
+      terminated_runs: 1,
+      durable: true,
+    })).toBeNull();
+    expect(parseAgentLifecycleReceipt({
+      agent: { ...agent, status: "disabled" },
+      action: "retire",
+      changed: true,
+      terminated_runs: 0,
+      durable: true,
+      credential: "must-not-cross",
     })).toBeNull();
   });
 

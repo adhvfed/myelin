@@ -132,13 +132,15 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await page.keyboard.press("Escape");
   await expect(workspace).toBeHidden();
 
-  await postProductJson(
-    request,
-    `/v1/agents/${encodeURIComponent(agentId)}/suspend`,
-    {},
-    { token: sessionToken, scheme: "session", status: 200 },
-  );
+  let resumedThroughProduct = false;
   try {
+    await page.getByRole("button", { name: "Manage my agents" }).click();
+    const lifecycleRoster = page.getByRole("dialog", { name: "My named agents" });
+    const lifecycleAgent = lifecycleRoster.getByRole("listitem").filter({ hasText: agentName });
+    await lifecycleAgent.getByRole("button", { name: "Suspend" }).click();
+    await expect(lifecycleAgent).toContainText("suspended · external MCP");
+    await lifecycleRoster.getByRole("button", { name: "Close", exact: true }).click();
+
     await page.reload();
     await waitForAppHydration(page);
     await page.getByRole("button", { name: "Agent workspace" }).click();
@@ -158,13 +160,23 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
       { token: sessionToken, scheme: "session", status: 409 },
     );
     await page.keyboard.press("Escape");
+
+    await page.getByRole("button", { name: "Manage my agents" }).click();
+    const resumeRoster = page.getByRole("dialog", { name: "My named agents" });
+    const suspendedAgent = resumeRoster.getByRole("listitem").filter({ hasText: agentName });
+    await suspendedAgent.getByRole("button", { name: "Resume" }).click();
+    await expect(suspendedAgent).toContainText("active · external MCP");
+    resumedThroughProduct = true;
+    await resumeRoster.getByRole("button", { name: "Close", exact: true }).click();
   } finally {
-    await postProductJson(
-      request,
-      `/v1/agents/${encodeURIComponent(agentId)}/resume`,
-      {},
-      { token: sessionToken, scheme: "session", status: 200 },
-    );
+    if (!resumedThroughProduct) {
+      await postProductJson(
+        request,
+        `/v1/agents/${encodeURIComponent(agentId)}/resume`,
+        {},
+        { token: sessionToken, scheme: "session", status: 200 },
+      );
+    }
   }
 
   await page.getByLabel(`Message ${threadName}`).fill(problem);
@@ -255,4 +267,21 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
     .analyze();
   expect(accessibility.violations).toEqual([]);
+
+  await page.getByRole("button", { name: "Manage my agents" }).click();
+  const retirementRoster = page.getByRole("dialog", { name: "My named agents" });
+  const retiringAgent = retirementRoster.getByRole("listitem").filter({ hasText: agentName });
+  await retiringAgent.getByRole("button", { name: "Retire" }).click();
+  const confirmation = page.getByRole("alertdialog", { name: `Retire ${agentName}?` });
+  await expect(confirmation).toContainText("cannot be undone");
+  await confirmation.getByRole("button", { name: "Retire agent" }).click();
+  await expect(retiringAgent).toContainText("Retired permanently");
+  await retirementRoster.getByRole("button", { name: "Close", exact: true }).click();
+
+  await page.reload();
+  await waitForAppHydration(page);
+  await page.getByRole("button", { name: "Manage my agents" }).click();
+  await expect(page.getByRole("dialog", { name: "My named agents" })
+    .getByRole("listitem").filter({ hasText: agentName }))
+    .toContainText("disabled · external MCP");
 });

@@ -526,6 +526,21 @@ export default function AgentThreadsIndex() {
           setManagingAgents(false);
           setConfiguringAgent(agent);
         }}
+        onChanged={(receipt) => {
+          setActivatedAgents((current) => mergeById([receipt.agent], [current]));
+          void Promise.all([
+            revalidate(getAgentChoices.keyFor({ limit: 100 })),
+            revalidate(getAgentChoice.keyFor(receipt.agent.id)),
+          ]);
+          toast.show({
+            title: receipt.action === "suspend"
+              ? `${receipt.agent.name} is paused`
+              : receipt.action === "resume"
+                ? `${receipt.agent.name} is active again`
+                : `${receipt.agent.name} is retired`,
+            variant: "success",
+          });
+        }}
         onClose={() => setManagingAgents(false)}
       />
       <AgentWorkspaceDefaultsDialog

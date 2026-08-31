@@ -44,6 +44,14 @@ export interface AgentWorkspaceGuidanceReceipt {
   durable: true;
 }
 
+export interface AgentLifecycleReceipt {
+  agent: AgentChoice;
+  action: "suspend" | "resume" | "retire";
+  changed: boolean;
+  terminated_runs: number;
+  durable: true;
+}
+
 export interface AgentWorkspaceGuidanceConfig {
   agent_id: string;
   revision: number;
@@ -279,6 +287,29 @@ export function parseAgentWorkspaceGuidanceReceipt(
       typeof receipt.changed === "boolean" && receipt.durable === true
     ? { agent, changed: receipt.changed, durable: true }
     : null;
+}
+
+export function parseAgentLifecycleReceipt(value: unknown): AgentLifecycleReceipt | null {
+  const envelope = record(value);
+  if (!envelope || !exact(envelope, [
+    "agent", "action", "changed", "terminated_runs", "durable",
+  ])) return null;
+  const agent = agentChoice(envelope.agent);
+  if (!agent || !["suspend", "resume", "retire"].includes(envelope.action as string) ||
+      typeof envelope.changed !== "boolean" || envelope.durable !== true ||
+      !Number.isSafeInteger(envelope.terminated_runs) ||
+      (envelope.terminated_runs as number) < 0) return null;
+  const expectedStatus = envelope.action === "resume" ? "active"
+    : envelope.action === "suspend" ? "suspended" : "disabled";
+  if (agent.status !== expectedStatus ||
+      (envelope.action === "resume" && envelope.terminated_runs !== 0)) return null;
+  return {
+    agent,
+    action: envelope.action as AgentLifecycleReceipt["action"],
+    changed: envelope.changed,
+    terminated_runs: envelope.terminated_runs as number,
+    durable: true,
+  };
 }
 
 export function parseAgentWorkspaceGuidanceConfig(

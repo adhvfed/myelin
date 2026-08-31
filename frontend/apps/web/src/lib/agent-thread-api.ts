@@ -8,6 +8,7 @@ import {
   parseAgentWorkspaceGuidanceConfig,
   parseAgentChoice,
   parseAgentChoices,
+  parseAgentLifecycleReceipt,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
   parseAgentThreadReviewReceipt,
@@ -18,6 +19,7 @@ import {
   type AgentChoice,
   type AgentChoicePage,
   type AgentActivationReceipt,
+  type AgentLifecycleReceipt,
   type AgentWorkspaceGuidanceReceipt,
   type AgentWorkspaceGuidanceConfig,
   type AgentThread,
@@ -35,6 +37,7 @@ export type AgentThreadMutationResult =
   | { ok: true; op: "mark-ready"; receipt: AgentThreadReviewReceipt }
   | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
   | { ok: true; op: "configure-agent"; receipt: AgentWorkspaceGuidanceReceipt }
+  | { ok: true; op: "lifecycle-agent"; receipt: AgentLifecycleReceipt }
   | { ok: true; op: "post-message"; messageId: string; threadId: string }
   | { ok: false; error: AgentThreadErrorKind };
 
@@ -279,6 +282,20 @@ export const mutateAgentThread = action(async (input: unknown) => {
       ));
       return receipt
         ? respond({ ok: true, op: "configure-agent", receipt })
+        : respond({ ok: false, error: "error" });
+    }
+    if (mutation.op === "lifecycle-agent" && Object.keys(mutation).every((key) =>
+      ["op", "agentId", "action", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 4 && isAgentThreadId(mutation.agentId) &&
+        ["suspend", "resume", "retire"].includes(mutation.action as string) &&
+        cleanNonce(mutation.clientNonce)) {
+      const receipt = parseAgentLifecycleReceipt(await edgePost(
+        `/v1/agents/${segment(mutation.agentId)}/${mutation.action as string}`,
+        {},
+        { idempotencyKey: mutation.clientNonce },
+      ));
+      return receipt
+        ? respond({ ok: true, op: "lifecycle-agent", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "create" && Object.keys(mutation).every((key) =>

@@ -195,6 +195,7 @@
 }
 .agent-thread-button.primary { border: none; background: var(--c-btn-primary-bg); color: var(--c-btn-primary-text); }
 .agent-thread-button.secondary { border: var(--hairline) solid var(--border-strong); background: transparent; color: var(--text-primary); }
+.agent-thread-button.danger { border: none; background: var(--c-btn-danger-bg); color: var(--c-btn-danger-text); }
 .agent-thread-button:disabled,
 .agent-thread-icon-button:disabled,
 .agent-thread-load-more:disabled { opacity: .6; cursor: not-allowed; }
@@ -273,10 +274,13 @@
   border: var(--hairline) solid var(--border);
   background: var(--surface-raised);
 }
-.agent-roster-list li > div { min-width: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+.agent-roster-summary { min-width: 0; display: flex; flex-direction: column; gap: var(--space-1); }
 .agent-roster-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-roster-list span,
 .agent-roster-list small { color: var(--text-subtle); }
+.agent-roster-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--space-1); }
+.agent-roster-error { color: var(--danger) !important; }
+.agent-roster-retired { display: inline-flex; align-items: center; gap: var(--space-1); white-space: nowrap; }
 .agent-roster-empty { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-2); color: var(--text-muted); }
 .agent-roster-empty strong { color: var(--text-primary); }
 .agent-roster-empty p { margin: 0; }
@@ -316,6 +320,8 @@
   .agent-thread-private-cue { display: none; }
   .agent-thread-review-actions { gap: 0; }
   .agent-thread-composer { padding-inline: var(--space-2); }
+  .agent-roster-list li { align-items: stretch; flex-direction: column; }
+  .agent-roster-actions { justify-content: flex-start; }
   .agent-thread-composer-footer { align-items: flex-end; }
   .agent-thread-composer-footer > span { max-width: 22ch; }
 }
