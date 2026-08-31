@@ -519,8 +519,13 @@ export default function AgentThreadsIndex() {
           setActivatedAgents((current) => mergeById([receipt.agent], [current]));
           setPreferredAgentId(receipt.agent.id);
           void revalidate(getAgentChoices.keyFor({ limit: 100 }));
-          openCreate();
-          toast.show({ title: `${receipt.agent.name} is ready for private work`, variant: "success" });
+          if (receipt.agent.runtime_ref === "external:mcp") {
+            openCreate();
+            toast.show({ title: `${receipt.agent.name} is ready for private work`, variant: "success" });
+          } else {
+            setManagingAgents(true);
+            toast.show({ title: `${receipt.agent.name} is ready for governed automations`, variant: "success" });
+          }
         }}
       />
       <AgentRosterDialog

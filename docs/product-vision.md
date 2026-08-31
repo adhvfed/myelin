@@ -12,13 +12,18 @@ Federation remain first-class.
 
 ## Personal cloud agents
 
-Every person can keep a small stable of named agents that reflect how they work: their instructions,
-tool palette, runtime, project context, and spending boundaries are explicit and editable. Starting
-work with one creates a named cloud thread with a durable branch, conversation, and workspace. The
-same workspace survives model context changes and can be opened through ordinary SSH or SFTP with a
-short-lived owner-authorized credential. A person can also authorize an existing Ed25519 key and
-generate an expiring, host-key-pinned OpenSSH profile for an SFTP-capable editor; Myelin never
-copies or prints the private key, and refreshing access does not replace the retained workspace.
+Every person can keep a small stable of named agents that reflect how they work. Instructions and
+the tool palette are editable; project context is an explicit choice on each piece of work; hosted
+automation budgets and firing limits are explicit per use. Runtime is an explicit identity choice:
+external MCP agents resume private cloud threads, while hosted agents run governed event-driven
+automations without a provider credential. Runtime stays fixed after activation so existing threads
+and automations cannot silently move execution environments; choosing another runtime creates a
+distinct named identity. Starting private work creates a named cloud thread with a durable branch,
+conversation, and workspace. The same workspace survives model context changes and can be opened
+through ordinary SSH or SFTP with a short-lived owner-authorized credential. A person can also
+authorize an existing Ed25519 key and generate an expiring, host-key-pinned OpenSSH profile for an
+SFTP-capable editor; Myelin never copies or prints the private key, and refreshing access does not
+replace the retained workspace.
 
 An agent's owner can maintain a private default workspace augmentation on that named agent:
 `AGENTS.md` instructions plus bounded create-only context files. The organization-visible roster

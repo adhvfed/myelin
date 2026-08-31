@@ -265,8 +265,9 @@ export const mutateAgentThread = action(async (input: unknown) => {
   const mutation = input as Record<string, unknown>;
   try {
     if (mutation.op === "activate-agent" && Object.keys(mutation).every((key) =>
-      ["op", "name", "tools", "workspaceInstructions", "workspaceFiles", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 6 && cleanText(mutation.name, 80) &&
+      ["op", "name", "runtime", "tools", "workspaceInstructions", "workspaceFiles", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 7 && cleanText(mutation.name, 80) &&
+        ["external", "hosted"].includes(mutation.runtime as string) &&
         validAgentToolPalette(mutation.tools) && cleanNonce(mutation.clientNonce)) {
       if (typeof mutation.workspaceInstructions !== "string" ||
           (mutation.workspaceInstructions !== "" &&
@@ -281,7 +282,7 @@ export const mutateAgentThread = action(async (input: unknown) => {
       }
       const receipt = parseAgentActivationReceipt(await edgePost("/v1/agents", {
         name: mutation.name,
-        runtime: "external",
+        runtime: mutation.runtime,
         tools: mutation.tools,
         ...(mutation.workspaceInstructions === ""
           ? {}

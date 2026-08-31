@@ -67,7 +67,8 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await page.getByRole("link", { name: "Agents" }).click();
   await page.waitForURL("**/agents");
   await page.getByRole("button", { name: "Activate an agent" }).click();
-  const activation = page.getByRole("dialog", { name: "Activate private-work agent" });
+  const activation = page.getByRole("dialog", { name: "Activate named agent" });
+  await expect(activation.getByRole("combobox", { name: "Runtime" })).toHaveValue("external");
   await activation.getByRole("textbox", { name: "Agent name" }).fill(agentName);
   await activation.getByRole("textbox", { name: "Default workspace instructions" })
     .fill(agentDefaults);
@@ -333,7 +334,25 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await page.reload();
   await waitForAppHydration(page);
   await page.getByRole("button", { name: "Manage my agents" }).click();
-  await expect(page.getByRole("dialog", { name: "My named agents" })
-    .getByRole("listitem").filter({ hasText: renamedAgentName }))
+  const finalRoster = page.getByRole("dialog", { name: "My named agents" });
+  await expect(finalRoster.getByRole("listitem").filter({ hasText: renamedAgentName }))
     .toContainText("disabled · external MCP");
+
+  await finalRoster.getByRole("button", { name: "Activate agent" }).click();
+  const hostedActivation = page.getByRole("dialog", { name: "Activate named agent" });
+  const hostedAgentName = `hosted-triage-${suffix}`;
+  await hostedActivation.getByRole("textbox", { name: "Agent name" }).fill(hostedAgentName);
+  await hostedActivation.getByRole("combobox", { name: "Runtime" }).selectOption("hosted");
+  await expect(hostedActivation.getByRole("textbox", { name: "Default workspace instructions" }))
+    .toHaveCount(0);
+  await hostedActivation.getByRole("button", { name: "Activate agent" }).click();
+  await expect(hostedActivation).toBeHidden();
+  const hostedRoster = page.getByRole("dialog", { name: "My named agents" });
+  const hostedAgent = hostedRoster.getByRole("listitem").filter({ hasText: hostedAgentName });
+  await expect(hostedAgent).toContainText("active · hosted");
+  await expect(page.getByRole("dialog", { name: "Start private agent thread" })).toHaveCount(0);
+  await hostedAgent.getByRole("button", { name: "Retire" }).click();
+  await page.getByRole("alertdialog", { name: `Retire ${hostedAgentName}?` })
+    .getByRole("button", { name: "Retire agent" }).click();
+  await expect(hostedAgent).toContainText("Retired permanently");
 });

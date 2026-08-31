@@ -56,6 +56,8 @@ export const DEFAULT_PERSONAL_AGENT_TOOLS = PERSONAL_AGENT_TOOLS
   .filter((tool) => tool.name !== "workspace.exec")
   .map((tool) => tool.name);
 
+export const DEFAULT_HOSTED_AGENT_TOOLS = ["ci.read_run", "issues.create"] as const;
+
 const TOOL_NAME = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
 
 export function validAgentToolPalette(value: unknown): value is string[] {

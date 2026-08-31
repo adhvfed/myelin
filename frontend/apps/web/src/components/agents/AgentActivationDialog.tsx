@@ -9,12 +9,15 @@ import {
 import type { AgentActivationReceipt, AgentWorkspaceFile } from "~/lib/agent-thread-response";
 import { validAgentWorkspaceAugmentation } from "~/lib/agent-workspace-augmentation";
 import {
+  DEFAULT_HOSTED_AGENT_TOOLS,
   DEFAULT_PERSONAL_AGENT_TOOLS,
   type AgentToolDefinition,
   validAgentToolPalette,
 } from "~/lib/agent-tool-palette";
 import { AgentToolPaletteEditor } from "./AgentToolPaletteEditor";
 import { AgentWorkspaceFilesEditor } from "./AgentWorkspaceFilesEditor";
+
+type AgentRuntime = "external" | "hosted";
 
 function errorCopy(kind: AgentThreadErrorKind): string {
   if (kind === "bad-input") return "Use a clean agent name.";
@@ -31,6 +34,7 @@ export function AgentActivationDialog(props: {
 }) {
   const mutate = useAction(mutateAgentThread);
   const [name, setName] = createSignal("");
+  const [runtime, setRuntime] = createSignal<AgentRuntime>("external");
   const [tools, setTools] = createSignal<string[]>([...DEFAULT_PERSONAL_AGENT_TOOLS]);
   const [workspaceInstructions, setWorkspaceInstructions] = createSignal("");
   const [workspaceFiles, setWorkspaceFiles] = createSignal<AgentWorkspaceFile[]>([]);
@@ -44,6 +48,7 @@ export function AgentActivationDialog(props: {
     openingGeneration += 1;
     if (!props.open) return;
     setName("");
+    setRuntime("external");
     setTools([...DEFAULT_PERSONAL_AGENT_TOOLS]);
     setWorkspaceInstructions("");
     setWorkspaceFiles([]);
@@ -79,6 +84,7 @@ export function AgentActivationDialog(props: {
       const result = await mutate({
         op: "activate-agent",
         name: name(),
+        runtime: runtime(),
         tools: tools(),
         workspaceInstructions: workspaceInstructions(),
         workspaceFiles: workspaceFiles(),
@@ -102,8 +108,10 @@ export function AgentActivationDialog(props: {
     <Dialog
       open={props.open}
       onClose={close}
-      title="Activate private-work agent"
-      description="Give an external agent a Myelin identity for private conversations and bounded workspace files. No provider credential or API key is created."
+      title="Activate named agent"
+      description={runtime() === "external"
+        ? "Connect an existing agent client to private conversations and durable workspaces."
+        : "Run governed event-driven work on Myelin’s hosted runtime without a provider credential."}
       size="md"
       dismissable={!submitting()}
       initialFocus={() => nameInput}
@@ -131,41 +139,67 @@ export function AgentActivationDialog(props: {
             onInput={(event) => editName(event.currentTarget.value)}
           />
         </label>
+        <label>
+          Runtime
+          <select
+            value={runtime()}
+            disabled={submitting()}
+            onChange={(event) => {
+              const next = event.currentTarget.value as AgentRuntime;
+              setRuntime(next);
+              setTools(next === "external"
+                ? [...DEFAULT_PERSONAL_AGENT_TOOLS]
+                : [...DEFAULT_HOSTED_AGENT_TOOLS]);
+              setWorkspaceInstructions("");
+              setWorkspaceFiles([]);
+              setClientNonce(crypto.randomUUID());
+              setError(null);
+            }}
+          >
+            <option value="external">External MCP · private threads and workspaces</option>
+            <option value="hosted">Hosted Myelin · governed automations</option>
+          </select>
+        </label>
         <div class="agent-activation-scope">
           <Icon name="gate" />
           <p>
-            The initial tool set covers conversation history, private replies, and files in a
-            generation-fenced workspace. Your live permissions remain the authority ceiling.
+            {runtime() === "external"
+              ? "The agent connects with a short-lived run credential bound to its private work."
+              : "Each automation sets its own budget, firing limit, event scope, and approval rule."}
+            {" "}Your live permissions remain the authority ceiling. Runtime is fixed for this
+            identity so existing work cannot silently change execution environments.
           </p>
         </div>
-        <label>
-          Default workspace instructions <span aria-hidden="true">(optional)</span>
-          <textarea
-            value={workspaceInstructions()}
-            rows={6}
-            placeholder={"# How I work\n\nExplain tradeoffs before changing interfaces. Run the narrow journey first."}
+        <Show when={runtime() === "external"}>
+          <label>
+            Default workspace instructions <span aria-hidden="true">(optional)</span>
+            <textarea
+              value={workspaceInstructions()}
+              rows={6}
+              placeholder={"# How I work\n\nExplain tradeoffs before changing interfaces. Run the narrow journey first."}
+              disabled={submitting()}
+              onInput={(event) => {
+                setWorkspaceInstructions(event.currentTarget.value);
+                setClientNonce(crypto.randomUUID());
+                setError(null);
+              }}
+            />
+          </label>
+          <p class="agent-thread-note">
+            New private threads inherit this owner-only overlay. You can add thread-specific
+            instructions and files later; existing workspaces keep their original snapshot.
+          </p>
+          <AgentWorkspaceFilesEditor
+            files={workspaceFiles()}
             disabled={submitting()}
-            onInput={(event) => {
-              setWorkspaceInstructions(event.currentTarget.value);
+            legend="Default private context files"
+            onChange={(files) => {
+              setWorkspaceFiles(files);
               setClientNonce(crypto.randomUUID());
               setError(null);
             }}
           />
-        </label>
-        <p class="agent-thread-note">
-          New private threads inherit this owner-only overlay. You can add thread-specific
-          instructions and files later; existing workspaces keep their original snapshot.
-        </p>
-        <AgentWorkspaceFilesEditor
-          files={workspaceFiles()}
-          disabled={submitting()}
-          legend="Default private context files"
-          onChange={(files) => {
-            setWorkspaceFiles(files);
-            setClientNonce(crypto.randomUUID());
-            setError(null);
-          }}
-        />
+        </Show>
         <AgentToolPaletteEditor
           tools={tools()}
           availableTools={props.availableTools}

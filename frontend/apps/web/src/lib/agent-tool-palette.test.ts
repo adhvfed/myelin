@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_HOSTED_AGENT_TOOLS,
   DEFAULT_PERSONAL_AGENT_TOOLS,
   PERSONAL_AGENT_TOOLS,
   parseAgentToolDefinitionPage,
@@ -19,6 +20,8 @@ describe("personal agent tool palette", () => {
     expect(PERSONAL_AGENT_TOOLS.map((tool) => tool.name)).toContain("workspace.exec");
     expect(DEFAULT_PERSONAL_AGENT_TOOLS).not.toContain("workspace.exec");
     expect(validAgentToolPalette(DEFAULT_PERSONAL_AGENT_TOOLS)).toBe(true);
+    expect(DEFAULT_HOSTED_AGENT_TOOLS).toEqual(["ci.read_run", "issues.create"]);
+    expect(validAgentToolPalette([...DEFAULT_HOSTED_AGENT_TOOLS])).toBe(true);
   });
 
   it("refuses empty, duplicate, malformed, and unbounded palettes", () => {

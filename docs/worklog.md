@@ -4,6 +4,21 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Agent runtime is an honest activation choice in the web product
+
+The backend and CLI supported both external MCP identities and Myelin-hosted automation identities,
+but the web activation path silently hard-coded external runtime and immediately opened a private
+thread. Activation now names the runtime choice, explains the distinct execution model, starts each
+runtime with a relevant tool palette, and shows workspace defaults only for external agents. A
+hosted activation returns to the personal roster instead of offering a private thread it cannot run.
+Runtime is deliberately immutable identity metadata: changing it in place could strand retained
+threads or break existing automation bindings, so another runtime receives another named identity.
+Budgets and firing limits remain explicit on each hosted automation.
+
+The Chromium product journey proves external remains the visible default, completes the full private
+workspace lifecycle, then activates a hosted agent, observes it as active in the personal roster,
+proves no private-thread dialog appears, and retires it through the same owner controls.
+
 ## 2026-08-31 — Private threads no longer acquire an implicit review project
 
 The private-thread dialog labeled its project as optional but silently selected the first visible
