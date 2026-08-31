@@ -4,9 +4,10 @@ use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_result_on_runtime;
 use crate::Method;
+use myelin_events::Timestamp;
 use myelin_identity::{
-    Consistency, ConsistencyMode, Decision, IdentityService, ObjectId, Permission, PrincipalKind,
-    PrincipalStatus, Zookie,
+    Consistency, ConsistencyMode, Decision, IdentityService, ObjectId, Permission, Principal,
+    PrincipalId, PrincipalKind, PrincipalStatus, RelName, RelationTuple, TupleDelta, Zookie,
 };
 use myelin_identity_service::{
     project_ref, NewProject, PgProjectStore, PrincipalStore, Project, ProjectError,
@@ -23,6 +24,7 @@ const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
 const MAX_COLLABORATOR_TEXT_BYTES: usize = 255;
 const COLLABORATOR_SCAN_MULTIPLIER: usize = 2;
+const PROJECT_READER_RELATION: &str = "reader";
 
 #[derive(Clone)]
 pub struct DurableProjectReadApi {
@@ -87,21 +89,160 @@ impl ProjectHttpApi {
         )
     }
 
-    fn may_view(&self, ctx: &HandlerCtx<'_>, project_id: &str) -> bool {
+    fn allows(&self, principal: &Principal, project_id: &str, permission: &str) -> bool {
         let consistency = Consistency {
             at_least: Zookie(String::new()),
             mode: ConsistencyMode::Strong,
         };
         matches!(
             self.authz.check(
-                ctx.principal,
-                &Permission("view".into()),
-                &project_ref(&ctx.principal.tenant.0, project_id),
+                principal,
+                &Permission(permission.into()),
+                &project_ref(&principal.tenant.0, project_id),
                 &consistency,
                 None,
             ),
             Ok(Decision::Allow)
         )
+    }
+
+    fn may_view(&self, ctx: &HandlerCtx<'_>, project_id: &str) -> bool {
+        self.allows(ctx.principal, project_id, "view")
+    }
+
+    fn may_manage_access(&self, ctx: &HandlerCtx<'_>, project_id: &str) -> bool {
+        self.allows(ctx.principal, project_id, "manage_access")
+    }
+
+    fn access_directory(
+        &self,
+        ctx: &HandlerCtx<'_>,
+        project_id: &str,
+        page: Page,
+    ) -> Result<Value, EdgeError> {
+        let project = self
+            .drive(self.store.get(ctx.principal, project_id))
+            .map_err(map_project_error)?;
+        if !self.may_manage_access(ctx, &project.id) {
+            return Err(EdgeError::NotFound("project not found".into()));
+        }
+        let scan_limit = page.limit.saturating_mul(COLLABORATOR_SCAN_MULTIPLIER);
+        let mut rows = self
+            .principals
+            .principals_after(
+                ctx.scope,
+                page.cursor.as_deref(),
+                u32::try_from(scan_limit + 1).expect("access directory scan is bounded"),
+            )
+            .map_err(|_| EdgeError::Unavailable("project access is unavailable".into()))?;
+        let has_more_rows = rows.len() > scan_limit;
+        rows.truncate(scan_limit);
+        let mut rows = rows.into_iter().peekable();
+        let mut items = Vec::with_capacity(page.limit);
+        let mut last_scanned = None;
+        for row in rows.by_ref() {
+            last_scanned = Some(row.principal_id.0.clone());
+            if row.kind != PrincipalKind::Human
+                || row.status != PrincipalStatus::Active
+                || row.principal_id == ctx.principal.principal_id
+                || !valid_collaborator_text(&row.principal_id.0)
+            {
+                continue;
+            }
+            let display_name = self
+                .principals
+                .get_profile(ctx.scope, &row.principal_id)
+                .map_err(|_| EdgeError::Unavailable("project access is unavailable".into()))?
+                .map(|profile| profile.display_name)
+                .filter(|name| valid_collaborator_text(name))
+                .unwrap_or_else(|| row.principal_id.0.clone());
+            let principal = Principal::new(
+                row.tenant,
+                row.region,
+                row.principal_id.clone(),
+                row.kind,
+                row.data_role,
+                row.status,
+            );
+            items.push(json!({
+                "principal_id": row.principal_id.0,
+                "display_name": display_name,
+                "has_access": self.allows(&principal, &project.id, "view"),
+                "removable": self.allows(&principal, &project.id, "assigned_reader"),
+            }));
+            if items.len() == page.limit {
+                break;
+            }
+        }
+        let next_cursor = (rows.peek().is_some() || has_more_rows)
+            .then_some(last_scanned)
+            .flatten();
+        Ok(page_envelope(json!(items), next_cursor, page.limit))
+    }
+
+    fn set_access(
+        &self,
+        ctx: &HandlerCtx<'_>,
+        project_id: &str,
+        requested: ProjectAccessBody,
+    ) -> Result<Value, EdgeError> {
+        let project = self
+            .drive(self.store.get(ctx.principal, project_id))
+            .map_err(map_project_error)?;
+        if !self.may_manage_access(ctx, &project.id) {
+            return Err(EdgeError::NotFound("project not found".into()));
+        }
+        if requested.principal_id == ctx.principal.principal_id.0
+            || !valid_collaborator_text(&requested.principal_id)
+        {
+            return Err(EdgeError::BadRequest(
+                "project access requires another valid human principal".into(),
+            ));
+        }
+        let principal_id = PrincipalId(requested.principal_id);
+        let target = self
+            .principals
+            .get_principal(ctx.scope, &principal_id)
+            .map_err(|_| EdgeError::Unavailable("project access is unavailable".into()))?
+            .filter(|row| row.kind == PrincipalKind::Human && row.status == PrincipalStatus::Active)
+            .ok_or_else(|| EdgeError::NotFound("project collaborator not found".into()))?;
+        let tuple = RelationTuple {
+            object: ObjectId(format!("project:{}", project.id)),
+            relation: RelName(PROJECT_READER_RELATION.into()),
+            subject: target.principal_id.clone(),
+            caveat: None,
+        };
+        let delta = if requested.access {
+            TupleDelta::Add(tuple)
+        } else {
+            TupleDelta::Remove(tuple)
+        };
+        self.authz
+            .tuples()
+            .write_tuples(
+                ctx.scope,
+                ctx.principal,
+                &[delta],
+                None,
+                None,
+                Timestamp(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
+            )
+            .map_err(|_| EdgeError::Unavailable("project access is unavailable".into()))?;
+        let principal = Principal::new(
+            target.tenant,
+            target.region,
+            target.principal_id.clone(),
+            target.kind,
+            target.data_role,
+            target.status,
+        );
+        Ok(json!({
+            "principal_id": target.principal_id.0,
+            "requested_access": requested.access,
+            "has_access": self.allows(&principal, &project.id, "view"),
+            "removable": self.allows(&principal, &project.id, "assigned_reader"),
+            "durable": true,
+        }))
     }
 
     fn collaborators(
@@ -191,6 +332,13 @@ struct CreateProjectBody {
     issue_prefix: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectAccessBody {
+    principal_id: String,
+    access: bool,
+}
+
 struct ProjectCreateHandler {
     api: ProjectHttpApi,
 }
@@ -255,6 +403,38 @@ struct ProjectCollaboratorListHandler {
     api: ProjectHttpApi,
 }
 
+struct ProjectAccessListHandler {
+    api: ProjectHttpApi,
+}
+
+impl Handler for ProjectAccessListHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_body(ctx, "project access directory")?;
+        let page = Page::parse(&ctx.request.query, "project access directory")?;
+        let project_id = project_param(ctx)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &self.api.access_directory(ctx, project_id, page)?,
+        )))
+    }
+}
+
+struct ProjectAccessSetHandler {
+    api: ProjectHttpApi,
+}
+
+impl Handler for ProjectAccessSetHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let project_id = project_param(ctx)?;
+        let body = parse_access_body(&ctx.request.body)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &self.api.set_access(ctx, project_id, body)?,
+        )))
+    }
+}
+
 impl Handler for ProjectCollaboratorListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_body(ctx, "project collaborator list")?;
@@ -316,7 +496,19 @@ pub fn register_projects(
             Method::Get,
             "/v1/projects/{project}/collaborators",
             "identity.project.view",
-            Arc::new(ProjectCollaboratorListHandler { api }),
+            Arc::new(ProjectCollaboratorListHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/projects/{project}/access",
+            "identity.project.access.manage",
+            Arc::new(ProjectAccessListHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Put,
+            "/v1/projects/{project}/access",
+            "identity.project.access.manage",
+            Arc::new(ProjectAccessSetHandler { api }),
         )
 }
 
@@ -344,6 +536,21 @@ fn parse_body(bytes: &[u8]) -> Result<CreateProjectBody, EdgeError> {
     }
     serde_json::from_slice(bytes)
         .map_err(|error| EdgeError::BadRequest(format!("invalid project create body: {error}")))
+}
+
+fn parse_access_body(bytes: &[u8]) -> Result<ProjectAccessBody, EdgeError> {
+    if bytes.len() > MAX_PROJECT_JSON_BYTES {
+        return Err(EdgeError::PayloadTooLarge(format!(
+            "project access request body exceeds {MAX_PROJECT_JSON_BYTES} bytes"
+        )));
+    }
+    if bytes.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "empty request body (expected JSON)".into(),
+        ));
+    }
+    serde_json::from_slice(bytes)
+        .map_err(|error| EdgeError::BadRequest(format!("invalid project access body: {error}")))
 }
 
 fn parse_page_query(query: &str) -> Result<(u32, Option<String>), EdgeError> {
@@ -457,6 +664,11 @@ mod tests {
         for invalid in ["limit=0", "limit=101", "limit=1&limit=2", "tenant=other"] {
             assert!(parse_page_query(invalid).is_err(), "accepted `{invalid}`");
         }
+        assert!(parse_access_body(br#"{"principal_id":"p:reviewer","access":true}"#).is_ok());
+        assert!(parse_access_body(
+            br#"{"principal_id":"p:reviewer","access":true,"tenant":"other"}"#
+        )
+        .is_err());
     }
 
     #[test]

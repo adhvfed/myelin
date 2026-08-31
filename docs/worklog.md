@@ -4,6 +4,32 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Project writers can manage real collaborators in the product
+
+Creating a project no longer leaves its useful authorization graph dependent on bootstrap policy.
+The new Projects surface lists the organization's other active humans by decrypted profile name and
+lets a project writer give or remove direct reader access. The durable relationship is the existing
+`project#reader` tuple, so Issues, Chat, published agent conversations, and reviewer selection all
+observe the same change. Writer and team-derived access is presented as inherited and cannot be
+removed by deleting an unrelated reader edge. A reader cannot open the writer-only directory or
+mutation surface.
+
+The production directory path is keyset-paged by the last raw principal id, bounded before profile
+decryption, tenant/region scoped, active-human-only, and strict about public text. Project
+`manage_access` resolves only from the direct writer relation; `assigned_reader` distinguishes a
+removable direct grant from effective access inherited elsewhere. Both reads and writes remain
+no-store and fail closed. The first live attempt was rejected by Edge's action allowlist, which
+confirmed the pre-handler policy boundary; the exact signed capability requirement is now mounted
+and covered by its invariant suite.
+
+The readable TypeScript system journey creates a project, proves the second identity sees 404,
+discovers that identity through the writer-only directory, grants access, proves project and
+collaborator discovery, proves the new reader still receives 404 for administration, revokes the
+grant, and observes 404 again. It passed against the running Edge and PostgreSQL store. The Chromium
+journey creates its project through the web, opens Projects, grants the named reviewer, observes the
+durable removable state, and removes it again. Strict Clippy, Rust namespace/directory/handler and
+action-policy tests, web and system typechecks, web lint, and all 677 web unit tests also pass.
+
 ## 2026-09-01 — Reviewers are chosen from the project's real collaborators
 
 The private-work pane no longer requires an owner to know and type an opaque reviewer identity.

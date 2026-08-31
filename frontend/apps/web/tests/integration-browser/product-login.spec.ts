@@ -220,6 +220,7 @@ command = ["true"]
   await issueDialog.getByLabel("Issue key").fill(issuePrefix);
   await issueDialog.getByRole("button", { name: "Create project" }).click();
   await expect(issueDialog.getByLabel("Project")).toHaveValue(/^[0-9a-f-]{36}$/);
+  const browserProjectId = await issueDialog.getByLabel("Project").inputValue();
   await issueDialog.getByLabel("Title").fill(issueTitle);
   await issueDialog.getByRole("button", { name: "Create issue" }).click();
 
@@ -262,4 +263,16 @@ command = ["true"]
     state: "Backlog",
     state_category: "unstarted",
   });
+
+  await navigateToApp(page, "/projects");
+  await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
+  await page.locator(".projects-picker select").selectOption(browserProjectId);
+  const reviewerAccess = page.getByTestId("project-access-member").filter({
+    hasText: "Myelin Reviewer",
+  });
+  await expect(reviewerAccess.getByRole("button", { name: "Give access" })).toBeVisible();
+  await reviewerAccess.getByRole("button", { name: "Give access" }).click();
+  await expect(reviewerAccess.getByRole("button", { name: "Remove direct access" })).toBeVisible();
+  await reviewerAccess.getByRole("button", { name: "Remove direct access" }).click();
+  await expect(reviewerAccess.getByRole("button", { name: "Give access" })).toBeVisible();
 });

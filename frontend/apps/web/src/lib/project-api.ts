@@ -1,7 +1,11 @@
 import { action, json, query, redirect } from "@solidjs/router";
-import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
+import { edgeGet, edgePost, edgePut, GatewayError, isUnauthorized } from "../server/gateway";
 import {
   parseNewProjectInput,
+  parseProjectAccessListInput,
+  parseProjectAccessPage,
+  parseProjectAccessReceipt,
+  parseProjectAccessSetInput,
   parseProjectCollaboratorListInput,
   parseProjectCollaboratorPage,
   parseProjectCreation,
@@ -10,6 +14,10 @@ import {
   projectListSearchParams,
   projectCollaboratorSearchParams,
   type NewProjectInput,
+  type ProjectAccessListInput,
+  type ProjectAccessPage,
+  type ProjectAccessReceipt,
+  type ProjectAccessSetInput,
   type ProjectCreationReceipt,
   type ProjectCollaboratorListInput,
   type ProjectCollaboratorPage,
@@ -26,6 +34,12 @@ export type ProjectCreateResult =
   | { ok: false; error: ProjectErrorKind };
 export type ProjectCollaboratorListResult =
   | { ok: true; page: ProjectCollaboratorPage }
+  | { ok: false; error: ProjectErrorKind };
+export type ProjectAccessListResult =
+  | { ok: true; page: ProjectAccessPage }
+  | { ok: false; error: ProjectErrorKind };
+export type ProjectAccessSetResult =
+  | { ok: true; receipt: ProjectAccessReceipt }
   | { ok: false; error: ProjectErrorKind };
 
 function errorKind(error: unknown): ProjectErrorKind {
@@ -70,6 +84,46 @@ export const getProjectCollaborators = query(async (
     return { ok: false, error: errorKind(error) };
   }
 }, "project-collaborators-list");
+
+export const getProjectAccess = query(async (
+  value: ProjectAccessListInput,
+): Promise<ProjectAccessListResult> => {
+  "use server";
+  const input = parseProjectAccessListInput(value);
+  if (!input) return { ok: false, error: "bad-input" };
+  try {
+    const queryString = projectCollaboratorSearchParams(input).toString();
+    const page = parseProjectAccessPage(await edgeGet(
+      `/v1/projects/${encodeURIComponent(input.projectId)}/access${
+        queryString ? `?${queryString}` : ""
+      }`,
+    ));
+    return page ? { ok: true, page } : { ok: false, error: "error" };
+  } catch (error) {
+    if (isUnauthorized(error)) throw redirect("/login");
+    return { ok: false, error: errorKind(error) };
+  }
+}, "project-access-list");
+
+export const setProjectAccess = action(async (
+  value: ProjectAccessSetInput,
+) => {
+  "use server";
+  const result = (response: ProjectAccessSetResult) => json(response, { revalidate: [] });
+  const input = parseProjectAccessSetInput(value);
+  if (!input) return result({ ok: false, error: "bad-input" });
+  try {
+    const receipt = parseProjectAccessReceipt(await edgePut(
+      `/v1/projects/${encodeURIComponent(input.projectId)}/access`,
+      { principal_id: input.principalId, access: input.access },
+      { idempotencyKey: input.clientNonce },
+    ));
+    return result(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
+  } catch (error) {
+    if (isUnauthorized(error)) throw redirect("/login");
+    return result({ ok: false, error: errorKind(error) });
+  }
+}, "project-access-set");
 
 export const createProject = action(async (value: NewProjectInput) => {
   "use server";

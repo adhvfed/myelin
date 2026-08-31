@@ -537,17 +537,27 @@ pub fn core_hierarchy() -> Vec<FragmentDef> {
                 RelName("writer".into()),
                 RelName("parent_team".into()),
             ],
-            permissions: vec![PermissionRule {
-                permission: Permission("view".into()),
-                rewrite: Userset::Union(vec![
-                    Userset::Relation(RelName("reader".into())),
-                    Userset::Relation(RelName("writer".into())),
-                    Userset::TupleToUserset {
-                        tupleset: RelName("parent_team".into()),
-                        computed: RelName("view".into()),
-                    },
-                ]),
-            }],
+            permissions: vec![
+                PermissionRule {
+                    permission: Permission("view".into()),
+                    rewrite: Userset::Union(vec![
+                        Userset::Relation(RelName("reader".into())),
+                        Userset::Relation(RelName("writer".into())),
+                        Userset::TupleToUserset {
+                            tupleset: RelName("parent_team".into()),
+                            computed: RelName("view".into()),
+                        },
+                    ]),
+                },
+                PermissionRule {
+                    permission: Permission("manage_access".into()),
+                    rewrite: Userset::Relation(RelName("writer".into())),
+                },
+                PermissionRule {
+                    permission: Permission("assigned_reader".into()),
+                    rewrite: Userset::Relation(RelName("reader".into())),
+                },
+            ],
         },
     ]
 }
@@ -658,6 +668,41 @@ mod tests {
             &subject("p:alice"),
             "project",
             "view",
+            &ArtifactRef("project:web".into()),
+            &latest(),
+        ));
+    }
+
+    #[test]
+    fn only_a_direct_project_writer_may_manage_access() {
+        let ns = NamespaceEngine::with_core_hierarchy();
+        let s = scope("acme");
+        let eng = engine_with(
+            &s,
+            &[
+                add("project:web", "writer", "p:writer"),
+                add("project:web", "reader", "p:reader"),
+                add("project:web", "parent_team", "team:eng#view"),
+                add("team:eng", "member", "p:inherited"),
+            ],
+        );
+        for principal in ["p:reader", "p:inherited"] {
+            assert!(!ns.permits(
+                &eng,
+                &s,
+                &subject(principal),
+                "project",
+                "manage_access",
+                &ArtifactRef("project:web".into()),
+                &latest(),
+            ));
+        }
+        assert!(ns.permits(
+            &eng,
+            &s,
+            &subject("p:writer"),
+            "project",
+            "manage_access",
             &ArtifactRef("project:web".into()),
             &latest(),
         ));
@@ -936,7 +981,14 @@ mod tests {
         let abi = frag.to_abi();
         assert_eq!(abi.object_type, ObjectType("project".into()));
         assert!(abi.relations.contains(&RelName("parent_team".into())));
-        assert_eq!(abi.permissions, vec![Permission("view".into())]);
+        assert_eq!(
+            abi.permissions,
+            vec![
+                Permission("view".into()),
+                Permission("manage_access".into()),
+                Permission("assigned_reader".into()),
+            ]
+        );
     }
 
     #[test]
@@ -945,6 +997,10 @@ mod tests {
         assert_eq!(ns.object_types(), vec!["org", "project", "team"]);
         assert!(ns.has_relation("project", "parent_team"));
         assert!(ns.resolve_permission("project", "view").is_some());
+        assert!(ns.resolve_permission("project", "manage_access").is_some());
+        assert!(ns
+            .resolve_permission("project", "assigned_reader")
+            .is_some());
         assert!(ns.resolve_permission("project", "delete").is_none());
     }
 

@@ -16,6 +16,14 @@ retry-safe state changes with metadata-only audit events; reopening restores the
 without discarding its identity or history. Richer configurable workflows must extend that durable
 transition boundary rather than replacing it with client-side state.
 
+Project ownership must be useful without an operator editing policy behind the product. A project
+writer can discover the organization's other active humans by their profile names and give or
+remove direct reader access from a dedicated project surface. The live ReBAC graph remains the only
+membership source: direct readers immediately become project collaborators across Issues, Chat,
+and agent review, while writer and team-inherited access is shown honestly and cannot be removed by
+deleting an unrelated direct-reader edge. Directory reads are tenant-scoped, bounded, paged, and
+available only to project writers; readers receive the same not-found boundary as outsiders.
+
 ## Personal cloud agents
 
 Every person can keep a small stable of named agents that reflect how they work. Instructions and
@@ -141,6 +149,10 @@ Product claims are proved as readable TypeScript journeys against running servic
 stores. A privacy journey must use two real identities and demonstrate both sides of the boundary:
 the collaborator receives an indistinguishable not-found response before publication, then sees the
 work after the owner's explicit transition, while workspace execution and SSH remain denied.
+Project-access journeys must begin with a second identity outside a newly created project, discover
+that human through the writer-only product directory, grant access through the live authorization
+graph, prove the reader can collaborate but cannot administer access, and revoke the direct grant
+again. A browser journey must repeat the grant and revoke through the visible project surface.
 Cloud-branch handoff journeys must additionally prove the ref is absent before the explicit action,
 publish a real commit made inside the confined workspace, give a named reviewer access to the exact
 pull request, survive a reload and retry, and demonstrate that private augmentation paths are absent

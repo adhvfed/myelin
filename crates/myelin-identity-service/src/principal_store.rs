@@ -59,6 +59,7 @@ struct EncryptedProfile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrincipalError {
     InvalidProvisioning,
+    InvalidDirectoryPage,
     CrossTenant { detail: String },
     Kms(String),
     CorruptProfile,
@@ -72,6 +73,9 @@ impl core::fmt::Display for PrincipalError {
         match self {
             PrincipalError::InvalidProvisioning => f.write_str(
                 "principal credential provisioning requires non-empty opaque identifiers and a valid scheme",
+            ),
+            PrincipalError::InvalidDirectoryPage => f.write_str(
+                "principal directory page requires a row limit between 1 and 201 and a printable cursor",
             ),
             PrincipalError::CrossTenant { detail } => write!(
                 f,
@@ -502,6 +506,47 @@ impl PrincipalStore {
         }
     }
 
+    pub fn principals_after(
+        &self,
+        scope: &TenantScope,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<PrincipalRow>, PrincipalError> {
+        if limit == 0
+            || limit > 201
+            || cursor.is_some_and(|value| {
+                value.is_empty() || value.len() > 255 || value.chars().any(char::is_control)
+            })
+        {
+            return Err(PrincipalError::InvalidDirectoryPage);
+        }
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PrincipalBackend::Memory(inner_arc) => {
+                let inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                let mut rows = inner
+                    .partitions
+                    .get(&Self::part_key(scope))
+                    .map(|partition| partition.values().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                rows.sort_by(|left, right| left.principal_id.0.cmp(&right.principal_id.0));
+                rows.retain(|row| cursor.is_none_or(|cursor| row.principal_id.0.as_str() > cursor));
+                rows.truncate(limit as usize);
+                Ok(rows)
+            }
+            PrincipalBackend::Pg(pg) => pg
+                .block(
+                    pg.backing
+                        .principals_after(&scope.tenant().0, cursor, limit),
+                )
+                .map_err(|e| PrincipalError::Storage(e.to_string()))?
+                .into_iter()
+                .map(|drow| Self::durable_to_row(scope, drow))
+                .collect(),
+        }
+    }
+
     pub fn link_credential(
         &self,
         scope: &TenantScope,
@@ -794,6 +839,40 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn directory_pages_use_a_bounded_raw_principal_cursor() {
+        let store = PrincipalStore::new(kms());
+        let s = scope("acme");
+        for id in ["p:charlie", "p:alice", "p:bob"] {
+            store
+                .put_principal(
+                    &s,
+                    PrincipalId(id.into()),
+                    PrincipalKind::Human,
+                    DataRole::Processor,
+                    PrincipalStatus::Active,
+                    None,
+                )
+                .expect("seed directory row");
+        }
+        let first = store.principals_after(&s, None, 2).expect("first page");
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.principal_id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["p:alice", "p:bob"]
+        );
+        let second = store
+            .principals_after(&s, Some("p:bob"), 2)
+            .expect("second page");
+        assert_eq!(second[0].principal_id.0, "p:charlie");
+        assert!(matches!(
+            store.principals_after(&s, None, 202),
+            Err(PrincipalError::InvalidDirectoryPage)
+        ));
     }
 
     #[test]

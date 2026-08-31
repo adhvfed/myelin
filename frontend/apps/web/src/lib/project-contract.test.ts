@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   parseNewProjectInput,
+  parseProjectAccessListInput,
+  parseProjectAccessPage,
+  parseProjectAccessReceipt,
+  parseProjectAccessSetInput,
   parseProjectCollaboratorListInput,
   parseProjectCollaboratorPage,
   parseProjectCreation,
@@ -58,6 +62,50 @@ describe("project browser contract", () => {
       page: { next_cursor: null, limit: 50 },
     })).toBeNull();
     expect(parseProjectCollaboratorListInput({ projectId: project.id, cursor: "bad\n" }))
+      .toBeNull();
+  });
+
+  it("keeps project access management exact and distinguishes removable readers", () => {
+    const reader = {
+      principal_id: "human:grace",
+      display_name: "Grace Hopper",
+      has_access: true,
+      removable: true,
+    };
+    expect(parseProjectAccessPage({
+      items: [reader],
+      page: { next_cursor: "human:grace", limit: 50 },
+    })).toEqual({ items: [reader], page: { next_cursor: "human:grace", limit: 50 } });
+    expect(parseProjectAccessPage({
+      items: [{ ...reader, has_access: false }],
+      page: { next_cursor: null, limit: 50 },
+    })).toBeNull();
+    expect(parseProjectAccessListInput({ projectId: project.id, limit: 100 }))
+      .toEqual({ projectId: project.id, limit: 100 });
+    expect(parseProjectAccessSetInput({
+      projectId: project.id,
+      principalId: reader.principal_id,
+      access: false,
+      clientNonce: "access_1",
+    })).toEqual({
+      projectId: project.id,
+      principalId: reader.principal_id,
+      access: false,
+      clientNonce: "access_1",
+    });
+    expect(parseProjectAccessReceipt({
+      principal_id: reader.principal_id,
+      requested_access: false,
+      has_access: false,
+      removable: false,
+      durable: true,
+    })).toEqual({
+      principal_id: reader.principal_id,
+      requested_access: false,
+      has_access: false,
+      removable: false,
+    });
+    expect(parseProjectAccessReceipt({ ...reader, requested_access: true, durable: false }))
       .toBeNull();
   });
 

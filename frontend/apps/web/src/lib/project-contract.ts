@@ -34,6 +34,34 @@ export interface ProjectCollaboratorListInput {
   limit?: number;
 }
 
+export interface ProjectAccessVM {
+  principal_id: string;
+  display_name: string;
+  has_access: boolean;
+  removable: boolean;
+}
+
+export interface ProjectAccessPage {
+  items: ProjectAccessVM[];
+  page: { next_cursor: string | null; limit: number };
+}
+
+export type ProjectAccessListInput = ProjectCollaboratorListInput;
+
+export interface ProjectAccessSetInput {
+  projectId: string;
+  principalId: string;
+  access: boolean;
+  clientNonce: string;
+}
+
+export interface ProjectAccessReceipt {
+  principal_id: string;
+  requested_access: boolean;
+  has_access: boolean;
+  removable: boolean;
+}
+
 export interface ProjectListInput {
   cursor?: string;
   limit?: number;
@@ -141,6 +169,17 @@ export function parseProjectCollaboratorListInput(
   };
 }
 
+export const parseProjectAccessListInput = parseProjectCollaboratorListInput;
+
+export function parseProjectAccessSetInput(value: unknown): ProjectAccessSetInput | null {
+  const input = record(value);
+  if (!input || !exact(input, ["projectId", "principalId", "access", "clientNonce"]) ||
+      !isProjectId(input.projectId) || !bounded(input.principalId, 255) ||
+      hasControl(input.principalId) || input.principalId.trim() !== input.principalId ||
+      typeof input.access !== "boolean" || !isClientNonce(input.clientNonce)) return null;
+  return input as unknown as ProjectAccessSetInput;
+}
+
 export function projectCollaboratorSearchParams(
   input: ProjectCollaboratorListInput,
 ): URLSearchParams {
@@ -213,6 +252,52 @@ export function parseProjectCollaboratorPage(value: unknown): ProjectCollaborato
   return {
     items: items as ProjectCollaboratorVM[],
     page: { next_cursor: page.next_cursor, limit: page.limit as number },
+  };
+}
+
+export function parseProjectAccessPage(value: unknown): ProjectAccessPage | null {
+  const input = record(value);
+  const page = record(input?.page);
+  if (!input || !exact(input, ["items", "page"]) || !Array.isArray(input.items) ||
+      input.items.length > MAX_PROJECT_PAGE_SIZE || !page ||
+      !exact(page, ["next_cursor", "limit"]) ||
+      !(page.next_cursor === null || (bounded(page.next_cursor, 255) &&
+        !hasControl(page.next_cursor))) ||
+      !Number.isSafeInteger(page.limit) || (page.limit as number) < 1 ||
+      (page.limit as number) > MAX_PROJECT_PAGE_SIZE) return null;
+  const items = input.items.map((value) => {
+    const member = record(value);
+    return member && exact(member, ["principal_id", "display_name", "has_access", "removable"]) &&
+      bounded(member.principal_id, 255) && !hasControl(member.principal_id) &&
+      member.principal_id.trim() === member.principal_id &&
+      bounded(member.display_name, 255) && !hasControl(member.display_name) &&
+      member.display_name.trim() === member.display_name &&
+      typeof member.has_access === "boolean" && typeof member.removable === "boolean" &&
+      (!member.removable || member.has_access)
+      ? member as unknown as ProjectAccessVM
+      : null;
+  });
+  if (items.some((item) => item === null)) return null;
+  return {
+    items: items as ProjectAccessVM[],
+    page: { next_cursor: page.next_cursor, limit: page.limit as number },
+  };
+}
+
+export function parseProjectAccessReceipt(value: unknown): ProjectAccessReceipt | null {
+  const input = record(value);
+  if (!input || !exact(input, [
+    "principal_id", "requested_access", "has_access", "removable", "durable",
+  ]) || !bounded(input.principal_id, 255) || hasControl(input.principal_id) ||
+      input.principal_id.trim() !== input.principal_id ||
+      typeof input.requested_access !== "boolean" || typeof input.has_access !== "boolean" ||
+      typeof input.removable !== "boolean" || (!input.has_access && input.removable) ||
+      input.durable !== true) return null;
+  return {
+    principal_id: input.principal_id,
+    requested_access: input.requested_access,
+    has_access: input.has_access,
+    removable: input.removable,
   };
 }
 

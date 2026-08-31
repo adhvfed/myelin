@@ -111,6 +111,53 @@ describe("issue lifecycle", () => {
     });
     expect(hiddenFromPeer.body).toMatchObject({ error: { code: "not_found" } });
     await expect(findProject(reviewerClient, projectId)).resolves.toBeUndefined();
+
+    const directory = await systemClient.json(`/v1/projects/${projectId}/access?limit=100`);
+    const reviewer = array(directory.body.items, "project access directory").find((item) =>
+      record(item, "project access entry").principal_id === systemTestConfig.reviewerPrincipal
+    );
+    expect(reviewer).toMatchObject({
+      principal_id: systemTestConfig.reviewerPrincipal,
+      has_access: false,
+      removable: false,
+    });
+
+    const granted = await systemClient.json(`/v1/projects/${projectId}/access`, {
+      method: "PUT",
+      body: { principal_id: systemTestConfig.reviewerPrincipal, access: true },
+      idempotencyKey: `grant-project-access-${randomUUID()}`,
+    });
+    expect(granted.body).toEqual({
+      principal_id: systemTestConfig.reviewerPrincipal,
+      requested_access: true,
+      has_access: true,
+      removable: true,
+      durable: true,
+    });
+    await expect(findProject(reviewerClient, projectId)).resolves.toMatchObject({ id: projectId });
+    await reviewerClient.json(`/v1/projects/${projectId}/access?limit=100`, {
+      expectedStatus: 404,
+    });
+    const collaborators = await systemClient.json(
+      `/v1/projects/${projectId}/collaborators?limit=100`,
+    );
+    expect(array(collaborators.body.items, "project collaborators")).toContainEqual(
+      expect.objectContaining({ principal_id: systemTestConfig.reviewerPrincipal }),
+    );
+
+    const revoked = await systemClient.json(`/v1/projects/${projectId}/access`, {
+      method: "PUT",
+      body: { principal_id: systemTestConfig.reviewerPrincipal, access: false },
+      idempotencyKey: `revoke-project-access-${randomUUID()}`,
+    });
+    expect(revoked.body).toEqual({
+      principal_id: systemTestConfig.reviewerPrincipal,
+      requested_access: false,
+      has_access: false,
+      removable: false,
+      durable: true,
+    });
+    await reviewerClient.json(`/v1/projects/${projectId}`, { expectedStatus: 404 });
   });
 
   test("moves an issue through authorization, discovery, completion, and reopening", async () => {

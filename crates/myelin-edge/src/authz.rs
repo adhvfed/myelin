@@ -44,6 +44,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.projects.list",
     "identity.project.create",
     "identity.project.view",
+    "identity.project.access.manage",
     "issues.list",
     "issues.create",
     "issues.import.dry_run",
@@ -271,6 +272,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("identity.projects.list", "project.view", OP_PAT),
     requirement!("identity.project.create", "project.create", OP_PAT),
     requirement!("identity.project.view", "project.view", OP_PAT),
+    requirement!(
+        "identity.project.access.manage",
+        "project.manage_access",
+        OP_PAT
+    ),
     requirement!("issues.list", "issue.view", OP_PAT),
     requirement!("issues.create", "issue.create", OP_PAT),
     requirement!("issues.import.dry_run", "issue.create", OP_PAT),

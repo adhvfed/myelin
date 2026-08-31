@@ -61,6 +61,7 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { href: "/git/repos", icon: "nav-code", label: "Code" },
+  { href: "/projects", icon: "team", label: "Projects" },
   { href: "/issues", icon: "nav-issues", label: "Issues" },
   { href: "/chat", icon: "nav-chat", label: "Chat" },
   { href: "/agents", icon: "agent", label: "Agents" },

@@ -884,6 +884,42 @@ impl DurablePrincipalBacking {
             .await
     }
 
+    /// Reads one stable, bounded directory page. The cursor is the last raw principal id scanned,
+    /// not an offset, so concurrent inserts cannot make an existing row repeat or disappear.
+    pub async fn principals_after(
+        &self,
+        tenant: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DurablePrincipalRow>, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let cursor = cursor.map(str::to_string);
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT principal_id, kind, data_role, status, \
+                                profile_key_ref, profile_nonce, profile_ciphertext \
+                           FROM principal \
+                          WHERE tenant_id = $1 AND region = $2 \
+                            AND ($3::text IS NULL OR principal_id > $3) \
+                          ORDER BY principal_id \
+                          LIMIT $4",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(cursor)
+                    .bind(i64::from(limit))
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    rows.iter().map(row_to_principal).collect()
+                })
+            })
+            .await
+    }
+
     pub async fn link_credential(
         &self,
         tenant: &str,
