@@ -213,6 +213,7 @@ describe("private agent work wire projection", () => {
     })?.items).toEqual([{
       id: AGENT,
       name: "Checkout companion",
+      owner_principal_id: "developer",
       runtime_ref: "external:mcp",
       status: "active",
       selected_tools: ["chat.post"],
@@ -222,6 +223,7 @@ describe("private agent work wire projection", () => {
     expect(parseAgentChoice({ agent })).toEqual({
       id: AGENT,
       name: "Checkout companion",
+      owner_principal_id: "developer",
       runtime_ref: "external:mcp",
       status: "active",
       selected_tools: ["chat.post"],
@@ -232,6 +234,7 @@ describe("private agent work wire projection", () => {
       agent: {
         id: AGENT,
         name: "Checkout companion",
+        owner_principal_id: "developer",
         runtime_ref: "external:mcp",
         status: "active",
         selected_tools: ["chat.post"],

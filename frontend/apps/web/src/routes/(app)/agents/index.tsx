@@ -12,6 +12,7 @@ import {
 
 import { AgentActivationDialog } from "~/components/agents/AgentActivationDialog";
 import { AgentThreadCreateDialog } from "~/components/agents/AgentThreadCreateDialog";
+import { AgentRosterDialog } from "~/components/agents/AgentRosterDialog";
 import { AgentWorkspaceDefaultsDialog } from "~/components/agents/AgentWorkspaceDefaultsDialog";
 import { AgentThreadSidebar } from "~/components/agents/AgentThreadSidebar";
 import {
@@ -21,7 +22,7 @@ import {
 } from "~/components/agents/AgentThreadStates";
 import { AgentThreadTimeline } from "~/components/agents/AgentThreadTimeline";
 import { AgentWorkspaceContext } from "~/components/agents/AgentWorkspaceContext";
-import { useContextPane } from "~/components/AppShell";
+import { useAppViewer, useContextPane } from "~/components/AppShell";
 import {
   agentThreadErrorKind,
   getAgentChoice,
@@ -66,6 +67,7 @@ export default function AgentThreadsIndex() {
   const navigate = useNavigate();
   const toast = useToast();
   const pane = useContextPane();
+  const viewer = useAppViewer();
   const mutate = useAction(mutateAgentThread);
   const selectedId = () => typeof search.thread === "string" ? search.thread : undefined;
   const validSelectedId = () => isAgentThreadId(selectedId()) ? selectedId() : undefined;
@@ -80,6 +82,7 @@ export default function AgentThreadsIndex() {
   const [activatedAgents, setActivatedAgents] = createSignal<AgentChoice[]>([]);
   const [preferredAgentId, setPreferredAgentId] = createSignal<string>();
   const [configuringAgent, setConfiguringAgent] = createSignal<AgentChoice | null>(null);
+  const [managingAgents, setManagingAgents] = createSignal(false);
   const [loadingMoreAgents, setLoadingMoreAgents] = createSignal(false);
   const [earlierMessagePages, setEarlierMessagePages] = createSignal<Awaited<ReturnType<typeof getAgentThreadMessages>>[]>([]);
   const [loadingEarlier, setLoadingEarlier] = createSignal(false);
@@ -448,6 +451,7 @@ export default function AgentThreadsIndex() {
           onLoadMore={() => void loadMoreThreads()}
           onNew={openCreate}
           onActivateAgent={openActivation}
+          onManageAgents={() => setManagingAgents(true)}
         />
         <section class="agent-thread-workspace" aria-label="Private agent work">
           <Show when={selectedId()} fallback={<AgentThreadWelcome onNew={openCreate} interactive={interactive()} />}>
@@ -481,6 +485,7 @@ export default function AgentThreadsIndex() {
         agentsLoading={firstAgents() === undefined}
         agentsHaveMore={Boolean(nextAgentCursor())}
         agentsLoadingMore={loadingMoreAgents()}
+        viewerPrincipalId={viewer.principalId}
         onLoadMoreAgents={() => void loadMoreAgents()}
         onActivateAgent={openActivation}
         onConfigureAgent={setConfiguringAgent}
@@ -503,6 +508,25 @@ export default function AgentThreadsIndex() {
           openCreate();
           toast.show({ title: `${receipt.agent.name} is ready for private work`, variant: "success" });
         }}
+      />
+      <AgentRosterDialog
+        open={managingAgents()}
+        agents={agents()}
+        viewerPrincipalId={viewer.principalId}
+        loading={firstAgents() === undefined}
+        unavailable={Boolean(firstAgents()?.error)}
+        hasMore={Boolean(nextAgentCursor())}
+        loadingMore={loadingMoreAgents()}
+        onLoadMore={() => void loadMoreAgents()}
+        onActivate={() => {
+          setManagingAgents(false);
+          openActivation();
+        }}
+        onConfigure={(agent) => {
+          setManagingAgents(false);
+          setConfiguringAgent(agent);
+        }}
+        onClose={() => setManagingAgents(false)}
       />
       <AgentWorkspaceDefaultsDialog
         agent={configuringAgent()}

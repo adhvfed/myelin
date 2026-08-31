@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Personal agent configuration is a first-class owner journey
+
+Named-agent defaults could be edited in the web only after opening “Start private agent thread”
+and selecting an agent. That made maintenance depend on an unrelated creation flow. Worse, the
+same edit button appeared for organization agents owned by another person, even though the
+correct owner-only API would inevitably reject it.
+
+The Agents sidebar now opens a direct “My named agents” roster with each owner-controlled agent's
+runtime, lifecycle state, and workspace-default revision. Owners can open the encrypted defaults
+editor there without drafting a thread. The strict agent projection retains the already-public
+`on_behalf_of` identity as an owner fact: the thread picker keeps shared agents usable but replaces
+their impossible edit action with an explicit private-owner boundary, and the personal roster
+excludes them entirely.
+
+The readable Chromium journey now activates an agent, leaves the automatically offered thread,
+opens the first-class roster, revises the agent through that owner surface, and then starts a fresh
+repository-backed cloud workspace with revision 2. It passed end to end against the running web
+application, Edge, PostgreSQL/KMS, durable Git, workspace gateway, and gVisor before continuing
+through suspension, SSH denial, durable private chat, and accessibility checks. All 662 frontend
+contract tests, TypeScript checking, lint, and the production build pass.
+
 ## 2026-08-31 — Workspace-default changes leave a private-safe audit trail
 
 Editable named-agent defaults were durable and retry-safe, but changing them left no domain event.

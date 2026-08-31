@@ -11,6 +11,7 @@ export type AgentThreadState = "provisioning" | "ready" | "expiring" | "deleted"
 export interface AgentChoice {
   id: string;
   name: string;
+  owner_principal_id: string;
   runtime_ref: "external:mcp" | "hosted:luna";
   status: "active" | "suspended" | "disabled";
   selected_tools: string[];
@@ -218,6 +219,7 @@ function agentChoice(value: unknown): AgentChoice | null {
   return {
     id: row.id,
     name: row.name,
+    owner_principal_id: row.on_behalf_of,
     runtime_ref: row.runtime_ref,
     status: row.status,
     selected_tools: selectedTools,

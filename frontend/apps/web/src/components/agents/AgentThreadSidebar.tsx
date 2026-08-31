@@ -15,6 +15,7 @@ export function AgentThreadSidebar(props: {
   onLoadMore: () => void;
   onNew: () => void;
   onActivateAgent: () => void;
+  onManageAgents: () => void;
 }) {
   return (
     <aside
@@ -28,6 +29,15 @@ export function AgentThreadSidebar(props: {
           <h1><Icon name="agent" /> Agents</h1>
         </div>
         <div class="agent-thread-sidebar-actions">
+          <button
+            type="button"
+            class="agent-thread-icon-button"
+            aria-label="Manage my agents"
+            disabled={!props.interactive}
+            onClick={() => props.onManageAgents()}
+          >
+            <Icon name="settings" />
+          </button>
           <button
             type="button"
             class="agent-thread-icon-button"

@@ -24,6 +24,7 @@ export function AgentThreadCreateDialog(props: {
   agentsLoading: boolean;
   agentsHaveMore: boolean;
   agentsLoadingMore: boolean;
+  viewerPrincipalId: string;
   onLoadMoreAgents: () => void;
   onActivateAgent: () => void;
   onConfigureAgent: (agent: AgentChoice) => void;
@@ -172,14 +173,21 @@ export function AgentThreadCreateDialog(props: {
                 ? `This agent carries private AGENTS.md defaults at revision ${agent().workspace_profile.revision}.`
                 : "This agent has no default workspace instructions yet."}
             </p>
-            <button
-              type="button"
-              class="agent-thread-button secondary"
-              disabled={submitting()}
-              onClick={() => props.onConfigureAgent(agent())}
+            <Show
+              when={agent().owner_principal_id === props.viewerPrincipalId}
+              fallback={<p class="agent-thread-note">
+                Workspace defaults are private to this agent’s owner.
+              </p>}
             >
-              <Icon name="agent" /> Edit workspace defaults
-            </button>
+              <button
+                type="button"
+                class="agent-thread-button secondary"
+                disabled={submitting()}
+                onClick={() => props.onConfigureAgent(agent())}
+              >
+                <Icon name="edit" /> Edit workspace defaults
+              </button>
+            </Show>
           </div>
         )}</Show>
         <Show when={!props.agentsLoading && available().length === 0}>

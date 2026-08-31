@@ -68,16 +68,15 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await activation.getByRole("checkbox", { name: "Allow bounded workspace commands" }).check();
   await activation.getByRole("button", { name: "Activate agent" }).click();
 
-  const dialog = page.getByRole("dialog", { name: "Start private agent thread" });
-  await expect(dialog).toBeVisible();
-  await dialog.getByRole("textbox", { name: "Problem name" }).fill(threadName);
-  const agentChoice = dialog.getByRole("combobox", { name: "Agent" });
-  await agentChoice.selectOption({ label: agentName });
-  const agentId = await agentChoice.inputValue();
-  expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
-  await expect(dialog.getByText("This agent carries private AGENTS.md defaults at revision 1."))
-    .toBeVisible();
-  await dialog.getByRole("button", { name: "Edit workspace defaults" }).click();
+  const initialThreadDialog = page.getByRole("dialog", { name: "Start private agent thread" });
+  await expect(initialThreadDialog).toBeVisible();
+  await initialThreadDialog.getByRole("button", { name: "Cancel" }).click();
+
+  await page.getByRole("button", { name: "Manage my agents" }).click();
+  const roster = page.getByRole("dialog", { name: "My named agents" });
+  const agentRow = roster.getByRole("listitem").filter({ hasText: agentName });
+  await expect(agentRow).toContainText("AGENTS.md defaults · revision 1");
+  await agentRow.getByRole("button", { name: "Configure" }).click();
   const defaults = page.getByRole("dialog", { name: `${agentName} · workspace defaults` });
   const defaultsEditor = defaults.getByRole("textbox", {
     name: "Default AGENTS.md instructions",
@@ -86,6 +85,14 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await defaultsEditor.fill(revisedAgentDefaults);
   await defaults.getByRole("button", { name: "Save defaults" }).click();
   await expect(defaults).toBeHidden();
+
+  await page.getByRole("button", { name: "New private thread" }).click();
+  const dialog = page.getByRole("dialog", { name: "Start private agent thread" });
+  await dialog.getByRole("textbox", { name: "Problem name" }).fill(threadName);
+  const agentChoice = dialog.getByRole("combobox", { name: "Agent" });
+  await agentChoice.selectOption({ label: agentName });
+  const agentId = await agentChoice.inputValue();
+  expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
   await expect(dialog.getByText("This agent carries private AGENTS.md defaults at revision 2."))
     .toBeVisible();
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");
