@@ -286,7 +286,7 @@ describe("private work with an agent", () => {
     }
   });
 
-  test("layers owner instructions over repository AGENTS.md and preserves them across agent contexts", async () => {
+  test("layers owner instructions and create-only context files across agent contexts", async () => {
     const founder = await browserApprovedCliClient();
     const companion = await activateExternalAgent(
       founder,
@@ -303,6 +303,8 @@ describe("private work with an agent", () => {
       "Explain the tradeoff before changing an interface.",
       "Use the smallest real system journey that proves the change.",
     ].join("\n");
+    const contextPath = ".myelin/checkout-context.md";
+    const contextContents = `# Private checkout context\n\nTrace ${repository.slug} before changing it.\n`;
     const retryKey = `personalized-agent-thread-${randomUUID()}`;
 
     const created = await startPrivateAgentThread(founder, {
@@ -312,11 +314,11 @@ describe("private work with an agent", () => {
       workspace: {
         repository: repository.slug,
         instructions: personalGuidance,
+        files: [{ path: contextPath, contents: contextContents, strategy: "create" }],
       },
     });
     expect(created.thread.workspace.personalization).toEqual({
-      path: "AGENTS.md",
-      strategy: "append",
+      format: "workspace_augmentation_v1",
       content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
     });
 
@@ -324,13 +326,18 @@ describe("private work with an agent", () => {
     const firstAgents = await askAgent(firstContext, 1, "workspace.read_file", {
       path: "AGENTS.md",
     });
-    await closeAgentRun(firstContext);
     expect(firstAgents).toMatchObject({
       content: expect.stringContaining(repositoryGuidance),
     });
     expect(record(firstAgents, "personalized AGENTS result").content).toEqual(
       expect.stringContaining(personalGuidance),
     );
+    const firstContextFile = await askAgent(firstContext, 2, "workspace.read_file", {
+      path: contextPath,
+    });
+    await closeAgentRun(firstContext);
+    expect(record(firstContextFile, "personalized context-file result").content)
+      .toBe(contextContents);
 
     const replay = await startPrivateAgentThread(founder, {
       name: created.thread.name,
@@ -339,6 +346,7 @@ describe("private work with an agent", () => {
       workspace: {
         repository: repository.slug,
         instructions: personalGuidance,
+        files: [{ path: contextPath, contents: contextContents, strategy: "create" }],
       },
       expectedStatus: 200,
     });
@@ -351,7 +359,12 @@ describe("private work with an agent", () => {
         agent_id: companion.agent.id,
         workspace: {
           repository: repository.slug,
-          instructions: `${personalGuidance}\nDo something different.`,
+          instructions: personalGuidance,
+          files: [{
+            path: contextPath,
+            contents: `${contextContents}Use a different retry intent.\n`,
+            strategy: "create",
+          }],
         },
       },
       idempotencyKey: retryKey,
@@ -362,9 +375,17 @@ describe("private work with an agent", () => {
     const resumedAgents = await askAgent(resumedContext, 1, "workspace.read_file", {
       path: "AGENTS.md",
     });
+    const resumedContextFile = await askAgent(resumedContext, 2, "workspace.read_file", {
+      path: contextPath,
+    });
     await closeAgentRun(resumedContext);
     expect(resumedAgents).toEqual(firstAgents);
+    expect(resumedContextFile).toEqual(firstContextFile);
     expect((await repository.readFile("main", "AGENTS.md")).contents).toBe(repositoryGuidance);
+    await founder.json(
+      `${repository.path}/blob/main/.myelin/checkout-context.md`,
+      { expectedStatus: 404 },
+    );
   });
 
   test("carries editable named-agent defaults into new work while existing threads keep their snapshot", async () => {

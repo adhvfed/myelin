@@ -119,8 +119,7 @@ describe("private agent work from the CLI", () => {
         state: "ready",
         retention_days: 3,
         personalization: {
-          path: "AGENTS.md",
-          strategy: "append",
+          format: "workspace_augmentation_v1",
           content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
         },
       },

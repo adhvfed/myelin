@@ -35,12 +35,14 @@ agent authority without making retained work disappear.
 
 The workspace is personalizable at creation time. Repository guidance remains the shared default,
 while an owner can layer their own way of working into the assigned workspace—for example, custom
-root `AGENTS.md` instructions—without changing the source repository. Personalization is durable
-across fresh agent contexts and provisioning recovery, encrypted as owner-scoped agent data at
-rest, bounded, and projected publicly only as an integrity receipt. Overlays must use confined
-workspace writes and must fail closed on symlinks or conflicting durable markers. This initial
-`AGENTS.md` seam should grow into a small declarative workspace augmentation model rather than an
-unbounded startup-script escape hatch.
+root `AGENTS.md` instructions and private context files—without changing the source repository.
+Personalization is durable across fresh agent contexts and provisioning recovery, encrypted as
+owner-scoped agent data at rest, bounded, and projected publicly only as an integrity receipt.
+Declarative files are create-only: an identical existing file makes recovery idempotent, while a
+different file, symlink, traversal, `.git` target, or attempt to replace the dedicated `AGENTS.md`
+layer fails closed. The initial model deliberately permits at most eight files and 12 KiB of total
+encrypted augmentation data. Richer strategies can grow from this explicit contract; arbitrary
+startup scripts must not become a configuration escape hatch.
 
 Exploration is private by default. A personal agent thread, its conversation, branch intent,
 environment receipt, and workspace metadata are visible only to its owner and selected agent while

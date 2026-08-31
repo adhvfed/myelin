@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Private workspaces accept bounded declarative context files
+
+Private workspace personalization no longer stops at a root `AGENTS.md` append. A thread can carry
+up to eight create-only files alongside its owner and thread instructions, within the existing
+12 KiB encrypted owner-data envelope. Paths pass through the confined workspace validator;
+`AGENTS.md`, `.git`, traversal, NUL content, duplicate paths, and conflicting existing files fail
+closed. An exact existing file is accepted during provisioning recovery, and the file layer is part
+of the creation-intent digest, so both retries and changed retries retain their honest semantics.
+Legacy instruction-only ciphertext remains readable.
+
+The web creation flow exposes one optional private context file and describes its create-only
+contract. The workspace receipt is now a format-and-digest projection instead of falsely claiming
+that every personalization is an `AGENTS.md` append. The readable TypeScript journey creates a
+repository-backed thread with both layered instructions and `.myelin/checkout-context.md`, reads
+both through a real bound agent run, opens a fresh agent context and reads byte-identical results,
+replays the original request, rejects a changed retry, and receives not-found when it asks the
+source Git repository for the private file. That journey passed against restarted Edge,
+PostgreSQL, durable Git, the agent service, and the workspace store. The real Chromium product
+journey submitted the overlay through the browser, and the complete CLI thread journey retained
+compatibility against the running stack. Focused Rust units (13), strict all-target Edge checking
+and Clippy, frontend typechecking and lint, and system-test typechecking pass.
+
 ## 2026-08-31 — Owners manage named-agent lifecycle in the web product
 
 The durable owner-only suspend, resume, and retire boundary already terminated live runs,

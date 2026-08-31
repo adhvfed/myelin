@@ -83,8 +83,7 @@ export interface AgentThread {
       branch: string;
     } | null;
     personalization: {
-      path: "AGENTS.md";
-      strategy: "append";
+      format: "workspace_augmentation_v1";
       content_digest: string;
     } | null;
     environment: {
@@ -369,8 +368,8 @@ function thread(value: unknown): AgentThread | null {
         typeof repository.base_oid !== "string" || !/^[0-9a-f]{40}$/.test(repository.base_oid) ||
         !cleanText(repository.branch, 1_024))) ||
       (personalization !== null &&
-        (!exact(personalization, ["path", "strategy", "content_digest"]) ||
-          personalization.path !== "AGENTS.md" || personalization.strategy !== "append" ||
+        (!exact(personalization, ["format", "content_digest"]) ||
+          personalization.format !== "workspace_augmentation_v1" ||
           typeof personalization.content_digest !== "string" ||
           !/^blake3:[0-9a-f]{64}$/.test(personalization.content_digest))) ||
       (environment !== null && (repository === null ||

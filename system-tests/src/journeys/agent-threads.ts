@@ -29,8 +29,7 @@ export interface AgentThreadWorkspaceEnvironment {
 }
 
 export interface AgentThreadWorkspacePersonalization {
-  path: string;
-  strategy: string;
+  format: string;
   content_digest: string;
 }
 
@@ -80,6 +79,7 @@ export async function startPrivateAgentThread(
       baseRef?: string;
       branch?: string;
       instructions?: string;
+      files?: Array<{ path: string; contents: string; strategy: "create" }>;
     };
   },
 ): Promise<{ thread: PrivateAgentThread; created: boolean }> {
@@ -106,6 +106,9 @@ export async function startPrivateAgentThread(
               ...(intent.workspace.instructions === undefined
                 ? {}
                 : { instructions: intent.workspace.instructions }),
+              ...(intent.workspace.files === undefined
+                ? {}
+                : { files: intent.workspace.files }),
             },
           }),
     },
@@ -244,8 +247,7 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
       personalization: personalization === null
         ? null
         : {
-            path: string(personalization.path, "workspace personalization path"),
-            strategy: string(personalization.strategy, "workspace personalization strategy"),
+            format: string(personalization.format, "workspace personalization format"),
             content_digest: string(
               personalization.content_digest,
               "workspace personalization content digest",

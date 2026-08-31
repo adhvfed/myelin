@@ -97,11 +97,19 @@ describe("private agent work wire projection", () => {
       content_digest: `blake3:${"a".repeat(64)}`,
       state: "declared",
     };
+    const personalization = {
+      format: "workspace_augmentation_v1",
+      content_digest: `blake3:${"b".repeat(64)}`,
+    };
     const parsed = parseAgentThread({
-      thread: { ...subject, workspace: { ...subject.workspace, repository, environment } },
+      thread: {
+        ...subject,
+        workspace: { ...subject.workspace, repository, environment, personalization },
+      },
     });
     expect(parsed?.workspace.repository).toEqual(repository);
     expect(parsed?.workspace.environment).toEqual(environment);
+    expect(parsed?.workspace.personalization).toEqual(personalization);
     expect(parseAgentThread({
       thread: {
         ...subject,
@@ -121,6 +129,15 @@ describe("private agent work wire projection", () => {
           ...subject.workspace,
           repository,
           environment: { ...environment, content_digest: "blake3:short" },
+        },
+      },
+    })).toBeNull();
+    expect(parseAgentThread({
+      thread: {
+        ...subject,
+        workspace: {
+          ...subject.workspace,
+          personalization: { ...personalization, path: "AGENTS.md" },
         },
       },
     })).toBeNull();

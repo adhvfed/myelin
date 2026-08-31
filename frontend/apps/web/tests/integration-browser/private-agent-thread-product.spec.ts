@@ -33,6 +33,8 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const personalInstructions = `# My workflow\n\nKeep the ${suffix} diagnosis private until it is ready.`;
   const agentDefaults = `# Checkout companion defaults\n\nExplain the ${suffix} tradeoff first.`;
   const revisedAgentDefaults = `${agentDefaults}\nRun the focused browser journey.`;
+  const contextFilePath = ".myelin/browser-context.md";
+  const contextFileContents = `# Browser context\n\nKeep ${suffix} private until review.\n`;
   const repositorySlug = `cloud-workspace-${suffix}`;
   const sessionToken = await browserApprovedSession(request);
   await postProductJson(
@@ -99,6 +101,10 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await dialog.getByRole("textbox", { name: "Repository slug" }).fill(repositorySlug);
   await dialog.getByRole("textbox", { name: "Personal agent instructions" })
     .fill(personalInstructions);
+  await dialog.getByRole("textbox", { name: "Private context file path" })
+    .fill(contextFilePath);
+  await dialog.getByRole("textbox", { name: "Private context file contents" })
+    .fill(contextFileContents);
   await dialog.getByRole("button", { name: "Start thread" }).click();
 
   await page.waitForURL(/\/agents\?thread=[0-9a-f-]{36}$/);
@@ -112,7 +118,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
     .toContainText("Service Federation · declared");
   await expect(workspace.getByText("fed.yaml", { exact: true })).toBeVisible();
   await expect(workspace.getByTestId("workspace-personalization"))
-    .toContainText("AGENTS.md · personal overlay");
+    .toContainText("Declarative workspace overlay");
   await expect(workspace.getByTestId("workspace-environment-state"))
     .toContainText("pinned to this source commit");
   await expect(workspace.getByText("No workspace entries yet.")).toBeVisible();

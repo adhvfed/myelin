@@ -2,7 +2,10 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use myelin_agent_service::{
-    workspace::{AgentWorkspaceStore, RepositoryWorkspaceSource, WorkspaceAccessError},
+    workspace::{
+        validate_workspace_file_path, AgentWorkspaceStore, RepositoryWorkspaceSource,
+        WorkspaceAccessError,
+    },
     PlatformToolCatalogue,
 };
 use myelin_chat::conversation::{Conversation, ConversationKind};
@@ -23,7 +26,7 @@ use myelin_storage::{
     MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
     MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::types::Uuid;
 use tokio::runtime::Handle;
@@ -51,6 +54,8 @@ pub const AGENT_THREAD_RECOVERY_TENANTS_ENV: &str = "MYELIN_AGENT_THREAD_RECOVER
 const DEFAULT_RECOVERY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_RECOVERY_STALE_MS: u64 = 30_000;
 const MAX_RECOVERY_BATCH: u32 = 100;
+const MAX_WORKSPACE_AUGMENTATION_FILES: usize = 8;
+const WORKSPACE_AUGMENTATION_PREFIX: &[u8] = b"myelin.workspace-augmentation.v1\0";
 
 #[derive(Clone)]
 pub struct AgentThreadRecoveryConfig {
@@ -248,20 +253,26 @@ impl AgentThreadHttpApi {
             .workspace
             .as_ref()
             .and_then(|workspace| workspace.instructions.as_deref());
-        let request_content_digest = request_instructions
-            .map(|instructions| workspace_guidance_digest(instructions.as_bytes()));
-        proposal.workspace_guidance =
-            combined_workspace_guidance(agent_instructions.as_deref(), request_instructions)?
-                .as_deref()
-                .map(|instructions| {
-                    self.seal_workspace_guidance(
-                        principal,
-                        &proposal,
-                        instructions,
-                        request_content_digest.clone(),
-                    )
-                })
-                .transpose()?;
+        let request_files = intent
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.files.as_slice())
+            .unwrap_or_default();
+        proposal.workspace_guidance = workspace_augmentation_payload(
+            agent_instructions.as_deref(),
+            request_instructions,
+            request_files,
+        )?
+        .as_deref()
+        .map(|payload| {
+            self.seal_workspace_guidance(
+                principal,
+                &proposal,
+                payload,
+                intent.workspace_request_digest.clone(),
+            )
+        })
+        .transpose()?;
         let outcome = self
             .drive(self.threads.create(&principal.tenant.0, proposal))?
             .map_err(|_| EdgeError::Internal("agent thread storage failed".into()))?;
@@ -535,16 +546,16 @@ impl AgentThreadHttpApi {
         &self,
         principal: &Principal,
         proposal: &NewAgentThread,
-        instructions: &str,
+        payload: &[u8],
         request_content_digest: Option<String>,
     ) -> Result<AgentThreadWorkspaceGuidance, EdgeError> {
-        let content_digest = workspace_guidance_digest(instructions.as_bytes());
+        let content_digest = workspace_guidance_digest(payload);
         let encrypted_content = ColumnCryptor::new(&self.kms, principal.region.clone())
             .encrypt_for_subject_scope_with_aad(
                 &principal.tenant,
                 &SubjectId::new(&principal.principal_id.0),
                 SubjectKeyScope::AgentData,
-                instructions.as_bytes(),
+                payload,
                 &workspace_guidance_aad(
                     principal,
                     proposal.thread_id,
@@ -595,39 +606,79 @@ impl AgentThreadHttpApi {
                 "stored agent workspace guidance failed integrity validation".into(),
             ));
         }
-        let instructions = std::str::from_utf8(&plaintext).map_err(|_| {
-            EdgeError::Internal("stored agent workspace guidance is not UTF-8".into())
-        })?;
-        let existing =
-            match self
+        let augmentation = decode_workspace_augmentation(&plaintext)?;
+        if let Some(instructions) = augmentation.agents_md.as_deref() {
+            let existing =
+                match self
+                    .workspaces
+                    .read_file(&principal.tenant.0, workspace_id, "AGENTS.md")
+                {
+                    Ok(file) => file.bytes,
+                    Err(WorkspaceAccessError::NotFound) => Vec::new(),
+                    Err(error) => {
+                        return Err(EdgeError::Unavailable(format!(
+                            "agent workspace AGENTS.md could not be read: {error}"
+                        )))
+                    }
+                };
+            let personalized =
+                personalized_agents_file(&existing, instructions, &guidance.content_digest)?;
+            if personalized != existing {
+                self.workspaces
+                    .write_file(
+                        &principal.tenant.0,
+                        workspace_id,
+                        "AGENTS.md",
+                        &personalized,
+                    )
+                    .map_err(|error| {
+                        EdgeError::Unavailable(format!(
+                            "agent workspace AGENTS.md could not be personalized: {error}"
+                        ))
+                    })?;
+            }
+        }
+        for file in augmentation.files {
+            self.apply_workspace_file(principal, workspace_id, &file)?;
+        }
+        Ok(())
+    }
+
+    fn apply_workspace_file(
+        &self,
+        principal: &Principal,
+        workspace_id: Uuid,
+        file: &CreateAgentThreadWorkspaceFileBody,
+    ) -> Result<(), EdgeError> {
+        match self
+            .workspaces
+            .read_file(&principal.tenant.0, workspace_id, &file.path)
+        {
+            Ok(existing) if existing.bytes == file.contents.as_bytes() => Ok(()),
+            Ok(_) => Err(EdgeError::Internal(format!(
+                "agent workspace augmentation conflicts with existing {}",
+                file.path
+            ))),
+            Err(WorkspaceAccessError::NotFound) => self
                 .workspaces
-                .read_file(&principal.tenant.0, workspace_id, "AGENTS.md")
-            {
-                Ok(file) => file.bytes,
-                Err(WorkspaceAccessError::NotFound) => Vec::new(),
-                Err(error) => {
-                    return Err(EdgeError::Unavailable(format!(
-                        "agent workspace AGENTS.md could not be read: {error}"
-                    )))
-                }
-            };
-        let personalized =
-            personalized_agents_file(&existing, instructions, &guidance.content_digest)?;
-        if personalized != existing {
-            self.workspaces
                 .write_file(
                     &principal.tenant.0,
                     workspace_id,
-                    "AGENTS.md",
-                    &personalized,
+                    &file.path,
+                    file.contents.as_bytes(),
                 )
+                .map(|_| ())
                 .map_err(|error| {
                     EdgeError::Unavailable(format!(
-                        "agent workspace AGENTS.md could not be personalized: {error}"
+                        "agent workspace augmentation {} could not be created: {error}",
+                        file.path
                     ))
-                })?;
+                }),
+            Err(error) => Err(EdgeError::Unavailable(format!(
+                "agent workspace augmentation {} could not be inspected: {error}",
+                file.path
+            ))),
         }
-        Ok(())
     }
 
     fn complete_publication(
@@ -783,6 +834,31 @@ struct CreateAgentThreadWorkspaceBody {
     branch: Option<String>,
     #[serde(default)]
     instructions: Option<String>,
+    #[serde(default)]
+    files: Vec<CreateAgentThreadWorkspaceFileBody>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CreateAgentThreadWorkspaceFileBody {
+    path: String,
+    contents: String,
+    strategy: WorkspaceFileStrategy,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceFileStrategy {
+    Create,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceAugmentationBundle {
+    version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agents_md: Option<String>,
+    files: Vec<CreateAgentThreadWorkspaceFileBody>,
 }
 
 struct ValidatedThreadIntent {
@@ -792,6 +868,7 @@ struct ValidatedThreadIntent {
     project_id: Option<String>,
     retention_days: i16,
     workspace: Option<CreateAgentThreadWorkspaceBody>,
+    workspace_request_digest: Option<String>,
     client_nonce: String,
     now: DateTime<Utc>,
 }
@@ -822,9 +899,13 @@ impl ValidatedThreadIntent {
                     "agent thread workspace base_ref and branch require a repository".into(),
                 ));
             }
-            if workspace.repository.is_none() && workspace.instructions.is_none() {
+            if workspace.repository.is_none()
+                && workspace.instructions.is_none()
+                && workspace.files.is_empty()
+            {
                 return Err(EdgeError::BadRequest(
-                    "agent thread workspace must configure a repository or instructions".into(),
+                    "agent thread workspace must configure a repository, instructions, or files"
+                        .into(),
                 ));
             }
             if let Some(repository) = workspace.repository.as_deref() {
@@ -848,7 +929,14 @@ impl ValidatedThreadIntent {
             if let Some(instructions) = workspace.instructions.as_deref() {
                 validate_workspace_instructions(instructions)?;
             }
+            validate_workspace_files(&workspace.files)?;
         }
+        let workspace_request_digest = body
+            .workspace
+            .as_ref()
+            .map(workspace_request_digest)
+            .transpose()?
+            .flatten();
         let now = Utc::now()
             .with_nanosecond(0)
             .expect("zero nanoseconds is a valid timestamp");
@@ -859,6 +947,7 @@ impl ValidatedThreadIntent {
             project_id: body.project_id,
             retention_days: body.retention_days,
             workspace: body.workspace,
+            workspace_request_digest,
             client_nonce,
             now,
         })
@@ -914,13 +1003,7 @@ impl ValidatedThreadIntent {
         {
             return false;
         }
-        let requested_guidance = self.workspace.as_ref().and_then(|workspace| {
-            workspace
-                .instructions
-                .as_ref()
-                .map(|instructions| workspace_guidance_digest(instructions.as_bytes()))
-        });
-        if requested_guidance.as_deref()
+        if self.workspace_request_digest.as_deref()
             != thread
                 .workspace_guidance
                 .as_ref()
@@ -1407,8 +1490,7 @@ fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
                 "branch": git.branch,
             })),
             "personalization": thread.workspace_guidance.as_ref().map(|guidance| json!({
-                "path": "AGENTS.md",
-                "strategy": "append",
+                "format": "workspace_augmentation_v1",
                 "content_digest": guidance.content_digest,
             })),
             "environment": thread.environment.as_ref().map(|environment| json!({
@@ -1447,8 +1529,121 @@ fn validate_workspace_instructions(instructions: &str) -> Result<(), EdgeError> 
     Ok(())
 }
 
+fn validate_workspace_files(files: &[CreateAgentThreadWorkspaceFileBody]) -> Result<(), EdgeError> {
+    if files.len() > MAX_WORKSPACE_AUGMENTATION_FILES {
+        return Err(EdgeError::BadRequest(format!(
+            "agent thread workspace supports at most {MAX_WORKSPACE_AUGMENTATION_FILES} declarative files"
+        )));
+    }
+    let mut paths = BTreeSet::new();
+    for file in files {
+        validate_workspace_file_path(&file.path).map_err(|error| {
+            EdgeError::BadRequest(format!(
+                "agent thread workspace file path is invalid: {error}"
+            ))
+        })?;
+        if file.path == "AGENTS.md" || file.path.split('/').next() == Some(".git") {
+            return Err(EdgeError::BadRequest(
+                "agent thread workspace files cannot replace AGENTS.md or write inside .git".into(),
+            ));
+        }
+        if file.contents.contains('\0') {
+            return Err(EdgeError::BadRequest(
+                "agent thread workspace file contents cannot contain NUL characters".into(),
+            ));
+        }
+        if !paths.insert(file.path.as_str()) {
+            return Err(EdgeError::BadRequest(
+                "agent thread workspace file paths must be unique".into(),
+            ));
+        }
+    }
+    if !files.is_empty() {
+        encode_workspace_augmentation(None, files)?;
+    }
+    Ok(())
+}
+
 fn workspace_guidance_digest(content: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(content).to_hex())
+}
+
+fn workspace_request_digest(
+    workspace: &CreateAgentThreadWorkspaceBody,
+) -> Result<Option<String>, EdgeError> {
+    if workspace.files.is_empty() {
+        return Ok(workspace
+            .instructions
+            .as_deref()
+            .map(|instructions| workspace_guidance_digest(instructions.as_bytes())));
+    }
+    let payload =
+        encode_workspace_augmentation(workspace.instructions.as_deref(), &workspace.files)?;
+    Ok(Some(workspace_guidance_digest(&payload)))
+}
+
+fn workspace_augmentation_payload(
+    agent_default: Option<&str>,
+    thread_instructions: Option<&str>,
+    files: &[CreateAgentThreadWorkspaceFileBody],
+) -> Result<Option<Vec<u8>>, EdgeError> {
+    let agents_md = combined_workspace_guidance(agent_default, thread_instructions)?;
+    if files.is_empty() {
+        return Ok(agents_md.map(String::into_bytes));
+    }
+    encode_workspace_augmentation(agents_md.as_deref(), files).map(Some)
+}
+
+fn encode_workspace_augmentation(
+    agents_md: Option<&str>,
+    files: &[CreateAgentThreadWorkspaceFileBody],
+) -> Result<Vec<u8>, EdgeError> {
+    let bundle = WorkspaceAugmentationBundle {
+        version: 1,
+        agents_md: agents_md.map(str::to_string),
+        files: files.to_vec(),
+    };
+    let encoded = serde_json::to_vec(&bundle).map_err(|_| {
+        EdgeError::Internal("agent workspace augmentation could not be encoded".into())
+    })?;
+    let mut payload = Vec::with_capacity(WORKSPACE_AUGMENTATION_PREFIX.len() + encoded.len());
+    payload.extend_from_slice(WORKSPACE_AUGMENTATION_PREFIX);
+    payload.extend_from_slice(&encoded);
+    if payload.len() > MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES {
+        return Err(EdgeError::BadRequest(format!(
+            "agent workspace augmentation exceeds the {MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES}-byte encrypted limit"
+        )));
+    }
+    Ok(payload)
+}
+
+fn decode_workspace_augmentation(payload: &[u8]) -> Result<WorkspaceAugmentationBundle, EdgeError> {
+    let Some(encoded) = payload.strip_prefix(WORKSPACE_AUGMENTATION_PREFIX) else {
+        let instructions = std::str::from_utf8(payload).map_err(|_| {
+            EdgeError::Internal("stored agent workspace guidance is not UTF-8".into())
+        })?;
+        return Ok(WorkspaceAugmentationBundle {
+            version: 1,
+            agents_md: Some(instructions.to_string()),
+            files: Vec::new(),
+        });
+    };
+    let bundle: WorkspaceAugmentationBundle = serde_json::from_slice(encoded).map_err(|_| {
+        EdgeError::Internal("stored agent workspace augmentation is invalid".into())
+    })?;
+    if bundle.version != 1 {
+        return Err(EdgeError::Internal(
+            "stored agent workspace augmentation has an unsupported version".into(),
+        ));
+    }
+    if let Some(instructions) = bundle.agents_md.as_deref() {
+        validate_workspace_instructions(instructions).map_err(|_| {
+            EdgeError::Internal("stored agent workspace instructions are invalid".into())
+        })?;
+    }
+    validate_workspace_files(&bundle.files)
+        .map_err(|_| EdgeError::Internal("stored agent workspace files are invalid".into()))?;
+    Ok(bundle)
 }
 
 fn combined_workspace_guidance(
@@ -1901,6 +2096,88 @@ mod tests {
             combined_workspace_guidance(Some(&default), Some("one byte too many")),
             Err(EdgeError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn declarative_workspace_payload_layers_files_without_losing_legacy_guidance() {
+        let files = vec![CreateAgentThreadWorkspaceFileBody {
+            path: ".myelin/checkout-context.md".into(),
+            contents: "# Private context\n\nTrace the lease first.\n".into(),
+            strategy: WorkspaceFileStrategy::Create,
+        }];
+        let payload = workspace_augmentation_payload(
+            Some("Default workflow"),
+            Some("Keep this diagnosis private."),
+            &files,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(payload.starts_with(WORKSPACE_AUGMENTATION_PREFIX));
+        let decoded = decode_workspace_augmentation(&payload).unwrap();
+        assert_eq!(
+            decoded.agents_md.as_deref(),
+            Some("Default workflow\n\n## Thread-specific instructions\n\nKeep this diagnosis private.")
+        );
+        assert_eq!(decoded.files.len(), 1);
+        assert_eq!(decoded.files[0].path, ".myelin/checkout-context.md");
+        assert_eq!(decoded.files[0].contents, files[0].contents);
+        assert!(matches!(
+            decoded.files[0].strategy,
+            WorkspaceFileStrategy::Create
+        ));
+
+        let legacy = decode_workspace_augmentation(b"Legacy AGENTS.md overlay").unwrap();
+        assert_eq!(
+            legacy.agents_md.as_deref(),
+            Some("Legacy AGENTS.md overlay")
+        );
+        assert!(legacy.files.is_empty());
+    }
+
+    #[test]
+    fn declarative_workspace_files_are_bounded_unique_and_retry_significant() {
+        let file = |path: &str, contents: &str| CreateAgentThreadWorkspaceFileBody {
+            path: path.into(),
+            contents: contents.into(),
+            strategy: WorkspaceFileStrategy::Create,
+        };
+        let parse = |contents: &str| {
+            serde_json::from_value::<CreateAgentThreadWorkspaceBody>(json!({
+                "files": [{
+                    "path": ".myelin/context.md",
+                    "contents": contents,
+                    "strategy": "create"
+                }]
+            }))
+            .unwrap()
+        };
+        let first = workspace_request_digest(&parse("first")).unwrap();
+        let second = workspace_request_digest(&parse("second")).unwrap();
+        assert_ne!(first, second);
+
+        for files in [
+            vec![file("../escape", "x")],
+            vec![file("AGENTS.md", "x")],
+            vec![file(".git/config", "x")],
+            vec![file("context.md", "x"), file("context.md", "x")],
+        ] {
+            assert!(matches!(
+                validate_workspace_files(&files),
+                Err(EdgeError::BadRequest(_))
+            ));
+        }
+        let too_many = (0..=MAX_WORKSPACE_AUGMENTATION_FILES)
+            .map(|index| file(&format!("context-{index}.md"), "x"))
+            .collect::<Vec<_>>();
+        assert!(validate_workspace_files(&too_many).is_err());
+        assert!(encode_workspace_augmentation(
+            None,
+            &[file(
+                "context.md",
+                &"x".repeat(MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES)
+            )],
+        )
+        .is_err());
     }
 
     #[test]

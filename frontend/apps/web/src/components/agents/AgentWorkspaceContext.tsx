@@ -77,12 +77,12 @@ export function AgentWorkspaceContext(props: {
               </dd>
             </div>
           </>}</Show>
-          <Show when={props.thread.workspace.personalization}>{(personalization) => <>
+          <Show when={props.thread.workspace.personalization}><>
             <div data-testid="workspace-personalization">
-              <dt>Instructions</dt>
-              <dd><code>{personalization().path}</code> · personal overlay</dd>
+              <dt>Personalization</dt>
+              <dd>Declarative workspace overlay</dd>
             </div>
-          </>}</Show>
+          </></Show>
           <div><dt>Workspace</dt><dd><code>{props.thread.workspace.id}</code></dd></div>
         </dl>
         <Show when={props.thread.workspace.environment}>
@@ -92,7 +92,8 @@ export function AgentWorkspaceContext(props: {
         </Show>
         <Show when={props.thread.workspace.personalization}>{(personalization) => (
           <p class="agent-thread-note" title={personalization().content_digest}>
-            Owner guidance is encrypted at rest and appended without changing the source repository.
+            Owner instructions and create-only files are encrypted at rest and applied without
+            changing the source repository.
           </p>
         )}</Show>
       </section>

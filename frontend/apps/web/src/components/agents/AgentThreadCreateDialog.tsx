@@ -41,6 +41,8 @@ export function AgentThreadCreateDialog(props: {
   const [baseRef, setBaseRef] = createSignal("main");
   const [branch, setBranch] = createSignal("");
   const [instructions, setInstructions] = createSignal("");
+  const [contextFilePath, setContextFilePath] = createSignal("");
+  const [contextFileContents, setContextFileContents] = createSignal("");
   const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -64,6 +66,8 @@ export function AgentThreadCreateDialog(props: {
     setBaseRef("main");
     setBranch("");
     setInstructions("");
+    setContextFilePath("");
+    setContextFileContents("");
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
@@ -87,7 +91,12 @@ export function AgentThreadCreateDialog(props: {
         (repository() !== "" && (!baseRef() || baseRef().trim() !== baseRef() ||
           branch().trim() !== branch())) || instructions().includes("\0") ||
         new TextEncoder().encode(instructions()).byteLength > 12 * 1024 ||
-        (instructions() !== "" && instructions().trim() === "")) {
+        (instructions() !== "" && instructions().trim() === "") ||
+        contextFilePath().trim() !== contextFilePath() ||
+        (contextFilePath() === "") !== (contextFileContents() === "") ||
+        contextFilePath().includes("\0") || contextFileContents().includes("\0") ||
+        new TextEncoder().encode(contextFilePath()).byteLength > 1_024 ||
+        new TextEncoder().encode(contextFileContents()).byteLength > 8 * 1_024) {
       setError("Use a clean problem name, active external agent, and valid workspace fields and instructions.");
       nameInput?.focus();
       return;
@@ -106,6 +115,8 @@ export function AgentThreadCreateDialog(props: {
         baseRef: baseRef(),
         branch: branch(),
         instructions: instructions(),
+        contextFilePath: contextFilePath(),
+        contextFileContents: contextFileContents(),
         clientNonce: clientNonce(),
       });
       if (generation !== openingGeneration) return;
@@ -310,6 +321,30 @@ export function AgentThreadCreateDialog(props: {
         <p class="agent-thread-note">
           Myelin appends these instructions to this private workspace’s root <code>AGENTS.md</code>.
           Repository instructions stay intact, and fresh agent contexts reopen the personalized file.
+        </p>
+        <label>
+          Private context file path <span aria-hidden="true">(optional)</span>
+          <input
+            value={contextFilePath()}
+            autocomplete="off"
+            placeholder=".myelin/checkout-context.md"
+            disabled={submitting()}
+            onInput={(event) => { setContextFilePath(event.currentTarget.value); edit(); }}
+          />
+        </label>
+        <label>
+          Private context file contents <span aria-hidden="true">(optional)</span>
+          <textarea
+            value={contextFileContents()}
+            rows={5}
+            placeholder={"# Context for this workspace\n\nKeep the checkout lease diagnosis private."}
+            disabled={submitting()}
+            onInput={(event) => { setContextFileContents(event.currentTarget.value); edit(); }}
+          />
+        </label>
+        <p class="agent-thread-note">
+          The file is created only when that path is absent. Myelin fails closed on an existing
+          different file, symlink, traversal, <code>AGENTS.md</code>, or <code>.git</code> path.
         </p>
         <p class="agent-thread-note">
           A fresh agent context can reopen this conversation and the same workspace until it expires.
