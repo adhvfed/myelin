@@ -13,6 +13,8 @@ import {
   parseAgentThreadMessages,
   parseAgentThreadReviewReceipt,
   parseAgentThreads,
+  parseAgentWorkspaceGuidanceConfig,
+  parseAgentWorkspaceGuidanceReceipt,
   parseWorkspaceSessions,
 } from "./agent-thread-response";
 
@@ -37,6 +39,7 @@ const agent = {
   }],
   effective_tools: [],
   grants: ["chat.post"],
+  workspace_profile: { revision: 0, instructions: null, updated_at: null },
   created_at: "2026-08-22T12:00:00Z",
 };
 const governance = {
@@ -214,6 +217,7 @@ describe("private agent work wire projection", () => {
       status: "active",
       selected_tools: ["chat.post"],
       effective_tools: [],
+      workspace_profile: { revision: 0, instructions: null, updated_at: null },
     }]);
     expect(parseAgentChoice({ agent })).toEqual({
       id: AGENT,
@@ -222,6 +226,7 @@ describe("private agent work wire projection", () => {
       status: "active",
       selected_tools: ["chat.post"],
       effective_tools: [],
+      workspace_profile: { revision: 0, instructions: null, updated_at: null },
     });
     expect(parseAgentActivationReceipt({ agent, created: true, durable: true, governance })).toEqual({
       agent: {
@@ -231,10 +236,64 @@ describe("private agent work wire projection", () => {
         status: "active",
         selected_tools: ["chat.post"],
         effective_tools: [],
+        workspace_profile: { revision: 0, instructions: null, updated_at: null },
       },
       created: true,
       durable: true,
     });
+  });
+
+  it("keeps editable workspace instructions behind the owner-only config projection", () => {
+    const updatedAt = "2026-08-22T12:04:00Z";
+    const contentDigest = `blake3:${"a".repeat(64)}`;
+    const configuredAgent = {
+      ...agent,
+      workspace_profile: {
+        revision: 2,
+        instructions: { path: "AGENTS.md", strategy: "append", content_digest: contentDigest },
+        updated_at: updatedAt,
+      },
+    };
+
+    expect(parseAgentChoice({ agent: configuredAgent })?.workspace_profile).toEqual(
+      configuredAgent.workspace_profile,
+    );
+    expect(parseAgentWorkspaceGuidanceConfig({
+      agent_id: AGENT,
+      revision: 2,
+      instructions: "Run the repository checks before handing work back.",
+      updated_at: updatedAt,
+    })).toEqual({
+      agent_id: AGENT,
+      revision: 2,
+      instructions: "Run the repository checks before handing work back.",
+      updated_at: updatedAt,
+    });
+    expect(parseAgentWorkspaceGuidanceReceipt({
+      agent: configuredAgent,
+      changed: true,
+      durable: true,
+    })?.agent.workspace_profile.revision).toBe(2);
+
+    expect(parseAgentWorkspaceGuidanceConfig({
+      agent_id: AGENT,
+      revision: 2,
+      instructions: "private text",
+      updated_at: updatedAt,
+      content_digest: contentDigest,
+    })).toBeNull();
+    expect(parseAgentChoice({
+      agent: { ...configuredAgent, workspace_profile: {
+        ...configuredAgent.workspace_profile,
+        instructions: { ...configuredAgent.workspace_profile.instructions, plaintext: "private" },
+      } },
+    })).toBeNull();
+    expect(parseAgentWorkspaceGuidanceConfig({
+      agent_id: AGENT,
+      revision: 0,
+      instructions: "impossible pre-revision defaults",
+      updated_at: null,
+    })).toBeNull();
   });
 
   it("refuses crossed aggregates and surplus connection material", () => {

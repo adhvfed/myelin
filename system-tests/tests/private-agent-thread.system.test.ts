@@ -367,6 +367,113 @@ describe("private work with an agent", () => {
     expect((await repository.readFile("main", "AGENTS.md")).contents).toBe(repositoryGuidance);
   });
 
+  test("carries editable named-agent defaults into new work while existing threads keep their snapshot", async () => {
+    const founder = await browserApprovedCliClient();
+    const teammate = await browserApprovedCliClient(reviewerClient);
+    const firstDefaults = "# Checkout companion defaults\n\nExplain the smallest safe change first.";
+    const companion = await activateExternalAgent(
+      founder,
+      uniqueName("Configurable workspace companion"),
+      ["workspace.read_file"],
+      { workspaceInstructions: firstDefaults },
+    );
+    expect(companion.agent.workspace_profile).toMatchObject({
+      revision: 1,
+      instructions: {
+        path: "AGENTS.md",
+        strategy: "append",
+        content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
+      },
+      updated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+    });
+
+    const privateConfig = await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
+    );
+    expect(privateConfig.body).toMatchObject({
+      agent_id: companion.agent.id,
+      revision: 1,
+      instructions: firstDefaults,
+    });
+    await teammate.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
+      { expectedStatus: 404 },
+    );
+
+    const firstRetry = `agent-default-thread-${randomUUID()}`;
+    const firstThread = await startPrivateAgentThread(founder, {
+      name: uniqueName("Keep original agent defaults"),
+      agentId: companion.agent.id,
+      idempotencyKey: firstRetry,
+    });
+    const firstRun = await beginAgentThreadRun(founder, firstThread.thread.id);
+    const firstAgents = await askAgent(firstRun, 1, "workspace.read_file", {
+      path: "AGENTS.md",
+    });
+    await closeAgentRun(firstRun);
+    expect(record(firstAgents, "first named-agent AGENTS result").content).toContain(firstDefaults);
+
+    const secondDefaults = "# Checkout companion defaults\n\nStart with the failing full-system journey.";
+    const updated = await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
+      {
+        method: "POST",
+        body: { instructions: secondDefaults, expected_revision: 1 },
+        idempotencyKey: `agent-default-update-${randomUUID()}`,
+        expectedStatus: 200,
+      },
+    );
+    expect(updated.body).toMatchObject({
+      changed: true,
+      durable: true,
+      agent: { workspace_profile: { revision: 2 } },
+    });
+    await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
+      {
+        method: "POST",
+        body: { instructions: "stale replacement", expected_revision: 1 },
+        idempotencyKey: `agent-default-stale-${randomUUID()}`,
+        expectedStatus: 409,
+      },
+    );
+
+    const replay = await startPrivateAgentThread(founder, {
+      name: firstThread.thread.name,
+      agentId: companion.agent.id,
+      idempotencyKey: firstRetry,
+      expectedStatus: 200,
+    });
+    expect(replay).toEqual({ created: false, thread: firstThread.thread });
+    const replayRun = await beginAgentThreadRun(founder, replay.thread.id);
+    const replayAgents = await askAgent(replayRun, 1, "workspace.read_file", {
+      path: "AGENTS.md",
+    });
+    await closeAgentRun(replayRun);
+    expect(replayAgents).toEqual(firstAgents);
+    expect(JSON.stringify(replayAgents)).not.toContain(secondDefaults);
+
+    const taskInstructions = "For this task, preserve the public API shape.";
+    const secondThread = await startPrivateAgentThread(founder, {
+      name: uniqueName("Use revised agent defaults"),
+      agentId: companion.agent.id,
+      workspace: { instructions: taskInstructions },
+    });
+    const secondRun = await beginAgentThreadRun(founder, secondThread.thread.id);
+    const secondAgents = await askAgent(secondRun, 1, "workspace.read_file", {
+      path: "AGENTS.md",
+    });
+    await closeAgentRun(secondRun);
+    const combined = string(
+      record(secondAgents, "revised named-agent AGENTS result").content,
+      "revised named-agent AGENTS contents",
+    );
+    expect(combined).toContain(secondDefaults);
+    expect(combined).toContain("## Thread-specific instructions");
+    expect(combined).toContain(taskInstructions);
+    expect(combined).not.toContain(firstDefaults);
+  });
+
   test("refuses an agent runtime that cannot resume private work before provisioning anything", async () => {
     const founder = await browserApprovedCliClient();
     const threadName = uniqueName("Hosted thread that must not exist");

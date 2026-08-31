@@ -385,6 +385,31 @@ UPDATE agent_thread
        workspace_guidance_nonce, workspace_guidance_ciphertext) NOT IN (0, 4);
 "#;
 
+pub const AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  ADD COLUMN IF NOT EXISTS workspace_guidance_request_digest text;
+ALTER TABLE agent_thread
+  DROP CONSTRAINT IF EXISTS agent_thread_workspace_guidance_request_shape;
+ALTER TABLE agent_thread
+  ADD CONSTRAINT agent_thread_workspace_guidance_request_shape CHECK (
+    workspace_guidance_request_digest IS NULL
+    OR (workspace_guidance_digest IS NOT NULL
+      AND workspace_guidance_request_digest ~ '^blake3:[0-9a-f]{64}$')
+  ) NOT VALID;
+"#;
+
+pub const AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_BACKFILL_MIGRATION: &str = r#"
+UPDATE agent_thread
+   SET workspace_guidance_request_digest = workspace_guidance_digest
+ WHERE workspace_guidance_digest IS NOT NULL
+   AND workspace_guidance_request_digest IS NULL;
+"#;
+
+pub const AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_INVARIANT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  VALIDATE CONSTRAINT agent_thread_workspace_guidance_request_shape;
+"#;
+
 pub const AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION: &str = r#"
 UPDATE agent_thread_workspace_session
    SET launched_at = started_at
@@ -680,6 +705,29 @@ pub fn agent_thread_workspace_guidance_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_workspace_guidance_source_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0172_agent_thread_workspace_guidance_source_expand",
+            AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0173_agent_thread_workspace_guidance_source_backfill",
+            AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0174_agent_thread_workspace_guidance_source_invariant",
+            AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_INVARIANT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread",
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,6 +775,23 @@ mod tests {
         assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
         assert!(AGENT_THREAD_WORKSPACE_GUIDANCE_EXPAND_MIGRATION.contains("bytea"));
         assert!(AGENT_THREAD_WORKSPACE_GUIDANCE_EXPAND_MIGRATION.contains("NOT VALID"));
+    }
+
+    #[test]
+    fn workspace_guidance_source_is_an_online_retry_stability_receipt() {
+        let migrations = agent_thread_workspace_guidance_source_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["agent_thread"]))
+            .expect("the live workspace-guidance source migration is online-safe");
+
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+        assert!(AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_EXPAND_MIGRATION.contains("NOT VALID"));
+        assert!(AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_BACKFILL_MIGRATION
+            .contains("workspace_guidance_request_digest = workspace_guidance_digest"));
     }
 
     #[test]

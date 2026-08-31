@@ -4,6 +4,8 @@ import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gatew
 import {
   isAgentThreadId,
   parseAgentActivationReceipt,
+  parseAgentWorkspaceGuidanceReceipt,
+  parseAgentWorkspaceGuidanceConfig,
   parseAgentChoice,
   parseAgentChoices,
   parseAgentThread,
@@ -16,6 +18,8 @@ import {
   type AgentChoice,
   type AgentChoicePage,
   type AgentActivationReceipt,
+  type AgentWorkspaceGuidanceReceipt,
+  type AgentWorkspaceGuidanceConfig,
   type AgentThread,
   type AgentThreadCreateReceipt,
   type AgentThreadPage,
@@ -30,6 +34,7 @@ export type AgentThreadMutationResult =
   | { ok: true; op: "retry"; receipt: AgentThreadCreateReceipt }
   | { ok: true; op: "mark-ready"; receipt: AgentThreadReviewReceipt }
   | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
+  | { ok: true; op: "configure-agent"; receipt: AgentWorkspaceGuidanceReceipt }
   | { ok: true; op: "post-message"; messageId: string; threadId: string }
   | { ok: false; error: AgentThreadErrorKind };
 
@@ -134,6 +139,20 @@ export const getAgentChoice = query(async (agentId: string): Promise<AgentChoice
   });
 }, "agent-thread-agent-choice");
 
+export const getAgentWorkspaceGuidance = query(async (
+  agentId: string,
+): Promise<AgentWorkspaceGuidanceConfig> => {
+  "use server";
+  if (!isAgentThreadId(agentId)) throw new AgentThreadRouteError("bad-input");
+  return authed(async () => {
+    const response = parseAgentWorkspaceGuidanceConfig(await edgeGet(
+      `/v1/agents/${segment(agentId)}/workspace-guidance`,
+    ));
+    if (!response || response.agent_id !== agentId) throw new AgentThreadRouteError("error");
+    return response;
+  });
+}, "agent-workspace-guidance");
+
 export const getAgentThreads = query(async (request: {
   cursor?: string;
   limit?: number;
@@ -216,18 +235,50 @@ export const mutateAgentThread = action(async (input: unknown) => {
   const mutation = input as Record<string, unknown>;
   try {
     if (mutation.op === "activate-agent" && Object.keys(mutation).every((key) =>
-      ["op", "name", "allowWorkspaceCommands", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 4 && cleanText(mutation.name, 80) &&
+      ["op", "name", "allowWorkspaceCommands", "workspaceInstructions", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 5 && cleanText(mutation.name, 80) &&
         typeof mutation.allowWorkspaceCommands === "boolean" && cleanNonce(mutation.clientNonce)) {
+      if (typeof mutation.workspaceInstructions !== "string" ||
+          (mutation.workspaceInstructions !== "" &&
+            (utf8.encode(mutation.workspaceInstructions).byteLength > 12 * 1_024 ||
+              mutation.workspaceInstructions.trim().length === 0 ||
+              mutation.workspaceInstructions.includes("\0")))) {
+        return respond({ ok: false, error: "bad-input" });
+      }
       const receipt = parseAgentActivationReceipt(await edgePost("/v1/agents", {
         name: mutation.name,
         runtime: "external",
         tools: mutation.allowWorkspaceCommands
           ? [...PRIVATE_WORK_AGENT_TOOLS, PRIVATE_WORK_COMMAND_TOOL]
           : PRIVATE_WORK_AGENT_TOOLS,
+        ...(mutation.workspaceInstructions === ""
+          ? {}
+          : { workspace_instructions: mutation.workspaceInstructions }),
       }, { idempotencyKey: mutation.clientNonce }));
       return receipt
         ? respond({ ok: true, op: "activate-agent", receipt })
+        : respond({ ok: false, error: "error" });
+    }
+    if (mutation.op === "configure-agent" && Object.keys(mutation).every((key) =>
+      ["op", "agentId", "workspaceInstructions", "expectedRevision", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 5 && isAgentThreadId(mutation.agentId) &&
+        (mutation.workspaceInstructions === null ||
+          (typeof mutation.workspaceInstructions === "string" &&
+            utf8.encode(mutation.workspaceInstructions).byteLength <= 12 * 1_024 &&
+            mutation.workspaceInstructions.trim().length > 0 &&
+            !mutation.workspaceInstructions.includes("\0"))) &&
+        Number.isSafeInteger(mutation.expectedRevision) &&
+        (mutation.expectedRevision as number) >= 0 && cleanNonce(mutation.clientNonce)) {
+      const receipt = parseAgentWorkspaceGuidanceReceipt(await edgePost(
+        `/v1/agents/${segment(mutation.agentId)}/workspace-guidance`,
+        {
+          instructions: mutation.workspaceInstructions,
+          expected_revision: mutation.expectedRevision,
+        },
+        { idempotencyKey: mutation.clientNonce },
+      ));
+      return receipt
+        ? respond({ ok: true, op: "configure-agent", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "create" && Object.keys(mutation).every((key) =>

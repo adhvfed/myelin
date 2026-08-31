@@ -26,22 +26,27 @@ pub use schema::{
     agent_thread_publication_migrations, agent_thread_recent_list_migrations,
     agent_thread_review_ready_migrations, agent_thread_session_launch_migrations,
     agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
-    agent_thread_workspace_guidance_migrations, AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION,
-    AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION, AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION,
-    AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION, AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION,
-    AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION, AGENT_THREAD_MIGRATION,
-    AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
-    AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX,
-    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,
-    AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION, AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION,
-    AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION, AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
+    agent_thread_workspace_guidance_migrations, agent_thread_workspace_guidance_source_migrations,
+    AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION, AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION, AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION,
+    AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION, AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION,
+    AGENT_THREAD_MIGRATION, AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION,
+    AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION, AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION,
+    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION,
+    AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION,
+    AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION, AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION,
+    AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION,
     AGENT_THREAD_SSH_CONNECTION_BACKFILL_MIGRATION, AGENT_THREAD_SSH_CONNECTION_EXPAND_MIGRATION,
     AGENT_THREAD_SSH_CONNECTION_INVARIANT_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
     AGENT_THREAD_SSH_SINGLE_USE_MIGRATION, AGENT_THREAD_WORKSPACE_GUIDANCE_BACKFILL_MIGRATION,
     AGENT_THREAD_WORKSPACE_GUIDANCE_EXPAND_MIGRATION,
-    AGENT_THREAD_WORKSPACE_GUIDANCE_INVARIANT_MIGRATION, AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
+    AGENT_THREAD_WORKSPACE_GUIDANCE_INVARIANT_MIGRATION,
+    AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_BACKFILL_MIGRATION,
+    AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_EXPAND_MIGRATION,
+    AGENT_THREAD_WORKSPACE_GUIDANCE_SOURCE_INVARIANT_MIGRATION,
+    AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
 };
 pub use ssh_access::{
     CreateWorkspaceSshGrantOutcome, DurableWorkspaceSshGrant, LiveWorkspaceSshAdmission,
@@ -126,7 +131,8 @@ impl DurableAgentThreadBacking {
                             RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                               conversation_id, workspace_id, workspace_generation, name, project_id,
                               repository_slug, base_ref, base_oid, workspace_branch,
-                              workspace_guidance_digest, workspace_guidance_key_ref,
+                              workspace_guidance_digest, workspace_guidance_request_digest,
+                              workspace_guidance_key_ref,
                               workspace_guidance_nonce, workspace_guidance_ciphertext,
                               environment_provider, environment_config_path,
                               environment_config_digest,
@@ -213,15 +219,17 @@ impl DurableAgentThreadBacking {
                            tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
-                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_digest, workspace_guidance_request_digest,
+                           workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            retention_days, client_nonce, state, created_at, expires_at, updated_at
-                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'provisioning',$20,$21,$20)
+                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'provisioning',$21,$22,$21)
                          ON CONFLICT DO NOTHING
                          RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
-                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_digest, workspace_guidance_request_digest,
+                           workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
@@ -248,6 +256,12 @@ impl DurableAgentThreadBacking {
                             .workspace_guidance
                             .as_ref()
                             .map(|guidance| guidance.content_digest.as_str()),
+                    )
+                    .bind(
+                        proposal
+                            .workspace_guidance
+                            .as_ref()
+                            .and_then(|guidance| guidance.request_content_digest.as_deref()),
                     )
                     .bind(
                         proposal
@@ -354,7 +368,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
-                          workspace_guidance_digest, workspace_guidance_key_ref,
+                          workspace_guidance_digest, workspace_guidance_request_digest,
+                          workspace_guidance_key_ref,
                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
                           environment_config_digest,
@@ -454,7 +469,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
-                          workspace_guidance_digest, workspace_guidance_key_ref,
+                          workspace_guidance_digest, workspace_guidance_request_digest,
+                          workspace_guidance_key_ref,
                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
                           environment_config_digest,
@@ -494,7 +510,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
-                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_digest, workspace_guidance_request_digest,
+                           workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
@@ -538,7 +555,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
-                          workspace_guidance_digest, workspace_guidance_key_ref,
+                          workspace_guidance_digest, workspace_guidance_request_digest,
+                          workspace_guidance_key_ref,
                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
                           environment_config_digest,
@@ -613,7 +631,9 @@ impl DurableAgentThreadBacking {
                           thread.workspace_id, thread.workspace_generation, thread.name,
                           thread.project_id, thread.repository_slug, thread.base_ref,
                           thread.base_oid, thread.workspace_branch,
-                          thread.workspace_guidance_digest, thread.workspace_guidance_key_ref,
+                          thread.workspace_guidance_digest,
+                          thread.workspace_guidance_request_digest,
+                          thread.workspace_guidance_key_ref,
                           thread.workspace_guidance_nonce, thread.workspace_guidance_ciphertext,
                           thread.environment_provider, thread.environment_config_path,
                           thread.environment_config_digest, thread.retention_days, thread.state,
@@ -683,7 +703,8 @@ impl DurableAgentThreadBacking {
                                 RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                                   conversation_id, workspace_id, workspace_generation, name, project_id,
                                   repository_slug, base_ref, base_oid, workspace_branch,
-                                  workspace_guidance_digest, workspace_guidance_key_ref,
+                                  workspace_guidance_digest, workspace_guidance_request_digest,
+                                  workspace_guidance_key_ref,
                                   workspace_guidance_nonce, workspace_guidance_ciphertext,
                                   environment_provider, environment_config_path,
                                   environment_config_digest,
@@ -800,7 +821,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
-                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_digest, workspace_guidance_request_digest,
+                           workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
@@ -859,7 +881,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
-                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_digest, workspace_guidance_request_digest,
+                           workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
@@ -959,6 +982,16 @@ fn validate_proposal(proposal: &NewAgentThread) -> Result<(), ProviderError> {
             || guidance.encrypted_content.ciphertext.len() < 17
             || guidance.encrypted_content.ciphertext.len()
                 > MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES + 16
+            || guidance
+                .request_content_digest
+                .as_ref()
+                .is_some_and(|digest| {
+                    let digest = digest.strip_prefix("blake3:").unwrap_or_default();
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
         {
             return Err(query(
                 "agent thread workspace guidance is not a canonical encrypted receipt",
@@ -1033,11 +1066,11 @@ fn same_intent(thread: &DurableAgentThread, proposal: &NewAgentThread) -> bool {
         && thread
             .workspace_guidance
             .as_ref()
-            .map(|guidance| guidance.content_digest.as_str())
+            .and_then(|guidance| guidance.request_content_digest.as_deref())
             == proposal
                 .workspace_guidance
                 .as_ref()
-                .map(|guidance| guidance.content_digest.as_str())
+                .and_then(|guidance| guidance.request_content_digest.as_deref())
         && thread.retention_days == proposal.retention_days
 }
 
@@ -1090,7 +1123,8 @@ async fn by_nonce(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
-           workspace_guidance_digest, workspace_guidance_key_ref,
+           workspace_guidance_digest, workspace_guidance_request_digest,
+           workspace_guidance_key_ref,
            workspace_guidance_nonce, workspace_guidance_ciphertext,
            environment_provider, environment_config_path, environment_config_digest,
            retention_days, state, storage_locator, publication_completed_at, review_ready_at,
@@ -1120,7 +1154,8 @@ async fn by_id(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
-           workspace_guidance_digest, workspace_guidance_key_ref,
+           workspace_guidance_digest, workspace_guidance_request_digest,
+           workspace_guidance_key_ref,
            workspace_guidance_nonce, workspace_guidance_ciphertext,
            environment_provider, environment_config_path, environment_config_digest,
            retention_days, state, storage_locator, publication_completed_at, review_ready_at,
@@ -1170,12 +1205,19 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
     let owner_principal_id = row.get::<String, _>("owner_principal_id");
     let workspace_guidance = match (
         row.get::<Option<String>, _>("workspace_guidance_digest"),
+        row.get::<Option<String>, _>("workspace_guidance_request_digest"),
         row.get::<Option<String>, _>("workspace_guidance_key_ref"),
         row.get::<Option<Vec<u8>>, _>("workspace_guidance_nonce"),
         row.get::<Option<Vec<u8>>, _>("workspace_guidance_ciphertext"),
     ) {
-        (None, None, None, None) => None,
-        (Some(content_digest), Some(key_ref), Some(nonce), Some(ciphertext)) => {
+        (None, None, None, None, None) => None,
+        (
+            Some(content_digest),
+            request_content_digest,
+            Some(key_ref),
+            Some(nonce),
+            Some(ciphertext),
+        ) => {
             let key_ref = PiiKeyRef::parse(&key_ref).ok_or_else(|| {
                 PgError::Query("agent thread workspace guidance key reference is invalid".into())
             })?;
@@ -1195,6 +1237,7 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
             }
             Some(AgentThreadWorkspaceGuidance {
                 content_digest,
+                request_content_digest,
                 encrypted_content: EncryptedColumn {
                     key_ref,
                     nonce,

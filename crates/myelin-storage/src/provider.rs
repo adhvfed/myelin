@@ -260,6 +260,8 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_thread_durable::agent_thread_environment_migrations(),
         crate::agent_thread_durable::agent_thread_review_ready_migrations(),
         crate::agent_thread_durable::agent_thread_workspace_guidance_migrations(),
+        crate::identity_durable::identity_agent_workspace_profile_migrations(),
+        crate::agent_thread_durable::agent_thread_workspace_guidance_source_migrations(),
     ]
 }
 

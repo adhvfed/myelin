@@ -112,12 +112,17 @@ pub fn is_destructive(ddl: &str) -> bool {
 
 pub fn is_blocking_alter(ddl: &str) -> bool {
     let lower = ddl.to_ascii_lowercase();
-    let add_not_null = lower.contains("alter table")
-        && lower.contains("add column")
-        && lower.contains("not null")
-        && !lower.contains("default");
-    let alter_column_inplace = lower.split(';').any(|statement| {
+    let statements = lower.split(';').map(|statement| {
         let normalized = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+        normalized
+    });
+    let add_not_null = statements.clone().any(|normalized| {
+        normalized.contains("alter table")
+            && normalized.contains("add column")
+            && normalized.contains("not null")
+            && !normalized.contains("default")
+    });
+    let alter_column_inplace = statements.clone().any(|normalized| {
         let is_alter_column =
             normalized.contains("alter table") && normalized.contains("alter column");
         let metadata_only_drop_not_null = normalized.matches("alter column").count() == 1
@@ -568,5 +573,14 @@ mod tests {
         assert!(HotTables::none().is_empty());
         assert_eq!(HotTables::none(), HotTables::default());
         assert_eq!(HotTables::none().tables().count(), 0);
+    }
+
+    #[test]
+    fn nullable_expansion_is_not_tainted_by_a_later_not_valid_check() {
+        assert!(!is_blocking_alter(
+            "ALTER TABLE issue ADD COLUMN priority INT; \
+             ALTER TABLE issue ADD CONSTRAINT priority_shape \
+             CHECK (priority IS NOT NULL) NOT VALID;"
+        ));
     }
 }

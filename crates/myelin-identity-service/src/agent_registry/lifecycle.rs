@@ -260,7 +260,10 @@ async fn lifecycle_by_nonce(
     nonce: &str,
 ) -> Result<Option<AgentLifecycleOutcome>, myelin_storage::PgError> {
     let row = sqlx::query(
-        "SELECT a.agent_id, a.name, a.runtime_ref, a.created_by, a.tools, a.grants, \
+        "SELECT a.tenant_id, a.agent_id, a.name, a.runtime_ref, a.created_by, a.tools, a.grants, \
+                a.workspace_guidance_revision, a.workspace_guidance_digest, \
+                a.workspace_guidance_key_ref, a.workspace_guidance_nonce, \
+                a.workspace_guidance_ciphertext, a.workspace_guidance_updated_at, \
                 a.created_at, c.requested_status, c.changed, c.terminated_runs \
            FROM agent_lifecycle_command c \
            JOIN identity_agent a ON a.tenant_id = c.tenant_id AND a.region = c.region \
@@ -306,7 +309,10 @@ async fn lock_owned_agent(
     agent_id: Uuid,
 ) -> Result<Option<AgentRegistration>, myelin_storage::PgError> {
     let row = sqlx::query(
-        "SELECT a.agent_id, a.name, a.runtime_ref, a.created_by, a.tools, a.grants, \
+        "SELECT a.tenant_id, a.agent_id, a.name, a.runtime_ref, a.created_by, a.tools, a.grants, \
+                a.workspace_guidance_revision, a.workspace_guidance_digest, \
+                a.workspace_guidance_key_ref, a.workspace_guidance_nonce, \
+                a.workspace_guidance_ciphertext, a.workspace_guidance_updated_at, \
                 a.created_at, p.kind, p.status \
            FROM identity_agent a \
            JOIN principal p ON p.tenant_id = a.tenant_id AND p.region = a.region \

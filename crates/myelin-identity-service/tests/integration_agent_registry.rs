@@ -5,14 +5,17 @@ use myelin_identity::{
     DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId, RuntimeRef,
 };
 use myelin_identity_service::{
-    AgentRegistryError, Authority, DelegationPolicySource, NewAgent, PgAgentRegistry,
+    AgentLifecycleAction, AgentLifecycleRequest, AgentRegistryError, AgentWorkspaceGuidance,
+    AgentWorkspaceGuidanceUpdate, Authority, DelegationPolicySource, NewAgent, PgAgentRegistry,
     EXTERNAL_MCP_RUNTIME,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
-    all_durable_migrations, DurableDelegationPolicyBacking, SubstrateProvider, TenantScope,
+    all_durable_migrations, ColumnCryptor, DurableDelegationPolicyBacking, KekId, KmsEngine,
+    SubjectId, SubjectKeyScope, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
+use uuid::Uuid;
 
 fn test_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
@@ -75,6 +78,7 @@ fn human(tenant: &str, region: &str) -> Principal {
 
 fn proposal(nonce: &str) -> NewAgent {
     NewAgent {
+        agent_id: Uuid::new_v4(),
         name: "Review companion".into(),
         runtime_ref: EXTERNAL_MCP_RUNTIME.into(),
         tools: vec!["git.open_pr".into(), "ci.read_run".into()],
@@ -84,6 +88,7 @@ fn proposal(nonce: &str) -> NewAgent {
             "repo.push".into(),
             "run.view".into(),
         ],
+        workspace_guidance: None,
         tenant_policy_if_missing: vec![
             "agent.tools.read".into(),
             "edge.identity.read".into(),
@@ -213,6 +218,113 @@ async fn one_human_activation_is_retry_safe_durable_and_ready_for_a_governed_run
             .expect("the roster survives a process-shaped restart"),
         agent
     );
+    cleanup(&admin, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_workspace_defaults_are_encrypted_revisioned_and_retry_safe() {
+    let (admin, app) = providers().await;
+    let tenant = unique("workspace-profile");
+    let region = app.config().region.clone();
+    let actor = human(&tenant, &region);
+    let registry = PgAgentRegistry::new(app.clone());
+    let kms = KmsEngine::new();
+    kms.ensure_kek(&KekId::new(actor.tenant.clone(), actor.region.clone()))
+        .unwrap();
+    let seal = |content: &[u8]| AgentWorkspaceGuidance {
+        content_digest: format!("blake3:{}", blake3::hash(content).to_hex()),
+        encrypted_content: ColumnCryptor::new(&kms, actor.region.clone())
+            .encrypt_for_subject_scope(
+                &actor.tenant,
+                &SubjectId::new(&actor.principal_id.0),
+                SubjectKeyScope::AgentData,
+                content,
+            )
+            .unwrap(),
+    };
+    let original = b"Explain the smallest safe change first.";
+    let mut intent = proposal("activate-configurable-agent-v1");
+    intent.workspace_guidance = Some(seal(original));
+    let created = registry.create(&actor, intent).await.unwrap().agent;
+    assert_eq!(created.workspace_guidance_revision, 1);
+    assert_eq!(
+        created.workspace_guidance.as_ref().unwrap().content_digest,
+        format!("blake3:{}", blake3::hash(original).to_hex())
+    );
+
+    let ciphertext: Vec<u8> = sqlx::query_scalar(
+        "SELECT workspace_guidance_ciphertext FROM identity_agent \
+          WHERE tenant_id = $1 AND region = $2 AND agent_id = $3",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .bind(Uuid::parse_str(&created.id).unwrap())
+    .fetch_one(admin.db_pool())
+    .await
+    .unwrap();
+    assert!(!ciphertext
+        .windows(original.len())
+        .any(|window| window == original));
+
+    let revised = b"Start with the failing full-system journey.";
+    let update = AgentWorkspaceGuidanceUpdate {
+        agent_id: created.id.clone(),
+        expected_revision: 1,
+        guidance: Some(seal(revised)),
+    };
+    let changed = registry
+        .update_workspace_guidance(&actor, update.clone())
+        .await
+        .unwrap();
+    assert!(changed.changed);
+    assert_eq!(changed.agent.workspace_guidance_revision, 2);
+    let replay = registry
+        .update_workspace_guidance(&actor, update)
+        .await
+        .unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.agent, changed.agent);
+
+    let suspend = AgentLifecycleRequest {
+        agent_id: created.id.clone(),
+        action: AgentLifecycleAction::Suspend,
+        client_nonce: "suspend-configurable-agent-v1".into(),
+    };
+    let suspended = registry
+        .change_status(&actor, suspend.clone())
+        .await
+        .unwrap();
+    assert!(suspended.changed);
+    assert_eq!(suspended.agent.status, PrincipalStatus::Suspended);
+    assert_eq!(
+        suspended.agent.workspace_guidance, changed.agent.workspace_guidance,
+        "lifecycle changes preserve the encrypted workspace-default receipt"
+    );
+    let suspend_replay = registry.change_status(&actor, suspend).await.unwrap();
+    assert_eq!(suspend_replay, suspended);
+    registry
+        .change_status(
+            &actor,
+            AgentLifecycleRequest {
+                agent_id: created.id.clone(),
+                action: AgentLifecycleAction::Resume,
+                client_nonce: "resume-configurable-agent-v1".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let stale = registry
+        .update_workspace_guidance(
+            &actor,
+            AgentWorkspaceGuidanceUpdate {
+                agent_id: created.id,
+                expected_revision: 1,
+                guidance: None,
+            },
+        )
+        .await;
+    assert!(matches!(stale, Err(AgentRegistryError::Conflict(_))));
     cleanup(&admin, &tenant).await;
 }
 

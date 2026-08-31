@@ -34,6 +34,21 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
             let _ = write!(output, " {}", selected_tool_label(tool)?);
         }
     }
+    let workspace_profile = agent.get("workspace_profile")?;
+    let workspace_revision = workspace_profile.get("revision")?.as_u64()?;
+    if workspace_profile.get("instructions")?.is_null() {
+        let _ = write!(
+            output,
+            "\n  workspace defaults: none (revision {workspace_revision})"
+        );
+    } else {
+        let instructions = workspace_profile.get("instructions")?;
+        let path = terminal_safe_single_line(instructions.get("path")?.as_str()?);
+        let _ = write!(
+            output,
+            "\n  workspace defaults: {path} personal overlay (revision {workspace_revision})"
+        );
+    }
     output.push_str(
         "\n  Durable identity and policy are ready; no long-lived API key was created.\n",
     );
@@ -247,6 +262,11 @@ mod tests {
             }],
             "effective_tools": [],
             "grants": ["run.view"],
+            "workspace_profile": {
+                "revision": 0,
+                "instructions": null,
+                "updated_at": null,
+            },
             "created_at": "2026-08-09T12:00:00Z",
         })
     }

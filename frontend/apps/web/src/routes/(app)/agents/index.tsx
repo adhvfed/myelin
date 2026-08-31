@@ -12,6 +12,7 @@ import {
 
 import { AgentActivationDialog } from "~/components/agents/AgentActivationDialog";
 import { AgentThreadCreateDialog } from "~/components/agents/AgentThreadCreateDialog";
+import { AgentWorkspaceDefaultsDialog } from "~/components/agents/AgentWorkspaceDefaultsDialog";
 import { AgentThreadSidebar } from "~/components/agents/AgentThreadSidebar";
 import {
   AgentThreadLoading,
@@ -78,6 +79,7 @@ export default function AgentThreadsIndex() {
   const [agentPages, setAgentPages] = createSignal<AgentChoicePage[]>([]);
   const [activatedAgents, setActivatedAgents] = createSignal<AgentChoice[]>([]);
   const [preferredAgentId, setPreferredAgentId] = createSignal<string>();
+  const [configuringAgent, setConfiguringAgent] = createSignal<AgentChoice | null>(null);
   const [loadingMoreAgents, setLoadingMoreAgents] = createSignal(false);
   const [earlierMessagePages, setEarlierMessagePages] = createSignal<Awaited<ReturnType<typeof getAgentThreadMessages>>[]>([]);
   const [loadingEarlier, setLoadingEarlier] = createSignal(false);
@@ -481,6 +483,7 @@ export default function AgentThreadsIndex() {
         agentsLoadingMore={loadingMoreAgents()}
         onLoadMoreAgents={() => void loadMoreAgents()}
         onActivateAgent={openActivation}
+        onConfigureAgent={setConfiguringAgent}
         onClose={closeCreate}
         onCreated={(receipt) => {
           threadGeneration += 1;
@@ -499,6 +502,24 @@ export default function AgentThreadsIndex() {
           void revalidate(getAgentChoices.keyFor({ limit: 100 }));
           openCreate();
           toast.show({ title: `${receipt.agent.name} is ready for private work`, variant: "success" });
+        }}
+      />
+      <AgentWorkspaceDefaultsDialog
+        agent={configuringAgent()}
+        onClose={() => setConfiguringAgent(null)}
+        onConfigured={(receipt) => {
+          setActivatedAgents((current) => mergeById([receipt.agent], [current]));
+          setPreferredAgentId(receipt.agent.id);
+          void Promise.all([
+            revalidate(getAgentChoices.keyFor({ limit: 100 })),
+            revalidate(getAgentChoice.keyFor(receipt.agent.id)),
+          ]);
+          toast.show({
+            title: receipt.changed
+              ? `${receipt.agent.name} workspace defaults saved`
+              : `${receipt.agent.name} workspace defaults already current`,
+            variant: "success",
+          });
         }}
       />
     </>

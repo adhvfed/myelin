@@ -29,6 +29,7 @@ use myelin_storage::{
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use tokio::sync::OnceCell;
+use uuid::Uuid;
 
 static HOST_SCHEMA_READY: OnceCell<()> = OnceCell::const_new();
 
@@ -515,10 +516,12 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
         .create(
             &founder,
             NewAgent {
+                agent_id: Uuid::new_v4(),
                 name: "explain-bot".into(),
                 runtime_ref: HOSTED_LUNA_RUNTIME.into(),
                 tools: vec!["ci.read_run.v1".into()],
                 grants: grants.clone(),
+                workspace_guidance: None,
                 tenant_policy_if_missing: grants.clone(),
                 trigger_actor_policy_if_missing: grants,
                 client_nonce: unique("explain-bot"),

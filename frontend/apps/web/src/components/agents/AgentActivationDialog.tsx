@@ -23,6 +23,7 @@ export function AgentActivationDialog(props: {
   const mutate = useAction(mutateAgentThread);
   const [name, setName] = createSignal("");
   const [allowWorkspaceCommands, setAllowWorkspaceCommands] = createSignal(false);
+  const [workspaceInstructions, setWorkspaceInstructions] = createSignal("");
   const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -34,6 +35,7 @@ export function AgentActivationDialog(props: {
     if (!props.open) return;
     setName("");
     setAllowWorkspaceCommands(false);
+    setWorkspaceInstructions("");
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
@@ -48,7 +50,10 @@ export function AgentActivationDialog(props: {
   const close = () => { if (!submitting()) props.onClose(); };
   const submit = async (event: SubmitEvent) => {
     event.preventDefault();
-    if (!name().trim() || name().trim() !== name()) {
+    if (!name().trim() || name().trim() !== name() ||
+        workspaceInstructions().includes("\0") ||
+        new TextEncoder().encode(workspaceInstructions()).byteLength > 12 * 1024 ||
+        (workspaceInstructions() !== "" && workspaceInstructions().trim() === "")) {
       setError("Use a clean agent name without leading or trailing whitespace.");
       nameInput?.focus();
       return;
@@ -61,6 +66,7 @@ export function AgentActivationDialog(props: {
         op: "activate-agent",
         name: name(),
         allowWorkspaceCommands: allowWorkspaceCommands(),
+        workspaceInstructions: workspaceInstructions(),
         clientNonce: clientNonce(),
       });
       if (generation !== openingGeneration) return;
@@ -117,6 +123,24 @@ export function AgentActivationDialog(props: {
             generation-fenced workspace. Your live permissions remain the authority ceiling.
           </p>
         </div>
+        <label>
+          Default workspace instructions <span aria-hidden="true">(optional)</span>
+          <textarea
+            value={workspaceInstructions()}
+            rows={6}
+            placeholder={"# How I work\n\nExplain tradeoffs before changing interfaces. Run the narrow journey first."}
+            disabled={submitting()}
+            onInput={(event) => {
+              setWorkspaceInstructions(event.currentTarget.value);
+              setClientNonce(crypto.randomUUID());
+              setError(null);
+            }}
+          />
+        </label>
+        <p class="agent-thread-note">
+          New private threads inherit this owner-only <code>AGENTS.md</code> overlay. You can add
+          thread-specific instructions later; existing workspaces keep their original snapshot.
+        </p>
         <label class="agent-activation-command-toggle" for="agent-allow-workspace-commands">
           <input
             id="agent-allow-workspace-commands"

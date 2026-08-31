@@ -7,11 +7,14 @@ use myelin_identity::PrincipalStatus;
 use myelin_identity_service::{
     agent_ref, agent_run_ref, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
     AgentLifecycleRequest, AgentRegistration, AgentRegistryError, AgentSessionError,
-    AgentSessionIssuer, AgentSessionRequest, ClosedAgentSession, IssuedAgentSession, NewAgent,
-    PgAgentRegistry, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
+    AgentSessionIssuer, AgentSessionRequest, AgentWorkspaceGuidance, AgentWorkspaceGuidanceUpdate,
+    ClosedAgentSession, IssuedAgentSession, NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
+    HOSTED_LUNA_RUNTIME, MAX_AGENT_WORKSPACE_GUIDANCE_BYTES,
 };
+use myelin_storage::{ColumnCryptor, KmsEngine, SubjectId, SubjectKeyScope};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::types::Uuid;
 use tokio::runtime::Handle;
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
@@ -21,7 +24,7 @@ use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
 use crate::Method;
 
-const MAX_AGENT_JSON_BYTES: usize = 16 * 1024;
+const MAX_AGENT_JSON_BYTES: usize = 64 * 1024;
 const AGENT_BASELINE_GRANTS: &[&str] = &["agent.tools.read", "edge.identity.read"];
 
 #[derive(Clone)]
@@ -29,6 +32,7 @@ struct AgentHttpApi {
     registry: PgAgentRegistry,
     sessions: AgentSessionIssuer,
     catalogue: Arc<PlatformToolCatalogue>,
+    kms: Arc<KmsEngine>,
     runtime: Handle,
 }
 
@@ -48,6 +52,15 @@ struct CreateAgentBody {
     tools: Vec<String>,
     #[serde(default)]
     runtime: AgentRuntimeSelection,
+    #[serde(default)]
+    workspace_instructions: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateAgentWorkspaceGuidanceBody {
+    instructions: Value,
+    expected_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -78,7 +91,8 @@ impl Handler for AgentCreateHandler {
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
-        let proposal = activation_proposal(ctx, &self.api.catalogue, body, client_nonce)?;
+        let proposal =
+            activation_proposal(ctx, &self.api.catalogue, &self.api.kms, body, client_nonce)?;
         let activation = self
             .api
             .drive(self.api.registry.create(ctx.principal, proposal))?
@@ -91,6 +105,14 @@ impl Handler for AgentCreateHandler {
 }
 
 struct AgentGetHandler {
+    api: AgentHttpApi,
+}
+
+struct AgentWorkspaceGuidanceUpdateHandler {
+    api: AgentHttpApi,
+}
+
+struct AgentWorkspaceGuidanceGetHandler {
     api: AgentHttpApi,
 }
 
@@ -217,6 +239,76 @@ impl Handler for AgentGetHandler {
     }
 }
 
+impl Handler for AgentWorkspaceGuidanceUpdateHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let body: UpdateAgentWorkspaceGuidanceBody =
+            parse_agent_body(&ctx.request.body, "agent workspace guidance")?;
+        let instructions = match body.instructions {
+            Value::Null => None,
+            Value::String(instructions) => {
+                validate_workspace_instructions(&instructions)?;
+                Some(instructions)
+            }
+            _ => {
+                return Err(EdgeError::BadRequest(
+                    "agent workspace instructions must be a UTF-8 string or null".into(),
+                ))
+            }
+        };
+        let agent_id = agent_param(ctx)?.to_string();
+        let guidance = instructions
+            .as_deref()
+            .map(|instructions| {
+                seal_workspace_guidance(&self.api.kms, ctx.principal, &agent_id, instructions)
+            })
+            .transpose()?;
+        let outcome = self
+            .api
+            .drive(self.api.registry.update_workspace_guidance(
+                ctx.principal,
+                AgentWorkspaceGuidanceUpdate {
+                    agent_id,
+                    expected_revision: body.expected_revision,
+                    guidance,
+                },
+            ))?
+            .map_err(map_registry_error)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "agent": agent_json(&ctx.principal.tenant.0, &self.api.catalogue, &outcome.agent),
+                "changed": outcome.changed,
+                "durable": true,
+            }),
+        )))
+    }
+}
+
+impl Handler for AgentWorkspaceGuidanceGetHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        require_empty_body(ctx, "agent workspace guidance")?;
+        let agent = self
+            .api
+            .drive(self.api.registry.get(ctx.principal, agent_param(ctx)?))?
+            .map_err(map_registry_error)?;
+        if agent.created_by != ctx.principal.principal_id.0 {
+            return Err(EdgeError::NotFound("agent not found".into()));
+        }
+        let instructions = open_agent_workspace_guidance(&self.api.kms, ctx.principal, &agent)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "agent_id": agent.id,
+                "revision": agent.workspace_guidance_revision,
+                "instructions": instructions,
+                "updated_at": agent.workspace_guidance_updated_at,
+            }),
+        )))
+    }
+}
+
 struct AgentListHandler {
     api: AgentHttpApi,
 }
@@ -253,6 +345,7 @@ pub fn register_agents(
     builder: GatewayBuilder,
     registry: PgAgentRegistry,
     sessions: AgentSessionIssuer,
+    kms: Arc<KmsEngine>,
     runtime: Handle,
 ) -> GatewayBuilder {
     let catalogue = Arc::new(
@@ -263,6 +356,7 @@ pub fn register_agents(
         registry,
         sessions,
         catalogue,
+        kms,
         runtime,
     };
     builder
@@ -271,6 +365,12 @@ pub fn register_agents(
             "/v1/agents",
             "identity.agents.list",
             Arc::new(AgentListHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/agents/{agent}/workspace-guidance",
+            "identity.agent.update",
+            Arc::new(AgentWorkspaceGuidanceGetHandler { api: api.clone() }),
         )
         .route(
             Method::Post,
@@ -283,6 +383,12 @@ pub fn register_agents(
             "/v1/agents/{agent}",
             "identity.agent.view",
             Arc::new(AgentGetHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agents/{agent}/workspace-guidance",
+            "identity.agent.update",
+            Arc::new(AgentWorkspaceGuidanceUpdateHandler { api: api.clone() }),
         )
         .route(
             Method::Post,
@@ -328,9 +434,11 @@ pub fn register_agents(
 fn activation_proposal(
     ctx: &HandlerCtx<'_>,
     catalogue: &PlatformToolCatalogue,
+    kms: &KmsEngine,
     body: CreateAgentBody,
     client_nonce: String,
 ) -> Result<NewAgent, EdgeError> {
+    let agent_id = Uuid::new_v4();
     if body.tools.is_empty() {
         return Err(EdgeError::BadRequest(
             "agent create needs at least one `--tool` selection".into(),
@@ -400,10 +508,19 @@ fn activation_proposal(
         .map(str::to_string)
         .collect::<Vec<_>>();
     Ok(NewAgent {
+        agent_id,
         name: body.name,
         runtime_ref: body.runtime.runtime_ref().into(),
         tools: selected,
         grants: grants.into_iter().collect(),
+        workspace_guidance: body
+            .workspace_instructions
+            .as_deref()
+            .map(|instructions| {
+                validate_workspace_instructions(instructions)?;
+                seal_workspace_guidance(kms, ctx.principal, &agent_id.to_string(), instructions)
+            })
+            .transpose()?,
         tenant_policy_if_missing: tenant_policy.into_iter().collect(),
         trigger_actor_policy_if_missing: trigger_actor_policy,
         client_nonce,
@@ -471,8 +588,96 @@ fn agent_json(tenant: &str, catalogue: &PlatformToolCatalogue, agent: &AgentRegi
         "selected_tools": selected_tools,
         "effective_tools": effective_tools,
         "grants": agent.grants,
+        "workspace_profile": {
+            "revision": agent.workspace_guidance_revision,
+            "instructions": agent.workspace_guidance.as_ref().map(|guidance| json!({
+                "path": "AGENTS.md",
+                "strategy": "append",
+                "content_digest": guidance.content_digest,
+            })),
+            "updated_at": agent.workspace_guidance_updated_at,
+        },
         "created_at": agent.created_at,
     })
+}
+
+fn validate_workspace_instructions(instructions: &str) -> Result<(), EdgeError> {
+    if instructions.trim().is_empty()
+        || instructions.len() > MAX_AGENT_WORKSPACE_GUIDANCE_BYTES
+        || instructions.contains('\0')
+    {
+        return Err(EdgeError::BadRequest(format!(
+            "agent workspace instructions must contain 1..={MAX_AGENT_WORKSPACE_GUIDANCE_BYTES} UTF-8 bytes and no NUL characters"
+        )));
+    }
+    Ok(())
+}
+
+fn seal_workspace_guidance(
+    kms: &KmsEngine,
+    principal: &myelin_identity::Principal,
+    agent_id: &str,
+    instructions: &str,
+) -> Result<AgentWorkspaceGuidance, EdgeError> {
+    let content_digest = format!("blake3:{}", blake3::hash(instructions.as_bytes()).to_hex());
+    let encrypted_content = ColumnCryptor::new(kms, principal.region.clone())
+        .encrypt_for_subject_scope_with_aad(
+            &principal.tenant,
+            &SubjectId::new(&principal.principal_id.0),
+            SubjectKeyScope::AgentData,
+            instructions.as_bytes(),
+            &workspace_guidance_aad(principal, agent_id),
+        )
+        .map_err(|error| {
+            EdgeError::Internal(format!(
+                "agent workspace-guidance encryption failed: {error}"
+            ))
+        })?;
+    Ok(AgentWorkspaceGuidance {
+        content_digest,
+        encrypted_content,
+    })
+}
+
+pub(crate) fn open_agent_workspace_guidance(
+    kms: &KmsEngine,
+    principal: &myelin_identity::Principal,
+    agent: &AgentRegistration,
+) -> Result<Option<String>, EdgeError> {
+    let Some(guidance) = agent.workspace_guidance.as_ref() else {
+        return Ok(None);
+    };
+    let plaintext = ColumnCryptor::new(kms, principal.region.clone())
+        .decrypt_with_aad(
+            &guidance.encrypted_content,
+            &workspace_guidance_aad(principal, &agent.id),
+        )
+        .map_err(|_| EdgeError::Internal("agent workspace guidance cannot be decrypted".into()))?;
+    if plaintext.len() > MAX_AGENT_WORKSPACE_GUIDANCE_BYTES
+        || format!("blake3:{}", blake3::hash(&plaintext).to_hex()) != guidance.content_digest
+    {
+        return Err(EdgeError::Internal(
+            "agent workspace guidance failed integrity validation".into(),
+        ));
+    }
+    String::from_utf8(plaintext)
+        .map(Some)
+        .map_err(|_| EdgeError::Internal("agent workspace guidance is not UTF-8".into()))
+}
+
+fn workspace_guidance_aad(principal: &myelin_identity::Principal, agent_id: &str) -> Vec<u8> {
+    let mut aad = Vec::new();
+    for field in [
+        "myelin.identity-agent.workspace-guidance.v1",
+        principal.tenant.as_str(),
+        principal.region.as_str(),
+        principal.principal_id.0.as_str(),
+        agent_id,
+    ] {
+        aad.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        aad.extend_from_slice(field.as_bytes());
+    }
+    aad
 }
 
 pub(crate) fn agent_session_json(
@@ -564,6 +769,13 @@ fn status_name(status: PrincipalStatus) -> &'static str {
 }
 
 fn parse_create_body(bytes: &[u8]) -> Result<CreateAgentBody, EdgeError> {
+    parse_agent_body(bytes, "agent create")
+}
+
+fn parse_agent_body<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    label: &str,
+) -> Result<T, EdgeError> {
     if bytes.len() > MAX_AGENT_JSON_BYTES {
         return Err(EdgeError::PayloadTooLarge(format!(
             "agent request body exceeds {MAX_AGENT_JSON_BYTES} bytes"
@@ -575,7 +787,7 @@ fn parse_create_body(bytes: &[u8]) -> Result<CreateAgentBody, EdgeError> {
         ));
     }
     serde_json::from_slice(bytes)
-        .map_err(|error| EdgeError::BadRequest(format!("invalid agent create body: {error}")))
+        .map_err(|error| EdgeError::BadRequest(format!("invalid {label} body: {error}")))
 }
 
 fn parse_page_query(query: &str) -> Result<(usize, Option<String>), EdgeError> {
@@ -730,10 +942,12 @@ mod tests {
                 params: &params,
             },
             &PlatformToolCatalogue::platform().unwrap(),
+            &KmsEngine::new(),
             CreateAgentBody {
                 name: "Review companion".into(),
                 tools: tools.iter().map(|tool| (*tool).into()).collect(),
                 runtime: AgentRuntimeSelection::External,
+                workspace_instructions: None,
             },
             "retry-safe".into(),
         )

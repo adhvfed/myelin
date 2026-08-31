@@ -31,6 +31,8 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const threadName = `Investigate checkout race ${suffix}`;
   const problem = `The final reader for ${suffix} still owns its checkout lease.`;
   const personalInstructions = `# My workflow\n\nKeep the ${suffix} diagnosis private until it is ready.`;
+  const agentDefaults = `# Checkout companion defaults\n\nExplain the ${suffix} tradeoff first.`;
+  const revisedAgentDefaults = `${agentDefaults}\nRun the focused browser journey.`;
   const repositorySlug = `cloud-workspace-${suffix}`;
   const sessionToken = await browserApprovedSession(request);
   await postProductJson(
@@ -61,6 +63,8 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await page.getByRole("button", { name: "Activate an agent" }).click();
   const activation = page.getByRole("dialog", { name: "Activate private-work agent" });
   await activation.getByRole("textbox", { name: "Agent name" }).fill(agentName);
+  await activation.getByRole("textbox", { name: "Default workspace instructions" })
+    .fill(agentDefaults);
   await activation.getByRole("checkbox", { name: "Allow bounded workspace commands" }).check();
   await activation.getByRole("button", { name: "Activate agent" }).click();
 
@@ -71,6 +75,19 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await agentChoice.selectOption({ label: agentName });
   const agentId = await agentChoice.inputValue();
   expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  await expect(dialog.getByText("This agent carries private AGENTS.md defaults at revision 1."))
+    .toBeVisible();
+  await dialog.getByRole("button", { name: "Edit workspace defaults" }).click();
+  const defaults = page.getByRole("dialog", { name: `${agentName} · workspace defaults` });
+  const defaultsEditor = defaults.getByRole("textbox", {
+    name: "Default AGENTS.md instructions",
+  });
+  await expect(defaultsEditor).toHaveValue(agentDefaults);
+  await defaultsEditor.fill(revisedAgentDefaults);
+  await defaults.getByRole("button", { name: "Save defaults" }).click();
+  await expect(defaults).toBeHidden();
+  await expect(dialog.getByText("This agent carries private AGENTS.md defaults at revision 2."))
+    .toBeVisible();
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");
   await dialog.getByRole("textbox", { name: "Repository slug" }).fill(repositorySlug);
   await dialog.getByRole("textbox", { name: "Personal agent instructions" })

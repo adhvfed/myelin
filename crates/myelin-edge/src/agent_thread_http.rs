@@ -10,7 +10,9 @@ use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::{ConversationId, SystemUlidSource, UlidSource};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
-use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
+use myelin_identity_service::{
+    AgentRegistryError, AgentSessionIssuer, AgentSessionRequest, PgAgentRegistry,
+};
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
     AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRunBinding, AgentThreadState,
@@ -150,6 +152,7 @@ impl AgentThreadRecoveryHandle {
 #[derive(Clone)]
 struct AgentThreadHttpApi {
     threads: DurableAgentThreadBacking,
+    agents: PgAgentRegistry,
     chat_reads: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
     workspaces: Arc<dyn AgentWorkspaceStore>,
@@ -233,12 +236,32 @@ impl AgentThreadHttpApi {
             .transpose()?;
         let mut proposal =
             intent.proposal(self.conversation_ids.mint().as_str(), repository.as_ref())?;
-        proposal.workspace_guidance = intent
+        let agent = self
+            .drive(self.agents.get(principal, &intent.agent_id.to_string()))?
+            .map_err(map_agent_registry_error)?;
+        if agent.created_by != principal.principal_id.0 {
+            return Err(EdgeError::NotFound("agent not found".into()));
+        }
+        let agent_instructions =
+            crate::agent_http::open_agent_workspace_guidance(&self.kms, principal, &agent)?;
+        let request_instructions = intent
             .workspace
             .as_ref()
-            .and_then(|workspace| workspace.instructions.as_deref())
-            .map(|instructions| self.seal_workspace_guidance(principal, &proposal, instructions))
-            .transpose()?;
+            .and_then(|workspace| workspace.instructions.as_deref());
+        let request_content_digest = request_instructions
+            .map(|instructions| workspace_guidance_digest(instructions.as_bytes()));
+        proposal.workspace_guidance =
+            combined_workspace_guidance(agent_instructions.as_deref(), request_instructions)?
+                .as_deref()
+                .map(|instructions| {
+                    self.seal_workspace_guidance(
+                        principal,
+                        &proposal,
+                        instructions,
+                        request_content_digest.clone(),
+                    )
+                })
+                .transpose()?;
         let outcome = self
             .drive(self.threads.create(&principal.tenant.0, proposal))?
             .map_err(|_| EdgeError::Internal("agent thread storage failed".into()))?;
@@ -513,6 +536,7 @@ impl AgentThreadHttpApi {
         principal: &Principal,
         proposal: &NewAgentThread,
         instructions: &str,
+        request_content_digest: Option<String>,
     ) -> Result<AgentThreadWorkspaceGuidance, EdgeError> {
         let content_digest = workspace_guidance_digest(instructions.as_bytes());
         let encrypted_content = ColumnCryptor::new(&self.kms, principal.region.clone())
@@ -535,6 +559,7 @@ impl AgentThreadHttpApi {
             })?;
         Ok(AgentThreadWorkspaceGuidance {
             content_digest,
+            request_content_digest,
             encrypted_content,
         })
     }
@@ -721,6 +746,7 @@ impl AgentThreadHttpApi {
 
 pub struct AgentThreadHttpInputs {
     pub threads: DurableAgentThreadBacking,
+    pub agents: PgAgentRegistry,
     pub chat_reads: DurableChatReadApi,
     pub chat_mutations: DurableChatMutationApi,
     pub workspaces: Arc<dyn AgentWorkspaceStore>,
@@ -898,7 +924,7 @@ impl ValidatedThreadIntent {
             != thread
                 .workspace_guidance
                 .as_ref()
-                .map(|guidance| guidance.content_digest.as_str())
+                .and_then(|guidance| guidance.request_content_digest.as_deref())
         {
             return false;
         }
@@ -1206,6 +1232,7 @@ pub fn register_agent_threads(
     let recovery_config = inputs.recovery;
     let api = AgentThreadHttpApi {
         threads: inputs.threads,
+        agents: inputs.agents,
         chat_reads: inputs.chat_reads,
         chat_mutations: inputs.chat_mutations,
         workspaces: inputs.workspaces,
@@ -1422,6 +1449,38 @@ fn validate_workspace_instructions(instructions: &str) -> Result<(), EdgeError> 
 
 fn workspace_guidance_digest(content: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(content).to_hex())
+}
+
+fn combined_workspace_guidance(
+    agent_default: Option<&str>,
+    thread_instructions: Option<&str>,
+) -> Result<Option<String>, EdgeError> {
+    let combined = match (agent_default, thread_instructions) {
+        (None, None) => return Ok(None),
+        (Some(default), None) => default.to_string(),
+        (None, Some(instructions)) => instructions.to_string(),
+        (Some(default), Some(instructions)) => format!(
+            "{}\n\n## Thread-specific instructions\n\n{}",
+            default.trim_end(),
+            instructions
+        ),
+    };
+    if combined.len() > MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES {
+        return Err(EdgeError::BadRequest(format!(
+            "the named-agent defaults and thread instructions exceed the {MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES}-byte workspace-guidance limit"
+        )));
+    }
+    Ok(Some(combined))
+}
+
+fn map_agent_registry_error(error: AgentRegistryError) -> EdgeError {
+    match error {
+        AgentRegistryError::BadInput(message) => EdgeError::BadRequest(message),
+        AgentRegistryError::NotFound => EdgeError::NotFound("agent not found".into()),
+        AgentRegistryError::Conflict(message) => EdgeError::Conflict(message),
+        AgentRegistryError::Policy(message) => EdgeError::Forbidden(message),
+        AgentRegistryError::Storage(message) => EdgeError::Internal(message),
+    }
 }
 
 fn workspace_guidance_aad(
@@ -1810,6 +1869,38 @@ mod tests {
             .unwrap();
             assert!(ValidatedThreadIntent::new(&principal(), body, "retry".into()).is_err());
         }
+    }
+
+    #[test]
+    fn named_agent_defaults_are_followed_by_the_more_specific_thread_layer() {
+        assert_eq!(
+            combined_workspace_guidance(
+                Some("# Default workflow\n\nExplain the tradeoff."),
+                Some("Run the checkout regression first."),
+            )
+            .unwrap()
+            .as_deref(),
+            Some(
+                "# Default workflow\n\nExplain the tradeoff.\n\n## Thread-specific instructions\n\nRun the checkout regression first."
+            )
+        );
+        assert_eq!(
+            combined_workspace_guidance(Some("Default only"), None).unwrap(),
+            Some("Default only".into())
+        );
+        assert_eq!(
+            combined_workspace_guidance(None, Some("Thread only")).unwrap(),
+            Some("Thread only".into())
+        );
+    }
+
+    #[test]
+    fn combined_workspace_guidance_never_crosses_the_workspace_limit() {
+        let default = "d".repeat(MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES);
+        assert!(matches!(
+            combined_workspace_guidance(Some(&default), Some("one byte too many")),
+            Err(EdgeError::BadRequest(_))
+        ));
     }
 
     #[test]

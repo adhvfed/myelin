@@ -18,6 +18,14 @@ work with one creates a named cloud thread with a durable branch, conversation, 
 same workspace survives model context changes and can be opened through ordinary SSH or SFTP with a
 short-lived owner-authorized credential.
 
+An agent's owner can maintain private default workspace instructions on that named agent. The
+organization-visible roster exposes only a revision and content digest; plaintext is encrypted as
+owner-scoped agent data and available only through the owner's edit surface. Each new thread
+snapshots the current defaults, then appends any thread-specific instructions as the more specific
+layer. Editing the named agent affects future work without silently rewriting an existing thread,
+including an idempotent retry of that thread's original creation request. Edits use an expected
+revision, while an exact semantic retry converges on the already-written state.
+
 The workspace is personalizable at creation time. Repository guidance remains the shared default,
 while an owner can layer their own way of working into the assigned workspace—for example, custom
 root `AGENTS.md` instructions—without changing the source repository. Personalization is durable
@@ -55,4 +63,7 @@ stores. A privacy journey must use two real identities and demonstrate both side
 the collaborator receives an indistinguishable not-found response before publication, then sees the
 work after the owner's explicit transition, while workspace execution and SSH remain denied.
 Workspace-personalization journeys must read the resulting file through an actual bound agent run,
-open it again from a fresh context, and prove the repository source was never modified.
+open it again from a fresh context, and prove the repository source was never modified. Named-agent
+default journeys must prove plaintext is owner-only, stale edits conflict, new work receives the
+latest revision, thread-specific instructions take precedence, and existing work retains its
+original snapshot after the defaults change.

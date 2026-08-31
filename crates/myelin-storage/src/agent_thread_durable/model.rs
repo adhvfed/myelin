@@ -13,6 +13,7 @@ pub const MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES: usize = 12 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentThreadWorkspaceGuidance {
     pub content_digest: String,
+    pub request_content_digest: Option<String>,
     pub encrypted_content: EncryptedColumn,
 }
 

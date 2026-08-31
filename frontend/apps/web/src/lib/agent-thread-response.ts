@@ -15,6 +15,15 @@ export interface AgentChoice {
   status: "active" | "suspended" | "disabled";
   selected_tools: string[];
   effective_tools: string[];
+  workspace_profile: {
+    revision: number;
+    instructions: {
+      path: "AGENTS.md";
+      strategy: "append";
+      content_digest: string;
+    } | null;
+    updated_at: string | null;
+  };
 }
 
 export interface AgentChoicePage {
@@ -26,6 +35,19 @@ export interface AgentActivationReceipt {
   agent: AgentChoice;
   created: boolean;
   durable: true;
+}
+
+export interface AgentWorkspaceGuidanceReceipt {
+  agent: AgentChoice;
+  changed: boolean;
+  durable: true;
+}
+
+export interface AgentWorkspaceGuidanceConfig {
+  agent_id: string;
+  revision: number;
+  instructions: string | null;
+  updated_at: string | null;
 }
 
 export interface AgentThread {
@@ -167,16 +189,32 @@ function agentChoice(value: unknown): AgentChoice | null {
   const row = record(value);
   const selectedTools = toolNames(row?.selected_tools);
   const effectiveTools = toolNames(row?.effective_tools);
+  const workspaceProfile = record(row?.workspace_profile);
+  const workspaceInstructions = workspaceProfile?.instructions === null
+    ? null
+    : record(workspaceProfile?.instructions);
   if (!row || !exact(row, [
     "id", "ref", "principal_id", "name", "runtime_ref", "on_behalf_of", "status",
-    "selected_tools", "effective_tools", "grants", "created_at",
+    "selected_tools", "effective_tools", "grants", "workspace_profile", "created_at",
   ]) || !isAgentThreadId(row.id) || !cleanText(row.ref, 4_096) ||
       !cleanText(row.principal_id, 512) || !cleanText(row.name, 80) ||
       !["external:mcp", "hosted:luna"].includes(row.runtime_ref as string) ||
       !cleanText(row.on_behalf_of, 512) ||
       !["active", "suspended", "disabled"].includes(row.status as string) ||
       !selectedTools || !effectiveTools ||
-      !stringArray(row.grants, 512) || !timestamp(row.created_at)) return null;
+      !stringArray(row.grants, 512) || !workspaceProfile ||
+      !exact(workspaceProfile, ["revision", "instructions", "updated_at"]) ||
+      !Number.isSafeInteger(workspaceProfile.revision) || (workspaceProfile.revision as number) < 0 ||
+      (workspaceProfile.updated_at !== null && !timestamp(workspaceProfile.updated_at)) ||
+      ((workspaceProfile.revision as number) === 0 &&
+        (workspaceProfile.updated_at !== null || workspaceInstructions !== null)) ||
+      ((workspaceProfile.revision as number) > 0 && workspaceProfile.updated_at === null) ||
+      (workspaceInstructions !== null &&
+        (!exact(workspaceInstructions, ["path", "strategy", "content_digest"]) ||
+          workspaceInstructions.path !== "AGENTS.md" || workspaceInstructions.strategy !== "append" ||
+          typeof workspaceInstructions.content_digest !== "string" ||
+          !/^blake3:[0-9a-f]{64}$/.test(workspaceInstructions.content_digest))) ||
+      !timestamp(row.created_at)) return null;
   return {
     id: row.id,
     name: row.name,
@@ -184,6 +222,11 @@ function agentChoice(value: unknown): AgentChoice | null {
     status: row.status,
     selected_tools: selectedTools,
     effective_tools: effectiveTools,
+    workspace_profile: {
+      revision: workspaceProfile.revision as number,
+      instructions: workspaceInstructions as AgentChoice["workspace_profile"]["instructions"],
+      updated_at: workspaceProfile.updated_at as string | null,
+    },
   } as AgentChoice;
 }
 
@@ -223,6 +266,35 @@ export function parseAgentActivationReceipt(value: unknown): AgentActivationRece
     typeof receipt.created === "boolean" && receipt.durable === true
     ? { agent, created: receipt.created, durable: true }
     : null;
+}
+
+export function parseAgentWorkspaceGuidanceReceipt(
+  value: unknown,
+): AgentWorkspaceGuidanceReceipt | null {
+  const receipt = record(value);
+  const agent = agentChoice(receipt?.agent);
+  return receipt && exact(receipt, ["agent", "changed", "durable"]) && agent &&
+      typeof receipt.changed === "boolean" && receipt.durable === true
+    ? { agent, changed: receipt.changed, durable: true }
+    : null;
+}
+
+export function parseAgentWorkspaceGuidanceConfig(
+  value: unknown,
+): AgentWorkspaceGuidanceConfig | null {
+  const config = record(value);
+  if (!config || !exact(config, ["agent_id", "revision", "instructions", "updated_at"]) ||
+      !isAgentThreadId(config.agent_id) || !Number.isSafeInteger(config.revision) ||
+      (config.revision as number) < 0 ||
+      (config.instructions !== null &&
+        (typeof config.instructions !== "string" || config.instructions.trim().length === 0 ||
+          utf8.encode(config.instructions).byteLength > 12 * 1_024 ||
+          config.instructions.includes("\0"))) ||
+      (config.updated_at !== null && !timestamp(config.updated_at)) ||
+      ((config.revision as number) === 0 &&
+        (config.updated_at !== null || config.instructions !== null)) ||
+      ((config.revision as number) > 0 && config.updated_at === null)) return null;
+  return config as unknown as AgentWorkspaceGuidanceConfig;
 }
 
 function policyCoordinates(value: unknown): boolean {

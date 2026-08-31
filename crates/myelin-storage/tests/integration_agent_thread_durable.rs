@@ -258,6 +258,10 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
         .unwrap();
     intended.workspace_guidance = Some(AgentThreadWorkspaceGuidance {
         content_digest: format!("blake3:{}", blake3::hash(private_guidance).to_hex()),
+        request_content_digest: Some(format!(
+            "blake3:{}",
+            blake3::hash(private_guidance).to_hex()
+        )),
         encrypted_content: ColumnCryptor::new(&kms, region)
             .encrypt_for_subject_scope(
                 &tenant_id,

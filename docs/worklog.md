@@ -4,6 +4,34 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Named agents carry editable private workspace defaults
+
+A person's named agent can now hold default `AGENTS.md` instructions instead of requiring the same
+workflow to be pasted into every new thread. Defaults can be set at activation or edited and
+cleared later through the web, API, and CLI. New work snapshots the current revision and appends
+thread-specific instructions afterward, so a task can refine the agent's usual way of working.
+Editing the agent changes future threads without rewriting existing work or changing what an
+idempotent retry means.
+
+The plaintext is encrypted with the owner's agent-data key. Agent lists and ordinary fetches expose
+only a revisioned BLAKE3 receipt; only the owner can open the edit projection, while another member
+receives the same not-found boundary used for private artifacts. Replacements use optimistic
+revision checks, but exact semantic retries converge even when their expected revision is stale.
+Migrations `0169`–`0174` add the revisioned encrypted profile and a separate creation-intent digest
+through online expand/backfill/contract cycles.
+
+The readable TypeScript API journey uses two identities to create defaults, deny the teammate,
+revise them, reject a stale replacement, preserve an existing thread's snapshot, and layer the new
+defaults into later work. The CLI journey activates and configures the agent, then reads the
+resulting `AGENTS.md` through a real thread-bound MCP run. The Chromium journey activates an agent,
+edits revision 1 to revision 2 inside the thread flow, starts a repository-backed cloud workspace,
+and continues through suspension, SSH denial, durable chat, and accessibility checks. Those three
+journeys passed against running Edge, PostgreSQL, KMS, durable Git, the agent service, workspace
+gateway, and gVisor. A database integration test separately proves ciphertext-at-rest, revision and
+retry behavior, stale conflict, lifecycle preservation, and lifecycle-command replay. The browser
+journey exposed and drove a fix for lifecycle projections that still selected the pre-profile row
+shape; the online-migration test also drove a statement-scoping fix in the hot-table DDL checker.
+
 ## 2026-08-31 — The product CLI opens a private workspace with standard SFTP
 
 The gateway supported confined SFTP, but `myelin agent thread ssh` could only launch an SSH shell or

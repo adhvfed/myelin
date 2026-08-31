@@ -20,11 +20,12 @@ pub fn agent_dispatch_with_project(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent command given (try: create <name> --tool <name> | list | show <id> | thread start|ready|retry|list|show | approve|reject <gate>)".into(),
+            "no agent command given (try: create <name> --tool <name> [--workspace-instructions <markdown>] | configure <id> --expected-revision <n> (--workspace-instructions <markdown> | --clear-workspace-instructions) | list | show <id> | thread start|ready|retry|list|show | approve|reject <gate>)".into(),
         )
     })?;
     match *verb {
         "create" => create_call(rest),
+        "configure" => configure_call(rest),
         "list" => list_call(rest),
         "show" => show_call(rest),
         "suspend" => lifecycle_call(rest, "suspend"),
@@ -117,6 +118,7 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     let mut name = None;
     let mut tools = Vec::new();
     let mut runtime = None;
+    let mut workspace_instructions = None;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
@@ -127,6 +129,15 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
             "--runtime" => {
                 return Err(CliError::Usage(
                     "agent create accepts --runtime only once".into(),
+                ))
+            }
+            "--workspace-instructions" if workspace_instructions.is_none() => {
+                workspace_instructions =
+                    Some(flag_value(args, &mut index, "--workspace-instructions")?)
+            }
+            "--workspace-instructions" => {
+                return Err(CliError::Usage(
+                    "agent create accepts --workspace-instructions only once".into(),
                 ))
             }
             token if !token.starts_with('-') && name.is_none() => name = Some(token),
@@ -182,7 +193,94 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     if let Some(runtime) = runtime {
         body["runtime"] = json!(runtime);
     }
+    if let Some(instructions) = workspace_instructions {
+        validate_workspace_instructions(instructions)?;
+        body["workspace_instructions"] = json!(instructions);
+    }
     Ok(EdgeCall::post_json("/v1/agents", body))
+}
+
+fn configure_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let mut agent_id = None;
+    let mut expected_revision = None;
+    let mut instructions = None;
+    let mut clear = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--expected-revision" if expected_revision.is_none() => {
+                expected_revision = Some(flag_value(args, &mut index, "--expected-revision")?)
+            }
+            "--expected-revision" => {
+                return Err(CliError::Usage(
+                    "agent configure accepts --expected-revision only once".into(),
+                ))
+            }
+            "--workspace-instructions" if instructions.is_none() && !clear => {
+                instructions = Some(flag_value(args, &mut index, "--workspace-instructions")?)
+            }
+            "--workspace-instructions" => {
+                return Err(CliError::Usage(
+                    "agent configure accepts one workspace-instruction choice".into(),
+                ))
+            }
+            "--clear-workspace-instructions" if instructions.is_none() && !clear => clear = true,
+            "--clear-workspace-instructions" => {
+                return Err(CliError::Usage(
+                    "agent configure accepts one workspace-instruction choice".into(),
+                ))
+            }
+            token if !token.starts_with('-') && agent_id.is_none() => agent_id = Some(token),
+            token if !token.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unexpected agent configure argument `{token}`"
+                )))
+            }
+            flag => {
+                return Err(CliError::Usage(format!(
+                    "unknown agent configure flag `{flag}`"
+                )))
+            }
+        }
+        index += 1;
+    }
+    let agent_id = agent_id.ok_or_else(|| CliError::Usage("agent configure needs an id".into()))?;
+    require_agent_id("agent id", agent_id)?;
+    let revision = expected_revision
+        .ok_or_else(|| CliError::Usage("agent configure needs --expected-revision <n>".into()))?
+        .parse::<u64>()
+        .map_err(|_| {
+            CliError::Usage("agent expected revision must be a non-negative integer".into())
+        })?;
+    if !clear && instructions.is_none() {
+        return Err(CliError::Usage(
+            "agent configure needs --workspace-instructions or --clear-workspace-instructions"
+                .into(),
+        ));
+    }
+    if let Some(instructions) = instructions {
+        validate_workspace_instructions(instructions)?;
+    }
+    Ok(EdgeCall::post_json(
+        format!("/v1/agents/{agent_id}/workspace-guidance"),
+        json!({
+            "instructions": instructions,
+            "expected_revision": revision,
+        }),
+    ))
+}
+
+fn validate_workspace_instructions(instructions: &str) -> Result<(), CliError> {
+    if instructions.trim().is_empty()
+        || instructions.len() > 12 * 1024
+        || instructions.contains('\0')
+    {
+        return Err(CliError::Usage(
+            "agent workspace instructions must contain 1..=12288 UTF-8 bytes and no NUL characters"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
@@ -332,6 +430,44 @@ mod tests {
             })
         );
 
+        let personalized = agent_dispatch(&[
+            "create",
+            "Workspace companion",
+            "--tool",
+            "workspace.read_file",
+            "--workspace-instructions",
+            "# My defaults\n\nRun focused tests.",
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(personalized.payload.as_ref().unwrap())
+                .unwrap(),
+            json!({
+                "name": "Workspace companion",
+                "tools": ["workspace.read_file"],
+                "workspace_instructions": "# My defaults\n\nRun focused tests.",
+            })
+        );
+        let configured = agent_dispatch(&[
+            "configure",
+            AGENT,
+            "--expected-revision",
+            "2",
+            "--workspace-instructions",
+            "# Revised defaults",
+        ])
+        .unwrap();
+        assert_eq!(
+            configured.path,
+            format!("/v1/agents/{AGENT}/workspace-guidance")
+        );
+        assert_eq!(configured.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(configured.payload.as_ref().unwrap())
+                .unwrap(),
+            json!({ "instructions": "# Revised defaults", "expected_revision": 2 })
+        );
+
         let list = agent_dispatch(&["list", "--limit", "7", "--cursor", AGENT]).unwrap();
         assert_eq!(
             list.query.as_deref(),
@@ -387,6 +523,14 @@ mod tests {
             vec!["suspend"],
             vec!["resume", "not-an-id"],
             vec!["retire", AGENT, "again"],
+            vec!["configure", AGENT, "--expected-revision", "0"],
+            vec![
+                "configure",
+                AGENT,
+                "--expected-revision",
+                "stale",
+                "--clear-workspace-instructions",
+            ],
         ] {
             assert!(agent_dispatch(&args).is_err(), "accepted {args:?}");
         }

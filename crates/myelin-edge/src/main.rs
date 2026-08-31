@@ -1332,6 +1332,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         builder,
         agent_registry.clone(),
         agent_sessions.clone(),
+        kms.clone(),
         handle.clone(),
     );
     let inbox_store = Arc::new(PgInboxStore::new(provider.db_pool().clone()));
@@ -1408,7 +1409,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         builder,
         AgentMcpServices::new(
             AgentMcpAuthority::new(
-                agent_registry,
+                agent_registry.clone(),
                 agent_sessions.clone(),
                 check.run_token_minter().clone(),
                 Arc::new(run_token_authorizer),
@@ -1442,6 +1443,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         builder,
         AgentThreadHttpInputs {
             threads: agent_threads,
+            agents: agent_registry.clone(),
             chat_reads: mcp_chat.clone(),
             chat_mutations: agent_thread_chat_mutations,
             workspaces: agent_workspaces,

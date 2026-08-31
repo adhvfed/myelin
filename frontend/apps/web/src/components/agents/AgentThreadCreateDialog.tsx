@@ -26,6 +26,7 @@ export function AgentThreadCreateDialog(props: {
   agentsLoadingMore: boolean;
   onLoadMoreAgents: () => void;
   onActivateAgent: () => void;
+  onConfigureAgent: (agent: AgentChoice) => void;
   onClose: () => void;
   onCreated: (receipt: AgentThreadCreateReceipt) => void;
 }) {
@@ -47,6 +48,7 @@ export function AgentThreadCreateDialog(props: {
 
   const available = () => props.agents.filter((agent) =>
     agent.status === "active" && agent.runtime_ref === "external:mcp");
+  const selectedAgent = () => available().find((agent) => agent.id === agentId());
 
   createEffect(() => {
     openingGeneration += 1;
@@ -163,6 +165,23 @@ export function AgentThreadCreateDialog(props: {
             <For each={available()}>{(agent) => <option value={agent.id}>{agent.name}</option>}</For>
           </select>
         </label>
+        <Show when={selectedAgent()}>{(agent) => (
+          <div class="agent-thread-empty-choice">
+            <p class="agent-thread-note">
+              {agent().workspace_profile.instructions
+                ? `This agent carries private AGENTS.md defaults at revision ${agent().workspace_profile.revision}.`
+                : "This agent has no default workspace instructions yet."}
+            </p>
+            <button
+              type="button"
+              class="agent-thread-button secondary"
+              disabled={submitting()}
+              onClick={() => props.onConfigureAgent(agent())}
+            >
+              <Icon name="agent" /> Edit workspace defaults
+            </button>
+          </div>
+        )}</Show>
         <Show when={!props.agentsLoading && available().length === 0}>
           <div class="agent-thread-empty-choice">
             <p class="agent-thread-note">No active external agents are available.</p>

@@ -41,6 +41,7 @@ describe("private agent work from the CLI", () => {
     expect(await finish(login, approval)).toContain("Approved. Your CLI session is ready");
 
     const runMyelin = (...args: string[]) => runCli(configDirectory, ...args);
+    const initialAgentDefaults = "# CLI companion defaults\n\nStart from the durable workspace.";
     const activated = await runMyelin(
       "--json",
       "--idempotency-key",
@@ -56,6 +57,8 @@ describe("private agent work from the CLI", () => {
       "workspace.read_file",
       "--tool",
       "workspace.write_file",
+      "--workspace-instructions",
+      initialAgentDefaults,
     );
     expect(activated.exitCode, activated.stderr).toBe(0);
     const companion = record(
@@ -63,6 +66,28 @@ describe("private agent work from the CLI", () => {
       "activated private-work agent",
     );
     const companionId = string(companion.id, "activated private-work agent id");
+    expect(companion).toMatchObject({
+      workspace_profile: { revision: 1, instructions: { path: "AGENTS.md" } },
+    });
+    const revisedAgentDefaults = `${initialAgentDefaults}\nExplain the retry boundary.`;
+    const configured = await runMyelin(
+      "--json",
+      "--idempotency-key",
+      `cli-agent-config-${randomUUID()}`,
+      "agent",
+      "configure",
+      companionId,
+      "--expected-revision",
+      "1",
+      "--workspace-instructions",
+      revisedAgentDefaults,
+    );
+    expect(configured.exitCode, configured.stderr).toBe(0);
+    expect(JSON.parse(configured.stdout)).toMatchObject({
+      changed: true,
+      durable: true,
+      agent: { id: companionId, workspace_profile: { revision: 2 } },
+    });
 
     const threadName = uniqueName("Investigate checkout final-reader race");
     const personalInstructions = "# CLI owner workflow\n\nPreserve final readers before cleanup.";
@@ -176,6 +201,8 @@ describe("private agent work from the CLI", () => {
     expect(bridgeResponses).toHaveLength(3);
     expect(JSON.stringify(bridgeResponses[1])).toContain("# CLI owner workflow");
     expect(JSON.stringify(bridgeResponses[1])).toContain("Preserve final readers before cleanup.");
+    expect(JSON.stringify(bridgeResponses[1])).toContain("# CLI companion defaults");
+    expect(JSON.stringify(bridgeResponses[1])).toContain("Explain the retry boundary.");
     expect(record(bridgeResponses[2]?.result, "thread-bound MCP write result"))
       .toMatchObject({ isError: false, _meta: { tool: "workspace.write_file" } });
 

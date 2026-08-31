@@ -56,6 +56,15 @@ export interface ActivatedAgentEnvelope {
     selected_tools: Array<{ name: string; version: number; ref: string }>;
     effective_tools: Array<{ name: string; version: number; ref: string }>;
     grants: string[];
+    workspace_profile: {
+      revision: number;
+      instructions: {
+        path: string;
+        strategy: string;
+        content_digest: string;
+      } | null;
+      updated_at: string | null;
+    };
   };
   created: boolean;
   durable: boolean;
@@ -65,10 +74,17 @@ export async function activateExternalAgent(
   client: SystemTestClient,
   name: string,
   tools: string[],
+  options: { workspaceInstructions?: string } = {},
 ): Promise<ActivatedAgentEnvelope> {
   const response = await client.json("/v1/agents", {
     method: "POST",
-    body: { name, tools },
+    body: {
+      name,
+      tools,
+      ...(options.workspaceInstructions === undefined
+        ? {}
+        : { workspace_instructions: options.workspaceInstructions }),
+    },
     idempotencyKey: `agent-${randomUUID()}`,
     expectedStatus: 201,
   });

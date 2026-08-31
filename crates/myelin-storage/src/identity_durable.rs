@@ -151,6 +151,50 @@ pub const IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION: &str = "\
 CREATE INDEX CONCURRENTLY IF NOT EXISTS identity_agent_recent_list_idx
     ON identity_agent (tenant_id, region, created_at DESC, agent_id DESC);";
 
+pub const IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE identity_agent
+  ADD COLUMN IF NOT EXISTS workspace_guidance_revision bigint DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS workspace_guidance_digest text,
+  ADD COLUMN IF NOT EXISTS workspace_guidance_key_ref text,
+  ADD COLUMN IF NOT EXISTS workspace_guidance_nonce bytea,
+  ADD COLUMN IF NOT EXISTS workspace_guidance_ciphertext bytea,
+  ADD COLUMN IF NOT EXISTS workspace_guidance_updated_at timestamptz;
+ALTER TABLE identity_agent
+  DROP CONSTRAINT IF EXISTS identity_agent_workspace_guidance_shape;
+ALTER TABLE identity_agent
+  ADD CONSTRAINT identity_agent_workspace_guidance_shape CHECK (
+    workspace_guidance_revision IS NOT NULL
+    AND ((workspace_guidance_revision = 0
+      AND num_nonnulls(workspace_guidance_digest, workspace_guidance_key_ref,
+        workspace_guidance_nonce, workspace_guidance_ciphertext,
+        workspace_guidance_updated_at) = 0)
+      OR (workspace_guidance_revision > 0
+        AND workspace_guidance_updated_at IS NOT NULL
+        AND (num_nonnulls(workspace_guidance_digest, workspace_guidance_key_ref,
+              workspace_guidance_nonce, workspace_guidance_ciphertext) = 0
+          OR (workspace_guidance_digest ~ '^blake3:[0-9a-f]{64}$'
+            AND octet_length(workspace_guidance_key_ref) BETWEEN 1 AND 1024
+            AND octet_length(workspace_guidance_nonce) = 12
+            AND octet_length(workspace_guidance_ciphertext) BETWEEN 17 AND 12304))))
+  ) NOT VALID;
+"#;
+
+pub const IDENTITY_AGENT_WORKSPACE_PROFILE_BACKFILL_MIGRATION: &str = r#"
+UPDATE identity_agent
+   SET workspace_guidance_revision = 0,
+       workspace_guidance_digest = NULL,
+       workspace_guidance_key_ref = NULL,
+       workspace_guidance_nonce = NULL,
+       workspace_guidance_ciphertext = NULL,
+       workspace_guidance_updated_at = NULL
+ WHERE workspace_guidance_revision IS NULL;
+"#;
+
+pub const IDENTITY_AGENT_WORKSPACE_PROFILE_INVARIANT_MIGRATION: &str = r#"
+ALTER TABLE identity_agent
+  VALIDATE CONSTRAINT identity_agent_workspace_guidance_shape;
+"#;
+
 pub const AUTH_REPLAY_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS auth_replay (
     tenant_id text   NOT NULL,
@@ -297,6 +341,29 @@ pub fn identity_agent_recent_list_migrations() -> Migrations {
         MigrationPhase::Expand,
         "identity_agent",
     )])
+}
+
+pub fn identity_agent_workspace_profile_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0169_identity_agent_workspace_profile_expand",
+            IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION,
+            MigrationPhase::Expand,
+            "identity_agent",
+        ),
+        Migration::phased(
+            "0170_identity_agent_workspace_profile_backfill",
+            IDENTITY_AGENT_WORKSPACE_PROFILE_BACKFILL_MIGRATION,
+            MigrationPhase::Backfill,
+            "identity_agent",
+        ),
+        Migration::phased(
+            "0171_identity_agent_workspace_profile_invariant",
+            IDENTITY_AGENT_WORKSPACE_PROFILE_INVARIANT_MIGRATION,
+            MigrationPhase::Contract,
+            "identity_agent",
+        ),
+    ])
 }
 
 pub fn auth_replay_durable_migrations() -> Migrations {
@@ -1020,6 +1087,35 @@ mod recent_list_migration_tests {
             IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION,
             "tenant_id, region, created_at DESC, agent_id DESC",
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_workspace_profile_migration_tests {
+    use super::{
+        identity_agent_workspace_profile_migrations,
+        IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION,
+    };
+    use crate::{HotTables, MigrationPhase, OnlineMigrationRunner};
+
+    #[test]
+    fn agent_workspace_profile_is_an_online_encrypted_revisioned_receipt() {
+        let migrations = identity_agent_workspace_profile_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["identity_agent"]))
+            .expect("the live agent workspace-profile migration is online-safe");
+
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+        assert!(IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION.contains("bytea"));
+        assert!(IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION.contains("NOT VALID"));
+        assert!(IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION
+            .contains("workspace_guidance_revision bigint DEFAULT 0"));
+        assert!(IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION
+            .contains("workspace_guidance_revision > 0"));
     }
 }
 

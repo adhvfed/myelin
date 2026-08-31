@@ -14,6 +14,7 @@ use myelin_identity_service::{
 use myelin_storage::migration::HotTables;
 use myelin_storage::{all_durable_migrations, KmsEngine, SubstrateProvider, TenantScope};
 use myelin_tenancy::{Region, TenantId};
+use uuid::Uuid;
 
 fn test_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
@@ -82,10 +83,12 @@ fn activation(nonce: &str) -> NewAgent {
         "run.view".into(),
     ];
     NewAgent {
+        agent_id: Uuid::new_v4(),
         name: "Release companion".into(),
         runtime_ref: EXTERNAL_MCP_RUNTIME.into(),
         tools: vec!["ci.read_run.v1".into(), "git.open_pr.v1".into()],
         grants: grants.clone(),
+        workspace_guidance: None,
         tenant_policy_if_missing: grants.clone(),
         trigger_actor_policy_if_missing: grants,
         client_nonce: nonce.into(),
