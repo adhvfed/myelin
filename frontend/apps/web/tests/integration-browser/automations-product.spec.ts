@@ -35,45 +35,35 @@ test("an automation owner governs durable agent work without configuring an inte
   const project = createdProject.project as JsonObject;
   const projectId = String(project.id);
   expect(projectId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
-  const createdAgent = await post(request, "/v1/agents", {
-    name: `ownership-companion-${suffix}`,
-    runtime: "hosted",
-    tools: ["ci.read_run"],
-  }, { ...owner, status: 201 });
-  const agent = createdAgent.agent as JsonObject;
-  const agentId = String(agent.id);
-  expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
-
-  const createdAutomation = await post(request, "/v1/triggers", {
-    event_type: "issue.issue.created",
-    run_as_agent_id: agentId,
-    task,
-    budget_minor_units: 125_000,
-    max_firings: 8,
-    max_causal_depth: 3,
-    delegation_caveats: ["run.view"],
-    require_human_approval: true,
-  }, { ...owner, status: 201 });
-  const automation = (createdAutomation.trigger as JsonObject);
-  const automationId = String(automation.id);
-  expect(automationId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
-  const secondTask = `Summarise a separate ownership change for ${suffix}.`;
-  const createdSecondAutomation = await post(request, "/v1/triggers", {
-    event_type: "issue.issue.created",
-    run_as_agent_id: agentId,
-    task: secondTask,
-    budget_minor_units: 125_000,
-    max_firings: 8,
-    max_causal_depth: 3,
-    delegation_caveats: ["run.view"],
-    require_human_approval: true,
-  }, { ...owner, status: 201 });
-  const secondAutomation = createdSecondAutomation.trigger as JsonObject;
-  const secondAutomationId = String(secondAutomation.id);
-  expect(secondAutomationId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  const agentName = `ownership-companion-${suffix}`;
 
   await signIn(page);
-  await page.getByRole("link", { name: "Automations" }).click();
+  await page.getByRole("link", { name: "Agents" }).click();
+  await page.waitForURL("**/agents");
+  await page.getByRole("button", { name: "Activate an agent" }).click();
+  const activation = page.getByRole("dialog", { name: "Activate named agent" });
+  await activation.getByRole("textbox", { name: "Agent name" }).fill(agentName);
+  await activation.getByRole("combobox", { name: "Runtime" }).selectOption("hosted");
+  await activation.getByRole("button", { name: "Activate agent" }).click();
+  await expect(activation).toBeHidden();
+  const activatedRoster = page.getByRole("dialog", { name: "My named agents" });
+  await expect(activatedRoster.getByRole("listitem").filter({ hasText: agentName }))
+    .toContainText("active · hosted");
+  await activatedRoster.getByRole("button", { name: "Close", exact: true }).click();
+
+  await page.getByLabel("Primary").getByRole("link", { name: "Automations" }).click();
+  await page.waitForURL("**/automations");
+  const firstAutomation = await createAutomationInBrowser(page, agentName, task);
+  const automationId = firstAutomation.id;
+  const automationRef = firstAutomation.ref;
+  const secondTask = `Summarise a separate ownership change for ${suffix}.`;
+  await page.getByLabel("Primary").getByRole("link", { name: "Automations" }).click();
+  await page.waitForURL("**/automations");
+  const secondAutomation = await createAutomationInBrowser(page, agentName, secondTask);
+  const secondAutomationId = secondAutomation.id;
+  const secondAutomationRef = secondAutomation.ref;
+
+  await page.getByLabel("Primary").getByRole("link", { name: "Automations" }).click();
   await page.waitForURL("**/automations");
   const row = page.getByTestId("automation-row").filter({ hasText: task });
   await expect(row).toBeVisible();
@@ -85,7 +75,7 @@ test("an automation owner governs durable agent work without configuring an inte
   await page.waitForURL(`**/automations/${automationId}`);
   await expect(page.getByRole("heading", { level: 1, name: task })).toBeVisible();
   await expect(page.getByRole("button", { name: "Copy reference" }))
-    .toHaveAttribute("title", String(automation.ref));
+    .toHaveAttribute("title", automationRef);
   await expect(page.getByText("Required", { exact: true })).toBeVisible();
   await expect(page.getByText("Refused", { exact: true })).toBeVisible();
   await expect(page.getByText("No matching events have reserved work yet.")).toBeVisible();
@@ -152,7 +142,11 @@ test("an automation owner governs durable agent work without configuring an inte
   await expect(page.getByTitle("State: Active")).toBeVisible();
   await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Copy reference" }))
-    .toHaveAttribute("title", String(secondAutomation.ref));
+    .toHaveAttribute("title", secondAutomationRef);
+  await page.getByRole("button", { name: "Disable" }).click();
+  await page.getByRole("alertdialog", { name: "Disable this automation?" })
+    .getByRole("button", { name: "Disable automation" }).click();
+  await expect(page.getByTitle("State: Disabled")).toBeVisible();
 
   await page.goBack();
   await page.waitForURL(`**/automations/${automationId}`);
@@ -163,7 +157,41 @@ test("an automation owner governs durable agent work without configuring an inte
   await waitForAppHydration(page);
   await expect(page.getByTitle("State: Disabled")).toBeVisible();
   await expectAccessible(page, "disabled automation detail");
+
+  await page.getByRole("link", { name: "Agents" }).click();
+  await page.waitForURL("**/agents");
+  await page.getByRole("button", { name: "Manage my agents" }).click();
+  const cleanupRoster = page.getByRole("dialog", { name: "My named agents" });
+  const cleanupAgent = cleanupRoster.getByRole("listitem").filter({ hasText: agentName });
+  await cleanupAgent.getByRole("button", { name: "Retire" }).click();
+  await page.getByRole("alertdialog", { name: `Retire ${agentName}?` })
+    .getByRole("button", { name: "Retire agent" }).click();
+  await expect(cleanupAgent).toContainText("Retired permanently");
 });
+
+async function createAutomationInBrowser(
+  page: Page,
+  agentName: string,
+  task: string,
+): Promise<{ id: string; ref: string }> {
+  await page.getByRole("button", { name: "New automation" }).click();
+  const dialog = page.getByRole("dialog", { name: "Create governed automation" });
+  await dialog.getByRole("combobox", { name: "Run as hosted agent" })
+    .selectOption({ label: agentName });
+  await dialog.getByRole("combobox", { name: "Platform event" }).fill("issue.issue.created");
+  await dialog.getByRole("textbox", { name: "Agent task" }).fill(task);
+  await dialog.getByRole("spinbutton", { name: "Budget per firing · minor units" }).fill("125000");
+  await dialog.getByRole("spinbutton", { name: "Maximum firings" }).fill("8");
+  await expect(dialog.getByRole("checkbox", { name: "Require a human approval" })).toBeChecked();
+  await dialog.getByRole("button", { name: "Create automation" }).click();
+  await page.waitForURL(/\/automations\/[0-9a-f-]{36}$/);
+  const id = new URL(page.url()).pathname.split("/").at(-1) ?? "";
+  expect(id).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+  await expect(page.getByRole("heading", { level: 1, name: task })).toBeVisible();
+  const ref = await page.getByRole("button", { name: "Copy reference" }).getAttribute("title");
+  expect(ref).toMatch(/^myelin:\/\//);
+  return { id, ref: ref! };
+}
 
 async function createIssueEvent(
   request: Parameters<typeof post>[0],

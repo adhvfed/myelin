@@ -19,12 +19,17 @@ therefore consumed and acknowledged the event while the automation silently skip
 visibility now authorizes the canonical subject identity directly through the same live Identity
 relationship check used by the rest of the consumer; it no longer performs an invalid key lookup.
 
-The Chromium product journey creates two real issues through Edge's asynchronous authorization
-boundary, crosses PostgreSQL outbox publication and NATS trigger dispatch, observes both incoming
-firings in the open page, approves one, confirms rejection of the other, and reloads their retained
-decisions before completing pause, resume, disable, and identity teardown. Proof also includes all
-120 Agent Service integration-feature unit tests, strict Agent Service clippy, all 674 web unit
-tests, TypeScript checking, lint, and the production build.
+The Chromium product journey now activates its hosted identity and creates both governed rules
+through the visible browser dialogs instead of seeding them through test-side trigger APIs. It then
+creates two real issues through Edge's asynchronous authorization boundary, crosses PostgreSQL
+outbox publication and NATS trigger dispatch, observes both incoming firings in the open page,
+approves one, confirms rejection of the other, and reloads their retained decisions before
+completing pause, resume, disable, and identity teardown. An approved hosted run is allowed to reach
+its real terminal state; its failure or result detail no longer replaces the durable human decision
+in the row. Apart from authentication and prerequisite project setup, direct HTTP is used only to
+produce the real platform events under test. Proof also includes all 120 Agent Service
+integration-feature unit tests, strict Agent Service clippy, all 674 web unit tests, TypeScript
+checking, lint, and the production build.
 
 ## 2026-08-31 — Automation creation searches the complete private agent catalogue
 

@@ -300,6 +300,14 @@ function FiringRow(props: { automationId: string; firing: AutomationFiringVM }) 
       <span class="automation-firing-main">
         <code>{firing().event_id}</code>
         <span>{firingDetail(firing())}</span>
+        <Show when={firing().approval}>
+          {(approval) => (
+            <span class="automation-firing-decision">
+              <Icon name={approval().decision === "approved" ? "check-pass" : "close"} />
+              {approval().decision} by {approval().decided_by}
+            </span>
+          )}
+        </Show>
         <Show when={firing().state === "awaiting_approval"}>
           <span class="automation-firing-actions">
             <button
@@ -351,8 +359,11 @@ function FiringRow(props: { automationId: string; firing: AutomationFiringVM }) 
 
 function firingDetail(firing: AutomationFiringVM): string {
   if (firing.terminal_reason) return firing.terminal_reason;
-  if (firing.approval) return `${firing.approval.decision} by ${firing.approval.decided_by}`;
   if (firing.state === "awaiting_approval") return "Waiting for its owner’s decision";
+  if (firing.approval?.decision === "approved") {
+    return `Hosted work is ${firing.state.replaceAll("_", " ")}`;
+  }
+  if (firing.approval?.decision === "rejected") return "Hosted work did not start";
   return "No human decision required";
 }
 
