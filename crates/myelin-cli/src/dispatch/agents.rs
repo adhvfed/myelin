@@ -20,7 +20,7 @@ pub fn agent_dispatch_with_project(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent command given (try: create <name> --tool <name> [--workspace-instructions <markdown>] | rename <id> <name> --expected-name <name> | configure <id> --expected-revision <n> (--workspace-instructions <markdown> | --clear-workspace-instructions) | list | show <id> | thread start|renew|ready|retry|list|show | approve|reject <gate>)".into(),
+            "no agent command given (try: create <name> --tool <name> [--workspace-instructions <markdown>] | rename <id> <name> --expected-name <name> | configure <id> --expected-revision <n> (--workspace-instructions <markdown> | --clear-workspace-instructions) | list | show <id> | thread start|renew|ready|pull-request|retry|list|show | approve|reject <gate>)".into(),
         )
     })?;
     match *verb {

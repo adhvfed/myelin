@@ -8,6 +8,9 @@ use super::{CliError, EdgeCall, FormQuery, HttpMethod, RetryPolicy};
 
 const DEFAULT_RETENTION_DAYS: u8 = 3;
 const MAX_RETENTION_DAYS: u8 = 30;
+const MAX_PULL_REQUEST_TITLE_BYTES: usize = 512;
+const MAX_PULL_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_PULL_REQUEST_REVIEWERS: usize = 100;
 
 pub(super) fn agent_thread_dispatch(
     args: &[&str],
@@ -15,7 +18,7 @@ pub(super) fn agent_thread_dispatch(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent thread command given (try: start <name> --agent <id> [--repository <slug>] [--instructions <markdown>] | renew <id> --retention-days <days> | ready <id> | retry <id> | list | show <id> | say <id> <message> | history <id>)"
+            "no agent thread command given (try: start <name> --agent <id> [--repository <slug>] [--instructions <markdown>] | renew <id> --retention-days <days> | ready <id> | pull-request <id> [--title <title>] [--body <markdown>] [--reviewer <principal>] | retry <id> | list | show <id> | say <id> <message> | history <id>)"
                 .into(),
         )
     })?;
@@ -23,6 +26,7 @@ pub(super) fn agent_thread_dispatch(
         "start" => start_call(rest, default_project),
         "renew" => renew_call(rest),
         "ready" => ready_call(rest),
+        "pull-request" => pull_request_call(rest),
         "retry" => retry_call(rest),
         "list" => list_call(rest),
         "show" => show_call(rest),
@@ -241,6 +245,86 @@ fn ready_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     Ok(EdgeCall::post_retry_safe_json(
         format!("/v1/agent-threads/{id}/ready"),
         json!({}),
+    ))
+}
+
+fn pull_request_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let Some((id, flags)) = args.split_first() else {
+        return Err(CliError::Usage(
+            "agent thread pull-request needs a thread id".into(),
+        ));
+    };
+    require_agent_id("agent thread id", id)?;
+    let mut title = None;
+    let mut body = None;
+    let mut reviewers = Vec::new();
+    let mut index = 0;
+    while index < flags.len() {
+        match flags[index] {
+            "--title" if title.is_none() => {
+                title = Some(flag_value(flags, &mut index, "--title")?);
+            }
+            "--title" => {
+                return Err(CliError::Usage(
+                    "agent thread pull-request accepts --title only once".into(),
+                ));
+            }
+            "--body" if body.is_none() => {
+                body = Some(flag_value(flags, &mut index, "--body")?);
+            }
+            "--body" => {
+                return Err(CliError::Usage(
+                    "agent thread pull-request accepts --body only once".into(),
+                ));
+            }
+            "--reviewer" => {
+                if reviewers.len() == MAX_PULL_REQUEST_REVIEWERS {
+                    return Err(CliError::Usage(format!(
+                        "agent thread pull-request accepts at most {MAX_PULL_REQUEST_REVIEWERS} reviewers"
+                    )));
+                }
+                reviewers.push(flag_value(flags, &mut index, "--reviewer")?);
+            }
+            token => {
+                return Err(CliError::Usage(format!(
+                    "unknown agent thread pull-request flag `{token}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if let Some(title) = title {
+        validate_workspace_text("pull-request title", title, MAX_PULL_REQUEST_TITLE_BYTES)?;
+    }
+    if let Some(body) = body {
+        if body.is_empty() || body.len() > MAX_PULL_REQUEST_BODY_BYTES || body.contains('\0') {
+            return Err(CliError::Usage(format!(
+                "agent thread pull-request body must contain 1..={MAX_PULL_REQUEST_BODY_BYTES} UTF-8 bytes and no NUL characters"
+            )));
+        }
+    }
+    let mut distinct_reviewers = std::collections::BTreeSet::new();
+    for reviewer in &reviewers {
+        validate_workspace_text("pull-request reviewer", reviewer, 255)?;
+        if !distinct_reviewers.insert(*reviewer) {
+            return Err(CliError::Usage(format!(
+                "agent thread pull-request repeats reviewer `{reviewer}`"
+            )));
+        }
+    }
+    let mut payload = json!({});
+    if let Some(title) = title {
+        payload["title"] = json!(title);
+    }
+    if let Some(body) = body {
+        payload["body_md"] = json!(body);
+    }
+    if !reviewers.is_empty() {
+        payload["reviewers"] = json!(reviewers);
+    }
+    Ok(EdgeCall::post_json(
+        format!("/v1/agent-threads/{id}/pull-request"),
+        payload,
     ))
 }
 
@@ -472,6 +556,35 @@ mod tests {
         assert_eq!(ready.retry_policy, RetryPolicy::None);
         assert_eq!(ready.payload.as_deref(), Some(b"{}".as_slice()));
 
+        let pull_request = agent_dispatch(&[
+            "thread",
+            "pull-request",
+            THREAD,
+            "--title",
+            "Review the cloud branch",
+            "--body",
+            "Ready for a human review.\n\nPrivate context stays private.",
+            "--reviewer",
+            "human:grace",
+            "--reviewer",
+            "human:linus",
+        ])
+        .unwrap();
+        assert_eq!(
+            pull_request.path,
+            format!("/v1/agent-threads/{THREAD}/pull-request")
+        );
+        assert_eq!(pull_request.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(pull_request.payload.as_ref().unwrap())
+                .unwrap(),
+            json!({
+                "title": "Review the cloud branch",
+                "body_md": "Ready for a human review.\n\nPrivate context stays private.",
+                "reviewers": ["human:grace", "human:linus"],
+            })
+        );
+
         let say = agent_dispatch(&[
             "thread",
             "say",
@@ -533,6 +646,19 @@ mod tests {
             vec!["thread", "renew", THREAD, "--retention-days", "030"],
             vec!["thread", "ready"],
             vec!["thread", "ready", "not-a-thread"],
+            vec!["thread", "pull-request"],
+            vec!["thread", "pull-request", "not-a-thread"],
+            vec!["thread", "pull-request", THREAD, "--title", "  "],
+            vec!["thread", "pull-request", THREAD, "--body", ""],
+            vec![
+                "thread",
+                "pull-request",
+                THREAD,
+                "--reviewer",
+                "human:grace",
+                "--reviewer",
+                "human:grace",
+            ],
             vec!["thread", "say", THREAD],
             vec!["thread", "say", THREAD, "  "],
             vec!["thread", "history"],

@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Remote-editor work can reach review without leaving the CLI
+
+The safe cloud-branch handoff existed in the workspace pane and Edge, but the CLI stopped after
+marking the conversation ready. `myelin agent thread pull-request` now accepts one canonical thread,
+optional bounded title and Markdown body, and up to one hundred distinct clean reviewer identities.
+It uses the ordinary caller-supplied idempotency key, opens the same durable handoff as the web, and
+renders whether it created or reloaded the pull request together with its exact branch, commit, and
+copyable `myelin git pr view` command. Ready repository threads point directly to that next action.
+Malformed identities, repeated reviewers, oversized text, duplicate flags, and NUL-bearing bodies
+fail before transport.
+
+The readable TypeScript CLI journey now creates a real repository-backed personalized cloud branch,
+logs in by device approval, configures a named agent, works through thread-bound MCP, SSH, SFTP, and
+a generated OpenSSH editor profile, commits the files produced by those sessions, marks the thread
+ready, and opens a pull request with a named reviewer. It reads a committed file back from the
+published durable branch, loads the exact PR from Edge, and replays the same CLI intent to the same
+PR. The journey passed against live PostgreSQL, durable Git, Edge, Chat/ReBAC, agent service,
+workspace gateway, gVisor, and the real CLI binary. All 165 CLI unit tests, strict Clippy, and the
+system-test TypeScript check also pass.
+
 ## 2026-09-01 — A private cloud branch becomes one safe, durable pull request
 
 Marking agent work ready made its conversation reviewable, but the code still existed only inside

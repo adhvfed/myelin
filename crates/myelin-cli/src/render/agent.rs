@@ -8,6 +8,9 @@ use crate::dispatch::{is_canonical_agent_id, EdgeCall};
 use super::{query_field, terminal_safe_single_line};
 
 pub(super) fn render_response(value: &Value, call: Option<&EdgeCall>) -> Option<String> {
+    if let Some(handoff) = value.get("handoff") {
+        return render_review_handoff(value, handoff);
+    }
     if let Some(thread) = value.get("thread") {
         return render_thread_response(value, thread, call);
     }
@@ -65,6 +68,35 @@ pub(super) fn render_response(value: &Value, call: Option<&EdgeCall>) -> Option<
         "\n  Durable identity and policy are ready; no long-lived API key was created.\n",
     );
     Some(output)
+}
+
+fn render_review_handoff(value: &Value, handoff: &Value) -> Option<String> {
+    if value.get("durable").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let repository = terminal_safe_single_line(handoff.get("repository")?.as_str()?);
+    let head_ref = terminal_safe_single_line(handoff.get("head_ref")?.as_str()?);
+    let head_oid = handoff.get("head_oid")?.as_str()?;
+    if head_oid.len() != 40
+        || !head_oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let pull_request = handoff.get("pull_request")?;
+    let number = pull_request.get("number")?.as_u64()?;
+    if number == 0 {
+        return None;
+    }
+    let disposition = match value.get("created").and_then(Value::as_bool) {
+        Some(true) => "Opened pull request",
+        Some(false) => "Pull request already open",
+        None => "Pull request",
+    };
+    Some(format!(
+        "{disposition}: {repository}#{number}\n  branch: {head_ref}\n  commit: {head_oid}\n  view: myelin git pr view {repository} {number}\n"
+    ))
 }
 
 fn render_lifecycle(value: &Value, action: &str, agent: &Value, summary: String) -> Option<String> {
@@ -203,6 +235,15 @@ fn render_thread_response(
             let _ = writeln!(output, "  share for review: myelin agent thread ready {id}");
         } else if review_state == "ready" {
             output.push_str("  review: visible to current project collaborators; workspace control remains yours.\n");
+            if workspace
+                .get("repository")
+                .is_some_and(|repository| !repository.is_null())
+            {
+                let _ = writeln!(
+                    output,
+                    "  publish code: myelin --idempotency-key <key> agent thread pull-request {id}"
+                );
+            }
         }
     } else if matches!(state.as_str(), "failed" | "provisioning")
         && DateTime::parse_from_rfc3339(&expires_at).is_ok_and(|deadline| deadline > Utc::now())
@@ -480,6 +521,12 @@ mod tests {
         published["project_id"] = json!("33333333-3333-3333-3333-333333333333");
         published["review_state"] = json!("ready");
         published["review_ready_at"] = json!("2026-08-22T13:00:00Z");
+        published["workspace"]["repository"] = json!({
+            "slug": "platform/api",
+            "base_ref": "refs/heads/main",
+            "base_oid": "b".repeat(40),
+            "branch": "myelin/thread-0123456789abcdef0123",
+        });
         let rendered = render_response(
             &json!({
                 "thread": published,
@@ -491,6 +538,7 @@ mod tests {
         .unwrap();
         assert!(rendered.starts_with("Published agent thread for review:"));
         assert!(rendered.contains("workspace control remains yours"));
+        assert!(rendered.contains(&format!("agent thread pull-request {THREAD_ID}")));
 
         let mut expiring = thread();
         expiring["workspace"]["state"] = json!("expiring");
@@ -511,6 +559,41 @@ mod tests {
         assert!(!rendered.contains("myelin agent thread say"));
         assert!(!rendered.contains("myelin agent thread ssh"));
         assert!(!rendered.contains("myelin mcp serve"));
+    }
+
+    #[test]
+    fn review_handoff_is_a_safe_exact_cli_receipt() {
+        let receipt = json!({
+            "handoff": {
+                "thread_id": THREAD_ID,
+                "repository": "platform/api",
+                "base_ref": "refs/heads/main",
+                "head_ref": "refs/heads/myelin/thread-0123456789abcdef0123",
+                "head_oid": "a".repeat(40),
+                "pull_request": {
+                    "number": 42,
+                    "ref": "myelin://acme/git/pr/platform/api:42",
+                },
+                "created_at": "2026-08-22T13:00:00Z",
+            },
+            "created": true,
+            "durable": true,
+        });
+        let rendered = render_response(&receipt, None).unwrap();
+        assert_eq!(
+            rendered,
+            format!(
+                "Opened pull request: platform/api#42\n  branch: refs/heads/myelin/thread-0123456789abcdef0123\n  commit: {}\n  view: myelin git pr view platform/api 42\n",
+                "a".repeat(40)
+            )
+        );
+        let mut replay = receipt;
+        replay["created"] = json!(false);
+        assert!(render_response(&replay, None)
+            .unwrap()
+            .starts_with("Pull request already open:"));
+        replay["handoff"]["head_oid"] = json!("not-an-oid");
+        assert!(render_response(&replay, None).is_none());
     }
 
     #[test]

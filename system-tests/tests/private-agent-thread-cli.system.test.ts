@@ -9,7 +9,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { systemTestConfig } from "../src/config.js";
 import { systemClient, uniqueName } from "../src/context.js";
-import { record, string } from "../src/json.js";
+import { GitProject } from "../src/git-project.js";
+import { integer, record, string } from "../src/json.js";
 import { finish, runCli, runCliWith, startCli, waitForCode } from "../src/myelin-cli.js";
 import {
   generateEphemeralSshKey,
@@ -51,6 +52,13 @@ describe("private agent work from the CLI", () => {
     expect(await finish(login, approval)).toContain("Approved. Your CLI session is ready");
 
     const runMyelin = (...args: string[]) => runCli(configDirectory, ...args);
+    const repository = new GitProject(uniqueName("cli-private-cloud-branch"), systemClient);
+    await repository.create();
+    await repository.writeFile(
+      "main",
+      "README.md",
+      "# CLI private cloud branch\n\nWork privately, then publish the committed result.\n",
+    );
     const initialAgentDefaults = "# CLI companion defaults\n\nStart from the durable workspace.";
     const initialAgentName = uniqueName("CLI checkout companion");
     const activated = await runMyelin(
@@ -139,6 +147,10 @@ describe("private agent work from the CLI", () => {
       companionId,
       "--retention-days",
       "3",
+      "--project",
+      systemTestConfig.issues.projectId,
+      "--repository",
+      repository.slug,
       "--instructions",
       personalInstructions,
     );
@@ -151,9 +163,15 @@ describe("private agent work from the CLI", () => {
     expect(thread).toMatchObject({
       name: threadName,
       agent_id: companionId,
+      project_id: systemTestConfig.issues.projectId,
       workspace: {
         state: "ready",
         retention_days: 3,
+        repository: {
+          slug: repository.slug,
+          base_ref: "refs/heads/main",
+          branch: expect.stringMatching(/^myelin\/thread-[0-9a-f]{20}$/),
+        },
         personalization: {
           format: "workspace_augmentation_v1",
           content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
@@ -409,6 +427,84 @@ describe("private agent work from the CLI", () => {
       maxBuffer: 512 * 1024,
     });
 
+    const committed = await runMyelin(
+      "agent",
+      "thread",
+      "ssh",
+      threadId,
+      "--command",
+      "git config user.name 'Myelin CLI developer' && git config user.email 'cli@myelin.invalid' && git add notes && git commit -m 'Prepare CLI workspace for review'",
+    );
+    expect(committed.exitCode, committed.stderr).toBe(0);
+    expect(committed.stdout).toContain("Prepare CLI workspace for review");
+
+    const ready = await runMyelin("agent", "thread", "ready", threadId);
+    expect(ready.exitCode, ready.stderr).toBe(0);
+    expect(ready.stdout).toContain("Published agent thread for review");
+    expect(ready.stdout).toContain(`agent thread pull-request ${threadId}`);
+
+    const handoffKey = `cli-private-review-${randomUUID()}`;
+    const reviewTitle = uniqueName("Review CLI private cloud work");
+    const publishArgs = [
+      "agent",
+      "thread",
+      "pull-request",
+      threadId,
+      "--title",
+      reviewTitle,
+      "--body",
+      "The developer finished the private editor session and explicitly published the committed branch.",
+      "--reviewer",
+      systemTestConfig.reviewerPrincipal,
+    ];
+    const published = await runMyelin(
+      "--json",
+      "--idempotency-key",
+      handoffKey,
+      ...publishArgs,
+    );
+    expect(published.exitCode, published.stderr).toBe(0);
+    const reviewReceipt = record(JSON.parse(published.stdout), "CLI review handoff");
+    const handoff = record(reviewReceipt.handoff, "CLI review handoff receipt");
+    const pullRequest = record(handoff.pull_request, "CLI review pull request");
+    const pullRequestNumber = integer(pullRequest.number, "CLI review pull request number");
+    const workspaceRepository = record(
+      record(thread.workspace, "created private workspace").repository,
+      "created private workspace repository",
+    );
+    const branch = string(workspaceRepository.branch, "private workspace branch");
+    expect(reviewReceipt).toMatchObject({
+      created: true,
+      durable: true,
+      handoff: {
+        thread_id: threadId,
+        repository: repository.slug,
+        head_ref: `refs/heads/${branch}`,
+        head_oid: expect.stringMatching(/^[0-9a-f]{40}$/),
+      },
+    });
+    expect((await repository.readFile(branch, "notes/from-cli.txt")).contents).toBe(observation);
+    expect((await systemClient.json(`${repository.path}/prs/${pullRequestNumber}`)).body)
+      .toMatchObject({
+        number: pullRequestNumber,
+        title: reviewTitle,
+        head_ref: `refs/heads/${branch}`,
+        head_oid: handoff.head_oid,
+      });
+
+    const replayedReview = await runMyelin(
+      "--idempotency-key",
+      handoffKey,
+      ...publishArgs,
+    );
+    expect(replayedReview.exitCode, replayedReview.stderr).toBe(0);
+    expect(replayedReview.stdout).toContain(
+      `Pull request already open: ${repository.slug}#${pullRequestNumber}`,
+    );
+    expect(replayedReview.stdout).toContain(
+      `myelin git pr view ${repository.slug} ${pullRequestNumber}`,
+    );
+
     for (const result of [
       activated,
       renamed,
@@ -424,6 +520,10 @@ describe("private agent work from the CLI", () => {
       resumedWorkspace,
       transferredWorkspace,
       configuredEditor,
+      committed,
+      ready,
+      published,
+      replayedReview,
     ]) {
       expect(result.stdout).not.toContain(systemTestConfig.token);
       expect(result.stderr).not.toContain(systemTestConfig.token);
