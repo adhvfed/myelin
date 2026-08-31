@@ -5,13 +5,13 @@ use myelin_config::MyelinConfig;
 use myelin_events::IdMinter;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
-    all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadExpiryCompletion,
-    AgentThreadExpiryFailure, AgentThreadProvisioningFailure, BindAgentThreadRunOutcome,
-    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
-    ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant,
-    NewWorkspaceSshSession, RetryAgentThreadOutcome, SealKey, SubstrateProvider,
-    WorkspaceSessionMode, WorkspaceSshRouteKey, AGENT_THREAD_EXPIRY_GRACE_SECONDS,
-    WORKSPACE_SSH_SESSION_STARTED,
+    all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadActivation,
+    AgentThreadExpiryCompletion, AgentThreadExpiryFailure, AgentThreadProvisioningFailure,
+    BindAgentThreadRunOutcome, CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome,
+    DurableAgentThreadBacking, HotTables, ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome,
+    NewAgentThread, NewWorkspaceSshGrant, NewWorkspaceSshSession, RetryAgentThreadOutcome, SealKey,
+    SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
+    AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
 };
 use sqlx::types::Uuid;
 
@@ -301,9 +301,12 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
                 &tenant,
                 owner,
                 intended.thread_id,
-                intended.workspace_id,
-                &intended.conversation_id,
-                "workspace://local/101",
+                AgentThreadActivation {
+                    workspace_id: intended.workspace_id,
+                    conversation_id: intended.conversation_id.clone(),
+                    storage_locator: "workspace://local/101".into(),
+                    environment: None,
+                },
             )
             .await
             .unwrap(),
@@ -444,9 +447,12 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             &tenant,
             owner,
             intended.thread_id,
-            Uuid::from_u128(999),
-            &intended.conversation_id,
-            "workspace://local/wrong",
+            AgentThreadActivation {
+                workspace_id: Uuid::from_u128(999),
+                conversation_id: intended.conversation_id.clone(),
+                storage_locator: "workspace://local/wrong".into(),
+                environment: None,
+            },
         )
         .await
         .unwrap();
@@ -457,9 +463,12 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             &tenant,
             owner,
             intended.thread_id,
-            intended.workspace_id,
-            &intended.conversation_id,
-            "workspace://local/101",
+            AgentThreadActivation {
+                workspace_id: intended.workspace_id,
+                conversation_id: intended.conversation_id.clone(),
+                storage_locator: "workspace://local/101".into(),
+                environment: None,
+            },
         )
         .await
         .unwrap();
@@ -583,9 +592,12 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
                 &tenant,
                 owner,
                 intended.thread_id,
-                intended.workspace_id,
-                &intended.conversation_id,
-                "workspace://local/101",
+                AgentThreadActivation {
+                    workspace_id: intended.workspace_id,
+                    conversation_id: intended.conversation_id.clone(),
+                    storage_locator: "workspace://local/101".into(),
+                    environment: None,
+                },
             )
             .await
             .unwrap(),

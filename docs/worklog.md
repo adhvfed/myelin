@@ -4,6 +4,32 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — A cloud branch carries its exact environment declaration
+
+Repository-backed private work now discovers a root `fed.yaml` at the exact source commit, records
+its BLAKE3 content digest with the durable thread, and exposes the binding as a `declared` Service
+Federation environment. Discovery reads the pinned Git tree rather than the mutable checkout or
+current trunk, accepts only a bounded regular UTF-8 file, and never executes repository content.
+Idempotent creation, list, fetch, and retry therefore describe the same environment input even
+after trunk changes.
+
+Migrations `0160`–`0162` add the provider, path, and digest as one all-or-nothing repository-bound
+receipt through an online expand/backfill/contract cycle. The public shape deliberately says
+`declared`, not `ready`: Myelin does not run `fed` with host Docker authority. The next activation
+boundary belongs behind a hardened environment provisioner with status, logs, TTL teardown, and
+network policy; Service Federation's proposed `fedd` API is the natural seam, but that daemon is
+not yet implemented in Service Federation Cloud.
+
+The readable TypeScript cloud-branch journey creates a real repository with `README.md` and
+`fed.yaml`, starts private work, advances both files on trunk, replays the request, and proves the
+thread retains the original commit and manifest digest. A scoped agent reads the original manifest
+and executes Git in the gVisor workspace to verify the exact branch, commit, and origin. All four
+private-work stories passed against running Edge, PostgreSQL, durable Git, the agent service, and
+gVisor. The exact-checkout unit story hashes a real Git blob, the online migration guard accepts the
+three-phase change, and the live durable-thread lifecycle plus production migration-checksum audit
+pass. All 842 affected Rust library tests pass, strict all-target Clippy is clean, and the TypeScript
+system suite typechecks.
+
 ## 2026-08-31 — A standard editor can change private workspace files over confined SFTP
 
 SSH multiplexing supplied the channel shape remote tools need, but the gateway still rejected the
@@ -4908,6 +4934,10 @@ stories passed, strict all-target Clippy was clean, and the TypeScript system su
     command/store, environment administration API, publisher, authenticated
     browser journey, or rollback executor. The former in-memory approval map
     and draft constructors were removed rather than counted as that product.
+    Private repository work can now bind and expose the exact digest of a root
+    `fed.yaml`, but it truthfully remains `declared`: no hardened provisioner,
+    environment lifecycle, status/log stream, network policy, or TTL teardown is
+    connected yet, and Myelin does not execute it with host Docker authority.
 22. **Storage has no product-wide priority admission boundary.** The composed
     OLTP pool enforces global and per-tenant connection permits, but PostgreSQL,
     blob, and owner-store operations do not share a human/agent/CI/speculative

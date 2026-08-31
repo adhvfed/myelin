@@ -156,11 +156,12 @@ pub use restore_verify::{
 pub use rls::{RlsError, TenantQuery, TenantScope, TenantTable};
 
 pub use agent_thread_durable::{
-    agent_thread_durable_migrations, agent_thread_file_transfer_migrations,
-    agent_thread_git_binding_migrations, agent_thread_publication_migrations,
-    agent_thread_recent_list_migrations, agent_thread_session_launch_migrations,
-    agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
-    ActivateAgentThreadOutcome, AgentThreadExpiry, AgentThreadExpiryCompletion,
+    agent_thread_durable_migrations, agent_thread_environment_migrations,
+    agent_thread_file_transfer_migrations, agent_thread_git_binding_migrations,
+    agent_thread_publication_migrations, agent_thread_recent_list_migrations,
+    agent_thread_session_launch_migrations, agent_thread_ssh_connection_migrations,
+    agent_thread_ssh_single_use_migrations, ActivateAgentThreadOutcome, AgentThreadActivation,
+    AgentThreadEnvironmentBinding, AgentThreadExpiry, AgentThreadExpiryCompletion,
     AgentThreadExpiryFailure, AgentThreadGitBinding, AgentThreadProvisioningFailure,
     AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
     CreateWorkspaceSshGrantOutcome, DurableAgentThread, DurableAgentThreadBacking,

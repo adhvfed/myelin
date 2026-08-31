@@ -295,6 +295,37 @@ ALTER TABLE agent_thread_workspace_session
   DROP CONSTRAINT IF EXISTS agent_thread_workspace_session_session_mode_check;
 "#;
 
+pub const AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  ADD COLUMN IF NOT EXISTS environment_provider text,
+  ADD COLUMN IF NOT EXISTS environment_config_path text,
+  ADD COLUMN IF NOT EXISTS environment_config_digest text;
+ALTER TABLE agent_thread
+  DROP CONSTRAINT IF EXISTS agent_thread_environment_complete;
+ALTER TABLE agent_thread
+  ADD CONSTRAINT agent_thread_environment_complete CHECK (
+    num_nonnulls(environment_provider, environment_config_path, environment_config_digest) = 0
+    OR (num_nonnulls(repository_slug) = 1
+      AND environment_provider = 'service_federation'
+      AND environment_config_path = 'fed.yaml'
+      AND environment_config_digest ~ '^blake3:[0-9a-f]{64}$')
+  ) NOT VALID;
+"#;
+
+pub const AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION: &str = r#"
+UPDATE agent_thread
+   SET environment_provider = NULL,
+       environment_config_path = NULL,
+       environment_config_digest = NULL
+ WHERE num_nonnulls(environment_provider, environment_config_path, environment_config_digest)
+       NOT IN (0, 3);
+"#;
+
+pub const AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  VALIDATE CONSTRAINT agent_thread_environment_complete;
+"#;
+
 pub const AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION: &str = r#"
 UPDATE agent_thread_workspace_session
    SET launched_at = started_at
@@ -521,6 +552,29 @@ pub fn agent_thread_file_transfer_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_environment_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0160_agent_thread_environment_expand",
+            AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0161_agent_thread_environment_backfill",
+            AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0162_agent_thread_environment_contract",
+            AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread",
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +603,19 @@ mod tests {
                 &HotTables::declare(["agent_thread_workspace_session"]),
             )
             .expect("the live workspace history migration is online-safe");
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+    }
+
+    #[test]
+    fn environment_receipt_is_a_forward_only_online_schema_change() {
+        let migrations = agent_thread_environment_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["agent_thread"]))
+            .expect("the live agent thread migration is online-safe");
         assert_eq!(migrations.0.len(), 3);
         assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
         assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);

@@ -50,7 +50,18 @@ describe("private work with an agent", () => {
     const repository = new GitProject(uniqueName("cloud-workspace"), founder);
     await repository.create();
     const initialReadme = "# A real project\n\nCheckout the durable source, not a synthetic fixture.\n";
-    const initial = await repository.writeFile("main", "README.md", initialReadme);
+    await repository.writeFile("main", "README.md", initialReadme);
+    const declaredEnvironment = [
+      "parameters:",
+      "  APP_PORT: { type: port, default: 8000 }",
+      "services:",
+      "  app:",
+      "    process: python3 -m http.server {{APP_PORT}}",
+      "    startup_message: App ready at http://localhost:{{APP_PORT}}",
+      "entrypoint: app",
+      "",
+    ].join("\n");
+    const initial = await repository.writeFile("main", "fed.yaml", declaredEnvironment);
     const idempotencyKey = `repository-agent-thread-${randomUUID()}`;
 
     const teammate = await browserApprovedCliClient(reviewerClient);
@@ -99,11 +110,22 @@ describe("private work with an agent", () => {
       base_oid: initial.commitOid,
       branch: expect.stringMatching(/^myelin\/thread-[0-9a-f]{20}$/),
     });
+    expect(created.thread.workspace.environment).toEqual({
+      provider: "service_federation",
+      config_path: "fed.yaml",
+      content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
+      state: "declared",
+    });
 
     await repository.updateFile(
       "main",
       "README.md",
       "# A newer trunk\n",
+    );
+    await repository.updateFile(
+      "main",
+      "fed.yaml",
+      "services:\n  replacement:\n    process: false\nentrypoint: replacement\n",
     );
     const replay = await startPrivateAgentThread(founder, {
       name: created.thread.name,
@@ -113,15 +135,28 @@ describe("private work with an agent", () => {
       expectedStatus: 200,
     });
     expect(replay).toEqual({ created: false, thread: created.thread });
+    expect(await listPrivateAgentThreads(founder)).toEqual(
+      expect.arrayContaining([created.thread]),
+    );
+    const fetched = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}`,
+    );
+    expect(parsePrivateAgentThread(fetched.body.thread)).toEqual(created.thread);
+    expect(await retryPrivateAgentThread(founder, created.thread.id)).toEqual({
+      created: false,
+      thread: created.thread,
+    });
 
     const run = await beginAgentThreadRun(founder, created.thread.id);
     try {
       const readme = await askAgent(run, 1, "workspace.read_file", { path: "README.md" });
       expect(readme).toMatchObject({ content: initialReadme });
+      const environment = await askAgent(run, 2, "workspace.read_file", { path: "fed.yaml" });
+      expect(environment).toMatchObject({ content: declaredEnvironment });
       const repositoryReceipt = record(
         (await askAgentToAct(
           run,
-          2,
+          3,
           "workspace.exec",
           {
             command: "git branch --show-current && git rev-parse HEAD && git remote get-url origin",

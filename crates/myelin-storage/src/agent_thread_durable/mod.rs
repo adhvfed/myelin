@@ -11,18 +11,20 @@ pub use expiry::{
     AGENT_THREAD_EXPIRY_GRACE_SECONDS,
 };
 pub use model::{
-    ActivateAgentThreadOutcome, AgentThreadGitBinding, AgentThreadProvisioningFailure,
-    AgentThreadState, CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread,
-    RetryAgentThreadOutcome, MAX_AGENT_THREAD_GIT_REF_BYTES, MAX_AGENT_THREAD_NAME_BYTES,
-    MAX_AGENT_THREAD_REPOSITORY_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
-    MIN_AGENT_THREAD_RETENTION_DAYS,
+    ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
+    AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadState,
+    CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread, RetryAgentThreadOutcome,
+    MAX_AGENT_THREAD_GIT_REF_BYTES, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_REPOSITORY_BYTES,
+    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
-    agent_thread_durable_migrations, agent_thread_file_transfer_migrations,
-    agent_thread_git_binding_migrations, agent_thread_publication_migrations,
-    agent_thread_recent_list_migrations, agent_thread_session_launch_migrations,
-    agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
+    agent_thread_durable_migrations, agent_thread_environment_migrations,
+    agent_thread_file_transfer_migrations, agent_thread_git_binding_migrations,
+    agent_thread_publication_migrations, agent_thread_recent_list_migrations,
+    agent_thread_session_launch_migrations, agent_thread_ssh_connection_migrations,
+    agent_thread_ssh_single_use_migrations, AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION, AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION,
     AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION, AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION,
     AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION, AGENT_THREAD_MIGRATION,
     AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
@@ -109,6 +111,8 @@ impl DurableAgentThreadBacking {
                             RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                               conversation_id, workspace_id, workspace_generation, name, project_id,
                               repository_slug, base_ref, base_oid, workspace_branch,
+                              environment_provider, environment_config_path,
+                              environment_config_digest,
                               retention_days, state, storage_locator, publication_completed_at,
                               failure_reason, created_at,
                               expires_at, updated_at",
@@ -197,6 +201,8 @@ impl DurableAgentThreadBacking {
                          RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           environment_provider, environment_config_path,
+                           environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
                            failure_reason, created_at,
                            expires_at, updated_at",
@@ -251,16 +257,17 @@ impl DurableAgentThreadBacking {
         tenant: &str,
         owner_principal_id: &str,
         thread_id: Uuid,
-        workspace_id: Uuid,
-        conversation_id: &str,
-        storage_locator: &str,
+        activation: AgentThreadActivation,
     ) -> Result<ActivateAgentThreadOutcome, ProviderError> {
-        validate_storage_locator(storage_locator)?;
+        validate_storage_locator(&activation.storage_locator)?;
+        validate_environment_binding(activation.environment.as_ref())?;
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         let owner = owner_principal_id.to_string();
-        let conversation = conversation_id.to_string();
-        let locator = storage_locator.to_string();
+        let workspace_id = activation.workspace_id;
+        let conversation = activation.conversation_id;
+        let locator = activation.storage_locator;
+        let environment = activation.environment;
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
@@ -276,7 +283,9 @@ impl DurableAgentThreadBacking {
                     }
                     if current.state == AgentThreadState::Ready {
                         return Ok(
-                            if current.storage_locator.as_deref() == Some(locator.as_str()) {
+                            if current.storage_locator.as_deref() == Some(locator.as_str())
+                                && current.environment == environment
+                            {
                                 ActivateAgentThreadOutcome::AlreadyReady(current)
                             } else {
                                 ActivateAgentThreadOutcome::Conflict
@@ -289,6 +298,8 @@ impl DurableAgentThreadBacking {
                     let row = sqlx::query(
                         "UPDATE agent_thread
                             SET state = 'ready', storage_locator = $6, failure_reason = NULL,
+                                environment_provider = $8, environment_config_path = $9,
+                                environment_config_digest = $10,
                                 updated_at = CURRENT_TIMESTAMP
                           WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
                             AND owner_principal_id = $4 AND workspace_id = $5
@@ -296,6 +307,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
+                          environment_provider, environment_config_path,
+                          environment_config_digest,
                           retention_days, state, storage_locator, publication_completed_at,
                           failure_reason, created_at,
                           expires_at, updated_at",
@@ -307,6 +320,13 @@ impl DurableAgentThreadBacking {
                     .bind(workspace_id)
                     .bind(&locator)
                     .bind(&conversation)
+                    .bind(environment.as_ref().map(|value| value.provider.as_str()))
+                    .bind(environment.as_ref().map(|value| value.config_path.as_str()))
+                    .bind(
+                        environment
+                            .as_ref()
+                            .map(|value| value.content_digest.as_str()),
+                    )
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("activate agent thread"))?;
@@ -384,6 +404,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
+                          environment_provider, environment_config_path,
+                          environment_config_digest,
                           retention_days, state, storage_locator, publication_completed_at,
                           failure_reason, created_at, expires_at, updated_at",
                     )
@@ -447,7 +469,9 @@ impl DurableAgentThreadBacking {
                           thread.owner_principal_id, thread.agent_id, thread.conversation_id,
                           thread.workspace_id, thread.workspace_generation, thread.name,
                           thread.project_id, thread.repository_slug, thread.base_ref,
-                          thread.base_oid, thread.workspace_branch, thread.retention_days, thread.state,
+                          thread.base_oid, thread.workspace_branch,
+                          thread.environment_provider, thread.environment_config_path,
+                          thread.environment_config_digest, thread.retention_days, thread.state,
                           thread.storage_locator, thread.publication_completed_at,
                           thread.failure_reason, thread.created_at, thread.expires_at,
                           thread.updated_at",
@@ -513,6 +537,8 @@ impl DurableAgentThreadBacking {
                                 RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                                   conversation_id, workspace_id, workspace_generation, name, project_id,
                                   repository_slug, base_ref, base_oid, workspace_branch,
+                                  environment_provider, environment_config_path,
+                                  environment_config_digest,
                                   retention_days, state, storage_locator, publication_completed_at,
                                   failure_reason, created_at,
                                   expires_at, updated_at",
@@ -625,6 +651,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           environment_provider, environment_config_path,
+                           environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
                            failure_reason, created_at,
                            expires_at, updated_at
@@ -679,6 +707,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           environment_provider, environment_config_path,
+                           environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
                            failure_reason, created_at,
                            expires_at, updated_at
@@ -786,6 +816,29 @@ fn validate_storage_locator(locator: &str) -> Result<(), ProviderError> {
     Ok(())
 }
 
+fn validate_environment_binding(
+    environment: Option<&AgentThreadEnvironmentBinding>,
+) -> Result<(), ProviderError> {
+    if let Some(environment) = environment {
+        let digest = environment
+            .content_digest
+            .strip_prefix("blake3:")
+            .unwrap_or_default();
+        if environment.provider != "service_federation"
+            || environment.config_path != "fed.yaml"
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(query(
+                "agent thread environment binding is not a canonical manifest receipt",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn canonical_ulid(value: &str) -> bool {
     value.len() == 26
         && value
@@ -851,6 +904,7 @@ async fn by_nonce(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
+           environment_provider, environment_config_path, environment_config_digest,
            retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
@@ -877,6 +931,7 @@ async fn by_id(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
+           environment_provider, environment_config_path, environment_config_digest,
            retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
@@ -919,6 +974,30 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
             ))
         }
     };
+    let environment = match (
+        row.get::<Option<String>, _>("environment_provider"),
+        row.get::<Option<String>, _>("environment_config_path"),
+        row.get::<Option<String>, _>("environment_config_digest"),
+    ) {
+        (None, None, None) => None,
+        (Some(provider), Some(config_path), Some(content_digest)) => {
+            Some(AgentThreadEnvironmentBinding {
+                provider,
+                config_path,
+                content_digest,
+            })
+        }
+        _ => {
+            return Err(PgError::Query(
+                "agent thread has an incomplete durable environment binding".into(),
+            ))
+        }
+    };
+    if environment.is_some() && git.is_none() {
+        return Err(PgError::Query(
+            "agent thread environment binding is missing its durable Git binding".into(),
+        ));
+    }
     Ok(DurableAgentThread {
         thread_id: row.get::<Uuid, _>("thread_id").to_string(),
         owner_principal_id: row.get("owner_principal_id"),
@@ -931,6 +1010,7 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
             .get::<Option<Uuid>, _>("project_id")
             .map(|id| id.to_string()),
         git,
+        environment,
         retention_days: row.get("retention_days"),
         state,
         storage_locator: row.get("storage_locator"),

@@ -14,10 +14,19 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 pub const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
 const MAX_WORKSPACE_PATH_BYTES: usize = 1024;
 const MAX_WORKSPACE_PATH_DEPTH: usize = 32;
+const MAX_FED_MANIFEST_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceEnvironmentManifest {
+    pub provider: String,
+    pub config_path: String,
+    pub content_digest: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionedWorkspace {
     pub locator: String,
+    pub environment: Option<WorkspaceEnvironmentManifest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,6 +352,7 @@ impl AgentWorkspaceProvisioner for LocalDevelopmentWorkspaceProvisioner {
         sync_directory(self.root.as_path())?;
         Ok(ProvisionedWorkspace {
             locator: Self::locator(tenant, workspace_id),
+            environment: None,
         })
     }
 
@@ -361,6 +371,7 @@ impl AgentWorkspaceProvisioner for LocalDevelopmentWorkspaceProvisioner {
             verify_repository_workspace(&workspace_directory, source)?;
             return Ok(ProvisionedWorkspace {
                 locator: Self::locator(tenant, workspace_id),
+                environment: repository_environment_manifest(&workspace_directory, source)?,
             });
         }
 
@@ -381,8 +392,47 @@ impl AgentWorkspaceProvisioner for LocalDevelopmentWorkspaceProvisioner {
         verify_repository_workspace(&workspace_directory, source)?;
         Ok(ProvisionedWorkspace {
             locator: Self::locator(tenant, workspace_id),
+            environment: repository_environment_manifest(&workspace_directory, source)?,
         })
     }
+}
+
+fn repository_environment_manifest(
+    workspace: &Path,
+    source: &RepositoryWorkspaceSource,
+) -> Result<Option<WorkspaceEnvironmentManifest>, WorkspaceProvisionError> {
+    let repository = git2::Repository::open(workspace)
+        .map_err(git_error("open repository for environment discovery"))?;
+    let oid = git2::Oid::from_str(&source.base_oid)
+        .map_err(git_error("parse environment source commit"))?;
+    let commit = repository
+        .find_commit(oid)
+        .map_err(git_error("find environment source commit"))?;
+    let tree = commit
+        .tree()
+        .map_err(git_error("open environment source tree"))?;
+    let Ok(entry) = tree.get_path(Path::new("fed.yaml")) else {
+        return Ok(None);
+    };
+    if !matches!(entry.filemode(), 0o100644 | 0o100755) {
+        return Ok(None);
+    }
+    let blob = repository
+        .find_blob(entry.id())
+        .map_err(git_error("read Service Federation manifest"))?;
+    if blob.is_binary()
+        || blob.content().is_empty()
+        || blob.content().len() > MAX_FED_MANIFEST_BYTES
+        || std::str::from_utf8(blob.content()).is_err()
+    {
+        return Ok(None);
+    }
+    let digest = blake3::hash(blob.content());
+    Ok(Some(WorkspaceEnvironmentManifest {
+        provider: "service_federation".into(),
+        config_path: "fed.yaml".into(),
+        content_digest: format!("blake3:{digest}"),
+    }))
 }
 
 fn validate_repository_source(
@@ -1030,8 +1080,11 @@ mod tests {
         let source_path = source_root.path().join("source.git");
         let source_repository = git2::Repository::init_bare(&source_path).unwrap();
         let blob = source_repository.blob(b"hello from Myelin\n").unwrap();
+        let fed_manifest = b"services:\n  app:\n    process: ./dev\nentrypoint: app\n";
+        let fed_blob = source_repository.blob(fed_manifest).unwrap();
         let mut tree = source_repository.treebuilder(None).unwrap();
         tree.insert("README.md", blob, 0o100644).unwrap();
+        tree.insert("fed.yaml", fed_blob, 0o100644).unwrap();
         let tree_oid = tree.write().unwrap();
         let tree = source_repository.find_tree(tree_oid).unwrap();
         let signature = git2::Signature::now("Myelin", "myelin@example.invalid").unwrap();
@@ -1067,6 +1120,14 @@ mod tests {
             .provision_from_repository("acme", workspace_id, &source)
             .unwrap();
         assert_eq!(first, replay);
+        assert_eq!(
+            first.environment,
+            Some(WorkspaceEnvironmentManifest {
+                provider: "service_federation".into(),
+                config_path: "fed.yaml".into(),
+                content_digest: format!("blake3:{}", blake3::hash(fed_manifest)),
+            })
+        );
         let workspace = store
             .tenant_directory("acme")
             .join(workspace_id.to_string());

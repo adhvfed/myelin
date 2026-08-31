@@ -109,7 +109,9 @@ myelin agent thread start "Investigate checkout race" \
   --repository platform/api --base-ref main \
   --idempotency-key investigate-checkout-race
 # Myelin pins the exact base commit and creates a durable private `myelin/thread-*` branch in the
-# workspace. Use `--branch alice/checkout-race` when you want to name it yourself.
+# workspace. A root `fed.yaml` is bound by content digest and reported as a declared environment;
+# it is not executed until a hardened environment provisioner exists. Use
+# `--branch alice/checkout-race` when you want to name the branch yourself.
 myelin agent thread list
 # If startup was interrupted, reopen the same durable conversation and workspace identities.
 myelin agent thread retry 33333333-3333-4333-8333-333333333333

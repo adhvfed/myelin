@@ -12,11 +12,12 @@ use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
-    ActivateAgentThreadOutcome, AgentThreadGitBinding, AgentThreadProvisioningFailure,
-    AgentThreadRunBinding, AgentThreadState, BindAgentThreadRunOutcome, CreateAgentThreadOutcome,
-    DurableAgentThread, DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread,
-    RetryAgentThreadOutcome, WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES,
-    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
+    AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRunBinding, AgentThreadState,
+    BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
+    DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread, RetryAgentThreadOutcome,
+    WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -349,15 +350,27 @@ impl AgentThreadHttpApi {
                 ));
             }
         };
+        let environment =
+            provisioned
+                .environment
+                .as_ref()
+                .map(|environment| AgentThreadEnvironmentBinding {
+                    provider: environment.provider.clone(),
+                    config_path: environment.config_path.clone(),
+                    content_digest: environment.content_digest.clone(),
+                });
         let activation = self.drive(
             self.threads.activate(
                 &principal.tenant.0,
                 &principal.principal_id.0,
                 parse_uuid("stored thread id", &thread.thread_id)
                     .map_err(|_| EdgeError::Internal("stored agent thread id is invalid".into()))?,
-                workspace_id,
-                &thread.conversation_id,
-                &provisioned.locator,
+                AgentThreadActivation {
+                    workspace_id,
+                    conversation_id: thread.conversation_id.clone(),
+                    storage_locator: provisioned.locator,
+                    environment,
+                },
             ),
         )?;
         let activated = match activation {
@@ -1105,6 +1118,12 @@ fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
                 "base_oid": git.base_oid,
                 "branch": git.branch,
             })),
+            "environment": thread.environment.as_ref().map(|environment| json!({
+                "provider": environment.provider,
+                "config_path": environment.config_path,
+                "content_digest": environment.content_digest,
+                "state": "declared",
+            })),
         },
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
@@ -1391,6 +1410,7 @@ mod tests {
             name: "Investigate checkout race".into(),
             project_id: None,
             git: replay.git,
+            environment: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:receipt".into()),
@@ -1498,6 +1518,7 @@ mod tests {
             name: "Investigate checkout race".into(),
             project_id: None,
             git: None,
+            environment: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),
@@ -1541,6 +1562,7 @@ mod tests {
             name: "Investigate checkout race".into(),
             project_id: None,
             git: None,
+            environment: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),

@@ -10,6 +10,7 @@ export interface AgentThreadWorkspace {
   retention_days: number;
   expires_at: string;
   repository: AgentThreadWorkspaceRepository | null;
+  environment: AgentThreadWorkspaceEnvironment | null;
 }
 
 export interface AgentThreadWorkspaceRepository {
@@ -17,6 +18,13 @@ export interface AgentThreadWorkspaceRepository {
   base_ref: string;
   base_oid: string;
   branch: string;
+}
+
+export interface AgentThreadWorkspaceEnvironment {
+  provider: string;
+  config_path: string;
+  content_digest: string;
+  state: string;
 }
 
 export interface PrivateAgentThread {
@@ -171,6 +179,9 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
   const repository = workspace.repository === null
     ? null
     : record(workspace.repository, "private agent workspace repository");
+  const environment = workspace.environment === null
+    ? null
+    : record(workspace.environment, "private agent workspace environment");
   return {
     id: string(thread.id, "agent thread id"),
     ref: string(thread.ref, "agent thread ref"),
@@ -193,6 +204,17 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
             base_ref: string(repository.base_ref, "workspace repository base ref"),
             base_oid: string(repository.base_oid, "workspace repository base oid"),
             branch: string(repository.branch, "workspace repository branch"),
+          },
+      environment: environment === null
+        ? null
+        : {
+            provider: string(environment.provider, "workspace environment provider"),
+            config_path: string(environment.config_path, "workspace environment config path"),
+            content_digest: string(
+              environment.content_digest,
+              "workspace environment content digest",
+            ),
+            state: string(environment.state, "workspace environment state"),
           },
     },
     created_at: string(thread.created_at, "agent thread creation time"),

@@ -15,6 +15,21 @@ pub struct AgentThreadGitBinding {
     pub branch: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadEnvironmentBinding {
+    pub provider: String,
+    pub config_path: String,
+    pub content_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentThreadActivation {
+    pub workspace_id: Uuid,
+    pub conversation_id: String,
+    pub storage_locator: String,
+    pub environment: Option<AgentThreadEnvironmentBinding>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentThreadState {
     Provisioning,
@@ -91,6 +106,7 @@ pub struct DurableAgentThread {
     pub name: String,
     pub project_id: Option<String>,
     pub git: Option<AgentThreadGitBinding>,
+    pub environment: Option<AgentThreadEnvironmentBinding>,
     pub retention_days: i16,
     pub state: AgentThreadState,
     pub storage_locator: Option<String>,
