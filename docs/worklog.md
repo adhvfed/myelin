@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Thread setup exposes the complete declarative file overlay
+
+The thread API accepted eight private context files, but the browser exposed one bespoke path/body
+pair while the named-agent editor exposed the complete list. Thread setup now uses the same
+add/remove multi-file editor as reusable agent defaults. A person can describe the whole task-local
+overlay without dropping to a raw API, and editing any file refreshes the retry identity just like
+the other creation intent fields.
+
+One shared frontend contract now validates owner defaults, thread overlays, server actions, and
+strict owner-only response decoding. It rejects traversal, reserved `AGENTS.md` and `.git` targets,
+duplicates, ambiguous shapes, NUL content, and a complete encoded envelope over 12 KiB before a
+request leaves the product. Three focused contract cases exercise those boundaries. All 666 web
+contract tests, TypeScript checking, and lint pass; the Chromium private-agent journey added files
+through both editors and completed against the running web app, Edge, PostgreSQL, durable Git, the
+agent service, and workspace gateway.
+
 ## 2026-08-31 — Named agents carry reusable instruction-and-file overlays
 
 A named agent's reusable defaults now use the same versioned workspace-augmentation contract as a

@@ -111,10 +111,9 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await dialog.getByRole("textbox", { name: "Repository slug" }).fill(repositorySlug);
   await dialog.getByRole("textbox", { name: "Personal agent instructions" })
     .fill(personalInstructions);
-  await dialog.getByRole("textbox", { name: "Private context file path" })
-    .fill(contextFilePath);
-  await dialog.getByRole("textbox", { name: "Private context file contents" })
-    .fill(contextFileContents);
+  await dialog.getByRole("button", { name: "Add context file" }).click();
+  await dialog.getByRole("textbox", { name: "File 1 path" }).fill(contextFilePath);
+  await dialog.getByRole("textbox", { name: "File 1 contents" }).fill(contextFileContents);
   await dialog.getByRole("button", { name: "Start thread" }).click();
 
   await page.waitForURL(/\/agents\?thread=[0-9a-f-]{36}$/);

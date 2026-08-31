@@ -1,36 +1,11 @@
 import { For, Show } from "solid-js";
 
-import type { AgentWorkspaceFile } from "~/lib/agent-thread-response";
-
-const utf8 = new TextEncoder();
-
-export function validAgentWorkspaceAugmentation(
-  instructions: string,
-  files: readonly AgentWorkspaceFile[],
-): boolean {
-  if (files.length > 8) return false;
-  const paths = new Set<string>();
-  for (const file of files) {
-    const segments = file.path.split("/");
-    if (!file.path || file.path.trim() !== file.path || file.path.startsWith("/") ||
-        file.path.includes("\\") || file.path.includes("\0") ||
-        segments.some((segment) => !segment || segment === "." || segment === "..") ||
-        file.path === "AGENTS.md" || segments[0] === ".git" || paths.has(file.path) ||
-        file.contents.includes("\0") || file.strategy !== "create") return false;
-    paths.add(file.path);
-  }
-  if (files.length === 0) return utf8.encode(instructions).byteLength <= 12 * 1_024;
-  const payload = `myelin.workspace-augmentation.v1\0${JSON.stringify({
-    version: 1,
-    ...(instructions === "" ? {} : { agents_md: instructions }),
-    files,
-  })}`;
-  return utf8.encode(payload).byteLength <= 12 * 1_024;
-}
+import type { AgentWorkspaceFile } from "~/lib/agent-workspace-augmentation";
 
 export function AgentWorkspaceFilesEditor(props: {
   files: readonly AgentWorkspaceFile[];
   disabled: boolean;
+  legend?: string;
   onChange: (files: AgentWorkspaceFile[]) => void;
 }) {
   const update = (index: number, field: "path" | "contents", value: string) => {
@@ -44,7 +19,7 @@ export function AgentWorkspaceFilesEditor(props: {
 
   return (
     <fieldset class="agent-workspace-files">
-      <legend>Default private context files <span aria-hidden="true">(optional)</span></legend>
+      <legend>{props.legend ?? "Private context files"} <span aria-hidden="true">(optional)</span></legend>
       <For each={props.files}>{(file, index) => (
         <div class="agent-workspace-file">
           <label>

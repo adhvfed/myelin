@@ -29,6 +29,7 @@ import {
   type WorkspaceSessionPage,
 } from "./agent-thread-response";
 import type { ChatMessagePage } from "./chat-response";
+import { validAgentWorkspaceAugmentation } from "./agent-workspace-augmentation";
 
 export type AgentThreadErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
 export type AgentThreadMutationResult =
@@ -68,41 +69,6 @@ function segment(value: string): string {
 function cleanText(value: unknown, maximum: number): value is string {
   return typeof value === "string" && value.length > 0 && value.trim() === value &&
     utf8.encode(value).byteLength <= maximum && !/[\p{Cc}]/u.test(value);
-}
-
-function workspaceFiles(value: unknown): value is Array<{
-  path: string;
-  contents: string;
-  strategy: "create";
-}> {
-  if (!Array.isArray(value) || value.length > 8) return false;
-  const paths = new Set<string>();
-  return value.every((candidate) => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
-    const file = candidate as Record<string, unknown>;
-    if (Object.keys(file).length !== 3 ||
-        !Object.keys(file).every((key) => ["path", "contents", "strategy"].includes(key)) ||
-        !cleanText(file.path, 4_096) || paths.has(file.path as string) ||
-        typeof file.contents !== "string" || file.contents.includes("\0") ||
-        file.strategy !== "create") return false;
-    paths.add(file.path);
-    return true;
-  });
-}
-
-function workspaceAugmentationFits(
-  instructions: string | null,
-  files: Array<{ path: string; contents: string; strategy: "create" }>,
-): boolean {
-  if (files.length === 0) {
-    return instructions === null || utf8.encode(instructions).byteLength <= 12 * 1_024;
-  }
-  const payload = `myelin.workspace-augmentation.v1\0${JSON.stringify({
-    version: 1,
-    ...(instructions === null ? {} : { agents_md: instructions }),
-    files,
-  })}`;
-  return utf8.encode(payload).byteLength <= 12 * 1_024;
 }
 
 function isUlid(value: unknown): value is string {
@@ -281,8 +247,7 @@ export const mutateAgentThread = action(async (input: unknown) => {
             (utf8.encode(mutation.workspaceInstructions).byteLength > 12 * 1_024 ||
               mutation.workspaceInstructions.trim().length === 0 ||
               mutation.workspaceInstructions.includes("\0"))) ||
-          !workspaceFiles(mutation.workspaceFiles) ||
-          !workspaceAugmentationFits(
+          !validAgentWorkspaceAugmentation(
             mutation.workspaceInstructions === "" ? null : mutation.workspaceInstructions,
             mutation.workspaceFiles,
           )) {
@@ -312,8 +277,8 @@ export const mutateAgentThread = action(async (input: unknown) => {
           (typeof mutation.workspaceInstructions === "string" &&
             utf8.encode(mutation.workspaceInstructions).byteLength <= 12 * 1_024 &&
             mutation.workspaceInstructions.trim().length > 0 &&
-            !mutation.workspaceInstructions.includes("\0"))) && workspaceFiles(mutation.workspaceFiles) &&
-        workspaceAugmentationFits(mutation.workspaceInstructions, mutation.workspaceFiles) &&
+            !mutation.workspaceInstructions.includes("\0"))) &&
+        validAgentWorkspaceAugmentation(mutation.workspaceInstructions, mutation.workspaceFiles) &&
         Number.isSafeInteger(mutation.expectedRevision) &&
         (mutation.expectedRevision as number) >= 0 && cleanNonce(mutation.clientNonce)) {
       const receipt = parseAgentWorkspaceGuidanceReceipt(await edgePost(
@@ -344,8 +309,8 @@ export const mutateAgentThread = action(async (input: unknown) => {
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "create" && Object.keys(mutation).every((key) =>
-      ["op", "name", "agentId", "projectId", "retentionDays", "repository", "baseRef", "branch", "instructions", "contextFilePath", "contextFileContents", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 12 && cleanText(mutation.name, 80) &&
+      ["op", "name", "agentId", "projectId", "retentionDays", "repository", "baseRef", "branch", "instructions", "workspaceFiles", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 11 && cleanText(mutation.name, 80) &&
         isAgentThreadId(mutation.agentId) && positiveRetention(mutation.retentionDays) &&
         typeof mutation.projectId === "string" &&
         (mutation.projectId === "" || isAgentThreadId(mutation.projectId)) &&
@@ -357,12 +322,10 @@ export const mutateAgentThread = action(async (input: unknown) => {
         typeof mutation.instructions === "string" &&
         (mutation.instructions === "" || (utf8.encode(mutation.instructions).byteLength <= 12 * 1_024 &&
           mutation.instructions.trim().length > 0 && !mutation.instructions.includes("\0"))) &&
-        typeof mutation.contextFilePath === "string" &&
-        typeof mutation.contextFileContents === "string" &&
-        (mutation.contextFilePath === "" || cleanText(mutation.contextFilePath, 1_024)) &&
-        (mutation.contextFilePath === "") === (mutation.contextFileContents === "") &&
-        utf8.encode(mutation.contextFileContents).byteLength <= 8 * 1_024 &&
-        !mutation.contextFileContents.includes("\0") &&
+        validAgentWorkspaceAugmentation(
+          mutation.instructions === "" ? null : mutation.instructions,
+          mutation.workspaceFiles,
+        ) &&
         cleanNonce(mutation.clientNonce)) {
       const receipt = parseAgentThreadCreateReceipt(await edgePost("/v1/agent-threads", {
         name: mutation.name,
@@ -370,7 +333,7 @@ export const mutateAgentThread = action(async (input: unknown) => {
         ...(mutation.projectId === "" ? {} : { project_id: mutation.projectId }),
         retention_days: mutation.retentionDays,
         ...(mutation.repository === "" && mutation.instructions === "" &&
-          mutation.contextFilePath === "" ? {} : {
+          mutation.workspaceFiles.length === 0 ? {} : {
           workspace: {
             ...(mutation.repository === "" ? {} : {
               repository: mutation.repository,
@@ -378,13 +341,7 @@ export const mutateAgentThread = action(async (input: unknown) => {
               ...(mutation.branch === "" ? {} : { branch: mutation.branch }),
             }),
             ...(mutation.instructions === "" ? {} : { instructions: mutation.instructions }),
-            ...(mutation.contextFilePath === "" ? {} : {
-              files: [{
-                path: mutation.contextFilePath,
-                contents: mutation.contextFileContents,
-                strategy: "create",
-              }],
-            }),
+            ...(mutation.workspaceFiles.length === 0 ? {} : { files: mutation.workspaceFiles }),
           },
         }),
       }, { idempotencyKey: mutation.clientNonce }));

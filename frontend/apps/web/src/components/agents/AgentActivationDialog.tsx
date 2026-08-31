@@ -7,10 +7,8 @@ import {
   type AgentThreadErrorKind,
 } from "~/lib/agent-thread-api";
 import type { AgentActivationReceipt, AgentWorkspaceFile } from "~/lib/agent-thread-response";
-import {
-  AgentWorkspaceFilesEditor,
-  validAgentWorkspaceAugmentation,
-} from "./AgentWorkspaceFilesEditor";
+import { validAgentWorkspaceAugmentation } from "~/lib/agent-workspace-augmentation";
+import { AgentWorkspaceFilesEditor } from "./AgentWorkspaceFilesEditor";
 
 function errorCopy(kind: AgentThreadErrorKind): string {
   if (kind === "bad-input") return "Use a clean agent name.";
@@ -59,7 +57,10 @@ export function AgentActivationDialog(props: {
     if (!name().trim() || name().trim() !== name() ||
         workspaceInstructions().includes("\0") ||
         (workspaceInstructions() !== "" && workspaceInstructions().trim() === "") ||
-        !validAgentWorkspaceAugmentation(workspaceInstructions(), workspaceFiles())) {
+        !validAgentWorkspaceAugmentation(
+          workspaceInstructions() === "" ? null : workspaceInstructions(),
+          workspaceFiles(),
+        )) {
       setError("Use a clean agent name and a workspace overlay within 12 KiB.");
       nameInput?.focus();
       return;
@@ -151,6 +152,7 @@ export function AgentActivationDialog(props: {
         <AgentWorkspaceFilesEditor
           files={workspaceFiles()}
           disabled={submitting()}
+          legend="Default private context files"
           onChange={(files) => {
             setWorkspaceFiles(files);
             setClientNonce(crypto.randomUUID());

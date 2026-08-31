@@ -11,10 +11,8 @@ import type {
   AgentWorkspaceFile,
   AgentWorkspaceGuidanceReceipt,
 } from "~/lib/agent-thread-response";
-import {
-  AgentWorkspaceFilesEditor,
-  validAgentWorkspaceAugmentation,
-} from "./AgentWorkspaceFilesEditor";
+import { validAgentWorkspaceAugmentation } from "~/lib/agent-workspace-augmentation";
+import { AgentWorkspaceFilesEditor } from "./AgentWorkspaceFilesEditor";
 
 export function AgentWorkspaceDefaultsDialog(props: {
   agent: AgentChoice | null;
@@ -71,7 +69,7 @@ export function AgentWorkspaceDefaultsDialog(props: {
     if (!agent || loading() || submitting()) return;
     const value = instructions();
     if (value.includes("\0") || (value !== "" && value.trim() === "") ||
-        !validAgentWorkspaceAugmentation(value, files())) {
+        !validAgentWorkspaceAugmentation(value === "" ? null : value, files())) {
       setError("Use a valid instruction and file overlay within the 12 KiB encrypted limit.");
       return;
     }
@@ -146,6 +144,7 @@ export function AgentWorkspaceDefaultsDialog(props: {
         <AgentWorkspaceFilesEditor
           files={files()}
           disabled={loading() || submitting()}
+          legend="Default private context files"
           onChange={(nextFiles) => {
             setFiles(nextFiles);
             setClientNonce(crypto.randomUUID());

@@ -1,5 +1,11 @@
 import { parseChatMessages, type ChatMessagePage } from "./chat-response";
 import { parseArtifactRef } from "./artifact-ref";
+import {
+  agentWorkspaceAugmentationFits,
+  parseAgentWorkspaceFiles,
+  type AgentWorkspaceFile,
+} from "./agent-workspace-augmentation";
+export type { AgentWorkspaceFile } from "./agent-workspace-augmentation";
 
 const utf8 = new TextEncoder();
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -7,12 +13,6 @@ const ULID = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 type WireRecord = Record<string, unknown>;
 
 export type AgentThreadState = "provisioning" | "ready" | "expiring" | "deleted" | "failed";
-
-export interface AgentWorkspaceFile {
-  path: string;
-  contents: string;
-  strategy: "create";
-}
 
 export interface AgentChoice {
   id: string;
@@ -321,7 +321,7 @@ export function parseAgentWorkspaceGuidanceConfig(
   value: unknown,
 ): AgentWorkspaceGuidanceConfig | null {
   const config = record(value);
-  const files = workspaceFiles(config?.files);
+  const files = parseAgentWorkspaceFiles(config?.files);
   if (!config || !exact(config, ["agent_id", "revision", "instructions", "files", "updated_at"]) ||
       !isAgentThreadId(config.agent_id) || !Number.isSafeInteger(config.revision) ||
       (config.revision as number) < 0 ||
@@ -329,28 +329,12 @@ export function parseAgentWorkspaceGuidanceConfig(
         (typeof config.instructions !== "string" || config.instructions.trim().length === 0 ||
           utf8.encode(config.instructions).byteLength > 12 * 1_024 ||
           config.instructions.includes("\0"))) ||
-      !files ||
+      !files || !agentWorkspaceAugmentationFits(config.instructions as string | null, files) ||
       (config.updated_at !== null && !timestamp(config.updated_at)) ||
       ((config.revision as number) === 0 &&
         (config.updated_at !== null || config.instructions !== null || files.length > 0)) ||
       ((config.revision as number) > 0 && config.updated_at === null)) return null;
   return { ...config, files } as unknown as AgentWorkspaceGuidanceConfig;
-}
-
-function workspaceFiles(value: unknown): AgentWorkspaceFile[] | null {
-  if (!Array.isArray(value) || value.length > 8) return null;
-  const files: AgentWorkspaceFile[] = [];
-  const paths = new Set<string>();
-  for (const valueFile of value) {
-    const file = record(valueFile);
-    if (!file || !exact(file, ["path", "contents", "strategy"]) ||
-        !cleanText(file.path, 4_096) || paths.has(file.path) ||
-        typeof file.contents !== "string" || file.contents.includes("\0") ||
-        utf8.encode(file.contents).byteLength > 12 * 1_024 || file.strategy !== "create") return null;
-    paths.add(file.path);
-    files.push(file as unknown as AgentWorkspaceFile);
-  }
-  return files;
 }
 
 function policyCoordinates(value: unknown): boolean {
