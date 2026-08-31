@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Automation approval is a complete web journey
+
+An automation detail could say that a firing awaited human approval but offered no way to make that
+decision. The detail now refreshes visible firing history while the page is open, lets the owner
+approve in place, requires an explicit confirmation before rejection, and follows the firing's
+subsequent durable state. Both actions strictly decode the exact Edge receipt, present conflicts and
+temporary failures without inventing success, and relinquish optimistic state as soon as a fresh
+durable row arrives.
+
+Exercising the real journey exposed a deeper dispatcher bug: an Issue event carries its canonical
+issue UUID, but the trigger visibility adapter treated that UUID as a human issue key. JetStream
+therefore consumed and acknowledged the event while the automation silently skipped it. Issue
+visibility now authorizes the canonical subject identity directly through the same live Identity
+relationship check used by the rest of the consumer; it no longer performs an invalid key lookup.
+
+The Chromium product journey creates two real issues through Edge's asynchronous authorization
+boundary, crosses PostgreSQL outbox publication and NATS trigger dispatch, observes both incoming
+firings in the open page, approves one, confirms rejection of the other, and reloads their retained
+decisions before completing pause, resume, disable, and identity teardown. Proof also includes all
+120 Agent Service integration-feature unit tests, strict Agent Service clippy, all 674 web unit
+tests, TypeScript checking, lint, and the production build.
+
 ## 2026-08-31 — Automation creation searches the complete private agent catalogue
 
 The new web automation dialog initially inspected only the newest 100 identities. That bounded read

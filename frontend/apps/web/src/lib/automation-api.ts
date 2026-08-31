@@ -3,6 +3,7 @@ import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gatew
 import {
   AUTOMATION_PAGE_LIMIT,
   isAutomationId,
+  parseAutomationApproval,
   parseAutomation,
   parseAutomationCreate,
   parseAutomationErasure,
@@ -11,6 +12,7 @@ import {
   parseAutomationPage,
   parseAutomationResult,
   type AutomationErasureVM,
+  type AutomationApprovalReceiptVM,
   type AutomationCreateReceipt,
   type AutomationFiringPage,
   type AutomationLifecycleVM,
@@ -31,6 +33,7 @@ export interface AutomationPageInput {
 }
 
 export type AutomationLifecycleAction = "pause" | "resume" | "disable";
+export type AutomationApprovalAction = "approve" | "reject";
 export type AutomationMutationResult<T> =
   | { ok: true; receipt: T }
   | { ok: false; error: AutomationErrorKind };
@@ -226,6 +229,40 @@ export const changeAutomationLifecycle = action(async (input: {
       : "error" });
   }
 }, "automation-lifecycle");
+
+export const decideAutomationFiring = action(async (input: {
+  automationId: string;
+  eventId: string;
+  action: AutomationApprovalAction;
+}) => {
+  "use server";
+  const respond = (value: AutomationMutationResult<AutomationApprovalReceiptVM>) =>
+    json(value, { revalidate: [] });
+  if (!input || !isAutomationId(input.automationId) || !validEventCursor(input.eventId) ||
+      !["approve", "reject"].includes(input.action)) {
+    return respond({ ok: false, error: "bad-input" });
+  }
+  try {
+    const receipt = parseAutomationApproval(await edgePost(
+      `/v1/triggers/${segment(input.automationId)}/firings/${input.action}`,
+      { event_id: input.eventId },
+    ));
+    return receipt
+      ? respond({ ok: true, receipt })
+      : respond({ ok: false, error: "error" });
+  } catch (error) {
+    if (isUnauthorized(error)) throw redirect("/login");
+    if (error instanceof GatewayError) {
+      if (error.status === 400) return respond({ ok: false, error: "bad-input" });
+      if (error.status === 403 || error.status === 404) {
+        return respond({ ok: false, error: "not-found" });
+      }
+      if (error.status === 409) return respond({ ok: false, error: "conflict" });
+      if (error.status === 503) return respond({ ok: false, error: "unavailable" });
+    }
+    return respond({ ok: false, error: "error" });
+  }
+}, "automation-firing-decision");
 
 export const eraseAutomationResult = action(async (input: {
   automationId: string;

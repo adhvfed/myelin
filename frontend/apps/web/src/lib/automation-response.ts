@@ -94,6 +94,13 @@ export interface AutomationLifecycleVM {
   trigger: AutomationVM;
 }
 
+export interface AutomationApprovalReceiptVM {
+  action: "approve" | "reject";
+  changed: boolean;
+  durable: true;
+  firing: AutomationFiringVM;
+}
+
 export interface AutomationPage {
   items: AutomationVM[];
   page: { next_cursor: string | null; limit: number };
@@ -333,4 +340,16 @@ export function parseAutomationLifecycle(value: unknown): AutomationLifecycleVM 
       typeof row.changed !== "boolean" || !safeInteger(row.canceled_firings, 0, 1_000_000) ||
       row.durable !== true || !trigger) return null;
   return { ...row, trigger } as AutomationLifecycleVM;
+}
+
+export function parseAutomationApproval(value: unknown): AutomationApprovalReceiptVM | null {
+  const row = record(value);
+  const decodedFiring = firing(row?.firing);
+  if (!row || !exact(row, ["action", "changed", "durable", "firing"]) ||
+      !["approve", "reject"].includes(row.action as string) ||
+      typeof row.changed !== "boolean" || row.durable !== true || !decodedFiring ||
+      decodedFiring.approval?.decision !== (row.action === "approve" ? "approved" : "rejected")) {
+    return null;
+  }
+  return { ...row, firing: decodedFiring } as AutomationApprovalReceiptVM;
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_AUTOMATION_TASK_BYTES,
+  parseAutomationApproval,
   parseAutomation,
   parseAutomationCreate,
   parseAutomationErasure,
@@ -81,6 +82,16 @@ describe("automation response decoding", () => {
       durable: true,
       trigger: { ...automation, state: "paused" },
     })).toMatchObject({ action: "pause", changed: true, trigger: { state: "paused" } });
+    expect(parseAutomationApproval({
+      action: "approve",
+      changed: false,
+      durable: true,
+      firing,
+    })).toMatchObject({
+      action: "approve",
+      changed: false,
+      firing: { approval: { decision: "approved" } },
+    });
   });
 
   it("accepts an idempotent, recreation-blocking erasure receipt", () => {
@@ -105,6 +116,19 @@ describe("automation response decoding", () => {
       trigger: automation,
       created: true,
       durable: true,
+      provider_token: "must-never-cross",
+    })).toBeNull();
+    expect(parseAutomationApproval({
+      action: "reject",
+      changed: true,
+      durable: true,
+      firing,
+    })).toBeNull();
+    expect(parseAutomationApproval({
+      action: "approve",
+      changed: true,
+      durable: true,
+      firing,
       provider_token: "must-never-cross",
     })).toBeNull();
     expect(parseAutomationFiringPage({

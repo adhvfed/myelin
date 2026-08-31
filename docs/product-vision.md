@@ -37,10 +37,12 @@ per-firing budget, lifetime firing limit, and human-approval rule. The safe init
 refuses personal-data events and delegates no extra caveats; advanced constraints may remain in the
 CLI until the web can present them without obscuring their authority. Creation uses a retained
 idempotency identity, lands on the durable rule, and exposes the same pause, resume, disable, firing,
-approval, result, and erasure history as rules created by other clients. Agent selection traverses
-the owner's complete paged catalogue, including the case where no eligible hosted identity appears
-in the newest page; an unavailable catalogue is presented as a retriable failure, never as proof
-that the owner has no agent.
+approval, result, and erasure history as rules created by other clients. New firings appear without
+a manual reload; the owner can approve or explicitly confirm rejection in place, follow subsequent
+progress, and reload the page without losing either decision. Agent selection traverses the owner's
+complete paged catalogue, including the case where no eligible hosted identity appears in the
+newest page; an unavailable catalogue is presented as a retriable failure, never as proof that the
+owner has no agent.
 
 An agent's owner can maintain a private default workspace augmentation on that named agent:
 `AGENTS.md` instructions plus bounded create-only context files. The organization-visible roster
@@ -130,6 +132,8 @@ then leave Myelin's process: ordinary OpenSSH must use that profile for both a c
 transfer against the same retained workspace. The proof must check file permissions, exact host
 pinning, connection sharing, and absence of credentials from CLI output and generated config.
 Web automation journeys must activate a real hosted identity, create a bounded rule through the
-browser, reload its durable detail, verify budget, firing, approval, and personal-data constraints,
-and disable it through the authenticated product boundary. Existing full-system event journeys must
-separately prove that a matching durable event actually reaches approval and hosted execution.
+browser, produce real durable platform events, observe incoming firings without a manual reload,
+approve one, confirm rejection of another, reload both decisions, verify budget and personal-data
+constraints, and disable the rule through the authenticated product boundary. Full-system event
+journeys must additionally prove that an approved firing reaches hosted execution and its durable
+result.

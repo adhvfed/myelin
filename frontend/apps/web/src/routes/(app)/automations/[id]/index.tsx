@@ -1,4 +1,4 @@
-import { ErrorBoundary, For, Show, Suspense, createEffect, createSignal, onMount } from "solid-js";
+import { ErrorBoundary, For, Show, Suspense, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { A, createAsync, revalidate, useAction, useParams, useSearchParams } from "@solidjs/router";
 import { ConfirmDialog, Icon, Skeleton, useToast } from "@myelin/design-system";
@@ -7,8 +7,10 @@ import { AutomationStateLabel } from "~/components/AutomationStateLabel";
 import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 import {
   changeAutomationLifecycle,
+  decideAutomationFiring,
   getAutomation,
   getAutomationFirings,
+  type AutomationApprovalAction,
   type AutomationLifecycleAction,
 } from "~/lib/automation-api";
 import {
@@ -28,7 +30,13 @@ export default function AutomationDetail() {
   const [mutationError, setMutationError] = createSignal(false);
   const [interactive, setInteractive] = createSignal(false);
   let routeGeneration = 0;
-  onMount(() => setInteractive(true));
+  onMount(() => {
+    setInteractive(true);
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void revalidate("automation-firings");
+    }, 5_000);
+    onCleanup(() => window.clearInterval(timer));
+  });
   const automationId = () => params.id ?? "";
   const cursor = () => search.cursor as string | undefined;
   const detail = createAsync(async () => {
@@ -247,26 +255,96 @@ export default function AutomationDetail() {
 }
 
 function FiringRow(props: { automationId: string; firing: AutomationFiringVM }) {
-  const resultAvailable = () => props.firing.result_state === "available" && props.firing.run_id !== null;
+  const mutate = useAction(decideAutomationFiring);
+  const toast = useToast();
+  const [replacement, setReplacement] = createSignal<AutomationFiringVM | null>(null);
+  const [pending, setPending] = createSignal<AutomationApprovalAction | null>(null);
+  const [confirmingReject, setConfirmingReject] = createSignal(false);
+  const [decisionError, setDecisionError] = createSignal(false);
+  const firing = () => replacement() ?? props.firing;
+  createEffect(on(() => props.firing, () => setReplacement(null), { defer: true }));
+  const resultAvailable = () => firing().result_state === "available" && firing().run_id !== null;
+  const decide = async (action: AutomationApprovalAction) => {
+    if (pending()) return;
+    setPending(action);
+    setDecisionError(false);
+    try {
+      const result = await mutate({
+        automationId: props.automationId,
+        eventId: firing().event_id,
+        action,
+      });
+      if (!result.ok) {
+        setDecisionError(true);
+        return;
+      }
+      setReplacement(result.receipt.firing);
+      toast.show({
+        title: action === "approve" ? "Approved automation firing" : "Rejected automation firing",
+        variant: "success",
+      });
+      void revalidate("automation-firings");
+    } catch {
+      setDecisionError(true);
+    } finally {
+      setPending(null);
+      setConfirmingReject(false);
+    }
+  };
   return (
-    <li class="automation-firing-row">
-      <span class="automation-status" data-state={props.firing.outcome ?? props.firing.state}>
-        <Icon name={props.firing.outcome === "succeeded" ? "check-pass" : props.firing.outcome ? "check-fail" : "check-pending"} />
-        {firingLabel(props.firing)}
+    <li class="automation-firing-row" data-testid="automation-firing-row">
+      <span class="automation-status" data-state={firing().outcome ?? firing().state}>
+        <Icon name={firing().outcome === "succeeded" ? "check-pass" : firing().outcome ? "check-fail" : "check-pending"} />
+        {firingLabel(firing())}
       </span>
       <span class="automation-firing-main">
-        <code>{props.firing.event_id}</code>
-        <span>{firingDetail(props.firing)}</span>
+        <code>{firing().event_id}</code>
+        <span>{firingDetail(firing())}</span>
+        <Show when={firing().state === "awaiting_approval"}>
+          <span class="automation-firing-actions">
+            <button
+              type="button"
+              class="automation-button automation-button-primary"
+              disabled={pending() !== null}
+              onClick={() => void decide("approve")}
+            >
+              <Icon name="check-pass" /> {pending() === "approve" ? "Approving…" : "Approve"}
+            </button>
+            <button
+              type="button"
+              class="automation-button automation-button-danger"
+              disabled={pending() !== null}
+              onClick={() => setConfirmingReject(true)}
+            >
+              <Icon name="close" /> Reject
+            </button>
+          </span>
+        </Show>
+        <Show when={decisionError()}>
+          <span class="automation-mutation-error" role="alert">
+            The decision could not be confirmed. Refresh before retrying.
+          </span>
+        </Show>
       </span>
       <span class="automation-firing-meta">
-        <time datetime={props.firing.created_at}>{formatAutomationTime(props.firing.created_at)}</time>
+        <time datetime={firing().created_at}>{formatAutomationTime(firing().created_at)}</time>
         <Show when={resultAvailable()}>
-          <A href={`/automations/${props.automationId}/runs/${props.firing.run_id}`}>Read result</A>
+          <A href={`/automations/${props.automationId}/runs/${firing().run_id}`}>Read result</A>
         </Show>
-        <Show when={props.firing.result_state === "erased"}>
+        <Show when={firing().result_state === "erased"}>
           <span>Result erased</span>
         </Show>
       </span>
+      <ConfirmDialog
+        open={confirmingReject()}
+        onCancel={() => !pending() && setConfirmingReject(false)}
+        onConfirm={() => void decide("reject")}
+        title="Reject this automation firing?"
+        description="This firing will end without starting the hosted agent. The decision is retained in its history."
+        confirmLabel="Reject firing"
+        cancelLabel="Keep waiting"
+        variant="destructive"
+      />
     </li>
   );
 }

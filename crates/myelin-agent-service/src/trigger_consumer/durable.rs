@@ -23,7 +23,6 @@ pub struct DurableTriggerBindingStore {
 }
 
 pub struct DurableOwnerVisibility {
-    provider: SubstrateProvider,
     principals: DurablePrincipalBacking,
     runs: CiRunStore,
     identity: StoreBackedCheck,
@@ -51,7 +50,6 @@ pub enum TriggerVisibilityRule {
 pub enum TriggerSubjectAddress {
     SubjectId,
     GitRefRepository,
-    IssueKey,
 }
 
 pub fn trigger_visibility_rule(subject_type: &str) -> Option<TriggerVisibilityRule> {
@@ -85,7 +83,7 @@ pub fn trigger_visibility_rule(subject_type: &str) -> Option<TriggerVisibilityRu
             subsystem: "issue",
             identity_object_type: "issue",
             permission: "view",
-            address: TriggerSubjectAddress::IssueKey,
+            address: TriggerSubjectAddress::SubjectId,
         }),
         "page" => Some(TriggerVisibilityRule::Direct {
             subsystem: "knowledge",
@@ -133,7 +131,6 @@ impl DurableOwnerVisibility {
         runtime: Handle,
     ) -> Self {
         Self {
-            provider: provider.clone(),
             principals: DurablePrincipalBacking::new(provider.clone()),
             runs,
             identity,
@@ -167,49 +164,18 @@ impl DurableOwnerVisibility {
     }
 
     fn direct_identity_object(
-        &self,
-        tenant: &str,
         subject_id: &str,
         identity_object_type: &str,
         address: TriggerSubjectAddress,
-    ) -> Result<Option<String>, String> {
+    ) -> Option<String> {
         match address {
             TriggerSubjectAddress::SubjectId => {
-                return Ok(Some(format!("{identity_object_type}:{subject_id}")));
+                Some(format!("{identity_object_type}:{subject_id}"))
             }
             TriggerSubjectAddress::GitRefRepository => {
-                return Ok(git_ref_repository_identity_object(
-                    subject_id,
-                    identity_object_type,
-                ));
+                git_ref_repository_identity_object(subject_id, identity_object_type)
             }
-            TriggerSubjectAddress::IssueKey => {}
         }
-        let tenant = tenant.to_string();
-        let region = self.region.clone();
-        let issue_key = subject_id.to_string();
-        let issue_id = self
-            .drive(self.provider.with_tenant_tx(&tenant.clone(), move |conn| {
-                Box::pin(async move {
-                    sqlx::query_scalar::<_, Uuid>(
-                        "SELECT id FROM issue \
-                          WHERE tenant_id = $1 AND region = $2 AND key = $3 \
-                            AND deleted_at IS NULL",
-                    )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(&issue_key)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .map_err(|_| {
-                        myelin_storage::PgError::Query(
-                            "resolve trigger issue authorization object".into(),
-                        )
-                    })
-                })
-            }))?
-            .map_err(|_| "trigger issue lookup is unavailable".to_string())?;
-        Ok(issue_id.map(|id| format!("{identity_object_type}:{id}")))
     }
 }
 
@@ -355,12 +321,8 @@ impl TriggerOwnerVisibility for DurableOwnerVisibility {
             if subject_key.subsystem.as_deref() != Some(subsystem) {
                 return Ok(false);
             }
-            let Some(object) = self.direct_identity_object(
-                &envelope.tenant.0,
-                &subject_key.id,
-                identity_object_type,
-                address,
-            )?
+            let Some(object) =
+                Self::direct_identity_object(&subject_key.id, identity_object_type, address)
             else {
                 return Ok(false);
             };
@@ -427,7 +389,7 @@ mod visibility_rule_tests {
                 subsystem: "issue",
                 identity_object_type: "issue",
                 permission: "view",
-                address: TriggerSubjectAddress::IssueKey,
+                address: TriggerSubjectAddress::SubjectId,
             })
         );
         assert_eq!(
@@ -468,6 +430,18 @@ mod visibility_rule_tests {
             git_ref_repository_identity_object("missing-ref-separator", "repo"),
             None,
             "a malformed subject fails closed instead of naming another repository"
+        );
+    }
+
+    #[test]
+    fn an_issue_event_authorizes_its_canonical_subject_id() {
+        assert_eq!(
+            DurableOwnerVisibility::direct_identity_object(
+                "e0edd6b6-e9b8-4a8c-95c2-9646ccd61eb0",
+                "issue",
+                TriggerSubjectAddress::SubjectId,
+            ),
+            Some("issue:e0edd6b6-e9b8-4a8c-95c2-9646ccd61eb0".into()),
         );
     }
 }
