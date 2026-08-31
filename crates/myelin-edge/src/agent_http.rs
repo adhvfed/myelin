@@ -7,9 +7,9 @@ use myelin_identity::PrincipalStatus;
 use myelin_identity_service::{
     agent_ref, agent_run_ref, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
     AgentLifecycleRequest, AgentRegistration, AgentRegistryError, AgentSessionError,
-    AgentSessionIssuer, AgentSessionRequest, AgentWorkspaceGuidance, AgentWorkspaceGuidanceUpdate,
-    ClosedAgentSession, IssuedAgentSession, NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
-    HOSTED_LUNA_RUNTIME,
+    AgentSessionIssuer, AgentSessionRequest, AgentToolPaletteRequest, AgentWorkspaceGuidance,
+    AgentWorkspaceGuidanceUpdate, ClosedAgentSession, IssuedAgentSession, NewAgent,
+    PgAgentRegistry, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
 };
 use myelin_storage::{ColumnCryptor, KmsEngine, SubjectId, SubjectKeyScope};
 use serde::Deserialize;
@@ -70,6 +70,13 @@ struct UpdateAgentWorkspaceGuidanceBody {
     expected_revision: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateAgentToolsBody {
+    expected_tools: Vec<String>,
+    tools: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AgentRuntimeSelection {
@@ -120,6 +127,10 @@ struct AgentWorkspaceGuidanceUpdateHandler {
 }
 
 struct AgentWorkspaceGuidanceGetHandler {
+    api: AgentHttpApi,
+}
+
+struct AgentToolsUpdateHandler {
     api: AgentHttpApi,
 }
 
@@ -330,6 +341,50 @@ impl Handler for AgentWorkspaceGuidanceGetHandler {
     }
 }
 
+impl Handler for AgentToolsUpdateHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let body: UpdateAgentToolsBody = parse_agent_body(&ctx.request.body, "agent tools")?;
+        let expected_tools = canonical_tool_names(body.expected_tools)?;
+        let selection = resolve_tool_selection(ctx, &self.api.catalogue, body.tools)?;
+        let outcome = self
+            .api
+            .drive(self.api.registry.update_tool_palette(
+                ctx.principal,
+                AgentToolPaletteRequest {
+                    agent_id: agent_param(ctx)?.to_string(),
+                    expected_tools,
+                    tools: selection.tools,
+                    grants: selection.grants,
+                },
+            ))?
+            .map_err(map_registry_error)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "agent": agent_json(&ctx.principal.tenant.0, &self.api.catalogue, &outcome.agent),
+                "changed": outcome.changed,
+                "terminated_runs": outcome.terminated_runs,
+                "durable": true,
+                "governance": {
+                    "policy_versions": {
+                        "agent": outcome.policy_versions.agent,
+                        "delegation": outcome.policy_versions.delegation,
+                        "tenant": outcome.policy_versions.tenant,
+                        "trigger_actor": outcome.policy_versions.trigger_actor,
+                    },
+                    "policy_revisions": {
+                        "agent": outcome.policy_revisions.agent,
+                        "delegation": outcome.policy_revisions.delegation,
+                        "tenant": outcome.policy_revisions.tenant,
+                        "trigger_actor": outcome.policy_revisions.trigger_actor,
+                    },
+                },
+            }),
+        )))
+    }
+}
+
 struct AgentListHandler {
     api: AgentHttpApi,
 }
@@ -413,6 +468,12 @@ pub fn register_agents(
         )
         .route(
             Method::Post,
+            "/v1/agents/{agent}/tools",
+            "identity.agent.update",
+            Arc::new(AgentToolsUpdateHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
             "/v1/agents/{agent}/suspend",
             "identity.agent.suspend",
             Arc::new(AgentLifecycleHandler {
@@ -460,15 +521,38 @@ fn activation_proposal(
     client_nonce: String,
 ) -> Result<NewAgent, EdgeError> {
     let agent_id = Uuid::new_v4();
-    if body.tools.is_empty() {
-        return Err(EdgeError::BadRequest(
-            "agent create needs at least one `--tool` selection".into(),
-        ));
-    }
-    let mut requested = body.tools;
-    if requested.len() > myelin_identity_service::MAX_AGENT_TOOLS {
+    let selection = resolve_tool_selection(ctx, catalogue, body.tools)?;
+    let workspace_augmentation =
+        WorkspaceAugmentation::from_parts(body.workspace_instructions, body.workspace_files)?;
+    Ok(NewAgent {
+        agent_id,
+        name: body.name,
+        runtime_ref: body.runtime.runtime_ref().into(),
+        tools: selection.tools,
+        grants: selection.grants,
+        workspace_guidance: workspace_augmentation
+            .as_ref()
+            .map(|augmentation| {
+                seal_workspace_guidance(kms, ctx.principal, &agent_id.to_string(), augmentation)
+            })
+            .transpose()?,
+        tenant_policy_if_missing: selection.tenant_policy,
+        trigger_actor_policy_if_missing: selection.trigger_actor_policy,
+        client_nonce,
+    })
+}
+
+struct ResolvedToolSelection {
+    tools: Vec<String>,
+    grants: Vec<String>,
+    tenant_policy: Vec<String>,
+    trigger_actor_policy: Vec<String>,
+}
+
+fn canonical_tool_names(mut requested: Vec<String>) -> Result<Vec<String>, EdgeError> {
+    if requested.is_empty() || requested.len() > myelin_identity_service::MAX_AGENT_TOOLS {
         return Err(EdgeError::BadRequest(format!(
-            "agent create accepts at most {} tools",
+            "select between 1 and {} agent tools",
             myelin_identity_service::MAX_AGENT_TOOLS
         )));
     }
@@ -480,19 +564,27 @@ fn activation_proposal(
             "agent tool selections must be distinct".into(),
         ));
     }
+    if let Some(name) = requested.iter().find(|name| !is_canonical_tool_name(name)) {
+        return Err(EdgeError::BadRequest(format!(
+            "agent tool `{name}` is not a canonical `<subsystem>.<name>`"
+        )));
+    }
+    Ok(requested)
+}
 
+fn resolve_tool_selection(
+    ctx: &HandlerCtx<'_>,
+    catalogue: &PlatformToolCatalogue,
+    requested: Vec<String>,
+) -> Result<ResolvedToolSelection, EdgeError> {
+    let requested = canonical_tool_names(requested)?;
     let actor_authority = &ctx.identity.capability().effective_authority;
-    let mut selected = Vec::with_capacity(requested.len());
+    let mut tools = Vec::with_capacity(requested.len());
     let mut grants = AGENT_BASELINE_GRANTS
         .iter()
         .map(|grant| (*grant).to_string())
         .collect::<BTreeSet<_>>();
     for name in requested {
-        if !is_canonical_tool_name(&name) {
-            return Err(EdgeError::BadRequest(format!(
-                "agent tool `{name}` is not a canonical `<subsystem>.<name>`"
-            )));
-        }
         let definition = catalogue
             .resolve(&name)
             .filter(|definition| definition.exposed_over_mcp)
@@ -505,7 +597,7 @@ fn activation_proposal(
             }
             grants.insert(capability.clone());
         }
-        selected.push(catalogue_cursor(definition));
+        tools.push(catalogue_cursor(definition));
     }
     for baseline in AGENT_BASELINE_GRANTS {
         if !actor_authority.holds(baseline) {
@@ -514,7 +606,6 @@ fn activation_proposal(
             )));
         }
     }
-
     let mut tenant_policy = AGENT_BASELINE_GRANTS
         .iter()
         .map(|grant| (*grant).to_string())
@@ -524,27 +615,11 @@ fn activation_proposal(
             tenant_policy.extend(definition.required_caps.iter().cloned());
         }
     }
-    let trigger_actor_policy = actor_authority
-        .grants()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let workspace_augmentation =
-        WorkspaceAugmentation::from_parts(body.workspace_instructions, body.workspace_files)?;
-    Ok(NewAgent {
-        agent_id,
-        name: body.name,
-        runtime_ref: body.runtime.runtime_ref().into(),
-        tools: selected,
+    Ok(ResolvedToolSelection {
+        tools,
         grants: grants.into_iter().collect(),
-        workspace_guidance: workspace_augmentation
-            .as_ref()
-            .map(|augmentation| {
-                seal_workspace_guidance(kms, ctx.principal, &agent_id.to_string(), augmentation)
-            })
-            .transpose()?,
-        tenant_policy_if_missing: tenant_policy.into_iter().collect(),
-        trigger_actor_policy_if_missing: trigger_actor_policy,
-        client_nonce,
+        tenant_policy: tenant_policy.into_iter().collect(),
+        trigger_actor_policy: actor_authority.grants().map(str::to_string).collect(),
     })
 }
 

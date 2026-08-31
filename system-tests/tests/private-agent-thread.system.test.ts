@@ -558,6 +558,113 @@ describe("private work with an agent", () => {
       .toBe(secondDefaultContext);
   });
 
+  test("narrows a named agent's tool palette, closes old authority, and constrains fresh work", async () => {
+    const founder = await browserApprovedCliClient();
+    const teammate = await browserApprovedCliClient(reviewerClient);
+    const instructions = "# Palette proof\n\nRead the assigned workspace before changing it.";
+    const companion = await activateExternalAgent(
+      founder,
+      uniqueName("Least-authority companion"),
+      ["workspace.read_file", "workspace.write_file"],
+      { workspaceInstructions: instructions },
+    );
+    const thread = await startPrivateAgentThread(founder, {
+      name: uniqueName("Constrain fresh agent work"),
+      agentId: companion.agent.id,
+    });
+    const oldRun = await beginAgentThreadRun(founder, thread.thread.id);
+    expect(oldRun.run.selected_tools.map((tool) => tool.name)).toEqual([
+      "workspace.read_file",
+      "workspace.write_file",
+    ]);
+    expect(record(await askAgent(oldRun, 1, "workspace.read_file", { path: "AGENTS.md" }),
+      "workspace before palette reduction").content).toContain(instructions);
+
+    await teammate.json(`/v1/agents/${encodeURIComponent(companion.agent.id)}/tools`, {
+      method: "POST",
+      body: {
+        expected_tools: ["workspace.read_file", "workspace.write_file"],
+        tools: ["workspace.read_file"],
+      },
+      idempotencyKey: `foreign-agent-tools-${randomUUID()}`,
+      expectedStatus: 404,
+    });
+    const updateBody = {
+      expected_tools: ["workspace.read_file", "workspace.write_file"],
+      tools: ["workspace.read_file"],
+    };
+    const updated = await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/tools`,
+      {
+        method: "POST",
+        body: updateBody,
+        idempotencyKey: `agent-tools-${randomUUID()}`,
+        expectedStatus: 200,
+      },
+    );
+    expect(updated.body).toMatchObject({
+      agent: {
+        id: companion.agent.id,
+        selected_tools: [{ name: "workspace.read_file", version: 1 }],
+      },
+      changed: true,
+      terminated_runs: 1,
+      durable: true,
+      governance: {
+        policy_versions: {
+          agent: expect.any(Number),
+          delegation: expect.any(Number),
+          tenant: expect.any(Number),
+          trigger_actor: expect.any(Number),
+        },
+        policy_revisions: {
+          agent: expect.any(Number),
+          delegation: expect.any(Number),
+          tenant: expect.any(Number),
+          trigger_actor: expect.any(Number),
+        },
+      },
+    });
+    await systemClient.json("/v1/whoami", {
+      token: oldRun.credential.token,
+      tokenScheme: "agent",
+      expectedStatus: 401,
+    });
+
+    const exactRetry = await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/tools`,
+      {
+        method: "POST",
+        body: updateBody,
+        idempotencyKey: `agent-tools-retry-${randomUUID()}`,
+        expectedStatus: 200,
+      },
+    );
+    expect(exactRetry.body).toMatchObject({
+      agent: { id: companion.agent.id },
+      changed: false,
+      terminated_runs: 0,
+      durable: true,
+    });
+    await founder.json(`/v1/agents/${encodeURIComponent(companion.agent.id)}/tools`, {
+      method: "POST",
+      body: {
+        expected_tools: ["workspace.write_file"],
+        tools: ["workspace.read_file", "workspace.write_file"],
+      },
+      idempotencyKey: `stale-agent-tools-${randomUUID()}`,
+      expectedStatus: 409,
+    });
+
+    const freshRun = await beginAgentThreadRun(founder, thread.thread.id);
+    expect(freshRun.run.selected_tools.map((tool) => tool.name)).toEqual([
+      "workspace.read_file",
+    ]);
+    expect(record(await askAgent(freshRun, 1, "workspace.read_file", { path: "AGENTS.md" }),
+      "workspace after palette reduction").content).toContain(instructions);
+    await closeAgentRun(freshRun);
+  });
+
   test("refuses an agent runtime that cannot resume private work before provisioning anything", async () => {
     const founder = await browserApprovedCliClient();
     const threadName = uniqueName("Hosted thread that must not exist");

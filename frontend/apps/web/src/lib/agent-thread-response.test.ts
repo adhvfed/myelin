@@ -8,6 +8,7 @@ import {
   parseAgentChoice,
   parseAgentChoices,
   parseAgentLifecycleReceipt,
+  parseAgentToolPaletteReceipt,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
   parseAgentThreadMessageReceipt,
@@ -361,6 +362,43 @@ describe("private agent work wire projection", () => {
       terminated_runs: 0,
       durable: true,
       credential: "must-not-cross",
+    })).toBeNull();
+  });
+
+  it("decodes tool changes only with durable policy coordinates and honest revocation", () => {
+    const configured = {
+      ...agent,
+      selected_tools: [{
+        name: "workspace.read_file",
+        version: 1,
+        ref: "myelin://acme/agent/tool/workspace.read_file@1",
+      }],
+    };
+    expect(parseAgentToolPaletteReceipt({
+      agent: configured,
+      changed: true,
+      terminated_runs: 2,
+      durable: true,
+      governance,
+    })).toMatchObject({
+      agent: { id: AGENT, selected_tools: ["workspace.read_file"] },
+      changed: true,
+      terminated_runs: 2,
+      governance,
+    });
+    expect(parseAgentToolPaletteReceipt({
+      agent: configured,
+      changed: false,
+      terminated_runs: 1,
+      durable: true,
+      governance,
+    })).toBeNull();
+    expect(parseAgentToolPaletteReceipt({
+      agent: configured,
+      changed: true,
+      terminated_runs: 0,
+      durable: true,
+      governance: { ...governance, policy_versions: { ...governance.policy_versions, agent: 0 } },
     })).toBeNull();
   });
 

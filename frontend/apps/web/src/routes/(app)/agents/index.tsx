@@ -13,6 +13,7 @@ import {
 import { AgentActivationDialog } from "~/components/agents/AgentActivationDialog";
 import { AgentThreadCreateDialog } from "~/components/agents/AgentThreadCreateDialog";
 import { AgentRosterDialog } from "~/components/agents/AgentRosterDialog";
+import { AgentToolsDialog } from "~/components/agents/AgentToolsDialog";
 import { AgentWorkspaceDefaultsDialog } from "~/components/agents/AgentWorkspaceDefaultsDialog";
 import { AgentThreadSidebar } from "~/components/agents/AgentThreadSidebar";
 import {
@@ -30,6 +31,7 @@ import {
   getAgentThread,
   getAgentThreadMessages,
   getAgentThreads,
+  getAgentToolDefinitions,
   getWorkspaceSessions,
   mutateAgentThread,
   type AgentThreadErrorKind,
@@ -82,6 +84,7 @@ export default function AgentThreadsIndex() {
   const [activatedAgents, setActivatedAgents] = createSignal<AgentChoice[]>([]);
   const [preferredAgentId, setPreferredAgentId] = createSignal<string>();
   const [configuringAgent, setConfiguringAgent] = createSignal<AgentChoice | null>(null);
+  const [configuringAgentTools, setConfiguringAgentTools] = createSignal<AgentChoice | null>(null);
   const [managingAgents, setManagingAgents] = createSignal(false);
   const [loadingMoreAgents, setLoadingMoreAgents] = createSignal(false);
   const [earlierMessagePages, setEarlierMessagePages] = createSignal<Awaited<ReturnType<typeof getAgentThreadMessages>>[]>([]);
@@ -110,6 +113,14 @@ export default function AgentThreadsIndex() {
     } catch (error) {
       if (error instanceof Response) throw error;
       return { page: null, error: agentThreadErrorKind(error) };
+    }
+  }, { deferStream: true });
+  const availableAgentTools = createAsync(async () => {
+    try {
+      return await getAgentToolDefinitions();
+    } catch (error) {
+      if (error instanceof Response) throw error;
+      return [];
     }
   }, { deferStream: true });
 
@@ -500,6 +511,7 @@ export default function AgentThreadsIndex() {
       />
       <AgentActivationDialog
         open={activationOpen()}
+        availableTools={availableAgentTools() ?? []}
         onClose={closeActivation}
         onActivated={(receipt) => {
           setActivatedAgents((current) => mergeById([receipt.agent], [current]));
@@ -522,9 +534,13 @@ export default function AgentThreadsIndex() {
           setManagingAgents(false);
           openActivation();
         }}
-        onConfigure={(agent) => {
+        onConfigureWorkspace={(agent) => {
           setManagingAgents(false);
           setConfiguringAgent(agent);
+        }}
+        onConfigureTools={(agent) => {
+          setManagingAgents(false);
+          setConfiguringAgentTools(agent);
         }}
         onChanged={(receipt) => {
           setActivatedAgents((current) => mergeById([receipt.agent], [current]));
@@ -557,6 +573,25 @@ export default function AgentThreadsIndex() {
             title: receipt.changed
               ? `${receipt.agent.name} workspace defaults saved`
               : `${receipt.agent.name} workspace defaults already current`,
+            variant: "success",
+          });
+        }}
+      />
+      <AgentToolsDialog
+        agent={configuringAgentTools()}
+        availableTools={availableAgentTools() ?? []}
+        onClose={() => setConfiguringAgentTools(null)}
+        onConfigured={(receipt) => {
+          setActivatedAgents((current) => mergeById([receipt.agent], [current]));
+          setPreferredAgentId(receipt.agent.id);
+          void Promise.all([
+            revalidate(getAgentChoices.keyFor({ limit: 100 })),
+            revalidate(getAgentChoice.keyFor(receipt.agent.id)),
+          ]);
+          toast.show({
+            title: receipt.changed
+              ? `${receipt.agent.name} tools saved${receipt.terminated_runs > 0 ? ` · ${receipt.terminated_runs} live ${receipt.terminated_runs === 1 ? "run" : "runs"} closed` : ""}`
+              : `${receipt.agent.name} tools already current`,
             variant: "success",
           });
         }}

@@ -73,7 +73,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await activation.getByRole("button", { name: "Add context file" }).click();
   await activation.getByRole("textbox", { name: "File 1 path" }).fill(agentContextPath);
   await activation.getByRole("textbox", { name: "File 1 contents" }).fill(agentContextContents);
-  await activation.getByRole("checkbox", { name: "Allow bounded workspace commands" }).check();
+  await activation.getByRole("checkbox", { name: "Run bounded commands" }).check();
   await activation.getByRole("button", { name: "Activate agent" }).click();
 
   const initialThreadDialog = page.getByRole("dialog", { name: "Start private agent thread" });
@@ -84,7 +84,19 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const roster = page.getByRole("dialog", { name: "My named agents" });
   const agentRow = roster.getByRole("listitem").filter({ hasText: agentName });
   await expect(agentRow).toContainText("Workspace defaults · revision 1");
-  await agentRow.getByRole("button", { name: "Configure" }).click();
+  await expect(agentRow).toContainText("6 selected tools");
+  await agentRow.getByRole("button", { name: "Tools" }).click();
+  const tools = page.getByRole("dialog", { name: `${agentName} · tools` });
+  await expect(tools.getByRole("checkbox", { name: "Run bounded commands" })).toBeChecked();
+  await tools.getByRole("checkbox", { name: "Reply in threads" }).uncheck();
+  await tools.getByRole("button", { name: "Save tools" }).click();
+  await expect(tools).toBeHidden();
+
+  await page.getByRole("button", { name: "Manage my agents" }).click();
+  const revisedRoster = page.getByRole("dialog", { name: "My named agents" });
+  const revisedAgentRow = revisedRoster.getByRole("listitem").filter({ hasText: agentName });
+  await expect(revisedAgentRow).toContainText("5 selected tools");
+  await revisedAgentRow.getByRole("button", { name: "Workspace" }).click();
   const defaults = page.getByRole("dialog", { name: `${agentName} · workspace defaults` });
   const defaultsEditor = defaults.getByRole("textbox", {
     name: "Default AGENTS.md instructions",
@@ -219,6 +231,9 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   }).agent;
   expect(durableAgent.selected_tools).toEqual(expect.arrayContaining([
     expect.objectContaining({ name: "workspace.exec" }),
+  ]));
+  expect(durableAgent.selected_tools).not.toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "chat.reply" }),
   ]));
   expect(durableAgent.effective_tools).toEqual(expect.arrayContaining([
     expect.objectContaining({ name: "workspace.exec" }),

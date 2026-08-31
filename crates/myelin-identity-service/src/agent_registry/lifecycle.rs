@@ -331,7 +331,7 @@ async fn lock_owned_agent(
     row.as_ref().map(agent_from_joined_row).transpose()
 }
 
-async fn terminate_unfinished_runs(
+pub(super) async fn terminate_unfinished_runs(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,

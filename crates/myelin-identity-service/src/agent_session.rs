@@ -349,6 +349,8 @@ impl AgentSessionIssuer {
                 &actor.principal_id.0,
                 &request.trigger_credential_jti,
                 &trigger_authority,
+                &registration.tools,
+                &registration.grants,
                 &request.client_nonce,
                 run_id,
                 &proposed_jti,

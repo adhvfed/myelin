@@ -13,6 +13,8 @@ pub const IDENTITY_AGENT_CREATED: &str = "identity.agent.created";
 
 pub const IDENTITY_AGENT_STATUS_CHANGED: &str = "identity.agent.status_changed";
 
+pub const IDENTITY_AGENT_TOOLS_UPDATED: &str = "identity.agent.tools_updated";
+
 pub const IDENTITY_AGENT_WORKSPACE_GUIDANCE_UPDATED: &str =
     "identity.agent.workspace_guidance_updated";
 
@@ -23,6 +25,7 @@ pub const IDENTITY_EVENT_TOKENS: &[&str] = &[
     IDENTITY_PROJECT_CREATED,
     IDENTITY_AGENT_CREATED,
     IDENTITY_AGENT_STATUS_CHANGED,
+    IDENTITY_AGENT_TOOLS_UPDATED,
     IDENTITY_AGENT_WORKSPACE_GUIDANCE_UPDATED,
 ];
 
@@ -106,12 +109,13 @@ mod tests {
                 );
             }
         }
-        assert_eq!(IDENTITY_EVENT_TOKENS.len(), 7);
+        assert_eq!(IDENTITY_EVENT_TOKENS.len(), 8);
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_TUPLE_WRITTEN));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_ROLE_GRANTED));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_BREAK_GLASS));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_PROJECT_CREATED));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_AGENT_STATUS_CHANGED));
+        assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_AGENT_TOOLS_UPDATED));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_AGENT_WORKSPACE_GUIDANCE_UPDATED));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_AGENT_CREATED));
     }

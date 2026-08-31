@@ -216,9 +216,10 @@ pub use authz_projection_durable::{
 };
 pub use delegation_policy_durable::{
     delegation_policy_durable_migrations, ensure_agent_policy_bundle_on_conn,
-    DurableDelegationPolicyBacking, DurableDelegationPolicyBundle, DurableDelegationPolicyError,
-    DurableDelegationPolicyHeadCursor, DurableDelegationPolicyRevisions,
-    DurableDelegationPolicySnapshot, DurableDelegationPolicyVersions,
+    replace_agent_policy_bundle_on_conn, DurableDelegationPolicyBacking,
+    DurableDelegationPolicyBundle, DurableDelegationPolicyError, DurableDelegationPolicyHeadCursor,
+    DurableDelegationPolicyRevisions, DurableDelegationPolicySnapshot,
+    DurableDelegationPolicyVersions,
 };
 pub use events_durable::{
     bus_erasure_durable_migrations, consumer_dead_letter_migrations,

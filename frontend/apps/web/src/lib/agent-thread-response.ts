@@ -49,6 +49,24 @@ export interface AgentWorkspaceGuidanceReceipt {
   durable: true;
 }
 
+interface AgentPolicyCoordinates {
+  agent: number;
+  delegation: number;
+  tenant: number;
+  trigger_actor: number;
+}
+
+export interface AgentToolPaletteReceipt {
+  agent: AgentChoice;
+  changed: boolean;
+  terminated_runs: number;
+  durable: true;
+  governance: {
+    policy_versions: AgentPolicyCoordinates;
+    policy_revisions: AgentPolicyCoordinates;
+  };
+}
+
 export interface AgentLifecycleReceipt {
   agent: AgentChoice;
   action: "suspend" | "resume" | "retire";
@@ -292,6 +310,28 @@ export function parseAgentWorkspaceGuidanceReceipt(
       typeof receipt.changed === "boolean" && receipt.durable === true
     ? { agent, changed: receipt.changed, durable: true }
     : null;
+}
+
+export function parseAgentToolPaletteReceipt(value: unknown): AgentToolPaletteReceipt | null {
+  const receipt = record(value);
+  const agent = agentChoice(receipt?.agent);
+  const governance = record(receipt?.governance);
+  if (!receipt || !exact(receipt, [
+    "agent", "changed", "terminated_runs", "durable", "governance",
+  ]) || !agent || typeof receipt.changed !== "boolean" ||
+      !Number.isSafeInteger(receipt.terminated_runs) || (receipt.terminated_runs as number) < 0 ||
+      receipt.durable !== true || !governance ||
+      !exact(governance, ["policy_versions", "policy_revisions"]) ||
+      !policyCoordinates(governance.policy_versions) ||
+      !policyCoordinates(governance.policy_revisions) ||
+      (!receipt.changed && receipt.terminated_runs !== 0)) return null;
+  return {
+    agent,
+    changed: receipt.changed,
+    terminated_runs: receipt.terminated_runs as number,
+    durable: true,
+    governance: governance as unknown as AgentToolPaletteReceipt["governance"],
+  };
 }
 
 export function parseAgentLifecycleReceipt(value: unknown): AgentLifecycleReceipt | null {

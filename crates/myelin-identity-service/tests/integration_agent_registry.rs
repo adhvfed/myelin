@@ -5,9 +5,9 @@ use myelin_identity::{
     DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId, RuntimeRef,
 };
 use myelin_identity_service::{
-    AgentLifecycleAction, AgentLifecycleRequest, AgentRegistryError, AgentWorkspaceGuidance,
-    AgentWorkspaceGuidanceUpdate, Authority, DelegationPolicySource, NewAgent, PgAgentRegistry,
-    EXTERNAL_MCP_RUNTIME,
+    AgentLifecycleAction, AgentLifecycleRequest, AgentRegistryError, AgentToolPaletteRequest,
+    AgentWorkspaceGuidance, AgentWorkspaceGuidanceUpdate, Authority, DelegationPolicySource,
+    NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
@@ -25,6 +25,110 @@ fn test_config() -> MyelinConfig {
         }
     }
     config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_tool_changes_replace_policy_and_emit_one_metadata_event() {
+    let (admin, app) = providers().await;
+    let tenant = unique("tool-palette");
+    let region = app.config().region.clone();
+    let actor = human(&tenant, &region);
+    let registry = PgAgentRegistry::new(app.clone());
+    let mut intent = proposal("activate-tool-palette-agent-v1");
+    intent.tools = vec!["git.open_pr.v1".into(), "ci.read_run.v1".into()];
+    let created = registry.create(&actor, intent).await.unwrap().agent;
+
+    let request = AgentToolPaletteRequest {
+        agent_id: created.id.clone(),
+        expected_tools: vec!["git.open_pr".into(), "ci.read_run".into()],
+        tools: vec!["ci.read_run.v1".into()],
+        grants: vec![
+            "agent.tools.read".into(),
+            "edge.identity.read".into(),
+            "run.view".into(),
+        ],
+    };
+    let updated = registry
+        .update_tool_palette(&actor, request.clone())
+        .await
+        .expect("the owner narrows the palette and all durable policy conjuncts together");
+    assert!(updated.changed);
+    assert_eq!(updated.terminated_runs, 0);
+    assert_eq!(updated.agent.tools, vec!["ci.read_run.v1"]);
+    assert_eq!(
+        updated.agent.grants,
+        vec!["agent.tools.read", "edge.identity.read", "run.view"]
+    );
+    assert!(updated.policy_versions.agent > 1);
+    assert!(updated.policy_versions.delegation > 1);
+
+    let governed_agent = Principal::new(
+        actor.tenant.clone(),
+        actor.region.clone(),
+        PrincipalId(updated.agent.principal_id.clone()),
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef(updated.agent.runtime_ref.clone()),
+            on_behalf_of: Some(actor.principal_id.clone()),
+        },
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let scope = TenantScope::from_verified_token(&actor, actor.region.clone());
+    let resolved =
+        DelegationPolicySource::with_pg(DurableDelegationPolicyBacking::new(app.clone()))
+            .resolve_for_run(
+                &scope,
+                &governed_agent,
+                &actor,
+                &RunId("run:tool-palette-proof".into()),
+            )
+            .await
+            .expect("the replacement policy resolves after the same commit");
+    assert!(resolved.input().agent_policy.holds("run.view"));
+    assert!(!resolved.input().agent_policy.holds("repo.push"));
+    assert!(!resolved.input().delegation.holds("repo.push"));
+
+    let replay = registry
+        .update_tool_palette(&actor, request)
+        .await
+        .expect("an exact semantic retry converges");
+    assert!(!replay.changed);
+    assert_eq!(replay.terminated_runs, 0);
+    let conflict = registry
+        .update_tool_palette(
+            &actor,
+            AgentToolPaletteRequest {
+                agent_id: created.id.clone(),
+                expected_tools: vec!["git.open_pr".into()],
+                tools: vec!["git.open_pr.v1".into()],
+                grants: vec![
+                    "agent.tools.read".into(),
+                    "edge.identity.read".into(),
+                    "repo.push".into(),
+                ],
+            },
+        )
+        .await;
+    assert!(matches!(conflict, Err(AgentRegistryError::Conflict(_))));
+
+    let events: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+          WHERE aggregate = $1 AND envelope->>'type_' = 'identity.agent.tools_updated' \
+          ORDER BY event_id",
+    )
+    .bind(format!("identity:agent:{}", created.id))
+    .fetch_all(admin.db_pool())
+    .await
+    .expect("read tool palette audit metadata");
+    assert_eq!(events.len(), 1, "retry and conflict emit no second event");
+    assert_eq!(events[0]["payload"]["agent_id"], created.id);
+    assert_eq!(events[0]["payload"]["terminated_runs"], 0);
+    assert_eq!(
+        events[0]["payload"]["tools"],
+        serde_json::json!(["ci.read_run.v1"])
+    );
+    assert!(events[0]["payload"].get("grants").is_none());
+    cleanup(&admin, &tenant).await;
 }
 
 fn admin_config(config: &MyelinConfig) -> MyelinConfig {

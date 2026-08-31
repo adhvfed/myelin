@@ -20,8 +20,10 @@ use sqlx::Row;
 use uuid::Uuid;
 
 mod lifecycle;
+mod tool_palette;
 
 pub use lifecycle::{AgentLifecycleAction, AgentLifecycleOutcome, AgentLifecycleRequest};
+pub use tool_palette::{AgentToolPaletteOutcome, AgentToolPaletteRequest};
 
 pub const EXTERNAL_MCP_RUNTIME: &str = "external:mcp";
 pub const HOSTED_LUNA_RUNTIME: &str = "hosted:luna";

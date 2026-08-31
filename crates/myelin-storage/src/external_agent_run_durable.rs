@@ -165,6 +165,8 @@ impl DurableExternalAgentRunBacking {
         trigger_actor_id: &str,
         trigger_credential_jti: &str,
         trigger_authority: &[String],
+        expected_tools: &[String],
+        expected_grants: &[String],
         client_nonce: &str,
         proposed_run_id: Uuid,
         token_jti: &str,
@@ -176,6 +178,8 @@ impl DurableExternalAgentRunBacking {
         let trigger_actor_id = trigger_actor_id.to_string();
         let trigger_credential_jti = trigger_credential_jti.to_string();
         let trigger_authority = trigger_authority.to_vec();
+        let expected_tools = expected_tools.to_vec();
+        let expected_grants = expected_grants.to_vec();
         let client_nonce = client_nonce.to_string();
         let token_jti = token_jti.to_string();
         self.provider
@@ -187,17 +191,20 @@ impl DurableExternalAgentRunBacking {
                             AND p.region = a.region \
                             AND p.principal_id = 'agent:' || a.agent_id::text \
                           WHERE a.tenant_id = $1 AND a.region = $2 AND a.agent_id = $3 \
+                            AND a.tools = $4 AND a.grants = $5 \
                           FOR UPDATE OF p",
                     )
                     .bind(&tenant)
                     .bind(&region)
                     .bind(agent_id)
+                    .bind(&expected_tools)
+                    .bind(&expected_grants)
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("lock external agent before run claim"))?;
                     if status.as_deref() != Some(ACTIVE_PRINCIPAL_STATUS_JSON) {
                         return Err(PgError::Query(
-                            "external agent run claim refused an inactive or unknown agent".into(),
+                            "external agent run claim refused an inactive, unknown, or reconfigured agent".into(),
                         ));
                     }
                     let inserted = sqlx::query(

@@ -35,6 +35,17 @@ editable action to the viewer. The same owner surface can pause an identity imme
 later, or retire it permanently with an explicit confirmation; pausing or retirement revokes live
 agent authority without making retained work disappear.
 
+The tool palette is equally concrete. Activation shows the complete live platform catalogue rather
+than hiding a fixed authority bundle behind a broad toggle, and the personal roster lets the owner
+replace the exact selection later. A palette update re-derives grants from the catalogue under the
+owner's current authority ceiling, advances the agent and delegation policy heads, updates the
+registration, terminates unfinished runs, and emits metadata-only audit evidence in one durable
+transaction. Run creation binds its claim to the registration's exact tool-and-grant snapshot, so
+a concurrent update cannot mint stale authority. Optimistic edits compare semantic tool names so a
+catalogue version advance does not strand an older agent; exact retries converge, while a genuinely
+stale selection conflicts. Existing workspace data remains intact and only a fresh connection can
+receive the new palette.
+
 The workspace is personalizable at creation time. Repository guidance remains the shared default,
 while an owner can layer their own way of working into the assigned workspace—for example, custom
 root `AGENTS.md` instructions and private context files—without changing the source repository.
@@ -78,4 +89,6 @@ open it again from a fresh context, and prove the repository source was never mo
 default journeys must prove plaintext is owner-only, stale edits conflict, instruction-only edits
 preserve configured files, new work receives the latest revision, thread-specific instructions take
 precedence, and existing work retains its original instruction-and-file snapshot after the defaults
-change.
+change. Tool-palette journeys must prove a second identity cannot edit, a real live run is
+terminated, its credential stops authenticating, an exact retry is inert, a stale edit conflicts,
+and a fresh run exposes only the saved tools while retaining its workspace.

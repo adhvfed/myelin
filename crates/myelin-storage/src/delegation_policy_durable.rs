@@ -382,6 +382,109 @@ pub async fn ensure_agent_policy_bundle_on_conn(
     Ok(Ok((versions, revisions)))
 }
 
+/// Replaces the exact agent and owner-delegation grant heads in the caller's transaction.
+/// Tenant and trigger-actor ceilings remain immutable and must already contain every requested
+/// grant. Advancing both heads together invalidates every previously minted policy snapshot.
+pub async fn replace_agent_policy_bundle_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    agent_id: &str,
+    trigger_actor_id: &str,
+    mut agent_grants: Vec<String>,
+) -> Result<
+    Result<
+        (
+            DurableDelegationPolicyVersions,
+            DurableDelegationPolicyRevisions,
+        ),
+        DurableDelegationPolicyError,
+    >,
+    PgError,
+> {
+    if let Err(error) = canonicalize_grants(&mut agent_grants) {
+        return Ok(Err(error));
+    }
+    if agent_grants.is_empty() {
+        return Ok(Err(DurableDelegationPolicyError::InvalidGrantSet));
+    }
+    let keys = PolicyKey::all(agent_id, trigger_actor_id);
+    lock_policy_keys(conn, tenant, region, &keys, false).await?;
+    let mut heads = BTreeMap::new();
+    for key in &keys {
+        let Some(row) = load_policy_head_for_update(conn, tenant, region, key).await? else {
+            return Ok(Err(DurableDelegationPolicyError::MissingPolicy(key.kind)));
+        };
+        heads.insert(key.kind.to_string(), row);
+    }
+    for kind in [TENANT, TRIGGER_ACTOR] {
+        let row = heads
+            .get(kind)
+            .expect("all four delegation policy heads were loaded");
+        if let Err(error) = require_active(row, kind) {
+            return Ok(Err(error));
+        }
+        if !contains_every(&row.grants, &agent_grants) {
+            return Ok(Err(DurableDelegationPolicyError::IncompatiblePolicy(kind)));
+        }
+    }
+    for kind in [AGENT, DELEGATION] {
+        let row = heads
+            .get(kind)
+            .expect("all four delegation policy heads were loaded");
+        if let Err(error) = require_active(row, kind) {
+            return Ok(Err(error));
+        }
+    }
+
+    let already_current = [AGENT, DELEGATION].iter().all(|kind| {
+        heads
+            .get(*kind)
+            .is_some_and(|row| row.grants == agent_grants)
+    });
+    if !already_current {
+        for key in [
+            PolicyKey::agent(agent_id),
+            PolicyKey::delegation(agent_id, trigger_actor_id),
+        ] {
+            let current = heads
+                .get(key.kind)
+                .expect("the mutable policy head was loaded")
+                .clone();
+            let version = current.version + 1;
+            let revision = append_and_advance_head(
+                conn,
+                tenant,
+                region,
+                &key,
+                PolicyUpdate {
+                    version,
+                    status: ACTIVE,
+                    grants: agent_grants.clone(),
+                    platform_managed: false,
+                },
+            )
+            .await?;
+            heads.insert(
+                key.kind.to_string(),
+                PolicyRow {
+                    kind: key.kind.to_string(),
+                    version,
+                    revision,
+                    status: ACTIVE.into(),
+                    grants: agent_grants.clone(),
+                    platform_managed: false,
+                },
+            );
+        }
+    }
+    let versions = versions_of(&heads)
+        .ok_or_else(|| PgError::Query("agent update lost a delegation policy head".into()))?;
+    let revisions = revisions_of(&heads)
+        .ok_or_else(|| PgError::Query("agent update lost a delegation policy revision".into()))?;
+    Ok(Ok((versions, revisions)))
+}
+
 fn platform_tenant_upgrade(
     tenant: Option<&PolicyRow>,
     agent_grants: &[String],

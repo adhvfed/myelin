@@ -23,7 +23,8 @@ export function AgentRosterDialog(props: {
   loadingMore: boolean;
   onLoadMore: () => void;
   onActivate: () => void;
-  onConfigure: (agent: AgentChoice) => void;
+  onConfigureWorkspace: (agent: AgentChoice) => void;
+  onConfigureTools: (agent: AgentChoice) => void;
   onChanged: (receipt: AgentLifecycleReceipt) => void;
   onClose: () => void;
 }) {
@@ -124,6 +125,7 @@ export function AgentRosterDialog(props: {
                           ? `Workspace defaults · revision ${agent.workspace_profile.revision}`
                           : "No workspace defaults"}
                       </small>
+                      <small>{agent.selected_tools.length} selected {agent.selected_tools.length === 1 ? "tool" : "tools"}</small>
                       <Show when={errorAgentId() === agent.id}>
                         <small class="agent-roster-error" role="alert">
                           Myelin couldn’t confirm that change. Retry it with the retained request.
@@ -138,9 +140,17 @@ export function AgentRosterDialog(props: {
                           type="button"
                           class="agent-thread-button secondary"
                           disabled={Boolean(pending())}
-                          onClick={() => props.onConfigure(agent)}
+                          onClick={() => props.onConfigureTools(agent)}
                         >
-                          <Icon name="edit" /> Configure
+                          <Icon name="gate" /> Tools
+                        </button>
+                        <button
+                          type="button"
+                          class="agent-thread-button secondary"
+                          disabled={Boolean(pending())}
+                          onClick={() => props.onConfigureWorkspace(agent)}
+                        >
+                          <Icon name="edit" /> Workspace
                         </button>
                         <Show when={agent.status === "active"} fallback={
                           <button

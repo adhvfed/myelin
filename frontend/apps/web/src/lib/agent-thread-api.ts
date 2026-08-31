@@ -9,6 +9,7 @@ import {
   parseAgentChoice,
   parseAgentChoices,
   parseAgentLifecycleReceipt,
+  parseAgentToolPaletteReceipt,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
   parseAgentThreadReviewReceipt,
@@ -20,6 +21,7 @@ import {
   type AgentChoicePage,
   type AgentActivationReceipt,
   type AgentLifecycleReceipt,
+  type AgentToolPaletteReceipt,
   type AgentWorkspaceGuidanceReceipt,
   type AgentWorkspaceGuidanceConfig,
   type AgentThread,
@@ -30,6 +32,11 @@ import {
 } from "./agent-thread-response";
 import type { ChatMessagePage } from "./chat-response";
 import { validAgentWorkspaceAugmentation } from "./agent-workspace-augmentation";
+import {
+  parseAgentToolDefinitionPage,
+  validAgentToolPalette,
+  type AgentToolDefinition,
+} from "./agent-tool-palette";
 
 export type AgentThreadErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
 export type AgentThreadMutationResult =
@@ -38,21 +45,13 @@ export type AgentThreadMutationResult =
   | { ok: true; op: "mark-ready"; receipt: AgentThreadReviewReceipt }
   | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
   | { ok: true; op: "configure-agent"; receipt: AgentWorkspaceGuidanceReceipt }
+  | { ok: true; op: "configure-agent-tools"; receipt: AgentToolPaletteReceipt }
   | { ok: true; op: "lifecycle-agent"; receipt: AgentLifecycleReceipt }
   | { ok: true; op: "post-message"; messageId: string; threadId: string }
   | { ok: false; error: AgentThreadErrorKind };
 
 const AGENT_THREAD_ERR_PREFIX = "AGENT_THREAD_ERR:";
 const utf8 = new TextEncoder();
-const PRIVATE_WORK_AGENT_TOOLS = [
-  "chat.read_messages",
-  "chat.post",
-  "chat.reply",
-  "workspace.read_file",
-  "workspace.write_file",
-] as const;
-const PRIVATE_WORK_COMMAND_TOOL = "workspace.exec" as const;
-
 export class AgentThreadRouteError extends Error {
   readonly kind: AgentThreadErrorKind;
   constructor(kind: AgentThreadErrorKind) {
@@ -157,6 +156,30 @@ export const getAgentWorkspaceGuidance = query(async (
   });
 }, "agent-workspace-guidance");
 
+export const getAgentToolDefinitions = query(async (): Promise<AgentToolDefinition[]> => {
+  "use server";
+  return authed(async () => {
+    const tools: AgentToolDefinition[] = [];
+    let cursor: string | null = null;
+    const visited = new Set<string>();
+    do {
+      const query = new URLSearchParams({ limit: "100" });
+      if (cursor) query.set("cursor", cursor);
+      const page = parseAgentToolDefinitionPage(await edgeGet(`/v1/tools?${query}`));
+      if (!page) throw new AgentThreadRouteError("error");
+      tools.push(...page.items.filter((tool) => tool.exposed_over_mcp));
+      if (tools.length > 128) throw new AgentThreadRouteError("error");
+      cursor = page.page.next_cursor;
+      if (cursor !== null && visited.has(cursor)) throw new AgentThreadRouteError("error");
+      if (cursor !== null) visited.add(cursor);
+    } while (cursor !== null);
+    if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
+      throw new AgentThreadRouteError("error");
+    }
+    return tools;
+  });
+}, "agent-tool-definitions");
+
 export const getAgentThreads = query(async (request: {
   cursor?: string;
   limit?: number;
@@ -239,9 +262,9 @@ export const mutateAgentThread = action(async (input: unknown) => {
   const mutation = input as Record<string, unknown>;
   try {
     if (mutation.op === "activate-agent" && Object.keys(mutation).every((key) =>
-      ["op", "name", "allowWorkspaceCommands", "workspaceInstructions", "workspaceFiles", "clientNonce"].includes(key)) &&
+      ["op", "name", "tools", "workspaceInstructions", "workspaceFiles", "clientNonce"].includes(key)) &&
         Object.keys(mutation).length === 6 && cleanText(mutation.name, 80) &&
-        typeof mutation.allowWorkspaceCommands === "boolean" && cleanNonce(mutation.clientNonce)) {
+        validAgentToolPalette(mutation.tools) && cleanNonce(mutation.clientNonce)) {
       if (typeof mutation.workspaceInstructions !== "string" ||
           (mutation.workspaceInstructions !== "" &&
             (utf8.encode(mutation.workspaceInstructions).byteLength > 12 * 1_024 ||
@@ -256,9 +279,7 @@ export const mutateAgentThread = action(async (input: unknown) => {
       const receipt = parseAgentActivationReceipt(await edgePost("/v1/agents", {
         name: mutation.name,
         runtime: "external",
-        tools: mutation.allowWorkspaceCommands
-          ? [...PRIVATE_WORK_AGENT_TOOLS, PRIVATE_WORK_COMMAND_TOOL]
-          : PRIVATE_WORK_AGENT_TOOLS,
+        tools: mutation.tools,
         ...(mutation.workspaceInstructions === ""
           ? {}
           : { workspace_instructions: mutation.workspaceInstructions }),
@@ -268,6 +289,20 @@ export const mutateAgentThread = action(async (input: unknown) => {
       }, { idempotencyKey: mutation.clientNonce }));
       return receipt
         ? respond({ ok: true, op: "activate-agent", receipt })
+        : respond({ ok: false, error: "error" });
+    }
+    if (mutation.op === "configure-agent-tools" && Object.keys(mutation).every((key) =>
+      ["op", "agentId", "expectedTools", "tools", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 5 && isAgentThreadId(mutation.agentId) &&
+        validAgentToolPalette(mutation.expectedTools) && validAgentToolPalette(mutation.tools) &&
+        cleanNonce(mutation.clientNonce)) {
+      const receipt = parseAgentToolPaletteReceipt(await edgePost(
+        `/v1/agents/${segment(mutation.agentId)}/tools`,
+        { expected_tools: mutation.expectedTools, tools: mutation.tools },
+        { idempotencyKey: mutation.clientNonce },
+      ));
+      return receipt
+        ? respond({ ok: true, op: "configure-agent-tools", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "configure-agent" && Object.keys(mutation).every((key) =>

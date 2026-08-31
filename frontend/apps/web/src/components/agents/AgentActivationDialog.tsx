@@ -8,6 +8,12 @@ import {
 } from "~/lib/agent-thread-api";
 import type { AgentActivationReceipt, AgentWorkspaceFile } from "~/lib/agent-thread-response";
 import { validAgentWorkspaceAugmentation } from "~/lib/agent-workspace-augmentation";
+import {
+  DEFAULT_PERSONAL_AGENT_TOOLS,
+  type AgentToolDefinition,
+  validAgentToolPalette,
+} from "~/lib/agent-tool-palette";
+import { AgentToolPaletteEditor } from "./AgentToolPaletteEditor";
 import { AgentWorkspaceFilesEditor } from "./AgentWorkspaceFilesEditor";
 
 function errorCopy(kind: AgentThreadErrorKind): string {
@@ -21,10 +27,11 @@ export function AgentActivationDialog(props: {
   open: boolean;
   onClose: () => void;
   onActivated: (receipt: AgentActivationReceipt) => void;
+  availableTools: AgentToolDefinition[];
 }) {
   const mutate = useAction(mutateAgentThread);
   const [name, setName] = createSignal("");
-  const [allowWorkspaceCommands, setAllowWorkspaceCommands] = createSignal(false);
+  const [tools, setTools] = createSignal<string[]>([...DEFAULT_PERSONAL_AGENT_TOOLS]);
   const [workspaceInstructions, setWorkspaceInstructions] = createSignal("");
   const [workspaceFiles, setWorkspaceFiles] = createSignal<AgentWorkspaceFile[]>([]);
   const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
@@ -37,7 +44,7 @@ export function AgentActivationDialog(props: {
     openingGeneration += 1;
     if (!props.open) return;
     setName("");
-    setAllowWorkspaceCommands(false);
+    setTools([...DEFAULT_PERSONAL_AGENT_TOOLS]);
     setWorkspaceInstructions("");
     setWorkspaceFiles([]);
     setClientNonce(crypto.randomUUID());
@@ -54,7 +61,7 @@ export function AgentActivationDialog(props: {
   const close = () => { if (!submitting()) props.onClose(); };
   const submit = async (event: SubmitEvent) => {
     event.preventDefault();
-    if (!name().trim() || name().trim() !== name() ||
+    if (!name().trim() || name().trim() !== name() || !validAgentToolPalette(tools()) ||
         workspaceInstructions().includes("\0") ||
         (workspaceInstructions() !== "" && workspaceInstructions().trim() === "") ||
         !validAgentWorkspaceAugmentation(
@@ -72,7 +79,7 @@ export function AgentActivationDialog(props: {
       const result = await mutate({
         op: "activate-agent",
         name: name(),
-        allowWorkspaceCommands: allowWorkspaceCommands(),
+        tools: tools(),
         workspaceInstructions: workspaceInstructions(),
         workspaceFiles: workspaceFiles(),
         clientNonce: clientNonce(),
@@ -159,21 +166,16 @@ export function AgentActivationDialog(props: {
             setError(null);
           }}
         />
-        <label class="agent-activation-command-toggle" for="agent-allow-workspace-commands">
-          <input
-            id="agent-allow-workspace-commands"
-            type="checkbox"
-            checked={allowWorkspaceCommands()}
-            disabled={submitting()}
-            onChange={(event) => {
-              setAllowWorkspaceCommands(event.currentTarget.checked);
-              setClientNonce(crypto.randomUUID());
-              setError(null);
-            }}
-          />
-          <strong>Allow bounded workspace commands</strong>
-          <small>Lets this agent run generation-fenced, network-denied commands with durable effect receipts.</small>
-        </label>
+        <AgentToolPaletteEditor
+          tools={tools()}
+          availableTools={props.availableTools}
+          disabled={submitting()}
+          onChange={(next) => {
+            setTools(next);
+            setClientNonce(crypto.randomUUID());
+            setError(null);
+          }}
+        />
         <Show when={error()}>{(message) => <p role="alert" class="agent-thread-error">{message()}</p>}</Show>
       </form>
     </Dialog>

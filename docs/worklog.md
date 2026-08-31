@@ -4,6 +4,38 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Named-agent tool palettes are explicit, editable, and immediately enforced
+
+Agent activation used to hide five fixed tools behind prose and one command checkbox, while the
+personal roster could not change the selection at all. The browser now discovers the complete live
+platform tool catalogue, validates its strict paged response, presents the exact selection during
+activation, and gives every owned non-retired agent a first-class Tools editor. Friendly copy makes
+the common private-work tools approachable; catalogue metadata keeps every other platform tool
+selectable, and an already-assigned tool missing from current discovery stays visible instead of
+being silently dropped. The roster reports the selected count, and saving tells the owner when a
+live connection was closed.
+
+The update is an authority transition, not a cosmetic registration edit. Edge resolves the desired
+latest tool definitions, re-derives their exact grants under the authenticated human's current
+authority, and sends a semantic expected-name set that remains usable across catalogue version
+advances. The identity service locks the principal and agent, advances both mutable delegation
+policy heads, terminates every unfinished run, updates tools and grants, and co-commits the
+`identity.agent.tools_updated` metadata event in one PostgreSQL transaction. Exact retries are
+inert and stale edits conflict. Run claims now require the registration's exact tool-and-grant
+snapshot under the same principal lock, closing the race where an update could otherwise land
+between registration read and credential minting.
+
+The readable TypeScript system journey uses two real identities, denies the non-owner, reads a
+workspace through a live two-tool run, narrows the palette, observes one terminated run, proves its
+bearer receives 401, retries exactly, rejects a stale replacement, and opens a fresh one-tool run
+against the same workspace. It passed against restarted Edge, PostgreSQL, durable policy heads,
+the agent service, and workspace storage. A PostgreSQL integration story separately proves policy
+head replacement, removed grant authority, retry/conflict event cardinality, and a metadata-only
+audit payload. The Chromium journey selects commands explicitly, removes a chat tool from the
+personal roster, verifies the durable selection, and completes the existing private branch,
+Service Federation receipt, SSH/lifecycle, publication, and accessibility flow. All 418 identity
+units and 670 web contract tests pass.
+
 ## 2026-08-31 — Thread setup exposes the complete declarative file overlay
 
 The thread API accepted eight private context files, but the browser exposed one bespoke path/body
