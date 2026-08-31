@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — The workspace pane shows what will bring a branch alive
+
+The durable Service Federation receipt reached the API, but the web client discarded the new field
+at its strict decoder, leaving a human unable to tell that their cloud branch declared an
+environment. The workspace pane now shows Service Federation's `declared` state, the pinned
+`fed.yaml` path, and a shortened digest with the complete value available as its title. It says
+plainly that activation is not available yet, so discovery cannot be mistaken for a running stack.
+
+The same audit found that the web decoder still treated SSH history as a two-mode vocabulary.
+After a real SFTP edit, one valid `file_transfer` receipt could therefore make the entire history
+response fail closed and disappear. The shared contract now accepts and renders that durable mode
+as “File transfer,” while retaining exact-key validation and rejecting unknown modes.
+
+The real Chromium product journey now creates a Myelin repository, commits `README.md` and
+`fed.yaml` through Edge, chooses that repository in the private-thread dialog, opens the resulting
+workspace pane, and sees the repository plus declared environment before continuing the existing
+agent-authority, durable-message, linked-reference, and WCAG checks. It passed against the running
+web app, Edge, PostgreSQL, and durable Git store in 3.2 seconds. All 661 web unit tests, strict
+frontend decoding tests, TypeScript checking, and lint pass.
+
 ## 2026-08-31 — A cloud branch carries its exact environment declaration
 
 Repository-backed private work now discovers a root `fed.yaml` at the exact source commit, records

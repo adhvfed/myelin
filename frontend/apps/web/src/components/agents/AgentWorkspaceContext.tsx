@@ -13,6 +13,12 @@ function dateTime(value: string): string {
   return `${new Date(value).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 }
 
+function sessionLabel(mode: WorkspaceSession["mode"]): string {
+  if (mode === "shell") return "Interactive shell";
+  if (mode === "file_transfer") return "File transfer";
+  return "Remote command";
+}
+
 export function AgentWorkspaceContext(props: {
   thread: AgentThread;
   agent: AgentChoice | undefined;
@@ -55,8 +61,28 @@ export function AgentWorkspaceContext(props: {
             <div><dt>Branch</dt><dd>{repository().branch}</dd></div>
             <div><dt>Base</dt><dd>{repository().base_ref} · {repository().base_oid.slice(0, 12)}</dd></div>
           </>}</Show>
+          <Show when={props.thread.workspace.environment}>{(environment) => <>
+            <div data-testid="workspace-environment">
+              <dt>Environment</dt>
+              <dd>Service Federation · {environment().state}</dd>
+            </div>
+            <div>
+              <dt>Manifest</dt>
+              <dd>
+                <code>{environment().config_path}</code> ·{" "}
+                <code title={environment().content_digest}>
+                  {environment().content_digest.slice(0, 19)}…
+                </code>
+              </dd>
+            </div>
+          </>}</Show>
           <div><dt>Workspace</dt><dd><code>{props.thread.workspace.id}</code></dd></div>
         </dl>
+        <Show when={props.thread.workspace.environment}>
+          <p class="agent-thread-note" data-testid="workspace-environment-state">
+            The manifest is pinned to this source commit. Environment activation is not available yet.
+          </p>
+        </Show>
       </section>
       <section>
         <h3>Agent workspace authority</h3>
@@ -126,7 +152,7 @@ export function AgentWorkspaceContext(props: {
                   <li>
                     <Icon name="external-link" />
                     <span>
-                      <strong>{session.mode === "shell" ? "Interactive shell" : "Remote command"}</strong>
+                      <strong>{sessionLabel(session.mode)}</strong>
                       <small>{session.terminal ? "terminal allocated" : "no terminal"} · {dateTime(session.started_at)}</small>
                     </span>
                   </li>

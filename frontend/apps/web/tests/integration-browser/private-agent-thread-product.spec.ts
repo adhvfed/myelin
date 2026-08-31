@@ -22,7 +22,7 @@ function ephemeralEd25519PublicKey(): string {
   return `ssh-ed25519 ${blob.toString("base64")}`;
 }
 
-test("an engineer authorizes bounded commands and keeps a named problem with one agent", async ({
+test("an engineer keeps a cloud branch and its environment with one agent", async ({
   page,
   request,
 }) => {
@@ -30,7 +30,29 @@ test("an engineer authorizes bounded commands and keeps a named problem with one
   const agentName = `checkout-companion-${suffix}`;
   const threadName = `Investigate checkout race ${suffix}`;
   const problem = `The final reader for ${suffix} still owns its checkout lease.`;
+  const repositorySlug = `cloud-workspace-${suffix}`;
   const sessionToken = await browserApprovedSession(request);
+  await postProductJson(
+    request,
+    "/v1/git/repos",
+    { slug: repositorySlug },
+    { token: sessionToken, scheme: "session", status: 201 },
+  );
+  await postProductJson(
+    request,
+    `/v1/git/repos/${encodeURIComponent(repositorySlug)}/blob/main/README.md`,
+    { base_oid: "", contents: "# Browser-owned cloud workspace\n" },
+    { token: sessionToken, scheme: "session", status: 200 },
+  );
+  await postProductJson(
+    request,
+    `/v1/git/repos/${encodeURIComponent(repositorySlug)}/blob/main/fed.yaml`,
+    {
+      base_oid: "",
+      contents: "services:\n  app:\n    process: exec sleep 300\nentrypoint: app\n",
+    },
+    { token: sessionToken, scheme: "session", status: 200 },
+  );
 
   await signIn(page);
   await page.getByRole("link", { name: "Agents" }).click();
@@ -49,6 +71,7 @@ test("an engineer authorizes bounded commands and keeps a named problem with one
   const agentId = await agentChoice.inputValue();
   expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");
+  await dialog.getByRole("textbox", { name: "Repository slug" }).fill(repositorySlug);
   await dialog.getByRole("button", { name: "Start thread" }).click();
 
   await page.waitForURL(/\/agents\?thread=[0-9a-f-]{36}$/);
@@ -57,6 +80,12 @@ test("an engineer authorizes bounded commands and keeps a named problem with one
   await page.getByRole("button", { name: "Agent workspace" }).click();
   const workspace = page.getByRole("dialog", { name: "Agent workspace" });
   await expect(workspace.getByText("Generation 1", { exact: true })).toBeVisible();
+  await expect(workspace.getByText(repositorySlug, { exact: true })).toBeVisible();
+  await expect(workspace.getByTestId("workspace-environment"))
+    .toContainText("Service Federation · declared");
+  await expect(workspace.getByText("fed.yaml", { exact: true })).toBeVisible();
+  await expect(workspace.getByTestId("workspace-environment-state"))
+    .toContainText("pinned to this source commit");
   await expect(workspace.getByText("No workspace entries yet.")).toBeVisible();
   await expect(workspace.getByTestId("agent-command-scope"))
     .toContainText("Bounded commands authorized");

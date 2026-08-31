@@ -49,6 +49,12 @@ export interface AgentThread {
       base_oid: string;
       branch: string;
     } | null;
+    environment: {
+      provider: "service_federation";
+      config_path: "fed.yaml";
+      content_digest: string;
+      state: "declared";
+    } | null;
   };
   created_at: string;
   updated_at: string;
@@ -69,7 +75,7 @@ export interface WorkspaceSession {
   id: string;
   ref: string;
   method: "ssh";
-  mode: "shell" | "command";
+  mode: "shell" | "command" | "file_transfer";
   terminal: boolean;
   workspace: { id: string; generation: number };
   started_at: string;
@@ -218,11 +224,12 @@ function thread(value: unknown): AgentThread | null {
   const row = record(value);
   const workspace = record(row?.workspace);
   const repository = workspace?.repository === null ? null : record(workspace?.repository);
+  const environment = workspace?.environment === null ? null : record(workspace?.environment);
   if (!row || !exact(row, [
     "id", "ref", "name", "agent_id", "agent_ref", "project_id", "conversation_id",
     "conversation_ref", "workspace", "created_at", "updated_at",
   ]) || !workspace || !exact(workspace, [
-    "id", "generation", "state", "retention_days", "expires_at", "repository",
+    "id", "generation", "state", "retention_days", "expires_at", "repository", "environment",
   ]) || !isAgentThreadId(row.id) || !cleanText(row.ref, 4_096) || !cleanText(row.name, 80) ||
       !isAgentThreadId(row.agent_id) || !cleanText(row.agent_ref, 4_096) ||
       (row.project_id !== null && !isAgentThreadId(row.project_id)) ||
@@ -235,6 +242,12 @@ function thread(value: unknown): AgentThread | null {
         !(repository.base_ref as string).startsWith("refs/heads/") ||
         typeof repository.base_oid !== "string" || !/^[0-9a-f]{40}$/.test(repository.base_oid) ||
         !cleanText(repository.branch, 1_024))) ||
+      (environment !== null && (repository === null ||
+        !exact(environment, ["provider", "config_path", "content_digest", "state"]) ||
+        environment.provider !== "service_federation" || environment.config_path !== "fed.yaml" ||
+        typeof environment.content_digest !== "string" ||
+        !/^blake3:[0-9a-f]{64}$/.test(environment.content_digest) ||
+        environment.state !== "declared")) ||
       !timestamp(row.created_at) || !timestamp(row.updated_at)) return null;
   const thread = row as unknown as AgentThread;
   if (!thread.ref.endsWith(`/agent/thread/${thread.id}`) ||
@@ -285,7 +298,8 @@ function workspaceSession(value: unknown): WorkspaceSession | null {
       !workspace || !exact(workspace, ["id", "generation"]) || !isUlid(row.id) ||
       !reference || reference.subsystem !== "agent" || reference.type !== "session" ||
       reference.id !== row.id || reference.sub !== null || row.method !== "ssh" ||
-      !["shell", "command"].includes(row.mode as string) || typeof row.terminal !== "boolean" ||
+      !["shell", "command", "file_transfer"].includes(row.mode as string) ||
+      typeof row.terminal !== "boolean" ||
       !isAgentThreadId(workspace.id) || !positiveInteger(workspace.generation, 4_294_967_295) ||
       !timestamp(row.started_at)) return null;
   return row as unknown as WorkspaceSession;

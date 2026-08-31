@@ -58,6 +58,7 @@ const subject = {
     retention_days: 3,
     expires_at: "2026-08-25T12:00:00Z",
     repository: null,
+    environment: null,
   },
   created_at: "2026-08-22T12:00:00Z",
   updated_at: "2026-08-22T12:00:01Z",
@@ -75,20 +76,44 @@ const conversation = {
 };
 
 describe("private agent work wire projection", () => {
-  it("decodes the exact repository receipt for a private cloud branch", () => {
+  it("decodes the exact repository and environment receipt for a private cloud branch", () => {
     const repository = {
       slug: "platform/api",
       base_ref: "refs/heads/main",
       base_oid: "0123456789abcdef0123456789abcdef01234567",
       branch: "myelin/thread-0123456789abcdef0123",
     };
-    expect(parseAgentThread({
-      thread: { ...subject, workspace: { ...subject.workspace, repository } },
-    })?.workspace.repository).toEqual(repository);
+    const environment = {
+      provider: "service_federation",
+      config_path: "fed.yaml",
+      content_digest: `blake3:${"a".repeat(64)}`,
+      state: "declared",
+    };
+    const parsed = parseAgentThread({
+      thread: { ...subject, workspace: { ...subject.workspace, repository, environment } },
+    });
+    expect(parsed?.workspace.repository).toEqual(repository);
+    expect(parsed?.workspace.environment).toEqual(environment);
     expect(parseAgentThread({
       thread: {
         ...subject,
         workspace: { ...subject.workspace, repository: { ...repository, base_oid: "short" } },
+      },
+    })).toBeNull();
+    expect(parseAgentThread({
+      thread: {
+        ...subject,
+        workspace: { ...subject.workspace, repository: null, environment },
+      },
+    })).toBeNull();
+    expect(parseAgentThread({
+      thread: {
+        ...subject,
+        workspace: {
+          ...subject.workspace,
+          repository,
+          environment: { ...environment, content_digest: "blake3:short" },
+        },
       },
     })).toBeNull();
   });
@@ -218,6 +243,18 @@ describe("private agent work wire projection", () => {
       }],
       page: { next_cursor: null, limit: 100 },
     })).toBeNull();
+    expect(parseWorkspaceSessions({
+      items: [{
+        id: SESSION,
+        ref: `myelin://acme/agent/session/${SESSION}`,
+        method: "ssh",
+        mode: "file_transfer",
+        terminal: false,
+        workspace: { id: WORKSPACE, generation: 1 },
+        started_at: "2026-08-22T12:02:00Z",
+      }],
+      page: { next_cursor: null, limit: 100 },
+    })?.items[0]?.mode).toBe("file_transfer");
     const sessionPage = (ref: string) => ({
       items: [{
         id: SESSION,
