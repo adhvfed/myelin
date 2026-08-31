@@ -42,7 +42,9 @@ a manual reload; the owner can approve or explicitly confirm rejection in place,
 progress, and reload the page without losing either decision. Agent selection traverses the owner's
 complete paged catalogue, including the case where no eligible hosted identity appears in the
 newest page; an unavailable catalogue is presented as a retriable failure, never as proof that the
-owner has no agent.
+owner has no agent. When no hosted identity exists, the activation handoff preserves that intent and
+opens with the hosted runtime selected; ordinary activation elsewhere continues to default to an
+external private-work identity.
 
 An agent's owner can maintain a private default workspace augmentation on that named agent:
 `AGENTS.md` instructions plus bounded create-only context files. The organization-visible roster

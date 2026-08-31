@@ -119,7 +119,7 @@ export function AutomationCreateDialog(props: {
           <div class="automation-empty">
             <strong>No active hosted agent is ready</strong>
             <p>Activate a named agent with the Hosted Myelin runtime first.</p>
-            <A href="/agents?activate=1" class="automation-button automation-button-secondary">
+            <A href="/agents?activate=1&runtime=hosted" class="automation-button automation-button-secondary">
               <Icon name="agent" /> Activate agent
             </A>
           </div>

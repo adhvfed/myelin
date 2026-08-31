@@ -10,7 +10,10 @@ import {
   Show,
 } from "solid-js";
 
-import { AgentActivationDialog } from "~/components/agents/AgentActivationDialog";
+import {
+  AgentActivationDialog,
+  type AgentRuntime,
+} from "~/components/agents/AgentActivationDialog";
 import { AgentThreadCreateDialog } from "~/components/agents/AgentThreadCreateDialog";
 import { AgentRosterDialog } from "~/components/agents/AgentRosterDialog";
 import { AgentNameDialog } from "~/components/agents/AgentNameDialog";
@@ -77,6 +80,7 @@ export default function AgentThreadsIndex() {
   const validSelectedId = () => isAgentThreadId(selectedId()) ? selectedId() : undefined;
   const createOpen = () => search.new === "1";
   const activationOpen = () => search.activate === "1";
+  const activationRuntime = (): AgentRuntime => search.runtime === "hosted" ? "hosted" : "external";
   const [interactive, setInteractive] = createSignal(false);
   const [observedAt, setObservedAt] = createSignal(Date.now());
 
@@ -513,6 +517,7 @@ export default function AgentThreadsIndex() {
       />
       <AgentActivationDialog
         open={activationOpen()}
+        initialRuntime={activationRuntime()}
         availableTools={availableAgentTools() ?? []}
         onClose={closeActivation}
         onActivated={(receipt) => {

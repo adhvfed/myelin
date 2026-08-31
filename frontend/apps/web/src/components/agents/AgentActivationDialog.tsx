@@ -17,7 +17,7 @@ import {
 import { AgentToolPaletteEditor } from "./AgentToolPaletteEditor";
 import { AgentWorkspaceFilesEditor } from "./AgentWorkspaceFilesEditor";
 
-type AgentRuntime = "external" | "hosted";
+export type AgentRuntime = "external" | "hosted";
 
 function errorCopy(kind: AgentThreadErrorKind): string {
   if (kind === "bad-input") return "Use a clean agent name.";
@@ -31,6 +31,7 @@ export function AgentActivationDialog(props: {
   onClose: () => void;
   onActivated: (receipt: AgentActivationReceipt) => void;
   availableTools: AgentToolDefinition[];
+  initialRuntime?: AgentRuntime;
 }) {
   const mutate = useAction(mutateAgentThread);
   const [name, setName] = createSignal("");
@@ -47,9 +48,12 @@ export function AgentActivationDialog(props: {
   createEffect(() => {
     openingGeneration += 1;
     if (!props.open) return;
+    const initialRuntime = props.initialRuntime ?? "external";
     setName("");
-    setRuntime("external");
-    setTools([...DEFAULT_PERSONAL_AGENT_TOOLS]);
+    setRuntime(initialRuntime);
+    setTools(initialRuntime === "hosted"
+      ? [...DEFAULT_HOSTED_AGENT_TOOLS]
+      : [...DEFAULT_PERSONAL_AGENT_TOOLS]);
     setWorkspaceInstructions("");
     setWorkspaceFiles([]);
     setClientNonce(crypto.randomUUID());

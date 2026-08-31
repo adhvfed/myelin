@@ -38,12 +38,11 @@ test("an automation owner governs durable agent work without configuring an inte
   const agentName = `ownership-companion-${suffix}`;
 
   await signIn(page);
-  await page.getByRole("link", { name: "Agents" }).click();
-  await page.waitForURL("**/agents");
-  await page.getByRole("button", { name: "Activate an agent" }).click();
+  await page.goto("/agents?activate=1&runtime=hosted");
+  await waitForAppHydration(page);
   const activation = page.getByRole("dialog", { name: "Activate named agent" });
+  await expect(activation.getByRole("combobox", { name: "Runtime" })).toHaveValue("hosted");
   await activation.getByRole("textbox", { name: "Agent name" }).fill(agentName);
-  await activation.getByRole("combobox", { name: "Runtime" }).selectOption("hosted");
   await activation.getByRole("button", { name: "Activate agent" }).click();
   await expect(activation).toBeHidden();
   const activatedRoster = page.getByRole("dialog", { name: "My named agents" });

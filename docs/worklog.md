@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — First-time automation setup no longer activates the wrong runtime
+
+The empty automation dialog directed its owner to activate an agent, but opened the generic agent
+form with External MCP selected. Accepting the product's own default created an identity that could
+not run automations and diverted the owner into an unrelated private-thread flow. The handoff now
+names the hosted runtime in its bounded route intent. Agent activation consumes that intent only
+when it is valid, initializes the corresponding hosted tool palette, and still defaults to External
+MCP when opened from the ordinary Agents surface.
+
+The Chromium automation journey enters through the same hosted-intent route, proves Hosted Myelin is
+selected before the owner touches the form, activates the identity, and continues through two real
+browser-created rules, durable events, approval, rejection, lifecycle, and retirement. The focused
+private-agent journey separately proves ordinary activation still begins as External MCP and
+completes its retained branch, workspace, and review flow. Both journeys pass alongside all 674 web
+unit tests, TypeScript checking, lint, and the production build.
+
 ## 2026-08-31 — Automation approval is a complete web journey
 
 An automation detail could say that a firing awaited human approval but offered no way to make that
