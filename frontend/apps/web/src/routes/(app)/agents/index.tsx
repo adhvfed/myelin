@@ -33,6 +33,7 @@ import {
   getAgentChoice,
   getAgentChoices,
   getAgentThread,
+  getAgentThreadReviewHandoff,
   getAgentThreadMessages,
   getAgentThreads,
   getAgentToolDefinitions,
@@ -105,6 +106,9 @@ export default function AgentThreadsIndex() {
   const [renewalIntentDays, setRenewalIntentDays] = createSignal<number | null>(null);
   const [renewalNonce, setRenewalNonce] = createSignal("");
   const [markingReady, setMarkingReady] = createSignal(false);
+  const [publishingReview, setPublishingReview] = createSignal(false);
+  const [reviewHandoffError, setReviewHandoffError] = createSignal<string | null>(null);
+  const [reviewHandoffNonce, setReviewHandoffNonce] = createSignal("");
   let threadGeneration = 0;
   let messageGeneration = 0;
   let workspaceSessionGeneration = 0;
@@ -155,6 +159,17 @@ export default function AgentThreadsIndex() {
     } catch (error) {
       if (error instanceof Response) throw error;
       return { page: null, error: agentThreadErrorKind(error) };
+    }
+  }, { deferStream: true });
+
+  const selectedReviewHandoff = createAsync(async () => {
+    const thread = selectedThread()?.page;
+    if (!thread || thread.review_state !== "ready" || !thread.workspace.repository) return null;
+    try {
+      return await getAgentThreadReviewHandoff(thread.id);
+    } catch (error) {
+      if (error instanceof Response) throw error;
+      return null;
     }
   }, { deferStream: true });
 
@@ -382,6 +397,52 @@ export default function AgentThreadsIndex() {
       setMarkingReady(false);
     }
   };
+  const publishReview = async () => {
+    const thread = selectedThread()?.page;
+    if (!thread || thread.review_state !== "ready" || !thread.workspace.repository ||
+        publishingReview()) return;
+    let nonce = reviewHandoffNonce();
+    if (!nonce) {
+      nonce = crypto.randomUUID();
+      setReviewHandoffNonce(nonce);
+    }
+    setPublishingReview(true);
+    setReviewHandoffError(null);
+    try {
+      const result = await mutate({
+        op: "publish-review",
+        threadId: thread.id,
+        title: thread.name,
+        bodyMd: `Published from private agent work “${thread.name}”.`,
+        reviewers: [],
+        clientNonce: nonce,
+      });
+      if (!result.ok || result.op !== "publish-review") {
+        setReviewHandoffError(result.ok || result.error === "error"
+          ? "Myelin couldn’t confirm the pull request. Retry this unchanged handoff."
+          : result.error === "conflict"
+            ? "Commit the intended code changes and remove private workspace files from the commit before publishing."
+            : result.error === "not-found"
+              ? "This private thread is no longer available."
+              : "Review publication is temporarily unavailable. Retry this unchanged handoff.");
+        return;
+      }
+      setReviewHandoffNonce("");
+      await revalidate(getAgentThreadReviewHandoff.keyFor(thread.id));
+      toast.show({
+        title: result.receipt.created
+          ? `Pull request #${result.receipt.handoff.pull_request.number} opened`
+          : `Pull request #${result.receipt.handoff.pull_request.number} is already open`,
+        variant: "success",
+      });
+    } catch {
+      setReviewHandoffError(
+        "Myelin couldn’t confirm the pull request. Retry this unchanged handoff.",
+      );
+    } finally {
+      setPublishingReview(false);
+    }
+  };
   createEffect(() => {
     const id = validSelectedId();
     const conversationId = selectedThread()?.page?.conversation_id;
@@ -418,6 +479,14 @@ export default function AgentThreadsIndex() {
       renewing={renewingWorkspace()}
       renewalError={renewWorkspaceError()}
       onRenew={(days) => void renewWorkspace(days)}
+      reviewHandoff={selectedReviewHandoff() ?? null}
+      reviewHandoffLoading={Boolean(
+        thread.review_state === "ready" && thread.workspace.repository &&
+        selectedReviewHandoff() === undefined
+      )}
+      publishingReview={publishingReview()}
+      reviewHandoffError={reviewHandoffError()}
+      onPublishReview={() => void publishReview()}
     /> : null);
     onCleanup(() => pane.setContextPane(null));
   });

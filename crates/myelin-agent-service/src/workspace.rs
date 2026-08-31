@@ -39,6 +39,19 @@ pub struct RepositoryWorkspaceSource {
     pub branch: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryReviewPublication {
+    pub head_oid: String,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct RepositoryReviewPublicationRequest<'a> {
+    pub source: &'a RepositoryWorkspaceSource,
+    pub storage_locator: &'a str,
+    pub protected_paths: &'a [String],
+}
+
 #[derive(Debug)]
 pub enum WorkspaceProvisionError {
     InvalidRoot(String),
@@ -63,6 +76,46 @@ pub enum WorkspaceDeletionError {
     UnsafeStorage(String),
     Io(String),
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkspacePublicationError {
+    LocatorMismatch,
+    WorkspaceUnavailable,
+    InvalidRepository(String),
+    DirtyWorkspace(String),
+    ProtectedWorkspaceData(String),
+    NoChanges,
+    Diverged,
+    Io(String),
+}
+
+impl core::fmt::Display for WorkspacePublicationError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::LocatorMismatch => {
+                formatter.write_str("workspace locator does not identify the publication target")
+            }
+            Self::WorkspaceUnavailable => formatter.write_str("workspace is unavailable"),
+            Self::InvalidRepository(reason) => {
+                write!(formatter, "workspace repository is invalid: {reason}")
+            }
+            Self::DirtyWorkspace(path) => {
+                write!(formatter, "workspace has an uncommitted change at {path}")
+            }
+            Self::ProtectedWorkspaceData(path) => write!(
+                formatter,
+                "workspace commit includes private augmentation at {path}"
+            ),
+            Self::NoChanges => formatter.write_str("workspace branch has no committed changes"),
+            Self::Diverged => {
+                formatter.write_str("workspace branch no longer descends from its pinned base")
+            }
+            Self::Io(reason) => write!(formatter, "workspace publication failed: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspacePublicationError {}
 
 impl core::fmt::Display for WorkspaceDeletionError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -216,6 +269,13 @@ pub trait AgentWorkspaceStore: AgentWorkspaceProvisioner {
         workspace_id: Uuid,
         storage_locator: Option<&str>,
     ) -> Result<WorkspaceDeletion, WorkspaceDeletionError>;
+
+    fn publish_repository_for_review(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        request: RepositoryReviewPublicationRequest<'_>,
+    ) -> Result<RepositoryReviewPublication, WorkspacePublicationError>;
 }
 
 #[derive(Clone)]
@@ -742,6 +802,180 @@ impl AgentWorkspaceStore for LocalDevelopmentWorkspaceProvisioner {
             )),
         }
     }
+
+    fn publish_repository_for_review(
+        &self,
+        tenant: &str,
+        workspace_id: Uuid,
+        request: RepositoryReviewPublicationRequest<'_>,
+    ) -> Result<RepositoryReviewPublication, WorkspacePublicationError> {
+        validate_repository_source(request.source)
+            .map_err(|error| WorkspacePublicationError::InvalidRepository(error.to_string()))?;
+        let workspace = self
+            .open_verified_directory(tenant, workspace_id, request.storage_locator)
+            .map_err(|error| match error {
+                WorkspaceAccessError::LocatorMismatch => WorkspacePublicationError::LocatorMismatch,
+                WorkspaceAccessError::NotFound => WorkspacePublicationError::WorkspaceUnavailable,
+                other => WorkspacePublicationError::Io(other.to_string()),
+            })?;
+        publish_repository_branch(workspace.path.as_path(), request)
+    }
+}
+
+fn publish_repository_branch(
+    workspace_path: &Path,
+    request: RepositoryReviewPublicationRequest<'_>,
+) -> Result<RepositoryReviewPublication, WorkspacePublicationError> {
+    let source = request.source;
+    let repository = git2::Repository::open(workspace_path)
+        .map_err(publication_git_error("open workspace repository"))?;
+    let expected_head = format!("refs/heads/{}", source.branch);
+    let head = repository
+        .head()
+        .map_err(publication_git_error("read workspace HEAD"))?;
+    if head.name().ok() != Some(expected_head.as_str()) {
+        return Err(WorkspacePublicationError::InvalidRepository(
+            "HEAD does not identify the durable workspace branch".into(),
+        ));
+    }
+    let head_oid = head.target().ok_or_else(|| {
+        WorkspacePublicationError::InvalidRepository("workspace HEAD is symbolic or unborn".into())
+    })?;
+    let base_oid = git2::Oid::from_str(&source.base_oid)
+        .map_err(publication_git_error("parse pinned workspace base"))?;
+    let config = repository.config().map_err(publication_git_error(
+        "open workspace repository configuration",
+    ))?;
+    for (key, expected) in [
+        ("myelin.workspace.repository", source.repository.as_str()),
+        ("myelin.workspace.base-ref", source.base_ref.as_str()),
+        ("myelin.workspace.base-oid", source.base_oid.as_str()),
+        ("remote.origin.url", source.clone_url.as_str()),
+    ] {
+        if config.get_string(key).ok().as_deref() != Some(expected) {
+            return Err(WorkspacePublicationError::InvalidRepository(format!(
+                "stored {key} receipt changed"
+            )));
+        }
+    }
+    if head_oid == base_oid {
+        return Err(WorkspacePublicationError::NoChanges);
+    }
+    if !repository
+        .graph_descendant_of(head_oid, base_oid)
+        .map_err(publication_git_error("verify workspace ancestry"))?
+    {
+        return Err(WorkspacePublicationError::Diverged);
+    }
+
+    let protected = request
+        .protected_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut status_options = git2::StatusOptions::new();
+    status_options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+    for entry in repository
+        .statuses(Some(&mut status_options))
+        .map_err(publication_git_error("inspect workspace status"))?
+        .iter()
+    {
+        let path = entry.path().map_err(|_| {
+            WorkspacePublicationError::InvalidRepository(
+                "workspace status contains a non-UTF-8 path".into(),
+            )
+        })?;
+        if !protected.contains(path) {
+            return Err(WorkspacePublicationError::DirtyWorkspace(path.into()));
+        }
+    }
+
+    let base_tree = repository
+        .find_commit(base_oid)
+        .and_then(|commit| commit.tree())
+        .map_err(publication_git_error("read pinned workspace base tree"))?;
+    let head_tree = repository
+        .find_commit(head_oid)
+        .and_then(|commit| commit.tree())
+        .map_err(publication_git_error("read workspace review tree"))?;
+    let diff = repository
+        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
+        .map_err(publication_git_error("inspect workspace review changes"))?;
+    for delta in diff.deltas() {
+        for path in [delta.old_file().path(), delta.new_file().path()]
+            .into_iter()
+            .flatten()
+        {
+            let path = path.to_str().ok_or_else(|| {
+                WorkspacePublicationError::InvalidRepository(
+                    "workspace commit contains a non-UTF-8 path".into(),
+                )
+            })?;
+            if protected.contains(path) {
+                return Err(WorkspacePublicationError::ProtectedWorkspaceData(
+                    path.into(),
+                ));
+            }
+        }
+    }
+
+    let destination = git2::Repository::open_bare(&source.repository_path)
+        .map_err(publication_git_error("open durable review repository"))?;
+    if destination.find_commit(base_oid).is_err() {
+        return Err(WorkspacePublicationError::InvalidRepository(
+            "durable repository no longer contains the pinned base".into(),
+        ));
+    }
+    let destination_tip = destination
+        .find_reference(&expected_head)
+        .ok()
+        .and_then(|reference| reference.target());
+    if destination_tip == Some(head_oid) {
+        return Ok(RepositoryReviewPublication {
+            head_oid: head_oid.to_string(),
+            changed: false,
+        });
+    }
+    if let Some(previous) = destination_tip {
+        if !repository
+            .graph_descendant_of(head_oid, previous)
+            .map_err(publication_git_error("verify published branch ancestry"))?
+        {
+            return Err(WorkspacePublicationError::Diverged);
+        }
+    }
+    let destination_path = source.repository_path.to_str().ok_or_else(|| {
+        WorkspacePublicationError::InvalidRepository(
+            "durable repository path is not clean UTF-8".into(),
+        )
+    })?;
+    let refspec = format!("{expected_head}:{expected_head}");
+    repository
+        .remote_anonymous(destination_path)
+        .and_then(|mut remote| remote.push(&[&refspec], None))
+        .map_err(publication_git_error("publish workspace review branch"))?;
+    let published_tip = destination
+        .find_reference(&expected_head)
+        .ok()
+        .and_then(|reference| reference.target());
+    if published_tip != Some(head_oid) {
+        return Err(WorkspacePublicationError::Io(
+            "durable review branch did not reach the committed workspace head".into(),
+        ));
+    }
+    Ok(RepositoryReviewPublication {
+        head_oid: head_oid.to_string(),
+        changed: true,
+    })
+}
+
+fn publication_git_error(
+    context: &'static str,
+) -> impl FnOnce(git2::Error) -> WorkspacePublicationError {
+    move |error| WorkspacePublicationError::Io(format!("{context}: {error}"))
 }
 
 impl LocalDevelopmentWorkspaceProvisioner {
@@ -1144,6 +1378,142 @@ mod tests {
         assert_eq!(
             checkout.find_remote("origin").unwrap().url().unwrap(),
             source.clone_url.as_str()
+        );
+    }
+
+    #[test]
+    fn review_publication_is_fast_forward_idempotent_and_excludes_private_augmentation() {
+        let source_root = durable_test_root();
+        let source_path = source_root.path().join("source.git");
+        let source_repository = git2::Repository::init_bare(&source_path).unwrap();
+        let blob = source_repository.blob(b"private cloud branch\n").unwrap();
+        let mut tree = source_repository.treebuilder(None).unwrap();
+        tree.insert("README.md", blob, 0o100644).unwrap();
+        let tree = source_repository.find_tree(tree.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("Myelin", "myelin@example.invalid").unwrap();
+        let base_oid = source_repository
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "seed",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        source_repository.set_head("refs/heads/main").unwrap();
+
+        let temporary = durable_test_root();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = LocalDevelopmentWorkspaceProvisioner::open(temporary.path()).unwrap();
+        let workspace_id = Uuid::parse_str("76767676-7676-4676-8676-767676767676").unwrap();
+        let source = RepositoryWorkspaceSource {
+            repository: "sweet-platform".into(),
+            repository_path: source_path,
+            clone_url: "https://myelin.example/acme/eu/sweet-platform.git".into(),
+            base_ref: "refs/heads/main".into(),
+            base_oid: base_oid.to_string(),
+            branch: "myelin/private-review".into(),
+        };
+        let provisioned = store
+            .provision_from_repository("acme", workspace_id, &source)
+            .unwrap();
+        store
+            .write_file(
+                "acme",
+                workspace_id,
+                ".myelin/private-context.md",
+                b"owner-only context\n",
+            )
+            .unwrap();
+        let workspace = store
+            .tenant_directory("acme")
+            .join(workspace_id.to_string());
+        std::fs::write(workspace.join("README.md"), "ready for a human review\n").unwrap();
+        let checkout = git2::Repository::open(&workspace).unwrap();
+        let mut index = checkout.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = checkout.find_commit(base_oid).unwrap();
+        let review_oid = checkout
+            .commit(
+                Some("refs/heads/myelin/private-review"),
+                &signature,
+                &signature,
+                "prepare review",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+
+        let protected = vec![".myelin/private-context.md".to_string()];
+        let request = || RepositoryReviewPublicationRequest {
+            source: &source,
+            storage_locator: &provisioned.locator,
+            protected_paths: &protected,
+        };
+        let published = store
+            .publish_repository_for_review("acme", workspace_id, request())
+            .unwrap();
+        assert_eq!(
+            published,
+            RepositoryReviewPublication {
+                head_oid: review_oid.to_string(),
+                changed: true,
+            }
+        );
+        assert_eq!(
+            source_repository
+                .find_reference("refs/heads/myelin/private-review")
+                .unwrap()
+                .target(),
+            Some(review_oid)
+        );
+        assert!(source_repository
+            .find_commit(review_oid)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new(".myelin/private-context.md"))
+            .is_err());
+        assert!(
+            !store
+                .publish_repository_for_review("acme", workspace_id, request())
+                .unwrap()
+                .changed
+        );
+
+        let mut index = checkout.index().unwrap();
+        index
+            .add_path(Path::new(".myelin/private-context.md"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = checkout.find_commit(review_oid).unwrap();
+        checkout
+            .commit(
+                Some("refs/heads/myelin/private-review"),
+                &signature,
+                &signature,
+                "accidentally stage private context",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        assert_eq!(
+            store.publish_repository_for_review("acme", workspace_id, request()),
+            Err(WorkspacePublicationError::ProtectedWorkspaceData(
+                ".myelin/private-context.md".into()
+            ))
+        );
+        assert_eq!(
+            source_repository
+                .find_reference("refs/heads/myelin/private-review")
+                .unwrap()
+                .target(),
+            Some(review_oid),
+            "a rejected private-data commit never advances the durable branch"
         );
     }
 

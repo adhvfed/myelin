@@ -451,17 +451,13 @@ mod tests {
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID} --sftp")));
         assert!(rendered.contains(&format!("myelin agent thread ssh-config {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin mcp serve --as {ID} --thread {THREAD_ID}")));
-        assert!(rendered.contains(&format!("agent thread renew {THREAD_ID} --retention-days 30")));
+        assert!(rendered.contains(&format!(
+            "agent thread renew {THREAD_ID} --retention-days 30"
+        )));
         assert!(!rendered.contains("storage_locator"));
 
-        let renewal_call = agent_dispatch(&[
-            "thread",
-            "renew",
-            THREAD_ID,
-            "--retention-days",
-            "30",
-        ])
-        .unwrap();
+        let renewal_call =
+            agent_dispatch(&["thread", "renew", THREAD_ID, "--retention-days", "30"]).unwrap();
         let renewed = render_response(
             &json!({ "thread": thread(), "changed": true, "durable": true }),
             Some(&renewal_call),

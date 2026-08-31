@@ -1,6 +1,7 @@
 mod expiry;
 mod model;
 mod renewal;
+mod review_handoff;
 mod run;
 mod schema;
 mod ssh_access;
@@ -21,22 +22,26 @@ pub use model::{
     MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use renewal::{AgentThreadRenewal, BeginAgentThreadRenewalOutcome};
+pub use review_handoff::{
+    AgentThreadReviewHandoff, BindAgentThreadReviewHandoffOutcome, NewAgentThreadReviewHandoff,
+};
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
     agent_thread_durable_migrations, agent_thread_environment_migrations,
     agent_thread_file_transfer_migrations, agent_thread_git_binding_migrations,
     agent_thread_publication_migrations, agent_thread_recent_list_migrations,
-    agent_thread_renewal_migrations, agent_thread_review_ready_migrations,
-    agent_thread_session_launch_migrations, agent_thread_ssh_connection_migrations,
-    agent_thread_ssh_single_use_migrations, agent_thread_workspace_guidance_migrations,
-    agent_thread_workspace_guidance_source_migrations, AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION,
-    AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION, AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION,
-    AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION, AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION,
-    AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION, AGENT_THREAD_MIGRATION,
-    AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
-    AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX,
-    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,
-    AGENT_THREAD_RENEWAL_MIGRATION, AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION,
+    agent_thread_renewal_migrations, agent_thread_review_handoff_migrations,
+    agent_thread_review_ready_migrations, agent_thread_session_launch_migrations,
+    agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
+    agent_thread_workspace_guidance_migrations, agent_thread_workspace_guidance_source_migrations,
+    AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION, AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION, AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION,
+    AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION, AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION,
+    AGENT_THREAD_MIGRATION, AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION,
+    AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION, AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION,
+    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION,
+    AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_RENEWAL_MIGRATION,
+    AGENT_THREAD_REVIEW_HANDOFF_MIGRATION, AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION,
     AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION, AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION,
     AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,

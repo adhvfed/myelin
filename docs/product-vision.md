@@ -110,16 +110,25 @@ who shared it and when. It does not grant collaborators agent-run, command, SSH,
 authority; those capabilities remain owner-controlled. Publishing a review surface must never
 publish reusable credentials, host paths, model context, or unrelated workspace data.
 
+Ready code has a deliberate second boundary. The owner can publish one committed descendant of the
+pinned workspace base into its durable Myelin repository and open a pull request. Until that action,
+the workspace branch does not exist in the shared repository. Publication refuses ordinary
+uncommitted changes, divergent history, and any commit that contains the owner-only `AGENTS.md`
+layer or private context paths. A stable thread-derived Git operation makes an interrupted retry
+converge on one pull request, while an optional named-reviewer list grants exact-review access
+without silently broadening repository membership. The durable handoff survives reload and links
+the thread to the exact head ref, commit, and pull-request number.
+
 This creates a humane gradient rather than a false choice between secret local work and noisy public
 automation:
 
 ```text
-personal draft -> owner and agent iterate -> owner marks ready -> project reviews shared work
+personal draft -> owner and agent iterate -> owner marks ready -> publish committed branch -> review
 ```
 
-Future slices may add named reviewers, reversible archival, merge/PR handoff, and richer agent
-profiles, but they must preserve the private-by-default boundary and use the same production
-authorization path as every other Myelin artifact.
+Future slices may add reversible archival, incremental updates to an opened handoff, richer reviewer
+selection in the web, and richer agent profiles, but they must preserve the private-by-default
+boundary and use the same production authorization path as every other Myelin artifact.
 
 ## Evidence standard
 
@@ -127,6 +136,10 @@ Product claims are proved as readable TypeScript journeys against running servic
 stores. A privacy journey must use two real identities and demonstrate both sides of the boundary:
 the collaborator receives an indistinguishable not-found response before publication, then sees the
 work after the owner's explicit transition, while workspace execution and SSH remain denied.
+Cloud-branch handoff journeys must additionally prove the ref is absent before the explicit action,
+publish a real commit made inside the confined workspace, give a named reviewer access to the exact
+pull request, survive a reload and retry, and demonstrate that private augmentation paths are absent
+from the shared repository.
 Workspace-personalization journeys must read the resulting file through an actual bound agent run,
 open it again from a fresh context, and prove the repository source was never modified. Named-agent
 default journeys must prove plaintext is owner-only, stale edits conflict, instruction-only edits

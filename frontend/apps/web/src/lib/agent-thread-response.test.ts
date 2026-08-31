@@ -15,6 +15,8 @@ import {
   parseAgentThreadMessageReceipt,
   parseAgentThreadMessages,
   parseAgentThreadRenewalReceipt,
+  parseAgentThreadReviewHandoff,
+  parseAgentThreadReviewHandoffReceipt,
   parseAgentThreadReviewReceipt,
   parseAgentThreads,
   parseAgentWorkspaceGuidanceConfig,
@@ -87,6 +89,34 @@ const conversation = {
 };
 
 describe("private agent work wire projection", () => {
+  it("decodes one exact durable pull-request handoff", () => {
+    const handoff = {
+      thread_id: THREAD,
+      repository: "platform/api",
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/myelin/thread-0123456789abcdef0123",
+      head_oid: "a".repeat(40),
+      pull_request: {
+        number: 42,
+        ref: "myelin://acme/git/pr/platform/api:42",
+      },
+      created_at: "2026-08-22T12:30:00Z",
+    };
+    expect(parseAgentThreadReviewHandoff({ handoff, durable: true })).toEqual(handoff);
+    expect(parseAgentThreadReviewHandoffReceipt({ handoff, created: true, durable: true }))
+      .toEqual({ handoff, created: true, durable: true });
+    expect(parseAgentThreadReviewHandoff({
+      handoff: { ...handoff, private_workspace_path: "/srv/workspaces/secret" },
+      durable: true,
+    })).toBeNull();
+    expect(parseAgentThreadReviewHandoff({
+      handoff: { ...handoff, pull_request: { ...handoff.pull_request, ref: "wrong" } },
+      durable: true,
+    })).toBeNull();
+    expect(parseAgentThreadReviewHandoffReceipt({ handoff, created: "yes", durable: true }))
+      .toBeNull();
+  });
+
   it("decodes the exact repository and environment receipt for a private cloud branch", () => {
     const repository = {
       slug: "platform/api",

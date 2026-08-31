@@ -6,11 +6,12 @@ use myelin_events::IdMinter;
 use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
     all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadActivation,
-    AgentThreadExpiryCompletion, AgentThreadExpiryFailure, AgentThreadProvisioningFailure,
-    AgentThreadWorkspaceGuidance, BeginAgentThreadRenewalOutcome, BindAgentThreadRunOutcome,
-    ColumnCryptor, CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome,
-    DurableAgentThreadBacking, HotTables, KekId, KmsEngine, ListAgentThreadsOutcome,
-    ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant, NewWorkspaceSshSession,
+    AgentThreadExpiryCompletion, AgentThreadExpiryFailure, AgentThreadGitBinding,
+    AgentThreadProvisioningFailure, AgentThreadWorkspaceGuidance, BeginAgentThreadRenewalOutcome,
+    BindAgentThreadReviewHandoffOutcome, BindAgentThreadRunOutcome, ColumnCryptor,
+    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
+    KekId, KmsEngine, ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome, NewAgentThread,
+    NewAgentThreadReviewHandoff, NewWorkspaceSshGrant, NewWorkspaceSshSession,
     RetryAgentThreadOutcome, SealKey, SubjectId, SubjectKeyScope, SubstrateProvider,
     WorkspaceSessionMode, WorkspaceSshRouteKey, AGENT_THREAD_EXPIRY_GRACE_SECONDS,
     WORKSPACE_SSH_SESSION_STARTED,
@@ -259,6 +260,150 @@ async fn workspace_renewal_is_exactly_once_and_wins_the_expiry_race() {
             .len(),
         1,
         "the renewed workspace still expires at its exact new deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_review_handoff_is_one_durable_receipt_for_the_ready_workspace_branch() {
+    let config = test_config();
+    let admin = SubstrateProvider::connect(admin_config(&config), 4)
+        .await
+        .expect("connect the migration role for the review handoff");
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    let app = SubstrateProvider::connect(config, 6)
+        .await
+        .expect("connect the constrained runtime role");
+    let tenant = format!("agent-thread-review-handoff-{}", unique());
+    let owner = "p:review-owner";
+    let agent_id = Uuid::from_u128(81);
+    seed_agent(&app, &tenant, owner, agent_id).await;
+    let threads = DurableAgentThreadBacking::new(app);
+    let mut intended = proposal(owner, agent_id, 181);
+    intended.project_id = Some(Uuid::from_u128(8181));
+    intended.git = Some(AgentThreadGitBinding {
+        repository: "platform/api".into(),
+        base_ref: "refs/heads/main".into(),
+        base_oid: "1".repeat(40),
+        branch: "myelin/thread-private-review".into(),
+    });
+    let CreateAgentThreadOutcome::Created(_) =
+        threads.create(&tenant, intended.clone()).await.unwrap()
+    else {
+        panic!("the handoff story needs a new private thread");
+    };
+    let ActivateAgentThreadOutcome::Activated(_) = threads
+        .activate(
+            &tenant,
+            owner,
+            intended.thread_id,
+            AgentThreadActivation {
+                workspace_id: intended.workspace_id,
+                conversation_id: intended.conversation_id.clone(),
+                storage_locator: "workspace://local/review".into(),
+                environment: None,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the review workspace should activate");
+    };
+    threads
+        .complete_publication(
+            &tenant,
+            owner,
+            intended.thread_id,
+            &intended.conversation_id,
+            intended.created_at + Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .expect("the private workspace should become usable");
+    assert!(threads
+        .review_handoff(&tenant, owner, intended.thread_id)
+        .await
+        .unwrap()
+        .is_none());
+    let marked = threads
+        .mark_review_ready(
+            &tenant,
+            owner,
+            intended.thread_id,
+            intended.created_at + Duration::minutes(2),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        marked,
+        myelin_storage::MarkAgentThreadReviewReadyOutcome::Marked(_)
+    ));
+    let proposal = NewAgentThreadReviewHandoff {
+        repository_slug: "platform/api".into(),
+        base_ref: "refs/heads/main".into(),
+        head_ref: "refs/heads/myelin/thread-private-review".into(),
+        head_oid: "2".repeat(40),
+        pull_request_number: 42,
+    };
+    let BindAgentThreadReviewHandoffOutcome::Bound(bound) = threads
+        .bind_review_handoff(
+            &tenant,
+            owner,
+            intended.thread_id,
+            proposal.clone(),
+            intended.created_at + Duration::minutes(3),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the first exact review handoff should bind");
+    };
+    assert_eq!(bound.repository_slug, proposal.repository_slug);
+    assert_eq!(bound.head_oid, proposal.head_oid);
+    assert_eq!(bound.pull_request_number, 42);
+    assert_eq!(
+        threads
+            .review_handoff(&tenant, owner, intended.thread_id)
+            .await
+            .unwrap(),
+        Some(bound.clone())
+    );
+    assert!(threads
+        .review_handoff(&tenant, "p:somebody-else", intended.thread_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        threads
+            .bind_review_handoff(
+                &tenant,
+                owner,
+                intended.thread_id,
+                proposal.clone(),
+                intended.created_at + Duration::minutes(4),
+            )
+            .await
+            .unwrap(),
+        BindAgentThreadReviewHandoffOutcome::AlreadyBound(bound)
+    );
+    assert_eq!(
+        threads
+            .bind_review_handoff(
+                &tenant,
+                owner,
+                intended.thread_id,
+                NewAgentThreadReviewHandoff {
+                    head_oid: "3".repeat(40),
+                    ..proposal
+                },
+                intended.created_at + Duration::minutes(5),
+            )
+            .await
+            .unwrap(),
+        BindAgentThreadReviewHandoffOutcome::Conflict
     );
 }
 

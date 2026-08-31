@@ -4,6 +4,34 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — A private cloud branch becomes one safe, durable pull request
+
+Marking agent work ready made its conversation reviewable, but the code still existed only inside
+the owner's retained workspace. The workspace pane can now publish a committed descendant of the
+pinned base into Myelin Git and open one durable pull request. Before that explicit handoff the ref
+is absent from the shared repository. The receipt records the exact repository, base, head ref,
+commit, PR number, and timestamp and survives reload. A thread-derived Git operation and a durable
+PostgreSQL binding make ambiguous retries converge on the same PR. The API can request named
+reviewers, granting the chosen principal the exact review without turning project conversation
+visibility into broad repository membership.
+
+The publication boundary treats private workspace augmentation as data that must never hitch a ride
+in source control. It accepts protected augmentation files remaining locally dirty, refuses every
+other uncommitted path, verifies that HEAD descends from the pinned base, rejects non-fast-forward
+publication, and scans the complete base-to-head diff for the personalized `AGENTS.md` and private
+context paths before pushing. A unit test performs a real local Git push, replays it, then commits a
+private context file and proves the durable ref does not advance. The PostgreSQL integration story
+proves owner-only lookup, exact binding and replay, and conflicting-head refusal.
+
+The readable TypeScript full-system journey creates a repository and private personalized cloud
+branch, commits code through a real bound agent run in gVisor, proves another identity gets 404 for
+the branch before handoff, marks the thread ready, opens the PR, retries and reloads its durable
+receipt, reads the committed file, proves both private context and personalized `AGENTS.md` are
+absent, and lets the explicitly requested reviewer open the exact PR. The Chromium journey performs
+the same commit through live MCP, opens the PR from the workspace pane, reloads its link, and remains
+WCAG-clean. Both passed against running Edge, PostgreSQL, durable Git, Chat/ReBAC, agent service,
+workspace gateway, gVisor, and the web app.
+
 ## 2026-09-01 — The CLI can keep the cloud branch it is working in
 
 Workspace renewal initially existed only in the browser even though remote shells, editor profiles,

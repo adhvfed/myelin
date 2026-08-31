@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
+import type { APIRequestContext } from "@playwright/test";
 
 import {
   browserApprovedSession,
@@ -20,6 +21,63 @@ function ephemeralEd25519PublicKey(): string {
   };
   const blob = Buffer.concat([length(algorithm), algorithm, length(key), key]);
   return `ssh-ed25519 ${blob.toString("base64")}`;
+}
+
+async function commitWorkspaceReview(
+  request: APIRequestContext,
+  sessionToken: string,
+  threadId: string,
+): Promise<void> {
+  const envelope = await postProductJson(
+    request,
+    `/v1/agent-threads/${encodeURIComponent(threadId)}/runs`,
+    {},
+    { token: sessionToken, scheme: "session", status: 201 },
+  );
+  const run = envelope.run as JsonObject;
+  const credential = envelope.credential as JsonObject;
+  const runId = String(run.id);
+  const runToken = String(credential.token);
+  const executed = await request.post(
+    `${integrationEdgeUrl}/v1/agent-runs/${encodeURIComponent(runId)}/mcp`,
+    {
+      headers: {
+        authorization: `Bearer ${runToken}`,
+        "x-myelin-token-scheme": "agent",
+      },
+      data: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "workspace.exec",
+          arguments: {
+            command: [
+              "git config user.name 'Myelin browser agent'",
+              "git config user.email 'browser-agent@myelin.invalid'",
+              "printf 'export const browserReview = true;\\n' > browser-review.ts",
+              "git add browser-review.ts",
+              "git commit -m 'Prepare browser cloud branch for review'",
+            ].join(" && "),
+            timeout_seconds: 10,
+          },
+          _meta: { "com.myelin/idempotencyKey": `browser-review-${randomUUID()}` },
+        },
+      },
+      failOnStatusCode: false,
+    },
+  );
+  const executedText = await executed.text();
+  expect(executed.status(), executedText).toBe(200);
+  expect(JSON.parse(executedText)).toMatchObject({
+    result: { isError: false, structuredContent: { data: { exit_code: 0 } } },
+  });
+  await postProductJson(
+    request,
+    `/v1/agent-runs/${encodeURIComponent(runId)}/close`,
+    {},
+    { token: runToken, scheme: "agent", status: 200 },
+  );
 }
 
 test("an engineer keeps a cloud branch and its environment with one agent", async ({
@@ -249,6 +307,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await expect(page.getByText(`Private with ${renamedAgentName}`)).toBeVisible();
 
   const threadId = new URL(page.url()).searchParams.get("thread")!;
+  await commitWorkspaceReview(request, sessionToken, threadId);
   const agentResponse = await request.get(
     `${integrationEdgeUrl}/v1/agents/${encodeURIComponent(agentId)}`,
     {
@@ -326,10 +385,22 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
   await expect(page.getByText(`Project review with ${renamedAgentName}`, { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send to review" })).toBeVisible();
+  await page.getByRole("button", { name: "Agent workspace" }).click();
+  await expect(workspace.getByRole("button", { name: "Open pull request" })).toBeVisible();
+  await workspace.getByRole("button", { name: "Open pull request" }).click();
+  const pullRequestLink = workspace.getByRole("link", { name: /^Pull request #\d+$/ });
+  await expect(pullRequestLink).toBeVisible();
+  const pullRequestHref = await pullRequestLink.getAttribute("href");
+  expect(pullRequestHref).toMatch(
+    new RegExp(`/git/repos/${encodeURIComponent(repositorySlug)}/prs/\\d+$`),
+  );
+  await page.keyboard.press("Escape");
   await page.reload();
   await waitForAppHydration(page);
   await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Agent workspace" }).click();
+  await expect(workspace.getByRole("link", { name: /^Pull request #\d+$/ }))
+    .toHaveAttribute("href", pullRequestHref!);
   await workspace.getByRole("button", { name: "Keep workspace" }).click();
   await expect.poll(async () => workspace.locator("time").getAttribute("datetime"))
     .not.toBe(retainedDeadline);

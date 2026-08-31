@@ -508,6 +508,39 @@ CREATE POLICY myelin_tenant_isolation ON agent_thread_renewal
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_THREAD_REVIEW_HANDOFF_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_thread_review_handoff (
+    tenant_id            text        NOT NULL,
+    region               text        NOT NULL,
+    thread_id            uuid        NOT NULL,
+    owner_principal_id   text        NOT NULL,
+    repository_slug      text        NOT NULL,
+    base_ref             text        NOT NULL,
+    head_ref             text        NOT NULL,
+    head_oid             text        NOT NULL,
+    pull_request_number  bigint      NOT NULL,
+    created_at           timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, region, thread_id),
+    UNIQUE (tenant_id, region, repository_slug, pull_request_number),
+    FOREIGN KEY (tenant_id, region, thread_id)
+      REFERENCES agent_thread (tenant_id, region, thread_id),
+    CHECK (length(owner_principal_id) BETWEEN 1 AND 255),
+    CHECK (octet_length(repository_slug) BETWEEN 1 AND 255),
+    CHECK (octet_length(base_ref) BETWEEN 12 AND 1024),
+    CHECK (octet_length(head_ref) BETWEEN 12 AND 1024),
+    CHECK (head_oid ~ '^[0-9a-f]{40}$'),
+    CHECK (pull_request_number > 0)
+);
+ALTER TABLE agent_thread_review_handoff ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_thread_review_handoff FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON agent_thread_review_handoff;
+CREATE POLICY myelin_tenant_isolation ON agent_thread_review_handoff
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub const AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION: &str = r#"
 ALTER TABLE agent_thread
   DROP CONSTRAINT IF EXISTS agent_thread_publication_after_creation;
@@ -614,6 +647,13 @@ pub fn agent_thread_renewal_migrations() -> Migrations {
     Migrations::of([Migration::plain(
         "0175_agent_thread_renewal",
         AGENT_THREAD_RENEWAL_MIGRATION,
+    )])
+}
+
+pub fn agent_thread_review_handoff_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0176_agent_thread_review_handoff",
+        AGENT_THREAD_REVIEW_HANDOFF_MIGRATION,
     )])
 }
 

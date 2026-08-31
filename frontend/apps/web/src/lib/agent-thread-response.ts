@@ -138,6 +138,22 @@ export interface AgentThreadCreateReceipt {
   durable: true;
 }
 
+export interface AgentThreadReviewHandoff {
+  thread_id: string;
+  repository: string;
+  base_ref: string;
+  head_ref: string;
+  head_oid: string;
+  pull_request: { number: number; ref: string };
+  created_at: string;
+}
+
+export interface AgentThreadReviewHandoffReceipt {
+  handoff: AgentThreadReviewHandoff;
+  created: boolean;
+  durable: true;
+}
+
 export interface AgentThreadReviewReceipt {
   thread: AgentThread;
   changed: boolean;
@@ -483,6 +499,45 @@ export function parseAgentThreadReviewReceipt(value: unknown): AgentThreadReview
     typeof receipt.changed === "boolean" && receipt.durable === true && reviewedThread &&
     reviewedThread.review_state === "ready" && reviewedThread.review_ready_at !== null
     ? { thread: reviewedThread, changed: receipt.changed, durable: true }
+    : null;
+}
+
+function reviewHandoff(value: unknown): AgentThreadReviewHandoff | null {
+  const row = record(value);
+  const pullRequest = record(row?.pull_request);
+  if (!row || !pullRequest ||
+      !exact(row, ["thread_id", "repository", "base_ref", "head_ref", "head_oid", "pull_request", "created_at"]) ||
+      !exact(pullRequest, ["number", "ref"]) || !isAgentThreadId(row.thread_id) ||
+      !cleanText(row.repository, 255) || !cleanText(row.base_ref, 1_024) ||
+      !cleanText(row.head_ref, 1_024) || !(row.base_ref as string).startsWith("refs/heads/") ||
+      !(row.head_ref as string).startsWith("refs/heads/") ||
+      typeof row.head_oid !== "string" || !/^[0-9a-f]{40}$/.test(row.head_oid) ||
+      !positiveInteger(pullRequest.number, Number.MAX_SAFE_INTEGER) ||
+      !cleanText(pullRequest.ref, 4_096) || !timestamp(row.created_at)) return null;
+  const expectedSuffix = `/git/pr/${row.repository}:${pullRequest.number}`;
+  return (pullRequest.ref as string).endsWith(expectedSuffix)
+    ? row as unknown as AgentThreadReviewHandoff
+    : null;
+}
+
+export function parseAgentThreadReviewHandoff(
+  value: unknown,
+): AgentThreadReviewHandoff | null {
+  const receipt = record(value);
+  const handoff = reviewHandoff(receipt?.handoff);
+  return receipt && exact(receipt, ["handoff", "durable"]) && receipt.durable === true && handoff
+    ? handoff
+    : null;
+}
+
+export function parseAgentThreadReviewHandoffReceipt(
+  value: unknown,
+): AgentThreadReviewHandoffReceipt | null {
+  const receipt = record(value);
+  const handoff = reviewHandoff(receipt?.handoff);
+  return receipt && exact(receipt, ["handoff", "created", "durable"]) &&
+    typeof receipt.created === "boolean" && receipt.durable === true && handoff
+    ? { handoff, created: receipt.created, durable: true }
     : null;
 }
 

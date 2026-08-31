@@ -263,6 +263,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::identity_durable::identity_agent_workspace_profile_migrations(),
         crate::agent_thread_durable::agent_thread_workspace_guidance_source_migrations(),
         crate::agent_thread_durable::agent_thread_renewal_migrations(),
+        crate::agent_thread_durable::agent_thread_review_handoff_migrations(),
     ]
 }
 

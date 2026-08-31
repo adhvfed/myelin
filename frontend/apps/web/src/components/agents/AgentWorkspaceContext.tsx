@@ -1,4 +1,5 @@
 import { Icon } from "@myelin/design-system";
+import { A } from "@solidjs/router";
 import { createSignal, For, Show } from "solid-js";
 
 import {
@@ -6,8 +7,10 @@ import {
   externalAgentCanConnect,
   type AgentChoice,
   type AgentThread,
+  type AgentThreadReviewHandoff,
   type WorkspaceSession,
 } from "~/lib/agent-thread-response";
+import { gitRepositoryPath } from "~/lib/git-route";
 
 function dateTime(value: string): string {
   return `${new Date(value).toISOString().slice(0, 16).replace("T", " ")} UTC`;
@@ -35,6 +38,11 @@ export function AgentWorkspaceContext(props: {
   renewing: boolean;
   renewalError: string | null;
   onRenew: (retentionDays: number) => void;
+  reviewHandoff: AgentThreadReviewHandoff | null;
+  reviewHandoffLoading: boolean;
+  publishingReview: boolean;
+  reviewHandoffError: string | null;
+  onPublishReview: () => void;
 }) {
   const [renewalDays, setRenewalDays] = createSignal(30);
   const agentCommand = () =>
@@ -101,6 +109,45 @@ export function AgentWorkspaceContext(props: {
             Owner instructions and create-only files are encrypted at rest and applied without
             changing the source repository.
           </p>
+        )}</Show>
+        <Show when={props.thread.workspace.repository}>{(repository) => (
+          <div class="agent-workspace-review-handoff" data-testid="workspace-review-handoff">
+            <h3>Code review</h3>
+            <Show when={props.thread.review_state === "ready"} fallback={
+              <p>Mark this thread ready when its committed branch should become available for review.</p>
+            }>
+              <Show when={!props.reviewHandoffLoading} fallback={<p>Checking for a review handoff…</p>}>
+                <Show when={props.reviewHandoff} fallback={<>
+                  <p>
+                    Publish the committed workspace branch and open one durable pull request.
+                    Uncommitted changes are refused, and owner-only workspace augmentation can’t
+                    enter the review commit.
+                  </p>
+                  <button
+                    type="button"
+                    class="agent-thread-button primary"
+                    disabled={props.publishingReview}
+                    onClick={() => props.onPublishReview()}
+                    data-testid="publish-workspace-review"
+                  >
+                    <Icon name={props.publishingReview ? "cycle" : "external-link"} />
+                    {props.publishingReview ? "Opening review…" : "Open pull request"}
+                  </button>
+                </>}>{(handoff) => (
+                  <p>
+                    <A href={`${gitRepositoryPath(repository().slug)}/prs/${handoff().pull_request.number}`}>
+                      Pull request #{handoff().pull_request.number}
+                    </A>{" "}
+                    tracks <code>{handoff().head_ref}</code> at{" "}
+                    <code>{handoff().head_oid.slice(0, 12)}</code>.
+                  </p>
+                )}</Show>
+              </Show>
+              <Show when={props.reviewHandoffError}>
+                <p role="alert">{props.reviewHandoffError}</p>
+              </Show>
+            </Show>
+          </div>
         )}</Show>
         <Show when={props.workspaceAvailable}>
           <div class="agent-workspace-renewal">

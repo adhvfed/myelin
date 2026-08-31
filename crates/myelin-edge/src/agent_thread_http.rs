@@ -2,13 +2,17 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use myelin_agent_service::{
-    workspace::{AgentWorkspaceStore, RepositoryWorkspaceSource, WorkspaceAccessError},
+    workspace::{
+        AgentWorkspaceStore, RepositoryReviewPublicationRequest, RepositoryWorkspaceSource,
+        WorkspaceAccessError, WorkspacePublicationError,
+    },
     PlatformToolCatalogue,
 };
 use myelin_chat::conversation::{Conversation, ConversationKind};
 use myelin_chat::events::pseudonymized_event_principal;
 use myelin_chat::store::{ConversationId, SystemUlidSource, UlidSource};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
+use myelin_git::pg_pr_store::PrOperationId;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     AgentRegistryError, AgentSessionIssuer, AgentSessionRequest, PgAgentRegistry,
@@ -16,12 +20,14 @@ use myelin_identity_service::{
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
     AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRenewal,
-    AgentThreadRunBinding, AgentThreadState, AgentThreadWorkspaceGuidance,
-    BeginAgentThreadRenewalOutcome, BindAgentThreadRunOutcome, ColumnCryptor,
+    AgentThreadReviewHandoff, AgentThreadRunBinding, AgentThreadState,
+    AgentThreadWorkspaceGuidance, BeginAgentThreadRenewalOutcome,
+    BindAgentThreadReviewHandoffOutcome, BindAgentThreadRunOutcome, ColumnCryptor,
     CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, KmsEngine,
     ListAgentThreadsOutcome, MarkAgentThreadReviewReadyOutcome, NewAgentThread,
-    RetryAgentThreadOutcome, SubjectId, SubjectKeyScope, WorkspaceSshRouteKey,
-    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    NewAgentThreadReviewHandoff, RetryAgentThreadOutcome, SubjectId, SubjectKeyScope,
+    WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -393,6 +399,144 @@ impl AgentThreadHttpApi {
         }
     }
 
+    fn review_handoff(
+        &self,
+        principal: &Principal,
+        thread_id: Uuid,
+    ) -> Result<Option<AgentThreadReviewHandoff>, EdgeError> {
+        self.drive(self.threads.review_handoff(
+            &principal.tenant.0,
+            &principal.principal_id.0,
+            thread_id,
+        ))?
+        .map_err(|_| EdgeError::Internal("agent thread review handoff lookup failed".into()))
+    }
+
+    fn publish_review_handoff(
+        &self,
+        principal: &Principal,
+        thread_id: Uuid,
+        title: Option<String>,
+        body_md: Option<String>,
+        reviewers: Vec<String>,
+    ) -> Result<(AgentThreadReviewHandoff, bool), EdgeError> {
+        if let Some(existing) = self.review_handoff(principal, thread_id)? {
+            return Ok((existing, false));
+        }
+        let observed_at = Utc::now();
+        let thread = self.available_owner_thread(principal, thread_id, observed_at)?;
+        if thread.review_ready_at.is_none() {
+            return Err(EdgeError::Conflict(
+                "mark the private thread ready before publishing its branch".into(),
+            ));
+        }
+        let binding = thread.git.as_ref().ok_or_else(|| {
+            EdgeError::Conflict("this agent thread has no repository branch to publish".into())
+        })?;
+        let workspace_id = parse_uuid("stored workspace id", &thread.workspace_id)
+            .map_err(|_| EdgeError::Internal("stored agent workspace id is invalid".into()))?;
+        let locator = thread.storage_locator.as_deref().ok_or_else(|| {
+            EdgeError::Conflict("agent thread workspace is not available for review".into())
+        })?;
+        let resolved = self
+            .git
+            .reopen_workspace_repository(
+                principal,
+                &binding.repository,
+                &binding.base_ref,
+                &binding.base_oid,
+            )
+            .map_err(map_durable_err)?;
+        let source = RepositoryWorkspaceSource {
+            repository: resolved.repository,
+            repository_path: resolved.repository_path,
+            clone_url: resolved.clone_url,
+            base_ref: resolved.base_ref,
+            base_oid: resolved.base_oid,
+            branch: binding.branch.clone(),
+        };
+        let protected_paths = self.protected_workspace_paths(principal, &thread, workspace_id)?;
+        let published = self
+            .workspaces
+            .publish_repository_for_review(
+                &principal.tenant.0,
+                workspace_id,
+                RepositoryReviewPublicationRequest {
+                    source: &source,
+                    storage_locator: locator,
+                    protected_paths: &protected_paths,
+                },
+            )
+            .map_err(map_workspace_publication_error)?;
+        let head_ref = format!("refs/heads/{}", binding.branch);
+        let title = title.unwrap_or_else(|| thread.name.clone());
+        let body_md = body_md.or_else(|| {
+            Some(format!(
+                "Published from private agent thread `{}` after its owner marked the work ready for review.",
+                thread.name
+            ))
+        });
+        let operation = PrOperationId::derive(
+            "myelin.agent-thread.review-handoff.v1",
+            &[
+                principal.tenant.0.as_bytes(),
+                principal.region.0.as_bytes(),
+                thread.thread_id.as_bytes(),
+            ],
+        )
+        .map_err(map_durable_err)?;
+        let pull_request = self
+            .git
+            .open_pr_with_operation(
+                &principal.tenant.0,
+                &principal.region.0,
+                &binding.repository,
+                &json!({
+                    "title": title,
+                    "body_md": body_md,
+                    "base_ref": binding.base_ref,
+                    "head_ref": head_ref,
+                    "head_oid": published.head_oid,
+                    "draft": false,
+                    "reviewers": reviewers,
+                }),
+                principal,
+                &operation,
+            )
+            .map_err(map_durable_err)?;
+        let proposal = NewAgentThreadReviewHandoff {
+            repository_slug: binding.repository.clone(),
+            base_ref: binding.base_ref.clone(),
+            head_ref,
+            head_oid: published.head_oid,
+            pull_request_number: pull_request.number,
+        };
+        let outcome = self
+            .drive(self.threads.bind_review_handoff(
+                &principal.tenant.0,
+                &principal.principal_id.0,
+                thread_id,
+                proposal,
+                observed_at,
+            ))?
+            .map_err(|_| {
+                EdgeError::Internal("agent thread review handoff could not be saved".into())
+            })?;
+        match outcome {
+            BindAgentThreadReviewHandoffOutcome::Bound(handoff) => Ok((handoff, true)),
+            BindAgentThreadReviewHandoffOutcome::AlreadyBound(handoff) => Ok((handoff, false)),
+            BindAgentThreadReviewHandoffOutcome::NotFound => {
+                Err(EdgeError::NotFound("agent thread not found".into()))
+            }
+            BindAgentThreadReviewHandoffOutcome::Conflict => Err(EdgeError::Conflict(
+                "agent thread review handoff conflicts with its durable branch".into(),
+            )),
+            BindAgentThreadReviewHandoffOutcome::Unavailable => Err(EdgeError::Conflict(
+                "agent thread is not available for a review handoff".into(),
+            )),
+        }
+    }
+
     fn renew(
         &self,
         principal: &Principal,
@@ -671,30 +815,14 @@ impl AgentThreadHttpApi {
         thread: &DurableAgentThread,
         workspace_id: Uuid,
     ) -> Result<(), EdgeError> {
-        let Some(guidance) = thread.workspace_guidance.as_ref() else {
+        let Some(augmentation) = self.workspace_augmentation(principal, thread, workspace_id)?
+        else {
             return Ok(());
         };
-        let thread_id = parse_uuid("stored thread id", &thread.thread_id)
-            .map_err(|_| EdgeError::Internal("stored agent thread id is invalid".into()))?;
-        let plaintext = ColumnCryptor::new(&self.kms, principal.region.clone())
-            .decrypt_with_aad(
-                &guidance.encrypted_content,
-                &workspace_guidance_aad(
-                    principal,
-                    thread_id,
-                    &thread.owner_principal_id,
-                    workspace_id,
-                ),
-            )
-            .map_err(|_| {
-                EdgeError::Internal("stored agent workspace guidance cannot be decrypted".into())
-            })?;
-        if workspace_guidance_digest(&plaintext) != guidance.content_digest {
-            return Err(EdgeError::Internal(
-                "stored agent workspace guidance failed integrity validation".into(),
-            ));
-        }
-        let augmentation = WorkspaceAugmentation::decode(&plaintext)?;
+        let guidance = thread
+            .workspace_guidance
+            .as_ref()
+            .expect("decoded workspace augmentation has a durable guidance receipt");
         if let Some(instructions) = augmentation.agents_md.as_deref() {
             let existing =
                 match self
@@ -730,6 +858,61 @@ impl AgentThreadHttpApi {
             self.apply_workspace_file(principal, workspace_id, &file)?;
         }
         Ok(())
+    }
+
+    fn workspace_augmentation(
+        &self,
+        principal: &Principal,
+        thread: &DurableAgentThread,
+        workspace_id: Uuid,
+    ) -> Result<Option<WorkspaceAugmentation>, EdgeError> {
+        let Some(guidance) = thread.workspace_guidance.as_ref() else {
+            return Ok(None);
+        };
+        let thread_id = parse_uuid("stored thread id", &thread.thread_id)
+            .map_err(|_| EdgeError::Internal("stored agent thread id is invalid".into()))?;
+        let plaintext = ColumnCryptor::new(&self.kms, principal.region.clone())
+            .decrypt_with_aad(
+                &guidance.encrypted_content,
+                &workspace_guidance_aad(
+                    principal,
+                    thread_id,
+                    &thread.owner_principal_id,
+                    workspace_id,
+                ),
+            )
+            .map_err(|_| {
+                EdgeError::Internal("stored agent workspace guidance cannot be decrypted".into())
+            })?;
+        if workspace_guidance_digest(&plaintext) != guidance.content_digest {
+            return Err(EdgeError::Internal(
+                "stored agent workspace guidance failed integrity validation".into(),
+            ));
+        }
+        WorkspaceAugmentation::decode(&plaintext).map(Some)
+    }
+
+    fn protected_workspace_paths(
+        &self,
+        principal: &Principal,
+        thread: &DurableAgentThread,
+        workspace_id: Uuid,
+    ) -> Result<Vec<String>, EdgeError> {
+        let Some(augmentation) = self.workspace_augmentation(principal, thread, workspace_id)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut paths = augmentation
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        if augmentation.agents_md.is_some() {
+            paths.push("AGENTS.md".into());
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     fn apply_workspace_file(
@@ -1218,6 +1401,69 @@ impl Handler for AgentThreadReviewReadyHandler {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentThreadReviewHandoffBody {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body_md: Option<String>,
+    #[serde(default)]
+    reviewers: Vec<String>,
+}
+
+struct AgentThreadReviewHandoffGetHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadReviewHandoffGetHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        require_empty_body(ctx)?;
+        let handoff = self
+            .api
+            .review_handoff(ctx.principal, thread_param(ctx)?)?
+            .ok_or_else(|| EdgeError::NotFound("agent thread review handoff not found".into()))?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "handoff": review_handoff_json(&ctx.principal.tenant.0, &handoff),
+                "durable": true,
+            }),
+        )))
+    }
+}
+
+struct AgentThreadReviewHandoffCreateHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadReviewHandoffCreateHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let body: AgentThreadReviewHandoffBody =
+            parse_interactive_body(&ctx.request.body, "agent thread review handoff")?;
+        let _client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let (handoff, created) = self.api.publish_review_handoff(
+            ctx.principal,
+            thread_param(ctx)?,
+            body.title,
+            body.body_md,
+            body.reviewers,
+        )?;
+        Ok(no_store(EdgeResponse::json(
+            if created { 201 } else { 200 },
+            &json!({
+                "handoff": review_handoff_json(&ctx.principal.tenant.0, &handoff),
+                "created": created,
+                "durable": true,
+            }),
+        )))
+    }
+}
+
 struct AgentThreadRunCreateHandler {
     api: AgentThreadHttpApi,
 }
@@ -1469,6 +1715,18 @@ pub fn register_agent_threads(
             Arc::new(AgentThreadReviewReadyHandler { api: api.clone() }),
         )
         .route(
+            Method::Get,
+            "/v1/agent-threads/{thread}/pull-request",
+            "identity.agent_thread.view",
+            Arc::new(AgentThreadReviewHandoffGetHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agent-threads/{thread}/pull-request",
+            "identity.agent_thread.review.publish",
+            Arc::new(AgentThreadReviewHandoffCreateHandler { api: api.clone() }),
+        )
+        .route(
             Method::Post,
             "/v1/agent-threads/{thread}/renew",
             "identity.agent_thread.create",
@@ -1645,6 +1903,49 @@ pub(crate) fn agent_thread_public_state(thread: &DurableAgentThread) -> &'static
 
 fn thread_ref(tenant: &str, thread_id: &str) -> String {
     format!("myelin://{tenant}/agent/thread/{thread_id}")
+}
+
+fn review_handoff_json(tenant: &str, handoff: &AgentThreadReviewHandoff) -> Value {
+    json!({
+        "thread_id": handoff.thread_id.to_string(),
+        "repository": handoff.repository_slug,
+        "base_ref": handoff.base_ref,
+        "head_ref": handoff.head_ref,
+        "head_oid": handoff.head_oid,
+        "pull_request": {
+            "number": handoff.pull_request_number,
+            "ref": format!(
+                "myelin://{tenant}/git/pr/{}:{}",
+                handoff.repository_slug, handoff.pull_request_number
+            ),
+        },
+        "created_at": handoff.created_at,
+    })
+}
+
+fn map_workspace_publication_error(error: WorkspacePublicationError) -> EdgeError {
+    match error {
+        WorkspacePublicationError::LocatorMismatch
+        | WorkspacePublicationError::WorkspaceUnavailable => {
+            EdgeError::Conflict("agent thread workspace is no longer available for review".into())
+        }
+        WorkspacePublicationError::NoChanges => EdgeError::Conflict(
+            "commit at least one workspace change before opening a review".into(),
+        ),
+        WorkspacePublicationError::DirtyWorkspace(path) => EdgeError::Conflict(format!(
+            "commit or discard the workspace change at `{path}` before opening a review"
+        )),
+        WorkspacePublicationError::ProtectedWorkspaceData(path) => EdgeError::Conflict(format!(
+            "the review commit includes owner-only workspace augmentation at `{path}`; remove it from the commit before publishing"
+        )),
+        WorkspacePublicationError::Diverged => EdgeError::Conflict(
+            "the workspace review branch diverged from its durable publication history".into(),
+        ),
+        WorkspacePublicationError::InvalidRepository(reason) => EdgeError::Conflict(reason),
+        WorkspacePublicationError::Io(_) => {
+            EdgeError::Unavailable("agent workspace branch could not be published".into())
+        }
+    }
 }
 
 fn workspace_request_digest(

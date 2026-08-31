@@ -28,7 +28,7 @@ import {
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { GitProject } from "../src/git-project.js";
-import { array, record, string } from "../src/json.js";
+import { array, integer, record, string } from "../src/json.js";
 import { reconcileAgentThreads } from "../src/operator.js";
 import {
   connectMultiplexedToWorkspace,
@@ -210,8 +210,17 @@ describe("private work with an agent", () => {
     const created = await startPrivateAgentThread(founder, {
       name: uniqueName("Talk through my cloud branch"),
       agentId: companion.agent.id,
+      projectId: systemTestConfig.issues.projectId,
       idempotencyKey,
-      workspace: { repository: repository.slug },
+      workspace: {
+        repository: repository.slug,
+        instructions: "Keep the owner's exploratory notes private during review handoff.",
+        files: [{
+          path: ".myelin/private-review-context.md",
+          contents: "This owner-only context must never enter the review branch.\n",
+          strategy: "create",
+        }],
+      },
     });
     expect(created.thread.workspace.repository).toEqual({
       slug: repository.slug,
@@ -239,8 +248,17 @@ describe("private work with an agent", () => {
     const replay = await startPrivateAgentThread(founder, {
       name: created.thread.name,
       agentId: companion.agent.id,
+      projectId: systemTestConfig.issues.projectId,
       idempotencyKey,
-      workspace: { repository: repository.slug },
+      workspace: {
+        repository: repository.slug,
+        instructions: "Keep the owner's exploratory notes private during review handoff.",
+        files: [{
+          path: ".myelin/private-review-context.md",
+          contents: "This owner-only context must never enter the review branch.\n",
+          strategy: "create",
+        }],
+      },
       expectedStatus: 200,
     });
     expect(replay).toEqual({ created: false, thread: created.thread });
@@ -281,9 +299,110 @@ describe("private work with an agent", () => {
           initial.commitOid,
           expect.stringContaining(`/${repository.slug}.git`),
         ]);
+      const committed = record(
+        (await askAgentToAct(
+          run,
+          4,
+          "workspace.exec",
+          {
+            command: [
+              "git config user.name 'Myelin cloud agent'",
+              "git config user.email 'agent@myelin.invalid'",
+              "printf 'export const reviewed = true;\\n' > review-ready.ts",
+              "git add review-ready.ts",
+              "git commit -m 'Prepare private cloud branch for review'",
+              "git rev-parse HEAD",
+            ].join(" && "),
+            timeout_seconds: 10,
+          },
+          `commit-cloud-branch-${randomUUID()}`,
+        )).data,
+        "committed cloud branch command",
+      );
+      expect(string(committed.stdout, "committed cloud branch stdout"))
+        .toContain("Prepare private cloud branch for review");
     } finally {
       await closeAgentRun(run);
     }
+
+    const branch = created.thread.workspace.repository!.branch;
+    await teammate.json(`${repository.path}/blob/${encodeURIComponent(branch)}/review-ready.ts`, {
+      expectedStatus: 404,
+    });
+    await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: `premature-review-handoff-${randomUUID()}`,
+        expectedStatus: 409,
+      },
+    );
+    await markAgentThreadReadyForReview(founder, created.thread.id);
+    const handoffKey = `private-review-handoff-${randomUUID()}`;
+    const opened = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: {
+          title: "Review the private cloud branch",
+          body_md: "The owner has finished the private exploration and is ready for a human review.",
+          reviewers: [systemTestConfig.reviewerPrincipal],
+        },
+        idempotencyKey: handoffKey,
+        expectedStatus: 201,
+      },
+    );
+    const handoff = record(opened.body.handoff, "private branch review handoff");
+    const pullRequest = record(handoff.pull_request, "private branch pull request");
+    const pullRequestNumber = integer(pullRequest.number, "private branch pull request number");
+    expect(handoff).toMatchObject({
+      thread_id: created.thread.id,
+      repository: repository.slug,
+      base_ref: "refs/heads/main",
+      head_ref: `refs/heads/${branch}`,
+      head_oid: expect.stringMatching(/^[0-9a-f]{40}$/),
+      created_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+    });
+    const replayedHandoff = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: {
+          title: "Review the private cloud branch",
+          body_md: "The owner has finished the private exploration and is ready for a human review.",
+          reviewers: [systemTestConfig.reviewerPrincipal],
+        },
+        idempotencyKey: handoffKey,
+        expectedStatus: 200,
+      },
+    );
+    expect(replayedHandoff.body).toEqual({
+      handoff,
+      created: false,
+      durable: true,
+    });
+    const loadedHandoff = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+    );
+    expect(loadedHandoff.body).toEqual({ handoff, durable: true });
+    expect((await repository.readFile(branch, "review-ready.ts")).contents)
+      .toBe("export const reviewed = true;\n");
+    await founder.json(
+      `${repository.path}/blob/${encodeURIComponent(branch)}/.myelin/private-review-context.md`,
+      { expectedStatus: 404 },
+    );
+    await founder.json(`${repository.path}/blob/${encodeURIComponent(branch)}/AGENTS.md`, {
+      expectedStatus: 404,
+    });
+    const review = await teammate.json(`${repository.path}/prs/${pullRequestNumber}`);
+    expect(review.body).toMatchObject({
+      number: pullRequestNumber,
+      title: "Review the private cloud branch",
+      head_ref: `refs/heads/${branch}`,
+      head_oid: handoff.head_oid,
+      pr_state: "open",
+    });
   });
 
   test("layers owner instructions and create-only context files across agent contexts", async () => {
