@@ -565,15 +565,24 @@ scripts:
       MYELIN_INTEGRATION_WEB_URL: "http://127.0.0.1:{{WEB_PORT}}"
       MYELIN_BROWSER_TENANT: "development-{{FED_PROJECT_ID}}"
       MYELIN_BROWSER_PRINCIPAL: developer
+      MYELIN_BROWSER_REVIEWER_PRINCIPAL: reviewer
+      MYELIN_BROWSER_PROJECT_ID: 20aee030-c7fa-4757-8243-700faf528690
     script: >-
       sh -c 'set -eu;
       browser_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_BROWSER_TENANT" --region fr-par
       --principal "$MYELIN_BROWSER_PRINCIPAL" --display-name "Myelin Developer"
-      --issues-project 20aee030-c7fa-4757-8243-700faf528690
+      --issues-project "$MYELIN_BROWSER_PROJECT_ID"
       --issues-type 7d457754-f6a1-4cd8-8738-21751570b627 --issues-prefix MYL --ttl-days 1)";
       test -n "$browser_token";
       export MYELIN_BROWSER_EDGE_TOKEN="$browser_token";
+      browser_reviewer_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_BROWSER_TENANT" --region fr-par
+      --principal "$MYELIN_BROWSER_REVIEWER_PRINCIPAL" --display-name "Myelin Reviewer"
+      --issues-project "$MYELIN_BROWSER_PROJECT_ID"
+      --issues-type 7d457754-f6a1-4cd8-8738-21751570b627 --issues-prefix MYL --ttl-days 1)";
+      test -n "$browser_reviewer_token";
+      export MYELIN_BROWSER_REVIEWER_EDGE_TOKEN="$browser_reviewer_token";
       pnpm --dir frontend --filter @myelin/web exec playwright test
       --config playwright.integration.config.ts "$@"' -- "$@"
 

@@ -6,6 +6,9 @@ import type { APIRequestContext } from "@playwright/test";
 import {
   browserApprovedSession,
   integrationEdgeUrl,
+  integrationProjectId,
+  integrationReviewerPrincipal,
+  integrationReviewerToken,
   postProductJson,
   type JsonObject,
 } from "./product-api";
@@ -191,9 +194,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
   const reviewProject = dialog.getByRole("combobox", { name: "Project for eventual review" });
   await expect(reviewProject).toHaveValue("");
-  const reviewProjectId = await reviewProject.locator("option").nth(1).getAttribute("value");
-  expect(reviewProjectId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
-  await reviewProject.selectOption(reviewProjectId!);
+  await reviewProject.selectOption(integrationProjectId);
   await expect(dialog.getByText("This agent carries private workspace defaults at revision 2."))
     .toBeVisible();
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");
@@ -360,7 +361,11 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   );
   const threadText = await threadResponse.text();
   expect(threadResponse.status(), threadText).toBe(200);
-  const threadRef = (JSON.parse(threadText) as { thread: { ref: string } }).thread.ref;
+  const durableThread = JSON.parse(threadText) as {
+    thread: { ref: string; project_id: string };
+  };
+  const threadRef = durableThread.thread.ref;
+  const projectId = durableThread.thread.project_id;
 
   await page.getByRole("link", { name: "Chat" }).click();
   await page.waitForURL("**/chat");
@@ -385,8 +390,30 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
   await expect(page.getByText(`Project review with ${renamedAgentName}`, { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send to review" })).toBeVisible();
+  const collaboratorResponse = await request.get(
+    `${integrationEdgeUrl}/v1/projects/${encodeURIComponent(projectId)}/collaborators?limit=100`,
+    {
+      headers: {
+        authorization: `Bearer ${sessionToken}`,
+        "x-myelin-token-scheme": "session",
+      },
+      failOnStatusCode: false,
+    },
+  );
+  const collaboratorText = await collaboratorResponse.text();
+  expect(collaboratorResponse.status(), collaboratorText).toBe(200);
+  expect((JSON.parse(collaboratorText) as { items: Array<{ principal_id: string }> }).items)
+    .toEqual(expect.arrayContaining([
+      expect.objectContaining({ principal_id: integrationReviewerPrincipal }),
+    ]));
   await page.getByRole("button", { name: "Agent workspace" }).click();
   await expect(workspace.getByRole("button", { name: "Open pull request" })).toBeVisible();
+  const reviewers = workspace.getByRole("group", { name: "Request review from" });
+  const reviewer = reviewers.getByRole("checkbox", {
+    name: new RegExp(integrationReviewerPrincipal),
+  });
+  await expect(reviewer).toBeVisible();
+  await reviewer.check();
   await workspace.getByRole("button", { name: "Open pull request" }).click();
   const pullRequestLink = workspace.getByRole("link", { name: /^Pull request #\d+$/ });
   await expect(pullRequestLink).toBeVisible();
@@ -394,6 +421,15 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   expect(pullRequestHref).toMatch(
     new RegExp(`/git/repos/${encodeURIComponent(repositorySlug)}/prs/\\d+$`),
   );
+  const reviewerPullRequest = await request.get(`${integrationEdgeUrl}/v1${pullRequestHref}`, {
+    headers: {
+      authorization: `Bearer ${integrationReviewerToken}`,
+      "x-myelin-token-scheme": "agent",
+    },
+    failOnStatusCode: false,
+  });
+  const reviewerPullRequestText = await reviewerPullRequest.text();
+  expect(reviewerPullRequest.status(), reviewerPullRequestText).toBe(200);
   await page.keyboard.press("Escape");
   await page.reload();
   await waitForAppHydration(page);

@@ -1010,6 +1010,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
+    let project_principals = human_store.clone();
     let mcp_principals = PrincipalStore::with_pg(
         kms.clone(),
         DurablePrincipalBacking::new(provider.clone()),
@@ -1313,7 +1314,13 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             )),
     );
     builder = register_issues(builder, issue_mutations.clone());
-    builder = register_projects(builder, projects.clone(), check.clone(), handle.clone());
+    builder = register_projects(
+        builder,
+        projects.clone(),
+        check.clone(),
+        project_principals,
+        handle.clone(),
+    );
     builder = register_refs(
         builder,
         DurableRefsReadApi::new(provider.db_pool().clone(), repo_authz, handle.clone()),

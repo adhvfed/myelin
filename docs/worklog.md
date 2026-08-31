@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Reviewers are chosen from the project's real collaborators
+
+The private-work pane no longer requires an owner to know and type an opaque reviewer identity.
+Once project-bound work is ready, it loads the other active human collaborators from the exact live
+`project#view` authorization expansion, resolves their encrypted profile names, and offers explicit
+checkboxes before publication. Selection still grants only the resulting pull request: it does not
+grant repository, workspace, SSH, or agent-run authority. The bounded endpoint is viewer-protected,
+tenant-scoped, paged, no-store, excludes the caller and non-human or inactive principals, and omits
+legacy identity text that the strict public contract cannot represent.
+
+The first running test exposed that ordinary authorization checks canonicalized Myelin artifact
+references to tuple keys while subject expansion did not. `list_subjects_in` and its explain path
+now use the same canonical object mapping as `check`, while preserving the requested reference in
+their response. A focused identity contract proves a canonical artifact expands the same stored
+relationship as its tuple key. The browser fixture also stopped selecting whichever project happened
+to sort first in an accumulated durable store; it now chooses its declared project explicitly.
+
+The TypeScript system journey proves a real second project identity appears through the new Edge
+endpoint. The Chromium product journey pins the review project, loads and selects the reviewer by
+name, publishes a real committed private branch, opens the durable pull request, and then uses the
+reviewer's separate credential to read that exact PR. Both passed against running Edge, PostgreSQL,
+durable Git, Chat/ReBAC, the agent service, workspace gateway, gVisor, and the web app. Strict Clippy,
+the identity expansion contract, web and system typechecks, and all 676 web unit tests also pass.
+
 ## 2026-09-01 — Remote-editor work can reach review without leaving the CLI
 
 The safe cloud-branch handoff existed in the workspace pane and Edge, but the CLI stopped after

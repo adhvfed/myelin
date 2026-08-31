@@ -44,6 +44,17 @@ describe("private work with an agent", () => {
   test("keeps project-bound work private until its owner marks the conversation ready", async () => {
     const founder = await browserApprovedCliClient();
     const teammate = await browserApprovedCliClient(reviewerClient);
+    const collaborators = await founder.json(
+      `/v1/projects/${encodeURIComponent(systemTestConfig.issues.projectId)}/collaborators?limit=100`,
+    );
+    expect(array(collaborators.body.items, "project collaborators")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          principal_id: systemTestConfig.reviewerPrincipal,
+          display_name: expect.any(String),
+        }),
+      ]),
+    );
     const companion = await activateExternalAgent(
       founder,
       uniqueName("Private draft companion"),

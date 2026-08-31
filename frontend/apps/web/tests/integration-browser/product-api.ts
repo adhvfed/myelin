@@ -12,6 +12,9 @@ function requiredEnvironment(name: string): string {
 export const integrationEdgeUrl = requiredEnvironment("MYELIN_INTEGRATION_EDGE_URL")
   .replace(/\/$/, "");
 const operatorToken = requiredEnvironment("MYELIN_BROWSER_EDGE_TOKEN");
+export const integrationReviewerToken = requiredEnvironment("MYELIN_BROWSER_REVIEWER_EDGE_TOKEN");
+export const integrationReviewerPrincipal = requiredEnvironment("MYELIN_BROWSER_REVIEWER_PRINCIPAL");
+export const integrationProjectId = requiredEnvironment("MYELIN_BROWSER_PROJECT_ID");
 
 export async function postProductJson(
   request: APIRequestContext,

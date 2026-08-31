@@ -943,8 +943,12 @@ impl StoreBackedCheck {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let expand = Expand::new(self.tuples.clone(), namespace);
-        let object_type = ObjectType(infer_object_type(&object.0));
-        expand.list_subjects(scope, object, &object_type, permission, at)
+        let tuple_object = tuple_object_id(object);
+        let object_type = ObjectType(infer_object_type(&tuple_object.0));
+        let mut subjects =
+            expand.list_subjects(scope, &tuple_object, &object_type, permission, at)?;
+        subjects.object = object.clone();
+        Ok(subjects)
     }
 
     pub fn list_watchers_in(
@@ -970,8 +974,9 @@ impl StoreBackedCheck {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let expand = Expand::new(self.tuples.clone(), namespace);
-        let object_type = ObjectType(infer_object_type(&object.0));
-        expand.explain(scope, subject, object, &object_type, permission, at)
+        let tuple_object = tuple_object_id(object);
+        let object_type = ObjectType(infer_object_type(&tuple_object.0));
+        expand.explain(scope, subject, &tuple_object, &object_type, permission, at)
     }
 
     pub fn check_many(
@@ -1023,6 +1028,12 @@ fn infer_object_type(object_id: &str) -> String {
         .split_once(':')
         .map(|(ty, _)| ty.to_string())
         .unwrap_or_else(|| object_id.to_string())
+}
+
+fn tuple_object_id(object: &myelin_identity::ObjectId) -> myelin_identity::ObjectId {
+    myelin_refs::object_key(&ArtifactRef(object.0.clone()))
+        .map(|key| myelin_identity::ObjectId(key.tuple_key()))
+        .unwrap_or_else(|| object.clone())
 }
 
 impl IdentityService for StoreBackedCheck {

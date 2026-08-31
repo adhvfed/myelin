@@ -11,6 +11,7 @@ import {
   type WorkspaceSession,
 } from "~/lib/agent-thread-response";
 import { gitRepositoryPath } from "~/lib/git-route";
+import type { ProjectCollaboratorVM } from "~/lib/project-contract";
 
 function dateTime(value: string): string {
   return `${new Date(value).toISOString().slice(0, 16).replace("T", " ")} UTC`;
@@ -42,6 +43,14 @@ export function AgentWorkspaceContext(props: {
   reviewHandoffLoading: boolean;
   publishingReview: boolean;
   reviewHandoffError: string | null;
+  reviewers: ProjectCollaboratorVM[];
+  reviewersLoading: boolean;
+  reviewersUnavailable: boolean;
+  reviewersHaveMore: boolean;
+  reviewersLoadingMore: boolean;
+  selectedReviewerIds: string[];
+  onToggleReviewer: (principalId: string) => void;
+  onLoadMoreReviewers: () => void;
   onPublishReview: () => void;
 }) {
   const [renewalDays, setRenewalDays] = createSignal(30);
@@ -122,6 +131,44 @@ export function AgentWorkspaceContext(props: {
                     Publish the committed workspace branch and open one durable pull request.
                     Uncommitted changes are refused, and owner-only workspace augmentation can’t
                     enter the review commit.
+                  </p>
+                  <fieldset class="agent-workspace-reviewers">
+                    <legend>Request review from</legend>
+                    <Show when={!props.reviewersLoading} fallback={<p>Loading project collaborators…</p>}>
+                      <Show when={!props.reviewersUnavailable} fallback={
+                        <p role="alert">Project collaborators are temporarily unavailable. You can still open an unassigned review.</p>
+                      }>
+                        <Show when={props.reviewers.length > 0} fallback={
+                          <p>No other active human collaborators are available in this project.</p>
+                        }>
+                          <For each={props.reviewers}>{(reviewer) => (
+                            <label>
+                              <input
+                                type="checkbox"
+                                checked={props.selectedReviewerIds.includes(reviewer.principal_id)}
+                                disabled={props.publishingReview}
+                                onChange={() => props.onToggleReviewer(reviewer.principal_id)}
+                              />
+                              <span>{reviewer.display_name}</span>{" "}
+                              <code>{reviewer.principal_id}</code>
+                            </label>
+                          )}</For>
+                        </Show>
+                        <Show when={props.reviewersHaveMore}>
+                          <button
+                            type="button"
+                            class="agent-thread-button secondary"
+                            disabled={props.reviewersLoadingMore || props.publishingReview}
+                            onClick={() => props.onLoadMoreReviewers()}
+                          >
+                            {props.reviewersLoadingMore ? "Loading…" : "Load more collaborators"}
+                          </button>
+                        </Show>
+                      </Show>
+                    </Show>
+                  </fieldset>
+                  <p class="agent-thread-note">
+                    Selected reviewers receive access to this pull request only, not the repository or workspace.
                   </p>
                   <button
                     type="button"

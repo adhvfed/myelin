@@ -1,15 +1,18 @@
-use crate::catalogue::{page_envelope, Handler, HandlerCtx};
+use crate::catalogue::{page_envelope, Handler, HandlerCtx, Page};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_result_on_runtime;
 use crate::Method;
 use myelin_identity::{
-    Consistency, ConsistencyMode, Decision, IdentityService, Permission, Zookie,
+    Consistency, ConsistencyMode, Decision, IdentityService, ObjectId, Permission, PrincipalKind,
+    PrincipalStatus, Zookie,
 };
 use myelin_identity_service::{
-    project_ref, NewProject, PgProjectStore, Project, ProjectError, StoreBackedCheck,
+    project_ref, NewProject, PgProjectStore, PrincipalStore, Project, ProjectError,
+    StoreBackedCheck,
 };
+use myelin_storage::TenantScope;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -18,6 +21,8 @@ use tokio::runtime::Handle;
 const MAX_PROJECT_JSON_BYTES: usize = 4 * 1024;
 const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
+const MAX_COLLABORATOR_TEXT_BYTES: usize = 255;
+const COLLABORATOR_SCAN_MULTIPLIER: usize = 2;
 
 #[derive(Clone)]
 pub struct DurableProjectReadApi {
@@ -66,6 +71,7 @@ struct ProjectHttpApi {
     store: PgProjectStore,
     reads: DurableProjectReadApi,
     authz: StoreBackedCheck,
+    principals: PrincipalStore,
     runtime: Handle,
 }
 
@@ -96,6 +102,85 @@ impl ProjectHttpApi {
             ),
             Ok(Decision::Allow)
         )
+    }
+
+    fn collaborators(
+        &self,
+        ctx: &HandlerCtx<'_>,
+        project_id: &str,
+        page: Page,
+    ) -> Result<Value, EdgeError> {
+        let project = self
+            .drive(self.store.get(ctx.principal, project_id))
+            .map_err(map_project_error)?;
+        if !self.may_view(ctx, &project.id) {
+            return Err(EdgeError::NotFound("project not found".into()));
+        }
+        let scope = TenantScope::from_verified_token(ctx.principal, ctx.principal.region.clone());
+        let object = ObjectId(project_ref(&ctx.principal.tenant.0, &project.id).0);
+        let consistency = Consistency {
+            at_least: Zookie(String::new()),
+            mode: ConsistencyMode::Strong,
+        };
+        let subjects = self
+            .authz
+            .list_subjects_in(&scope, &object, &Permission("view".into()), &consistency)
+            .map_err(|_| EdgeError::Unavailable("project collaborators are unavailable".into()))?;
+        let mut candidates = subjects
+            .members
+            .into_iter()
+            .filter(|principal_id| {
+                page.cursor
+                    .as_ref()
+                    .is_none_or(|cursor| principal_id.0 > *cursor)
+            })
+            .peekable();
+        let mut items = Vec::with_capacity(page.limit);
+        let mut last_scanned = None;
+        let mut scanned = 0;
+        let scan_limit = page.limit.saturating_mul(COLLABORATOR_SCAN_MULTIPLIER);
+        while items.len() < page.limit && scanned < scan_limit {
+            let Some(principal_id) = candidates.next() else {
+                break;
+            };
+            scanned += 1;
+            last_scanned = Some(principal_id.0.clone());
+            let Some(principal) = self
+                .principals
+                .get_principal(&scope, &principal_id)
+                .map_err(|_| {
+                    EdgeError::Unavailable("project collaborators are unavailable".into())
+                })?
+            else {
+                continue;
+            };
+            if principal.kind != PrincipalKind::Human
+                || principal.status != PrincipalStatus::Active
+                || principal.principal_id == ctx.principal.principal_id
+                || !valid_collaborator_text(&principal.principal_id.0)
+            {
+                continue;
+            }
+            let display_name = self
+                .principals
+                .get_profile(&scope, &principal.principal_id)
+                .map_err(|_| {
+                    EdgeError::Unavailable("project collaborators are unavailable".into())
+                })?
+                .map(|profile| profile.display_name)
+                .filter(|name| valid_collaborator_text(name))
+                .unwrap_or_else(|| principal.principal_id.0.clone());
+            items.push(json!({
+                "principal_id": principal.principal_id.0,
+                "display_name": display_name,
+            }));
+        }
+        let next_cursor = candidates
+            .peek()
+            .is_some()
+            .then_some(last_scanned)
+            .flatten();
+        Ok(page_envelope(json!(items), next_cursor, page.limit))
     }
 }
 
@@ -166,6 +251,22 @@ struct ProjectListHandler {
     api: ProjectHttpApi,
 }
 
+struct ProjectCollaboratorListHandler {
+    api: ProjectHttpApi,
+}
+
+impl Handler for ProjectCollaboratorListHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_body(ctx, "project collaborator list")?;
+        let page = Page::parse(&ctx.request.query, "project collaborator list")?;
+        let project_id = project_param(ctx)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &self.api.collaborators(ctx, project_id, page)?,
+        )))
+    }
+}
+
 impl Handler for ProjectListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_body(ctx, "project list")?;
@@ -181,6 +282,7 @@ pub fn register_projects(
     builder: GatewayBuilder,
     store: PgProjectStore,
     authz: StoreBackedCheck,
+    principals: PrincipalStore,
     runtime: Handle,
 ) -> GatewayBuilder {
     let reads = DurableProjectReadApi::new(store.clone(), runtime.clone());
@@ -188,6 +290,7 @@ pub fn register_projects(
         store,
         reads,
         authz,
+        principals,
         runtime,
     };
     builder
@@ -207,7 +310,13 @@ pub fn register_projects(
             Method::Get,
             "/v1/projects/{project}",
             "identity.project.view",
-            Arc::new(ProjectGetHandler { api }),
+            Arc::new(ProjectGetHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/projects/{project}/collaborators",
+            "identity.project.view",
+            Arc::new(ProjectCollaboratorListHandler { api }),
         )
 }
 
@@ -325,6 +434,13 @@ fn no_store(response: EdgeResponse) -> EdgeResponse {
     response.with_header("Cache-Control", "no-store")
 }
 
+fn valid_collaborator_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_COLLABORATOR_TEXT_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +466,13 @@ mod tests {
         ));
         assert_eq!(error.client_message(), "internal error");
         assert!(!error.envelope().to_string().contains("postgres"));
+    }
+
+    #[test]
+    fn collaborator_projection_rejects_text_the_public_contract_cannot_represent() {
+        assert!(valid_collaborator_text("Ada Lovelace"));
+        assert!(!valid_collaborator_text(" Ada Lovelace"));
+        assert!(!valid_collaborator_text("Ada\nLovelace"));
+        assert!(!valid_collaborator_text(&"a".repeat(256)));
     }
 }

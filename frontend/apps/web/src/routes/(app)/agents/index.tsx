@@ -53,6 +53,8 @@ import {
 } from "~/lib/agent-thread-response";
 import { mergeMessagePages } from "~/lib/chat-view";
 import { nextCursorForPages } from "~/lib/pagination";
+import { getProjectCollaborators } from "~/lib/project-api";
+import type { ProjectCollaboratorPage, ProjectCollaboratorVM } from "~/lib/project-contract";
 
 interface PageResult<T> {
   page: T | null;
@@ -68,6 +70,18 @@ function mergeById<T extends { id: string }>(first: T[] = [], pages: T[][] = [])
     merged.push(row);
   }
   return merged;
+}
+
+function mergeCollaborators(
+  first: ProjectCollaboratorVM[] = [],
+  pages: ProjectCollaboratorVM[][] = [],
+): ProjectCollaboratorVM[] {
+  const seen = new Set<string>();
+  return first.concat(...pages).filter((reviewer) => {
+    if (seen.has(reviewer.principal_id)) return false;
+    seen.add(reviewer.principal_id);
+    return true;
+  });
 }
 
 export default function AgentThreadsIndex() {
@@ -109,9 +123,14 @@ export default function AgentThreadsIndex() {
   const [publishingReview, setPublishingReview] = createSignal(false);
   const [reviewHandoffError, setReviewHandoffError] = createSignal<string | null>(null);
   const [reviewHandoffNonce, setReviewHandoffNonce] = createSignal("");
+  const [reviewerPages, setReviewerPages] = createSignal<ProjectCollaboratorPage[]>([]);
+  const [selectedReviewerIds, setSelectedReviewerIds] = createSignal<string[]>([]);
+  const [loadingMoreReviewers, setLoadingMoreReviewers] = createSignal(false);
   let threadGeneration = 0;
   let messageGeneration = 0;
   let workspaceSessionGeneration = 0;
+  let reviewerGeneration = 0;
+  let reviewerThreadId: string | undefined;
 
   const firstThreads = createAsync(async (): Promise<PageResult<AgentThreadPage>> => {
     try {
@@ -173,6 +192,13 @@ export default function AgentThreadsIndex() {
     }
   }, { deferStream: true });
 
+  const firstReviewers = createAsync(async () => {
+    const thread = selectedThread()?.page;
+    if (!thread || thread.review_state !== "ready" || !thread.workspace.repository ||
+        !thread.project_id) return null;
+    return getProjectCollaborators({ projectId: thread.project_id, limit: 100 });
+  }, { deferStream: true });
+
   const recentMessages = createAsync(async () => {
     const id = validSelectedId();
     if (!id) return null;
@@ -211,6 +237,17 @@ export default function AgentThreadsIndex() {
     recentSessions()?.page?.items,
     workspaceSessionPages().map((page) => page.items),
   ));
+  const reviewers = createMemo(() => {
+    const first = firstReviewers();
+    return mergeCollaborators(
+      first?.ok ? first.page.items : [],
+      reviewerPages().map((page) => page.items),
+    );
+  });
+  const nextReviewerCursor = () => {
+    const first = firstReviewers();
+    return reviewerPages().at(-1)?.page.next_cursor ?? (first?.ok ? first.page.page.next_cursor : null);
+  };
   const selectedAgent = () => selectedThreadAgent()?.page ?? undefined;
   const workspaceAvailable = () => {
     const thread = selectedThread()?.page;
@@ -257,7 +294,7 @@ export default function AgentThreadsIndex() {
     onCleanup(() => window.clearInterval(timer));
   });
   createEffect(() => {
-    validSelectedId();
+    const selected = validSelectedId();
     messageGeneration += 1;
     workspaceSessionGeneration += 1;
     setEarlierMessagePages([]);
@@ -271,6 +308,14 @@ export default function AgentThreadsIndex() {
     setRenewalIntentDays(null);
     setRenewalNonce("");
     setMarkingReady(false);
+    if (reviewerThreadId !== selected) {
+      reviewerThreadId = selected;
+      reviewerGeneration += 1;
+      setReviewerPages([]);
+      setSelectedReviewerIds([]);
+      setLoadingMoreReviewers(false);
+      setReviewHandoffNonce("");
+    }
   });
 
   const retryWorkspace = async () => {
@@ -414,7 +459,7 @@ export default function AgentThreadsIndex() {
         threadId: thread.id,
         title: thread.name,
         bodyMd: `Published from private agent work “${thread.name}”.`,
-        reviewers: [],
+        reviewers: selectedReviewerIds(),
         clientNonce: nonce,
       });
       if (!result.ok || result.op !== "publish-review") {
@@ -486,6 +531,21 @@ export default function AgentThreadsIndex() {
       )}
       publishingReview={publishingReview()}
       reviewHandoffError={reviewHandoffError()}
+      reviewers={reviewers()}
+      reviewersLoading={Boolean(
+        thread.review_state === "ready" && thread.workspace.repository && thread.project_id &&
+        firstReviewers() === undefined
+      )}
+      reviewersUnavailable={Boolean(firstReviewers() && !firstReviewers()!.ok)}
+      reviewersHaveMore={Boolean(nextReviewerCursor())}
+      reviewersLoadingMore={loadingMoreReviewers()}
+      selectedReviewerIds={selectedReviewerIds()}
+      onToggleReviewer={(principalId) => setSelectedReviewerIds((current) =>
+        current.includes(principalId)
+          ? current.filter((candidate) => candidate !== principalId)
+          : [...current, principalId]
+      )}
+      onLoadMoreReviewers={() => void loadMoreReviewers()}
       onPublishReview={() => void publishReview()}
     /> : null);
     onCleanup(() => pane.setContextPane(null));
@@ -517,6 +577,31 @@ export default function AgentThreadsIndex() {
       toast.show({ title: "More agents couldn’t be loaded", variant: "warning" });
     } finally {
       setLoadingMoreAgents(false);
+    }
+  };
+
+  const loadMoreReviewers = async () => {
+    const thread = selectedThread()?.page;
+    const cursor = nextReviewerCursor();
+    if (!thread?.project_id || !cursor || loadingMoreReviewers()) return;
+    const generation = reviewerGeneration;
+    setLoadingMoreReviewers(true);
+    try {
+      const result = await getProjectCollaborators({
+        projectId: thread.project_id,
+        cursor,
+        limit: 100,
+      });
+      if (generation === reviewerGeneration) {
+        if (result.ok) setReviewerPages((pages) => [...pages, result.page]);
+        else {
+          toast.show({ title: "More project collaborators couldn’t be loaded", variant: "warning" });
+        }
+      }
+    } catch {
+      toast.show({ title: "More project collaborators couldn’t be loaded", variant: "warning" });
+    } finally {
+      if (generation === reviewerGeneration) setLoadingMoreReviewers(false);
     }
   };
 

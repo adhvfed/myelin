@@ -18,6 +18,22 @@ export interface ProjectPage {
   page: { next_cursor: string | null; limit: number };
 }
 
+export interface ProjectCollaboratorVM {
+  principal_id: string;
+  display_name: string;
+}
+
+export interface ProjectCollaboratorPage {
+  items: ProjectCollaboratorVM[];
+  page: { next_cursor: string | null; limit: number };
+}
+
+export interface ProjectCollaboratorListInput {
+  projectId: string;
+  cursor?: string;
+  limit?: number;
+}
+
 export interface ProjectListInput {
   cursor?: string;
   limit?: number;
@@ -108,6 +124,32 @@ export function projectListSearchParams(input: ProjectListInput): URLSearchParam
   return query;
 }
 
+export function parseProjectCollaboratorListInput(
+  value: unknown,
+): ProjectCollaboratorListInput | null {
+  const input = record(value);
+  if (!input || !Object.keys(input).every((key) =>
+    key === "projectId" || key === "cursor" || key === "limit") ||
+      !isProjectId(input.projectId) ||
+      (input.cursor !== undefined && (!bounded(input.cursor, 255) || hasControl(input.cursor))) ||
+      (input.limit !== undefined && (!Number.isSafeInteger(input.limit) ||
+        (input.limit as number) < 1 || (input.limit as number) > MAX_PROJECT_PAGE_SIZE))) return null;
+  return {
+    projectId: input.projectId,
+    ...(input.cursor === undefined ? {} : { cursor: input.cursor as string }),
+    ...(input.limit === undefined ? {} : { limit: input.limit as number }),
+  };
+}
+
+export function projectCollaboratorSearchParams(
+  input: ProjectCollaboratorListInput,
+): URLSearchParams {
+  const query = new URLSearchParams();
+  if (input.cursor) query.set("cursor", input.cursor);
+  if (input.limit !== undefined) query.set("limit", String(input.limit));
+  return query;
+}
+
 export function parseNewProjectInput(value: unknown): NewProjectInput | null {
   const input = record(value);
   if (!input || !exact(input, ["name", "issuePrefix", "clientNonce"]) ||
@@ -145,6 +187,33 @@ export function parseProjectPage(value: unknown): ProjectPage | null {
     next_cursor: page.next_cursor,
     limit: page.limit as number,
   } };
+}
+
+export function parseProjectCollaboratorPage(value: unknown): ProjectCollaboratorPage | null {
+  const input = record(value);
+  const page = record(input?.page);
+  if (!input || !exact(input, ["items", "page"]) || !Array.isArray(input.items) ||
+      input.items.length > MAX_PROJECT_PAGE_SIZE || !page ||
+      !exact(page, ["next_cursor", "limit"]) ||
+      !(page.next_cursor === null || (bounded(page.next_cursor, 255) &&
+        !hasControl(page.next_cursor))) ||
+      !Number.isSafeInteger(page.limit) || (page.limit as number) < 1 ||
+      (page.limit as number) > MAX_PROJECT_PAGE_SIZE) return null;
+  const items = input.items.map((value) => {
+    const collaborator = record(value);
+    return collaborator && exact(collaborator, ["principal_id", "display_name"]) &&
+      bounded(collaborator.principal_id, 255) && !hasControl(collaborator.principal_id) &&
+      collaborator.principal_id.trim() === collaborator.principal_id &&
+      bounded(collaborator.display_name, 255) && !hasControl(collaborator.display_name) &&
+      collaborator.display_name.trim() === collaborator.display_name
+      ? collaborator as unknown as ProjectCollaboratorVM
+      : null;
+  });
+  if (items.some((item) => item === null)) return null;
+  return {
+    items: items as ProjectCollaboratorVM[],
+    page: { next_cursor: page.next_cursor, limit: page.limit as number },
+  };
 }
 
 export function parseProjectCreation(value: unknown): ProjectCreationReceipt | null {

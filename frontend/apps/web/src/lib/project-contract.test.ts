@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   parseNewProjectInput,
+  parseProjectCollaboratorListInput,
+  parseProjectCollaboratorPage,
   parseProjectCreation,
   parseProjectListInput,
   parseProjectPage,
@@ -37,6 +39,26 @@ describe("project browser contract", () => {
     expect(parseProjectPage({ items: [project], page: { next_cursor: "opaque", limit: 50 } }))
       .toBeNull();
     expect(parseProjectCreation({ project, created: true, durable: false })).toBeNull();
+  });
+
+  it("projects only bounded exact project collaborators", () => {
+    const collaborator = { principal_id: "human:grace", display_name: "Grace Hopper" };
+    expect(parseProjectCollaboratorPage({
+      items: [collaborator],
+      page: { next_cursor: "human:grace", limit: 50 },
+    })).toEqual({ items: [collaborator], page: { next_cursor: "human:grace", limit: 50 } });
+    expect(parseProjectCollaboratorListInput({ projectId: project.id, limit: 100 }))
+      .toEqual({ projectId: project.id, limit: 100 });
+    expect(parseProjectCollaboratorPage({
+      items: [{ ...collaborator, email: "private@example.test" }],
+      page: { next_cursor: null, limit: 50 },
+    })).toBeNull();
+    expect(parseProjectCollaboratorPage({
+      items: [{ ...collaborator, display_name: "bad\nname" }],
+      page: { next_cursor: null, limit: 50 },
+    })).toBeNull();
+    expect(parseProjectCollaboratorListInput({ projectId: project.id, cursor: "bad\n" }))
+      .toBeNull();
   });
 
   it("bounds list and create inputs before a URL or write can be built", () => {

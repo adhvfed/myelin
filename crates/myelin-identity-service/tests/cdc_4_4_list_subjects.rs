@@ -122,6 +122,22 @@ fn cdc_4_4_list_subjects_flattens_membership_inspector_renders_it() {
 }
 
 #[test]
+fn cdc_4_4_list_subjects_resolves_the_same_canonical_object_as_check() {
+    let s = scope("acme");
+    let svc = provider(&s, &[grant("issue:PROJ-1", "approver", "p:alice")]);
+    let canonical = ObjectId("myelin://acme/issues/issue/PROJ-1".into());
+    let tree = svc
+        .list_subjects_in(&s, &canonical, &Permission("approve".into()), &at_latest())
+        .expect("expand a canonical artifact reference");
+
+    assert_eq!(
+        tree.object, canonical,
+        "the response preserves the requested ref"
+    );
+    assert_eq!(admin_inspector_renders(&tree), vec!["p:alice"]);
+}
+
+#[test]
 fn cdc_4_4_hitl_approver_set_admits_only_members() {
     let s = scope("acme");
     let svc = provider(

@@ -115,12 +115,14 @@ pinned workspace base into its durable Myelin repository and open a pull request
 the workspace branch does not exist in the shared repository. Publication refuses ordinary
 uncommitted changes, divergent history, and any commit that contains the owner-only `AGENTS.md`
 layer or private context paths. A stable thread-derived Git operation makes an interrupted retry
-converge on one pull request, while an optional named-reviewer list grants exact-review access
-without silently broadening repository membership. The durable handoff survives reload and links
-the thread to the exact head ref, commit, and pull-request number. This boundary is available from
-both the workspace pane and `myelin agent thread pull-request`: remote-editor work should not force
-a developer to leave the CLI or manually reconstruct an internal HTTP request. Both clients name
-the same stable intent and render the existing pull request honestly on replay.
+converge on one pull request. The workspace pane derives its reviewer choices from the project's
+current authorization graph, presents only other active humans by their profile display name, and
+lets the owner grant selected people access to that exact review without silently broadening
+repository membership. The durable handoff survives reload and links the thread to the exact head
+ref, commit, and pull-request number. This boundary is available from both the workspace pane and
+`myelin agent thread pull-request`: remote-editor work should not force a developer to leave the
+CLI or manually reconstruct an internal HTTP request. Both clients name the same stable intent and
+render the existing pull request honestly on replay.
 
 This creates a humane gradient rather than a false choice between secret local work and noisy public
 automation:
@@ -129,9 +131,9 @@ automation:
 personal draft -> owner and agent iterate -> owner marks ready -> publish committed branch -> review
 ```
 
-Future slices may add reversible archival, incremental updates to an opened handoff, richer reviewer
-selection in the web, and richer agent profiles, but they must preserve the private-by-default
-boundary and use the same production authorization path as every other Myelin artifact.
+Future slices may add reversible archival, incremental updates to an opened handoff, and richer
+agent profiles, but they must preserve the private-by-default boundary and use the same production
+authorization path as every other Myelin artifact.
 
 ## Evidence standard
 
@@ -142,7 +144,9 @@ work after the owner's explicit transition, while workspace execution and SSH re
 Cloud-branch handoff journeys must additionally prove the ref is absent before the explicit action,
 publish a real commit made inside the confined workspace, give a named reviewer access to the exact
 pull request, survive a reload and retry, and demonstrate that private augmentation paths are absent
-from the shared repository. The CLI journey must cross the actual device-login, MCP, SSH/SFTP,
+from the shared repository. The browser journey must load reviewer choices from the live project
+authorization graph, select the named human through the visible product, and prove their exact PR
+access with a separate identity. The CLI journey must cross the actual device-login, MCP, SSH/SFTP,
 editor-profile, Git commit, ready, and pull-request boundaries rather than certifying only argument
 parsing or a mocked transport.
 Workspace-personalization journeys must read the resulting file through an actual bound agent run,

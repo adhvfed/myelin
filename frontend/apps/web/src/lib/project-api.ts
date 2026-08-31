@@ -2,12 +2,17 @@ import { action, json, query, redirect } from "@solidjs/router";
 import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
 import {
   parseNewProjectInput,
+  parseProjectCollaboratorListInput,
+  parseProjectCollaboratorPage,
   parseProjectCreation,
   parseProjectListInput,
   parseProjectPage,
   projectListSearchParams,
+  projectCollaboratorSearchParams,
   type NewProjectInput,
   type ProjectCreationReceipt,
+  type ProjectCollaboratorListInput,
+  type ProjectCollaboratorPage,
   type ProjectListInput,
   type ProjectPage,
 } from "./project-contract";
@@ -18,6 +23,9 @@ export type ProjectListResult =
   | { ok: false; error: ProjectErrorKind };
 export type ProjectCreateResult =
   | { ok: true; receipt: ProjectCreationReceipt }
+  | { ok: false; error: ProjectErrorKind };
+export type ProjectCollaboratorListResult =
+  | { ok: true; page: ProjectCollaboratorPage }
   | { ok: false; error: ProjectErrorKind };
 
 function errorKind(error: unknown): ProjectErrorKind {
@@ -42,6 +50,26 @@ export const getProjects = query(async (value: ProjectListInput = {}): Promise<P
     return { ok: false, error: errorKind(error) };
   }
 }, "projects-list");
+
+export const getProjectCollaborators = query(async (
+  value: ProjectCollaboratorListInput,
+): Promise<ProjectCollaboratorListResult> => {
+  "use server";
+  const input = parseProjectCollaboratorListInput(value);
+  if (!input) return { ok: false, error: "bad-input" };
+  try {
+    const queryString = projectCollaboratorSearchParams(input).toString();
+    const page = parseProjectCollaboratorPage(await edgeGet(
+      `/v1/projects/${encodeURIComponent(input.projectId)}/collaborators${
+        queryString ? `?${queryString}` : ""
+      }`,
+    ));
+    return page ? { ok: true, page } : { ok: false, error: "error" };
+  } catch (error) {
+    if (isUnauthorized(error)) throw redirect("/login");
+    return { ok: false, error: errorKind(error) };
+  }
+}, "project-collaborators-list");
 
 export const createProject = action(async (value: NewProjectInput) => {
   "use server";
