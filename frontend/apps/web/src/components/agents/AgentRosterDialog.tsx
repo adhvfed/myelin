@@ -120,8 +120,8 @@ export function AgentRosterDialog(props: {
                       <strong>{agent.name}</strong>
                       <span>{agent.status} · {agent.runtime_ref === "external:mcp" ? "external MCP" : "hosted"}</span>
                       <small>
-                        {agent.workspace_profile.instructions
-                          ? `AGENTS.md defaults · revision ${agent.workspace_profile.revision}`
+                        {agent.workspace_profile.personalization
+                          ? `Workspace defaults · revision ${agent.workspace_profile.revision}`
                           : "No workspace defaults"}
                       </small>
                       <Show when={errorAgentId() === agent.id}>

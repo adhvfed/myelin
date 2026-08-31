@@ -8,8 +8,13 @@ import {
 } from "~/lib/agent-thread-api";
 import type {
   AgentChoice,
+  AgentWorkspaceFile,
   AgentWorkspaceGuidanceReceipt,
 } from "~/lib/agent-thread-response";
+import {
+  AgentWorkspaceFilesEditor,
+  validAgentWorkspaceAugmentation,
+} from "./AgentWorkspaceFilesEditor";
 
 export function AgentWorkspaceDefaultsDialog(props: {
   agent: AgentChoice | null;
@@ -18,6 +23,7 @@ export function AgentWorkspaceDefaultsDialog(props: {
 }) {
   const mutate = useAction(mutateAgentThread);
   const [instructions, setInstructions] = createSignal("");
+  const [files, setFiles] = createSignal<AgentWorkspaceFile[]>([]);
   const [revision, setRevision] = createSignal(0);
   const [loading, setLoading] = createSignal(false);
   const [submitting, setSubmitting] = createSignal(false);
@@ -30,6 +36,7 @@ export function AgentWorkspaceDefaultsDialog(props: {
     generation += 1;
     const current = generation;
     setInstructions("");
+    setFiles([]);
     setRevision(agent?.workspace_profile.revision ?? 0);
     setError(null);
     setSubmitting(false);
@@ -43,6 +50,7 @@ export function AgentWorkspaceDefaultsDialog(props: {
       .then((config) => {
         if (current !== generation) return;
         setInstructions(config.instructions ?? "");
+        setFiles(config.files);
         setRevision(config.revision);
       })
       .catch(() => {
@@ -62,9 +70,9 @@ export function AgentWorkspaceDefaultsDialog(props: {
     const agent = props.agent;
     if (!agent || loading() || submitting()) return;
     const value = instructions();
-    if (value.includes("\0") || new TextEncoder().encode(value).byteLength > 12 * 1024 ||
-        (value !== "" && value.trim() === "")) {
-      setError("Use UTF-8 instructions up to 12 KiB, or leave the field empty to clear them.");
+    if (value.includes("\0") || (value !== "" && value.trim() === "") ||
+        !validAgentWorkspaceAugmentation(value, files())) {
+      setError("Use a valid instruction and file overlay within the 12 KiB encrypted limit.");
       return;
     }
     const current = generation;
@@ -75,6 +83,7 @@ export function AgentWorkspaceDefaultsDialog(props: {
         op: "configure-agent",
         agentId: agent.id,
         workspaceInstructions: value === "" ? null : value,
+        workspaceFiles: files(),
         expectedRevision: revision(),
         clientNonce: clientNonce(),
       });
@@ -134,6 +143,15 @@ export function AgentWorkspaceDefaultsDialog(props: {
           Thread-specific instructions are appended after these defaults, so they can narrow the
           approach for one task. Existing workspaces keep their encrypted snapshot.
         </p>
+        <AgentWorkspaceFilesEditor
+          files={files()}
+          disabled={loading() || submitting()}
+          onChange={(nextFiles) => {
+            setFiles(nextFiles);
+            setClientNonce(crypto.randomUUID());
+            setError(null);
+          }}
+        />
         <Show when={error()}>{(message) => (
           <p role="alert" class="agent-thread-error">{message()}</p>
         )}</Show>

@@ -18,13 +18,15 @@ work with one creates a named cloud thread with a durable branch, conversation, 
 same workspace survives model context changes and can be opened through ordinary SSH or SFTP with a
 short-lived owner-authorized credential.
 
-An agent's owner can maintain private default workspace instructions on that named agent. The
-organization-visible roster exposes only a revision and content digest; plaintext is encrypted as
-owner-scoped agent data and available only through the owner's edit surface. Each new thread
-snapshots the current defaults, then appends any thread-specific instructions as the more specific
-layer. Editing the named agent affects future work without silently rewriting an existing thread,
-including an idempotent retry of that thread's original creation request. Edits use an expected
-revision, while an exact semantic retry converges on the already-written state.
+An agent's owner can maintain a private default workspace augmentation on that named agent:
+`AGENTS.md` instructions plus bounded create-only context files. The organization-visible roster
+exposes only a revision and content digest; plaintext is encrypted as owner-scoped agent data and
+available only through the owner's edit surface. Each new thread snapshots the current defaults,
+then appends any thread-specific instructions and files as the more specific layer. Editing the
+named agent affects future work without silently rewriting an existing thread, including an
+idempotent retry of that thread's original creation request. Edits use an expected revision, while
+an exact semantic retry converges on the already-written state. Instruction-only clients preserve
+configured files they do not know how to edit.
 
 The web product gives each person a direct roster for their own named agents; maintaining an agent
 must not require beginning an unrelated thread. Organization agents owned by somebody else can
@@ -73,6 +75,7 @@ the collaborator receives an indistinguishable not-found response before publica
 work after the owner's explicit transition, while workspace execution and SSH remain denied.
 Workspace-personalization journeys must read the resulting file through an actual bound agent run,
 open it again from a fresh context, and prove the repository source was never modified. Named-agent
-default journeys must prove plaintext is owner-only, stale edits conflict, new work receives the
-latest revision, thread-specific instructions take precedence, and existing work retains its
-original snapshot after the defaults change.
+default journeys must prove plaintext is owner-only, stale edits conflict, instruction-only edits
+preserve configured files, new work receives the latest revision, thread-specific instructions take
+precedence, and existing work retains its original instruction-and-file snapshot after the defaults
+change.

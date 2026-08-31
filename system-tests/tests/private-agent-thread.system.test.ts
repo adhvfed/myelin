@@ -392,17 +392,25 @@ describe("private work with an agent", () => {
     const founder = await browserApprovedCliClient();
     const teammate = await browserApprovedCliClient(reviewerClient);
     const firstDefaults = "# Checkout companion defaults\n\nExplain the smallest safe change first.";
+    const defaultContextPath = ".myelin/companion-context.md";
+    const firstDefaultContext = "# Companion context\n\nStart from the checkout lease.\n";
     const companion = await activateExternalAgent(
       founder,
       uniqueName("Configurable workspace companion"),
       ["workspace.read_file"],
-      { workspaceInstructions: firstDefaults },
+      {
+        workspaceInstructions: firstDefaults,
+        workspaceFiles: [{
+          path: defaultContextPath,
+          contents: firstDefaultContext,
+          strategy: "create",
+        }],
+      },
     );
     expect(companion.agent.workspace_profile).toMatchObject({
       revision: 1,
-      instructions: {
-        path: "AGENTS.md",
-        strategy: "append",
+      personalization: {
+        format: "workspace_augmentation_v1",
         content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
       },
       updated_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
@@ -415,6 +423,11 @@ describe("private work with an agent", () => {
       agent_id: companion.agent.id,
       revision: 1,
       instructions: firstDefaults,
+      files: [{
+        path: defaultContextPath,
+        contents: firstDefaultContext,
+        strategy: "create",
+      }],
     });
     await teammate.json(
       `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
@@ -431,15 +444,29 @@ describe("private work with an agent", () => {
     const firstAgents = await askAgent(firstRun, 1, "workspace.read_file", {
       path: "AGENTS.md",
     });
+    const firstContext = await askAgent(firstRun, 2, "workspace.read_file", {
+      path: defaultContextPath,
+    });
     await closeAgentRun(firstRun);
     expect(record(firstAgents, "first named-agent AGENTS result").content).toContain(firstDefaults);
+    expect(record(firstContext, "first named-agent context result").content)
+      .toBe(firstDefaultContext);
 
     const secondDefaults = "# Checkout companion defaults\n\nStart with the failing full-system journey.";
+    const secondDefaultContext = "# Companion context\n\nStart from the durable retry ledger.\n";
     const updated = await founder.json(
       `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
       {
         method: "POST",
-        body: { instructions: secondDefaults, expected_revision: 1 },
+        body: {
+          instructions: secondDefaults,
+          files: [{
+            path: defaultContextPath,
+            contents: secondDefaultContext,
+            strategy: "create",
+          }],
+          expected_revision: 1,
+        },
         idempotencyKey: `agent-default-update-${randomUUID()}`,
         expectedStatus: 200,
       },
@@ -448,6 +475,32 @@ describe("private work with an agent", () => {
       changed: true,
       durable: true,
       agent: { workspace_profile: { revision: 2 } },
+    });
+    const finalDefaults = `${secondDefaults}\nPreserve configured context files when an older client edits instructions.`;
+    const legacyCompatibleUpdate = await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
+      {
+        method: "POST",
+        body: { instructions: finalDefaults, expected_revision: 2 },
+        idempotencyKey: `agent-default-compatible-update-${randomUUID()}`,
+        expectedStatus: 200,
+      },
+    );
+    expect(legacyCompatibleUpdate.body).toMatchObject({
+      changed: true,
+      durable: true,
+      agent: { workspace_profile: { revision: 3 } },
+    });
+    expect((await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
+    )).body).toMatchObject({
+      revision: 3,
+      instructions: finalDefaults,
+      files: [{
+        path: defaultContextPath,
+        contents: secondDefaultContext,
+        strategy: "create",
+      }],
     });
     await founder.json(
       `/v1/agents/${encodeURIComponent(companion.agent.id)}/workspace-guidance`,
@@ -470,9 +523,14 @@ describe("private work with an agent", () => {
     const replayAgents = await askAgent(replayRun, 1, "workspace.read_file", {
       path: "AGENTS.md",
     });
+    const replayContext = await askAgent(replayRun, 2, "workspace.read_file", {
+      path: defaultContextPath,
+    });
     await closeAgentRun(replayRun);
     expect(replayAgents).toEqual(firstAgents);
-    expect(JSON.stringify(replayAgents)).not.toContain(secondDefaults);
+    expect(replayContext).toEqual(firstContext);
+    expect(JSON.stringify(replayAgents)).not.toContain(finalDefaults);
+    expect(JSON.stringify(replayContext)).not.toContain(secondDefaultContext);
 
     const taskInstructions = "For this task, preserve the public API shape.";
     const secondThread = await startPrivateAgentThread(founder, {
@@ -484,15 +542,20 @@ describe("private work with an agent", () => {
     const secondAgents = await askAgent(secondRun, 1, "workspace.read_file", {
       path: "AGENTS.md",
     });
+    const secondContext = await askAgent(secondRun, 2, "workspace.read_file", {
+      path: defaultContextPath,
+    });
     await closeAgentRun(secondRun);
     const combined = string(
       record(secondAgents, "revised named-agent AGENTS result").content,
       "revised named-agent AGENTS contents",
     );
-    expect(combined).toContain(secondDefaults);
+    expect(combined).toContain(finalDefaults);
     expect(combined).toContain("## Thread-specific instructions");
     expect(combined).toContain(taskInstructions);
     expect(combined).not.toContain(firstDefaults);
+    expect(record(secondContext, "revised named-agent context result").content)
+      .toBe(secondDefaultContext);
   });
 
   test("refuses an agent runtime that cannot resume private work before provisioning anything", async () => {

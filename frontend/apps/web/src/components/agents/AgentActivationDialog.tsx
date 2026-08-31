@@ -6,7 +6,11 @@ import {
   mutateAgentThread,
   type AgentThreadErrorKind,
 } from "~/lib/agent-thread-api";
-import type { AgentActivationReceipt } from "~/lib/agent-thread-response";
+import type { AgentActivationReceipt, AgentWorkspaceFile } from "~/lib/agent-thread-response";
+import {
+  AgentWorkspaceFilesEditor,
+  validAgentWorkspaceAugmentation,
+} from "./AgentWorkspaceFilesEditor";
 
 function errorCopy(kind: AgentThreadErrorKind): string {
   if (kind === "bad-input") return "Use a clean agent name.";
@@ -24,6 +28,7 @@ export function AgentActivationDialog(props: {
   const [name, setName] = createSignal("");
   const [allowWorkspaceCommands, setAllowWorkspaceCommands] = createSignal(false);
   const [workspaceInstructions, setWorkspaceInstructions] = createSignal("");
+  const [workspaceFiles, setWorkspaceFiles] = createSignal<AgentWorkspaceFile[]>([]);
   const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -36,6 +41,7 @@ export function AgentActivationDialog(props: {
     setName("");
     setAllowWorkspaceCommands(false);
     setWorkspaceInstructions("");
+    setWorkspaceFiles([]);
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
@@ -52,9 +58,9 @@ export function AgentActivationDialog(props: {
     event.preventDefault();
     if (!name().trim() || name().trim() !== name() ||
         workspaceInstructions().includes("\0") ||
-        new TextEncoder().encode(workspaceInstructions()).byteLength > 12 * 1024 ||
-        (workspaceInstructions() !== "" && workspaceInstructions().trim() === "")) {
-      setError("Use a clean agent name without leading or trailing whitespace.");
+        (workspaceInstructions() !== "" && workspaceInstructions().trim() === "") ||
+        !validAgentWorkspaceAugmentation(workspaceInstructions(), workspaceFiles())) {
+      setError("Use a clean agent name and a workspace overlay within 12 KiB.");
       nameInput?.focus();
       return;
     }
@@ -67,6 +73,7 @@ export function AgentActivationDialog(props: {
         name: name(),
         allowWorkspaceCommands: allowWorkspaceCommands(),
         workspaceInstructions: workspaceInstructions(),
+        workspaceFiles: workspaceFiles(),
         clientNonce: clientNonce(),
       });
       if (generation !== openingGeneration) return;
@@ -138,9 +145,18 @@ export function AgentActivationDialog(props: {
           />
         </label>
         <p class="agent-thread-note">
-          New private threads inherit this owner-only <code>AGENTS.md</code> overlay. You can add
-          thread-specific instructions later; existing workspaces keep their original snapshot.
+          New private threads inherit this owner-only overlay. You can add thread-specific
+          instructions and files later; existing workspaces keep their original snapshot.
         </p>
+        <AgentWorkspaceFilesEditor
+          files={workspaceFiles()}
+          disabled={submitting()}
+          onChange={(files) => {
+            setWorkspaceFiles(files);
+            setClientNonce(crypto.randomUUID());
+            setError(null);
+          }}
+        />
         <label class="agent-activation-command-toggle" for="agent-allow-workspace-commands">
           <input
             id="agent-allow-workspace-commands"

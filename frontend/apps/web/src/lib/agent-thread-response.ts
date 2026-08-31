@@ -8,6 +8,12 @@ type WireRecord = Record<string, unknown>;
 
 export type AgentThreadState = "provisioning" | "ready" | "expiring" | "deleted" | "failed";
 
+export interface AgentWorkspaceFile {
+  path: string;
+  contents: string;
+  strategy: "create";
+}
+
 export interface AgentChoice {
   id: string;
   name: string;
@@ -18,9 +24,8 @@ export interface AgentChoice {
   effective_tools: string[];
   workspace_profile: {
     revision: number;
-    instructions: {
-      path: "AGENTS.md";
-      strategy: "append";
+    personalization: {
+      format: "workspace_augmentation_v1";
       content_digest: string;
     } | null;
     updated_at: string | null;
@@ -56,6 +61,7 @@ export interface AgentWorkspaceGuidanceConfig {
   agent_id: string;
   revision: number;
   instructions: string | null;
+  files: AgentWorkspaceFile[];
   updated_at: string | null;
 }
 
@@ -198,9 +204,9 @@ function agentChoice(value: unknown): AgentChoice | null {
   const selectedTools = toolNames(row?.selected_tools);
   const effectiveTools = toolNames(row?.effective_tools);
   const workspaceProfile = record(row?.workspace_profile);
-  const workspaceInstructions = workspaceProfile?.instructions === null
+  const workspacePersonalization = workspaceProfile?.personalization === null
     ? null
-    : record(workspaceProfile?.instructions);
+    : record(workspaceProfile?.personalization);
   if (!row || !exact(row, [
     "id", "ref", "principal_id", "name", "runtime_ref", "on_behalf_of", "status",
     "selected_tools", "effective_tools", "grants", "workspace_profile", "created_at",
@@ -211,17 +217,17 @@ function agentChoice(value: unknown): AgentChoice | null {
       !["active", "suspended", "disabled"].includes(row.status as string) ||
       !selectedTools || !effectiveTools ||
       !stringArray(row.grants, 512) || !workspaceProfile ||
-      !exact(workspaceProfile, ["revision", "instructions", "updated_at"]) ||
+      !exact(workspaceProfile, ["revision", "personalization", "updated_at"]) ||
       !Number.isSafeInteger(workspaceProfile.revision) || (workspaceProfile.revision as number) < 0 ||
       (workspaceProfile.updated_at !== null && !timestamp(workspaceProfile.updated_at)) ||
       ((workspaceProfile.revision as number) === 0 &&
-        (workspaceProfile.updated_at !== null || workspaceInstructions !== null)) ||
+        (workspaceProfile.updated_at !== null || workspacePersonalization !== null)) ||
       ((workspaceProfile.revision as number) > 0 && workspaceProfile.updated_at === null) ||
-      (workspaceInstructions !== null &&
-        (!exact(workspaceInstructions, ["path", "strategy", "content_digest"]) ||
-          workspaceInstructions.path !== "AGENTS.md" || workspaceInstructions.strategy !== "append" ||
-          typeof workspaceInstructions.content_digest !== "string" ||
-          !/^blake3:[0-9a-f]{64}$/.test(workspaceInstructions.content_digest))) ||
+      (workspacePersonalization !== null &&
+        (!exact(workspacePersonalization, ["format", "content_digest"]) ||
+          workspacePersonalization.format !== "workspace_augmentation_v1" ||
+          typeof workspacePersonalization.content_digest !== "string" ||
+          !/^blake3:[0-9a-f]{64}$/.test(workspacePersonalization.content_digest))) ||
       !timestamp(row.created_at)) return null;
   return {
     id: row.id,
@@ -233,7 +239,7 @@ function agentChoice(value: unknown): AgentChoice | null {
     effective_tools: effectiveTools,
     workspace_profile: {
       revision: workspaceProfile.revision as number,
-      instructions: workspaceInstructions as AgentChoice["workspace_profile"]["instructions"],
+      personalization: workspacePersonalization as AgentChoice["workspace_profile"]["personalization"],
       updated_at: workspaceProfile.updated_at as string | null,
     },
   } as AgentChoice;
@@ -315,18 +321,36 @@ export function parseAgentWorkspaceGuidanceConfig(
   value: unknown,
 ): AgentWorkspaceGuidanceConfig | null {
   const config = record(value);
-  if (!config || !exact(config, ["agent_id", "revision", "instructions", "updated_at"]) ||
+  const files = workspaceFiles(config?.files);
+  if (!config || !exact(config, ["agent_id", "revision", "instructions", "files", "updated_at"]) ||
       !isAgentThreadId(config.agent_id) || !Number.isSafeInteger(config.revision) ||
       (config.revision as number) < 0 ||
       (config.instructions !== null &&
         (typeof config.instructions !== "string" || config.instructions.trim().length === 0 ||
           utf8.encode(config.instructions).byteLength > 12 * 1_024 ||
           config.instructions.includes("\0"))) ||
+      !files ||
       (config.updated_at !== null && !timestamp(config.updated_at)) ||
       ((config.revision as number) === 0 &&
-        (config.updated_at !== null || config.instructions !== null)) ||
+        (config.updated_at !== null || config.instructions !== null || files.length > 0)) ||
       ((config.revision as number) > 0 && config.updated_at === null)) return null;
-  return config as unknown as AgentWorkspaceGuidanceConfig;
+  return { ...config, files } as unknown as AgentWorkspaceGuidanceConfig;
+}
+
+function workspaceFiles(value: unknown): AgentWorkspaceFile[] | null {
+  if (!Array.isArray(value) || value.length > 8) return null;
+  const files: AgentWorkspaceFile[] = [];
+  const paths = new Set<string>();
+  for (const valueFile of value) {
+    const file = record(valueFile);
+    if (!file || !exact(file, ["path", "contents", "strategy"]) ||
+        !cleanText(file.path, 4_096) || paths.has(file.path) ||
+        typeof file.contents !== "string" || file.contents.includes("\0") ||
+        utf8.encode(file.contents).byteLength > 12 * 1_024 || file.strategy !== "create") return null;
+    paths.add(file.path);
+    files.push(file as unknown as AgentWorkspaceFile);
+  }
+  return files;
 }
 
 function policyCoordinates(value: unknown): boolean {

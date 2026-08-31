@@ -33,6 +33,9 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const personalInstructions = `# My workflow\n\nKeep the ${suffix} diagnosis private until it is ready.`;
   const agentDefaults = `# Checkout companion defaults\n\nExplain the ${suffix} tradeoff first.`;
   const revisedAgentDefaults = `${agentDefaults}\nRun the focused browser journey.`;
+  const agentContextPath = ".myelin/companion-defaults.md";
+  const agentContextContents = `# Companion defaults\n\nTrace ${suffix} from its durable receipt.\n`;
+  const revisedAgentContextContents = `${agentContextContents}Keep the reusable context concise.\n`;
   const contextFilePath = ".myelin/browser-context.md";
   const contextFileContents = `# Browser context\n\nKeep ${suffix} private until review.\n`;
   const repositorySlug = `cloud-workspace-${suffix}`;
@@ -67,6 +70,9 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await activation.getByRole("textbox", { name: "Agent name" }).fill(agentName);
   await activation.getByRole("textbox", { name: "Default workspace instructions" })
     .fill(agentDefaults);
+  await activation.getByRole("button", { name: "Add context file" }).click();
+  await activation.getByRole("textbox", { name: "File 1 path" }).fill(agentContextPath);
+  await activation.getByRole("textbox", { name: "File 1 contents" }).fill(agentContextContents);
   await activation.getByRole("checkbox", { name: "Allow bounded workspace commands" }).check();
   await activation.getByRole("button", { name: "Activate agent" }).click();
 
@@ -77,13 +83,17 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await page.getByRole("button", { name: "Manage my agents" }).click();
   const roster = page.getByRole("dialog", { name: "My named agents" });
   const agentRow = roster.getByRole("listitem").filter({ hasText: agentName });
-  await expect(agentRow).toContainText("AGENTS.md defaults · revision 1");
+  await expect(agentRow).toContainText("Workspace defaults · revision 1");
   await agentRow.getByRole("button", { name: "Configure" }).click();
   const defaults = page.getByRole("dialog", { name: `${agentName} · workspace defaults` });
   const defaultsEditor = defaults.getByRole("textbox", {
     name: "Default AGENTS.md instructions",
   });
   await expect(defaultsEditor).toHaveValue(agentDefaults);
+  await expect(defaults.getByRole("textbox", { name: "File 1 path" }))
+    .toHaveValue(agentContextPath);
+  await defaults.getByRole("textbox", { name: "File 1 contents" })
+    .fill(revisedAgentContextContents);
   await defaultsEditor.fill(revisedAgentDefaults);
   await defaults.getByRole("button", { name: "Save defaults" }).click();
   await expect(defaults).toBeHidden();
@@ -95,7 +105,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await agentChoice.selectOption({ label: agentName });
   const agentId = await agentChoice.inputValue();
   expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
-  await expect(dialog.getByText("This agent carries private AGENTS.md defaults at revision 2."))
+  await expect(dialog.getByText("This agent carries private workspace defaults at revision 2."))
     .toBeVisible();
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");
   await dialog.getByRole("textbox", { name: "Repository slug" }).fill(repositorySlug);

@@ -67,7 +67,10 @@ describe("private agent work from the CLI", () => {
     );
     const companionId = string(companion.id, "activated private-work agent id");
     expect(companion).toMatchObject({
-      workspace_profile: { revision: 1, instructions: { path: "AGENTS.md" } },
+      workspace_profile: {
+        revision: 1,
+        personalization: { format: "workspace_augmentation_v1" },
+      },
     });
     const revisedAgentDefaults = `${initialAgentDefaults}\nExplain the retry boundary.`;
     const configured = await runMyelin(

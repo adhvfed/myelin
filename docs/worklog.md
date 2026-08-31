@@ -4,6 +4,34 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Named agents carry reusable instruction-and-file overlays
+
+A named agent's reusable defaults now use the same versioned workspace-augmentation contract as a
+private thread: optional root `AGENTS.md` guidance plus as many as eight create-only context files
+inside one 12 KiB encrypted owner-data envelope. Activation and the first-class personal-agent
+editor expose the files, including add/remove and exact path/content editing. List and ordinary get
+responses reveal only a generic format-and-digest receipt; the owner-only configuration projection
+is the sole plaintext read surface. Existing instruction-only ciphertext remains readable without
+a migration.
+
+The update API distinguishes omission from an explicit empty file list. That keeps older CLI and
+API clients from silently erasing files they cannot represent, while current clients can clear the
+list deliberately. Revision checks, exact semantic retries, audit metadata, owner-only reads, and
+thread snapshots continue through the existing durable agent boundary. Agent and thread code now
+share one augmentation codec and validator, including a compile-time assertion that their storage
+limits cannot drift.
+
+The readable TypeScript journey activates an agent with instructions and a private file, denies a
+second identity the plaintext, reads both from the first bound workspace, updates both, then makes
+an instruction-only update and proves the file survived. It replays the old thread and reads its
+original byte-exact snapshot, while fresh work receives the newest instructions and file. The
+journey passed against restarted Edge, PostgreSQL/KMS, the agent service, and durable workspace
+storage. The Chromium journey added the file during activation, reopened it from the personal
+roster, edited it, and created real repository-backed work with revision 2. The unchanged CLI
+thread journey also passed, proving response and instruction-only update compatibility. All 378
+Edge units, five focused CLI rendering units, 663 web contract tests, and the relevant TypeScript
+checks pass.
+
 ## 2026-08-31 — Private workspaces accept bounded declarative context files
 
 Private workspace personalization no longer stops at a root `AGENTS.md` append. A thread can carry

@@ -36,17 +36,19 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
     }
     let workspace_profile = agent.get("workspace_profile")?;
     let workspace_revision = workspace_profile.get("revision")?.as_u64()?;
-    if workspace_profile.get("instructions")?.is_null() {
+    if workspace_profile.get("personalization")?.is_null() {
         let _ = write!(
             output,
             "\n  workspace defaults: none (revision {workspace_revision})"
         );
     } else {
-        let instructions = workspace_profile.get("instructions")?;
-        let path = terminal_safe_single_line(instructions.get("path")?.as_str()?);
+        let personalization = workspace_profile.get("personalization")?;
+        if personalization.get("format")?.as_str()? != "workspace_augmentation_v1" {
+            return None;
+        }
         let _ = write!(
             output,
-            "\n  workspace defaults: {path} personal overlay (revision {workspace_revision})"
+            "\n  workspace defaults: declarative personal overlay (revision {workspace_revision})"
         );
     }
     output.push_str(
@@ -264,7 +266,7 @@ mod tests {
             "grants": ["run.view"],
             "workspace_profile": {
                 "revision": 0,
-                "instructions": null,
+                "personalization": null,
                 "updated_at": null,
             },
             "created_at": "2026-08-09T12:00:00Z",

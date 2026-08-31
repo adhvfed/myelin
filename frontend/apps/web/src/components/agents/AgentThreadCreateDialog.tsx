@@ -180,9 +180,9 @@ export function AgentThreadCreateDialog(props: {
         <Show when={selectedAgent()}>{(agent) => (
           <div class="agent-thread-empty-choice">
             <p class="agent-thread-note">
-              {agent().workspace_profile.instructions
-                ? `This agent carries private AGENTS.md defaults at revision ${agent().workspace_profile.revision}.`
-                : "This agent has no default workspace instructions yet."}
+              {agent().workspace_profile.personalization
+                ? `This agent carries private workspace defaults at revision ${agent().workspace_profile.revision}.`
+                : "This agent has no default workspace personalization yet."}
             </p>
             <Show
               when={agent().owner_principal_id === props.viewerPrincipalId}

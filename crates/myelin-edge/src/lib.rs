@@ -50,6 +50,7 @@ pub mod tool_http;
 pub mod trigger_http;
 mod trigger_lifecycle;
 mod workspace_access;
+mod workspace_augmentation;
 mod workspace_effect;
 mod workspace_ssh_http;
 

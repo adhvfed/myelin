@@ -9,7 +9,7 @@ use myelin_identity_service::{
     AgentLifecycleRequest, AgentRegistration, AgentRegistryError, AgentSessionError,
     AgentSessionIssuer, AgentSessionRequest, AgentWorkspaceGuidance, AgentWorkspaceGuidanceUpdate,
     ClosedAgentSession, IssuedAgentSession, NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
-    HOSTED_LUNA_RUNTIME, MAX_AGENT_WORKSPACE_GUIDANCE_BYTES,
+    HOSTED_LUNA_RUNTIME,
 };
 use myelin_storage::{ColumnCryptor, KmsEngine, SubjectId, SubjectKeyScope};
 use serde::Deserialize;
@@ -22,6 +22,9 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
+use crate::workspace_augmentation::{
+    content_digest as workspace_guidance_digest, WorkspaceAugmentation, WorkspaceFile,
+};
 use crate::Method;
 
 const MAX_AGENT_JSON_BYTES: usize = 64 * 1024;
@@ -54,12 +57,16 @@ struct CreateAgentBody {
     runtime: AgentRuntimeSelection,
     #[serde(default)]
     workspace_instructions: Option<String>,
+    #[serde(default)]
+    workspace_files: Vec<WorkspaceFile>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateAgentWorkspaceGuidanceBody {
     instructions: Value,
+    #[serde(default)]
+    files: Option<Vec<WorkspaceFile>>,
     expected_revision: u64,
 }
 
@@ -246,10 +253,7 @@ impl Handler for AgentWorkspaceGuidanceUpdateHandler {
             parse_agent_body(&ctx.request.body, "agent workspace guidance")?;
         let instructions = match body.instructions {
             Value::Null => None,
-            Value::String(instructions) => {
-                validate_workspace_instructions(&instructions)?;
-                Some(instructions)
-            }
+            Value::String(instructions) => Some(instructions),
             _ => {
                 return Err(EdgeError::BadRequest(
                     "agent workspace instructions must be a UTF-8 string or null".into(),
@@ -257,10 +261,26 @@ impl Handler for AgentWorkspaceGuidanceUpdateHandler {
             }
         };
         let agent_id = agent_param(ctx)?.to_string();
-        let guidance = instructions
-            .as_deref()
-            .map(|instructions| {
-                seal_workspace_guidance(&self.api.kms, ctx.principal, &agent_id, instructions)
+        let files = match body.files {
+            Some(files) => files,
+            None => {
+                let current = self
+                    .api
+                    .drive(self.api.registry.get(ctx.principal, &agent_id))?
+                    .map_err(map_registry_error)?;
+                if current.created_by != ctx.principal.principal_id.0 {
+                    return Err(EdgeError::NotFound("agent not found".into()));
+                }
+                open_agent_workspace_guidance(&self.api.kms, ctx.principal, &current)?
+                    .map(|augmentation| augmentation.files)
+                    .unwrap_or_default()
+            }
+        };
+        let augmentation = WorkspaceAugmentation::from_parts(instructions, files)?;
+        let guidance = augmentation
+            .as_ref()
+            .map(|augmentation| {
+                seal_workspace_guidance(&self.api.kms, ctx.principal, &agent_id, augmentation)
             })
             .transpose()?;
         let outcome = self
@@ -296,13 +316,14 @@ impl Handler for AgentWorkspaceGuidanceGetHandler {
         if agent.created_by != ctx.principal.principal_id.0 {
             return Err(EdgeError::NotFound("agent not found".into()));
         }
-        let instructions = open_agent_workspace_guidance(&self.api.kms, ctx.principal, &agent)?;
+        let augmentation = open_agent_workspace_guidance(&self.api.kms, ctx.principal, &agent)?;
         Ok(no_store(EdgeResponse::json(
             200,
             &json!({
                 "agent_id": agent.id,
                 "revision": agent.workspace_guidance_revision,
-                "instructions": instructions,
+                "instructions": augmentation.as_ref().and_then(|value| value.agents_md.as_deref()),
+                "files": augmentation.as_ref().map(|value| value.files.as_slice()).unwrap_or_default(),
                 "updated_at": agent.workspace_guidance_updated_at,
             }),
         )))
@@ -507,18 +528,18 @@ fn activation_proposal(
         .grants()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let workspace_augmentation =
+        WorkspaceAugmentation::from_parts(body.workspace_instructions, body.workspace_files)?;
     Ok(NewAgent {
         agent_id,
         name: body.name,
         runtime_ref: body.runtime.runtime_ref().into(),
         tools: selected,
         grants: grants.into_iter().collect(),
-        workspace_guidance: body
-            .workspace_instructions
-            .as_deref()
-            .map(|instructions| {
-                validate_workspace_instructions(instructions)?;
-                seal_workspace_guidance(kms, ctx.principal, &agent_id.to_string(), instructions)
+        workspace_guidance: workspace_augmentation
+            .as_ref()
+            .map(|augmentation| {
+                seal_workspace_guidance(kms, ctx.principal, &agent_id.to_string(), augmentation)
             })
             .transpose()?,
         tenant_policy_if_missing: tenant_policy.into_iter().collect(),
@@ -590,9 +611,8 @@ fn agent_json(tenant: &str, catalogue: &PlatformToolCatalogue, agent: &AgentRegi
         "grants": agent.grants,
         "workspace_profile": {
             "revision": agent.workspace_guidance_revision,
-            "instructions": agent.workspace_guidance.as_ref().map(|guidance| json!({
-                "path": "AGENTS.md",
-                "strategy": "append",
+            "personalization": agent.workspace_guidance.as_ref().map(|guidance| json!({
+                "format": "workspace_augmentation_v1",
                 "content_digest": guidance.content_digest,
             })),
             "updated_at": agent.workspace_guidance_updated_at,
@@ -601,31 +621,20 @@ fn agent_json(tenant: &str, catalogue: &PlatformToolCatalogue, agent: &AgentRegi
     })
 }
 
-fn validate_workspace_instructions(instructions: &str) -> Result<(), EdgeError> {
-    if instructions.trim().is_empty()
-        || instructions.len() > MAX_AGENT_WORKSPACE_GUIDANCE_BYTES
-        || instructions.contains('\0')
-    {
-        return Err(EdgeError::BadRequest(format!(
-            "agent workspace instructions must contain 1..={MAX_AGENT_WORKSPACE_GUIDANCE_BYTES} UTF-8 bytes and no NUL characters"
-        )));
-    }
-    Ok(())
-}
-
 fn seal_workspace_guidance(
     kms: &KmsEngine,
     principal: &myelin_identity::Principal,
     agent_id: &str,
-    instructions: &str,
+    augmentation: &WorkspaceAugmentation,
 ) -> Result<AgentWorkspaceGuidance, EdgeError> {
-    let content_digest = format!("blake3:{}", blake3::hash(instructions.as_bytes()).to_hex());
+    let payload = augmentation.encode()?;
+    let content_digest = workspace_guidance_digest(&payload);
     let encrypted_content = ColumnCryptor::new(kms, principal.region.clone())
         .encrypt_for_subject_scope_with_aad(
             &principal.tenant,
             &SubjectId::new(&principal.principal_id.0),
             SubjectKeyScope::AgentData,
-            instructions.as_bytes(),
+            &payload,
             &workspace_guidance_aad(principal, agent_id),
         )
         .map_err(|error| {
@@ -643,7 +652,7 @@ pub(crate) fn open_agent_workspace_guidance(
     kms: &KmsEngine,
     principal: &myelin_identity::Principal,
     agent: &AgentRegistration,
-) -> Result<Option<String>, EdgeError> {
+) -> Result<Option<WorkspaceAugmentation>, EdgeError> {
     let Some(guidance) = agent.workspace_guidance.as_ref() else {
         return Ok(None);
     };
@@ -653,16 +662,12 @@ pub(crate) fn open_agent_workspace_guidance(
             &workspace_guidance_aad(principal, &agent.id),
         )
         .map_err(|_| EdgeError::Internal("agent workspace guidance cannot be decrypted".into()))?;
-    if plaintext.len() > MAX_AGENT_WORKSPACE_GUIDANCE_BYTES
-        || format!("blake3:{}", blake3::hash(&plaintext).to_hex()) != guidance.content_digest
-    {
+    if workspace_guidance_digest(&plaintext) != guidance.content_digest {
         return Err(EdgeError::Internal(
             "agent workspace guidance failed integrity validation".into(),
         ));
     }
-    String::from_utf8(plaintext)
-        .map(Some)
-        .map_err(|_| EdgeError::Internal("agent workspace guidance is not UTF-8".into()))
+    WorkspaceAugmentation::decode(&plaintext).map(Some)
 }
 
 fn workspace_guidance_aad(principal: &myelin_identity::Principal, agent_id: &str) -> Vec<u8> {
@@ -948,6 +953,7 @@ mod tests {
                 tools: tools.iter().map(|tool| (*tool).into()).collect(),
                 runtime: AgentRuntimeSelection::External,
                 workspace_instructions: None,
+                workspace_files: Vec::new(),
             },
             "retry-safe".into(),
         )

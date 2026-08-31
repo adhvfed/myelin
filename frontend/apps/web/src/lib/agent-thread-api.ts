@@ -70,6 +70,41 @@ function cleanText(value: unknown, maximum: number): value is string {
     utf8.encode(value).byteLength <= maximum && !/[\p{Cc}]/u.test(value);
 }
 
+function workspaceFiles(value: unknown): value is Array<{
+  path: string;
+  contents: string;
+  strategy: "create";
+}> {
+  if (!Array.isArray(value) || value.length > 8) return false;
+  const paths = new Set<string>();
+  return value.every((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const file = candidate as Record<string, unknown>;
+    if (Object.keys(file).length !== 3 ||
+        !Object.keys(file).every((key) => ["path", "contents", "strategy"].includes(key)) ||
+        !cleanText(file.path, 4_096) || paths.has(file.path as string) ||
+        typeof file.contents !== "string" || file.contents.includes("\0") ||
+        file.strategy !== "create") return false;
+    paths.add(file.path);
+    return true;
+  });
+}
+
+function workspaceAugmentationFits(
+  instructions: string | null,
+  files: Array<{ path: string; contents: string; strategy: "create" }>,
+): boolean {
+  if (files.length === 0) {
+    return instructions === null || utf8.encode(instructions).byteLength <= 12 * 1_024;
+  }
+  const payload = `myelin.workspace-augmentation.v1\0${JSON.stringify({
+    version: 1,
+    ...(instructions === null ? {} : { agents_md: instructions }),
+    files,
+  })}`;
+  return utf8.encode(payload).byteLength <= 12 * 1_024;
+}
+
 function isUlid(value: unknown): value is string {
   return typeof value === "string" && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
 }
@@ -238,14 +273,19 @@ export const mutateAgentThread = action(async (input: unknown) => {
   const mutation = input as Record<string, unknown>;
   try {
     if (mutation.op === "activate-agent" && Object.keys(mutation).every((key) =>
-      ["op", "name", "allowWorkspaceCommands", "workspaceInstructions", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 5 && cleanText(mutation.name, 80) &&
+      ["op", "name", "allowWorkspaceCommands", "workspaceInstructions", "workspaceFiles", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 6 && cleanText(mutation.name, 80) &&
         typeof mutation.allowWorkspaceCommands === "boolean" && cleanNonce(mutation.clientNonce)) {
       if (typeof mutation.workspaceInstructions !== "string" ||
           (mutation.workspaceInstructions !== "" &&
             (utf8.encode(mutation.workspaceInstructions).byteLength > 12 * 1_024 ||
               mutation.workspaceInstructions.trim().length === 0 ||
-              mutation.workspaceInstructions.includes("\0")))) {
+              mutation.workspaceInstructions.includes("\0"))) ||
+          !workspaceFiles(mutation.workspaceFiles) ||
+          !workspaceAugmentationFits(
+            mutation.workspaceInstructions === "" ? null : mutation.workspaceInstructions,
+            mutation.workspaceFiles,
+          )) {
         return respond({ ok: false, error: "bad-input" });
       }
       const receipt = parseAgentActivationReceipt(await edgePost("/v1/agents", {
@@ -257,25 +297,30 @@ export const mutateAgentThread = action(async (input: unknown) => {
         ...(mutation.workspaceInstructions === ""
           ? {}
           : { workspace_instructions: mutation.workspaceInstructions }),
+        ...(mutation.workspaceFiles.length === 0
+          ? {}
+          : { workspace_files: mutation.workspaceFiles }),
       }, { idempotencyKey: mutation.clientNonce }));
       return receipt
         ? respond({ ok: true, op: "activate-agent", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "configure-agent" && Object.keys(mutation).every((key) =>
-      ["op", "agentId", "workspaceInstructions", "expectedRevision", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 5 && isAgentThreadId(mutation.agentId) &&
+      ["op", "agentId", "workspaceInstructions", "workspaceFiles", "expectedRevision", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 6 && isAgentThreadId(mutation.agentId) &&
         (mutation.workspaceInstructions === null ||
           (typeof mutation.workspaceInstructions === "string" &&
             utf8.encode(mutation.workspaceInstructions).byteLength <= 12 * 1_024 &&
             mutation.workspaceInstructions.trim().length > 0 &&
-            !mutation.workspaceInstructions.includes("\0"))) &&
+            !mutation.workspaceInstructions.includes("\0"))) && workspaceFiles(mutation.workspaceFiles) &&
+        workspaceAugmentationFits(mutation.workspaceInstructions, mutation.workspaceFiles) &&
         Number.isSafeInteger(mutation.expectedRevision) &&
         (mutation.expectedRevision as number) >= 0 && cleanNonce(mutation.clientNonce)) {
       const receipt = parseAgentWorkspaceGuidanceReceipt(await edgePost(
         `/v1/agents/${segment(mutation.agentId)}/workspace-guidance`,
         {
           instructions: mutation.workspaceInstructions,
+          files: mutation.workspaceFiles,
           expected_revision: mutation.expectedRevision,
         },
         { idempotencyKey: mutation.clientNonce },
