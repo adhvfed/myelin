@@ -49,6 +49,12 @@ export interface AgentWorkspaceGuidanceReceipt {
   durable: true;
 }
 
+export interface AgentNameReceipt {
+  agent: AgentChoice;
+  changed: boolean;
+  durable: true;
+}
+
 interface AgentPolicyCoordinates {
   agent: number;
   delegation: number;
@@ -304,6 +310,15 @@ export function parseAgentActivationReceipt(value: unknown): AgentActivationRece
 export function parseAgentWorkspaceGuidanceReceipt(
   value: unknown,
 ): AgentWorkspaceGuidanceReceipt | null {
+  const receipt = record(value);
+  const agent = agentChoice(receipt?.agent);
+  return receipt && exact(receipt, ["agent", "changed", "durable"]) && agent &&
+      typeof receipt.changed === "boolean" && receipt.durable === true
+    ? { agent, changed: receipt.changed, durable: true }
+    : null;
+}
+
+export function parseAgentNameReceipt(value: unknown): AgentNameReceipt | null {
   const receipt = record(value);
   const agent = agentChoice(receipt?.agent);
   return receipt && exact(receipt, ["agent", "changed", "durable"]) && agent &&

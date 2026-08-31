@@ -58,7 +58,7 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if let Some(rendered) = privacy::render_response(value) {
         return rendered;
     }
-    if let Some(rendered) = agent::render_response(value) {
+    if let Some(rendered) = agent::render_response(value, call) {
         return rendered;
     }
     if let Some(rendered) = automation::render_response(value) {

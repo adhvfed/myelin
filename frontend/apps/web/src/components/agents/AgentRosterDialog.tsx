@@ -23,6 +23,7 @@ export function AgentRosterDialog(props: {
   loadingMore: boolean;
   onLoadMore: () => void;
   onActivate: () => void;
+  onRename: (agent: AgentChoice) => void;
   onConfigureWorkspace: (agent: AgentChoice) => void;
   onConfigureTools: (agent: AgentChoice) => void;
   onChanged: (receipt: AgentLifecycleReceipt) => void;
@@ -136,6 +137,14 @@ export function AgentRosterDialog(props: {
                       <Show when={agent.status !== "disabled"} fallback={
                         <span class="agent-roster-retired"><Icon name="gate" /> Retired permanently</span>
                       }>
+                        <button
+                          type="button"
+                          class="agent-thread-button secondary"
+                          disabled={Boolean(pending())}
+                          onClick={() => props.onRename(agent)}
+                        >
+                          <Icon name="edit" /> Rename
+                        </button>
                         <button
                           type="button"
                           class="agent-thread-button secondary"

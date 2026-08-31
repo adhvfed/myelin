@@ -20,11 +20,12 @@ pub fn agent_dispatch_with_project(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent command given (try: create <name> --tool <name> [--workspace-instructions <markdown>] | configure <id> --expected-revision <n> (--workspace-instructions <markdown> | --clear-workspace-instructions) | list | show <id> | thread start|ready|retry|list|show | approve|reject <gate>)".into(),
+            "no agent command given (try: create <name> --tool <name> [--workspace-instructions <markdown>] | rename <id> <name> --expected-name <name> | configure <id> --expected-revision <n> (--workspace-instructions <markdown> | --clear-workspace-instructions) | list | show <id> | thread start|ready|retry|list|show | approve|reject <gate>)".into(),
         )
     })?;
     match *verb {
         "create" => create_call(rest),
+        "rename" => rename_call(rest),
         "configure" => configure_call(rest),
         "list" => list_call(rest),
         "show" => show_call(rest),
@@ -37,6 +38,49 @@ pub fn agent_dispatch_with_project(
             "unknown agent command token `{other}`"
         ))),
     }
+}
+
+fn rename_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let mut agent_id = None;
+    let mut name = None;
+    let mut expected_name = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--expected-name" if expected_name.is_none() => {
+                expected_name = Some(flag_value(args, &mut index, "--expected-name")?)
+            }
+            "--expected-name" => {
+                return Err(CliError::Usage(
+                    "agent rename accepts --expected-name only once".into(),
+                ))
+            }
+            token if !token.starts_with('-') && agent_id.is_none() => agent_id = Some(token),
+            token if !token.starts_with('-') && name.is_none() => name = Some(token),
+            token if !token.starts_with('-') => {
+                return Err(CliError::Usage(format!(
+                    "unexpected agent rename argument `{token}`"
+                )))
+            }
+            flag => {
+                return Err(CliError::Usage(format!(
+                    "unknown agent rename flag `{flag}`"
+                )))
+            }
+        }
+        index += 1;
+    }
+    let agent_id = agent_id.ok_or_else(|| CliError::Usage("agent rename needs an id".into()))?;
+    require_agent_id("agent id", agent_id)?;
+    let name = name.ok_or_else(|| CliError::Usage("agent rename needs a new name".into()))?;
+    let expected_name = expected_name
+        .ok_or_else(|| CliError::Usage("agent rename needs --expected-name <name>".into()))?;
+    validate_clean_name("agent name", name)?;
+    validate_clean_name("expected agent name", expected_name)?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/agents/{agent_id}/name"),
+        json!({ "expected_name": expected_name, "name": name }),
+    ))
 }
 
 pub(super) fn validate_clean_name(label: &str, value: &str) -> Result<(), CliError> {
@@ -481,6 +525,47 @@ mod tests {
             let call = agent_dispatch(&[action, AGENT]).unwrap();
             assert_eq!(call.path, format!("/v1/agents/{AGENT}/{action}"));
             assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
+        }
+    }
+
+    #[test]
+    fn rename_is_one_optimistic_metadata_update() {
+        let call = agent_dispatch(&[
+            "rename",
+            AGENT,
+            "Checkout continuity companion",
+            "--expected-name",
+            "Checkout companion",
+        ])
+        .unwrap();
+        assert_eq!(call.method, HttpMethod::Post);
+        assert_eq!(call.path, format!("/v1/agents/{AGENT}/name"));
+        assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(call.payload.as_ref().unwrap()).unwrap(),
+            json!({
+                "expected_name": "Checkout companion",
+                "name": "Checkout continuity companion",
+            })
+        );
+        for malformed in [
+            vec!["rename", AGENT],
+            vec!["rename", AGENT, "New name"],
+            vec!["rename", AGENT, "New name", "--expected-name"],
+            vec![
+                "rename",
+                AGENT,
+                "New name",
+                "--expected-name",
+                "Old name",
+                "--expected-name",
+                "Older name",
+            ],
+        ] {
+            assert!(
+                agent_dispatch(&malformed).is_err(),
+                "accepted {malformed:?}"
+            );
         }
     }
 

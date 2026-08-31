@@ -36,10 +36,11 @@ pub mod workspace_ssh;
 
 pub use agent_registry::{
     agent_ref, validate_new_agent, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
-    AgentLifecycleRequest, AgentRegistration, AgentRegistryError, AgentToolPaletteOutcome,
-    AgentToolPaletteRequest, AgentWorkspaceGuidance, AgentWorkspaceGuidanceOutcome,
-    AgentWorkspaceGuidanceUpdate, NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
-    HOSTED_LUNA_RUNTIME, MAX_AGENT_NAME_BYTES, MAX_AGENT_TOOLS, MAX_AGENT_WORKSPACE_GUIDANCE_BYTES,
+    AgentLifecycleRequest, AgentNameOutcome, AgentNameRequest, AgentRegistration,
+    AgentRegistryError, AgentToolPaletteOutcome, AgentToolPaletteRequest, AgentWorkspaceGuidance,
+    AgentWorkspaceGuidanceOutcome, AgentWorkspaceGuidanceUpdate, NewAgent, PgAgentRegistry,
+    EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME, MAX_AGENT_NAME_BYTES, MAX_AGENT_TOOLS,
+    MAX_AGENT_WORKSPACE_GUIDANCE_BYTES,
 };
 pub use agent_session::{
     agent_run_ref, AgentSession, AgentSessionError, AgentSessionIssuer, AgentSessionRequest,

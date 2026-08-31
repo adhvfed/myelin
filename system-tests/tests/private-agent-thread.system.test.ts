@@ -665,6 +665,101 @@ describe("private work with an agent", () => {
     await closeAgentRun(freshRun);
   });
 
+  test("renames only the owner's agent identity without interrupting its live private work", async () => {
+    const founder = await browserApprovedCliClient();
+    const teammate = await browserApprovedCliClient(reviewerClient);
+    const originalName = uniqueName("Private pairing companion");
+    const renamedName = uniqueName("Continuity companion");
+    const companion = await activateExternalAgent(
+      founder,
+      originalName,
+      ["workspace.read_file"],
+      { workspaceInstructions: "# Continuity proof\n\nKeep this private workspace resumable." },
+    );
+    const occupied = await activateExternalAgent(
+      founder,
+      uniqueName("Already named companion"),
+      ["workspace.read_file"],
+    );
+    const thread = await startPrivateAgentThread(founder, {
+      name: uniqueName("Keep working through a rename"),
+      agentId: companion.agent.id,
+    });
+    const liveRun = await beginAgentThreadRun(founder, thread.thread.id);
+    expect(record(await askAgent(liveRun, 1, "workspace.read_file", { path: "AGENTS.md" }),
+      "workspace before identity rename").content).toContain("Continuity proof");
+
+    const updateBody = { expected_name: originalName, name: renamedName };
+    await founder.json(`/v1/agents/${encodeURIComponent(companion.agent.id)}/name`, {
+      method: "POST",
+      body: { ...updateBody, replace_identity: true },
+      idempotencyKey: `malformed-agent-rename-${randomUUID()}`,
+      expectedStatus: 400,
+    });
+    await teammate.json(`/v1/agents/${encodeURIComponent(companion.agent.id)}/name`, {
+      method: "POST",
+      body: updateBody,
+      idempotencyKey: `foreign-agent-rename-${randomUUID()}`,
+      expectedStatus: 404,
+    });
+    const renamed = await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/name`,
+      {
+        method: "POST",
+        body: updateBody,
+        idempotencyKey: `agent-rename-${randomUUID()}`,
+      },
+    );
+    expect(renamed.body).toMatchObject({
+      agent: {
+        id: companion.agent.id,
+        name: renamedName,
+        runtime_ref: companion.agent.runtime_ref,
+        selected_tools: companion.agent.selected_tools,
+        grants: companion.agent.grants,
+        workspace_profile: companion.agent.workspace_profile,
+      },
+      changed: true,
+      durable: true,
+    });
+
+    const exactRetry = await founder.json(
+      `/v1/agents/${encodeURIComponent(companion.agent.id)}/name`,
+      {
+        method: "POST",
+        body: updateBody,
+        idempotencyKey: `agent-rename-retry-${randomUUID()}`,
+      },
+    );
+    expect(exactRetry.body).toMatchObject({
+      agent: { id: companion.agent.id, name: renamedName },
+      changed: false,
+      durable: true,
+    });
+    await founder.json(`/v1/agents/${encodeURIComponent(companion.agent.id)}/name`, {
+      method: "POST",
+      body: { expected_name: originalName, name: uniqueName("Stale rename") },
+      idempotencyKey: `stale-agent-rename-${randomUUID()}`,
+      expectedStatus: 409,
+    });
+    await founder.json(`/v1/agents/${encodeURIComponent(companion.agent.id)}/name`, {
+      method: "POST",
+      body: { expected_name: renamedName, name: occupied.agent.name },
+      idempotencyKey: `occupied-agent-rename-${randomUUID()}`,
+      expectedStatus: 409,
+    });
+
+    expect(record(await askAgent(liveRun, 2, "workspace.read_file", { path: "AGENTS.md" }),
+      "workspace after identity rename").content).toContain("Continuity proof");
+    const fetched = await founder.json(`/v1/agents/${encodeURIComponent(companion.agent.id)}`);
+    expect(fetched.body).toMatchObject({ agent: { id: companion.agent.id, name: renamedName } });
+    const listed = await founder.json("/v1/agents?limit=100");
+    expect(array(listed.body.items, "owner's named-agent roster")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: companion.agent.id, name: renamedName })]),
+    );
+    await closeAgentRun(liveRun);
+  });
+
   test("refuses an agent runtime that cannot resume private work before provisioning anything", async () => {
     const founder = await browserApprovedCliClient();
     const threadName = uniqueName("Hosted thread that must not exist");

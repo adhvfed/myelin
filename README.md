@@ -99,6 +99,8 @@ myelin agent create "Review companion" --tool ci.read_run --tool git.open_pr \
   --tool knowledge.list_pages --tool knowledge.read_page --tool knowledge.link_work \
   --tool chat.list_conversations --tool chat.post --tool chat.read_messages \
   --idempotency-key review-companion
+myelin agent rename 22222222-2222-2222-2222-222222222222 "Release companion" \
+  --expected-name "Review companion" --idempotency-key rename-review-companion
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222
 myelin agent suspend 22222222-2222-2222-2222-222222222222 \
   --idempotency-key pause-review-companion

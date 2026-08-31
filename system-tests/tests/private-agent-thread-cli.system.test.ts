@@ -52,13 +52,14 @@ describe("private agent work from the CLI", () => {
 
     const runMyelin = (...args: string[]) => runCli(configDirectory, ...args);
     const initialAgentDefaults = "# CLI companion defaults\n\nStart from the durable workspace.";
+    const initialAgentName = uniqueName("CLI checkout companion");
     const activated = await runMyelin(
       "--json",
       "--idempotency-key",
       `cli-private-agent-${randomUUID()}`,
       "agent",
       "create",
-      uniqueName("CLI checkout companion"),
+      initialAgentName,
       "--tool",
       "chat.read_messages",
       "--tool",
@@ -101,6 +102,28 @@ describe("private agent work from the CLI", () => {
       durable: true,
       agent: { id: companionId, workspace_profile: { revision: 2 } },
     });
+    const renamedAgentName = uniqueName("CLI checkout continuity companion");
+    const renamed = await runMyelin(
+      "--json",
+      "--idempotency-key",
+      `cli-agent-rename-${randomUUID()}`,
+      "agent",
+      "rename",
+      companionId,
+      renamedAgentName,
+      "--expected-name",
+      initialAgentName,
+    );
+    expect(renamed.exitCode, renamed.stderr).toBe(0);
+    expect(JSON.parse(renamed.stdout)).toMatchObject({
+      changed: true,
+      durable: true,
+      agent: { id: companionId, name: renamedAgentName },
+    });
+    const namedAgents = await runMyelin("agent", "list", "--limit", "100");
+    expect(namedAgents.exitCode, namedAgents.stderr).toBe(0);
+    expect(namedAgents.stdout).toContain(renamedAgentName);
+    expect(namedAgents.stdout).not.toContain(initialAgentName);
 
     const threadName = uniqueName("Investigate checkout final-reader race");
     const personalInstructions = "# CLI owner workflow\n\nPreserve final readers before cleanup.";
@@ -345,6 +368,8 @@ describe("private agent work from the CLI", () => {
 
     for (const result of [
       activated,
+      renamed,
+      namedAgents,
       started,
       shown,
       listed,

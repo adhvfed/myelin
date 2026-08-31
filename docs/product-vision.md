@@ -33,9 +33,13 @@ configured files they do not know how to edit.
 The web product gives each person a direct roster for their own named agents; maintaining an agent
 must not require beginning an unrelated thread. Organization agents owned by somebody else can
 still be selected where policy permits, but their private configuration is never presented as an
-editable action to the viewer. The same owner surface can pause an identity immediately, resume it
-later, or retire it permanently with an explicit confirmation; pausing or retirement revokes live
-agent authority without making retained work disappear.
+editable action to the viewer. An owner can rename a non-retired agent without replacing its
+identity, retained threads, workspaces, policy, tool palette, or live authority. Names remain unique
+within the organization; optimistic replacement detects a genuinely stale view while an exact retry
+converges on the saved name. Audit evidence records only the stable agent identifier because a
+human-chosen name can itself contain personal data. The same owner surface can pause an identity
+immediately, resume it later, or retire it permanently with an explicit confirmation; pausing or
+retirement revokes live agent authority without making retained work disappear.
 
 The tool palette is equally concrete. Activation shows the complete live platform catalogue rather
 than hiding a fixed authority bundle behind a broad toggle, and the personal roster lets the owner
@@ -94,6 +98,9 @@ precedence, and existing work retains its original instruction-and-file snapshot
 change. Tool-palette journeys must prove a second identity cannot edit, a real live run is
 terminated, its credential stops authenticating, an exact retry is inert, a stale edit conflicts,
 and a fresh run exposes only the saved tools while retaining its workspace.
+Rename journeys must prove a second identity receives not-found, the owner sees occupied and stale
+conflicts, an exact retry is inert, list and detail reads expose the saved name, and a live agent run
+continues against the same retained workspace and authority.
 Editor-profile journeys must generate a real key, create the profile through the product CLI, and
 then leave Myelin's process: ordinary OpenSSH must use that profile for both a command and an SFTP
 transfer against the same retained workspace. The proof must check file permissions, exact host

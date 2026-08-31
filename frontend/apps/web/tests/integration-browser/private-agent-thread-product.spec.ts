@@ -28,6 +28,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
 }) => {
   const suffix = `${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
   const agentName = `checkout-companion-${suffix}`;
+  const renamedAgentName = `checkout-continuity-companion-${suffix}`;
   const threadName = `Investigate checkout race ${suffix}`;
   const problem = `The final reader for ${suffix} still owns its checkout lease.`;
   const personalInstructions = `# My workflow\n\nKeep the ${suffix} diagnosis private until it is ready.`;
@@ -85,8 +86,20 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const agentRow = roster.getByRole("listitem").filter({ hasText: agentName });
   await expect(agentRow).toContainText("Workspace defaults · revision 1");
   await expect(agentRow).toContainText("6 selected tools");
-  await agentRow.getByRole("button", { name: "Tools" }).click();
-  const tools = page.getByRole("dialog", { name: `${agentName} · tools` });
+  await agentRow.getByRole("button", { name: "Rename" }).click();
+  const rename = page.getByRole("dialog", { name: `Rename ${agentName}` });
+  await expect(rename.getByRole("textbox", { name: "Agent name" })).toHaveValue(agentName);
+  await rename.getByRole("textbox", { name: "Agent name" }).fill(renamedAgentName);
+  await rename.getByRole("button", { name: "Rename agent" }).click();
+  await expect(rename).toBeHidden();
+
+  await page.getByRole("button", { name: "Manage my agents" }).click();
+  const renamedRoster = page.getByRole("dialog", { name: "My named agents" });
+  const renamedAgentRow = renamedRoster.getByRole("listitem").filter({ hasText: renamedAgentName });
+  await expect(renamedAgentRow).toContainText("Workspace defaults · revision 1");
+  await expect(renamedRoster.getByRole("listitem").filter({ hasText: agentName })).toHaveCount(0);
+  await renamedAgentRow.getByRole("button", { name: "Tools" }).click();
+  const tools = page.getByRole("dialog", { name: `${renamedAgentName} · tools` });
   await expect(tools.getByRole("checkbox", { name: "Run bounded commands" })).toBeChecked();
   await tools.getByRole("checkbox", { name: "Reply in threads" }).uncheck();
   await tools.getByRole("button", { name: "Save tools" }).click();
@@ -94,10 +107,10 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
 
   await page.getByRole("button", { name: "Manage my agents" }).click();
   const revisedRoster = page.getByRole("dialog", { name: "My named agents" });
-  const revisedAgentRow = revisedRoster.getByRole("listitem").filter({ hasText: agentName });
+  const revisedAgentRow = revisedRoster.getByRole("listitem").filter({ hasText: renamedAgentName });
   await expect(revisedAgentRow).toContainText("5 selected tools");
   await revisedAgentRow.getByRole("button", { name: "Workspace" }).click();
-  const defaults = page.getByRole("dialog", { name: `${agentName} · workspace defaults` });
+  const defaults = page.getByRole("dialog", { name: `${renamedAgentName} · workspace defaults` });
   const defaultsEditor = defaults.getByRole("textbox", {
     name: "Default AGENTS.md instructions",
   });
@@ -114,7 +127,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const dialog = page.getByRole("dialog", { name: "Start private agent thread" });
   await dialog.getByRole("textbox", { name: "Problem name" }).fill(threadName);
   const agentChoice = dialog.getByRole("combobox", { name: "Agent" });
-  await agentChoice.selectOption({ label: agentName });
+  await agentChoice.selectOption({ label: renamedAgentName });
   const agentId = await agentChoice.inputValue();
   expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
   await expect(dialog.getByText("This agent carries private workspace defaults at revision 2."))
@@ -130,7 +143,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
 
   await page.waitForURL(/\/agents\?thread=[0-9a-f-]{36}$/);
   await expect(page.getByRole("heading", { level: 2, name: threadName })).toBeVisible();
-  await expect(page.getByText(`Private with ${agentName}`)).toBeVisible();
+  await expect(page.getByText(`Private with ${renamedAgentName}`)).toBeVisible();
   await page.getByRole("button", { name: "Agent workspace" }).click();
   const workspace = page.getByRole("dialog", { name: "Agent workspace" });
   await expect(workspace.getByText("Generation 1", { exact: true })).toBeVisible();
@@ -167,7 +180,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   try {
     await page.getByRole("button", { name: "Manage my agents" }).click();
     const lifecycleRoster = page.getByRole("dialog", { name: "My named agents" });
-    const lifecycleAgent = lifecycleRoster.getByRole("listitem").filter({ hasText: agentName });
+    const lifecycleAgent = lifecycleRoster.getByRole("listitem").filter({ hasText: renamedAgentName });
     await lifecycleAgent.getByRole("button", { name: "Suspend" }).click();
     await expect(lifecycleAgent).toContainText("suspended · external MCP");
     await lifecycleRoster.getByRole("button", { name: "Close", exact: true }).click();
@@ -176,7 +189,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
     await waitForAppHydration(page);
     await page.getByRole("button", { name: "Agent workspace" }).click();
     await expect(workspace.getByTestId("agent-connect-unavailable"))
-      .toContainText(`${agentName} is suspended`);
+      .toContainText(`${renamedAgentName} is suspended`);
     await expect(workspace.getByTestId("agent-connect-command")).toHaveCount(0);
     await expect(workspace.getByTestId("agent-workspace-command")).toHaveCount(0);
     await expect(workspace.getByTestId("agent-workspace-file-command")).toHaveCount(0);
@@ -194,7 +207,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
 
     await page.getByRole("button", { name: "Manage my agents" }).click();
     const resumeRoster = page.getByRole("dialog", { name: "My named agents" });
-    const suspendedAgent = resumeRoster.getByRole("listitem").filter({ hasText: agentName });
+    const suspendedAgent = resumeRoster.getByRole("listitem").filter({ hasText: renamedAgentName });
     await suspendedAgent.getByRole("button", { name: "Resume" }).click();
     await expect(suspendedAgent).toContainText("active · external MCP");
     resumedThroughProduct = true;
@@ -216,7 +229,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await page.reload();
   await waitForAppHydration(page);
   await expect(page.getByText(problem)).toBeVisible();
-  await expect(page.getByText(`Private with ${agentName}`)).toBeVisible();
+  await expect(page.getByText(`Private with ${renamedAgentName}`)).toBeVisible();
 
   const threadId = new URL(page.url()).searchParams.get("thread")!;
   const agentResponse = await request.get(
@@ -291,7 +304,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await expect(page.getByText("Owner and agent only", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Ready for review" }).click();
   await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
-  await expect(page.getByText(`Project review with ${agentName}`, { exact: true })).toBeVisible();
+  await expect(page.getByText(`Project review with ${renamedAgentName}`, { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Send to review" })).toBeVisible();
   await page.reload();
   await waitForAppHydration(page);
@@ -304,9 +317,9 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
 
   await page.getByRole("button", { name: "Manage my agents" }).click();
   const retirementRoster = page.getByRole("dialog", { name: "My named agents" });
-  const retiringAgent = retirementRoster.getByRole("listitem").filter({ hasText: agentName });
+  const retiringAgent = retirementRoster.getByRole("listitem").filter({ hasText: renamedAgentName });
   await retiringAgent.getByRole("button", { name: "Retire" }).click();
-  const confirmation = page.getByRole("alertdialog", { name: `Retire ${agentName}?` });
+  const confirmation = page.getByRole("alertdialog", { name: `Retire ${renamedAgentName}?` });
   await expect(confirmation).toContainText("cannot be undone");
   await confirmation.getByRole("button", { name: "Retire agent" }).click();
   await expect(retiringAgent).toContainText("Retired permanently");
@@ -316,6 +329,6 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await waitForAppHydration(page);
   await page.getByRole("button", { name: "Manage my agents" }).click();
   await expect(page.getByRole("dialog", { name: "My named agents" })
-    .getByRole("listitem").filter({ hasText: agentName }))
+    .getByRole("listitem").filter({ hasText: renamedAgentName }))
     .toContainText("disabled · external MCP");
 });

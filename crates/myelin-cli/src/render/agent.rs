@@ -7,7 +7,7 @@ use crate::dispatch::{is_canonical_agent_id, EdgeCall};
 
 use super::{query_field, terminal_safe_single_line};
 
-pub(super) fn render_response(value: &Value) -> Option<String> {
+pub(super) fn render_response(value: &Value, call: Option<&EdgeCall>) -> Option<String> {
     if let Some(thread) = value.get("thread") {
         return render_thread_response(value, thread);
     }
@@ -16,10 +16,20 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
     if let Some(action) = value.get("action") {
         return render_lifecycle(value, action.as_str()?, agent, summary);
     }
-    let disposition = match value.get("created").and_then(Value::as_bool) {
-        Some(true) => "Activated agent",
-        Some(false) => "Agent already active",
-        None => "Agent",
+    let rename = call
+        .is_some_and(|call| call.path.starts_with("/v1/agents/") && call.path.ends_with("/name"));
+    let disposition = match (
+        rename,
+        value.get("created").and_then(Value::as_bool),
+        value.get("changed").and_then(Value::as_bool),
+        value.get("durable").and_then(Value::as_bool),
+    ) {
+        (true, None, Some(true), Some(true)) => "Renamed agent",
+        (true, None, Some(false), Some(true)) => "Agent name already current",
+        (true, _, _, _) => return None,
+        (false, Some(true), _, _) => "Activated agent",
+        (false, Some(false), _, _) => "Agent already active",
+        (false, None, _, _) => "Agent",
     };
     let principal = terminal_safe_single_line(agent.get("principal_id")?.as_str()?);
     let on_behalf_of = terminal_safe_single_line(agent.get("on_behalf_of")?.as_str()?);
@@ -303,7 +313,7 @@ mod tests {
 
     #[test]
     fn activation_is_legible_addressable_and_honest_about_credentials() {
-        let rendered = render_response(&json!({"agent": agent(), "created": true})).unwrap();
+        let rendered = render_response(&json!({"agent": agent(), "created": true}), None).unwrap();
         assert!(rendered.starts_with(&format!(
             "Activated agent: Review\\ncompanion  [active, external:mcp]  myelin://acme/identity/agent/{ID}"
         )));
@@ -315,8 +325,35 @@ mod tests {
             "cursor": "chat.retired.v1",
             "state": "unavailable",
         }]);
-        let rendered = render_response(&json!({"agent": with_retired_tool})).unwrap();
+        let rendered = render_response(&json!({"agent": with_retired_tool}), None).unwrap();
         assert!(rendered.contains("selected tools: chat.retired.v1 [unavailable]"));
+    }
+
+    #[test]
+    fn rename_receipts_name_the_identity_preserving_change() {
+        let call = agent_dispatch(&[
+            "rename",
+            ID,
+            "Release companion",
+            "--expected-name",
+            "Review companion",
+        ])
+        .unwrap();
+        let receipt = json!({
+            "agent": agent(),
+            "changed": true,
+            "durable": true,
+        });
+        assert!(render_response(&receipt, Some(&call))
+            .unwrap()
+            .starts_with("Renamed agent:"));
+        let mut retry = receipt;
+        retry["changed"] = json!(false);
+        assert!(render_response(&retry, Some(&call))
+            .unwrap()
+            .starts_with("Agent name already current:"));
+        retry.as_object_mut().unwrap().remove("durable");
+        assert!(render_response(&retry, Some(&call)).is_none());
     }
 
     #[test]
@@ -334,13 +371,16 @@ mod tests {
     fn lifecycle_results_explain_what_changed_without_exposing_credentials() {
         let mut suspended = agent();
         suspended["status"] = json!("suspended");
-        let rendered = render_response(&json!({
-            "agent": suspended,
-            "action": "suspend",
-            "changed": true,
-            "terminated_runs": 1,
-            "durable": true,
-        }))
+        let rendered = render_response(
+            &json!({
+                "agent": suspended,
+                "action": "suspend",
+                "changed": true,
+                "terminated_runs": 1,
+                "durable": true,
+            }),
+            None,
+        )
         .unwrap();
         assert!(rendered.starts_with("Suspended agent: Review\\ncompanion"));
         assert!(rendered.contains("stopped 1 active run"));
@@ -348,13 +388,16 @@ mod tests {
 
         let mut resumed = agent();
         resumed["status"] = json!("active");
-        let rendered = render_response(&json!({
-            "agent": resumed,
-            "action": "resume",
-            "changed": true,
-            "terminated_runs": 0,
-            "durable": true,
-        }))
+        let rendered = render_response(
+            &json!({
+                "agent": resumed,
+                "action": "resume",
+                "changed": true,
+                "terminated_runs": 0,
+                "durable": true,
+            }),
+            None,
+        )
         .unwrap();
         assert!(rendered.starts_with("Resumed agent:"));
         assert!(rendered.contains("previously terminated runs remain closed"));
@@ -362,13 +405,16 @@ mod tests {
 
         let mut retired = agent();
         retired["status"] = json!("disabled");
-        let rendered = render_response(&json!({
-            "agent": retired,
-            "action": "retire",
-            "changed": true,
-            "terminated_runs": 2,
-            "durable": true,
-        }))
+        let rendered = render_response(
+            &json!({
+                "agent": retired,
+                "action": "retire",
+                "changed": true,
+                "terminated_runs": 2,
+                "durable": true,
+            }),
+            None,
+        )
         .unwrap();
         assert!(rendered.starts_with("Retired agent:"));
         assert!(rendered.contains("stopped 2 active runs"));
@@ -377,11 +423,14 @@ mod tests {
 
     #[test]
     fn private_thread_receipts_explain_how_to_continue_the_work() {
-        let rendered = render_response(&json!({
-            "thread": thread(),
-            "created": true,
-            "durable": true,
-        }))
+        let rendered = render_response(
+            &json!({
+                "thread": thread(),
+                "created": true,
+                "durable": true,
+            }),
+            None,
+        )
         .unwrap();
         assert!(rendered.starts_with("Started private agent thread: Checkout\\nrace"));
         assert!(rendered.contains("workspace: ready; retained until 2099-08-25T12:00:00Z"));
@@ -394,38 +443,41 @@ mod tests {
 
         let mut project_draft = thread();
         project_draft["project_id"] = json!("33333333-3333-3333-3333-333333333333");
-        let rendered = render_response(&json!({ "thread": project_draft })).unwrap();
+        let rendered = render_response(&json!({ "thread": project_draft }), None).unwrap();
         assert!(rendered.contains(&format!("myelin agent thread ready {THREAD_ID}")));
 
         let mut published = thread();
         published["project_id"] = json!("33333333-3333-3333-3333-333333333333");
         published["review_state"] = json!("ready");
         published["review_ready_at"] = json!("2026-08-22T13:00:00Z");
-        let rendered = render_response(&json!({
-            "thread": published,
-            "changed": true,
-            "durable": true,
-        }))
+        let rendered = render_response(
+            &json!({
+                "thread": published,
+                "changed": true,
+                "durable": true,
+            }),
+            None,
+        )
         .unwrap();
         assert!(rendered.starts_with("Published agent thread for review:"));
         assert!(rendered.contains("workspace control remains yours"));
 
         let mut expiring = thread();
         expiring["workspace"]["state"] = json!("expiring");
-        let rendered = render_response(&json!({ "thread": expiring })).unwrap();
+        let rendered = render_response(&json!({ "thread": expiring }), None).unwrap();
         assert!(rendered.starts_with("Private agent thread:"));
         assert!(!rendered.contains("myelin agent thread ssh"));
         assert!(!rendered.contains("myelin mcp serve"));
 
         let mut failed = thread();
         failed["workspace"]["state"] = json!("failed");
-        let rendered = render_response(&json!({ "thread": failed })).unwrap();
+        let rendered = render_response(&json!({ "thread": failed }), None).unwrap();
         assert!(rendered.contains(&format!("myelin agent thread retry {THREAD_ID}")));
         assert!(!rendered.contains("myelin agent thread ssh"));
 
         let mut elapsed = thread();
         elapsed["workspace"]["expires_at"] = json!("2020-08-25T12:00:00Z");
-        let rendered = render_response(&json!({ "thread": elapsed })).unwrap();
+        let rendered = render_response(&json!({ "thread": elapsed }), None).unwrap();
         assert!(!rendered.contains("myelin agent thread say"));
         assert!(!rendered.contains("myelin agent thread ssh"));
         assert!(!rendered.contains("myelin mcp serve"));

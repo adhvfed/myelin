@@ -9,6 +9,7 @@ import {
   parseAgentChoice,
   parseAgentChoices,
   parseAgentLifecycleReceipt,
+  parseAgentNameReceipt,
   parseAgentToolPaletteReceipt,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
@@ -21,6 +22,7 @@ import {
   type AgentChoicePage,
   type AgentActivationReceipt,
   type AgentLifecycleReceipt,
+  type AgentNameReceipt,
   type AgentToolPaletteReceipt,
   type AgentWorkspaceGuidanceReceipt,
   type AgentWorkspaceGuidanceConfig,
@@ -44,6 +46,7 @@ export type AgentThreadMutationResult =
   | { ok: true; op: "retry"; receipt: AgentThreadCreateReceipt }
   | { ok: true; op: "mark-ready"; receipt: AgentThreadReviewReceipt }
   | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
+  | { ok: true; op: "rename-agent"; receipt: AgentNameReceipt }
   | { ok: true; op: "configure-agent"; receipt: AgentWorkspaceGuidanceReceipt }
   | { ok: true; op: "configure-agent-tools"; receipt: AgentToolPaletteReceipt }
   | { ok: true; op: "lifecycle-agent"; receipt: AgentLifecycleReceipt }
@@ -289,6 +292,20 @@ export const mutateAgentThread = action(async (input: unknown) => {
       }, { idempotencyKey: mutation.clientNonce }));
       return receipt
         ? respond({ ok: true, op: "activate-agent", receipt })
+        : respond({ ok: false, error: "error" });
+    }
+    if (mutation.op === "rename-agent" && Object.keys(mutation).every((key) =>
+      ["op", "agentId", "expectedName", "name", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 5 && isAgentThreadId(mutation.agentId) &&
+        cleanText(mutation.expectedName, 80) && cleanText(mutation.name, 80) &&
+        cleanNonce(mutation.clientNonce)) {
+      const receipt = parseAgentNameReceipt(await edgePost(
+        `/v1/agents/${segment(mutation.agentId)}/name`,
+        { expected_name: mutation.expectedName, name: mutation.name },
+        { idempotencyKey: mutation.clientNonce },
+      ));
+      return receipt
+        ? respond({ ok: true, op: "rename-agent", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "configure-agent-tools" && Object.keys(mutation).every((key) =>

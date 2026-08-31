@@ -5,9 +5,9 @@ use myelin_identity::{
     DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId, RuntimeRef,
 };
 use myelin_identity_service::{
-    AgentLifecycleAction, AgentLifecycleRequest, AgentRegistryError, AgentToolPaletteRequest,
-    AgentWorkspaceGuidance, AgentWorkspaceGuidanceUpdate, Authority, DelegationPolicySource,
-    NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
+    AgentLifecycleAction, AgentLifecycleRequest, AgentNameRequest, AgentRegistryError,
+    AgentToolPaletteRequest, AgentWorkspaceGuidance, AgentWorkspaceGuidanceUpdate, Authority,
+    DelegationPolicySource, NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
@@ -128,6 +128,106 @@ async fn owner_tool_changes_replace_policy_and_emit_one_metadata_event() {
         serde_json::json!(["ci.read_run.v1"])
     );
     assert!(events[0]["payload"].get("grants").is_none());
+    cleanup(&admin, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_renames_are_private_optimistic_and_metadata_only() {
+    let (admin, app) = providers().await;
+    let tenant = unique("agent-name");
+    let region = app.config().region.clone();
+    let actor = human(&tenant, &region);
+    let registry = PgAgentRegistry::new(app);
+    let created = registry
+        .create(&actor, proposal("activate-agent-to-rename-v1"))
+        .await
+        .unwrap()
+        .agent;
+    let mut reserved_intent = proposal("activate-reserved-agent-name-v1");
+    reserved_intent.name = "Reserved companion".into();
+    registry.create(&actor, reserved_intent).await.unwrap();
+
+    let outsider = Principal::new(
+        actor.tenant.clone(),
+        actor.region.clone(),
+        PrincipalId("human:other-member".into()),
+        PrincipalKind::Human,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let denied = registry
+        .update_name(
+            &outsider,
+            AgentNameRequest {
+                agent_id: created.id.clone(),
+                expected_name: created.name.clone(),
+                name: "Outsider rename".into(),
+            },
+        )
+        .await;
+    assert!(matches!(denied, Err(AgentRegistryError::NotFound)));
+
+    let request = AgentNameRequest {
+        agent_id: created.id.clone(),
+        expected_name: created.name.clone(),
+        name: "Checkout continuity companion".into(),
+    };
+    let renamed = registry.update_name(&actor, request.clone()).await.unwrap();
+    assert!(renamed.changed);
+    assert_eq!(renamed.agent.name, request.name);
+    assert_eq!(renamed.agent.runtime_ref, created.runtime_ref);
+    assert_eq!(renamed.agent.tools, created.tools);
+    assert_eq!(renamed.agent.grants, created.grants);
+    assert_eq!(renamed.agent.workspace_guidance, created.workspace_guidance);
+
+    let replay = registry.update_name(&actor, request).await.unwrap();
+    assert!(!replay.changed);
+    assert_eq!(replay.agent, renamed.agent);
+    let stale = registry
+        .update_name(
+            &actor,
+            AgentNameRequest {
+                agent_id: created.id.clone(),
+                expected_name: created.name.clone(),
+                name: "A genuinely different rename".into(),
+            },
+        )
+        .await;
+    assert!(matches!(stale, Err(AgentRegistryError::Conflict(_))));
+    let occupied = registry
+        .update_name(
+            &actor,
+            AgentNameRequest {
+                agent_id: created.id.clone(),
+                expected_name: renamed.agent.name.clone(),
+                name: "Reserved companion".into(),
+            },
+        )
+        .await;
+    assert!(matches!(occupied, Err(AgentRegistryError::Conflict(_))));
+
+    let events: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+          WHERE aggregate = $1 AND envelope->>'type_' = 'identity.agent.name_updated' \
+          ORDER BY event_id",
+    )
+    .bind(format!("identity:agent:{}", created.id))
+    .fetch_all(admin.db_pool())
+    .await
+    .expect("read agent rename audit metadata");
+    assert_eq!(events.len(), 1, "denial, retry, and conflicts emit nothing");
+    assert_eq!(
+        events[0]["payload"],
+        serde_json::json!({ "agent_id": created.id })
+    );
+    let event = events[0].to_string();
+    for name in [
+        created.name,
+        renamed.agent.name,
+        "Reserved companion".into(),
+    ] {
+        assert!(!event.contains(&name));
+    }
     cleanup(&admin, &tenant).await;
 }
 

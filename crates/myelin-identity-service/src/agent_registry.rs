@@ -20,9 +20,11 @@ use sqlx::Row;
 use uuid::Uuid;
 
 mod lifecycle;
+mod name;
 mod tool_palette;
 
 pub use lifecycle::{AgentLifecycleAction, AgentLifecycleOutcome, AgentLifecycleRequest};
+pub use name::{AgentNameOutcome, AgentNameRequest};
 pub use tool_palette::{AgentToolPaletteOutcome, AgentToolPaletteRequest};
 
 pub const EXTERNAL_MCP_RUNTIME: &str = "external:mcp";
@@ -707,7 +709,7 @@ async fn agent_by_id(
     row.as_ref().map(agent_from_joined_row).transpose()
 }
 
-async fn agent_name_exists(
+pub(super) async fn agent_name_exists(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
@@ -880,15 +882,7 @@ pub fn validate_new_agent(
             "agent id must be a UUID v4".into(),
         ));
     }
-    if proposal.name.is_empty()
-        || proposal.name.len() > MAX_AGENT_NAME_BYTES
-        || proposal.name.trim() != proposal.name
-        || proposal.name.chars().any(char::is_control)
-    {
-        return Err(AgentRegistryError::BadInput(format!(
-            "name must contain 1..={MAX_AGENT_NAME_BYTES} bytes, without surrounding whitespace or control characters"
-        )));
-    }
+    validate_agent_name(&proposal.name)?;
     if proposal.runtime_ref.is_empty()
         || proposal.runtime_ref.len() > 255
         || !proposal
@@ -952,6 +946,20 @@ pub fn validate_new_agent(
     }
     validate_workspace_guidance(actor, proposal.workspace_guidance.as_ref())?;
     Ok(())
+}
+
+pub(super) fn validate_agent_name(name: &str) -> Result<(), AgentRegistryError> {
+    if name.is_empty()
+        || name.len() > MAX_AGENT_NAME_BYTES
+        || name.trim() != name
+        || name.chars().any(char::is_control)
+    {
+        Err(AgentRegistryError::BadInput(format!(
+            "name must contain 1..={MAX_AGENT_NAME_BYTES} bytes, without surrounding whitespace or control characters"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_workspace_guidance(

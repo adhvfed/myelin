@@ -8,6 +8,7 @@ import {
   parseAgentChoice,
   parseAgentChoices,
   parseAgentLifecycleReceipt,
+  parseAgentNameReceipt,
   parseAgentToolPaletteReceipt,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
@@ -306,6 +307,17 @@ describe("private agent work wire projection", () => {
       changed: true,
       durable: true,
     })?.agent.workspace_profile.revision).toBe(2);
+    expect(parseAgentNameReceipt({
+      agent: { ...configuredAgent, name: "Pairing copilot" },
+      changed: true,
+      durable: true,
+    })?.agent.name).toBe("Pairing copilot");
+    expect(parseAgentNameReceipt({
+      agent: configuredAgent,
+      changed: true,
+      durable: true,
+      leaked_previous_name: "private",
+    })).toBeNull();
 
     expect(parseAgentWorkspaceGuidanceConfig({
       agent_id: AGENT,

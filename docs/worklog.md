@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Personal agents can change names without changing identity
+
+A named agent's owner can now rename it from the personal roster or the CLI without replacing its
+stable identity, retained threads and workspaces, runtime, workspace defaults, tools, grants, policy,
+or live runs. The write is an owner-only optimistic replacement: an exact semantic retry is inert,
+a genuinely stale expected name conflicts, organization names remain unique, and retired identities
+stay immutable. Creation and rename share the same transaction-scoped name lock, so their uniqueness
+race cannot escape as an internal database error. The durable `identity.agent.name_updated` event
+contains only the stable agent identifier; it deliberately excludes both human-chosen names.
+
+The readable TypeScript system journey uses two browser-approved identities, proves the non-owner
+gets an indistinguishable not-found response, exercises owner success, exact retry, stale conflict,
+and occupied-name conflict, verifies fresh list/detail reads, and keeps an already-issued agent run
+reading the same private workspace after the rename. The shipped CLI renames an agent and observes
+the new roster entry before completing its real MCP, SSH, SFTP, and editor-profile journey. The
+Chromium product journey renames from the personal roster, then configures the same agent and carries
+the new name through private work, suspend/resume, review publication, and retirement. The focused
+PostgreSQL integration test also proves the metadata-only outbox event and unchanged configuration.
+All three live journeys pass, as do 670 web unit tests, web and system TypeScript checks, and web
+lint.
+
 ## 2026-08-31 — An existing owner key opens the private workspace in an editor
 
 The supported CLI could launch its own shell or SFTP process, but it always generated and destroyed

@@ -13,6 +13,7 @@ import {
 import { AgentActivationDialog } from "~/components/agents/AgentActivationDialog";
 import { AgentThreadCreateDialog } from "~/components/agents/AgentThreadCreateDialog";
 import { AgentRosterDialog } from "~/components/agents/AgentRosterDialog";
+import { AgentNameDialog } from "~/components/agents/AgentNameDialog";
 import { AgentToolsDialog } from "~/components/agents/AgentToolsDialog";
 import { AgentWorkspaceDefaultsDialog } from "~/components/agents/AgentWorkspaceDefaultsDialog";
 import { AgentThreadSidebar } from "~/components/agents/AgentThreadSidebar";
@@ -85,6 +86,7 @@ export default function AgentThreadsIndex() {
   const [preferredAgentId, setPreferredAgentId] = createSignal<string>();
   const [configuringAgent, setConfiguringAgent] = createSignal<AgentChoice | null>(null);
   const [configuringAgentTools, setConfiguringAgentTools] = createSignal<AgentChoice | null>(null);
+  const [renamingAgent, setRenamingAgent] = createSignal<AgentChoice | null>(null);
   const [managingAgents, setManagingAgents] = createSignal(false);
   const [loadingMoreAgents, setLoadingMoreAgents] = createSignal(false);
   const [earlierMessagePages, setEarlierMessagePages] = createSignal<Awaited<ReturnType<typeof getAgentThreadMessages>>[]>([]);
@@ -534,6 +536,10 @@ export default function AgentThreadsIndex() {
           setManagingAgents(false);
           openActivation();
         }}
+        onRename={(agent) => {
+          setManagingAgents(false);
+          setRenamingAgent(agent);
+        }}
         onConfigureWorkspace={(agent) => {
           setManagingAgents(false);
           setConfiguringAgent(agent);
@@ -558,6 +564,30 @@ export default function AgentThreadsIndex() {
           });
         }}
         onClose={() => setManagingAgents(false)}
+      />
+      <AgentNameDialog
+        agent={renamingAgent()}
+        onClose={() => setRenamingAgent(null)}
+        onConflict={(agentId) => {
+          void Promise.all([
+            revalidate(getAgentChoices.keyFor({ limit: 100 })),
+            revalidate(getAgentChoice.keyFor(agentId)),
+          ]);
+        }}
+        onRenamed={(receipt) => {
+          setActivatedAgents((current) => mergeById([receipt.agent], [current]));
+          setPreferredAgentId(receipt.agent.id);
+          void Promise.all([
+            revalidate(getAgentChoices.keyFor({ limit: 100 })),
+            revalidate(getAgentChoice.keyFor(receipt.agent.id)),
+          ]);
+          toast.show({
+            title: receipt.changed
+              ? `Agent renamed to ${receipt.agent.name}`
+              : `${receipt.agent.name} was already current`,
+            variant: "success",
+          });
+        }}
       />
       <AgentWorkspaceDefaultsDialog
         agent={configuringAgent()}

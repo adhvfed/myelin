@@ -6,10 +6,10 @@ use myelin_agent_service::{catalogue_cursor, tool_ref, PlatformToolCatalogue};
 use myelin_identity::PrincipalStatus;
 use myelin_identity_service::{
     agent_ref, agent_run_ref, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
-    AgentLifecycleRequest, AgentRegistration, AgentRegistryError, AgentSessionError,
-    AgentSessionIssuer, AgentSessionRequest, AgentToolPaletteRequest, AgentWorkspaceGuidance,
-    AgentWorkspaceGuidanceUpdate, ClosedAgentSession, IssuedAgentSession, NewAgent,
-    PgAgentRegistry, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
+    AgentLifecycleRequest, AgentNameRequest, AgentRegistration, AgentRegistryError,
+    AgentSessionError, AgentSessionIssuer, AgentSessionRequest, AgentToolPaletteRequest,
+    AgentWorkspaceGuidance, AgentWorkspaceGuidanceUpdate, ClosedAgentSession, IssuedAgentSession,
+    NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
 };
 use myelin_storage::{ColumnCryptor, KmsEngine, SubjectId, SubjectKeyScope};
 use serde::Deserialize;
@@ -77,6 +77,13 @@ struct UpdateAgentToolsBody {
     tools: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateAgentNameBody {
+    expected_name: String,
+    name: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AgentRuntimeSelection {
@@ -131,6 +138,10 @@ struct AgentWorkspaceGuidanceGetHandler {
 }
 
 struct AgentToolsUpdateHandler {
+    api: AgentHttpApi,
+}
+
+struct AgentNameUpdateHandler {
     api: AgentHttpApi,
 }
 
@@ -385,6 +396,32 @@ impl Handler for AgentToolsUpdateHandler {
     }
 }
 
+impl Handler for AgentNameUpdateHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let body: UpdateAgentNameBody = parse_agent_body(&ctx.request.body, "agent name")?;
+        let outcome = self
+            .api
+            .drive(self.api.registry.update_name(
+                ctx.principal,
+                AgentNameRequest {
+                    agent_id: agent_param(ctx)?.to_string(),
+                    expected_name: body.expected_name,
+                    name: body.name,
+                },
+            ))?
+            .map_err(map_registry_error)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "agent": agent_json(&ctx.principal.tenant.0, &self.api.catalogue, &outcome.agent),
+                "changed": outcome.changed,
+                "durable": true,
+            }),
+        )))
+    }
+}
+
 struct AgentListHandler {
     api: AgentHttpApi,
 }
@@ -471,6 +508,12 @@ pub fn register_agents(
             "/v1/agents/{agent}/tools",
             "identity.agent.update",
             Arc::new(AgentToolsUpdateHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agents/{agent}/name",
+            "identity.agent.update",
+            Arc::new(AgentNameUpdateHandler { api: api.clone() }),
         )
         .route(
             Method::Post,
