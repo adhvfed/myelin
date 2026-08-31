@@ -23,6 +23,7 @@ const MAX_REMOTE_COMMAND_BYTES: usize = 32 * 1024;
 pub struct WorkspaceSshCommand {
     thread_id: String,
     remote_command: Option<String>,
+    sftp: bool,
 }
 
 impl WorkspaceSshCommand {
@@ -41,6 +42,7 @@ impl WorkspaceSshCommand {
             ));
         }
         let mut remote_command = None;
+        let mut sftp = false;
         let mut index = 3;
         while index < args.len() {
             match args[index].as_str() {
@@ -57,6 +59,15 @@ impl WorkspaceSshCommand {
                         "agent thread ssh accepts --command only once".into(),
                     ));
                 }
+                "--sftp" if !sftp => {
+                    sftp = true;
+                    index += 1;
+                }
+                "--sftp" => {
+                    return Err(CliError::Usage(
+                        "agent thread ssh accepts --sftp only once".into(),
+                    ));
+                }
                 argument => {
                     return Err(CliError::Usage(format!(
                         "unexpected agent thread ssh argument `{argument}`"
@@ -64,9 +75,15 @@ impl WorkspaceSshCommand {
                 }
             }
         }
+        if sftp && remote_command.is_some() {
+            return Err(CliError::Usage(
+                "agent thread ssh accepts either --sftp or --command, not both".into(),
+            ));
+        }
         Ok(Some(Self {
             thread_id: thread_id.clone(),
             remote_command,
+            sftp,
         }))
     }
 
@@ -135,6 +152,7 @@ mod tests {
                 .unwrap();
         assert_eq!(interactive.thread_id(), THREAD);
         assert_eq!(interactive.remote_command, None);
+        assert!(!interactive.sftp);
 
         let command = WorkspaceSshCommand::parse_agent_args(&[
             "thread".into(),
@@ -149,6 +167,18 @@ mod tests {
             command.remote_command.as_deref(),
             Some("cat notes/continuity.md")
         );
+        assert!(!command.sftp);
+
+        let sftp = WorkspaceSshCommand::parse_agent_args(&[
+            "thread".into(),
+            "ssh".into(),
+            THREAD.into(),
+            "--sftp".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(sftp.sftp);
+        assert_eq!(sftp.remote_command, None);
 
         for malformed in [
             vec!["thread", "ssh"],
@@ -156,6 +186,8 @@ mod tests {
             vec!["thread", "ssh", THREAD, "--command"],
             vec!["thread", "ssh", THREAD, "--command", ""],
             vec!["thread", "ssh", THREAD, "--idempotency-key", "x"],
+            vec!["thread", "ssh", THREAD, "--sftp", "--sftp"],
+            vec!["thread", "ssh", THREAD, "--sftp", "--command", "pwd"],
         ] {
             let args = malformed.into_iter().map(String::from).collect::<Vec<_>>();
             assert!(

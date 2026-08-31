@@ -125,6 +125,8 @@ myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \
 # SFTP runs the pinned OpenSSH server inside gVisor, so editors can use a standard remote-file
 # client without gaining a host-side filesystem path.
 myelin agent thread ssh 33333333-3333-4333-8333-333333333333
+# Or open the same confined workspace with the standard OpenSSH SFTP client.
+myelin agent thread ssh 33333333-3333-4333-8333-333333333333 --sftp
 
 myelin agent create "Mainline triage" --runtime hosted \
   --tool ci.read_run --tool issues.create --idempotency-key mainline-triage

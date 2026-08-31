@@ -145,6 +145,7 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
             "  message: myelin agent thread say {id} \"<message>\""
         );
         let _ = writeln!(output, "  workspace: myelin agent thread ssh {id}");
+        let _ = writeln!(output, "  files: myelin agent thread ssh {id} --sftp");
     } else if matches!(state.as_str(), "failed" | "provisioning")
         && DateTime::parse_from_rfc3339(&expires_at).is_ok_and(|deadline| deadline > Utc::now())
     {
@@ -343,6 +344,7 @@ mod tests {
         assert!(rendered.contains("workspace: ready; retained until 2099-08-25T12:00:00Z"));
         assert!(rendered.contains(&format!("myelin agent thread say {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID}")));
+        assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID} --sftp")));
         assert!(rendered.contains(&format!("myelin mcp serve --as {ID} --thread {THREAD_ID}")));
         assert!(!rendered.contains("storage_locator"));
 

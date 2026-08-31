@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — The product CLI opens a private workspace with standard SFTP
+
+The gateway supported confined SFTP, but `myelin agent thread ssh` could only launch an SSH shell or
+one remote command. The CLI generated its one-shot key internally and removed it when that process
+ended, so users could not reach the working file protocol through the supported product command.
+
+`myelin agent thread ssh <thread> --sftp` now requests the same short-lived owner-authorized grant,
+pins the returned host key, and launches the operating system's OpenSSH `sftp` client. It clears the
+ambient SSH configuration, agent, proxy, forwarding, and password paths exactly as the SSH mode
+does. `--sftp` and `--command` are explicitly mutually exclusive, the temporary key and host pin
+live only for the client process, and the web workspace pane surfaces the copyable file command.
+
+The readable TypeScript CLI journey logs in through device approval, creates a private agent and
+workspace, resumes it through thread-bound MCP, proves command continuity, then invokes the real
+product CLI in SFTP mode to upload and download a file through Edge, PostgreSQL, the workspace
+gateway, OpenSSH, and gVisor. The byte-exact result passed in 19.92 seconds. CLI argument tests,
+strict all-target Clippy, frontend typechecking, and frontend lint pass.
+
 ## 2026-08-31 — The workspace pane shows what will bring a branch alive
 
 The durable Service Federation receipt reached the API, but the web client discarded the new field

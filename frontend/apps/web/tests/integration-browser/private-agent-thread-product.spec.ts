@@ -96,6 +96,10 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const sshCommand = workspace.getByTestId("agent-workspace-command");
   await expect(sshCommand).toContainText("myelin agent thread ssh");
   await expect(sshCommand).toContainText(new URL(page.url()).searchParams.get("thread")!);
+  await expect(workspace.getByTestId("agent-workspace-file-command"))
+    .toContainText(`myelin agent thread ssh ${
+      new URL(page.url()).searchParams.get("thread")!
+    } --sftp`);
   await page.keyboard.press("Escape");
   await expect(workspace).toBeHidden();
 
@@ -113,6 +117,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
       .toContainText(`${agentName} is suspended`);
     await expect(workspace.getByTestId("agent-connect-command")).toHaveCount(0);
     await expect(workspace.getByTestId("agent-workspace-command")).toHaveCount(0);
+    await expect(workspace.getByTestId("agent-workspace-file-command")).toHaveCount(0);
     await expect(workspace.getByTestId("workspace-ssh-unavailable"))
       .toContainText("until the selected agent identity is active");
     await postProductJson(

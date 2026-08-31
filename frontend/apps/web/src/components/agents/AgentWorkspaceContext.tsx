@@ -36,6 +36,7 @@ export function AgentWorkspaceContext(props: {
   const agentCommand = () =>
     `myelin mcp serve --as ${props.thread.agent_id} --thread ${props.thread.id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
+  const fileCommand = () => `${command()} --sftp`;
   const agentName = () => props.agent?.name ?? `Agent ${props.thread.agent_id.slice(0, 8)}`;
   const commandScope = () => props.agent?.selected_tools.includes("workspace.exec");
   const retryable = () => agentThreadAwaitingRecovery(props.thread);
@@ -139,6 +140,8 @@ export function AgentWorkspaceContext(props: {
           }>
             <p>Run this from an authenticated Myelin CLI. It creates a one-shot key and pins the workspace host.</p>
             <code class="agent-workspace-command" data-testid="agent-workspace-command">{command()}</code>
+            <p>Open the same workspace with the standard SFTP client for remote file editing.</p>
+            <code class="agent-workspace-command" data-testid="agent-workspace-file-command">{fileCommand()}</code>
           </Show>
         </section>
       </Show>

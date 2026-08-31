@@ -1,5 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -190,6 +190,25 @@ describe("private agent work from the CLI", () => {
     expect(resumedWorkspace.exitCode, resumedWorkspace.stderr).toBe(0);
     expect(resumedWorkspace.stdout).toBe(observation);
 
+    const uploadPath = resolve(configDirectory, "editor-upload.txt");
+    const downloadPath = resolve(configDirectory, "editor-download.txt");
+    const editorObservation = uniqueName("The standard CLI SFTP client was here");
+    await writeFile(uploadPath, editorObservation, { encoding: "utf8", mode: 0o600 });
+    const transferredWorkspace = await runCliWith(
+      configDirectory,
+      {
+        input: [
+          `put ${uploadPath} notes/from-cli-sftp.txt`,
+          `get notes/from-cli-sftp.txt ${downloadPath}`,
+          "bye",
+          "",
+        ].join("\n"),
+      },
+      ["agent", "thread", "ssh", threadId, "--sftp"],
+    );
+    expect(transferredWorkspace.exitCode, transferredWorkspace.stderr).toBe(0);
+    expect(await readFile(downloadPath, "utf8")).toBe(editorObservation);
+
     for (const result of [
       activated,
       started,
@@ -201,6 +220,7 @@ describe("private agent work from the CLI", () => {
       agentWorkspace,
       wroteWorkspace,
       resumedWorkspace,
+      transferredWorkspace,
     ]) {
       expect(result.stdout).not.toContain(systemTestConfig.token);
       expect(result.stderr).not.toContain(systemTestConfig.token);
