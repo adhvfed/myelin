@@ -13,8 +13,9 @@ pub use expiry::{
 pub use model::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
     AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadState,
-    CreateAgentThreadOutcome, DurableAgentThread, NewAgentThread, RetryAgentThreadOutcome,
-    MAX_AGENT_THREAD_GIT_REF_BYTES, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_REPOSITORY_BYTES,
+    CreateAgentThreadOutcome, DurableAgentThread, MarkAgentThreadReviewReadyOutcome,
+    NewAgentThread, RetryAgentThreadOutcome, MAX_AGENT_THREAD_GIT_REF_BYTES,
+    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_REPOSITORY_BYTES,
     MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
@@ -22,14 +23,16 @@ pub use schema::{
     agent_thread_durable_migrations, agent_thread_environment_migrations,
     agent_thread_file_transfer_migrations, agent_thread_git_binding_migrations,
     agent_thread_publication_migrations, agent_thread_recent_list_migrations,
-    agent_thread_session_launch_migrations, agent_thread_ssh_connection_migrations,
-    agent_thread_ssh_single_use_migrations, AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION,
-    AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION, AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION,
-    AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION, AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION,
-    AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION, AGENT_THREAD_MIGRATION,
-    AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
-    AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX,
-    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,
+    agent_thread_review_ready_migrations, agent_thread_session_launch_migrations,
+    agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
+    AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION, AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION, AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION,
+    AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION, AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION,
+    AGENT_THREAD_MIGRATION, AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION,
+    AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION, AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION,
+    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION,
+    AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION,
+    AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION, AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION,
     AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION,
@@ -114,6 +117,7 @@ impl DurableAgentThreadBacking {
                               environment_provider, environment_config_path,
                               environment_config_digest,
                               retention_days, state, storage_locator, publication_completed_at,
+                              review_ready_at,
                               failure_reason, created_at,
                               expires_at, updated_at",
                         )
@@ -204,6 +208,7 @@ impl DurableAgentThreadBacking {
                            environment_provider, environment_config_path,
                            environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
+                           review_ready_at,
                            failure_reason, created_at,
                            expires_at, updated_at",
                     )
@@ -310,6 +315,7 @@ impl DurableAgentThreadBacking {
                           environment_provider, environment_config_path,
                           environment_config_digest,
                           retention_days, state, storage_locator, publication_completed_at,
+                          review_ready_at,
                           failure_reason, created_at,
                           expires_at, updated_at",
                     )
@@ -407,6 +413,7 @@ impl DurableAgentThreadBacking {
                           environment_provider, environment_config_path,
                           environment_config_digest,
                           retention_days, state, storage_locator, publication_completed_at,
+                          review_ready_at,
                           failure_reason, created_at, expires_at, updated_at",
                     )
                     .bind(&tenant)
@@ -419,6 +426,93 @@ impl DurableAgentThreadBacking {
                     .await
                     .map_err(query_error("complete agent thread publication"))?;
                     row.as_ref().map(row_to_thread).transpose()
+                })
+            })
+            .await
+    }
+
+    pub async fn mark_review_ready(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        thread_id: Uuid,
+        marked_at: DateTime<Utc>,
+    ) -> Result<MarkAgentThreadReviewReadyOutcome, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner = owner_principal_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let current = sqlx::query(
+                        "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
+                           conversation_id, workspace_id, workspace_generation, name, project_id,
+                           repository_slug, base_ref, base_oid, workspace_branch,
+                           environment_provider, environment_config_path,
+                           environment_config_digest,
+                           retention_days, state, storage_locator, publication_completed_at,
+                           review_ready_at, failure_reason, created_at, expires_at, updated_at
+                         FROM agent_thread
+                         WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                           AND owner_principal_id = $4
+                         FOR UPDATE",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(thread_id)
+                    .bind(&owner)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("lock agent thread for review publication"))?;
+                    let Some(current) = current.as_ref().map(row_to_thread).transpose()? else {
+                        return Ok(MarkAgentThreadReviewReadyOutcome::NotFound);
+                    };
+                    if current.project_id.is_none() {
+                        return Ok(MarkAgentThreadReviewReadyOutcome::ProjectRequired);
+                    }
+                    if current.review_ready_at.is_some() {
+                        return Ok(MarkAgentThreadReviewReadyOutcome::AlreadyReady(current));
+                    }
+                    if !current.is_published()
+                        || current.state != AgentThreadState::Ready
+                        || DateTime::parse_from_rfc3339(&current.expires_at).map_err(|_| {
+                            PgError::Query("stored agent thread expiry is invalid".into())
+                        })? <= marked_at
+                    {
+                        return Ok(MarkAgentThreadReviewReadyOutcome::Unavailable);
+                    }
+
+                    let row = sqlx::query(
+                        "UPDATE agent_thread
+                            SET review_ready_at = $5, updated_at = GREATEST(updated_at, $5)
+                          WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
+                            AND owner_principal_id = $4 AND review_ready_at IS NULL
+                        RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
+                          conversation_id, workspace_id, workspace_generation, name, project_id,
+                          repository_slug, base_ref, base_oid, workspace_branch,
+                          environment_provider, environment_config_path,
+                          environment_config_digest,
+                          retention_days, state, storage_locator, publication_completed_at,
+                          review_ready_at, failure_reason, created_at, expires_at, updated_at",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(thread_id)
+                    .bind(&owner)
+                    .bind(marked_at)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("mark agent thread ready for review"))?;
+                    row.as_ref()
+                        .map(row_to_thread)
+                        .transpose()?
+                        .map(MarkAgentThreadReviewReadyOutcome::Marked)
+                        .ok_or_else(|| {
+                            PgError::Query(
+                                "agent thread review publication lost its locked row".into(),
+                            )
+                            .into()
+                        })
                 })
             })
             .await
@@ -473,6 +567,7 @@ impl DurableAgentThreadBacking {
                           thread.environment_provider, thread.environment_config_path,
                           thread.environment_config_digest, thread.retention_days, thread.state,
                           thread.storage_locator, thread.publication_completed_at,
+                          thread.review_ready_at,
                           thread.failure_reason, thread.created_at, thread.expires_at,
                           thread.updated_at",
                     )
@@ -540,6 +635,7 @@ impl DurableAgentThreadBacking {
                                   environment_provider, environment_config_path,
                                   environment_config_digest,
                                   retention_days, state, storage_locator, publication_completed_at,
+                                  review_ready_at,
                                   failure_reason, created_at,
                                   expires_at, updated_at",
                             )
@@ -654,6 +750,7 @@ impl DurableAgentThreadBacking {
                            environment_provider, environment_config_path,
                            environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
+                           review_ready_at,
                            failure_reason, created_at,
                            expires_at, updated_at
                         FROM agent_thread
@@ -710,6 +807,7 @@ impl DurableAgentThreadBacking {
                            environment_provider, environment_config_path,
                            environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
+                           review_ready_at,
                            failure_reason, created_at,
                            expires_at, updated_at
                          FROM agent_thread
@@ -905,7 +1003,8 @@ async fn by_nonce(
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
            environment_provider, environment_config_path, environment_config_digest,
-           retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
+           retention_days, state, storage_locator, publication_completed_at, review_ready_at,
+           failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
         WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3 AND client_nonce = $4
@@ -932,7 +1031,8 @@ async fn by_id(
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
            environment_provider, environment_config_path, environment_config_digest,
-           retention_days, state, storage_locator, publication_completed_at, failure_reason, created_at,
+           retention_days, state, storage_locator, publication_completed_at, review_ready_at,
+           failure_reason, created_at,
            expires_at, updated_at
          FROM agent_thread
         WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
@@ -1016,6 +1116,9 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
         storage_locator: row.get("storage_locator"),
         publication_completed_at: row
             .get::<Option<DateTime<Utc>>, _>("publication_completed_at")
+            .map(DurableAgentThread::timestamp),
+        review_ready_at: row
+            .get::<Option<DateTime<Utc>>, _>("review_ready_at")
             .map(DurableAgentThread::timestamp),
         failure_reason: row.get("failure_reason"),
         created_at: DurableAgentThread::timestamp(row.get("created_at")),

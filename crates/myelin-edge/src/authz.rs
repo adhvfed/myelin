@@ -24,6 +24,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.agent_threads.list",
     "identity.agent_thread.create",
     "identity.agent_thread.view",
+    "identity.agent_thread.review.publish",
     "identity.agent_thread.run.create",
     "identity.agent_thread.ssh_access.create",
     "identity.agent_thread.workspace_sessions.list",
@@ -189,6 +190,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         HUMAN_SESSION
     ),
     requirement!("identity.agent_thread.view", "agent.view", HUMAN_SESSION),
+    requirement!(
+        "identity.agent_thread.review.publish",
+        "agent.manage",
+        HUMAN_SESSION
+    ),
     requirement!(
         "identity.agent_thread.run.create",
         "agent.run",

@@ -326,6 +326,29 @@ ALTER TABLE agent_thread
   VALIDATE CONSTRAINT agent_thread_environment_complete;
 "#;
 
+pub const AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  ADD COLUMN IF NOT EXISTS review_ready_at timestamptz;
+"#;
+
+pub const AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  DROP CONSTRAINT IF EXISTS agent_thread_review_ready_shape;
+ALTER TABLE agent_thread
+  ADD CONSTRAINT agent_thread_review_ready_shape CHECK (
+    review_ready_at IS NULL
+    OR (project_id IS NOT NULL
+      AND publication_completed_at IS NOT NULL
+      AND state IN ('ready', 'expiring', 'deleted')
+      AND review_ready_at >= publication_completed_at)
+  ) NOT VALID;
+"#;
+
+pub const AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  VALIDATE CONSTRAINT agent_thread_review_ready_shape;
+"#;
+
 pub const AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION: &str = r#"
 UPDATE agent_thread_workspace_session
    SET launched_at = started_at
@@ -575,6 +598,29 @@ pub fn agent_thread_environment_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_review_ready_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0163_agent_thread_review_ready_expand",
+            AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0164_agent_thread_review_ready_shape",
+            AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0165_agent_thread_review_ready_invariant",
+            AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread",
+        ),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +666,20 @@ mod tests {
         assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
         assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
         assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+    }
+
+    #[test]
+    fn review_ready_is_a_forward_only_online_schema_change() {
+        let migrations = agent_thread_review_ready_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["agent_thread"]))
+            .expect("the live review-ready migration is online-safe");
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+        assert!(AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION.contains("NOT VALID"));
     }
 
     #[test]

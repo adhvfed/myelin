@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration as StdDuration};
 
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use myelin_agent_service::{
     workspace::{AgentWorkspaceStore, RepositoryWorkspaceSource},
     PlatformToolCatalogue,
@@ -15,9 +15,9 @@ use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
     AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRunBinding, AgentThreadState,
     BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, ListAgentThreadsOutcome, NewAgentThread, RetryAgentThreadOutcome,
-    WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
-    MIN_AGENT_THREAD_RETENTION_DAYS,
+    DurableAgentThreadBacking, ListAgentThreadsOutcome, MarkAgentThreadReviewReadyOutcome,
+    NewAgentThread, RetryAgentThreadOutcome, WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES,
+    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -291,6 +291,56 @@ impl AgentThreadHttpApi {
             }
         };
         self.provision(principal, thread)
+    }
+
+    fn mark_ready_for_review(
+        &self,
+        principal: &Principal,
+        thread_id: Uuid,
+    ) -> Result<(DurableAgentThread, bool), EdgeError> {
+        let marked_at = Utc::now();
+        let thread = self.available_owner_thread(principal, thread_id, marked_at)?;
+        let project_id = thread.project_id.as_deref().ok_or_else(|| {
+            EdgeError::Conflict(
+                "an agent thread must belong to a project before it can be marked ready".into(),
+            )
+        })?;
+        let conversation = ConversationId::new(
+            principal.tenant.0.clone(),
+            principal.region.0.clone(),
+            thread.conversation_id.clone(),
+        );
+        self.chat_mutations
+            .publish_private_conversation_to_project(
+                principal,
+                &conversation,
+                project_id,
+                Timestamp(thread.expires_at.clone()),
+                Timestamp(marked_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            )?;
+        let outcome = self
+            .drive(self.threads.mark_review_ready(
+                &principal.tenant.0,
+                &principal.principal_id.0,
+                thread_id,
+                marked_at,
+            ))?
+            .map_err(|_| {
+                EdgeError::Internal("agent thread review state could not be saved".into())
+            })?;
+        match outcome {
+            MarkAgentThreadReviewReadyOutcome::Marked(thread) => Ok((thread, true)),
+            MarkAgentThreadReviewReadyOutcome::AlreadyReady(thread) => Ok((thread, false)),
+            MarkAgentThreadReviewReadyOutcome::NotFound => {
+                Err(EdgeError::NotFound("agent thread not found".into()))
+            }
+            MarkAgentThreadReviewReadyOutcome::ProjectRequired => Err(EdgeError::Conflict(
+                "an agent thread must belong to a project before it can be marked ready".into(),
+            )),
+            MarkAgentThreadReviewReadyOutcome::Unavailable => Err(EdgeError::Conflict(
+                "agent thread is no longer available for review publication".into(),
+            )),
+        }
     }
 
     fn recover(&self, tenant: &TenantId, region: &Region, thread: DurableAgentThread) {
@@ -750,6 +800,32 @@ impl Handler for AgentThreadRetryHandler {
     }
 }
 
+struct AgentThreadReviewReadyHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadReviewReadyHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "agent thread review publication",
+            MAX_AGENT_THREAD_JSON_BYTES,
+        )?;
+        let (thread, changed) = self
+            .api
+            .mark_ready_for_review(ctx.principal, thread_param(ctx)?)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "thread": thread_json(&ctx.principal.tenant.0, &thread),
+                "changed": changed,
+                "durable": true,
+            }),
+        )))
+    }
+}
+
 struct AgentThreadRunCreateHandler {
     api: AgentThreadHttpApi,
 }
@@ -994,6 +1070,12 @@ pub fn register_agent_threads(
         )
         .route(
             Method::Post,
+            "/v1/agent-threads/{thread}/ready",
+            "identity.agent_thread.review.publish",
+            Arc::new(AgentThreadReviewReadyHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
             "/v1/agent-threads/{thread}/runs",
             "identity.agent_thread.run.create",
             Arc::new(AgentThreadRunCreateHandler { api: api.clone() }),
@@ -1106,6 +1188,8 @@ fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
             "myelin://{tenant}/chat/channel/{}",
             thread.conversation_id
         ),
+        "review_state": if thread.review_ready_at.is_some() { "ready" } else { "draft" },
+        "review_ready_at": thread.review_ready_at,
         "workspace": {
             "id": thread.workspace_id,
             "generation": thread.workspace_generation,
@@ -1415,6 +1499,7 @@ mod tests {
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:receipt".into()),
             publication_completed_at: Some("2026-08-31T00:00:01Z".into()),
+            review_ready_at: None,
             failure_reason: None,
             created_at: "2026-08-31T00:00:00Z".into(),
             expires_at: "2026-09-03T00:00:00Z".into(),
@@ -1523,6 +1608,7 @@ mod tests {
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),
             publication_completed_at: Some("2026-08-22T00:00:01Z".into()),
+            review_ready_at: None,
             failure_reason: None,
             created_at: "2026-08-22T00:00:00Z".into(),
             expires_at: "2026-08-25T00:00:00Z".into(),
@@ -1531,6 +1617,12 @@ mod tests {
         let rendered = thread_json("acme", &thread);
         assert!(!rendered.to_string().contains("internal"));
         assert_eq!(rendered["workspace"]["state"], "ready");
+        assert_eq!(rendered["review_state"], "draft");
+
+        thread.review_ready_at = Some("2026-08-22T00:00:02Z".into());
+        let ready_for_review = thread_json("acme", &thread);
+        assert_eq!(ready_for_review["review_state"], "ready");
+        assert_eq!(ready_for_review["review_ready_at"], "2026-08-22T00:00:02Z");
 
         thread.publication_completed_at = None;
         let unpublished = thread_json("acme", &thread);
@@ -1567,6 +1659,7 @@ mod tests {
             state: AgentThreadState::Ready,
             storage_locator: Some("workspace:v1:internal".into()),
             publication_completed_at: Some("2026-08-22T00:00:01Z".into()),
+            review_ready_at: None,
             failure_reason: None,
             created_at: "2026-08-22T00:00:00Z".into(),
             expires_at: "2026-08-25T00:00:00Z".into(),

@@ -349,7 +349,7 @@ impl DurableChatMutationApi {
         let zookie = self
             .reads
             .authorization
-            .bind_public_project(principal, &persisted, now)?;
+            .bind_public_project(principal, &persisted, None, now)?;
         self.drive(async {
             self.reads
                 .conversations
@@ -412,6 +412,45 @@ impl DurableChatMutationApi {
             self.reads
                 .conversations
                 .stamp_acl_zookie(conversation, acl_zookie)
+                .await
+                .map_err(map_conversation_error)
+        })
+    }
+
+    pub fn publish_private_conversation_to_project(
+        &self,
+        principal: &Principal,
+        conversation: &ConversationId,
+        project_id: &str,
+        expires_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<Conversation, EdgeError> {
+        let persisted = self.drive(async {
+            self.reads
+                .conversations
+                .get(conversation)
+                .await
+                .map_err(map_conversation_error)
+        })?;
+        if persisted.parent_project.as_deref() != Some(project_id)
+            || !matches!(
+                persisted.kind,
+                ConversationKind::ChannelPrivate | ConversationKind::ChannelPublic
+            )
+            || persisted.archived
+        {
+            return Err(EdgeError::NotFound("conversation not found".into()));
+        }
+        let zookie = self.reads.authorization.bind_public_project(
+            principal,
+            &persisted,
+            Some(expires_at),
+            now,
+        )?;
+        self.drive(async {
+            self.reads
+                .conversations
+                .publish_private_to_project(conversation, project_id, &zookie.0)
                 .await
                 .map_err(map_conversation_error)
         })

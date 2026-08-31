@@ -37,6 +37,8 @@ export interface AgentThread {
   project_id: string | null;
   conversation_id: string;
   conversation_ref: string;
+  review_state: "draft" | "ready";
+  review_ready_at: string | null;
   workspace: {
     id: string;
     generation: number;
@@ -68,6 +70,12 @@ export interface AgentThreadPage {
 export interface AgentThreadCreateReceipt {
   thread: AgentThread;
   created: boolean;
+  durable: true;
+}
+
+export interface AgentThreadReviewReceipt {
+  thread: AgentThread;
+  changed: boolean;
   durable: true;
 }
 
@@ -227,13 +235,17 @@ function thread(value: unknown): AgentThread | null {
   const environment = workspace?.environment === null ? null : record(workspace?.environment);
   if (!row || !exact(row, [
     "id", "ref", "name", "agent_id", "agent_ref", "project_id", "conversation_id",
-    "conversation_ref", "workspace", "created_at", "updated_at",
+    "conversation_ref", "review_state", "review_ready_at", "workspace", "created_at", "updated_at",
   ]) || !workspace || !exact(workspace, [
     "id", "generation", "state", "retention_days", "expires_at", "repository", "environment",
   ]) || !isAgentThreadId(row.id) || !cleanText(row.ref, 4_096) || !cleanText(row.name, 80) ||
       !isAgentThreadId(row.agent_id) || !cleanText(row.agent_ref, 4_096) ||
       (row.project_id !== null && !isAgentThreadId(row.project_id)) ||
       !isUlid(row.conversation_id) || !cleanText(row.conversation_ref, 4_096) ||
+      !["draft", "ready"].includes(row.review_state as string) ||
+      (row.review_ready_at !== null && !timestamp(row.review_ready_at)) ||
+      (row.review_state === "draft" && row.review_ready_at !== null) ||
+      (row.review_state === "ready" && (row.project_id === null || !timestamp(row.review_ready_at))) ||
       !isAgentThreadId(workspace.id) || !positiveInteger(workspace.generation, 4_294_967_295) ||
       !["provisioning", "ready", "expiring", "deleted", "failed"].includes(workspace.state as string) ||
       !positiveInteger(workspace.retention_days, 30) || !timestamp(workspace.expires_at) ||
@@ -281,10 +293,21 @@ export function parseAgentThreadCreateReceipt(value: unknown): AgentThreadCreate
     : null;
 }
 
+export function parseAgentThreadReviewReceipt(value: unknown): AgentThreadReviewReceipt | null {
+  const receipt = record(value);
+  const reviewedThread = thread(receipt?.thread);
+  return receipt && exact(receipt, ["thread", "changed", "durable"]) &&
+    typeof receipt.changed === "boolean" && receipt.durable === true && reviewedThread &&
+    reviewedThread.review_state === "ready" && reviewedThread.review_ready_at !== null
+    ? { thread: reviewedThread, changed: receipt.changed, durable: true }
+    : null;
+}
+
 export function parseAgentThreadMessages(value: unknown, threadId: string): ChatMessagePage | null {
   if (!isAgentThreadId(threadId)) return null;
   const messages = parseChatMessages(value);
-  return messages?.conversation.kind === "channel_private" &&
+  if (!messages) return null;
+  return ["channel_private", "channel_public"].includes(messages.conversation.kind) &&
     messages.conversation.linked_ref?.endsWith(`/agent/thread/${threadId}`)
     ? messages
     : null;

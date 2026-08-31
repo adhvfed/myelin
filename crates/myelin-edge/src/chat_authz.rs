@@ -50,6 +50,7 @@ impl ChatAuthorization {
         &self,
         actor: &Principal,
         conversation: &Conversation,
+        expires_at: Option<Timestamp>,
         occurred_at: Timestamp,
     ) -> Result<Zookie, EdgeError> {
         let project_id = conversation.parent_project.as_deref().ok_or_else(|| {
@@ -79,7 +80,7 @@ impl ChatAuthorization {
         let scope = TenantScope::from_verified_token(actor, actor.region.clone());
         self.identity
             .tuples()
-            .write_tuples(&scope, actor, &deltas, None, None, occurred_at)
+            .write_tuples(&scope, actor, &deltas, None, expires_at, occurred_at)
             .map_err(|error| {
                 EdgeError::Internal(format!(
                     "Chat authorization could not be persisted: {error}"
@@ -251,7 +252,12 @@ mod tests {
         let mut room = conversation(&owner);
         room.acl_zookie = Some(
             authorization
-                .bind_public_project(&owner, &room, Timestamp("2026-08-11T00:00:01Z".into()))
+                .bind_public_project(
+                    &owner,
+                    &room,
+                    None,
+                    Timestamp("2026-08-11T00:00:01Z".into()),
+                )
                 .unwrap()
                 .0,
         );

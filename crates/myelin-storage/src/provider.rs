@@ -258,6 +258,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_thread_durable::agent_thread_ssh_connection_migrations(),
         crate::agent_thread_durable::agent_thread_file_transfer_migrations(),
         crate::agent_thread_durable::agent_thread_environment_migrations(),
+        crate::agent_thread_durable::agent_thread_review_ready_migrations(),
     ]
 }
 

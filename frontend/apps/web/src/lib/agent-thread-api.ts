@@ -8,6 +8,7 @@ import {
   parseAgentChoices,
   parseAgentThread,
   parseAgentThreadCreateReceipt,
+  parseAgentThreadReviewReceipt,
   parseAgentThreadMessageReceipt,
   parseAgentThreadMessages,
   parseAgentThreads,
@@ -18,6 +19,7 @@ import {
   type AgentThread,
   type AgentThreadCreateReceipt,
   type AgentThreadPage,
+  type AgentThreadReviewReceipt,
   type WorkspaceSessionPage,
 } from "./agent-thread-response";
 import type { ChatMessagePage } from "./chat-response";
@@ -26,6 +28,7 @@ export type AgentThreadErrorKind = "bad-input" | "not-found" | "conflict" | "una
 export type AgentThreadMutationResult =
   | { ok: true; op: "create"; receipt: AgentThreadCreateReceipt }
   | { ok: true; op: "retry"; receipt: AgentThreadCreateReceipt }
+  | { ok: true; op: "mark-ready"; receipt: AgentThreadReviewReceipt }
   | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
   | { ok: true; op: "post-message"; messageId: string; threadId: string }
   | { ok: false; error: AgentThreadErrorKind };
@@ -228,9 +231,11 @@ export const mutateAgentThread = action(async (input: unknown) => {
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "create" && Object.keys(mutation).every((key) =>
-      ["op", "name", "agentId", "retentionDays", "repository", "baseRef", "branch", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 8 && cleanText(mutation.name, 80) &&
+      ["op", "name", "agentId", "projectId", "retentionDays", "repository", "baseRef", "branch", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 9 && cleanText(mutation.name, 80) &&
         isAgentThreadId(mutation.agentId) && positiveRetention(mutation.retentionDays) &&
+        typeof mutation.projectId === "string" &&
+        (mutation.projectId === "" || isAgentThreadId(mutation.projectId)) &&
         typeof mutation.repository === "string" &&
         (mutation.repository === "" || cleanText(mutation.repository, 255)) &&
         typeof mutation.baseRef === "string" && cleanText(mutation.baseRef, 1_024) &&
@@ -240,6 +245,7 @@ export const mutateAgentThread = action(async (input: unknown) => {
       const receipt = parseAgentThreadCreateReceipt(await edgePost("/v1/agent-threads", {
         name: mutation.name,
         agent_id: mutation.agentId,
+        ...(mutation.projectId === "" ? {} : { project_id: mutation.projectId }),
         retention_days: mutation.retentionDays,
         ...(mutation.repository === "" ? {} : {
           workspace: {
@@ -262,6 +268,17 @@ export const mutateAgentThread = action(async (input: unknown) => {
       ));
       return receipt
         ? respond({ ok: true, op: "retry", receipt })
+        : respond({ ok: false, error: "error" });
+    }
+    if (mutation.op === "mark-ready" && Object.keys(mutation).every((key) =>
+      ["op", "threadId"].includes(key)) && Object.keys(mutation).length === 2 &&
+        isAgentThreadId(mutation.threadId)) {
+      const receipt = parseAgentThreadReviewReceipt(await edgePost(
+        `/v1/agent-threads/${segment(mutation.threadId)}/ready`,
+        {},
+      ));
+      return receipt
+        ? respond({ ok: true, op: "mark-ready", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "post-message" && Object.keys(mutation).every((key) =>

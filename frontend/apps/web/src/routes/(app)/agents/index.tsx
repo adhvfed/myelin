@@ -85,6 +85,7 @@ export default function AgentThreadsIndex() {
   const [loadingMoreSessions, setLoadingMoreSessions] = createSignal(false);
   const [retryingWorkspace, setRetryingWorkspace] = createSignal(false);
   const [retryWorkspaceError, setRetryWorkspaceError] = createSignal<string | null>(null);
+  const [markingReady, setMarkingReady] = createSignal(false);
   let threadGeneration = 0;
   let messageGeneration = 0;
   let workspaceSessionGeneration = 0;
@@ -224,6 +225,7 @@ export default function AgentThreadsIndex() {
     setLoadingMoreSessions(false);
     setRetryingWorkspace(false);
     setRetryWorkspaceError(null);
+    setMarkingReady(false);
   });
 
   const retryWorkspace = async () => {
@@ -259,6 +261,44 @@ export default function AgentThreadsIndex() {
       setRetryWorkspaceError("Myelin couldn’t confirm the retry. Try again with the same retained thread.");
     } finally {
       setRetryingWorkspace(false);
+    }
+  };
+  const markReadyForReview = async () => {
+    const thread = selectedThread()?.page;
+    if (!thread || !thread.project_id || thread.review_state === "ready" || markingReady()) return;
+    setMarkingReady(true);
+    try {
+      const result = await mutate({ op: "mark-ready", threadId: thread.id });
+      if (!result.ok || result.op !== "mark-ready") {
+        toast.show({
+          title: result.ok || result.error === "error"
+            ? "Myelin couldn’t confirm project visibility"
+            : result.error === "conflict"
+              ? "This retained workspace can no longer be shared"
+              : result.error === "not-found"
+                ? "This private thread is no longer available"
+                : "Project visibility is temporarily unavailable",
+          variant: "warning",
+        });
+        return;
+      }
+      threadGeneration += 1;
+      setThreadPages([]);
+      await Promise.all([
+        revalidate(getAgentThread.keyFor(thread.id)),
+        revalidate(getAgentThreads.keyFor({ limit: 100 })),
+        revalidate(getAgentThreadMessages.keyFor({ threadId: thread.id, limit: 100 })),
+      ]);
+      toast.show({
+        title: result.receipt.changed
+          ? "Ready for project review"
+          : "Already visible to project collaborators",
+        variant: "success",
+      });
+    } catch {
+      toast.show({ title: "Myelin couldn’t confirm project visibility", variant: "warning" });
+    } finally {
+      setMarkingReady(false);
     }
   };
   createEffect(() => {
@@ -367,7 +407,12 @@ export default function AgentThreadsIndex() {
 
   const refreshMessages = async (threadId: string) => {
     await revalidate(getAgentThreadMessages.keyFor({ threadId, limit: 100 }));
-    toast.show({ title: "Message sent privately", variant: "success" });
+    toast.show({
+      title: selectedThread()?.page?.review_state === "ready"
+        ? "Message sent to project review"
+        : "Message sent privately",
+      variant: "success",
+    });
   };
   const openCreate = () => navigate(validSelectedId()
     ? `/agents?thread=${encodeURIComponent(validSelectedId()!)}&new=1`
@@ -419,6 +464,8 @@ export default function AgentThreadsIndex() {
                   onLoadEarlier={() => void loadEarlier()}
                   onPosted={refreshMessages}
                   workspaceAvailable={workspaceAvailable()}
+                  markingReady={markingReady()}
+                  onMarkReady={() => void markReadyForReview()}
                 />
               </Show>
             </Show>

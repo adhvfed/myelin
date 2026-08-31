@@ -11,6 +11,7 @@ import {
   parseAgentThreadCreateReceipt,
   parseAgentThreadMessageReceipt,
   parseAgentThreadMessages,
+  parseAgentThreadReviewReceipt,
   parseAgentThreads,
   parseWorkspaceSessions,
 } from "./agent-thread-response";
@@ -51,6 +52,8 @@ const subject = {
   project_id: null,
   conversation_id: CONVERSATION,
   conversation_ref: `myelin://acme/chat/channel/${CONVERSATION}`,
+  review_state: "draft",
+  review_ready_at: null,
   workspace: {
     id: WORKSPACE,
     generation: 1,
@@ -161,6 +164,16 @@ describe("private agent work wire projection", () => {
     expect(parseAgentThread({ thread: subject })).toEqual(subject);
     expect(parseAgentThreadCreateReceipt({ thread: subject, created: true, durable: true }))
       .toEqual({ thread: subject, created: true, durable: true });
+    const ready = {
+      ...subject,
+      project_id: "55555555-5555-4555-8555-555555555555",
+      review_state: "ready",
+      review_ready_at: "2026-08-22T12:00:02Z",
+    };
+    expect(parseAgentThreadReviewReceipt({ thread: ready, changed: true, durable: true }))
+      .toEqual({ thread: ready, changed: true, durable: true });
+    expect(parseAgentThreadReviewReceipt({ thread: subject, changed: true, durable: true }))
+      .toBeNull();
     expect(parseAgentThreadMessages({
       conversation,
       items: [{

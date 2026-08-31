@@ -381,6 +381,46 @@ impl PgConversationStore {
         Ok(())
     }
 
+    /// Promote a project-bound private conversation to project visibility.
+    ///
+    /// The transition is deliberately one-way and idempotent. Authorization tuples are
+    /// written first by the caller; storing their zookie with the kind change makes the
+    /// conversation discoverable to project collaborators only after that grant exists.
+    pub async fn publish_private_to_project(
+        &self,
+        id: &ConversationId,
+        project_id: &str,
+        acl_zookie: &str,
+    ) -> Result<Conversation, ConversationError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(storage("acquire conversation publication connection"))?;
+        self.set_session_scope(&mut conn, &id.tenant, &id.region)
+            .await?;
+        let row = sqlx::query(
+            "UPDATE chat_conversation
+                SET kind = 'channel_public', acl_zookie = $5
+              WHERE tenant_id = $1 AND region = $2 AND conversation_id = $3
+                AND parent_project = $4 AND kind IN ('channel_private', 'channel_public')
+                AND NOT archived
+            RETURNING tenant_id, region, conversation_id, kind, home_cell, parent_project, name,
+                      topic, linked_ref, pinned_canvas, retention_days, archived, created_by,
+                      acl_zookie",
+        )
+        .bind(&id.tenant)
+        .bind(&id.region)
+        .bind(&id.conversation_id)
+        .bind(project_id)
+        .bind(acl_zookie)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(storage("publish private conversation to project"))?
+        .ok_or_else(|| ConversationError::NotFound(id.conversation_id.clone()))?;
+        row_to_conversation(&row)
+    }
+
     pub async fn find_public_by_name_topic(
         &self,
         tenant: &str,

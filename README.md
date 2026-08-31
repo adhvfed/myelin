@@ -3,6 +3,11 @@
 A self-hostable software collaboration platform: git hosting, issues, CI, chat,
 and agents in one platform, built in Rust.
 
+The [product vision](docs/product-vision.md) centers on private-by-default personal cloud agents:
+people can shape named agents, iterate with them in durable cloud branches and workspaces, connect an
+ordinary editor over owner-authorized SSH/SFTP, and deliberately publish project-bound work only
+when it is ready for review.
+
 ## What's inside
 
 - **Git hosting** — smart HTTP wire protocol, durable refs with transactional
@@ -118,6 +123,10 @@ myelin agent thread retry 33333333-3333-4333-8333-333333333333
 myelin agent thread say 33333333-3333-4333-8333-333333333333 \
   "The final reader still owns its checkout lease."
 myelin agent thread history 33333333-3333-4333-8333-333333333333
+# A project-bound thread remains owner-and-agent-only until this explicit transition. Marking it
+# ready shares its durable conversation with current project collaborators, but never grants them
+# agent-run, command, SSH, or infrastructure authority.
+myelin agent thread ready 33333333-3333-4333-8333-333333333333
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \
   --thread 33333333-3333-4333-8333-333333333333
 # The one-shot credential claims one SSH transport, which may carry multiple bounded, separately

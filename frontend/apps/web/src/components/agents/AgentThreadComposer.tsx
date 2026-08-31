@@ -32,6 +32,7 @@ function errorCopy(kind: AgentThreadErrorKind): string {
 export function AgentThreadComposer(props: {
   threadId: string;
   threadName: string;
+  sharedForReview: boolean;
   disabled?: boolean;
   onPosted: (threadId: string) => Promise<void> | void;
 }) {
@@ -133,7 +134,7 @@ export function AgentThreadComposer(props: {
           disabled={!interactive() || draft().sending || props.disabled || !draft().content.trim()}
         >
           <Icon name={draft().sending ? "cycle" : "message"} />
-          {draft().sending ? "Sending…" : "Send privately"}
+          {draft().sending ? "Sending…" : props.sharedForReview ? "Send to review" : "Send privately"}
         </button>
       </div>
     </div>

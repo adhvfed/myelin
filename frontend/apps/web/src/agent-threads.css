@@ -147,6 +147,24 @@
   white-space: nowrap;
 }
 
+.agent-thread-review-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-inline-start: auto;
+}
+
+.agent-thread-ready-cue {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--success);
+  font-size: var(--fs-caption);
+  white-space: nowrap;
+}
+
+.agent-thread-review-button { min-height: 2rem; }
+
 .agent-thread-composer {
   padding: var(--space-3) var(--space-4);
   border-block-start: var(--hairline) solid var(--border);
@@ -277,6 +295,7 @@
   .agent-thread-sidebar-mobile-hidden { display: none; }
   .agent-thread-sidebar { border-inline-end: none; }
   .agent-thread-private-cue { display: none; }
+  .agent-thread-review-actions { gap: 0; }
   .agent-thread-composer { padding-inline: var(--space-2); }
   .agent-thread-composer-footer { align-items: flex-end; }
   .agent-thread-composer-footer > span { max-width: 22ch; }

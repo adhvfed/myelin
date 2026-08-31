@@ -111,10 +111,20 @@ pub struct DurableAgentThread {
     pub state: AgentThreadState,
     pub storage_locator: Option<String>,
     pub publication_completed_at: Option<String>,
+    pub review_ready_at: Option<String>,
     pub failure_reason: Option<String>,
     pub created_at: String,
     pub expires_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkAgentThreadReviewReadyOutcome {
+    Marked(DurableAgentThread),
+    AlreadyReady(DurableAgentThread),
+    NotFound,
+    ProjectRequired,
+    Unavailable,
 }
 
 impl DurableAgentThread {

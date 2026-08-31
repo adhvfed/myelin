@@ -36,6 +36,8 @@ export interface PrivateAgentThread {
   project_id: string | null;
   conversation_id: string;
   conversation_ref: string;
+  review_state: "draft" | "ready";
+  review_ready_at: string | null;
   workspace: AgentThreadWorkspace;
   created_at: string;
   updated_at: string;
@@ -129,6 +131,20 @@ export async function retryPrivateAgentThread(
   };
 }
 
+export async function markAgentThreadReadyForReview(
+  client: SystemTestClient,
+  threadId: string,
+): Promise<{ thread: PrivateAgentThread; changed: boolean }> {
+  const response = await client.json(
+    `/v1/agent-threads/${encodeURIComponent(threadId)}/ready`,
+    { method: "POST", body: {}, expectedStatus: 200 },
+  );
+  return {
+    thread: parsePrivateAgentThread(response.body.thread),
+    changed: response.body.changed === true,
+  };
+}
+
 export async function requestWorkspaceSshAccess(
   client: SystemTestClient,
   threadId: string,
@@ -191,6 +207,10 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
     project_id: thread.project_id === null ? null : string(thread.project_id, "thread project id"),
     conversation_id: string(thread.conversation_id, "thread conversation id"),
     conversation_ref: string(thread.conversation_ref, "thread conversation ref"),
+    review_state: reviewState(thread.review_state),
+    review_ready_at: thread.review_ready_at === null
+      ? null
+      : string(thread.review_ready_at, "thread review-ready time"),
     workspace: {
       id: string(workspace.id, "agent workspace id"),
       generation: positiveInteger(workspace.generation, "agent workspace generation"),
@@ -220,6 +240,13 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
     created_at: string(thread.created_at, "agent thread creation time"),
     updated_at: string(thread.updated_at, "agent thread update time"),
   };
+}
+
+function reviewState(value: unknown): "draft" | "ready" {
+  if (value !== "draft" && value !== "ready") {
+    throw new TypeError("agent thread review state must be draft or ready");
+  }
+  return value;
 }
 
 function positiveInteger(value: unknown, context: string): number {

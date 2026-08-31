@@ -1,6 +1,6 @@
 # Private agent threads and durable workspaces
 
-Status: implementation design, 2026-08-22.
+Status: implemented, including private-draft review publication; updated 2026-08-31.
 
 ## The user story
 
@@ -22,6 +22,11 @@ myelin agent thread ssh <thread>
 
 The web application should consume the same Edge resources. There is no privileged GUI-only or
 CLI-only route.
+
+The thread begins as a personal draft even when it has project context. When the owner decides the
+work is coherent, they can mark it ready for review. That explicit, one-way transition publishes the
+conversation to the project's live visibility boundary. It does not publish the workspace itself or
+delegate run, command, SSH, or infrastructure authority.
 
 ## Product model
 
@@ -63,6 +68,13 @@ Every surface resolves through that same live relationship:
 - agent run creation and governed Chat/workspace tools;
 - workspace state and SSH access; and
 - later invitation, removal, archive, renewal, and erasure operations.
+
+Project context is not publication. Before `review_ready_at` exists, a project collaborator must get
+the same content-free not-found result as a stranger on every thread and conversation surface. Once
+the owner marks the work ready, project collaborators inherit Chat read and post authority through
+the existing `parent_project -> view` relationship. Owner-only workspace authority remains
+unchanged. The transition is durable and idempotent; it cannot be reverted to manufacture an
+ambiguous interval in which already-read work is described as private again.
 
 An unauthorized caller receives `not_found` for the thread, conversation, workspace, and SSH grant.
 No list item, error distinction, event, notification, reference projection, hostname, or timing
@@ -133,15 +145,16 @@ The initial Edge surface is intentionally resource-shaped:
 - `GET /v1/agent-threads/{thread}` returns conversation and workspace state.
 - `POST /v1/agent-threads/{thread}/runs` issues a short-lived, thread-bound agent run.
 - `POST /v1/agent-threads/{thread}/ssh-access` issues an ephemeral SSH grant.
+- `POST /v1/agent-threads/{thread}/ready` publishes a project-bound draft conversation for review.
 
 Chat messages continue through `/v1/chat/conversations/{conversation}/messages`; the aggregate does
 not invent a second messaging implementation. Every mutation uses the normal `Idempotency-Key`
 contract. A repeated key returns the original resource only when the full intent matches.
 
 Thread JSON includes `name`, agent and conversation references, workspace id and generation,
-`state`, `retention_days`, `created_at`, and `expires_at`. It never returns internal locators or
-credentials. Expired and deleted threads remain addressable to their owner as lifecycle receipts,
-while their Chat, run, workspace-tool, and SSH surfaces refuse access.
+`state`, `retention_days`, `review_state`, `review_ready_at`, `created_at`, and `expires_at`. It never
+returns internal locators or credentials. Expired and deleted threads remain addressable to their
+owner as lifecycle receipts, while their Chat, run, workspace-tool, and SSH surfaces refuse access.
 
 ## System story
 
@@ -158,6 +171,8 @@ The black-box TypeScript story should read as user behavior and prove the assemb
 9. Expiry makes messages, new runs, workspace tools, and SSH admission fail closed; cleanup deletes
    storage while preserving an owner-visible lifecycle receipt.
 10. No response, CLI output, event frame, or test diagnostic contains a run token or private key.
+11. A project collaborator cannot discover the draft conversation, then can read and reply after
+    the owner marks it ready; the same collaborator still cannot create a run or obtain SSH access.
 
 The time-dependent part should use a production operator reconciliation command with an injected
 clock in the Fed stack, not a test-only HTTP backdoor and not a multi-day sleep. Live Postgres tests
@@ -193,4 +208,3 @@ writes, contract 4.9's Chat namespace, contract 8.1's governed tool catalogue, a
 multi-day durable work. It also answers the 2026-08-10 review's Chat finding without reviving its
 failure mode: private threads use the already-live ReBAC path repaired by `8a494693`, never a handler
 local `kind == private` permission check.
-

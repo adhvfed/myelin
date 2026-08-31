@@ -213,6 +213,15 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await expect(page).toHaveURL(new RegExp(`/agents\\?thread=${threadId}$`));
   await expect(page.getByRole("heading", { level: 2, name: threadName })).toBeVisible();
 
+  await expect(page.getByText("Owner and agent only", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Ready for review" }).click();
+  await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
+  await expect(page.getByText(`Project review with ${agentName}`, { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send to review" })).toBeVisible();
+  await page.reload();
+  await waitForAppHydration(page);
+  await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
+
   const accessibility = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
     .analyze();

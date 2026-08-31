@@ -20,6 +20,7 @@ import {
 } from "../src/journeys/agents.js";
 import {
   listPrivateAgentThreads,
+  markAgentThreadReadyForReview,
   parsePrivateAgentThread,
   requestWorkspaceSshAccess,
   retryPrivateAgentThread,
@@ -40,6 +41,114 @@ import {
 const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1_000;
 
 describe("private work with an agent", () => {
+  test("keeps project-bound work private until its owner marks the conversation ready", async () => {
+    const founder = await browserApprovedCliClient();
+    const teammate = await browserApprovedCliClient(reviewerClient);
+    const companion = await activateExternalAgent(
+      founder,
+      uniqueName("Private draft companion"),
+      ["chat.read_messages"],
+    );
+    const created = await startPrivateAgentThread(founder, {
+      name: uniqueName("Draft before project review"),
+      agentId: companion.agent.id,
+      projectId: systemTestConfig.issues.projectId,
+    });
+    expect(created.thread).toMatchObject({
+      project_id: systemTestConfig.issues.projectId,
+      review_state: "draft",
+      review_ready_at: null,
+    });
+
+    const privateMessage = "This diagnosis is private until I say it is ready.";
+    await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/messages`,
+      {
+        method: "POST",
+        body: { content: privateMessage },
+        idempotencyKey: `private-draft-message-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const hiddenRooms = await reviewerClient.json("/v1/chat/conversations?limit=100");
+    expect(array(hiddenRooms.body.items, "collaborator rooms before review")).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: created.thread.conversation_id })]),
+    );
+    await reviewerClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(created.thread.conversation_id)}/messages?limit=100`,
+      { expectedStatus: 404 },
+    );
+    await teammate.json(`/v1/agent-threads/${encodeURIComponent(created.thread.id)}`, {
+      expectedStatus: 404,
+    });
+    await teammate.json(`/v1/agent-threads/${encodeURIComponent(created.thread.id)}/ready`, {
+      method: "POST",
+      body: {},
+      expectedStatus: 404,
+    });
+
+    const published = await markAgentThreadReadyForReview(founder, created.thread.id);
+    expect(published.changed).toBe(true);
+    expect(published.thread).toMatchObject({
+      id: created.thread.id,
+      conversation_id: created.thread.conversation_id,
+      review_state: "ready",
+      review_ready_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+    });
+    const replay = await markAgentThreadReadyForReview(founder, created.thread.id);
+    expect(replay).toEqual({ changed: false, thread: published.thread });
+
+    const visibleRooms = await reviewerClient.json("/v1/chat/conversations?limit=100");
+    expect(array(visibleRooms.body.items, "collaborator rooms after review")).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        id: created.thread.conversation_id,
+        kind: "channel_public",
+        project_id: systemTestConfig.issues.projectId,
+      })]),
+    );
+    const conversation = new Conversation(created.thread.conversation_id, {});
+    expect(await conversation.messages(reviewerClient)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ content: privateMessage })]),
+    );
+    const reviewMessage = "Reviewed from a second project principal.";
+    await conversation.post(reviewerClient, reviewMessage);
+    const ownerHistory = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/messages?limit=100`,
+    );
+    expect(array(ownerHistory.body.items, "owner history after review")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ content: reviewMessage })]),
+    );
+
+    await teammate.json(`/v1/agent-threads/${encodeURIComponent(created.thread.id)}/runs`, {
+      method: "POST",
+      body: {},
+      idempotencyKey: `non-owner-run-${randomUUID()}`,
+      expectedStatus: 404,
+    });
+    const key = await generateEphemeralSshKey();
+    try {
+      await teammate.json(
+        `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/ssh-access`,
+        {
+          method: "POST",
+          body: { public_key: key.publicKey },
+          idempotencyKey: `non-owner-ssh-${randomUUID()}`,
+          expectedStatus: 404,
+        },
+      );
+    } finally {
+      await key.remove();
+    }
+
+    const freshOwner = await browserApprovedCliClient();
+    const fetched = await freshOwner.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}`,
+    );
+    expect(parsePrivateAgentThread(fetched.body.thread)).toEqual(published.thread);
+    const ownerRun = await beginAgentThreadRun(freshOwner, created.thread.id);
+    await closeAgentRun(ownerRun);
+  });
+
   test("starts from an exact repository commit on a durable private branch", async () => {
     const founder = await browserApprovedCliClient();
     const companion = await activateExternalAgent(

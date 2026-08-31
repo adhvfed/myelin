@@ -20,7 +20,7 @@ pub fn agent_dispatch_with_project(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent command given (try: create <name> --tool <name> | list | show <id> | thread start|retry|list|show | approve|reject <gate>)".into(),
+            "no agent command given (try: create <name> --tool <name> | list | show <id> | thread start|ready|retry|list|show | approve|reject <gate>)".into(),
         )
     })?;
     match *verb {

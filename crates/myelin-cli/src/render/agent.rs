@@ -127,10 +127,20 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
     let workspace = thread.get("workspace")?;
     let state = terminal_safe_single_line(workspace.get("state")?.as_str()?);
     let expires_at = terminal_safe_single_line(workspace.get("expires_at")?.as_str()?);
-    let prefix = match value.get("created").and_then(Value::as_bool) {
-        Some(true) => "Started private agent thread",
-        Some(false) => "Private agent thread already exists",
-        None => "Private agent thread",
+    let review_state = thread
+        .get("review_state")
+        .and_then(Value::as_str)
+        .unwrap_or("draft");
+    let prefix = match (
+        review_state,
+        value.get("changed").and_then(Value::as_bool),
+        value.get("created").and_then(Value::as_bool),
+    ) {
+        ("ready", Some(true), _) => "Published agent thread for review",
+        ("ready", Some(false), _) => "Agent thread already ready for review",
+        (_, _, Some(true)) => "Started private agent thread",
+        (_, _, Some(false)) => "Private agent thread already exists",
+        _ => "Private agent thread",
     };
     let mut output = format!(
         "{prefix}: {summary}\n  agent: {agent}\n  conversation: {conversation}\n  workspace: {state}; retained until {expires_at}\n"
@@ -146,6 +156,11 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
         );
         let _ = writeln!(output, "  workspace: myelin agent thread ssh {id}");
         let _ = writeln!(output, "  files: myelin agent thread ssh {id} --sftp");
+        if review_state == "draft" && thread.get("project_id").is_some_and(|id| !id.is_null()) {
+            let _ = writeln!(output, "  share for review: myelin agent thread ready {id}");
+        } else if review_state == "ready" {
+            output.push_str("  review: visible to current project collaborators; workspace control remains yours.\n");
+        }
     } else if matches!(state.as_str(), "failed" | "provisioning")
         && DateTime::parse_from_rfc3339(&expires_at).is_ok_and(|deadline| deadline > Utc::now())
     {
@@ -246,6 +261,8 @@ mod tests {
             "project_id": null,
             "conversation_id": "01J00000000000000000000000",
             "conversation_ref": "myelin://acme/chat/channel/01J00000000000000000000000",
+            "review_state": "draft",
+            "review_ready_at": null,
             "workspace": {
                 "id": "33333333-3333-3333-3333-333333333333",
                 "generation": 1,
@@ -347,6 +364,24 @@ mod tests {
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID} --sftp")));
         assert!(rendered.contains(&format!("myelin mcp serve --as {ID} --thread {THREAD_ID}")));
         assert!(!rendered.contains("storage_locator"));
+
+        let mut project_draft = thread();
+        project_draft["project_id"] = json!("33333333-3333-3333-3333-333333333333");
+        let rendered = render_response(&json!({ "thread": project_draft })).unwrap();
+        assert!(rendered.contains(&format!("myelin agent thread ready {THREAD_ID}")));
+
+        let mut published = thread();
+        published["project_id"] = json!("33333333-3333-3333-3333-333333333333");
+        published["review_state"] = json!("ready");
+        published["review_ready_at"] = json!("2026-08-22T13:00:00Z");
+        let rendered = render_response(&json!({
+            "thread": published,
+            "changed": true,
+            "durable": true,
+        }))
+        .unwrap();
+        assert!(rendered.starts_with("Published agent thread for review:"));
+        assert!(rendered.contains("workspace control remains yours"));
 
         let mut expiring = thread();
         expiring["workspace"]["state"] = json!("expiring");

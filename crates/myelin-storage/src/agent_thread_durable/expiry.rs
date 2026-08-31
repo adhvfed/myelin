@@ -163,7 +163,7 @@ impl DurableAgentThreadBacking {
                               SELECT 'channel:' || conversation_id
                                 FROM unnest($3::text[]) AS conversation_id
                             )
-                            AND relation IN ('member', 'watcher')",
+                            AND relation IN ('member', 'watcher', 'parent_project')",
                     )
                     .bind(&tenant)
                     .bind(&region)

@@ -6,6 +6,7 @@ import {
   mutateAgentThread,
   type AgentThreadErrorKind,
 } from "~/lib/agent-thread-api";
+import { createProjectCatalogue } from "~/components/projects/project-catalogue";
 import type { AgentChoice, AgentThreadCreateReceipt } from "~/lib/agent-thread-response";
 
 function errorCopy(kind: AgentThreadErrorKind): string {
@@ -29,8 +30,10 @@ export function AgentThreadCreateDialog(props: {
   onCreated: (receipt: AgentThreadCreateReceipt) => void;
 }) {
   const mutate = useAction(mutateAgentThread);
+  const catalogue = createProjectCatalogue();
   const [name, setName] = createSignal("");
   const [agentId, setAgentId] = createSignal("");
+  const [projectId, setProjectId] = createSignal<string>();
   const [retentionDays, setRetentionDays] = createSignal(3);
   const [repository, setRepository] = createSignal("");
   const [baseRef, setBaseRef] = createSignal("main");
@@ -51,6 +54,7 @@ export function AgentThreadCreateDialog(props: {
     const preferred = untrack(() => props.preferredAgentId);
     const canUsePreferred = untrack(() => available().some((agent) => agent.id === preferred));
     setAgentId(canUsePreferred && preferred ? preferred : "");
+    setProjectId(undefined);
     setRetentionDays(3);
     setRepository("");
     setBaseRef("main");
@@ -58,6 +62,11 @@ export function AgentThreadCreateDialog(props: {
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
+  });
+  createEffect(() => {
+    if (props.open && projectId() === undefined && !catalogue.loading()) {
+      setProjectId(catalogue.projects()[0]?.id ?? "");
+    }
   });
   onCleanup(() => { openingGeneration += 1; });
 
@@ -84,6 +93,7 @@ export function AgentThreadCreateDialog(props: {
         op: "create",
         name: name(),
         agentId: agentId(),
+        projectId: projectId() ?? "",
         retentionDays: retentionDays(),
         repository: repository(),
         baseRef: baseRef(),
@@ -109,7 +119,7 @@ export function AgentThreadCreateDialog(props: {
       open={props.open}
       onClose={close}
       title="Start private agent thread"
-      description="Keep one named problem, its conversation, and its workspace together. Only you and the chosen agent can enter."
+      description="Keep one named problem, its conversation, and its workspace together privately. You decide when project collaborators can review it."
       size="lg"
       dismissable={!submitting()}
       initialFocus={() => nameInput}
@@ -172,6 +182,39 @@ export function AgentThreadCreateDialog(props: {
           </button>
         </Show>
         <label>
+          Project for eventual review <span aria-hidden="true">(optional)</span>
+          <select
+            value={projectId() ?? ""}
+            disabled={submitting() || catalogue.loading()}
+            onChange={(event) => { setProjectId(event.currentTarget.value); edit(); }}
+          >
+            <option value="">Personal only</option>
+            <For each={catalogue.projects()}>{(project) => (
+              <option value={project.id}>{project.name}</option>
+            )}</For>
+          </select>
+        </label>
+        <Show when={catalogue.loading()}>
+          <p class="agent-thread-note">Loading projects… You can still start personal-only work.</p>
+        </Show>
+        <Show when={catalogue.unavailable()}>
+          <p class="agent-thread-note">
+            Projects couldn’t be loaded. This thread will remain personal-only.
+            {" "}<button type="button" onClick={() => void catalogue.retry()}>Try again</button>
+          </p>
+        </Show>
+        <Show when={catalogue.nextCursor()}>
+          <button
+            type="button"
+            class="agent-thread-load-more"
+            disabled={submitting() || catalogue.loadingMore()}
+            onClick={() => void catalogue.loadMore()}
+          >
+            <Icon name={catalogue.loadingMore() ? "cycle" : "chevron"} />
+            {catalogue.loadingMore() ? "Loading more projects…" : "Load more projects"}
+          </button>
+        </Show>
+        <label>
           Keep workspace for
           <select
             value={retentionDays()}
@@ -224,7 +267,8 @@ export function AgentThreadCreateDialog(props: {
         </Show>
         <p class="agent-thread-note">
           A fresh agent context can reopen this conversation and the same workspace until it expires.
-          Add a Myelin repository to begin from an exact commit on a private branch.
+          Add a Myelin repository to begin from an exact commit on a private branch. Project work
+          stays private until you explicitly mark it ready for review.
         </p>
         <Show when={error()}>{(message) => <p role="alert" class="agent-thread-error">{message()}</p>}</Show>
       </form>
