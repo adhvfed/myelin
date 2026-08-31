@@ -1449,6 +1449,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             sessions: agent_sessions,
             ssh_routes: workspace_ssh_routes,
             ssh_endpoint: workspace_ssh_endpoint,
+            kms: kms.clone(),
             runtime: handle.clone(),
             recovery: agent_thread_recovery_config,
         },

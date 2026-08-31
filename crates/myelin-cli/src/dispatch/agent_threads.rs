@@ -15,7 +15,7 @@ pub(super) fn agent_thread_dispatch(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent thread command given (try: start <name> --agent <id> | ready <id> | retry <id> | list | show <id> | say <id> <message> | history <id>)"
+            "no agent thread command given (try: start <name> --agent <id> [--repository <slug>] [--instructions <markdown>] | ready <id> | retry <id> | list | show <id> | say <id> <message> | history <id>)"
                 .into(),
         )
     })?;
@@ -41,6 +41,7 @@ fn start_call(args: &[&str], default_project: Option<&str>) -> Result<EdgeCall, 
     let mut repository = None;
     let mut base_ref = None;
     let mut branch = None;
+    let mut instructions = None;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
@@ -90,6 +91,14 @@ fn start_call(args: &[&str], default_project: Option<&str>) -> Result<EdgeCall, 
                     "agent thread start accepts --branch only once".into(),
                 ));
             }
+            "--instructions" if instructions.is_none() => {
+                instructions = Some(flag_value(args, &mut index, "--instructions")?);
+            }
+            "--instructions" => {
+                return Err(CliError::Usage(
+                    "agent thread start accepts --instructions only once".into(),
+                ));
+            }
             token if !token.starts_with('-') && name.is_none() => name = Some(token),
             token if !token.starts_with('-') => {
                 return Err(CliError::Usage(format!(
@@ -135,16 +144,30 @@ fn start_call(args: &[&str], default_project: Option<&str>) -> Result<EdgeCall, 
             "agent thread --base-ref and --branch require --repository <slug>".into(),
         ));
     }
-    if let Some(repository) = repository {
-        validate_workspace_text("repository", repository, 255)?;
-        let mut workspace = json!({ "repository": repository });
-        if let Some(base_ref) = base_ref {
-            validate_workspace_text("base ref", base_ref, 1024)?;
-            workspace["base_ref"] = json!(base_ref);
+    if repository.is_some() || instructions.is_some() {
+        let mut workspace = json!({});
+        if let Some(instructions) = instructions {
+            if instructions.trim().is_empty()
+                || instructions.len() > 12 * 1024
+                || instructions.contains('\0')
+            {
+                return Err(CliError::Usage(
+                    "agent thread workspace instructions must contain 1..=12288 UTF-8 bytes and no NUL characters".into(),
+                ));
+            }
+            workspace["instructions"] = json!(instructions);
         }
-        if let Some(branch) = branch {
-            validate_workspace_text("branch", branch, 1024)?;
-            workspace["branch"] = json!(branch);
+        if let Some(repository) = repository {
+            validate_workspace_text("repository", repository, 255)?;
+            workspace["repository"] = json!(repository);
+            if let Some(base_ref) = base_ref {
+                validate_workspace_text("base ref", base_ref, 1024)?;
+                workspace["base_ref"] = json!(base_ref);
+            }
+            if let Some(branch) = branch {
+                validate_workspace_text("branch", branch, 1024)?;
+                workspace["branch"] = json!(branch);
+            }
         }
         payload["workspace"] = workspace;
     }
@@ -360,6 +383,29 @@ mod tests {
             "main",
         ])
         .is_err());
+
+        let personalized = agent_dispatch(&[
+            "thread",
+            "start",
+            "Follow my playbook",
+            "--agent",
+            AGENT,
+            "--instructions",
+            "# Personal workflow\n\nRun the narrow system journey before committing.",
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(personalized.payload.as_ref().unwrap())
+                .unwrap(),
+            json!({
+                "name": "Follow my playbook",
+                "agent_id": AGENT,
+                "retention_days": 3,
+                "workspace": {
+                    "instructions": "# Personal workflow\n\nRun the narrow system journey before committing.",
+                },
+            })
+        );
 
         let list = agent_dispatch(&["thread", "list", "--limit", "7", "--cursor", THREAD]).unwrap();
         assert_eq!(list.path, "/v1/agent-threads");

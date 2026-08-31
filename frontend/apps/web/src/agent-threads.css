@@ -215,7 +215,8 @@
 .agent-thread-create { display: flex; flex-direction: column; gap: var(--space-3); }
 .agent-thread-create label { color: var(--text-primary); font-size: var(--fs-caption); font-weight: var(--weight-medium); }
 .agent-thread-create input,
-.agent-thread-create select {
+.agent-thread-create select,
+.agent-thread-create textarea {
   width: 100%;
   min-height: var(--control-h);
   display: block;

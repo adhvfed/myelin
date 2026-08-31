@@ -18,6 +18,15 @@ work with one creates a named cloud thread with a durable branch, conversation, 
 same workspace survives model context changes and can be opened through ordinary SSH or SFTP with a
 short-lived owner-authorized credential.
 
+The workspace is personalizable at creation time. Repository guidance remains the shared default,
+while an owner can layer their own way of working into the assigned workspace—for example, custom
+root `AGENTS.md` instructions—without changing the source repository. Personalization is durable
+across fresh agent contexts and provisioning recovery, encrypted as owner-scoped agent data at
+rest, bounded, and projected publicly only as an integrity receipt. Overlays must use confined
+workspace writes and must fail closed on symlinks or conflicting durable markers. This initial
+`AGENTS.md` seam should grow into a small declarative workspace augmentation model rather than an
+unbounded startup-script escape hatch.
+
 Exploration is private by default. A personal agent thread, its conversation, branch intent,
 environment receipt, and workspace metadata are visible only to its owner and selected agent while
 the work is a draft. Project membership alone must not reveal that the draft exists.
@@ -45,4 +54,5 @@ Product claims are proved as readable TypeScript journeys against running servic
 stores. A privacy journey must use two real identities and demonstrate both sides of the boundary:
 the collaborator receives an indistinguishable not-found response before publication, then sees the
 work after the owner's explicit transition, while workspace execution and SSH remain denied.
-
+Workspace-personalization journeys must read the resulting file through an actual bound agent run,
+open it again from a fresh context, and prove the repository source was never modified.

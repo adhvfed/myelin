@@ -77,6 +77,12 @@ export function AgentWorkspaceContext(props: {
               </dd>
             </div>
           </>}</Show>
+          <Show when={props.thread.workspace.personalization}>{(personalization) => <>
+            <div data-testid="workspace-personalization">
+              <dt>Instructions</dt>
+              <dd><code>{personalization().path}</code> · personal overlay</dd>
+            </div>
+          </>}</Show>
           <div><dt>Workspace</dt><dd><code>{props.thread.workspace.id}</code></dd></div>
         </dl>
         <Show when={props.thread.workspace.environment}>
@@ -84,6 +90,11 @@ export function AgentWorkspaceContext(props: {
             The manifest is pinned to this source commit. Environment activation is not available yet.
           </p>
         </Show>
+        <Show when={props.thread.workspace.personalization}>{(personalization) => (
+          <p class="agent-thread-note" title={personalization().content_digest}>
+            Owner guidance is encrypted at rest and appended without changing the source repository.
+          </p>
+        )}</Show>
       </section>
       <section>
         <h3>Agent workspace authority</h3>

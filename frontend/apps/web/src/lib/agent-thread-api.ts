@@ -231,8 +231,8 @@ export const mutateAgentThread = action(async (input: unknown) => {
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "create" && Object.keys(mutation).every((key) =>
-      ["op", "name", "agentId", "projectId", "retentionDays", "repository", "baseRef", "branch", "clientNonce"].includes(key)) &&
-        Object.keys(mutation).length === 9 && cleanText(mutation.name, 80) &&
+      ["op", "name", "agentId", "projectId", "retentionDays", "repository", "baseRef", "branch", "instructions", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 10 && cleanText(mutation.name, 80) &&
         isAgentThreadId(mutation.agentId) && positiveRetention(mutation.retentionDays) &&
         typeof mutation.projectId === "string" &&
         (mutation.projectId === "" || isAgentThreadId(mutation.projectId)) &&
@@ -241,17 +241,23 @@ export const mutateAgentThread = action(async (input: unknown) => {
         typeof mutation.baseRef === "string" && cleanText(mutation.baseRef, 1_024) &&
         typeof mutation.branch === "string" &&
         (mutation.branch === "" || cleanText(mutation.branch, 1_024)) &&
+        typeof mutation.instructions === "string" &&
+        (mutation.instructions === "" || (utf8.encode(mutation.instructions).byteLength <= 12 * 1_024 &&
+          mutation.instructions.trim().length > 0 && !mutation.instructions.includes("\0"))) &&
         cleanNonce(mutation.clientNonce)) {
       const receipt = parseAgentThreadCreateReceipt(await edgePost("/v1/agent-threads", {
         name: mutation.name,
         agent_id: mutation.agentId,
         ...(mutation.projectId === "" ? {} : { project_id: mutation.projectId }),
         retention_days: mutation.retentionDays,
-        ...(mutation.repository === "" ? {} : {
+        ...(mutation.repository === "" && mutation.instructions === "" ? {} : {
           workspace: {
-            repository: mutation.repository,
-            base_ref: mutation.baseRef,
-            ...(mutation.branch === "" ? {} : { branch: mutation.branch }),
+            ...(mutation.repository === "" ? {} : {
+              repository: mutation.repository,
+              base_ref: mutation.baseRef,
+              ...(mutation.branch === "" ? {} : { branch: mutation.branch }),
+            }),
+            ...(mutation.instructions === "" ? {} : { instructions: mutation.instructions }),
           },
         }),
       }, { idempotencyKey: mutation.clientNonce }));

@@ -7,12 +7,14 @@ use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
     all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadActivation,
     AgentThreadExpiryCompletion, AgentThreadExpiryFailure, AgentThreadProvisioningFailure,
-    BindAgentThreadRunOutcome, CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome,
-    DurableAgentThreadBacking, HotTables, ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome,
-    NewAgentThread, NewWorkspaceSshGrant, NewWorkspaceSshSession, RetryAgentThreadOutcome, SealKey,
-    SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
+    AgentThreadWorkspaceGuidance, BindAgentThreadRunOutcome, ColumnCryptor,
+    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
+    KekId, KmsEngine, ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome, NewAgentThread,
+    NewWorkspaceSshGrant, NewWorkspaceSshSession, RetryAgentThreadOutcome, SealKey, SubjectId,
+    SubjectKeyScope, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
     AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
 };
+use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 
 fn test_config() -> MyelinConfig {
@@ -57,6 +59,7 @@ fn proposal(owner: &str, agent_id: Uuid, suffix: u128) -> NewAgentThread {
         name: "Investigate checkout race".into(),
         project_id: None,
         git: None,
+        workspace_guidance: None,
         retention_days: 3,
         client_nonce: "private-thread-retry".into(),
         created_at,
@@ -246,7 +249,24 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
     let agent_id = Uuid::from_u128(41);
     seed_agent(&app, &tenant, owner, agent_id).await;
     let threads = DurableAgentThreadBacking::new(app.clone());
-    let intended = proposal(owner, agent_id, 101);
+    let mut intended = proposal(owner, agent_id, 101);
+    let private_guidance = b"Prefer the owner's focused system journey.";
+    let kms = KmsEngine::new();
+    let tenant_id = TenantId(tenant.clone());
+    let region = Region(app.config().region.clone());
+    kms.ensure_kek(&KekId::new(tenant_id.clone(), region.clone()))
+        .unwrap();
+    intended.workspace_guidance = Some(AgentThreadWorkspaceGuidance {
+        content_digest: format!("blake3:{}", blake3::hash(private_guidance).to_hex()),
+        encrypted_content: ColumnCryptor::new(&kms, region)
+            .encrypt_for_subject_scope(
+                &tenant_id,
+                &SubjectId::new(owner),
+                SubjectKeyScope::AgentData,
+                private_guidance,
+            )
+            .unwrap(),
+    });
 
     set_agent_runtime(&app, &tenant, agent_id, "hosted:luna").await;
     assert_eq!(
@@ -274,6 +294,27 @@ async fn a_private_thread_is_one_retry_safe_workspace_lifecycle() {
             .to_rfc3339_opts(SecondsFormat::Secs, true)
     );
     assert!(created.storage_locator.is_none());
+    assert_eq!(created.workspace_guidance, intended.workspace_guidance);
+    let tenant_for_read = tenant.clone();
+    let stored_ciphertext = app
+        .with_tenant_tx(&tenant_for_read.clone(), move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, Vec<u8>>(
+                    "SELECT workspace_guidance_ciphertext FROM agent_thread
+                      WHERE tenant_id = $1 AND thread_id = $2",
+                )
+                .bind(&tenant_for_read)
+                .bind(Uuid::from_u128(101))
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+            })
+        })
+        .await
+        .unwrap();
+    assert!(!stored_ciphertext
+        .windows(private_guidance.len())
+        .any(|window| window == private_guidance));
 
     assert!(threads
         .record_provisioning_failure(

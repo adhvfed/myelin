@@ -13,10 +13,11 @@ pub use expiry::{
 pub use model::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
     AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadState,
-    CreateAgentThreadOutcome, DurableAgentThread, MarkAgentThreadReviewReadyOutcome,
-    NewAgentThread, RetryAgentThreadOutcome, MAX_AGENT_THREAD_GIT_REF_BYTES,
-    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_REPOSITORY_BYTES,
-    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    AgentThreadWorkspaceGuidance, CreateAgentThreadOutcome, DurableAgentThread,
+    MarkAgentThreadReviewReadyOutcome, NewAgentThread, RetryAgentThreadOutcome,
+    MAX_AGENT_THREAD_GIT_REF_BYTES, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_REPOSITORY_BYTES,
+    MAX_AGENT_THREAD_RETENTION_DAYS, MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES,
+    MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
@@ -25,20 +26,22 @@ pub use schema::{
     agent_thread_publication_migrations, agent_thread_recent_list_migrations,
     agent_thread_review_ready_migrations, agent_thread_session_launch_migrations,
     agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
-    AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION, AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION,
-    AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION, AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION,
-    AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION, AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION,
-    AGENT_THREAD_MIGRATION, AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION,
-    AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION, AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION,
-    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION,
-    AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION, AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION,
-    AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION, AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION,
-    AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
+    agent_thread_workspace_guidance_migrations, AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION, AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION,
+    AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION, AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION,
+    AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION, AGENT_THREAD_MIGRATION,
+    AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION, AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION,
+    AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION, AGENT_THREAD_PUBLICATION_RECOVERY_INDEX,
+    AGENT_THREAD_PUBLICATION_RECOVERY_INDEX_MIGRATION, AGENT_THREAD_RECENT_LIST_INDEX_MIGRATION,
+    AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION, AGENT_THREAD_REVIEW_READY_INVARIANT_MIGRATION,
+    AGENT_THREAD_REVIEW_READY_SHAPE_MIGRATION, AGENT_THREAD_RLS_POLICY, AGENT_THREAD_RUN_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_BACKFILL_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_EXPAND_MIGRATION,
     AGENT_THREAD_SESSION_LAUNCH_INDEX_MIGRATION, AGENT_THREAD_SESSION_LAUNCH_INVARIANT_MIGRATION,
     AGENT_THREAD_SSH_CONNECTION_BACKFILL_MIGRATION, AGENT_THREAD_SSH_CONNECTION_EXPAND_MIGRATION,
     AGENT_THREAD_SSH_CONNECTION_INVARIANT_MIGRATION, AGENT_THREAD_SSH_GRANT_MIGRATION,
-    AGENT_THREAD_SSH_SINGLE_USE_MIGRATION, AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
+    AGENT_THREAD_SSH_SINGLE_USE_MIGRATION, AGENT_THREAD_WORKSPACE_GUIDANCE_BACKFILL_MIGRATION,
+    AGENT_THREAD_WORKSPACE_GUIDANCE_EXPAND_MIGRATION,
+    AGENT_THREAD_WORKSPACE_GUIDANCE_INVARIANT_MIGRATION, AGENT_THREAD_WORKSPACE_SESSION_MIGRATION,
 };
 pub use ssh_access::{
     CreateWorkspaceSshGrantOutcome, DurableWorkspaceSshGrant, LiveWorkspaceSshAdmission,
@@ -55,8 +58,8 @@ use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::{
-    PgError, ProviderError, SubstrateProvider, ACTIVE_PRINCIPAL_STATUS_JSON,
-    HUMAN_PRINCIPAL_KIND_JSON,
+    EncryptedColumn, KeyClass, PgError, PiiKeyRef, ProviderError, SubjectKeyScope,
+    SubstrateProvider, ACTIVE_PRINCIPAL_STATUS_JSON, HUMAN_PRINCIPAL_KIND_JSON, NONCE_LEN,
 };
 
 const RESUMABLE_AGENT_RUNTIME_REF: &str = "external:mcp";
@@ -85,6 +88,15 @@ impl DurableAgentThreadBacking {
         proposal: NewAgentThread,
     ) -> Result<CreateAgentThreadOutcome, ProviderError> {
         validate_proposal(&proposal)?;
+        if proposal
+            .workspace_guidance
+            .as_ref()
+            .is_some_and(|guidance| guidance.encrypted_content.key_ref.tenant.as_str() != tenant)
+        {
+            return Err(query(
+                "agent thread workspace guidance key does not match its tenant",
+            ));
+        }
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         self.provider
@@ -114,6 +126,8 @@ impl DurableAgentThreadBacking {
                             RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                               conversation_id, workspace_id, workspace_generation, name, project_id,
                               repository_slug, base_ref, base_oid, workspace_branch,
+                              workspace_guidance_digest, workspace_guidance_key_ref,
+                              workspace_guidance_nonce, workspace_guidance_ciphertext,
                               environment_provider, environment_config_path,
                               environment_config_digest,
                               retention_days, state, storage_locator, publication_completed_at,
@@ -199,12 +213,16 @@ impl DurableAgentThreadBacking {
                            tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                            retention_days, client_nonce, state, created_at, expires_at, updated_at
-                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,$14,$15,'provisioning',$16,$17,$16)
+                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'provisioning',$20,$21,$20)
                          ON CONFLICT DO NOTHING
                          RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
@@ -225,6 +243,30 @@ impl DurableAgentThreadBacking {
                     .bind(proposal.git.as_ref().map(|git| git.base_ref.as_str()))
                     .bind(proposal.git.as_ref().map(|git| git.base_oid.as_str()))
                     .bind(proposal.git.as_ref().map(|git| git.branch.as_str()))
+                    .bind(
+                        proposal
+                            .workspace_guidance
+                            .as_ref()
+                            .map(|guidance| guidance.content_digest.as_str()),
+                    )
+                    .bind(
+                        proposal
+                            .workspace_guidance
+                            .as_ref()
+                            .map(|guidance| guidance.encrypted_content.key_ref.to_uri()),
+                    )
+                    .bind(
+                        proposal
+                            .workspace_guidance
+                            .as_ref()
+                            .map(|guidance| guidance.encrypted_content.nonce.to_vec()),
+                    )
+                    .bind(
+                        proposal
+                            .workspace_guidance
+                            .as_ref()
+                            .map(|guidance| guidance.encrypted_content.ciphertext.as_slice()),
+                    )
                     .bind(proposal.retention_days)
                     .bind(&proposal.client_nonce)
                     .bind(proposal.created_at)
@@ -312,6 +354,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
+                          workspace_guidance_digest, workspace_guidance_key_ref,
+                          workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
                           environment_config_digest,
                           retention_days, state, storage_locator, publication_completed_at,
@@ -410,6 +454,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
+                          workspace_guidance_digest, workspace_guidance_key_ref,
+                          workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
                           environment_config_digest,
                           retention_days, state, storage_locator, publication_completed_at,
@@ -448,6 +494,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
@@ -490,6 +538,8 @@ impl DurableAgentThreadBacking {
                         RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                           conversation_id, workspace_id, workspace_generation, name, project_id,
                           repository_slug, base_ref, base_oid, workspace_branch,
+                          workspace_guidance_digest, workspace_guidance_key_ref,
+                          workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
                           environment_config_digest,
                           retention_days, state, storage_locator, publication_completed_at,
@@ -511,7 +561,6 @@ impl DurableAgentThreadBacking {
                             PgError::Query(
                                 "agent thread review publication lost its locked row".into(),
                             )
-                            .into()
                         })
                 })
             })
@@ -564,6 +613,8 @@ impl DurableAgentThreadBacking {
                           thread.workspace_id, thread.workspace_generation, thread.name,
                           thread.project_id, thread.repository_slug, thread.base_ref,
                           thread.base_oid, thread.workspace_branch,
+                          thread.workspace_guidance_digest, thread.workspace_guidance_key_ref,
+                          thread.workspace_guidance_nonce, thread.workspace_guidance_ciphertext,
                           thread.environment_provider, thread.environment_config_path,
                           thread.environment_config_digest, thread.retention_days, thread.state,
                           thread.storage_locator, thread.publication_completed_at,
@@ -632,6 +683,8 @@ impl DurableAgentThreadBacking {
                                 RETURNING tenant_id, region, thread_id, owner_principal_id, agent_id,
                                   conversation_id, workspace_id, workspace_generation, name, project_id,
                                   repository_slug, base_ref, base_oid, workspace_branch,
+                                  workspace_guidance_digest, workspace_guidance_key_ref,
+                                  workspace_guidance_nonce, workspace_guidance_ciphertext,
                                   environment_provider, environment_config_path,
                                   environment_config_digest,
                                   retention_days, state, storage_locator, publication_completed_at,
@@ -747,6 +800,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
@@ -804,6 +859,8 @@ impl DurableAgentThreadBacking {
                         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
                            conversation_id, workspace_id, workspace_generation, name, project_id,
                            repository_slug, base_ref, base_oid, workspace_branch,
+                           workspace_guidance_digest, workspace_guidance_key_ref,
+                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
                            environment_config_digest,
                            retention_days, state, storage_locator, publication_completed_at,
@@ -885,6 +942,29 @@ fn validate_proposal(proposal: &NewAgentThread) -> Result<(), ProviderError> {
             ));
         }
     }
+    if let Some(guidance) = &proposal.workspace_guidance {
+        let digest = guidance
+            .content_digest
+            .strip_prefix("blake3:")
+            .unwrap_or_default();
+        let expected_key_class = KeyClass::ScopedSubject {
+            scope: SubjectKeyScope::AgentData,
+            subject: proposal.owner_principal_id.clone(),
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || guidance.encrypted_content.key_ref.class != expected_key_class
+            || guidance.encrypted_content.ciphertext.len() < 17
+            || guidance.encrypted_content.ciphertext.len()
+                > MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES + 16
+        {
+            return Err(query(
+                "agent thread workspace guidance is not a canonical encrypted receipt",
+            ));
+        }
+    }
     let expected_expiry = proposal
         .created_at
         .checked_add_signed(Duration::days(i64::from(proposal.retention_days)))
@@ -950,6 +1030,14 @@ fn same_intent(thread: &DurableAgentThread, proposal: &NewAgentThread) -> bool {
         && thread.name == proposal.name
         && thread.project_id == proposal.project_id.map(|id| id.to_string())
         && same_git_intent(thread.git.as_ref(), proposal.git.as_ref())
+        && thread
+            .workspace_guidance
+            .as_ref()
+            .map(|guidance| guidance.content_digest.as_str())
+            == proposal
+                .workspace_guidance
+                .as_ref()
+                .map(|guidance| guidance.content_digest.as_str())
         && thread.retention_days == proposal.retention_days
 }
 
@@ -1002,6 +1090,8 @@ async fn by_nonce(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
+           workspace_guidance_digest, workspace_guidance_key_ref,
+           workspace_guidance_nonce, workspace_guidance_ciphertext,
            environment_provider, environment_config_path, environment_config_digest,
            retention_days, state, storage_locator, publication_completed_at, review_ready_at,
            failure_reason, created_at,
@@ -1030,6 +1120,8 @@ async fn by_id(
         "SELECT tenant_id, region, thread_id, owner_principal_id, agent_id,
            conversation_id, workspace_id, workspace_generation, name, project_id,
            repository_slug, base_ref, base_oid, workspace_branch,
+           workspace_guidance_digest, workspace_guidance_key_ref,
+           workspace_guidance_nonce, workspace_guidance_ciphertext,
            environment_provider, environment_config_path, environment_config_digest,
            retention_days, state, storage_locator, publication_completed_at, review_ready_at,
            failure_reason, created_at,
@@ -1074,6 +1166,48 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
             ))
         }
     };
+    let tenant = row.get::<String, _>("tenant_id");
+    let owner_principal_id = row.get::<String, _>("owner_principal_id");
+    let workspace_guidance = match (
+        row.get::<Option<String>, _>("workspace_guidance_digest"),
+        row.get::<Option<String>, _>("workspace_guidance_key_ref"),
+        row.get::<Option<Vec<u8>>, _>("workspace_guidance_nonce"),
+        row.get::<Option<Vec<u8>>, _>("workspace_guidance_ciphertext"),
+    ) {
+        (None, None, None, None) => None,
+        (Some(content_digest), Some(key_ref), Some(nonce), Some(ciphertext)) => {
+            let key_ref = PiiKeyRef::parse(&key_ref).ok_or_else(|| {
+                PgError::Query("agent thread workspace guidance key reference is invalid".into())
+            })?;
+            let nonce: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| {
+                PgError::Query("agent thread workspace guidance nonce is invalid".into())
+            })?;
+            if key_ref.tenant.as_str() != tenant
+                || key_ref.class
+                    != (KeyClass::ScopedSubject {
+                        scope: SubjectKeyScope::AgentData,
+                        subject: owner_principal_id.clone(),
+                    })
+            {
+                return Err(PgError::Query(
+                    "agent thread workspace guidance key does not match its owner".into(),
+                ));
+            }
+            Some(AgentThreadWorkspaceGuidance {
+                content_digest,
+                encrypted_content: EncryptedColumn {
+                    key_ref,
+                    nonce,
+                    ciphertext,
+                },
+            })
+        }
+        _ => {
+            return Err(PgError::Query(
+                "agent thread has incomplete durable workspace guidance".into(),
+            ))
+        }
+    };
     let environment = match (
         row.get::<Option<String>, _>("environment_provider"),
         row.get::<Option<String>, _>("environment_config_path"),
@@ -1100,7 +1234,7 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
     }
     Ok(DurableAgentThread {
         thread_id: row.get::<Uuid, _>("thread_id").to_string(),
-        owner_principal_id: row.get("owner_principal_id"),
+        owner_principal_id,
         agent_id: row.get::<Uuid, _>("agent_id").to_string(),
         conversation_id: row.get("conversation_id"),
         workspace_id: row.get::<Uuid, _>("workspace_id").to_string(),
@@ -1110,6 +1244,7 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
             .get::<Option<Uuid>, _>("project_id")
             .map(|id| id.to_string()),
         git,
+        workspace_guidance,
         environment,
         retention_days: row.get("retention_days"),
         state,
@@ -1151,6 +1286,7 @@ mod tests {
             name: "Investigate checkout race".into(),
             project_id: None,
             git: None,
+            workspace_guidance: None,
             retention_days: 3,
             client_nonce: "thread-retry".into(),
             created_at,

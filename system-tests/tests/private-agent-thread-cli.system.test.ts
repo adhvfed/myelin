@@ -65,6 +65,7 @@ describe("private agent work from the CLI", () => {
     const companionId = string(companion.id, "activated private-work agent id");
 
     const threadName = uniqueName("Investigate checkout final-reader race");
+    const personalInstructions = "# CLI owner workflow\n\nPreserve final readers before cleanup.";
     const started = await runMyelin(
       "--json",
       "--idempotency-key",
@@ -77,6 +78,8 @@ describe("private agent work from the CLI", () => {
       companionId,
       "--retention-days",
       "3",
+      "--instructions",
+      personalInstructions,
     );
     expect(started.exitCode, started.stderr).toBe(0);
     const thread = record(
@@ -87,7 +90,15 @@ describe("private agent work from the CLI", () => {
     expect(thread).toMatchObject({
       name: threadName,
       agent_id: companionId,
-      workspace: { state: "ready", retention_days: 3 },
+      workspace: {
+        state: "ready",
+        retention_days: 3,
+        personalization: {
+          path: "AGENTS.md",
+          strategy: "append",
+          content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
+        },
+      },
     });
 
     const shown = await runMyelin("agent", "thread", "show", threadId);
@@ -140,6 +151,15 @@ describe("private agent work from the CLI", () => {
             id: 2,
             method: "tools/call",
             params: {
+              name: "workspace.read_file",
+              arguments: { path: "AGENTS.md" },
+            },
+          }),
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: {
               name: "workspace.write_file",
               arguments: { path: agentPath, content: agentObservation },
               _meta: { "com.myelin/idempotencyKey": `cli-thread-write-${randomUUID()}` },
@@ -153,8 +173,10 @@ describe("private agent work from the CLI", () => {
     expect(bridge.exitCode, bridge.stderr).toBe(0);
     expect(bridge.stderr).toBe("");
     const bridgeResponses = bridge.stdout.trim().split("\n").map((line) => JSON.parse(line));
-    expect(bridgeResponses).toHaveLength(2);
-    expect(record(bridgeResponses[1]?.result, "thread-bound MCP write result"))
+    expect(bridgeResponses).toHaveLength(3);
+    expect(JSON.stringify(bridgeResponses[1])).toContain("# CLI owner workflow");
+    expect(JSON.stringify(bridgeResponses[1])).toContain("Preserve final readers before cleanup.");
+    expect(record(bridgeResponses[2]?.result, "thread-bound MCP write result"))
       .toMatchObject({ isError: false, _meta: { tool: "workspace.write_file" } });
 
     const agentWorkspace = await runMyelin(

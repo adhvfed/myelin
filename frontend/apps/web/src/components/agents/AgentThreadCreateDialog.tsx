@@ -38,6 +38,7 @@ export function AgentThreadCreateDialog(props: {
   const [repository, setRepository] = createSignal("");
   const [baseRef, setBaseRef] = createSignal("main");
   const [branch, setBranch] = createSignal("");
+  const [instructions, setInstructions] = createSignal("");
   const [clientNonce, setClientNonce] = createSignal(crypto.randomUUID());
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -59,6 +60,7 @@ export function AgentThreadCreateDialog(props: {
     setRepository("");
     setBaseRef("main");
     setBranch("");
+    setInstructions("");
     setClientNonce(crypto.randomUUID());
     setSubmitting(false);
     setError(null);
@@ -80,8 +82,10 @@ export function AgentThreadCreateDialog(props: {
     if (!name().trim() || name().trim() !== name() || !agentId() ||
         repository().trim() !== repository() ||
         (repository() !== "" && (!baseRef() || baseRef().trim() !== baseRef() ||
-          branch().trim() !== branch()))) {
-      setError("Use a clean problem name, active external agent, and valid repository fields.");
+          branch().trim() !== branch())) || instructions().includes("\0") ||
+        new TextEncoder().encode(instructions()).byteLength > 12 * 1024 ||
+        (instructions() !== "" && instructions().trim() === "")) {
+      setError("Use a clean problem name, active external agent, and valid workspace fields and instructions.");
       nameInput?.focus();
       return;
     }
@@ -98,6 +102,7 @@ export function AgentThreadCreateDialog(props: {
         repository: repository(),
         baseRef: baseRef(),
         branch: branch(),
+        instructions: instructions(),
         clientNonce: clientNonce(),
       });
       if (generation !== openingGeneration) return;
@@ -265,6 +270,20 @@ export function AgentThreadCreateDialog(props: {
             </label>
           </div>
         </Show>
+        <label>
+          Personal agent instructions <span aria-hidden="true">(optional)</span>
+          <textarea
+            value={instructions()}
+            rows={6}
+            placeholder={"# How to work here\n\nRun focused tests before broad suites. Keep commits small and explain tradeoffs."}
+            disabled={submitting()}
+            onInput={(event) => { setInstructions(event.currentTarget.value); edit(); }}
+          />
+        </label>
+        <p class="agent-thread-note">
+          Myelin appends these instructions to this private workspace’s root <code>AGENTS.md</code>.
+          Repository instructions stay intact, and fresh agent contexts reopen the personalized file.
+        </p>
         <p class="agent-thread-note">
           A fresh agent context can reopen this conversation and the same workspace until it expires.
           Add a Myelin repository to begin from an exact commit on a private branch. Project work

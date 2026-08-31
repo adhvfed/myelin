@@ -30,6 +30,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const agentName = `checkout-companion-${suffix}`;
   const threadName = `Investigate checkout race ${suffix}`;
   const problem = `The final reader for ${suffix} still owns its checkout lease.`;
+  const personalInstructions = `# My workflow\n\nKeep the ${suffix} diagnosis private until it is ready.`;
   const repositorySlug = `cloud-workspace-${suffix}`;
   const sessionToken = await browserApprovedSession(request);
   await postProductJson(
@@ -72,6 +73,8 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   expect(agentId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
   await dialog.getByRole("combobox", { name: "Keep workspace for" }).selectOption("3");
   await dialog.getByRole("textbox", { name: "Repository slug" }).fill(repositorySlug);
+  await dialog.getByRole("textbox", { name: "Personal agent instructions" })
+    .fill(personalInstructions);
   await dialog.getByRole("button", { name: "Start thread" }).click();
 
   await page.waitForURL(/\/agents\?thread=[0-9a-f-]{36}$/);
@@ -84,6 +87,8 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await expect(workspace.getByTestId("workspace-environment"))
     .toContainText("Service Federation · declared");
   await expect(workspace.getByText("fed.yaml", { exact: true })).toBeVisible();
+  await expect(workspace.getByTestId("workspace-personalization"))
+    .toContainText("AGENTS.md · personal overlay");
   await expect(workspace.getByTestId("workspace-environment-state"))
     .toContainText("pinned to this source commit");
   await expect(workspace.getByText("No workspace entries yet.")).toBeVisible();

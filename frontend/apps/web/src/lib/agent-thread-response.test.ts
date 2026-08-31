@@ -61,6 +61,7 @@ const subject = {
     retention_days: 3,
     expires_at: "2026-08-25T12:00:00Z",
     repository: null,
+    personalization: null,
     environment: null,
   },
   created_at: "2026-08-22T12:00:00Z",

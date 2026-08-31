@@ -10,6 +10,7 @@ export interface AgentThreadWorkspace {
   retention_days: number;
   expires_at: string;
   repository: AgentThreadWorkspaceRepository | null;
+  personalization: AgentThreadWorkspacePersonalization | null;
   environment: AgentThreadWorkspaceEnvironment | null;
 }
 
@@ -25,6 +26,12 @@ export interface AgentThreadWorkspaceEnvironment {
   config_path: string;
   content_digest: string;
   state: string;
+}
+
+export interface AgentThreadWorkspacePersonalization {
+  path: string;
+  strategy: string;
+  content_digest: string;
 }
 
 export interface PrivateAgentThread {
@@ -69,9 +76,10 @@ export async function startPrivateAgentThread(
     idempotencyKey?: string;
     expectedStatus?: 200 | 201;
     workspace?: {
-      repository: string;
+      repository?: string;
       baseRef?: string;
       branch?: string;
+      instructions?: string;
     };
   },
 ): Promise<{ thread: PrivateAgentThread; created: boolean }> {
@@ -86,13 +94,18 @@ export async function startPrivateAgentThread(
         ? {}
         : {
             workspace: {
-              repository: intent.workspace.repository,
+              ...(intent.workspace.repository === undefined
+                ? {}
+                : { repository: intent.workspace.repository }),
               ...(intent.workspace.baseRef === undefined
                 ? {}
                 : { base_ref: intent.workspace.baseRef }),
               ...(intent.workspace.branch === undefined
                 ? {}
                 : { branch: intent.workspace.branch }),
+              ...(intent.workspace.instructions === undefined
+                ? {}
+                : { instructions: intent.workspace.instructions }),
             },
           }),
     },
@@ -198,6 +211,9 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
   const environment = workspace.environment === null
     ? null
     : record(workspace.environment, "private agent workspace environment");
+  const personalization = workspace.personalization === null
+    ? null
+    : record(workspace.personalization, "private agent workspace personalization");
   return {
     id: string(thread.id, "agent thread id"),
     ref: string(thread.ref, "agent thread ref"),
@@ -224,6 +240,16 @@ export function parsePrivateAgentThread(value: unknown): PrivateAgentThread {
             base_ref: string(repository.base_ref, "workspace repository base ref"),
             base_oid: string(repository.base_oid, "workspace repository base oid"),
             branch: string(repository.branch, "workspace repository branch"),
+          },
+      personalization: personalization === null
+        ? null
+        : {
+            path: string(personalization.path, "workspace personalization path"),
+            strategy: string(personalization.strategy, "workspace personalization strategy"),
+            content_digest: string(
+              personalization.content_digest,
+              "workspace personalization content digest",
+            ),
           },
       environment: environment === null
         ? null

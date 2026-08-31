@@ -51,6 +51,11 @@ export interface AgentThread {
       base_oid: string;
       branch: string;
     } | null;
+    personalization: {
+      path: "AGENTS.md";
+      strategy: "append";
+      content_digest: string;
+    } | null;
     environment: {
       provider: "service_federation";
       config_path: "fed.yaml";
@@ -232,12 +237,16 @@ function thread(value: unknown): AgentThread | null {
   const row = record(value);
   const workspace = record(row?.workspace);
   const repository = workspace?.repository === null ? null : record(workspace?.repository);
+  const personalization = workspace?.personalization === null
+    ? null
+    : record(workspace?.personalization);
   const environment = workspace?.environment === null ? null : record(workspace?.environment);
   if (!row || !exact(row, [
     "id", "ref", "name", "agent_id", "agent_ref", "project_id", "conversation_id",
     "conversation_ref", "review_state", "review_ready_at", "workspace", "created_at", "updated_at",
   ]) || !workspace || !exact(workspace, [
-    "id", "generation", "state", "retention_days", "expires_at", "repository", "environment",
+    "id", "generation", "state", "retention_days", "expires_at", "repository",
+    "personalization", "environment",
   ]) || !isAgentThreadId(row.id) || !cleanText(row.ref, 4_096) || !cleanText(row.name, 80) ||
       !isAgentThreadId(row.agent_id) || !cleanText(row.agent_ref, 4_096) ||
       (row.project_id !== null && !isAgentThreadId(row.project_id)) ||
@@ -254,6 +263,11 @@ function thread(value: unknown): AgentThread | null {
         !(repository.base_ref as string).startsWith("refs/heads/") ||
         typeof repository.base_oid !== "string" || !/^[0-9a-f]{40}$/.test(repository.base_oid) ||
         !cleanText(repository.branch, 1_024))) ||
+      (personalization !== null &&
+        (!exact(personalization, ["path", "strategy", "content_digest"]) ||
+          personalization.path !== "AGENTS.md" || personalization.strategy !== "append" ||
+          typeof personalization.content_digest !== "string" ||
+          !/^blake3:[0-9a-f]{64}$/.test(personalization.content_digest))) ||
       (environment !== null && (repository === null ||
         !exact(environment, ["provider", "config_path", "content_digest", "state"]) ||
         environment.provider !== "service_federation" || environment.config_path !== "fed.yaml" ||

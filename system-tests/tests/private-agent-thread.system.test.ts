@@ -286,6 +286,87 @@ describe("private work with an agent", () => {
     }
   });
 
+  test("layers owner instructions over repository AGENTS.md and preserves them across agent contexts", async () => {
+    const founder = await browserApprovedCliClient();
+    const companion = await activateExternalAgent(
+      founder,
+      uniqueName("Personal workflow companion"),
+      ["workspace.read_file"],
+    );
+    const repository = new GitProject(uniqueName("personalized-workspace"), founder);
+    await repository.create();
+    const repositoryGuidance = "# Repository guidance\n\nRun the project formatter.\n";
+    await repository.writeFile("main", "AGENTS.md", repositoryGuidance);
+    const personalGuidance = [
+      "# My way of working",
+      "",
+      "Explain the tradeoff before changing an interface.",
+      "Use the smallest real system journey that proves the change.",
+    ].join("\n");
+    const retryKey = `personalized-agent-thread-${randomUUID()}`;
+
+    const created = await startPrivateAgentThread(founder, {
+      name: uniqueName("Use my workspace playbook"),
+      agentId: companion.agent.id,
+      idempotencyKey: retryKey,
+      workspace: {
+        repository: repository.slug,
+        instructions: personalGuidance,
+      },
+    });
+    expect(created.thread.workspace.personalization).toEqual({
+      path: "AGENTS.md",
+      strategy: "append",
+      content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
+    });
+
+    const firstContext = await beginAgentThreadRun(founder, created.thread.id);
+    const firstAgents = await askAgent(firstContext, 1, "workspace.read_file", {
+      path: "AGENTS.md",
+    });
+    await closeAgentRun(firstContext);
+    expect(firstAgents).toMatchObject({
+      content: expect.stringContaining(repositoryGuidance),
+    });
+    expect(record(firstAgents, "personalized AGENTS result").content).toEqual(
+      expect.stringContaining(personalGuidance),
+    );
+
+    const replay = await startPrivateAgentThread(founder, {
+      name: created.thread.name,
+      agentId: companion.agent.id,
+      idempotencyKey: retryKey,
+      workspace: {
+        repository: repository.slug,
+        instructions: personalGuidance,
+      },
+      expectedStatus: 200,
+    });
+    expect(replay).toEqual({ created: false, thread: created.thread });
+
+    await founder.json("/v1/agent-threads", {
+      method: "POST",
+      body: {
+        name: created.thread.name,
+        agent_id: companion.agent.id,
+        workspace: {
+          repository: repository.slug,
+          instructions: `${personalGuidance}\nDo something different.`,
+        },
+      },
+      idempotencyKey: retryKey,
+      expectedStatus: 409,
+    });
+
+    const resumedContext = await beginAgentThreadRun(founder, created.thread.id);
+    const resumedAgents = await askAgent(resumedContext, 1, "workspace.read_file", {
+      path: "AGENTS.md",
+    });
+    await closeAgentRun(resumedContext);
+    expect(resumedAgents).toEqual(firstAgents);
+    expect((await repository.readFile("main", "AGENTS.md")).contents).toBe(repositoryGuidance);
+  });
+
   test("refuses an agent runtime that cannot resume private work before provisioning anything", async () => {
     const founder = await browserApprovedCliClient();
     const threadName = uniqueName("Hosted thread that must not exist");

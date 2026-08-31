@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use myelin_agent_service::{
-    workspace::{AgentWorkspaceStore, RepositoryWorkspaceSource},
+    workspace::{AgentWorkspaceStore, RepositoryWorkspaceSource, WorkspaceAccessError},
     PlatformToolCatalogue,
 };
 use myelin_chat::conversation::{Conversation, ConversationKind};
@@ -14,10 +14,12 @@ use myelin_identity_service::{AgentSessionIssuer, AgentSessionRequest};
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
     AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRunBinding, AgentThreadState,
-    BindAgentThreadRunOutcome, CreateAgentThreadOutcome, DurableAgentThread,
-    DurableAgentThreadBacking, ListAgentThreadsOutcome, MarkAgentThreadReviewReadyOutcome,
-    NewAgentThread, RetryAgentThreadOutcome, WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES,
-    MAX_AGENT_THREAD_RETENTION_DAYS, MIN_AGENT_THREAD_RETENTION_DAYS,
+    AgentThreadWorkspaceGuidance, BindAgentThreadRunOutcome, ColumnCryptor,
+    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, KmsEngine,
+    ListAgentThreadsOutcome, MarkAgentThreadReviewReadyOutcome, NewAgentThread,
+    RetryAgentThreadOutcome, SubjectId, SubjectKeyScope, WorkspaceSshRouteKey,
+    MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
+    MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES, MIN_AGENT_THREAD_RETENTION_DAYS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -41,7 +43,7 @@ use crate::workspace_ssh_http::{
 };
 use crate::{EdgeError, Method};
 
-pub(crate) const MAX_AGENT_THREAD_JSON_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_AGENT_THREAD_JSON_BYTES: usize = 64 * 1024;
 const DEFAULT_RETENTION_DAYS: i16 = 3;
 pub const AGENT_THREAD_RECOVERY_TENANTS_ENV: &str = "MYELIN_AGENT_THREAD_RECOVERY_TENANTS";
 const DEFAULT_RECOVERY_INTERVAL_MS: u64 = 5_000;
@@ -156,6 +158,7 @@ struct AgentThreadHttpApi {
     catalogue: Arc<PlatformToolCatalogue>,
     event_ids: Arc<dyn IdMinter>,
     conversation_ids: Arc<dyn UlidSource>,
+    kms: Arc<KmsEngine>,
     runtime: Handle,
 }
 
@@ -212,18 +215,30 @@ impl AgentThreadHttpApi {
         let repository = intent
             .workspace
             .as_ref()
-            .map(|workspace| {
+            .and_then(|workspace| {
+                workspace
+                    .repository
+                    .as_ref()
+                    .map(|repository| (workspace, repository))
+            })
+            .map(|(workspace, repository)| {
                 self.git
                     .resolve_workspace_repository(
                         principal,
-                        &workspace.repository,
-                        &workspace.base_ref,
+                        repository,
+                        workspace.base_ref.as_deref().unwrap_or("main"),
                     )
                     .map_err(map_durable_err)
             })
             .transpose()?;
-        let proposal =
+        let mut proposal =
             intent.proposal(self.conversation_ids.mint().as_str(), repository.as_ref())?;
+        proposal.workspace_guidance = intent
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.instructions.as_deref())
+            .map(|instructions| self.seal_workspace_guidance(principal, &proposal, instructions))
+            .transpose()?;
         let outcome = self
             .drive(self.threads.create(&principal.tenant.0, proposal))?
             .map_err(|_| EdgeError::Internal("agent thread storage failed".into()))?;
@@ -400,6 +415,14 @@ impl AgentThreadHttpApi {
                 ));
             }
         };
+        if let Err(error) = self.apply_workspace_guidance(principal, &thread, workspace_id) {
+            self.record_provisioning_failure(
+                principal,
+                &thread,
+                AgentThreadProvisioningFailure::WorkspaceUnavailable,
+            )?;
+            return Err(error);
+        }
         let environment =
             provisioned
                 .environment
@@ -483,6 +506,103 @@ impl AgentThreadHttpApi {
                 },
             )
             .map_err(|error| error.to_string())
+    }
+
+    fn seal_workspace_guidance(
+        &self,
+        principal: &Principal,
+        proposal: &NewAgentThread,
+        instructions: &str,
+    ) -> Result<AgentThreadWorkspaceGuidance, EdgeError> {
+        let content_digest = workspace_guidance_digest(instructions.as_bytes());
+        let encrypted_content = ColumnCryptor::new(&self.kms, principal.region.clone())
+            .encrypt_for_subject_scope_with_aad(
+                &principal.tenant,
+                &SubjectId::new(&principal.principal_id.0),
+                SubjectKeyScope::AgentData,
+                instructions.as_bytes(),
+                &workspace_guidance_aad(
+                    principal,
+                    proposal.thread_id,
+                    &proposal.owner_principal_id,
+                    proposal.workspace_id,
+                ),
+            )
+            .map_err(|error| {
+                EdgeError::Internal(format!(
+                    "agent workspace guidance encryption failed: {error}"
+                ))
+            })?;
+        Ok(AgentThreadWorkspaceGuidance {
+            content_digest,
+            encrypted_content,
+        })
+    }
+
+    fn apply_workspace_guidance(
+        &self,
+        principal: &Principal,
+        thread: &DurableAgentThread,
+        workspace_id: Uuid,
+    ) -> Result<(), EdgeError> {
+        let Some(guidance) = thread.workspace_guidance.as_ref() else {
+            return Ok(());
+        };
+        let thread_id = parse_uuid("stored thread id", &thread.thread_id)
+            .map_err(|_| EdgeError::Internal("stored agent thread id is invalid".into()))?;
+        let plaintext = ColumnCryptor::new(&self.kms, principal.region.clone())
+            .decrypt_with_aad(
+                &guidance.encrypted_content,
+                &workspace_guidance_aad(
+                    principal,
+                    thread_id,
+                    &thread.owner_principal_id,
+                    workspace_id,
+                ),
+            )
+            .map_err(|_| {
+                EdgeError::Internal("stored agent workspace guidance cannot be decrypted".into())
+            })?;
+        if plaintext.len() > MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES
+            || workspace_guidance_digest(&plaintext) != guidance.content_digest
+        {
+            return Err(EdgeError::Internal(
+                "stored agent workspace guidance failed integrity validation".into(),
+            ));
+        }
+        let instructions = std::str::from_utf8(&plaintext).map_err(|_| {
+            EdgeError::Internal("stored agent workspace guidance is not UTF-8".into())
+        })?;
+        let existing =
+            match self
+                .workspaces
+                .read_file(&principal.tenant.0, workspace_id, "AGENTS.md")
+            {
+                Ok(file) => file.bytes,
+                Err(WorkspaceAccessError::NotFound) => Vec::new(),
+                Err(error) => {
+                    return Err(EdgeError::Unavailable(format!(
+                        "agent workspace AGENTS.md could not be read: {error}"
+                    )))
+                }
+            };
+        let personalized =
+            personalized_agents_file(&existing, instructions, &guidance.content_digest)?;
+        if personalized != existing {
+            self.workspaces
+                .write_file(
+                    &principal.tenant.0,
+                    workspace_id,
+                    "AGENTS.md",
+                    &personalized,
+                )
+                .map_err(|error| {
+                    EdgeError::Unavailable(format!(
+                        "agent workspace AGENTS.md could not be personalized: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     fn complete_publication(
@@ -608,6 +728,7 @@ pub struct AgentThreadHttpInputs {
     pub sessions: AgentSessionIssuer,
     pub ssh_routes: WorkspaceSshRouteKey,
     pub ssh_endpoint: WorkspaceSshEndpoint,
+    pub kms: Arc<KmsEngine>,
     pub runtime: Handle,
     pub recovery: AgentThreadRecoveryConfig,
 }
@@ -628,11 +749,14 @@ struct CreateAgentThreadBody {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateAgentThreadWorkspaceBody {
-    repository: String,
-    #[serde(default = "default_workspace_base_ref")]
-    base_ref: String,
+    #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
+    base_ref: Option<String>,
     #[serde(default)]
     branch: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 struct ValidatedThreadIntent {
@@ -665,9 +789,38 @@ impl ValidatedThreadIntent {
             )));
         }
         if let Some(workspace) = body.workspace.as_ref() {
-            validate_workspace_branch(&workspace.base_ref, "base_ref", true)?;
-            if let Some(branch) = workspace.branch.as_deref() {
-                validate_workspace_branch(branch, "branch", false)?;
+            if workspace.repository.is_none()
+                && (workspace.base_ref.is_some() || workspace.branch.is_some())
+            {
+                return Err(EdgeError::BadRequest(
+                    "agent thread workspace base_ref and branch require a repository".into(),
+                ));
+            }
+            if workspace.repository.is_none() && workspace.instructions.is_none() {
+                return Err(EdgeError::BadRequest(
+                    "agent thread workspace must configure a repository or instructions".into(),
+                ));
+            }
+            if let Some(repository) = workspace.repository.as_deref() {
+                if repository.is_empty()
+                    || repository.len() > 255
+                    || repository.chars().any(char::is_control)
+                {
+                    return Err(EdgeError::BadRequest(
+                        "agent thread workspace repository must be clean bounded text".into(),
+                    ));
+                }
+                validate_workspace_branch(
+                    workspace.base_ref.as_deref().unwrap_or("main"),
+                    "base_ref",
+                    true,
+                )?;
+                if let Some(branch) = workspace.branch.as_deref() {
+                    validate_workspace_branch(branch, "branch", false)?;
+                }
+            }
+            if let Some(instructions) = workspace.instructions.as_deref() {
+                validate_workspace_instructions(instructions)?;
             }
         }
         let now = Utc::now()
@@ -718,6 +871,7 @@ impl ValidatedThreadIntent {
                         default_workspace_branch(&self.owner_principal_id, &self.client_nonce)
                     }),
             }),
+            workspace_guidance: None,
             retention_days: self.retention_days,
             client_nonce: self.client_nonce.clone(),
             created_at: self.now,
@@ -734,14 +888,36 @@ impl ValidatedThreadIntent {
         {
             return false;
         }
-        match (self.workspace.as_ref(), thread.git.as_ref()) {
+        let requested_guidance = self.workspace.as_ref().and_then(|workspace| {
+            workspace
+                .instructions
+                .as_ref()
+                .map(|instructions| workspace_guidance_digest(instructions.as_bytes()))
+        });
+        if requested_guidance.as_deref()
+            != thread
+                .workspace_guidance
+                .as_ref()
+                .map(|guidance| guidance.content_digest.as_str())
+        {
+            return false;
+        }
+        match (
+            self.workspace
+                .as_ref()
+                .and_then(|workspace| workspace.repository.as_ref().map(|_| workspace)),
+            thread.git.as_ref(),
+        ) {
             (None, None) => true,
             (Some(requested), Some(stored)) => {
                 let branch = requested.branch.clone().unwrap_or_else(|| {
                     default_workspace_branch(&self.owner_principal_id, &self.client_nonce)
                 });
-                stored.repository == requested.repository
-                    && stored.base_ref == normalized_workspace_base_ref(&requested.base_ref)
+                stored.repository == requested.repository.as_deref().unwrap_or_default()
+                    && stored.base_ref
+                        == normalized_workspace_base_ref(
+                            requested.base_ref.as_deref().unwrap_or("main"),
+                        )
                     && stored.branch == branch
             }
             _ => false,
@@ -1041,6 +1217,7 @@ pub fn register_agent_threads(
         ),
         event_ids: Arc::new(myelin_events::UlidMinter::new()),
         conversation_ids: Arc::new(SystemUlidSource::new()),
+        kms: inputs.kms,
         runtime: inputs.runtime,
     };
     let builder = builder
@@ -1202,6 +1379,11 @@ fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
                 "base_oid": git.base_oid,
                 "branch": git.branch,
             })),
+            "personalization": thread.workspace_guidance.as_ref().map(|guidance| json!({
+                "path": "AGENTS.md",
+                "strategy": "append",
+                "content_digest": guidance.content_digest,
+            })),
             "environment": thread.environment.as_ref().map(|environment| json!({
                 "provider": environment.provider,
                 "config_path": environment.config_path,
@@ -1226,8 +1408,85 @@ fn thread_ref(tenant: &str, thread_id: &str) -> String {
     format!("myelin://{tenant}/agent/thread/{thread_id}")
 }
 
-fn default_workspace_base_ref() -> String {
-    "main".into()
+fn validate_workspace_instructions(instructions: &str) -> Result<(), EdgeError> {
+    if instructions.trim().is_empty()
+        || instructions.len() > MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES
+        || instructions.contains('\0')
+    {
+        return Err(EdgeError::BadRequest(format!(
+            "agent thread workspace instructions must contain 1..={MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES} UTF-8 bytes and no NUL characters"
+        )));
+    }
+    Ok(())
+}
+
+fn workspace_guidance_digest(content: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(content).to_hex())
+}
+
+fn workspace_guidance_aad(
+    principal: &Principal,
+    thread_id: Uuid,
+    owner_principal_id: &str,
+    workspace_id: Uuid,
+) -> Vec<u8> {
+    let mut aad = Vec::new();
+    let thread_id = thread_id.to_string();
+    let workspace_id = workspace_id.to_string();
+    for field in [
+        "myelin.agent-thread.workspace-guidance.v1",
+        principal.tenant.as_str(),
+        principal.region.as_str(),
+        thread_id.as_str(),
+        owner_principal_id,
+        workspace_id.as_str(),
+    ] {
+        aad.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        aad.extend_from_slice(field.as_bytes());
+    }
+    aad
+}
+
+fn personalized_agents_file(
+    existing: &[u8],
+    instructions: &str,
+    content_digest: &str,
+) -> Result<Vec<u8>, EdgeError> {
+    let marker_prefix = b"<!-- myelin:personal-workspace-guidance:";
+    let start = format!("<!-- myelin:personal-workspace-guidance:{content_digest} -->\n");
+    let mut section = start.into_bytes();
+    section.extend_from_slice(instructions.as_bytes());
+    if !section.ends_with(b"\n") {
+        section.push(b'\n');
+    }
+    section.extend_from_slice(b"<!-- /myelin:personal-workspace-guidance -->\n");
+
+    if existing
+        .windows(section.len())
+        .any(|candidate| candidate == section)
+    {
+        return Ok(existing.to_vec());
+    }
+    if existing
+        .windows(marker_prefix.len())
+        .any(|candidate| candidate == marker_prefix)
+    {
+        return Err(EdgeError::Internal(
+            "agent workspace has conflicting durable personal guidance".into(),
+        ));
+    }
+    std::str::from_utf8(existing).map_err(|_| {
+        EdgeError::Unavailable("agent workspace AGENTS.md is not UTF-8 text".into())
+    })?;
+    let mut personalized = existing.to_vec();
+    if !personalized.is_empty() {
+        if !personalized.ends_with(b"\n") {
+            personalized.push(b'\n');
+        }
+        personalized.push(b'\n');
+    }
+    personalized.extend_from_slice(&section);
+    Ok(personalized)
 }
 
 fn default_workspace_branch(owner: &str, client_nonce: &str) -> String {
@@ -1494,6 +1753,7 @@ mod tests {
             name: "Investigate checkout race".into(),
             project_id: None,
             git: replay.git,
+            workspace_guidance: None,
             environment: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
@@ -1520,6 +1780,54 @@ mod tests {
             ValidatedThreadIntent::new(&principal(), body, "retry".into()),
             Err(EdgeError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn personal_instructions_can_configure_an_empty_workspace() {
+        let body: CreateAgentThreadBody = serde_json::from_value(json!({
+            "name": "Use my playbook",
+            "agent_id": "11111111-1111-4111-8111-111111111111",
+            "workspace": {
+                "instructions": "# My workflow\n\nRun the focused journey first."
+            },
+        }))
+        .unwrap();
+        let intent = ValidatedThreadIntent::new(&principal(), body, "retry".into()).unwrap();
+        let proposal = intent.proposal("01J00000000000000000000000", None).unwrap();
+        assert!(proposal.git.is_none());
+
+        for workspace in [
+            json!({}),
+            json!({ "instructions": "   \n" }),
+            json!({ "instructions": "x\u{0000}y" }),
+            json!({ "base_ref": "main", "instructions": "work carefully" }),
+        ] {
+            let body: CreateAgentThreadBody = serde_json::from_value(json!({
+                "name": "Invalid personalization",
+                "agent_id": "11111111-1111-4111-8111-111111111111",
+                "workspace": workspace,
+            }))
+            .unwrap();
+            assert!(ValidatedThreadIntent::new(&principal(), body, "retry".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn personal_agents_guidance_preserves_repository_defaults_and_is_idempotent() {
+        let repository = b"# Repository workflow\n\nRun cargo fmt.\n";
+        let personal = "# My workflow\n\nExplain interface tradeoffs.";
+        let digest = workspace_guidance_digest(personal.as_bytes());
+        let personalized = personalized_agents_file(repository, personal, &digest).unwrap();
+        let rendered = std::str::from_utf8(&personalized).unwrap();
+        assert!(rendered.starts_with(std::str::from_utf8(repository).unwrap()));
+        assert!(rendered.contains(personal));
+        assert!(rendered.contains(&digest));
+        assert_eq!(
+            personalized_agents_file(&personalized, personal, &digest).unwrap(),
+            personalized
+        );
+        assert!(personalized_agents_file(repository, "different", "blake3:deadbeef").is_ok());
+        assert!(personalized_agents_file(&personalized, "different", "blake3:deadbeef").is_err());
     }
 
     #[test]
@@ -1603,6 +1911,7 @@ mod tests {
             name: "Investigate checkout race".into(),
             project_id: None,
             git: None,
+            workspace_guidance: None,
             environment: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
@@ -1654,6 +1963,7 @@ mod tests {
             name: "Investigate checkout race".into(),
             project_id: None,
             git: None,
+            workspace_guidance: None,
             environment: None,
             retention_days: 3,
             state: AgentThreadState::Ready,
