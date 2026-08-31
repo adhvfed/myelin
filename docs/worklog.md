@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — The CLI can keep the cloud branch it is working in
+
+Workspace renewal initially existed only in the browser even though remote shells, editor profiles,
+and thread-bound MCP work naturally begin from the CLI. `myelin agent thread renew` now accepts one
+canonical thread identity and one bounded `--retention-days` value. It requires the caller's stable
+idempotency key, sends the same narrow Edge intent as the web, renders changed and replayed receipts
+honestly, and keeps the continuation command beside the other workspace actions. Malformed,
+duplicate, noncanonical, or out-of-policy input fails before transport.
+
+The readable TypeScript CLI journey logs in through device approval, activates and configures its
+named agent, starts a three-day personalized workspace, retains that exact workspace for thirty
+days, and replays the same key without moving the deadline again. It then continues through the
+existing thread-bound MCP write, ordinary SSH/SFTP/editor access, durable history, lifecycle, and
+review flow against the live Edge, PostgreSQL, Chat/ReBAC, agent service, workspace gateway, and
+gVisor stack. All 164 CLI unit tests also pass.
+
 ## 2026-09-01 — A personal cloud branch can be kept alive deliberately
 
 A private workspace previously had a fixed one-to-thirty-day lifetime chosen only at creation. An

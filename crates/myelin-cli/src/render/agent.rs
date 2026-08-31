@@ -9,7 +9,7 @@ use super::{query_field, terminal_safe_single_line};
 
 pub(super) fn render_response(value: &Value, call: Option<&EdgeCall>) -> Option<String> {
     if let Some(thread) = value.get("thread") {
-        return render_thread_response(value, thread);
+        return render_thread_response(value, thread, call);
     }
     let agent = value.get("agent")?;
     let summary = render_agent(agent)?;
@@ -142,7 +142,11 @@ pub(super) fn page_command(call: &EdgeCall, cursor: &str) -> Option<String> {
     }
 }
 
-fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
+fn render_thread_response(
+    value: &Value,
+    thread: &Value,
+    call: Option<&EdgeCall>,
+) -> Option<String> {
     let summary = render_thread(thread)?;
     let id = terminal_safe_single_line(thread.get("id")?.as_str()?);
     let conversation = terminal_safe_single_line(thread.get("conversation_ref")?.as_str()?);
@@ -158,15 +162,19 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
         .get("review_state")
         .and_then(Value::as_str)
         .unwrap_or("draft");
+    let renewal = call.is_some_and(|call| call.path.ends_with("/renew"));
     let prefix = match (
+        renewal,
         review_state,
         value.get("changed").and_then(Value::as_bool),
         value.get("created").and_then(Value::as_bool),
     ) {
-        ("ready", Some(true), _) => "Published agent thread for review",
-        ("ready", Some(false), _) => "Agent thread already ready for review",
-        (_, _, Some(true)) => "Started private agent thread",
-        (_, _, Some(false)) => "Private agent thread already exists",
+        (true, _, Some(true), _) => "Retained private agent workspace",
+        (true, _, Some(false), _) => "Private agent workspace already retained",
+        (false, "ready", Some(true), _) => "Published agent thread for review",
+        (false, "ready", Some(false), _) => "Agent thread already ready for review",
+        (false, _, _, Some(true)) => "Started private agent thread",
+        (false, _, _, Some(false)) => "Private agent thread already exists",
         _ => "Private agent thread",
     };
     let mut output = format!(
@@ -183,6 +191,10 @@ fn render_thread_response(value: &Value, thread: &Value) -> Option<String> {
         );
         let _ = writeln!(output, "  workspace: myelin agent thread ssh {id}");
         let _ = writeln!(output, "  files: myelin agent thread ssh {id} --sftp");
+        let _ = writeln!(
+            output,
+            "  keep: myelin --idempotency-key <key> agent thread renew {id} --retention-days 30"
+        );
         let _ = writeln!(
             output,
             "  editor: myelin agent thread ssh-config {id} --identity /path/to/ssh_identity"
@@ -439,7 +451,29 @@ mod tests {
         assert!(rendered.contains(&format!("myelin agent thread ssh {THREAD_ID} --sftp")));
         assert!(rendered.contains(&format!("myelin agent thread ssh-config {THREAD_ID}")));
         assert!(rendered.contains(&format!("myelin mcp serve --as {ID} --thread {THREAD_ID}")));
+        assert!(rendered.contains(&format!("agent thread renew {THREAD_ID} --retention-days 30")));
         assert!(!rendered.contains("storage_locator"));
+
+        let renewal_call = agent_dispatch(&[
+            "thread",
+            "renew",
+            THREAD_ID,
+            "--retention-days",
+            "30",
+        ])
+        .unwrap();
+        let renewed = render_response(
+            &json!({ "thread": thread(), "changed": true, "durable": true }),
+            Some(&renewal_call),
+        )
+        .unwrap();
+        assert!(renewed.starts_with("Retained private agent workspace:"));
+        let replayed = render_response(
+            &json!({ "thread": thread(), "changed": false, "durable": true }),
+            Some(&renewal_call),
+        )
+        .unwrap();
+        assert!(replayed.starts_with("Private agent workspace already retained:"));
 
         let mut project_draft = thread();
         project_draft["project_id"] = json!("33333333-3333-3333-3333-333333333333");

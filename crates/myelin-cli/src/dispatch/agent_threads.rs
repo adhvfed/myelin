@@ -15,12 +15,13 @@ pub(super) fn agent_thread_dispatch(
 ) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent thread command given (try: start <name> --agent <id> [--repository <slug>] [--instructions <markdown>] | ready <id> | retry <id> | list | show <id> | say <id> <message> | history <id>)"
+            "no agent thread command given (try: start <name> --agent <id> [--repository <slug>] [--instructions <markdown>] | renew <id> --retention-days <days> | ready <id> | retry <id> | list | show <id> | say <id> <message> | history <id>)"
                 .into(),
         )
     })?;
     match *verb {
         "start" => start_call(rest, default_project),
+        "renew" => renew_call(rest),
         "ready" => ready_call(rest),
         "retry" => retry_call(rest),
         "list" => list_call(rest),
@@ -195,6 +196,42 @@ fn retry_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     Ok(EdgeCall::post_retry_safe_json(
         format!("/v1/agent-threads/{id}/retry"),
         json!({}),
+    ))
+}
+
+fn renew_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let Some((id, flags)) = args.split_first() else {
+        return Err(CliError::Usage(
+            "agent thread renew needs a thread id and --retention-days <days>".into(),
+        ));
+    };
+    require_agent_id("agent thread id", id)?;
+    let mut retention_days = None;
+    let mut index = 0;
+    while index < flags.len() {
+        match flags[index] {
+            "--retention-days" if retention_days.is_none() => {
+                retention_days = Some(flag_value(flags, &mut index, "--retention-days")?);
+            }
+            "--retention-days" => {
+                return Err(CliError::Usage(
+                    "agent thread renew accepts --retention-days only once".into(),
+                ));
+            }
+            token => {
+                return Err(CliError::Usage(format!(
+                    "unknown agent thread renew flag `{token}`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let retention_days = retention_days
+        .ok_or_else(|| CliError::Usage("agent thread renew needs --retention-days <days>".into()))
+        .and_then(parse_retention_days)?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/agent-threads/{id}/renew"),
+        json!({ "retention_days": retention_days }),
     ))
 }
 
@@ -422,6 +459,14 @@ mod tests {
         assert_eq!(retry.retry_policy, RetryPolicy::None);
         assert_eq!(retry.payload.as_deref(), Some(b"{}".as_slice()));
 
+        let renew = agent_dispatch(&["thread", "renew", THREAD, "--retention-days", "30"]).unwrap();
+        assert_eq!(renew.path, format!("/v1/agent-threads/{THREAD}/renew"));
+        assert_eq!(renew.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(renew.payload.as_ref().unwrap()).unwrap(),
+            json!({ "retention_days": 30 })
+        );
+
         let ready = agent_dispatch(&["thread", "ready", THREAD]).unwrap();
         assert_eq!(ready.path, format!("/v1/agent-threads/{THREAD}/ready"));
         assert_eq!(ready.retry_policy, RetryPolicy::None);
@@ -483,6 +528,9 @@ mod tests {
             vec!["thread", "show", "not-a-thread"],
             vec!["thread", "retry"],
             vec!["thread", "retry", "not-a-thread"],
+            vec!["thread", "renew", THREAD],
+            vec!["thread", "renew", THREAD, "--retention-days", "31"],
+            vec!["thread", "renew", THREAD, "--retention-days", "030"],
             vec!["thread", "ready"],
             vec!["thread", "ready", "not-a-thread"],
             vec!["thread", "say", THREAD],

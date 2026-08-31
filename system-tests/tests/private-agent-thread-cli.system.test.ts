@@ -160,12 +160,55 @@ describe("private agent work from the CLI", () => {
         },
       },
     });
+    const initialExpiry = Date.parse(string(
+      record(thread.workspace, "created private workspace").expires_at,
+      "created private workspace expiry",
+    ));
+    const renewalKey = `cli-private-renewal-${randomUUID()}`;
+    const renew = () => runMyelin(
+      "--json",
+      "--idempotency-key",
+      renewalKey,
+      "agent",
+      "thread",
+      "renew",
+      threadId,
+      "--retention-days",
+      "30",
+    );
+    const renewed = await renew();
+    expect(renewed.exitCode, renewed.stderr).toBe(0);
+    const renewalReceipt = record(JSON.parse(renewed.stdout), "CLI workspace renewal");
+    const renewedThread = record(renewalReceipt.thread, "renewed private thread");
+    expect(renewalReceipt).toMatchObject({ changed: true, durable: true });
+    expect(renewedThread).toMatchObject({
+      id: threadId,
+      workspace: {
+        id: record(thread.workspace, "created private workspace").id,
+        retention_days: 30,
+      },
+    });
+    expect(Date.parse(string(
+      record(renewedThread.workspace, "renewed private workspace").expires_at,
+      "renewed private workspace expiry",
+    ))).toBeGreaterThan(initialExpiry);
+    const replayed = await renew();
+    expect(replayed.exitCode, replayed.stderr).toBe(0);
+    expect(JSON.parse(replayed.stdout)).toMatchObject({
+      changed: false,
+      durable: true,
+      thread: {
+        id: threadId,
+        workspace: { id: record(thread.workspace, "created private workspace").id },
+      },
+    });
 
     const shown = await runMyelin("agent", "thread", "show", threadId);
     expect(shown.exitCode, shown.stderr).toBe(0);
     expect(shown.stdout).toContain(`Private agent thread: ${threadName}`);
     expect(shown.stdout).toContain(`myelin agent thread say ${threadId}`);
     expect(shown.stdout).toContain(`myelin agent thread ssh ${threadId}`);
+    expect(shown.stdout).toContain(`agent thread renew ${threadId} --retention-days 30`);
     expect(shown.stdout).toContain(
       `myelin mcp serve --as ${companionId} --thread ${threadId}`,
     );

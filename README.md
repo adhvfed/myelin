@@ -122,6 +122,9 @@ myelin agent thread start "Investigate checkout race" \
 myelin agent thread list
 # If startup was interrupted, reopen the same durable conversation and workspace identities.
 myelin agent thread retry 33333333-3333-4333-8333-333333333333
+# Keep a useful live branch without replacing it. Exact retries need the same client intent key.
+myelin --idempotency-key keep-checkout-race \
+  agent thread renew 33333333-3333-4333-8333-333333333333 --retention-days 30
 myelin agent thread say 33333333-3333-4333-8333-333333333333 \
   "The final reader still owns its checkout lease."
 myelin agent thread history 33333333-3333-4333-8333-333333333333
