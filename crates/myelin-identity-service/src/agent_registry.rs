@@ -8,6 +8,7 @@ use myelin_events::{
 };
 use myelin_identity::{
     DataRole, Principal, PrincipalKind, PrincipalStatus, RuntimeRef, IDENTITY_AGENT_CREATED,
+    IDENTITY_AGENT_WORKSPACE_GUIDANCE_UPDATED,
 };
 use myelin_storage::{
     ensure_agent_policy_bundle_on_conn, DurableDelegationPolicyError,
@@ -152,6 +153,11 @@ impl PgAgentRegistry {
             EventId(self.event_ids.mint().0),
             created_at,
         );
+        let event_actor = actor.clone();
+        let workspace_event_id = proposal
+            .workspace_guidance
+            .as_ref()
+            .map(|_| EventId(self.event_ids.mint().0));
         let proposal_for_tx = proposal.clone();
 
         let outcome = self
@@ -301,6 +307,20 @@ impl PgAgentRegistry {
                         &event,
                     )
                     .await?;
+                    if let Some(workspace_event_id) = workspace_event_id {
+                        let workspace_event = agent_workspace_guidance_updated_event(
+                            &event_actor,
+                            &agent,
+                            workspace_event_id,
+                            created_at,
+                        );
+                        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+                            conn,
+                            &workspace_event.aggregate.0,
+                            &workspace_event,
+                        )
+                        .await?;
+                    }
                     Ok(CreateTx::Created {
                         agent,
                         versions,
@@ -441,6 +461,8 @@ impl PgAgentRegistry {
         let region = actor.region.0.clone();
         let owner = actor.principal_id.0.clone();
         let updated_at = Utc::now();
+        let event_actor = actor.clone();
+        let event_id = EventId(self.event_ids.mint().0);
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
@@ -520,8 +542,21 @@ impl PgAgentRegistry {
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(query_error("update agent workspace guidance"))?;
+                    let agent = agent_from_row(&row, current.status)?;
+                    let event = agent_workspace_guidance_updated_event(
+                        &event_actor,
+                        &agent,
+                        event_id,
+                        updated_at,
+                    );
+                    myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+                        conn,
+                        &event.aggregate.0,
+                        &event,
+                    )
+                    .await?;
                     Ok(Some(Ok(AgentWorkspaceGuidanceOutcome {
-                        agent: agent_from_row(&row, current.status)?,
+                        agent,
                         changed: true,
                     })))
                 })
@@ -1000,6 +1035,44 @@ fn agent_created_event(
                 "runtime_ref": runtime_ref,
                 "tools": tools,
                 "delegator_principal_id": actor.principal_id.0,
+            }),
+            data_role: EventDataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        },
+        EmitContext {
+            event_id,
+            tenant: actor.tenant.clone(),
+            region: actor.region.clone(),
+            actor: Actor(actor.clone()),
+            schema_ver: 1,
+            occurred_at: timestamp.clone(),
+            recorded_at: timestamp,
+            caused_by: None,
+        },
+        None,
+    )
+}
+
+fn agent_workspace_guidance_updated_event(
+    actor: &Principal,
+    agent: &AgentRegistration,
+    event_id: EventId,
+    now: DateTime<Utc>,
+) -> myelin_events::EventEnvelope {
+    let timestamp = Timestamp(now.to_rfc3339_opts(SecondsFormat::Micros, true));
+    derive_envelope(
+        EventDraft {
+            type_: EventType(IDENTITY_AGENT_WORKSPACE_GUIDANCE_UPDATED.into()),
+            subject: agent_ref(&actor.tenant.0, &agent.id),
+            aggregate: AggregateKey(format!("identity:agent:{}", agent.id)),
+            payload: serde_json::json!({
+                "agent_id": agent.id,
+                "revision": agent.workspace_guidance_revision,
+                "configured": agent.workspace_guidance.is_some(),
+                "content_digest": agent.workspace_guidance.as_ref()
+                    .map(|guidance| guidance.content_digest.as_str()),
             }),
             data_role: EventDataRole::Controller,
             visibility: Visibility::Internal,

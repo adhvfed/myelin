@@ -318,13 +318,91 @@ async fn owner_workspace_defaults_are_encrypted_revisioned_and_retry_safe() {
         .update_workspace_guidance(
             &actor,
             AgentWorkspaceGuidanceUpdate {
-                agent_id: created.id,
+                agent_id: created.id.clone(),
                 expected_revision: 1,
                 guidance: None,
             },
         )
         .await;
     assert!(matches!(stale, Err(AgentRegistryError::Conflict(_))));
+
+    let clear = AgentWorkspaceGuidanceUpdate {
+        agent_id: created.id.clone(),
+        expected_revision: 2,
+        guidance: None,
+    };
+    let cleared = registry
+        .update_workspace_guidance(&actor, clear.clone())
+        .await
+        .unwrap();
+    assert!(cleared.changed);
+    assert_eq!(cleared.agent.workspace_guidance_revision, 3);
+    assert!(cleared.agent.workspace_guidance.is_none());
+    let clear_replay = registry
+        .update_workspace_guidance(&actor, clear)
+        .await
+        .unwrap();
+    assert!(!clear_replay.changed);
+    assert_eq!(clear_replay.agent, cleared.agent);
+
+    let events: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT envelope FROM outbox \
+          WHERE aggregate = $1 \
+            AND envelope->>'type_' = 'identity.agent.workspace_guidance_updated' \
+          ORDER BY seq",
+    )
+    .bind(format!("identity:agent:{}", created.id))
+    .fetch_all(admin.db_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        events.len(),
+        3,
+        "activation, replacement, and clear emit once; retries and stale writes emit nothing"
+    );
+    assert_eq!(events[0]["payload"]["agent_id"], created.id);
+    assert_eq!(events[0]["payload"]["revision"], 1);
+    assert_eq!(events[0]["payload"]["configured"], true);
+    assert_eq!(
+        events[0]["payload"]["content_digest"],
+        format!("blake3:{}", blake3::hash(original).to_hex())
+    );
+    assert_eq!(events[1]["payload"]["revision"], 2);
+    assert_eq!(events[1]["payload"]["configured"], true);
+    assert_eq!(
+        events[1]["payload"]["content_digest"],
+        format!("blake3:{}", blake3::hash(revised).to_hex())
+    );
+    assert_eq!(events[2]["payload"]["revision"], 3);
+    assert_eq!(events[2]["payload"]["configured"], false);
+    assert!(events[2]["payload"]["content_digest"].is_null());
+    for event in &events {
+        assert_eq!(event["contains_personal_data"], false);
+        assert_eq!(event["visibility"], "Internal");
+        assert!(event["pii_key_ref"].is_null());
+        let mut payload_keys = event["payload"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        payload_keys.sort_unstable();
+        assert_eq!(
+            payload_keys,
+            ["agent_id", "configured", "content_digest", "revision"]
+        );
+        let rendered = event.to_string();
+        assert!(!rendered.contains(std::str::from_utf8(original).unwrap()));
+        assert!(!rendered.contains(std::str::from_utf8(revised).unwrap()));
+        for forbidden in [
+            "ciphertext",
+            "workspace_guidance_key_ref",
+            "nonce",
+            "instructions",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
     cleanup(&admin, &tenant).await;
 }
 

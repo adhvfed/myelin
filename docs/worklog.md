@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-08-31 — Workspace-default changes leave a private-safe audit trail
+
+Editable named-agent defaults were durable and retry-safe, but changing them left no domain event.
+That made a sensitive configuration mutation invisible to the platform audit trail even though
+agent creation and lifecycle changes were already co-committed with their state.
+
+`identity.agent.workspace_guidance_updated` now records initial configuration, replacement, and
+clear in the same PostgreSQL transaction as the agent row. Its internal payload contains only the
+agent ID, revision, configured state, and content digest. It contains no plaintext instructions,
+nonce, ciphertext, owner key reference, or PII key, and it is classified as non-personal controller
+metadata. Exact semantic retries and rejected stale writes do not produce another event.
+
+The live durable-agent integration journey creates encrypted defaults, retries and replaces them,
+suspends and resumes the agent, rejects a stale clear, clears the current revision, and retries that
+clear. It reads the real outbox and proves exactly three ordered metadata-only events—one each for
+activation, replacement, and clear—while both retry paths and the conflict remain absent. The
+identity event taxonomy test and strict package compilation pass.
+
 ## 2026-08-31 — Named agents carry editable private workspace defaults
 
 A person's named agent can now hold default `AGENTS.md` instructions instead of requiring the same
