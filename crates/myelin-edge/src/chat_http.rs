@@ -303,6 +303,15 @@ pub struct PrivateConversationCreation {
     pub defer_visibility: bool,
 }
 
+pub struct PrivateConversationRenewal<'a> {
+    pub conversation: &'a ConversationId,
+    pub agent_id: &'a str,
+    pub project_authority_ready: bool,
+    pub retention_days: i32,
+    pub expires_at: Timestamp,
+    pub now: Timestamp,
+}
+
 impl DurableChatMutationApi {
     pub fn new(reads: DurableChatReadApi, principals: PrincipalStore) -> Self {
         Self {
@@ -451,6 +460,66 @@ impl DurableChatMutationApi {
             self.reads
                 .conversations
                 .publish_private_to_project(conversation, project_id, &zookie.0)
+                .await
+                .map_err(map_conversation_error)
+        })
+    }
+
+    pub fn renew_private_conversation_authority(
+        &self,
+        principal: &Principal,
+        renewal: PrivateConversationRenewal<'_>,
+    ) -> Result<(), EdgeError> {
+        let PrivateConversationRenewal {
+            conversation,
+            agent_id,
+            project_authority_ready,
+            retention_days,
+            expires_at,
+            now,
+        } = renewal;
+        let persisted = self.drive(async {
+            self.reads
+                .conversations
+                .get(conversation)
+                .await
+                .map_err(map_conversation_error)
+        })?;
+        let expected_creator = pseudonymized_event_principal(&principal.tenant.0, principal)
+            .principal_id
+            .0;
+        if persisted.archived
+            || !matches!(
+                persisted.kind,
+                ConversationKind::ChannelPrivate | ConversationKind::ChannelPublic
+            )
+            || persisted.created_by != expected_creator
+        {
+            return Err(EdgeError::NotFound("conversation not found".into()));
+        }
+        let members = [
+            principal.principal_id.clone(),
+            PrincipalId(format!("agent:{agent_id}")),
+        ];
+        let mut zookie = self.reads.authorization.renew_agent_thread_members(
+            principal,
+            &persisted,
+            &members,
+            expires_at.clone(),
+            now.clone(),
+        )?;
+        if project_authority_ready {
+            zookie = self.reads.authorization.bind_public_project(
+                principal,
+                &persisted,
+                Some(expires_at),
+                now,
+            )?;
+        }
+        self.drive(async {
+            self.reads
+                .conversations
+                .renew_retention(&persisted.id, retention_days, &zookie.0)
                 .await
                 .map_err(map_conversation_error)
         })

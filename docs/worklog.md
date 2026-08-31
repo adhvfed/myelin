@@ -4,6 +4,35 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — A personal cloud branch can be kept alive deliberately
+
+A private workspace previously had a fixed one-to-thirty-day lifetime chosen only at creation. An
+owner could reconnect from fresh agent contexts, but could not keep valuable work beyond that first
+deadline. The workspace pane now lets its owner retain a live branch for 7, 14, or 30 days from
+today. The same durable receipt, workspace identity, repository branch, personalized files, and
+declared Service Federation environment remain in place. Existing agent-run and SSH credentials do
+not grow with it; fresh credentials remain short-lived and bounded by the new workspace deadline.
+
+Renewal locks the thread against expiration and co-commits its exact new deadline, displayed
+retention window, and a pending cross-store repair record. Stable client intent makes a lost-response
+retry inert rather than adding another lifetime. The recovery worker advances the owner, agent, and
+already-published project Chat relationships plus the conversation retention receipt, then marks
+the repair complete. The first running browser attempt exposed that Chat stores a tenant-scoped
+owner pseudonym rather than the raw principal: storage advanced safely, the request failed closed,
+and the pending repair remained durable. Correcting that comparison and restarting Edge let the
+worker finish the exact interrupted renewal, directly exercising the recovery design.
+
+The PostgreSQL integration story proves the renewal wins the old expiry race, leases and completes
+pending repair, replays exactly once, rejects a changed or foreign-owner retry, remains inert when
+the existing deadline is later, and expires at the exact new boundary. The Chromium product journey
+starts a three-day repository workspace, retains it for thirty days in the visible pane, observes
+both the new deadline and “30 days” list receipt, reloads the same deadline, and continues through
+private messaging, lifecycle, editor/SSH affordances, review publication, and durable Chat where
+the conversation also reports thirty days. It then renews the same thread again after publication
+so both direct owner/agent membership and project-derived review authority cross the production
+path. Rebuilt Edge and web services, PostgreSQL, durable Git, Chat/ReBAC, the workspace gateway, and
+gVisor are all live in that proof.
+
 ## 2026-08-31 — First-time automation setup no longer activates the wrong runtime
 
 The empty automation dialog directed its owner to activate an agent, but opened the generic agent

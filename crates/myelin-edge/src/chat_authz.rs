@@ -1,5 +1,5 @@
 use crate::EdgeError;
-use myelin_chat::conversation::Conversation;
+use myelin_chat::conversation::{Conversation, ConversationKind};
 use myelin_chat::membership::{channel_object, permissions};
 use myelin_events::Timestamp;
 use myelin_identity::{
@@ -101,6 +101,36 @@ impl ChatAuthorization {
                 "direct Chat membership is only valid for private conversations".into(),
             ));
         }
+        self.write_direct_members(actor, conversation, members, expires_at, occurred_at)
+    }
+
+    pub(crate) fn renew_agent_thread_members(
+        &self,
+        actor: &Principal,
+        conversation: &Conversation,
+        members: &[PrincipalId],
+        expires_at: Timestamp,
+        occurred_at: Timestamp,
+    ) -> Result<Zookie, EdgeError> {
+        if !matches!(
+            conversation.kind,
+            ConversationKind::ChannelPrivate | ConversationKind::ChannelPublic
+        ) {
+            return Err(EdgeError::Internal(
+                "agent thread membership requires a channel conversation".into(),
+            ));
+        }
+        self.write_direct_members(actor, conversation, members, Some(expires_at), occurred_at)
+    }
+
+    fn write_direct_members(
+        &self,
+        actor: &Principal,
+        conversation: &Conversation,
+        members: &[PrincipalId],
+        expires_at: Option<Timestamp>,
+        occurred_at: Timestamp,
+    ) -> Result<Zookie, EdgeError> {
         if conversation.id.tenant != actor.tenant.0 || conversation.id.region != actor.region.0 {
             return Err(EdgeError::Internal(
                 "a Chat authorization grant crossed its verified tenant scope".into(),
@@ -108,7 +138,7 @@ impl ChatAuthorization {
         }
         if members.is_empty() || !members.iter().any(|member| member == &actor.principal_id) {
             return Err(EdgeError::Internal(
-                "a private Chat conversation must include its creator".into(),
+                "a direct Chat membership must include its creator".into(),
             ));
         }
         let mut unique_members = members.iter().collect::<Vec<_>>();
@@ -116,7 +146,7 @@ impl ChatAuthorization {
         unique_members.dedup();
         if unique_members.len() != members.len() {
             return Err(EdgeError::Internal(
-                "private Chat conversation members must be distinct".into(),
+                "direct Chat conversation members must be distinct".into(),
             ));
         }
 
@@ -138,7 +168,7 @@ impl ChatAuthorization {
             .write_tuples(&scope, actor, &deltas, None, expires_at, occurred_at)
             .map_err(|error| {
                 EdgeError::Internal(format!(
-                    "private Chat authorization could not be persisted: {error}"
+                    "direct Chat authorization could not be persisted: {error}"
                 ))
             })
     }
@@ -333,5 +363,66 @@ mod tests {
         assert!(authorization.may_post_to_channel(&agent, &room));
         assert!(!authorization.may_read_channel(&project_peer, &room));
         assert!(!authorization.may_post_to_channel(&project_peer, &room));
+    }
+
+    #[test]
+    fn a_published_agent_thread_renews_its_original_direct_members() {
+        let owner = principal("owner");
+        let agent = Principal::stub(
+            PrincipalId("agent:helper".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("external:mcp".into()),
+                on_behalf_of: Some(owner.principal_id.clone()),
+            },
+            owner.tenant.clone(),
+        );
+        let tuples = TupleStore::new(OutboxStore::new());
+        let identity = StoreBackedCheck::new(tuples.clone());
+        for admitted in identity.admit_chat_fragment() {
+            assert!(matches!(admitted, FragmentAdmit::Admitted { .. }));
+        }
+        let authorization = ChatAuthorization::new(identity);
+        let mut room = Conversation {
+            kind: ConversationKind::ChannelPrivate,
+            ..conversation(&owner)
+        };
+        let members = [owner.principal_id.clone(), agent.principal_id.clone()];
+        authorization
+            .bind_direct_members(
+                &owner,
+                &room,
+                &members,
+                Some(Timestamp("2098-08-22T00:00:00Z".into())),
+                Timestamp("2026-08-22T00:00:00Z".into()),
+            )
+            .unwrap();
+
+        room.kind = ConversationKind::ChannelPublic;
+        let renewed_expiry = Timestamp("2099-08-22T00:00:00Z".into());
+        authorization
+            .renew_agent_thread_members(
+                &owner,
+                &room,
+                &members,
+                renewed_expiry.clone(),
+                Timestamp("2026-08-22T00:00:01Z".into()),
+            )
+            .unwrap();
+
+        let scope = TenantScope::from_verified_token(&owner, owner.region.clone());
+        let direct = tuples
+            .tuples_in(&scope)
+            .unwrap()
+            .into_iter()
+            .filter(|stored| {
+                stored.tuple.object.0 == channel_object(&room.id.conversation_id)
+                    && stored.tuple.relation.0 == "member"
+                    && members.contains(&stored.tuple.subject)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(direct.len(), 2);
+        assert!(direct
+            .iter()
+            .all(|stored| stored.expires_at.as_ref() == Some(&renewed_expiry)));
     }
 }

@@ -14,6 +14,7 @@ import {
   parseAgentThreadCreateReceipt,
   parseAgentThreadMessageReceipt,
   parseAgentThreadMessages,
+  parseAgentThreadRenewalReceipt,
   parseAgentThreadReviewReceipt,
   parseAgentThreads,
   parseAgentWorkspaceGuidanceConfig,
@@ -198,6 +199,18 @@ describe("private agent work wire projection", () => {
       .toEqual({ thread: ready, changed: true, durable: true });
     expect(parseAgentThreadReviewReceipt({ thread: subject, changed: true, durable: true }))
       .toBeNull();
+    const renewed = {
+      ...subject,
+      workspace: { ...subject.workspace, expires_at: "2026-09-21T12:00:00Z" },
+    };
+    expect(parseAgentThreadRenewalReceipt({ thread: renewed, changed: true, durable: true }))
+      .toEqual({ thread: renewed, changed: true, durable: true });
+    expect(parseAgentThreadRenewalReceipt({
+      thread: renewed,
+      changed: true,
+      durable: true,
+      previous_expires_at: subject.workspace.expires_at,
+    })).toBeNull();
     expect(parseAgentThreadMessages({
       conversation,
       items: [{

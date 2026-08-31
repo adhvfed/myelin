@@ -31,6 +31,15 @@ authorize an existing Ed25519 key and generate an expiring, host-key-pinned Open
 SFTP-capable editor; Myelin never copies or prints the private key, and refreshing access does not
 replace the retained workspace.
 
+A useful cloud branch is not a one-shot trial. While a workspace is live, its owner can explicitly
+keep it for 7, 14, or 30 days from today. Renewal advances the branch, conversation retention
+receipt, and owner/agent Chat authority to one exact deadline without replacing the workspace.
+The deadline change is transactionally ordered before expiry cleanup and keyed by the client's
+stable intent, so an ambiguous retry cannot compound the lifetime. Cross-store Chat repair has a
+durable pending record and remains fail-closed until recovery completes. Existing agent-run and SSH
+credentials keep their original short expiry; continuing work always obtains fresh authority
+bounded by the renewed workspace.
+
 Hosted work is a product journey, not a CLI escape hatch. From the Automations surface, an owner can
 choose one of their active hosted agents, name the platform event and bounded task, and set the
 per-firing budget, lifetime firing limit, and human-approval rule. The safe initial form always
@@ -133,6 +142,11 @@ Editor-profile journeys must generate a real key, create the profile through the
 then leave Myelin's process: ordinary OpenSSH must use that profile for both a command and an SFTP
 transfer against the same retained workspace. The proof must check file permissions, exact host
 pinning, connection sharing, and absence of credentials from CLI output and generated config.
+Workspace-renewal journeys must advance a live short-retention branch through the product, reload
+the exact new deadline and retention receipt from durable stores, and continue private messaging
+and workspace access without replacing its identity. Storage proof must race the old deadline,
+replay the same intent, recover an interrupted Chat-authority update, and still expire the workspace
+at the new exact boundary.
 Web automation journeys must activate a real hosted identity, create a bounded rule through the
 browser, produce real durable platform events, observe incoming firings without a manual reload,
 approve one, confirm rejection of another, reload both decisions, verify budget and personal-data

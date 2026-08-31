@@ -15,8 +15,9 @@ use myelin_identity_service::{
 };
 use myelin_storage::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
-    AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRunBinding, AgentThreadState,
-    AgentThreadWorkspaceGuidance, BindAgentThreadRunOutcome, ColumnCryptor,
+    AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadRenewal,
+    AgentThreadRunBinding, AgentThreadState, AgentThreadWorkspaceGuidance,
+    BeginAgentThreadRenewalOutcome, BindAgentThreadRunOutcome, ColumnCryptor,
     CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, KmsEngine,
     ListAgentThreadsOutcome, MarkAgentThreadReviewReadyOutcome, NewAgentThread,
     RetryAgentThreadOutcome, SubjectId, SubjectKeyScope, WorkspaceSshRouteKey,
@@ -34,6 +35,7 @@ use crate::agent_http::{agent_session_json, map_session_error};
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::chat_http::{
     parse_messages_query, DurableChatMutationApi, DurableChatReadApi, PrivateConversationCreation,
+    PrivateConversationRenewal,
 };
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::{map_durable_err, DurableGitBackend, ResolvedWorkspaceRepository};
@@ -391,6 +393,81 @@ impl AgentThreadHttpApi {
         }
     }
 
+    fn renew(
+        &self,
+        principal: &Principal,
+        thread_id: Uuid,
+        retention_days: i16,
+        client_nonce: String,
+    ) -> Result<(DurableAgentThread, bool), EdgeError> {
+        let observed_at = Utc::now();
+        let outcome = self
+            .drive(self.threads.begin_renewal(
+                &principal.tenant.0,
+                &principal.principal_id.0,
+                thread_id,
+                Uuid::new_v4(),
+                retention_days,
+                &client_nonce,
+                observed_at,
+            ))?
+            .map_err(|_| EdgeError::Internal("agent thread renewal storage failed".into()))?;
+        match outcome {
+            BeginAgentThreadRenewalOutcome::Begun { renewal, thread } => {
+                self.complete_renewal_authority(principal, &renewal)?;
+                Ok((thread, true))
+            }
+            BeginAgentThreadRenewalOutcome::Replayed { renewal, thread } => {
+                if renewal.completed_at.is_none() {
+                    self.complete_renewal_authority(principal, &renewal)?;
+                }
+                Ok((thread, false))
+            }
+            BeginAgentThreadRenewalOutcome::AlreadyRetained(thread) => Ok((thread, false)),
+            BeginAgentThreadRenewalOutcome::Conflict => Err(EdgeError::Conflict(
+                "that idempotency key was already used for a different workspace renewal".into(),
+            )),
+            BeginAgentThreadRenewalOutcome::NotFound => {
+                Err(EdgeError::NotFound("agent thread not found".into()))
+            }
+            BeginAgentThreadRenewalOutcome::Unavailable => Err(EdgeError::Conflict(
+                "agent thread workspace is no longer available for renewal".into(),
+            )),
+        }
+    }
+
+    fn complete_renewal_authority(
+        &self,
+        principal: &Principal,
+        renewal: &AgentThreadRenewal,
+    ) -> Result<(), EdgeError> {
+        let conversation = ConversationId::new(
+            principal.tenant.0.clone(),
+            principal.region.0.clone(),
+            renewal.conversation_id.clone(),
+        );
+        let completed_at = Utc::now();
+        let agent_id = renewal.agent_id.to_string();
+        self.chat_mutations.renew_private_conversation_authority(
+            principal,
+            PrivateConversationRenewal {
+                conversation: &conversation,
+                agent_id: &agent_id,
+                project_authority_ready: renewal.review_ready,
+                retention_days: i32::from(renewal.retention_days),
+                expires_at: Timestamp(renewal.expires_at.clone()),
+                now: Timestamp(completed_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            },
+        )?;
+        self.drive(self.threads.complete_renewal(
+            &principal.tenant.0,
+            renewal.renewal_id,
+            completed_at,
+        ))?
+        .map_err(|_| EdgeError::Internal("agent thread renewal could not be completed".into()))?;
+        Ok(())
+    }
+
     fn recover(&self, tenant: &TenantId, region: &Region, thread: DurableAgentThread) {
         let owner = Principal::new(
             tenant.clone(),
@@ -402,6 +479,20 @@ impl AgentThreadHttpApi {
         );
         if let Err(error) = self.provision(&owner, thread) {
             eprintln!("agent thread recovery: provisioning attempt failed: {error}");
+        }
+    }
+
+    fn recover_renewal(&self, tenant: &TenantId, region: &Region, renewal: AgentThreadRenewal) {
+        let owner = Principal::new(
+            tenant.clone(),
+            region.clone(),
+            PrincipalId(renewal.owner_principal_id.clone()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        if let Err(error) = self.complete_renewal_authority(&owner, &renewal) {
+            eprintln!("agent thread recovery: renewal attempt failed: {error}");
         }
     }
 
@@ -1063,6 +1154,48 @@ struct AgentThreadReviewReadyHandler {
     api: AgentThreadHttpApi,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentThreadRenewalBody {
+    retention_days: i16,
+}
+
+struct AgentThreadRenewalHandler {
+    api: AgentThreadHttpApi,
+}
+
+impl Handler for AgentThreadRenewalHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let body: AgentThreadRenewalBody =
+            parse_interactive_body(&ctx.request.body, "agent thread renewal")?;
+        if !(MIN_AGENT_THREAD_RETENTION_DAYS..=MAX_AGENT_THREAD_RETENTION_DAYS)
+            .contains(&body.retention_days)
+        {
+            return Err(EdgeError::BadRequest(format!(
+                "agent thread renewal retention_days must be between {MIN_AGENT_THREAD_RETENTION_DAYS} and {MAX_AGENT_THREAD_RETENTION_DAYS}"
+            )));
+        }
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let (thread, changed) = self.api.renew(
+            ctx.principal,
+            thread_param(ctx)?,
+            body.retention_days,
+            client_nonce,
+        )?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "thread": thread_json(&ctx.principal.tenant.0, &thread),
+                "changed": changed,
+                "durable": true,
+            }),
+        )))
+    }
+}
+
 impl Handler for AgentThreadReviewReadyHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
@@ -1337,6 +1470,12 @@ pub fn register_agent_threads(
         )
         .route(
             Method::Post,
+            "/v1/agent-threads/{thread}/renew",
+            "identity.agent_thread.create",
+            Arc::new(AgentThreadRenewalHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
             "/v1/agent-threads/{thread}/runs",
             "identity.agent_thread.run.create",
             Arc::new(AgentThreadRunCreateHandler { api: api.clone() }),
@@ -1398,6 +1537,23 @@ async fn run_agent_thread_recovery(
                     }
                 }
                 Err(error) => eprintln!("agent thread recovery: tenant sweep failed: {error}"),
+            }
+            match api
+                .threads
+                .claim_pending_renewals(tenant.as_str(), stale_before, now, config.batch_limit)
+                .await
+            {
+                Ok(work) => {
+                    for renewal in work {
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                        api.recover_renewal(tenant, &config.region, renewal);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("agent thread recovery: renewal tenant sweep failed: {error}");
+                }
             }
         }
         tokio::select! {

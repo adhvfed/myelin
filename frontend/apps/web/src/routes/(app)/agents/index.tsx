@@ -100,6 +100,10 @@ export default function AgentThreadsIndex() {
   const [loadingMoreSessions, setLoadingMoreSessions] = createSignal(false);
   const [retryingWorkspace, setRetryingWorkspace] = createSignal(false);
   const [retryWorkspaceError, setRetryWorkspaceError] = createSignal<string | null>(null);
+  const [renewingWorkspace, setRenewingWorkspace] = createSignal(false);
+  const [renewWorkspaceError, setRenewWorkspaceError] = createSignal<string | null>(null);
+  const [renewalIntentDays, setRenewalIntentDays] = createSignal<number | null>(null);
+  const [renewalNonce, setRenewalNonce] = createSignal("");
   const [markingReady, setMarkingReady] = createSignal(false);
   let threadGeneration = 0;
   let messageGeneration = 0;
@@ -247,6 +251,10 @@ export default function AgentThreadsIndex() {
     setLoadingMoreSessions(false);
     setRetryingWorkspace(false);
     setRetryWorkspaceError(null);
+    setRenewingWorkspace(false);
+    setRenewWorkspaceError(null);
+    setRenewalIntentDays(null);
+    setRenewalNonce("");
     setMarkingReady(false);
   });
 
@@ -283,6 +291,57 @@ export default function AgentThreadsIndex() {
       setRetryWorkspaceError("Myelin couldn’t confirm the retry. Try again with the same retained thread.");
     } finally {
       setRetryingWorkspace(false);
+    }
+  };
+  const renewWorkspace = async (retentionDays: number) => {
+    const threadId = validSelectedId();
+    if (!threadId || renewingWorkspace()) return;
+    let nonce = renewalNonce();
+    if (!nonce || renewalIntentDays() !== retentionDays) {
+      nonce = crypto.randomUUID();
+      setRenewalNonce(nonce);
+      setRenewalIntentDays(retentionDays);
+    }
+    setRenewingWorkspace(true);
+    setRenewWorkspaceError(null);
+    try {
+      const result = await mutate({
+        op: "renew",
+        threadId,
+        retentionDays,
+        clientNonce: nonce,
+      });
+      if (!result.ok || result.op !== "renew") {
+        setRenewWorkspaceError(result.ok || result.error === "error"
+          ? "Myelin couldn’t confirm the new workspace deadline. Retry this unchanged request."
+          : result.error === "conflict"
+            ? "This workspace changed or reached the end of its retained lifetime."
+            : result.error === "not-found"
+              ? "This private thread is no longer available."
+              : "Workspace renewal is temporarily unavailable. Retry this unchanged request.");
+        return;
+      }
+      setRenewalNonce("");
+      setRenewalIntentDays(null);
+      setObservedAt(Date.now());
+      threadGeneration += 1;
+      setThreadPages([]);
+      await Promise.all([
+        revalidate(getAgentThread.keyFor(threadId)),
+        revalidate(getAgentThreads.keyFor({ limit: 100 })),
+      ]);
+      toast.show({
+        title: result.receipt.changed
+          ? `Workspace retained until ${new Date(result.receipt.thread.workspace.expires_at).toLocaleDateString()}`
+          : "Workspace already has that much retained time",
+        variant: "success",
+      });
+    } catch {
+      setRenewWorkspaceError(
+        "Myelin couldn’t confirm the new workspace deadline. Retry this unchanged request.",
+      );
+    } finally {
+      setRenewingWorkspace(false);
     }
   };
   const markReadyForReview = async () => {
@@ -356,6 +415,9 @@ export default function AgentThreadsIndex() {
       retrying={retryingWorkspace()}
       retryError={retryWorkspaceError()}
       onRetry={() => void retryWorkspace()}
+      renewing={renewingWorkspace()}
+      renewalError={renewWorkspaceError()}
+      onRenew={(days) => void renewWorkspace(days)}
     /> : null);
     onCleanup(() => pane.setContextPane(null));
   });

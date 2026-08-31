@@ -179,6 +179,16 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
     .toContainText(`myelin agent thread ssh-config ${
       new URL(page.url()).searchParams.get("thread")!
     } --identity /path/to/ssh_identity`);
+  const workspaceDeadline = workspace.locator("time");
+  const initialDeadline = await workspaceDeadline.getAttribute("datetime");
+  expect(initialDeadline).not.toBeNull();
+  await workspace.getByRole("combobox", { name: "Keep from today" }).selectOption("30");
+  await workspace.getByRole("button", { name: "Keep workspace" }).click();
+  await expect.poll(async () => workspaceDeadline.getAttribute("datetime"))
+    .not.toBe(initialDeadline);
+  const retainedDeadline = await workspaceDeadline.getAttribute("datetime");
+  expect(Date.parse(retainedDeadline!)).toBeGreaterThan(Date.parse(initialDeadline!));
+  await expect(page.getByRole("link", { name: `${threadName} ready · 30 days` })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(workspace).toBeHidden();
 
@@ -194,6 +204,7 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
     await page.reload();
     await waitForAppHydration(page);
     await page.getByRole("button", { name: "Agent workspace" }).click();
+    await expect(workspace.locator("time")).toHaveAttribute("datetime", retainedDeadline!);
     await expect(workspace.getByTestId("agent-connect-unavailable"))
       .toContainText(`${renamedAgentName} is suspended`);
     await expect(workspace.getByTestId("agent-connect-command")).toHaveCount(0);
@@ -275,6 +286,9 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   expect((JSON.parse(durableText) as JsonObject).items).toEqual(expect.arrayContaining([
     expect.objectContaining({ content: problem, is_you: true, state: "active" }),
   ]));
+  expect((JSON.parse(durableText) as JsonObject).conversation).toEqual(expect.objectContaining({
+    retention_days: 30,
+  }));
 
   const threadResponse = await request.get(
     `${integrationEdgeUrl}/v1/agent-threads/${encodeURIComponent(threadId)}`,
@@ -314,6 +328,12 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await expect(page.getByRole("button", { name: "Send to review" })).toBeVisible();
   await page.reload();
   await waitForAppHydration(page);
+  await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Agent workspace" }).click();
+  await workspace.getByRole("button", { name: "Keep workspace" }).click();
+  await expect.poll(async () => workspace.locator("time").getAttribute("datetime"))
+    .not.toBe(retainedDeadline);
+  await page.keyboard.press("Escape");
   await expect(page.getByText("Project collaborators can review", { exact: true })).toBeVisible();
 
   const accessibility = await new AxeBuilder({ page })

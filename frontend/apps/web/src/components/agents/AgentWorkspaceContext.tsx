@@ -1,5 +1,5 @@
 import { Icon } from "@myelin/design-system";
-import { For, Show } from "solid-js";
+import { createSignal, For, Show } from "solid-js";
 
 import {
   agentThreadAwaitingRecovery,
@@ -32,7 +32,11 @@ export function AgentWorkspaceContext(props: {
   retrying: boolean;
   retryError: string | null;
   onRetry: () => void;
+  renewing: boolean;
+  renewalError: string | null;
+  onRenew: (retentionDays: number) => void;
 }) {
+  const [renewalDays, setRenewalDays] = createSignal(30);
   const agentCommand = () =>
     `myelin mcp serve --as ${props.thread.agent_id} --thread ${props.thread.id}`;
   const command = () => `myelin agent thread ssh ${props.thread.id}`;
@@ -98,6 +102,38 @@ export function AgentWorkspaceContext(props: {
             changing the source repository.
           </p>
         )}</Show>
+        <Show when={props.workspaceAvailable}>
+          <div class="agent-workspace-renewal">
+            <label>
+              Keep from today
+              <select
+                value={renewalDays()}
+                disabled={props.renewing}
+                onChange={(event) => setRenewalDays(Number(event.currentTarget.value))}
+              >
+                <option value="7">7 days</option>
+                <option value="14">14 days</option>
+                <option value="30">30 days</option>
+              </select>
+            </label>
+            <button
+              type="button"
+              class="agent-thread-button secondary"
+              disabled={props.renewing}
+              onClick={() => props.onRenew(renewalDays())}
+            >
+              <Icon name="cycle" />
+              {props.renewing ? "Retaining…" : "Keep workspace"}
+            </button>
+          </div>
+          <p class="agent-thread-note">
+            Advances this workspace and conversation to the selected deadline when it is later.
+            Existing run and SSH credentials keep their original short expiry.
+          </p>
+          <Show when={props.renewalError}>
+            <p role="alert">{props.renewalError}</p>
+          </Show>
+        </Show>
       </section>
       <section>
         <h3>Agent workspace authority</h3>

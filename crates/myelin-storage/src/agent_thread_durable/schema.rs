@@ -465,6 +465,49 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_thread_provisioning_recovery
      OR (state = 'ready' AND publication_completed_at IS NULL);
 "#;
 
+pub const AGENT_THREAD_RENEWAL_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_thread_renewal (
+    tenant_id            text        NOT NULL,
+    region               text        NOT NULL,
+    renewal_id           uuid        NOT NULL,
+    thread_id            uuid        NOT NULL,
+    owner_principal_id   text        NOT NULL,
+    agent_id             uuid        NOT NULL,
+    conversation_id      text        NOT NULL,
+    project_id           uuid,
+    review_ready         boolean     NOT NULL,
+    retention_days       smallint    NOT NULL,
+    client_nonce         text        NOT NULL,
+    previous_expires_at  timestamptz NOT NULL,
+    expires_at           timestamptz NOT NULL,
+    completed_at         timestamptz,
+    created_at           timestamptz NOT NULL,
+    updated_at           timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, region, renewal_id),
+    UNIQUE (tenant_id, region, owner_principal_id, client_nonce),
+    FOREIGN KEY (tenant_id, region, thread_id)
+      REFERENCES agent_thread (tenant_id, region, thread_id),
+    CHECK (length(owner_principal_id) BETWEEN 1 AND 255),
+    CHECK (length(conversation_id) = 26),
+    CHECK (retention_days BETWEEN 1 AND 30),
+    CHECK (length(client_nonce) BETWEEN 1 AND 128),
+    CHECK (expires_at > previous_expires_at),
+    CHECK (updated_at >= created_at),
+    CHECK (completed_at IS NULL OR completed_at >= created_at)
+);
+CREATE INDEX IF NOT EXISTS agent_thread_renewal_pending
+  ON agent_thread_renewal (tenant_id, region, updated_at, renewal_id)
+  WHERE completed_at IS NULL;
+ALTER TABLE agent_thread_renewal ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_thread_renewal FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON agent_thread_renewal;
+CREATE POLICY myelin_tenant_isolation ON agent_thread_renewal
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub const AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION: &str = r#"
 ALTER TABLE agent_thread
   DROP CONSTRAINT IF EXISTS agent_thread_publication_after_creation;
@@ -565,6 +608,13 @@ pub fn agent_thread_publication_migrations() -> Migrations {
             "agent_thread",
         ),
     ])
+}
+
+pub fn agent_thread_renewal_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0175_agent_thread_renewal",
+        AGENT_THREAD_RENEWAL_MIGRATION,
+    )])
 }
 
 pub fn agent_thread_git_binding_migrations() -> Migrations {

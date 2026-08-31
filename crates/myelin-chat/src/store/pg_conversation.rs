@@ -381,6 +381,48 @@ impl PgConversationStore {
         Ok(())
     }
 
+    /// Advance the retention receipt and authorization watermark for a retained agent thread.
+    ///
+    /// Authorization tuples are written first by the caller. Updating both projections together
+    /// keeps a recovered renewal from advertising either the old window or a stale zookie.
+    pub async fn renew_retention(
+        &self,
+        id: &ConversationId,
+        retention_days: i32,
+        zookie: &str,
+    ) -> Result<(), ConversationError> {
+        if !(1..=30).contains(&retention_days) {
+            return Err(ConversationError::SchemaViolation(
+                "conversation retention must be between 1 and 30 days".into(),
+            ));
+        }
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(storage("acquire conversation renewal connection"))?;
+        self.set_session_scope(&mut conn, &id.tenant, &id.region)
+            .await?;
+        let result = sqlx::query(
+            "UPDATE chat_conversation
+                SET retention_days = $4, acl_zookie = $5
+              WHERE tenant_id = $1 AND region = $2 AND conversation_id = $3
+                AND kind IN ('channel_private', 'channel_public') AND NOT archived",
+        )
+        .bind(&id.tenant)
+        .bind(&id.region)
+        .bind(&id.conversation_id)
+        .bind(retention_days)
+        .bind(zookie)
+        .execute(&mut *conn)
+        .await
+        .map_err(storage("renew conversation retention receipt"))?;
+        if result.rows_affected() == 0 {
+            return Err(ConversationError::NotFound(id.conversation_id.clone()));
+        }
+        Ok(())
+    }
+
     /// Promote a project-bound private conversation to project visibility.
     ///
     /// The transition is deliberately one-way and idempotent. Authorization tuples are

@@ -144,6 +144,8 @@ export interface AgentThreadReviewReceipt {
   durable: true;
 }
 
+export type AgentThreadRenewalReceipt = AgentThreadReviewReceipt;
+
 export interface WorkspaceSession {
   id: string;
   ref: string;
@@ -481,6 +483,15 @@ export function parseAgentThreadReviewReceipt(value: unknown): AgentThreadReview
     typeof receipt.changed === "boolean" && receipt.durable === true && reviewedThread &&
     reviewedThread.review_state === "ready" && reviewedThread.review_ready_at !== null
     ? { thread: reviewedThread, changed: receipt.changed, durable: true }
+    : null;
+}
+
+export function parseAgentThreadRenewalReceipt(value: unknown): AgentThreadRenewalReceipt | null {
+  const receipt = record(value);
+  const renewedThread = thread(receipt?.thread);
+  return receipt && exact(receipt, ["thread", "changed", "durable"]) &&
+    typeof receipt.changed === "boolean" && receipt.durable === true && renewedThread
+    ? { thread: renewedThread, changed: receipt.changed, durable: true }
     : null;
 }
 

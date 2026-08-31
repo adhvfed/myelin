@@ -7,12 +7,13 @@ use myelin_identity::{DataRole, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::{
     all_durable_migrations, ActivateAgentThreadOutcome, AgentThreadActivation,
     AgentThreadExpiryCompletion, AgentThreadExpiryFailure, AgentThreadProvisioningFailure,
-    AgentThreadWorkspaceGuidance, BindAgentThreadRunOutcome, ColumnCryptor,
-    CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome, DurableAgentThreadBacking, HotTables,
-    KekId, KmsEngine, ListAgentThreadsOutcome, ListWorkspaceSessionsOutcome, NewAgentThread,
-    NewWorkspaceSshGrant, NewWorkspaceSshSession, RetryAgentThreadOutcome, SealKey, SubjectId,
-    SubjectKeyScope, SubstrateProvider, WorkspaceSessionMode, WorkspaceSshRouteKey,
-    AGENT_THREAD_EXPIRY_GRACE_SECONDS, WORKSPACE_SSH_SESSION_STARTED,
+    AgentThreadWorkspaceGuidance, BeginAgentThreadRenewalOutcome, BindAgentThreadRunOutcome,
+    ColumnCryptor, CreateAgentThreadOutcome, CreateWorkspaceSshGrantOutcome,
+    DurableAgentThreadBacking, HotTables, KekId, KmsEngine, ListAgentThreadsOutcome,
+    ListWorkspaceSessionsOutcome, NewAgentThread, NewWorkspaceSshGrant, NewWorkspaceSshSession,
+    RetryAgentThreadOutcome, SealKey, SubjectId, SubjectKeyScope, SubstrateProvider,
+    WorkspaceSessionMode, WorkspaceSshRouteKey, AGENT_THREAD_EXPIRY_GRACE_SECONDS,
+    WORKSPACE_SSH_SESSION_STARTED,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
@@ -65,6 +66,200 @@ fn proposal(owner: &str, agent_id: Uuid, suffix: u128) -> NewAgentThread {
         created_at,
         expires_at: created_at + Duration::days(3),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_renewal_is_exactly_once_and_wins_the_expiry_race() {
+    let config = test_config();
+    let admin = SubstrateProvider::connect(admin_config(&config), 4)
+        .await
+        .expect("connect the migration role for workspace renewal");
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    let app = SubstrateProvider::connect(config, 6)
+        .await
+        .expect("connect the constrained runtime role");
+    let tenant = format!("agent-thread-renewal-{}", unique());
+    let owner = "p:renewing-owner";
+    let agent_id = Uuid::from_u128(71);
+    seed_agent(&app, &tenant, owner, agent_id).await;
+    let threads = DurableAgentThreadBacking::new(app);
+    let intended = proposal(owner, agent_id, 171);
+    let CreateAgentThreadOutcome::Created(created) =
+        threads.create(&tenant, intended.clone()).await.unwrap()
+    else {
+        panic!("the renewal story needs a new private thread");
+    };
+    let ActivateAgentThreadOutcome::Activated(_) = threads
+        .activate(
+            &tenant,
+            owner,
+            intended.thread_id,
+            AgentThreadActivation {
+                workspace_id: intended.workspace_id,
+                conversation_id: intended.conversation_id.clone(),
+                storage_locator: "workspace://local/renewal".into(),
+                environment: None,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the renewal workspace should activate");
+    };
+    threads
+        .complete_publication(
+            &tenant,
+            owner,
+            intended.thread_id,
+            &intended.conversation_id,
+            intended.created_at + Duration::minutes(1),
+        )
+        .await
+        .unwrap()
+        .expect("the renewal workspace should be published");
+
+    let observed_at = intended.created_at + Duration::days(1);
+    let renewal_id = Uuid::from_u128(172);
+    let BeginAgentThreadRenewalOutcome::Begun { renewal, thread } = threads
+        .begin_renewal(
+            &tenant,
+            owner,
+            intended.thread_id,
+            renewal_id,
+            10,
+            "renew-workspace-once",
+            observed_at,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the first owner renewal should advance the deadline");
+    };
+    assert_eq!(renewal.previous_expires_at, created.expires_at);
+    assert_eq!(
+        renewal.expires_at,
+        (observed_at + Duration::days(10)).to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    assert_eq!(thread.expires_at, renewal.expires_at);
+    assert_eq!(thread.retention_days, 10);
+    assert!(renewal.completed_at.is_none());
+    assert!(
+        threads
+            .start_due_expirations(&tenant, intended.expires_at, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the locked renewal advances expiry before cleanup can claim it"
+    );
+
+    assert!(threads
+        .claim_pending_renewals(&tenant, observed_at - Duration::seconds(1), observed_at, 10,)
+        .await
+        .unwrap()
+        .is_empty());
+    let pending = threads
+        .claim_pending_renewals(&tenant, observed_at, observed_at + Duration::seconds(1), 10)
+        .await
+        .unwrap();
+    assert_eq!(pending, vec![renewal.clone()]);
+    assert!(threads
+        .complete_renewal(&tenant, renewal_id, observed_at + Duration::seconds(2))
+        .await
+        .unwrap());
+    assert!(!threads
+        .complete_renewal(&tenant, renewal_id, observed_at + Duration::seconds(3))
+        .await
+        .unwrap());
+    assert!(threads
+        .claim_pending_renewals(
+            &tenant,
+            observed_at + Duration::seconds(3),
+            observed_at + Duration::seconds(4),
+            10,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+    let BeginAgentThreadRenewalOutcome::Replayed {
+        renewal: replayed,
+        thread: replayed_thread,
+    } = threads
+        .begin_renewal(
+            &tenant,
+            owner,
+            intended.thread_id,
+            Uuid::from_u128(999),
+            10,
+            "renew-workspace-once",
+            observed_at + Duration::hours(1),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("an exact retry should return the retained renewal");
+    };
+    assert_eq!(replayed.renewal_id, renewal_id);
+    assert!(replayed.completed_at.is_some());
+    assert_eq!(replayed_thread.expires_at, renewal.expires_at);
+    assert_eq!(
+        threads
+            .begin_renewal(
+                &tenant,
+                owner,
+                intended.thread_id,
+                Uuid::from_u128(998),
+                9,
+                "renew-workspace-once",
+                observed_at,
+            )
+            .await
+            .unwrap(),
+        BeginAgentThreadRenewalOutcome::Conflict
+    );
+    assert!(matches!(
+        threads
+            .begin_renewal(
+                &tenant,
+                "p:another-owner",
+                intended.thread_id,
+                Uuid::from_u128(997),
+                10,
+                "another-owner-renewal",
+                observed_at,
+            )
+            .await
+            .unwrap(),
+        BeginAgentThreadRenewalOutcome::NotFound
+    ));
+    assert!(matches!(
+        threads
+            .begin_renewal(
+                &tenant,
+                owner,
+                intended.thread_id,
+                Uuid::from_u128(996),
+                1,
+                "already-retained",
+                observed_at,
+            )
+            .await
+            .unwrap(),
+        BeginAgentThreadRenewalOutcome::AlreadyRetained(_)
+    ));
+    assert_eq!(
+        threads
+            .start_due_expirations(&tenant, observed_at + Duration::days(10), 10,)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the renewed workspace still expires at its exact new deadline"
+    );
 }
 
 async fn seed_agent(provider: &SubstrateProvider, tenant: &str, owner: &str, agent_id: Uuid) {

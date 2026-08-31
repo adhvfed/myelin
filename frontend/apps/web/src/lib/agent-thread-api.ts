@@ -14,6 +14,7 @@ import {
   parseAgentThread,
   parseAgentThreadCreateReceipt,
   parseAgentThreadReviewReceipt,
+  parseAgentThreadRenewalReceipt,
   parseAgentThreadMessageReceipt,
   parseAgentThreadMessages,
   parseAgentThreads,
@@ -30,6 +31,7 @@ import {
   type AgentThreadCreateReceipt,
   type AgentThreadPage,
   type AgentThreadReviewReceipt,
+  type AgentThreadRenewalReceipt,
   type WorkspaceSessionPage,
 } from "./agent-thread-response";
 import type { ChatMessagePage } from "./chat-response";
@@ -45,6 +47,7 @@ export type AgentThreadMutationResult =
   | { ok: true; op: "create"; receipt: AgentThreadCreateReceipt }
   | { ok: true; op: "retry"; receipt: AgentThreadCreateReceipt }
   | { ok: true; op: "mark-ready"; receipt: AgentThreadReviewReceipt }
+  | { ok: true; op: "renew"; receipt: AgentThreadRenewalReceipt }
   | { ok: true; op: "activate-agent"; receipt: AgentActivationReceipt }
   | { ok: true; op: "rename-agent"; receipt: AgentNameReceipt }
   | { ok: true; op: "configure-agent"; receipt: AgentWorkspaceGuidanceReceipt }
@@ -422,6 +425,19 @@ export const mutateAgentThread = action(async (input: unknown) => {
       ));
       return receipt
         ? respond({ ok: true, op: "mark-ready", receipt })
+        : respond({ ok: false, error: "error" });
+    }
+    if (mutation.op === "renew" && Object.keys(mutation).every((key) =>
+      ["op", "threadId", "retentionDays", "clientNonce"].includes(key)) &&
+        Object.keys(mutation).length === 4 && isAgentThreadId(mutation.threadId) &&
+        positiveRetention(mutation.retentionDays) && cleanNonce(mutation.clientNonce)) {
+      const receipt = parseAgentThreadRenewalReceipt(await edgePost(
+        `/v1/agent-threads/${segment(mutation.threadId)}/renew`,
+        { retention_days: mutation.retentionDays },
+        { idempotencyKey: mutation.clientNonce },
+      ));
+      return receipt
+        ? respond({ ok: true, op: "renew", receipt })
         : respond({ ok: false, error: "error" });
     }
     if (mutation.op === "post-message" && Object.keys(mutation).every((key) =>
