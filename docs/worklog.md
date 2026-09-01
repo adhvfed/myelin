@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — New cloud-branch commits bring the reviewer back
+
+Updating an active private-cloud-branch pull request correctly cleared approvals tied to the old
+head, but it left the selected reviewer with a completed inbox item. The review remained accessible
+if the human already knew its URL, yet Myelin did not tell them that their decision had become stale
+and new work needed attention.
+
+The co-committed `git.pr.synchronized` path now derives the same outstanding-reviewer signal as the
+initial open. It retains the exact pull-request subject and recipient-scoped dedup identity, so the
+durable inbox reopens the existing item as unread and increments its coalesce count instead of
+creating noise. A reviewer who has not acted also sees new head activity; an explicit snooze remains
+respected by the existing inbox contract.
+
+The readable TypeScript full-system journey now selects a real project collaborator, publishes its
+confined workspace commit, observes one unread review request in that person's durable inbox,
+submits an approval, and waits for the item to become done. It then creates another real gVisor
+workspace commit, updates the same pull request, proves the approval count returns to zero, and
+observes the same inbox item reopen unread with coalesce count two. The focused journey passed in
+4.57 seconds against Edge, PostgreSQL, durable Git, outbox publication, the Notification worker,
+the agent service, workspace gateway, and gVisor; strict Rust and TypeScript checks also pass.
+
 ## 2026-09-01 — Legacy pull-request text can enter Git's truthful erasure boundary
 
 Git pull-request title and body encryption is product-scoped now, but rows written before that

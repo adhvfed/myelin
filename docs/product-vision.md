@@ -137,8 +137,10 @@ workspace and deliberately update the same pull request from either the workspac
 Updates are fast-forward-only: the durable branch tip, pull-request head, and thread receipt advance
 through one retry-safe saga with compare-and-swap checks at each boundary. Reviewer assignments
 remain, but approvals, code-owner satisfaction, endorsements, and check facts for the previous head
-are cleared; an event with the new head generation lets CI and other consumers evaluate the exact
-commit now under review. Each caller-supplied idempotency key is bound to one exact head transition:
+are cleared. The chosen reviewers' durable inbox request is reopened on that same pull request, so
+invalidating a decision cannot silently leave the human unaware that new work needs review. An event
+with the new head generation lets CI and other consumers evaluate the exact commit now under review.
+Each caller-supplied idempotency key is bound to one exact head transition:
 replaying it is inert, while reusing it for later workspace work conflicts and requires a fresh
 intent. Replaying an already-current update reports that state honestly rather than opening a
 second pull request.
@@ -171,7 +173,9 @@ from the shared repository. It must then make another real workspace commit, upd
 pull request without changing its identity, and prove an exact replay is inert. The browser journey
 must load reviewer choices from the live project authorization graph, select the named human through
 the visible product, update the same review through its visible control, and prove their exact PR
-access with a separate identity. The CLI journey must cross the actual device-login, MCP, SSH/SFTP,
+access with a separate identity. The durable-store journey must also observe the reviewer request
+arrive unread, complete after a submitted decision, and reopen on the same PR when a new head makes
+that decision stale. The CLI journey must cross the actual device-login, MCP, SSH/SFTP,
 editor-profile, Git commit, ready, and pull-request boundaries rather than certifying only argument
 parsing or a mocked transport.
 Workspace-personalization journeys must read the resulting file through an actual bound agent run,

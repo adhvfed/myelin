@@ -56,7 +56,7 @@ pub fn register_git_notif_rules(
     Ok(registry)
 }
 
-pub(crate) fn review_request_opened_signal_drafts(
+pub(crate) fn outstanding_review_request_signal_drafts(
     tenant: &TenantId,
     region: &Region,
     repo: &str,
@@ -289,7 +289,7 @@ mod tests {
             },
         ];
 
-        let drafts = review_request_opened_signal_drafts(
+        let drafts = outstanding_review_request_signal_drafts(
             &tenant(),
             &Region("fr-par".into()),
             "core",

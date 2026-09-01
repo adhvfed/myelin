@@ -9,6 +9,7 @@ import {
   uniqueName,
 } from "../src/context.js";
 import { systemTestConfig } from "../src/config.js";
+import { eventually } from "../src/eventually.js";
 import {
   activateExternalAgent,
   askAgent,
@@ -28,6 +29,7 @@ import {
 } from "../src/journeys/agent-threads.js";
 import { Conversation } from "../src/journeys/chat.js";
 import { GitProject } from "../src/git-project.js";
+import { findInboxItem, pullRequestSubject } from "../src/journeys/inbox.js";
 import { array, integer, record, string } from "../src/json.js";
 import { reconcileAgentThreads } from "../src/operator.js";
 import {
@@ -367,6 +369,7 @@ describe("private work with an agent", () => {
     const handoff = record(opened.body.handoff, "private branch review handoff");
     const pullRequest = record(handoff.pull_request, "private branch pull request");
     const pullRequestNumber = integer(pullRequest.number, "private branch pull request number");
+    const reviewSubject = pullRequestSubject(repository.slug, pullRequestNumber);
     expect(handoff).toMatchObject({
       thread_id: created.thread.id,
       repository: repository.slug,
@@ -417,6 +420,16 @@ describe("private work with an agent", () => {
       head_oid: handoff.head_oid,
       pr_state: "open",
     });
+    const requestedReview = await eventually(
+      () => findInboxItem(reviewerClient, reviewSubject),
+      { description: "the private cloud branch to reach its chosen reviewer's inbox" },
+    );
+    expect(requestedReview).toMatchObject({
+      reason: "review_requested",
+      class: "direct",
+      state: "unread",
+      coalesce_count: 1,
+    });
     await teammate.json(`${repository.path}/prs/${pullRequestNumber}/reviews`, {
       method: "POST",
       body: { verdict: "approve" },
@@ -424,6 +437,10 @@ describe("private work with an agent", () => {
     });
     expect((await teammate.json(`${repository.path}/prs/${pullRequestNumber}/checks`)).body)
       .toMatchObject({ current_approvals: 1 });
+    await eventually(async () => {
+      const item = await findInboxItem(reviewerClient, reviewSubject);
+      return item?.state === "done" ? item : undefined;
+    }, { description: "the reviewer's submitted decision to complete the request" });
 
     const followUpRun = await beginAgentThreadRun(founder, created.thread.id);
     try {
@@ -483,6 +500,16 @@ describe("private work with an agent", () => {
       });
     expect((await teammate.json(`${repository.path}/prs/${pullRequestNumber}/checks`)).body)
       .toMatchObject({ current_approvals: 0 });
+    const renewedReview = await eventually(async () => {
+      const item = await findInboxItem(reviewerClient, reviewSubject);
+      return item?.state === "unread" && item.coalesce_count === 2 ? item : undefined;
+    }, { description: "new cloud-branch commits to renew the same review request" });
+    expect(renewedReview).toMatchObject({
+      reason: "review_requested",
+      class: "direct",
+      state: "unread",
+      coalesce_count: 2,
+    });
     const replayedUpdate = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
       {
