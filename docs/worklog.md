@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Fed runtime state cannot hitch a ride into cloud-branch review
+
+Private cloud-branch publication rejected owner augmentation, but it copied committed Git objects
+directly into the durable repository rather than crossing the ordinary receive-pack secret scanner.
+A force-added Service Federation secret cache, generated-secret file, lock database, or log could
+therefore enter a review even though those `.fed` files are workspace runtime state, not source.
+
+The review boundary now treats every `.fed/` path as private workspace data except the two files
+Service Federation deliberately makes commit-worthy: `.fed/cloud.yaml` and `.fed/.gitignore`.
+Personalized paths use the same predicate. The complete base-to-head diff is inspected before any
+durable ref moves, so a rejected commit cannot partially publish; ignored untracked Fed state may
+remain local without making an otherwise clean review impossible. Public errors name the offending
+path but never its contents.
+
+The real-Git Rust story force-commits `.fed/secrets.generated.env`, proves publication rejects it
+and the durable ref stays on its previous commit, resets the confined checkout, and continues to
+prove personalized context is also refused. It explicitly admits the committed cloud link and
+self-managed ignore file. The readable TypeScript full-system journey performs the same accidental
+Fed-secret commit through a governed gVisor agent run, gets a public conflict before the branch or PR
+exists, removes the commit through a fresh run, and then completes publication, reviewer inbox,
+approval, later update, and renewed-review notification against the running stack. The focused
+journey passed in 5.62 seconds; strict Rust and TypeScript checks also pass.
+
 ## 2026-09-01 — New cloud-branch commits bring the reviewer back
 
 Updating an active private-cloud-branch pull request correctly cleared approvals tied to the old

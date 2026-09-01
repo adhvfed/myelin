@@ -132,6 +132,11 @@ myelin agent thread history 33333333-3333-4333-8333-333333333333
 # ready shares its durable conversation with current project collaborators, but never grants them
 # agent-run, command, SSH, or infrastructure authority.
 myelin agent thread ready 33333333-3333-4333-8333-333333333333
+# Publish the committed cloud branch and open one retry-safe review. Myelin refuses personalized
+# context and Service Federation runtime state under `.fed/`; the intentionally committed
+# `.fed/cloud.yaml` link and `.fed/.gitignore` remain ordinary reviewable source files.
+myelin agent thread pull-request 33333333-3333-4333-8333-333333333333 \
+  --reviewer system-reviewer --idempotency-key publish-checkout-race
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \
   --thread 33333333-3333-4333-8333-333333333333
 # The one-shot credential claims one SSH transport, which may carry multiple bounded, separately

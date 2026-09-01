@@ -2009,7 +2009,7 @@ fn map_workspace_publication_error(error: WorkspacePublicationError) -> EdgeErro
             "commit or discard the workspace change at `{path}` before opening a review"
         )),
         WorkspacePublicationError::ProtectedWorkspaceData(path) => EdgeError::Conflict(format!(
-            "the review commit includes owner-only workspace augmentation at `{path}`; remove it from the commit before publishing"
+            "the review commit includes private workspace data at `{path}`; remove it from the commit before publishing"
         )),
         WorkspacePublicationError::Diverged => EdgeError::Conflict(
             "the workspace review branch diverged from its durable publication history".into(),

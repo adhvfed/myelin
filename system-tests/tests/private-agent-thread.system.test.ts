@@ -324,6 +324,10 @@ describe("private work with an agent", () => {
               "printf 'export const reviewed = true;\\n' > review-ready.ts",
               "git add review-ready.ts",
               "git commit -m 'Prepare private cloud branch for review'",
+              "mkdir -p .fed",
+              "printf 'PRIVATE_TOKEN=must-not-publish\\n' > .fed/secrets.generated.env",
+              "git add -f .fed/secrets.generated.env",
+              "git commit -m 'Accidentally stage Fed runtime state'",
               "git rev-parse HEAD",
             ].join(" && "),
             timeout_seconds: 10,
@@ -352,16 +356,56 @@ describe("private work with an agent", () => {
       },
     );
     await markAgentThreadReadyForReview(founder, created.thread.id);
+    const reviewHandoffBody = {
+      title: "Review the private cloud branch",
+      body_md: "The owner has finished the private exploration and is ready for a human review.",
+      reviewers: [systemTestConfig.reviewerPrincipal],
+    };
+    const blockedFedState = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: reviewHandoffBody,
+        idempotencyKey: `private-review-fed-state-${randomUUID()}`,
+        expectedStatus: 409,
+      },
+    );
+    expect(blockedFedState.body).toMatchObject({
+      error: {
+        code: "conflict",
+        message: expect.stringContaining(".fed/secrets.generated.env"),
+      },
+    });
+    const cleanupRun = await beginAgentThreadRun(founder, created.thread.id);
+    try {
+      const cleaned = record(
+        (await askAgentToAct(
+          cleanupRun,
+          1,
+          "workspace.exec",
+          {
+            command: [
+              "git reset --hard HEAD~1",
+              "test ! -e .fed/secrets.generated.env",
+              "git status --porcelain",
+            ].join(" && "),
+            timeout_seconds: 10,
+          },
+          `remove-private-fed-state-${randomUUID()}`,
+        )).data,
+        "Fed runtime cleanup command",
+      );
+      expect(string(cleaned.stdout, "Fed runtime cleanup stdout")).not
+        .toContain("secrets.generated.env");
+    } finally {
+      await closeAgentRun(cleanupRun);
+    }
     const handoffKey = `private-review-handoff-${randomUUID()}`;
     const opened = await founder.json(
       `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
       {
         method: "POST",
-        body: {
-          title: "Review the private cloud branch",
-          body_md: "The owner has finished the private exploration and is ready for a human review.",
-          reviewers: [systemTestConfig.reviewerPrincipal],
-        },
+        body: reviewHandoffBody,
         idempotencyKey: handoffKey,
         expectedStatus: 201,
       },
@@ -384,11 +428,7 @@ describe("private work with an agent", () => {
       `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
       {
         method: "POST",
-        body: {
-          title: "Review the private cloud branch",
-          body_md: "The owner has finished the private exploration and is ready for a human review.",
-          reviewers: [systemTestConfig.reviewerPrincipal],
-        },
+        body: reviewHandoffBody,
         idempotencyKey: handoffKey,
         expectedStatus: 200,
       },

@@ -102,10 +102,12 @@ impl core::fmt::Display for WorkspacePublicationError {
             Self::DirtyWorkspace(path) => {
                 write!(formatter, "workspace has an uncommitted change at {path}")
             }
-            Self::ProtectedWorkspaceData(path) => write!(
-                formatter,
-                "workspace commit includes private augmentation at {path}"
-            ),
+            Self::ProtectedWorkspaceData(path) => {
+                write!(
+                    formatter,
+                    "workspace commit includes private data at {path}"
+                )
+            }
             Self::NoChanges => formatter.write_str("workspace branch has no committed changes"),
             Self::Diverged => {
                 formatter.write_str("workspace branch no longer descends from its pinned base")
@@ -914,7 +916,7 @@ fn publish_repository_branch(
                     "workspace commit contains a non-UTF-8 path".into(),
                 )
             })?;
-            if protected.contains(path) {
+            if private_review_path(path, &protected) {
                 return Err(WorkspacePublicationError::ProtectedWorkspaceData(
                     path.into(),
                 ));
@@ -970,6 +972,11 @@ fn publish_repository_branch(
         head_oid: head_oid.to_string(),
         changed: true,
     })
+}
+
+fn private_review_path(path: &str, personalized: &std::collections::BTreeSet<&str>) -> bool {
+    personalized.contains(path)
+        || (path.starts_with(".fed/") && !matches!(path, ".fed/cloud.yaml" | ".fed/.gitignore"))
 }
 
 fn publication_git_error(
@@ -1383,6 +1390,17 @@ mod tests {
 
     #[test]
     fn review_publication_is_fast_forward_idempotent_and_excludes_private_augmentation() {
+        let personalized = std::collections::BTreeSet::from(["AGENTS.md"]);
+        assert!(private_review_path("AGENTS.md", &personalized));
+        assert!(private_review_path(".fed/lock.db", &personalized));
+        assert!(private_review_path(".fed/logs/app.log", &personalized));
+        assert!(private_review_path(
+            ".fed/secrets.generated.env",
+            &personalized
+        ));
+        assert!(!private_review_path(".fed/cloud.yaml", &personalized));
+        assert!(!private_review_path(".fed/.gitignore", &personalized));
+
         let source_root = durable_test_root();
         let source_path = source_root.path().join("source.git");
         let source_repository = git2::Repository::init_bare(&source_path).unwrap();
@@ -1483,6 +1501,51 @@ mod tests {
                 .unwrap()
                 .changed
         );
+
+        std::fs::create_dir_all(workspace.join(".fed")).unwrap();
+        std::fs::write(
+            workspace.join(".fed/secrets.generated.env"),
+            "PRIVATE_TOKEN=must-not-publish\n",
+        )
+        .unwrap();
+        let mut index = checkout.index().unwrap();
+        index
+            .add_path(Path::new(".fed/secrets.generated.env"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = checkout.find_commit(review_oid).unwrap();
+        checkout
+            .commit(
+                Some("refs/heads/myelin/private-review"),
+                &signature,
+                &signature,
+                "accidentally stage Fed runtime state",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        assert_eq!(
+            store.publish_repository_for_review("acme", workspace_id, request()),
+            Err(WorkspacePublicationError::ProtectedWorkspaceData(
+                ".fed/secrets.generated.env".into()
+            ))
+        );
+        assert_eq!(
+            source_repository
+                .find_reference("refs/heads/myelin/private-review")
+                .unwrap()
+                .target(),
+            Some(review_oid),
+            "a rejected Fed runtime file never advances the durable branch"
+        );
+        checkout
+            .reset(
+                &checkout.find_commit(review_oid).unwrap().into_object(),
+                git2::ResetType::Hard,
+                None,
+            )
+            .unwrap();
 
         let mut index = checkout.index().unwrap();
         index

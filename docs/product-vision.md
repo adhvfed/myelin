@@ -122,7 +122,10 @@ Ready code has a deliberate second boundary. The owner can publish one committed
 pinned workspace base into its durable Myelin repository and open a pull request. Until that action,
 the workspace branch does not exist in the shared repository. Publication refuses ordinary
 uncommitted changes, divergent history, and any commit that contains the owner-only `AGENTS.md`
-layer or private context paths. A stable thread-derived Git operation makes an interrupted retry
+layer, private context paths, or Service Federation's generated `.fed` runtime state. The committed
+`.fed/cloud.yaml` project link and `.fed/.gitignore` remain reviewable source configuration; lock
+databases, generated or cached secrets, logs, and future runtime artifacts never cross the handoff.
+A stable thread-derived Git operation makes an interrupted retry
 converge on one pull request. The workspace pane derives its reviewer choices from the project's
 current authorization graph, presents only other active humans by their profile display name, and
 lets the owner grant selected people access to that exact review without silently broadening
@@ -169,7 +172,10 @@ again. A browser journey must repeat the grant and revoke through the visible pr
 Cloud-branch handoff journeys must additionally prove the ref is absent before the explicit action,
 publish a real commit made inside the confined workspace, give a named reviewer access to the exact
 pull request, survive a reload and retry, and demonstrate that private augmentation paths are absent
-from the shared repository. It must then make another real workspace commit, update the existing
+from the shared repository. The journey must force-add realistic Service Federation runtime secret
+state, prove publication refuses it without creating or advancing the durable branch, remove that
+commit inside the confined workspace, and only then publish successfully. It must then make another
+real workspace commit, update the existing
 pull request without changing its identity, and prove an exact replay is inert. The browser journey
 must load reviewer choices from the live project authorization graph, select the named human through
 the visible product, update the same review through its visible control, and prove their exact PR
