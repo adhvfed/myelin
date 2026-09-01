@@ -408,7 +408,7 @@ describe("private work with an agent", () => {
           "workspace.exec",
           {
             command: [
-              "printf 'export CLOUD_KEY=AK%s_TEST_ONLY\\n' 'IA' > credentials.env",
+              "printf 'export GITHUB_TOKEN=gh%saB3dE5fG7hJ9kL2mN4pQ6rS8tV0wX1yZ\\n' 'p_' > credentials.env",
               "git add credentials.env",
               "git commit -m 'Accidentally commit a credential'",
               "git rm credentials.env",

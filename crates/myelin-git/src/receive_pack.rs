@@ -305,6 +305,159 @@ impl Default for PushPolicy {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CredentialSignature {
+    prefix: &'static str,
+    label: &'static str,
+    minimum_suffix_bytes: usize,
+}
+
+// Provider-defined prefixes come from the official GitHub, GitLab, and Slack token catalogues.
+// Minimum length plus diversity keeps short documentation examples from becoming false positives.
+const CREDENTIAL_SIGNATURES: &[CredentialSignature] = &[
+    CredentialSignature {
+        prefix: "github_pat_",
+        label: "GitHub fine-grained token",
+        minimum_suffix_bytes: 40,
+    },
+    CredentialSignature {
+        prefix: "ghp_",
+        label: "GitHub personal access token",
+        minimum_suffix_bytes: 32,
+    },
+    CredentialSignature {
+        prefix: "gho_",
+        label: "GitHub OAuth token",
+        minimum_suffix_bytes: 32,
+    },
+    CredentialSignature {
+        prefix: "ghu_",
+        label: "GitHub App user token",
+        minimum_suffix_bytes: 32,
+    },
+    CredentialSignature {
+        prefix: "ghs_",
+        label: "GitHub App installation token",
+        minimum_suffix_bytes: 32,
+    },
+    CredentialSignature {
+        prefix: "ghr_",
+        label: "GitHub App refresh token",
+        minimum_suffix_bytes: 32,
+    },
+    CredentialSignature {
+        prefix: "glpat-",
+        label: "GitLab access token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "gloas-",
+        label: "GitLab OAuth secret",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "gldt-",
+        label: "GitLab deploy token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glrt-",
+        label: "GitLab runner token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glrtr-",
+        label: "GitLab runner registration token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glcbt-",
+        label: "GitLab CI job token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glptt-",
+        label: "GitLab trigger token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glft-",
+        label: "GitLab feed token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glimt-",
+        label: "GitLab incoming-mail token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glagent-",
+        label: "GitLab agent token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "glwt-",
+        label: "GitLab workspace token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "xoxb-",
+        label: "Slack bot token",
+        minimum_suffix_bytes: 16,
+    },
+    CredentialSignature {
+        prefix: "xoxp-",
+        label: "Slack user token",
+        minimum_suffix_bytes: 16,
+    },
+    CredentialSignature {
+        prefix: "xapp-",
+        label: "Slack app token",
+        minimum_suffix_bytes: 20,
+    },
+    CredentialSignature {
+        prefix: "xwfp-",
+        label: "Slack workflow token",
+        minimum_suffix_bytes: 20,
+    },
+];
+
+fn credential_signature(haystack: &str) -> Option<&'static str> {
+    CREDENTIAL_SIGNATURES.iter().find_map(|signature| {
+        haystack
+            .match_indices(signature.prefix)
+            .any(|(start, _)| {
+                looks_like_credential_suffix(
+                    &haystack.as_bytes()[start + signature.prefix.len()..],
+                    signature.minimum_suffix_bytes,
+                )
+            })
+            .then_some(signature.label)
+    })
+}
+
+fn looks_like_credential_suffix(input: &[u8], minimum_bytes: usize) -> bool {
+    let mut seen = [false; 128];
+    let mut length = 0_usize;
+    let mut lowercase = false;
+    let mut uppercase = false;
+    let mut digit = false;
+    for byte in input.iter().copied().take(256) {
+        if !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.') {
+            break;
+        }
+        length += 1;
+        lowercase |= byte.is_ascii_lowercase();
+        uppercase |= byte.is_ascii_uppercase();
+        digit |= byte.is_ascii_digit();
+        seen[usize::from(byte)] = true;
+    }
+    let classes = usize::from(lowercase) + usize::from(uppercase) + usize::from(digit);
+    length >= minimum_bytes
+        && classes >= 2
+        && seen.into_iter().filter(|present| *present).count() >= 8
+}
+
 impl PushPolicy {
     pub fn evaluate_object_content(&self, oid: &Oid, bytes: &[u8]) -> Result<(), RejectReason> {
         if bytes.len() > self.max_object_bytes {
@@ -322,6 +475,12 @@ impl PushPolicy {
                     pattern: pattern.clone(),
                 });
             }
+        }
+        if let Some(signature) = credential_signature(&haystack) {
+            return Err(RejectReason::SecretDetected {
+                oid: oid.clone(),
+                pattern: signature.into(),
+            });
         }
         Ok(())
     }
@@ -1744,6 +1903,49 @@ mod tests {
             "the secret object was NOT promoted out of quarantine"
         );
         assert_eq!(outbox.outbox_depth(), 0);
+    }
+
+    #[test]
+    fn provider_credentials_are_detected_without_rejecting_prefix_documentation() {
+        let policy = PushPolicy::default();
+        let examples = [
+            (
+                ["gh", "p_", "aB3dE5fG7hJ9kL2mN4pQ6rS8tV0wX1yZ"].concat(),
+                "GitHub personal access token",
+            ),
+            (
+                ["gl", "pat-", "aB3dE5fG7hJ9kL2mN4pQ"].concat(),
+                "GitLab access token",
+            ),
+            (
+                ["xo", "xb-", "123456789-AbCdEfGhIjKlMnOp"].concat(),
+                "Slack bot token",
+            ),
+        ];
+        for (index, (credential, expected)) in examples.into_iter().enumerate() {
+            assert_eq!(
+                policy.evaluate_object_content(
+                    &Oid::new(format!("provider-secret-{index}")),
+                    credential.as_bytes(),
+                ),
+                Err(RejectReason::SecretDetected {
+                    oid: Oid::new(format!("provider-secret-{index}")),
+                    pattern: expected.into(),
+                })
+            );
+        }
+
+        for documentation in [
+            "GitHub personal access tokens start with ghp_",
+            "Use github_pat_example in this tutorial.",
+            "A placeholder such as ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx is inert.",
+        ] {
+            assert_eq!(
+                policy
+                    .evaluate_object_content(&Oid::new("documentation"), documentation.as_bytes()),
+                Ok(())
+            );
+        }
     }
 
     #[test]

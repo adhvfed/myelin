@@ -129,7 +129,9 @@ A clean tip is not enough: before moving a durable ref, Myelin scans every base-
 introduced blob with the same bounded object-size and credential-content policy as an ordinary Git
 push. Deleting a credential in a later commit therefore does not make the reachable review history
 publishable; the owner must rewrite it out of the branch. History and aggregate object limits keep
-this pre-publication inspection bounded.
+this pre-publication inspection bounded. High-confidence provider signatures cover the GitHub,
+GitLab, and Slack token families that teams commonly remove from their collaboration plumbing;
+minimum length and character-diversity checks keep prefix documentation and placeholders reviewable.
 A stable thread-derived Git operation makes an interrupted retry
 converge on one pull request. The workspace pane derives its reviewer choices from the project's
 current authorization graph, presents only other active humans by their profile display name, and
@@ -180,8 +182,9 @@ pull request, survive a reload and retry, and demonstrate that private augmentat
 from the shared repository. The journey must force-add realistic Service Federation runtime state,
 delete it in a later commit, prove the clean-looking tip is still refused without creating or
 advancing the durable branch, and rewrite both commits inside the confined workspace. It must then
-commit a recognizable credential, delete it in a later commit, prove that clean-looking tip is also
-refused, rewrite that reachable history, and only then publish successfully. It must then make
+commit a realistically shaped provider credential, delete it in a later commit, prove that
+clean-looking tip is also refused, rewrite that reachable history, and only then publish
+successfully. It must then make
 another real workspace commit, update the existing
 pull request without changing its identity, and prove an exact replay is inert. The browser journey
 must load reviewer choices from the live project authorization graph, select the named human through

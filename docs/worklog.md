@@ -4,6 +4,27 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Cloud review recognizes the credentials teams are replacing
+
+The shared Git content policy detected AWS access-key identifiers and PEM private keys, but a
+realistically shaped GitHub, GitLab, or Slack token passed. Cloud publication now reused that policy
+correctly across history, yet the detector beneath it did not cover the collaboration credentials
+Myelin is specifically intended to make unnecessary.
+
+The production policy now recognizes the current provider-defined GitHub personal, OAuth, App user,
+installation, refresh, and fine-grained prefixes; GitLab access, OAuth, deploy, runner, job, trigger,
+feed, incoming-mail, agent, and workspace prefixes; and Slack bot, user, app, and workflow prefixes.
+Detection requires a provider-specific minimum suffix length, two ASCII character classes, and at
+least eight distinct characters. It examines at most 256 suffix bytes after a matched prefix, so
+large adversarial objects do not create an allocation or unbounded scan. Short prose such as
+`ghp_` and repetitive placeholders remain ordinary source.
+
+A Git policy unit story exercises realistic GitHub, GitLab, and Slack shapes as well as the allowed
+documentation cases. The readable TypeScript cloud-branch journey now commits a realistic GitHub
+personal-access token, deletes it from the visible tree, observes the live publication conflict,
+rewrites both commits, and completes the review. The focused full-system journey passed in 6.55
+seconds against the running stack.
+
 ## 2026-09-01 — Deleted Fed artifacts remain private history, not review history
 
 Cloud publication's path boundary inspected the final base-to-head diff. After the content-policy
