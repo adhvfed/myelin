@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Review history bounds include deletions and Git tree metadata
+
+Cloud publication capped commits, unique inspected commit/blob objects, and aggregate bytes, but it
+did not charge deletion-only diff entries. It also skipped Git tree objects even though ordinary
+receive-pack applies the 50 MiB and secret-content policy to every quarantined object. A pathological
+large deletion could consume work outside the documented limit, and credential material placed in a
+filename remained in tree metadata without crossing the shared policy.
+
+The validator now admits at most 100,000 deltas across the whole base-exclusive walk, independent of
+whether they add an object. Each commit's root tree and every changed path's ancestor trees are
+deduplicated into the existing 100,000-object and 512 MiB aggregate ceilings and pass through the
+normal individual-object policy. Deletion paths still cross the private-path rule but no longer try
+to resolve ancestors that correctly disappeared from the new tree.
+
+The real-Git Rust story adds a harmless-body file whose filename contains a recognizable credential,
+proves publication rejects the tree metadata, and proves the durable ref remains fixed. The complete
+private cloud-branch journey still passed against the running Fed stack in 6.67 seconds after the
+stronger traversal, and strict all-target/all-feature Clippy is clean.
+
 ## 2026-09-01 — Review refusal tells the browser owner what to rewrite
 
 Edge returned safe, path-specific conflicts for dirty work, private artifacts, likely credentials,

@@ -129,7 +129,9 @@ A clean tip is not enough: before moving a durable ref, Myelin scans every base-
 introduced blob with the same bounded object-size and credential-content policy as an ordinary Git
 push. Deleting a credential in a later commit therefore does not make the reachable review history
 publishable; the owner must rewrite it out of the branch. History and aggregate object limits keep
-this pre-publication inspection bounded. High-confidence provider signatures cover the GitHub,
+this pre-publication inspection bounded. Commits, blobs, and changed Git tree metadata all cross the
+same individual-object policy, while a separate delta ceiling charges deletion-only work that does
+not introduce an object. High-confidence provider signatures cover the GitHub,
 GitLab, and Slack token families that teams commonly remove from their collaboration plumbing;
 minimum length and character-diversity checks keep prefix documentation and placeholders reviewable.
 A stable thread-derived Git operation makes an interrupted retry

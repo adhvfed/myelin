@@ -17,6 +17,7 @@ const MAX_WORKSPACE_PATH_BYTES: usize = 1024;
 const MAX_WORKSPACE_PATH_DEPTH: usize = 32;
 const MAX_FED_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_REVIEW_PUBLICATION_COMMITS: usize = 10_000;
+const MAX_REVIEW_PUBLICATION_DELTAS: usize = 100_000;
 const MAX_REVIEW_PUBLICATION_OBJECTS: usize = 100_000;
 const MAX_REVIEW_PUBLICATION_BYTES: usize = 512 * 1024 * 1024;
 
@@ -987,6 +988,7 @@ fn validate_review_history_content(
         .and_then(|()| revwalk.hide(base_oid))
         .map_err(publication_git_error("bound workspace review history"))?;
     let mut commits = 0_usize;
+    let mut deltas = 0_usize;
     let mut objects = HashSet::new();
     let mut bytes = 0_usize;
 
@@ -1011,6 +1013,14 @@ fn validate_review_history_content(
         let tree = commit
             .tree()
             .map_err(publication_git_error("read workspace review commit tree"))?;
+        scan_review_object(
+            &policy,
+            &odb,
+            tree.id(),
+            &format!("tree for commit {oid}"),
+            &mut objects,
+            &mut bytes,
+        )?;
         let parent_tree = if commit.parent_count() == 0 {
             None
         } else {
@@ -1027,6 +1037,10 @@ fn validate_review_history_content(
                 "inspect workspace review commit content",
             ))?;
         for delta in diff.deltas() {
+            deltas = deltas
+                .checked_add(1)
+                .filter(|count| *count <= MAX_REVIEW_PUBLICATION_DELTAS)
+                .ok_or(WorkspacePublicationError::HistoryTooLarge)?;
             for path in [delta.old_file().path(), delta.new_file().path()]
                 .into_iter()
                 .flatten()
@@ -1043,6 +1057,18 @@ fn validate_review_history_content(
                 }
             }
             let oid = delta.new_file().id();
+            if !oid.is_zero() {
+                if let Some(path) = delta.new_file().path() {
+                    scan_review_tree_ancestors(
+                        &tree,
+                        path,
+                        &policy,
+                        &odb,
+                        &mut objects,
+                        &mut bytes,
+                    )?;
+                }
+            }
             if oid.is_zero() || objects.contains(&oid) {
                 continue;
             }
@@ -1063,6 +1089,39 @@ fn validate_review_history_content(
                 })?;
             scan_review_object(&policy, &odb, oid, path, &mut objects, &mut bytes)?;
         }
+    }
+    Ok(())
+}
+
+fn scan_review_tree_ancestors(
+    root: &git2::Tree<'_>,
+    path: &Path,
+    policy: &myelin_git::receive_pack::PushPolicy,
+    odb: &git2::Odb<'_>,
+    objects: &mut HashSet<git2::Oid>,
+    bytes: &mut usize,
+) -> Result<(), WorkspacePublicationError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut ancestor = std::path::PathBuf::new();
+    for component in parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(WorkspacePublicationError::InvalidRepository(
+                "workspace review history contains an unsafe path".into(),
+            ));
+        };
+        ancestor.push(component);
+        let entry = root
+            .get_path(&ancestor)
+            .map_err(publication_git_error("read workspace review subtree"))?;
+        if entry.kind() != Some(git2::ObjectType::Tree) {
+            return Err(WorkspacePublicationError::InvalidRepository(
+                "workspace review history path parent is not a tree".into(),
+            ));
+        }
+        let oid = entry.id();
+        scan_review_object(policy, odb, oid, &format!("tree {oid}"), objects, bytes)?;
     }
     Ok(())
 }
@@ -1748,6 +1807,47 @@ mod tests {
                 .target(),
             Some(review_oid),
             "a secret hidden in review history never advances the durable branch"
+        );
+        checkout
+            .reset(
+                &checkout.find_commit(review_oid).unwrap().into_object(),
+                git2::ResetType::Hard,
+                None,
+            )
+            .unwrap();
+
+        let credential_filename = ["leaked-AK", "IAIOSFODNN7EXAMPLE"].concat();
+        std::fs::write(workspace.join(&credential_filename), "harmless file body\n").unwrap();
+        let mut index = checkout.index().unwrap();
+        index.add_path(Path::new(&credential_filename)).unwrap();
+        index.write().unwrap();
+        let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = checkout.find_commit(review_oid).unwrap();
+        checkout
+            .commit(
+                Some("refs/heads/myelin/private-review"),
+                &signature,
+                &signature,
+                "accidentally expose a credential through a filename",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        assert_eq!(
+            store.publish_repository_for_review("acme", workspace_id, request()),
+            Err(WorkspacePublicationError::SecretDetected(format!(
+                "tree for commit {}",
+                checkout.head().unwrap().target().unwrap()
+            ))),
+            "tree metadata crosses the same content policy as blobs and commits"
+        );
+        assert_eq!(
+            source_repository
+                .find_reference("refs/heads/myelin/private-review")
+                .unwrap()
+                .target(),
+            Some(review_oid),
+            "a secret in tree metadata never advances the durable branch"
         );
         checkout
             .reset(
