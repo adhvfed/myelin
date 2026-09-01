@@ -306,6 +306,26 @@ impl Default for PushPolicy {
 }
 
 impl PushPolicy {
+    pub fn evaluate_object_content(&self, oid: &Oid, bytes: &[u8]) -> Result<(), RejectReason> {
+        if bytes.len() > self.max_object_bytes {
+            return Err(RejectReason::ObjectTooLarge {
+                oid: oid.clone(),
+                size: bytes.len(),
+                limit: self.max_object_bytes,
+            });
+        }
+        let haystack = String::from_utf8_lossy(bytes);
+        for pattern in &self.secret_patterns {
+            if haystack.contains(pattern.as_str()) {
+                return Err(RejectReason::SecretDetected {
+                    oid: oid.clone(),
+                    pattern: pattern.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn evaluate(&self, push: &PushSession) -> Result<(), RejectReason> {
         if push.pusher.pseudonym.trim().is_empty() {
             return Err(RejectReason::PseudonymRequired);
@@ -330,22 +350,7 @@ impl PushPolicy {
             }
         }
         for obj in &push.quarantine {
-            if obj.bytes.len() > self.max_object_bytes {
-                return Err(RejectReason::ObjectTooLarge {
-                    oid: obj.oid.clone(),
-                    size: obj.bytes.len(),
-                    limit: self.max_object_bytes,
-                });
-            }
-            let haystack = String::from_utf8_lossy(&obj.bytes);
-            for pat in &self.secret_patterns {
-                if haystack.contains(pat.as_str()) {
-                    return Err(RejectReason::SecretDetected {
-                        oid: obj.oid.clone(),
-                        pattern: pat.clone(),
-                    });
-                }
-            }
+            self.evaluate_object_content(&obj.oid, &obj.bytes)?;
             if crate::commit::is_commit_object(&obj.bytes) {
                 if let Err(identity) =
                     crate::commit::enforce_pseudonymous_commit(&obj.bytes, &self.tenant)

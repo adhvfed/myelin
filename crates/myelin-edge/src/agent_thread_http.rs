@@ -2011,6 +2011,15 @@ fn map_workspace_publication_error(error: WorkspacePublicationError) -> EdgeErro
         WorkspacePublicationError::ProtectedWorkspaceData(path) => EdgeError::Conflict(format!(
             "the review commit includes private workspace data at `{path}`; remove it from the commit before publishing"
         )),
+        WorkspacePublicationError::SecretDetected(path) => EdgeError::Conflict(format!(
+            "the review history contains a possible secret at `{path}`; rewrite it out of the branch before publishing"
+        )),
+        WorkspacePublicationError::ObjectTooLarge(path) => EdgeError::Conflict(format!(
+            "the review history contains an oversized object at `{path}`; remove it from the branch before publishing"
+        )),
+        WorkspacePublicationError::HistoryTooLarge => EdgeError::Conflict(
+            "the workspace review history exceeds safe publication limits".into(),
+        ),
         WorkspacePublicationError::Diverged => EdgeError::Conflict(
             "the workspace review branch diverged from its durable publication history".into(),
         ),

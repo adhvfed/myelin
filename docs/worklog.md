@@ -4,6 +4,31 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — A clean cloud-branch tip cannot conceal a secret-bearing commit
+
+Private workspace publication pushed directly from the confined checkout into the durable bare
+repository. Its final-tree path checks kept personalized context and Fed runtime state out, but the
+path looked only at the base-to-head result. An agent could commit a credential to an ordinary file,
+delete the file in a later commit, and present a clean tip while the credential blob remained
+reachable in the review history.
+
+Publication now walks every commit reachable from the proposed head but not the pinned base and
+inspects each introduced blob before any durable ref moves. The content check is the ordinary Git
+push policy's production size-and-secret primitive rather than a publication-only approximation.
+The walk is capped at 10,000 commits, 100,000 unique inspected objects, and 512 MiB in aggregate;
+individual objects retain the normal 50 MiB limit. Agent workspace commit attribution remains the
+explicit owner-authorized publication path and is not confused with receive-pack pseudonym checks.
+Public conflicts identify the path that needs rewriting without echoing its contents.
+
+The real-Git Rust story commits a recognizable credential, deletes it in a child commit, proves the
+tip tree no longer contains the file, and still observes rejection with the durable branch fixed on
+its prior commit. The readable TypeScript full-system journey repeats that history through governed
+gVisor runs after the separate Fed-runtime refusal, gets a conflict from the running Edge, rewrites
+both commits, and only then completes the durable pull-request handoff. The focused journey passed
+in 6.21 seconds against Edge, PostgreSQL, durable Git, the agent service, workspace gateway, and
+gVisor. All affected Git, agent-service, and Edge package tests, strict all-target/all-feature
+Clippy, and TypeScript checking also pass.
+
 ## 2026-09-01 — Fed runtime state cannot hitch a ride into cloud-branch review
 
 Private cloud-branch publication rejected owner augmentation, but it copied committed Git objects

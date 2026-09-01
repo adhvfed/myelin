@@ -125,6 +125,11 @@ uncommitted changes, divergent history, and any commit that contains the owner-o
 layer, private context paths, or Service Federation's generated `.fed` runtime state. The committed
 `.fed/cloud.yaml` project link and `.fed/.gitignore` remain reviewable source configuration; lock
 databases, generated or cached secrets, logs, and future runtime artifacts never cross the handoff.
+A clean tip is not enough: before moving a durable ref, Myelin scans every base-exclusive commit and
+introduced blob with the same bounded object-size and credential-content policy as an ordinary Git
+push. Deleting a credential in a later commit therefore does not make the reachable review history
+publishable; the owner must rewrite it out of the branch. History and aggregate object limits keep
+this pre-publication inspection bounded.
 A stable thread-derived Git operation makes an interrupted retry
 converge on one pull request. The workspace pane derives its reviewer choices from the project's
 current authorization graph, presents only other active humans by their profile display name, and
@@ -174,8 +179,9 @@ publish a real commit made inside the confined workspace, give a named reviewer 
 pull request, survive a reload and retry, and demonstrate that private augmentation paths are absent
 from the shared repository. The journey must force-add realistic Service Federation runtime secret
 state, prove publication refuses it without creating or advancing the durable branch, remove that
-commit inside the confined workspace, and only then publish successfully. It must then make another
-real workspace commit, update the existing
+commit inside the confined workspace, then commit a recognizable credential and delete it in a
+later commit, prove the clean-looking tip is still refused, rewrite that reachable history, and only
+then publish successfully. It must then make another real workspace commit, update the existing
 pull request without changing its identity, and prove an exact replay is inert. The browser journey
 must load reviewer choices from the live project authorization graph, select the named human through
 the visible product, update the same review through its visible control, and prove their exact PR

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{DirBuilder, File};
 use std::io::{self, Read, Write};
@@ -15,6 +16,9 @@ pub const MAX_WORKSPACE_FILE_BYTES: usize = 256 * 1024;
 const MAX_WORKSPACE_PATH_BYTES: usize = 1024;
 const MAX_WORKSPACE_PATH_DEPTH: usize = 32;
 const MAX_FED_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_REVIEW_PUBLICATION_COMMITS: usize = 10_000;
+const MAX_REVIEW_PUBLICATION_OBJECTS: usize = 100_000;
+const MAX_REVIEW_PUBLICATION_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceEnvironmentManifest {
@@ -84,6 +88,9 @@ pub enum WorkspacePublicationError {
     InvalidRepository(String),
     DirtyWorkspace(String),
     ProtectedWorkspaceData(String),
+    SecretDetected(String),
+    ObjectTooLarge(String),
+    HistoryTooLarge,
     NoChanges,
     Diverged,
     Io(String),
@@ -107,6 +114,21 @@ impl core::fmt::Display for WorkspacePublicationError {
                     formatter,
                     "workspace commit includes private data at {path}"
                 )
+            }
+            Self::SecretDetected(path) => {
+                write!(
+                    formatter,
+                    "workspace commit contains a possible secret at {path}"
+                )
+            }
+            Self::ObjectTooLarge(path) => {
+                write!(
+                    formatter,
+                    "workspace commit contains an oversized object at {path}"
+                )
+            }
+            Self::HistoryTooLarge => {
+                formatter.write_str("workspace review history exceeds safe publication limits")
             }
             Self::NoChanges => formatter.write_str("workspace branch has no committed changes"),
             Self::Diverged => {
@@ -895,6 +917,8 @@ fn publish_repository_branch(
         }
     }
 
+    validate_review_history_content(&repository, base_oid, head_oid)?;
+
     let base_tree = repository
         .find_commit(base_oid)
         .and_then(|commit| commit.tree())
@@ -972,6 +996,124 @@ fn publish_repository_branch(
         head_oid: head_oid.to_string(),
         changed: true,
     })
+}
+
+fn validate_review_history_content(
+    repository: &git2::Repository,
+    base_oid: git2::Oid,
+    head_oid: git2::Oid,
+) -> Result<(), WorkspacePublicationError> {
+    let policy = myelin_git::receive_pack::PushPolicy::default();
+    let odb = repository
+        .odb()
+        .map_err(publication_git_error("open workspace object database"))?;
+    let mut revwalk = repository
+        .revwalk()
+        .map_err(publication_git_error("open workspace review history"))?;
+    revwalk
+        .push(head_oid)
+        .and_then(|()| revwalk.hide(base_oid))
+        .map_err(publication_git_error("bound workspace review history"))?;
+    let mut commits = 0_usize;
+    let mut objects = HashSet::new();
+    let mut bytes = 0_usize;
+
+    for oid in revwalk {
+        let oid = oid.map_err(publication_git_error("walk workspace review history"))?;
+        commits = commits
+            .checked_add(1)
+            .filter(|count| *count <= MAX_REVIEW_PUBLICATION_COMMITS)
+            .ok_or(WorkspacePublicationError::HistoryTooLarge)?;
+        scan_review_object(
+            &policy,
+            &odb,
+            oid,
+            &format!("commit {oid}"),
+            &mut objects,
+            &mut bytes,
+        )?;
+
+        let commit = repository
+            .find_commit(oid)
+            .map_err(publication_git_error("read workspace review commit"))?;
+        let tree = commit
+            .tree()
+            .map_err(publication_git_error("read workspace review commit tree"))?;
+        let parent_tree = if commit.parent_count() == 0 {
+            None
+        } else {
+            Some(
+                commit
+                    .parent(0)
+                    .and_then(|parent| parent.tree())
+                    .map_err(publication_git_error("read workspace review parent tree"))?,
+            )
+        };
+        let diff = repository
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+            .map_err(publication_git_error(
+                "inspect workspace review commit content",
+            ))?;
+        for delta in diff.deltas() {
+            let oid = delta.new_file().id();
+            if oid.is_zero() || objects.contains(&oid) {
+                continue;
+            }
+            let object = odb
+                .read(oid)
+                .map_err(publication_git_error("read workspace review object"))?;
+            if object.kind() != git2::ObjectType::Blob {
+                continue;
+            }
+            let path = delta
+                .new_file()
+                .path()
+                .and_then(Path::to_str)
+                .ok_or_else(|| {
+                    WorkspacePublicationError::InvalidRepository(
+                        "workspace review history contains a non-UTF-8 path".into(),
+                    )
+                })?;
+            scan_review_object(&policy, &odb, oid, path, &mut objects, &mut bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_review_object(
+    policy: &myelin_git::receive_pack::PushPolicy,
+    odb: &git2::Odb<'_>,
+    oid: git2::Oid,
+    path: &str,
+    objects: &mut HashSet<git2::Oid>,
+    bytes: &mut usize,
+) -> Result<(), WorkspacePublicationError> {
+    if !objects.insert(oid) {
+        return Ok(());
+    }
+    if objects.len() > MAX_REVIEW_PUBLICATION_OBJECTS {
+        return Err(WorkspacePublicationError::HistoryTooLarge);
+    }
+    let object = odb.read(oid).map_err(publication_git_error(
+        "read workspace review object content",
+    ))?;
+    *bytes = bytes
+        .checked_add(object.data().len())
+        .filter(|total| *total <= MAX_REVIEW_PUBLICATION_BYTES)
+        .ok_or(WorkspacePublicationError::HistoryTooLarge)?;
+    let policy_oid = myelin_git::receive_pack::Oid::new(oid.to_string());
+    match policy.evaluate_object_content(&policy_oid, object.data()) {
+        Ok(()) => Ok(()),
+        Err(myelin_git::receive_pack::RejectReason::SecretDetected { .. }) => {
+            Err(WorkspacePublicationError::SecretDetected(path.into()))
+        }
+        Err(myelin_git::receive_pack::RejectReason::ObjectTooLarge { .. }) => {
+            Err(WorkspacePublicationError::ObjectTooLarge(path.into()))
+        }
+        Err(_) => Err(WorkspacePublicationError::InvalidRepository(
+            "workspace review object failed content policy".into(),
+        )),
+    }
 }
 
 fn private_review_path(path: &str, personalized: &std::collections::BTreeSet<&str>) -> bool {
@@ -1538,6 +1680,69 @@ mod tests {
                 .target(),
             Some(review_oid),
             "a rejected Fed runtime file never advances the durable branch"
+        );
+        checkout
+            .reset(
+                &checkout.find_commit(review_oid).unwrap().into_object(),
+                git2::ResetType::Hard,
+                None,
+            )
+            .unwrap();
+
+        let credential = [b"CLOUD_KEY=AK".as_slice(), b"IA_TEST_ONLY\n"].concat();
+        std::fs::write(workspace.join("credentials.env"), credential).unwrap();
+        let mut index = checkout.index().unwrap();
+        index.add_path(Path::new("credentials.env")).unwrap();
+        index.write().unwrap();
+        let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = checkout.find_commit(review_oid).unwrap();
+        let secret_oid = checkout
+            .commit(
+                Some("refs/heads/myelin/private-review"),
+                &signature,
+                &signature,
+                "accidentally commit a credential",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        std::fs::remove_file(workspace.join("credentials.env")).unwrap();
+        let mut index = checkout.index().unwrap();
+        index.remove_path(Path::new("credentials.env")).unwrap();
+        index.write().unwrap();
+        let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = checkout.find_commit(secret_oid).unwrap();
+        let cleaned_oid = checkout
+            .commit(
+                Some("refs/heads/myelin/private-review"),
+                &signature,
+                &signature,
+                "remove credential from the visible tree",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        assert!(checkout
+            .find_commit(cleaned_oid)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new("credentials.env"))
+            .is_err());
+        assert_eq!(
+            store.publish_repository_for_review("acme", workspace_id, request()),
+            Err(WorkspacePublicationError::SecretDetected(
+                "credentials.env".into()
+            )),
+            "content policy must inspect deleted intermediate objects, not only the head tree"
+        );
+        assert_eq!(
+            source_repository
+                .find_reference("refs/heads/myelin/private-review")
+                .unwrap()
+                .target(),
+            Some(review_oid),
+            "a secret hidden in review history never advances the durable branch"
         );
         checkout
             .reset(

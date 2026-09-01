@@ -397,8 +397,66 @@ describe("private work with an agent", () => {
       );
       expect(string(cleaned.stdout, "Fed runtime cleanup stdout")).not
         .toContain("secrets.generated.env");
+
+      const hiddenCredential = record(
+        (await askAgentToAct(
+          cleanupRun,
+          2,
+          "workspace.exec",
+          {
+            command: [
+              "printf 'export CLOUD_KEY=AK%s_TEST_ONLY\\n' 'IA' > credentials.env",
+              "git add credentials.env",
+              "git commit -m 'Accidentally commit a credential'",
+              "git rm credentials.env",
+              "git commit -m 'Remove credential from visible tree'",
+              "test ! -e credentials.env",
+              "git status --porcelain",
+            ].join(" && "),
+            timeout_seconds: 10,
+          },
+          `hide-credential-in-history-${randomUUID()}`,
+        )).data,
+        "hidden review credential command",
+      );
+      expect(string(hiddenCredential.stdout, "hidden review credential stdout"))
+        .toContain("Remove credential from visible tree");
     } finally {
       await closeAgentRun(cleanupRun);
+    }
+
+    const blockedCredentialHistory = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: reviewHandoffBody,
+        idempotencyKey: `private-review-secret-history-${randomUUID()}`,
+        expectedStatus: 409,
+      },
+    );
+    expect(blockedCredentialHistory.body).toMatchObject({
+      error: {
+        code: "conflict",
+        message: expect.stringContaining("credentials.env"),
+      },
+    });
+    expect(record(blockedCredentialHistory.body.error, "secret history error").message)
+      .toContain("possible secret");
+
+    const rewriteRun = await beginAgentThreadRun(founder, created.thread.id);
+    try {
+      await askAgentToAct(
+        rewriteRun,
+        1,
+        "workspace.exec",
+        {
+          command: "git reset --hard HEAD~2 && test ! -e credentials.env && test -z \"$(git status --porcelain)\"",
+          timeout_seconds: 10,
+        },
+        `rewrite-secret-history-${randomUUID()}`,
+      );
+    } finally {
+      await closeAgentRun(rewriteRun);
     }
     const handoffKey = `private-review-handoff-${randomUUID()}`;
     const opened = await founder.json(
