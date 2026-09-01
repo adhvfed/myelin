@@ -29,6 +29,11 @@ head. The CLI journey makes another commit over owner-authorized SSH, invokes th
 receipt tests cover advance, replay, stale compare-and-swap, and owner isolation; Git tests cover
 fast-forward enforcement, retry, reviewer retention, and stale decision invalidation.
 
+The update route also stopped merely validating and discarding its caller idempotency key. A
+principal/thread-scoped operation now binds that key to the exact old/new PR projection in the
+durable Git command ledger. The system journey makes a third real commit, proves reuse of the prior
+successful update key returns a public conflict, then supplies a fresh key and advances the same PR.
+
 ## 2026-09-01 — Project writers can manage real collaborators in the product
 
 Creating a project no longer leaves its useful authorization graph dependent on bootstrap policy.

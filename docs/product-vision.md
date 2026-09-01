@@ -138,8 +138,10 @@ Updates are fast-forward-only: the durable branch tip, pull-request head, and th
 through one retry-safe saga with compare-and-swap checks at each boundary. Reviewer assignments
 remain, but approvals, code-owner satisfaction, endorsements, and check facts for the previous head
 are cleared; an event with the new head generation lets CI and other consumers evaluate the exact
-commit now under review. Replaying an already-current update is inert and reports that state
-honestly rather than opening a second pull request.
+commit now under review. Each caller-supplied idempotency key is bound to one exact head transition:
+replaying it is inert, while reusing it for later workspace work conflicts and requires a fresh
+intent. Replaying an already-current update reports that state honestly rather than opening a
+second pull request.
 
 This creates a humane gradient rather than a false choice between secret local work and noisy public
 automation:

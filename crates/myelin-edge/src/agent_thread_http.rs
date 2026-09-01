@@ -419,6 +419,7 @@ impl AgentThreadHttpApi {
         title: Option<String>,
         body_md: Option<String>,
         reviewers: Vec<String>,
+        client_nonce: &str,
     ) -> Result<(AgentThreadReviewHandoff, bool, bool), EdgeError> {
         let existing = self.review_handoff(principal, thread_id)?;
         let observed_at = Utc::now();
@@ -483,13 +484,13 @@ impl AgentThreadHttpApi {
                 return Ok((existing, false, false));
             }
             let operation = PrOperationId::derive(
-                "myelin.agent-thread.review-handoff-update.v1",
+                "myelin.agent-thread.review-handoff-update.v2",
                 &[
                     principal.tenant.0.as_bytes(),
                     principal.region.0.as_bytes(),
+                    principal.principal_id.0.as_bytes(),
                     thread.thread_id.as_bytes(),
-                    existing.head_oid.as_bytes(),
-                    published.head_oid.as_bytes(),
+                    client_nonce.as_bytes(),
                 ],
             )
             .map_err(map_durable_err)?;
@@ -1512,7 +1513,7 @@ impl Handler for AgentThreadReviewHandoffCreateHandler {
         require_empty_query(ctx)?;
         let body: AgentThreadReviewHandoffBody =
             parse_interactive_body(&ctx.request.body, "agent thread review handoff")?;
-        let _client_nonce = ctx
+        let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
         let (handoff, created, updated) = self.api.publish_review_handoff(
@@ -1521,6 +1522,7 @@ impl Handler for AgentThreadReviewHandoffCreateHandler {
             body.title,
             body.body_md,
             body.reviewers,
+            &client_nonce,
         )?;
         Ok(no_store(EdgeResponse::json(
             if created { 201 } else { 200 },

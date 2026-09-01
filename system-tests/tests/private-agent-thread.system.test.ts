@@ -497,6 +497,51 @@ describe("private work with an agent", () => {
       updated: false,
       durable: true,
     });
+
+    const nextRun = await beginAgentThreadRun(founder, created.thread.id);
+    try {
+      await askAgentToAct(
+        nextRun,
+        1,
+        "workspace.exec",
+        {
+          command: [
+            "printf 'export const finalFollowUp = true;\\n' > review-final.ts",
+            "git add review-final.ts",
+            "git commit -m 'Finish the private review follow-up'",
+          ].join(" && "),
+          timeout_seconds: 10,
+        },
+        `final-cloud-review-${randomUUID()}`,
+      );
+    } finally {
+      await closeAgentRun(nextRun);
+    }
+    const reusedIntent = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: updateKey,
+        expectedStatus: 409,
+      },
+    );
+    expect(reusedIntent.body).toMatchObject({ error: { code: "conflict" } });
+    const finalUpdate = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(created.thread.id)}/pull-request`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: `private-review-final-${randomUUID()}`,
+      },
+    );
+    expect(finalUpdate.body).toMatchObject({ created: false, updated: true, durable: true });
+    const finalHandoff = record(finalUpdate.body.handoff, "final private branch handoff");
+    expect(finalHandoff).toMatchObject({
+      pull_request: { number: pullRequestNumber },
+      head_oid: expect.stringMatching(/^[0-9a-f]{40}$/),
+    });
+    expect(finalHandoff.head_oid).not.toBe(updatedHandoff.head_oid);
   });
 
   test("layers owner instructions and create-only context files across agent contexts", async () => {
