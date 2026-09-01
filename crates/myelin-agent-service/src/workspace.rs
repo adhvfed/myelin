@@ -509,6 +509,7 @@ fn repository_environment_manifest(
         || blob.content().is_empty()
         || blob.content().len() > MAX_FED_MANIFEST_BYTES
         || std::str::from_utf8(blob.content()).is_err()
+        || !is_service_federation_manifest(blob.content())
     {
         return Ok(None);
     }
@@ -518,6 +519,54 @@ fn repository_environment_manifest(
         config_path: "fed.yaml".into(),
         content_digest: format!("blake3:{digest}"),
     }))
+}
+
+fn is_service_federation_manifest(content: &[u8]) -> bool {
+    let Ok(serde_yaml_ng::Value::Mapping(root)) = serde_yaml_ng::from_slice(content) else {
+        return false;
+    };
+    let key = |name: &str| serde_yaml_ng::Value::String(name.into());
+    let mapping = |name: &str| {
+        root.get(key(name))
+            .is_none_or(|value| matches!(value, serde_yaml_ng::Value::Mapping(_)))
+    };
+    let sequence = |name: &str| {
+        root.get(key(name))
+            .is_none_or(|value| matches!(value, serde_yaml_ng::Value::Sequence(_)))
+    };
+    let string = |name: &str| {
+        root.get(key(name))
+            .is_none_or(|value| matches!(value, serde_yaml_ng::Value::String(_)))
+    };
+    let known = [
+        "parameters",
+        "services",
+        "compose",
+        "templates",
+        "dependencies",
+        "entrypoint",
+        "entrypoints",
+        "scripts",
+        "packages",
+        "metadata",
+        "env_file",
+    ];
+
+    known.iter().any(|name| root.contains_key(key(name)))
+        && [
+            "parameters",
+            "services",
+            "templates",
+            "dependencies",
+            "scripts",
+            "metadata",
+        ]
+        .iter()
+        .all(|name| mapping(name))
+        && ["compose", "entrypoints", "packages", "env_file"]
+            .iter()
+            .all(|name| sequence(name))
+        && string("entrypoint")
 }
 
 fn validate_repository_source(
@@ -1502,6 +1551,24 @@ mod tests {
             entries[0].metadata().unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn environment_receipts_require_a_structural_fed_manifest() {
+        assert!(is_service_federation_manifest(
+            b"services:\n  app:\n    process: ./dev\nentrypoint: app\n"
+        ));
+        assert!(is_service_federation_manifest(
+            b"compose:\n  - ./compose.yaml\n"
+        ));
+        assert!(!is_service_federation_manifest(
+            b"services:\n  app: [unterminated\n"
+        ));
+        assert!(!is_service_federation_manifest(b"services: app\n"));
+        assert!(!is_service_federation_manifest(
+            b"title: this is an unrelated yaml document\n"
+        ));
+        assert!(!is_service_federation_manifest(b"just a scalar\n"));
     }
 
     #[test]

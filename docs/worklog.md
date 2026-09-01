@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — A Fed receipt now means the pinned file is a manifest
+
+Environment discovery previously blessed every bounded UTF-8 blob named `fed.yaml`. Broken YAML, a
+scalar, or an unrelated YAML document therefore appeared in the workspace pane as a declared
+Service Federation environment even though Fed could not interpret it as a configuration.
+
+Discovery now parses the pinned bytes without executing repository content. It requires a YAML
+mapping with at least one recognized Fed top-level field and enforces the collection/string shapes
+of Fed's root contract; malformed and unrelated files remain ordinary repository files with no
+environment receipt. This is intentionally structural admission, not an activation claim: semantic
+validation and execution still belong to the future hardened environment provisioner.
+
+The readable TypeScript cloud-branch journey creates a real repository containing malformed
+`fed.yaml`, starts private work through the running product, and observes that the durable workspace
+has no environment receipt before continuing through the valid pinned-manifest journey. Focused
+Rust coverage exercises valid native and Compose declarations plus malformed, wrong-shaped,
+unrelated, and scalar documents.
+
 ## 2026-09-01 — The reserved Fed root cannot become a review file
 
 The publication predicate protected generated paths beneath `.fed/` but not an entry named exactly
@@ -5701,8 +5719,8 @@ stories passed, strict all-target Clippy was clean, and the TypeScript system su
     command/store, environment administration API, publisher, authenticated
     browser journey, or rollback executor. The former in-memory approval map
     and draft constructors were removed rather than counted as that product.
-    Private repository work can now bind and expose the exact digest of a root
-    `fed.yaml`, but it truthfully remains `declared`: no hardened provisioner,
+    Private repository work can now bind and expose the exact digest of a structurally admitted
+    root `fed.yaml`, but it truthfully remains `declared`: no hardened provisioner,
     environment lifecycle, status/log stream, network policy, or TTL teardown is
     connected yet, and Myelin does not execute it with host Docker authority.
 22. **Storage has no product-wide priority admission boundary.** The composed

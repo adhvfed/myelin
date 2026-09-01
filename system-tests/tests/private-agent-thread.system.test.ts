@@ -169,6 +169,20 @@ describe("private work with an agent", () => {
       uniqueName("Cloud branch companion"),
       ["workspace.read_file", "workspace.exec"],
     );
+    const malformedRepository = new GitProject(uniqueName("malformed-cloud-workspace"), founder);
+    await malformedRepository.create();
+    await malformedRepository.writeFile(
+      "main",
+      "fed.yaml",
+      "services:\n  app: [unterminated\n",
+    );
+    const malformedThread = await startPrivateAgentThread(founder, {
+      name: uniqueName("Do not bless a broken environment"),
+      agentId: companion.agent.id,
+      workspace: { repository: malformedRepository.slug },
+    });
+    expect(malformedThread.thread.workspace.environment).toBeNull();
+
     const repository = new GitProject(uniqueName("cloud-workspace"), founder);
     await repository.create();
     const initialReadme = "# A real project\n\nCheckout the durable source, not a synthetic fixture.\n";
