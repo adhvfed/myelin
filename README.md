@@ -304,14 +304,15 @@ journals through Edge or `myelin privacy agent-data`. Erasure records a durable 
 deletes every live record, destroys the scoped agent-data key so ciphertext in backups remains
 unrecoverable, and permanently blocks later agent processing for that person.
 
-The durable privacy-request surface covers the three holder slices Myelin can currently prove:
-agent data, authored Chat messages, and authored Issue titles. `myelin privacy request erase`
-requires an explicit scope, confirmation, and retry-stable idempotency key; its returned request ID
-addresses durable status and a content-addressed holder certificate. Chat and Issue erasure
-tombstone only the requesting person's authored content, destroy that holder-specific subject key,
-and leave other products and other authors untouched. Each scope has real post-restore re-erasure
-proof. These operations are deliberately not presented as full account or organization erasure;
-unlisted holders remain outside the certificate rather than receiving ceremonial receipts.
+The durable privacy-request surface covers the four holder slices Myelin can currently prove:
+agent data, authored Chat messages, authored Issue titles, and authored Git pull-request text.
+`myelin privacy request erase` requires an explicit scope, confirmation, and retry-stable
+idempotency key; its returned request ID addresses durable status and a content-addressed holder
+certificate. Chat, Issue, and Git pull-request erasure tombstone only the requesting person's
+authored content, destroy that holder-specific subject key, and leave other products and other
+authors untouched. Each scope has real post-restore re-erasure proof. These operations are
+deliberately not presented as full account or organization erasure; unlisted holders remain outside
+the certificate rather than receiving ceremonial receipts.
 
 Sensitive effects such as `git.merge` have a second, narrower approval boundary. The agent may
 reason up to the effect, but Myelin withholds the mutation, parks the durable workflow without

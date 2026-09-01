@@ -622,6 +622,11 @@ pub struct PgPrStore {
     minter: Arc<dyn IdMinter>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrTextRekeyBatch {
+    pub rows_rekeyed: u32,
+}
+
 impl PgPrStore {
     pub fn new(
         provider: SubstrateProvider,
@@ -661,6 +666,100 @@ impl PgPrStore {
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         tokio::task::block_in_place(|| self.runtime.block_on(future))
+    }
+
+    pub fn rekey_legacy_pr_text_batch(
+        &self,
+        tenant: &str,
+        limit: u32,
+    ) -> Result<PrTextRekeyBatch, DurableError> {
+        if tenant.trim() != tenant || tenant.is_empty() || tenant.len() > 255 {
+            return Err(DurableError::InvalidInput(
+                "legacy PR text rekey tenant is invalid".into(),
+            ));
+        }
+        if !(1..=1_000).contains(&limit) {
+            return Err(DurableError::InvalidInput(
+                "legacy PR text rekey batch limit must be between 1 and 1000".into(),
+            ));
+        }
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let provider = self.provider.clone();
+        let kms = self.kms.clone();
+        let crypto_region = Region(region.clone());
+        self.block_on(async move {
+            provider
+                .with_tenant_tx(&tenant.clone(), move |conn| {
+                    Box::pin(async move {
+                        sqlx::query(
+                            "SELECT pg_advisory_xact_lock(hashtextextended( \
+                             'myelin.git.pr-text-rekey.v1:' || length($1)::text || ':' || $1 || ':' || $2, 0))",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|_| pg_query("lock legacy Git PR text rekey tenant"))?;
+                        let rows = sqlx::query(&format!(
+                            "SELECT repo_slug, number, {PR_RECORD_COLUMNS}
+                               FROM git_pr
+                              WHERE tenant_id=$1 AND region=$2 AND NOT free_text_erased
+                                AND (split_part(title_pii_key_ref, '/', 5) LIKE 'subject:%'
+                                  OR split_part(body_pii_key_ref, '/', 5) LIKE 'subject:%')
+                              ORDER BY repo_slug, number
+                              LIMIT $3 FOR UPDATE"
+                        ))
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(i64::from(limit))
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(|_| pg_query("select legacy Git PR text rekey batch"))?;
+                        let rows_rekeyed = u32::try_from(rows.len())
+                            .map_err(|_| pg_query("count legacy Git PR text rekey batch"))?;
+                        for row in rows {
+                            let repo_slug: String = row
+                                .try_get("repo_slug")
+                                .map_err(|_| pg_query("decode legacy Git PR text repository"))?;
+                            let number: i64 = row
+                                .try_get("number")
+                                .map_err(|_| pg_query("decode legacy Git PR text number"))?;
+                            let record = decode_record(&kms, &crypto_region, &tenant, row)
+                                .map_err(|_| pg_query("decrypt legacy Git PR text"))?;
+                            let sealed = seal_pr_record(
+                                &kms,
+                                crypto_region.clone(),
+                                &TenantId::from_token(&tenant),
+                                &record,
+                            )
+                            .map_err(|_| pg_query("encrypt scoped Git PR text"))?;
+                            sqlx::query(
+                                "UPDATE git_pr
+                                    SET title_nonce=$5,title_ciphertext=$6,title_pii_key_ref=$7,
+                                        body_nonce=$8,body_ciphertext=$9,body_pii_key_ref=$10
+                                  WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
+                            )
+                            .bind(&tenant)
+                            .bind(&region)
+                            .bind(repo_slug)
+                            .bind(number)
+                            .bind(sealed.title.nonce.to_vec())
+                            .bind(sealed.title.ciphertext)
+                            .bind(sealed.title.key_ref.to_uri())
+                            .bind(sealed.body.as_ref().map(|column| column.nonce.to_vec()))
+                            .bind(sealed.body.as_ref().map(|column| column.ciphertext.clone()))
+                            .bind(sealed.body.as_ref().map(|column| column.key_ref.to_uri()))
+                            .execute(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("persist scoped Git PR text"))?;
+                        }
+                        Ok(PrTextRekeyBatch { rows_rekeyed })
+                    })
+                })
+                .await
+        })
+        .map_err(pg_error)
     }
 
     fn scoped_loc(&self, scope: &TenantScope, repo: &str) -> Result<RepoLoc, DurableError> {
@@ -3563,6 +3662,143 @@ mod tests {
         let scope_a = TenantScope::from_verified_token(&actor, actor.region.clone());
         let scope_b = TenantScope::from_verified_token(&actor_b, actor_b.region.clone());
         let repo = "core";
+
+        let legacy_tenant = format!("git-pr-legacy-{suffix}");
+        let legacy_actor = principal(
+            &legacy_tenant,
+            &region,
+            &format!("legacy-git-subject-{suffix}"),
+        );
+        let legacy_scope =
+            TenantScope::from_verified_token(&legacy_actor, legacy_actor.region.clone());
+        let legacy_repo = format!("legacy-rekey-{suffix}");
+        let legacy_title = "legacy shared-key title";
+        let legacy_body = format!("body:{legacy_title}");
+        let legacy_pr = store
+            .open(
+                &legacy_scope,
+                &legacy_repo,
+                record(&"9".repeat(40), legacy_title, &legacy_repo),
+                &PrOperationId::parse("open-legacy-rekey").unwrap(),
+                &legacy_actor,
+            )
+            .expect("open a PR before simulating its legacy key shape");
+        let cryptor = ColumnCryptor::new(&kms, Region::new(region.clone()));
+        let tenant_id = TenantId::from_token(&legacy_tenant);
+        let subject_id = SubjectId::new(legacy_actor.principal_id.0.clone());
+        let erasure = myelin_gdpr::ErasureMethod::CryptoShred("subject_dek".into());
+        let generic_title = cryptor
+            .encrypt(
+                &tenant_id,
+                Some(&subject_id),
+                &erasure,
+                legacy_title.as_bytes(),
+            )
+            .expect("encrypt a real legacy title");
+        let generic_body = cryptor
+            .encrypt(
+                &tenant_id,
+                Some(&subject_id),
+                &erasure,
+                legacy_body.as_bytes(),
+            )
+            .expect("encrypt a real legacy body");
+        sqlx::query(
+            "UPDATE git_pr
+                SET title_nonce=$5,title_ciphertext=$6,title_pii_key_ref=$7,
+                    body_nonce=$8,body_ciphertext=$9,body_pii_key_ref=$10
+              WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
+        )
+        .bind(&legacy_tenant)
+        .bind(&region)
+        .bind(&legacy_repo)
+        .bind(i64::try_from(legacy_pr.number).unwrap())
+        .bind(generic_title.nonce.to_vec())
+        .bind(generic_title.ciphertext)
+        .bind(generic_title.key_ref.to_uri())
+        .bind(generic_body.nonce.to_vec())
+        .bind(generic_body.ciphertext)
+        .bind(generic_body.key_ref.to_uri())
+        .execute(&admin)
+        .await
+        .unwrap();
+        let before_rekey: (serde_json::Value, i64, String) = sqlx::query_as(
+            "SELECT record,version,updated_at::text FROM git_pr
+                  WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
+        )
+        .bind(&legacy_tenant)
+        .bind(&region)
+        .bind(&legacy_repo)
+        .bind(i64::try_from(legacy_pr.number).unwrap())
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        let readable_legacy = store
+            .get(&legacy_scope, &legacy_repo, legacy_pr.number)
+            .unwrap()
+            .expect("legacy PR remains readable before rekey");
+        assert_eq!(readable_legacy.title, legacy_title);
+        assert_eq!(
+            readable_legacy.body_md.as_deref(),
+            Some(legacy_body.as_str())
+        );
+
+        assert_eq!(
+            store
+                .rekey_legacy_pr_text_batch(&legacy_tenant, 1)
+                .expect("rekey one bounded legacy PR text row"),
+            PrTextRekeyBatch { rows_rekeyed: 1 }
+        );
+        assert_eq!(
+            store
+                .rekey_legacy_pr_text_batch(&legacy_tenant, 1)
+                .expect("replaying a completed rekey is inert"),
+            PrTextRekeyBatch { rows_rekeyed: 0 }
+        );
+        let after_rekey: (serde_json::Value, i64, String, String, String) = sqlx::query_as(
+            "SELECT record,version,updated_at::text,title_pii_key_ref,body_pii_key_ref
+               FROM git_pr
+              WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
+        )
+        .bind(&legacy_tenant)
+        .bind(&region)
+        .bind(&legacy_repo)
+        .bind(i64::try_from(legacy_pr.number).unwrap())
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            (&after_rekey.0, after_rekey.1, after_rekey.2),
+            (&before_rekey.0, before_rekey.1, before_rekey.2),
+            "rekey changes ciphertext only, not PR semantics, version, or update time"
+        );
+        assert!(after_rekey.3.contains("/scoped-subject:git:"));
+        assert!(after_rekey.4.contains("/scoped-subject:git:"));
+        let rekeyed = store
+            .get(&legacy_scope, &legacy_repo, legacy_pr.number)
+            .unwrap()
+            .expect("rekeyed PR remains readable");
+        assert_eq!(rekeyed.title, legacy_title);
+        assert_eq!(rekeyed.body_md.as_deref(), Some(legacy_body.as_str()));
+        let legacy_eraser = crate::durable_erase::DurablePrTextEraser::new(
+            store.clone(),
+            kms.clone(),
+            DurablePostPitLedger::new(provider.clone()),
+        );
+        let legacy_erasure = legacy_eraser
+            .erase_subject_pr_text(
+                &legacy_tenant,
+                legacy_actor.principal_id.0.as_str(),
+                PrTextErasureAttempt::new(
+                    "privacy-git-pr-text-after-rekey",
+                    Actor(pseudonymized_event_principal(&legacy_tenant, &legacy_actor)),
+                    system_clock_reading().unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the existing certified holder accepts the rekeyed row");
+        assert_eq!(legacy_erasure.pull_requests_erased, 1);
 
         let abort_op = PrOperationId::parse("abort-open").unwrap();
         let mut abort_record = record(&"1".repeat(40), "abort-secret", repo);

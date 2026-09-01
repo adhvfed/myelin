@@ -1,4 +1,5 @@
 mod agent_thread_operator;
+mod git_pr_text_rekey_operator;
 mod privacy_restore_operator;
 
 use bytes::Bytes;
@@ -901,6 +902,11 @@ async fn main() {
             let core = compose_core(runtime.cell_id).await;
             agent_thread_operator::run(core.provider, &args[1..]).await;
         }
+        Some("git-pr-text-rekey") => {
+            let runtime = runtime_config_or_exit(false);
+            let core = compose_core(runtime.cell_id).await;
+            git_pr_text_rekey_operator::run(core.provider, core.kms, core.handle, &args[1..]).await;
+        }
         Some("privacy-reerase") => {
             let runtime = runtime_config_or_exit(false);
             let core = compose_core(runtime.cell_id).await;
@@ -915,7 +921,7 @@ async fn main() {
         }
         Some(other) => {
             eprintln!(
-                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke | secret | agent-thread-reconcile | privacy-reerase)"
+                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke | secret | agent-thread-reconcile | git-pr-text-rekey | privacy-reerase)"
             );
             std::process::exit(2);
         }

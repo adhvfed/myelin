@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Legacy pull-request text can enter Git's truthful erasure boundary
+
+Git pull-request title and body encryption is product-scoped now, but rows written before that
+boundary still used the person's generic cross-product key. The Git holder correctly refused to
+claim that erasing those rows was isolated; there was no safe way to bring an upgraded deployment
+or restored backup through that refusal.
+
+The maintenance-only `git-pr-text-rekey` command now migrates one explicitly named tenant in
+bounded transactions. It decrypts through the legacy-compatible reader, reseals only title and body
+under Git's scoped subject key, and leaves the durable PR projection, version, timestamps, event
+history, repository state, and plaintext unchanged. Each transaction locks its ordered rows rather
+than skipping another operator's in-flight work, and a replay selects only legacy key references,
+so the JSON completion receipt is restart-safe and an already-converged pass is inert. Arguments
+reject ambiguous tenants and noncanonical or unbounded batch sizes; output contains receipt
+metadata and counts, never pull-request text or key references.
+
+The live PostgreSQL proof creates a real pull request, replaces its protected fields with genuinely
+encrypted generic-subject ciphertext, reads it through the compatibility path, rekeys one bounded
+row, and proves the projection/version/update time and plaintext did not move. A second pass reports
+zero. It then invokes the production Git eraser and proves the newly scoped row is erased. Operator
+parser tests cover exact and refused invocations, and all-target/all-feature builds cover the binary
+composition. The compiled operator also ran against the live Service Federation Edge environment
+and PostgreSQL store and returned a truthful zero-row completion receipt for an empty tenant.
+
 ## 2026-09-01 — An active cloud review follows new committed work without changing identity
 
 A personal cloud branch no longer becomes a dead end after its first pull-request handoff. Its
@@ -5378,10 +5402,11 @@ stories passed, strict all-target Clippy was clean, and the TypeScript system su
    tombstoning, holder receipt, public requests, ledger replay, and fail-closed
    legacy-row handling. Git pull-request text now has the equivalent isolated
    key, bounded operation, holder receipt, lifecycle fence, failure recovery,
-   restore replay, and real dump/restore drill. It fails closed when validation
-   encounters a legacy generic-key row rather than overstating erasure; a
-   deliberate legacy rekey migration remains required before old rows can be
-   erased through this holder.
+   restore replay, and real dump/restore drill. Validation still fails closed
+   if it encounters a legacy generic-key row rather than overstating erasure;
+   the bounded, restart-safe `git-pr-text-rekey` maintenance command now moves
+   those old rows into the isolated Git holder before live erasure or restore
+   replay.
 2. **DSR has four truthful product slices, not full holder coverage.** durable
    submit/status/certificate is wired for `agent_data`, `chat_messages`, and
    `issue_titles`, and `git_pull_request_text`, with holder-specific proofs and

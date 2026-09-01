@@ -41,6 +41,30 @@ holder.
 5. Set `MYELIN_POST_RESTORE_LEDGER_DATABASE_URL` to the preserved live ledger
    database. Keep connection material in the process environment or the
    deployment secret mechanism; never place it in the command line or a ticket.
+6. If the backup can contain Git pull requests written before scoped Git text
+   keys were deployed, run the legacy rekey pass below for every affected
+   tenant while the cell remains stopped. The privacy replay deliberately fails
+   closed on an unscoped row.
+
+## Rekey legacy Git pull-request text
+
+With the restored cell's ordinary database and KMS environment configured, run
+one tenant at a time:
+
+```sh
+cargo run --quiet -p myelin-edge --bin edge -- git-pr-text-rekey \
+  --tenant acme \
+  --batch-size 100
+```
+
+The command updates bounded, ordered transactions until that tenant has no
+legacy Git title or body key references. It changes ciphertext only: pull
+request content, coordinates, versions, timestamps, events, repository state,
+and other products' keys do not move. It is safe to restart or rerun. A
+converged pass returns `rows_rekeyed: 0`; a successful nonzero pass returns the
+number migrated and `complete: true`. Retain the JSON receipt with the restore
+record. Any nonzero process exit means the tenant has not been proven complete
+and the privacy replay must not begin.
 
 ## Run the pass
 
