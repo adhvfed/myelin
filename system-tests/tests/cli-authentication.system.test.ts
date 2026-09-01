@@ -356,6 +356,7 @@ describe.sequential("the CLI authentication journey", () => {
         "git.merge",
         "ci.read_run",
         "ci.read_log",
+        "ci.retry_run",
         "issues.close",
         "issues.create",
         "issues.list",
@@ -372,6 +373,9 @@ describe.sequential("the CLI authentication journey", () => {
       ]),
     );
     expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
+    expect(mcpManifest.tools.find((tool) => tool.name === "ci.retry_run")).toMatchObject({
+      annotations: { requiresApproval: true, readOnlyHint: false },
+    });
     expect(mcpDescription.stdout).not.toContain(systemTestConfig.token);
   }, 60_000);
 

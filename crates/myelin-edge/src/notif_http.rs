@@ -21,6 +21,7 @@ use sqlx::types::Uuid;
 use tokio::runtime::Handle;
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, Method};
+use crate::ci_http::DurableCiReadApi;
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::DurableGitBackend;
@@ -35,6 +36,7 @@ struct DurableNotifHttpApi {
     store: Arc<PgInboxStore>,
     identity: StoreBackedCheck,
     git: Arc<DurableGitBackend>,
+    ci: DurableCiReadApi,
     runtime: Handle,
 }
 
@@ -52,12 +54,29 @@ impl DurableNotifHttpApi {
         row: &DurableInboxItem,
         cache: &mut SubjectReadCache,
     ) -> Result<bool, PgInboxError> {
-        let issue_object =
-            if subsystem_of(&row.item.subject) == myelin_notif::list_inbox::Subsystem::Issue {
-                self.issue_authorization_object(principal, &row.item.subject, cache)?
-            } else {
-                None
+        let subsystem = subsystem_of(&row.item.subject);
+        if subsystem == myelin_notif::list_inbox::Subsystem::Ci {
+            let Some(run_id) = ci_run_id(&row.item.subject, principal.tenant.as_str()) else {
+                return Ok(false);
             };
+            let access = SubjectAccess::CiRun {
+                run_id: run_id.clone(),
+            };
+            if let Some(allowed) = cache.decisions.get(&access) {
+                return Ok(*allowed);
+            }
+            let allowed = self
+                .ci
+                .may_view_run(principal, &run_id)
+                .map_err(|_| PgInboxError::Database)?;
+            cache.decisions.insert(access, allowed);
+            return Ok(allowed);
+        }
+        let issue_object = if subsystem == myelin_notif::list_inbox::Subsystem::Issue {
+            self.issue_authorization_object(principal, &row.item.subject, cache)?
+        } else {
+            None
+        };
         Ok(can_read_subject_cached(
             &self.identity,
             Some(&self.git),
@@ -134,6 +153,9 @@ enum SubjectAccess {
     PullRequestReview {
         repository: String,
         number: u64,
+    },
+    CiRun {
+        run_id: String,
     },
 }
 
@@ -539,8 +561,10 @@ fn can_read_subject_cached(
             };
             access
         }
-        myelin_notif::list_inbox::Subsystem::Knowledge
-        | myelin_notif::list_inbox::Subsystem::Ci => ("read", row.item.subject.clone()),
+        myelin_notif::list_inbox::Subsystem::Knowledge => ("read", row.item.subject.clone()),
+        // Durable notification reads authorize CI subjects through the source repository before
+        // reaching this identity-only helper. Fail closed in isolated unit callers.
+        myelin_notif::list_inbox::Subsystem::Ci => return false,
         myelin_notif::list_inbox::Subsystem::Git => {
             if row.item.reason == myelin_notif::Reason::ReviewRequested
                 && row.item.recipient == principal.principal_id.0
@@ -645,6 +669,19 @@ fn git_pr_coordinate(subject: &ArtifactRef, expected_tenant: &str) -> Option<(St
     Some((repo.to_string(), number))
 }
 
+fn ci_run_id(subject: &ArtifactRef, expected_tenant: &str) -> Option<String> {
+    let parsed = myelin_refs::parse_scoped(&subject.0).ok()?;
+    if parsed.tenant.as_str() != expected_tenant
+        || parsed.subsystem != "ci"
+        || parsed.type_ != "run"
+        || parsed.sub.is_some()
+        || !crate::ci_http::canonical_uuid(&parsed.id)
+    {
+        return None;
+    }
+    Some(parsed.id)
+}
+
 fn git_pr_parts(id: &str) -> Option<(&str, u64)> {
     let (repo, number) = id.rsplit_once(':')?;
     myelin_git::coordinate::RepositorySlug::parse(repo).ok()?;
@@ -695,12 +732,14 @@ pub fn register_notif(
     store: Arc<PgInboxStore>,
     identity: StoreBackedCheck,
     git: Arc<DurableGitBackend>,
+    ci: DurableCiReadApi,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = DurableNotifHttpApi {
         store,
         identity,
         git,
+        ci,
         runtime,
     };
     builder
@@ -889,6 +928,27 @@ mod tests {
                 git_pr_coordinate(&ArtifactRef(subject.into()), "acme"),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn ci_subjects_reduce_only_to_exact_same_tenant_run_ids() {
+        let run_id = "018f4f5a-8f6b-7c1d-8d46-78c1380a16ca";
+        assert_eq!(
+            ci_run_id(
+                &ArtifactRef(format!("myelin://acme/ci/run/{run_id}")),
+                "acme"
+            ),
+            Some(run_id.into())
+        );
+        for subject in [
+            format!("myelin://other/ci/run/{run_id}"),
+            format!("myelin://acme/ci/job/{run_id}"),
+            format!("myelin://acme/ci/run/{run_id}#job-1"),
+            "myelin://acme/ci/run/not-a-uuid".into(),
+            "myelin://acme/ci/run/018F4F5A-8F6B-7C1D-8D46-78C1380A16CA".into(),
+        ] {
+            assert_eq!(ci_run_id(&ArtifactRef(subject), "acme"), None);
         }
     }
 

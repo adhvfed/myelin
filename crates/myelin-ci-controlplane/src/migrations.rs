@@ -66,6 +66,12 @@ pub const CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID: &str =
 pub const CI_RUN_BRANCH_SCOPE_EXPAND_MIGRATION_ID: &str = "ci_0025b_ci_run_branch_scope_expand";
 pub const CI_RUN_BRANCH_SCOPE_VALIDATE_MIGRATION_ID: &str = "ci_0025c_ci_run_branch_scope_validate";
 pub const CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID: &str = "ci_0025d_ci_run_branch_scope_contract";
+pub const CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID: &str =
+    "ci_0025e_ci_run_agent_source_scope_expand";
+pub const CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID: &str =
+    "ci_0025f_ci_run_agent_source_scope_validate";
+pub const CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID: &str =
+    "ci_0025g_ci_run_agent_source_scope_contract";
 pub const CI_JOB_SPEC_STAGE_MIGRATION_ID: &str = "ci_0015a_ci_job_spec_stage";
 pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str = "ci_0017a_ci_job_accounting_skipped";
 pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID: &str =
@@ -255,6 +261,23 @@ pub const CONTRACT_CI_RUN_BRANCH_SCOPE_DDL: &str = "ALTER TABLE ci_run \
 DROP CONSTRAINT ci_run_source_ref_shape; \
 ALTER TABLE ci_run \
 RENAME CONSTRAINT ci_run_source_ref_shape_v2 TO ci_run_source_ref_shape";
+
+pub const EXPAND_CI_RUN_AGENT_SOURCE_SCOPE_DDL: &str = "ALTER TABLE ci_run \
+ADD CONSTRAINT ci_run_source_ref_shape_v3 \
+CHECK (source_ref IS NULL OR (\
+trigger_kind IN ('push', 'pull_request', 'agent') \
+AND source_ref ~ '^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$' \
+AND octet_length(source_ref) BETWEEN 12 AND 1024 \
+AND source_ref !~ '(^|/)\\.\\.?(/|$)' \
+AND source_ref !~ '[[:cntrl:] ~^:?*\\[]')) NOT VALID";
+
+pub const VALIDATE_CI_RUN_AGENT_SOURCE_SCOPE_DDL: &str =
+    "ALTER TABLE ci_run VALIDATE CONSTRAINT ci_run_source_ref_shape_v3";
+
+pub const CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL: &str = "ALTER TABLE ci_run \
+DROP CONSTRAINT ci_run_source_ref_shape; \
+ALTER TABLE ci_run \
+RENAME CONSTRAINT ci_run_source_ref_shape_v3 TO ci_run_source_ref_shape";
 
 pub const CREATE_CI_DRIVE_MANIFEST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_drive_manifest (
@@ -2076,6 +2099,21 @@ pub fn ci_controlplane_migrations() -> Migrations {
         CONTRACT_CI_RUN_BRANCH_SCOPE_DDL,
         CI_RUN_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID,
+        EXPAND_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID,
+        VALIDATE_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
+        CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
     migrations.push(Migration::plain(
         CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID,
         SEED_CI_PIPELINE_V4_CUTOVER_FENCE_ROW_DDL,
@@ -2154,6 +2192,21 @@ pub fn ci_durable_migrations() -> Migrations {
     migrations.push(Migration::plain_on(
         CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
         CONTRACT_CI_RUN_BRANCH_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID,
+        EXPAND_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID,
+        VALIDATE_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
+        CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
         CI_RUN_TABLE,
     ));
     Migrations::of(migrations)
@@ -2861,6 +2914,9 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_RUN_BRANCH_SCOPE_EXPAND_MIGRATION_ID,
                 CI_RUN_BRANCH_SCOPE_VALIDATE_MIGRATION_ID,
                 CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
+                CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID,
+                CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID,
+                CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
                 CI_PIPELINE_V4_CUTOVER_FENCE_ROW_MIGRATION_ID,
                 CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID,
                 CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID,
@@ -2927,11 +2983,36 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
     }
 
     #[test]
+    fn agent_retries_preserve_the_validated_source_branch() {
+        let expand = EXPAND_CI_RUN_AGENT_SOURCE_SCOPE_DDL;
+        for required in [
+            "ADD CONSTRAINT ci_run_source_ref_shape_v3",
+            "trigger_kind IN ('push', 'pull_request', 'agent')",
+            "refs/heads/",
+            "NOT VALID",
+        ] {
+            assert!(
+                expand.contains(required),
+                "the retry provenance expand contains `{required}`"
+            );
+        }
+        assert_eq!(
+            VALIDATE_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+            "ALTER TABLE ci_run VALIDATE CONSTRAINT ci_run_source_ref_shape_v3"
+        );
+        assert_eq!(
+            CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+            "ALTER TABLE ci_run DROP CONSTRAINT ci_run_source_ref_shape; \
+             ALTER TABLE ci_run RENAME CONSTRAINT ci_run_source_ref_shape_v3 TO ci_run_source_ref_shape"
+        );
+    }
+
+    #[test]
     fn the_migration_set_is_forward_only_and_rls_scoped() {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            80,
+            83,
             "the complete append-only schema includes durable scheduler fairness"
         );
         fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
@@ -2976,6 +3057,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 const CONSTRAINT_REPLACEMENT_ALLOWLIST: &[&str] = &[
                     CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID,
                     CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
+                    CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
                 ];
                 assert!(
                     CONSTRAINT_REPLACEMENT_ALLOWLIST.contains(&m.id.as_ref()),
@@ -2984,12 +3066,26 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                      re-added constraint is a STRICT SUPERSET of the one it replaces",
                     m.id
                 );
-                if m.id == CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID {
-                    assert_eq!(m.ddl, CONTRACT_CI_RUN_BRANCH_SCOPE_DDL);
+                if m.id == CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID
+                    || m.id == CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID
+                {
+                    let (expected, staged_name) =
+                        if m.id == CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID {
+                            (
+                                CONTRACT_CI_RUN_BRANCH_SCOPE_DDL,
+                                "CI_RUN_SOURCE_REF_SHAPE_V2",
+                            )
+                        } else {
+                            (
+                                CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+                                "CI_RUN_SOURCE_REF_SHAPE_V3",
+                            )
+                        };
+                    assert_eq!(m.ddl, expected);
                     assert!(
-                        upper.contains(
-                            "RENAME CONSTRAINT CI_RUN_SOURCE_REF_SHAPE_V2 TO CI_RUN_SOURCE_REF_SHAPE"
-                        ),
+                        upper.contains(&format!(
+                            "RENAME CONSTRAINT {staged_name} TO CI_RUN_SOURCE_REF_SHAPE"
+                        )),
                         "the validated superset assumes the canonical constraint name"
                     );
                 } else {
@@ -3030,6 +3126,12 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, VALIDATE_CI_RUN_BRANCH_SCOPE_DDL);
             } else if m.id == CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID {
                 assert_eq!(m.ddl, CONTRACT_CI_RUN_BRANCH_SCOPE_DDL);
+            } else if m.id == CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID {
+                assert_eq!(m.ddl, EXPAND_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
+            } else if m.id == CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID {
+                assert_eq!(m.ddl, VALIDATE_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
+            } else if m.id == CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID {
+                assert_eq!(m.ddl, CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
             } else if m.id == CI_JOB_SPEC_STAGE_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL);
             } else if m.id == CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID {
@@ -3131,7 +3233,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            80,
+            83,
             "the runner applied the complete schema plus every additive follow-on"
         );
         assert_eq!(
@@ -3596,6 +3698,9 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_RUN_BRANCH_SCOPE_EXPAND_MIGRATION_ID,
                 CI_RUN_BRANCH_SCOPE_VALIDATE_MIGRATION_ID,
                 CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
+                CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID,
+                CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID,
+                CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
             ],
             "the subset is exactly the writer-critical creates plus ci_run's forward ALTERs and repaired provenance contract"
         );
@@ -3627,8 +3732,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let subset = ci_durable_migrations();
         assert_eq!(
             subset.0.len(),
-            13,
-            "four writer-critical CI tables plus nine forward ci_run ALTERs"
+            16,
+            "four writer-critical CI tables plus twelve forward ci_run ALTERs"
         );
         for m in &subset.0 {
             assert!(
@@ -3654,6 +3759,12 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, VALIDATE_CI_RUN_BRANCH_SCOPE_DDL);
             } else if m.id == CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID {
                 assert_eq!(m.ddl, CONTRACT_CI_RUN_BRANCH_SCOPE_DDL);
+            } else if m.id == CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID {
+                assert_eq!(m.ddl, EXPAND_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
+            } else if m.id == CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID {
+                assert_eq!(m.ddl, VALIDATE_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
+            } else if m.id == CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID {
+                assert_eq!(m.ddl, CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
             } else {
                 assert!(
                     m.ddl.contains("myelin_make_tenant_scoped"),
@@ -3666,6 +3777,6 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         runner
             .run(&subset, &ci_durable_hot_tables())
             .expect("the CI durable writer subset applies forward-only");
-        assert_eq!(runner.applied().len(), 13);
+        assert_eq!(runner.applied().len(), 16);
     }
 }

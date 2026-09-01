@@ -192,6 +192,10 @@ mod tests {
                 "unavailable ci.{unavailable} remains gated by the fail-closed fallback"
             );
         }
+        assert!(
+            requires_approval_default("ci", "retry_run"),
+            "retrying CI spends fresh compute and remains human-gated"
+        );
 
         assert!(
             requires_approval_default("git", "merge"),

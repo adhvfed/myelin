@@ -2,6 +2,7 @@
 pub enum McpApprovalContract {
     GitMerge,
     IssuesClose,
+    CiRetryRun,
 }
 
 impl McpApprovalContract {
@@ -9,6 +10,7 @@ impl McpApprovalContract {
         match tool {
             "git.merge" => Some(Self::GitMerge),
             "issues.close" => Some(Self::IssuesClose),
+            "ci.retry_run" => Some(Self::CiRetryRun),
             _ => None,
         }
     }
@@ -17,6 +19,7 @@ impl McpApprovalContract {
         match self {
             Self::GitMerge => "git.merge",
             Self::IssuesClose => "issues.close",
+            Self::CiRetryRun => "ci.retry_run",
         }
     }
 }
@@ -30,6 +33,7 @@ mod tests {
         for (tool, expected) in [
             ("git.merge", McpApprovalContract::GitMerge),
             ("issues.close", McpApprovalContract::IssuesClose),
+            ("ci.retry_run", McpApprovalContract::CiRetryRun),
         ] {
             let contract = McpApprovalContract::for_tool(tool).unwrap();
             assert_eq!(contract, expected);

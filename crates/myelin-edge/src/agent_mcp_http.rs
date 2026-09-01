@@ -37,10 +37,10 @@ use crate::runtime::drive_edge_future;
 use crate::workspace_access::DurableAgentWorkspaceAccess;
 use crate::workspace_effect::WorkspaceEffectApi;
 use crate::{
-    ChatEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
-    DurableIssueMutationApi, DurableKnowledgeMutationApi, DurableKnowledgeReadApi,
-    DurableProjectReadApi, GitEffectApi, IssueEffectApi, KnowledgeEffectApi, McpReadExecutor,
-    RoutedEffectApi,
+    ChatEffectApi, CiEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi,
+    DurableGitBackend, DurableIssueMutationApi, DurableKnowledgeMutationApi,
+    DurableKnowledgeReadApi, DurableProjectReadApi, GitEffectApi, IssueEffectApi,
+    KnowledgeEffectApi, McpReadExecutor, RoutedEffectApi,
 };
 
 #[derive(Clone)]
@@ -476,6 +476,15 @@ impl Handler for AgentMcpHandler {
                 )) as Box<dyn EffectApi>,
             ),
             (
+                "ci",
+                Box::new(CiEffectApi::new(
+                    self.services.resources.ci.clone(),
+                    ctx.principal.clone(),
+                    delegator.clone(),
+                    self.services.authority.boundary.clone(),
+                )) as Box<dyn EffectApi>,
+            ),
+            (
                 "knowledge",
                 Box::new(KnowledgeEffectApi::new(
                     self.services.resources.knowledge_mutations.clone(),
@@ -504,6 +513,7 @@ impl Handler for AgentMcpHandler {
             principals: self.services.authority.principals.clone(),
             repos: self.services.resources.git.repo_authorizer().clone(),
             issues: self.services.resources.issues.clone(),
+            ci: self.services.resources.ci.clone(),
         });
         let router = GovernedRouter::with_issued_run(
             self.services.authority.run_tokens.clone(),
@@ -713,6 +723,7 @@ struct CreatorApproverPolicy {
     principals: PrincipalStore,
     repos: Arc<dyn RepoAuthorizer>,
     issues: DurableIssueMutationApi,
+    ci: DurableCiReadApi,
 }
 
 impl GateApproverPolicy for CreatorApproverPolicy {
@@ -768,6 +779,15 @@ impl GateApproverPolicy for CreatorApproverPolicy {
                 self.issues
                     .may_close_ref(&approver, issue_ref)
                     .map_err(|error| format!("issue approver lookup unavailable: {error:?}"))?
+            }
+            McpApprovalContract::CiRetryRun => {
+                let run_id = args
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "CI retry approval requires a canonical run_id".to_string())?;
+                self.ci
+                    .may_retry_run(&approver, run_id)
+                    .map_err(|error| format!("CI retry approver lookup unavailable: {error:?}"))?
             }
         };
         if !permitted {

@@ -494,6 +494,7 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
         [
             "ci.read_log",
             "ci.read_run",
+            "ci.retry_run",
             "git.open_pr",
             "git.write_file"
         ]

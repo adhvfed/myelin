@@ -20,6 +20,16 @@ pub const CI_RUN_FAILED: &str = "ci.run.failed";
 pub const CI_RUN_CANCELLED: &str = "ci.run.cancelled";
 pub const CI_RUN_TIMED_OUT: &str = "ci.run.timed_out";
 pub const CI_RUN_REAPED: &str = "ci.run.reaped";
+pub const CI_RUN_RETRY_REQUESTED: &str = "ci.run.retry_requested";
+
+pub const CI_RETRY_RUN_ATTEMPTED: &str = "ci.run.retry_attempted";
+pub const CI_RETRY_RUN_APPLIED: &str = "ci.run.retry_applied";
+pub const CI_RETRY_RUN_GATED: &str = "ci.run.retry_gated";
+pub const CI_RETRY_RUN_DENIED: &str = "ci.run.retry_denied";
+pub const CI_RETRY_RUN_INDETERMINATE: &str = "ci.run.retry_indeterminate";
+pub const CI_RETRY_RUN_APPROVED: &str = "ci.run.retry_approved";
+pub const CI_RETRY_RUN_REJECTED: &str = "ci.run.retry_rejected";
+pub const CI_RETRY_RUN_EXPIRED: &str = "ci.run.retry_expired";
 
 pub const CI_JOB_STARTED: &str = "ci.job.started";
 pub const CI_JOB_SUCCEEDED: &str = "ci.job.succeeded";
@@ -67,6 +77,15 @@ pub const CI_DURABLE_TOKENS: &[&str] = &[
     CI_RUN_CANCELLED,
     CI_RUN_TIMED_OUT,
     CI_RUN_REAPED,
+    CI_RUN_RETRY_REQUESTED,
+    CI_RETRY_RUN_ATTEMPTED,
+    CI_RETRY_RUN_APPLIED,
+    CI_RETRY_RUN_GATED,
+    CI_RETRY_RUN_DENIED,
+    CI_RETRY_RUN_INDETERMINATE,
+    CI_RETRY_RUN_APPROVED,
+    CI_RETRY_RUN_REJECTED,
+    CI_RETRY_RUN_EXPIRED,
     CI_JOB_STARTED,
     CI_JOB_SUCCEEDED,
     CI_JOB_FAILED,

@@ -1432,7 +1432,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             provider.clone(),
             AgentMcpResources::new(AgentMcpResourceInputs {
                 git: git_backend.clone(),
-                ci: mcp_ci,
+                ci: mcp_ci.clone(),
                 issues: issue_mutations,
                 knowledge: knowledge_mutations.clone(),
                 chat: mcp_chat.clone(),
@@ -1478,6 +1478,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         inbox_store,
         check.clone(),
         git_backend,
+        mcp_ci,
         handle.clone(),
     );
     let gateway = Arc::new(builder.build());

@@ -2,7 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use myelin_ci_sandbox::ResourceUsage;
-use myelin_events::OutboxRow;
+use myelin_events::{
+    derive_envelope_from_persisted_cause, Actor, CorrelationId, DataRole as EventDataRole,
+    EmitContext, EventDraft, EventId, EventType, OutboxRow, PersistedEventCause, Timestamp,
+    Visibility,
+};
+use myelin_identity::{Principal, PrincipalKind, PrincipalStatus};
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{
     with_tenant_tx, with_tenant_tx_error, DurableCostLedger, MicroUsd, PgError, RunId as CostRunId,
@@ -70,6 +75,15 @@ pub struct CiRunRecord {
     pub trust_tier: String,
     pub state: String,
     pub correlation_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiRunRetryOutcome {
+    pub run_id: String,
+    pub workflow_run_id: String,
+    pub source_run_id: String,
+    pub event_id: String,
+    pub replayed: bool,
 }
 
 pub const INSERT_CI_RUN_QUERY: &str = "\
@@ -256,6 +270,11 @@ pub enum CiRunStoreError {
     FinalizationStateDivergence,
     SkippedJobAccounting,
     FinalizationManifestDivergence,
+    RetryRunNotFound,
+    RetryRunNotTerminal,
+    RetryRunInvalidActor,
+    RetryRunInvalidKey,
+    RetryRunInvalidProvenance,
 }
 
 impl core::fmt::Display for CiRunStoreError {
@@ -322,6 +341,24 @@ impl core::fmt::Display for CiRunStoreError {
             CiRunStoreError::FinalizationManifestDivergence => write!(
                 f,
                 "durable ci_run finalization differs from immutable manifest authority"
+            ),
+            CiRunStoreError::RetryRunNotFound => {
+                write!(f, "the CI run to retry does not exist in the active scope")
+            }
+            CiRunStoreError::RetryRunNotTerminal => write!(
+                f,
+                "only a failed, timed-out, cancelled, or reaped CI run can be retried"
+            ),
+            CiRunStoreError::RetryRunInvalidActor => write!(
+                f,
+                "CI retry requires an active agent in the exact tenant and region"
+            ),
+            CiRunStoreError::RetryRunInvalidKey => {
+                write!(f, "CI retry requires a bounded non-empty idempotency key")
+            }
+            CiRunStoreError::RetryRunInvalidProvenance => write!(
+                f,
+                "the source CI run lacks immutable retry provenance"
             ),
         }
     }
@@ -590,6 +627,41 @@ impl CiRunStore {
         .await
     }
 
+    pub async fn retry_ci_run(
+        &self,
+        actor: &Principal,
+        source_run_id: &str,
+        idempotency_key: &str,
+    ) -> Result<CiRunRetryOutcome, CiRunStoreError> {
+        if Uuid::parse_str(source_run_id)
+            .map(|parsed| parsed.to_string() != source_run_id)
+            .unwrap_or(true)
+        {
+            return Err(CiRunStoreError::RetryRunNotFound);
+        }
+        if !matches!(actor.kind, PrincipalKind::Agent { .. })
+            || actor.status != PrincipalStatus::Active
+            || actor.tenant.0.is_empty()
+            || actor.region.0.is_empty()
+        {
+            return Err(CiRunStoreError::RetryRunInvalidActor);
+        }
+        if idempotency_key.is_empty() || idempotency_key.len() > 512 {
+            return Err(CiRunStoreError::RetryRunInvalidKey);
+        }
+        let tenant = actor.tenant.0.clone();
+        let region = actor.region.0.clone();
+        let actor = actor.clone();
+        let source_run_id = source_run_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move {
+                retry_ci_run_on_conn(conn, &actor, &source_run_id, &idempotency_key).await
+            })
+        })
+        .await
+    }
+
     pub async fn get_ci_run(
         &self,
         tenant_id: &str,
@@ -686,6 +758,191 @@ fn ci_run_record_from_row(row: sqlx::postgres::PgRow) -> CiRunRecord {
         state: row.get("state"),
         correlation_id: row.get("correlation_id"),
     }
+}
+
+async fn retry_ci_run_on_conn(
+    conn: &mut sqlx::PgConnection,
+    actor: &Principal,
+    source_run_id: &str,
+    idempotency_key: &str,
+) -> Result<CiRunRetryOutcome, CiRunStoreError> {
+    let source_query = format!("{SELECT_CI_RUN_QUERY} AND region = $3 FOR SHARE");
+    let source = sqlx::query(&source_query)
+        .bind(&actor.tenant.0)
+        .bind(source_run_id)
+        .bind(&actor.region.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|error| CiRunStoreError::Db(format!("lock CI retry source: {error}")))?
+        .map(ci_run_record_from_row)
+        .ok_or(CiRunStoreError::RetryRunNotFound)?;
+    if !matches!(
+        source.state.as_str(),
+        "failed" | "timed_out" | "cancelled" | "reaped"
+    ) {
+        return Err(CiRunStoreError::RetryRunNotTerminal);
+    }
+    let source_cause_event_id = source
+        .cause_event_id
+        .clone()
+        .ok_or(CiRunStoreError::RetryRunInvalidProvenance)?;
+    let source_cause_depth = u32::try_from(source.cause_depth)
+        .map_err(|_| CiRunStoreError::RetryRunInvalidProvenance)?;
+    if source.repo_ref.is_none()
+        || source.commit_oid.is_none()
+        || source.definition_snapshot.is_empty()
+        || source.correlation_id.is_empty()
+    {
+        return Err(CiRunStoreError::RetryRunInvalidProvenance);
+    }
+
+    let material = retry_identity_material(
+        &actor.tenant.0,
+        &actor.region.0,
+        source_run_id,
+        &actor.principal_id.0,
+        idempotency_key,
+    );
+    let run_id = retry_uuid("run", &material);
+    let workflow_run_id = retry_uuid("workflow", &material);
+    let retry_event_id = EventId(retry_uuid("event", &material));
+    let cause = PersistedEventCause {
+        event_id: EventId(source_cause_event_id),
+        correlation_id: CorrelationId(source.correlation_id.clone()),
+        caused_by: source.caused_by.clone().map(myelin_events::CausedBy),
+        depth: source_cause_depth,
+    };
+    let retry_depth = cause
+        .depth
+        .checked_add(1)
+        .ok_or(CiRunStoreError::RetryRunInvalidProvenance)?;
+    let retry = CiRunInsert {
+        tenant_id: source.tenant_id.clone(),
+        region: source.region.clone(),
+        run_id: run_id.clone(),
+        project_id: source.project_id.clone(),
+        pipeline_id: source.pipeline_id.clone(),
+        wf_run_id: workflow_run_id.clone(),
+        definition_snapshot: source.definition_snapshot.clone(),
+        trigger_kind: "agent".into(),
+        concurrency_group: None,
+        pr_head_generation: None,
+        trust_tier: source.trust_tier.clone(),
+        state: "queued".into(),
+        correlation_id: source.correlation_id.clone(),
+        cause_event_id: Some(retry_event_id.0.clone()),
+        cause_depth: i64::from(retry_depth),
+        caused_by: cause.caused_by.as_ref().map(|value| value.0.clone()),
+        repo_ref: source.repo_ref.clone(),
+        source_ref: source.source_ref.clone(),
+        commit_oid: source.commit_oid.clone(),
+        triggered_by: Some(actor.principal_id.0.clone()),
+    };
+    let inserted = insert_on_conn(conn, &retry).await?;
+    let contexts = sqlx::query_scalar::<_, String>(
+        "SELECT context FROM ci_run_check_attempt \
+         WHERE tenant_id=$1 AND region=$2 AND run_id=$3::uuid ORDER BY context",
+    )
+    .bind(&actor.tenant.0)
+    .bind(&actor.region.0)
+    .bind(source_run_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|error| CiRunStoreError::Db(format!("load CI retry contexts: {error}")))?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if contexts.is_empty() {
+        return Err(CiRunStoreError::RetryRunInvalidProvenance);
+    }
+    allocate_reserve_check_attempts(conn, &retry, &contexts).await?;
+
+    let requested_at: String = sqlx::query_scalar(
+        "SELECT to_char(created_at AT TIME ZONE 'UTC', \
+         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM ci_run \
+         WHERE tenant_id=$1 AND region=$2 AND run_id=$3::uuid",
+    )
+    .bind(&actor.tenant.0)
+    .bind(&actor.region.0)
+    .bind(&run_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|error| CiRunStoreError::Db(format!("load CI retry timestamp: {error}")))?;
+    let run_ref = crate::surfacing::ci_run_ref(&actor.tenant.0, &run_id)
+        .map_err(|_| CiRunStoreError::RetryRunInvalidProvenance)?;
+    let timestamp = Timestamp(requested_at);
+    let envelope = derive_envelope_from_persisted_cause(
+        EventDraft {
+            type_: EventType(crate::events::CI_RUN_RETRY_REQUESTED.into()),
+            subject: run_ref.clone(),
+            aggregate: crate::events::run_aggregate(&run_id),
+            payload: serde_json::json!({
+                "run": run_ref.0,
+                "run_id": run_id,
+                "source_run_id": source_run_id,
+                "repo_ref": source.repo_ref,
+                "source_ref": source.source_ref,
+                "commit_oid": source.commit_oid,
+                "definition_snapshot": source.definition_snapshot,
+                "trust_tier": source.trust_tier,
+                "triggered_by": actor.principal_id.0,
+            }),
+            data_role: EventDataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        },
+        EmitContext {
+            event_id: retry_event_id,
+            tenant: actor.tenant.clone(),
+            region: actor.region.clone(),
+            actor: Actor(actor.clone()),
+            schema_ver: 1,
+            occurred_at: timestamp.clone(),
+            recorded_at: timestamp,
+            caused_by: None,
+        },
+        Some(&cause),
+    );
+    let aggregate = envelope.aggregate.0.clone();
+    PgRelay::co_commit_in_tx(conn, &aggregate, &envelope)
+        .await
+        .map_err(CiRunStoreError::from)?;
+
+    Ok(CiRunRetryOutcome {
+        run_id,
+        workflow_run_id,
+        source_run_id: source_run_id.to_string(),
+        event_id: envelope.event_id.0,
+        replayed: !inserted,
+    })
+}
+
+fn retry_identity_material(
+    tenant: &str,
+    region: &str,
+    source_run_id: &str,
+    actor_id: &str,
+    idempotency_key: &str,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("myelin.ci.retry-run-identity.v1");
+    for value in [tenant, region, source_run_id, actor_id, idempotency_key] {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn retry_uuid(kind: &str, material: &[u8; 32]) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("myelin.ci.retry-run-uuid.v1");
+    hasher.update(&(kind.len() as u64).to_be_bytes());
+    hasher.update(kind.as_bytes());
+    hasher.update(material);
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
 }
 
 async fn finalize_on_conn(

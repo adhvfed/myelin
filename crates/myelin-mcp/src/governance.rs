@@ -1372,6 +1372,8 @@ fn approval_card_ref(scope: &TenantScope, tool: &str, args: &serde_json::Value) 
         McpApprovalContract::IssuesClose => {
             canonical_issue_ref_arg(scope, args).map(str::to_string)
         }
+        McpApprovalContract::CiRetryRun => canonical_ci_run_id_arg(args)
+            .map(|run_id| format!("myelin://{}/ci/run/{run_id}", scope.tenant().0)),
     }
 }
 
@@ -1395,6 +1397,10 @@ fn approval_risk_summary(tool: &str, args: &serde_json::Value) -> Vec<u8> {
                 || b"Close an issue".to_vec(),
                 |parsed| format!("Close issue {}", parsed.id).into_bytes(),
             ),
+        McpApprovalContract::CiRetryRun => canonical_ci_run_id_arg(args).map_or_else(
+            || b"Retry a CI run".to_vec(),
+            |run_id| format!("Retry CI run {run_id}").into_bytes(),
+        ),
     }
 }
 
@@ -1412,6 +1418,19 @@ fn canonical_issue_ref_arg_for_any_tenant(args: &serde_json::Value) -> Option<&s
     let parsed = myelin_refs::parse_scoped(reference).ok()?;
     (parsed.subsystem == "issue" && parsed.type_ == "issue" && parsed.sub.is_none())
         .then_some(reference)
+}
+
+fn canonical_ci_run_id_arg(args: &serde_json::Value) -> Option<&str> {
+    let run_id = args.get("run_id")?.as_str()?;
+    canonical_uuid(run_id).then_some(run_id)
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
 }
 
 fn timestamp_to_unix(timestamp: &Timestamp) -> Result<i64, String> {
@@ -1487,6 +1506,9 @@ pub fn approval_contract_from_effect_key(effect_key: &str) -> Option<McpApproval
             git_merge_repo_from_effect_key(effect_key).map(|_| contract)
         }
         McpApprovalContract::IssuesClose => {
+            valid_digest_effect_key(effect_key, contract.tool()).then_some(contract)
+        }
+        McpApprovalContract::CiRetryRun => {
             valid_digest_effect_key(effect_key, contract.tool()).then_some(contract)
         }
     }

@@ -4,6 +4,40 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Agents can retry failed CI without a provider credential
+
+Agents could inspect CI but could not act on a failure, leaving a human to step outside Myelin or
+hand over another provider credential. `ci.retry_run` is now a first-class selected MCP effect for
+one exact failed, timed-out, cancelled, or reaped run. It is always human-gated, rechecks the
+delegator's current repository push authority both when the gate opens and when it applies, and
+keeps the agent as the attributed actor.
+
+The durable mutation locks the source run, preserves its repository, branch, commit, definition
+snapshot, trust tier, correlation, and causal provenance, then allocates fresh run, workflow, and
+check-attempt identities. The queued row and `ci.run.retry_requested` event co-commit in one tenant
+transaction. Their identities derive from the caller's bounded idempotency key, so an ambiguous
+retry returns the same run and actual event receipt without launching or charging for another copy.
+CI reads now expose the immutable definition-snapshot reference needed to inspect that claim.
+
+The full-system journey exposed two production seams while crossing the whole path. CI approval
+cards were durably routed but invisible because the inbox checked a synthetic Identity permission
+on the run; notification reads now resolve canonical same-tenant CI references and inherit live pull
+visibility from the stored source repository. The existing source-branch constraint also excluded
+the already-supported `agent` trigger kind. Migrations `ci_0025e`–`ci_0025g` expand, validate, and
+contract that constraint online so a retry retains `refs/heads/...` rather than discarding useful
+provenance.
+
+The readable TypeScript journey creates and executes a genuinely failing pipeline, activates an
+external named agent with only `ci.retry_run`, observes the exact failed run in the owner's inbox,
+proves another human cannot approve it, applies the owner's approval, and waits for a distinct
+agent-triggered run to execute and fail. It compares the repository, branch, commit, definition
+snapshot, and trust tier through the live CI API, verifies the returned durable event identity,
+replays the same MCP intent, and still finds exactly two runs. It passed in 34.65 seconds against
+the restarted Edge, PostgreSQL, durable Git, agent service, CI control plane, runner, and gVisor.
+PostgreSQL independently showed one retry event, two runs for the commit, and matching immutable
+provenance. All 1,669 affected Rust unit and MCP-routing stories pass, system TypeScript checking is
+clean, and strict all-target/all-feature Clippy passes for every modified Rust crate.
+
 ## 2026-09-01 — A Fed receipt now means the pinned file is a manifest
 
 Environment discovery previously blessed every bounded UTF-8 blob named `fed.yaml`. Broken YAML, a

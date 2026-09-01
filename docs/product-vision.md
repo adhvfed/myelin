@@ -96,6 +96,15 @@ catalogue version advance does not strand an older agent; exact retries converge
 stale selection conflicts. Existing workspace data remains intact and only a fresh connection can
 receive the new palette.
 
+CI is part of that governed working surface, not a read-only dashboard or another provider token.
+An agent can request a retry of one exact failed, timed-out, cancelled, or reaped run when its human
+delegator still has push authority on the source repository. The retry always requires explicit
+human approval, preserves the immutable repository, branch, commit, definition snapshot, trust
+tier, and causal provenance, and allocates a fresh run, workflow, and check attempts. Approval cards
+inherit visibility from the run's live source repository rather than a synthetic CI permission.
+Exact retries converge on the same requested run and event; they never buy or launch duplicate
+compute.
+
 The workspace is personalizable at creation time. Repository guidance remains the shared default,
 while an owner can layer their own way of working into the assigned workspace—for example, custom
 root `AGENTS.md` instructions and private context files—without changing the source repository.
@@ -223,6 +232,11 @@ the exact new deadline and retention receipt from durable stores, and continue p
 and workspace access without replacing its identity. Storage proof must race the old deadline,
 replay the same intent, recover an interrupted Chat-authority update, and still expire the workspace
 at the new exact boundary.
+CI-effect journeys must create and execute a real failing pipeline, prove an unrelated human cannot
+approve the retry, approve it as the repository owner, and observe a fresh terminal run in durable
+storage with the same repository, branch, commit, definition snapshot, and trust tier. They must
+also prove the retry event is co-committed exactly once and an exact MCP replay does not create a
+third run or another event.
 Web automation journeys must activate a real hosted identity, create a bounded rule through the
 browser, produce real durable platform events, observe incoming firings without a manual reload,
 approve one, confirm rejection of another, reload both decisions, verify budget and personal-data

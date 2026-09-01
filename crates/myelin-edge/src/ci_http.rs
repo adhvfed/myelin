@@ -12,6 +12,7 @@ use myelin_ci_controlplane::surfacing_store::{
     CiRunStateFilter, CiRunSummary, CiRunSurfaceError, CiStepSurface, CI_LOG_RANGE_DEFAULT,
     CI_LOG_TAIL_BATCH_MAX, CI_RUN_PAGE_DEFAULT,
 };
+use myelin_ci_controlplane::CiRunRetryOutcome;
 use myelin_identity::Principal;
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
@@ -21,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 
+use crate::repo_authz::RepoPermission;
 use crate::runtime::drive_result_on_runtime;
+use myelin_git::core::RepoLoc;
 
 const CI_LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CI_LOG_TAIL_CHANNEL_CAPACITY: usize = CI_LOG_TAIL_BATCH_MAX * 2 + 2;
@@ -128,6 +131,82 @@ impl DurableCiReadApi {
             "jobs": detail.jobs.iter().map(job_json).collect::<Vec<_>>(),
             "steps": detail.steps.iter().map(step_json).collect::<Vec<_>>(),
         }))
+    }
+
+    pub fn may_retry_run(&self, principal: &Principal, run_id: &str) -> Result<bool, EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Ok(false);
+        }
+        let Some(record) = self
+            .drive_run(self.runs.get_ci_run(
+                principal.tenant.as_str(),
+                principal.region.as_str(),
+                run_id,
+            ))
+            .map_err(map_run_error)?
+        else {
+            return Ok(false);
+        };
+        let Some(repo_ref) = record.repo_ref else {
+            return Ok(false);
+        };
+        let Some(slug) = repo_slug_from_ref(principal.tenant.as_str(), &repo_ref) else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            record.state.as_str(),
+            "failed" | "timed_out" | "cancelled" | "reaped"
+        ) && self.git.repo_authorizer().authorize_repo_permission(
+            principal,
+            &RepoLoc::new(&principal.tenant.0, &principal.region.0, slug),
+            RepoPermission::Push,
+        ))
+    }
+
+    pub(crate) fn may_view_run(
+        &self,
+        principal: &Principal,
+        run_id: &str,
+    ) -> Result<bool, EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Ok(false);
+        }
+        let Some(record) = self
+            .drive_run(self.runs.get_ci_run(
+                principal.tenant.as_str(),
+                principal.region.as_str(),
+                run_id,
+            ))
+            .map_err(map_run_error)?
+        else {
+            return Ok(false);
+        };
+        let Some(repo_ref) = record.repo_ref else {
+            return Ok(false);
+        };
+        let Some(slug) = repo_slug_from_ref(principal.tenant.as_str(), &repo_ref) else {
+            return Ok(false);
+        };
+        Ok(self.git.may_view_ci_repo(principal, slug))
+    }
+
+    pub fn retry_run(
+        &self,
+        principal: &Principal,
+        delegator: &Principal,
+        run_id: &str,
+        idempotency_key: &str,
+    ) -> Result<CiRunRetryOutcome, EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Err(EdgeError::BadRequest(
+                "CI run id must be a canonical UUID".into(),
+            ));
+        }
+        if !self.may_retry_run(delegator, run_id)? {
+            return Err(EdgeError::NotFound("retryable CI run not found".into()));
+        }
+        self.drive_run(self.runs.retry_ci_run(principal, run_id, idempotency_key))
+            .map_err(map_retry_error)
     }
 
     pub fn read_log(
@@ -334,6 +413,24 @@ fn map_run_error(_: CiRunStoreError) -> EdgeError {
     EdgeError::Unavailable("CI run data is temporarily unavailable".into())
 }
 
+fn map_retry_error(error: CiRunStoreError) -> EdgeError {
+    match error {
+        CiRunStoreError::RetryRunNotFound => {
+            EdgeError::NotFound("retryable CI run not found".into())
+        }
+        CiRunStoreError::RetryRunNotTerminal => EdgeError::Conflict(
+            "only a failed, timed-out, cancelled, or reaped CI run can be retried".into(),
+        ),
+        CiRunStoreError::RetryRunInvalidKey => {
+            EdgeError::BadRequest("CI retry idempotency key is invalid".into())
+        }
+        error => {
+            eprintln!("edge: durable CI retry failed: {error}");
+            EdgeError::Unavailable("CI retry is temporarily unavailable".into())
+        }
+    }
+}
+
 fn no_store(response: EdgeResponse) -> EdgeResponse {
     response.with_header("Cache-Control", "no-store")
 }
@@ -535,6 +632,7 @@ fn run_json(run: &CiRunSummary, tenant: &str) -> Value {
         "repo_ref": run.repo_ref,
         "source_ref": run.source_ref,
         "commit_oid": run.commit_oid,
+        "definition_snapshot": run.definition_snapshot,
         "trigger_kind": run.trigger_kind,
         "trust_tier": run.trust_tier,
         "state": run.state,

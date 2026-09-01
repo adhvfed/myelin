@@ -235,9 +235,9 @@ pub use ci_run_starter_poller::{
 };
 pub use ci_run_store::{
     CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationOutcome, CiRunFinalizationWrite,
-    CiRunFinalizer, CiRunInsert, CiRunRecord, CiRunStore, CiRunStoreError, CiRunTerminalState,
-    DurableCiRunFinalizer, ERASED_PSEUDONYM, FINALIZE_CI_RUN_QUERY, INSERT_CI_RUN_QUERY,
-    LOCK_CI_RUN_FOR_FINALIZE_QUERY, LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY,
+    CiRunFinalizer, CiRunInsert, CiRunRecord, CiRunRetryOutcome, CiRunStore, CiRunStoreError,
+    CiRunTerminalState, DurableCiRunFinalizer, ERASED_PSEUDONYM, FINALIZE_CI_RUN_QUERY,
+    INSERT_CI_RUN_QUERY, LOCK_CI_RUN_FOR_FINALIZE_QUERY, LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY,
     SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };
 pub use ci_run_supersession::{CiRunSupersessionError, PgCiRunSupersession};

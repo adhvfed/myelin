@@ -17,6 +17,7 @@ myelin-chat = { path = "../myelin-chat" }
 myelin-content = { path = "../myelin-content" }
 myelin-git = { path = "../myelin-git" }
 myelin-issues = { path = "../myelin-issues" }
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 
 myelin-agent = { path = "../myelin-agent" }
 myelin-agent-service = { path = "../myelin-agent-service" }
@@ -35,7 +36,6 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 myelin-edge = { path = "../myelin-edge", features = ["test-support"] }
-myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-flow = { path = "../myelin-flow" }
 myelin-config = { workspace = true }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }

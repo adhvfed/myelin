@@ -93,7 +93,8 @@ myelin doctor
 
 myelin tool list
 myelin tool show ci.read_run
-myelin agent create "Review companion" --tool ci.read_run --tool git.open_pr \
+myelin agent create "Review companion" --tool ci.read_run --tool ci.retry_run \
+  --tool git.open_pr \
   --tool git.list_repositories --tool git.search_code --tool git.read_file \
   --tool projects.list --tool issues.list --tool issues.view \
   --tool knowledge.list_pages --tool knowledge.read_page --tool knowledge.link_work \
@@ -333,6 +334,11 @@ with a fresh attempt-scoped run credential and can authorize only that effect on
 expiry settles the run without applying it and closes every approver's copy of the card. The agent
 remains the attributed actor while its active human delegation supplies repository visibility, so
 neither side needs a GitHub token.
+
+`ci.retry_run` uses the same boundary for fresh compute. An agent can select one exact failed,
+timed-out, cancelled, or reaped run, but only a human with current push authority on its source
+repository can approve the retry. Myelin keeps the source commit, branch, definition snapshot, and
+trust tier fixed, creates fresh run and check identities, and makes an exact MCP replay inert.
 
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous
