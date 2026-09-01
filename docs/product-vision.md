@@ -7,8 +7,9 @@ repositories, environments, permissions, and audit trail.
 
 The product should feel useful before it feels configurable. A repository can declare its local
 stack with `fed.yaml` and optional `.fed` configuration; Myelin can pin that declaration to an exact
-source revision and use it as the default environment recipe. Projects that do not use Service
-Federation remain first-class.
+source revision and use it as the default environment recipe. A malformed or unrelated root file
+retains its pinned digest but is visibly invalid rather than silently disappearing or being blessed
+as a declaration. Projects that do not use Service Federation remain first-class.
 
 Everyday work should remain forgiving. A person can create, find, close, and reopen an issue through
 the web or CLI under the same project-derived transition authority. Close and reopen are durable,

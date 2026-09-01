@@ -30,6 +30,30 @@ pub struct AgentThreadEnvironmentBinding {
     pub provider: String,
     pub config_path: String,
     pub content_digest: String,
+    pub state: AgentThreadEnvironmentState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentThreadEnvironmentState {
+    Declared,
+    Invalid,
+}
+
+impl AgentThreadEnvironmentState {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "declared" => Ok(Self::Declared),
+            "invalid" => Ok(Self::Invalid),
+            _ => Err("agent thread environment has an invalid durable state".into()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

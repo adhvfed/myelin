@@ -326,6 +326,51 @@ ALTER TABLE agent_thread
   VALIDATE CONSTRAINT agent_thread_environment_complete;
 "#;
 
+pub const AGENT_THREAD_ENVIRONMENT_STATE_EXPAND_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  ADD COLUMN IF NOT EXISTS environment_state text;
+ALTER TABLE agent_thread
+  DROP CONSTRAINT IF EXISTS agent_thread_environment_complete;
+ALTER TABLE agent_thread
+  ADD CONSTRAINT agent_thread_environment_complete CHECK (
+    num_nonnulls(environment_provider, environment_config_path, environment_config_digest) = 0
+    OR (num_nonnulls(environment_provider, environment_config_path, environment_config_digest) = 3
+      AND num_nonnulls(repository_slug) = 1
+      AND environment_provider = 'service_federation'
+      AND environment_config_path = 'fed.yaml'
+      AND environment_config_digest ~ '^blake3:[0-9a-f]{64}$'
+      AND (environment_state IS NULL OR environment_state IN ('declared', 'invalid')))
+  ) NOT VALID;
+"#;
+
+pub const AGENT_THREAD_ENVIRONMENT_STATE_BACKFILL_MIGRATION: &str = r#"
+UPDATE agent_thread
+   SET environment_state = 'declared'
+ WHERE environment_provider IS NOT NULL
+   AND environment_config_path IS NOT NULL
+   AND environment_config_digest IS NOT NULL
+   AND environment_state IS NULL;
+"#;
+
+pub const AGENT_THREAD_ENVIRONMENT_STATE_CONTRACT_MIGRATION: &str = r#"
+ALTER TABLE agent_thread
+  DROP CONSTRAINT IF EXISTS agent_thread_environment_complete;
+ALTER TABLE agent_thread
+  ADD CONSTRAINT agent_thread_environment_complete CHECK (
+    num_nonnulls(environment_provider, environment_config_path, environment_config_digest,
+                 environment_state) = 0
+    OR (num_nonnulls(environment_provider, environment_config_path, environment_config_digest,
+                    environment_state) = 4
+      AND num_nonnulls(repository_slug) = 1
+      AND environment_provider = 'service_federation'
+      AND environment_config_path = 'fed.yaml'
+      AND environment_config_digest ~ '^blake3:[0-9a-f]{64}$'
+      AND environment_state IN ('declared', 'invalid'))
+  ) NOT VALID;
+ALTER TABLE agent_thread
+  VALIDATE CONSTRAINT agent_thread_environment_complete;
+"#;
+
 pub const AGENT_THREAD_REVIEW_READY_EXPAND_MIGRATION: &str = r#"
 ALTER TABLE agent_thread
   ADD COLUMN IF NOT EXISTS review_ready_at timestamptz;
@@ -772,6 +817,29 @@ pub fn agent_thread_environment_migrations() -> Migrations {
     ])
 }
 
+pub fn agent_thread_environment_state_migrations() -> Migrations {
+    Migrations::of([
+        Migration::phased(
+            "0178_agent_thread_environment_state_expand",
+            AGENT_THREAD_ENVIRONMENT_STATE_EXPAND_MIGRATION,
+            crate::MigrationPhase::Expand,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0179_agent_thread_environment_state_backfill",
+            AGENT_THREAD_ENVIRONMENT_STATE_BACKFILL_MIGRATION,
+            crate::MigrationPhase::Backfill,
+            "agent_thread",
+        ),
+        Migration::phased(
+            "0180_agent_thread_environment_state_contract",
+            AGENT_THREAD_ENVIRONMENT_STATE_CONTRACT_MIGRATION,
+            crate::MigrationPhase::Contract,
+            "agent_thread",
+        ),
+    ])
+}
+
 pub fn agent_thread_review_ready_migrations() -> Migrations {
     Migrations::of([
         Migration::phased(
@@ -918,6 +986,24 @@ mod tests {
         assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
         assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
         assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+    }
+
+    #[test]
+    fn environment_state_is_a_forward_only_online_schema_change() {
+        let migrations = agent_thread_environment_state_migrations();
+        let mut runner = OnlineMigrationRunner::new();
+        runner
+            .run(&migrations, &HotTables::declare(["agent_thread"]))
+            .expect("the live environment-state migration is online-safe");
+        assert_eq!(migrations.0.len(), 3);
+        assert_eq!(migrations.0[0].phase, MigrationPhase::Expand);
+        assert_eq!(migrations.0[1].phase, MigrationPhase::Backfill);
+        assert_eq!(migrations.0[2].phase, MigrationPhase::Contract);
+        assert!(
+            AGENT_THREAD_ENVIRONMENT_STATE_EXPAND_MIGRATION.contains("environment_state IS NULL")
+        );
+        assert!(AGENT_THREAD_ENVIRONMENT_STATE_BACKFILL_MIGRATION.contains("'declared'"));
+        assert!(AGENT_THREAD_ENVIRONMENT_STATE_CONTRACT_MIGRATION.contains("'invalid'"));
     }
 
     #[test]

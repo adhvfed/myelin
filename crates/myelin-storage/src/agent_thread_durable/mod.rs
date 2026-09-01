@@ -14,8 +14,8 @@ pub use expiry::{
 };
 pub use model::{
     ActivateAgentThreadOutcome, AgentThreadActivation, AgentThreadEnvironmentBinding,
-    AgentThreadGitBinding, AgentThreadProvisioningFailure, AgentThreadState,
-    AgentThreadWorkspaceGuidance, CreateAgentThreadOutcome, DurableAgentThread,
+    AgentThreadEnvironmentState, AgentThreadGitBinding, AgentThreadProvisioningFailure,
+    AgentThreadState, AgentThreadWorkspaceGuidance, CreateAgentThreadOutcome, DurableAgentThread,
     MarkAgentThreadReviewReadyOutcome, NewAgentThread, RetryAgentThreadOutcome,
     MAX_AGENT_THREAD_GIT_REF_BYTES, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_REPOSITORY_BYTES,
     MAX_AGENT_THREAD_RETENTION_DAYS, MAX_AGENT_THREAD_WORKSPACE_GUIDANCE_BYTES,
@@ -29,14 +29,17 @@ pub use review_handoff::{
 pub use run::{AgentThreadRunBinding, BindAgentThreadRunOutcome};
 pub use schema::{
     agent_thread_durable_migrations, agent_thread_environment_migrations,
-    agent_thread_file_transfer_migrations, agent_thread_git_binding_migrations,
-    agent_thread_publication_migrations, agent_thread_recent_list_migrations,
-    agent_thread_renewal_migrations, agent_thread_review_handoff_migrations,
-    agent_thread_review_ready_migrations, agent_thread_session_launch_migrations,
-    agent_thread_ssh_connection_migrations, agent_thread_ssh_single_use_migrations,
-    agent_thread_workspace_guidance_migrations, agent_thread_workspace_guidance_source_migrations,
-    AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION, AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION,
-    AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION, AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION,
+    agent_thread_environment_state_migrations, agent_thread_file_transfer_migrations,
+    agent_thread_git_binding_migrations, agent_thread_publication_migrations,
+    agent_thread_recent_list_migrations, agent_thread_renewal_migrations,
+    agent_thread_review_handoff_migrations, agent_thread_review_ready_migrations,
+    agent_thread_session_launch_migrations, agent_thread_ssh_connection_migrations,
+    agent_thread_ssh_single_use_migrations, agent_thread_workspace_guidance_migrations,
+    agent_thread_workspace_guidance_source_migrations, AGENT_THREAD_ENVIRONMENT_BACKFILL_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_CONTRACT_MIGRATION, AGENT_THREAD_ENVIRONMENT_EXPAND_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_STATE_BACKFILL_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_STATE_CONTRACT_MIGRATION,
+    AGENT_THREAD_ENVIRONMENT_STATE_EXPAND_MIGRATION, AGENT_THREAD_FILE_TRANSFER_BACKFILL_MIGRATION,
     AGENT_THREAD_FILE_TRANSFER_CONTRACT_MIGRATION, AGENT_THREAD_FILE_TRANSFER_EXPAND_MIGRATION,
     AGENT_THREAD_MIGRATION, AGENT_THREAD_PUBLICATION_BACKFILL_MIGRATION,
     AGENT_THREAD_PUBLICATION_EXPAND_MIGRATION, AGENT_THREAD_PUBLICATION_INVARIANT_MIGRATION,
@@ -144,7 +147,7 @@ impl DurableAgentThreadBacking {
                               workspace_guidance_key_ref,
                               workspace_guidance_nonce, workspace_guidance_ciphertext,
                               environment_provider, environment_config_path,
-                              environment_config_digest,
+                              environment_config_digest, environment_state,
                               retention_days, state, storage_locator, publication_completed_at,
                               review_ready_at,
                               failure_reason, created_at,
@@ -241,7 +244,7 @@ impl DurableAgentThreadBacking {
                            workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
-                           environment_config_digest,
+                           environment_config_digest, environment_state,
                            retention_days, state, storage_locator, publication_completed_at,
                            review_ready_at,
                            failure_reason, created_at,
@@ -369,7 +372,7 @@ impl DurableAgentThreadBacking {
                         "UPDATE agent_thread
                             SET state = 'ready', storage_locator = $6, failure_reason = NULL,
                                 environment_provider = $8, environment_config_path = $9,
-                                environment_config_digest = $10,
+                                environment_config_digest = $10, environment_state = $11,
                                 updated_at = CURRENT_TIMESTAMP
                           WHERE tenant_id = $1 AND region = $2 AND thread_id = $3
                             AND owner_principal_id = $4 AND workspace_id = $5
@@ -381,7 +384,7 @@ impl DurableAgentThreadBacking {
                           workspace_guidance_key_ref,
                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
-                          environment_config_digest,
+                          environment_config_digest, environment_state,
                           retention_days, state, storage_locator, publication_completed_at,
                           review_ready_at,
                           failure_reason, created_at,
@@ -401,6 +404,7 @@ impl DurableAgentThreadBacking {
                             .as_ref()
                             .map(|value| value.content_digest.as_str()),
                     )
+                    .bind(environment.as_ref().map(|value| value.state.token()))
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("activate agent thread"))?;
@@ -482,7 +486,7 @@ impl DurableAgentThreadBacking {
                           workspace_guidance_key_ref,
                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
-                          environment_config_digest,
+                          environment_config_digest, environment_state,
                           retention_days, state, storage_locator, publication_completed_at,
                           review_ready_at,
                           failure_reason, created_at, expires_at, updated_at",
@@ -523,7 +527,7 @@ impl DurableAgentThreadBacking {
                            workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
-                           environment_config_digest,
+                           environment_config_digest, environment_state,
                            retention_days, state, storage_locator, publication_completed_at,
                            review_ready_at, failure_reason, created_at, expires_at, updated_at
                          FROM agent_thread
@@ -568,7 +572,7 @@ impl DurableAgentThreadBacking {
                           workspace_guidance_key_ref,
                           workspace_guidance_nonce, workspace_guidance_ciphertext,
                           environment_provider, environment_config_path,
-                          environment_config_digest,
+                          environment_config_digest, environment_state,
                           retention_days, state, storage_locator, publication_completed_at,
                           review_ready_at, failure_reason, created_at, expires_at, updated_at",
                     )
@@ -645,7 +649,8 @@ impl DurableAgentThreadBacking {
                           thread.workspace_guidance_key_ref,
                           thread.workspace_guidance_nonce, thread.workspace_guidance_ciphertext,
                           thread.environment_provider, thread.environment_config_path,
-                          thread.environment_config_digest, thread.retention_days, thread.state,
+                          thread.environment_config_digest, thread.environment_state,
+                          thread.retention_days, thread.state,
                           thread.storage_locator, thread.publication_completed_at,
                           thread.review_ready_at,
                           thread.failure_reason, thread.created_at, thread.expires_at,
@@ -716,7 +721,7 @@ impl DurableAgentThreadBacking {
                                   workspace_guidance_key_ref,
                                   workspace_guidance_nonce, workspace_guidance_ciphertext,
                                   environment_provider, environment_config_path,
-                                  environment_config_digest,
+                                  environment_config_digest, environment_state,
                                   retention_days, state, storage_locator, publication_completed_at,
                                   review_ready_at,
                                   failure_reason, created_at,
@@ -834,7 +839,7 @@ impl DurableAgentThreadBacking {
                            workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
-                           environment_config_digest,
+                           environment_config_digest, environment_state,
                            retention_days, state, storage_locator, publication_completed_at,
                            review_ready_at,
                            failure_reason, created_at,
@@ -894,7 +899,7 @@ impl DurableAgentThreadBacking {
                            workspace_guidance_key_ref,
                            workspace_guidance_nonce, workspace_guidance_ciphertext,
                            environment_provider, environment_config_path,
-                           environment_config_digest,
+                           environment_config_digest, environment_state,
                            retention_days, state, storage_locator, publication_completed_at,
                            review_ready_at,
                            failure_reason, created_at,
@@ -1136,6 +1141,7 @@ async fn by_nonce(
            workspace_guidance_key_ref,
            workspace_guidance_nonce, workspace_guidance_ciphertext,
            environment_provider, environment_config_path, environment_config_digest,
+           environment_state,
            retention_days, state, storage_locator, publication_completed_at, review_ready_at,
            failure_reason, created_at,
            expires_at, updated_at
@@ -1167,6 +1173,7 @@ async fn by_id(
            workspace_guidance_key_ref,
            workspace_guidance_nonce, workspace_guidance_ciphertext,
            environment_provider, environment_config_path, environment_config_digest,
+           environment_state,
            retention_days, state, storage_locator, publication_completed_at, review_ready_at,
            failure_reason, created_at,
            expires_at, updated_at
@@ -1264,13 +1271,15 @@ fn row_to_thread(row: &sqlx::postgres::PgRow) -> Result<DurableAgentThread, PgEr
         row.get::<Option<String>, _>("environment_provider"),
         row.get::<Option<String>, _>("environment_config_path"),
         row.get::<Option<String>, _>("environment_config_digest"),
+        row.get::<Option<String>, _>("environment_state"),
     ) {
-        (None, None, None) => None,
-        (Some(provider), Some(config_path), Some(content_digest)) => {
+        (None, None, None, None) => None,
+        (Some(provider), Some(config_path), Some(content_digest), Some(state)) => {
             Some(AgentThreadEnvironmentBinding {
                 provider,
                 config_path,
                 content_digest,
+                state: AgentThreadEnvironmentState::parse(&state).map_err(PgError::Query)?,
             })
         }
         _ => {

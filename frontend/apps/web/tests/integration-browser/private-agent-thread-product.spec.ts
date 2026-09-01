@@ -118,7 +118,20 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   const contextFilePath = ".myelin/browser-context.md";
   const contextFileContents = `# Browser context\n\nKeep ${suffix} private until review.\n`;
   const repositorySlug = `cloud-workspace-${suffix}`;
+  const malformedRepositorySlug = `malformed-cloud-workspace-${suffix}`;
   const sessionToken = await browserApprovedSession(request);
+  await postProductJson(
+    request,
+    "/v1/git/repos",
+    { slug: malformedRepositorySlug },
+    { token: sessionToken, scheme: "session", status: 201 },
+  );
+  await postProductJson(
+    request,
+    `/v1/git/repos/${encodeURIComponent(malformedRepositorySlug)}/blob/main/fed.yaml`,
+    { base_oid: "", contents: "services:\n  app: [unterminated\n" },
+    { token: sessionToken, scheme: "session", status: 200 },
+  );
   await postProductJson(
     request,
     "/v1/git/repos",
@@ -201,6 +214,27 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   await defaultsEditor.fill(revisedAgentDefaults);
   await defaults.getByRole("button", { name: "Save defaults" }).click();
   await expect(defaults).toBeHidden();
+
+  await page.getByRole("button", { name: "New private thread" }).click();
+  const malformedDialog = page.getByRole("dialog", { name: "Start private agent thread" });
+  const malformedThreadName = `Diagnose invalid environment ${suffix}`;
+  await malformedDialog.getByRole("textbox", { name: "Problem name" })
+    .fill(malformedThreadName);
+  await malformedDialog.getByRole("combobox", { name: "Agent" })
+    .selectOption({ label: renamedAgentName });
+  await malformedDialog.getByRole("textbox", { name: "Repository slug" })
+    .fill(malformedRepositorySlug);
+  await malformedDialog.getByRole("button", { name: "Start thread" }).click();
+  await page.waitForURL(/\/agents\?thread=[0-9a-f-]{36}$/);
+  await expect(page.getByRole("heading", { level: 2, name: malformedThreadName })).toBeVisible();
+  await page.getByRole("button", { name: "Agent workspace" }).click();
+  const malformedWorkspace = page.getByRole("dialog", { name: "Agent workspace" });
+  await expect(malformedWorkspace.getByTestId("workspace-environment"))
+    .toContainText("Service Federation · invalid");
+  await expect(malformedWorkspace.getByTestId("workspace-environment-state"))
+    .toContainText("Correct the source and start new work from that commit.");
+  await page.keyboard.press("Escape");
+  await expect(malformedWorkspace).toBeHidden();
 
   await page.getByRole("button", { name: "New private thread" }).click();
   const dialog = page.getByRole("dialog", { name: "Start private agent thread" });

@@ -110,7 +110,9 @@ export function AgentWorkspaceContext(props: {
         </dl>
         <Show when={props.thread.workspace.environment}>
           <p class="agent-thread-note" data-testid="workspace-environment-state">
-            The manifest is pinned to this source commit. Environment activation is not available yet.
+            {props.thread.workspace.environment?.state === "invalid"
+              ? "The pinned fed.yaml is not a structurally valid Service Federation manifest. Correct the source and start new work from that commit."
+              : "The manifest is pinned to this source commit. Environment activation is not available yet."}
           </p>
         </Show>
         <Show when={props.thread.workspace.personalization}>{(personalization) => (

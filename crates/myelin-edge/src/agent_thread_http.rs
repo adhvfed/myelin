@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use myelin_agent_service::{
     workspace::{
         AgentWorkspaceStore, RepositoryReviewPublicationRequest, RepositoryWorkspaceSource,
-        WorkspaceAccessError, WorkspacePublicationError,
+        WorkspaceAccessError, WorkspaceEnvironmentState, WorkspacePublicationError,
     },
     PlatformToolCatalogue,
 };
@@ -19,12 +19,12 @@ use myelin_identity_service::{
 };
 use myelin_storage::{
     ActivateAgentThreadOutcome, AdvanceAgentThreadReviewHandoffOutcome, AgentThreadActivation,
-    AgentThreadEnvironmentBinding, AgentThreadGitBinding, AgentThreadProvisioningFailure,
-    AgentThreadRenewal, AgentThreadReviewHandoff, AgentThreadRunBinding, AgentThreadState,
-    AgentThreadWorkspaceGuidance, BeginAgentThreadRenewalOutcome,
-    BindAgentThreadReviewHandoffOutcome, BindAgentThreadRunOutcome, ColumnCryptor,
-    CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking, KmsEngine,
-    ListAgentThreadsOutcome, MarkAgentThreadReviewReadyOutcome, NewAgentThread,
+    AgentThreadEnvironmentBinding, AgentThreadEnvironmentState, AgentThreadGitBinding,
+    AgentThreadProvisioningFailure, AgentThreadRenewal, AgentThreadReviewHandoff,
+    AgentThreadRunBinding, AgentThreadState, AgentThreadWorkspaceGuidance,
+    BeginAgentThreadRenewalOutcome, BindAgentThreadReviewHandoffOutcome, BindAgentThreadRunOutcome,
+    ColumnCryptor, CreateAgentThreadOutcome, DurableAgentThread, DurableAgentThreadBacking,
+    KmsEngine, ListAgentThreadsOutcome, MarkAgentThreadReviewReadyOutcome, NewAgentThread,
     NewAgentThreadReviewHandoff, RetryAgentThreadOutcome, SubjectId, SubjectKeyScope,
     WorkspaceSshRouteKey, MAX_AGENT_THREAD_NAME_BYTES, MAX_AGENT_THREAD_RETENTION_DAYS,
     MIN_AGENT_THREAD_RETENTION_DAYS,
@@ -769,6 +769,12 @@ impl AgentThreadHttpApi {
                     provider: environment.provider.clone(),
                     config_path: environment.config_path.clone(),
                     content_digest: environment.content_digest.clone(),
+                    state: match environment.state {
+                        WorkspaceEnvironmentState::Declared => {
+                            AgentThreadEnvironmentState::Declared
+                        }
+                        WorkspaceEnvironmentState::Invalid => AgentThreadEnvironmentState::Invalid,
+                    },
                 });
         let activation = self.drive(
             self.threads.activate(
@@ -1957,7 +1963,7 @@ fn thread_json(tenant: &str, thread: &DurableAgentThread) -> Value {
                 "provider": environment.provider,
                 "config_path": environment.config_path,
                 "content_digest": environment.content_digest,
-                "state": "declared",
+                "state": environment.state.token(),
             })),
         },
         "created_at": thread.created_at,

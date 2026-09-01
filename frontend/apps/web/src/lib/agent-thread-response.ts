@@ -120,7 +120,7 @@ export interface AgentThread {
       provider: "service_federation";
       config_path: "fed.yaml";
       content_digest: string;
-      state: "declared";
+      state: "declared" | "invalid";
     } | null;
   };
   created_at: string;
@@ -460,7 +460,7 @@ function thread(value: unknown): AgentThread | null {
         environment.provider !== "service_federation" || environment.config_path !== "fed.yaml" ||
         typeof environment.content_digest !== "string" ||
         !/^blake3:[0-9a-f]{64}$/.test(environment.content_digest) ||
-        environment.state !== "declared")) ||
+        !["declared", "invalid"].includes(environment.state as string))) ||
       !timestamp(row.created_at) || !timestamp(row.updated_at)) return null;
   const thread = row as unknown as AgentThread;
   if (!thread.ref.endsWith(`/agent/thread/${thread.id}`) ||

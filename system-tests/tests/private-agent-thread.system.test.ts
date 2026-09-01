@@ -181,7 +181,18 @@ describe("private work with an agent", () => {
       agentId: companion.agent.id,
       workspace: { repository: malformedRepository.slug },
     });
-    expect(malformedThread.thread.workspace.environment).toBeNull();
+    expect(malformedThread.thread.workspace.environment).toEqual({
+      provider: "service_federation",
+      config_path: "fed.yaml",
+      content_digest: expect.stringMatching(/^blake3:[0-9a-f]{64}$/),
+      state: "invalid",
+    });
+    const malformedFetched = await founder.json(
+      `/v1/agent-threads/${encodeURIComponent(malformedThread.thread.id)}`,
+    );
+    expect(parsePrivateAgentThread(malformedFetched.body.thread)).toEqual(
+      malformedThread.thread,
+    );
 
     const repository = new GitProject(uniqueName("cloud-workspace"), founder);
     await repository.create();

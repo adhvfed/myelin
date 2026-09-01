@@ -153,6 +153,17 @@ describe("private agent work wire projection", () => {
     expect(parseAgentThread({
       thread: {
         ...subject,
+        workspace: {
+          ...subject.workspace,
+          repository,
+          environment: { ...environment, state: "invalid" },
+          personalization,
+        },
+      },
+    })?.workspace.environment?.state).toBe("invalid");
+    expect(parseAgentThread({
+      thread: {
+        ...subject,
         workspace: { ...subject.workspace, repository: { ...repository, base_oid: "short" } },
       },
     })).toBeNull();

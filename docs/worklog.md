@@ -10,17 +10,33 @@ Environment discovery previously blessed every bounded UTF-8 blob named `fed.yam
 scalar, or an unrelated YAML document therefore appeared in the workspace pane as a declared
 Service Federation environment even though Fed could not interpret it as a configuration.
 
-Discovery now parses the pinned bytes without executing repository content. It requires a YAML
-mapping with at least one recognized Fed top-level field and enforces the collection/string shapes
-of Fed's root contract; malformed and unrelated files remain ordinary repository files with no
-environment receipt. This is intentionally structural admission, not an activation claim: semantic
-validation and execution still belong to the future hardened environment provisioner.
+Discovery now parses the pinned bytes without executing repository content. A YAML mapping with at
+least one recognized Fed top-level field and the collection/string shapes of Fed's root contract is
+`declared`; a malformed, wrong-shaped, scalar, or unrelated bounded text file retains the same
+pinned path and digest but is explicitly `invalid`. This is intentionally structural admission, not
+an activation claim: semantic validation and execution still belong to the future hardened
+environment provisioner.
+
+Migrations `0178`–`0180` add that state through an online expand/backfill/contract
+cycle. Existing three-field receipts backfill to `declared`; the final constraint requires all four
+fields together and admits only `declared` or `invalid` on repository-bound work. Edge carries the
+durable state instead of synthesizing `declared`, the strict web decoder accepts only the two exact
+tokens, and the workspace pane gives invalid work a corrective next step without exposing content.
 
 The readable TypeScript cloud-branch journey creates a real repository containing malformed
-`fed.yaml`, starts private work through the running product, and observes that the durable workspace
-has no environment receipt before continuing through the valid pinned-manifest journey. Focused
-Rust coverage exercises valid native and Compose declarations plus malformed, wrong-shaped,
-unrelated, and scalar documents.
+`fed.yaml`, starts private work through the running product, and observes its durable `invalid`
+receipt before continuing through the valid pinned-manifest journey. Focused Rust coverage
+exercises valid native and Compose declarations plus malformed, wrong-shaped, unrelated, and scalar
+documents; the migration shape, Edge model, strict web decoder, and owner-facing copy have their
+package-level proofs. The focused TypeScript journey passed against the restarted Edge, PostgreSQL,
+durable Git, workspace service, and gVisor in 7.59 seconds; a separate fetch returned the exact
+stored invalid receipt. PostgreSQL contained both states under the validated final constraint. The
+Chromium product journey then created malformed and valid cloud branches through the visible UI,
+showed the corrective invalid-state guidance, and completed its existing review flow in 21.8
+seconds. The three live durable-thread lifecycle tests and migration checksum guard also pass.
+The complete Edge and Storage library suites passed all 743 stories, strict all-target/all-feature
+Clippy is clean, and all 677 web unit tests, frontend lint/typechecking, and system typechecking
+pass.
 
 ## 2026-09-01 — The reserved Fed root cannot become a review file
 

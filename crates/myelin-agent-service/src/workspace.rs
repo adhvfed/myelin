@@ -26,6 +26,13 @@ pub struct WorkspaceEnvironmentManifest {
     pub provider: String,
     pub config_path: String,
     pub content_digest: String,
+    pub state: WorkspaceEnvironmentState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceEnvironmentState {
+    Declared,
+    Invalid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -509,7 +516,6 @@ fn repository_environment_manifest(
         || blob.content().is_empty()
         || blob.content().len() > MAX_FED_MANIFEST_BYTES
         || std::str::from_utf8(blob.content()).is_err()
-        || !is_service_federation_manifest(blob.content())
     {
         return Ok(None);
     }
@@ -518,6 +524,11 @@ fn repository_environment_manifest(
         provider: "service_federation".into(),
         config_path: "fed.yaml".into(),
         content_digest: format!("blake3:{digest}"),
+        state: if is_service_federation_manifest(blob.content()) {
+            WorkspaceEnvironmentState::Declared
+        } else {
+            WorkspaceEnvironmentState::Invalid
+        },
     }))
 }
 
@@ -1623,6 +1634,7 @@ mod tests {
                 provider: "service_federation".into(),
                 config_path: "fed.yaml".into(),
                 content_digest: format!("blake3:{}", blake3::hash(fed_manifest)),
+                state: WorkspaceEnvironmentState::Declared,
             })
         );
         let workspace = store

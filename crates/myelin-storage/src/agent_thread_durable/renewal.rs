@@ -171,7 +171,8 @@ impl DurableAgentThreadBacking {
                           workspace_guidance_digest, workspace_guidance_request_digest,
                           workspace_guidance_key_ref, workspace_guidance_nonce,
                           workspace_guidance_ciphertext, environment_provider,
-                          environment_config_path, environment_config_digest, retention_days,
+                          environment_config_path, environment_config_digest, environment_state,
+                          retention_days,
                           state, storage_locator, publication_completed_at, review_ready_at,
                           failure_reason, created_at, expires_at, updated_at",
                     )
