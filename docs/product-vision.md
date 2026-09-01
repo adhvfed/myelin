@@ -124,7 +124,8 @@ the workspace branch does not exist in the shared repository. Publication refuse
 uncommitted changes, divergent history, and any commit that contains the owner-only `AGENTS.md`
 layer, private context paths, or Service Federation's generated `.fed` runtime state. The committed
 `.fed/cloud.yaml` project link and `.fed/.gitignore` remain reviewable source configuration; lock
-databases, generated or cached secrets, logs, and future runtime artifacts never cross the handoff.
+databases, generated or cached secrets, logs, a file or symlink replacing the reserved `.fed`
+directory itself, and future runtime artifacts never cross the handoff.
 A clean tip is not enough: before moving a durable ref, Myelin scans every base-exclusive commit and
 introduced blob with the same bounded object-size and credential-content policy as an ordinary Git
 push. Deleting a credential in a later commit therefore does not make the reachable review history

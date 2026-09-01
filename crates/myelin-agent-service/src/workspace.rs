@@ -1164,6 +1164,7 @@ fn scan_review_object(
 
 fn private_review_path(path: &str, personalized: &std::collections::BTreeSet<&str>) -> bool {
     personalized.contains(path)
+        || path == ".fed"
         || (path.starts_with(".fed/") && !matches!(path, ".fed/cloud.yaml" | ".fed/.gitignore"))
 }
 
@@ -1580,6 +1581,7 @@ mod tests {
     fn review_publication_is_fast_forward_idempotent_and_excludes_private_augmentation() {
         let personalized = std::collections::BTreeSet::from(["AGENTS.md"]);
         assert!(private_review_path("AGENTS.md", &personalized));
+        assert!(private_review_path(".fed", &personalized));
         assert!(private_review_path(".fed/lock.db", &personalized));
         assert!(private_review_path(".fed/logs/app.log", &personalized));
         assert!(private_review_path(
@@ -1690,16 +1692,9 @@ mod tests {
                 .changed
         );
 
-        std::fs::create_dir_all(workspace.join(".fed")).unwrap();
-        std::fs::write(
-            workspace.join(".fed/secrets.generated.env"),
-            "PRIVATE_TOKEN=must-not-publish\n",
-        )
-        .unwrap();
+        std::fs::write(workspace.join(".fed"), "PRIVATE_RUNTIME_STATE=local-only\n").unwrap();
         let mut index = checkout.index().unwrap();
-        index
-            .add_path(Path::new(".fed/secrets.generated.env"))
-            .unwrap();
+        index.add_path(Path::new(".fed")).unwrap();
         index.write().unwrap();
         let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
         let parent = checkout.find_commit(review_oid).unwrap();
@@ -1713,11 +1708,9 @@ mod tests {
                 &[&parent],
             )
             .unwrap();
-        std::fs::remove_file(workspace.join(".fed/secrets.generated.env")).unwrap();
+        std::fs::remove_file(workspace.join(".fed")).unwrap();
         let mut index = checkout.index().unwrap();
-        index
-            .remove_path(Path::new(".fed/secrets.generated.env"))
-            .unwrap();
+        index.remove_path(Path::new(".fed")).unwrap();
         index.write().unwrap();
         let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
         let parent = checkout.find_commit(fed_state_oid).unwrap();
@@ -1734,7 +1727,7 @@ mod tests {
         assert_eq!(
             store.publish_repository_for_review("acme", workspace_id, request()),
             Err(WorkspacePublicationError::ProtectedWorkspaceData(
-                ".fed/secrets.generated.env".into()
+                ".fed".into()
             ))
         );
         assert_eq!(

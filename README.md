@@ -133,7 +133,7 @@ myelin agent thread history 33333333-3333-4333-8333-333333333333
 # agent-run, command, SSH, or infrastructure authority.
 myelin agent thread ready 33333333-3333-4333-8333-333333333333
 # Publish the committed cloud branch and open one retry-safe review. Myelin refuses personalized
-# context and Service Federation runtime state under `.fed/`; the intentionally committed
+# context and Service Federation runtime state at `.fed` or beneath `.fed/`; the intentionally committed
 # `.fed/cloud.yaml` link and `.fed/.gitignore` remain ordinary reviewable source files. It also scans
 # the full unpublished history, so deleting private workspace data or an accidentally committed
 # GitHub, GitLab, Slack, AWS, or private-key credential is not enough: rewrite the offending commit

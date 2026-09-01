@@ -4,6 +4,19 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — The reserved Fed root cannot become a review file
+
+The publication predicate protected generated paths beneath `.fed/` but not an entry named exactly
+`.fed`. An agent could replace Service Federation's runtime directory with a committed file or
+symlink and publish that ambiguous root even though the two explicit source exceptions live beneath
+the namespace.
+
+The root entry is now private alongside generated descendants; `.fed/cloud.yaml` and
+`.fed/.gitignore` remain the only reviewable exceptions. The real-Git history story now commits a
+non-secret `.fed` runtime file, deletes it in a child commit, and proves the hidden root is rejected
+without advancing the durable ref. The full-system journey independently retains its realistic
+nested generated-secret proof. The focused Rust story and strict all-target/all-feature Clippy pass.
+
 ## 2026-09-01 — Review history bounds include deletions and Git tree metadata
 
 Cloud publication capped commits, unique inspected commit/blob objects, and aggregate bytes, but it
