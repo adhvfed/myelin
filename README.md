@@ -135,8 +135,8 @@ myelin agent thread ready 33333333-3333-4333-8333-333333333333
 # Publish the committed cloud branch and open one retry-safe review. Myelin refuses personalized
 # context and Service Federation runtime state under `.fed/`; the intentionally committed
 # `.fed/cloud.yaml` link and `.fed/.gitignore` remain ordinary reviewable source files. It also scans
-# the full unpublished history, so deleting an accidentally committed credential is not enough:
-# rewrite the secret-bearing commit before handoff.
+# the full unpublished history, so deleting private workspace data or an accidentally committed
+# credential is not enough: rewrite the offending commit before handoff.
 myelin agent thread pull-request 33333333-3333-4333-8333-333333333333 \
   --reviewer system-reviewer --idempotency-key publish-checkout-race
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \

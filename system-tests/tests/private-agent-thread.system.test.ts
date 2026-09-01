@@ -328,6 +328,9 @@ describe("private work with an agent", () => {
               "printf 'PRIVATE_TOKEN=must-not-publish\\n' > .fed/secrets.generated.env",
               "git add -f .fed/secrets.generated.env",
               "git commit -m 'Accidentally stage Fed runtime state'",
+              "git rm .fed/secrets.generated.env",
+              "git commit -m 'Remove Fed runtime state from visible tree'",
+              "test ! -e .fed/secrets.generated.env",
               "git rev-parse HEAD",
             ].join(" && "),
             timeout_seconds: 10,
@@ -385,7 +388,7 @@ describe("private work with an agent", () => {
           "workspace.exec",
           {
             command: [
-              "git reset --hard HEAD~1",
+              "git reset --hard HEAD~2",
               "test ! -e .fed/secrets.generated.env",
               "git status --porcelain",
             ].join(" && "),

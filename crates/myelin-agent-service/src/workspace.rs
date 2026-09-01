@@ -917,36 +917,7 @@ fn publish_repository_branch(
         }
     }
 
-    validate_review_history_content(&repository, base_oid, head_oid)?;
-
-    let base_tree = repository
-        .find_commit(base_oid)
-        .and_then(|commit| commit.tree())
-        .map_err(publication_git_error("read pinned workspace base tree"))?;
-    let head_tree = repository
-        .find_commit(head_oid)
-        .and_then(|commit| commit.tree())
-        .map_err(publication_git_error("read workspace review tree"))?;
-    let diff = repository
-        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)
-        .map_err(publication_git_error("inspect workspace review changes"))?;
-    for delta in diff.deltas() {
-        for path in [delta.old_file().path(), delta.new_file().path()]
-            .into_iter()
-            .flatten()
-        {
-            let path = path.to_str().ok_or_else(|| {
-                WorkspacePublicationError::InvalidRepository(
-                    "workspace commit contains a non-UTF-8 path".into(),
-                )
-            })?;
-            if private_review_path(path, &protected) {
-                return Err(WorkspacePublicationError::ProtectedWorkspaceData(
-                    path.into(),
-                ));
-            }
-        }
-    }
+    validate_review_history_content(&repository, base_oid, head_oid, &protected)?;
 
     let destination = git2::Repository::open_bare(&source.repository_path)
         .map_err(publication_git_error("open durable review repository"))?;
@@ -1002,6 +973,7 @@ fn validate_review_history_content(
     repository: &git2::Repository,
     base_oid: git2::Oid,
     head_oid: git2::Oid,
+    protected_paths: &std::collections::BTreeSet<&str>,
 ) -> Result<(), WorkspacePublicationError> {
     let policy = myelin_git::receive_pack::PushPolicy::default();
     let odb = repository
@@ -1055,6 +1027,21 @@ fn validate_review_history_content(
                 "inspect workspace review commit content",
             ))?;
         for delta in diff.deltas() {
+            for path in [delta.old_file().path(), delta.new_file().path()]
+                .into_iter()
+                .flatten()
+            {
+                let path = path.to_str().ok_or_else(|| {
+                    WorkspacePublicationError::InvalidRepository(
+                        "workspace review history contains a non-UTF-8 path".into(),
+                    )
+                })?;
+                if private_review_path(path, protected_paths) {
+                    return Err(WorkspacePublicationError::ProtectedWorkspaceData(
+                        path.into(),
+                    ));
+                }
+            }
             let oid = delta.new_file().id();
             if oid.is_zero() || objects.contains(&oid) {
                 continue;
@@ -1657,12 +1644,30 @@ mod tests {
         index.write().unwrap();
         let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
         let parent = checkout.find_commit(review_oid).unwrap();
-        checkout
+        let fed_state_oid = checkout
             .commit(
                 Some("refs/heads/myelin/private-review"),
                 &signature,
                 &signature,
                 "accidentally stage Fed runtime state",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        std::fs::remove_file(workspace.join(".fed/secrets.generated.env")).unwrap();
+        let mut index = checkout.index().unwrap();
+        index
+            .remove_path(Path::new(".fed/secrets.generated.env"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = checkout.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = checkout.find_commit(fed_state_oid).unwrap();
+        checkout
+            .commit(
+                Some("refs/heads/myelin/private-review"),
+                &signature,
+                &signature,
+                "remove Fed runtime state from the visible tree",
                 &tree,
                 &[&parent],
             )
@@ -1679,7 +1684,7 @@ mod tests {
                 .unwrap()
                 .target(),
             Some(review_oid),
-            "a rejected Fed runtime file never advances the durable branch"
+            "Fed runtime state hidden in review history never advances the durable branch"
         );
         checkout
             .reset(

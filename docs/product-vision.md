@@ -177,11 +177,12 @@ again. A browser journey must repeat the grant and revoke through the visible pr
 Cloud-branch handoff journeys must additionally prove the ref is absent before the explicit action,
 publish a real commit made inside the confined workspace, give a named reviewer access to the exact
 pull request, survive a reload and retry, and demonstrate that private augmentation paths are absent
-from the shared repository. The journey must force-add realistic Service Federation runtime secret
-state, prove publication refuses it without creating or advancing the durable branch, remove that
-commit inside the confined workspace, then commit a recognizable credential and delete it in a
-later commit, prove the clean-looking tip is still refused, rewrite that reachable history, and only
-then publish successfully. It must then make another real workspace commit, update the existing
+from the shared repository. The journey must force-add realistic Service Federation runtime state,
+delete it in a later commit, prove the clean-looking tip is still refused without creating or
+advancing the durable branch, and rewrite both commits inside the confined workspace. It must then
+commit a recognizable credential, delete it in a later commit, prove that clean-looking tip is also
+refused, rewrite that reachable history, and only then publish successfully. It must then make
+another real workspace commit, update the existing
 pull request without changing its identity, and prove an exact replay is inert. The browser journey
 must load reviewer choices from the live project authorization graph, select the named human through
 the visible product, update the same review through its visible control, and prove their exact PR

@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Deleted Fed artifacts remain private history, not review history
+
+Cloud publication's path boundary inspected the final base-to-head diff. After the content-policy
+fix, a deleted credential in an ordinary file was correctly rejected, but a non-secret workspace
+artifact could still evade the path predicate: commit `.fed/lock.db`, delete it in a child commit,
+and its blob remained reachable even though the proposed tip looked clean.
+
+The one bounded base-exclusive history walk now applies both publication rules. Every old and new
+path in every commit delta crosses the private workspace predicate, while each introduced blob and
+commit crosses the shared Git content policy. The redundant final-tree path pass is gone, leaving a
+single fail-closed validation boundary before the durable repository is opened for publication.
+
+The real-Git Rust story now commits `.fed/secrets.generated.env`, deletes it in a child commit,
+proves publication still identifies the hidden private path, and proves the durable ref does not
+advance. The TypeScript full-system journey performs the same two-commit concealment through a
+governed gVisor run, observes the running Edge reject its clean-looking tip, rewrites both commits,
+then independently proves the deleted ordinary credential case before publishing. The focused
+journey passed in 6.69 seconds against the running stack.
+
 ## 2026-09-01 — A clean cloud-branch tip cannot conceal a secret-bearing commit
 
 Private workspace publication pushed directly from the confined checkout into the durable bare
@@ -38,7 +57,7 @@ therefore enter a review even though those `.fed` files are workspace runtime st
 
 The review boundary now treats every `.fed/` path as private workspace data except the two files
 Service Federation deliberately makes commit-worthy: `.fed/cloud.yaml` and `.fed/.gitignore`.
-Personalized paths use the same predicate. The complete base-to-head diff is inspected before any
+Personalized paths use the same predicate. The complete base-exclusive history is inspected before any
 durable ref moves, so a rejected commit cannot partially publish; ignored untracked Fed state may
 remain local without making an otherwise clean review impossible. Public errors name the offending
 path but never its contents.
