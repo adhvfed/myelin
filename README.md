@@ -140,6 +140,8 @@ myelin agent thread ready 33333333-3333-4333-8333-333333333333
 # before handoff.
 myelin agent thread pull-request 33333333-3333-4333-8333-333333333333 \
   --reviewer system-reviewer --idempotency-key publish-checkout-race
+# The web workspace pane applies the same boundary and presents its safe path-specific rewrite
+# instruction instead of collapsing every refusal into a generic publication error.
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222 \
   --thread 33333333-3333-4333-8333-333333333333
 # The one-shot credential claims one SSH transport, which may carry multiple bounded, separately

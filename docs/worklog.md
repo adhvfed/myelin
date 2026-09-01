@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-09-01 — Review refusal tells the browser owner what to rewrite
+
+Edge returned safe, path-specific conflicts for dirty work, private artifacts, likely credentials,
+oversized objects, excessive history, and divergence. The web server action discarded that bounded
+message and reduced every 409 to “remove private workspace files.” A branch whose credential existed
+only in an earlier commit therefore had a correct safety boundary but no usable browser recovery
+journey.
+
+The server action now carries detail only for a canonical `conflict` response to the review-publish
+operation. The message must remain nonblank, at most 2 KiB, trimmed, and free of control characters;
+all other operations and storage/transport failures retain their coarse categories. The visible
+workspace pane prefers this safe detail and keeps the existing generic fallback. Solid renders it as
+text, so the Edge message cannot become active markup.
+
+The Chromium product journey now commits and deletes a realistically shaped GitHub token through a
+governed workspace run, clicks **Open pull request**, and sees the exact path-specific instruction to
+rewrite `browser-credential.env`. It resets both commits through a fresh governed run and retries the
+same visible handoff before completing reviewer access, update, reload, and accessibility checks.
+That browser journey passed in 16.0 seconds against the running Fed web, Edge, PostgreSQL, durable
+Git, agent-service, workspace gateway, and gVisor stack. Web lint and typechecking pass, as do all 677
+unit tests (with eight integration-only tests skipped in the unit environment).
+
 ## 2026-09-01 — Cloud review recognizes the credentials teams are replacing
 
 The shared Git content policy detected AWS access-key identifiers and PEM private keys, but a

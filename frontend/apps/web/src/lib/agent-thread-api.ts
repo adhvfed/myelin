@@ -59,7 +59,7 @@ export type AgentThreadMutationResult =
   | { ok: true; op: "configure-agent-tools"; receipt: AgentToolPaletteReceipt }
   | { ok: true; op: "lifecycle-agent"; receipt: AgentLifecycleReceipt }
   | { ok: true; op: "post-message"; messageId: string; threadId: string }
-  | { ok: false; error: AgentThreadErrorKind };
+  | { ok: false; error: AgentThreadErrorKind; detail?: string };
 
 const AGENT_THREAD_ERR_PREFIX = "AGENT_THREAD_ERR:";
 const utf8 = new TextEncoder();
@@ -514,7 +514,13 @@ export const mutateAgentThread = action(async (input: unknown) => {
       if (error.status === 403 || error.status === 404) {
         return respond({ ok: false, error: "not-found" });
       }
-      if (error.status === 409) return respond({ ok: false, error: "conflict" });
+      if (error.status === 409) {
+        const detail = mutation.op === "publish-review" && error.code === "conflict" &&
+            cleanText(error.message, 2_048)
+          ? error.message
+          : undefined;
+        return respond({ ok: false, error: "conflict", ...(detail ? { detail } : {}) });
+      }
       if (error.status === 503) return respond({ ok: false, error: "unavailable" });
     }
     return respond({ ok: false, error: "error" });

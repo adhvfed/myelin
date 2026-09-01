@@ -30,7 +30,7 @@ async function commitWorkspaceReview(
   request: APIRequestContext,
   sessionToken: string,
   threadId: string,
-  change: "initial" | "follow-up" = "initial",
+  change: "initial" | "follow-up" | "hidden-credential" | "rewrite-hidden-credential" = "initial",
 ): Promise<void> {
   const envelope = await postProductJson(
     request,
@@ -64,11 +64,21 @@ async function commitWorkspaceReview(
                   "git add browser-review.ts",
                   "git commit -m 'Prepare browser cloud branch for review'",
                 ].join(" && ")
-              : [
+              : change === "follow-up"
+                ? [
                   "printf 'export const browserFollowUp = true;\\n' > browser-follow-up.ts",
                   "git add browser-follow-up.ts",
                   "git commit -m 'Follow up on browser cloud review'",
-                ].join(" && "),
+                ].join(" && ")
+                : change === "hidden-credential"
+                  ? [
+                      "printf 'GITHUB_TOKEN=gh%saB3dE5fG7hJ9kL2mN4pQ6rS8tV0wX1yZ\\n' 'p_' > browser-credential.env",
+                      "git add browser-credential.env",
+                      "git commit -m 'Accidentally commit browser credential'",
+                      "git rm browser-credential.env",
+                      "git commit -m 'Delete browser credential from visible tree'",
+                    ].join(" && ")
+                  : "git reset --hard HEAD~2 && test ! -e browser-credential.env",
             timeout_seconds: 10,
           },
           _meta: { "com.myelin/idempotencyKey": `browser-review-${change}-${randomUUID()}` },
@@ -421,6 +431,12 @@ test("an engineer keeps a cloud branch and its environment with one agent", asyn
   });
   await expect(reviewer).toBeVisible();
   await reviewer.check();
+  await commitWorkspaceReview(request, sessionToken, threadId, "hidden-credential");
+  await workspace.getByRole("button", { name: "Open pull request" }).click();
+  await expect(workspace.getByRole("alert")).toContainText(
+    "review history contains a possible secret at `browser-credential.env`; rewrite it out of the branch",
+  );
+  await commitWorkspaceReview(request, sessionToken, threadId, "rewrite-hidden-credential");
   await workspace.getByRole("button", { name: "Open pull request" }).click();
   const pullRequestLink = workspace.getByRole("link", { name: /^Pull request #\d+$/ });
   await expect(pullRequestLink).toBeVisible();

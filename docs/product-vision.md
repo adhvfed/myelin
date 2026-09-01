@@ -141,6 +141,10 @@ ref, commit, and pull-request number. This boundary is available from both the w
 `myelin agent thread pull-request`: remote-editor work should not force a developer to leave the
 CLI or manually reconstruct an internal HTTP request. Both clients name the same stable intent and
 render the existing pull request honestly on replay.
+When publication is refused, the visible workspace pane preserves Edge's bounded safe explanation:
+it distinguishes dirty work, private paths, likely credentials, oversized history, and divergence,
+and names only the path the owner can act on. A generic conflict must not turn a safe refusal into an
+opaque dead end, while storage and transport failures must remain unprojected.
 
 The handoff remains useful while review is active. The owner can commit more work in the retained
 workspace and deliberately update the same pull request from either the workspace pane or CLI.
@@ -188,8 +192,9 @@ successfully. It must then make
 another real workspace commit, update the existing
 pull request without changing its identity, and prove an exact replay is inert. The browser journey
 must load reviewer choices from the live project authorization graph, select the named human through
-the visible product, update the same review through its visible control, and prove their exact PR
-access with a separate identity. The durable-store journey must also observe the reviewer request
+the visible product, attempt a hidden provider credential, render Edge's exact safe rewrite
+instruction, rewrite it through governed work, update the same review through its visible control,
+and prove their exact PR access with a separate identity. The durable-store journey must also observe the reviewer request
 arrive unread, complete after a submitted decision, and reopen on the same PR when a new head makes
 that decision stale. The CLI journey must cross the actual device-login, MCP, SSH/SFTP,
 editor-profile, Git commit, ready, and pull-request boundaries rather than certifying only argument

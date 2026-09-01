@@ -466,7 +466,8 @@ export default function AgentThreadsIndex() {
         setReviewHandoffError(result.ok || result.error === "error"
           ? "Myelin couldn’t confirm the pull request. Retry this unchanged handoff."
           : result.error === "conflict"
-            ? "Commit the intended code changes and remove private workspace files from the commit before publishing."
+            ? result.detail ??
+              "Commit the intended code changes and remove private workspace files from the commit before publishing."
             : result.error === "not-found"
               ? "This private thread is no longer available."
               : "Review publication is temporarily unavailable. Retry this unchanged handoff.");
