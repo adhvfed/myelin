@@ -22,3 +22,7 @@ overrides:
 # releases. All vulnerable paths are dev/build tooling (eslint, nitropack's archiver) on
 # trusted input. Remove the ignore when the plugins support a minimatch major carrying
 # brace-expansion >=5.
+
+# Supply-chain guard: never resolve a version published less than 3 days ago
+# (in minutes). Most hijacked releases are caught and yanked within that window.
+minimumReleaseAge: 4320
