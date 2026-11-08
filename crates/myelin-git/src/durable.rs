@@ -348,6 +348,19 @@ pub struct PreparedFileCommit {
     pub trees: Vec<Oid>,
 }
 
+/// The result of merging a base commit into a head commit without touching any ref.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreparedMerge {
+    /// The head already contains the base.
+    UpToDate,
+    /// Paths both sides changed incompatibly, sorted and bounded.
+    Conflicted { paths: Vec<String> },
+    /// A two-parent commit (head, base) written into this repository's own object store.
+    Merged { commit: Oid },
+}
+
+const MAX_REPORTED_CONFLICTS: usize = 100;
+
 #[derive(Clone, Copy)]
 struct CommitDiffLimits {
     files: usize,
@@ -909,9 +922,10 @@ impl DurableGitRepo {
                 Err(error) if error.code() == git2::ErrorCode::NotFound => continue,
                 Err(error) => return Err(git_err("find reflog operation commit", error)),
             };
-            let message = commit.message().map_err(|_| {
-                DurableError::Git("reflog operation commit message is not UTF-8".into())
-            })?;
+            // Myelin writes its trailers in UTF-8; a pushed commit with another encoding never matches.
+            let Ok(message) = commit.message() else {
+                continue;
+            };
             if message.lines().any(|line| line == trailer) {
                 return Ok(Some(ReflogCommitMessage {
                     oid: entry.new_oid,
@@ -2190,6 +2204,134 @@ impl DurableGitRepo {
         is_commit
     }
 
+    pub fn prepare_merge_commit(
+        &self,
+        head: &Oid,
+        base: &Oid,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<PreparedMerge, DurableError> {
+        let repo = self.open_git()?;
+        let head_g = Self::parse_oid(head)?;
+        let base_g = Self::parse_oid(base)?;
+        if head_g == base_g
+            || repo
+                .graph_descendant_of(head_g, base_g)
+                .map_err(|e| git_err("graph_descendant_of", e))?
+        {
+            return Ok(PreparedMerge::UpToDate);
+        }
+        let head_commit = repo
+            .find_commit(head_g)
+            .map_err(|e| git_err("find merge head", e))?;
+        let base_commit = repo
+            .find_commit(base_g)
+            .map_err(|e| git_err("find merge base", e))?;
+        match repo.merge_base(head_g, base_g) {
+            Ok(_) => {}
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                return Err(DurableError::Conflict(
+                    "the branch and its base share no history; merge them locally and push".into(),
+                ))
+            }
+            Err(error) => return Err(git_err("merge base", error)),
+        }
+        let mut index = repo
+            .merge_commits(&head_commit, &base_commit, None)
+            .map_err(|e| git_err("merge commits", e))?;
+        if index.has_conflicts() {
+            let mut paths = std::collections::BTreeSet::new();
+            for conflict in index
+                .conflicts()
+                .map_err(|e| git_err("read conflicts", e))?
+            {
+                let conflict = conflict.map_err(|e| git_err("read conflict", e))?;
+                for entry in [conflict.ancestor, conflict.our, conflict.their]
+                    .into_iter()
+                    .flatten()
+                {
+                    paths.insert(String::from_utf8_lossy(&entry.path).into_owned());
+                }
+            }
+            return Ok(PreparedMerge::Conflicted {
+                paths: paths.into_iter().take(MAX_REPORTED_CONFLICTS).collect(),
+            });
+        }
+        let tree_oid = index
+            .write_tree_to(&repo)
+            .map_err(|e| git_err("write merged tree", e))?;
+        let tree = repo
+            .find_tree(tree_oid)
+            .map_err(|e| git_err("find merged tree", e))?;
+        let signature =
+            git2::Signature::now(author_name, author_email).map_err(|e| git_err("signature", e))?;
+        let commit = repo
+            .commit(
+                None,
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&head_commit, &base_commit],
+            )
+            .map_err(|e| git_err("write merge commit", e))?;
+        Ok(PreparedMerge::Merged {
+            commit: Oid::new(commit.to_string()),
+        })
+    }
+
+    /// Loose objects written into this repository's own object directory, not its alternates:
+    /// exactly what a quarantine created.
+    pub fn own_loose_objects(&self) -> Result<Vec<Oid>, DurableError> {
+        let objects = self.path.join("objects");
+        let mut found = Vec::new();
+        let fanout = std::fs::read_dir(&objects)
+            .map_err(|e| DurableError::Io(format!("read {}: {e}", objects.display())))?;
+        for directory in fanout {
+            let directory =
+                directory.map_err(|e| DurableError::Io(format!("read object fanout: {e}")))?;
+            let prefix = directory.file_name().to_string_lossy().into_owned();
+            if prefix.len() != 2 || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let entries = std::fs::read_dir(directory.path())
+                .map_err(|e| DurableError::Io(format!("read object directory: {e}")))?;
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| DurableError::Io(format!("read loose object: {e}")))?;
+                let rest = entry.file_name().to_string_lossy().into_owned();
+                if rest.len() == 38 && rest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    found.push(Oid::new(format!("{prefix}{rest}")));
+                }
+            }
+        }
+        found.sort();
+        Ok(found)
+    }
+
+    /// An object's kind and size without reading its contents.
+    pub fn object_header(&self, oid: &Oid) -> Result<(&'static str, usize), DurableError> {
+        let repo = self.open_git()?;
+        let odb = repo.odb().map_err(|e| git_err("odb", e))?;
+        let (size, kind) = odb
+            .read_header(Self::parse_oid(oid)?)
+            .map_err(|e| DurableError::NotFound(format!("object {}: {e}", oid.as_str())))?;
+        let kind = match kind {
+            git2::ObjectType::Blob => "blob",
+            git2::ObjectType::Tree => "tree",
+            git2::ObjectType::Commit => "commit",
+            git2::ObjectType::Tag => "tag",
+            _ => {
+                return Err(DurableError::Git(format!(
+                    "object {} has an unsupported kind",
+                    oid.as_str()
+                )))
+            }
+        };
+        Ok((kind, size))
+    }
+
     pub fn is_fast_forward(
         &self,
         base_tip: Option<&Oid>,
@@ -2659,6 +2801,104 @@ mod tests {
             "psn-7@acme.noreply",
         )
         .expect("commit")
+    }
+
+    #[test]
+    fn a_base_merges_into_a_head_without_moving_any_ref() {
+        let root = temp_root("merge");
+        let repo = init_bare_repo(&root.join("repo.git")).expect("repo");
+        let commit = |files: &[(&str, &[u8])], parents: &[&Oid], message: &str| {
+            let blobs: Vec<(&str, Oid)> = files
+                .iter()
+                .map(|(name, contents)| (*name, repo.write_blob(contents).expect("blob")))
+                .collect();
+            let entries: Vec<(&str, &Oid)> = blobs.iter().map(|(name, oid)| (*name, oid)).collect();
+            let tree = repo.write_tree(&entries).expect("tree");
+            repo.write_commit(&tree, parents, message, "psn", "psn@acme.noreply")
+                .expect("commit")
+        };
+        let start = commit(&[("a.txt", b"one\n"), ("b.txt", b"one\n")], &[], "start");
+        let base = commit(
+            &[("a.txt", b"two\n"), ("b.txt", b"one\n")],
+            &[&start],
+            "base",
+        );
+        let head = commit(
+            &[("a.txt", b"one\n"), ("b.txt", b"two\n")],
+            &[&start],
+            "head",
+        );
+        let clash = commit(
+            &[("a.txt", b"three\n"), ("b.txt", b"one\n")],
+            &[&start],
+            "clash",
+        );
+        let merge = |head: &Oid, base: &Oid| {
+            repo.prepare_merge_commit(head, base, "Merge main", "psn", "psn@acme.noreply")
+                .expect("prepare merge")
+        };
+
+        let unrelated = commit(&[("c.txt", b"other\n")], &[], "unrelated root");
+        assert!(matches!(
+            repo.prepare_merge_commit(&head, &unrelated, "Merge", "psn", "psn@acme.noreply"),
+            Err(DurableError::Conflict(_))
+        ));
+        assert_eq!(merge(&base, &start), PreparedMerge::UpToDate);
+        assert_eq!(merge(&base, &base), PreparedMerge::UpToDate);
+        assert_eq!(
+            merge(&clash, &base),
+            PreparedMerge::Conflicted {
+                paths: vec!["a.txt".into()]
+            }
+        );
+
+        let quarantine =
+            DurableGitRepo::init_quarantine(&root.join("quarantine"), &repo.path().join("objects"))
+                .expect("quarantine");
+        let PreparedMerge::Merged { commit: merged } = quarantine
+            .prepare_merge_commit(&head, &base, "Merge main", "psn", "psn@acme.noreply")
+            .expect("prepare merge")
+        else {
+            panic!("independent edits merge cleanly");
+        };
+        assert!(
+            !repo.has_object(&merged),
+            "the merge stays in the quarantine"
+        );
+        let written = quarantine.own_loose_objects().expect("quarantined objects");
+        let mut kinds: Vec<&str> = written
+            .iter()
+            .map(|oid| quarantine.object_header(oid).expect("header").0)
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            ["commit", "tree"],
+            "only the merge and its new tree are new"
+        );
+        assert!(written.contains(&merged));
+
+        let git = quarantine.open_git().expect("open");
+        let merged = git
+            .find_commit(git2::Oid::from_str(merged.as_str()).unwrap())
+            .expect("merged commit");
+        let parents: Vec<String> = merged.parent_ids().map(|id| id.to_string()).collect();
+        assert_eq!(parents, [head.0.clone(), base.0.clone()]);
+        let tree = merged.tree().expect("tree");
+        let read = |name: &str| {
+            let entry = tree.get_name(name).expect("entry");
+            git.find_blob(entry.id()).expect("blob").content().to_vec()
+        };
+        assert_eq!(read("a.txt"), b"two\n");
+        assert_eq!(read("b.txt"), b"two\n");
+        let main = repo.open_git().expect("open");
+        for refs in [git.references(), main.references()] {
+            assert!(
+                refs.expect("refs").next().is_none(),
+                "preparing a merge never moves a ref"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

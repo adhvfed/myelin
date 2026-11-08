@@ -193,6 +193,7 @@ mod tests {
                 "git.resolve_thread",
                 "git.search_code",
                 "git.submit_review",
+                "git.update_branch",
                 "git.write_file",
                 "issues.close",
                 "issues.create",

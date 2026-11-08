@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   hasAppliedAction,
+  parseAppliedBranchUpdate,
   parseAppliedComment,
   parseAppliedMerge,
   parseAppliedReview,
@@ -10,6 +11,7 @@ import {
   parseIssueAuthorizationStatus,
   parseIssueCreateReceipt,
   parseIssuesPage,
+  parseMergeConflicts,
   parsePrChecks,
   parsePrThreads,
 } from "./mutation-response";
@@ -178,6 +180,32 @@ describe("PR mutation response decoders", () => {
       { applied: { action: "git.pr.merge", merged: true, base_ref: "refs/heads/main", new_oid: "bad" }, durable: true },
       { applied: { action: "git.pr.open", merged: true, base_ref: "refs/heads/main", new_oid: SHA1 }, durable: true },
     ]) expect(parseAppliedMerge(value)).toBeNull();
+  });
+
+  it("reads a branch update receipt and the paths a conflicting update reports", () => {
+    expect(parseAppliedBranchUpdate({
+      applied: { action: "git.pr.update_branch", updated: true, head_oid: SHA1, replayed: false },
+      durable: true,
+    })).toEqual({ updated: true, head_oid: SHA1 });
+    for (const value of [
+      { applied: { action: "git.pr.update_branch", updated: "yes", head_oid: SHA1, replayed: false }, durable: true },
+      { applied: { action: "git.pr.update_branch", updated: true, head_oid: "bad", replayed: false }, durable: true },
+      { applied: { action: "git.pr.merge", updated: true, head_oid: SHA1, replayed: false }, durable: true },
+      { applied: { action: "git.pr.update_branch", updated: true, head_oid: SHA1 }, durable: true },
+    ]) expect(parseAppliedBranchUpdate(value)).toBeNull();
+
+    expect(parseMergeConflicts({
+      error: { code: "merge_conflict", message: "both changed" },
+      conflicts: ["README.md", "src/lib.rs"],
+      durable: true,
+    })).toEqual(["README.md", "src/lib.rs"]);
+    for (const value of [
+      { error: { code: "conflict" }, conflicts: ["README.md"] },
+      { error: { code: "merge_conflict" }, conflicts: "README.md" },
+      { error: { code: "merge_conflict" }, conflicts: [7] },
+      { error: { code: "merge_conflict" }, conflicts: [] },
+      { error: { code: "merge_conflict" }, conflicts: Array.from({ length: 101 }, (_, i) => `f${i}`) },
+    ]) expect(parseMergeConflicts(value)).toBeNull();
   });
 
   it("validates the authoritative checks carried by a blocked merge", () => {

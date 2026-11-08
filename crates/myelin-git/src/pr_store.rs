@@ -1090,6 +1090,10 @@ pub enum MergeAttempt {
         update_seq: u64,
     },
     Blocked(MergeEval),
+    /// The base moved past the branch; updating the branch makes it mergeable.
+    BehindBase {
+        base_ref: String,
+    },
     InvalidHead(String),
     RefRefused(crate::receive_pack::RejectReason),
 }
@@ -1128,10 +1132,9 @@ pub fn merge_pr<P: RepoPathResolver>(
         )));
     }
     if !repo.is_fast_forward(cur_tip.as_ref(), &head_core)? {
-        return Ok(MergeAttempt::InvalidHead(format!(
-            "head_oid {} is not a fast-forward of {}",
-            rec.head_oid, rec.base_ref
-        )));
+        return Ok(MergeAttempt::BehindBase {
+            base_ref: rec.base_ref.clone(),
+        });
     }
 
     let expected_old = cur_tip
@@ -2115,7 +2118,7 @@ mod tests {
                     PushProvenance::NonAgent,
                 )
                 .unwrap(),
-                MergeAttempt::InvalidHead(_)
+                MergeAttempt::BehindBase { .. }
             ),
             "an ancestor (non-descendant) head is refused"
         );

@@ -4,6 +4,74 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — Update branch
+
+Merging is fast-forward only, so every merge stranded every other open pull request on the same
+base: their branches no longer contained the base, and merge answered `400 invalid merge head:
+the locked head OID is not a fast-forward of the target ref`. The only way forward was a local
+checkout, `git merge main`, and a push, which also threw away every approval.
+
+`POST /v1/git/repos/{repo}/prs/{n}/update-branch` now merges the base into a same-repository pull
+request's branch on the server. The merge is computed with libgit2 in a quarantine repository whose
+alternates point at the real object store. Only the objects the merge wrote, bounded to 10,000
+objects and 64 MiB, are promoted through the existing ref-store receive. That receive
+compare-and-swaps the branch from the tip that was merged, under the same protected-ref admission
+as a web file commit, so agents still cannot write a protected branch. A conflict writes nothing and
+answers `409 merge_conflict` with the conflicting paths. A branch that already contains its base
+answers `updated: false`. An optional `expected_head_oid` refuses to merge into a branch that moved
+since the caller looked. The idempotency key is recorded as a commit trailer, so a retry returns
+the same merge commit.
+
+The pull request then moves onto the merge with a new `AdoptBaseMerge` transition. Reviews are kept,
+because Myelin computed the merge from the exact reviewed head and the change under review is
+unchanged. Check facts, endorsements, and code-owner state are cleared, and `git.pr.synchronized`
+makes CI test the merged result. Approvals are kept only when the pull request's reviewed head is
+exactly the merge's first parent. When a push got there first, ordinary branch following settles
+the pull request and clears approvals as any push does. A reviewer whose review still stands no
+longer gets their review request reopened by the synchronization.
+
+Merging a pull request whose branch is behind now answers `409 branch_behind_base`, a typed
+outcome, instead of a 400 that blamed the caller. The pull-request overview reports `behind_base`
+for open same-repository pull requests. The web merge card says the base moved on and offers
+**Update branch**, and it shows conflicting files inline. It no longer offers a merge that would
+certainly fail, and its confirmation copy no longer claims a merge commit. `myelin repo pr update
+<repo> <n>` does the same from the terminal, and the CLI now prints update and merge receipts as
+sentences. Agents get the governed `git.update_branch` tool, which needs `repo.push` and no approval,
+like `git.write_file`.
+
+An independent review, four reviewers each taking a slice, found the most important issue. A retry
+located its earlier commit by trailer lines in the branch's reflog, and anyone who can push can
+write those lines. A pushed commit carrying forged trailers could therefore be "replayed" in the
+moment before its push synchronized the pull request, keeping approvals on unreviewed content. A
+replay now never keeps reviews. It only follows the branch, as after any push. A Rust regression
+test lands such a commit and checks that its approval is cleared. Against the earlier code that
+test fails. The review also found:
+
+- One non-UTF-8 commit message in a branch's reflog made every later replay lookup fail, for file
+  writes too. Such commits are now skipped.
+- Branches with no shared history answered 500. They now get a 409 that says so.
+- The web page lost its conflict list to the router's automatic revalidation, and showed one generic
+  error for every refusal.
+- The agent tool's conflict text was unbounded. It now names five paths, as HTTP does.
+- The protected-branch refusal told a branch update to "write a file elsewhere".
+- A stale MCP contract test still called `ci.cancel_run` unimplemented. It was fixed while here.
+
+Proof: the readable TypeScript journey opens two approved pull requests and merges the first. It
+sees the second refused with `branch_behind_base`, updates it, and checks the response and its
+replay, the merge commit's parents and summary, the kept approval, the cleared `behind_base`, and a
+`pull_request` CI run for the merge commit. Then it merges the second pull request. A second journey
+gets `merge_conflict` with `README.md` named, an untouched branch, a refusal for a stale expected
+head, and a refusal for a principal without push. A third journey has an external agent with only
+`git.update_branch` update its pull request through MCP, replay the receipt, and be refused on a
+stale head. The real-stack browser spec signs in and sees "main has moved on.". It clicks Update branch and
+sees the one-approval gate stay open, then merges. Mocked browser tests cover the clean and the
+conflicting update. Unit tests cover the libgit2 merge (up to date, conflict, a clean merge that writes only
+a commit and a tree into the quarantine and moves no ref), the adoption transition, the
+review-request rule, and the web and CLI parsers and renderers. Edge unit tests cover the merge,
+replay, conflict, and forged-trailer paths, and the object-authorization suite checks that update-branch
+is refused without a push grant. The Git, pull-request, review, inbox, agent, privacy, and CLI
+journeys pass (95 journeys), along with the frontend check and strict Clippy for the touched crates.
+
 ## 2026-11-08 — Pull requests follow their branch
 
 A pull request recorded its head when it was opened and never looked at its branch again. Pushing a

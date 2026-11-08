@@ -69,8 +69,16 @@ pub(crate) fn outstanding_review_request_signal_drafts(
         tenant.0, record.number
     ));
     let mut drafts = Vec::new();
-    for review in &record.reviews {
+    for (index, review) in record.reviews.iter().enumerate() {
         if !matches!(review.state, ReviewState::Requested) {
+            continue;
+        }
+        // A review submitted after the request, and kept across a base merge, still answers it.
+        let answered = record.reviews[index + 1..].iter().any(|later| {
+            later.reviewer_pseudonym == review.reviewer_pseudonym
+                && matches!(later.state, ReviewState::Submitted(_))
+        });
+        if answered {
             continue;
         }
         if let Some(draft) = review_request_signal_draft(
@@ -332,6 +340,19 @@ mod tests {
         let signal: Signal = serde_json::from_value(resolved.payload).unwrap();
         assert_eq!(signal.state, SignalState::Resolved);
         assert_eq!(signal.last_seen, "2026-08-09T12:05:00Z");
+
+        let after_base_merge = outstanding_review_request_signal_drafts(
+            &tenant(),
+            &Region("fr-par".into()),
+            "core",
+            &record,
+            "2026-08-09T12:10:00Z",
+        )
+        .unwrap();
+        assert!(
+            after_base_merge.is_empty(),
+            "a review that still stands does not reopen its request"
+        );
     }
 
     #[test]

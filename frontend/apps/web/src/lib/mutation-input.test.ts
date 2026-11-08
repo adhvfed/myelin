@@ -91,6 +91,12 @@ describe("parsePrMutation", () => {
       n: 42,
       clientNonce: "review-start_1",
     });
+    expect(parsePrMutation({
+      op: "update-branch",
+      repo: "team/core",
+      n: 42,
+      expected_head_oid: "b".repeat(40),
+    })).toEqual({ op: "update-branch", repo: "team/core", n: 42, expected_head_oid: "b".repeat(40) });
   });
 
   it.each([
@@ -102,6 +108,9 @@ describe("parsePrMutation", () => {
     { op: "merge", repo: "core", n: 0 },
     { op: "merge", repo: "core", n: Number.MAX_SAFE_INTEGER + 1 },
     { op: "merge", repo: "core", n: 1, surprise: true },
+    { op: "update-branch", repo: "core", n: 1 },
+    { op: "update-branch", repo: "core", n: 1, expected_head_oid: "B".repeat(40) },
+    { op: "update-branch", repo: "core", n: 1, expected_head_oid: "b".repeat(40), force: true },
     { op: "comment", repo: "core", n: 1, threadId: "r-1", body_md: "x", clientNonce: "comment_1" },
     { op: "resolve", repo: "core", n: 1, threadId: "t-1", resolved: "yes" },
     { op: "review-start", repo: "core", n: 1 },

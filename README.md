@@ -217,6 +217,8 @@ myelin privacy request certificate 55555555-5555-4555-8555-555555555555
 
 myelin repo list
 myelin repo pr list
+# Merge the base into a pull request that another merge left behind, on the server:
+myelin --idempotency-key update-pr-7 repo pr update platform 7
 myelin project create "Developer experience" --prefix DX --idempotency-key developer-experience
 myelin project show
 myelin project list
@@ -348,6 +350,11 @@ trust tier fixed, creates fresh run and check identities, and makes an exact MCP
 `ci.cancel_run` is its counterpart for a queued or running run: after the same approval, Myelin
 stops the workflow, terminates the sandbox, settles its cost once, and records the agent as the
 actor that cancelled it.
+
+`git.update_branch` keeps an agent's pull request mergeable without a checkout. Myelin merges the
+base into the pull request's branch on the server, under the same protected-branch admission as an
+agent file write. A clean merge keeps the reviews on the change; a conflict names the files and
+writes nothing.
 
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous

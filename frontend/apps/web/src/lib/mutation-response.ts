@@ -285,6 +285,23 @@ export function parseAppliedMerge(value: unknown): { base_ref: string; new_oid: 
   return { base_ref: payload.base_ref, new_oid: payload.new_oid };
 }
 
+export function parseAppliedBranchUpdate(value: unknown): { updated: boolean; head_oid: string } | null {
+  const payload = applied(value, "git.pr.update_branch");
+  if (!payload || typeof payload.updated !== "boolean" || !oid(payload.head_oid) ||
+      typeof payload.replayed !== "boolean") return null;
+  return { updated: payload.updated, head_oid: payload.head_oid };
+}
+
+/** The bounded paths a refused branch update reports as conflicting. */
+export function parseMergeConflicts(value: unknown): string[] | null {
+  const input = record(value);
+  const error = record(input?.error);
+  if (error?.code !== "merge_conflict" || !Array.isArray(input?.conflicts) ||
+      input.conflicts.length === 0 || input.conflicts.length > 100 ||
+      input.conflicts.some((path) => !boundedString(path, 64 * 1024))) return null;
+  return [...input.conflicts] as string[];
+}
+
 function contextArray(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length > MAX_CHECK_CONTEXTS ||
       value.some((entry) => !boundedString(entry, 512))) return null;

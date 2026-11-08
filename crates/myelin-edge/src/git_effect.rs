@@ -16,7 +16,10 @@ use serde_json::Value;
 
 use crate::agent_delegation::is_active_delegation;
 use crate::effect_carrier::parse_proposed;
-use crate::git_durable::{map_durable_err, AgentFileWrite, DurableGitBackend, RepoActorContext};
+use crate::git_durable::{
+    describe_conflicts, map_durable_err, AgentFileWrite, BranchUpdate, DurableGitBackend,
+    RepoActorContext,
+};
 use crate::repo_authz::RepoPermission;
 
 pub struct GitEffectApi {
@@ -380,6 +383,31 @@ impl GitEffectApi {
                     Err(error) => deny_durable_error(error),
                 }
             }
+            "git.update_branch" => {
+                let (repo, number) = match repo_and_number(args) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::Push) {
+                    return denied;
+                }
+                match self.backend.update_pr_branch_with_operation(
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
+                    str_arg(args, "expected_head_oid"),
+                    operation_id,
+                ) {
+                    Ok(BranchUpdate::Updated { head_oid, .. }) => {
+                        branch_update_applied(run, t, repo, number, true, head_oid)
+                    }
+                    Ok(BranchUpdate::UpToDate { head_oid }) => {
+                        branch_update_applied(run, t, repo, number, false, head_oid)
+                    }
+                    Ok(BranchUpdate::Conflicted { paths }) => {
+                        EffectResult::Denied(describe_conflicts(&paths))
+                    }
+                    Err(error) => deny_durable_error(error),
+                }
+            }
             "git.merge" => {
                 let (repo, number) = match repo_and_number(args) {
                     Ok(v) => v,
@@ -405,6 +433,10 @@ impl GitEffectApi {
                     Ok(MergeAttempt::RefRefused(why)) => {
                         EffectResult::Denied(format!("merge ref advance refused: {why:?}"))
                     }
+                    Ok(MergeAttempt::BehindBase { base_ref }) => EffectResult::Denied(format!(
+                        "the pull request's branch is behind {base_ref}; update the branch, then \
+                         merge"
+                    )),
                     Ok(MergeAttempt::InvalidHead(why)) => {
                         EffectResult::Denied(format!("invalid merge head: {why}"))
                     }
@@ -507,6 +539,27 @@ fn applied_resource(run: &RunCtx, action: &str, artifact_ref: String, data: Valu
         event_id: EventId(format!("{action}|{}", run.0)),
         resource: EffectResource::new(artifact_ref, data),
     }
+}
+
+fn branch_update_applied(
+    run: &RunCtx,
+    tenant: &str,
+    repo: &str,
+    number: u64,
+    updated: bool,
+    head_oid: String,
+) -> EffectResult {
+    applied_resource(
+        run,
+        &format!("git.pr.update_branch:#{number}:{head_oid}"),
+        format!("myelin://{tenant}/git/commit/{repo}:{head_oid}"),
+        serde_json::json!({
+            "repo": repo,
+            "number": number,
+            "updated": updated,
+            "head_oid": head_oid,
+        }),
+    )
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {

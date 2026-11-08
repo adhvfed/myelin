@@ -8,6 +8,7 @@ import {
   createMemo,
   createSignal,
   createEffect,
+  on,
   onCleanup,
   untrack,
 } from "solid-js";
@@ -32,6 +33,7 @@ import {
   PR_COMMITS_PAGE_LIMIT,
   RepoRouteError,
   prMutate,
+  type BranchUpdateResult,
   type MergeResult,
   type PrVM,
   type PrChecksVM,
@@ -965,6 +967,44 @@ function MergeCard(props: {
     return reasons;
   });
 
+  const behind = () => props.pr.behind_base === true;
+  const baseName = () => props.pr.base_ref.replace(/^refs\/heads\//, "");
+  const [updating, setUpdating] = createSignal(false);
+  const [conflicts, setConflicts] = createSignal<string[] | null>(null);
+  // Conflicts describe one head; a push that moves it makes them stale.
+  createEffect(on(() => props.pr.head_oid, () => setConflicts(null), { defer: true }));
+
+  const doUpdate = async () => {
+    setUpdating(true);
+    setConflicts(null);
+    let result: BranchUpdateResult | null = null;
+    try {
+      result = await doMutate({
+        op: "update-branch",
+        repo: props.repo,
+        n: props.n,
+        expected_head_oid: props.pr.head_oid,
+      }) as BranchUpdateResult;
+    } catch {
+      props.toast.show({ title: "Could not update the branch", variant: "danger" });
+    } finally {
+      setUpdating(false);
+    }
+    if (result && "conflicts" in result) {
+      setConflicts(result.conflicts);
+      return;
+    }
+    if (result && "refused" in result) {
+      props.toast.show({ title: result.refused, variant: "warning" });
+    } else if (result) {
+      props.toast.show({
+        title: result.updated ? `Merged ${baseName()} into this branch` : "Already up to date",
+        variant: "success",
+      });
+    }
+    await props.onChange().catch(() => undefined);
+  };
+
   const doMerge = async () => {
     try {
       const res = await doMutate({ op: "merge", repo: props.repo, n: props.n });
@@ -973,7 +1013,14 @@ function MergeCard(props: {
         // N6 — the gate flipped mid-dialog: re-render the blocked card from the FRESH checks, never merge.
         if (r.checks) setLive(r.checks);
         setConfirm(false);
-        props.toast.show({ title: "Merge blocked — the gate changed. Showing the current state.", variant: "warning" });
+        props.toast.show({
+          title: r.behind_base
+            ? `${baseName()} moved on. Bring this branch up to date, then merge.`
+            : r.checks
+              ? "Merge blocked — the gate changed. Showing the current state."
+              : "The pull request changed while merging. Showing the current state.",
+          variant: "warning",
+        });
         await props.onChange();
       } else {
         setConfirm(false);
@@ -999,6 +1046,26 @@ function MergeCard(props: {
           </span>
         }
       >
+        <Show when={behind()}>
+          <div data-testid="branch-behind" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+            <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)" }}>
+              <Icon name="branch" /> <span><strong>{baseName()} has moved on.</strong> Update this branch to merge it. Reviews stay; checks run again.</span>
+            </span>
+            <Show when={conflicts()}>
+              {(paths) => (
+                <div role="alert" data-testid="branch-conflicts" style={{ color: "var(--warning)" }}>
+                  <p style={{ margin: "0" }}>Both branches changed {paths().length === 1 ? "this file" : paths().length >= 100 ? "these files (the first 100)" : "these files"}. Merge {baseName()} locally, resolve the conflicts, and push.</p>
+                  <ul style={{ margin: "0", "padding-inline-start": "var(--space-4)" }}>
+                    <For each={paths()}>{(path) => <li><code>{path}</code></li>}</For>
+                  </ul>
+                </div>
+              )}
+            </Show>
+            <button type="button" data-testid="update-branch-button" disabled={updating()} aria-busy={updating()} onClick={() => void doUpdate()} class="btn-secondary" style={{ ...barBtn, "align-self": "flex-start" }}>
+              <Icon name="cycle" /> {updating() ? "Updating…" : "Update branch"}
+            </button>
+          </div>
+        </Show>
         <Show
           when={live().gate_admitted}
           fallback={
@@ -1010,14 +1077,16 @@ function MergeCard(props: {
             </div>
           }
         >
-          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-            <span data-testid="merge-ready" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--success)" }}>
-              <Icon name="check-pass" /> <strong>Ready to merge</strong> — all required checks satisfied.
-            </span>
-            <button type="button" data-testid="merge-button" onClick={() => setConfirm(true)} class="btn-primary" style={{ ...barBtnPrimary, "align-self": "flex-start" }}>
-              <Icon name="merge" /> Merge pull request
-            </button>
-          </div>
+          <Show when={!behind()}>
+            <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+              <span data-testid="merge-ready" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--success)" }}>
+                <Icon name="check-pass" /> <strong>Ready to merge</strong> — all required checks satisfied.
+              </span>
+              <button type="button" data-testid="merge-button" onClick={() => setConfirm(true)} class="btn-primary" style={{ ...barBtnPrimary, "align-self": "flex-start" }}>
+                <Icon name="merge" /> Merge pull request
+              </button>
+            </div>
+          </Show>
         </Show>
       </Show>
 
@@ -1026,7 +1095,7 @@ function MergeCard(props: {
         onCancel={() => setConfirm(false)}
         onConfirm={() => void doMerge()}
         title="Merge this pull request?"
-        description={`This merges ${props.pr.head_ref} into ${props.pr.base_ref} with a merge commit. The branch protection gate is re-checked at merge time.`}
+        description={`This moves ${baseName()} forward to the reviewed head of ${props.pr.head_ref.replace(/^refs\/heads\//, "")}. Branch protection is checked again at merge time.`}
         confirmLabel="Merge"
         cancelLabel="Cancel"
       />

@@ -307,6 +307,10 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/merge"),
             json!({}),
         )),
+        CliCommand::PrUpdateBranch { repo, number } => Ok(EdgeCall::post_json(
+            format!("/v1/git/repos/{repo}/prs/{number}/update-branch"),
+            json!({}),
+        )),
         CliCommand::PrEndorseForkCi { repo, number } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/endorse-fork-ci"),
             json!({}),
@@ -643,6 +647,11 @@ mod tests {
         let merge = git_dispatch(&["pr", "merge", "alpha", "7"]).unwrap();
         assert_eq!(merge.method, HttpMethod::Post);
         assert_eq!(merge.path, "/v1/git/repos/alpha/prs/7/merge");
+
+        let update = git_dispatch(&["pr", "update", "alpha", "7"]).unwrap();
+        assert_eq!(update.method, HttpMethod::Post);
+        assert_eq!(update.path, "/v1/git/repos/alpha/prs/7/update-branch");
+        assert_eq!(update.payload.as_deref(), Some(b"{}".as_slice()));
 
         let review = git_dispatch(&["pr", "review", "alpha", "7", "--approve"]).unwrap();
         assert_eq!(review.path, "/v1/git/repos/alpha/prs/7/reviews");

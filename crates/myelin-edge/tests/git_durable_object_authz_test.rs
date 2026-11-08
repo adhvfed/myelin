@@ -399,6 +399,7 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
             br#"{"rulesets":[]}"#.as_slice(),
         ),
         ("/v1/git/repos/alpha/prs/1/endorse-fork-ci", b"".as_slice()),
+        ("/v1/git/repos/alpha/prs/1/update-branch", b"".as_slice()),
     ] {
         let (st, v) = h.call("subj-mallory", "POST", path, body);
         assert_eq!(st, 403, "un-granted {path} must be 403: {v}");
@@ -538,6 +539,13 @@ fn reader_grant_admits_reads_not_writes() {
     assert_eq!(st, 403, "a reader must NOT write: {v}");
     let (st, v) = h.call("subj-reader", "POST", "/v1/git/repos/alpha/prs", br#"{}"#);
     assert_eq!(st, 403, "a reader must NOT open a PR: {v}");
+    let (st, v) = h.call(
+        "subj-reader",
+        "POST",
+        "/v1/git/repos/alpha/prs/1/update-branch",
+        b"",
+    );
+    assert_eq!(st, 403, "a reader must NOT update a branch: {v}");
 }
 
 #[test]

@@ -32,7 +32,7 @@ fn cdc_8_1_ci_provider_and_mcp_consumer_are_byte_aligned() {
         );
     }
 
-    for internal_only in ["run", "cancel_run", "validate", "plan", "deploy"] {
+    for internal_only in ["run", "validate", "plan", "deploy"] {
         assert!(
             registry.resolve(&format!("ci.{internal_only}")).is_none(),
             "MCP must not promise an unimplemented CI adapter"

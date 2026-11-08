@@ -240,6 +240,7 @@ mod tests {
             "git.merge",
             "git.open_pr",
             "git.write_file",
+            "git.update_branch",
             "ci.read_run",
             "ci.read_log",
             "ci.retry_run",

@@ -97,6 +97,11 @@ pub const GIT_WRITE_FILE_APPLIED: &str = "git.write_file.applied";
 pub const GIT_WRITE_FILE_GATED: &str = "git.write_file.gated";
 pub const GIT_WRITE_FILE_DENIED: &str = "git.write_file.denied";
 pub const GIT_WRITE_FILE_INDETERMINATE: &str = "git.write_file.indeterminate";
+pub const GIT_UPDATE_BRANCH_ATTEMPTED: &str = "git.update_branch.attempted";
+pub const GIT_UPDATE_BRANCH_APPLIED: &str = "git.update_branch.applied";
+pub const GIT_UPDATE_BRANCH_GATED: &str = "git.update_branch.gated";
+pub const GIT_UPDATE_BRANCH_DENIED: &str = "git.update_branch.denied";
+pub const GIT_UPDATE_BRANCH_INDETERMINATE: &str = "git.update_branch.indeterminate";
 pub const GIT_SUBMIT_REVIEW_ATTEMPTED: &str = "git.submit_review.attempted";
 pub const GIT_SUBMIT_REVIEW_APPLIED: &str = "git.submit_review.applied";
 pub const GIT_SUBMIT_REVIEW_GATED: &str = "git.submit_review.gated";
@@ -142,6 +147,11 @@ pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     GIT_WRITE_FILE_GATED,
     GIT_WRITE_FILE_DENIED,
     GIT_WRITE_FILE_INDETERMINATE,
+    GIT_UPDATE_BRANCH_ATTEMPTED,
+    GIT_UPDATE_BRANCH_APPLIED,
+    GIT_UPDATE_BRANCH_GATED,
+    GIT_UPDATE_BRANCH_DENIED,
+    GIT_UPDATE_BRANCH_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,
@@ -228,6 +238,11 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_WRITE_FILE_GATED,
     GIT_WRITE_FILE_DENIED,
     GIT_WRITE_FILE_INDETERMINATE,
+    GIT_UPDATE_BRANCH_ATTEMPTED,
+    GIT_UPDATE_BRANCH_APPLIED,
+    GIT_UPDATE_BRANCH_GATED,
+    GIT_UPDATE_BRANCH_DENIED,
+    GIT_UPDATE_BRANCH_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,

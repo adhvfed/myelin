@@ -621,6 +621,9 @@ impl Handler for DPrOverview {
                     obj.insert("commits_count".into(), Value::Null);
                 }
             }
+            if let Some(behind) = self.be.pr_behind_base(&loc, &rec) {
+                obj.insert("behind_base".into(), json!(behind));
+            }
         }
         Ok(EdgeResponse::json(200, &vm))
     }
@@ -1482,6 +1485,19 @@ impl Handler for DMerge {
                     }),
                 ))
             }
+            MergeAttempt::BehindBase { base_ref } => Ok(EdgeResponse::json(
+                409,
+                &json!({
+                    "error": {
+                        "code": "branch_behind_base",
+                        "message": format!(
+                            "{} moved after this branch was made; update the branch, then merge",
+                            base_ref.strip_prefix("refs/heads/").unwrap_or(&base_ref)
+                        ),
+                    },
+                    "durable": true,
+                }),
+            )),
             MergeAttempt::RefRefused(reason) => Err(EdgeError::Conflict(format!(
                 "merge ref advance refused: {reason:?}"
             ))),
@@ -1489,6 +1505,62 @@ impl Handler for DMerge {
                 Err(EdgeError::BadRequest(format!("invalid merge head: {why}")))
             }
         }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateBranchBody {
+    expected_head_oid: Option<String>,
+}
+
+struct DUpdateBranch {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DUpdateBranch {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let body: UpdateBranchBody =
+            optional_json(&ctx.request.body, "pull request branch update")?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
+        let update = self
+            .be
+            .update_pr_branch_with_operation(
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(pull_request_number_param(ctx, "n")?),
+                body.expected_head_oid.as_deref(),
+                &operation_id,
+            )
+            .map_err(map_durable_err)?;
+        let (updated, head_oid, replayed) = match update {
+            BranchUpdate::UpToDate { head_oid } => (false, head_oid, false),
+            BranchUpdate::Updated { head_oid, replayed } => (true, head_oid, replayed),
+            BranchUpdate::Conflicted { paths } => {
+                return Ok(EdgeResponse::json(
+                    409,
+                    &json!({
+                        "error": {
+                            "code": "merge_conflict",
+                            "message": describe_conflicts(&paths),
+                        },
+                        "conflicts": paths,
+                        "durable": true,
+                    }),
+                ));
+            }
+        };
+        Ok(EdgeResponse::json(
+            200,
+            &json!({
+                "applied": { "action": "git.pr.update_branch", "updated": updated,
+                             "head_oid": head_oid, "replayed": replayed },
+                "durable": true,
+            }),
+        ))
     }
 }
 
@@ -1827,6 +1899,12 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
         "git.pr.threads.list",
         pr_read_guarded(&be, Arc::new(DPrThreads { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/update-branch"),
+        "git.pr.update_branch",
+        guarded(&be, Push, Arc::new(DUpdateBranch { be: be.clone() })),
     );
     b = b.route(
         post,

@@ -562,6 +562,8 @@ export function rawBytes(repo, _ref, path, attachment) {
 // A real two-commit history for acme/myelin (CommitRow::to_json).
 const C1 = "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334";
 const C2 = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
+/** The merge commit the dev edge reports after updating PR #6's branch with its base. */
+const UPDATED_HEAD = "c3d4e5f60718293a4b5c6d7e8f90011223344556";
 const BLOB_LIST_FILTER = "c3d4e5f60718293a4b5c6d7e8f90011223344556";
 const BLOB_BINARY = "d4e5f60718293a4b5c6d7e8f9001122334455667";
 const SEED_COMMITS = {
@@ -911,7 +913,54 @@ const SEED_PRS = {
     },
     checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: false, durable: true },
   },
+  // PR #6 — approved, but the base moved on: Update branch merges it cleanly (see devPost).
+  6: {
+    pr: {
+      number: 6,
+      pr_state: "open",
+      title: "Branch left behind by another merge",
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/behind",
+      head_oid: C2,
+      author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
+      reviews: 1,
+      created_at: 1718700000,
+      updated_at: 1718700000,
+      commits_count: 1,
+      commits_count_capped: false,
+      behind_base: true,
+      durable: true,
+    },
+    checks: { required_contexts: [], required_approvals: 1, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: true, changes_requested: false, current_approvals: 1, durable: true },
+  },
+  // PR #7 — behind, and its branch and the base changed the same lines.
+  7: {
+    pr: {
+      number: 7,
+      pr_state: "open",
+      title: "Branch that conflicts with its base",
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/clash",
+      head_oid: C2,
+      author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
+      reviews: 0,
+      created_at: 1718600000,
+      updated_at: 1718600000,
+      commits_count: 1,
+      commits_count_capped: false,
+      behind_base: true,
+      durable: true,
+    },
+    checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: true, changes_requested: false, current_approvals: 0, durable: true },
+  },
 };
+
+/** Pull requests whose branch the dev edge has updated since the last fixture reset. */
+const UPDATED_BRANCHES = new Set();
 
 // Keep one namespaced repository in the browser contract. Both coordinates deliberately share the
 // same PR records; the test double is proving transport and routing semantics, not modelling storage.
@@ -977,6 +1026,7 @@ let threadSeq = 0;
  *  test-control route so Playwright retries and repeated local suites start from the same state. */
 export function resetPrFixtures() {
   THREADS.clear();
+  UPDATED_BRANCHES.clear();
   threadSeq = 0;
 }
 function subjectKey(repo, n) {
@@ -1227,10 +1277,23 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
     doc.reviews = doc.reviews.filter((r) => r.id !== m[1]);
     return { status: 200, json: { applied: { action: "git.pr.review.discard", result: { discarded: m[1] } }, durable: true } };
   }
+  // POST …/update-branch — PR 6 merges its base cleanly; PR 7 conflicts; the rest are up to date.
+  if (tail === "update-branch") {
+    if (n === 7) {
+      return { status: 409, json: { error: { code: "merge_conflict", message: "the base and this branch both changed README.md; merge the base locally, resolve the conflicts, and push" }, conflicts: ["README.md"], durable: true } };
+    }
+    const updated = n === 6 && !UPDATED_BRANCHES.has(n);
+    if (updated) UPDATED_BRANCHES.add(n);
+    return { status: 200, json: { applied: { action: "git.pr.update_branch", updated, head_oid: prJson(repo, n).head_oid, replayed: false }, durable: true } };
+  }
   // POST …/merge — PR 2 is mergeable (gate admitted); PR 1 is blocked (409 + fresh checks, N6).
   if (tail === "merge") {
+    const current = prJson(repo, n);
+    if (current.behind_base) {
+      return { status: 409, json: { error: { code: "branch_behind_base", message: "main moved after this branch was made; update the branch, then merge" }, durable: true } };
+    }
     if (SEED_PRS[n].checks.gate_admitted) {
-      return { status: 200, json: { applied: { action: "git.pr.merge", merged: true, base_ref: SEED_PRS[n].pr.base_ref, new_oid: SEED_PRS[n].pr.head_oid }, durable: true } };
+      return { status: 200, json: { applied: { action: "git.pr.merge", merged: true, base_ref: current.base_ref, new_oid: current.head_oid }, durable: true } };
     }
     return { status: 409, json: { error: { code: "merge_blocked", message: "merge blocked by branch protection" }, checks: SEED_PRS[n].checks, durable: true } };
   }
@@ -1239,9 +1302,11 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
 
 /** GET /v1/git/repos/{repo}/prs/{n} → the durable PR record (null = 404). */
 export function prJson(repo, n) {
-  return hasSeedPullRequest(repo, n)
-    ? { ...SEED_PRS[n].pr, ref: `myelin://acme/git/pr/${repo}:${n}` }
-    : null;
+  if (!hasSeedPullRequest(repo, n)) return null;
+  const updated = UPDATED_BRANCHES.has(n)
+    ? { head_oid: UPDATED_HEAD, commits_count: SEED_PRS[n].pr.commits_count + 1, behind_base: false }
+    : {};
+  return { ...SEED_PRS[n].pr, ...updated, ref: `myelin://acme/git/pr/${repo}:${n}` };
 }
 
 /** GET /v1/git/repos/{repo}/prs/{n}/checks → the checks + merge-gate projection (null = 404). PR #3

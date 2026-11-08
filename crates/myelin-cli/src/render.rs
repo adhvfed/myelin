@@ -58,6 +58,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if let Some(rendered) = render_ci_run_change(value, call) {
         return rendered;
     }
+    if let Some(rendered) = render_pull_request_change(value, call) {
+        return rendered;
+    }
     if let Some(rendered) = privacy::render_response(value) {
         return rendered;
     }
@@ -411,7 +414,10 @@ fn render_ci_run_detail(value: &Value) -> String {
 
 fn render_ci_run_change(value: &Value, call: Option<&EdgeCall>) -> Option<String> {
     let path = call?.path.strip_prefix("/v1/ci/runs/")?;
-    let run_id = value.get("run_id").and_then(Value::as_str).filter(|id| safe_cli_uuid(id))?;
+    let run_id = value
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|id| safe_cli_uuid(id))?;
     let replayed = value.get("replayed").and_then(Value::as_bool) == Some(true);
     let again = if replayed { " (already requested)" } else { "" };
     if path.ends_with("/retry") {
@@ -425,6 +431,38 @@ fn render_ci_run_change(value: &Value, call: Option<&EdgeCall>) -> Option<String
     }
     if path.ends_with("/cancel") {
         return Some(format!("cancelled run {run_id}{again}\n"));
+    }
+    None
+}
+
+fn render_pull_request_change(value: &Value, call: Option<&EdgeCall>) -> Option<String> {
+    let path = call?.path.as_str();
+    let applied = value.get("applied")?;
+    let oid = |field: &str| {
+        applied
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|oid| oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(|oid| &oid[..12])
+    };
+    let action = applied.get("action")?.as_str()?;
+    if path.ends_with("/update-branch") && action == "git.pr.update_branch" {
+        let head = oid("head_oid")?;
+        let again = if applied.get("replayed").and_then(Value::as_bool) == Some(true) {
+            " (already done)"
+        } else {
+            ""
+        };
+        return Some(if applied.get("updated")?.as_bool()? {
+            format!("merged the base into the branch; head is now {head}{again}\n")
+        } else {
+            format!("already up to date at {head}\n")
+        });
+    }
+    if path.ends_with("/merge") && action == "git.pr.merge" {
+        let base = applied.get("base_ref")?.as_str()?;
+        let base = terminal_safe_single_line(base.strip_prefix("refs/heads/").unwrap_or(base));
+        return Some(format!("merged into {base} at {}\n", oid("new_oid")?));
     }
     None
 }
@@ -703,6 +741,42 @@ mod tests {
             "cr1_{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(frame)
         )
+    }
+
+    #[test]
+    fn pull_request_updates_and_merges_read_as_sentences() {
+        let head = "ab".repeat(20);
+        let update_call = crate::dispatch::git_dispatch(&["pr", "update", "alpha", "7"]).unwrap();
+        let merge_call = crate::dispatch::git_dispatch(&["pr", "merge", "alpha", "7"]).unwrap();
+        let update = |updated: bool, replayed: bool| {
+            json!({
+                "applied": { "action": "git.pr.update_branch", "updated": updated,
+                             "head_oid": head, "replayed": replayed },
+                "durable": true,
+            })
+        };
+        assert_eq!(
+            render_for_call(&update(true, false), false, &update_call),
+            "merged the base into the branch; head is now abababababab\n"
+        );
+        assert_eq!(
+            render_for_call(&update(true, true), false, &update_call),
+            "merged the base into the branch; head is now abababababab (already done)\n"
+        );
+        assert_eq!(
+            render_for_call(&update(false, false), false, &update_call),
+            "already up to date at abababababab\n"
+        );
+        let merged = json!({
+            "applied": { "action": "git.pr.merge", "merged": true, "base_ref": "refs/heads/main",
+                         "new_oid": head, "update_seq": 4 },
+            "durable": true,
+        });
+        assert_eq!(
+            render_for_call(&merged, false, &merge_call),
+            "merged into main at abababababab\n"
+        );
+        assert!(render_for_call(&merged, false, &update_call).starts_with('{'));
     }
 
     #[test]

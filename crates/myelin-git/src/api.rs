@@ -203,6 +203,10 @@ pub enum CliCommand {
         repo: String,
         number: u64,
     },
+    PrUpdateBranch {
+        repo: String,
+        number: u64,
+    },
     PrEndorseForkCi {
         repo: String,
         number: u64,
@@ -219,7 +223,8 @@ impl CliCommand {
             CliCommand::RepoList { .. } | CliCommand::PrList { .. } => Handler::ListFilter,
             CliCommand::RepoCreate { .. }
             | CliCommand::PrOpen { .. }
-            | CliCommand::PrReview { .. } => Handler::Lifecycle,
+            | CliCommand::PrReview { .. }
+            | CliCommand::PrUpdateBranch { .. } => Handler::Lifecycle,
             CliCommand::RepoView { .. } | CliCommand::PrView { .. } => Handler::Project,
             CliCommand::PrChecks { .. } => Handler::CheckStatus,
             CliCommand::PrMerge { .. } => Handler::MergeGate,
@@ -235,6 +240,7 @@ impl CliCommand {
                 | CliCommand::PrOpen { .. }
                 | CliCommand::PrReview { .. }
                 | CliCommand::PrMerge { .. }
+                | CliCommand::PrUpdateBranch { .. }
                 | CliCommand::PrEndorseForkCi { .. }
         )
     }
@@ -374,6 +380,10 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         "merge" => {
             let (repo, number) = repo_and_number(args)?;
             Ok(CliCommand::PrMerge { repo, number })
+        }
+        "update" | "update-branch" => {
+            let (repo, number) = repo_and_number(args)?;
+            Ok(CliCommand::PrUpdateBranch { repo, number })
         }
         "endorse-fork-ci" => {
             let (repo, number) = repo_and_number(args)?;
@@ -688,6 +698,13 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
             requires_approval: false,
             required_caps: &["repo.push"],
             handler: Handler::ReceivePack,
+        },
+        AgentToolDef {
+            local_name: "update_branch",
+            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"expected_head_oid":{"type":"string","pattern":"^[0-9a-f]{40}$","description":"the head last read; the update is refused if the branch has moved since"}},"additionalProperties":false}"#,
+            requires_approval: false,
+            required_caps: &["repo.push"],
+            handler: Handler::Lifecycle,
         },
         AgentToolDef {
             local_name: "submit_review",

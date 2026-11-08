@@ -150,6 +150,7 @@ export function parsePr(value: unknown): PrVM | null {
       (input.updated_at !== undefined && input.updated_at !== null && !uint(input.updated_at)) ||
       (input.commits_count !== undefined && input.commits_count !== null && !uint(input.commits_count)) ||
       (input.commits_count_capped !== undefined && typeof input.commits_count_capped !== "boolean") ||
+      (input.behind_base !== undefined && typeof input.behind_base !== "boolean") ||
       input.durable !== true) return null;
   return {
     number: input.number,
@@ -167,6 +168,7 @@ export function parsePr(value: unknown): PrVM | null {
     ...(input.updated_at === undefined ? {} : { updated_at: input.updated_at }),
     ...(input.commits_count === undefined ? {} : { commits_count: input.commits_count }),
     ...(input.commits_count_capped === undefined ? {} : { commits_count_capped: input.commits_count_capped }),
+    ...(input.behind_base === undefined ? {} : { behind_base: input.behind_base }),
     durable: true,
   };
 }

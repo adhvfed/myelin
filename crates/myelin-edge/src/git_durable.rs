@@ -1693,14 +1693,20 @@ impl DurableGitBackend {
 
         let loc = Self::loc(tenant, region, slug);
         let ref_name = RefName::new(full.clone());
-        self.admit_file_ref_update(
+        if let Some(reason) = self.protected_ref_refusal(
             &repo,
             &loc,
             principal,
             actor_is_agent,
             &ref_name,
             &prepared.commit,
-        )?;
+        )? {
+            return Err(DurableError::Conflict(format!(
+                "branch protection refused a direct file write to `{}`: {reason}; write to an \
+                 unprotected working branch and open a pull request",
+                ref_name.0
+            )));
+        }
 
         let ref_store =
             self.open_durable_refstore(repo.clone(), slug, tenant, region, principal)?;
@@ -1743,7 +1749,9 @@ impl DurableGitBackend {
         }
     }
 
-    fn admit_file_ref_update(
+    /// Why branch protection refuses a commit Myelin is about to land directly on `ref_name`,
+    /// or `None` when it may land.
+    fn protected_ref_refusal(
         &self,
         repo: &DurableGitRepo,
         loc: &RepoLoc,
@@ -1751,7 +1759,7 @@ impl DurableGitBackend {
         actor_is_agent: bool,
         ref_name: &RefName,
         new_commit: &CoreOid,
-    ) -> Result<(), DurableError> {
+    ) -> Result<Option<String>, DurableError> {
         let protection = self.prs.get_protection(loc)?;
         let is_configured = protection
             .as_ref()
@@ -1759,7 +1767,7 @@ impl DurableGitBackend {
             .is_some();
         let default_ref = RefName::new(repo.default_branch_ref()?);
         if !is_configured && !ref_name.has_baseline_protection(&default_ref) {
-            return Ok(());
+            return Ok(None);
         }
 
         // Agent file edits are proposals. The human delegator's repository administration grant
@@ -1772,7 +1780,7 @@ impl DurableGitBackend {
             );
         let (green, fork_unendorsed, endorsed) =
             self.check_facts_for_head(loc, new_commit.as_str(), principal);
-        evaluate_protected_ref_push(
+        Ok(evaluate_protected_ref_push(
             ref_name,
             false,
             false,
@@ -1783,13 +1791,8 @@ impl DurableGitBackend {
             &fork_unendorsed,
             &endorsed,
         )
-        .map_err(|reason| {
-            DurableError::Conflict(format!(
-                "branch protection refused a direct file write to `{}`: {reason:?}; write to an \
-                 unprotected working branch and open a pull request",
-                ref_name.0
-            ))
-        })
+        .err()
+        .map(|reason| format!("{reason:?}")))
     }
 
     pub fn get_pr(
@@ -3725,7 +3728,10 @@ mod repo_summary;
 mod repo_visibility;
 mod repository_views;
 mod review_threads;
+mod update_branch;
 pub use check_projection::GitDatabaseProviders;
+pub use update_branch::BranchUpdate;
+pub(crate) use update_branch::describe_conflicts;
 pub use http::register_git_durable;
 use http::{cross_pr_before_key, mint_pr_list_cursors, BlobViewOptions, RawResponseOptions};
 pub use recovery::{recover_placed_git_at_boot, GitBootRecoveryReport, GitCellBootRecoveryReport};

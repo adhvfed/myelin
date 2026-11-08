@@ -351,6 +351,34 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(matchingComments).toHaveCount(baseline + 1);
   });
 
+  test("a branch the base left behind is updated in place and becomes mergeable", async ({ page }) => {
+    await resetPrFixtures();
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/6");
+    await page.waitForLoadState("networkidle");
+    const behind = page.getByTestId("branch-behind");
+    await expect(behind).toContainText("main has moved on.");
+    await expect(page.getByTestId("merge-button")).toHaveCount(0);
+    await behind.getByRole("button", { name: "Update branch" }).click();
+    await expect(page.getByText("Merged main into this branch")).toBeVisible();
+    await expect(behind).toHaveCount(0);
+    await expect(page.getByTestId("merge-ready")).toBeVisible();
+    await expect(page.getByTestId("merge-button")).toBeVisible();
+  });
+
+  test("a conflicting base names the files and keeps the branch as it was", async ({ page }) => {
+    await resetPrFixtures();
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/7");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("branch-behind").getByRole("button", { name: "Update branch" }).click();
+    const conflicts = page.getByTestId("branch-conflicts");
+    await expect(conflicts).toHaveAttribute("role", "alert");
+    await expect(conflicts).toContainText("Both branches changed this file.");
+    await expect(conflicts.getByRole("listitem")).toHaveText(["README.md"]);
+    await expect(page.getByTestId("branch-behind")).toBeVisible();
+  });
+
   test("a mergeable PR opens the merge ConfirmDialog (alertdialog, safe-action focus)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/2"); // gate admitted.

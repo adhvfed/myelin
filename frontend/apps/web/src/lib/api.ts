@@ -2,7 +2,7 @@
 // `"use server"` directive keeps the gateway + token strictly server-side. On `Unauthorized` (a 401
 // that survived the single refresh + retry) the query throws a `/login` redirect — the canon's
 // 401→/login behaviour, applied centrally.
-import { action, json, query, redirect } from "@solidjs/router";
+import { action, json, query, redirect, type CustomResponse } from "@solidjs/router";
 import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
 import {
   parsePrMutation,
@@ -10,11 +10,13 @@ import {
 } from "./mutation-input";
 import {
   hasAppliedAction,
+  parseAppliedBranchUpdate,
   parseAppliedComment,
   parseAppliedMerge,
   parseAppliedReview,
   parseAppliedThreadResolution,
   parseAppliedThread,
+  parseMergeConflicts,
   parsePrChecks,
   parsePrThreads,
 } from "./mutation-response";
@@ -371,6 +373,8 @@ export interface PrVM {
   updated_at?: number | null;
   commits_count?: number | null;
   commits_count_capped?: boolean;
+  /** The base moved past this open branch; it must be updated before it can merge. */
+  behind_base?: boolean;
   durable: boolean;
 }
 
@@ -1127,6 +1131,8 @@ export const getFileLines = query(
 export interface MergeBlocked {
   blocked: true;
   checks: PrChecksVM | null;
+  /** The base moved past the branch; updating the branch makes it mergeable. */
+  behind_base: boolean;
 }
 export interface MergeOk {
   blocked: false;
@@ -1135,6 +1141,12 @@ export interface MergeOk {
 }
 export type MergeResult = MergeOk | MergeBlocked;
 
+export type BranchUpdateResult =
+  | { updated: boolean; head_oid: string }
+  | { conflicts: string[] }
+  /** Why the Edge would not update the branch, in words for the person who asked. */
+  | { refused: string };
+
 /** PR mutations share one action because Vinxi collides sibling actions in this module. */
 /** The union of every mutation's result (the caller narrows by `op`). */
 export type PrMutationResult =
@@ -1142,9 +1154,12 @@ export type PrMutationResult =
   | { comment: PrCommentVM }
   | { review: PrReviewVM }
   | { ok: true }
-  | MergeResult;
+  | MergeResult
+  | BranchUpdateResult;
 
-export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> => {
+export const prMutate = action(async (
+  m: PrMutation,
+): Promise<PrMutationResult | CustomResponse<PrMutationResult>> => {
   "use server";
   const parsed = parsePrMutation(m);
   if (!parsed) throw new RepoRouteError("error");
@@ -1230,9 +1245,44 @@ export const prMutate = action(async (m: PrMutation): Promise<PrMutationResult> 
               ? e.body as Record<string, unknown>
               : null;
             const checks = parsePrChecks(body?.checks);
-            return { blocked: true, checks };
+            const error = body?.error;
+            const behind_base = error !== null && typeof error === "object" &&
+              (error as Record<string, unknown>).code === "branch_behind_base";
+            return { blocked: true, checks, behind_base };
           }
           throw e;
+        }
+      }
+      case "update-branch": {
+        try {
+          const response = await edgePost(
+            `${base}/update-branch`,
+            { expected_head_oid: parsed.expected_head_oid },
+            mutationOptions,
+          );
+          const update = parseAppliedBranchUpdate(response);
+          if (!update) throw new RepoRouteError("error");
+          return update;
+        } catch (e) {
+          if (!(e instanceof GatewayError)) throw e;
+          if (e.status === 403 || e.status === 404) {
+            return { refused: "You can't update this branch." };
+          }
+          if (e.status !== 409) throw e;
+          const conflicts = parseMergeConflicts(e.body);
+          // Nothing changed, so the page keeps its state and shows the conflicting files.
+          if (conflicts) return json({ conflicts }, { revalidate: [] });
+          const error = e.body !== null && typeof e.body === "object" && !Array.isArray(e.body)
+            ? (e.body as Record<string, unknown>).error
+            : null;
+          const message = error !== null && typeof error === "object"
+            ? (error as Record<string, unknown>).message
+            : null;
+          return {
+            refused: typeof message === "string" && message.length > 0 && message.length <= 512
+              ? `Could not update the branch: ${message}`
+              : "Could not update the branch. Showing the latest state.",
+          };
         }
       }
     }

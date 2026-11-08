@@ -456,6 +456,26 @@ fn cli_is_loud_on_unknown_and_missing() {
 }
 
 #[test]
+fn update_branch_takes_exactly_a_repository_and_a_number() {
+    for verb in ["update", "update-branch"] {
+        assert_eq!(
+            parse_cli(&["pr", verb, "team/core", "7"]),
+            Ok(CliCommand::PrUpdateBranch {
+                repo: "team/core".into(),
+                number: 7,
+            })
+        );
+        assert!(parse_cli(&["pr", verb, "team/core", "7", "--force"]).is_err());
+        assert!(parse_cli(&["pr", verb, "team/core"]).is_err());
+    }
+    assert!(CliCommand::PrUpdateBranch {
+        repo: "core".into(),
+        number: 1
+    }
+    .is_write());
+}
+
+#[test]
 fn agent_tool_requires_approval_defaults_are_frozen() {
     let tools = agent_tools();
     let merge = tools

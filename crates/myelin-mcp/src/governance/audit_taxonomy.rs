@@ -57,6 +57,13 @@ pub(super) fn effect_event_type(
             denied: myelin_git::events::GIT_WRITE_FILE_DENIED,
             indeterminate: myelin_git::events::GIT_WRITE_FILE_INDETERMINATE,
         },
+        "git.update_branch" => EffectAuditEvents {
+            attempted: myelin_git::events::GIT_UPDATE_BRANCH_ATTEMPTED,
+            applied: myelin_git::events::GIT_UPDATE_BRANCH_APPLIED,
+            gated: myelin_git::events::GIT_UPDATE_BRANCH_GATED,
+            denied: myelin_git::events::GIT_UPDATE_BRANCH_DENIED,
+            indeterminate: myelin_git::events::GIT_UPDATE_BRANCH_INDETERMINATE,
+        },
         "git.submit_review" => EffectAuditEvents {
             attempted: myelin_git::events::GIT_SUBMIT_REVIEW_ATTEMPTED,
             applied: myelin_git::events::GIT_SUBMIT_REVIEW_APPLIED,

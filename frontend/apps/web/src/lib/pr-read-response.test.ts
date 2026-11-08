@@ -57,6 +57,7 @@ describe("PR read response projection", () => {
       updated_at: 1_719_450_001,
       commits_count: 2,
       commits_count_capped: false,
+      behind_base: true,
       durable: true,
       storage_key: "drop",
     })).toEqual({
@@ -75,8 +76,28 @@ describe("PR read response projection", () => {
       updated_at: 1_719_450_001,
       commits_count: 2,
       commits_count_capped: false,
+      behind_base: true,
       durable: true,
     });
+  });
+
+  it("refuses a PR record whose behind-base signal is not a boolean", () => {
+    const record = {
+      number: 42,
+      ref: "myelin://acme/git/pr/platform/api:42",
+      pr_state: "open",
+      title: null,
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/read-boundary",
+      head_oid: HEAD,
+      author: "reviewer@example.invalid",
+      reviews: 0,
+      created_at: null,
+      durable: true,
+    };
+    expect(parsePr(record)).not.toBeNull();
+    expect(parsePr({ ...record, behind_base: "yes" })).toBeNull();
   });
 
   it("projects PR diffs recursively", () => {

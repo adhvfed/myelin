@@ -16,6 +16,7 @@ impl MergeCommandResult {
                 update_seq,
             },
             Self::Blocked { evaluation } => MergeAttempt::Blocked(evaluation),
+            Self::BehindBase { base_ref } => MergeAttempt::BehindBase { base_ref },
             Self::InvalidHead { reason } => MergeAttempt::InvalidHead(reason),
             Self::RefRefused {
                 base_ref,

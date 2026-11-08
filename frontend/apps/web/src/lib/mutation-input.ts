@@ -23,7 +23,8 @@ export type PrMutation =
   | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string; clientNonce: string }
   | { op: "review-submit"; repo: string; n: number; reviewId: string; verdict: ReviewVerdict; summary_md?: string }
   | { op: "review-discard"; repo: string; n: number; reviewId: string }
-  | { op: "merge"; repo: string; n: number };
+  | { op: "merge"; repo: string; n: number }
+  | { op: "update-branch"; repo: string; n: number; expected_head_oid: string };
 
 export interface PrAnchor {
   path: string;
@@ -197,6 +198,11 @@ export function parsePrMutation(value: unknown): PrMutation | null {
         : null;
     case "merge":
       return exactKeys(input, ["op", "repo", "n"]) ? { op: "merge", ...base } : null;
+    case "update-branch":
+      return exactKeys(input, ["op", "repo", "n", "expected_head_oid"]) &&
+          typeof input.expected_head_oid === "string" && /^[0-9a-f]{40}$/.test(input.expected_head_oid)
+        ? { op: "update-branch", ...base, expected_head_oid: input.expected_head_oid }
+        : null;
     default:
       return null;
   }

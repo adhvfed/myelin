@@ -4,3 +4,5 @@ node_modules
 dist
 test-results
 playwright-report
+# vinxi writes and normally removes this while loading app.config.ts
+app.config.timestamp_*.js

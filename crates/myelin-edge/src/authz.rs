@@ -95,6 +95,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "git.pr.review",
     "git.pr.endorse_fork_ci",
     "git.pr.merge",
+    "git.pr.update_branch",
     "git.repo.branch_protection.set",
     "git.checks.report",
     "git.search.code",
@@ -333,6 +334,7 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         OP_PAT
     ),
     requirement!("git.pr.merge", "pull_request.merge", OP_PAT),
+    requirement!("git.pr.update_branch", "repo.push", OP_PAT),
     requirement!("git.repo.branch_protection.set", "repo.administer", OP_PAT),
     requirement!("git.checks.report", "ci.checks.report", CI_ONLY),
     requirement!("git.search.code", "repo.pull", OP_PAT),

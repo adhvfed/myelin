@@ -398,6 +398,9 @@ enum MergeCommandResult {
     Blocked {
         evaluation: MergeEval,
     },
+    BehindBase {
+        base_ref: String,
+    },
     InvalidHead {
         reason: String,
     },
@@ -428,6 +431,12 @@ pub enum PrMutation {
         expected_head_oid: String,
         head_oid: String,
     },
+    /// Moves the head onto a merge of the base that Myelin made from the reviewed head. The change
+    /// under review is unchanged, so reviews stand while checks rerun.
+    AdoptBaseMerge {
+        expected_head_oid: String,
+        head_oid: String,
+    },
     Touch,
 }
 
@@ -438,6 +447,7 @@ impl PrMutation {
             Self::SubmitReview(_) => "submit-review",
             Self::EndorseContexts(_) => "endorse-contexts",
             Self::SynchronizeHead { .. } => "synchronize-head",
+            Self::AdoptBaseMerge { .. } => "adopt-base-merge",
             Self::Touch => "touch",
         }
     }
@@ -445,7 +455,7 @@ impl PrMutation {
     fn event_type(&self) -> &'static str {
         match self {
             Self::SubmitReview(_) => GIT_REVIEW_SUBMITTED,
-            Self::SynchronizeHead { .. } => GIT_PR_SYNCHRONIZED,
+            Self::SynchronizeHead { .. } | Self::AdoptBaseMerge { .. } => GIT_PR_SYNCHRONIZED,
             Self::ReportChecks { .. } | Self::EndorseContexts(_) | Self::Touch => GIT_PR_UPDATED,
         }
     }
@@ -487,33 +497,47 @@ impl PrMutation {
                 expected_head_oid,
                 head_oid,
             } => {
-                if !matches!(record.state, PrState::Draft | PrState::Open) {
-                    return Err("pull request is not open for head synchronization");
-                }
-                if record.head_oid != expected_head_oid {
-                    return Err("pull request head changed before synchronization");
-                }
-                if head_oid.len() != 40
-                    || !head_oid
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err("pull request synchronized head is malformed");
-                }
-                record.head_oid = head_oid;
+                move_head(record, expected_head_oid, head_oid)?;
                 record.reviews.retain(|review| {
                     matches!(review.state, crate::lifecycle::ReviewState::Requested)
                 });
-                record.green_contexts.clear();
-                record.fork_unendorsed_contexts.clear();
-                record.endorsed_contexts.clear();
-                record.codeowner_review_satisfied = false;
             }
+            Self::AdoptBaseMerge {
+                expected_head_oid,
+                head_oid,
+            } => move_head(record, expected_head_oid, head_oid)?,
             Self::Touch => {}
         }
         record.updated_at = Some(updated_at_unix);
         Ok(())
     }
+}
+
+/// Points an open pull request at a new head and drops the check facts reported for the old one.
+fn move_head(
+    record: &mut PrRecord,
+    expected_head_oid: String,
+    head_oid: String,
+) -> Result<(), &'static str> {
+    if !matches!(record.state, PrState::Draft | PrState::Open) {
+        return Err("pull request is not open for head synchronization");
+    }
+    if record.head_oid != expected_head_oid {
+        return Err("pull request head changed before synchronization");
+    }
+    if head_oid.len() != 40
+        || !head_oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("pull request synchronized head is malformed");
+    }
+    record.head_oid = head_oid;
+    record.green_contexts.clear();
+    record.fork_unendorsed_contexts.clear();
+    record.endorsed_contexts.clear();
+    record.codeowner_review_satisfied = false;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1817,8 +1841,8 @@ impl PgPrStore {
                 &actor_subject_id,
                 &command_hash,
                 "completed",
-                MergeCommandResult::InvalidHead {
-                    reason: "the locked head OID is not a fast-forward of the target ref".into(),
+                MergeCommandResult::BehindBase {
+                    base_ref: record.base_ref.clone(),
                 },
             );
         }
@@ -3442,6 +3466,51 @@ mod tests {
         assert_eq!(record.updated_at, Some(1_722_470_401));
         assert_eq!(
             PrMutation::SynchronizeHead {
+                expected_head_oid: "a".repeat(40),
+                head_oid: "c".repeat(40),
+            }
+            .apply_to_at(&mut record, 1_722_470_402),
+            Err("pull request head changed before synchronization")
+        );
+    }
+
+    #[test]
+    fn adopting_a_base_merge_keeps_reviews_but_reruns_checks() {
+        let pull_request = crate::lifecycle::PullRequest::open(
+            1,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pull_request, "a".repeat(40));
+        let approval = crate::pr_store::ReviewRecord {
+            reviewer_pseudonym: "approved@acme.noreply".into(),
+            state: crate::lifecycle::ReviewState::Submitted(
+                crate::lifecycle::ReviewVerdict::Approve,
+            ),
+            is_agent: false,
+        };
+        record.reviews = vec![approval.clone()];
+        record.green_contexts = vec!["ci/test".into()];
+        record.codeowner_review_satisfied = true;
+
+        let adoption = PrMutation::AdoptBaseMerge {
+            expected_head_oid: "a".repeat(40),
+            head_oid: "b".repeat(40),
+        };
+        assert_eq!(adoption.event_type(), GIT_PR_SYNCHRONIZED);
+        assert_eq!(adoption.command_kind(), "adopt-base-merge");
+        adoption
+            .apply_to_at(&mut record, 1_722_470_401)
+            .expect("open PR adopts its base merge");
+
+        assert_eq!(record.head_oid, "b".repeat(40));
+        assert_eq!(record.reviews, [approval]);
+        assert!(record.green_contexts.is_empty());
+        assert!(!record.codeowner_review_satisfied);
+        assert_eq!(
+            PrMutation::AdoptBaseMerge {
                 expected_head_oid: "a".repeat(40),
                 head_oid: "c".repeat(40),
             }
