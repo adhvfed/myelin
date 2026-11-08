@@ -409,16 +409,15 @@ impl PgFlowExecutor {
             .map_err(|error| Self::map_signal_store_error(error, error_run_id))
     }
 
-    pub async fn cancel_on_conn(
+    /// Row-locks one workflow and returns its lifecycle state.
+    pub async fn lock_state_on_conn(
         &self,
         conn: &mut sqlx::PgConnection,
         run: &RunId,
-        reason: &str,
-    ) -> Result<CancelOnConnOutcome, ExecutorError> {
+    ) -> Result<String, ExecutorError> {
         bounded("run_id", &run.0, 256)?;
-        bounded("cancel reason", reason, 128)?;
         self.verify_connection_scope(conn).await?;
-        let state = sqlx::query_scalar::<_, String>(
+        sqlx::query_scalar::<_, String>(
             "SELECT state FROM workflow_run \
              WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
         )
@@ -427,8 +426,18 @@ impl PgFlowExecutor {
         .bind(&run.0)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(|error| store_error("lock workflow for cancellation", error))?
-        .ok_or_else(|| ExecutorError::UnknownRun(run.0.clone()))?;
+        .map_err(|error| store_error("lock workflow", error))?
+        .ok_or_else(|| ExecutorError::UnknownRun(run.0.clone()))
+    }
+
+    pub async fn cancel_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        run: &RunId,
+        reason: &str,
+    ) -> Result<CancelOnConnOutcome, ExecutorError> {
+        bounded("cancel reason", reason, 128)?;
+        let state = self.lock_state_on_conn(conn, run).await?;
         if run_state::is_terminal(&state) {
             return Ok(CancelOnConnOutcome::TerminalNoOp);
         }

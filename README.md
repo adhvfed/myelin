@@ -339,6 +339,9 @@ neither side needs a GitHub token.
 timed-out, cancelled, or reaped run, but only a human with current push authority on its source
 repository can approve the retry. Myelin keeps the source commit, branch, definition snapshot, and
 trust tier fixed, creates fresh run and check identities, and makes an exact MCP replay inert.
+`ci.cancel_run` is its counterpart for a queued or running run: after the same approval, Myelin
+stops the workflow, terminates the sandbox, settles its cost once, and records the agent as the
+actor that cancelled it.
 
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous

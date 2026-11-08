@@ -103,7 +103,9 @@ human approval, preserves the immutable repository, branch, commit, definition s
 tier, and causal provenance, and allocates a fresh run, workflow, and check attempts. Approval cards
 inherit visibility from the run's live source repository rather than a synthetic CI permission.
 Exact retries converge on the same requested run and event; they never buy or launch duplicate
-compute.
+compute. The same agent can ask to cancel one exact queued or running run under the same approval
+rule. Cancelling, whether by an agent or by supersession, stops the sandbox within seconds rather
+than letting abandoned compute run to its timeout, and its measured usage settles exactly once.
 
 The workspace is personalizable at creation time. Repository guidance remains the shared default,
 while an owner can layer their own way of working into the assigned workspace—for example, custom
@@ -236,7 +238,9 @@ CI-effect journeys must create and execute a real failing pipeline, prove an unr
 approve the retry, approve it as the repository owner, and observe a fresh terminal run in durable
 storage with the same repository, branch, commit, definition snapshot, and trust tier. They must
 also prove the retry event is co-committed exactly once and an exact MCP replay does not create a
-third run or another event.
+third run or another event. Cancellation journeys must cancel a workload that is genuinely running
+in gVisor and observe the run cancelled, its job cancelled, and its cost settled well before the
+command would have exited.
 Web automation journeys must activate a real hosted identity, create a bounded rule through the
 browser, produce real durable platform events, observe incoming firings without a manual reload,
 approve one, confirm rejection of another, reload both decisions, verify budget and personal-data

@@ -240,7 +240,7 @@ pub use ci_run_store::{
     INSERT_CI_RUN_QUERY, LOCK_CI_RUN_FOR_FINALIZE_QUERY, LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY,
     SELECT_CI_RUN_ACCOUNTING_QUERY, SELECT_CI_RUN_QUERY, VERIFY_CI_RUN_REPLAY_QUERY,
 };
-pub use ci_run_supersession::{CiRunSupersessionError, PgCiRunSupersession};
+pub use ci_run_supersession::{CiRunCancelOutcome, CiRunSupersessionError, PgCiRunSupersession};
 pub use ci_runner_host::{
     wait_for_ci_runner_host_drain_timeout, wait_for_ci_runner_host_failure, CiRunnerHost,
     CiRunnerHostConfig, CiRunnerHostFailure, CiRunnerHostHandle, CI_RUNNER_HOST_DRAIN_TIMEOUT,

@@ -8,11 +8,19 @@ fn catalogue_contains_only_durable_permission_checked_tools() {
             .iter()
             .map(ToolDef::canonical_name)
             .collect::<Vec<_>>(),
-        ["ci.read_log", "ci.read_run", "ci.retry_run"]
+        [
+            "ci.cancel_run",
+            "ci.read_log",
+            "ci.read_run",
+            "ci.retry_run"
+        ]
     );
     for definition in definitions {
         definition.validate().unwrap();
-        if definition.canonical_name() == "ci.retry_run" {
+        if matches!(
+            definition.canonical_name().as_str(),
+            "ci.cancel_run" | "ci.retry_run"
+        ) {
             assert_eq!(definition.required_caps, ["repo.push", CAP_RUN_VIEW]);
             assert_eq!(definition.effect_kind, EffectKind::Mutate);
             assert!(definition.side_effecting);
@@ -32,7 +40,6 @@ fn unavailable_ci_agent_actions_cannot_be_turned_into_definitions() {
     for unavailable in [
         "run",
         "run_pipeline",
-        "cancel_run",
         "validate",
         "plan",
         "deploy",
@@ -58,4 +65,8 @@ fn read_schemas_match_the_durable_handler_inputs() {
     let retry_run = ci_tool_def("retry_run").unwrap();
     assert!(retry_run.input_schema.contains("run_id"));
     assert!(!retry_run.input_schema.contains("job_id"));
+
+    let cancel_run = ci_tool_def("cancel_run").unwrap();
+    assert!(cancel_run.input_schema.contains("run_id"));
+    assert!(!cancel_run.input_schema.contains("job_id"));
 }

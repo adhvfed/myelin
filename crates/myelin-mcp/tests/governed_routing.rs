@@ -492,6 +492,7 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
     assert_eq!(
         names,
         [
+            "ci.cancel_run",
             "ci.read_log",
             "ci.read_run",
             "ci.retry_run",

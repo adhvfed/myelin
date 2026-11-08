@@ -179,6 +179,7 @@ mod tests {
                 "chat.post",
                 "chat.read_messages",
                 "chat.reply",
+                "ci.cancel_run",
                 "ci.read_log",
                 "ci.read_run",
                 "ci.retry_run",

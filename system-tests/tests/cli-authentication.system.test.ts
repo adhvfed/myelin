@@ -354,6 +354,7 @@ describe.sequential("the CLI authentication journey", () => {
         "git.resolve_thread",
         "git.search_code",
         "git.merge",
+        "ci.cancel_run",
         "ci.read_run",
         "ci.read_log",
         "ci.retry_run",
@@ -374,6 +375,9 @@ describe.sequential("the CLI authentication journey", () => {
     );
     expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
     expect(mcpManifest.tools.find((tool) => tool.name === "ci.retry_run")).toMatchObject({
+      annotations: { requiresApproval: true, readOnlyHint: false },
+    });
+    expect(mcpManifest.tools.find((tool) => tool.name === "ci.cancel_run")).toMatchObject({
       annotations: { requiresApproval: true, readOnlyHint: false },
     });
     expect(mcpDescription.stdout).not.toContain(systemTestConfig.token);

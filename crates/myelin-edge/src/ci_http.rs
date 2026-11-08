@@ -12,10 +12,12 @@ use myelin_ci_controlplane::surfacing_store::{
     CiRunStateFilter, CiRunSummary, CiRunSurfaceError, CiStepSurface, CI_LOG_RANGE_DEFAULT,
     CI_LOG_TAIL_BATCH_MAX, CI_RUN_PAGE_DEFAULT,
 };
-use myelin_ci_controlplane::CiRunRetryOutcome;
+use myelin_ci_controlplane::{
+    CiRunCancelOutcome, CiRunRetryOutcome, CiRunSupersessionError, PgCiRunSupersession,
+};
 use myelin_identity::Principal;
-use myelin_storage::{BlobStore, ContentHash};
-use myelin_tenancy::TenantId;
+use myelin_storage::{BlobStore, ContentHash, DurableCostLedger, SubstrateProvider};
+use myelin_tenancy::{Region, TenantId};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -35,6 +37,13 @@ pub struct DurableCiReadApi {
     git: Arc<DurableGitBackend>,
     blobs: Arc<dyn BlobStore + Send + Sync>,
     runtime: Handle,
+    cancellation_ledger: Option<DurableCostLedger>,
+}
+
+struct RunSource {
+    state: String,
+    repo_ref: String,
+    repo_slug: String,
 }
 
 impl DurableCiReadApi {
@@ -49,7 +58,16 @@ impl DurableCiReadApi {
             git,
             blobs,
             runtime,
+            cancellation_ledger: None,
         }
+    }
+
+    pub fn with_agent_cancellation(mut self, provider: SubstrateProvider) -> Self {
+        self.cancellation_ledger = Some(DurableCostLedger::with_runtime(
+            provider,
+            self.runtime.clone(),
+        ));
+        self
     }
 
     fn drive<F, T>(&self, future: F) -> Result<T, CiRunSurfaceError>
@@ -134,33 +152,18 @@ impl DurableCiReadApi {
     }
 
     pub fn may_retry_run(&self, principal: &Principal, run_id: &str) -> Result<bool, EdgeError> {
-        if !canonical_uuid(run_id) {
-            return Ok(false);
-        }
-        let Some(record) = self
-            .drive_run(self.runs.get_ci_run(
-                principal.tenant.as_str(),
-                principal.region.as_str(),
-                run_id,
-            ))
-            .map_err(map_run_error)?
-        else {
-            return Ok(false);
-        };
-        let Some(repo_ref) = record.repo_ref else {
-            return Ok(false);
-        };
-        let Some(slug) = repo_slug_from_ref(principal.tenant.as_str(), &repo_ref) else {
-            return Ok(false);
-        };
-        Ok(matches!(
-            record.state.as_str(),
-            "failed" | "timed_out" | "cancelled" | "reaped"
-        ) && self.git.repo_authorizer().authorize_repo_permission(
-            principal,
-            &RepoLoc::new(&principal.tenant.0, &principal.region.0, slug),
-            RepoPermission::Push,
-        ))
+        Ok(self.run_source(principal, run_id)?.is_some_and(|run| {
+            matches!(
+                run.state.as_str(),
+                "failed" | "timed_out" | "cancelled" | "reaped"
+            ) && self.may_push(principal, &run)
+        }))
+    }
+
+    pub fn may_cancel_run(&self, principal: &Principal, run_id: &str) -> Result<bool, EdgeError> {
+        Ok(self.run_source(principal, run_id)?.is_some_and(|run| {
+            matches!(run.state.as_str(), "queued" | "running") && self.may_push(principal, &run)
+        }))
     }
 
     pub(crate) fn may_view_run(
@@ -168,26 +171,44 @@ impl DurableCiReadApi {
         principal: &Principal,
         run_id: &str,
     ) -> Result<bool, EdgeError> {
+        Ok(self
+            .run_source(principal, run_id)?
+            .is_some_and(|run| self.git.may_view_ci_repo(principal, &run.repo_slug)))
+    }
+
+    /// `None` covers a non-canonical id, an unknown run, and a run without a repository.
+    fn run_source(
+        &self,
+        principal: &Principal,
+        run_id: &str,
+    ) -> Result<Option<RunSource>, EdgeError> {
         if !canonical_uuid(run_id) {
-            return Ok(false);
+            return Ok(None);
         }
-        let Some(record) = self
-            .drive_run(self.runs.get_ci_run(
-                principal.tenant.as_str(),
-                principal.region.as_str(),
-                run_id,
-            ))
-            .map_err(map_run_error)?
-        else {
-            return Ok(false);
-        };
-        let Some(repo_ref) = record.repo_ref else {
-            return Ok(false);
-        };
-        let Some(slug) = repo_slug_from_ref(principal.tenant.as_str(), &repo_ref) else {
-            return Ok(false);
-        };
-        Ok(self.git.may_view_ci_repo(principal, slug))
+        let tenant = principal.tenant.as_str();
+        let record = self
+            .drive_run(
+                self.runs
+                    .get_ci_run(tenant, principal.region.as_str(), run_id),
+            )
+            .map_err(map_run_error)?;
+        Ok(record.and_then(|record| {
+            let repo_ref = record.repo_ref?;
+            let repo_slug = repo_slug_from_ref(tenant, &repo_ref)?.to_owned();
+            Some(RunSource {
+                state: record.state,
+                repo_ref,
+                repo_slug,
+            })
+        }))
+    }
+
+    fn may_push(&self, principal: &Principal, run: &RunSource) -> bool {
+        self.git.repo_authorizer().authorize_repo_permission(
+            principal,
+            &RepoLoc::new(&principal.tenant.0, &principal.region.0, &run.repo_slug),
+            RepoPermission::Push,
+        )
     }
 
     pub fn retry_run(
@@ -207,6 +228,53 @@ impl DurableCiReadApi {
         }
         self.drive_run(self.runs.retry_ci_run(principal, run_id, idempotency_key))
             .map_err(map_retry_error)
+    }
+
+    pub fn cancel_run(
+        &self,
+        principal: &Principal,
+        delegator: &Principal,
+        run_id: &str,
+        idempotency_key: &str,
+    ) -> Result<CiRunCancelOutcome, EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Err(EdgeError::BadRequest(
+                "CI run id must be a canonical UUID".into(),
+            ));
+        }
+        // Replays reach an already-cancelled run, so only authority is checked here.
+        if !self
+            .run_source(delegator, run_id)?
+            .is_some_and(|run| self.may_push(delegator, &run))
+        {
+            return Err(EdgeError::NotFound("cancellable CI run not found".into()));
+        }
+        let ledger = self.cancellation_ledger.clone().ok_or_else(|| {
+            EdgeError::Unavailable("CI run cancellation authority is unavailable".into())
+        })?;
+        let authority = PgCiRunSupersession::new(
+            self.runs.pool().clone(),
+            ledger,
+            principal.tenant.clone(),
+            Region(principal.region.0.clone()),
+            self.runtime.clone(),
+        )
+        .map_err(map_cancel_error)?;
+        self.drive_cancel(authority.cancel_run(principal, run_id, idempotency_key))
+            .map_err(map_cancel_error)
+    }
+
+    fn drive_cancel<F, T>(&self, future: F) -> Result<T, CiRunSupersessionError>
+    where
+        F: std::future::Future<Output = Result<T, CiRunSupersessionError>>,
+    {
+        drive_result_on_runtime(
+            &self.runtime,
+            future,
+            CiRunSupersessionError::Database(
+                "CI cancellation requires the Edge multi-thread runtime",
+            ),
+        )
     }
 
     pub fn read_log(
@@ -427,6 +495,27 @@ fn map_retry_error(error: CiRunStoreError) -> EdgeError {
         error => {
             eprintln!("edge: durable CI retry failed: {error}");
             EdgeError::Unavailable("CI retry is temporarily unavailable".into())
+        }
+    }
+}
+
+fn map_cancel_error(error: CiRunSupersessionError) -> EdgeError {
+    match error {
+        CiRunSupersessionError::RunNotFound => {
+            EdgeError::NotFound("cancellable CI run not found".into())
+        }
+        CiRunSupersessionError::RunNotActive => {
+            EdgeError::Conflict("the CI run already finished".into())
+        }
+        CiRunSupersessionError::InvalidIdempotencyKey => {
+            EdgeError::BadRequest("CI cancellation idempotency key is invalid".into())
+        }
+        CiRunSupersessionError::InvalidActor => {
+            EdgeError::Forbidden("CI cancellation requires an active principal".into())
+        }
+        error => {
+            eprintln!("edge: durable CI cancellation failed: {error}");
+            EdgeError::Unavailable("CI cancellation is temporarily unavailable".into())
         }
     }
 }
@@ -671,21 +760,10 @@ fn authorized_repo_ref(
     principal: &Principal,
     run_id: &str,
 ) -> Result<String, EdgeError> {
-    let tenant = principal.tenant.as_str();
-    let region = principal.region.as_str();
-    let record = api
-        .drive_run(api.runs.get_ci_run(tenant, region, run_id))
-        .map_err(map_run_error)?
-        .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
-    let repo_ref = record
-        .repo_ref
-        .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
-    let repo_slug = repo_slug_from_ref(tenant, &repo_ref)
-        .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
-    if !api.git.may_view_ci_repo(principal, repo_slug) {
-        return Err(EdgeError::NotFound("CI run not found".into()));
-    }
-    Ok(repo_ref)
+    api.run_source(principal, run_id)?
+        .filter(|run| api.git.may_view_ci_repo(principal, &run.repo_slug))
+        .map(|run| run.repo_ref)
+        .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))
 }
 
 fn materialize_log_archive(

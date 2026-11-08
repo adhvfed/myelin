@@ -206,7 +206,6 @@ mod tests {
         for unavailable in [
             "ci.run",
             "ci.run_pipeline",
-            "ci.cancel_run",
             "ci.validate",
             "ci.plan",
             "ci.deploy",
@@ -244,6 +243,7 @@ mod tests {
             "ci.read_run",
             "ci.read_log",
             "ci.retry_run",
+            "ci.cancel_run",
             "issues.close",
             "issues.create",
             "issues.list",

@@ -22,6 +22,15 @@ pub const CI_RUN_TIMED_OUT: &str = "ci.run.timed_out";
 pub const CI_RUN_REAPED: &str = "ci.run.reaped";
 pub const CI_RUN_RETRY_REQUESTED: &str = "ci.run.retry_requested";
 
+pub const CI_CANCEL_RUN_ATTEMPTED: &str = "ci.run.cancel_attempted";
+pub const CI_CANCEL_RUN_APPLIED: &str = "ci.run.cancel_applied";
+pub const CI_CANCEL_RUN_GATED: &str = "ci.run.cancel_gated";
+pub const CI_CANCEL_RUN_DENIED: &str = "ci.run.cancel_denied";
+pub const CI_CANCEL_RUN_INDETERMINATE: &str = "ci.run.cancel_indeterminate";
+pub const CI_CANCEL_RUN_APPROVED: &str = "ci.run.cancel_approved";
+pub const CI_CANCEL_RUN_REJECTED: &str = "ci.run.cancel_rejected";
+pub const CI_CANCEL_RUN_EXPIRED: &str = "ci.run.cancel_expired";
+
 pub const CI_RETRY_RUN_ATTEMPTED: &str = "ci.run.retry_attempted";
 pub const CI_RETRY_RUN_APPLIED: &str = "ci.run.retry_applied";
 pub const CI_RETRY_RUN_GATED: &str = "ci.run.retry_gated";
@@ -78,6 +87,14 @@ pub const CI_DURABLE_TOKENS: &[&str] = &[
     CI_RUN_TIMED_OUT,
     CI_RUN_REAPED,
     CI_RUN_RETRY_REQUESTED,
+    CI_CANCEL_RUN_ATTEMPTED,
+    CI_CANCEL_RUN_APPLIED,
+    CI_CANCEL_RUN_GATED,
+    CI_CANCEL_RUN_DENIED,
+    CI_CANCEL_RUN_INDETERMINATE,
+    CI_CANCEL_RUN_APPROVED,
+    CI_CANCEL_RUN_REJECTED,
+    CI_CANCEL_RUN_EXPIRED,
     CI_RETRY_RUN_ATTEMPTED,
     CI_RETRY_RUN_APPLIED,
     CI_RETRY_RUN_GATED,

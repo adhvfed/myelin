@@ -21,7 +21,7 @@ pub struct CiEffectApi {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RetryRunRequest {
+struct RunMutationRequest {
     run_id: String,
 }
 
@@ -55,7 +55,10 @@ impl CiEffectApi {
         if !is_active_delegation(&self.principal, &self.delegator) {
             return Err("CI effect delegation is not an active human relationship".into());
         }
-        let definition = myelin_ci_controlplane::ci_tool_def("retry_run")
+        let local_tool = proposed_tool
+            .strip_prefix("ci.")
+            .ok_or_else(|| format!("unknown CI tool `{proposed_tool}`"))?;
+        let definition = myelin_ci_controlplane::ci_tool_def(local_tool)
             .filter(|definition| definition.canonical_name() == proposed_tool)
             .ok_or_else(|| format!("unknown CI tool `{proposed_tool}`"))?;
         let scope =
@@ -73,36 +76,62 @@ impl CiEffectApi {
     fn apply_tool(
         &self,
         _run: &RunCtx,
+        proposed_tool: &str,
         arguments: serde_json::Value,
         idempotency_key: &str,
     ) -> EffectResult {
-        let request: RetryRunRequest = match serde_json::from_value(arguments) {
+        let request: RunMutationRequest = match serde_json::from_value(arguments) {
             Ok(request) => request,
             Err(error) => {
-                return EffectResult::Denied(format!("invalid ci.retry_run arguments: {error}"))
+                return EffectResult::Denied(format!("invalid CI run mutation arguments: {error}"))
             }
         };
-        match self.ci.retry_run(
-            &self.principal,
-            &self.delegator,
-            &request.run_id,
-            idempotency_key,
-        ) {
-            Ok(outcome) => EffectResult::AppliedResource {
-                event_id: EventId(outcome.event_id),
-                resource: EffectResource::new(
-                    format!(
-                        "myelin://{}/ci/run/{}",
-                        self.principal.tenant.0, outcome.run_id
+        match proposed_tool {
+            "ci.retry_run" => match self.ci.retry_run(
+                &self.principal,
+                &self.delegator,
+                &request.run_id,
+                idempotency_key,
+            ) {
+                Ok(outcome) => EffectResult::AppliedResource {
+                    event_id: EventId(outcome.event_id),
+                    resource: EffectResource::new(
+                        format!(
+                            "myelin://{}/ci/run/{}",
+                            self.principal.tenant.0, outcome.run_id
+                        ),
+                        serde_json::json!({
+                            "run_id": outcome.run_id,
+                            "source_run_id": outcome.source_run_id,
+                            "workflow_run_id": outcome.workflow_run_id,
+                        }),
                     ),
-                    serde_json::json!({
-                        "run_id": outcome.run_id,
-                        "source_run_id": outcome.source_run_id,
-                        "workflow_run_id": outcome.workflow_run_id,
-                    }),
-                ),
+                },
+                Err(error) => EffectResult::Denied(error.client_message()),
             },
-            Err(error) => EffectResult::Denied(error.client_message()),
+            "ci.cancel_run" => match self.ci.cancel_run(
+                &self.principal,
+                &self.delegator,
+                &request.run_id,
+                idempotency_key,
+            ) {
+                Ok(outcome) => EffectResult::AppliedResource {
+                    event_id: EventId(outcome.event_id),
+                    resource: EffectResource::new(
+                        format!(
+                            "myelin://{}/ci/run/{}",
+                            self.principal.tenant.0, outcome.run_id
+                        ),
+                        serde_json::json!({
+                            "run_id": outcome.run_id,
+                            "workflow_run_id": outcome.workflow_run_id,
+                            "state": "cancelled",
+                        }),
+                    ),
+                },
+                Err(error) => EffectResult::Denied(error.client_message()),
+            },
+            tool => EffectResult::Denied(format!("unknown CI mutation `{tool}`")),
         }
     }
 }
@@ -124,7 +153,7 @@ impl EffectApi for CiEffectApi {
             return EffectResult::Denied("malformed proposed CI effect".into());
         };
         match self.authorize(authority, &tool) {
-            Ok(()) => self.apply_tool(run, arguments, &authority.idempotency_key),
+            Ok(()) => self.apply_tool(run, &tool, arguments, &authority.idempotency_key),
             Err(reason) => EffectResult::Denied(reason),
         }
     }
@@ -141,12 +170,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tool, "ci.retry_run");
-        let request: RetryRunRequest = serde_json::from_value(arguments).unwrap();
+        let request: RunMutationRequest = serde_json::from_value(arguments).unwrap();
         assert_eq!(request.run_id, "11111111-1111-1111-1111-111111111111");
         let (_, extra) = parse_proposed(
             r#"tool:ci.retry_run|args:{"run_id":"11111111-1111-1111-1111-111111111111","force":true}"#,
         )
         .unwrap();
-        assert!(serde_json::from_value::<RetryRunRequest>(extra).is_err());
+        assert!(serde_json::from_value::<RunMutationRequest>(extra).is_err());
     }
 }

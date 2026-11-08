@@ -5,8 +5,8 @@ use myelin_ci_sandbox::ResourceUsage;
 use myelin_events::check_seam::{ci_result_draft, rollup_ci_result};
 use myelin_events::{
     derive_envelope_from_persisted_cause, Actor, ArtifactRef, CausedBy, CorrelationId, DataRole,
-    EmitContext, EventDraft, EventId, EventType, MonotonicMinter, PersistedEventCause, Timestamp,
-    Visibility,
+    EmitContext, EventDraft, EventEnvelope, EventId, EventType, MonotonicMinter,
+    PersistedEventCause, Timestamp, Visibility,
 };
 use myelin_flow::{
     CancelOnConnOutcome, PgFlowExecutor, RunId, SignalPayload, TypedSignalSpec, JOB_DONE_SIGNAL,
@@ -17,6 +17,7 @@ use myelin_identity::{
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{DurableCostLedger, MeteredUnit, RunId as CostRunId, TenantScope};
 use myelin_tenancy::{Region, TenantId};
+use sqlx::types::Uuid;
 use sqlx::Row;
 
 use crate::ci_pipeline_driver::{
@@ -40,6 +41,70 @@ use crate::{
 
 const SUPERSEDED_REASON: &str = "superseded-by-newer-pr-head";
 const EVENT_ID_DOMAIN: &str = "myelin.ci.pr-run-supersession-event.v1";
+const AGENT_CANCEL_REASON: &str = "agent-requested";
+const AGENT_CANCEL_EVENT_ID_DOMAIN: &str = "myelin.ci.agent-run-cancellation-event.v1";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiRunCancelOutcome {
+    pub run_id: String,
+    pub workflow_run_id: String,
+    pub event_id: String,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug)]
+enum CancellationCause {
+    Superseded,
+    Agent {
+        actor: Principal,
+        idempotency_key: String,
+    },
+}
+
+impl CancellationCause {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Superseded => SUPERSEDED_REASON,
+            Self::Agent { .. } => AGENT_CANCEL_REASON,
+        }
+    }
+
+    fn actor(&self, tenant: &TenantId) -> Principal {
+        match self {
+            Self::Superseded => Principal::stub(
+                PrincipalId("ci-controlplane".into()),
+                PrincipalKind::Service,
+                tenant.clone(),
+            ),
+            Self::Agent { actor, .. } => actor.clone(),
+        }
+    }
+
+    fn event_id(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        run_id: &str,
+        kind: &str,
+        context: Option<&str>,
+    ) -> EventId {
+        match self {
+            Self::Superseded => supersession_event_id(tenant, region, run_id, kind, context),
+            Self::Agent {
+                actor,
+                idempotency_key,
+            } => agent_cancel_event_id(
+                tenant,
+                region,
+                run_id,
+                &actor.principal_id.0,
+                idempotency_key,
+                kind,
+                context,
+            ),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeadDecision {
@@ -76,6 +141,12 @@ struct CancellationProvenance {
 #[derive(Debug)]
 pub enum CiRunSupersessionError {
     InvalidScope,
+    InvalidActor,
+    InvalidIdempotencyKey,
+    RunNotFound,
+    RunNotActive,
+    /// The run moved between the unlocked read and its lock; the caller re-reads once.
+    RunChanged,
     Database(&'static str),
     Manifest,
     Workflow,
@@ -91,6 +162,13 @@ impl std::fmt::Display for CiRunSupersessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidScope => f.write_str("CI run supersession scope is invalid"),
+            Self::InvalidActor => f.write_str("CI run cancellation actor is invalid"),
+            Self::InvalidIdempotencyKey => {
+                f.write_str("CI run cancellation idempotency key is invalid")
+            }
+            Self::RunNotFound => f.write_str("CI run cancellation target was not found"),
+            Self::RunNotActive => f.write_str("CI run cancellation target is not active"),
+            Self::RunChanged => f.write_str("CI run cancellation target changed concurrently"),
             Self::Database(operation) => {
                 write!(
                     f,
@@ -230,6 +308,17 @@ impl PgCiRunSupersession {
         run_id: &str,
         wf_run_id: &str,
     ) -> Result<(), CiRunSupersessionError> {
+        self.cancel_queued_on_conn(conn, run_id, wf_run_id, &CancellationCause::Superseded)
+            .await
+    }
+
+    async fn cancel_queued_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        run_id: &str,
+        wf_run_id: &str,
+        cause: &CancellationCause,
+    ) -> Result<(), CiRunSupersessionError> {
         let attached: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM ci_drive_manifest \
                               WHERE tenant_id = $1 AND region = $2 \
@@ -278,8 +367,155 @@ impl PgCiRunSupersession {
                 "stale queued run lifecycle changed under its lock",
             ));
         }
-        emit_stale_run_cancelled_on_conn(conn, &self.tenant, &self.region, run_id).await?;
+        emit_run_cancelled_on_conn(conn, &self.tenant, &self.region, run_id, cause).await?;
         Ok(())
+    }
+
+    pub async fn cancel_run(
+        &self,
+        actor: &Principal,
+        run_id: &str,
+        idempotency_key: &str,
+    ) -> Result<CiRunCancelOutcome, CiRunSupersessionError> {
+        if actor.tenant != self.tenant
+            || actor.region != self.region
+            || !matches!(actor.kind, PrincipalKind::Agent { .. })
+            || actor.status != PrincipalStatus::Active
+        {
+            return Err(CiRunSupersessionError::InvalidActor);
+        }
+        if !canonical_uuid(run_id) {
+            return Err(CiRunSupersessionError::RunNotFound);
+        }
+        if idempotency_key.is_empty() || idempotency_key.len() > 512 {
+            return Err(CiRunSupersessionError::InvalidIdempotencyKey);
+        }
+        let cause = CancellationCause::Agent {
+            actor: actor.clone(),
+            idempotency_key: idempotency_key.to_owned(),
+        };
+        match self.try_cancel_run(&cause, run_id).await {
+            Err(CiRunSupersessionError::RunChanged) => {
+                match self.try_cancel_run(&cause, run_id).await {
+                    Err(CiRunSupersessionError::RunChanged) => {
+                        Err(CiRunSupersessionError::RunNotActive)
+                    }
+                    outcome => outcome,
+                }
+            }
+            outcome => outcome,
+        }
+    }
+
+    /// Locks in the order the starter, supersession, and completion already use: the PR group,
+    /// then the run row while it is still queued, or the workflow row once it is running.
+    async fn try_cancel_run(
+        &self,
+        cause: &CancellationCause,
+        run_id: &str,
+    ) -> Result<CiRunCancelOutcome, CiRunSupersessionError> {
+        let authority = self.clone();
+        let cause = cause.clone();
+        let run_id = run_id.to_owned();
+        myelin_storage::with_tenant_tx_error(
+            &self.pool,
+            &self.tenant.0,
+            &self.region.0,
+            move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT wf_run_id::text AS wf_run_id, state, concurrency_group \
+                         FROM ci_run \
+                         WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid",
+                    )
+                    .bind(&authority.tenant.0)
+                    .bind(&authority.region.0)
+                    .bind(&run_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|_| CiRunSupersessionError::Database("read cancellation target"))?
+                    .ok_or(CiRunSupersessionError::RunNotFound)?;
+                    let workflow_run_id: String = row.get("wf_run_id");
+                    let state: String = row.get("state");
+                    let group: Option<String> = row.get("concurrency_group");
+                    if let Some(group) = &group {
+                        authority.lock_group_on_conn(conn, group).await?;
+                    }
+                    let event_id = cause.event_id(
+                        &authority.tenant,
+                        &authority.region,
+                        &run_id,
+                        "run-cancelled",
+                        None,
+                    );
+                    let outcome = |replayed| CiRunCancelOutcome {
+                        run_id: run_id.clone(),
+                        workflow_run_id: workflow_run_id.clone(),
+                        event_id: event_id.0.clone(),
+                        replayed,
+                    };
+                    match state.as_str() {
+                        "queued" => {
+                            let locked: String = sqlx::query_scalar(
+                                "SELECT state FROM ci_run \
+                                 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid \
+                                 FOR UPDATE",
+                            )
+                            .bind(&authority.tenant.0)
+                            .bind(&authority.region.0)
+                            .bind(&run_id)
+                            .fetch_one(&mut *conn)
+                            .await
+                            .map_err(|_| {
+                                CiRunSupersessionError::Database("lock queued cancellation target")
+                            })?;
+                            if locked != "queued" {
+                                return Err(CiRunSupersessionError::RunChanged);
+                            }
+                            authority
+                                .cancel_queued_on_conn(conn, &run_id, &workflow_run_id, &cause)
+                                .await?;
+                            Ok(outcome(false))
+                        }
+                        "running" => {
+                            let workflow = authority
+                                .executor
+                                .lock_state_on_conn(conn, &RunId(workflow_run_id.clone()))
+                                .await
+                                .map_err(|_| CiRunSupersessionError::Workflow)?;
+                            if myelin_flow::run_state::is_terminal(&workflow) {
+                                return Err(CiRunSupersessionError::RunChanged);
+                            }
+                            let peer = ActivePrRun {
+                                run_id: run_id.clone(),
+                                wf_run_id: workflow_run_id.clone(),
+                                state,
+                                generation: None,
+                            };
+                            authority
+                                .cancel_running_on_conn_with_cause(conn, &peer, &cause)
+                                .await?;
+                            Ok(outcome(false))
+                        }
+                        "cancelled"
+                            if cancellation_event_exists_on_conn(
+                                conn,
+                                &event_id,
+                                &authority.tenant,
+                                &run_id,
+                                cause.reason(),
+                                &cause.actor(&authority.tenant),
+                            )
+                            .await? =>
+                        {
+                            Ok(outcome(true))
+                        }
+                        _ => Err(CiRunSupersessionError::RunNotActive),
+                    }
+                })
+            },
+        )
+        .await
     }
 
     pub(crate) async fn cancel_older_on_conn(
@@ -306,7 +542,14 @@ impl PgCiRunSupersession {
                     self.cancel_stale_queued_on_conn(conn, &peer.run_id, &peer.wf_run_id)
                         .await?;
                 }
-                "running" => self.cancel_running_on_conn(conn, &peer).await?,
+                "running" => {
+                    self.cancel_running_on_conn_with_cause(
+                        conn,
+                        &peer,
+                        &CancellationCause::Superseded,
+                    )
+                    .await?
+                }
                 _ => {
                     return Err(CiRunSupersessionError::CorruptState(
                         "active peer has an impossible lifecycle token",
@@ -336,7 +579,15 @@ impl PgCiRunSupersession {
             &self.tenant.0,
             &self.region.0,
             move |conn| {
-                Box::pin(async move { authority.cancel_running_on_conn(conn, &peer).await })
+                Box::pin(async move {
+                    authority
+                        .cancel_running_on_conn_with_cause(
+                            conn,
+                            &peer,
+                            &CancellationCause::Superseded,
+                        )
+                        .await
+                })
             },
         )
         .await
@@ -395,10 +646,11 @@ impl PgCiRunSupersession {
             .collect())
     }
 
-    async fn cancel_running_on_conn(
+    async fn cancel_running_on_conn_with_cause(
         &self,
         conn: &mut sqlx::PgConnection,
         peer: &ActivePrRun,
+        cause: &CancellationCause,
     ) -> Result<(), CiRunSupersessionError> {
         let (manifest, _) = self
             .manifest
@@ -427,7 +679,7 @@ impl PgCiRunSupersession {
         }
         let flow_outcome = self
             .executor
-            .cancel_on_conn(conn, &RunId(peer.wf_run_id.clone()), SUPERSEDED_REASON)
+            .cancel_on_conn(conn, &RunId(peer.wf_run_id.clone()), cause.reason())
             .await
             .map_err(|_| CiRunSupersessionError::Workflow)?;
         let queue_rows = sqlx::query(
@@ -582,6 +834,7 @@ impl PgCiRunSupersession {
                 &manifest,
                 unsettled_launched == 0,
                 true,
+                cause,
             )
             .await?;
         } else if updated.rows_affected() == 0 && flow_outcome == CancelOnConnOutcome::TerminalNoOp
@@ -1284,14 +1537,24 @@ pub(crate) async fn emit_settled_cancelled_checks_on_conn(
     region: &Region,
     manifest: &crate::CiDriveManifestV1,
 ) -> Result<(), CiRunSupersessionError> {
-    emit_cancelled_manifest_facts_on_conn(conn, tenant, region, manifest, true, false).await
+    emit_cancelled_manifest_facts_on_conn(
+        conn,
+        tenant,
+        region,
+        manifest,
+        true,
+        false,
+        &CancellationCause::Superseded,
+    )
+    .await
 }
 
-async fn emit_stale_run_cancelled_on_conn(
+async fn emit_run_cancelled_on_conn(
     conn: &mut sqlx::PgConnection,
     tenant: &TenantId,
     region: &Region,
     run_id: &str,
+    cause: &CancellationCause,
 ) -> Result<(), CiRunSupersessionError> {
     let provenance = cancellation_provenance(conn, tenant, region, run_id).await?;
     let run_ref = format!("myelin://{}/ci/run/{run_id}", tenant.0);
@@ -1302,7 +1565,7 @@ async fn emit_stale_run_cancelled_on_conn(
         payload: serde_json::json!({
             "run": run_ref,
             "repo_ref": &provenance.repo_ref,
-            "reason": SUPERSEDED_REASON,
+            "reason": cause.reason(),
         }),
         data_role: DataRole::Controller,
         visibility: Visibility::Internal,
@@ -1314,8 +1577,9 @@ async fn emit_stale_run_cancelled_on_conn(
         tenant,
         region,
         &provenance,
-        supersession_event_id(tenant, region, run_id, "run-cancelled", None),
+        cause.event_id(tenant, region, run_id, "run-cancelled", None),
         draft,
+        &cause.actor(tenant),
     )
     .await
 }
@@ -1327,6 +1591,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
     manifest: &crate::CiDriveManifestV1,
     cost_settled: bool,
     include_terminal_lifecycle: bool,
+    cause: &CancellationCause,
 ) -> Result<(), CiRunSupersessionError> {
     if manifest.tenant_id != tenant.0 || manifest.region != region.0 {
         return Err(CiRunSupersessionError::CorruptState(
@@ -1367,7 +1632,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
             tenant,
             region,
             &provenance,
-            supersession_event_id(
+            cause.event_id(
                 tenant,
                 region,
                 &manifest.ci_run_id,
@@ -1379,6 +1644,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
                 Some(context),
             ),
             draft,
+            &cause.actor(tenant),
         )
         .await?;
     }
@@ -1394,7 +1660,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
             "run": manifest.run_ref,
             "repo_ref": manifest.repo_ref,
             "commit_oid": manifest.commit_oid,
-            "reason": SUPERSEDED_REASON,
+            "reason": cause.reason(),
         }),
         data_role: DataRole::Controller,
         visibility: Visibility::Internal,
@@ -1406,8 +1672,9 @@ async fn emit_cancelled_manifest_facts_on_conn(
         tenant,
         region,
         &provenance,
-        supersession_event_id(tenant, region, &manifest.ci_run_id, "run-cancelled", None),
+        cause.event_id(tenant, region, &manifest.ci_run_id, "run-cancelled", None),
         run_draft,
+        &cause.actor(tenant),
     )
     .await?;
 
@@ -1428,7 +1695,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
             tenant,
             region,
             &provenance,
-            supersession_event_id(
+            cause.event_id(
                 tenant,
                 region,
                 &manifest.ci_run_id,
@@ -1436,6 +1703,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
                 None,
             ),
             ci_result_draft(&manifest.repo_ref, &result),
+            &cause.actor(tenant),
         )
         .await?;
     }
@@ -1492,6 +1760,7 @@ async fn co_commit_fact(
     provenance: &CancellationProvenance,
     event_id: EventId,
     draft: EventDraft,
+    actor: &Principal,
 ) -> Result<(), CiRunSupersessionError> {
     let timestamp = Timestamp(provenance.emitted_at.clone());
     let cause = PersistedEventCause {
@@ -1506,11 +1775,7 @@ async fn co_commit_fact(
             event_id,
             tenant: tenant.clone(),
             region: region.clone(),
-            actor: Actor(Principal::stub(
-                PrincipalId("ci-controlplane".into()),
-                PrincipalKind::Service,
-                tenant.clone(),
-            )),
+            actor: Actor(actor.clone()),
             schema_ver: 1,
             occurred_at: timestamp.clone(),
             recorded_at: timestamp,
@@ -1543,6 +1808,82 @@ fn supersession_event_id(
         hasher.update(field.as_bytes());
     }
     EventId(format!("ci-supersession-{}", hasher.finalize().to_hex()))
+}
+
+fn agent_cancel_event_id(
+    tenant: &TenantId,
+    region: &Region,
+    run_id: &str,
+    actor_id: &str,
+    idempotency_key: &str,
+    kind: &str,
+    context: Option<&str>,
+) -> EventId {
+    let mut hasher = blake3::Hasher::new_derive_key(AGENT_CANCEL_EVENT_ID_DOMAIN);
+    for field in [
+        tenant.0.as_str(),
+        region.0.as_str(),
+        run_id,
+        actor_id,
+        idempotency_key,
+        kind,
+        context.unwrap_or(""),
+    ] {
+        hasher.update(&(field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    EventId(format!("ci-agent-cancel-{}", hasher.finalize().to_hex()))
+}
+
+async fn cancellation_event_exists_on_conn(
+    conn: &mut sqlx::PgConnection,
+    event_id: &EventId,
+    tenant: &TenantId,
+    run_id: &str,
+    reason: &str,
+    actor: &Principal,
+) -> Result<bool, CiRunSupersessionError> {
+    let stored = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT envelope FROM outbox WHERE event_id = $1",
+    )
+    .bind(&event_id.0)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| CiRunSupersessionError::Database("verify cancellation replay"))?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    let envelope: EventEnvelope = serde_json::from_value(stored).map_err(|_| {
+        CiRunSupersessionError::CorruptState("cancellation replay event is malformed")
+    })?;
+    let run_ref = format!("myelin://{}/ci/run/{run_id}", tenant.0);
+    if envelope.event_id != *event_id
+        || envelope.tenant != *tenant
+        || envelope.actor.0 != *actor
+        || envelope.type_.0 != myelin_ci_sandbox::events::CI_RUN_CANCELLED
+        || envelope.subject.0 != run_ref
+        || envelope
+            .payload
+            .get("run")
+            .and_then(serde_json::Value::as_str)
+            != Some(run_ref.as_str())
+        || envelope
+            .payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            != Some(reason)
+    {
+        return Err(CiRunSupersessionError::CorruptState(
+            "cancellation replay event diverges from its deterministic identity",
+        ));
+    }
+    Ok(true)
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    Uuid::parse_str(value)
+        .map(|parsed| parsed.to_string() == value)
+        .unwrap_or(false)
 }
 
 fn manifest_check_trust_tier(

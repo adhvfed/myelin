@@ -1281,7 +1281,8 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         git_backend.clone(),
         ci_blobs.clone(),
         handle.clone(),
-    );
+    )
+    .with_agent_cancellation(provider.clone());
     builder = register_ci(
         builder,
         ci_runs,

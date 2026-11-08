@@ -1372,8 +1372,10 @@ fn approval_card_ref(scope: &TenantScope, tool: &str, args: &serde_json::Value) 
         McpApprovalContract::IssuesClose => {
             canonical_issue_ref_arg(scope, args).map(str::to_string)
         }
-        McpApprovalContract::CiRetryRun => canonical_ci_run_id_arg(args)
-            .map(|run_id| format!("myelin://{}/ci/run/{run_id}", scope.tenant().0)),
+        McpApprovalContract::CiCancelRun | McpApprovalContract::CiRetryRun => {
+            canonical_ci_run_id_arg(args)
+                .map(|run_id| format!("myelin://{}/ci/run/{run_id}", scope.tenant().0))
+        }
     }
 }
 
@@ -1400,6 +1402,10 @@ fn approval_risk_summary(tool: &str, args: &serde_json::Value) -> Vec<u8> {
         McpApprovalContract::CiRetryRun => canonical_ci_run_id_arg(args).map_or_else(
             || b"Retry a CI run".to_vec(),
             |run_id| format!("Retry CI run {run_id}").into_bytes(),
+        ),
+        McpApprovalContract::CiCancelRun => canonical_ci_run_id_arg(args).map_or_else(
+            || b"Cancel a CI run".to_vec(),
+            |run_id| format!("Cancel CI run {run_id}").into_bytes(),
         ),
     }
 }
@@ -1508,7 +1514,7 @@ pub fn approval_contract_from_effect_key(effect_key: &str) -> Option<McpApproval
         McpApprovalContract::IssuesClose => {
             valid_digest_effect_key(effect_key, contract.tool()).then_some(contract)
         }
-        McpApprovalContract::CiRetryRun => {
+        McpApprovalContract::CiCancelRun | McpApprovalContract::CiRetryRun => {
             valid_digest_effect_key(effect_key, contract.tool()).then_some(contract)
         }
     }

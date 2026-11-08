@@ -196,6 +196,10 @@ mod tests {
             requires_approval_default("ci", "retry_run"),
             "retrying CI spends fresh compute and remains human-gated"
         );
+        assert!(
+            requires_approval_default("ci", "cancel_run"),
+            "cancelling CI interrupts shared compute and remains human-gated"
+        );
 
         assert!(
             requires_approval_default("git", "merge"),

@@ -6,7 +6,7 @@ pub const CI_TOOL_VERSION: u32 = 1;
 
 pub const CAP_RUN_VIEW: &str = "run.view";
 
-pub const CI_TOOL_NAMES: &[&str] = &["read_log", "read_run", "retry_run"];
+pub const CI_TOOL_NAMES: &[&str] = &["cancel_run", "read_log", "read_run", "retry_run"];
 
 pub fn ci_tool_def(tool: &str) -> Option<ToolDef> {
     let input_schema = match tool {
@@ -16,12 +16,12 @@ pub fn ci_tool_def(tool: &str) -> Option<ToolDef> {
         "read_log" => {
             r#"{"type":"object","required":["run_id","job_id"],"properties":{"run_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"job_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"start":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":262144}},"additionalProperties":false}"#
         }
-        "retry_run" => {
+        "cancel_run" | "retry_run" => {
             r#"{"type":"object","required":["run_id"],"properties":{"run_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}},"additionalProperties":false}"#
         }
         _ => return None,
     };
-    let side_effecting = tool == "retry_run";
+    let side_effecting = matches!(tool, "cancel_run" | "retry_run");
     Some(ToolDef {
         name: ToolName(tool.to_string()),
         subsystem: CI_SUBSYSTEM.to_string(),

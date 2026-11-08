@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — Agents can ask to cancel CI
+
+`ci.cancel_run` is the counterpart to `ci.retry_run`: a governed MCP effect for one exact queued or
+running run. It is always owner-approved, and the approver must hold push authority on the run's
+repository. At apply time the delegator's push authority is rechecked, and the agent stays the
+attributed actor.
+
+The durable transaction locks in the order the starter, supersession, and natural completion
+already use: the PR concurrency group, then the run row while it is still queued, or the workflow
+row once it is running. That keeps it deadlock-free against all three. A run that moves underneath
+gets one re-read, so a cancel that loses to natural completion reports "already finished" instead
+of a transient 503. The event identity derives from the agent and its idempotency key. An exact
+replay finds the stored, verified event and returns the same receipt without touching cost.
+
+Proof: the readable TypeScript journey starts a 90-second pipeline, waits for its job to run in
+gVisor, and activates an external agent with only `ci.cancel_run`. It finds the exact run in the
+owner's inbox, proves another human cannot approve, approves as the owner, and applies and replays
+the effect. It then observes the run `cancelled` with its job cancelled and cost settled. It
+passed in 3.8 seconds against the restarted Edge, PostgreSQL, durable Git, agent service, CI
+control plane, runner, and gVisor. PostgreSQL held exactly one `ci.run.cancelled` event, with the
+agent as actor. The retry, CI lifecycle, CI history, pull-request lifecycle, CLI authentication,
+merge-approval, and privacy journeys also pass, as do the affected Rust unit suites and strict
+workspace Clippy.
+
 ## 2026-11-08 — Governed-merge stories publish the event Issues actually emits
 
 The merge-approval and privacy journeys published synthetic `issue.issue.updated` events whose
@@ -5830,13 +5854,13 @@ stories passed, strict all-target Clippy was clean, and the TypeScript system su
     agent journey before discovery. Git also has no production merge queue:
     durable checks and direct merges ship, but no PostgreSQL Flow merge body
     consumes `ci.result` and survives restart.
-19. **Agents can inspect CI, but cannot command it directly.** They can read
-    durable runs and bounded logs. Pipeline trigger/retry/cancel, validation,
-    planning, deploy/approve/rollback, and secret administration have no CI
-    effect carrier and remain absent from discovery. The existing repository
-    event pipeline and human secret administration do not substitute for a
-    governed, idempotent agent command with authorization, audit, and a
-    full-system journey.
+19. **Agent CI commands remain narrow.** Agents can read durable runs and bounded logs, and can
+    request owner-approved, retry-safe retries of one exact failed, timed-out, cancelled, or
+    reaped run and cancellation of one exact queued or running run, without a provider
+    credential. Pipeline trigger, validation, planning, deploy/approve/rollback, and secret
+    administration still have no CI effect carrier and remain absent from discovery. The
+    existing repository event pipeline and human secret administration do not substitute for
+    governed, idempotent agent commands with authorization, audit, and full-system journeys.
 20. **CI has no production elasticity controller.** Durable queue ordering and
     per-tenant launch admission exist, but runner demand histograms, prewarming,
     lane shedding, and plan-sensitive backpressure are not connected to a

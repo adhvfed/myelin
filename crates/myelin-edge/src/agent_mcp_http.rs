@@ -789,6 +789,17 @@ impl GateApproverPolicy for CreatorApproverPolicy {
                     .may_retry_run(&approver, run_id)
                     .map_err(|error| format!("CI retry approver lookup unavailable: {error:?}"))?
             }
+            McpApprovalContract::CiCancelRun => {
+                let run_id = args
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        "CI cancellation approval requires a canonical run_id".to_string()
+                    })?;
+                self.ci.may_cancel_run(&approver, run_id).map_err(|error| {
+                    format!("CI cancellation approver lookup unavailable: {error:?}")
+                })?
+            }
         };
         if !permitted {
             return Ok(Vec::new());

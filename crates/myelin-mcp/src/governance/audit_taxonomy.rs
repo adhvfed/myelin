@@ -127,6 +127,13 @@ pub(super) fn effect_event_type(
             denied: myelin_ci_controlplane::events::CI_RETRY_RUN_DENIED,
             indeterminate: myelin_ci_controlplane::events::CI_RETRY_RUN_INDETERMINATE,
         },
+        "ci.cancel_run" => EffectAuditEvents {
+            attempted: myelin_ci_controlplane::events::CI_CANCEL_RUN_ATTEMPTED,
+            applied: myelin_ci_controlplane::events::CI_CANCEL_RUN_APPLIED,
+            gated: myelin_ci_controlplane::events::CI_CANCEL_RUN_GATED,
+            denied: myelin_ci_controlplane::events::CI_CANCEL_RUN_DENIED,
+            indeterminate: myelin_ci_controlplane::events::CI_CANCEL_RUN_INDETERMINATE,
+        },
         "knowledge.create_page" => EffectAuditEvents {
             attempted: myelin_content::events::KNOWLEDGE_CREATE_PAGE_ATTEMPTED,
             applied: myelin_content::events::KNOWLEDGE_CREATE_PAGE_APPLIED,
@@ -182,6 +189,12 @@ pub(super) fn approval_event_type(
             AuditPhase::Approved => Ok(myelin_ci_controlplane::events::CI_RETRY_RUN_APPROVED),
             AuditPhase::Rejected => Ok(myelin_ci_controlplane::events::CI_RETRY_RUN_REJECTED),
             AuditPhase::Expired => Ok(myelin_ci_controlplane::events::CI_RETRY_RUN_EXPIRED),
+            _ => Err("invalid approval audit phase".into()),
+        },
+        McpApprovalContract::CiCancelRun => match phase {
+            AuditPhase::Approved => Ok(myelin_ci_controlplane::events::CI_CANCEL_RUN_APPROVED),
+            AuditPhase::Rejected => Ok(myelin_ci_controlplane::events::CI_CANCEL_RUN_REJECTED),
+            AuditPhase::Expired => Ok(myelin_ci_controlplane::events::CI_CANCEL_RUN_EXPIRED),
             _ => Err("invalid approval audit phase".into()),
         },
     }
