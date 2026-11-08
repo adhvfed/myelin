@@ -92,8 +92,10 @@ pub fn gate_id_from_ref_token(encoded: &str) -> Option<String> {
     }
     let bytes = encoded
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| Some((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| Some((hex_nibble(high)? << 4) | hex_nibble(low)?))
         .collect::<Option<Vec<_>>>()?;
     String::from_utf8(bytes).ok().filter(|gate_id| {
         !gate_id.is_empty()

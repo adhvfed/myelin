@@ -784,7 +784,7 @@ fn b64_decode_strict(input: &str) -> Result<Vec<u8>, String> {
         return Err("non-canonical firecracker stream base64".to_string());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (group_index, group) in bytes.chunks_exact(4).enumerate() {
+    for (group_index, group) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = group_index + 1 == bytes.len() / 4;
         let pad = match (group[2], group[3]) {
             (b'=', b'=') => 2,

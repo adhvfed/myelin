@@ -881,7 +881,7 @@ impl OciConfig {
             gid = process_id,
             args = args,
             process_cwd = process_cwd,
-            env_json = &*env_json,
+            env_json = *env_json,
             nnp = self.no_new_privileges,
             ro = self.root_readonly,
             mounts_json = mounts_json,

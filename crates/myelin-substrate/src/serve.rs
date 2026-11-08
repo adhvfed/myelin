@@ -1119,7 +1119,7 @@ mod tests {
         ) -> Result<(), myelin_events::DeadLetterError> {
             if self
                 .fail_next
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                     if left > 0 {
                         Some(left - 1)
                     } else {

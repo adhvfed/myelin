@@ -803,7 +803,7 @@ fn wait_until_ready(pipe: &mut OwnedFd) -> io::Result<()> {
                 }
                 return Err(error);
             }
-            return if read == 1 && ready == [b'R'] {
+            return if read == 1 && ready == *b"R" {
                 Ok(())
             } else {
                 Err(io::Error::new(

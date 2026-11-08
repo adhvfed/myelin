@@ -115,8 +115,8 @@ pub fn decode_issue_page_cursor(
         return Err("malformed or unsupported cursor");
     }
     let mut payload = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
-        payload.push((decode_hex(pair[0])? << 4) | decode_hex(pair[1])?);
+    for &[high, low] in hex.as_bytes().as_chunks::<2>().0 {
+        payload.push((decode_hex(high)? << 4) | decode_hex(low)?);
     }
     if payload.len() < 3 + 8 + 36 || payload[0] != CURSOR_VERSION {
         return Err("malformed or unsupported cursor");

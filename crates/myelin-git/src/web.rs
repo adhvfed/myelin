@@ -491,9 +491,9 @@ fn parse_cursor_oid(value: &str) -> Result<[u8; 20], PrCommitCursorError> {
         return Err(PrCommitCursorError);
     }
     let mut bytes = [0_u8; 20];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = cursor_hex_nibble(pair[0]).ok_or(PrCommitCursorError)?;
-        let low = cursor_hex_nibble(pair[1]).ok_or(PrCommitCursorError)?;
+    for (index, &[high, low]) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let high = cursor_hex_nibble(high).ok_or(PrCommitCursorError)?;
+        let low = cursor_hex_nibble(low).ok_or(PrCommitCursorError)?;
         bytes[index] = (high << 4) | low;
     }
     Ok(bytes)

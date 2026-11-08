@@ -727,7 +727,7 @@ impl OutboxTransaction {
                 ));
             }
         }
-        Ok(self.staged_rows.drain(..).collect())
+        Ok(std::mem::take(&mut self.staged_rows))
     }
 
     pub fn stage_state_change(&mut self, change: impl Into<String>) {
@@ -742,7 +742,7 @@ impl OutboxTransaction {
             OutboxError("detached outbox rows require a caller-owned atomic commit".into())
         })?;
         if let Some(backing) = store.durable_backing() {
-            let rows: Vec<OutboxRow> = self.staged_rows.drain(..).collect();
+            let rows: Vec<OutboxRow> = std::mem::take(&mut self.staged_rows);
             return backing.commit_staged_absorb(rows);
         }
         #[cfg(any(test, feature = "test-support"))]
@@ -781,7 +781,7 @@ impl OutboxTransaction {
             OutboxError("detached outbox rows require a caller-owned atomic commit".into())
         })?;
         if let Some(backing) = store.durable_backing() {
-            let rows: Vec<OutboxRow> = self.staged_rows.drain(..).collect();
+            let rows: Vec<OutboxRow> = std::mem::take(&mut self.staged_rows);
             return backing.commit_staged(rows);
         }
         #[cfg(any(test, feature = "test-support"))]

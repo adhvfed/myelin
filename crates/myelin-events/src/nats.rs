@@ -395,7 +395,7 @@ fn classify_delivery_body(
 
 fn allocate_delivery_token(sequence: &AtomicU64) -> Result<DeliveryToken, TransportError> {
     let previous = sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| TransportError("delivery token space exhausted".into()))?;
