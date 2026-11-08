@@ -41,6 +41,13 @@ pub fn resolved_explicit_userns_runsc_root() -> &'static Path {
     })
 }
 
+/// VFS_CAP_REVISION_2 `security.capability` blobs granting exactly cap_setuid / cap_setgid,
+/// permitted and effective.
+const NEWUIDMAP_CAP_SETUID_EP: &[u8] =
+    b"\x01\x00\x00\x02\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+const NEWGIDMAP_CAP_SETGID_EP: &[u8] =
+    b"\x01\x00\x00\x02\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+
 pub fn preflight_explicit_userns_helpers(helper_dir: &Path) -> Result<(), String> {
     if !helper_dir.is_absolute() {
         return Err(format!("{helper_dir:?} must be an absolute path"));
@@ -68,10 +75,6 @@ pub fn preflight_explicit_userns_helpers(helper_dir: &Path) -> Result<(), String
     crate::dirlock::verify_ancestors_not_writable_by_us(helper_dir).map_err(|reason| {
         format!("{helper_dir:?}'s ancestor chain is not safely anchored: {reason}")
     })?;
-    const NEWUIDMAP_CAP_SETUID_EP: &[u8] =
-        b"\x01\x00\x00\x02\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-    const NEWGIDMAP_CAP_SETGID_EP: &[u8] =
-        b"\x01\x00\x00\x02\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
     for (helper, expected_file_capability) in [
         ("newuidmap", NEWUIDMAP_CAP_SETUID_EP),
         ("newgidmap", NEWGIDMAP_CAP_SETGID_EP),
@@ -90,19 +93,18 @@ pub fn preflight_explicit_userns_helpers(helper_dir: &Path) -> Result<(), String
                 meta.uid()
             ));
         }
-        if meta.mode() & 0o4000 == 0 {
-            return Err(format!(
-                "{path:?} must be setuid (mode {:o} lacks the setuid bit)",
-                meta.mode() & 0o7777
-            ));
-        }
         if meta.mode() & 0o022 != 0 {
             return Err(format!(
                 "{path:?} must not be group/other-writable (mode {:o})",
                 meta.mode() & 0o777
             ));
         }
-        verify_helper_security_capability_xattr(&path, expected_file_capability)?;
+        verify_helper_privilege(
+            &path,
+            meta.mode(),
+            security_capability_xattr(&path)?.as_deref(),
+            expected_file_capability,
+        )?;
         let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| format!("{path:?} contains an interior NUL: {e}"))?;
         let executable_by_us = unsafe {
@@ -215,13 +217,25 @@ fn reject_security_capability_xattr_given(
     }
 }
 
-fn verify_helper_security_capability_xattr(path: &Path, expected: &[u8]) -> Result<(), String> {
-    match security_capability_xattr(path)? {
-        None => Ok(()),
-        Some(actual) if actual == expected => Ok(()),
-        Some(_) => Err(format!(
+/// A helper is privileged either by setuid-root or by exactly its distro file capability
+/// (shadow 4.20+ ships `cap_setuid=ep` / `cap_setgid=ep` instead of setuid).
+fn verify_helper_privilege(
+    path: &Path,
+    mode: u32,
+    capability: Option<&[u8]>,
+    expected: &[u8],
+) -> Result<(), String> {
+    match capability {
+        Some(actual) if actual != expected => Err(format!(
             "{path:?} carries an unexpected security.capability xattr; only its exact \
              distro-provided helper capability is accepted"
+        )),
+        Some(_) => Ok(()),
+        None if mode & 0o4000 != 0 => Ok(()),
+        None => Err(format!(
+            "{path:?} must be setuid or carry its distro file capability (mode {:o}, no \
+             security.capability xattr)",
+            mode & 0o7777
         )),
     }
 }
@@ -639,6 +653,41 @@ mod tests {
             result.is_err(),
             "a non-root-owned, non-setuid substitute must be refused"
         );
+    }
+
+    #[test]
+    fn helper_capabilities_grant_exactly_one_id_mapping_capability() {
+        const CAP_SETGID: u32 = 6;
+        const CAP_SETUID: u32 = 7;
+        const VFS_CAP_REVISION_2_EFFECTIVE: u32 = 0x0200_0001;
+        for (blob, capability) in [
+            (NEWUIDMAP_CAP_SETUID_EP, CAP_SETUID),
+            (NEWGIDMAP_CAP_SETGID_EP, CAP_SETGID),
+        ] {
+            let words: Vec<u32> = blob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect();
+            assert_eq!(
+                words,
+                [VFS_CAP_REVISION_2_EFFECTIVE, 1 << capability, 0, 0, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn helper_privilege_is_setuid_or_the_exact_distro_capability() {
+        let path = Path::new("/usr/bin/newuidmap");
+        let cap = NEWUIDMAP_CAP_SETUID_EP;
+        let other = NEWGIDMAP_CAP_SETGID_EP;
+        assert!(verify_helper_privilege(path, 0o104755, None, cap).is_ok());
+        assert!(verify_helper_privilege(path, 0o104755, Some(cap), cap).is_ok());
+        assert!(verify_helper_privilege(path, 0o100755, Some(cap), cap).is_ok());
+        assert!(verify_helper_privilege(path, 0o100755, None, cap).is_err());
+        assert!(verify_helper_privilege(path, 0o104755, Some(other), cap).is_err());
+        assert!(verify_helper_privilege(path, 0o100755, Some(other), cap).is_err());
     }
 
     #[test]

@@ -4,6 +4,37 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — The CI runner starts on current hosts again
+
+Three changes on the development host had quietly stopped self-hosted CI from passing its own
+checks:
+
+- **Capability-based user-namespace helpers.** shadow 4.20 ships `newuidmap`/`newgidmap` without
+  setuid, privileged only by `cap_setuid=ep`/`cap_setgid=ep`. The explicit-userns preflight insisted
+  on setuid, so the runner refused to start. A helper is now accepted when it is privileged by
+  exactly one recognized mechanism: setuid-root, or exactly its distro file capability. Every other
+  check (root ownership, writability, symlinks, ancestor anchoring, and the exact-capability rule)
+  is unchanged. A file capability grants strictly less than setuid-root.
+- **Workspace vendor asset.** Two September commits changed `Cargo.lock` without restaging the
+  offline vendor tree, and the staged tree had also drifted on disk. It was rebuilt with
+  `cargo vendor --locked` through the existing content-addressed flow and repinned in
+  `runner-assets.toml` and the sandbox registry.
+- **Rust 1.99.** `Atomic*::fetch_update` is deprecated in favour of `try_update`, and Clippy
+  gained `drain_collect`, `chunks_exact_to_as_chunks`, `useless_borrows_in_formatting`, and
+  `byte_char_slices` findings across eight call sites. Each was rewritten in its idiomatic form;
+  the hex and base64 decoders now destructure fixed-size chunks instead of indexing them.
+
+The Flow recovery lane also discarded its error, so the only symptom was "Flow recovery lane
+failed". `CiRuntimeCompositionError` now carries the step that failed and its cause, and the runner
+host logs it.
+
+Proof: the production-registry test verifies every staged asset, including the repinned vendor
+tree, and the explicit-userns suite (including the real-host preflight) passes. New tests cover the
+privilege rule (setuid, capability, both, neither, wrong capability) and decode both capability
+blobs to exactly one permitted-and-effective bit. Strict all-target/all-feature Clippy is clean for
+the whole workspace, the 3,242 unit stories in the twelve touched crates pass, and the CI control
+plane starts and executes jobs on the live Fed stack.
+
 ## 2026-11-08 — Cancelled runs can close their accounting again
 
 A cancelled run whose launched job settles after the cancellation never reached `cost_settled`.
