@@ -909,6 +909,65 @@ impl PgPrStore {
             .collect()
     }
 
+    /// `(number, head_oid)` of each open or draft pull request in `repo` whose head is one of
+    /// `head_refs` (a branch's full and short spellings) in that same repository.
+    pub fn open_heads_for_ref(
+        &self,
+        scope: &TenantScope,
+        repo: &str,
+        head_refs: &[&str],
+        maximum: usize,
+    ) -> Result<Vec<(u64, String)>, DurableError> {
+        let target = self.scoped_target(scope, repo)?;
+        let provider = self.provider.clone();
+        let tenant_id = target.tenant_id;
+        let region = target.region;
+        let loc = target.loc;
+        let transaction_tenant = tenant_id.0.clone();
+        let head_refs: Vec<String> = head_refs.iter().map(|head| (*head).to_owned()).collect();
+        let limit = i64::try_from(maximum).unwrap_or(i64::MAX);
+        let rows = self
+            .block_on(async move {
+                provider
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
+                        Box::pin(async move {
+                            sqlx::query(
+                                "SELECT number, record->>'head_oid' AS head_oid FROM git_pr \
+                                 WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 \
+                                   AND head_repo_slug=$3 AND record->>'head_ref' = ANY($4) \
+                                   AND record->>'state' IN ('Open','Draft') \
+                                 ORDER BY number LIMIT $5",
+                            )
+                            .bind(&tenant_id.0)
+                            .bind(&region.0)
+                            .bind(&loc.repo)
+                            .bind(&head_refs)
+                            .bind(limit)
+                            .fetch_all(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("list PRs following a branch"))
+                        })
+                    })
+                    .await
+            })
+            .map_err(pg_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let number: i64 = row
+                    .try_get("number")
+                    .map_err(|_| DurableError::Io("PR number malformed".into()))?;
+                let head_oid: Option<String> = row
+                    .try_get("head_oid")
+                    .map_err(|_| DurableError::Io("PR head malformed".into()))?;
+                Ok((
+                    u64::try_from(number)
+                        .map_err(|_| DurableError::Io("PR number malformed".into()))?,
+                    head_oid.ok_or_else(|| DurableError::Io("PR head missing".into()))?,
+                ))
+            })
+            .collect()
+    }
+
     pub fn list_bounded(
         &self,
         scope: &TenantScope,

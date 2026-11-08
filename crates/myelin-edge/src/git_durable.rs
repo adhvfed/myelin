@@ -117,6 +117,10 @@ pub struct PrActorContext<'a> {
     number: u64,
 }
 
+/// A branch shared by more open pull requests than this is not a review workflow worth syncing.
+const MAX_PULL_REQUESTS_FOLLOWING_A_BRANCH: usize = 100;
+/// Concurrent updates to one branch converge within a few reconciliation passes.
+const FOLLOW_BRANCH_ATTEMPTS: usize = 3;
 const MAX_CHECK_CONTEXTS: usize = 256;
 const MAX_CHECK_CONTEXT_BYTES: usize = 255;
 const MAX_BRANCH_PROTECTION_RULESETS: usize = 256;
@@ -1724,6 +1728,7 @@ impl DurableGitBackend {
         {
             PushOutcome::Accepted { .. } => {
                 let _ = repo.heal_head_symref();
+                self.follow_branch(&loc, principal, &full);
                 Ok(WebEditOutcome::Committed {
                     new_oid: prepared.commit.0,
                 })
@@ -1798,6 +1803,108 @@ impl DurableGitBackend {
         self.pr_get(&Self::loc(tenant, region, slug), number, principal)
     }
 
+    /// Moves each open pull request whose head is `branch` in this repository to the branch's
+    /// current tip, so its review, checks, and CI follow what was pushed. The ref update has
+    /// already committed, so a failure here is reported, not raised.
+    fn follow_branch(&self, loc: &RepoLoc, principal: &Principal, branch: &str) {
+        let branch = if branch.starts_with("refs/") {
+            branch.to_owned()
+        } else {
+            format!("refs/heads/{branch}")
+        };
+        if !branch.starts_with("refs/heads/") {
+            return;
+        }
+        for _ in 0..FOLLOW_BRANCH_ATTEMPTS {
+            match self.follow_branch_once(loc, principal, &branch) {
+                Ok(true) => return,
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "edge: pull requests on {}:{branch} could not follow it: {error}",
+                        loc.repo
+                    );
+                    return;
+                }
+            }
+        }
+        eprintln!(
+            "edge: pull requests on {}:{branch} did not settle on its tip",
+            loc.repo
+        );
+    }
+
+    /// One reconciliation pass; `false` when a concurrent update moved a pull request first.
+    fn follow_branch_once(
+        &self,
+        loc: &RepoLoc,
+        principal: &Principal,
+        branch: &str,
+    ) -> Result<bool, DurableError> {
+        let Some(tip) = self.store.open_repo(loc)?.read_ref(branch)? else {
+            return Ok(true);
+        };
+        let followers = self.open_prs_on_branch(loc, principal, branch)?;
+        if followers.len() >= MAX_PULL_REQUESTS_FOLLOWING_A_BRANCH {
+            eprintln!(
+                "edge: only the first {MAX_PULL_REQUESTS_FOLLOWING_A_BRANCH} pull requests on \
+                 {}:{branch} follow it",
+                loc.repo
+            );
+        }
+        let mut settled = true;
+        for (number, head_oid) in followers {
+            if head_oid == tip.0 {
+                continue;
+            }
+            let synchronized = self.pr_mutate(
+                loc,
+                number,
+                PrMutation::SynchronizeHead {
+                    expected_head_oid: head_oid,
+                    head_oid: tip.0.clone(),
+                },
+                &self.fresh_operation_id()?,
+                principal,
+            );
+            match synchronized {
+                Ok(_) => {}
+                Err(DurableError::Conflict(_)) => settled = false,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(settled)
+    }
+
+    fn open_prs_on_branch(
+        &self,
+        loc: &RepoLoc,
+        principal: &Principal,
+        branch: &str,
+    ) -> Result<Vec<(u64, String)>, DurableError> {
+        let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        if let Some(store) = &self.pg_prs {
+            return store.open_heads_for_ref(
+                &Self::verified_pr_scope(principal, loc)?,
+                &loc.repo,
+                &[branch, short],
+                MAX_PULL_REQUESTS_FOLLOWING_A_BRANCH,
+            );
+        }
+        Ok(self
+            .prs
+            .list_bounded(loc, PR_LIST_PER_REPO_MAX_RECORDS, PR_LIST_PER_REPO_MAX_BYTES)?
+            .into_iter()
+            .filter(|record| {
+                matches!(record.state, PrState::Open | PrState::Draft)
+                    && (record.head_ref == branch || record.head_ref == short)
+                    && record.head_repo_slug == loc.repo
+            })
+            .take(MAX_PULL_REQUESTS_FOLLOWING_A_BRANCH)
+            .map(|record| (record.number, record.head_oid))
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn synchronize_pr_head_with_operation(
         &self,
@@ -1825,12 +1932,20 @@ impl DurableGitBackend {
         if record.head_oid == head_oid {
             return Ok(record);
         }
-        if record.head_oid != expected_head_oid {
+        let repository = self.store.open_repo(&loc)?;
+        // A push to the branch may already have moved the pull request part of the way.
+        let expected_head_oid = if record.head_oid == expected_head_oid
+            || repository.is_fast_forward(
+                Some(&CoreOid::new(record.head_oid.clone())),
+                &CoreOid::new(head_oid.to_owned()),
+            )? {
+            record.head_oid.clone()
+        } else {
             return Err(DurableError::Conflict(
                 "pull request head changed before synchronization".into(),
             ));
-        }
-        let repository = self.store.open_repo(&loc)?;
+        };
+        let expected_head_oid = expected_head_oid.as_str();
         let current_tip = repository.read_ref(&record.head_ref)?;
         if current_tip.as_ref().map(CoreOid::as_str) != Some(head_oid) {
             return Err(DurableError::Conflict(
@@ -1927,16 +2042,16 @@ impl DurableGitBackend {
         }
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?;
-        let base_ref = body
-            .get("base_ref")
-            .and_then(Value::as_str)
-            .unwrap_or("refs/heads/main")
-            .to_string();
-        let head_ref = body
-            .get("head_ref")
-            .and_then(Value::as_str)
-            .unwrap_or("refs/heads/feature")
-            .to_string();
+        let base_ref = branch_ref(
+            body.get("base_ref")
+                .and_then(Value::as_str)
+                .unwrap_or("refs/heads/main"),
+        );
+        let head_ref = branch_ref(
+            body.get("head_ref")
+                .and_then(Value::as_str)
+                .unwrap_or("refs/heads/feature"),
+        );
         let head_repo_slug = body
             .get("head_repo")
             .or_else(|| body.get("head_repo_slug"))
@@ -1961,12 +2076,7 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let qualified_head_ref = if head_ref.starts_with("refs/") {
-            head_ref.clone()
-        } else {
-            format!("refs/heads/{head_ref}")
-        };
-        let source_tip = head_repo.read_ref(&qualified_head_ref)?;
+        let source_tip = head_repo.read_ref(&head_ref)?;
         let head_oid = if head_oid.is_empty() {
             match source_tip {
                 Some(tip) => tip.0,
@@ -2663,6 +2773,22 @@ impl DurableGitBackend {
         operation_id: &PrOperationId,
         ref_update_provenance: PushProvenance,
     ) -> Result<MergeAttempt, DurableError> {
+        let loc = Self::loc(target.repo.tenant, target.repo.region, target.repo.slug);
+        let actor = target.repo.principal;
+        let attempt = self.land_merge(target, repo_reader, operation_id, ref_update_provenance)?;
+        if let MergeAttempt::Merged { base_ref, .. } = &attempt {
+            self.follow_branch(&loc, actor, base_ref);
+        }
+        Ok(attempt)
+    }
+
+    fn land_merge(
+        &self,
+        target: PrActorContext<'_>,
+        repo_reader: &Principal,
+        operation_id: &PrOperationId,
+        ref_update_provenance: PushProvenance,
+    ) -> Result<MergeAttempt, DurableError> {
         let PrActorContext { repo, number } = target;
         let RepoActorContext {
             tenant,
@@ -2964,6 +3090,7 @@ impl DurableGitBackend {
 
         let ref_store =
             self.open_durable_refstore(repo.clone(), slug, tenant, region, principal)?;
+        let pushed_updates = updates.clone();
         let push = PushSession {
             updates,
             quarantine,
@@ -3030,6 +3157,9 @@ impl DurableGitBackend {
         match outcome.map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))? {
             PushOutcome::Accepted { .. } => {
                 let _ = repo.heal_head_symref();
+                for update in pushed_updates.iter().filter(|update| !update.new_oid.is_zero()) {
+                    self.follow_branch(&loc, principal, &update.ref_name.0);
+                }
                 Ok(report_status("ok", &per_ref_status))
             }
             PushOutcome::Rejected(reason) => Ok(report_status(

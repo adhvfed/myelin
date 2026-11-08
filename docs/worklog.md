@@ -4,6 +4,40 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — Pull requests follow their branch
+
+A pull request recorded its head when it was opened and never looked at its branch again. Pushing a
+review fix, whether with `git push` or through the web editor, moved the branch but not the review.
+The pull request kept showing the old commits, CI never tested the fix, approvals stayed attached
+to code nobody had reviewed, and merge refused because the branch no longer matched. Only the
+agent cloud-review handoff synchronized explicitly.
+
+After every accepted branch update (smart-HTTP push, web or API file commit, or a merge into a
+branch that is itself another pull request's head), Myelin reconciles the open and draft pull
+requests on that branch to its current tip. It uses the existing head-synchronization transition:
+approvals for the old head are cleared (requested reviewers stay), stale check facts and
+endorsements are dropped, the reviewer request reopens, and `git.pr.synchronized` makes CI test the
+exact new head. Each step compare-and-swaps on the pull request's current head. A pass that loses
+a race with a concurrent push re-reads the tip and tries again, so racing pushes, force pushes, and
+a force-push back to an earlier commit all converge on what the branch holds. The ref update has
+already committed, so a synchronization failure is reported rather than turned into a failed push.
+Pull requests now store full branch names when opened; short names such as `topic` previously
+broke their commit counts, and both spellings are matched for older records.
+
+The agent cloud-review handoff synchronizes explicitly. It now accepts a pull request that a
+person's push already moved part of the way along the same branch, instead of conflicting on every
+later publication. An independent review found that interaction, the replay-prone operation
+identity, short branch names, and the race.
+
+Proof: the readable TypeScript journey opens a pull request with a pull-request pipeline, then
+commits a fix through the API and observes the head and commit count follow. It pushes a second fix
+with stock `git` over smart HTTP and observes the head, the count, and a `pull_request` CI run for
+the pushed commit, then force-pushes a squashed rewrite and observes the head follow it. A second
+journey opens a pull request with short branch names and sees it follow, with a correct commit
+count. The ten Git, pull-request, cloud-review, agent-merge,
+dashboard, collaboration, and CI journeys also pass (40 journeys), and strict Clippy is clean for
+the touched crates.
+
 ## 2026-11-08 — Chat threads open in the web again
 
 Since late August the Edge has told a thread's viewer whether they follow it, so participants can
