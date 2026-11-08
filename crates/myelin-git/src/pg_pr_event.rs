@@ -125,7 +125,15 @@ pub(crate) async fn co_commit_event(
         .into_iter()
         .collect()
     } else {
-        Vec::new()
+        crate::notif_rules::auto_merge_signal_drafts(
+            &signal_ctx.tenant,
+            &signal_ctx.region,
+            &loc.repo,
+            record,
+            event_type,
+            &signal_ctx.recorded_at.0,
+        )
+        .map_err(|_| pg_query("derive automatic-merge signals"))?
     };
     let closes_targets = if event_type == GIT_PR_OPENED {
         closes_issue_targets(&loc.tenant, record.body_md.as_deref().unwrap_or_default())

@@ -17,6 +17,9 @@ pub const GIT_MENTIONED_RULE: &str = "git.mentioned";
 
 pub const GIT_WATCHED_RULE: &str = "git.watched";
 
+/// Tells the person who scheduled a merge that the merge queue stopped it.
+pub const GIT_AUTO_MERGE_STOPPED_RULE: &str = "git.auto_merge_stopped";
+
 fn review_requested_rule() -> Result<NotifRule, myelin_notif::DefineRuleError> {
     define_notif_rule(
         Reason::ReviewRequested,
@@ -44,7 +47,56 @@ pub fn git_notif_rules() -> Result<Vec<(&'static str, NotifRule)>, myelin_notif:
                 Class::Watching,
             )?,
         ),
+        (GIT_AUTO_MERGE_STOPPED_RULE, auto_merge_stopped_rule()?),
     ])
+}
+
+fn auto_merge_stopped_rule() -> Result<NotifRule, myelin_notif::DefineRuleError> {
+    define_notif_rule(
+        Reason::Blocked,
+        DedupTpl("git-auto-merge:{recipient}:{subject}".into()),
+        Class::Watching,
+    )
+}
+
+/// Opens a signal for the person whose scheduled merge the queue stopped, and resolves it when
+/// they schedule the pull request again.
+pub(crate) fn auto_merge_signal_drafts(
+    tenant: &TenantId,
+    region: &Region,
+    repo: &str,
+    record: &PrRecord,
+    event_type: &str,
+    recorded_at: &str,
+) -> Result<Vec<EventDraft>, ReviewSignalError> {
+    let (requested_by, state) = match (event_type, &record.auto_merge_stopped, &record.auto_merge) {
+        (crate::events::GIT_PR_MERGE_BLOCKED, Some(stopped), _) => {
+            (stopped.requested_by.as_str(), SignalState::Open)
+        }
+        (crate::events::GIT_PR_MERGE_QUEUED, _, Some(request)) => {
+            (request.requested_by.as_str(), SignalState::Resolved)
+        }
+        _ => return Ok(Vec::new()),
+    };
+    if requested_by.is_empty() {
+        return Ok(Vec::new());
+    }
+    let subject = ArtifactRef(format!(
+        "myelin://{}/git/pr/{repo}:{}",
+        tenant.0, record.number
+    ));
+    Ok(rule_signal_draft(
+        tenant,
+        region,
+        GIT_AUTO_MERGE_STOPPED_RULE,
+        &auto_merge_stopped_rule()?,
+        &subject,
+        &format!("{requested_by}@{}.noreply", tenant.0),
+        recorded_at,
+        state,
+    )?
+    .into_iter()
+    .collect())
 }
 
 pub fn register_git_notif_rules(
@@ -164,7 +216,30 @@ fn review_request_signal_draft(
     recorded_at: &str,
     state: SignalState,
 ) -> Result<Option<EventDraft>, ReviewSignalError> {
-    let Some(handle) = PseudonymHandle::parse(reviewer_pseudonym) else {
+    rule_signal_draft(
+        tenant,
+        region,
+        GIT_REVIEW_REQUESTED_RULE,
+        rule,
+        subject,
+        reviewer_pseudonym,
+        recorded_at,
+        state,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rule_signal_draft(
+    tenant: &TenantId,
+    region: &Region,
+    rule_key: &str,
+    rule: &NotifRule,
+    subject: &ArtifactRef,
+    recipient_pseudonym: &str,
+    recorded_at: &str,
+    state: SignalState,
+) -> Result<Option<EventDraft>, ReviewSignalError> {
+    let Some(handle) = PseudonymHandle::parse(recipient_pseudonym) else {
         return Ok(None);
     };
     if handle.tenant() != tenant.0 {
@@ -173,7 +248,7 @@ fn review_request_signal_draft(
     let recipient_id = handle.pseudonym();
     let dedup_key = rule.dedup_key(recipient_id, subject);
     let signal = Signal {
-        rule_id: RuleId(GIT_REVIEW_REQUESTED_RULE.into()),
+        rule_id: RuleId(rule_key.into()),
         tenant: tenant.clone(),
         severity: Severity::Notice,
         dedup_key: DedupKey(dedup_key.clone()),
@@ -207,7 +282,7 @@ fn review_request_signal_draft(
             "sig.{}.{}.{}",
             tenant.0,
             Severity::Notice.token(),
-            GIT_REVIEW_REQUESTED_RULE
+            rule_key
         )),
         aggregate: AggregateKey(format!("signal:{aggregate_id}")),
         payload,
@@ -246,7 +321,8 @@ mod tests {
             vec![
                 GIT_REVIEW_REQUESTED_RULE,
                 GIT_MENTIONED_RULE,
-                GIT_WATCHED_RULE
+                GIT_WATCHED_RULE,
+                GIT_AUTO_MERGE_STOPPED_RULE
             ]
         );
         for (key, rule) in &rules {
@@ -262,6 +338,7 @@ mod tests {
         assert_eq!(rules[1].1.default_class, Class::Direct);
         assert_eq!(rules[2].1.reason, Reason::Watched);
         assert_eq!(rules[2].1.default_class, Class::Watching);
+        assert_eq!(rules[3].1.reason, Reason::Blocked);
     }
 
     #[test]
@@ -356,14 +433,66 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_merge_reaches_the_person_who_scheduled_it() {
+        let pr = PullRequest::open(
+            7,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pr, "1".repeat(40));
+        record.auto_merge_stopped = Some(crate::pr_store::AutoMergeStopped {
+            reason: "a required check failed: ci/test".into(),
+            at: 10,
+            requested_by: "alice".into(),
+        });
+        let drafts = |event: &str, record: &PrRecord| {
+            auto_merge_signal_drafts(
+                &tenant(),
+                &Region("fr-par".into()),
+                "core",
+                record,
+                event,
+                "2026-11-09T00:00:00Z",
+            )
+            .unwrap()
+        };
+        let stopped = drafts(crate::events::GIT_PR_MERGE_BLOCKED, &record);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].type_.0, "signal.opened");
+        assert_eq!(
+            stopped[0].subject.0,
+            "sig.acme.notice.git.auto_merge_stopped"
+        );
+        assert_eq!(stopped[0].payload["notification_reason"], "blocked");
+        assert_eq!(
+            stopped[0].payload["mentions"][0]["Mention"]["principal_id"],
+            "alice"
+        );
+        assert!(drafts(crate::events::GIT_PR_UPDATED, &record).is_empty());
+
+        record.auto_merge_stopped = None;
+        record.auto_merge = Some(crate::pr_store::AutoMerge {
+            requested_by: "alice".into(),
+            requested_at: 20,
+            head_oid: "1".repeat(40),
+        });
+        let resolved = drafts(crate::events::GIT_PR_MERGE_QUEUED, &record);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].type_.0, "signal.resolved");
+        assert_eq!(resolved[0].aggregate, stopped[0].aggregate);
+    }
+
+    #[test]
     fn git_registers_with_zero_notif_change() {
         let mut reg = NotifRuleRegistry::platform_default();
         let before = reg.len();
         register_git_notif_rules(&mut reg).expect("git's set registers");
         assert_eq!(
             reg.len(),
-            before + 3,
-            "git's three rules accreted (no Notif enum/match edit)"
+            before + 4,
+            "git's four rules accreted (no Notif enum/match edit)"
         );
 
         let subject = myelin_refs::ArtifactRef("myelin://acme/git/pr/9".into());
@@ -388,8 +517,8 @@ mod tests {
         register_git_notif_rules(&mut reg).unwrap();
         assert_eq!(
             reg.len(),
-            3,
-            "re-registering Git's set keeps three rules (idempotent)"
+            4,
+            "re-registering Git's set keeps four rules (idempotent)"
         );
     }
 

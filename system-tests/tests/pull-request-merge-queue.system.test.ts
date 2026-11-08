@@ -5,6 +5,7 @@ import { systemTestConfig } from "../src/config.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { ciRunsMatching } from "../src/journeys/ci-runs.js";
+import { findInboxItemMatching, pullRequestSubject } from "../src/journeys/inbox.js";
 import { proposeChange, type OpenedPullRequest } from "../src/journeys/pull-requests.js";
 import { array, record, string, type JsonRecord } from "../src/json.js";
 
@@ -126,6 +127,13 @@ describe("the merge queue", () => {
       auto_merge: null,
       auto_merge_stopped: { reason: "a required check failed: ci/contract" },
     });
+    const subject = pullRequestSubject(project.slug, change.number);
+    const notice = await eventually(
+      () => findInboxItemMatching(systemClient, (item) =>
+        item.subject === subject && item.reason === "blocked"),
+      { description: "the person who scheduled the merge to hear that it stopped" },
+    );
+    expect(notice).toMatchObject({ reason: "blocked", class: "watching" });
 
     const again = await systemClient.json(`${project.path}/prs/${change.number}/auto-merge`, {
       method: "POST",

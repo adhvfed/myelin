@@ -136,6 +136,9 @@ pub struct AutoMerge {
 pub struct AutoMergeStopped {
     pub reason: String,
     pub at: i64,
+    /// Who scheduled the merge that stopped, so they hear about it.
+    #[serde(default)]
+    pub requested_by: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

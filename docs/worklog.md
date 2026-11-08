@@ -4,6 +4,20 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — The merge queue tells you when it stops
+
+A merge the queue stopped showed its reason only on the pull request. The person who scheduled it
+believed it was still on its way. Now a stop opens a notice in that person's inbox for the exact
+pull request, with the `blocked` reason, through a new `git.auto_merge_stopped` rule.
+Scheduling the pull request again resolves the notice. The stopped record keeps who scheduled it,
+so the notice reaches them even though the stop clears the schedule. Signal drafts for Git rules
+now share one builder rather than one hard-wired to review requests.
+
+Proof: the red-check merge-queue journey finds the `blocked` notice for its pull request in the
+scheduler's inbox, through the real notifications service. A unit test covers the opened signal,
+its recipient, and the matching resolution on scheduling again. The Git and notification journeys
+pass.
+
 ## 2026-11-09 — Merge when ready: a serial merge queue
 
 Update branch made a stranded pull request mergeable, but a person still had to watch CI and come

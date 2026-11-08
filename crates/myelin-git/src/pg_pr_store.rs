@@ -577,11 +577,16 @@ impl PrMutation {
                 {
                     return Err("the automatic merge changed before it could be stopped");
                 }
-                record.auto_merge = None;
+                let requested_by = record
+                    .auto_merge
+                    .take()
+                    .map(|request| request.requested_by)
+                    .unwrap_or_default();
                 record.auto_merge_stopped =
                     reason.map(|reason| crate::pr_store::AutoMergeStopped {
                         reason,
                         at: updated_at_unix,
+                        requested_by,
                     });
             }
             Self::Touch => {}
@@ -3752,6 +3757,7 @@ mod tests {
             Some(crate::pr_store::AutoMergeStopped {
                 reason: "conflicts with main".into(),
                 at: 700,
+                requested_by: "bob".into(),
             })
         );
         request("alice").apply_to_at(&mut record, 800).unwrap();
