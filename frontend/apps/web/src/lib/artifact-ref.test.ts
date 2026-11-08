@@ -82,6 +82,8 @@ describe("artifact references", () => {
   it("gives known work concise labels and local destinations", () => {
     expect(artifactRefLabel("myelin://acme/issue/issue/MYL-7")).toBe("MYL-7");
     expect(artifactRefHref("myelin://acme/issue/issue/MYL-7")).toBe("/issues?state=all&key=MYL-7");
+    expect(artifactRefHref("myelin://acme/issue/issue/c52b90e1-e302-4a0f-af7c-ecba6304b4c8"))
+      .toBe("/issues/c52b90e1-e302-4a0f-af7c-ecba6304b4c8");
     expect(artifactRefLabel("myelin://acme/git/pr/platform:42")).toBe("platform #42");
     expect(artifactRefHref("myelin://acme/git/pr/platform:42")).toBe("/git/repos/platform/prs/42");
     expect(artifactRefLabel("myelin://acme/git/pr/platform/api:42")).toBe("platform/api #42");

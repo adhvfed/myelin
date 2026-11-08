@@ -107,7 +107,11 @@ impl DurableNotifHttpApi {
         }
         let tenant = principal.tenant.0.clone();
         let region = principal.region.0.clone();
+        // References name an issue by key; Issues events name it by id.
         let issue_key = key.id;
+        let issue_uuid = Uuid::parse_str(&issue_key)
+            .ok()
+            .filter(|id| id.to_string() == issue_key);
         let query_tenant = tenant.clone();
         let query_region = region.clone();
         let issue_id = self.drive(with_tenant_tx_error(
@@ -118,12 +122,13 @@ impl DurableNotifHttpApi {
                 Box::pin(async move {
                     sqlx::query_scalar::<_, Uuid>(
                         "SELECT id FROM issue \
-                         WHERE tenant_id = $1 AND region = $2 AND key = $3 \
-                           AND deleted_at IS NULL",
+                         WHERE tenant_id = $1 AND region = $2 \
+                           AND (key = $3 OR id = $4) AND deleted_at IS NULL",
                     )
                     .bind(&query_tenant)
                     .bind(&query_region)
                     .bind(&issue_key)
+                    .bind(issue_uuid)
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(|_| PgInboxError::Database)

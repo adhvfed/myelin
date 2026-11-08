@@ -6,6 +6,8 @@ import { isFullGitRef } from "./git-ref";
 import { isGitPath } from "./git-read-input";
 import { gitBlobPath } from "./git-route";
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 const utf8 = new TextEncoder();
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_ARTIFACT_REF_BYTES = 4 * 1024;
@@ -258,7 +260,10 @@ export function artifactRefHref(reference: string, renderHint?: string): string 
   const parsed = parseArtifactRef(reference);
   if (!parsed) return undefined;
   if (parsed.subsystem === "issue" && parsed.type === "issue") {
-    return `/issues?state=all&key=${encodeURIComponent(parsed.id)}`;
+    // Issue events address the issue by id; references and API responses use its key.
+    return UUID.test(parsed.id)
+      ? `/issues/${parsed.id}`
+      : `/issues?state=all&key=${encodeURIComponent(parsed.id)}`;
   }
   if (parsed.subsystem === "knowledge" && parsed.type === "page") {
     return `/knowledge?page=${encodeURIComponent(parsed.id)}`;
