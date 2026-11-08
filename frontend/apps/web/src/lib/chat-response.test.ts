@@ -70,13 +70,18 @@ describe("Chat wire projection", () => {
       page: { next_cursor: null, limit: 50 },
     })?.items).toEqual([message]);
     expect(parseChatMessage({ conversation, message })).toEqual({ conversation, message });
-    expect(parseChatThread({
+    const thread = {
       conversation,
       ref: `myelin://acme/chat/thread/${NEXT}#thread-${NEXT}`,
+      following: true,
       root: { ...message, reply_count: 1 },
       items: [{ ...message, id: ID, thread_root_id: NEXT }],
       page: { next_cursor: null, limit: 50 },
-    })?.items).toEqual([{ ...message, id: ID, thread_root_id: NEXT }]);
+    };
+    expect(parseChatThread(thread)?.items).toEqual([{ ...message, id: ID, thread_root_id: NEXT }]);
+    expect(parseChatThread(thread)?.following).toBe(true);
+    expect(parseChatThread({ ...thread, following: "yes" })).toBeNull();
+    expect(parseChatThread({ ...thread, following: undefined })).toBeNull();
     expect(parseChatConversationReceipt({ conversation, durable: true })).toEqual({
       conversation,
       durable: true,

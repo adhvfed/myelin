@@ -4,6 +4,19 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — Chat threads open in the web again
+
+Since late August the Edge has told a thread's viewer whether they follow it, so participants can
+quiet a busy thread. The web's strict thread decoder was never taught the new field and rejected
+every response. Opening any reply thread in the browser therefore showed "Conversation
+unavailable", while the CLI and API kept working and the mocked browser contract, which lacked the
+field too, stayed green. The decoder and the dev-edge mock now carry `following`.
+
+Proof: the real-stack Chromium Chat journey creates an encrypted topic, links an issue, replies in a
+thread, links that thread from another message, and follows it back. It passed (21.6 s), and so does
+the complete real-stack browser suite (9 journeys). The web unit suite covers the field, including
+a missing and a malformed value.
+
 ## 2026-11-08 — A full regression sweep: issue approvals, SSH terminals, and stale journeys
 
 The complete system suite had not been run since September. On a fresh stack it found three

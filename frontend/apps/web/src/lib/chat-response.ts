@@ -68,6 +68,8 @@ export interface ChatMessageView {
 export interface ChatThreadPage {
   conversation: ChatConversation;
   ref: string;
+  /** Whether new replies in this thread notify the viewer. */
+  following: boolean;
   root: ChatMessage;
   items: ChatMessage[];
   page: { next_cursor: string | null; limit: number };
@@ -259,13 +261,21 @@ export function parseChatThread(value: unknown): ChatThreadPage | null {
   const subject = conversation(envelope?.conversation);
   const root = message(envelope?.root);
   const paging = page(envelope?.page);
-  if (!envelope || !exact(envelope, ["conversation", "ref", "root", "items", "page"]) ||
-      !subject || !cleanText(envelope.ref, 4 * 1024) || !root || root.thread_root_id !== null ||
+  if (!envelope || !exact(envelope, ["conversation", "ref", "following", "root", "items", "page"]) ||
+      !subject || !cleanText(envelope.ref, 4 * 1024) || typeof envelope.following !== "boolean" ||
+      !root || root.thread_root_id !== null ||
       !Array.isArray(envelope.items) || !paging || envelope.items.length > paging.limit) return null;
   const items = envelope.items.map(message);
   return items.every((item): item is ChatMessage =>
     item !== null && item.thread_root_id === root.id)
-    ? { conversation: subject, ref: envelope.ref, root, items, page: paging }
+    ? {
+      conversation: subject,
+      ref: envelope.ref,
+      following: envelope.following,
+      root,
+      items,
+      page: paging,
+    }
     : null;
 }
 

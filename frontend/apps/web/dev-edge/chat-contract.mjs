@@ -274,6 +274,7 @@ export class ChatFixtures {
     return {
       conversation: conversationJson(found.conversation),
       ref: `myelin://${TENANT}/chat/thread/${rootMessageId}#thread-${rootMessageId}`,
+      following: true,
       root: messageJson(found.message, replies.length),
       items: items.map((row) => messageJson(row)),
       page: {
