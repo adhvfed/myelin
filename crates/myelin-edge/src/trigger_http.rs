@@ -801,11 +801,13 @@ fn compile_matcher(
                 "payload.repo_ref",
                 format!("myelin://{tenant}/git/repo/{repository}"),
             )
-        } else if event_type == "git.ref.updated" && subject_type == "ref" {
+        } else if (event_type == "git.ref.updated" && subject_type == "ref") || subject_type == "pr"
+        {
             ("payload.repo", repository.to_owned())
         } else {
             return Err(EdgeError::BadRequest(
-                "repository scope is supported for CI run and Git ref automations".into(),
+                "repository scope is supported for CI run, Git ref, and pull-request automations"
+                    .into(),
             ));
         };
         condition_sources.push(format!("{field} == {}", quote_query_string(&value)));
@@ -831,10 +833,10 @@ fn compile_matcher(
                 "source_branch is not a canonical branch name".into(),
             ));
         }
-        let branch_field = if subject_type == "ref" {
-            "payload.ref"
-        } else {
-            "payload.source_ref"
+        let branch_field = match subject_type.as_str() {
+            "ref" => "payload.ref",
+            "pr" => "payload.head_ref",
+            _ => "payload.source_ref",
         };
         condition_sources.push(format!(
             "{branch_field} == {}",

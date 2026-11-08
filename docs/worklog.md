@@ -4,6 +4,42 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Automations can answer pull-request reviews
+
+Agents can open and update pull requests, but nothing could call one in when a reviewer asked for
+changes. An automation on `git.review.submitted` was impossible to create. The taxonomy inferred a
+"review" subject that no visibility rule knew, and naming the pull request explicitly was rejected
+as a conflict. The review event did not say what the reviewer decided, so even a working trigger
+could not tell "approve" from "request changes".
+
+Three things changed:
+- A review event's automation subject is now its pull request.
+- The event payload carries `review_verdict` and `reviewer_is_agent`. They are flat scalars,
+  because automation filters bind only top-level payload fields. A first attempt with a nested
+  object failed the journey for exactly that reason.
+- Pull-request automations accept a `repository` scope.
+
+So `event_type: "git.review.submitted"`, `repository`, and
+`filter: "payload.review_verdict == 'request_changes'"` bind an agent to exactly the reviews it
+should answer.
+
+Pull-request automations were invisible to their owners before this. Their visibility asked for
+`view` on a `pull_request` object, and production never writes that relation. They are now visible
+to whoever can pull the pull request's repository, the same boundary as reading it.
+
+An independent review found that, now that pull-request events are observable, their payloads
+leaked a fork's own repository name to anyone who can read the target repository. They now carry
+only `is_fork`, and nothing consumed the name. The review also found two smaller issues. The
+pull-request address now validates the repository slug. A `source_branch` scope on a pull-request
+automation now matches the pull request's head branch; it used to name a field that pull-request
+events do not have. One limit remains: a person who can review a pull request but not read its
+repository cannot own an automation on it.
+
+Proof: the readable TypeScript journey has a reviewer approve and then request changes on a pull
+request. The owner's automation records exactly one firing, for the requested changes, awaiting
+the owner's approval. Unit tests cover the subject inference, the repository-scoped visibility rule
+(including namespaced repositories and malformed ids), and the review payload.
+
 ## 2026-11-09 — The merge queue tells you when it stops
 
 A merge the queue stopped showed its reason only on the pull request. The person who scheduled it

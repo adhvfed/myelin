@@ -132,7 +132,11 @@ pub fn resolve_automation_subject_type(
     explicit: Option<&str>,
 ) -> Result<String, AutomationSubjectTypeError> {
     let segments = event_type.split('.').collect::<Vec<_>>();
-    let inferred = (segments.len() == 3).then(|| segments[1]);
+    // A review is recorded on its pull request, so that is the subject automations see.
+    let inferred = (segments.len() == 3).then(|| match (segments[0], segments[1]) {
+        ("git", "review") => "pr",
+        (_, middle) => middle,
+    });
     let subject_type = match (explicit, inferred) {
         (Some(explicit), Some(inferred)) if explicit != inferred => {
             return Err(AutomationSubjectTypeError::Conflict {
@@ -449,6 +453,15 @@ mod tests {
             resolve_automation_subject_type("git.ref.updated", None).unwrap(),
             "ref",
             "a branch update is governed through its repository"
+        );
+        assert_eq!(
+            resolve_automation_subject_type("git.review.submitted", None).unwrap(),
+            "pr",
+            "a review is governed through its pull request"
+        );
+        assert_eq!(
+            resolve_automation_subject_type("git.review.submitted", Some("pr")).unwrap(),
+            "pr"
         );
         assert_eq!(
             resolve_automation_subject_type("ci.result", Some("run")).unwrap(),

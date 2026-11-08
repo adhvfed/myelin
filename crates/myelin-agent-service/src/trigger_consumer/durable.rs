@@ -50,6 +50,8 @@ pub enum TriggerVisibilityRule {
 pub enum TriggerSubjectAddress {
     SubjectId,
     GitRefRepository,
+    /// A pull request (`<repo>:<number>`) is visible to whoever can pull its repository.
+    GitPullRequestRepository,
 }
 
 pub fn trigger_visibility_rule(subject_type: &str) -> Option<TriggerVisibilityRule> {
@@ -69,9 +71,9 @@ pub fn trigger_visibility_rule(subject_type: &str) -> Option<TriggerVisibilityRu
         }),
         "pr" => Some(TriggerVisibilityRule::Direct {
             subsystem: "git",
-            identity_object_type: "pull_request",
-            permission: "view",
-            address: TriggerSubjectAddress::SubjectId,
+            identity_object_type: "repo",
+            permission: "pull",
+            address: TriggerSubjectAddress::GitPullRequestRepository,
         }),
         "comment" => Some(TriggerVisibilityRule::Direct {
             subsystem: "git",
@@ -175,6 +177,14 @@ impl DurableOwnerVisibility {
             TriggerSubjectAddress::GitRefRepository => {
                 git_ref_repository_identity_object(subject_id, identity_object_type)
             }
+            TriggerSubjectAddress::GitPullRequestRepository => subject_id
+                .rsplit_once(':')
+                .filter(|(repo, number)| {
+                    myelin_git::coordinate::RepositorySlug::parse(repo).is_ok()
+                        && !number.is_empty()
+                        && number.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .map(|(repo, _)| format!("{identity_object_type}:{repo}")),
         }
     }
 }
@@ -414,10 +424,35 @@ mod visibility_rule_tests {
                 address: TriggerSubjectAddress::GitRefRepository,
             })
         );
+        assert_eq!(
+            trigger_visibility_rule("pr"),
+            Some(TriggerVisibilityRule::Direct {
+                subsystem: "git",
+                identity_object_type: "repo",
+                permission: "pull",
+                address: TriggerSubjectAddress::GitPullRequestRepository,
+            })
+        );
         assert_eq!(trigger_visibility_rule("deployment"), None);
         assert!(myelin_events::AUTOMATION_SUBJECT_TYPE_TOKENS
             .iter()
             .all(|subject_type| trigger_visibility_rule(subject_type).is_some()));
+    }
+
+    #[test]
+    fn a_pull_request_is_authorized_as_the_repository_that_contains_it() {
+        let object = |id: &str| {
+            DurableOwnerVisibility::direct_identity_object(
+                id,
+                "repo",
+                TriggerSubjectAddress::GitPullRequestRepository,
+            )
+        };
+        assert_eq!(object("team/api:7"), Some("repo:team/api".into()));
+        assert_eq!(object("core:12"), Some("repo:core".into()));
+        for malformed in ["core", "core:", ":7", "core:seven", "../core:7", "core.git/x:7"] {
+            assert_eq!(object(malformed), None, "{malformed}");
+        }
     }
 
     #[test]

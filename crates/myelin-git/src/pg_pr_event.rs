@@ -39,7 +39,6 @@ pub(crate) async fn co_commit_event(
             "base_ref": value.get("base_ref"),
             "expected_old_oid": value.get("expected_old_oid"),
             "head_oid": value.get("head_oid"),
-            "head_repo_slug": value.get("head_repo_slug"),
         })
     });
     let is_head_trigger = matches!(event_type, GIT_PR_OPENED | GIT_PR_SYNCHRONIZED);
@@ -69,15 +68,24 @@ pub(crate) async fn co_commit_event(
         "repo": loc.repo,
         "number": record.number,
         "base_ref": record.base_ref,
-        "head_repo": record.head_repo_slug,
         "head_ref": record.head_ref,
         "head_oid": record.head_oid,
+        // Anyone who can read the target repository may observe this event; a fork's own name
+        // can be private, so only the fact that it is a fork travels.
         "is_fork": record.head_repo_slug != loc.repo,
         "state": format!("{:?}", record.state).to_ascii_lowercase(),
         "operation": safe_operation,
     });
     if let Some(generation) = head_generation {
         payload["head_generation"] = generation.into();
+    }
+    if event_type == GIT_REVIEW_SUBMITTED {
+        // Automations act on the decision itself, such as an agent addressing requested changes.
+        // Automation filters see top-level scalars, so the decision is flat like the rest.
+        if let Some(review) = record.reviews.last() {
+            payload["review_verdict"] = review_verdict_token(&review.state).into();
+            payload["reviewer_is_agent"] = review.is_agent.into();
+        }
     }
     let mut tx = OutboxTransaction::detached(minter.clone(), ctx);
     tx.emit(
@@ -163,4 +171,37 @@ pub(crate) async fn co_commit_event(
         );
     }
     PgRelay::co_commit_rows_in_tx(conn, &rows).await
+}
+
+fn review_verdict_token(state: &crate::lifecycle::ReviewState) -> &'static str {
+    use crate::lifecycle::{ReviewState, ReviewVerdict};
+    match state {
+        ReviewState::Submitted(ReviewVerdict::Approve) => "approve",
+        ReviewState::Submitted(ReviewVerdict::RequestChanges) => "request_changes",
+        ReviewState::Submitted(ReviewVerdict::Comment) => "comment",
+        ReviewState::Requested => "requested",
+        ReviewState::Dismissed => "dismissed",
+    }
+}
+
+#[cfg(test)]
+mod review_payload_tests {
+    use super::review_verdict_token;
+    use crate::lifecycle::{ReviewState, ReviewVerdict};
+
+    #[test]
+    fn a_review_event_names_the_decision_automations_filter_on() {
+        assert_eq!(
+            review_verdict_token(&ReviewState::Submitted(ReviewVerdict::RequestChanges)),
+            "request_changes"
+        );
+        assert_eq!(
+            review_verdict_token(&ReviewState::Submitted(ReviewVerdict::Approve)),
+            "approve"
+        );
+        assert_eq!(
+            review_verdict_token(&ReviewState::Submitted(ReviewVerdict::Comment)),
+            "comment"
+        );
+    }
 }
