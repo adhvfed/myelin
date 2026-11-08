@@ -284,9 +284,10 @@ impl DurableCiApi {
         idempotency_key: &str,
     ) -> Result<CiRunCancelOutcome, EdgeError> {
         self.authorize_control(authority, run_id)?;
-        let ledger = self.cost_ledger.clone().ok_or_else(|| {
-            EdgeError::Unavailable("CI run cancellation is unavailable".into())
-        })?;
+        let ledger = self
+            .cost_ledger
+            .clone()
+            .ok_or_else(|| EdgeError::Unavailable("CI run cancellation is unavailable".into()))?;
         let supersession = PgCiRunSupersession::new(
             self.runs.pool().clone(),
             ledger,
