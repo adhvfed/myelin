@@ -45,12 +45,22 @@ pub fn ci_manifest_pipeline_definition() -> Result<CiWorkflowDefinitionPin, crat
     CiWorkflowDefinitionPin::new(CI_MANIFEST_PIPELINE_VERSION, CI_MANIFEST_PIPELINE_CODE_HASH)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CiRuntimeCompositionError;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CiRuntimeCompositionError(String);
+
+impl CiRuntimeCompositionError {
+    fn refused(reason: &str) -> Self {
+        Self(reason.to_owned())
+    }
+
+    fn caused(context: &str, error: impl std::fmt::Display) -> Self {
+        Self(format!("{context}: {error}"))
+    }
+}
 
 impl std::fmt::Display for CiRuntimeCompositionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("exact-tenant CI runtime composition refused")
+        write!(f, "exact-tenant CI runtime composition refused: {}", self.0)
     }
 }
 
@@ -275,14 +285,15 @@ impl CiProductionRuntimeFactory {
         rt: tokio::runtime::Handle,
     ) -> Result<Self, CiRuntimeCompositionError> {
         if !valid_scope_token(&region.0) {
-            return Err(CiRuntimeCompositionError);
+            return Err(CiRuntimeCompositionError::refused("region token is invalid"));
         }
         Ok(Self {
             pool,
             region,
             ledger,
             rt,
-            definition: ci_manifest_pipeline_definition().map_err(|_| CiRuntimeCompositionError)?,
+            definition: ci_manifest_pipeline_definition()
+                .map_err(|error| CiRuntimeCompositionError::caused("pipeline definition", error))?,
             backlog_probe_call: std::borrow::Cow::Borrowed(CI_PIPELINE_BACKLOG_PROBE_CALL),
             activation_readiness_probe: ActivationReadinessProbe::production(),
         })
@@ -544,7 +555,7 @@ impl CiProductionRuntimeFactory {
             self.definition.version(),
             self.definition.code_hash(),
         )
-        .map_err(|_| CiRuntimeCompositionError)
+        .map_err(|error| CiRuntimeCompositionError::caused("register pipeline definition", error))
     }
 
     pub fn workflow_poller(
@@ -554,7 +565,7 @@ impl CiProductionRuntimeFactory {
     ) -> Result<CiProductionWorkflowPoller, CiRuntimeCompositionError> {
         let worker_prefix = worker_prefix.into();
         if !valid_scope_token(&worker_prefix) {
-            return Err(CiRuntimeCompositionError);
+            return Err(CiRuntimeCompositionError::refused("worker prefix is invalid"));
         }
         Ok(CiProductionWorkflowPoller {
             discovery,
@@ -571,17 +582,17 @@ impl CiProductionRuntimeFactory {
         worker_id: impl Into<String>,
     ) -> Result<PgFlowWorker, CiRuntimeCompositionError> {
         if !valid_scope_token(&tenant.0) {
-            return Err(CiRuntimeCompositionError);
+            return Err(CiRuntimeCompositionError::refused("tenant token is invalid"));
         }
         let worker_id = worker_id.into();
         if !valid_scope_token(&worker_id) {
-            return Err(CiRuntimeCompositionError);
+            return Err(CiRuntimeCompositionError::refused("worker id is invalid"));
         }
         let principal = service_principal(&tenant, &self.region);
         let scope = TenantScope::from_verified_token(&principal, self.region.clone());
         let manifest =
             CiDriveManifestStore::new(self.pool.clone(), tenant.clone(), self.region.clone())
-                .map_err(|_| CiRuntimeCompositionError)?;
+                .map_err(|error| CiRuntimeCompositionError::caused("drive manifest store", error))?;
         let finalizer = Arc::new(DurableCiRunFinalizer::new(
             CiRunStore::with_pg(self.pool.clone()),
             self.ledger.clone(),
@@ -603,7 +614,7 @@ impl CiProductionRuntimeFactory {
             Actor(principal),
             CI_FLOW_OUTBOX_SCHEMA_VERSION,
         )
-        .map_err(|_| CiRuntimeCompositionError)?;
+        .map_err(|error| CiRuntimeCompositionError::caused("Flow worker scope", error))?;
         let mut worker = PgFlowWorker::new(
             self.pool.clone(),
             self.rt.clone(),
@@ -616,7 +627,7 @@ impl CiProductionRuntimeFactory {
             self.region.clone(),
             self.definition.clone(),
         )
-        .map_err(|_| CiRuntimeCompositionError)?;
+        .map_err(|error| CiRuntimeCompositionError::caused("manifest input resolver", error))?;
         register_durable_ci_manifest_pipeline(
             &mut worker,
             resolver,
@@ -624,7 +635,7 @@ impl CiProductionRuntimeFactory {
             finalizer,
             self.rt.clone(),
         )
-        .map_err(|_| CiRuntimeCompositionError)?;
+        .map_err(|error| CiRuntimeCompositionError::caused("register pipeline workflow", error))?;
         Ok(worker)
     }
 
@@ -669,7 +680,7 @@ impl CiProductionRuntimeFactory {
             ))
         });
         CiPipelineReporterRouter::new(self.region.clone(), factory)
-            .map_err(|_| CiRuntimeCompositionError)
+            .map_err(|error| CiRuntimeCompositionError::caused("reporter router", error))
     }
 }
 
@@ -720,20 +731,22 @@ impl CiProductionWorkflowPoller {
         if !(1..=MAX_CI_WORKFLOW_SCOPES_PER_PASS).contains(&max_scopes)
             || !(1..=MAX_CI_WORKFLOW_DRIVES_PER_SCOPE).contains(&max_drives_per_scope)
         {
-            return Err(CiRuntimeCompositionError);
+            return Err(CiRuntimeCompositionError::refused("workflow polling bounds are invalid"));
         }
         let mut page = self
             .discovery
             .active_run_page(&self.runtime.region.0, self.cursor.as_ref(), max_scopes)
             .await
-            .map_err(|_| CiRuntimeCompositionError)?;
+            .map_err(|error| CiRuntimeCompositionError::caused("discover active runs", error))?;
         if page.routes.is_empty() && self.cursor.is_some() {
             self.cursor = None;
             page = self
                 .discovery
                 .active_run_page(&self.runtime.region.0, None, max_scopes)
                 .await
-                .map_err(|_| CiRuntimeCompositionError)?;
+                .map_err(|error| {
+                    CiRuntimeCompositionError::caused("discover active runs", error)
+                })?;
         }
         let discovered = page.routes.len();
         self.cursor = if discovered == max_scopes {
@@ -777,7 +790,7 @@ impl CiProductionWorkflowPoller {
                         .await
                 }
             }
-            .map_err(|_| CiRuntimeCompositionError)?;
+            .map_err(|error| CiRuntimeCompositionError::caused("drive tenant workflows", error))?;
             scopes += 1;
             driven = driven.saturating_add(batch.driven);
             timers_fired = timers_fired.saturating_add(batch.timers_fired);
@@ -803,7 +816,7 @@ impl CiProductionWorkflowPoller {
             || !(1..=MAX_CI_WORKFLOW_SCOPES_PER_PASS).contains(&max_scopes)
             || !(1..=MAX_CI_WORKFLOW_DRIVES_PER_SCOPE).contains(&max_drives_per_scope)
         {
-            return Err(CiRuntimeCompositionError);
+            return Err(CiRuntimeCompositionError::refused("workflow polling bounds are invalid"));
         }
         loop {
             if *shutdown.borrow() {

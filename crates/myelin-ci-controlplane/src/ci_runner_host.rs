@@ -182,7 +182,10 @@ impl CiRunnerHost {
                         config.workflow_drives_per_scope,
                     )
                     .await
-                    .map_err(|_| CiRunnerHostFailure::Workflow)
+                    .map_err(|error| {
+                        eprintln!("ci-controlplane: Flow recovery lane failed: {error}");
+                        CiRunnerHostFailure::Workflow
+                    })
             },
             move |shutdown| runner.try_spawn_until_shutdown(shutdown),
         )
