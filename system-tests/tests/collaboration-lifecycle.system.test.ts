@@ -486,8 +486,9 @@ command = ["true"]
   test("holds a visible issue event for a human decision without pretending it is CI", async () => {
     const founder = await browserApprovedCliClient();
     const issue = await awaitActiveIssue(systemClient, uniqueName("Automation review"));
-    const issueRef = string(issue.ref, "visible issue ref");
+    const issueId = string(issue.id, "visible issue id");
     const issueKey = string(issue.key, "visible issue key");
+    const issueSubject = `myelin://${systemTestConfig.tenant}/issue/issue/${issueId}`;
 
     const activated = await founder.json("/v1/agents", {
       method: "POST",
@@ -542,8 +543,8 @@ command = ["true"]
         data_role: "Controller",
         status: "Active",
       },
-      subject: issueRef,
-      aggregate: `issue:${issueKey}`,
+      subject: issueSubject,
+      aggregate: `issue:${issueId}`,
       causation_id: null,
       correlation_id: eventId,
       caused_by: null,
@@ -555,7 +556,8 @@ command = ["true"]
       occurred_at: now,
       recorded_at: now,
       payload: {
-        issue: issueRef,
+        issue_id: issueId,
+        issue_key: issueKey,
         change_kind: "ownership",
         changed_fields: ["assignee"],
       },
@@ -567,7 +569,8 @@ command = ["true"]
         event_id: ignoredEventId,
         correlation_id: ignoredEventId,
         payload: {
-          issue: issueRef,
+          issue_id: issueId,
+          issue_key: issueKey,
           change_kind: "title",
           changed_fields: ["title"],
         },
@@ -598,7 +601,7 @@ command = ["true"]
     expect(approvalNotice).toMatchObject({
       reason: "approval_requested",
       class: "critical",
-      subject: issueRef,
+      subject: issueSubject,
       state: "unread",
       coalesce_count: 1,
       action: {

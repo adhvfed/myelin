@@ -13,6 +13,7 @@ import { findProject } from "../src/journeys/projects.js";
 import { awaitBacklink, awaitBacklinkGone } from "../src/journeys/refs.js";
 import { array, record, string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
+import { findPaged } from "../src/paging.js";
 
 describe("issue lifecycle", () => {
   test("lets a founder start a project and its first issue without operator-provided IDs", async () => {
@@ -112,9 +113,10 @@ describe("issue lifecycle", () => {
     expect(hiddenFromPeer.body).toMatchObject({ error: { code: "not_found" } });
     await expect(findProject(reviewerClient, projectId)).resolves.toBeUndefined();
 
-    const directory = await systemClient.json(`/v1/projects/${projectId}/access?limit=100`);
-    const reviewer = array(directory.body.items, "project access directory").find((item) =>
-      record(item, "project access entry").principal_id === systemTestConfig.reviewerPrincipal
+    const reviewer = await findPaged(
+      systemClient,
+      `/v1/projects/${projectId}/access`,
+      (item) => item.principal_id === systemTestConfig.reviewerPrincipal,
     );
     expect(reviewer).toMatchObject({
       principal_id: systemTestConfig.reviewerPrincipal,

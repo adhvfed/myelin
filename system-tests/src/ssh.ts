@@ -259,8 +259,10 @@ async function runWorkspaceCommand(
       { timeout: 30_000, maxBuffer: 512 * 1024 },
     );
     return result.stdout;
-  } catch {
-    throw new Error("the host-key-pinned workspace SSH command failed");
+  } catch (error) {
+    const stderr = (error as { stderr?: unknown }).stderr;
+    const detail = typeof stderr === "string" ? `: ${stderr.trim().slice(-400)}` : "";
+    throw new Error(`the host-key-pinned workspace SSH command failed${detail}`);
   }
 }
 

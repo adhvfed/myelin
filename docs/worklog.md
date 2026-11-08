@@ -4,6 +4,30 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — A full regression sweep: issue approvals, SSH terminals, and stale journeys
+
+The complete system suite had not been run since September. On a fresh stack it found three
+failures; each was a real defect or a journey that no longer matched production.
+
+- **Issue-event approvals were invisible.** Issues events address the issue by id, but the inbox
+  resolved an issue subject only by its key. An automation that parked a real issue event for human
+  approval therefore created a card its owner could never see. The inbox now resolves either form
+  with one bounded query. The web likewise linked an id-addressed issue reference to a key search
+  that matched nothing; it now opens the issue directly.
+- **SSH terminals required a `TERM`.** OpenSSH sends an empty terminal name when the client has no
+  `TERM` (scripts, CI, many editor integrations), and the workspace gateway refused the PTY. It now
+  gives such a client a `dumb` terminal, as it already defaulted an unsized window to 80×24. Every
+  other name and dimension bound is unchanged.
+- **Journeys that drifted.** The collaboration journey published issue events addressed by key, so
+  trigger visibility skipped them. It now emits the real subject, aggregate, and payload. The
+  project-access journey read only the first 100 directory entries of a tenant that had outgrown
+  them, and now walks the directory's own pages. The workspace SSH helper reports a bounded excerpt
+  of the client's error instead of swallowing it, which is how the PTY refusal surfaced.
+
+Proof: the full system suite ran on the live Fed stack (146 journeys, 143 passing before the fixes).
+The three failing files then passed together (14 journeys), with focused unit stories for the
+default terminal name and the issue-reference link.
+
 ## 2026-11-08 — People can re-run and cancel CI themselves
 
 Only agents could retry or cancel CI, and only through an approval card. A person with push access
