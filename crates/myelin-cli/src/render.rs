@@ -459,6 +459,14 @@ fn render_pull_request_change(value: &Value, call: Option<&EdgeCall>) -> Option<
             format!("already up to date at {head}\n")
         });
     }
+    if path.ends_with("/auto-merge") && action == "git.pr.auto_merge.request" {
+        return Some(
+            "will merge automatically once approved, up to date with its base, and green\n".into(),
+        );
+    }
+    if path.ends_with("/auto-merge") && action == "git.pr.auto_merge.cancel" {
+        return Some("automatic merge cancelled\n".into());
+    }
     if path.ends_with("/merge") && action == "git.pr.merge" {
         let base = applied.get("base_ref")?.as_str()?;
         let base = terminal_safe_single_line(base.strip_prefix("refs/heads/").unwrap_or(base));

@@ -97,6 +97,10 @@ describe("parsePrMutation", () => {
       n: 42,
       expected_head_oid: "b".repeat(40),
     })).toEqual({ op: "update-branch", repo: "team/core", n: 42, expected_head_oid: "b".repeat(40) });
+    for (const op of ["auto-merge", "cancel-auto-merge"]) {
+      expect(parsePrMutation({ op, repo: "team/core", n: 42 })).toEqual({ op, repo: "team/core", n: 42 });
+      expect(parsePrMutation({ op, repo: "team/core", n: 42, force: true })).toBeNull();
+    }
   });
 
   it.each([

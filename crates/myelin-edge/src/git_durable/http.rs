@@ -1537,6 +1537,11 @@ impl Handler for DUpdateBranch {
             )
             .map_err(map_durable_err)?;
         let (updated, head_oid, replayed) = match update {
+            BranchUpdate::Moved => {
+                return Err(EdgeError::Conflict(
+                    "the pull request's branch moved; reload it and try again".into(),
+                ))
+            }
             BranchUpdate::UpToDate { head_oid } => (false, head_oid, false),
             BranchUpdate::Updated { head_oid, replayed } => (true, head_oid, replayed),
             BranchUpdate::Conflicted { paths } => {
@@ -1558,6 +1563,46 @@ impl Handler for DUpdateBranch {
             &json!({
                 "applied": { "action": "git.pr.update_branch", "updated": updated,
                              "head_oid": head_oid, "replayed": replayed },
+                "durable": true,
+            }),
+        ))
+    }
+}
+
+struct DAutoMerge {
+    be: Arc<DurableGitBackend>,
+    request: bool,
+}
+impl Handler for DAutoMerge {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        optional_json::<EmptyMutationBody>(&ctx.request.body, "automatic merge")?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
+        let target = RepoActorContext::new(
+            tenant_of(ctx),
+            region_of(ctx),
+            param(ctx, "repo")?,
+            ctx.principal,
+        )
+        .for_pr(pull_request_number_param(ctx, "n")?);
+        let (action, record) = if self.request {
+            (
+                "git.pr.auto_merge.request",
+                self.be
+                    .request_auto_merge_with_operation(target, &operation_id),
+            )
+        } else {
+            (
+                "git.pr.auto_merge.cancel",
+                self.be
+                    .cancel_auto_merge_with_operation(target, &operation_id),
+            )
+        };
+        let record = record.map_err(map_durable_err)?;
+        let view = DurableGitBackend::pr_json(tenant_of(ctx), param(ctx, "repo")?, &record);
+        Ok(EdgeResponse::json(
+            200,
+            &json!({
+                "applied": { "action": action, "auto_merge": view["auto_merge"] },
                 "durable": true,
             }),
         ))
@@ -1899,6 +1944,32 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
         "git.pr.threads.list",
         pr_read_guarded(&be, Arc::new(DPrThreads { be: be.clone() })),
+    );
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/auto-merge"),
+        "git.pr.auto_merge.request",
+        guarded(
+            &be,
+            ProtectedPush,
+            Arc::new(DAutoMerge {
+                be: be.clone(),
+                request: true,
+            }),
+        ),
+    );
+    b = b.route(
+        crate::catalogue::Method::Delete,
+        &reroot("/api/git/repos/{repo}/prs/{n}/auto-merge"),
+        "git.pr.auto_merge.cancel",
+        guarded(
+            &be,
+            Push,
+            Arc::new(DAutoMerge {
+                be: be.clone(),
+                request: false,
+            }),
+        ),
     );
     b = b.route(
         post,

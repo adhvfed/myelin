@@ -1691,7 +1691,9 @@ describe.sequential("the CLI authentication journey", () => {
       durable: true,
     });
 
-    const imaginaryAutoMerge = await runCli(
+    // Scheduling a merge is a durable mutation like any other: it needs a retry identity and
+    // never merges on the spot.
+    const scheduledMerge = await runCli(
       configDirectory,
       "repo",
       "pr",
@@ -1700,9 +1702,9 @@ describe.sequential("the CLI authentication journey", () => {
       "1",
       "--auto",
     );
-    expect(imaginaryAutoMerge.exitCode).toBe(2);
-    expect(imaginaryAutoMerge.stdout).toBe("");
-    expect(imaginaryAutoMerge.stderr).toContain("unknown git command token `--auto`");
+    expect(scheduledMerge.exitCode).toBe(2);
+    expect(scheduledMerge.stdout).toBe("");
+    expect(scheduledMerge.stderr).toContain("mutating commands require --idempotency-key");
 
     sourceMarker = `credentialless_release_${randomUUID().replaceAll("-", "")}`;
     sourcePath = "src/release.ts";

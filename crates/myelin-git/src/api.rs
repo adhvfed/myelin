@@ -207,6 +207,14 @@ pub enum CliCommand {
         repo: String,
         number: u64,
     },
+    PrAutoMerge {
+        repo: String,
+        number: u64,
+    },
+    PrDisableAutoMerge {
+        repo: String,
+        number: u64,
+    },
     PrEndorseForkCi {
         repo: String,
         number: u64,
@@ -227,7 +235,9 @@ impl CliCommand {
             | CliCommand::PrUpdateBranch { .. } => Handler::Lifecycle,
             CliCommand::RepoView { .. } | CliCommand::PrView { .. } => Handler::Project,
             CliCommand::PrChecks { .. } => Handler::CheckStatus,
-            CliCommand::PrMerge { .. } => Handler::MergeGate,
+            CliCommand::PrMerge { .. }
+            | CliCommand::PrAutoMerge { .. }
+            | CliCommand::PrDisableAutoMerge { .. } => Handler::MergeGate,
             CliCommand::PrEndorseForkCi { .. } => Handler::ForkEndorse,
             CliCommand::SearchCode { .. } => Handler::CodeSearch,
         }
@@ -241,6 +251,8 @@ impl CliCommand {
                 | CliCommand::PrReview { .. }
                 | CliCommand::PrMerge { .. }
                 | CliCommand::PrUpdateBranch { .. }
+                | CliCommand::PrAutoMerge { .. }
+                | CliCommand::PrDisableAutoMerge { .. }
                 | CliCommand::PrEndorseForkCi { .. }
         )
     }
@@ -378,8 +390,17 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             })
         }
         "merge" => {
-            let (repo, number) = repo_and_number(args)?;
-            Ok(CliCommand::PrMerge { repo, number })
+            let (repo, number, flags) = repo_and_number_prefix(args)?;
+            match flags {
+                [] => Ok(CliCommand::PrMerge { repo, number }),
+                ["--auto"] => Ok(CliCommand::PrAutoMerge { repo, number }),
+                ["--disable-auto"] => Ok(CliCommand::PrDisableAutoMerge { repo, number }),
+                ["--auto" | "--disable-auto", extra, ..] | [extra, ..] => {
+                    Err(CliParseError::Unknown {
+                        token: (*extra).to_string(),
+                    })
+                }
+            }
         }
         "update" | "update-branch" => {
             let (repo, number) = repo_and_number(args)?;

@@ -32,6 +32,7 @@ import { GitProject } from "../src/git-project.js";
 import { findInboxItem, pullRequestSubject } from "../src/journeys/inbox.js";
 import { array, integer, record, string } from "../src/json.js";
 import { reconcileAgentThreads } from "../src/operator.js";
+import { findPaged } from "../src/paging.js";
 import {
   connectMultiplexedToWorkspace,
   connectToWorkspace,
@@ -46,17 +47,16 @@ describe("private work with an agent", () => {
   test("keeps project-bound work private until its owner marks the conversation ready", async () => {
     const founder = await browserApprovedCliClient();
     const teammate = await browserApprovedCliClient(reviewerClient);
-    const collaborators = await founder.json(
-      `/v1/projects/${encodeURIComponent(systemTestConfig.issues.projectId)}/collaborators?limit=100`,
+    // The shared test project accumulates collaborators, so walk every page.
+    const reviewerCollaborator = await findPaged(
+      founder,
+      `/v1/projects/${encodeURIComponent(systemTestConfig.issues.projectId)}/collaborators`,
+      (item) => item.principal_id === systemTestConfig.reviewerPrincipal,
     );
-    expect(array(collaborators.body.items, "project collaborators")).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          principal_id: systemTestConfig.reviewerPrincipal,
-          display_name: expect.any(String),
-        }),
-      ]),
-    );
+    expect(reviewerCollaborator).toMatchObject({
+      principal_id: systemTestConfig.reviewerPrincipal,
+      display_name: expect.any(String),
+    });
     const companion = await activateExternalAgent(
       founder,
       uniqueName("Private draft companion"),

@@ -1005,6 +1005,47 @@ function MergeCard(props: {
     await props.onChange().catch(() => undefined);
   };
 
+  const queued = () => props.pr.auto_merge ?? null;
+  const stopped = () => (queued() ? null : props.pr.auto_merge_stopped ?? null);
+  const mergeableNow = () => live().gate_admitted && !behind();
+  const canQueue = () => props.pr.pr_state === "open" && props.pr.is_fork !== true;
+  const [scheduling, setScheduling] = createSignal(false);
+  // The queue works in the background, so a queued pull request keeps its card current.
+  createEffect(() => {
+    if (!queued()) return;
+    const reload = props.onChange;
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void reload().catch(() => undefined);
+    }, 3_000);
+    onCleanup(() => window.clearInterval(timer));
+  });
+
+  const doAutoMerge = async (request: boolean) => {
+    setScheduling(true);
+    let result: { ok: true } | { refused: string } | null = null;
+    try {
+      result = await doMutate({
+        op: request ? "auto-merge" : "cancel-auto-merge",
+        repo: props.repo,
+        n: props.n,
+      }) as { ok: true } | { refused: string };
+    } catch {
+      props.toast.show({
+        title: request ? "Could not schedule the merge" : "Could not cancel the automatic merge",
+        variant: "danger",
+      });
+    }
+    if (result && "refused" in result) props.toast.show({ title: result.refused, variant: "warning" });
+    else if (result) {
+      props.toast.show({
+        title: request ? "Will merge automatically when ready" : "Automatic merge cancelled",
+        variant: "success",
+      });
+    }
+    await props.onChange().catch(() => undefined);
+    setScheduling(false);
+  };
+
   const doMerge = async () => {
     try {
       const res = await doMutate({ op: "merge", repo: props.repo, n: props.n });
@@ -1087,6 +1128,41 @@ function MergeCard(props: {
               </button>
             </div>
           </Show>
+        </Show>
+        <Show when={stopped()}>
+          {(why) => (
+            <p role="status" data-testid="auto-merge-stopped" style={{ margin: "0", color: "var(--warning)" }}>
+              <Icon name="gate" /> Automatic merge stopped: {why().reason.replace(/\.$/, "")}.
+            </p>
+          )}
+        </Show>
+        <Show
+          when={queued()}
+          fallback={
+            <Show when={canQueue() && !mergeableNow()}>
+              <button type="button" data-testid="auto-merge-button" disabled={scheduling()} aria-busy={scheduling()} onClick={() => void doAutoMerge(true)} class="btn-secondary" style={{ ...barBtn, "align-self": "flex-start" }}>
+                <Icon name="merge" /> Merge when ready
+              </button>
+            </Show>
+          }
+        >
+          {(request) => (
+            <div data-testid="auto-merge-queued" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+              <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)" }}>
+                <Icon name="cycle" />
+                <span>
+                  <strong>Merging automatically when ready.</strong> Once it is approved with nothing
+                  left unresolved, Myelin brings it up to date with {baseName()} and merges it when
+                  its required checks pass, one pull request at a time for {baseName()}. A failed
+                  required check or a conflict stops it. It merges with the merge rights
+                  of {request().requested_by}, who asked.
+                </span>
+              </span>
+              <button type="button" data-testid="cancel-auto-merge-button" disabled={scheduling()} aria-busy={scheduling()} onClick={() => void doAutoMerge(false)} class="btn-secondary" style={{ ...barBtn, "align-self": "flex-start" }}>
+                Cancel automatic merge
+              </button>
+            </div>
+          )}
         </Show>
       </Show>
 

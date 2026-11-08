@@ -953,6 +953,7 @@ const SEED_PRS = {
       commits_count: 1,
       commits_count_capped: false,
       behind_base: true,
+      auto_merge_stopped: { reason: "main and this branch both changed README.md", at: 1718600100 },
       durable: true,
     },
     checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: true, changes_requested: false, current_approvals: 0, durable: true },
@@ -961,6 +962,8 @@ const SEED_PRS = {
 
 /** Pull requests whose branch the dev edge has updated since the last fixture reset. */
 const UPDATED_BRANCHES = new Set();
+/** Merge-queue state changed since the last fixture reset: `{ auto_merge, auto_merge_stopped }`. */
+const AUTO_MERGES = new Map();
 
 // Keep one namespaced repository in the browser contract. Both coordinates deliberately share the
 // same PR records; the test double is proving transport and routing semantics, not modelling storage.
@@ -1027,6 +1030,7 @@ let threadSeq = 0;
 export function resetPrFixtures() {
   THREADS.clear();
   UPDATED_BRANCHES.clear();
+  AUTO_MERGES.clear();
   threadSeq = 0;
 }
 function subjectKey(repo, n) {
@@ -1277,6 +1281,16 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
     doc.reviews = doc.reviews.filter((r) => r.id !== m[1]);
     return { status: 200, json: { applied: { action: "git.pr.review.discard", result: { discarded: m[1] } }, durable: true } };
   }
+  // POST …/auto-merge — join the base branch's merge queue (open pull requests only).
+  if (tail === "auto-merge") {
+    if (SEED_PRS[n].pr.pr_state !== "open") {
+      return { status: 409, json: { error: { code: "conflict", message: "only an open pull request can merge automatically" } } };
+    }
+    const current = AUTO_MERGES.get(n)?.auto_merge;
+    const auto_merge = current ?? { requested_by: viewer, requested_at: 1719450100 };
+    AUTO_MERGES.set(n, { auto_merge, auto_merge_stopped: null });
+    return { status: 200, json: { applied: { action: "git.pr.auto_merge.request", auto_merge }, durable: true } };
+  }
   // POST …/update-branch — PR 6 merges its base cleanly; PR 7 conflicts; the rest are up to date.
   if (tail === "update-branch") {
     if (n === 7) {
@@ -1306,7 +1320,22 @@ export function prJson(repo, n) {
   const updated = UPDATED_BRANCHES.has(n)
     ? { head_oid: UPDATED_HEAD, commits_count: SEED_PRS[n].pr.commits_count + 1, behind_base: false }
     : {};
-  return { ...SEED_PRS[n].pr, ...updated, ref: `myelin://acme/git/pr/${repo}:${n}` };
+  return {
+    ...SEED_PRS[n].pr,
+    ...updated,
+    auto_merge: AUTO_MERGES.has(n) ? AUTO_MERGES.get(n).auto_merge : null,
+    auto_merge_stopped: AUTO_MERGES.has(n)
+      ? AUTO_MERGES.get(n).auto_merge_stopped
+      : SEED_PRS[n].pr.auto_merge_stopped ?? null,
+    ref: `myelin://acme/git/pr/${repo}:${n}`,
+  };
+}
+
+/** DELETE …/prs/{n}/auto-merge → leave the merge queue. */
+export function devCancelAutoMerge(repo, n) {
+  if (!hasSeedPullRequest(repo, n)) return { status: 404 };
+  AUTO_MERGES.set(n, { auto_merge: null, auto_merge_stopped: null });
+  return { status: 200, json: { applied: { action: "git.pr.auto_merge.cancel", auto_merge: null }, durable: true } };
 }
 
 /** GET /v1/git/repos/{repo}/prs/{n}/checks → the checks + merge-gate projection (null = 404). PR #3

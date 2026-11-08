@@ -299,6 +299,9 @@ pub struct DurableGitBackend {
     git_wire_credentials: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuerFactory>,
     repo_authz: Arc<dyn RepoAuthorizer>,
     bootstrap: Arc<dyn RepoBootstrapGrants>,
+    merge_queue_wakeup: Arc<tokio::sync::Notify>,
+    /// Confirms that the person behind a scheduled merge is still an active human.
+    principals: Option<myelin_identity_service::PrincipalStore>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +379,8 @@ impl DurableGitBackend {
                 crate::git_wire_exec::unavailable_git_wire_credential_issuer_factory(),
             repo_authz: Arc::new(DenyAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
+            merge_queue_wakeup: Arc::new(tokio::sync::Notify::new()),
+            principals: None,
         })
     }
 
@@ -397,6 +402,8 @@ impl DurableGitBackend {
             git_wire_credentials: crate::git_wire_exec::test_git_wire_credential_issuer_factory(),
             repo_authz: Arc::new(AllowAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
+            merge_queue_wakeup: Arc::new(tokio::sync::Notify::new()),
+            principals: None,
         }
     }
 
@@ -405,6 +412,14 @@ impl DurableGitBackend {
         repo_authz: Arc<dyn RepoAuthorizer>,
     ) -> DurableGitBackend {
         self.repo_authz = repo_authz;
+        self
+    }
+
+    pub fn with_principal_directory(
+        mut self,
+        principals: myelin_identity_service::PrincipalStore,
+    ) -> DurableGitBackend {
+        self.principals = Some(principals);
         self
     }
 
@@ -573,22 +588,26 @@ impl DurableGitBackend {
         operation_id: &PrOperationId,
         principal: &Principal,
     ) -> Result<PrRecord, DurableError> {
-        if let Some(store) = &self.pg_prs {
-            return store.apply_mutation(
+        let mutated = match &self.pg_prs {
+            Some(store) => store.apply_mutation(
                 &Self::verified_pr_scope(principal, loc)?,
                 &loc.repo,
                 number,
                 mutation,
                 operation_id,
                 principal,
-            );
+            ),
+            None => self.prs.update(loc, number, |record| {
+                mutation
+                    .apply_to_at(record, now_unix()?)
+                    .map_err(|reason| DurableError::Conflict(reason.into()))?;
+                Ok(record.clone())
+            }),
+        };
+        if mutated.is_ok() {
+            self.wake_merge_queue();
         }
-        self.prs.update(loc, number, |record| {
-            mutation
-                .apply_to_at(record, now_unix()?)
-                .map_err(|reason| DurableError::Conflict(reason.into()))?;
-            Ok(record.clone())
-        })
+        mutated
     }
 
     fn emit_ctx(
@@ -1818,6 +1837,8 @@ impl DurableGitBackend {
         if !branch.starts_with("refs/heads/") {
             return;
         }
+        // A moved branch can be a queued pull request's base or head.
+        self.wake_merge_queue();
         for _ in 0..FOLLOW_BRANCH_ATTEMPTS {
             match self.follow_branch_once(loc, principal, &branch) {
                 Ok(true) => return,
@@ -1896,7 +1917,11 @@ impl DurableGitBackend {
         }
         Ok(self
             .prs
-            .list_bounded(loc, PR_LIST_PER_REPO_MAX_RECORDS, PR_LIST_PER_REPO_MAX_BYTES)?
+            .list_bounded(
+                loc,
+                PR_LIST_PER_REPO_MAX_RECORDS,
+                PR_LIST_PER_REPO_MAX_BYTES,
+            )?
             .into_iter()
             .filter(|record| {
                 matches!(record.state, PrState::Open | PrState::Draft)
@@ -3160,7 +3185,10 @@ impl DurableGitBackend {
         match outcome.map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))? {
             PushOutcome::Accepted { .. } => {
                 let _ = repo.heal_head_symref();
-                for update in pushed_updates.iter().filter(|update| !update.new_oid.is_zero()) {
+                for update in pushed_updates
+                    .iter()
+                    .filter(|update| !update.new_oid.is_zero())
+                {
                     self.follow_branch(&loc, principal, &update.ref_name.0);
                 }
                 Ok(report_status("ok", &per_ref_status))
@@ -3188,6 +3216,15 @@ impl DurableGitBackend {
             "reviews": rec.reviews.len(),
             "updated_at": rec.updated_at,
             "created_at": rec.created_at,
+            "is_fork": rec.head_repo_slug != repo,
+            "auto_merge": rec.auto_merge.as_ref().filter(|_| rec.state == PrState::Open).map(|request| json!({
+                "requested_by": format!("{}@{tenant}.noreply", request.requested_by),
+                "requested_at": request.requested_at,
+            })),
+            "auto_merge_stopped": rec.auto_merge_stopped.as_ref().map(|stopped| json!({
+                "reason": stopped.reason,
+                "at": stopped.at,
+            })),
             "durable": true,
         })
     }
@@ -3724,14 +3761,18 @@ mod pr_queries;
 mod recovery;
 mod reference_cards;
 pub(crate) use reference_cards::{GitPrCommentLocation, GitReferenceCardRequest};
+mod merge_queue;
 mod repo_summary;
 mod repo_visibility;
 mod repository_views;
 mod review_threads;
 mod update_branch;
 pub use check_projection::GitDatabaseProviders;
-pub use update_branch::BranchUpdate;
-pub(crate) use update_branch::describe_conflicts;
 pub use http::register_git_durable;
 use http::{cross_pr_before_key, mint_pr_list_cursors, BlobViewOptions, RawResponseOptions};
+pub use merge_queue::{
+    merge_queue_interval_from_env, spawn_merge_queue, MergeQueueHandle, QueueStep,
+};
 pub use recovery::{recover_placed_git_at_boot, GitBootRecoveryReport, GitCellBootRecoveryReport};
+pub(crate) use update_branch::describe_conflicts;
+pub use update_branch::BranchUpdate;

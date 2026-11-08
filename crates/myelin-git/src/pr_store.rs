@@ -119,6 +119,25 @@ impl ReviewRecord {
     }
 }
 
+/// A request to merge as soon as the pull request can, with one person's merge authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoMerge {
+    /// The principal whose authority the merge queue checks again before every step.
+    pub requested_by: String,
+    pub requested_at: i64,
+    /// The head that person scheduled, or Myelin's own merge of the base into it. Commits pushed
+    /// after scheduling are not theirs to merge.
+    #[serde(default)]
+    pub head_oid: String,
+}
+
+/// Why the merge queue gave up on a pull request, kept until someone asks again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoMergeStopped {
+    pub reason: String,
+    pub at: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrRecord {
     pub number: u64,
@@ -147,6 +166,10 @@ pub struct PrRecord {
     pub endorsed_contexts: Vec<String>,
     pub codeowner_review_satisfied: bool,
     pub outstanding_conversations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge: Option<AutoMerge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge_stopped: Option<AutoMergeStopped>,
 }
 
 impl PrRecord {
@@ -171,6 +194,8 @@ impl PrRecord {
             endorsed_contexts: Vec::new(),
             codeowner_review_satisfied: false,
             outstanding_conversations: 0,
+            auto_merge: None,
+            auto_merge_stopped: None,
         }
     }
 

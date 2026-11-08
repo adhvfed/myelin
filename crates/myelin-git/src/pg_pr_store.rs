@@ -15,8 +15,8 @@ use crate::core::{Oid as CoreOid, RepoLoc};
 use crate::dek::{encrypt_free_text, is_git_subject_key_class, GitFreeText};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
-    event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_MERGED, GIT_PR_OPENED,
-    GIT_PR_SYNCHRONIZED, GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
+    event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_MERGED, GIT_PR_MERGE_BLOCKED,
+    GIT_PR_MERGE_QUEUED, GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
 };
 use crate::lifecycle::{BranchProtectionRuleset, PrState};
 use crate::pg_pr_event::co_commit_event;
@@ -298,6 +298,15 @@ pub fn git_pr_hot_tables() -> HotTables {
     ])
 }
 
+/// One pull request waiting in a base branch's merge queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedPullRequest {
+    pub repo: String,
+    pub number: u64,
+    pub base_ref: String,
+    pub requested_at: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrOperationId(String);
 
@@ -437,6 +446,17 @@ pub enum PrMutation {
         expected_head_oid: String,
         head_oid: String,
     },
+    /// Join the base branch's merge queue with `requested_by`'s merge authority for the current
+    /// head. Asking again for the same head keeps the original place in the queue.
+    RequestAutoMerge {
+        requested_by: String,
+    },
+    /// Leave the merge queue. A `reason` records why the queue gave up rather than a person; with
+    /// `requested_at`, it applies only to that request, never to a newer one.
+    CancelAutoMerge {
+        reason: Option<String>,
+        requested_at: Option<i64>,
+    },
     Touch,
 }
 
@@ -448,6 +468,8 @@ impl PrMutation {
             Self::EndorseContexts(_) => "endorse-contexts",
             Self::SynchronizeHead { .. } => "synchronize-head",
             Self::AdoptBaseMerge { .. } => "adopt-base-merge",
+            Self::RequestAutoMerge { .. } => "request-auto-merge",
+            Self::CancelAutoMerge { .. } => "cancel-auto-merge",
             Self::Touch => "touch",
         }
     }
@@ -456,7 +478,14 @@ impl PrMutation {
         match self {
             Self::SubmitReview(_) => GIT_REVIEW_SUBMITTED,
             Self::SynchronizeHead { .. } | Self::AdoptBaseMerge { .. } => GIT_PR_SYNCHRONIZED,
-            Self::ReportChecks { .. } | Self::EndorseContexts(_) | Self::Touch => GIT_PR_UPDATED,
+            Self::RequestAutoMerge { .. } => GIT_PR_MERGE_QUEUED,
+            Self::CancelAutoMerge {
+                reason: Some(_), ..
+            } => GIT_PR_MERGE_BLOCKED,
+            Self::ReportChecks { .. }
+            | Self::EndorseContexts(_)
+            | Self::CancelAutoMerge { reason: None, .. }
+            | Self::Touch => GIT_PR_UPDATED,
         }
     }
 
@@ -505,7 +534,56 @@ impl PrMutation {
             Self::AdoptBaseMerge {
                 expected_head_oid,
                 head_oid,
-            } => move_head(record, expected_head_oid, head_oid)?,
+            } => {
+                let merged = head_oid.clone();
+                move_head(record, expected_head_oid.clone(), head_oid)?;
+                // Myelin's own base merge of the scheduled head is still what was scheduled.
+                if let Some(request) = &mut record.auto_merge {
+                    if request.head_oid == expected_head_oid {
+                        request.head_oid = merged;
+                    }
+                }
+            }
+            Self::RequestAutoMerge { requested_by } => {
+                if record.state != PrState::Open {
+                    return Err("only an open pull request can merge automatically");
+                }
+                if requested_by.trim().is_empty() {
+                    return Err("an automatic merge needs the person who asked for it");
+                }
+                let unchanged = record
+                    .auto_merge
+                    .as_ref()
+                    .is_some_and(|request| request.head_oid == record.head_oid);
+                if !unchanged {
+                    record.auto_merge = Some(crate::pr_store::AutoMerge {
+                        requested_by,
+                        requested_at: updated_at_unix,
+                        head_oid: record.head_oid.clone(),
+                    });
+                }
+                record.auto_merge_stopped = None;
+            }
+            Self::CancelAutoMerge {
+                reason,
+                requested_at,
+            } => {
+                if requested_at.is_some()
+                    && record
+                        .auto_merge
+                        .as_ref()
+                        .map(|request| request.requested_at)
+                        != requested_at
+                {
+                    return Err("the automatic merge changed before it could be stopped");
+                }
+                record.auto_merge = None;
+                record.auto_merge_stopped =
+                    reason.map(|reason| crate::pr_store::AutoMergeStopped {
+                        reason,
+                        at: updated_at_unix,
+                    });
+            }
             Self::Touch => {}
         }
         record.updated_at = Some(updated_at_unix);
@@ -935,6 +1013,80 @@ impl PgPrStore {
 
     /// `(number, head_oid)` of each open or draft pull request in `repo` whose head is one of
     /// `head_refs` (a branch's full and short spellings) in that same repository.
+    /// Open pull requests waiting to merge automatically, across the tenant's repositories, in the
+    /// order they asked.
+    pub fn auto_merge_queue(
+        &self,
+        scope: &TenantScope,
+        after: Option<&QueuedPullRequest>,
+        maximum: usize,
+    ) -> Result<Vec<QueuedPullRequest>, DurableError> {
+        let cell = self.scoped_cell(scope)?;
+        let provider = self.provider.clone();
+        let tenant_id = cell.tenant_id;
+        let region = cell.region;
+        let transaction_tenant = tenant_id.0.clone();
+        let limit = i64::try_from(maximum).unwrap_or(i64::MAX);
+        let (after_at, after_repo, after_number) = match after {
+            Some(queued) => (
+                queued.requested_at,
+                queued.repo.clone(),
+                db_number(queued.number)?,
+            ),
+            None => (i64::MIN, String::new(), -1),
+        };
+        let rows = self
+            .block_on(async move {
+                provider
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
+                        Box::pin(async move {
+                            sqlx::query(
+                                "SELECT repo_slug, number, record->>'base_ref' AS base_ref, \
+                                        (record->'auto_merge'->>'requested_at')::bigint \
+                                          AS requested_at \
+                                 FROM git_pr \
+                                 WHERE tenant_id=$1 AND region=$2 \
+                                   AND record->>'state' = 'Open' \
+                                   AND record->'auto_merge' IS NOT NULL \
+                                   AND ((record->'auto_merge'->>'requested_at')::bigint, \
+                                        repo_slug, number) > ($3, $4, $5) \
+                                 ORDER BY 4, repo_slug, number \
+                                 LIMIT $6",
+                            )
+                            .bind(&tenant_id.0)
+                            .bind(&region.0)
+                            .bind(after_at)
+                            .bind(&after_repo)
+                            .bind(after_number)
+                            .bind(limit)
+                            .fetch_all(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("list the merge queue"))
+                        })
+                    })
+                    .await
+            })
+            .map_err(pg_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let malformed = || DurableError::Io("merge queue row malformed".into());
+                let number: i64 = row.try_get("number").map_err(|_| malformed())?;
+                Ok(QueuedPullRequest {
+                    repo: row.try_get("repo_slug").map_err(|_| malformed())?,
+                    number: u64::try_from(number).map_err(|_| malformed())?,
+                    base_ref: row
+                        .try_get::<Option<String>, _>("base_ref")
+                        .map_err(|_| malformed())?
+                        .ok_or_else(malformed)?,
+                    requested_at: row
+                        .try_get::<Option<i64>, _>("requested_at")
+                        .map_err(|_| malformed())?
+                        .ok_or_else(malformed)?,
+                })
+            })
+            .collect()
+    }
+
     pub fn open_heads_for_ref(
         &self,
         scope: &TenantScope,
@@ -3108,6 +3260,12 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         )
     } else if message.contains("synchronized head is malformed") {
         DurableError::InvalidInput("pull request synchronized head is malformed".into())
+    } else if message.contains("only an open pull request can merge automatically") {
+        DurableError::Conflict("only an open pull request can merge automatically".into())
+    } else if message.contains("the automatic merge changed before it could be stopped") {
+        DurableError::Conflict("the automatic merge changed before it could be stopped".into())
+    } else if message.contains("an automatic merge needs the person") {
+        DurableError::InvalidInput("an automatic merge needs the person who asked for it".into())
     } else if message.contains("different repository")
         || message.contains("different command")
         || message.contains("different merge")
@@ -3516,6 +3674,103 @@ mod tests {
             }
             .apply_to_at(&mut record, 1_722_470_402),
             Err("pull request head changed before synchronization")
+        );
+    }
+
+    #[test]
+    fn an_automatic_merge_is_bound_to_the_head_it_scheduled() {
+        let pull_request = crate::lifecycle::PullRequest::open(
+            1,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pull_request, "a".repeat(40));
+        let request = |by: &str| PrMutation::RequestAutoMerge {
+            requested_by: by.into(),
+        };
+        assert_eq!(request("alice").event_type(), GIT_PR_MERGE_QUEUED);
+        request("alice").apply_to_at(&mut record, 100).unwrap();
+        request("bob").apply_to_at(&mut record, 200).unwrap();
+        let scheduled = |by: &str, at: i64, head: char| {
+            Some(crate::pr_store::AutoMerge {
+                requested_by: by.into(),
+                requested_at: at,
+                head_oid: head.to_string().repeat(40),
+            })
+        };
+        assert_eq!(
+            record.auto_merge,
+            scheduled("alice", 100, 'a'),
+            "asking again for the same head keeps the original place"
+        );
+
+        PrMutation::AdoptBaseMerge {
+            expected_head_oid: "a".repeat(40),
+            head_oid: "b".repeat(40),
+        }
+        .apply_to_at(&mut record, 300)
+        .unwrap();
+        assert_eq!(
+            record.auto_merge,
+            scheduled("alice", 100, 'b'),
+            "Myelin's base merge is still the scheduled change"
+        );
+        PrMutation::SynchronizeHead {
+            expected_head_oid: "b".repeat(40),
+            head_oid: "c".repeat(40),
+        }
+        .apply_to_at(&mut record, 400)
+        .unwrap();
+        assert_eq!(
+            record.auto_merge,
+            scheduled("alice", 100, 'b'),
+            "a push does not inherit the schedule"
+        );
+        request("bob").apply_to_at(&mut record, 500).unwrap();
+        assert_eq!(record.auto_merge, scheduled("bob", 500, 'c'));
+
+        let stale_stop = PrMutation::CancelAutoMerge {
+            reason: Some("a required check failed".into()),
+            requested_at: Some(100),
+        };
+        assert_eq!(stale_stop.event_type(), GIT_PR_MERGE_BLOCKED);
+        assert_eq!(
+            stale_stop.apply_to_at(&mut record, 600),
+            Err("the automatic merge changed before it could be stopped")
+        );
+        PrMutation::CancelAutoMerge {
+            reason: Some("conflicts with main".into()),
+            requested_at: Some(500),
+        }
+        .apply_to_at(&mut record, 700)
+        .unwrap();
+        assert_eq!(record.auto_merge, None);
+        assert_eq!(
+            record.auto_merge_stopped,
+            Some(crate::pr_store::AutoMergeStopped {
+                reason: "conflicts with main".into(),
+                at: 700,
+            })
+        );
+        request("alice").apply_to_at(&mut record, 800).unwrap();
+        assert_eq!(record.auto_merge_stopped, None);
+        let cancel = PrMutation::CancelAutoMerge {
+            reason: None,
+            requested_at: None,
+        };
+        assert_eq!(cancel.event_type(), GIT_PR_UPDATED);
+        cancel.apply_to_at(&mut record, 900).unwrap();
+        assert_eq!(
+            (record.auto_merge.clone(), record.auto_merge_stopped.clone()),
+            (None, None)
+        );
+
+        record.state = PrState::Draft;
+        assert_eq!(
+            request("alice").apply_to_at(&mut record, 1000),
+            Err("only an open pull request can merge automatically")
         );
     }
 

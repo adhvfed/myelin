@@ -155,6 +155,20 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         }
     );
     assert_eq!(
+        parse_cli(&["pr", "merge", "core", "42", "--auto"]).unwrap(),
+        CliCommand::PrAutoMerge {
+            repo: "core".into(),
+            number: 42
+        }
+    );
+    assert_eq!(
+        parse_cli(&["pr", "merge", "core", "42", "--disable-auto"]).unwrap(),
+        CliCommand::PrDisableAutoMerge {
+            repo: "core".into(),
+            number: 42
+        }
+    );
+    assert_eq!(
         parse_cli(&["search", "code", "needle", "--repo", "core"]).unwrap(),
         CliCommand::SearchCode {
             query: "needle".into(),
@@ -183,7 +197,8 @@ fn git_cli_rejects_every_unconsumed_operand_flag_and_counterfeit_feature() {
         vec!["pr", "checks", "core", "1", "--unknown"],
         vec!["pr", "review", "core", "1", "--approve", "--comment"],
         vec!["pr", "review", "core", "1", "--approve", "extra"],
-        vec!["pr", "merge", "core", "1", "--auto"],
+        vec!["pr", "merge", "core", "1", "--auto", "--auto"],
+        vec!["pr", "merge", "core", "1", "--auto", "--disable-auto"],
         vec!["pr", "merge", "core", "1", "extra"],
         vec!["pr", "endorse-fork-ci", "core", "1", "extra"],
     ] {

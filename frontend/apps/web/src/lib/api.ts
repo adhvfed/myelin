@@ -3,7 +3,7 @@
 // that survived the single refresh + retry) the query throws a `/login` redirect — the canon's
 // 401→/login behaviour, applied centrally.
 import { action, json, query, redirect, type CustomResponse } from "@solidjs/router";
-import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
+import { edgeDelete, edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
 import {
   parsePrMutation,
   type PrMutation,
@@ -375,6 +375,12 @@ export interface PrVM {
   commits_count_capped?: boolean;
   /** The base moved past this open branch; it must be updated before it can merge. */
   behind_base?: boolean;
+  /** Waiting in its base branch's merge queue with this person's merge authority. */
+  auto_merge?: { requested_by: string; requested_at: number } | null;
+  /** Why the merge queue gave up, until someone asks again. */
+  auto_merge_stopped?: { reason: string; at: number } | null;
+  /** The branch lives in a fork, which Myelin does not update or queue. */
+  is_fork?: boolean;
   durable: boolean;
 }
 
@@ -1147,6 +1153,17 @@ export type BranchUpdateResult =
   /** Why the Edge would not update the branch, in words for the person who asked. */
   | { refused: string };
 
+/** The Edge's bounded, person-facing explanation from an error envelope, if it sent one. */
+function edgeErrorMessage(body: unknown): string | null {
+  const error = body !== null && typeof body === "object" && !Array.isArray(body)
+    ? (body as Record<string, unknown>).error
+    : null;
+  const message = error !== null && typeof error === "object"
+    ? (error as Record<string, unknown>).message
+    : null;
+  return typeof message === "string" && message.length > 0 && message.length <= 512 ? message : null;
+}
+
 /** PR mutations share one action because Vinxi collides sibling actions in this module. */
 /** The union of every mutation's result (the caller narrows by `op`). */
 export type PrMutationResult =
@@ -1154,6 +1171,7 @@ export type PrMutationResult =
   | { comment: PrCommentVM }
   | { review: PrReviewVM }
   | { ok: true }
+  | { refused: string }
   | MergeResult
   | BranchUpdateResult;
 
@@ -1253,6 +1271,30 @@ export const prMutate = action(async (
           throw e;
         }
       }
+      case "auto-merge":
+      case "cancel-auto-merge": {
+        const request = parsed.op === "auto-merge";
+        try {
+          const response = request
+            ? await edgePost(`${base}/auto-merge`, {}, mutationOptions)
+            : await edgeDelete(`${base}/auto-merge`, mutationOptions);
+          if (!hasAppliedAction(response, request ? "git.pr.auto_merge.request" : "git.pr.auto_merge.cancel")) {
+            throw new RepoRouteError("error");
+          }
+          return { ok: true };
+        } catch (e) {
+          if (e instanceof GatewayError && (e.status === 403 || e.status === 404)) {
+            return {
+              refused: request
+                ? "You can't merge this pull request."
+                : "You can't change this pull request's automatic merge.",
+            };
+          }
+          const message = e instanceof GatewayError && e.status === 409 ? edgeErrorMessage(e.body) : null;
+          if (message) return { refused: message };
+          throw e;
+        }
+      }
       case "update-branch": {
         try {
           const response = await edgePost(
@@ -1272,14 +1314,9 @@ export const prMutate = action(async (
           const conflicts = parseMergeConflicts(e.body);
           // Nothing changed, so the page keeps its state and shows the conflicting files.
           if (conflicts) return json({ conflicts }, { revalidate: [] });
-          const error = e.body !== null && typeof e.body === "object" && !Array.isArray(e.body)
-            ? (e.body as Record<string, unknown>).error
-            : null;
-          const message = error !== null && typeof error === "object"
-            ? (error as Record<string, unknown>).message
-            : null;
+          const message = edgeErrorMessage(e.body);
           return {
-            refused: typeof message === "string" && message.length > 0 && message.length <= 512
+            refused: message
               ? `Could not update the branch: ${message}`
               : "Could not update the branch. Showing the latest state.",
           };

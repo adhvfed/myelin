@@ -137,6 +137,18 @@ export function parsePrListPage(value: unknown, scope: "repo" | "cross"): PrList
   };
 }
 
+function autoMergeShape(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  const input = record(value);
+  return input !== null && bounded(input.requested_by, 4 * 1024) && uint(input.requested_at);
+}
+
+function autoMergeStoppedShape(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  const input = record(value);
+  return input !== null && bounded(input.reason, 4 * 1024) && uint(input.at);
+}
+
 export function parsePr(value: unknown): PrVM | null {
   const input = record(value);
   if (!input || !positive(input.number) || !prRef(input.ref, input.number) ||
@@ -151,6 +163,8 @@ export function parsePr(value: unknown): PrVM | null {
       (input.commits_count !== undefined && input.commits_count !== null && !uint(input.commits_count)) ||
       (input.commits_count_capped !== undefined && typeof input.commits_count_capped !== "boolean") ||
       (input.behind_base !== undefined && typeof input.behind_base !== "boolean") ||
+      !autoMergeShape(input.auto_merge) || !autoMergeStoppedShape(input.auto_merge_stopped) ||
+      (input.is_fork !== undefined && typeof input.is_fork !== "boolean") ||
       input.durable !== true) return null;
   return {
     number: input.number,
@@ -169,6 +183,19 @@ export function parsePr(value: unknown): PrVM | null {
     ...(input.commits_count === undefined ? {} : { commits_count: input.commits_count }),
     ...(input.commits_count_capped === undefined ? {} : { commits_count_capped: input.commits_count_capped }),
     ...(input.behind_base === undefined ? {} : { behind_base: input.behind_base }),
+    ...(input.is_fork === undefined ? {} : { is_fork: input.is_fork }),
+    ...(input.auto_merge === undefined ? {} : {
+      auto_merge: input.auto_merge === null ? null : {
+        requested_by: (input.auto_merge as Record<string, unknown>).requested_by as string,
+        requested_at: (input.auto_merge as Record<string, unknown>).requested_at as number,
+      },
+    }),
+    ...(input.auto_merge_stopped === undefined ? {} : {
+      auto_merge_stopped: input.auto_merge_stopped === null ? null : {
+        reason: (input.auto_merge_stopped as Record<string, unknown>).reason as string,
+        at: (input.auto_merge_stopped as Record<string, unknown>).at as number,
+      },
+    }),
     durable: true,
   };
 }

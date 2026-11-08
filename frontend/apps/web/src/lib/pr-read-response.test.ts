@@ -100,6 +100,35 @@ describe("PR read response projection", () => {
     expect(parsePr({ ...record, behind_base: "yes" })).toBeNull();
   });
 
+  it("reads where a pull request stands in its merge queue", () => {
+    const record = {
+      number: 42,
+      ref: "myelin://acme/git/pr/platform/api:42",
+      pr_state: "open",
+      title: null,
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/read-boundary",
+      head_oid: HEAD,
+      author: "reviewer@example.invalid",
+      reviews: 0,
+      created_at: null,
+      durable: true,
+    };
+    expect(parsePr({
+      ...record,
+      auto_merge: { requested_by: "alice@acme.noreply", requested_at: 10, extra: true },
+      auto_merge_stopped: null,
+    })).toMatchObject({
+      auto_merge: { requested_by: "alice@acme.noreply", requested_at: 10 },
+      auto_merge_stopped: null,
+    });
+    expect(parsePr({ ...record, auto_merge: null, auto_merge_stopped: { reason: "a check failed", at: 3 } }))
+      .toMatchObject({ auto_merge: null, auto_merge_stopped: { reason: "a check failed", at: 3 } });
+    expect(parsePr({ ...record, auto_merge: { requested_by: "", requested_at: 1 } })).toBeNull();
+    expect(parsePr({ ...record, auto_merge_stopped: { reason: "x", at: -1 } })).toBeNull();
+  });
+
   it("projects PR diffs recursively", () => {
     const projected = parsePrDiff({
       number: 42,

@@ -405,6 +405,9 @@ impl GitEffectApi {
                     Ok(BranchUpdate::Conflicted { paths }) => {
                         EffectResult::Denied(describe_conflicts(&paths))
                     }
+                    Ok(BranchUpdate::Moved) => EffectResult::Denied(
+                        "the pull request's branch moved; read it again and retry".into(),
+                    ),
                     Err(error) => deny_durable_error(error),
                 }
             }

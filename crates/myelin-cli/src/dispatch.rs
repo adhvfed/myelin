@@ -153,6 +153,13 @@ impl EdgeCall {
         }
     }
 
+    fn delete_keyed(path: impl Into<String>) -> EdgeCall {
+        EdgeCall {
+            retry_policy: RetryPolicy::CallerKeyRequired,
+            ..EdgeCall::delete(path)
+        }
+    }
+
     fn delete(path: impl Into<String>) -> EdgeCall {
         EdgeCall {
             method: HttpMethod::Delete,
@@ -311,6 +318,13 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/update-branch"),
             json!({}),
         )),
+        CliCommand::PrAutoMerge { repo, number } => Ok(EdgeCall::post_json(
+            format!("/v1/git/repos/{repo}/prs/{number}/auto-merge"),
+            json!({}),
+        )),
+        CliCommand::PrDisableAutoMerge { repo, number } => Ok(EdgeCall::delete_keyed(format!(
+            "/v1/git/repos/{repo}/prs/{number}/auto-merge"
+        ))),
         CliCommand::PrEndorseForkCi { repo, number } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/endorse-fork-ci"),
             json!({}),
@@ -647,6 +661,15 @@ mod tests {
         let merge = git_dispatch(&["pr", "merge", "alpha", "7"]).unwrap();
         assert_eq!(merge.method, HttpMethod::Post);
         assert_eq!(merge.path, "/v1/git/repos/alpha/prs/7/merge");
+
+        let auto = git_dispatch(&["pr", "merge", "alpha", "7", "--auto"]).unwrap();
+        assert_eq!(auto.method, HttpMethod::Post);
+        assert_eq!(auto.path, "/v1/git/repos/alpha/prs/7/auto-merge");
+        let disable = git_dispatch(&["pr", "merge", "alpha", "7", "--disable-auto"]).unwrap();
+        assert_eq!(disable.method, HttpMethod::Delete);
+        assert_eq!(disable.path, "/v1/git/repos/alpha/prs/7/auto-merge");
+        assert_eq!(disable.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert!(git_dispatch(&["pr", "merge", "alpha", "7", "--auto", "--disable-auto"]).is_err());
 
         let update = git_dispatch(&["pr", "update", "alpha", "7"]).unwrap();
         assert_eq!(update.method, HttpMethod::Post);

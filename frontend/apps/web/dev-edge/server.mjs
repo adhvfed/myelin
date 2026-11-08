@@ -22,6 +22,7 @@ import {
   prChecksJson,
   prThreadsJson,
   resetPrFixtures,
+  devCancelAutoMerge,
   prDiffJson,
   prDiffCapacityEnvelope,
   fileLinesJson,
@@ -1442,6 +1443,22 @@ const server = createServer((req, res) => {
     }
     state.issueCloseResponses += 1;
     return send(res, 200, output);
+  }
+
+  // Leaving the merge queue — the one PR write that is a DELETE.
+  let am;
+  if (
+    method === "DELETE" &&
+    (am = path.match(/^\/v1\/git\/repos\/([^/]+)\/prs\/(\d+)\/auto-merge$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (!validPrOperationId(req.headers["idempotency-key"])) {
+      return send(res, 400, {
+        error: { message: "production PR writes require a valid `Idempotency-Key` header", code: "bad_request" },
+      });
+    }
+    const out = devCancelAutoMerge(decodeURIComponent(am[1]), Number(am[2]));
+    return send(res, out.status, out.json ?? { error: { message: "no such pull request", code: "not_found" } });
   }
 
   // R3.3 — PR write paths (threads / reviews / merge). Stateful in-memory; the e2e drives these.

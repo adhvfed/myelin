@@ -11,19 +11,19 @@ use myelin_agent_service::workspace::{AgentWorkspaceStore, LocalDevelopmentWorks
 use myelin_agent_service::workspace_execution::AgentWorkspaceExecutor;
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
-    bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
-    register_agent_mcp, register_agent_threads, register_agents, register_chat, register_ci,
-    register_git_durable, register_git_wire, register_issues, register_knowledge, register_notif,
-    register_privacy, register_projects, register_refs, register_tools,
-    serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AgentMcpAuthority,
-    AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices, AgentThreadHttpInputs,
-    AgentThreadRecoveryConfig, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy,
-    BootstrapParams, CheckBackedRepoAuthorizer, DeviceAuthorizationBroker,
-    DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess, DurableChatMutationApi,
-    DurableChatReadApi, DurableChatReferenceApi, DurableCiApi, DurableGitBackend,
-    DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway, GitDatabaseProviders,
-    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
-    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    bootstrap_principal_and_mint, execute_secret_command, merge_queue_interval_from_env,
+    recover_placed_git_at_boot, register_agent_mcp, register_agent_threads, register_agents,
+    register_chat, register_ci, register_git_durable, register_git_wire, register_issues,
+    register_knowledge, register_notif, register_privacy, register_projects, register_refs,
+    register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
+    spawn_merge_queue, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources,
+    AgentMcpServices, AgentThreadHttpInputs, AgentThreadRecoveryConfig, AuthProvider,
+    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
+    DeviceAuthorizationBroker, DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess,
+    DurableChatMutationApi, DurableChatReadApi, DurableChatReferenceApi, DurableCiApi,
+    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway,
+    GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe,
+    SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
     TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
 };
 use myelin_events::OutboxStore;
@@ -1017,6 +1017,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         handle.clone(),
     );
     let project_principals = human_store.clone();
+    let git_principals = human_store.clone();
     let mcp_principals = PrincipalStore::with_pg(
         kms.clone(),
         DurablePrincipalBacking::new(provider.clone()),
@@ -1159,6 +1160,11 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 eprintln!("edge: Issues authorization reconciler refused to start: {error}");
                 std::process::exit(1);
             });
+    let cell_tenants: Vec<String> = issue_reconciliation_config
+        .tenants()
+        .iter()
+        .map(|tenant| tenant.0.clone())
+        .collect();
     let issue_reconciler = spawn_issue_authorization_reconciler(
         issue_store.clone(),
         check.clone(),
@@ -1206,6 +1212,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             std::process::exit(1);
         })
         .with_repo_authorizer(repo_authz.clone())
+        .with_principal_directory(git_principals)
         .with_repo_bootstrap(repo_bootstrap)
         .with_git_wire_credential_issuer(git_wire_credentials)
         .with_git_shutdown_signal(git_shutdown.clone()),
@@ -1222,6 +1229,15 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         recovery.repos_reconciled,
         recovery.refs_reapplied,
         recovery.merges_recovered
+    );
+    let merge_queue = spawn_merge_queue(
+        git_backend.clone(),
+        cell_tenants,
+        provider.config().region.clone(),
+        merge_queue_interval_from_env().unwrap_or_else(|error| {
+            eprintln!("edge: the merge queue refused to start: {error}");
+            std::process::exit(1);
+        }),
     );
 
     let edge_shed = match myelin_edge::shed_governor::EdgeShed::from_thresholds(&thresholds) {
@@ -1504,6 +1520,10 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         }
         signal_result
     });
+    if let Err(e) = merge_queue.shutdown().await {
+        eprintln!("edge: the merge queue did not drain cleanly: {e}");
+        std::process::exit(1);
+    }
     let reconciliation_result = issue_reconciler.shutdown().await;
     if let Err(e) = reconciliation_result {
         eprintln!("edge: Issues authorization reconciler did not drain cleanly: {e}");

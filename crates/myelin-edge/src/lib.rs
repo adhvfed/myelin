@@ -95,8 +95,9 @@ pub use gateway::{
     GatewayBuilder, WhoamiHandler,
 };
 pub use git_durable::{
-    recover_placed_git_at_boot, register_git_durable, DurableGitBackend, GitBootRecoveryReport,
-    GitCellBootRecoveryReport, GitDatabaseProviders,
+    merge_queue_interval_from_env, recover_placed_git_at_boot, register_git_durable,
+    spawn_merge_queue, DurableGitBackend, GitBootRecoveryReport, GitCellBootRecoveryReport,
+    GitDatabaseProviders, MergeQueueHandle,
 };
 pub use git_effect::GitEffectApi;
 pub use git_wire_exec::{

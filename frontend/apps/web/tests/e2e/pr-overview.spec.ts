@@ -379,6 +379,30 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(page.getByTestId("branch-behind")).toBeVisible();
   });
 
+  test("a pull request that cannot merge yet can be set to merge when ready, and back", async ({ page }) => {
+    await resetPrFixtures();
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/1"); // blocked by checks and approvals.
+    await page.waitForLoadState("networkidle");
+    await page.getByRole("button", { name: "Merge when ready" }).click();
+    await expect(page.getByText("Will merge automatically when ready")).toBeVisible();
+    const queued = page.getByTestId("auto-merge-queued");
+    await expect(queued).toContainText("Merging automatically when ready.");
+    await expect(queued).toContainText("merge rights of u_dev_operator@acme.noreply, who asked.");
+    await queued.getByRole("button", { name: "Cancel automatic merge" }).click();
+    await expect(page.getByText("Automatic merge cancelled")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Merge when ready" })).toBeVisible();
+  });
+
+  test("a stopped automatic merge says why", async ({ page }) => {
+    await resetPrFixtures();
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/7");
+    await page.waitForLoadState("networkidle");
+    await expect(page.getByTestId("auto-merge-stopped"))
+      .toContainText("Automatic merge stopped: main and this branch both changed README.md.");
+  });
+
   test("a mergeable PR opens the merge ConfirmDialog (alertdialog, safe-action focus)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/2"); // gate admitted.

@@ -275,7 +275,14 @@ export function parsePrThreads(value: unknown): PrThreadsVM | null {
   };
 }
 
-export function hasAppliedAction(value: unknown, action: "git.pr.review.submit" | "git.pr.review.discard"): boolean {
+export function hasAppliedAction(
+  value: unknown,
+  action:
+    | "git.pr.review.submit"
+    | "git.pr.review.discard"
+    | "git.pr.auto_merge.request"
+    | "git.pr.auto_merge.cancel",
+): boolean {
   return applied(value, action) !== null;
 }
 

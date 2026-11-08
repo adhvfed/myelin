@@ -17,6 +17,8 @@ pub enum BranchUpdate {
     Updated { head_oid: String, replayed: bool },
     /// Both sides changed these paths incompatibly; nothing was written.
     Conflicted { paths: Vec<String> },
+    /// The branch moved since the caller looked, or while it was being updated; nothing was written.
+    Moved,
 }
 
 struct UpdateTarget<'a> {
@@ -84,9 +86,7 @@ impl DurableGitBackend {
             DurableError::NotFound("the pull request's branch no longer exists".into())
         })?;
         if expected_head_oid.is_some_and(|expected| expected != head_tip.as_str()) {
-            return Err(DurableError::Conflict(
-                "the pull request's branch moved; reload it and try again".into(),
-            ));
+            return Ok(BranchUpdate::Moved);
         }
         let base_tip = repo.read_ref(&base_ref)?.ok_or_else(|| {
             DurableError::NotFound("the pull request's base branch no longer exists".into())
@@ -169,9 +169,7 @@ impl DurableGitBackend {
                 {
                     return self.replayed_update(&target, previous);
                 }
-                Err(DurableError::Conflict(
-                    "the pull request's branch moved while it was being updated; try again".into(),
-                ))
+                Ok(BranchUpdate::Moved)
             }
             PushOutcome::Rejected(reason) => Err(DurableError::Conflict(format!(
                 "the branch update was refused: {reason:?}"

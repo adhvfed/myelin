@@ -354,7 +354,9 @@ impl DurableGitBackend {
     }
 }
 
-fn canonical_required_context_tokens(raw: &[String]) -> Result<Vec<String>, DurableError> {
+pub(super) fn canonical_required_context_tokens(
+    raw: &[String],
+) -> Result<Vec<String>, DurableError> {
     MergeGatePolicy::from_required_contexts(raw)
         .map(|policy| {
             policy

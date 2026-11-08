@@ -219,6 +219,8 @@ myelin repo list
 myelin repo pr list
 # Merge the base into a pull request that another merge left behind, on the server:
 myelin --idempotency-key update-pr-7 repo pr update platform 7
+# Merge it once it is approved, up to date, and green; the queue lands one per base branch:
+myelin --idempotency-key queue-pr-7 repo pr merge platform 7 --auto
 myelin project create "Developer experience" --prefix DX --idempotency-key developer-experience
 myelin project show
 myelin project list

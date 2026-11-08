@@ -4,6 +4,72 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Merge when ready: a serial merge queue
+
+Update branch made a stranded pull request mergeable, but a person still had to watch CI and come
+back to press Merge. Every merge then stranded the next pull request again. With agents opening
+pull requests faster than people can shepherd them, that babysitting became the bottleneck.
+
+A person with merge rights can now schedule a pull request to merge when ready: **Merge when ready**
+on the web merge card, `myelin repo pr merge <repo> <n> --auto` (and `--disable-auto`), or
+`POST`/`DELETE /v1/git/repos/{repo}/prs/{n}/auto-merge`. A background queue in Edge works through
+scheduled pull requests one base branch at a time, oldest request first. It wakes after any pull
+request change or branch move, and at least every few seconds for check results that the check
+projection records. The oldest scheduled pull request that people have approved, with nothing left
+unresolved, is brought up to date with its base. Its required checks then run on that exact head,
+and it merges, fast-forward only. The next one then starts from the new base, so each lands tested
+on top of the last, and CI is not spent on branches that the merge ahead will make stale. A pull
+request waiting for review holds nothing up.
+
+The queue acts with the scheduling person's authority and checks it again before every step:
+- They must still be an active human in the principal directory, with merge rights on the repository.
+- The schedule is bound to the head they scheduled. Myelin's own base merges carry it forward, but
+  commits pushed afterwards stop it ("new commits arrived after the merge was scheduled"), so nobody
+  can ride someone else's decision.
+- Agents and CI credentials cannot schedule a merge.
+
+Anything a person can act on stops the automatic merge with a reason kept on the pull request. That
+covers a conflict with the base, a failed required check, required checks that never finish within
+six hours, a deleted base, a refused update, and lost rights. So no pull request holds its base
+indefinitely. A stop applies only to the exact request it judged, so a person who cancels or
+schedules again while a pass is deciding is never overridden. The queue reads the request once more
+just before it merges.
+
+An independent review found the first version bound schedules to people rather than heads. It also
+found these, all fixed with tests:
+- errors that held a base forever without a reason;
+- deterministic merge-operation identities that would have replayed a stale "blocked" result
+  forever;
+- an unbounded stop reason that could blank the pull-request page;
+- a stop racing a person's cancel;
+- a deleted base being recreated;
+- a page that never refreshed while queued;
+- a "Merge when ready" button offered on drafts and forks.
+
+The update-branch outcome for a branch that moved is now typed rather than an error. A journey that
+read only the first page of a grown project-collaborator list now walks every page.
+
+Proof:
+- The readable TypeScript journey schedules two approved pull requests under a ruleset that requires
+  `ci/contract` and one approval, then watches both merge with no further action. The second's
+  final head is a merge of the first's head, and CI succeeded on that exact commit before it landed.
+- A second journey sees a red required check stop the schedule with "a required check failed:
+  ci/contract", then schedules again, cancels, and is refused for a principal without merge rights.
+- The real-stack browser spec clicks Merge when ready while CI runs and watches the page show the
+  pull request merged.
+- Rust unit tests cover:
+  - the mutations' head binding;
+  - updating then merging;
+  - review waits;
+  - conflict stops;
+  - commits pushed after scheduling;
+  - a stale stop yielding to a newer request;
+  - a deleted base;
+  - agents refused.
+- Mocked browser tests cover scheduling, cancelling, and a stop reason.
+- The 21 Git, queue, CLI, and update-branch journeys and the 82-journey regression set pass, along
+  with the frontend check and strict Clippy for the touched crates.
+
 ## 2026-11-08 — Update branch
 
 Merging is fast-forward only, so every merge stranded every other open pull request on the same
