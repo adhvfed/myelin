@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — Cancelling CI stops the sandbox
+
+Cancellation used to stop only the bookkeeping. Supersession terminated the workflow and marked
+the run cancelled, but the runner never looked again: a superseded PR build kept burning its gVisor
+sandbox until the command exited or timed out.
+
+While a workload runs, the runner now polls a cheap durable probe every two seconds, plus once at
+launch: is this job's workflow terminated? When it is, the runner trips the job's existing
+cancellation flag. gVisor kills the container, and the reporter's terminated-workflow path settles
+the measured usage once. The runner reports the cycle as `Cancelled`, not as a retry. A cancel that
+lands during checkout preparation is also a clean stop: its retry report finds the job already
+settled, and the terminated workflow explains why. It is no longer logged as a claim needing
+reconciliation.
+
+Proof: a runner unit story proves a terminated workflow stops its live backend promptly and
+reports exactly one settlement through the retryable-attempt path as a clean cancellation. The
+agent-cancel journey below exercises it in gVisor, where the sandbox stopped about three seconds
+after the run started.
+
 ## 2026-11-08 — The CI runner starts on current hosts again
 
 Three changes on the development host had quietly stopped self-hosted CI from passing its own

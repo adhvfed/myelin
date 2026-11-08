@@ -7,8 +7,13 @@ use myelin_flow::{
 };
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
-use std::collections::BTreeMap;
-use std::sync::{mpsc::SyncSender, Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How often a running job re-checks whether its workflow was cancelled or superseded.
+pub const WORKFLOW_CANCELLATION_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct QueuedJob {
@@ -51,6 +56,7 @@ impl QueuedJob {
 #[derive(Clone, Default)]
 pub struct JobLeaseStore {
     inner: Arc<Mutex<BTreeMap<(String, String), QueuedJob>>>,
+    terminated: Arc<Mutex<BTreeSet<(String, String)>>>,
 }
 
 impl JobLeaseStore {
@@ -133,6 +139,20 @@ impl JobLeaseStore {
         self.lock().remove(&(tenant.0.clone(), job_id.to_string()));
     }
 
+    pub fn terminate_workflow(&self, tenant: &TenantId, job_id: &str) {
+        self.terminated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((tenant.0.clone(), job_id.to_string()));
+    }
+
+    pub fn workflow_terminated(&self, tenant: &TenantId, job_id: &str) -> bool {
+        self.terminated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(tenant.0.clone(), job_id.to_string()))
+    }
+
     pub fn claimable_depth(&self, runner_labels: &[String], region: &Region, now: i64) -> usize {
         self.lock()
             .values()
@@ -145,7 +165,7 @@ impl JobLeaseStore {
     }
 }
 
-pub trait LeaseStore {
+pub trait LeaseStore: Sync {
     fn claim_for_labels(
         &self,
         worker: &str,
@@ -166,6 +186,9 @@ pub trait LeaseStore {
     ) -> bool;
 
     fn settle(&self, tenant: &TenantId, job_id: &str);
+
+    /// True once the job's workflow was terminated, so its sandbox should stop.
+    fn workflow_terminated(&self, tenant: &TenantId, job_id: &str) -> bool;
 }
 
 impl LeaseStore for JobLeaseStore {
@@ -201,6 +224,10 @@ impl LeaseStore for JobLeaseStore {
 
     fn settle(&self, tenant: &TenantId, job_id: &str) {
         self.settle(tenant, job_id)
+    }
+
+    fn workflow_terminated(&self, tenant: &TenantId, job_id: &str) -> bool {
+        self.workflow_terminated(tenant, job_id)
     }
 }
 
@@ -527,6 +554,10 @@ pub enum RunnerCycleOutcome {
         job_id: String,
         report: PreparationRetryReport,
     },
+    /// The job's workflow was terminated; its usage settled through the cancelled run.
+    Cancelled {
+        job_id: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -681,7 +712,8 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         match self.run_one_cycle(now)? {
             RunnerCycleOutcome::Workload(outcome) => Ok(outcome),
             RunnerCycleOutcome::PreparationTerminal { job_id, .. }
-            | RunnerCycleOutcome::PreparationRetryable { job_id, .. } => {
+            | RunnerCycleOutcome::PreparationRetryable { job_id, .. }
+            | RunnerCycleOutcome::Cancelled { job_id } => {
                 Err(RunnerError::PreparationRoutingFailed {
                     job_id,
                     message: "typed preparation outcome requires the runner-cycle caller".into(),
@@ -738,6 +770,7 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
         let output_run_id = job.run_id.clone();
         let output_job_id = job.job_id.clone();
         let output_tenant = job.tenant.clone();
+        let workflow_cancelled = std::sync::atomic::AtomicBool::new(false);
         let launch_result = std::thread::scope(|scope| {
             let output: Arc<dyn SandboxOutputSink> = Arc::new(OutputChannelSink { tx });
             let cancellation = SandboxCancellation::new();
@@ -747,6 +780,24 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
             let spec = &job.spec;
             let launch_thread =
                 scope.spawn(move || backend.run_cycle(spec, hooks, output, backend_cancellation));
+            let (_stop_watching, launch_ended) = std::sync::mpsc::channel::<()>();
+            let watched_cancellation = cancellation.clone();
+            let leases = &self.leases;
+            let (tenant, job_id) = (&job.tenant, &job.job_id);
+            let workflow_cancelled = &workflow_cancelled;
+            scope.spawn(move || loop {
+                if leases.workflow_terminated(tenant, job_id) {
+                    workflow_cancelled.store(true, std::sync::atomic::Ordering::Release);
+                    watched_cancellation.cancel();
+                    return;
+                }
+                if !matches!(
+                    launch_ended.recv_timeout(WORKFLOW_CANCELLATION_POLL),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+            });
             let consumed = (|| -> Result<(), String> {
                 while let Ok(frame) = rx.recv() {
                     self.firehose.ship_frame(
@@ -906,6 +957,9 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                     },
                 )
                 .map_err(RunnerError::ReportFailed)?;
+            if workflow_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(RunnerCycleOutcome::Cancelled { job_id: job.job_id });
+            }
             return Err(RunnerError::RetryableAttemptRecorded {
                 job_id: job.job_id,
                 message,
@@ -974,6 +1028,13 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 job_id: job.job_id.clone(),
                 report: PreparationRetryReport::Requeued,
             }),
+            PreparationRetryReport::NoOp
+                if self.leases.workflow_terminated(&job.tenant, &job.job_id) =>
+            {
+                Ok(RunnerCycleOutcome::Cancelled {
+                    job_id: job.job_id.clone(),
+                })
+            }
             PreparationRetryReport::NoOp => Err(RunnerError::PreparationRoutingFailed {
                 job_id: job.job_id.clone(),
                 message:
@@ -2147,6 +2208,53 @@ mod tests {
             hook_settlements.lock().unwrap().is_empty(),
             "the backend hook cannot double-settle reporter-owned completion"
         );
+    }
+
+    #[test]
+    fn a_terminated_workflow_stops_its_running_sandbox() {
+        let q = JobLeaseStore::new();
+        q.enqueue(QueuedJob::new(
+            tenant(),
+            region(),
+            "run-cancelled",
+            "job-cancelled",
+            vec!["linux".into()],
+            ci_spec("idem-cancelled"),
+        ));
+        q.terminate_workflow(&tenant(), "job-cancelled");
+        let backend = BlockingStreamingBackend::default();
+        let firehose = CountingFirehose::new();
+        let reporter_settlements = Arc::new(Mutex::new(Vec::new()));
+        let reporter =
+            RecordingTerminalReporter::reporter_owned(reporter_settlements.clone(), false);
+        let agent = RunnerAgent::new(
+            "worker-cancelled",
+            vec!["linux".into()],
+            vec![TrustTier::Trusted],
+            region(),
+            30,
+            q,
+            &backend,
+            &firehose,
+            &reporter,
+            hooks_with_owner(
+                CompletionSettlementOwner::TerminalReporter,
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = agent
+            .run_one_cycle(1000)
+            .expect("a cancelled workload is a clean cycle");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(backend.cancellation_observed.load(Ordering::SeqCst));
+        assert!(matches!(
+            outcome,
+            RunnerCycleOutcome::Cancelled { ref job_id } if job_id == "job-cancelled"
+        ));
+        assert_eq!(reporter.reports.load(Ordering::SeqCst), 0);
+        assert_eq!(reporter.retry_reports.load(Ordering::SeqCst), 1);
     }
 
     #[test]

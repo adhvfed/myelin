@@ -251,6 +251,23 @@ impl LeaseStore for DurableLeaseAdapter {
         }
     }
 
+    fn workflow_terminated(&self, tenant: &TenantId, job_id: &str) -> bool {
+        match bridge(
+            &self.rt,
+            self.tenant_store
+                .workflow_terminated(&tenant.0, &self.region, job_id),
+        ) {
+            Ok(terminated) => terminated,
+            Err(e) => {
+                eprintln!(
+                    "ci-runner: cancellation check FAILED for job {job_id} (the job keeps \
+                     running): {e}"
+                );
+                false
+            }
+        }
+    }
+
     fn settle(&self, tenant: &TenantId, job_id: &str) {
         if let Err(e) = bridge(
             &self.rt,
@@ -474,6 +491,9 @@ impl CiRunnerLoop {
                     eprintln!(
                         "ci-runner[{worker_id}]: preparation requeued job {job_id} ({report:?})"
                     );
+                }
+                Ok(myelin_ci_sandbox::RunnerCycleOutcome::Cancelled { job_id }) => {
+                    eprintln!("ci-runner[{worker_id}]: stopped job {job_id}; its run was cancelled");
                 }
                 Err(RunnerError::NoWork) => {
                     if runner_sleep_until_shutdown(&mut shutdown, idle_backoff) {

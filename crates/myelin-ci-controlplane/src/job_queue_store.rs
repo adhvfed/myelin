@@ -931,6 +931,38 @@ impl CiJobQueueStore {
         .map_err(JobQueueStoreError::from_pg)?;
         Ok(extended)
     }
+
+    pub async fn workflow_terminated(
+        &self,
+        tenant_id: &str,
+        region: &str,
+        job_id: &str,
+    ) -> Result<bool, JobQueueStoreError> {
+        let job_uuid = parse_id("job_id", job_id)?;
+        let tenant_id_owned = tenant_id.to_string();
+        let region_owned = region.to_string();
+        with_tenant_tx(&self.pool, tenant_id, region, move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                       SELECT 1 FROM job_queue q
+                       JOIN workflow_run w
+                         ON w.tenant_id = q.tenant_id AND w.region = q.region
+                        AND w.run_id = q.run_id::text
+                       WHERE q.tenant_id = $1 AND q.region = $2 AND q.job_id = $3
+                         AND w.state = 'terminated')",
+                )
+                .bind(&tenant_id_owned)
+                .bind(&region_owned)
+                .bind(job_uuid)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))
+            })
+        })
+        .await
+        .map_err(JobQueueStoreError::from_pg)
+    }
 }
 
 pub struct JobQueueReaper {
