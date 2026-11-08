@@ -86,7 +86,7 @@ pub use chat_effect::ChatEffectApi;
 pub use chat_http::{register_chat, DurableChatMutationApi, DurableChatReadApi};
 pub use chat_reference::DurableChatReferenceApi;
 pub use ci_effect::CiEffectApi;
-pub use ci_http::{register_ci, DurableCiReadApi};
+pub use ci_http::{register_ci, DurableCiApi};
 pub use device_auth::{device_authorization_migrations, DeviceAuthorizationBroker};
 pub use effect_router::RoutedEffectApi;
 pub use error::{map_authz_error, EdgeError};

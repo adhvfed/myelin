@@ -138,6 +138,7 @@ pub const CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
 pub const CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID: &str =
     "ci_0028_ci_pipeline_v6_cutover_fence_row";
 pub const CI_SCHEDULER_FAIRNESS_WRITE_MIGRATION_ID: &str = "ci_0029_scheduler_fairness_write";
+pub const CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID: &str = "ci_0030_ci_run_manual_source_scope";
 
 pub const CREATE_CI_RUN_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_run (
@@ -278,6 +279,17 @@ pub const CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL: &str = "ALTER TABLE ci_run \
 DROP CONSTRAINT ci_run_source_ref_shape; \
 ALTER TABLE ci_run \
 RENAME CONSTRAINT ci_run_source_ref_shape_v3 TO ci_run_source_ref_shape";
+
+/// Manual (human) retries keep the branch of the run they replay.
+pub const WIDEN_CI_RUN_MANUAL_SOURCE_SCOPE_DDL: &str = "ALTER TABLE ci_run \
+DROP CONSTRAINT ci_run_source_ref_shape, \
+ADD CONSTRAINT ci_run_source_ref_shape \
+CHECK (source_ref IS NULL OR (\
+trigger_kind IN ('push', 'pull_request', 'agent', 'manual') \
+AND source_ref ~ '^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$' \
+AND octet_length(source_ref) BETWEEN 12 AND 1024 \
+AND source_ref !~ '(^|/)\\.\\.?(/|$)' \
+AND source_ref !~ '[[:cntrl:] ~^:?*\\[]'))";
 
 pub const CREATE_CI_DRIVE_MANIFEST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_drive_manifest (
@@ -2131,6 +2143,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
         GRANT_SCHEDULER_FAIRNESS_WRITE_DDL,
         FAIR_DEFICIT_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID,
+        WIDEN_CI_RUN_MANUAL_SOURCE_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -2207,6 +2224,11 @@ pub fn ci_durable_migrations() -> Migrations {
     migrations.push(Migration::plain_on(
         CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
         CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID,
+        WIDEN_CI_RUN_MANUAL_SOURCE_SCOPE_DDL,
         CI_RUN_TABLE,
     ));
     Migrations::of(migrations)
@@ -2921,6 +2943,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_PIPELINE_V5_CUTOVER_FENCE_ROW_MIGRATION_ID,
                 CI_PIPELINE_V6_CUTOVER_FENCE_ROW_MIGRATION_ID,
                 CI_SCHEDULER_FAIRNESS_WRITE_MIGRATION_ID,
+                CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID,
             ],
             "the append-only tail retains every expand → validate → contract dependency"
         );
@@ -3012,7 +3035,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            83,
+            84,
             "the complete append-only schema includes durable scheduler fairness"
         );
         fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
@@ -3058,6 +3081,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                     CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID,
                     CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
                     CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
+                    CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID,
                 ];
                 assert!(
                     CONSTRAINT_REPLACEMENT_ALLOWLIST.contains(&m.id.as_ref()),
@@ -3206,6 +3230,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, CREATE_CI_REGION_SCHEDULER_RLS_DDL);
             } else if m.id == CI_SCHEDULER_FAIRNESS_WRITE_MIGRATION_ID {
                 assert_eq!(m.ddl, GRANT_SCHEDULER_FAIRNESS_WRITE_DDL);
+            } else if m.id == CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID {
+                assert_eq!(m.ddl, WIDEN_CI_RUN_MANUAL_SOURCE_SCOPE_DDL);
             } else {
                 assert!(
                     m.ddl.starts_with("CREATE INDEX CONCURRENTLY")
@@ -3233,7 +3259,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            83,
+            84,
             "the runner applied the complete schema plus every additive follow-on"
         );
         assert_eq!(
@@ -3701,6 +3727,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 CI_RUN_AGENT_SOURCE_SCOPE_EXPAND_MIGRATION_ID,
                 CI_RUN_AGENT_SOURCE_SCOPE_VALIDATE_MIGRATION_ID,
                 CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID,
+                CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID,
             ],
             "the subset is exactly the writer-critical creates plus ci_run's forward ALTERs and repaired provenance contract"
         );
@@ -3732,8 +3759,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let subset = ci_durable_migrations();
         assert_eq!(
             subset.0.len(),
-            16,
-            "four writer-critical CI tables plus twelve forward ci_run ALTERs"
+            17,
+            "four writer-critical CI tables plus thirteen forward ci_run ALTERs"
         );
         for m in &subset.0 {
             assert!(
@@ -3765,6 +3792,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, VALIDATE_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
             } else if m.id == CI_RUN_AGENT_SOURCE_SCOPE_CONTRACT_MIGRATION_ID {
                 assert_eq!(m.ddl, CONTRACT_CI_RUN_AGENT_SOURCE_SCOPE_DDL);
+            } else if m.id == CI_RUN_MANUAL_SOURCE_SCOPE_MIGRATION_ID {
+                assert_eq!(m.ddl, WIDEN_CI_RUN_MANUAL_SOURCE_SCOPE_DDL);
             } else {
                 assert!(
                     m.ddl.contains("myelin_make_tenant_scoped"),
@@ -3777,6 +3806,6 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         runner
             .run(&subset, &ci_durable_hot_tables())
             .expect("the CI durable writer subset applies forward-only");
-        assert_eq!(runner.applied().len(), 16);
+        assert_eq!(runner.applied().len(), 17);
     }
 }

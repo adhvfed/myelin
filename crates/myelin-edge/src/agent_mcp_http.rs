@@ -37,7 +37,7 @@ use crate::runtime::drive_edge_future;
 use crate::workspace_access::DurableAgentWorkspaceAccess;
 use crate::workspace_effect::WorkspaceEffectApi;
 use crate::{
-    ChatEffectApi, CiEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi,
+    ChatEffectApi, CiEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiApi,
     DurableGitBackend, DurableIssueMutationApi, DurableKnowledgeMutationApi,
     DurableKnowledgeReadApi, DurableProjectReadApi, GitEffectApi, IssueEffectApi,
     KnowledgeEffectApi, McpReadExecutor, RoutedEffectApi,
@@ -76,7 +76,7 @@ impl AgentMcpAuthority {
 #[derive(Clone)]
 pub struct AgentMcpResources {
     git: Arc<DurableGitBackend>,
-    ci: DurableCiReadApi,
+    ci: DurableCiApi,
     issues: DurableIssueMutationApi,
     knowledge: DurableKnowledgeReadApi,
     knowledge_mutations: DurableKnowledgeMutationApi,
@@ -88,7 +88,7 @@ pub struct AgentMcpResources {
 
 pub struct AgentMcpResourceInputs {
     pub git: Arc<DurableGitBackend>,
-    pub ci: DurableCiReadApi,
+    pub ci: DurableCiApi,
     pub issues: DurableIssueMutationApi,
     pub knowledge: DurableKnowledgeMutationApi,
     pub chat: DurableChatReadApi,
@@ -723,7 +723,7 @@ struct CreatorApproverPolicy {
     principals: PrincipalStore,
     repos: Arc<dyn RepoAuthorizer>,
     issues: DurableIssueMutationApi,
-    ci: DurableCiReadApi,
+    ci: DurableCiApi,
 }
 
 impl GateApproverPolicy for CreatorApproverPolicy {

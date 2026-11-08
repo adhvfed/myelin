@@ -7,7 +7,7 @@ use sqlx::types::Uuid;
 use std::sync::Arc;
 
 use crate::agent_thread_http::agent_thread_public_state;
-use crate::ci_http::{canonical_uuid, repo_slug_from_ref, DurableCiReadApi};
+use crate::ci_http::{canonical_uuid, repo_slug_from_ref, DurableCiApi};
 use crate::{
     DurableAgentThreadReferenceApi, DurableChatReferenceApi, DurableGitBackend,
     DurableIssueReadApi, DurableKnowledgeReadApi,
@@ -130,7 +130,7 @@ impl DurableReferenceCardResolver {
         self
     }
 
-    pub fn with_ci(mut self, ci: DurableCiReadApi) -> Self {
+    pub fn with_ci(mut self, ci: DurableCiApi) -> Self {
         self.projectors
             .push(Arc::new(CiReferenceCardProjector { ci }));
         self
@@ -222,7 +222,7 @@ impl ReferenceCardProjector for KnowledgeReferenceCardProjector {
 }
 
 struct CiReferenceCardProjector {
-    ci: DurableCiReadApi,
+    ci: DurableCiApi,
 }
 
 struct AgentThreadReferenceCardProjector {

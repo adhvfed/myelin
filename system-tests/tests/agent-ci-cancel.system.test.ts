@@ -148,7 +148,7 @@ describe("human-governed agent CI cancellation", () => {
       );
       expect(replayed).toEqual(cancelled);
       expect(cancelled).toMatchObject({
-        event_id: expect.stringMatching(/^ci-agent-cancel-[0-9a-f]{64}$/),
+        event_id: expect.stringMatching(/^ci-cancel-[0-9a-f]{64}$/),
         ref: runRef,
         data: {
           run_id: runId,

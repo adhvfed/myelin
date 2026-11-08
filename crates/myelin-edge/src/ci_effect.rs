@@ -10,10 +10,10 @@ use serde::Deserialize;
 
 use crate::agent_delegation::is_active_delegation;
 use crate::effect_carrier::parse_proposed;
-use crate::DurableCiReadApi;
+use crate::DurableCiApi;
 
 pub struct CiEffectApi {
-    ci: DurableCiReadApi,
+    ci: DurableCiApi,
     principal: Principal,
     delegator: Principal,
     authority: Arc<RunTokenAuthorizer>,
@@ -27,7 +27,7 @@ struct RunMutationRequest {
 
 impl CiEffectApi {
     pub fn new(
-        ci: DurableCiReadApi,
+        ci: DurableCiApi,
         principal: Principal,
         delegator: Principal,
         authority: Arc<RunTokenAuthorizer>,

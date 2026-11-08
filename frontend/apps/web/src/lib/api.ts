@@ -69,6 +69,14 @@ import {
   type CiRunsPage,
 } from "./ci-read-response";
 import {
+  ciRunMutationErrorKind,
+  parseCiCancelReceipt,
+  parseCiRetryReceipt,
+  parseCiRunMutation,
+  type CiRunMutation,
+  type CiRunMutationResult,
+} from "./ci-run-control";
+import {
   codeSearchParams,
   parseCodeSearchInput,
   parseCodeSearchPage,
@@ -84,6 +92,7 @@ import {
 } from "./repo-error";
 
 export type { PrMutation } from "./mutation-input";
+export type { CiRunMutation, CiRunMutationResult } from "./ci-run-control";
 export type { CodeSearchHit, CodeSearchInput, CodeSearchPage } from "./code-search";
 export type { RepoCreateReceipt } from "./repo-create";
 export {
@@ -666,6 +675,34 @@ export const getCiLog = query(async (request: CiLogInput): Promise<CiLogRangeVM>
     return range;
   });
 }, "ci-log");
+
+/** Re-run or cancel one CI run. Re-run and cancel share one action because Vinxi collides sibling
+ *  actions in this module; the Edge decides push access and state, the browser only maps the outcome. */
+export const ciRunMutate = action(async (m: CiRunMutation) => {
+  "use server";
+  const respond = (value: CiRunMutationResult) => json(value, { revalidate: [] });
+  const parsed = parseCiRunMutation(m);
+  if (!parsed) return respond({ ok: false, error: "bad-input" });
+  try {
+    const response = await edgePost(
+      `/v1/ci/runs/${seg(parsed.run)}/${parsed.op}`,
+      {},
+      { idempotencyKey: parsed.clientNonce },
+    );
+    if (parsed.op === "retry") {
+      const receipt = parseCiRetryReceipt(response, parsed.run);
+      return respond(receipt ? { ok: true, op: "retry", receipt } : { ok: false, error: "error" });
+    }
+    const receipt = parseCiCancelReceipt(response, parsed.run);
+    return respond(receipt ? { ok: true, op: "cancel", receipt } : { ok: false, error: "error" });
+  } catch (e) {
+    if (isUnauthorized(e)) throw redirect("/login");
+    return respond({
+      ok: false,
+      error: e instanceof GatewayError ? ciRunMutationErrorKind(e.status) : "error",
+    });
+  }
+}, "ci-run-mutate");
 
 /** One bounded page of the authenticated viewer's unified inbox. */
 export const getInbox = query(async (cursor: string | null = null): Promise<InboxPage> => {

@@ -21,7 +21,7 @@ use sqlx::types::Uuid;
 use tokio::runtime::Handle;
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, Method};
-use crate::ci_http::DurableCiReadApi;
+use crate::ci_http::DurableCiApi;
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::DurableGitBackend;
@@ -36,7 +36,7 @@ struct DurableNotifHttpApi {
     store: Arc<PgInboxStore>,
     identity: StoreBackedCheck,
     git: Arc<DurableGitBackend>,
-    ci: DurableCiReadApi,
+    ci: DurableCiApi,
     runtime: Handle,
 }
 
@@ -732,7 +732,7 @@ pub fn register_notif(
     store: Arc<PgInboxStore>,
     identity: StoreBackedCheck,
     git: Arc<DurableGitBackend>,
-    ci: DurableCiReadApi,
+    ci: DurableCiApi,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = DurableNotifHttpApi {

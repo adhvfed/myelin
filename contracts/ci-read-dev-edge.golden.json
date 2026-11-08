@@ -54,6 +54,7 @@
             "repo_ref": "myelin://acme/git/repo/alpha",
             "source_ref": "refs/heads/main",
             "commit_oid": "0123456789abcdef",
+            "definition_snapshot": "cas:golden-newest",
             "trigger_kind": "push",
             "trust_tier": "trusted",
             "state": "failed",
@@ -92,6 +93,7 @@
             "repo_ref": "myelin://acme/git/repo/alpha",
             "source_ref": null,
             "commit_oid": "fedcba9876543210",
+            "definition_snapshot": "cas:golden-older",
             "trigger_kind": "pull_request",
             "trust_tier": "trusted",
             "state": "running",
@@ -159,6 +161,7 @@
           "repo_ref": "myelin://acme/git/repo/alpha",
           "source_ref": "refs/heads/main",
           "commit_oid": "0123456789abcdef",
+          "definition_snapshot": "cas:golden-newest",
           "trigger_kind": "push",
           "trust_tier": "trusted",
           "state": "failed",
@@ -193,7 +196,11 @@
             "status": "failed",
             "details_ref": "#step-contract"
           }
-        ]
+        ],
+        "controls": {
+          "retry": false,
+          "cancel": false
+        }
       }
     },
     {

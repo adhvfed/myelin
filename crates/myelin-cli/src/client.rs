@@ -322,6 +322,8 @@ fn validate_ci_success(call: &EdgeCall, body: &Value) -> Result<(), CliError> {
         [run, "jobs", job, "log"] if canonical_uuid(run) && canonical_uuid(job) => {
             validate_ci_log_range(call, run, job, body)
         }
+        [run, "retry"] if canonical_uuid(run) => validate_ci_retry_receipt(run, body),
+        [run, "cancel"] if canonical_uuid(run) => validate_ci_cancel_receipt(run, body),
         _ => malformed_ci("request route is not canonical"),
     }
 }
@@ -358,8 +360,70 @@ fn validate_ci_run_list(call: &EdgeCall, body: &Value) -> Result<(), CliError> {
     Ok(())
 }
 
+fn validate_ci_retry_receipt(source_run: &str, body: &Value) -> Result<(), CliError> {
+    let object = exact_object(
+        body,
+        &[
+            "run_id",
+            "ref",
+            "source_run_id",
+            "workflow_run_id",
+            "event_id",
+            "replayed",
+        ],
+        "run retry",
+    )?;
+    let run_id = validate_ci_change_receipt(object, "run retry")?;
+    if object["source_run_id"].as_str() != Some(source_run) || run_id == source_run {
+        return malformed_ci("run retry does not name a new run for the requested source");
+    }
+    Ok(())
+}
+
+fn validate_ci_cancel_receipt(requested_run: &str, body: &Value) -> Result<(), CliError> {
+    let object = exact_object(
+        body,
+        &[
+            "run_id",
+            "ref",
+            "workflow_run_id",
+            "state",
+            "event_id",
+            "replayed",
+        ],
+        "run cancellation",
+    )?;
+    let run_id = validate_ci_change_receipt(object, "run cancellation")?;
+    if run_id != requested_run || object["state"].as_str() != Some("cancelled") {
+        return malformed_ci("run cancellation does not describe the requested run");
+    }
+    Ok(())
+}
+
+/// The fields every run retry and cancellation receipt shares; returns the receipt's run id.
+fn validate_ci_change_receipt<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    what: &str,
+) -> Result<&'a str, CliError> {
+    let run_id = canonical_uuid_field(object, "run_id", what)?;
+    canonical_uuid_field(object, "workflow_run_id", what)?;
+    let reference = object["ref"].as_str().unwrap_or_default();
+    if !reference.starts_with("myelin://") || !reference.ends_with(&format!("/ci/run/{run_id}")) {
+        return malformed_ci("run change ref is not canonical");
+    }
+    bounded_string_field(object, "event_id", what, 256)?;
+    if !object["replayed"].is_boolean() {
+        return malformed_ci("run change replay flag must be a boolean");
+    }
+    Ok(run_id)
+}
+
 fn validate_ci_run_detail(requested_run: &str, body: &Value) -> Result<(), CliError> {
-    let object = exact_object(body, &["run", "jobs", "steps"], "run detail")?;
+    let object = exact_object(body, &["run", "jobs", "steps", "controls"], "run detail")?;
+    let controls = exact_object(&object["controls"], &["retry", "cancel"], "run controls")?;
+    if !controls["retry"].is_boolean() || !controls["cancel"].is_boolean() {
+        return malformed_ci("run controls must be booleans");
+    }
     validate_ci_run_summary(&object["run"])?;
     if object["run"]["run_id"].as_str() != Some(requested_run) {
         return malformed_ci("run detail id does not match the request");
@@ -489,6 +553,7 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
             "repo_ref",
             "source_ref",
             "commit_oid",
+            "definition_snapshot",
             "trigger_kind",
             "trust_tier",
             "state",
@@ -498,6 +563,7 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
         ],
         "run summary",
     )?;
+    bounded_string_field(run, "definition_snapshot", "run summary", 1_024)?;
     let run_id = canonical_uuid_field(run, "run_id", "run summary")?;
     canonical_uuid_field(run, "pipeline_id", "run summary")?;
     let repo_ref = bounded_string_field(run, "repo_ref", "run summary", 1_024)?;
@@ -520,7 +586,7 @@ fn validate_ci_run_summary(value: &Value) -> Result<(), CliError> {
         .ok_or_else(|| malformed_ci_error("run summary trigger kind is invalid"))?;
     if !(run["source_ref"].is_null()
         || run["source_ref"].as_str().is_some_and(|source_ref| {
-            matches!(trigger_kind, "push" | "pull_request")
+            matches!(trigger_kind, "push" | "pull_request" | "agent" | "manual")
                 && source_ref.starts_with("refs/heads/")
                 && bounded_string(source_ref, 1_024)
                 && myelin_git::receive_pack::RefName::new(source_ref)
@@ -1218,6 +1284,48 @@ mod tests {
                 "CLI trusted a malformed repository reference: {malformed}"
             );
         }
+    }
+
+    #[test]
+    fn ci_run_change_receipts_are_bound_to_the_requested_run() {
+        let source = "91000000-0000-4000-8000-000000000001";
+        let retried = "91000000-0000-4000-8000-0000000000aa";
+        let workflow = "94000000-0000-4000-8000-000000000001";
+        let retry_call = get(&format!("/v1/ci/runs/{source}/retry"), None);
+        let retry = json!({
+            "run_id": retried,
+            "ref": format!("myelin://acme/ci/run/{retried}"),
+            "source_run_id": source,
+            "workflow_run_id": workflow,
+            "event_id": "retry-event",
+            "replayed": false,
+        });
+        validate_ci_success(&retry_call, &retry).unwrap();
+        let mut same_run = retry.clone();
+        same_run["run_id"] = json!(source);
+        same_run["ref"] = json!(format!("myelin://acme/ci/run/{source}"));
+        assert!(validate_ci_success(&retry_call, &same_run).is_err());
+        let mut extra = retry.clone();
+        extra["state"] = json!("queued");
+        assert!(validate_ci_success(&retry_call, &extra).is_err());
+
+        let cancel_call = get(&format!("/v1/ci/runs/{source}/cancel"), None);
+        let cancel = json!({
+            "run_id": source,
+            "ref": format!("myelin://acme/ci/run/{source}"),
+            "workflow_run_id": workflow,
+            "state": "cancelled",
+            "event_id": "ci-cancel-event",
+            "replayed": true,
+        });
+        validate_ci_success(&cancel_call, &cancel).unwrap();
+        let mut other_run = cancel.clone();
+        other_run["run_id"] = json!(retried);
+        other_run["ref"] = json!(format!("myelin://acme/ci/run/{retried}"));
+        assert!(validate_ci_success(&cancel_call, &other_run).is_err());
+        let mut still_running = cancel;
+        still_running["state"] = json!("running");
+        assert!(validate_ci_success(&cancel_call, &still_running).is_err());
     }
 
     #[test]

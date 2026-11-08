@@ -55,6 +55,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if is_ci_run_detail(value) {
         return render_ci_run_detail(value);
     }
+    if let Some(rendered) = render_ci_run_change(value, call) {
+        return rendered;
+    }
     if let Some(rendered) = privacy::render_response(value) {
         return rendered;
     }
@@ -390,7 +393,40 @@ fn render_ci_run_detail(value: &Value) -> String {
             "    {marker} {state}  step {step_id}  job={job_id}  bytes={start}..{end}\n"
         ));
     }
+    if safe_cli_uuid(run_id) {
+        let controls = &value["controls"];
+        if controls["retry"].as_bool() == Some(true) {
+            output.push_str(&format!(
+                "  re-run: myelin --idempotency-key <key> ci retry {run_id}\n"
+            ));
+        }
+        if controls["cancel"].as_bool() == Some(true) {
+            output.push_str(&format!(
+                "  stop: myelin --idempotency-key <key> ci cancel {run_id}\n"
+            ));
+        }
+    }
     output
+}
+
+fn render_ci_run_change(value: &Value, call: Option<&EdgeCall>) -> Option<String> {
+    let path = call?.path.strip_prefix("/v1/ci/runs/")?;
+    let run_id = value.get("run_id").and_then(Value::as_str).filter(|id| safe_cli_uuid(id))?;
+    let replayed = value.get("replayed").and_then(Value::as_bool) == Some(true);
+    let again = if replayed { " (already requested)" } else { "" };
+    if path.ends_with("/retry") {
+        let source = value
+            .get("source_run_id")
+            .and_then(Value::as_str)
+            .filter(|id| safe_cli_uuid(id))?;
+        return Some(format!(
+            "queued run {run_id}, a retry of {source}{again}\n  follow: myelin ci view {run_id}\n"
+        ));
+    }
+    if path.ends_with("/cancel") {
+        return Some(format!("cancelled run {run_id}{again}\n"));
+    }
+    None
 }
 
 fn is_ci_log_range(value: &Value) -> bool {

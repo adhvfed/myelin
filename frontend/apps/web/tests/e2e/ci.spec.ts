@@ -18,6 +18,8 @@ async function setCiConfig(config: {
   ciLiveStaleNextResume?: boolean;
   ciLiveRejectNextAccess?: boolean;
   severCiLive?: boolean;
+  ciViewerCanPush?: boolean;
+  ciRunState?: { run: string; state: string };
 }) {
   const context = await pwRequest.newContext();
   const response = await context.post(`${EDGE}/__test/config`, { data: config });
@@ -220,5 +222,87 @@ test.describe("CT-005 CI web read surface", () => {
     );
     expect(overflow).toBeLessThanOrEqual(1);
     await expectNoAxeViolations(page, "CI mobile run list");
+  });
+});
+
+test.describe("CI run controls", () => {
+  const NEW_RUN = /\/ci\/runs\/91000000-0000-4000-8000-0000000001[0-9a-f]{2}$/;
+  const actions = (page: Page) => page.locator(".ci-run-detail-actions");
+
+  test("a failed run offers Re-run and opens the new queued run", async ({ page }) => {
+    await devLogin(page);
+    await page.goto(`/ci/runs/${FAILED_RUN}`);
+
+    await expect(page.getByRole("button", { name: "Re-run" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Cancel run" })).toHaveCount(0);
+    await expectNoAxeViolations(page, "failed run with Re-run");
+
+    await page.getByRole("button", { name: "Re-run" }).click();
+    await page.waitForURL(NEW_RUN);
+    await expect(page).not.toHaveURL(new RegExp(`${FAILED_RUN}$`));
+    await expect(actions(page).getByTitle("State: Queued")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Cancel run" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Re-run" })).toHaveCount(0);
+  });
+
+  test("cancelling a running run asks first, then shows it cancelled with Re-run", async ({ page }) => {
+    await devLogin(page);
+    await page.goto(`/ci/runs/${RUNNING_RUN}`);
+
+    await expect(page.getByRole("button", { name: "Re-run" })).toHaveCount(0);
+    await page.getByRole("button", { name: "Cancel run" }).click();
+    const dialog = page.getByRole("alertdialog", { name: "Cancel this run?" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Keep running" })).toBeFocused();
+    await expectNoAxeViolations(page, "cancel confirmation");
+
+    await dialog.getByRole("button", { name: "Keep running" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(actions(page).getByTitle("State: Running")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Cancel run" })).toBeFocused();
+
+    await page.getByRole("button", { name: "Cancel run" }).click();
+    await dialog.getByRole("button", { name: "Cancel run" }).click();
+    await expect(actions(page).getByTitle("State: Cancelled")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Re-run" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Cancel run" })).toHaveCount(0);
+    await expect(page.getByTestId("ci-run-action-error")).toHaveCount(0);
+  });
+
+  test("a viewer without push access sees neither control", async ({ page }) => {
+    await setCiConfig({ ciViewerCanPush: false });
+    await devLogin(page);
+    for (const run of [FAILED_RUN, RUNNING_RUN]) {
+      await page.goto(`/ci/runs/${run}`);
+      await expect(page.getByRole("heading", { level: 1, name: "Run 91000000" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Re-run" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Cancel run" })).toHaveCount(0);
+    }
+  });
+
+  test("cancelling a run that already finished explains it and offers no silent retry", async ({ page }) => {
+    await devLogin(page);
+    await page.goto(`/ci/runs/${RUNNING_RUN}`);
+    await expect(page.getByRole("button", { name: "Cancel run" })).toBeVisible();
+
+    await setCiConfig({ ciRunState: { run: RUNNING_RUN, state: "succeeded" } });
+    await page.getByRole("button", { name: "Cancel run" }).click();
+    await page.getByRole("alertdialog").getByRole("button", { name: "Cancel run" }).click();
+
+    await expect(page.getByRole("alert").filter({ hasText: "This run already finished." })).toBeVisible();
+    await expect(page.getByRole("alertdialog")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Cancel run" })).toBeEnabled();
+  });
+
+  test("a viewer who lost push access mid-session sees the access message", async ({ page }) => {
+    await devLogin(page);
+    await page.goto(`/ci/runs/${FAILED_RUN}`);
+    await expect(page.getByRole("button", { name: "Re-run" })).toBeVisible();
+
+    await setCiConfig({ ciViewerCanPush: false });
+    await page.getByRole("button", { name: "Re-run" }).click();
+    await expect(page.getByRole("alert").filter({ hasText: "You need push access to this repository." }))
+      .toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`${FAILED_RUN}$`));
   });
 });

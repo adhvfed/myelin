@@ -358,6 +358,12 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
         CiCliCommand::Watch { run_id, job_id } => {
             EdgeCall::get(format!("/v1/ci/runs/{run_id}/jobs/{job_id}/log/live"))
         }
+        CiCliCommand::Retry { run_id } => {
+            EdgeCall::post_json(format!("/v1/ci/runs/{run_id}/retry"), json!({}))
+        }
+        CiCliCommand::Cancel { run_id } => {
+            EdgeCall::post_json(format!("/v1/ci/runs/{run_id}/cancel"), json!({}))
+        }
     }
 }
 
@@ -928,6 +934,14 @@ mod tests {
         assert_eq!(watch.path, format!("/v1/ci/runs/{run}/jobs/{job}/log/live"));
         assert!(watch.query.is_none());
         assert!(watch.payload.is_none());
+
+        for (verb, route) in [("retry", "retry"), ("cancel", "cancel")] {
+            let change = ci_dispatch(&[verb, run]).unwrap();
+            assert_eq!(change.method, HttpMethod::Post);
+            assert_eq!(change.path, format!("/v1/ci/runs/{run}/{route}"));
+            assert_eq!(change.payload.as_deref(), Some(b"{}".as_slice()));
+            assert_eq!(change.retry_policy, RetryPolicy::CallerKeyRequired);
+        }
     }
 
     #[test]

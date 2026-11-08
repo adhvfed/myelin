@@ -104,7 +104,10 @@ tier, and causal provenance, and allocates a fresh run, workflow, and check atte
 inherit visibility from the run's live source repository rather than a synthetic CI permission.
 Exact retries converge on the same requested run and event; they never buy or launch duplicate
 compute. The same agent can ask to cancel one exact queued or running run under the same approval
-rule. Cancelling, whether by an agent or by supersession, stops the sandbox within seconds rather
+rule. People with push access do the same directly: the run page, `myelin ci retry|cancel`, and the
+API re-run a finished run or stop an active one, with a confirmation before anything is interrupted.
+A human re-run is recorded as `manual` and keeps the source branch; an exact retry of the same intent
+returns the same run. Cancelling, whether by an agent or by supersession, stops the sandbox within seconds rather
 than letting abandoned compute run to its timeout, and its measured usage settles exactly once.
 
 The workspace is personalizable at creation time. Repository guidance remains the shared default,

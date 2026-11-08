@@ -44,6 +44,7 @@ const NEWEST_RUN = Object.freeze({
     repo_ref: "myelin://acme/git/repo/alpha",
     source_ref: "refs/heads/main",
     commit_oid: "0123456789abcdef",
+    definition_snapshot: "cas:golden-newest",
     trigger_kind: "push",
     trust_tier: "trusted",
     state: "failed",
@@ -58,6 +59,7 @@ const OLDER_RUN = Object.freeze({
     repo_ref: "myelin://acme/git/repo/alpha",
     source_ref: null,
     commit_oid: "fedcba9876543210",
+    definition_snapshot: "cas:golden-older",
     trigger_kind: "pull_request",
     trust_tier: "trusted",
     state: "running",
@@ -282,11 +284,107 @@ export function ciRunsEnvelope(input, options = {}) {
   };
 }
 
+const RETRYABLE_STATES = new Set(["failed", "timed_out", "cancelled", "reaped"]);
+const CANCELLABLE_STATES = new Set(["queued", "running"]);
+const JOB_STATE = {
+  queued: "queued", running: "running", succeeded: "succeeded", failed: "failed",
+  cancelled: "cancelled", timed_out: "failed", reaped: "reaped",
+};
+
+export function ciControls(state, viewerCanPush = false) {
+  return {
+    retry: viewerCanPush && RETRYABLE_STATES.has(state),
+    cancel: viewerCanPush && CANCELLABLE_STATES.has(state),
+  };
+}
+
+/** `options.detail(runId)` lets a stateful server substitute its own run; fixtures are the default. */
 export function ciRunJson(runId, options = {}) {
   if (options.empty) return null;
-  if (runId === CI_NEWEST_RUN) return FAILED_DETAIL;
-  if (runId === CI_OLDER_RUN) return RUNNING_DETAIL;
-  return null;
+  const detail = options.detail
+    ? options.detail(runId)
+    : runId === CI_NEWEST_RUN ? FAILED_DETAIL : runId === CI_OLDER_RUN ? RUNNING_DETAIL : null;
+  if (!detail) return null;
+  return { ...detail, controls: ciControls(detail.run.state, options.viewerCanPush) };
+}
+
+function withState(detail, state, now) {
+  if (detail.run.state === state) return detail;
+  const finished = !CANCELLABLE_STATES.has(state);
+  return {
+    ...detail,
+    run: { ...detail.run, state, finished_at: finished ? now : null },
+    jobs: detail.jobs.map((job) => ({ ...job, state: JOB_STATE[state], result_summary: null })),
+  };
+}
+
+/**
+ * In-memory retry/cancel behaviour for the browser-contract server: cancelling changes the served
+ * run state, retrying creates a queued copy of the source run that the detail endpoint then serves.
+ */
+export function createCiRunControl() {
+  let states, created, receipts, sequence;
+  const reset = () => {
+    states = new Map();
+    created = new Map();
+    receipts = new Map();
+    sequence = 0;
+  };
+  reset();
+  const serial = (prefix) => `${prefix}-4000-8000-${(0x100 + ++sequence).toString(16).padStart(12, "0")}`;
+  const base = (runId) => created.get(runId) ??
+    (runId === CI_NEWEST_RUN ? FAILED_DETAIL : runId === CI_OLDER_RUN ? RUNNING_DETAIL : null);
+  const detail = (runId) => {
+    const found = base(runId);
+    const state = states.get(runId);
+    return found && state ? withState(found, state, "2026-07-24T12:10:00.000000Z") : found;
+  };
+
+  return {
+    reset,
+    detail,
+    setState(runId, state) {
+      if (base(runId) && RUN_STATES.has(state) && state !== "all") states.set(runId, state);
+    },
+    /** Result is `{ status, body }`, or null when the run is unknown. */
+    mutate(op, runId, key, viewerCanPush = false) {
+      const found = detail(runId);
+      if (!found) return null;
+      if (!viewerCanPush) return { status: 403, body: null };
+      const replayKey = `${op}|${runId}|${key}`;
+      const replay = receipts.get(replayKey);
+      if (replay) return { status: 200, body: { ...replay, replayed: true } };
+      const allowed = op === "retry" ? RETRYABLE_STATES : CANCELLABLE_STATES;
+      if (!allowed.has(found.run.state)) return { status: 409, body: null };
+      const workflowRunId = serial("94000000-0000");
+      const eventId = `evt-${sequence}`;
+      let body;
+      if (op === "cancel") {
+        states.set(runId, "cancelled");
+        body = {
+          run_id: runId, ref: found.run.ref, workflow_run_id: workflowRunId,
+          state: "cancelled", event_id: eventId, replayed: false,
+        };
+      } else {
+        const newId = serial("91000000-0000");
+        const ref = `myelin://acme/ci/run/${newId}`;
+        created.set(newId, {
+          run: {
+            ...found.run, run_id: newId, ref, trigger_kind: "manual", state: "queued", cost_settled: false,
+            created_at: "2026-07-24T12:10:00.000000Z", finished_at: null,
+          },
+          jobs: found.jobs.map((job) => ({ ...job, state: "queued", result_summary: null })),
+          steps: [],
+        });
+        body = {
+          run_id: newId, ref, source_run_id: runId, workflow_run_id: workflowRunId,
+          event_id: eventId, replayed: false,
+        };
+      }
+      receipts.set(replayKey, body);
+      return { status: op === "retry" ? 202 : 200, body };
+    },
+  };
 }
 
 export function parseCiLogQuery(query) {

@@ -26,6 +26,7 @@ function run() {
     repo_ref: "myelin://acme/git/repo/alpha",
     source_ref: "refs/heads/main",
     commit_oid: "0123456789abcdef",
+    definition_snapshot: "cas:golden-newest",
     trigger_kind: "push",
     trust_tier: "trusted",
     state: "failed",
@@ -34,6 +35,61 @@ function run() {
     finished_at: "2026-07-24T12:05:00.000000Z",
   };
 }
+
+describe("CI run provenance", () => {
+  const detail = (overrides: Record<string, unknown>) => ({
+    run: { ...run(), ...overrides },
+    jobs: [],
+    steps: [],
+    controls: { retry: false, cancel: false },
+  });
+
+  it("keeps the branch of agent and manual retries", () => {
+    for (const trigger_kind of ["push", "pull_request", "agent", "manual"]) {
+      expect(parseCiRunDetail(detail({ trigger_kind }), RUN)?.run.source_ref).toBe("refs/heads/main");
+    }
+    expect(parseCiRunDetail(detail({ trigger_kind: "schedule" }), RUN)).toBeNull();
+  });
+
+  it("requires the immutable definition snapshot", () => {
+    expect(parseCiRunDetail(detail({ definition_snapshot: undefined }), RUN)).toBeNull();
+    expect(parseCiRunDetail(detail({ definition_snapshot: "" }), RUN)).toBeNull();
+  });
+});
+
+describe("CI run detail controls", () => {
+  const detail = (controls?: unknown) => ({
+    run: run(),
+    jobs: [],
+    steps: [],
+    ...(controls === undefined ? {} : { controls }),
+  });
+
+  it("decodes both booleans exactly", () => {
+    expect(parseCiRunDetail(detail({ retry: true, cancel: false }))?.controls)
+      .toEqual({ retry: true, cancel: false });
+    expect(parseCiRunDetail(detail({ retry: false, cancel: true }))?.controls)
+      .toEqual({ retry: false, cancel: true });
+    expect(parseCiRunDetail(detail({ retry: false, cancel: false }))?.controls)
+      .toEqual({ retry: false, cancel: false });
+  });
+
+  it.each([
+    undefined,
+    null,
+    [],
+    "yes",
+    {},
+    { retry: true },
+    { cancel: false },
+    { retry: "true", cancel: false },
+    { retry: true, cancel: 0 },
+    { retry: null, cancel: false },
+    { retry: true, cancel: false, admin: true },
+  ])("refuses a missing or malformed controls object %#", (controls) => {
+    expect(parseCiRunDetail(detail(controls))).toBeNull();
+  });
+});
 
 describe("CI read responses", () => {
   it("strictly decodes list/detail facts and exact step anchors", () => {
@@ -48,6 +104,7 @@ describe("CI read responses", () => {
 
     const detail = parseCiRunDetail({
       run: run(),
+      controls: { retry: true, cancel: false },
       jobs: [{
         job_id: JOB,
         stage: "test",
@@ -87,6 +144,7 @@ describe("CI read responses", () => {
   it("normalizes legacy summaries and refuses unknown or contradictory modern results", () => {
     const detailWith = (result_summary: unknown) => parseCiRunDetail({
       run: run(),
+      controls: { retry: true, cancel: false },
       jobs: [{
         job_id: JOB,
         stage: "test",
@@ -176,7 +234,7 @@ describe("CI read responses", () => {
     { items: [{ ...run(), internal: true }], page: { next_cursor: null, limit: 1 } },
     { items: [{ ...run(), state: "leased" }], page: { next_cursor: null, limit: 1 } },
     { items: [{ ...run(), source_ref: "refs/tags/release" }], page: { next_cursor: null, limit: 1 } },
-    { items: [{ ...run(), trigger_kind: "pull_request" }], page: { next_cursor: null, limit: 1 } },
+    { items: [{ ...run(), trigger_kind: "schedule" }], page: { next_cursor: null, limit: 1 } },
   ])("rejects malformed list payload %#", (value) => {
     expect(parseCiRunsPage(value)).toBeNull();
   });
@@ -184,6 +242,7 @@ describe("CI read responses", () => {
   it("rejects orphaned or forged step anchors", () => {
     const base = {
       run: run(),
+      controls: { retry: true, cancel: false },
       jobs: [{
         job_id: JOB,
         stage: "test",
@@ -222,6 +281,7 @@ describe("CI read responses", () => {
   it("rejects a missing opaque or nullable field instead of treating it as optional", () => {
     const missingResult = {
       run: run(),
+      controls: { retry: true, cancel: false },
       jobs: [{
         job_id: JOB,
         stage: "test",
@@ -239,6 +299,7 @@ describe("CI read responses", () => {
   it("binds detail/log responses to the request and rejects a malformed job DAG", () => {
     const base = {
       run: run(),
+      controls: { retry: true, cancel: false },
       jobs: [{
         job_id: JOB,
         stage: "test",

@@ -20,7 +20,7 @@ use myelin_edge::{
     AgentThreadRecoveryConfig, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy,
     BootstrapParams, CheckBackedRepoAuthorizer, DeviceAuthorizationBroker,
     DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess, DurableChatMutationApi,
-    DurableChatReadApi, DurableChatReferenceApi, DurableCiReadApi, DurableGitBackend,
+    DurableChatReadApi, DurableChatReferenceApi, DurableCiApi, DurableGitBackend,
     DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway, GitDatabaseProviders,
     IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
     SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
@@ -1276,20 +1276,9 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         provider.db_pool().clone(),
         ci_surface_cursor_key,
     );
-    let mcp_ci = DurableCiReadApi::new(
-        ci_runs.clone(),
-        git_backend.clone(),
-        ci_blobs.clone(),
-        handle.clone(),
-    )
-    .with_agent_cancellation(provider.clone());
-    builder = register_ci(
-        builder,
-        ci_runs,
-        git_backend.clone(),
-        ci_blobs,
-        handle.clone(),
-    );
+    let mcp_ci = DurableCiApi::new(ci_runs, git_backend.clone(), ci_blobs, handle.clone())
+        .with_cost_ledger(provider.clone());
+    builder = register_ci(builder, mcp_ci.clone());
     if git_wire.is_some() {
         builder = register_git_wire(builder, git_backend.clone());
     }

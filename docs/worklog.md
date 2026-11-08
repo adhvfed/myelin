@@ -4,6 +4,55 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — People can re-run and cancel CI themselves
+
+Only agents could retry or cancel CI, and only through an approval card. A person with push access
+had no way to re-run a flaky failure or stop a runaway job except waiting for its timeout. The run
+page now offers **Re-run** for a failed, timed-out, cancelled, or reaped run and **Cancel run** for
+a queued or running one. Cancel asks for confirmation first, and errors are plain. The same changes
+are `myelin ci retry|cancel <run>` and `POST /v1/ci/runs/{run}/retry|cancel`, and run detail
+reports the viewer's `controls`.
+
+Both paths go through one gate shared with the agent effects. The authority must be an active human
+who can see the run (otherwise 404) and push to its repository (otherwise 403). Agent run
+credentials are refused at the route because the actions accept only human sessions, PATs, and
+operators. The durable retry records a human re-run as `manual` and keeps the source branch: a
+forward migration widens the branch-provenance check to that trigger kind. Cancellation reuses
+the deadlock-free requested-cancel transaction with one actor-neutral event identity. Replays of
+the same `Idempotency-Key` return the same run or event, reported as `replayed`.
+
+Proof: the readable TypeScript journey re-runs a genuinely failing pipeline and observes a fresh
+`manual` run on the same repository, branch, commit, definition snapshot, and trust tier. An exact
+replay returns it again and the commit ends with exactly two runs. It also stops a sandbox that is
+running in gVisor, which settles once, and proves an agent's run credential gets 403, an outsider
+gets 404, and a second cancel of the finished run gets 409. Both passed (9.5 s and 3.4 s) against
+the restarted stack alongside the agent retry, agent cancel, and CLI-authentication journeys.
+
+A real-stack Chromium journey pushes a two-minute pipeline. It opens the running run, dismisses
+and then confirms the cancellation, re-runs it from the cancelled page, lands on the `manual` run,
+and stops that too. It passed in 9.3 s, as did the full product journey. The shared golden
+contract and the Edge, web, and CLI decoders cover the new fields. The dev-edge browser contract
+suite adds five control scenarios (13 specs pass). The web unit suite passes 741 stories, and
+strict workspace Clippy is clean.
+
+## 2026-11-08 — CI pages decode real runs again
+
+The September CI-retry slice added `definition_snapshot` to every run the Edge returns, but the
+strict web and CLI decoders and the shared golden contract were not updated. Against a real Edge,
+the CI list, the run page, and `myelin ci list|view` rejected every run as malformed. Both
+decoders also accepted a branch only on `push` or `pull_request` runs, so agent and manual retries
+would have been unreadable too. The mocked browser suite hid all of this, and the real-stack
+product journey had not been run since. The decoders and the golden contract now carry the
+snapshot, and the branch rule matches the database constraint.
+
+The CI list also refreshed only while a listed run was active, so a run pushed after the page loaded
+never appeared once older runs had finished. The newest page now looks for new runs every five
+seconds while idle, and still every second while anything is running.
+
+Proof: the Edge golden-vector parity test passes against PostgreSQL. The web and CLI decoders have
+stories for agent and manual branches and a required snapshot. The real-stack product journey,
+which reaches the CI list and run page through the browser, passes again.
+
 ## 2026-11-08 — Agents can ask to cancel CI
 
 `ci.cancel_run` is the counterpart to `ci.retry_run`: a governed MCP effect for one exact queued or

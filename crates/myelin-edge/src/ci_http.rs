@@ -32,12 +32,26 @@ const CI_LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CI_LOG_TAIL_CHANNEL_CAPACITY: usize = CI_LOG_TAIL_BATCH_MAX * 2 + 2;
 
 #[derive(Clone)]
-pub struct DurableCiReadApi {
+pub struct DurableCiApi {
     runs: CiRunStore,
     git: Arc<DurableGitBackend>,
     blobs: Arc<dyn BlobStore + Send + Sync>,
     runtime: Handle,
-    cancellation_ledger: Option<DurableCostLedger>,
+    cost_ledger: Option<DurableCostLedger>,
+}
+
+const RETRYABLE_STATES: &[&str] = &["failed", "timed_out", "cancelled", "reaped"];
+const ACTIVE_STATES: &[&str] = &["queued", "running"];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunControls {
+    pub(crate) retry: bool,
+    pub(crate) cancel: bool,
+}
+
+fn is_active_human(principal: &Principal) -> bool {
+    principal.kind == myelin_identity::PrincipalKind::Human
+        && principal.status == myelin_identity::PrincipalStatus::Active
 }
 
 struct RunSource {
@@ -46,7 +60,7 @@ struct RunSource {
     repo_slug: String,
 }
 
-impl DurableCiReadApi {
+impl DurableCiApi {
     pub fn new(
         runs: CiRunStore,
         git: Arc<DurableGitBackend>,
@@ -58,12 +72,13 @@ impl DurableCiReadApi {
             git,
             blobs,
             runtime,
-            cancellation_ledger: None,
+            cost_ledger: None,
         }
     }
 
-    pub fn with_agent_cancellation(mut self, provider: SubstrateProvider) -> Self {
-        self.cancellation_ledger = Some(DurableCostLedger::with_runtime(
+    /// Cancelling settles reserved compute, so it needs the durable cost ledger.
+    pub fn with_cost_ledger(mut self, provider: SubstrateProvider) -> Self {
+        self.cost_ledger = Some(DurableCostLedger::with_runtime(
             provider,
             self.runtime.clone(),
         ));
@@ -152,18 +167,54 @@ impl DurableCiReadApi {
     }
 
     pub fn may_retry_run(&self, principal: &Principal, run_id: &str) -> Result<bool, EdgeError> {
-        Ok(self.run_source(principal, run_id)?.is_some_and(|run| {
-            matches!(
-                run.state.as_str(),
-                "failed" | "timed_out" | "cancelled" | "reaped"
-            ) && self.may_push(principal, &run)
-        }))
+        Ok(self.controls(principal, run_id)?.retry)
     }
 
     pub fn may_cancel_run(&self, principal: &Principal, run_id: &str) -> Result<bool, EdgeError> {
-        Ok(self.run_source(principal, run_id)?.is_some_and(|run| {
-            matches!(run.state.as_str(), "queued" | "running") && self.may_push(principal, &run)
-        }))
+        Ok(self.controls(principal, run_id)?.cancel)
+    }
+
+    /// What a human may do to the run right now; agents always go through governed tools.
+    pub(crate) fn controls(
+        &self,
+        principal: &Principal,
+        run_id: &str,
+    ) -> Result<RunControls, EdgeError> {
+        let Some(run) = self.run_source(principal, run_id)? else {
+            return Ok(RunControls::default());
+        };
+        if !is_active_human(principal) || !self.may_push(principal, &run) {
+            return Ok(RunControls::default());
+        }
+        Ok(RunControls {
+            retry: RETRYABLE_STATES.contains(&run.state.as_str()),
+            cancel: ACTIVE_STATES.contains(&run.state.as_str()),
+        })
+    }
+
+    /// The gate every retry or cancel passes: the human authority must see the run and hold push
+    /// access to its repository. Run state is the durable store's decision.
+    fn authorize_control(&self, authority: &Principal, run_id: &str) -> Result<(), EdgeError> {
+        if !canonical_uuid(run_id) {
+            return Err(EdgeError::BadRequest(
+                "CI run id must be a canonical UUID".into(),
+            ));
+        }
+        if !is_active_human(authority) {
+            return Err(EdgeError::Forbidden(
+                "CI runs are changed by people; agents use governed tools".into(),
+            ));
+        }
+        let run = self
+            .run_source(authority, run_id)?
+            .filter(|run| self.git.may_view_ci_repo(authority, &run.repo_slug))
+            .ok_or_else(|| EdgeError::NotFound("CI run not found".into()))?;
+        if !self.may_push(authority, &run) {
+            return Err(EdgeError::Forbidden(
+                "changing a CI run requires push access to its repository".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn may_view_run(
@@ -211,56 +262,40 @@ impl DurableCiReadApi {
         )
     }
 
+    /// `actor` is recorded on the new run; `authority` is the human whose access permits it
+    /// (the same person over HTTP, the delegator for an agent effect).
     pub fn retry_run(
         &self,
-        principal: &Principal,
-        delegator: &Principal,
+        actor: &Principal,
+        authority: &Principal,
         run_id: &str,
         idempotency_key: &str,
     ) -> Result<CiRunRetryOutcome, EdgeError> {
-        if !canonical_uuid(run_id) {
-            return Err(EdgeError::BadRequest(
-                "CI run id must be a canonical UUID".into(),
-            ));
-        }
-        if !self.may_retry_run(delegator, run_id)? {
-            return Err(EdgeError::NotFound("retryable CI run not found".into()));
-        }
-        self.drive_run(self.runs.retry_ci_run(principal, run_id, idempotency_key))
+        self.authorize_control(authority, run_id)?;
+        self.drive_run(self.runs.retry_ci_run(actor, run_id, idempotency_key))
             .map_err(map_retry_error)
     }
 
     pub fn cancel_run(
         &self,
-        principal: &Principal,
-        delegator: &Principal,
+        actor: &Principal,
+        authority: &Principal,
         run_id: &str,
         idempotency_key: &str,
     ) -> Result<CiRunCancelOutcome, EdgeError> {
-        if !canonical_uuid(run_id) {
-            return Err(EdgeError::BadRequest(
-                "CI run id must be a canonical UUID".into(),
-            ));
-        }
-        // Replays reach an already-cancelled run, so only authority is checked here.
-        if !self
-            .run_source(delegator, run_id)?
-            .is_some_and(|run| self.may_push(delegator, &run))
-        {
-            return Err(EdgeError::NotFound("cancellable CI run not found".into()));
-        }
-        let ledger = self.cancellation_ledger.clone().ok_or_else(|| {
-            EdgeError::Unavailable("CI run cancellation authority is unavailable".into())
+        self.authorize_control(authority, run_id)?;
+        let ledger = self.cost_ledger.clone().ok_or_else(|| {
+            EdgeError::Unavailable("CI run cancellation is unavailable".into())
         })?;
-        let authority = PgCiRunSupersession::new(
+        let supersession = PgCiRunSupersession::new(
             self.runs.pool().clone(),
             ledger,
-            principal.tenant.clone(),
-            Region(principal.region.0.clone()),
+            actor.tenant.clone(),
+            Region(actor.region.0.clone()),
             self.runtime.clone(),
         )
         .map_err(map_cancel_error)?;
-        self.drive_cancel(authority.cancel_run(principal, run_id, idempotency_key))
+        self.drive_cancel(supersession.cancel_run(actor, run_id, idempotency_key))
             .map_err(map_cancel_error)
     }
 
@@ -756,7 +791,7 @@ fn step_json(step: &CiStepSurface) -> Value {
 }
 
 fn authorized_repo_ref(
-    api: &DurableCiReadApi,
+    api: &DurableCiApi,
     principal: &Principal,
     run_id: &str,
 ) -> Result<String, EdgeError> {
@@ -852,7 +887,7 @@ fn materialize_log_archive(
 }
 
 struct CiRunListHandler {
-    api: DurableCiReadApi,
+    api: DurableCiApi,
 }
 
 impl Handler for CiRunListHandler {
@@ -897,7 +932,7 @@ impl Handler for CiRunListHandler {
 }
 
 struct CiRunViewHandler {
-    api: DurableCiReadApi,
+    api: DurableCiApi,
 }
 
 impl Handler for CiRunViewHandler {
@@ -908,17 +943,89 @@ impl Handler for CiRunViewHandler {
             ));
         }
         let run_id = run_param(ctx)?;
-        let value = self.api.read_run(ctx.principal, run_id)?;
+        let mut value = self.api.read_run(ctx.principal, run_id)?;
+        let controls = self.api.controls(ctx.principal, run_id)?;
+        value["controls"] = json!({ "retry": controls.retry, "cancel": controls.cancel });
         Ok(no_store(EdgeResponse::json(200, &value)))
     }
 }
 
+struct CiRunRetryHandler {
+    api: DurableCiApi,
+}
+
+impl Handler for CiRunRetryHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let run_id = run_param(ctx)?;
+        require_empty_object(ctx, "CI run retry")?;
+        let key = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let outcome = self
+            .api
+            .retry_run(ctx.principal, ctx.principal, run_id, &key)?;
+        Ok(no_store(EdgeResponse::json(
+            if outcome.replayed { 200 } else { 202 },
+            &json!({
+                "run_id": outcome.run_id,
+                "ref": format!("myelin://{}/ci/run/{}", ctx.principal.tenant.0, outcome.run_id),
+                "source_run_id": outcome.source_run_id,
+                "workflow_run_id": outcome.workflow_run_id,
+                "event_id": outcome.event_id,
+                "replayed": outcome.replayed,
+            }),
+        )))
+    }
+}
+
+struct CiRunCancelHandler {
+    api: DurableCiApi,
+}
+
+impl Handler for CiRunCancelHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let run_id = run_param(ctx)?;
+        require_empty_object(ctx, "CI run cancellation")?;
+        let key = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let outcome = self
+            .api
+            .cancel_run(ctx.principal, ctx.principal, run_id, &key)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "run_id": outcome.run_id,
+                "ref": format!("myelin://{}/ci/run/{}", ctx.principal.tenant.0, outcome.run_id),
+                "workflow_run_id": outcome.workflow_run_id,
+                "state": "cancelled",
+                "event_id": outcome.event_id,
+                "replayed": outcome.replayed,
+            }),
+        )))
+    }
+}
+
+fn require_empty_object(ctx: &HandlerCtx<'_>, operation: &str) -> Result<(), EdgeError> {
+    let empty = ctx.request.body.is_empty()
+        || matches!(
+            serde_json::from_slice::<Value>(&ctx.request.body),
+            Ok(Value::Object(fields)) if fields.is_empty()
+        );
+    if !ctx.request.query.is_empty() || !empty {
+        return Err(EdgeError::BadRequest(format!(
+            "{operation} accepts only an empty JSON object"
+        )));
+    }
+    Ok(())
+}
+
 struct CiLogArchiveHandler {
-    api: DurableCiReadApi,
+    api: DurableCiApi,
 }
 
 struct CiLogTailHandler {
-    api: DurableCiReadApi,
+    api: DurableCiApi,
 }
 
 impl Handler for CiLogTailHandler {
@@ -958,14 +1065,7 @@ impl Handler for CiLogArchiveHandler {
     }
 }
 
-pub fn register_ci(
-    builder: GatewayBuilder,
-    runs: CiRunStore,
-    git: Arc<DurableGitBackend>,
-    blobs: Arc<dyn BlobStore + Send + Sync>,
-    runtime: Handle,
-) -> GatewayBuilder {
-    let api = DurableCiReadApi::new(runs, git, blobs, runtime);
+pub fn register_ci(builder: GatewayBuilder, api: DurableCiApi) -> GatewayBuilder {
     builder
         .route(
             Method::Get,
@@ -989,7 +1089,19 @@ pub fn register_ci(
             Method::Get,
             "/v1/ci/runs/{run}/jobs/{job}/log/live",
             "ci.run.log.watch",
-            Arc::new(CiLogTailHandler { api }),
+            Arc::new(CiLogTailHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/ci/runs/{run}/retry",
+            "ci.run.retry",
+            Arc::new(CiRunRetryHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/ci/runs/{run}/cancel",
+            "ci.run.cancel",
+            Arc::new(CiRunCancelHandler { api }),
         )
 }
 

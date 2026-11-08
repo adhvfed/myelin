@@ -91,6 +91,12 @@ myelin context current
 myelin auth configure-git
 myelin doctor
 
+# Follow CI, and stop or re-run a run you can push to. Re-runs keep the exact commit and pipeline.
+myelin ci list --status running
+myelin ci watch 44444444-4444-4444-8444-444444444444 --job 55555555-5555-4555-8555-555555555555
+myelin --idempotency-key stop-soak ci cancel 44444444-4444-4444-8444-444444444444
+myelin --idempotency-key rerun-soak ci retry 44444444-4444-4444-8444-444444444444
+
 myelin tool list
 myelin tool show ci.read_run
 myelin agent create "Review companion" --tool ci.read_run --tool ci.retry_run \

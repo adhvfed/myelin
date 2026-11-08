@@ -14,6 +14,7 @@ import {
 import { CiErrorState, ciErrKind } from "~/components/CiErrorState";
 import { CiLiveLog } from "~/components/CiLiveLog";
 import { CiStatus, formatCiDate } from "~/components/CiStatus";
+import { CiRunControls, createCiRunControls } from "~/components/CiRunControls";
 import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 
 const ARCHIVE_CHUNK = 64 * 1024;
@@ -23,6 +24,7 @@ export default function CiRunDetail() {
   const [search] = useSearchParams();
   const runId = () => params.run ?? "";
   const detail = createAsync(() => getCiRun(runId()), { deferStream: true });
+  const controls = createCiRunControls(runId);
   const selectedJob = () => typeof search.job === "string" ? search.job : undefined;
   const selectedOffset = () => {
     if (search.offset === undefined) return 0;
@@ -74,7 +76,7 @@ export default function CiRunDetail() {
                 <header class="ci-run-detail-header">
                   <div>
                     <p class="ci-eyebrow">{ciRepoLabel(view.run.repo_ref)}</p>
-                    <h1 id="ci-run-heading">Run {view.run.run_id.slice(0, 8)}</h1>
+                    <h1 id="ci-run-heading" tabindex="-1">Run {view.run.run_id.slice(0, 8)}</h1>
                     <p>
                       <code>{view.run.commit_oid ?? "No commit object"}</code>
                       <span aria-hidden="true"> · </span>
@@ -82,6 +84,7 @@ export default function CiRunDetail() {
                     </p>
                   </div>
                   <div class="ci-run-detail-actions">
+                    <CiRunControls controls={view.controls} state={controls} />
                     <CopyArtifactRef reference={view.run.ref} />
                     <CiStatus state={view.run.state} />
                   </div>

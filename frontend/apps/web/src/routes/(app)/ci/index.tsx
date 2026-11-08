@@ -35,9 +35,14 @@ export default function CIIndex() {
       : CI_WEB_PAGE_LIMIT;
 
   onMount(() => {
+    let idleSeconds = 0;
     const timer = window.setInterval(() => {
-      if (document.hidden || !runs.latest?.items.some((run) =>
-        run.state === "queued" || run.state === "running")) return;
+      if (document.hidden) return;
+      const active = runs.latest?.items.some((run) =>
+        run.state === "queued" || run.state === "running");
+      // While nothing is running, the newest page still looks for runs pushed after it loaded.
+      if (!active && (search.cursor || ++idleSeconds < 5)) return;
+      idleSeconds = 0;
       const input = ciRunsInputFromSearch(search.state, search.limit, search.cursor);
       if (input) void revalidate(getCiRuns.keyFor(input));
     }, 1_000);

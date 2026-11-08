@@ -9,7 +9,7 @@ use myelin_ci_sandbox::FirehoseSink;
 use myelin_config::MyelinConfig;
 use myelin_edge::repo_authz::{GrantBackedRepos, RepoPermission};
 use myelin_edge::{
-    register_ci, AuthenticatedActionPolicy, DurableCiReadApi, DurableGitBackend, EdgeError,
+    register_ci, AuthenticatedActionPolicy, DurableCiApi, DurableGitBackend, EdgeError,
     EdgeRequest, Gateway, RepoAuthorizer,
 };
 use myelin_git::core::RepoLoc;
@@ -474,7 +474,7 @@ fn authenticated_gateway(
 ) -> (
     Gateway,
     CellTokenAuthority,
-    DurableCiReadApi,
+    DurableCiApi,
     Principal,
     Arc<AtomicBool>,
 ) {
@@ -529,7 +529,7 @@ fn authenticated_gateway(
         DataRole::Controller,
         PrincipalStatus::Active,
     );
-    let direct = DurableCiReadApi::new(
+    let direct = DurableCiApi::new(
         CiRunStore::with_pg(app.clone()),
         git.clone(),
         blobs.clone(),
@@ -538,14 +538,16 @@ fn authenticated_gateway(
     let builder = Gateway::builder(authn, human, Arc::new(AuthenticatedActionPolicy::mounted()));
     let builder = register_ci(
         builder,
-        CiRunStore::with_pg_surface_cursor_key(
-            app,
-            myelin_storage::SealKey::from_bytes([0x62; 32])
-                .derive_service_key("myelin test edge ci run surface cursor v1"),
+        DurableCiApi::new(
+            CiRunStore::with_pg_surface_cursor_key(
+                app,
+                myelin_storage::SealKey::from_bytes([0x62; 32])
+                    .derive_service_key("myelin test edge ci run surface cursor v1"),
+            ),
+            git,
+            blobs,
+            tokio::runtime::Handle::current(),
         ),
-        git,
-        blobs,
-        tokio::runtime::Handle::current(),
     );
     (builder.build(), cell, direct, viewer, alpha_enabled)
 }
@@ -691,11 +693,20 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
             visible.json_body().expect("visible detail JSON")["run"]["run_id"],
             VISIBLE_RUN
         );
+        let mut http_detail = visible.json_body().expect("HTTP visible detail JSON");
+        assert_eq!(
+            http_detail
+                .as_object_mut()
+                .expect("detail object")
+                .remove("controls"),
+            Some(serde_json::json!({ "retry": false, "cancel": false })),
+            "a service viewer is offered no CI controls"
+        );
         assert_eq!(
             direct
                 .read_run(&viewer, VISIBLE_RUN)
                 .expect("direct visible run"),
-            visible.json_body().expect("HTTP visible detail JSON"),
+            http_detail,
             "HTTP and agent/MCP use the same permission-checked durable read adapter"
         );
 

@@ -16,7 +16,7 @@ use registry_support::registry_for_subsystems;
 
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
 use myelin_edge::repo_authz::GrantBackedRepos;
-use myelin_edge::{DurableCiReadApi, DurableGitBackend, McpReadExecutor};
+use myelin_edge::{DurableCiApi, DurableGitBackend, McpReadExecutor};
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{
     DataRole, DelegationCaveats, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef,
@@ -192,7 +192,7 @@ impl GateApproverPolicy for NoApprovers {
 }
 
 fn server(
-    api: DurableCiReadApi,
+    api: DurableCiApi,
     router_revocations: RevocationStore,
     boundary_revocations: RevocationStore,
 ) -> McpServer {
@@ -292,7 +292,7 @@ async fn governed_ci_read_reverifies_the_run_token_at_the_durable_boundary() {
             DurableGitBackend::rooted_inmem_for_test(&git_root)
                 .with_repo_authorizer(Arc::new(grants)),
         );
-        let api = DurableCiReadApi::new(
+        let api = DurableCiApi::new(
             CiRunStore::with_pg(app),
             git,
             Arc::new(FsBlobStore::new()),

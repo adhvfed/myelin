@@ -35,6 +35,7 @@ export interface CiRunVM {
   repo_ref: string;
   source_ref: string | null;
   commit_oid: string | null;
+  definition_snapshot: string;
   trigger_kind: "push" | "pull_request" | "issue_transition" | "manual" | "agent" | "schedule";
   trust_tier: "trusted" | "untrusted_fork" | "self_hosted";
   state: CiRunState;
@@ -68,10 +69,17 @@ export interface CiStepVM {
   details_ref: string;
 }
 
+/** What the viewer may do to this run, decided by the Edge. */
+export interface CiRunControlsVM {
+  retry: boolean;
+  cancel: boolean;
+}
+
 export interface CiRunDetailVM {
   run: CiRunVM;
   jobs: CiJobVM[];
   steps: CiStepVM[];
+  controls: CiRunControlsVM;
 }
 
 export interface CiLogRangeVM {
@@ -120,15 +128,17 @@ function safeNonNegative(value: unknown): value is number {
 function run(value: unknown): CiRunVM | null {
   const row = record(value);
   if (!row || !exact(row, [
-    "run_id", "ref", "pipeline_id", "repo_ref", "source_ref", "commit_oid", "trigger_kind", "trust_tier",
-    "state", "cost_settled", "created_at", "finished_at",
+    "run_id", "ref", "pipeline_id", "repo_ref", "source_ref", "commit_oid", "definition_snapshot",
+    "trigger_kind", "trust_tier", "state", "cost_settled", "created_at", "finished_at",
   ]) || !isCiUuid(row.run_id) ||
       row.ref !== `myelin://${artifactTenant(row.repo_ref)}/ci/run/${row.run_id}` ||
       !isCiUuid(row.pipeline_id) ||
       !bounded(row.repo_ref, 1_024) ||
       (row.source_ref !== null &&
-        (row.trigger_kind !== "push" || !bounded(row.source_ref, 1_024) || !isBranchRef(row.source_ref))) ||
+        (!["push", "pull_request", "agent", "manual"].includes(row.trigger_kind as string) ||
+          !bounded(row.source_ref, 1_024) || !isBranchRef(row.source_ref))) ||
       (row.commit_oid !== null && !bounded(row.commit_oid, 256)) ||
+      !bounded(row.definition_snapshot, 1_024) ||
       !["push", "pull_request", "issue_transition", "manual", "agent", "schedule"]
         .includes(row.trigger_kind as string) ||
       !["trusted", "untrusted_fork", "self_hosted"].includes(row.trust_tier as string) ||
@@ -137,6 +147,13 @@ function run(value: unknown): CiRunVM | null {
       typeof row.cost_settled !== "boolean" || !canonicalTime(row.created_at) ||
       (row.finished_at !== null && !canonicalTime(row.finished_at))) return null;
   return row as unknown as CiRunVM;
+}
+
+function controls(value: unknown): CiRunControlsVM | null {
+  const row = record(value);
+  if (!row || !exact(row, ["retry", "cancel"]) || typeof row.retry !== "boolean" ||
+      typeof row.cancel !== "boolean") return null;
+  return { retry: row.retry, cancel: row.cancel };
 }
 
 function artifactTenant(value: unknown): string | null {
@@ -285,13 +302,14 @@ export function parseCiRunsPage(value: unknown): CiRunsPage | null {
 
 export function parseCiRunDetail(value: unknown, expectedRunId?: string): CiRunDetailVM | null {
   const envelope = record(value);
-  if (!envelope || !exact(envelope, ["run", "jobs", "steps"]) ||
+  if (!envelope || !exact(envelope, ["run", "jobs", "steps", "controls"]) ||
       !Array.isArray(envelope.jobs) || envelope.jobs.length > 10_000 ||
       !Array.isArray(envelope.steps) || envelope.steps.length > 100_000) return null;
   const runValue = run(envelope.run);
   const jobs = envelope.jobs.map(job);
   const steps = envelope.steps.map(step);
-  if (!runValue || !jobs.every((item): item is CiJobVM => item !== null) ||
+  const controlsValue = controls(envelope.controls);
+  if (!runValue || !controlsValue || !jobs.every((item): item is CiJobVM => item !== null) ||
       !steps.every((item): item is CiStepVM => item !== null)) return null;
   if (expectedRunId !== undefined && runValue.run_id !== expectedRunId) return null;
   const jobIds = new Set(jobs.map((item) => item.job_id));
@@ -313,7 +331,7 @@ export function parseCiRunDetail(value: unknown, expectedRunId?: string): CiRunD
   if (!jobs.every((item) => acyclic(item.job_id))) return null;
   const stepIds = new Set(steps.map((item) => `${item.job_id}\0${item.step_id}`));
   if (stepIds.size !== steps.length || steps.some((item) => !jobIds.has(item.job_id))) return null;
-  return { run: runValue, jobs, steps };
+  return { run: runValue, jobs, steps, controls: controlsValue };
 }
 
 export function parseCiLogRange(

@@ -639,7 +639,7 @@ impl CiRunStore {
         {
             return Err(CiRunStoreError::RetryRunNotFound);
         }
-        if !matches!(actor.kind, PrincipalKind::Agent { .. })
+        if !matches!(actor.kind, PrincipalKind::Agent { .. } | PrincipalKind::Human)
             || actor.status != PrincipalStatus::Active
             || actor.tenant.0.is_empty()
             || actor.region.0.is_empty()
@@ -824,7 +824,12 @@ async fn retry_ci_run_on_conn(
         pipeline_id: source.pipeline_id.clone(),
         wf_run_id: workflow_run_id.clone(),
         definition_snapshot: source.definition_snapshot.clone(),
-        trigger_kind: "agent".into(),
+        trigger_kind: if matches!(actor.kind, PrincipalKind::Agent { .. }) {
+            "agent"
+        } else {
+            "manual"
+        }
+        .into(),
         concurrency_group: None,
         pr_head_generation: None,
         trust_tier: source.trust_tier.clone(),

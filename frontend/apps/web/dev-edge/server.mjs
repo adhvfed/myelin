@@ -51,6 +51,7 @@ import {
   ciLiveOpen,
   ciLogJson,
   ciRunJson,
+  createCiRunControl,
   ciRunsEnvelope,
   isCiUuid,
   parseCiLogQuery,
@@ -157,6 +158,7 @@ const state = {
   // CT-005 CI read-surface controls. Cursors bind the canonicalized concrete visible-repository set,
   // just as production does; tests mutate membership rather than a synthetic generation counter.
   emptyCi: false,
+  ciViewerCanPush: true,
   ciUnavailable: false,
   ciLogUnavailable: false,
   ciVisibleRepoRefs: [...CI_VISIBLE_REPO_REFS],
@@ -172,6 +174,7 @@ const state = {
 const chat = new ChatFixtures();
 const knowledge = new KnowledgeFixtures();
 
+const ciRunControl = createCiRunControl();
 let ciLiveSegments = [{ cursor: 1n, byteStart: 0, bytes: Buffer.from(CI_LIVE_INITIAL_LOG) }];
 let ciLiveTerminal = false;
 let ciLiveStaleNextResume = false;
@@ -289,6 +292,8 @@ function resetCi() {
   for (const client of ciLiveClients) client.res.end();
   ciLiveClients.clear();
   state.emptyCi = false;
+  state.ciViewerCanPush = true;
+  ciRunControl.reset();
   state.ciUnavailable = false;
   state.ciLogUnavailable = false;
   state.ciVisibleRepoRefs = [...CI_VISIBLE_REPO_REFS];
@@ -632,6 +637,10 @@ const server = createServer((req, res) => {
         if (typeof body.bumpKnowledgePage === "string") knowledge.bump(body.bumpKnowledgePage);
         if (body.resetCi === true) resetCi();
         if (typeof body.emptyCi === "boolean") state.emptyCi = body.emptyCi;
+        if (typeof body.ciViewerCanPush === "boolean") state.ciViewerCanPush = body.ciViewerCanPush;
+        if (body.ciRunState && typeof body.ciRunState === "object") {
+          ciRunControl.setState(body.ciRunState.run, body.ciRunState.state);
+        }
         if (typeof body.ciUnavailable === "boolean") state.ciUnavailable = body.ciUnavailable;
         if (typeof body.ciLogUnavailable === "boolean") state.ciLogUnavailable = body.ciLogUnavailable;
         if (typeof body.appendCiLive === "string") appendCiLive(body.appendCiLive);
@@ -1150,10 +1159,35 @@ const server = createServer((req, res) => {
         error: { message: "CI run id must be a canonical UUID", code: "bad_request" },
       });
     }
-    const response = ciRunJson(runId, { empty: state.emptyCi });
+    const response = ciRunJson(runId, {
+      empty: state.emptyCi,
+      viewerCanPush: state.ciViewerCanPush,
+      detail: ciRunControl.detail,
+    });
     return response
       ? send(res, 200, response, { "cache-control": "no-store" })
       : send(res, 404, notFoundEnvelope("CI run"));
+  }
+
+  if (method === "POST" && (ciMatch = path.match(/^\/v1\/ci\/runs\/([^/]+)\/(retry|cancel)$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const runId = decodeCiPathSegment(ciMatch[1]);
+    const key = req.headers["idempotency-key"];
+    if (!isCiUuid(runId) || url.search || typeof key !== "string" || !/^[\x21-\x7e]{1,128}$/.test(key)) {
+      return send(res, 400, {
+        error: { message: "CI run id and Idempotency-Key must be valid", code: "bad_request" },
+      });
+    }
+    req.resume();
+    const outcome = state.emptyCi ? null : ciRunControl.mutate(ciMatch[2], runId, key, state.ciViewerCanPush);
+    if (!outcome) return send(res, 404, notFoundEnvelope("CI run"));
+    if (outcome.status === 403) {
+      return send(res, 403, { error: { message: "push access is required", code: "forbidden" } });
+    }
+    if (outcome.status === 409) {
+      return send(res, 409, { error: { message: "CI run state does not allow this action", code: "conflict" } });
+    }
+    return send(res, outcome.status, outcome.body, { "cache-control": "no-store" });
   }
 
   if (method === "GET" && path === "/v1/projects") {

@@ -1,5 +1,5 @@
 use crate::{
-    DurableChatReadApi, DurableCiReadApi, DurableIssueReadApi, DurableKnowledgeReadApi,
+    DurableChatReadApi, DurableCiApi, DurableIssueReadApi, DurableKnowledgeReadApi,
     DurableProjectReadApi, EdgeError,
 };
 use myelin_ci_controlplane::surfacing_store::CI_LOG_RANGE_DEFAULT;
@@ -20,7 +20,7 @@ use crate::workspace_access::{WorkspaceRunAccess, WorkspaceRunAccessError};
 use crate::DurableGitBackend;
 
 pub struct McpReadExecutor {
-    ci: DurableCiReadApi,
+    ci: DurableCiApi,
     issues: Option<DurableIssueReadApi>,
     knowledge: Option<DurableKnowledgeReadApi>,
     chat: Option<DurableChatReadApi>,
@@ -33,7 +33,7 @@ pub struct McpReadExecutor {
 
 impl McpReadExecutor {
     pub fn new(
-        ci: DurableCiReadApi,
+        ci: DurableCiApi,
         authority: Arc<RunTokenAuthorizer>,
         access_subject: Principal,
     ) -> Self {

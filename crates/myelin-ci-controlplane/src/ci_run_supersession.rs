@@ -41,8 +41,8 @@ use crate::{
 
 const SUPERSEDED_REASON: &str = "superseded-by-newer-pr-head";
 const EVENT_ID_DOMAIN: &str = "myelin.ci.pr-run-supersession-event.v1";
-const AGENT_CANCEL_REASON: &str = "agent-requested";
-const AGENT_CANCEL_EVENT_ID_DOMAIN: &str = "myelin.ci.agent-run-cancellation-event.v1";
+const REQUESTED_REASON: &str = "requested";
+const REQUESTED_EVENT_ID_DOMAIN: &str = "myelin.ci.requested-run-cancellation-event.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunCancelOutcome {
@@ -55,7 +55,8 @@ pub struct CiRunCancelOutcome {
 #[derive(Clone, Debug)]
 enum CancellationCause {
     Superseded,
-    Agent {
+    /// A person or an agent asked for this exact run to stop.
+    Requested {
         actor: Principal,
         idempotency_key: String,
     },
@@ -65,7 +66,7 @@ impl CancellationCause {
     fn reason(&self) -> &'static str {
         match self {
             Self::Superseded => SUPERSEDED_REASON,
-            Self::Agent { .. } => AGENT_CANCEL_REASON,
+            Self::Requested { .. } => REQUESTED_REASON,
         }
     }
 
@@ -76,7 +77,7 @@ impl CancellationCause {
                 PrincipalKind::Service,
                 tenant.clone(),
             ),
-            Self::Agent { actor, .. } => actor.clone(),
+            Self::Requested { actor, .. } => actor.clone(),
         }
     }
 
@@ -90,10 +91,10 @@ impl CancellationCause {
     ) -> EventId {
         match self {
             Self::Superseded => supersession_event_id(tenant, region, run_id, kind, context),
-            Self::Agent {
+            Self::Requested {
                 actor,
                 idempotency_key,
-            } => agent_cancel_event_id(
+            } => requested_cancel_event_id(
                 tenant,
                 region,
                 run_id,
@@ -379,7 +380,7 @@ impl PgCiRunSupersession {
     ) -> Result<CiRunCancelOutcome, CiRunSupersessionError> {
         if actor.tenant != self.tenant
             || actor.region != self.region
-            || !matches!(actor.kind, PrincipalKind::Agent { .. })
+            || !matches!(actor.kind, PrincipalKind::Agent { .. } | PrincipalKind::Human)
             || actor.status != PrincipalStatus::Active
         {
             return Err(CiRunSupersessionError::InvalidActor);
@@ -390,7 +391,7 @@ impl PgCiRunSupersession {
         if idempotency_key.is_empty() || idempotency_key.len() > 512 {
             return Err(CiRunSupersessionError::InvalidIdempotencyKey);
         }
-        let cause = CancellationCause::Agent {
+        let cause = CancellationCause::Requested {
             actor: actor.clone(),
             idempotency_key: idempotency_key.to_owned(),
         };
@@ -1810,7 +1811,7 @@ fn supersession_event_id(
     EventId(format!("ci-supersession-{}", hasher.finalize().to_hex()))
 }
 
-fn agent_cancel_event_id(
+fn requested_cancel_event_id(
     tenant: &TenantId,
     region: &Region,
     run_id: &str,
@@ -1819,7 +1820,7 @@ fn agent_cancel_event_id(
     kind: &str,
     context: Option<&str>,
 ) -> EventId {
-    let mut hasher = blake3::Hasher::new_derive_key(AGENT_CANCEL_EVENT_ID_DOMAIN);
+    let mut hasher = blake3::Hasher::new_derive_key(REQUESTED_EVENT_ID_DOMAIN);
     for field in [
         tenant.0.as_str(),
         region.0.as_str(),
@@ -1832,7 +1833,7 @@ fn agent_cancel_event_id(
         hasher.update(&(field.len() as u64).to_be_bytes());
         hasher.update(field.as_bytes());
     }
-    EventId(format!("ci-agent-cancel-{}", hasher.finalize().to_hex()))
+    EventId(format!("ci-cancel-{}", hasher.finalize().to_hex()))
 }
 
 async fn cancellation_event_exists_on_conn(

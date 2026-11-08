@@ -19,6 +19,12 @@ pub enum CliCommand {
         run_id: String,
         job_id: String,
     },
+    Retry {
+        run_id: String,
+    },
+    Cancel {
+        run_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,19 +40,19 @@ impl std::error::Error for CliParseError {}
 
 pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
-        usage(
-            "no CI command given (try: list | view <run> | logs <run> --job <job> | \
-             watch <run> --job <job>)",
-        )
+        usage(format!("no CI command given (try: {COMMANDS})"))
     })?;
     match *verb {
         "list" => parse_list(rest),
         "view" | "show" => parse_view(verb, rest),
         "logs" => parse_logs(rest),
         "watch" => parse_watch(rest),
+        "retry" | "rerun" => {
+            parse_run(verb, rest).map(|run_id| CliCommand::Retry { run_id })
+        }
+        "cancel" => parse_run(verb, rest).map(|run_id| CliCommand::Cancel { run_id }),
         other => Err(usage(format!(
-            "unknown CI command `{other}` (try: list | view <run> | logs <run> --job <job> | \
-             watch <run> --job <job>)"
+            "unknown CI command `{other}` (try: {COMMANDS})"
         ))),
     }
 }
@@ -93,14 +99,19 @@ fn parse_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
     Ok(CliCommand::List(request))
 }
 
+const COMMANDS: &str = "list | view <run> | logs <run> --job <job> | watch <run> --job <job> | \
+                        retry <run> | cancel <run>";
+
 fn parse_view(verb: &str, args: &[&str]) -> Result<CliCommand, CliParseError> {
+    parse_run(verb, args).map(|run_id| CliCommand::View { run_id })
+}
+
+fn parse_run(verb: &str, args: &[&str]) -> Result<String, CliParseError> {
     if args.len() != 1 {
         return Err(usage(format!("`ci {verb}` needs exactly one <run>")));
     }
     validate_uuid("run", args[0])?;
-    Ok(CliCommand::View {
-        run_id: args[0].to_string(),
-    })
+    Ok(args[0].to_string())
 }
 
 fn parse_logs(args: &[&str]) -> Result<CliCommand, CliParseError> {
@@ -282,6 +293,16 @@ mod tests {
                 job_id: JOB.into(),
             }
         );
+        for verb in ["retry", "rerun"] {
+            assert_eq!(
+                parse_cli(&[verb, RUN]).unwrap(),
+                CliCommand::Retry { run_id: RUN.into() }
+            );
+        }
+        assert_eq!(
+            parse_cli(&["cancel", RUN]).unwrap(),
+            CliCommand::Cancel { run_id: RUN.into() }
+        );
     }
 
     #[test]
@@ -303,6 +324,9 @@ mod tests {
             vec!["watch", RUN, "--job", "NOT-A-UUID"],
             vec!["watch", RUN, "--job", JOB, "--job", JOB],
             vec!["watch", RUN, "--job", JOB, "--cursor", "1"],
+            vec!["retry"],
+            vec!["retry", "NOT-A-UUID"],
+            vec!["cancel", RUN, RUN],
         ] {
             assert!(parse_cli(&invalid).is_err(), "{invalid:?} must be refused");
         }
