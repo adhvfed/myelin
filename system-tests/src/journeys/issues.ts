@@ -25,7 +25,7 @@ export interface IssuePage {
 
 export interface IssueChangeOptions {
   eventId: string;
-  issueRef: string;
+  issueId: string;
   issueKey: string;
   changeKind: string;
 }
@@ -107,6 +107,7 @@ export async function awaitActiveIssue(
 /// shared event boundary rather than at an Issues mutation endpoint.
 export async function announceIssueChange(options: IssueChangeOptions): Promise<void> {
   const now = new Date().toISOString();
+  const subject = `myelin://${systemTestConfig.tenant}/issue/issue/${options.issueId}`;
   const envelope: ExternalEventEnvelope = {
     event_id: options.eventId,
     type_: "issue.issue.updated",
@@ -121,8 +122,8 @@ export async function announceIssueChange(options: IssueChangeOptions): Promise<
       data_role: "Controller",
       status: "Active",
     },
-    subject: options.issueRef,
-    aggregate: `issue:${options.issueKey}`,
+    subject,
+    aggregate: `issue:${options.issueId}`,
     causation_id: null,
     correlation_id: options.eventId,
     caused_by: null,
@@ -134,7 +135,8 @@ export async function announceIssueChange(options: IssueChangeOptions): Promise<
     occurred_at: now,
     recorded_at: now,
     payload: {
-      issue: options.issueRef,
+      issue_id: options.issueId,
+      issue_key: options.issueKey,
       change_kind: options.changeKind,
     },
   };

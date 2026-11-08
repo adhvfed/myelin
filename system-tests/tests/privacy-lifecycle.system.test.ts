@@ -89,7 +89,7 @@ describe("a person's privacy lifecycle", () => {
       string(project.default_issue_type_id, "private work issue type id"),
       prefix,
     );
-    const issueRef = string(issue.ref, "privacy test issue ref");
+    const issueId = string(issue.id, "privacy test issue id");
     const issueKey = string(issue.key, "privacy test issue key");
     const agentResponse = await person.json("/v1/agents", {
       method: "POST",
@@ -125,7 +125,7 @@ describe("a person's privacy lifecycle", () => {
     const firstEventId = `privacy-work-${randomUUID()}`;
     await announceIssueChange({
       eventId: firstEventId,
-      issueRef,
+      issueId,
       issueKey,
       changeKind,
     });
@@ -256,7 +256,7 @@ describe("a person's privacy lifecycle", () => {
     const refusedEventId = `privacy-work-after-erasure-${randomUUID()}`;
     await announceIssueChange({
       eventId: refusedEventId,
-      issueRef,
+      issueId,
       issueKey,
       changeKind,
     });

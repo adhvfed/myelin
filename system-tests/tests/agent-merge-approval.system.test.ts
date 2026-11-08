@@ -20,7 +20,7 @@ describe("human-governed agent merges", () => {
   test("keeps every proposed merge asleep until its founder explicitly decides its fate", async () => {
     const founder = await browserApprovedCliClient();
     const issue = await awaitActiveIssue(systemClient, uniqueName("Merge handoff"));
-    const issueRef = string(issue.ref, "merge handoff issue ref");
+    const issueId = string(issue.id, "merge handoff issue id");
     const issueKey = string(issue.key, "merge handoff issue key");
 
     const slug = uniqueName("agent-approved-merge");
@@ -101,7 +101,7 @@ describe("human-governed agent merges", () => {
 
     const publishMergeRequest = (eventId: string) => announceIssueChange({
       eventId,
-      issueRef,
+      issueId,
       issueKey,
       changeKind: "merge_request",
     });
@@ -371,7 +371,7 @@ describe("human-governed agent merges", () => {
     const eventId = `out-of-scope-merge-${randomUUID()}`;
     await announceIssueChange({
       eventId,
-      issueRef: string(issue.ref, "repository-bound issue ref"),
+      issueId: string(issue.id, "repository-bound issue id"),
       issueKey: string(issue.key, "repository-bound issue key"),
       changeKind: "merge_request",
     });

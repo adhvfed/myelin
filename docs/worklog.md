@@ -4,6 +4,15 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — Governed-merge stories publish the event Issues actually emits
+
+The merge-approval and privacy journeys published synthetic `issue.issue.updated` events whose
+subject was the API's key-based `issue.ref`. Real Issues events address the issue by id. The
+trigger visibility check therefore resolved `issue:<key>`, found no authorization, and silently
+skipped the event, so both journeys had been failing since issue responses became re-addressable
+by key in August. The shared helper now takes the issue id and key and emits the real subject,
+aggregate, and payload shape. Both journeys pass again.
+
 ## 2026-11-08 — Cancelling CI stops the sandbox
 
 Cancellation used to stop only the bookkeeping. Supersession terminated the workflow and marked
