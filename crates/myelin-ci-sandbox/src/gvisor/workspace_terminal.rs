@@ -8,6 +8,8 @@ use nix::pty::{openpty, Winsize};
 const MAX_TERMINAL_NAME_BYTES: usize = 64;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
+/// OpenSSH sends an empty name when the client has no `TERM`; such a client gets a plain terminal.
+const DEFAULT_TERMINAL_NAME: &str = "dumb";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceTerminal {
@@ -23,8 +25,12 @@ impl WorkspaceTerminal {
         pixel_width: u32,
         pixel_height: u32,
     ) -> Result<Self, String> {
-        if term.is_empty()
-            || term.len() > MAX_TERMINAL_NAME_BYTES
+        let term = if term.is_empty() {
+            DEFAULT_TERMINAL_NAME
+        } else {
+            term
+        };
+        if term.len() > MAX_TERMINAL_NAME_BYTES
             || !term
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -189,13 +195,18 @@ mod tests {
         assert_eq!(terminal.environment(), "TERM=xterm-256color");
 
         for refused in [
-            WorkspaceTerminal::new("", 120, 40, 0, 0),
             WorkspaceTerminal::new("xterm;touch-host", 120, 40, 0, 0),
             WorkspaceTerminal::new("xterm", u32::from(u16::MAX) + 1, 40, 0, 0),
             WorkspaceTerminal::new("xterm", 120, u32::from(u16::MAX) + 1, 0, 0),
         ] {
             assert!(refused.is_err());
         }
+    }
+
+    #[test]
+    fn a_client_without_term_gets_a_plain_terminal() {
+        let terminal = WorkspaceTerminal::new("", 80, 24, 0, 0).unwrap();
+        assert_eq!(terminal.environment(), "TERM=dumb");
     }
 
     #[test]
