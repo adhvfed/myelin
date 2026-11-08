@@ -12,8 +12,13 @@ every response. Opening any reply thread in the browser therefore showed "Conver
 unavailable", while the CLI and API kept working and the mocked browser contract, which lacked the
 field too, stayed green. The decoder and the dev-edge mock now carry `following`.
 
+The web also gains the control the API had: the thread header's **Following** toggle quiets or
+resumes notifications for that thread, optimistically, with rollback and an inline error if the
+change fails.
+
 Proof: the real-stack Chromium Chat journey creates an encrypted topic, links an issue, replies in a
-thread, links that thread from another message, and follows it back. It passed (21.6 s), and so does
+thread, quiets and re-follows it across a reload, links that thread from another message, and
+follows the link back. It passed (21.6 s), and so does
 the complete real-stack browser suite (9 journeys). The web unit suite covers the field, including
 a missing and a malformed value.
 

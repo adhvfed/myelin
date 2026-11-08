@@ -223,6 +223,17 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await page.getByLabel(`Reply in ${topic}`).fill(threadReply);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText(threadReply)).toBeVisible();
+
+  const following = page.getByRole("button", { name: "Following" });
+  await expect(following).toHaveAttribute("aria-pressed", "true");
+  await following.click();
+  const quiet = page.getByRole("button", { name: "Follow thread" });
+  await expect(quiet).toHaveAttribute("aria-pressed", "false");
+  await page.reload();
+  await waitForAppHydration(page);
+  await expect(quiet).toBeVisible();
+  await quiet.click();
+  await expect(following).toHaveAttribute("aria-pressed", "true");
   await page.getByRole("link", { name: "View latest messages" }).click();
   await expect(page).toHaveURL(new RegExp(`/chat\\?conversation=[0-9A-HJKMNP-TV-Z]{26}$`));
   await expect(page.locator(`#message-${rootMessageId}`).getByRole("link", { name: "1 reply" }))

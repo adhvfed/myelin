@@ -120,4 +120,32 @@ describe("development Chat contract", () => {
       "create-4",
     ).status).toBe(400);
   });
+
+  it("remembers per-thread follow state as an idempotent set", () => {
+    const chat = new ChatFixtures();
+    const [root, other] = [fixtureRoot(chat, "a"), fixtureRoot(chat, "b")];
+    const state = (id: string) => chat.listThread(id, { before: undefined, limit: 50 })?.following;
+
+    expect(state(root)).toBe(true);
+    expect(chat.setThreadFollowing(root, false)).toEqual({ following: false, durable: true });
+    expect(chat.setThreadFollowing(root, false)).toEqual({ following: false, durable: true });
+    expect(state(root)).toBe(false);
+    expect(state(other)).toBe(true);
+    expect(chat.setThreadFollowing(root, true)).toEqual({ following: true, durable: true });
+    expect(state(root)).toBe(true);
+
+    expect(chat.setThreadFollowing("01J0000000000000000000000Z", true)).toBeNull();
+  });
 });
+
+function fixtureRoot(chat: ChatFixtures, nonce: string): string {
+  const created = chat.createConversation({
+    project_id: FIRST_PROJECT,
+    channel: "engineering",
+    topic: `follow ${nonce}`,
+  }, `create-${nonce}`);
+  if (!created.json) throw new Error("expected a created conversation");
+  const root = chat.postMessage(created.json.conversation.id, { content: "Root" }, `root-${nonce}`);
+  if (!root.json) throw new Error("expected a root message");
+  return root.json.message_id;
+}

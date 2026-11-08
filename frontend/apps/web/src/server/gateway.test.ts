@@ -15,6 +15,7 @@ import {
   MAX_EDGE_PUBLIC_RESPONSE_BYTES,
   MAX_EDGE_RAW_RESPONSE_BYTES,
   edgeApproveCliLogin,
+  edgeDelete,
   edgeGet,
   edgeGetEventStream,
   edgeGetPublic,
@@ -22,6 +23,7 @@ import {
   edgeLoginWithOidc,
   edgeMintDevSession,
   edgePost,
+  edgePut,
   gatewayRequestSignal,
 } from "./gateway";
 
@@ -256,6 +258,20 @@ describe("gateway refresh revocation races", () => {
       .toBe("merge-operation-1");
     expect(new Headers(fetchMock.mock.calls[2]?.[1]?.headers).get("idempotency-key"))
       .toBe("merge-operation-1");
+  });
+
+  it("sends bodyless PUT and DELETE state changes without a content type", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await edgePut("/v1/chat/threads/root/follow");
+    await edgeDelete("/v1/chat/threads/root/follow");
+
+    expect(fetchMock.mock.calls.map((call) => call[1]?.method)).toEqual(["PUT", "DELETE"]);
+    for (const call of fetchMock.mock.calls) {
+      expect(call[1]?.body).toBeUndefined();
+      expect(new Headers(call[1]?.headers).has("content-type")).toBe(false);
+    }
   });
 
   it("does not send a refresh request for a non-refreshable SSO session", async () => {

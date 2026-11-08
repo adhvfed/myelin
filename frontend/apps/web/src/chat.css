@@ -259,6 +259,21 @@
   background: var(--success);
 }
 
+.chat-conversation-header > .chat-follow {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+}
+.chat-follow-button { white-space: nowrap; }
+.chat-follow-button[aria-pressed="true"] { color: var(--text-muted); }
+.chat-conversation-header > .chat-follow .chat-follow-error {
+  display: block;
+  color: var(--danger);
+  font-size: var(--fs-caption);
+}
+
 .chat-mobile-back { display: none; }
 
 .chat-timeline {

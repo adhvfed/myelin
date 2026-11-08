@@ -62,6 +62,14 @@ export async function edgePut<T = unknown>(
   return edgeRequest<T>("PUT", path, body, options);
 }
 
+/** DELETE an idempotent resource state through the same gateway lifecycle. */
+export async function edgeDelete<T = unknown>(
+  path: string,
+  options?: GatewayMutationOptions,
+): Promise<T> {
+  return edgeRequest<T>("DELETE", path, undefined, options);
+}
+
 /** GET a public edge endpoint without the session or refresh lifecycle. */
 export async function edgeGetPublic<T = unknown>(path: string): Promise<T> {
   const res = await fetch(`${edgeOrigin()}${path}`, {

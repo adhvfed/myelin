@@ -1,9 +1,11 @@
 import { Icon } from "@myelin/design-system";
 import { A } from "@solidjs/router";
+import { Show } from "solid-js";
 import { ConversationTimeline } from "~/components/conversation/ConversationTimeline";
 
 import type { ChatConversation, ChatMessage } from "~/lib/api";
 import { ChatComposer } from "./ChatComposer";
+import { ThreadFollowToggle } from "./ThreadFollowToggle";
 
 export interface ChatTimelineProps {
   conversation: ChatConversation;
@@ -15,6 +17,8 @@ export interface ChatTimelineProps {
   onPosted: (conversationId: string) => Promise<void> | void;
   focusedMessageId?: string;
   threadRootId?: string;
+  /** The viewer's follow state for the thread, when the edge reported one. */
+  following?: boolean;
 }
 
 export function ChatTimeline(props: ChatTimelineProps) {
@@ -29,6 +33,9 @@ export function ChatTimeline(props: ChatTimelineProps) {
           <p><Icon name="channel" /> {props.conversation.channel}</p>
           <h2 id="chat-topic-heading">{props.conversation.topic}</h2>
         </div>
+        <Show when={props.threadRootId && props.following !== undefined ? props.threadRootId : undefined} keyed>
+          {(root) => <ThreadFollowToggle rootMessageId={root} following={props.following!} />}
+        </Show>
         {props.focusedMessageId || props.threadRootId
           ? <A
               href={`/chat?conversation=${encodeURIComponent(props.conversation.id)}`}

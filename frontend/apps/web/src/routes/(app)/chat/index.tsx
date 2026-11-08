@@ -39,6 +39,8 @@ import {
 interface PageResult<T> {
   page: T | null;
   error: ChatErrorKind | null;
+  /** Thread reads only: whether the viewer follows the thread. */
+  following?: boolean;
 }
 
 export default function ChatIndex() {
@@ -111,6 +113,7 @@ export default function ChatIndex() {
             page: thread.page,
           },
           error: null,
+          following: thread.following,
         };
       } catch (error) {
         if (error instanceof Response) throw error;
@@ -347,6 +350,7 @@ export default function ChatIndex() {
                   onPosted={messagePosted}
                   focusedMessageId={validFocusedMessageId()}
                   threadRootId={validThreadRootId()}
+                  following={recentMessages()?.following}
                 />
               </Show>
             </Show>

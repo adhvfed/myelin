@@ -142,6 +142,8 @@ const state = {
   chatConversationCursorRequests: 0,
   chatConversationCursorResponses: 0,
   chatPostResponseLosses: 0,
+  chatFollowFailures: 0,
+  chatFollowRequests: 0,
   chatPaginatedMessages: false,
   chatMessageCursorDelaysMs: [],
   chatMessageCursorRequests: 0,
@@ -521,6 +523,8 @@ const server = createServer((req, res) => {
           state.chatConversationCursorRequests = 0;
           state.chatConversationCursorResponses = 0;
           state.chatPostResponseLosses = 0;
+          state.chatFollowFailures = 0;
+          state.chatFollowRequests = 0;
           state.chatPaginatedMessages = false;
           state.chatMessageCursorDelaysMs = [];
           state.chatMessageCursorRequests = 0;
@@ -580,6 +584,9 @@ const server = createServer((req, res) => {
         }
         if (Number.isInteger(body.chatPostResponseLosses) && body.chatPostResponseLosses >= 0) {
           state.chatPostResponseLosses = body.chatPostResponseLosses;
+        }
+        if (Number.isInteger(body.chatFollowFailures) && body.chatFollowFailures >= 0) {
+          state.chatFollowFailures = body.chatFollowFailures;
         }
         if (body.resetKnowledge === true) {
           state.emptyKnowledge = false;
@@ -857,6 +864,29 @@ const server = createServer((req, res) => {
       return send(res, 400, { error: { message: "invalid Chat thread query", code: "bad_request" } });
     }
     const output = chat.listThread(rootMessageId, input);
+    return output
+      ? send(res, 200, output, { "cache-control": "no-store" })
+      : send(res, 404, notFoundEnvelope("thread"));
+  }
+
+  if (
+    (method === "PUT" || method === "DELETE") &&
+    (chatMatch = path.match(/^\/v1\/chat\/threads\/([^/]+)\/follow$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const rootMessageId = decodeCiPathSegment(chatMatch[1]);
+    if (!rootMessageId || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(rootMessageId) || url.search ||
+        req.headers["content-length"] > 0 || req.headers["transfer-encoding"]) {
+      return send(res, 400, { error: { message: "invalid Chat follow request", code: "bad_request" } });
+    }
+    state.chatFollowRequests += 1;
+    if (state.chatFollowFailures > 0) {
+      state.chatFollowFailures -= 1;
+      return send(res, 503, {
+        error: { message: "Chat follow is unavailable", code: "unavailable" },
+      });
+    }
+    const output = chat.setThreadFollowing(rootMessageId, method === "PUT");
     return output
       ? send(res, 200, output, { "cache-control": "no-store" })
       : send(res, 404, notFoundEnvelope("thread"));

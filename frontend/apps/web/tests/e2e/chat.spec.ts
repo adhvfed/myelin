@@ -305,4 +305,57 @@ test.describe("Chat workspace", () => {
     await expect(page.getByText("The canary is healthy.", { exact: false })).toHaveCount(0);
     await expect(page.getByText("Start the conversation")).toBeVisible();
   });
+
+  async function openFirstThread(page: Page) {
+    await devLogin(page);
+    await page.goto("/chat");
+    await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
+    await page.getByRole("link", { name: "Reply", exact: true }).first().click();
+    await page.waitForURL(/\/chat\?thread=[0-9A-HJKMNP-TV-Z]{26}#thread-/);
+  }
+
+  test("a participant can quiet and re-follow a thread, and the choice survives reload", async ({ page }) => {
+    await openFirstThread(page);
+
+    const following = page.getByRole("button", { name: "Following", exact: true });
+    await expect(following).toHaveAttribute("aria-pressed", "true");
+    await expect(following).toHaveAccessibleDescription(/controls whether new replies/);
+    await expectAccessible(page, "followed Chat thread");
+
+    await following.click();
+    const follow = page.getByRole("button", { name: "Follow thread", exact: true });
+    await expect(follow).toHaveAttribute("aria-pressed", "false");
+    await expect(follow).toBeEnabled();
+
+    await page.reload();
+    await expect(page.getByRole("button", { name: "Follow thread", exact: true }))
+      .toHaveAttribute("aria-pressed", "false");
+
+    await page.getByRole("button", { name: "Follow thread", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Following", exact: true }))
+      .toHaveAttribute("aria-pressed", "true");
+    await page.reload();
+    await expect(page.getByRole("button", { name: "Following", exact: true })).toBeVisible();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+
+  test("a failed follow change rolls back, says so, and can be retried", async ({ page, request }) => {
+    await openFirstThread(page);
+    const configured = await request.post(`${EDGE}/__test/config`, {
+      data: { chatFollowFailures: 1 },
+    });
+    expect(configured.ok()).toBe(true);
+
+    await page.getByRole("button", { name: "Following", exact: true }).click();
+    await expect(page.getByRole("alert")).toHaveText("Couldn’t update this thread. Try again.");
+    const rolledBack = page.getByRole("button", { name: "Following", exact: true });
+    await expect(rolledBack).toHaveAttribute("aria-pressed", "true");
+    await expect(rolledBack).toBeEnabled();
+    await expectAccessible(page, "failed follow change");
+
+    await rolledBack.click();
+    await expect(page.getByRole("button", { name: "Follow thread", exact: true }))
+      .toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
 });

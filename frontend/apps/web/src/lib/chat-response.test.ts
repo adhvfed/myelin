@@ -5,6 +5,8 @@ import {
   parseChatConversationDraft,
   parseChatConversationReceipt,
   parseChatConversations,
+  parseChatFollowDraft,
+  parseChatFollowReceipt,
   parseChatMessageDraft,
   parseChatMessageReceipt,
   parseChatMessages,
@@ -222,5 +224,33 @@ describe("Chat mutation input", () => {
       topic: "release",
       clientNonce: "response lost retry",
     })).toBeNull();
+  });
+});
+
+describe("Chat thread follow", () => {
+  it("decodes only the exact durable follow receipt", () => {
+    expect(parseChatFollowReceipt({ following: true, durable: true }))
+      .toEqual({ following: true, durable: true });
+    expect(parseChatFollowReceipt({ following: false, durable: true }))
+      .toEqual({ following: false, durable: true });
+    expect(parseChatFollowReceipt({ following: true, durable: true, extra: 1 })).toBeNull();
+    expect(parseChatFollowReceipt({ following: true })).toBeNull();
+    expect(parseChatFollowReceipt({ following: true, durable: false })).toBeNull();
+    expect(parseChatFollowReceipt({ following: "true", durable: true })).toBeNull();
+    expect(parseChatFollowReceipt({ following: 1, durable: true })).toBeNull();
+    expect(parseChatFollowReceipt(null)).toBeNull();
+    expect(parseChatFollowReceipt([])).toBeNull();
+  });
+
+  it("accepts only a thread root id and a boolean desired state", () => {
+    expect(parseChatFollowDraft({ rootMessageId: ID, following: false }))
+      .toEqual({ rootMessageId: ID, following: false });
+    expect(parseChatFollowDraft({ rootMessageId: ID, following: true }))
+      .toEqual({ rootMessageId: ID, following: true });
+    expect(parseChatFollowDraft({ rootMessageId: "not-a-ulid", following: true })).toBeNull();
+    expect(parseChatFollowDraft({ rootMessageId: ID, following: "yes" })).toBeNull();
+    expect(parseChatFollowDraft({ rootMessageId: ID })).toBeNull();
+    expect(parseChatFollowDraft({ rootMessageId: ID, following: true, tenant: "x" })).toBeNull();
+    expect(parseChatFollowDraft(undefined)).toBeNull();
   });
 });

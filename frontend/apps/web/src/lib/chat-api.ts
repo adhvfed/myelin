@@ -1,11 +1,13 @@
 import { action, json, query, redirect } from "@solidjs/router";
 
-import { edgeGet, edgePost, GatewayError, isUnauthorized } from "../server/gateway";
+import { edgeDelete, edgeGet, edgePost, edgePut, GatewayError, isUnauthorized } from "../server/gateway";
 import {
   isChatUlid,
   parseChatConversationDraft,
   parseChatConversationReceipt,
   parseChatConversations,
+  parseChatFollowDraft,
+  parseChatFollowReceipt,
   parseChatMessageDraft,
   parseChatMessage,
   parseChatMessageReceipt,
@@ -15,6 +17,8 @@ import {
   type ChatConversationDraft,
   type ChatConversationPage,
   type ChatConversationReceipt,
+  type ChatFollowDraft,
+  type ChatFollowReceipt,
   type ChatMessageDraft,
   type ChatMessagePage,
   type ChatMessageView,
@@ -28,6 +32,7 @@ export type {
   ChatConversation,
   ChatConversationPage,
   ChatConversationReceipt,
+  ChatFollowReceipt,
   ChatMessage,
   ChatMessageNode,
   ChatMessagePage,
@@ -172,12 +177,14 @@ export const getChatThread = query(async (request: {
 export type ChatMutation =
   | ({ op: "create-conversation" } & ChatConversationDraft)
   | ({ op: "post-message" } & ChatMessageDraft)
-  | ({ op: "post-reply" } & ChatReplyDraft);
+  | ({ op: "post-reply" } & ChatReplyDraft)
+  | ({ op: "set-thread-follow" } & ChatFollowDraft);
 
 export type ChatMutationResult =
   | { ok: true; op: "create-conversation"; receipt: ChatConversationReceipt }
   | { ok: true; op: "post-message"; receipt: ChatMessageReceipt }
   | { ok: true; op: "post-reply"; receipt: ChatMessageReceipt }
+  | { ok: true; op: "set-thread-follow"; receipt: ChatFollowReceipt }
   | { ok: false; error: ChatErrorKind };
 
 /** Chat writes use one narrow server action; tenant and author always come from the signed session. */
@@ -255,6 +262,25 @@ export const chatMutate = action(async (mutation: ChatMutation) => {
           { idempotencyKey: parsed.clientNonce },
         ));
         if (!decoded) throw new ChatRouteError("error");
+        return decoded;
+      });
+      return result({ ok: true, op: mutation.op, receipt });
+    }
+    if (mutation.op === "set-thread-follow") {
+      const parsed = parseChatFollowDraft({
+        rootMessageId: mutation.rootMessageId,
+        following: mutation.following,
+      });
+      if (!parsed || Object.keys(mutation).some((key) =>
+        !["op", "rootMessageId", "following"].includes(key))) {
+        return result({ ok: false, error: "bad-input" });
+      }
+      const path = `/v1/chat/threads/${segment(parsed.rootMessageId)}/follow`;
+      const receipt = await chatAuthed(async () => {
+        const decoded = parseChatFollowReceipt(
+          await (parsed.following ? edgePut(path) : edgeDelete(path)),
+        );
+        if (!decoded || decoded.following !== parsed.following) throw new ChatRouteError("error");
         return decoded;
       });
       return result({ ok: true, op: mutation.op, receipt });

@@ -124,6 +124,7 @@ export class ChatFixtures {
     }
     this.conversations = conversations.slice(0, count);
     this.messages = new Map();
+    this.threadFollowing = new Map();
     if (!empty) {
       const releaseMessages = [
         {
@@ -274,7 +275,7 @@ export class ChatFixtures {
     return {
       conversation: conversationJson(found.conversation),
       ref: `myelin://${TENANT}/chat/thread/${rootMessageId}#thread-${rootMessageId}`,
-      following: true,
+      following: this.threadFollowing.get(rootMessageId) ?? true,
       root: messageJson(found.message, replies.length),
       items: items.map((row) => messageJson(row)),
       page: {
@@ -282,6 +283,13 @@ export class ChatFixtures {
         limit,
       },
     };
+  }
+
+  setThreadFollowing(rootMessageId, following) {
+    const found = this.findMessage(rootMessageId);
+    if (!found || found.message.thread_root_id) return null;
+    this.threadFollowing.set(rootMessageId, following);
+    return { following, durable: true };
   }
 
   findMessage(messageId) {

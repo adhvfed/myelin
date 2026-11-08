@@ -85,6 +85,16 @@ export interface ChatMessageReceipt {
   durable: true;
 }
 
+export interface ChatFollowReceipt {
+  following: boolean;
+  durable: true;
+}
+
+export interface ChatFollowDraft {
+  rootMessageId: string;
+  following: boolean;
+}
+
 export interface ChatConversationDraft {
   projectId: string;
   channel: string;
@@ -292,6 +302,22 @@ export function parseChatMessageReceipt(value: unknown): ChatMessageReceipt | nu
   return receipt && exact(receipt, ["message_id", "durable"]) &&
     receipt.durable === true && isChatUlid(receipt.message_id)
     ? { message_id: receipt.message_id, durable: true }
+    : null;
+}
+
+export function parseChatFollowReceipt(value: unknown): ChatFollowReceipt | null {
+  const receipt = record(value);
+  return receipt && exact(receipt, ["following", "durable"]) &&
+    typeof receipt.following === "boolean" && receipt.durable === true
+    ? { following: receipt.following, durable: true }
+    : null;
+}
+
+export function parseChatFollowDraft(value: unknown): ChatFollowDraft | null {
+  const draft = record(value);
+  return draft && exact(draft, ["rootMessageId", "following"]) &&
+    isChatUlid(draft.rootMessageId) && typeof draft.following === "boolean"
+    ? { rootMessageId: draft.rootMessageId, following: draft.following }
     : null;
 }
 
