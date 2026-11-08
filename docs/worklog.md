@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-08 — Cancelled runs can close their accounting again
+
+A cancelled run whose launched job settles after the cancellation never reached `cost_settled`.
+The close-out read the run's `ci_job_accounting` rows `FOR SHARE`, but that table is append-only
+for the application role, and PostgreSQL requires UPDATE privilege for any row-locking clause. Every
+attempt therefore failed with `permission denied for table ci_job_accounting`, rolled back, and
+left the job `running` behind a terminated workflow. The reaper retried it forever, and the Flow
+recovery lane could take the whole CI host down on the same row at startup. The bug has been
+present since the July supersession serialization work; integration suites ran with broader grants
+and never saw it.
+
+The lock bought nothing: accounting rows are immutable, and the close-out already serializes
+settlers on the `ci_run` row. The read is now an ordinary `SELECT`.
+
+Proof: on the live Fed stack, a run cancelled on 2026-09-01 had been stranded with its job
+`running`, its reservation `inflight`, and `cost_settled = false`; instrumenting the close-out
+surfaced the privilege error. With the lock removed, the next reaper sweep reconciled it to
+`cancelled`/settled with the job terminal. The agent-cancel journey below exercises the runner's own
+post-cancel settlement through the application role.
+
 ## 2026-09-01 — Agents can retry failed CI without a provider credential
 
 Agents could inspect CI but could not act on a failure, leaving a human to step outside Myelin or

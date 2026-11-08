@@ -702,11 +702,12 @@ pub(crate) async fn close_cancelled_run_if_accounted(
         return Err(CompletionTxError::CancelledClosure);
     }
 
+    // Settlers serialize on the ci_run row lock above; accounting rows are append-only.
     let rows = sqlx::query(
         "SELECT job_id::text AS job_id, reserve_handle \
          FROM ci_job_accounting \
          WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid \
-           AND wf_run_id = $4::uuid ORDER BY job_id FOR SHARE",
+           AND wf_run_id = $4::uuid ORDER BY job_id",
     )
     .bind(accounting.scope.tenant().as_str())
     .bind(accounting.scope.region().as_str())
