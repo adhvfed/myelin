@@ -281,7 +281,10 @@ export function hasAppliedAction(
     | "git.pr.review.submit"
     | "git.pr.review.discard"
     | "git.pr.auto_merge.request"
-    | "git.pr.auto_merge.cancel",
+    | "git.pr.auto_merge.cancel"
+    | "git.pr.close"
+    | "git.pr.reopen"
+    | "git.pr.ready",
 ): boolean {
   return applied(value, action) !== null;
 }

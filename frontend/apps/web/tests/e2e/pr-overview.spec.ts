@@ -395,6 +395,34 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(page.getByRole("button", { name: "Merge when ready" })).toBeVisible();
   });
 
+  test("a draft is marked ready, closed, and reopened from its merge card", async ({ page }) => {
+    await resetPrFixtures();
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/8"); // a draft whose gate would pass.
+    await page.waitForLoadState("networkidle");
+    const card = page.getByTestId("merge-card");
+    await expect(card.getByTestId("draft-notice")).toContainText("This is a draft.");
+    await expect(card.getByTestId("merge-button")).toHaveCount(0);
+    await expect(card.getByTestId("merge-method")).toHaveCount(0);
+    await expectNoAxeViolations(page, "a draft pull request's merge card");
+
+    await card.getByRole("button", { name: "Ready for review" }).click();
+    await expect(page.getByText("Ready for review", { exact: true }).last()).toBeVisible();
+    await expect(card.getByTestId("draft-notice")).toHaveCount(0);
+    await expect(card.getByTestId("merge-button")).toBeVisible();
+
+    await card.getByRole("button", { name: "Close pull request" }).click();
+    await expect(page.getByText("Pull request closed")).toBeVisible();
+    await expect(card.getByTestId("merge-terminal"))
+      .toContainText("This pull request is closed. Closed by u_dev_operator@acme.noreply.");
+    await expect(card.getByTestId("merge-button")).toHaveCount(0);
+
+    await card.getByRole("button", { name: "Reopen pull request" }).click();
+    await expect(page.getByText("Pull request reopened")).toBeVisible();
+    await expect(card.getByTestId("merge-button")).toBeVisible();
+    await expect(card.getByRole("button", { name: "Close pull request" })).toBeVisible();
+  });
+
   test("a stopped automatic merge says why", async ({ page }) => {
     await resetPrFixtures();
     await devLogin(page);

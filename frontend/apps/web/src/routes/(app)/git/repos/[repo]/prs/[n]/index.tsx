@@ -42,7 +42,7 @@ import {
   type PrincipalVM,
   type PrCommitsPage,
 } from "~/lib/api";
-import type { MergeMethod } from "~/lib/mutation-input";
+import type { MergeMethod, PrStateOp } from "~/lib/mutation-input";
 import { NotAvailable } from "~/components/NotAvailable";
 import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
@@ -267,6 +267,7 @@ export default function PrOverviewScreen() {
                             <section aria-labelledby="merge-heading" style={{ ...card, color: "var(--text-muted)" }} data-testid="merge-degraded">
                               <h2 id="merge-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>Merge readiness</h2>
                               <p role="note" style={{ margin: "0" }}>Gate state unavailable — the checks service didn't respond, so merge readiness can't be shown. The gate is never assumed.</p>
+                              <PrStateControls repo={current.repo} n={current.n} pr={p()} onChange={reload} toast={toast} />
                             </section>
                           </Show>
                         }
@@ -1076,6 +1077,7 @@ function MergeCard(props: {
   };
 
   const isTerminal = () => props.pr.pr_state === "merged" || props.pr.pr_state === "closed";
+  const isDraft = () => props.pr.pr_state === "draft";
 
   return (
     <section aria-labelledby="merge-heading" style={{ ...card }} data-testid="merge-card">
@@ -1083,9 +1085,16 @@ function MergeCard(props: {
       <Show
         when={!isTerminal()}
         fallback={
-          <span data-testid="merge-terminal" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)" }}>
-            <Icon name={props.pr.pr_state === "merged" ? "merge" : "close"} /> This pull request is {props.pr.pr_state}.
-          </span>
+          <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+            <span data-testid="merge-terminal" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)" }}>
+              <Icon name={props.pr.pr_state === "merged" ? "merge" : "close"} />
+              <span>
+                This pull request is {props.pr.pr_state}.
+                <Show when={props.pr.closed_by}>{(closer) => <> Closed by {closer()}.</>}</Show>
+              </span>
+            </span>
+            <PrStateControls repo={props.repo} n={props.n} pr={props.pr} onChange={props.onChange} toast={props.toast} />
+          </div>
         }
       >
         <Show when={behind()}>
@@ -1108,6 +1117,15 @@ function MergeCard(props: {
             </button>
           </div>
         </Show>
+        <Show
+          when={!isDraft()}
+          fallback={
+            <p data-testid="draft-notice" style={{ margin: "0", display: "inline-flex", "align-items": "center", gap: "var(--space-1)" }}>
+              <Icon name="edit" />
+              <span><strong>This is a draft.</strong> Mark it ready for review when it can be reviewed and merged.</span>
+            </p>
+          }
+        >
         <label data-testid="merge-method" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", "align-self": "flex-start" }}>
           <span>How to merge</span>
           <select value={method()} onChange={(event) => setMethod(event.currentTarget.value as MergeMethod)}>
@@ -1179,6 +1197,8 @@ function MergeCard(props: {
             </div>
           )}
         </Show>
+        </Show>
+        <PrStateControls repo={props.repo} n={props.n} pr={props.pr} onChange={props.onChange} toast={props.toast} />
       </Show>
 
       <ConfirmDialog
@@ -1193,6 +1213,59 @@ function MergeCard(props: {
         cancelLabel="Cancel"
       />
     </section>
+  );
+}
+
+/** Closing, reopening, and marking a draft ready. Each is its author's call, or a maintainer's;
+ *  the edge refuses anyone else with a reason, shown as it says it. */
+function PrStateControls(props: {
+  repo: string;
+  n: number;
+  pr: PrVM;
+  onChange: () => Promise<void>;
+  toast: ReturnType<typeof useToast>;
+}) {
+  const doMutate = useAction(prMutate);
+  const [busy, setBusy] = createSignal(false);
+  const said = {
+    close: { done: "Pull request closed", failed: "Could not close the pull request" },
+    reopen: { done: "Pull request reopened", failed: "Could not reopen the pull request" },
+    ready: { done: "Ready for review", failed: "Could not mark the pull request ready" },
+  } as const;
+  const change = async (op: PrStateOp) => {
+    setBusy(true);
+    let result: { ok: true } | { refused: string } | null = null;
+    try {
+      result = await doMutate({ op, repo: props.repo, n: props.n }) as { ok: true } | { refused: string };
+    } catch {
+      props.toast.show({ title: said[op].failed, variant: "danger" });
+    }
+    if (result && "refused" in result) props.toast.show({ title: result.refused, variant: "warning" });
+    else if (result) props.toast.show({ title: said[op].done, variant: "success" });
+    await props.onChange().catch(() => undefined);
+    setBusy(false);
+  };
+  const live = () => props.pr.pr_state === "open" || props.pr.pr_state === "draft";
+  return (
+    <Show when={props.pr.pr_state !== "merged"}>
+      <div data-testid="pr-state-controls" style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
+        <Show when={props.pr.pr_state === "draft"}>
+          <button type="button" data-testid="ready-for-review-button" disabled={busy()} aria-busy={busy()} onClick={() => void change("ready")} class="btn-primary" style={barBtnPrimary}>
+            <Icon name="check-pass" /> Ready for review
+          </button>
+        </Show>
+        <Show when={live()}>
+          <button type="button" data-testid="close-pr-button" disabled={busy()} aria-busy={busy()} onClick={() => void change("close")} class="btn-secondary" style={barBtn}>
+            <Icon name="close" /> Close pull request
+          </button>
+        </Show>
+        <Show when={props.pr.pr_state === "closed"}>
+          <button type="button" data-testid="reopen-pr-button" disabled={busy()} aria-busy={busy()} onClick={() => void change("reopen")} class="btn-secondary" style={barBtn}>
+            <Icon name="cycle" /> Reopen pull request
+          </button>
+        </Show>
+      </div>
+    </Show>
   );
 }
 

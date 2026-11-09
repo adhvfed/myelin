@@ -386,6 +386,8 @@ export interface PrVM {
   auto_merge_stopped?: { reason: string; at: number } | null;
   /** The branch lives in a fork, which Myelin does not update or queue. */
   is_fork?: boolean;
+  /** Who closed it, while it is closed. */
+  closed_by?: string | null;
   durable: boolean;
 }
 
@@ -1301,6 +1303,22 @@ export const prMutate = action(async (
           }
           const message = e instanceof GatewayError && e.status === 409 ? edgeErrorMessage(e.body) : null;
           if (message) return { refused: message };
+          throw e;
+        }
+      }
+      case "close":
+      case "reopen":
+      case "ready": {
+        try {
+          const response = await edgePost(`${base}/${parsed.op}`, {}, mutationOptions);
+          if (!hasAppliedAction(response, `git.pr.${parsed.op}`)) throw new RepoRouteError("error");
+          return { ok: true };
+        } catch (e) {
+          if (!(e instanceof GatewayError)) throw e;
+          // The edge says who may make the change and why it cannot happen now.
+          const message = e.status === 403 || e.status === 409 ? edgeErrorMessage(e.body) : null;
+          if (message) return { refused: message };
+          if (e.status === 403 || e.status === 404) return { refused: "You can't change this pull request." };
           throw e;
         }
       }

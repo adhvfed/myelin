@@ -131,6 +131,11 @@ describe("PR read response projection", () => {
       .toBeNull();
     expect(parsePr({ ...record, auto_merge: { requested_by: "", requested_at: 1 } })).toBeNull();
     expect(parsePr({ ...record, auto_merge_stopped: { reason: "x", at: -1 } })).toBeNull();
+    expect(parsePr({ ...record, pr_state: "closed", closed_by: "bob@acme.noreply" }))
+      .toMatchObject({ pr_state: "closed", closed_by: "bob@acme.noreply" });
+    expect(parsePr({ ...record, closed_by: null })).toMatchObject({ closed_by: null });
+    expect(parsePr({ ...record, closed_by: 7 })).toBeNull();
+    expect(parsePr({ ...record, closed_by: "" })).toBeNull();
   });
 
   it("projects PR diffs recursively", () => {

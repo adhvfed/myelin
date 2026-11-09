@@ -4,6 +4,31 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — The pull request page closes, reopens, and readies
+
+The server learned to close, reopen and mark ready, but the web page had not. A draft whose gate
+passed still showed "Ready to merge" and a Merge button that the server now refuses, and nothing
+on the page could close or reopen a pull request.
+
+The merge card now follows the pull request's state:
+- **A draft** shows "This is a draft" and a **Ready for review** button in place of the merge
+  controls. Update branch still works on drafts.
+- **An open pull request** keeps its merge controls and adds a quiet **Close pull request**.
+- **A closed pull request** says who closed it and offers **Reopen pull request**.
+- **When the checks service is unavailable,** the degraded card keeps these controls, since closing
+  never depends on checks.
+
+Refusals from the edge are shown as the edge words them. For example, "only someone who can push
+to … can reopen a pull request that someone else closed".
+
+Proof:
+- A new real-stack browser spec has the signed-in author ready a draft opened through the API,
+  close it, and reopen it. The closer is named and no Merge button appears while it is closed.
+- The mocked PR overview suite gained a draft fixture whose gate passes. It proves the card shows no
+  merge controls for it and walks the same lifecycle, with an axe scan.
+- Unit tests cover the new mutation inputs and the `closed_by` decoding.
+- The update-branch and merge-queue browser specs and `pnpm --dir frontend check` pass.
+
 ## 2026-11-09 — Closing rules hold under the row lock
 
 A third independent pass re-checked the two review-fix commits. It confirmed all six earlier

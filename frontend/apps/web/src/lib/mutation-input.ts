@@ -26,7 +26,11 @@ export type PrMutation =
   | { op: "merge"; repo: string; n: number; method?: MergeMethod }
   | { op: "update-branch"; repo: string; n: number; expected_head_oid: string }
   | { op: "auto-merge"; repo: string; n: number; method?: MergeMethod }
-  | { op: "cancel-auto-merge"; repo: string; n: number };
+  | { op: "cancel-auto-merge"; repo: string; n: number }
+  | { op: PrStateOp; repo: string; n: number };
+
+/** Closing, reopening, and marking a draft ready; each is also its Edge route's last segment. */
+export type PrStateOp = "close" | "reopen" | "ready";
 
 export interface PrAnchor {
   path: string;
@@ -211,6 +215,9 @@ export function parsePrMutation(value: unknown): PrMutation | null {
       return { op: input.op, ...base, ...(method === undefined ? {} : { method }) };
     }
     case "cancel-auto-merge":
+    case "close":
+    case "reopen":
+    case "ready":
       return exactKeys(input, ["op", "repo", "n"]) ? { op: input.op, ...base } : null;
     case "update-branch":
       return exactKeys(input, ["op", "repo", "n", "expected_head_oid"]) &&

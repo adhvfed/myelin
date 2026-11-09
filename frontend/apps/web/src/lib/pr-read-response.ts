@@ -166,6 +166,7 @@ export function parsePr(value: unknown): PrVM | null {
       (input.behind_base !== undefined && typeof input.behind_base !== "boolean") ||
       !autoMergeShape(input.auto_merge) || !autoMergeStoppedShape(input.auto_merge_stopped) ||
       (input.is_fork !== undefined && typeof input.is_fork !== "boolean") ||
+      !(input.closed_by === undefined || input.closed_by === null || bounded(input.closed_by, 4 * 1024)) ||
       input.durable !== true) return null;
   return {
     number: input.number,
@@ -185,6 +186,7 @@ export function parsePr(value: unknown): PrVM | null {
     ...(input.commits_count_capped === undefined ? {} : { commits_count_capped: input.commits_count_capped }),
     ...(input.behind_base === undefined ? {} : { behind_base: input.behind_base }),
     ...(input.is_fork === undefined ? {} : { is_fork: input.is_fork }),
+    ...(input.closed_by === undefined ? {} : { closed_by: input.closed_by }),
     ...(input.auto_merge === undefined ? {} : {
       auto_merge: input.auto_merge === null ? null : {
         requested_by: (input.auto_merge as Record<string, unknown>).requested_by as string,

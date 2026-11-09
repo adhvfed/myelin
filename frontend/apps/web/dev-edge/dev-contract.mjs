@@ -958,12 +958,35 @@ const SEED_PRS = {
     },
     checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: true, changes_requested: false, current_approvals: 0, durable: true },
   },
+  // PR #8 — a draft whose gate would pass: it still must be marked ready before it can merge.
+  8: {
+    pr: {
+      number: 8,
+      pr_state: "draft",
+      title: "Draft: sketch the release notes",
+      body_md: null,
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/notes",
+      head_oid: C2,
+      author: "u_dev_operator@acme.noreply",
+      author_is_agent: false,
+      reviews: 0,
+      created_at: 1718500000,
+      updated_at: 1718500000,
+      commits_count: 1,
+      commits_count_capped: false,
+      durable: true,
+    },
+    checks: { required_contexts: [], required_approvals: 0, green_contexts: [], endorsed_contexts: [], fork_unendorsed_contexts: [], gate_admitted: true, changes_requested: false, current_approvals: 0, durable: true },
+  },
 };
 
 /** Pull requests whose branch the dev edge has updated since the last fixture reset. */
 const UPDATED_BRANCHES = new Set();
 /** Merge-queue state changed since the last fixture reset: `{ auto_merge, auto_merge_stopped }`. */
 const AUTO_MERGES = new Map();
+/** Pull requests closed, reopened, or marked ready since the last reset: `{ pr_state, closed_by, closed_while_draft }`. */
+const PR_STATES = new Map();
 
 // Keep one namespaced repository in the browser contract. Both coordinates deliberately share the
 // same PR records; the test double is proving transport and routing semantics, not modelling storage.
@@ -1031,6 +1054,7 @@ export function resetPrFixtures() {
   THREADS.clear();
   UPDATED_BRANCHES.clear();
   AUTO_MERGES.clear();
+  PR_STATES.clear();
   threadSeq = 0;
 }
 function subjectKey(repo, n) {
@@ -1281,9 +1305,30 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
     doc.reviews = doc.reviews.filter((r) => r.id !== m[1]);
     return { status: 200, json: { applied: { action: "git.pr.review.discard", result: { discarded: m[1] } }, durable: true } };
   }
+  // POST …/close, …/reopen, …/ready — mirror the edge's state machine and its refusals.
+  if (tail === "close" || tail === "reopen" || tail === "ready") {
+    const state = prJson(repo, n).pr_state;
+    const refusal = {
+      close: state === "open" || state === "draft" ? null : "only an open or draft pull request can be closed",
+      reopen: state === "closed" ? null : "only a closed pull request can be reopened",
+      ready: state === "draft" ? null : "only a draft pull request can be marked ready for review",
+    }[tail];
+    if (refusal) return { status: 409, json: { error: { code: "conflict", message: refusal } } };
+    const previous = PR_STATES.get(n);
+    if (tail === "close") {
+      PR_STATES.set(n, { pr_state: "closed", closed_by: viewer, closed_while_draft: state === "draft" });
+      AUTO_MERGES.set(n, { auto_merge: null, auto_merge_stopped: null });
+    } else if (tail === "reopen") {
+      PR_STATES.set(n, { pr_state: previous?.closed_while_draft ? "draft" : "open", closed_by: null, closed_while_draft: false });
+    } else {
+      PR_STATES.set(n, { pr_state: "open", closed_by: null, closed_while_draft: false });
+    }
+    const action = tail === "ready" ? "git.pr.ready" : `git.pr.${tail}`;
+    return { status: 200, json: { applied: { action, pr: prJson(repo, n) }, durable: true } };
+  }
   // POST …/auto-merge — join the base branch's merge queue (open pull requests only).
   if (tail === "auto-merge") {
-    if (SEED_PRS[n].pr.pr_state !== "open") {
+    if (prJson(repo, n).pr_state !== "open") {
       return { status: 409, json: { error: { code: "conflict", message: "only an open pull request can merge automatically" } } };
     }
     const current = AUTO_MERGES.get(n)?.auto_merge;
@@ -1303,6 +1348,12 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
   // POST …/merge — PR 2 is mergeable (gate admitted); PR 1 is blocked (409 + fresh checks, N6).
   if (tail === "merge") {
     const current = prJson(repo, n);
+    if (current.pr_state === "draft" || current.pr_state === "closed") {
+      const message = current.pr_state === "draft"
+        ? "a draft pull request cannot be merged; mark it ready for review first"
+        : "a closed pull request cannot be merged; reopen it first";
+      return { status: 409, json: { error: { code: "conflict", message } } };
+    }
     if (current.behind_base) {
       return { status: 409, json: { error: { code: "branch_behind_base", message: "main moved after this branch was made; update the branch, then merge" }, durable: true } };
     }
@@ -1320,9 +1371,12 @@ export function prJson(repo, n) {
   const updated = UPDATED_BRANCHES.has(n)
     ? { head_oid: UPDATED_HEAD, commits_count: SEED_PRS[n].pr.commits_count + 1, behind_base: false }
     : {};
+  const lifecycle = PR_STATES.get(n);
   return {
     ...SEED_PRS[n].pr,
     ...updated,
+    ...(lifecycle ? { pr_state: lifecycle.pr_state } : {}),
+    closed_by: lifecycle?.pr_state === "closed" ? lifecycle.closed_by : null,
     auto_merge: AUTO_MERGES.has(n) ? AUTO_MERGES.get(n).auto_merge : null,
     auto_merge_stopped: AUTO_MERGES.has(n)
       ? AUTO_MERGES.get(n).auto_merge_stopped
