@@ -60,6 +60,7 @@ pub const GIT_PR_CLOSED: &str = "git.pr.closed";
 pub const GIT_PR_REOPENED: &str = "git.pr.reopened";
 pub const GIT_PR_MERGED: &str = "git.pr.merged";
 pub const GIT_PR_SYNCHRONIZED: &str = "git.pr.synchronized";
+pub const GIT_PR_EDITED: &str = "git.pr.edited";
 
 pub const GIT_PR_HEAD_TRIGGER_SCHEMA_V2: u32 = 2;
 
@@ -228,6 +229,7 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_PR_REOPENED,
     GIT_PR_MERGED,
     GIT_PR_SYNCHRONIZED,
+    GIT_PR_EDITED,
     GIT_REVIEW_REQUESTED,
     GIT_REVIEW_SUBMITTED,
     GIT_REVIEW_DISMISSED,

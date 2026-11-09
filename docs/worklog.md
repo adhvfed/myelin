@@ -4,6 +4,39 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — A pull request's title and description can be edited
+
+A pull request's title and description were fixed at open. A typo stayed, a description could not
+follow the work, and an agent could not update what it said its change did.
+
+`POST /prs/{n}/edit` takes `{title?, body_md?}`, and `myelin repo pr edit <repo> <n> --title …
+--body …` is its CLI form.
+- **Who:** the same people who can close it: its author, or a person who can push. An agent edits
+  only what it opened.
+- **What it stores:**
+  - Titles are trimmed and limited as on open. An empty description removes it.
+  - The text is sealed under the author's key like the original, so it is erased with the rest of
+    the author's pull-request text.
+  - Once that text has been erased it cannot be rewritten. The store refuses under its row lock
+    with a 409 that says so.
+- **What follows from it:**
+  - An edit emits `git.pr.edited`.
+  - A description edited to name an issue gains its `Closes` reference edge.
+  - Merging still reads the current description, so its issues close as before.
+
+The operation ledger identifies commands that carry pull-request text by a digest keyed to the
+cell. That covers opens as well as edits. Before, an open's command row kept an unkeyed hash of
+its title and body. That hash outlived erasure, and could confirm a guessed title to anyone who
+could read the ledger. The KMS cell root is durable, so retries across restarts still match.
+
+Proof:
+- Store tests cover each edit rule and refusal, the erased-text mapping, and the keyed digests: a
+  digest differs from the plain hash and between tenants.
+- Edge tests cover who may edit, trimming, and invalid edits.
+- The live Postgres store test passes with keyed open hashes.
+- On the real stack, the privacy journey shows an erased pull request refusing a new title, and
+  the CLI journey retitles a merged pull request and reads the new title back.
+
 ## 2026-11-09 — Agents can ready and close their own pull requests
 
 An agent could open a draft pull request but never mark it ready. It could also never withdraw a

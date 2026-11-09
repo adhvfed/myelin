@@ -15,9 +15,9 @@ use crate::core::{Oid as CoreOid, RepoLoc};
 use crate::dek::{encrypt_free_text, is_git_subject_key_class, GitFreeText};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
-    event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_CLOSED, GIT_PR_MARKED_READY,
-    GIT_PR_MERGED, GIT_PR_MERGE_BLOCKED, GIT_PR_MERGE_QUEUED, GIT_PR_OPENED, GIT_PR_REOPENED,
-    GIT_PR_SYNCHRONIZED, GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
+    event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_CLOSED, GIT_PR_EDITED,
+    GIT_PR_MARKED_READY, GIT_PR_MERGED, GIT_PR_MERGE_BLOCKED, GIT_PR_MERGE_QUEUED, GIT_PR_OPENED,
+    GIT_PR_REOPENED, GIT_PR_SYNCHRONIZED, GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
 };
 use crate::lifecycle::{BranchProtectionRuleset, PrState};
 use crate::pg_pr_event::co_commit_event;
@@ -527,6 +527,11 @@ pub enum PrMutation {
     },
     /// A draft asks for review and becomes mergeable.
     MarkReady,
+    /// A new title, a new description, or both; an empty description removes it.
+    Edit {
+        title: Option<String>,
+        body_md: Option<String>,
+    },
     Touch,
 }
 
@@ -537,6 +542,14 @@ pub const MERGE_IN_PROGRESS: &str =
 pub const MERGE_REFUSAL: &str = "only an open pull request can be merged";
 const REOPEN_REFUSAL: &str = "only a closed pull request can be reopened";
 const MARK_READY_REFUSAL: &str = "only a draft pull request can be marked ready for review";
+const EDIT_NOTHING_REFUSAL: &str = "an edit changes the title, the description, or both";
+const EDIT_TITLE_REFUSAL: &str =
+    "a pull request title must be 1-512 bytes without surrounding space";
+const EDIT_BODY_REFUSAL: &str = "a pull request description must be at most 64 KiB";
+const ERASED_TEXT_REFUSAL: &str = "this pull request's text was erased, so it cannot be edited";
+/// Pull-request text commands are identified by a digest keyed to the cell, so a retained ledger
+/// row cannot confirm a guessed title after the text is erased.
+const PR_TEXT_COMMAND_CONTEXT: &str = "myelin.git.pr-text-command.v1";
 pub const REOPEN_CLOSER_REFUSAL: &str =
     "someone else closed this pull request; reopening it takes push access";
 
@@ -553,6 +566,7 @@ impl PrMutation {
             Self::Close { .. } => "close",
             Self::Reopen { .. } => "reopen",
             Self::MarkReady => "mark-ready",
+            Self::Edit { .. } => "edit",
             Self::Touch => "touch",
         }
     }
@@ -565,6 +579,7 @@ impl PrMutation {
             Self::Close { .. } => GIT_PR_CLOSED,
             Self::Reopen { .. } => GIT_PR_REOPENED,
             Self::MarkReady => GIT_PR_MARKED_READY,
+            Self::Edit { .. } => GIT_PR_EDITED,
             Self::CancelAutoMerge {
                 reason: Some(_), ..
             } => GIT_PR_MERGE_BLOCKED,
@@ -719,6 +734,26 @@ impl PrMutation {
                     return Err(MARK_READY_REFUSAL);
                 }
                 record.state = PrState::Open;
+            }
+            Self::Edit { title, body_md } => {
+                if title.is_none() && body_md.is_none() {
+                    return Err(EDIT_NOTHING_REFUSAL);
+                }
+                if let Some(title) = title {
+                    if title.trim() != title
+                        || title.is_empty()
+                        || title.len() > crate::pr_store::MAX_PR_TITLE_BYTES
+                    {
+                        return Err(EDIT_TITLE_REFUSAL);
+                    }
+                    record.title = title;
+                }
+                if let Some(body) = body_md {
+                    if body.len() > crate::typed_edges::MAX_CLOSES_MESSAGE_BYTES {
+                        return Err(EDIT_BODY_REFUSAL);
+                    }
+                    record.body_md = (!body.is_empty()).then_some(body);
+                }
             }
             Self::Touch => {}
         }
@@ -1687,7 +1722,7 @@ impl PgPrStore {
         record.author_subject_id = normalized_subject_id(principal)?;
         let actor_subject_id = record.author_subject_id.clone();
         record.number = 0;
-        let payload_hash = open_payload_hash(&record)?;
+        let payload_hash = open_payload_hash(&self.kms, &scope.tenant().0, &record)?;
         let ctx = self.operation_context(scope, principal)?;
         record.created_at = Some(ctx.unix_seconds);
         record.updated_at = Some(ctx.unix_seconds);
@@ -1715,7 +1750,7 @@ impl PgPrStore {
         record.author_subject_id = normalized_subject_id(principal)?;
         let actor_subject_id = record.author_subject_id.clone();
         record.number = 0;
-        let payload_hash = open_payload_hash(&record)?;
+        let payload_hash = open_payload_hash(&self.kms, &scope.tenant().0, &record)?;
         let ctx = self.operation_context(scope, principal)?;
         record.created_at = Some(ctx.unix_seconds);
         record.updated_at = Some(ctx.unix_seconds);
@@ -1895,6 +1930,9 @@ impl PgPrStore {
                         let free_text_erased: bool = row
                             .try_get("free_text_erased")
                             .map_err(|_| pg_query("decode PR text erasure state"))?;
+                        if free_text_erased && matches!(mutation, PrMutation::Edit { .. }) {
+                            return Err(pg_query(ERASED_TEXT_REFUSAL));
+                        }
                         let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode PR"))?;
                         mutation
@@ -1976,7 +2014,12 @@ impl PgPrStore {
         principal: &Principal,
     ) -> Result<PrRecord, DurableError> {
         let actor_subject_id = normalized_subject_id(principal)?;
-        let payload_hash = payload_hash(&(number, &mutation))?;
+        let payload_hash = match &mutation {
+            PrMutation::Edit { .. } => {
+                text_command_hash(&self.kms, &scope.tenant().0, &(number, &mutation))?
+            }
+            _ => payload_hash(&(number, &mutation))?,
+        };
         let context = self.operation_context(scope, principal)?;
         self.mutate(
             scope,
@@ -3363,12 +3406,30 @@ fn payload_hash(value: &impl serde::Serialize) -> Result<String, DurableError> {
 /// Edge stamps a fresh observation time onto every request. Those timestamps belong in the PR
 /// record, but they must not make a retry with the same idempotency key look like a different
 /// command after the wall clock advances.
-fn open_payload_hash(record: &PrRecord) -> Result<String, DurableError> {
+fn open_payload_hash(
+    kms: &KmsEngine,
+    tenant: &str,
+    record: &PrRecord,
+) -> Result<String, DurableError> {
     let mut intent = record.clone();
     intent.number = 0;
     intent.created_at = None;
     intent.updated_at = None;
-    payload_hash(&intent)
+    text_command_hash(kms, tenant, &intent)
+}
+
+fn text_command_hash(
+    kms: &KmsEngine,
+    tenant: &str,
+    command: &impl serde::Serialize,
+) -> Result<String, DurableError> {
+    let mut bytes = tenant.as_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend(
+        serde_json::to_vec(command)
+            .map_err(|_| DurableError::Git("encode PR command payload failed".into()))?,
+    );
+    Ok(kms.keyed_digest(PR_TEXT_COMMAND_CONTEXT, &bytes))
 }
 
 fn merge_payload_hash(number: u64, intent: &MergeIntent) -> Result<String, DurableError> {
@@ -3570,6 +3631,10 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         MARK_READY_REFUSAL,
         MERGE_REFUSAL,
         MERGE_IN_PROGRESS,
+        EDIT_NOTHING_REFUSAL,
+        EDIT_TITLE_REFUSAL,
+        EDIT_BODY_REFUSAL,
+        ERASED_TEXT_REFUSAL,
     ]
     .into_iter()
     .find(|refusal| message.contains(refusal))
@@ -4090,6 +4155,63 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_rewrites_the_title_or_description_and_nothing_else() {
+        let pull_request = crate::lifecycle::PullRequest::open(
+            1,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pull_request, "a".repeat(40));
+        record.title = "Fix the typo".into();
+        record.body_md = Some("Closes ENG-1".into());
+        let edit = |title: Option<&str>, body: Option<&str>| PrMutation::Edit {
+            title: title.map(str::to_string),
+            body_md: body.map(str::to_string),
+        };
+        assert_eq!(edit(Some("x"), None).event_type(), GIT_PR_EDITED);
+
+        edit(Some("Fix the onboarding typo"), None)
+            .apply_to_at(&mut record, 100)
+            .unwrap();
+        assert_eq!(
+            (record.title.as_str(), record.body_md.as_deref()),
+            ("Fix the onboarding typo", Some("Closes ENG-1")),
+            "an absent description is left as it was"
+        );
+        edit(None, Some("")).apply_to_at(&mut record, 200).unwrap();
+        assert_eq!(record.body_md, None, "an empty description removes it");
+        assert_eq!(record.updated_at, Some(200));
+
+        for (mutation, refusal) in [
+            (edit(None, None), EDIT_NOTHING_REFUSAL),
+            (edit(Some(""), None), EDIT_TITLE_REFUSAL),
+            (edit(Some(" padded "), None), EDIT_TITLE_REFUSAL),
+            (edit(Some(&"t".repeat(513)), None), EDIT_TITLE_REFUSAL),
+            (
+                edit(None, Some(&"b".repeat(64 * 1024 + 1))),
+                EDIT_BODY_REFUSAL,
+            ),
+        ] {
+            assert_eq!(mutation.apply_to_at(&mut record, 300), Err(refusal));
+        }
+        assert_eq!(record.title, "Fix the onboarding typo");
+
+        let kms = KmsEngine::new();
+        let mutation = edit(Some("Fix the onboarding typo"), None);
+        assert_ne!(
+            text_command_hash(&kms, "acme", &(1u64, &mutation)).unwrap(),
+            payload_hash(&(1u64, &mutation)).unwrap(),
+            "edits are identified by a keyed digest of their text"
+        );
+        assert!(matches!(
+            pg_error(myelin_storage::PgError::Query(ERASED_TEXT_REFUSAL.into())),
+            DurableError::Conflict(message) if message == ERASED_TEXT_REFUSAL
+        ));
+    }
+
+    #[test]
     fn a_draft_becomes_ready_and_a_closed_pull_request_can_come_back() {
         let draft = crate::lifecycle::PullRequest::open(
             1,
@@ -4244,15 +4366,27 @@ mod tests {
         retry.created_at = Some(101);
         retry.updated_at = Some(101);
 
+        let kms = KmsEngine::new();
+        let hash = |record: &PrRecord| open_payload_hash(&kms, "acme", record).unwrap();
         assert_eq!(
-            open_payload_hash(&first).unwrap(),
-            open_payload_hash(&retry).unwrap(),
+            hash(&first),
+            hash(&retry),
             "server observation time is not caller intent"
+        );
+        assert_ne!(
+            hash(&first),
+            payload_hash(&first).unwrap(),
+            "the digest is keyed, so a guessed title cannot be confirmed from the ledger"
+        );
+        assert_ne!(
+            hash(&first),
+            open_payload_hash(&kms, "other", &first).unwrap(),
+            "tenants never share a command identity"
         );
         retry.title = "A different change".into();
         assert_ne!(
-            open_payload_hash(&first).unwrap(),
-            open_payload_hash(&retry).unwrap(),
+            hash(&first),
+            hash(&retry),
             "a genuinely different open intent still conflicts"
         );
     }

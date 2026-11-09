@@ -9,8 +9,8 @@ use myelin_storage::pgrelay::PgRelay;
 
 use crate::core::RepoLoc;
 use crate::events::{
-    GIT_PR_CLOSED, GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_MARKED_READY, GIT_PR_MERGED,
-    GIT_PR_OPENED, GIT_PR_REOPENED, GIT_PR_SYNCHRONIZED, GIT_REVIEW_SUBMITTED,
+    GIT_PR_CLOSED, GIT_PR_EDITED, GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_MARKED_READY,
+    GIT_PR_MERGED, GIT_PR_OPENED, GIT_PR_REOPENED, GIT_PR_SYNCHRONIZED, GIT_REVIEW_SUBMITTED,
 };
 use crate::notif_rules::{
     outstanding_review_request_signal_drafts, review_request_resolved_signal_draft,
@@ -162,7 +162,7 @@ pub(crate) async fn co_commit_event(
         )
         .map_err(|_| pg_query("derive automatic-merge signals"))?
     };
-    let closes_targets = if event_type == GIT_PR_OPENED {
+    let closes_targets = if matches!(event_type, GIT_PR_OPENED | GIT_PR_EDITED) {
         closes_issue_targets(&loc.tenant, record.body_md.as_deref().unwrap_or_default())
             .map_err(|_| pg_query("parse PR lifecycle trailers"))?
     } else {

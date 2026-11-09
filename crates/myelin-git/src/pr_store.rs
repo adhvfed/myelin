@@ -162,6 +162,8 @@ impl PrStateChange {
     }
 }
 
+pub const MAX_PR_TITLE_BYTES: usize = 512;
+
 /// Squashed commit summaries beyond this many are counted rather than listed.
 const SQUASH_SUMMARY_LINES: usize = 50;
 

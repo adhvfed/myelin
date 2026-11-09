@@ -1611,6 +1611,39 @@ impl Handler for DPrState {
     }
 }
 
+struct DPrEdit {
+    be: Arc<DurableGitBackend>,
+}
+impl Handler for DPrEdit {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let body: EditPullRequestBody = required_json(&ctx.request.body, "pull request edit")?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
+        let repo = param(ctx, "repo")?;
+        let record = self
+            .be
+            .edit_pr_with_operation(
+                RepoActorContext::new(tenant_of(ctx), region_of(ctx), repo, ctx.principal)
+                    .for_pr(pull_request_number_param(ctx, "n")?),
+                PrEdit {
+                    title: body.title.as_deref(),
+                    body_md: body.body_md.as_deref(),
+                },
+                &operation_id,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({
+                "applied": {
+                    "action": "git.pr.edit",
+                    "pr": DurableGitBackend::pr_json(tenant_of(ctx), repo, &record),
+                },
+                "durable": true,
+            }),
+        ))
+    }
+}
+
 struct DAutoMerge {
     be: Arc<DurableGitBackend>,
     request: bool,
@@ -2025,6 +2058,12 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         guarded(&be, Push, Arc::new(DUpdateBranch { be: be.clone() })),
     );
     // The author may change their own pull request with only read access; the backend decides.
+    b = b.route(
+        post,
+        &reroot("/api/git/repos/{repo}/prs/{n}/edit"),
+        "git.pr.edit",
+        guarded(&be, Pull, Arc::new(DPrEdit { be: be.clone() })),
+    );
     for change in PrStateChange::ALL {
         b = b.route(
             post,

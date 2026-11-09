@@ -227,6 +227,12 @@ pub enum CliCommand {
         number: u64,
         change: crate::pr_store::PrStateChange,
     },
+    PrEdit {
+        repo: String,
+        number: u64,
+        title: Option<String>,
+        body: Option<String>,
+    },
     SearchCode {
         query: String,
         repo: Option<String>,
@@ -241,7 +247,8 @@ impl CliCommand {
             | CliCommand::PrOpen { .. }
             | CliCommand::PrReview { .. }
             | CliCommand::PrUpdateBranch { .. }
-            | CliCommand::PrChangeState { .. } => Handler::Lifecycle,
+            | CliCommand::PrChangeState { .. }
+            | CliCommand::PrEdit { .. } => Handler::Lifecycle,
             CliCommand::RepoView { .. } | CliCommand::PrView { .. } => Handler::Project,
             CliCommand::PrChecks { .. } => Handler::CheckStatus,
             CliCommand::PrMerge { .. }
@@ -264,6 +271,7 @@ impl CliCommand {
                 | CliCommand::PrDisableAutoMerge { .. }
                 | CliCommand::PrEndorseForkCi { .. }
                 | CliCommand::PrChangeState { .. }
+                | CliCommand::PrEdit { .. }
         )
     }
 }
@@ -442,6 +450,33 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         "endorse-fork-ci" => {
             let (repo, number) = repo_and_number(args)?;
             Ok(CliCommand::PrEndorseForkCi { repo, number })
+        }
+        "edit" => {
+            let (repo, number, flags) = repo_and_number_prefix(args)?;
+            let (mut title, mut body) = (None, None);
+            let mut index = 0;
+            while index < flags.len() {
+                match flags[index] {
+                    "--title" => parse_value_flag(flags, &mut index, "--title", &mut title)?,
+                    "--body" => parse_value_flag(flags, &mut index, "--body", &mut body)?,
+                    other => {
+                        return Err(CliParseError::Unknown {
+                            token: other.to_string(),
+                        })
+                    }
+                }
+            }
+            if title.is_none() && body.is_none() {
+                return Err(CliParseError::MissingArg {
+                    what: "--title or --body",
+                });
+            }
+            Ok(CliCommand::PrEdit {
+                repo,
+                number,
+                title,
+                body,
+            })
         }
         other => match crate::pr_store::PrStateChange::ALL
             .into_iter()

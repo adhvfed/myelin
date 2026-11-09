@@ -161,6 +161,21 @@ fn cli_parses_the_arch_section_3_2_verbs() {
             Err(CliParseError::BadArg { .. })
         ));
     }
+    assert_eq!(
+        parse_cli(&["pr", "edit", "core", "7", "--title", "Ship it", "--body", ""]).unwrap(),
+        CliCommand::PrEdit {
+            repo: "core".into(),
+            number: 7,
+            title: Some("Ship it".into()),
+            body: Some(String::new()),
+        }
+    );
+    assert!(matches!(
+        parse_cli(&["pr", "edit", "core", "7"]),
+        Err(CliParseError::MissingArg {
+            what: "--title or --body"
+        })
+    ));
     for (verb, change) in [
         ("close", crate::pr_store::PrStateChange::Close),
         ("reopen", crate::pr_store::PrStateChange::Reopen),

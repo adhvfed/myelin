@@ -1,5 +1,6 @@
-//! Closing, reopening, and marking a draft ready for review. Each is its author's call, or that of
-//! a person who can push to the repository; an agent changes only the pull requests it opened.
+//! Closing, reopening, marking a draft ready for review, and editing its title and description.
+//! Each is its author's call, or that of a person who can push to the repository; an agent changes
+//! only the pull requests it opened.
 
 use super::mutation_support::branch_ref;
 use super::*;
@@ -28,7 +29,104 @@ fn what(change: PrStateChange) -> &'static str {
     }
 }
 
+/// The text a person or agent asks to change; at least one is present.
+pub struct PrEdit<'a> {
+    pub title: Option<&'a str>,
+    pub body_md: Option<&'a str>,
+}
+
 impl DurableGitBackend {
+    /// Whether `principal` may change `record`: its author, or a person who can push. Returns
+    /// whether they can push, which also lets them undo someone else's close.
+    fn authorize_pr_change(
+        &self,
+        loc: &RepoLoc,
+        record: &PrRecord,
+        principal: &Principal,
+        reopening_someone_elses_close: bool,
+        what: &str,
+    ) -> Result<bool, DurableError> {
+        let me = Self::pseudonym(&loc.tenant, principal);
+        // Pushing to the repository is a person's authority over its pull requests; agents never
+        // borrow it.
+        let can_push = !Self::is_agent(principal)
+            && self
+                .repo_authz
+                .authorize_repo_permission(principal, loc, RepoPermission::Push);
+        if (record.author_pseudonym == me && !reopening_someone_elses_close) || can_push {
+            return Ok(can_push);
+        }
+        let slug = &loc.repo;
+        Err(DurableError::Forbidden(
+            match (Self::is_agent(principal), reopening_someone_elses_close) {
+                (true, false) => "an agent changes only the pull requests it opened".into(),
+                (true, true) => {
+                    "an agent cannot reopen a pull request that someone else closed".into()
+                }
+                (false, false) => {
+                    format!("only its author or someone who can push to {slug} can {what}")
+                }
+                (false, true) => format!(
+                    "only someone who can push to {slug} can reopen a pull request that someone \
+                     else closed"
+                ),
+            },
+        ))
+    }
+
+    /// Retitles a pull request or rewrites its description, sealed like the original text.
+    pub fn edit_pr_with_operation(
+        &self,
+        target: PrActorContext<'_>,
+        edit: PrEdit<'_>,
+        operation_id: &PrOperationId,
+    ) -> Result<PrRecord, DurableError> {
+        let PrActorContext {
+            repo: actor,
+            number,
+        } = target;
+        let loc = Self::loc(actor.tenant, actor.region, actor.slug);
+        let title = edit.title.map(str::trim);
+        if title.is_some_and(|title| title.is_empty() || title.len() > MAX_PR_TITLE_BYTES) {
+            return Err(DurableError::InvalidInput(format!(
+                "a pull request title must be 1-{MAX_PR_TITLE_BYTES} bytes"
+            )));
+        }
+        if edit
+            .body_md
+            .is_some_and(|body| body.len() > myelin_git::typed_edges::MAX_CLOSES_MESSAGE_BYTES)
+        {
+            return Err(DurableError::InvalidInput(
+                "a pull request description must be at most 64 KiB".into(),
+            ));
+        }
+        if title.is_none() && edit.body_md.is_none() {
+            return Err(DurableError::InvalidInput(
+                "an edit changes the title, the description, or both".into(),
+            ));
+        }
+        let record = self
+            .pr_get(&loc, number, actor.principal)?
+            .ok_or_else(|| DurableError::NotFound("pull request not found".into()))?;
+        self.authorize_pr_change(
+            &loc,
+            &record,
+            actor.principal,
+            false,
+            "edit this pull request",
+        )?;
+        self.pr_mutate(
+            &loc,
+            number,
+            PrMutation::Edit {
+                title: title.map(str::to_string),
+                body_md: edit.body_md.map(str::to_string),
+            },
+            operation_id,
+            actor.principal,
+        )
+    }
+
     pub fn change_pr_state_with_operation(
         &self,
         target: PrActorContext<'_>,
@@ -57,29 +155,13 @@ impl DurableGitBackend {
                 .closed_by
                 .as_deref()
                 .is_some_and(|closer| closer != me);
-        // Pushing to the repository is a person's authority over its pull requests; agents never
-        // borrow it.
-        let can_push = !Self::is_agent(principal)
-            && self
-                .repo_authz
-                .authorize_repo_permission(principal, &loc, RepoPermission::Push);
-        if (record.author_pseudonym != me || closed_by_someone_else) && !can_push {
-            let refusal = match (Self::is_agent(principal), closed_by_someone_else) {
-                (true, false) => "an agent changes only the pull requests it opened".into(),
-                (true, true) => {
-                    "an agent cannot reopen a pull request that someone else closed".into()
-                }
-                (false, false) => format!(
-                    "only its author or someone who can push to {slug} can {}",
-                    what(change)
-                ),
-                (false, true) => format!(
-                    "only someone who can push to {slug} can reopen a pull request that someone \
-                     else closed"
-                ),
-            };
-            return Err(DurableError::Forbidden(refusal));
-        }
+        let can_push = self.authorize_pr_change(
+            &loc,
+            &record,
+            principal,
+            closed_by_someone_else,
+            what(change),
+        )?;
         let head_ref = branch_ref(&record.head_ref);
         let same_repository = record.head_repo_slug == slug;
         if change == PrStateChange::Reopen && record.state == PrState::Closed {

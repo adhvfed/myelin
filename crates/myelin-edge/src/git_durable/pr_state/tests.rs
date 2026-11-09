@@ -413,3 +413,48 @@ fn only_active_people_and_agents_of_the_tenant_can_be_asked_to_review() {
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn its_author_or_a_writer_edits_its_title_and_description() {
+    let fixture = pull_request(principal("author", PrincipalKind::Human), false);
+    let edit = |actor: &Principal, title: Option<&str>, body_md: Option<&str>| {
+        fixture.backend.edit_pr_with_operation(
+            RepoActorContext::new(TENANT, REGION, REPO, actor).for_pr(fixture.number),
+            PrEdit { title, body_md },
+            &fixture.backend.fresh_operation_id().unwrap(),
+        )
+    };
+    let edited = edit(&fixture.author, Some("  Feature, explained  "), None).unwrap();
+    assert_eq!(
+        edited.title, "Feature, explained",
+        "titles are trimmed like on open"
+    );
+    let described = edit(&fixture.author, None, Some("Closes ENG-1")).unwrap();
+    assert_eq!(
+        (described.title.as_str(), described.body_md.as_deref()),
+        ("Feature, explained", Some("Closes ENG-1"))
+    );
+    assert_eq!(
+        edit(&principal("writer", PrincipalKind::Human), None, Some(""))
+            .unwrap()
+            .body_md,
+        None
+    );
+
+    assert!(matches!(
+        edit(&principal("reader", PrincipalKind::Human), Some("Mine now"), None),
+        Err(DurableError::Forbidden(message))
+            if message == "only its author or someone who can push to product can edit this pull request"
+    ));
+    assert!(matches!(
+        edit(&agent("writer"), Some("Mine now"), None),
+        Err(DurableError::Forbidden(message))
+            if message == "an agent changes only the pull requests it opened"
+    ));
+    for (title, body_md) in [(Some("   "), None), (None, None)] {
+        assert!(matches!(
+            edit(&fixture.author, title, body_md),
+            Err(DurableError::InvalidInput(_))
+        ));
+    }
+}

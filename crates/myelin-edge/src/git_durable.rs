@@ -42,7 +42,8 @@ use myelin_git::pr_list_pagination::{
 use myelin_git::pr_store::{
     effective_ruleset, merge_pr, BranchProtectionConfig, ChecksSummary, DurablePrStore,
     MergeAttempt, MergeMethod, PrCrossListQuery, PrListBucket, PrListCounts, PrListQuery,
-    PrListSlice, PrListSort, PrListState, PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
+    PrListSlice, PrListSort, PrListState, PrRecord, ReviewRecord, MAX_PR_TITLE_BYTES,
+    PR_LIST_OFFSET_MAX,
 };
 use myelin_git::pr_threads::{
     AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, CommentWrite,
@@ -2199,10 +2200,10 @@ impl DurableGitBackend {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| DurableError::Git("open-PR body missing a non-empty `title`".into()))?
             .to_string();
-        if title.len() > 512 {
-            return Err(DurableError::Git(
-                "open-PR `title` exceeds 512 bytes".into(),
-            ));
+        if title.len() > MAX_PR_TITLE_BYTES {
+            return Err(DurableError::Git(format!(
+                "open-PR `title` exceeds {MAX_PR_TITLE_BYTES} bytes"
+            )));
         }
         let body_md = body
             .get("body_md")
@@ -3942,7 +3943,7 @@ use http::{cross_pr_before_key, mint_pr_list_cursors, BlobViewOptions, RawRespon
 pub use merge_queue::{
     merge_queue_interval_from_env, spawn_merge_queue, MergeQueueHandle, QueueStep, QueueTenants,
 };
-pub use pr_state::PrStateChange;
+pub use pr_state::{PrEdit, PrStateChange};
 pub use recovery::{recover_placed_git_at_boot, GitBootRecoveryReport, GitCellBootRecoveryReport};
 pub(crate) use update_branch::describe_conflicts;
 pub use update_branch::BranchUpdate;

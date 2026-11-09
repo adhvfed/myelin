@@ -139,6 +139,15 @@ pub(super) struct ReviewBody {
 #[serde(deny_unknown_fields)]
 pub(super) struct EmptyMutationBody {}
 
+/// A pull request's new title, description, or both; an empty description removes it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct EditPullRequestBody {
+    pub(super) title: Option<String>,
+    #[serde(alias = "body")]
+    pub(super) body_md: Option<String>,
+}
+
 /// How a merge, or a merge scheduled for when the pull request is ready, lands.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

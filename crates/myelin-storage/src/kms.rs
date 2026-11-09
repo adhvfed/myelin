@@ -994,6 +994,12 @@ impl KmsEngine {
         self.core().blind_index(context, value)
     }
 
+    /// A digest of `value` keyed to the cell: equal inputs match, but nobody without the key can
+    /// confirm a guess. For durable identities derived from personal text.
+    pub fn keyed_digest(&self, context: &str, value: &[u8]) -> String {
+        self.blind_index(context, value)
+    }
+
     pub fn export_kek(&self, id: &KekId) -> Result<Option<ExportedKek>, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]

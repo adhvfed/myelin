@@ -337,6 +337,24 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/{}", change.verb()),
             json!({}),
         )),
+        CliCommand::PrEdit {
+            repo,
+            number,
+            title,
+            body,
+        } => {
+            let mut edit = json!({});
+            if let Some(title) = title {
+                edit["title"] = json!(title);
+            }
+            if let Some(body) = body {
+                edit["body_md"] = json!(body);
+            }
+            Ok(EdgeCall::post_json(
+                format!("/v1/git/repos/{repo}/prs/{number}/edit"),
+                edit,
+            ))
+        }
         CliCommand::PrAutoMerge {
             repo,
             number,

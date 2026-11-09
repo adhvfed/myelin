@@ -587,6 +587,13 @@ describe("a person's privacy lifecycle", () => {
       title: "[erased pull request title]",
       body_md: null,
     });
+    const rewrite = await person.json(`${personal.project.path}/prs/${personal.number}/edit`, {
+      method: "POST",
+      body: { title: "Bring the erased text back" },
+      expectedStatus: 409,
+    });
+    expect(JSON.stringify(rewrite.body))
+      .toContain("this pull request's text was erased, so it cannot be edited");
     expect(await personal.project.readFile("privacy-change", "private.txt"))
       .toMatchObject({ contents: "Durable repository content for personal-pr-privacy.\n" });
     expect((await colleague.json(

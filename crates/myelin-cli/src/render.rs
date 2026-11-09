@@ -482,6 +482,12 @@ fn render_pull_request_change(value: &Value, call: Option<&EdgeCall>) -> Option<
     {
         return Some(rendered);
     }
+    if path.ends_with("/edit") && action == "git.pr.edit" {
+        return Some(format!(
+            "edited {}\n",
+            pull_request::render_item(applied.get("pr")?)?
+        ));
+    }
     if path.ends_with("/prs") && action == "git.pr.open" {
         return Some(format!(
             "opened {}\n",
@@ -856,6 +862,28 @@ mod tests {
         assert_eq!(
             render(&list, false),
             "platform #48 Ship it [open]  ship → main · approved · checks running (4/5)\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_receipt_reads_as_the_pull_request_now_reads() {
+        let call = crate::dispatch::git_dispatch(&["pr", "edit", "alpha", "7", "--title", "Ship"])
+            .unwrap();
+        assert_eq!(call.path, "/v1/git/repos/alpha/prs/7/edit");
+        assert_eq!(
+            call.payload.as_deref(),
+            Some(br#"{"title":"Ship"}"#.as_slice())
+        );
+        let receipt = json!({
+            "applied": { "action": "git.pr.edit", "pr": {
+                "number": 7, "title": "Ship it", "pr_state": "open",
+                "base_ref": "refs/heads/main", "head_ref": "refs/heads/ship",
+            } },
+            "durable": true,
+        });
+        assert_eq!(
+            render_for_call(&receipt, false, &call),
+            "edited #7 Ship it [open]  ship → main\n"
         );
     }
 

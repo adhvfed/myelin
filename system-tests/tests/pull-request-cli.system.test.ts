@@ -135,5 +135,12 @@ describe("pull requests from the terminal", () => {
     }, { timeoutMs: 60_000, intervalMs: 1_000, description: "the queue to merge the approved pull request" });
     expect(merged).toMatch(/\n {2}merged as [0-9a-f]{12}\n/);
     expect(merged).not.toContain("merging when ready");
+
+    expect(await myelin(
+      "--idempotency-key", `edit-${randomUUID()}`,
+      "repo", "pr", "edit", project.slug, String(number),
+      "--title", "Add a friendly greeting",
+    )).toBe(`edited #${number} Add a friendly greeting [merged]  greet → main · approved\n`);
+    expect(await view()).toContain(`#${number} Add a friendly greeting [merged]\n`);
   }, 240_000);
 });
