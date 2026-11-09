@@ -217,6 +217,10 @@ myelin privacy request certificate 55555555-5555-4555-8555-555555555555
 
 myelin repo list
 myelin repo pr list
+myelin repo pr list platform
+myelin --idempotency-key open-greeting repo pr open platform --title "Add a greeting" \
+  --base refs/heads/main --head refs/heads/greet --reviewer alice
+myelin repo pr view platform 7
 # Merge the base into a pull request that another merge left behind, on the server:
 myelin --idempotency-key update-pr-7 repo pr update platform 7
 # Merge it once it is approved, up to date, and green; the queue lands one per base branch:

@@ -4,6 +4,41 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Pull requests read as sentences in the terminal
+
+`myelin repo pr view` and `pr list` printed raw single-line JSON. Opening a pull request did too.
+The terminal is where people and local agents work, so the state that decides what to do next was
+buried in JSON. That state is: behind its base, queued to merge, its review, and what stopped an
+automatic merge.
+
+- `pr view` now prints a headline plus one line each for branches, head, commit count, fork and
+  review state. It shows the queue position when the pull request is scheduled to merge, why an
+  automatic merge stopped, and the merged commit. When the base has moved on, it prints the exact
+  `pr update` command to run.
+- `pr list` prints one line per pull request with its review state and checks.
+- `pr open` prints a one-line receipt.
+- Every server-supplied string goes through the terminal-safe single-line filter.
+
+Two gaps came out of using it:
+- `pr open` could not request a reviewer, though the server accepted `reviewers`. It now takes a
+  repeatable `--reviewer`.
+- `pr list` alone took its repository as `--repo`, while every other pull-request verb takes it
+  positionally. `pr list platform` failed with "unknown token". It is now
+  `pr list [repo]`, with no compatibility alias since nothing has shipped.
+
+The pull-request view gained `review_state`, which list rows already carried.
+
+Proof: a new TypeScript journey drives the real CLI binary against the local stack:
+1. It opens a pull request with a reviewer.
+2. It moves `main` ahead, and the view shows the pull request is behind with the exact command to
+   run.
+3. It runs that command, schedules the merge with `--auto`, and the view shows the place in line.
+   The list line is checked too.
+4. The reviewer approves. The queue merges, and the view shows the merged commit.
+
+Unit tests cover each rendering, including a title carrying an escape sequence. Strict Clippy
+passes on the CLI, Git and edge crates.
+
 ## 2026-11-09 — The merge queue serves every tenant the cell hosts
 
 The merge queue and branch-follow sweep borrowed their tenant list from the Issues reconciler's

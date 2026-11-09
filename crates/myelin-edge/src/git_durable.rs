@@ -3338,6 +3338,7 @@ impl DurableGitBackend {
             "author": rec.author_pseudonym,
             "author_is_agent": rec.author_is_agent,
             "reviews": rec.reviews.len(),
+            "review_state": rec.review_state_label(),
             "updated_at": rec.updated_at,
             "created_at": rec.created_at,
             "is_fork": rec.head_repo_slug != repo,

@@ -81,7 +81,7 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         CliCommand::PrList { repo: None }
     );
     assert_eq!(
-        parse_cli(&["pr", "list", "--repo", "core"]).unwrap(),
+        parse_cli(&["pr", "list", "core"]).unwrap(),
         CliCommand::PrList {
             repo: Some("core".into())
         }
@@ -112,8 +112,37 @@ fn cli_parses_the_arch_section_3_2_verbs() {
             head_ref: None,
             head_oid: Some("abc".into()),
             draft: true,
+            reviewers: vec![],
         }
     );
+    assert_eq!(
+        parse_cli(&[
+            "pr",
+            "open",
+            "core",
+            "--title",
+            "Ship",
+            "--reviewer",
+            "alice",
+            "--reviewer",
+            "agent:triage"
+        ])
+        .unwrap(),
+        CliCommand::PrOpen {
+            repo: "core".into(),
+            title: "Ship".into(),
+            body: None,
+            base_ref: None,
+            head_ref: None,
+            head_oid: None,
+            draft: false,
+            reviewers: vec!["alice".into(), "agent:triage".into()],
+        }
+    );
+    assert!(matches!(
+        parse_cli(&["pr", "open", "core", "--title", "Ship", "--reviewer"]),
+        Err(CliParseError::MissingValue { flag: "--reviewer" })
+    ));
     assert!(matches!(
         parse_cli(&["pr", "open", "core", "--head-oid", "abc"]),
         Err(CliParseError::MissingArg { what: "title" })
@@ -201,9 +230,9 @@ fn git_cli_rejects_every_unconsumed_operand_flag_and_counterfeit_feature() {
         vec!["repo", "create", "core", "second-slug"],
         vec!["repo", "create", "../outside"],
         vec!["repo", "view", "core", "extra"],
-        vec!["pr", "list", "core"],
-        vec!["pr", "list", "--repo", "core", "extra"],
-        vec!["pr", "list", "--repo", "core", "--repo", "other"],
+        vec!["pr", "list", "--repo", "core"],
+        vec!["pr", "list", "core", "extra"],
+        vec!["pr", "list", "../outside"],
         vec!["pr", "open", "core", "--title", "Change", "extra"],
         vec![
             "pr", "open", "core", "--title", "Change", "--title", "Other",
@@ -442,7 +471,8 @@ fn cli_write_commands_are_classified_for_the_bus2_gate() {
         base_ref: None,
         head_ref: None,
         head_oid: None,
-        draft: false
+        draft: false,
+        reviewers: vec![],
     }
     .is_write());
     assert!(!CliCommand::RepoList {

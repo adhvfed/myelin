@@ -11,6 +11,7 @@ mod automation;
 mod collaboration;
 mod privacy;
 mod project;
+mod pull_request;
 mod refs;
 mod tool;
 
@@ -59,6 +60,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
         return rendered;
     }
     if let Some(rendered) = render_pull_request_change(value, call) {
+        return rendered;
+    }
+    if let Some(rendered) = pull_request::render_view(value, call) {
         return rendered;
     }
     if let Some(rendered) = privacy::render_response(value) {
@@ -258,6 +262,9 @@ fn render_item(item: &Value) -> String {
     if let Some(rendered) = collaboration::render_item(item) {
         return rendered;
     }
+    if let Some(rendered) = pull_request::render_item(item) {
+        return rendered;
+    }
     if let Some(slug) = item.get("slug").and_then(Value::as_str) {
         let state = item.get("state").and_then(Value::as_str).unwrap_or("?");
         let slug = terminal_safe_single_line(slug);
@@ -446,6 +453,12 @@ fn render_pull_request_change(value: &Value, call: Option<&EdgeCall>) -> Option<
             .map(|oid| &oid[..12])
     };
     let action = applied.get("action")?.as_str()?;
+    if path.ends_with("/prs") && action == "git.pr.open" {
+        return Some(format!(
+            "opened {}\n",
+            pull_request::render_item(applied.get("pr")?)?
+        ));
+    }
     if path.ends_with("/update-branch") && action == "git.pr.update_branch" {
         let head = oid("head_oid")?;
         let again = if applied.get("replayed").and_then(Value::as_bool) == Some(true) {
@@ -752,7 +765,69 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_request_reads_as_its_state_and_what_to_do_next() {
+        let view = crate::dispatch::git_dispatch(&["pr", "view", "core", "7"]).unwrap();
+        let pr = json!({
+            "number": 7, "ref": "myelin://acme/git/pr/core:7", "title": "Add a greeting",
+            "pr_state": "open", "base_ref": "refs/heads/main", "head_ref": "refs/heads/greet",
+            "head_oid": "ab".repeat(20), "commits_count": 2, "behind_base": true,
+            "review_state": "changes",
+            "is_fork": false, "merged_oid": null,
+            "auto_merge": { "requested_by": "alice@acme.noreply", "requested_at": 1, "ahead": 0 },
+            "auto_merge_stopped": null, "durable": true,
+        });
+        assert_eq!(
+            render_for_call(&pr, false, &view),
+            "#7 Add a greeting [open]\n  greet → main · head abababababab · 2 commits · changes \
+             requested\n  main \
+             has moved on; update the branch to merge: myelin --idempotency-key <key> repo pr \
+             update core 7\n  merging when ready · next in line for main · asked by \
+             alice@acme.noreply\n"
+        );
+        let merged = json!({
+            "number": 7, "title": "Add a greeting\u{1b}[31m", "pr_state": "merged",
+            "base_ref": "refs/heads/main", "head_ref": "refs/heads/greet",
+            "head_oid": "ab".repeat(20), "merged_oid": "cd".repeat(20),
+            "auto_merge_stopped": { "reason": "a required check failed: ci/test", "at": 2 },
+        });
+        let rendered = render_for_call(&merged, false, &view);
+        assert!(rendered.contains("merged as cdcdcdcdcdcd"));
+        assert!(rendered.contains("automatic merge stopped: a required check failed: ci/test"));
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "titles cannot drive the terminal"
+        );
+
+        let list = json!({
+            "items": [{
+                "number": 48, "title": "Ship it", "pr_state": "open",
+                "base_ref": "refs/heads/main", "head_ref": "refs/heads/ship",
+                "review_state": "approved", "repo": "platform",
+                "checks_summary": { "verdict": "running", "passing": 4, "failing": 0, "total": 5 },
+            }],
+            "page": { "next_cursor": null, "limit": 50 },
+        });
+        assert_eq!(
+            render(&list, false),
+            "platform #48 Ship it [open]  ship → main · approved · checks running (4/5)\n"
+        );
+    }
+
+    #[test]
     fn pull_request_updates_and_merges_read_as_sentences() {
+        let open_call =
+            crate::dispatch::git_dispatch(&["pr", "open", "alpha", "--title", "Ship"]).unwrap();
+        let opened = json!({
+            "applied": { "action": "git.pr.open", "pr": {
+                "number": 7, "title": "Ship it", "pr_state": "open", "review_state": "requested",
+                "base_ref": "refs/heads/main", "head_ref": "refs/heads/ship",
+            } },
+            "durable": true,
+        });
+        assert_eq!(
+            render_for_call(&opened, false, &open_call),
+            "opened #7 Ship it [open]  ship → main · review requested\n"
+        );
         let head = "ab".repeat(20);
         let update_call = crate::dispatch::git_dispatch(&["pr", "update", "alpha", "7"]).unwrap();
         let merge_call = crate::dispatch::git_dispatch(&["pr", "merge", "alpha", "7"]).unwrap();

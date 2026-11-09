@@ -185,6 +185,7 @@ pub enum CliCommand {
         head_ref: Option<String>,
         head_oid: Option<String>,
         draft: bool,
+        reviewers: Vec<String>,
     },
     PrView {
         repo: String,
@@ -440,28 +441,23 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
     }
 }
 
+/// `pr list` across every repository you can read, or `pr list <repo>` for one.
 fn parse_pr_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
-    let mut repo = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index] {
-            "--repo" => {
-                if repo.is_some() {
-                    return Err(CliParseError::DuplicateFlag { flag: "--repo" });
-                }
-                let value = required_flag_value(args, index, "--repo")?;
-                require_repository(value)?;
-                repo = Some(value.to_string());
-                index += 2;
-            }
-            other => {
-                return Err(CliParseError::Unknown {
-                    token: other.to_string(),
-                })
-            }
+    let unknown = |token: &str| CliParseError::Unknown {
+        token: token.to_string(),
+    };
+    match args {
+        [] => Ok(CliCommand::PrList { repo: None }),
+        [repo] if !repo.starts_with("--") => {
+            require_repository(repo)?;
+            Ok(CliCommand::PrList {
+                repo: Some((*repo).to_string()),
+            })
         }
+        [flag, ..] if flag.starts_with("--") => Err(unknown(flag)),
+        [_, extra, ..] => Err(unknown(extra)),
+        [only] => Err(unknown(only)),
     }
-    Ok(CliCommand::PrList { repo })
 }
 
 fn parse_pr_open(args: &[&str]) -> Result<CliCommand, CliParseError> {
@@ -479,6 +475,7 @@ fn parse_pr_open(args: &[&str]) -> Result<CliCommand, CliParseError> {
     let mut head_ref = None;
     let mut head_oid = None;
     let mut draft = false;
+    let mut reviewers = Vec::new();
     let mut index = 0;
     while index < flags.len() {
         match flags[index] {
@@ -487,6 +484,10 @@ fn parse_pr_open(args: &[&str]) -> Result<CliCommand, CliParseError> {
             "--base" => parse_value_flag(flags, &mut index, "--base", &mut base_ref)?,
             "--head" => parse_value_flag(flags, &mut index, "--head", &mut head_ref)?,
             "--head-oid" => parse_value_flag(flags, &mut index, "--head-oid", &mut head_oid)?,
+            "--reviewer" => {
+                reviewers.push(required_flag_value(flags, index, "--reviewer")?.to_string());
+                index += 2;
+            }
             "--draft" => {
                 if draft {
                     return Err(CliParseError::DuplicateFlag { flag: "--draft" });
@@ -513,6 +514,7 @@ fn parse_pr_open(args: &[&str]) -> Result<CliCommand, CliParseError> {
         head_ref,
         head_oid,
         draft,
+        reviewers,
     })
 }
 

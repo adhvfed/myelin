@@ -283,8 +283,12 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             head_ref,
             head_oid,
             draft,
+            reviewers,
         } => {
             let mut body = json!({ "draft": draft, "title": title });
+            if !reviewers.is_empty() {
+                body["reviewers"] = json!(reviewers);
+            }
             if let Some(b) = body_md {
                 body["body"] = json!(b);
             }
@@ -648,7 +652,7 @@ mod tests {
         assert_eq!(cross_repo.path, "/v1/git/prs");
         assert!(cross_repo.query.is_none() && cross_repo.payload.is_none());
 
-        let repo = git_dispatch(&["pr", "list", "--repo", "platform/api"]).unwrap();
+        let repo = git_dispatch(&["pr", "list", "platform/api"]).unwrap();
         assert_eq!(repo.method, HttpMethod::Get);
         assert_eq!(repo.path, "/v1/git/repos/platform/api/prs");
         assert!(repo.query.is_none() && repo.payload.is_none());
@@ -673,6 +677,27 @@ mod tests {
         let view = git_dispatch(&["pr", "view", "alpha", "7"]).unwrap();
         assert_eq!(view.method, HttpMethod::Get);
         assert_eq!(view.path, "/v1/git/repos/alpha/prs/7");
+
+        let open = git_dispatch(&[
+            "pr",
+            "open",
+            "alpha",
+            "--title",
+            "Ship",
+            "--reviewer",
+            "bob",
+            "--reviewer",
+            "carol",
+        ])
+        .unwrap();
+        assert_eq!(open.path, "/v1/git/repos/alpha/prs");
+        let body: serde_json::Value =
+            serde_json::from_slice(open.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(body["reviewers"], json!(["bob", "carol"]));
+        let alone = git_dispatch(&["pr", "open", "alpha", "--title", "Ship"]).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(alone.payload.as_deref().unwrap()).unwrap();
+        assert!(body.get("reviewers").is_none());
 
         let merge = git_dispatch(&["pr", "merge", "alpha", "7"]).unwrap();
         assert_eq!(merge.method, HttpMethod::Post);
