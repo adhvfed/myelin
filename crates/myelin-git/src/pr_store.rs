@@ -1237,6 +1237,8 @@ pub enum MergeAttempt {
         base_ref: String,
         new_oid: String,
         update_seq: u64,
+        /// The issues the merged description names, for the merger to close.
+        closes: Vec<String>,
     },
     Blocked(MergeEval),
     /// The base moved past the branch; updating the branch makes it mergeable.
@@ -1332,11 +1334,21 @@ pub fn merge_pr<P: RepoPathResolver>(
             rec.state = pr.state;
             rec.updated_at = Some(merged_at_unix);
             rec.merged_oid = Some(head.0.clone());
+            rec.auto_merge = None;
             store.put(repo_loc, &rec)?;
+            let closes = crate::typed_edges::closes_issue_targets(
+                &repo_loc.tenant,
+                rec.body_md.as_deref().unwrap_or_default(),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|issue| issue.0)
+            .collect();
             Ok(MergeAttempt::Merged {
                 base_ref: rec.base_ref,
                 new_oid: head.0,
                 update_seq,
+                closes,
             })
         }
         PushOutcome::Rejected(reason) => Ok(MergeAttempt::RefRefused(reason)),

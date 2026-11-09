@@ -199,6 +199,17 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS git_pr_command_operation_scope_ui
   ON git_pr_command (tenant_id, region, operation_id)
 "#;
 
+/// Pull requests erased before the erasure batch scrubbed their command digests lose them now.
+pub const SCRUB_ERASED_PR_COMMAND_DIGESTS_DDL: &str = r#"
+UPDATE git_pr_command AS command SET payload_hash = repeat('0', 64)
+  FROM git_pr AS pr
+ WHERE pr.tenant_id = command.tenant_id AND pr.region = command.region
+   AND pr.repo_slug = command.repo_slug AND pr.number = command.pr_number
+   AND pr.free_text_erased
+   AND command.command_kind IN ('open', 'edit')
+   AND command.payload_hash <> repeat('0', 64)
+"#;
+
 /// The branch-follow sweep reads every open pull request whose branch lives in its own repository.
 pub const CREATE_GIT_PR_OPEN_HEADS_INDEX_DDL: &str = r#"
 CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_open_heads_idx
@@ -316,6 +327,11 @@ pub fn git_pr_migrations() -> Migrations {
             CREATE_GIT_PR_AUTO_MERGE_QUEUE_INDEX_DDL,
             MigrationPhase::Expand,
             GIT_PR_TABLE,
+        ),
+        Migration::plain_on(
+            "git_0019_scrub_erased_pr_command_digests",
+            SCRUB_ERASED_PR_COMMAND_DIGESTS_DDL,
+            GIT_PR_COMMAND_TABLE,
         ),
     ])
 }
@@ -450,6 +466,9 @@ struct MergeAdmission {
     ctx: PrOperationContext,
     ruleset: BranchProtectionRuleset,
     project_checks: bool,
+    /// For the merge queue: the schedule it merges for, which must still stand under the row
+    /// lock. Once the intent is written, edits wait for the merge to finish.
+    scheduled_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -459,6 +478,9 @@ enum MergeCommandResult {
         base_ref: String,
         new_oid: String,
         update_seq: u64,
+        /// The issues named by the description that landed; a replay closes the same ones.
+        #[serde(default)]
+        closes: Vec<String>,
     },
     Blocked {
         evaluation: MergeEval,
@@ -531,11 +553,14 @@ pub enum PrMutation {
     Edit {
         title: Option<String>,
         body_md: Option<String>,
+        /// The editor's subject id; their own scheduled merge already saw their text.
+        by: String,
     },
     Touch,
 }
 
 const CLOSE_REFUSAL: &str = "only an open or draft pull request can be closed";
+pub const SCHEDULE_CHANGED_REFUSAL: &str = "the automatic merge changed before it could merge";
 pub const MERGE_IN_PROGRESS: &str =
     "a merge is in progress for this pull request; try again once it finishes";
 /// Checked under the row lock, so a merge that lost a race with closing does not land.
@@ -736,7 +761,7 @@ impl PrMutation {
                 }
                 record.state = PrState::Open;
             }
-            Self::Edit { title, body_md } => {
+            Self::Edit { title, body_md, by } => {
                 if title.is_none() && body_md.is_none() {
                     return Err(EDIT_NOTHING_REFUSAL);
                 }
@@ -756,7 +781,14 @@ impl PrMutation {
                     let body = (!body.is_empty()).then_some(body);
                     // Merging closes the issues the description names, under the authority of
                     // whoever scheduled it; they must see a changed description before it lands.
-                    if body != record.body_md {
+                    let scheduled_by_someone_else = record
+                        .auto_merge
+                        .as_ref()
+                        .is_some_and(|request| request.requested_by != by);
+                    if body != record.body_md
+                        && record.state == PrState::Open
+                        && scheduled_by_someone_else
+                    {
                         if let Some(request) = record.auto_merge.take() {
                             record.auto_merge_stopped = Some(crate::pr_store::AutoMergeStopped {
                                 reason: DESCRIPTION_CHANGED_STOP.into(),
@@ -1948,9 +1980,12 @@ impl PgPrStore {
                         }
                         let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode PR"))?;
+                        let edit_stops_schedule = matches!(mutation, PrMutation::Edit { .. })
+                            && record.auto_merge.is_some();
                         mutation
                             .apply_to_at(&mut record, context.unix_seconds)
                             .map_err(pg_query)?;
+                        let edit_stops_schedule = edit_stops_schedule && record.auto_merge.is_none();
                         if free_text_erased {
                             let projection = command_projection(&record)
                                 .map_err(|_| pg_query("encode erased PR projection"))?;
@@ -2000,14 +2035,27 @@ impl PgPrStore {
                         }
                         co_commit_event(
                             conn,
-                            minter,
-                            context.emit,
+                            minter.clone(),
+                            context.emit.clone(),
                             &loc,
                             &record,
                             event_type,
                             None,
                         )
                         .await?;
+                        if edit_stops_schedule {
+                            // The same notice as when the queue stops a merge.
+                            co_commit_event(
+                                conn,
+                                minter,
+                                context.emit,
+                                &loc,
+                                &record,
+                                GIT_PR_MERGE_BLOCKED,
+                                None,
+                            )
+                            .await?;
+                        }
                         record_command(conn, &loc, &command, &record).await?;
                         Ok(record)
                     })
@@ -2166,6 +2214,7 @@ impl PgPrStore {
         ref_update_provenance: PushProvenance,
         project_checks: bool,
         method: crate::pr_store::MergeMethod,
+        scheduled_at: Option<i64>,
     ) -> Result<MergeAttempt, DurableError> {
         let loc = self.scoped_loc(scope, repo)?;
         if &loc != target_loc {
@@ -2242,6 +2291,8 @@ impl PgPrStore {
                     base_ref: record.base_ref,
                     new_oid: record.merged_oid.unwrap_or(record.head_oid),
                     update_seq,
+                    // It merged earlier and closed its issues then.
+                    closes: Vec::new(),
                 },
             );
         }
@@ -2365,6 +2416,7 @@ impl PgPrStore {
                 ctx: ctx.clone(),
                 ruleset,
                 project_checks,
+                scheduled_at,
             },
         )? {
             return Ok(attempt);
@@ -2812,6 +2864,7 @@ impl PgPrStore {
             ctx,
             ruleset,
             project_checks,
+            scheduled_at,
         } = admission;
         validate_merge_intent(&intent)?;
         let intent_json = serde_json::to_value(&intent)
@@ -2874,6 +2927,15 @@ impl PgPrStore {
                             .map_err(|_| pg_query("decode merge PR"))?;
                         if matches!(record.state, PrState::Draft | PrState::Closed) {
                             return Err(pg_query(MERGE_REFUSAL));
+                        }
+                        if scheduled_at.is_some()
+                            && record
+                                .auto_merge
+                                .as_ref()
+                                .map(|request| request.requested_at)
+                                != scheduled_at
+                        {
+                            return Err(pg_query(SCHEDULE_CHANGED_REFUSAL));
                         }
                         if record.state == PrState::Merged
                             || record.head_oid != intent.head_oid
@@ -3020,9 +3082,20 @@ impl PgPrStore {
                 }
                 let free_text_erased: bool = row.try_get("free_text_erased").map_err(|_| pg_query("decode PR text erasure state"))?;
                 let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row).map_err(|_| pg_query("decode merge PR"))?;
+                // The description edits could not change since the intent was written, so these
+                // are exactly the issues named by what lands.
+                let closes = crate::typed_edges::closes_issue_targets(
+                    &loc.tenant,
+                    record.body_md.as_deref().unwrap_or_default(),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.0)
+                .collect();
                 record.state = PrState::Merged;
                 record.updated_at = Some(ctx.unix_seconds);
                 record.merged_oid = Some(target.clone());
+                record.auto_merge = None;
                 if free_text_erased {
                     let projection = command_projection(&record).map_err(|_| pg_query("encode erased merge PR projection"))?;
                     sqlx::query("UPDATE git_pr SET record=$5,version=version+1,merge_intent=NULL,updated_at=now() \
@@ -3049,6 +3122,7 @@ impl PgPrStore {
                     base_ref: record.base_ref.clone(),
                     new_oid: target,
                     update_seq,
+                    closes,
                 };
                 let result_json = serde_json::to_value(&result).map_err(|_| pg_query("encode merged command result"))?;
                 let updated = sqlx::query("UPDATE git_pr_command SET status='completed',result=$5
@@ -3650,6 +3724,7 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         MARK_READY_REFUSAL,
         MERGE_REFUSAL,
         MERGE_IN_PROGRESS,
+        SCHEDULE_CHANGED_REFUSAL,
         EDIT_NOTHING_REFUSAL,
         EDIT_TITLE_REFUSAL,
         EDIT_BODY_REFUSAL,
@@ -3844,7 +3919,7 @@ mod tests {
     #[test]
     fn migration_set_is_forward_only_and_declares_mutated_tables_hot() {
         let migrations = git_pr_migrations();
-        assert_eq!(migrations.0.len(), 18);
+        assert_eq!(migrations.0.len(), 19);
         for migration in &migrations.0 {
             let upper = migration.ddl.to_ascii_uppercase();
             assert!(!upper.contains("DROP TABLE"));
@@ -4185,10 +4260,12 @@ mod tests {
         let mut record = PrRecord::open(&pull_request, "a".repeat(40));
         record.title = "Fix the typo".into();
         record.body_md = Some("Closes ENG-1".into());
-        let edit = |title: Option<&str>, body: Option<&str>| PrMutation::Edit {
+        let edit_by = |by: &str, title: Option<&str>, body: Option<&str>| PrMutation::Edit {
             title: title.map(str::to_string),
             body_md: body.map(str::to_string),
+            by: by.into(),
         };
+        let edit = |title: Option<&str>, body: Option<&str>| edit_by("author", title, body);
         assert_eq!(edit(Some("x"), None).event_type(), GIT_PR_EDITED);
 
         edit(Some("Fix the onboarding typo"), None)
@@ -4235,6 +4312,13 @@ mod tests {
             record.auto_merge.is_some(),
             "the same description keeps it too"
         );
+        edit_by("carol", None, Some("Closes ENG-2"))
+            .apply_to_at(&mut record, 575)
+            .unwrap();
+        assert!(
+            record.auto_merge.is_some(),
+            "the scheduler's own edit keeps their schedule"
+        );
         edit(None, Some("Closes ENG-7"))
             .apply_to_at(&mut record, 600)
             .unwrap();
@@ -4250,6 +4334,22 @@ mod tests {
                 requested_by: "carol".into(),
             })
         );
+        record.state = PrState::Merged;
+        record.auto_merge_stopped = None;
+        record.auto_merge = Some(crate::pr_store::AutoMerge {
+            requested_by: "carol".into(),
+            requested_at: 400,
+            head_oid: record.head_oid.clone(),
+            method: crate::pr_store::MergeMethod::FastForward,
+        });
+        edit(None, Some("Closes ENG-9"))
+            .apply_to_at(&mut record, 650)
+            .unwrap();
+        assert_eq!(
+            record.auto_merge_stopped, None,
+            "a merged pull request has no schedule left to stop"
+        );
+        record.state = PrState::Open;
 
         let kms = KmsEngine::new();
         let mutation = edit(Some("Fix the onboarding typo"), None);
@@ -4912,6 +5012,7 @@ mod tests {
                             )
                             .unwrap(),
                         project_checks: true,
+                        scheduled_at: None,
                     },
                 )
                 .unwrap(),
@@ -5413,6 +5514,7 @@ mod tests {
                         allow_force_push: false,
                     },
                     project_checks: false,
+                    scheduled_at: None,
                 },
             );
             assert!(
@@ -5424,6 +5526,124 @@ mod tests {
                 .unwrap()
                 .is_none());
             assert_eq!(target.read_ref("refs/heads/main").unwrap(), Some(base));
+        }
+        {
+            // A merge closes the issues named by the description that lands, and only once.
+            let slug = "merge-closes";
+            let loc = RepoLoc::new(&tenant_a, &region, slug);
+            let target = Arc::new(git_store.create_repo(&loc).unwrap());
+            let (_, head) = seed_repo(&target);
+            policy_store
+                .put_protection(
+                    &loc,
+                    &crate::pr_store::BranchProtectionConfig {
+                        rulesets: vec![crate::lifecycle::BranchProtectionRuleset {
+                            ref_pattern: "refs/heads/main".into(),
+                            required_contexts: vec![],
+                            required_approvals: 0,
+                            require_codeowner_review: false,
+                            require_conversation_resolution: false,
+                            allow_force_push: false,
+                        }],
+                    },
+                )
+                .unwrap();
+            let mut proposed = record(head.as_str(), "merge closes", slug);
+            proposed.body_md = Some("Closes ENG-1".into());
+            let op = |key: &str| PrOperationId::parse(key).unwrap();
+            let opened = store
+                .open(&scope_a, slug, proposed, &op("open-merge-closes"), &actor)
+                .unwrap();
+            let mutate = |mutation: PrMutation, key: &str| {
+                store
+                    .apply_mutation(&scope_a, slug, opened.number, mutation, &op(key), &actor)
+                    .unwrap()
+            };
+            let describe = |body: &str| PrMutation::Edit {
+                title: None,
+                body_md: Some(body.into()),
+                by: "author".into(),
+            };
+            let ref_store = open_ref_store(
+                target.clone(),
+                slug,
+                store.operation_context(&scope_a, &actor).unwrap().emit,
+            );
+            let merge = |key: &str, scheduled_at: Option<i64>| {
+                store.merge_pr_durable(
+                    &scope_a,
+                    slug,
+                    opened.number,
+                    &op(key),
+                    &actor,
+                    &policy_store,
+                    &loc,
+                    &target,
+                    &target,
+                    &ref_store,
+                    "merger@tenant.noreply",
+                    PushProvenance::NonAgent,
+                    false,
+                    crate::pr_store::MergeMethod::FastForward,
+                    scheduled_at,
+                )
+            };
+            let issue = |key: &str| format!("myelin://{tenant_a}/issue/issue/{key}");
+
+            let scheduled = mutate(
+                PrMutation::RequestAutoMerge {
+                    requested_by: "carol".into(),
+                    method: crate::pr_store::MergeMethod::FastForward,
+                },
+                "schedule-merge-closes",
+            );
+            let scheduled_at = scheduled.auto_merge.unwrap().requested_at;
+            mutate(describe("Closes ENG-2"), "edit-merge-closes");
+            assert!(
+                matches!(
+                    merge("merge-stale-schedule", Some(scheduled_at)),
+                    Err(DurableError::Conflict(message)) if message == SCHEDULE_CHANGED_REFUSAL
+                ),
+                "the queue cannot merge for a schedule that the edit stopped"
+            );
+
+            let merged = merge("merge-closes-now", None).unwrap();
+            assert!(
+                matches!(&merged, MergeAttempt::Merged { closes, .. } if closes == &[issue("ENG-2")]),
+                "{merged:?}"
+            );
+            assert_eq!(
+                store
+                    .get(&scope_a, slug, opened.number)
+                    .unwrap()
+                    .unwrap()
+                    .auto_merge,
+                None
+            );
+            mutate(describe("Closes ENG-99"), "edit-after-merge");
+            assert!(
+                matches!(
+                    merge("merge-closes-again", None).unwrap(),
+                    MergeAttempt::Merged { closes, .. } if closes.is_empty()
+                ),
+                "merging it again closes nothing the merge did not land"
+            );
+            assert_eq!(
+                merge("merge-closes-now", None).unwrap(),
+                merged,
+                "a replay keeps the issues its merge landed with"
+            );
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM outbox WHERE aggregate=$1 AND envelope->>'tenant'=$2 \
+                 AND envelope->>'type_'=$3",
+            )
+            .bind(format!("git/pr/{slug}:{}", opened.number))
+            .bind(&tenant_a)
+            .bind(GIT_PR_MERGE_BLOCKED)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+            assert_eq!(blocked, 1, "the stopping edit says so like the queue does");
         }
         for slug in ["merge-before", "merge-after", "merge-cancel"] {
             let loc = RepoLoc::new(&tenant_a, &region, slug);
@@ -5506,6 +5726,7 @@ mod tests {
                             )
                             .unwrap(),
                         project_checks: false,
+                        scheduled_at: None,
                     },
                 )
                 .unwrap()
@@ -5663,6 +5884,7 @@ mod tests {
                         PushProvenance::NonAgent,
                         false,
                         crate::pr_store::MergeMethod::FastForward,
+                        None,
                     )
                     .unwrap();
                 assert_eq!(first, retry, "cancelled command replays deterministically");

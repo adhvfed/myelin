@@ -1467,6 +1467,7 @@ impl Handler for DMerge {
                 base_ref,
                 new_oid,
                 update_seq,
+                ..
             } => Ok(EdgeResponse::json(
                 200,
                 &json!({

@@ -73,12 +73,6 @@ pub(crate) fn auto_merge_signal_drafts(
         (crate::events::GIT_PR_MERGE_BLOCKED, Some(stopped), _) => {
             (stopped.requested_by.as_str(), SignalState::Open)
         }
-        // An edit that stopped the schedule just now.
-        (crate::events::GIT_PR_EDITED, Some(stopped), None)
-            if Some(stopped.at) == record.updated_at =>
-        {
-            (stopped.requested_by.as_str(), SignalState::Open)
-        }
         (crate::events::GIT_PR_MERGE_QUEUED, _, Some(request)) => {
             (request.requested_by.as_str(), SignalState::Resolved)
         }
@@ -547,23 +541,14 @@ mod tests {
         assert_eq!(resolved[0].aggregate, stopped[0].aggregate);
 
         record.auto_merge = None;
-        record.updated_at = Some(30);
         record.auto_merge_stopped = Some(crate::pr_store::AutoMergeStopped {
             reason: "its description changed".into(),
             at: 30,
             requested_by: "alice".into(),
         });
-        let edited = drafts(crate::events::GIT_PR_EDITED, &record);
-        assert_eq!(
-            edited.len(),
-            1,
-            "an edit that stops the schedule tells its requester"
-        );
-        assert_eq!(edited[0].type_.0, "signal.opened");
-        record.updated_at = Some(31);
         assert!(
             drafts(crate::events::GIT_PR_EDITED, &record).is_empty(),
-            "a later edit does not repeat an older stop"
+            "an edit's own event never raises a stop; the stopped event it emits does"
         );
     }
 

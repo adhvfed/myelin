@@ -10,10 +10,12 @@ impl MergeCommandResult {
                 base_ref,
                 new_oid,
                 update_seq,
+                closes,
             } => MergeAttempt::Merged {
                 base_ref,
                 new_oid,
                 update_seq,
+                closes,
             },
             Self::Blocked { evaluation } => MergeAttempt::Blocked(evaluation),
             Self::BehindBase { base_ref } => MergeAttempt::BehindBase { base_ref },

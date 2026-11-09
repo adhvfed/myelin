@@ -34,7 +34,9 @@ use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
 };
-use myelin_git::pg_pr_store::{PgPrStore, PrMutation, PrOperationId, MERGE_IN_PROGRESS};
+use myelin_git::pg_pr_store::{
+    PgPrStore, PrMutation, PrOperationId, MERGE_IN_PROGRESS, SCHEDULE_CHANGED_REFUSAL,
+};
 use myelin_git::pr_list_pagination::{
     pr_list_static_scope, pr_list_visible_scope, PrListCursor, PrListCursorEndpoint,
     PrListDirection, PrListKey, PrListPage, PR_LIST_CURSOR_PREFIX,
@@ -116,6 +118,12 @@ impl core::fmt::Debug for RepoActorContext<'_> {
 pub struct PrActorContext<'a> {
     repo: RepoActorContext<'a>,
     number: u64,
+}
+
+/// How a merge lands, and for the merge queue, the schedule it merges for.
+struct MergeTerms {
+    method: MergeMethod,
+    scheduled_at: Option<i64>,
 }
 
 /// A branch shared by more open pull requests than this is not a review workflow worth syncing.
@@ -2873,7 +2881,32 @@ impl DurableGitBackend {
             principal,
             operation_id,
             PushProvenance::direct(Self::is_agent(principal)),
-            method,
+            MergeTerms {
+                method,
+                scheduled_at: None,
+            },
+        )
+    }
+
+    /// The merge queue's merge for the schedule made at `scheduled_at`; refused if that schedule
+    /// no longer stands when the merge begins.
+    pub(super) fn merge_scheduled_with_operation(
+        &self,
+        target: PrActorContext<'_>,
+        operation_id: &PrOperationId,
+        method: MergeMethod,
+        scheduled_at: i64,
+    ) -> Result<MergeAttempt, DurableError> {
+        let principal = target.repo.principal;
+        self.merge_for_actor_with_operation(
+            target,
+            principal,
+            operation_id,
+            PushProvenance::direct(Self::is_agent(principal)),
+            MergeTerms {
+                method,
+                scheduled_at: Some(scheduled_at),
+            },
         )
     }
 
@@ -2894,7 +2927,10 @@ impl DurableGitBackend {
             repo_reader,
             operation_id,
             PushProvenance::HumanApprovedAgent,
-            method,
+            MergeTerms {
+                method,
+                scheduled_at: None,
+            },
         )
     }
 
@@ -2907,21 +2943,23 @@ impl DurableGitBackend {
         repo_reader: &Principal,
         operation_id: &PrOperationId,
         ref_update_provenance: PushProvenance,
-        method: MergeMethod,
+        terms: MergeTerms,
     ) -> Result<MergeAttempt, DurableError> {
         let loc = Self::loc(target.repo.tenant, target.repo.region, target.repo.slug);
         let actor = target.repo.principal;
-        let number = target.number;
         let attempt = self.land_merge(
             target,
             repo_reader,
             operation_id,
             ref_update_provenance,
-            method,
+            terms,
         )?;
-        if let MergeAttempt::Merged { base_ref, .. } = &attempt {
+        if let MergeAttempt::Merged {
+            base_ref, closes, ..
+        } = &attempt
+        {
             self.follow_branch(&loc, actor, base_ref);
-            self.close_merged_issues(&loc, number, actor, repo_reader);
+            self.close_merged_issues(actor, repo_reader, closes);
         }
         Ok(attempt)
     }
@@ -2930,44 +2968,19 @@ impl DurableGitBackend {
     /// The merge has already landed, so a failure here is reported, not raised.
     fn close_merged_issues(
         &self,
-        loc: &RepoLoc,
-        number: u64,
         actor: &Principal,
         authorized_viewer: &Principal,
+        closes: &[String],
     ) {
         let Some(follow_up) = self.merge_follow_up.get() else {
             return;
         };
         // Closing an issue is an agent effect that needs its own approval, so only a person's
         // merge closes issues; an agent's approved merge leaves them for a person.
-        if Self::is_agent(actor) {
+        if Self::is_agent(actor) || closes.is_empty() {
             return;
         }
-        let record = match self.pr_get(loc, number, actor) {
-            Ok(Some(record)) => record,
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!(
-                    "edge: could not read merged pull request {}#{number}: {error}",
-                    loc.repo
-                );
-                return;
-            }
-        };
-        match myelin_git::typed_edges::closes_issue_targets(
-            &loc.tenant,
-            record.body_md.as_deref().unwrap_or_default(),
-        ) {
-            Ok(closes) if !closes.is_empty() => {
-                let closes: Vec<String> = closes.into_iter().map(|issue| issue.0).collect();
-                follow_up.merged(actor, authorized_viewer, &closes);
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!(
-                "edge: merged pull request {}#{number} names issues it cannot close: {error}",
-                loc.repo
-            ),
-        }
+        follow_up.merged(actor, authorized_viewer, closes);
     }
 
     fn land_merge(
@@ -2976,8 +2989,12 @@ impl DurableGitBackend {
         repo_reader: &Principal,
         operation_id: &PrOperationId,
         ref_update_provenance: PushProvenance,
-        method: MergeMethod,
+        terms: MergeTerms,
     ) -> Result<MergeAttempt, DurableError> {
+        let MergeTerms {
+            method,
+            scheduled_at,
+        } = terms;
         let PrActorContext { repo, number } = target;
         let RepoActorContext {
             tenant,
@@ -3042,14 +3059,23 @@ impl DurableGitBackend {
                 ref_update_provenance,
                 self.checks.is_some(),
                 method,
+                scheduled_at,
             );
         }
-        if let Some(refusal) = self
-            .prs
-            .get(&loc, number)?
+        let record = self.prs.get(&loc, number)?;
+        if let Some(refusal) = record
+            .as_ref()
             .and_then(|record| pr_state::merge_refusal(record.state))
         {
             return Err(DurableError::Conflict(refusal.into()));
+        }
+        if scheduled_at.is_some()
+            && record
+                .and_then(|record| record.auto_merge)
+                .map(|request| request.requested_at)
+                != scheduled_at
+        {
+            return Err(DurableError::Conflict(SCHEDULE_CHANGED_REFUSAL.into()));
         }
         merge_pr(
             &self.prs,

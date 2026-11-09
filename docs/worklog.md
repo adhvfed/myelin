@@ -4,6 +4,53 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — A merge closes only what its own description named
+
+A re-check of the edit fixes showed the description-change stop was not enough. Merging closes the
+issues a description names, but the edge read the description after the merge had landed. It also
+read it again on every successful merge outcome. That left three ways for text the merge's
+authority never saw to close issues:
+- **The queue race.** An edit landing after the queue's last check, but before the merge began.
+- **Re-merge or replay.** A retry or second merge of an already-merged pull request. An author with
+  read access could add `Closes ENG-99` to a merged pull request, and a maintainer's retry would
+  close it.
+- **A manual merge racing an edit.**
+
+Issue closing is now bound to the merge itself:
+- **Captured under the lock.** The merge transaction records the `Closes` list from the
+  description that lands, while holding the row lock. Edits already wait while a merge intent is
+  pending, so that list is the text that merged. It travels in the durable merge result, and the
+  follow-up closes exactly that list without re-reading anything. A replay closes the same list,
+  which also completes a follow-up that crashed. A merge of an already-merged pull request closes
+  nothing.
+- **Schedule checked under the lock.** A queue merge carries the time of the schedule it merges
+  for. The merge refuses under the lock if that schedule no longer stands, and the queue treats
+  the refusal as waiting.
+- **Merging clears the schedule.** So editing a merged pull request can no longer raise a stale
+  stop notice.
+- **A real stop event.** An edit that stops a schedule emits the same `git.pr.merge_blocked` event
+  the queue does, in the same transaction. This replaces a timestamp heuristic.
+- **The scheduler's own edits.** An edit by the person who scheduled the merge leaves their
+  schedule alone.
+- **Earlier erasures backfilled.** A forward migration, `git_0019`, scrubs the text digests of pull
+  requests erased before the erasure batch did so. All 36 such rows in the dev database now carry
+  the marker.
+
+The manual-merge race is narrowed but not bound. A person who merges right after an author's edit
+merges with the text as it is then, which is what the page shows after a reload.
+
+Proof:
+- The live Postgres store test:
+  - refuses a merge for a schedule that an edit stopped;
+  - merges and reports exactly the issue named by the description that landed, with the schedule
+    cleared;
+  - after a later edit, closes nothing on a second merge;
+  - returns the original list on replay;
+  - counts exactly one `merge_blocked` event for the stopping edit.
+- Store tests cover the scheduler's own edit and the merged-pull-request case.
+- The merge-queue, closes-issue, privacy, CLI, close-and-reopen, Git lifecycle, agent-merge and
+  update-branch journeys pass (27 tests).
+
 ## 2026-11-09 — Review fixes for editing pull requests
 
 An independent review of the edit slice found no way for an edit to race erasure, and no

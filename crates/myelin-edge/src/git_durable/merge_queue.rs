@@ -322,10 +322,11 @@ impl DurableGitBackend {
             return Ok(QueueStep::WaitingForReview);
         }
         // A merge that lost a race is recorded as a finished attempt, so every attempt is new.
-        let attempt = self.merge_with_operation(
+        let attempt = self.merge_scheduled_with_operation(
             actor.for_pr(number),
             &self.fresh_operation_id()?,
             request.method,
+            request.requested_at,
         );
         match attempt {
             Ok(MergeAttempt::Merged { .. }) => Ok(QueueStep::Merged),
@@ -342,6 +343,10 @@ impl DurableGitBackend {
             Err(DurableError::Io(error)) => Err(DurableError::Io(error)),
             Err(DurableError::Conflict(message)) if message == MERGE_IN_PROGRESS => {
                 Ok(QueueStep::Holding)
+            }
+            // Someone cancelled, or a description edit stopped it, after this pass looked.
+            Err(DurableError::Conflict(message)) if message == SCHEDULE_CHANGED_REFUSAL => {
+                Ok(QueueStep::WaitingForReview)
             }
             Err(error) => stop(format!(
                 "the merge failed: {}",

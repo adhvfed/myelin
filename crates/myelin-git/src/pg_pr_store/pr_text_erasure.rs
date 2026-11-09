@@ -698,6 +698,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn erasure_and_its_backfill_scrub_command_digests_to_the_same_marker() {
+        assert_eq!(ERASED_COMMAND_DIGEST, "0".repeat(64));
+        assert!(super::super::SCRUB_ERASED_PR_COMMAND_DIGESTS_DDL.contains("repeat('0', 64)"));
+    }
+
+    #[test]
     fn migration_declares_a_bounded_forward_only_erasure_shape() {
         assert!(EXPAND_GIT_PR_TEXT_ERASURE_DDL.contains("free_text_erased"));
         assert!(CREATE_GIT_PR_TEXT_ERASURE_OPERATION_DDL.contains("OLD.completed_at IS NOT NULL"));

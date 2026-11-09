@@ -473,8 +473,10 @@ fn an_agents_approved_merge_leaves_issues_for_a_person() {
             on_behalf_of: Some(PrincipalId("author".into())),
         },
     );
-    fixture
-        .backend
-        .close_merged_issues(&loc(), fixture.number, &agent, &fixture.author);
+    fixture.backend.close_merged_issues(
+        &agent,
+        &fixture.author,
+        &["myelin://acme/issue/issue/DX-7".to_string()],
+    );
     assert!(recorded.0.lock().unwrap().is_empty());
 }

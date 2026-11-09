@@ -143,6 +143,7 @@ impl DurableGitBackend {
             PrMutation::Edit {
                 title: title.map(str::to_string),
                 body_md: edit.body_md.map(str::to_string),
+                by: actor.principal.principal_id.0.clone(),
             },
             operation_id,
             actor.principal,
