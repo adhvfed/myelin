@@ -364,12 +364,16 @@ impl PrRecord {
         }
     }
 
+    /// Whether `viewer_pseudonym` still owes this pull request a review; an ended pull request
+    /// asks nothing of anyone.
     pub fn is_review_requested_of(&self, viewer_pseudonym: &str) -> bool {
-        self.reviews
-            .iter()
-            .rev()
-            .find(|review| review.reviewer_pseudonym == viewer_pseudonym)
-            .is_some_and(|review| matches!(review.state, ReviewState::Requested))
+        matches!(self.state, PrState::Open | PrState::Draft)
+            && self
+                .reviews
+                .iter()
+                .rev()
+                .find(|review| review.reviewer_pseudonym == viewer_pseudonym)
+                .is_some_and(|review| matches!(review.state, ReviewState::Requested))
     }
 
     pub fn has_review_relationship_with(&self, viewer_pseudonym: &str) -> bool {
@@ -2216,6 +2220,12 @@ mod tests {
         assert!(rec.is_review_requested_of(reviewer));
         assert!(rec.has_review_relationship_with(reviewer));
         assert_eq!(rec.review_state_label(), "requested");
+        rec.state = PrState::Closed;
+        assert!(
+            !rec.is_review_requested_of(reviewer),
+            "a closed pull request asks nothing of its reviewers"
+        );
+        rec.state = PrState::Open;
 
         rec.reviews
             .push(review(ReviewState::Submitted(ReviewVerdict::Approve)));

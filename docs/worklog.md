@@ -4,6 +4,31 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Review fixes for closing and reopening
+
+An independent review of the close and reopen slice confirmed that no path merges a draft or
+closed pull request. It also checked the pending-merge, ledger-replay, erasure, and query
+interplay. It found three smaller issues:
+- **Stale banner.** Reopening a pull request whose queued merge had been stopped brought back the
+  "automatic merge stopped" banner. Its inbox notice had been withdrawn when the pull request
+  closed. Reopening now clears the stopped notice. Closing keeps it, so the closed event can say
+  whose notice to withdraw.
+- **Misleading error.** A close, update, or other change during an in-flight merge reported
+  "idempotency key is already bound to a different pull request operation". It now says a merge
+  is in progress and to try again once it finishes.
+- **Inflated count.** The per-repository "needs review" count, and the `you_are_requested` flag on
+  list rows, counted pull requests that had been closed or merged. Both now ask only of open and
+  draft pull requests.
+
+Proof:
+- The live Postgres PR store test closes a pull request with an outstanding request: the
+  reviewer's needs-review count drops to zero, then returns on reopen.
+- Unit tests cover the cleared banner and the new error mappings.
+
+Known gap, found in the same review and older than this work: when a different person schedules a
+stopped merge again, the first person's stopped notice is never withdrawn. Fixing it needs the
+mutation's previous state in the signal derivation.
+
 ## 2026-11-09 — Only an open pull request merges
 
 Closing a pull request was new, and nothing on the merge path knew it.

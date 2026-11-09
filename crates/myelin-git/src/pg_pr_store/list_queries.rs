@@ -82,7 +82,7 @@ pub(super) fn pr_list_page_sql(query: &PrListQuery) -> String {
                   count(*) FILTER (WHERE g.record->>'state' = 'Closed')::bigint AS closed_count, \
                   count(*)::bigint AS all_count, \
                   count(*) FILTER (WHERE g.record->>'author_pseudonym' = $4)::bigint AS yours_count, \
-                  count(*) FILTER (WHERE (\
+                  count(*) FILTER (WHERE g.record->>'state' IN ('Open','Draft') AND (\
                     SELECT review.item->>'state' \
                       FROM jsonb_array_elements(COALESCE(g.record->'reviews','[]'::jsonb)) \
                            WITH ORDINALITY AS review(item, position) \

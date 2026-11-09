@@ -174,7 +174,7 @@ fn its_author_or_a_writer_closes_it_and_an_agent_only_its_own() {
     assert_eq!(closed.state, PrState::Closed);
     assert!(matches!(
         fixture.change(&writer, PrStateChange::Close),
-        Err(DurableError::Conflict(message)) if message == "only an open pull request can be closed"
+        Err(DurableError::Conflict(message)) if message == "only an open or draft pull request can be closed"
     ));
     let reopened = fixture
         .change(&fixture.author, PrStateChange::Reopen)

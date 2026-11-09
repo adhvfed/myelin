@@ -534,7 +534,9 @@ impl From<crate::pr_store::PrStateChange> for PrMutation {
     }
 }
 
-const CLOSE_REFUSAL: &str = "only an open pull request can be closed";
+const CLOSE_REFUSAL: &str = "only an open or draft pull request can be closed";
+const MERGE_IN_PROGRESS: &str =
+    "a merge is in progress for this pull request; try again once it finishes";
 /// Checked under the row lock, so a merge that lost a race with closing does not land.
 pub const MERGE_REFUSAL: &str = "only an open pull request can be merged";
 const REOPEN_REFUSAL: &str = "only a closed pull request can be reopened";
@@ -695,6 +697,8 @@ impl PrMutation {
                     return Err(REOPEN_REFUSAL);
                 }
                 record.state = PrState::Open;
+                // Closing withdrew the stopped-merge notice; its banner must not come back.
+                record.auto_merge_stopped = None;
             }
             Self::MarkReady => {
                 if record.state != PrState::Draft {
@@ -1872,9 +1876,7 @@ impl PgPrStore {
                             .try_get("merge_intent")
                             .map_err(|_| pg_query("decode merge intent"))?;
                         if pending_intent.is_some() {
-                            return Err(myelin_storage::PgError::Query(
-                                "a merge operation is pending for this PR".into(),
-                            ));
+                            return Err(myelin_storage::PgError::Query(MERGE_IN_PROGRESS.into()));
                         }
                         let free_text_erased: bool = row
                             .try_get("free_text_erased")
@@ -3549,6 +3551,7 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         REOPEN_REFUSAL,
         MARK_READY_REFUSAL,
         MERGE_REFUSAL,
+        MERGE_IN_PROGRESS,
     ]
     .into_iter()
     .find(|refusal| message.contains(refusal))
@@ -4100,10 +4103,21 @@ mod tests {
         }
         .apply_to_at(&mut record, 400)
         .unwrap();
+        let stopped = crate::pr_store::AutoMergeStopped {
+            reason: "a required check failed".into(),
+            at: 450,
+            requested_by: "bob".into(),
+        };
+        record.auto_merge_stopped = Some(stopped.clone());
         assert_eq!(PrMutation::Close.event_type(), GIT_PR_CLOSED);
         PrMutation::Close.apply_to_at(&mut record, 500).unwrap();
         assert_eq!(record.state, PrState::Closed);
         assert_eq!(record.auto_merge, None, "closing leaves the merge queue");
+        assert_eq!(
+            record.auto_merge_stopped,
+            Some(stopped),
+            "the closed event still names whose stopped-merge notice to withdraw"
+        );
         assert_eq!(
             PrMutation::Close.apply_to_at(&mut record, 600),
             Err(CLOSE_REFUSAL)
@@ -4116,6 +4130,10 @@ mod tests {
             record.auto_merge, None,
             "reopening does not schedule a merge again"
         );
+        assert_eq!(
+            record.auto_merge_stopped, None,
+            "the withdrawn notice's banner does not come back"
+        );
 
         record.state = PrState::Merged;
         for (mutation, refusal) in [
@@ -4125,10 +4143,12 @@ mod tests {
         ] {
             assert_eq!(mutation.apply_to_at(&mut record, 800), Err(refusal));
         }
-        assert!(matches!(
-            pg_error(myelin_storage::PgError::Query(CLOSE_REFUSAL.into())),
-            DurableError::Conflict(message) if message == CLOSE_REFUSAL
-        ));
+        for refusal in [CLOSE_REFUSAL, MERGE_REFUSAL, MERGE_IN_PROGRESS] {
+            assert!(matches!(
+                pg_error(myelin_storage::PgError::Query(refusal.into())),
+                DurableError::Conflict(message) if message == refusal
+            ));
+        }
     }
 
     #[test]
@@ -4913,6 +4933,27 @@ mod tests {
                 .len(),
             1
         );
+        for (change, still_asked) in [(PrMutation::Close, 0), (PrMutation::Reopen, 1)] {
+            store
+                .apply_mutation(
+                    &scope_a,
+                    repo,
+                    opened.number,
+                    change,
+                    &PrOperationId::parse(&format!("needs-review-{still_asked}")).unwrap(),
+                    &actor,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .list_page(&scope_a, repo, &reviewer_page_query)
+                    .unwrap()
+                    .counts
+                    .needs_review,
+                still_asked,
+                "a closed pull request asks nothing of its reviewers"
+            );
+        }
 
         store
             .apply_mutation(
