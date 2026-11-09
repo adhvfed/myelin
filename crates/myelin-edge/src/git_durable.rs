@@ -302,6 +302,15 @@ pub struct DurableGitBackend {
     merge_queue_wakeup: Arc<tokio::sync::Notify>,
     /// Confirms that the person behind a scheduled merge is still an active human.
     principals: Option<myelin_identity_service::PrincipalStore>,
+    /// Finishes what a merge completes outside Git, set once the rest of Edge is composed.
+    merge_follow_up: std::sync::OnceLock<Arc<dyn MergeFollowUp>>,
+}
+
+/// Work a merge finishes outside Git, such as the issues a pull request says it closes.
+pub trait MergeFollowUp: Send + Sync {
+    /// `closes` are the issues named by `Closes` lines in the merged pull request's description.
+    /// The actor performed the merge; the authorized viewer supplied its authority.
+    fn merged(&self, actor: &Principal, authorized_viewer: &Principal, closes: &[String]);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +390,7 @@ impl DurableGitBackend {
             bootstrap: Arc::new(NoRepoBootstrap),
             merge_queue_wakeup: Arc::new(tokio::sync::Notify::new()),
             principals: None,
+            merge_follow_up: std::sync::OnceLock::new(),
         })
     }
 
@@ -404,6 +414,7 @@ impl DurableGitBackend {
             bootstrap: Arc::new(NoRepoBootstrap),
             merge_queue_wakeup: Arc::new(tokio::sync::Notify::new()),
             principals: None,
+            merge_follow_up: std::sync::OnceLock::new(),
         }
     }
 
@@ -413,6 +424,11 @@ impl DurableGitBackend {
     ) -> DurableGitBackend {
         self.repo_authz = repo_authz;
         self
+    }
+
+    /// Called once when Edge is composed; later calls are ignored.
+    pub fn follow_merges_with(&self, follow_up: Arc<dyn MergeFollowUp>) {
+        let _ = self.merge_follow_up.set(follow_up);
     }
 
     pub fn with_principal_directory(
@@ -2856,6 +2872,7 @@ impl DurableGitBackend {
     ) -> Result<MergeAttempt, DurableError> {
         let loc = Self::loc(target.repo.tenant, target.repo.region, target.repo.slug);
         let actor = target.repo.principal;
+        let number = target.number;
         let attempt = self.land_merge(
             target,
             repo_reader,
@@ -2865,8 +2882,53 @@ impl DurableGitBackend {
         )?;
         if let MergeAttempt::Merged { base_ref, .. } = &attempt {
             self.follow_branch(&loc, actor, base_ref);
+            self.close_merged_issues(&loc, number, actor, repo_reader);
         }
         Ok(attempt)
+    }
+
+    /// Closes the issues a merged pull request's description names, as the person who merged.
+    /// The merge has already landed, so a failure here is reported, not raised.
+    fn close_merged_issues(
+        &self,
+        loc: &RepoLoc,
+        number: u64,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+    ) {
+        let Some(follow_up) = self.merge_follow_up.get() else {
+            return;
+        };
+        // Closing an issue is an agent effect that needs its own approval, so only a person's
+        // merge closes issues; an agent's approved merge leaves them for a person.
+        if Self::is_agent(actor) {
+            return;
+        }
+        let record = match self.pr_get(loc, number, actor) {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!(
+                    "edge: could not read merged pull request {}#{number}: {error}",
+                    loc.repo
+                );
+                return;
+            }
+        };
+        match myelin_git::typed_edges::closes_issue_targets(
+            &loc.tenant,
+            record.body_md.as_deref().unwrap_or_default(),
+        ) {
+            Ok(closes) if !closes.is_empty() => {
+                let closes: Vec<String> = closes.into_iter().map(|issue| issue.0).collect();
+                follow_up.merged(actor, authorized_viewer, &closes);
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "edge: merged pull request {}#{number} names issues it cannot close: {error}",
+                loc.repo
+            ),
+        }
     }
 
     fn land_merge(

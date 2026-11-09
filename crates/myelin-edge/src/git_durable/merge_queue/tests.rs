@@ -38,6 +38,10 @@ fn loc() -> RepoLoc {
 
 /// A pull request whose base moved on after its branch was made.
 fn pull_request_behind_its_base(branch_change: (&str, &[u8])) -> Fixture {
+    pull_request_with_description(branch_change, "")
+}
+
+fn pull_request_with_description(branch_change: (&str, &[u8]), description: &str) -> Fixture {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
@@ -70,6 +74,7 @@ fn pull_request_behind_its_base(branch_change: (&str, &[u8])) -> Fixture {
             REPO,
             &serde_json::json!({
                 "title": "Feature",
+                "body_md": description,
                 "base_ref": "refs/heads/main",
                 "head_ref": "refs/heads/feature",
                 "head_oid": head.0,
@@ -418,4 +423,58 @@ fn a_sweep_brings_a_pull_request_left_behind_by_a_crash_onto_its_branch() {
         0,
         "a pull request already on its tip is left alone"
     );
+}
+
+#[derive(Default)]
+struct RecordedMerges(std::sync::Mutex<Vec<(String, Vec<String>)>>);
+
+impl crate::git_durable::MergeFollowUp for RecordedMerges {
+    fn merged(&self, actor: &Principal, _authorized_viewer: &Principal, closes: &[String]) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((actor.principal_id.0.clone(), closes.to_vec()));
+    }
+}
+
+#[test]
+fn a_persons_merge_closes_the_issues_its_description_names() {
+    let fixture = pull_request_with_description(
+        ("feature.txt", b"feature\n"),
+        "Fixes the release notes.\n\nCloses dx-7\nCloses DX-9",
+    );
+    let recorded = Arc::new(RecordedMerges::default());
+    fixture.backend.follow_merges_with(recorded.clone());
+    fixture.approve();
+    fixture.request(&fixture.author).unwrap();
+    assert_eq!(fixture.advance(), QueueStep::Holding);
+    assert_eq!(fixture.advance(), QueueStep::Merged);
+    assert_eq!(
+        *recorded.0.lock().unwrap(),
+        [(
+            "author".to_string(),
+            vec![
+                "myelin://acme/issue/issue/DX-7".to_string(),
+                "myelin://acme/issue/issue/DX-9".to_string(),
+            ],
+        )]
+    );
+}
+
+#[test]
+fn an_agents_approved_merge_leaves_issues_for_a_person() {
+    let fixture = pull_request_with_description(("feature.txt", b"feature\n"), "Closes DX-7");
+    let recorded = Arc::new(RecordedMerges::default());
+    fixture.backend.follow_merges_with(recorded.clone());
+    let agent = principal(
+        "agent:helper",
+        PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("runtime:local".into()),
+            on_behalf_of: Some(PrincipalId("author".into())),
+        },
+    );
+    fixture
+        .backend
+        .close_merged_issues(&loc(), fixture.number, &agent, &fixture.author);
+    assert!(recorded.0.lock().unwrap().is_empty());
 }

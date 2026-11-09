@@ -146,6 +146,28 @@ pub struct DurableIssueMutationApi {
     runtime: Handle,
 }
 
+impl crate::git_durable::MergeFollowUp for DurableIssueMutationApi {
+    fn merged(
+        &self,
+        actor: &myelin_identity::Principal,
+        authorized_viewer: &myelin_identity::Principal,
+        closes: &[String],
+    ) {
+        for issue in closes {
+            // Only someone who may close the issue closes it by merging.
+            match self.may_close_ref(authorized_viewer, issue) {
+                Ok(true) => {
+                    if let Err(error) = self.close_issue_ref(actor, authorized_viewer, issue) {
+                        eprintln!("edge: a merge could not close {issue}: {error}");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("edge: a merge could not check {issue}: {error}"),
+            }
+        }
+    }
+}
+
 impl DurableIssueMutationApi {
     pub fn new(
         store: Arc<ProductionIssueStore>,

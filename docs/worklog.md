@@ -4,6 +4,26 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Merging closes the issues a pull request names
+
+A `Closes DX-1` line in a pull request's description linked the pull request to the issue in the
+reference graph, but merging changed nothing: the issue stayed open until someone remembered to
+close it. That breaks the expectation people bring from every other hosting and tracking pair, and
+it is the kind of chore agents leave behind.
+
+After a merge lands, by a person or through the merge queue, Edge reads the merged pull request's
+description. It closes each issue named by a `Closes` line, acting as the person who merged and
+only where that person may close the issue themselves. So a description can never close something
+its merger could not. Closing is idempotent, so a replayed merge is harmless. An agent's
+human-approved merge leaves the issues open, because an agent closing an issue needs its own
+approval. A failure is reported rather than undoing the merge.
+
+Proof: the readable TypeScript journey creates an issue and opens a pull request whose description
+says `Closes <key>`. The issue stays open through review and is completed by the merge. Unit tests
+cover the issues a person's queued merge reports, with keys canonicalised, and an agent's merge
+reporting none. The issues, merge-queue, Git, and agent-merge journeys pass, along with strict
+Clippy.
+
 ## 2026-11-09 — Pull requests converge on their branch after a crash
 
 Pull requests follow their branch synchronously after every accepted branch update. Two things

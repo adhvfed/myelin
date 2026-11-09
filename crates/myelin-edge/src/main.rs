@@ -1325,6 +1325,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 handle.clone(),
             )),
     );
+    git_backend.follow_merges_with(Arc::new(issue_mutations.clone()));
     builder = register_issues(builder, issue_mutations.clone());
     builder = register_projects(
         builder,
